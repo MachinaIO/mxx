@@ -17,9 +17,9 @@ use super::{
     language::MxxLang,
     lower::{GraphLowerer, LoweredValue, LoweringControl},
     relation::{
-        RelationApplier, RelationSearcher, ReplacementPlan, RewriteContext, SharedRewriteBudget,
-        materialize_selected_polynomial_redex, selected_polynomial_monomials,
-        selected_polynomial_redexes_mut,
+        RelationApplier, RelationFailure, RelationSearcher, ReplacementPlan, RewriteContext,
+        SharedRewriteBudget, classify_proposal_node, materialize_selected_polynomial_redex,
+        selected_polynomial_monomials, selected_polynomial_redexes_mut,
     },
 };
 use crate::{OperationalDecoderKind, ProtocolDecl, StageId};
@@ -84,6 +84,21 @@ fn commit_structural_preference_batch(
         }
     }
     changed
+}
+
+fn preferred_batch_has_relation_redex(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    batch: &ExactStructuralPreferences,
+    context: &RewriteContext,
+) -> Result<bool, RelationFailure> {
+    let mut has_relation_redex = false;
+    for (origin, nodes) in batch {
+        for node in nodes {
+            has_relation_redex |=
+                classify_proposal_node(egraph, *origin, node, context)?.relation_redex;
+        }
+    }
+    Ok(has_relation_redex)
 }
 
 fn record_replacement_plan_preferences(
@@ -991,6 +1006,14 @@ pub fn check_operational_noise_candidate_with_progress(
                             });
                         }
                     }
+                    let materialized_relation_redex = preferred_batch_has_relation_redex(
+                        &lowerer.egraph,
+                        &materialized_batch,
+                        &context,
+                    )
+                    .map_err(|failure| {
+                        relation_error(&stage, wire, &lowerer.egraph.analysis.symbols, failure)
+                    })?;
                     commit_structural_preference_batch(
                         &mut structural_preferences,
                         materialized_batch,
@@ -1001,6 +1024,43 @@ pub fn check_operational_noise_candidate_with_progress(
                         Some(lowerer.egraph.total_size() as u64),
                     )?;
                     selected_roots = roots.iter().map(|root| lowerer.egraph.find(*root)).collect();
+                    if materialized_relation_redex {
+                        let iterations =
+                            run_ordinary_relation_saturation(&mut lowerer.egraph, &context)
+                                .map_err(|source| OperationalSimulationError::Relation {
+                                    site: site(&stage, wire, "relation rewrite"),
+                                    source,
+                                })?;
+                        egraph_mutation_epoch = egraph_mutation_epoch.saturating_add(1);
+                        {
+                            let mut control = control.borrow_mut();
+                            control.work(
+                                iterations as u64,
+                                None,
+                                Some(lowerer.egraph.total_size() as u64),
+                            )?;
+                            let diagnostics = control.diagnostics_mut();
+                            diagnostics.rewrite_iteration_count = accumulated_rewrite_iterations(
+                                diagnostics.rewrite_iteration_count,
+                                iterations,
+                            );
+                            diagnostics.egraph_node_count = lowerer.egraph.total_size() as u64;
+                            diagnostics.egraph_class_count =
+                                lowerer.egraph.number_of_classes() as u64;
+                        }
+                        if let Some(failure) = context.failure() {
+                            return Err(relation_error(
+                                &stage,
+                                wire,
+                                &lowerer.egraph.analysis.symbols,
+                                failure,
+                            ));
+                        }
+                        selected_roots =
+                            roots.iter().map(|root| lowerer.egraph.find(*root)).collect();
+                        normalization_epoch = 0;
+                        continue 'joint_fixed_point;
+                    }
                     normalization_epoch += 1;
                 }
             };
@@ -1923,6 +1983,120 @@ fn shared_round_div(numerator: &BigInt, denominator: &BigInt) -> BigInt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_matrix_atom(
+        egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+        name: &str,
+        relation_role: Option<super::super::identity::AtomicRelationRole>,
+    ) -> (egg::Id, super::super::identity::AtomicSourceId) {
+        let matrix_type = super::super::identity::ResolvedMatrixType {
+            modulus: super::super::identity::ResolvedIntExpr::Const(17.into()),
+            ring_dimension: super::super::identity::ResolvedIntExpr::Const(1.into()),
+            rows: super::super::identity::ResolvedIntExpr::Const(1.into()),
+            columns: super::super::identity::ResolvedIntExpr::Const(1.into()),
+        };
+        let source = egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::ProtocolInput(
+                    crate::ProtocolInputId::from(name),
+                ),
+                sort: super::super::analysis::MxxSort::Matrix(matrix_type),
+                integer_domain: None,
+                canonical_residue_convention: Some(
+                    super::super::identity::CanonicalResidueConvention::Nonnegative,
+                ),
+                relation_role,
+            },
+        );
+        let source = super::super::identity::AtomicSourceId(source);
+        let term = egraph.add(MxxLang::Atom { source, indices: Box::new([]) });
+        (term, source)
+    }
+
+    fn preferred_relation_fixture()
+    -> (EGraph<MxxLang, MxxAnalysis>, RewriteContext, ExactStructuralPreferences, egg::Id, egg::Id)
+    {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (public, _) = test_matrix_atom(&mut egraph, "preferred-public", None);
+        let (relation, source) = test_matrix_atom(
+            &mut egraph,
+            "preferred-relation",
+            Some(super::super::identity::AtomicRelationRole::Preimage),
+        );
+        let (target, _) = test_matrix_atom(&mut egraph, "preferred-target", None);
+        let product_node = MxxLang::MatrixMultiply(vec![public, relation].into_boxed_slice());
+        let product = egraph.add(product_node.clone());
+        egraph.rebuild();
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(super::super::relation::RelationRegistration {
+            source,
+            expected_public: public,
+            target,
+            trapdoor: None,
+            indices: Box::new([]),
+        });
+        let mut preferences = ExactStructuralPreferences::new();
+        preferences.entry(egraph.find(product)).or_default().insert(product_node);
+        (egraph, context, preferences, product, target)
+    }
+
+    #[test]
+    fn preferred_batch_exposes_relation_before_next_extraction() {
+        let (egraph, context, preferences, _, _) = preferred_relation_fixture();
+        assert!(
+            preferred_batch_has_relation_redex(&egraph, &preferences, &context)
+                .expect("registered preferred relation classifies")
+        );
+    }
+
+    #[test]
+    fn preferred_batch_does_not_retrigger_after_saturation() {
+        let (mut egraph, context, mut preferences, product, target) = preferred_relation_fixture();
+        assert!(
+            preferred_batch_has_relation_redex(&egraph, &preferences, &context)
+                .expect("registered preferred relation classifies")
+        );
+
+        run_ordinary_relation_saturation(&mut egraph, &context)
+            .expect("preferred relation saturates");
+        canonicalize_structural_preferences(&egraph, &mut preferences);
+
+        assert_eq!(egraph.find(product), egraph.find(target));
+        assert!(
+            !preferred_batch_has_relation_redex(&egraph, &preferences, &context)
+                .expect("satisfied preferred relation classifies")
+        );
+    }
+
+    #[test]
+    fn preferred_batch_without_relation_does_not_restart_or_reorder_preferences() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (left, _) = test_matrix_atom(&mut egraph, "preferred-left", None);
+        let (right, _) = test_matrix_atom(&mut egraph, "preferred-right", None);
+        let add_node = MxxLang::MatrixAdd(vec![left, right].into_boxed_slice());
+        let add = egraph.add(add_node.clone());
+        egraph.rebuild();
+        let mut preferences = ExactStructuralPreferences::new();
+        preferences.entry(egraph.find(add)).or_default().insert(add_node);
+        let original = preferences.clone();
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+
+        assert!(
+            !preferred_batch_has_relation_redex(&egraph, &preferences, &context)
+                .expect("ordinary preferred composite classifies")
+        );
+        assert_eq!(preferences, original, "classification does not alter extraction cost order");
+    }
+
+    #[test]
+    fn preferred_batch_relation_classification_failure_propagates() {
+        let (egraph, _, preferences, _, _) = preferred_relation_fixture();
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        assert!(matches!(
+            preferred_batch_has_relation_redex(&egraph, &preferences, &context),
+            Err(RelationFailure::MissingRegistration { .. })
+        ));
+    }
 
     #[test]
     fn replacement_preference_records_composites_but_not_existing_leaves() {

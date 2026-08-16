@@ -287,9 +287,18 @@ impl Applier<MxxLang, MxxAnalysis> for RelationApplier {
                 right_nested_relation_factor_candidates(egraph, &factors, &self.context);
             for candidate in std::iter::once(factors).chain(nested_candidates.into_iter().flatten())
             {
-                if let Some(plan) =
-                    checked_product_replacement_plan(egraph, &self.context, &candidate)
-                {
+                for relation_position in 1..candidate.len() {
+                    let Some(plan) = checked_product_replacement_plan_at(
+                        egraph,
+                        &self.context,
+                        &candidate,
+                        relation_position,
+                    ) else {
+                        if self.context.failure().is_some() {
+                            return Vec::new();
+                        }
+                        continue;
+                    };
                     if replacement_plan_satisfied(egraph, root, &plan.replacement) {
                         continue;
                     }
@@ -300,9 +309,9 @@ impl Applier<MxxLang, MxxAnalysis> for RelationApplier {
                         self.context.note_rewrite(plan.selector_distribution);
                         return vec![replacement];
                     }
-                }
-                if self.context.failure().is_some() {
-                    return Vec::new();
+                    if self.context.failure().is_some() {
+                        return Vec::new();
+                    }
                 }
             }
         }
@@ -481,27 +490,9 @@ fn splice_product_plan(
     }
 }
 
-fn checked_product_replacement_plan(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    context: &RewriteContext,
-    factors: &[Id],
-) -> Option<CheckedProductReplacementPlan> {
-    for relation_position in 1..factors.len() {
-        if let Some(replacement) =
-            checked_product_replacement_plan_at(egraph, context, factors, relation_position)
-        {
-            return Some(replacement);
-        }
-        if context.failure().is_some() {
-            return None;
-        }
-    }
-    None
-}
-
 /// Checks exactly one ordered public/relation boundary in one factor sequence.
-/// Callers that need a first rewrite keep the historical left-to-right scan;
-/// extraction instead visits every such boundary to rank all checked plans.
+/// Callers scan positions left-to-right and skip only a plan already present in
+/// the root e-class; extraction visits every boundary to rank checked plans.
 fn checked_product_replacement_plan_at(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     context: &RewriteContext,
@@ -8240,6 +8231,84 @@ mod tests {
             classification.local_checked_relation_count, 1,
             "the raw relation node retains one checked relation boundary after replacement"
         );
+        assert_eq!(context.failure(), None);
+    }
+
+    #[test]
+    fn applier_skips_a_satisfied_first_boundary_and_rewrites_the_later_one() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first_public, _) = matrix_atom(&mut egraph, "two-boundaries-first-public", None);
+        let (first_relation, first_source) = matrix_atom(
+            &mut egraph,
+            "two-boundaries-first-relation",
+            Some(AtomicRelationRole::Preimage),
+        );
+        let (first_target, _) = matrix_atom(&mut egraph, "two-boundaries-first-target", None);
+        let (second_public, _) = matrix_atom(&mut egraph, "two-boundaries-second-public", None);
+        let (second_relation, second_source) = matrix_atom(
+            &mut egraph,
+            "two-boundaries-second-relation",
+            Some(AtomicRelationRole::Preimage),
+        );
+        let (second_target, _) = matrix_atom(&mut egraph, "two-boundaries-second-target", None);
+        let root = egraph.add(MxxLang::MatrixMultiply(
+            vec![first_public, first_relation, second_public, second_relation].into_boxed_slice(),
+        ));
+        let first_replacement = egraph.add(MxxLang::MatrixMultiply(
+            vec![first_target, second_public, second_relation].into_boxed_slice(),
+        ));
+        let second_replacement = egraph.add(MxxLang::MatrixMultiply(
+            vec![first_public, first_relation, second_target].into_boxed_slice(),
+        ));
+        egraph.union(root, first_replacement);
+        egraph.rebuild();
+
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(first_source, first_public, first_target));
+        context.register(registration(second_source, second_public, second_target));
+        let factors = egraph[egraph.find(root)]
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                MxxLang::MatrixMultiply(factors)
+                    if factors.len() == 4 &&
+                        egraph.find(factors[0]) == egraph.find(first_public) &&
+                        egraph.find(factors[1]) == egraph.find(first_relation) &&
+                        egraph.find(factors[2]) == egraph.find(second_public) &&
+                        egraph.find(factors[3]) == egraph.find(second_relation) =>
+                {
+                    Some(factors.clone())
+                }
+                _ => None,
+            })
+            .expect("raw ordered product witness");
+        let first_plan = checked_product_replacement_plan_at(&egraph, &context, &factors, 1)
+            .expect("first checked boundary");
+        let second_plan = checked_product_replacement_plan_at(&egraph, &context, &factors, 3)
+            .expect("second checked boundary");
+        assert!(replacement_plan_satisfied(&egraph, root, &first_plan.replacement));
+        assert!(!replacement_plan_satisfied(&egraph, root, &second_plan.replacement));
+        let raw_node = MxxLang::MatrixMultiply(factors.clone());
+        let classification = classify_proposal_node(&egraph, root, &raw_node, &context)
+            .expect("both registered boundaries classify");
+        assert!(classification.relation_redex);
+        assert_eq!(classification.local_checked_relation_count, 2);
+
+        let applier = RelationApplier::new(context.clone());
+        assert!(
+            !Applier::apply_one(
+                &applier,
+                &mut egraph,
+                root,
+                &Subst::default(),
+                None,
+                Symbol::from("two-boundaries"),
+            )
+            .is_empty(),
+            "the applier skips the satisfied first boundary and rewrites the second"
+        );
+        assert_eq!(egraph.find(root), egraph.find(second_replacement));
+        assert_eq!(context.counters().rewrites, 1);
         assert_eq!(context.failure(), None);
     }
 

@@ -1113,6 +1113,24 @@ pub(crate) fn selected_polynomial_monomials_with_context(
     relation_context: Option<&RewriteContext>,
     progress: &mut dyn FnMut() -> Result<(), ()>,
 ) -> Option<Vec<Vec<(Box<[Id]>, bool)>>> {
+    selected_polynomial_monomials_internal(
+        egraph,
+        expression,
+        origins,
+        relation_context,
+        false,
+        progress,
+    )
+}
+
+fn selected_polynomial_monomials_internal(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    expression: &RecExpr<MxxLang>,
+    origins: &[Id],
+    relation_context: Option<&RewriteContext>,
+    canonical_relation_direction: bool,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<Vec<(Box<[Id]>, bool)>>> {
     if origins.len() != expression.as_ref().len() {
         return None;
     }
@@ -1147,12 +1165,93 @@ pub(crate) fn selected_polynomial_monomials_with_context(
                     canonicalize_central_constant_scalar_spines(egraph, &mut product, progress)?;
                     cancel_signed_spines(&mut product);
                 }
+                if canonical_relation_direction {
+                    let context = relation_context?;
+                    let origin = egraph.find(*origins.get(index)?);
+                    let mut directed = Vec::new();
+                    for (spine, negative) in product {
+                        let mut pending = vec![(spine, negative, true)];
+                        while let Some((spine, negative, require_satisfied)) = pending.pop() {
+                            let mut replacement = None;
+                            for relation_position in 1..spine.len() {
+                                progress().ok()?;
+                                let relation = egraph.find(spine[relation_position]);
+                                if egraph[relation].data.relation_provenance.is_empty() {
+                                    continue;
+                                }
+                                let Some(plan) = checked_product_replacement_plan_at(
+                                    egraph,
+                                    context,
+                                    &spine,
+                                    relation_position,
+                                ) else {
+                                    if context.failure().is_some() {
+                                        return None;
+                                    }
+                                    continue;
+                                };
+                                if require_satisfied &&
+                                    !replacement_plan_satisfied(
+                                        egraph,
+                                        origin,
+                                        &plan.replacement,
+                                    )
+                                {
+                                    return None;
+                                }
+                                replacement = Some(replacement_plan_signed_spines(
+                                    &plan.replacement,
+                                    progress,
+                                )?);
+                                break;
+                            }
+                            if let Some(replacement) = replacement {
+                                let prior_relation_count = spine
+                                    .iter()
+                                    .filter(|factor| {
+                                        !egraph[egraph.find(**factor)]
+                                            .data
+                                            .relation_provenance
+                                            .is_empty()
+                                    })
+                                    .count();
+                                for (replacement_spine, replacement_negative) in replacement {
+                                    progress().ok()?;
+                                    let replacement_relation_count = replacement_spine
+                                        .iter()
+                                        .filter(|factor| {
+                                            !egraph[egraph.find(**factor)]
+                                                .data
+                                                .relation_provenance
+                                                .is_empty()
+                                        })
+                                        .count();
+                                    if replacement_relation_count >= prior_relation_count {
+                                        return None;
+                                    }
+                                    pending.try_reserve(1).ok()?;
+                                    pending.push((
+                                        replacement_spine,
+                                        negative != replacement_negative,
+                                        false,
+                                    ));
+                                }
+                            } else {
+                                directed.try_reserve(1).ok()?;
+                                directed.push((spine, negative));
+                            }
+                        }
+                    }
+                    product = directed;
+                    canonicalize_central_constant_scalar_spines(egraph, &mut product, progress)?;
+                    cancel_signed_spines(&mut product);
+                }
                 product
             }
             _ => {
                 progress().ok()?;
                 let origin = egraph.find(*origins.get(index)?);
-                if let Some(context) = relation_context {
+                if !canonical_relation_direction && let Some(context) = relation_context {
                     if let Some(spine) = selected_unique_satisfied_relation_product(
                         egraph, origin, context, progress,
                     )? {
@@ -1173,6 +1272,57 @@ pub(crate) fn selected_polynomial_monomials_with_context(
     Some(memo)
 }
 
+fn replacement_plan_signed_spines(
+    plan: &ReplacementPlan,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<(Box<[Id]>, bool)>> {
+    match plan {
+        ReplacementPlan::Existing(term) => {
+            progress().ok()?;
+            Some(vec![(vec![*term].into_boxed_slice(), false)])
+        }
+        ReplacementPlan::Product(factors) => {
+            let mut product = vec![(Box::<[Id]>::default(), false)];
+            for factor in factors {
+                let terms = replacement_plan_signed_spines(factor, progress)?;
+                product = ordered_cartesian_multiply_signed_spines(product, &terms, progress)?;
+                cancel_signed_spines(&mut product);
+            }
+            Some(product)
+        }
+        ReplacementPlan::Add(terms) => {
+            let mut output = Vec::new();
+            for term in terms {
+                for spine in replacement_plan_signed_spines(term, progress)? {
+                    progress().ok()?;
+                    output.try_reserve(1).ok()?;
+                    output.push(spine);
+                }
+            }
+            cancel_signed_spines(&mut output);
+            Some(output)
+        }
+        ReplacementPlan::Negate(input) => {
+            let mut terms = replacement_plan_signed_spines(input, progress)?;
+            for (_, negative) in &mut terms {
+                *negative = !*negative;
+            }
+            Some(terms)
+        }
+        ReplacementPlan::Equivalent(plans) => {
+            let mut representable = plans
+                .iter()
+                .filter_map(|plan| {
+                    replacement_plan_signed_spines(plan, progress).map(|value| (plan, value))
+                })
+                .collect::<Vec<_>>();
+            representable.sort_by(|(left, _), (right, _)| left.cmp(right));
+            representable.into_iter().next().map(|(_, value)| value)
+        }
+        ReplacementPlan::Switch(_) | ReplacementPlan::Concat { .. } => None,
+    }
+}
+
 /// Builds the exact ordered-polynomial normal form of one already selected
 /// expression. The caller retains this recipe through final evaluation rather
 /// than re-selecting an arbitrary representative of its e-class.
@@ -1183,11 +1333,12 @@ pub(crate) fn selected_polynomial_normal_form_plan(
     context: &RewriteContext,
     progress: &mut dyn FnMut() -> Result<(), ()>,
 ) -> Option<ReplacementPlan> {
-    let monomials = selected_polynomial_monomials_with_context(
+    let monomials = selected_polynomial_monomials_internal(
         egraph,
         expression,
         origins,
         Some(context),
+        true,
         progress,
     )?;
     let root_index = usize::from(expression.root());
@@ -11056,6 +11207,167 @@ mod tests {
             monomials[usize::from(root)].is_empty(),
             "the opaque representative expands to the checked product and cancels its negation"
         );
+    }
+
+    #[test]
+    fn final_polynomial_directs_a_checked_relation_inside_prefix_and_suffix() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (prefix, _) = matrix_atom(&mut egraph, "final-directed-prefix", None);
+        let (public, _) = matrix_atom(&mut egraph, "final-directed-public", None);
+        let (preimage, source) =
+            matrix_atom(&mut egraph, "final-directed-preimage", Some(AtomicRelationRole::Preimage));
+        let (target, _) = matrix_atom(&mut egraph, "final-directed-target", None);
+        let (suffix, _) = matrix_atom(&mut egraph, "final-directed-suffix", None);
+        let raw = egraph.add(MxxLang::MatrixMultiply(
+            vec![prefix, public, preimage, suffix].into_boxed_slice(),
+        ));
+        let directed =
+            egraph.add(MxxLang::MatrixMultiply(vec![prefix, target, suffix].into_boxed_slice()));
+        egraph.union(raw, directed);
+        egraph.rebuild();
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source, public, target));
+
+        let atom_node = |egraph: &EGraph<MxxLang, MxxAnalysis>, term| {
+            egraph[egraph.find(term)]
+                .nodes
+                .iter()
+                .find(|node| matches!(node, MxxLang::Atom { .. }))
+                .expect("fixture atom")
+                .clone()
+        };
+        let mut expression = RecExpr::default();
+        let prefix_expr = expression.add(atom_node(&egraph, prefix));
+        let public_expr = expression.add(atom_node(&egraph, public));
+        let preimage_expr = expression.add(atom_node(&egraph, preimage));
+        let suffix_expr = expression.add(atom_node(&egraph, suffix));
+        let raw_expr = expression.add(MxxLang::MatrixMultiply(
+            vec![prefix_expr, public_expr, preimage_expr, suffix_expr].into_boxed_slice(),
+        ));
+        let target_expr = expression.add(atom_node(&egraph, target));
+        let directed_expr = expression.add(MxxLang::MatrixMultiply(
+            vec![prefix_expr, target_expr, suffix_expr].into_boxed_slice(),
+        ));
+        let negative_directed = expression.add(MxxLang::MatrixNegate([directed_expr]));
+        let root = expression
+            .add(MxxLang::MatrixAdd(vec![raw_expr, negative_directed].into_boxed_slice()));
+        let origins = [prefix, public, preimage, suffix, raw, target, directed, directed, raw];
+        assert_eq!(root, expression.root());
+
+        let mut ordinary_progress = || Ok(());
+        let ordinary = selected_polynomial_monomials_with_context(
+            &egraph,
+            &expression,
+            &origins,
+            Some(&context),
+            &mut ordinary_progress,
+        )
+        .expect("normalization scheduling keeps its existing direction");
+        assert!(!ordinary[usize::from(root)].is_empty());
+
+        let mut final_progress = || Ok(());
+        let plan = selected_polynomial_normal_form_plan(
+            &mut egraph,
+            &expression,
+            &origins,
+            &context,
+            &mut final_progress,
+        )
+        .expect("final NF applies the registered direction before cancellation");
+        assert!(matches!(plan, ReplacementPlan::Existing(zero)
+            if egraph[egraph.find(zero)].nodes.iter().any(|node| matches!(node, MxxLang::MatrixConstant(spec)
+                if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. }))))));
+
+        let (error, _) = matrix_atom(&mut egraph, "final-directed-bounded-error", None);
+        let mut residual = RecExpr::default();
+        let error_expr = residual.add(atom_node(&egraph, error));
+        let preimage_expr = residual.add(atom_node(&egraph, preimage));
+        let residual_root = residual
+            .add(MxxLang::MatrixMultiply(vec![error_expr, preimage_expr].into_boxed_slice()));
+        let residual_origin =
+            egraph.add(MxxLang::MatrixMultiply(vec![error, preimage].into_boxed_slice()));
+        egraph.rebuild();
+        let mut residual_progress = || Ok(());
+        let residual_plan = selected_polynomial_normal_form_plan(
+            &mut egraph,
+            &residual,
+            &[error, preimage, residual_origin],
+            &context,
+            &mut residual_progress,
+        )
+        .expect("an inapplicable public operand leaves the bounded error product intact");
+        assert_eq!(residual_root, residual.root());
+        assert_eq!(
+            residual_plan,
+            ReplacementPlan::Product(
+                vec![ReplacementPlan::Existing(error), ReplacementPlan::Existing(preimage)]
+                    .into_boxed_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn final_polynomial_directs_every_disjoint_checked_boundary() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (public_a, _) = matrix_atom(&mut egraph, "final-two-public-a", None);
+        let (preimage_a, source_a) =
+            matrix_atom(&mut egraph, "final-two-preimage-a", Some(AtomicRelationRole::Preimage));
+        let (target_a, _) = matrix_atom(&mut egraph, "final-two-target-a", None);
+        let (public_b, _) = matrix_atom(&mut egraph, "final-two-public-b", None);
+        let (preimage_b, source_b) =
+            matrix_atom(&mut egraph, "final-two-preimage-b", Some(AtomicRelationRole::Preimage));
+        let (target_b, _) = matrix_atom(&mut egraph, "final-two-target-b", None);
+        let raw = egraph.add(MxxLang::MatrixMultiply(
+            vec![public_a, preimage_a, public_b, preimage_b].into_boxed_slice(),
+        ));
+        let intermediate = egraph
+            .add(MxxLang::MatrixMultiply(vec![target_a, public_b, preimage_b].into_boxed_slice()));
+        let directed =
+            egraph.add(MxxLang::MatrixMultiply(vec![target_a, target_b].into_boxed_slice()));
+        egraph.union(raw, intermediate);
+        egraph.rebuild();
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source_a, public_a, target_a));
+        context.register(registration(source_b, public_b, target_b));
+
+        let atom = |egraph: &EGraph<MxxLang, MxxAnalysis>, term| {
+            egraph[egraph.find(term)]
+                .nodes
+                .iter()
+                .find(|node| matches!(node, MxxLang::Atom { .. }))
+                .expect("fixture atom")
+                .clone()
+        };
+        let mut expression = RecExpr::default();
+        let a = expression.add(atom(&egraph, public_a));
+        let ka = expression.add(atom(&egraph, preimage_a));
+        let b = expression.add(atom(&egraph, public_b));
+        let kb = expression.add(atom(&egraph, preimage_b));
+        let raw_expr =
+            expression.add(MxxLang::MatrixMultiply(vec![a, ka, b, kb].into_boxed_slice()));
+        let ta = expression.add(atom(&egraph, target_a));
+        let tb = expression.add(atom(&egraph, target_b));
+        let directed_expr =
+            expression.add(MxxLang::MatrixMultiply(vec![ta, tb].into_boxed_slice()));
+        let negative = expression.add(MxxLang::MatrixNegate([directed_expr]));
+        let root = expression.add(MxxLang::MatrixAdd(vec![raw_expr, negative].into_boxed_slice()));
+        let origins = [
+            public_a, preimage_a, public_b, preimage_b, raw, target_a, target_b, directed,
+            directed, raw,
+        ];
+        assert_eq!(root, expression.root());
+        let mut progress = || Ok(());
+        let plan = selected_polynomial_normal_form_plan(
+            &mut egraph,
+            &expression,
+            &origins,
+            &context,
+            &mut progress,
+        )
+        .expect("both checked boundaries use their registered direction");
+        assert!(matches!(plan, ReplacementPlan::Existing(zero)
+            if egraph[egraph.find(zero)].nodes.iter().any(|node| matches!(node, MxxLang::MatrixConstant(spec)
+                if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. }))))));
     }
 
     #[test]

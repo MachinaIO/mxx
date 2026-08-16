@@ -214,6 +214,8 @@ enum ExtractionState {
     Complete,
 }
 
+const FINAL_LEAF_DIAGNOSTIC_LIMIT: usize = 16;
+
 #[derive(Clone, Debug)]
 struct Candidate {
     cost: ProposalCost,
@@ -222,6 +224,59 @@ struct Candidate {
     node: MxxLang,
     state: ExtractionState,
     output: Option<Id>,
+}
+
+/// Failure-only evidence for one physical node in the first final-leaf class
+/// whose candidates were all filtered or unavailable. It is never retained
+/// in extraction state and cannot affect candidate selection.
+struct BlockedFinalLeafNode {
+    operator: &'static str,
+    relation_redex: Option<bool>,
+    local_checked_relation_count: Option<u64>,
+    missing_direct_child_candidates: Box<[usize]>,
+    omitted_missing_direct_child_count: usize,
+    self_reference: bool,
+    semantic_bound_status: &'static str,
+}
+
+impl fmt::Debug for BlockedFinalLeafNode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlockedFinalLeafNode")
+            .field("operator", &self.operator)
+            .field("relation_redex", &self.relation_redex)
+            .field("local_checked_relation_count", &self.local_checked_relation_count)
+            .field("missing_direct_child_candidates", &self.missing_direct_child_candidates)
+            .field("omitted_missing_direct_child_count", &self.omitted_missing_direct_child_count)
+            .field("self_reference", &self.self_reference)
+            .field("semantic_bound_status", &self.semantic_bound_status)
+            .finish()
+    }
+}
+
+fn bounded_final_leaf_ids(ids: impl Iterator<Item = usize>) -> (Box<[usize]>, usize) {
+    let mut ids = ids.collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    let total = ids.len();
+    ids.truncate(FINAL_LEAF_DIAGNOSTIC_LIMIT);
+    (ids.into_boxed_slice(), total.saturating_sub(FINAL_LEAF_DIAGNOSTIC_LIMIT))
+}
+
+fn final_leaf_semantic_bound_status(
+    self_reference: bool,
+    missing_child_count: usize,
+    was_evaluated_and_filtered: bool,
+) -> &'static str {
+    if self_reference {
+        "not_evaluated_self_reference"
+    } else if missing_child_count > 0 {
+        "not_evaluated_missing_child"
+    } else if was_evaluated_and_filtered {
+        "evaluated_without_error_then_filtered"
+    } else {
+        "not_evaluated_no_finite_child_dag"
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -414,6 +469,9 @@ fn extract_best_proposals_with_origins_and_structural_preference<I: BoundInput>(
     // indexed table holds both dynamic-programming choices and DAG build state.
     let slot_count = egraph.nodes().len();
     let mut candidates = vec![None::<Candidate>; slot_count];
+    let mut filtered_final_nodes = (reject_checked_relation_nodes &&
+        tracing::enabled!(tracing::Level::INFO))
+    .then(|| vec![Vec::<(MxxLang, ProposalNodeClassification)>::new(); slot_count]);
 
     for _ in 0..class_count {
         let mut changed = false;
@@ -463,6 +521,14 @@ fn extract_best_proposals_with_origins_and_structural_preference<I: BoundInput>(
                 };
                 if reject_checked_relation_nodes && classification.local_checked_relation_count > 0
                 {
+                    if let Some(filtered_final_nodes) = filtered_final_nodes.as_mut() {
+                        let rows = &mut filtered_final_nodes[index];
+                        if !rows.iter().any(|(existing, _)| existing == node) {
+                            rows.push((node.clone(), classification));
+                            rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+                            rows.truncate(FINAL_LEAF_DIAGNOSTIC_LIMIT);
+                        }
+                    }
                     continue;
                 }
                 let mut cost = cost;
@@ -637,6 +703,89 @@ fn extract_best_proposals_with_origins_and_structural_preference<I: BoundInput>(
         let root = egraph.find(*requested_root);
         let root_index = usize::from(root);
         if candidates.get(root_index).and_then(Option::as_ref).is_none() {
+            if reject_checked_relation_nodes && tracing::enabled!(tracing::Level::INFO) {
+                const PATH_LIMIT: usize = 64;
+                let mut blocked = root;
+                let mut visited = HashSet::new();
+                for _ in 0..PATH_LIMIT {
+                    if !visited.insert(blocked) {
+                        break;
+                    }
+                    let next = egraph[blocked]
+                        .nodes
+                        .iter()
+                        .flat_map(|node| node.children())
+                        .map(|child| egraph.find(*child))
+                        .filter(|child| {
+                            *child != blocked &&
+                                candidates
+                                    .get(usize::from(*child))
+                                    .and_then(Option::as_ref)
+                                    .is_none()
+                        })
+                        .min();
+                    let Some(next) = next else { break };
+                    blocked = next;
+                }
+                let physical_node_count = egraph[blocked].nodes.len();
+                let mut ordered_nodes = egraph[blocked].nodes.iter().collect::<Vec<_>>();
+                ordered_nodes.sort();
+                let mut physical_nodes = Vec::new();
+                for node in ordered_nodes.into_iter().take(FINAL_LEAF_DIAGNOSTIC_LIMIT) {
+                    let (missing_direct_child_candidates, omitted_missing_direct_child_count) =
+                        bounded_final_leaf_ids(
+                            node.children()
+                                .iter()
+                                .map(|child| egraph.find(*child))
+                                .filter(|child| {
+                                    candidates
+                                        .get(usize::from(*child))
+                                        .and_then(Option::as_ref)
+                                        .is_none()
+                                })
+                                .map(usize::from),
+                        );
+                    let missing_direct_child_count = missing_direct_child_candidates
+                        .len()
+                        .saturating_add(omitted_missing_direct_child_count);
+                    let self_reference =
+                        node.children().iter().any(|child| egraph.find(*child) == blocked);
+                    let classification = filtered_final_nodes
+                        .as_ref()
+                        .and_then(|rows| rows.get(usize::from(blocked)))
+                        .and_then(|rows| {
+                            rows.iter().find_map(|(filtered, classification)| {
+                                (filtered == node).then_some(classification)
+                            })
+                        });
+                    let semantic_bound_status = final_leaf_semantic_bound_status(
+                        self_reference,
+                        missing_direct_child_count,
+                        classification.is_some(),
+                    );
+                    physical_nodes.push(BlockedFinalLeafNode {
+                        operator: node.operator_name(),
+                        relation_redex: classification.map(|value| value.relation_redex),
+                        local_checked_relation_count: classification
+                            .map(|value| value.local_checked_relation_count),
+                        self_reference,
+                        missing_direct_child_candidates,
+                        omitted_missing_direct_child_count,
+                        semantic_bound_status,
+                    });
+                }
+                tracing::info!(
+                    event = "operational_final_leaf_no_eligible_candidate",
+                    requested_leaf = usize::from(root),
+                    blocked_class = usize::from(blocked),
+                    physical_node_count,
+                    omitted_physical_node_count =
+                        physical_node_count.saturating_sub(physical_nodes.len()),
+                    traversal_truncated = visited.len() == PATH_LIMIT,
+                    physical_nodes = ?physical_nodes,
+                    "final leaf has no eligible relation-free DAG representative"
+                );
+            }
             return Err((control.invalid_dag)(root));
         }
 
@@ -2974,7 +3123,9 @@ mod tests {
         fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
             let mut event_fields = DiagnosticEventFields::default();
             event.record(&mut event_fields);
-            if event_fields.fields.contains_key("selected_large_path") {
+            if event_fields.fields.contains_key("selected_large_path") ||
+                event_fields.fields.contains_key("physical_nodes")
+            {
                 self.events.lock().expect("diagnostic capture lock").push(event_fields.fields);
             }
         }
@@ -5013,20 +5164,57 @@ mod tests {
         let relation = egraph.add(MxxLang::IntConst(3.into()));
         let raw = egraph.add(MxxLang::IntMul([public, relation]));
         egraph.rebuild();
+        let calls = Cell::new(0_usize);
         let mut classify = |_: Id, node: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
+            calls.set(calls.get() + 1);
             Ok(ProposalNodeClassification {
                 local_checked_relation_count: u64::from(matches!(node, MxxLang::IntMul(_))),
                 ..Default::default()
             })
         };
-        let error = extract_final_leaf(&egraph, raw, &mut classify)
-            .expect_err("a raw-only checked lhs has no valid final representative");
+        let capture = SelectedLargeDiagnosticCapture::new(LevelFilter::INFO);
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let error = tracing::subscriber::with_default(subscriber, || {
+            extract_final_leaf(&egraph, raw, &mut classify)
+                .expect_err("a raw-only checked lhs has no valid final representative")
+        });
+        assert_eq!(
+            calls.get(),
+            6,
+            "failure diagnostics reuse classifications recorded during the two relaxation passes"
+        );
         assert!(matches!(
             error,
             OperationalSimulationError::Request(
                 super::super::error::RequestError::EmptyParameterName
             )
         ));
+        let events = capture.events.lock().expect("diagnostic capture lock");
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .get("physical_nodes")
+                .is_some_and(|nodes| nodes.contains("evaluated_without_error_then_filtered"))
+        );
+    }
+
+    #[test]
+    fn final_leaf_failure_diagnostic_bounds_ids_and_marks_unevaluated_nodes() {
+        let (ids, omitted) = bounded_final_leaf_ids((0..32).rev());
+        assert_eq!(ids.as_ref(), (0..16).collect::<Vec<_>>().as_slice());
+        assert_eq!(omitted, 16);
+        assert_eq!(
+            final_leaf_semantic_bound_status(false, 1, false),
+            "not_evaluated_missing_child"
+        );
+        assert_eq!(
+            final_leaf_semantic_bound_status(true, 0, false),
+            "not_evaluated_self_reference"
+        );
+        assert_eq!(
+            final_leaf_semantic_bound_status(false, 0, true),
+            "evaluated_without_error_then_filtered"
+        );
     }
 
     #[test]

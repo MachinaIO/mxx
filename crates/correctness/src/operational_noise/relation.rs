@@ -1260,71 +1260,6 @@ fn selected_context_has_independent_representative(
     Some(false)
 }
 
-const SELECTED_MISMATCH_SPINE_LIMIT: usize = 6;
-const SELECTED_MISMATCH_FACTOR_LIMIT: usize = 8;
-const SELECTED_MISMATCH_FACTOR_VIEW_LIMIT: usize = 12;
-
-fn selected_mismatch_spines(
-    terms: &[(Box<[Id]>, bool)],
-) -> (Vec<(bool, Box<[usize]>, usize, usize)>, usize) {
-    let mut retained = Vec::new();
-    let mut omitted = 0usize;
-    let mut index = 0usize;
-    while index < terms.len() {
-        let (factors, negative) = &terms[index];
-        let mut end = index + 1;
-        while end < terms.len() && terms[end] == terms[index] {
-            end += 1;
-        }
-        if retained.len() < SELECTED_MISMATCH_SPINE_LIMIT {
-            retained.push((
-                *negative,
-                factors
-                    .iter()
-                    .take(SELECTED_MISMATCH_FACTOR_LIMIT)
-                    .map(|factor| usize::from(*factor))
-                    .collect(),
-                factors.len().saturating_sub(SELECTED_MISMATCH_FACTOR_LIMIT),
-                end - index,
-            ));
-        } else {
-            omitted += end - index;
-        }
-        index = end;
-    }
-    (retained, omitted)
-}
-
-fn selected_mismatch_factor_views(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    baseline: &[(Box<[Id]>, bool)],
-    differing: &[(Box<[Id]>, bool)],
-) -> (Vec<LeafView>, usize) {
-    let baseline_counts = baseline.iter().fold(BTreeMap::new(), |mut counts, term| {
-        *counts.entry(term).or_insert(0usize) += 1;
-        counts
-    });
-    let differing_counts = differing.iter().fold(BTreeMap::new(), |mut counts, term| {
-        *counts.entry(term).or_insert(0usize) += 1;
-        counts
-    });
-    let mut factors = BTreeSet::new();
-    for term in baseline_counts.keys().chain(differing_counts.keys()) {
-        if baseline_counts.get(term) != differing_counts.get(term) {
-            factors.extend(term.0.iter().map(|factor| egraph.find(*factor)));
-        }
-    }
-    let omitted = factors.len().saturating_sub(SELECTED_MISMATCH_FACTOR_VIEW_LIMIT);
-    (
-        factors
-            .into_iter()
-            .take(SELECTED_MISMATCH_FACTOR_VIEW_LIMIT)
-            .map(|factor| leaf_view(egraph, factor))
-            .collect(),
-        omitted,
-    )
-}
-
 fn selected_spine_peel_term(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     spine: &[Id],
@@ -1818,13 +1753,18 @@ fn selected_same_selector_add_hoist_plan(
             }
             continue;
         }
-        // Cases are streamed.  The existing peel matcher is linear in stored
-        // cases and, per case, worst-case quadratic in actual versus fixed
-        // spines (times their ordered-factor traversal); no selector product
-        // or case polynomial is retained.
-        let mut common_result: Option<Vec<(Box<[Id]>, bool)>> = None;
-        let mut zero_witness = None;
+        // Cases are independent. Retained residual storage is linear in their
+        // total signed spines; the existing peel cost is unchanged and no
+        // selector Cartesian product is formed.
+        let mut case_results = Vec::new();
+        case_results.try_reserve_exact(case_count).ok()?;
+        let mut zero_witnesses = Vec::new();
+        zero_witnesses.try_reserve_exact(case_count).ok()?;
+        let mut reduced_case_count = 0usize;
         let mut peeled_case_count = 0usize;
+        let mut cancelled_case_count = 0usize;
+        let mut total_pre_count = 0usize;
+        let mut total_post_cancel_count = 0usize;
         let mut total_actual_count = 0usize;
         let mut total_fixed_count = 0usize;
         let mut total_unmatched_fixed_count = 0usize;
@@ -1837,7 +1777,6 @@ fn selected_same_selector_add_hoist_plan(
                 else {
                     return Some(None);
                 };
-                zero_witness.get_or_insert(case);
                 for (case_spine, case_negative) in monomials.get(*selected_case_index)? {
                     progress().ok()?;
                     let length =
@@ -1858,7 +1797,12 @@ fn selected_same_selector_add_hoist_plan(
                 combined.push((copy_ids(spine, progress)?, *negative));
             }
             canonicalize_central_constant_scalar_spines(egraph, &mut combined, progress)?;
+            let (witness_spine, witness_negative) = combined.first()?;
+            zero_witnesses.push(signed_spine_replacement_plan(witness_spine, *witness_negative)?);
+            let pre_count = combined.len();
             cancel_signed_spines(&mut combined);
+            let post_cancel_count = combined.len();
+            let cancelled = post_cancel_count < pre_count;
             let mut actual = Vec::new();
             let mut fixed_spines = Vec::new();
             for (spine, negative) in combined {
@@ -1893,6 +1837,10 @@ fn selected_same_selector_add_hoist_plan(
                 peel_fixed_targets(egraph, &mut actual, &fixed_spines, progress)?;
             let unmatched_fixed_count = unmatched_fixed.len();
             peeled_case_count += usize::from(peeled);
+            cancelled_case_count += usize::from(cancelled);
+            reduced_case_count += usize::from(cancelled || peeled);
+            total_pre_count = total_pre_count.checked_add(pre_count)?;
+            total_post_cancel_count = total_post_cancel_count.checked_add(post_cancel_count)?;
             total_actual_count = total_actual_count.checked_add(actual_count)?;
             total_fixed_count = total_fixed_count.checked_add(fixed_count)?;
             total_unmatched_fixed_count =
@@ -1905,79 +1853,47 @@ fn selected_same_selector_add_hoist_plan(
             }
             canonicalize_central_constant_scalar_spines(egraph, &mut combined, progress)?;
             cancel_signed_spines(&mut combined);
-            if let Some(previous) = &common_result {
-                if previous != &combined {
-                    if tracing::enabled!(tracing::Level::DEBUG) {
-                        let contexts = participants
-                            .iter()
-                            .map(|(_, _, negative, prefix, suffix)| {
-                                (*negative, prefix.len(), suffix.len())
-                            })
-                            .collect::<Vec<_>>();
-                        let (baseline_spines, baseline_omitted) =
-                            selected_mismatch_spines(previous);
-                        let (differing_spines, differing_omitted) =
-                            selected_mismatch_spines(&combined);
-                        let (differing_factor_views, differing_factor_views_omitted) =
-                            selected_mismatch_factor_views(egraph, previous, &combined);
-                        tracing::debug!(
-                            event = "operational_selected_full_case_residual_mismatch",
-                            add_origin = usize::from(root_origin),
-                            selector = usize::from(selector_origin),
-                            participant_count = participants.len(),
-                            exterior_count = exterior.len(),
-                            peeled,
-                            actual_count,
-                            fixed_count,
-                            unmatched_fixed_count,
-                            case_count,
-                            baseline_case = 0,
-                            differing_case = case_ordinal,
-                            contexts = ?contexts,
-                            baseline_monomial_count = previous.len(),
-                            differing_monomial_count = combined.len(),
-                            baseline_spines = ?baseline_spines,
-                            differing_spines = ?differing_spines,
-                            baseline_omitted,
-                            differing_omitted,
-                            differing_factor_views = ?differing_factor_views,
-                            differing_factor_views_omitted,
-                            "selected same-selector full-case residuals differ"
-                        );
-                    }
-                    common_result = None;
-                    break;
-                }
-            } else {
-                common_result = Some(combined);
-            }
+            case_results.push(combined);
         }
-        let Some(common_result) = common_result else {
+        if reduced_case_count != case_count {
+            tracing::debug!(
+                event = "operational_selected_full_case_noop_rejected",
+                add_origin = usize::from(root_origin),
+                selector = usize::from(selector_origin),
+                participant_count = participants.len(),
+                exterior_count = exterior.len(),
+                case_count,
+                reduced_case_count,
+                peeled_case_count,
+                cancelled_case_count,
+                "selected full-case candidate did not reduce every case"
+            );
             continue;
-        };
+        }
+        let plan = selected_case_residual_plan(
+            &case_results,
+            ReplacementPlan::Existing(selector_origin),
+            &zero_witnesses,
+            progress,
+        )?;
         tracing::debug!(
-            event = "operational_selected_full_case_residual_equal",
+            event = "operational_selected_full_case_reduced",
             add_origin = usize::from(root_origin),
             selector = usize::from(selector_origin),
             participant_count = participants.len(),
             exterior_count = exterior.len(),
             case_count,
+            reduced_case_count,
             peeled_case_count,
+            cancelled_case_count,
+            total_pre_count,
+            total_post_cancel_count,
             total_actual_count,
             total_fixed_count,
             total_unmatched_fixed_count,
-            residual_monomial_count = common_result.len(),
-            "selected same-selector cases have one complete residual"
+            retained_residual_count = case_results.iter().map(Vec::len).sum::<usize>(),
+            "selected same-selector cases reduced before residual planning"
         );
-        let plan = if common_result.is_empty() {
-            let witness = ReplacementPlan::Existing(zero_witness?);
-            ReplacementPlan::Add(
-                vec![witness.clone(), ReplacementPlan::Negate(Box::new(witness))]
-                    .into_boxed_slice(),
-            )
-        } else {
-            signed_spines_replacement_plan(&common_result, None)?
-        };
         let mut replaced_ordinals = participant_ordinals;
         replaced_ordinals.extend(exterior.iter().map(|(ordinal, ..)| *ordinal));
         let first = *replaced_ordinals.first()?;
@@ -2030,6 +1946,43 @@ fn signed_spines_replacement_plan(
         1 => terms.into_iter().next(),
         _ => Some(ReplacementPlan::Add(terms.into_boxed_slice())),
     }
+}
+
+/// Builds an exact common-plus-residual Switch from already canonical signed
+/// case residuals. Empty cases use their contextual full-result witness, so a
+/// zero never borrows an uncontextualized case or the rewritten root.
+fn selected_case_residual_plan(
+    case_terms: &[Vec<(Box<[Id]>, bool)>],
+    selector: ReplacementPlan,
+    zero_witnesses: &[ReplacementPlan],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<ReplacementPlan> {
+    if case_terms.is_empty() || case_terms.len() != zero_witnesses.len() {
+        return None;
+    }
+    let all_equal = case_terms[1..].iter().all(|terms| terms == &case_terms[0]);
+    if all_equal {
+        return signed_spines_replacement_plan(&case_terms[0], zero_witnesses.first());
+    }
+    let mut common = copy_signed_spines(case_terms.first()?, progress)?;
+    for terms in &case_terms[1..] {
+        progress().ok()?;
+        common = sorted_signed_spine_intersection(&common, terms, progress)?;
+    }
+    let common_plan = signed_spines_replacement_plan(&common, None);
+    let mut switch_cases = Vec::new();
+    switch_cases.try_reserve_exact(case_terms.len() + 1).ok()?;
+    switch_cases.push(selector);
+    for (terms, zero_witness) in case_terms.iter().zip(zero_witnesses) {
+        progress().ok()?;
+        let remainder = sorted_signed_spine_subtraction(terms, &common, progress)?;
+        switch_cases.push(signed_spines_replacement_plan(&remainder, Some(zero_witness))?);
+    }
+    let switch = ReplacementPlan::Switch(switch_cases.into_boxed_slice());
+    Some(match common_plan {
+        Some(common) => ReplacementPlan::Add(vec![common, switch].into_boxed_slice()),
+        None => switch,
+    })
 }
 
 fn selected_switch_hoist_plan(
@@ -10692,6 +10645,48 @@ mod tests {
     }
 
     #[test]
+    fn selected_case_residual_plan_preserves_common_order_and_typed_zero() {
+        let selector = ReplacementPlan::Existing(Id::from(1));
+        let zero0 = ReplacementPlan::Existing(Id::from(2));
+        let zero1 = ReplacementPlan::Existing(Id::from(3));
+        let common = Id::from(4);
+        let differing = Id::from(5);
+        let cases = vec![
+            vec![(vec![common].into_boxed_slice(), false)],
+            vec![
+                (vec![common].into_boxed_slice(), false),
+                (vec![differing].into_boxed_slice(), false),
+            ],
+        ];
+        let mut progress = || Ok(());
+        let plan = selected_case_residual_plan(
+            &cases,
+            selector.clone(),
+            &[zero0.clone(), zero1.clone()],
+            &mut progress,
+        )
+        .expect("common plus residual Switch");
+        let ReplacementPlan::Add(outer) = plan else { panic!("common outside Switch") };
+        assert!(matches!(outer[0], ReplacementPlan::Existing(id) if id == common));
+        let ReplacementPlan::Switch(switched) = &outer[1] else { panic!("residual Switch") };
+        assert_eq!(switched[0], selector);
+        assert!(matches!(switched[1], ReplacementPlan::Add(ref zero)
+            if zero.len() == 2 && zero[0] == zero0));
+        assert!(matches!(switched[2], ReplacementPlan::Existing(id) if id == differing));
+
+        let empty = vec![Vec::new(), Vec::new()];
+        let all_empty = selected_case_residual_plan(
+            &empty,
+            ReplacementPlan::Existing(Id::from(6)),
+            &[zero0.clone(), zero1],
+            &mut progress,
+        )
+        .expect("typed all-empty residual");
+        assert!(matches!(all_empty, ReplacementPlan::Add(ref zero)
+            if zero.len() == 2 && zero[0] == zero0));
+    }
+
+    #[test]
     fn selected_polynomial_eliminates_equal_same_selector_case_sums_without_a_switch_merge() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let selector = egraph.add(MxxLang::IntConst(0.into()));
@@ -10910,7 +10905,7 @@ mod tests {
             1,
             "the successful intermediate Add suppresses its mismatching parent"
         );
-        assert_eq!(redexes[0].0, egraph.find(outer));
+        assert_eq!(redexes[0].0, egraph.find(inner));
         fn contains_switch(plan: &ReplacementPlan) -> bool {
             match plan {
                 ReplacementPlan::Switch(_) => true,
@@ -10922,7 +10917,7 @@ mod tests {
                 ReplacementPlan::Existing(_) => false,
             }
         }
-        assert!(!contains_switch(&redexes[0].1));
+        assert!(contains_switch(&redexes[0].1));
     }
 
     #[test]
@@ -11049,38 +11044,17 @@ mod tests {
 
         let mut unequal = monomials.clone();
         unequal[usize::from(b1)].push((vec![atoms[2]].into(), false));
-        let capture = FixedPeelEventCapture::default();
-        let subscriber = tracing_subscriber::registry().with(capture.clone());
-        let unequal_plan = tracing::subscriber::with_default(subscriber, || {
-            selected_same_selector_add_hoist_plan(
-                &egraph,
-                &expression,
-                &origins,
-                &selected_indices,
-                &selected_switches,
-                usize::from(root_expression),
-                &unequal,
-                &mut progress,
-            )
-        });
-        assert!(unequal_plan.is_some_and(|plan| plan.is_none()));
-        let events = capture.0.lock().expect("event capture lock");
-        assert_eq!(events.len(), 1, "only the first differing case is logged");
-        assert_eq!(events[0].get("baseline_case").map(String::as_str), Some("0"));
-        assert_eq!(events[0].get("differing_case").map(String::as_str), Some("1"));
-        assert!(events[0].contains_key("contexts"));
-        assert!(events[0].get("baseline_spines").is_some_and(|value| value.contains("false")));
-        assert!(events[0].get("differing_spines").is_some_and(|value| value.contains("false")));
-        assert!(
-            events[0]
-                .get("differing_factor_views")
-                .is_some_and(|value| value.contains("source_kind: \"protocol-input\"") &&
-                    value.contains("relation_role: None"))
+        let unequal_plan = selected_same_selector_add_hoist_plan(
+            &egraph,
+            &expression,
+            &origins,
+            &selected_indices,
+            &selected_switches,
+            usize::from(root_expression),
+            &unequal,
+            &mut progress,
         );
-        assert!(events[0].contains_key("baseline_omitted"));
-        assert!(events[0].contains_key("differing_omitted"));
-        assert!(events[0].contains_key("differing_factor_views_omitted"));
-        drop(events);
+        assert!(unequal_plan.is_some_and(|plan| plan.is_some()));
         let mut interrupted = || Err(());
         assert!(
             selected_same_selector_add_hoist_plan(

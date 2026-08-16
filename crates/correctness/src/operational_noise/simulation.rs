@@ -1636,7 +1636,12 @@ pub fn check_operational_noise_candidate_with_progress(
                     &context,
                     &mut progress,
                 )
-                .ok_or_else(|| {
+                .map_err(|reason| {
+                    tracing::info!(
+                        root = usize::from(*root),
+                        ?reason,
+                        "final polynomial normalization failed"
+                    );
                     if let Some(failure) = context.failure() {
                         relation_error(&stage, wire, &lowerer.egraph.analysis.symbols, failure)
                     } else {

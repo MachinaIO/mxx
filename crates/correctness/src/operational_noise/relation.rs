@@ -1113,14 +1113,7 @@ pub(crate) fn selected_polynomial_monomials_with_context(
     relation_context: Option<&RewriteContext>,
     progress: &mut dyn FnMut() -> Result<(), ()>,
 ) -> Option<Vec<Vec<(Box<[Id]>, bool)>>> {
-    selected_polynomial_monomials_internal(
-        egraph,
-        expression,
-        origins,
-        relation_context,
-        false,
-        progress,
-    )
+    selected_polynomial_monomials_internal(egraph, expression, origins, relation_context, progress)
 }
 
 fn selected_polynomial_monomials_internal(
@@ -1128,7 +1121,6 @@ fn selected_polynomial_monomials_internal(
     expression: &RecExpr<MxxLang>,
     origins: &[Id],
     relation_context: Option<&RewriteContext>,
-    canonical_relation_direction: bool,
     progress: &mut dyn FnMut() -> Result<(), ()>,
 ) -> Option<Vec<Vec<(Box<[Id]>, bool)>>> {
     if origins.len() != expression.as_ref().len() {
@@ -1165,93 +1157,12 @@ fn selected_polynomial_monomials_internal(
                     canonicalize_central_constant_scalar_spines(egraph, &mut product, progress)?;
                     cancel_signed_spines(&mut product);
                 }
-                if canonical_relation_direction {
-                    let context = relation_context?;
-                    let origin = egraph.find(*origins.get(index)?);
-                    let mut directed = Vec::new();
-                    for (spine, negative) in product {
-                        let mut pending = vec![(spine, negative, true)];
-                        while let Some((spine, negative, require_satisfied)) = pending.pop() {
-                            let mut replacement = None;
-                            for relation_position in 1..spine.len() {
-                                progress().ok()?;
-                                let relation = egraph.find(spine[relation_position]);
-                                if egraph[relation].data.relation_provenance.is_empty() {
-                                    continue;
-                                }
-                                let Some(plan) = checked_product_replacement_plan_at(
-                                    egraph,
-                                    context,
-                                    &spine,
-                                    relation_position,
-                                ) else {
-                                    if context.failure().is_some() {
-                                        return None;
-                                    }
-                                    continue;
-                                };
-                                if require_satisfied &&
-                                    !replacement_plan_satisfied(
-                                        egraph,
-                                        origin,
-                                        &plan.replacement,
-                                    )
-                                {
-                                    return None;
-                                }
-                                replacement = Some(replacement_plan_signed_spines(
-                                    &plan.replacement,
-                                    progress,
-                                )?);
-                                break;
-                            }
-                            if let Some(replacement) = replacement {
-                                let prior_relation_count = spine
-                                    .iter()
-                                    .filter(|factor| {
-                                        !egraph[egraph.find(**factor)]
-                                            .data
-                                            .relation_provenance
-                                            .is_empty()
-                                    })
-                                    .count();
-                                for (replacement_spine, replacement_negative) in replacement {
-                                    progress().ok()?;
-                                    let replacement_relation_count = replacement_spine
-                                        .iter()
-                                        .filter(|factor| {
-                                            !egraph[egraph.find(**factor)]
-                                                .data
-                                                .relation_provenance
-                                                .is_empty()
-                                        })
-                                        .count();
-                                    if replacement_relation_count >= prior_relation_count {
-                                        return None;
-                                    }
-                                    pending.try_reserve(1).ok()?;
-                                    pending.push((
-                                        replacement_spine,
-                                        negative != replacement_negative,
-                                        false,
-                                    ));
-                                }
-                            } else {
-                                directed.try_reserve(1).ok()?;
-                                directed.push((spine, negative));
-                            }
-                        }
-                    }
-                    product = directed;
-                    canonicalize_central_constant_scalar_spines(egraph, &mut product, progress)?;
-                    cancel_signed_spines(&mut product);
-                }
                 product
             }
             _ => {
                 progress().ok()?;
                 let origin = egraph.find(*origins.get(index)?);
-                if !canonical_relation_direction && let Some(context) = relation_context {
+                if let Some(context) = relation_context {
                     if let Some(spine) = selected_unique_satisfied_relation_product(
                         egraph, origin, context, progress,
                     )? {
@@ -1272,54 +1183,135 @@ fn selected_polynomial_monomials_internal(
     Some(memo)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FinalPolynomialFailure {
+    MalformedSelectedExpression,
+    ProgressExhausted,
+    RelationContextFailure,
+    RelationCountDidNotDecrease,
+    UnrepresentableReplacementPlan,
+    UnrepresentableNormalForm,
+}
+
+fn explicit_relation_factor_count(egraph: &EGraph<MxxLang, MxxAnalysis>, spine: &[Id]) -> usize {
+    spine
+        .iter()
+        .filter(|factor| !egraph[egraph.find(**factor)].data.relation_provenance.is_empty())
+        .count()
+}
+
+fn direct_checked_relations_in_final_spines(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    terms: Vec<(Box<[Id]>, bool)>,
+    context: &RewriteContext,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Result<Vec<(Box<[Id]>, bool)>, FinalPolynomialFailure> {
+    let mut directed = Vec::new();
+    for (spine, negative) in terms {
+        let mut pending = vec![(spine, negative)];
+        while let Some((spine, negative)) = pending.pop() {
+            let mut replacement = None;
+            for relation_position in 1..spine.len() {
+                progress().map_err(|()| FinalPolynomialFailure::ProgressExhausted)?;
+                let relation = egraph.find(spine[relation_position]);
+                if egraph[relation].data.relation_provenance.is_empty() {
+                    continue;
+                }
+                let Some(plan) =
+                    checked_product_replacement_plan_at(egraph, context, &spine, relation_position)
+                else {
+                    if context.failure().is_some() {
+                        return Err(FinalPolynomialFailure::RelationContextFailure);
+                    }
+                    continue;
+                };
+                let converted = replacement_plan_signed_spines(&plan.replacement, progress)?;
+                replacement = Some(converted);
+                break;
+            }
+            if let Some(replacement) = replacement {
+                let prior_relation_count = explicit_relation_factor_count(egraph, &spine);
+                for (replacement_spine, replacement_negative) in replacement {
+                    progress().map_err(|()| FinalPolynomialFailure::ProgressExhausted)?;
+                    if explicit_relation_factor_count(egraph, &replacement_spine) >=
+                        prior_relation_count
+                    {
+                        return Err(FinalPolynomialFailure::RelationCountDidNotDecrease);
+                    }
+                    pending
+                        .try_reserve(1)
+                        .map_err(|_| FinalPolynomialFailure::UnrepresentableNormalForm)?;
+                    pending.push((replacement_spine, negative != replacement_negative));
+                }
+            } else {
+                directed
+                    .try_reserve(1)
+                    .map_err(|_| FinalPolynomialFailure::UnrepresentableNormalForm)?;
+                directed.push((spine, negative));
+            }
+        }
+    }
+    canonicalize_central_constant_scalar_spines(egraph, &mut directed, progress)
+        .ok_or(FinalPolynomialFailure::UnrepresentableNormalForm)?;
+    cancel_signed_spines(&mut directed);
+    Ok(directed)
+}
+
 fn replacement_plan_signed_spines(
     plan: &ReplacementPlan,
     progress: &mut dyn FnMut() -> Result<(), ()>,
-) -> Option<Vec<(Box<[Id]>, bool)>> {
+) -> Result<Vec<(Box<[Id]>, bool)>, FinalPolynomialFailure> {
     match plan {
         ReplacementPlan::Existing(term) => {
-            progress().ok()?;
-            Some(vec![(vec![*term].into_boxed_slice(), false)])
+            progress().map_err(|()| FinalPolynomialFailure::ProgressExhausted)?;
+            Ok(vec![(vec![*term].into_boxed_slice(), false)])
         }
         ReplacementPlan::Product(factors) => {
             let mut product = vec![(Box::<[Id]>::default(), false)];
             for factor in factors {
                 let terms = replacement_plan_signed_spines(factor, progress)?;
-                product = ordered_cartesian_multiply_signed_spines(product, &terms, progress)?;
+                product = ordered_cartesian_multiply_signed_spines(product, &terms, progress)
+                    .ok_or(FinalPolynomialFailure::UnrepresentableNormalForm)?;
                 cancel_signed_spines(&mut product);
             }
-            Some(product)
+            Ok(product)
         }
         ReplacementPlan::Add(terms) => {
             let mut output = Vec::new();
             for term in terms {
                 for spine in replacement_plan_signed_spines(term, progress)? {
-                    progress().ok()?;
-                    output.try_reserve(1).ok()?;
+                    progress().map_err(|()| FinalPolynomialFailure::ProgressExhausted)?;
+                    output
+                        .try_reserve(1)
+                        .map_err(|_| FinalPolynomialFailure::UnrepresentableNormalForm)?;
                     output.push(spine);
                 }
             }
             cancel_signed_spines(&mut output);
-            Some(output)
+            Ok(output)
         }
         ReplacementPlan::Negate(input) => {
             let mut terms = replacement_plan_signed_spines(input, progress)?;
             for (_, negative) in &mut terms {
                 *negative = !*negative;
             }
-            Some(terms)
+            Ok(terms)
         }
         ReplacementPlan::Equivalent(plans) => {
-            let mut representable = plans
-                .iter()
-                .filter_map(|plan| {
-                    replacement_plan_signed_spines(plan, progress).map(|value| (plan, value))
-                })
-                .collect::<Vec<_>>();
-            representable.sort_by(|(left, _), (right, _)| left.cmp(right));
-            representable.into_iter().next().map(|(_, value)| value)
+            let mut ordered = plans.iter().collect::<Vec<_>>();
+            ordered.sort();
+            for plan in ordered {
+                match replacement_plan_signed_spines(plan, progress) {
+                    Ok(value) => return Ok(value),
+                    Err(FinalPolynomialFailure::UnrepresentableReplacementPlan) => {}
+                    Err(failure) => return Err(failure),
+                }
+            }
+            Err(FinalPolynomialFailure::UnrepresentableReplacementPlan)
         }
-        ReplacementPlan::Switch(_) | ReplacementPlan::Concat { .. } => None,
+        ReplacementPlan::Switch(_) | ReplacementPlan::Concat { .. } => {
+            Err(FinalPolynomialFailure::UnrepresentableReplacementPlan)
+        }
     }
 }
 
@@ -1332,23 +1324,53 @@ pub(crate) fn selected_polynomial_normal_form_plan(
     origins: &[Id],
     context: &RewriteContext,
     progress: &mut dyn FnMut() -> Result<(), ()>,
-) -> Option<ReplacementPlan> {
-    let monomials = selected_polynomial_monomials_internal(
+) -> Result<ReplacementPlan, FinalPolynomialFailure> {
+    if origins.len() != expression.as_ref().len() {
+        return Err(FinalPolynomialFailure::MalformedSelectedExpression);
+    }
+    let mut progress_exhausted = false;
+    let monomials = {
+        let mut tracked_progress = || match progress() {
+            Ok(()) => Ok(()),
+            Err(()) => {
+                progress_exhausted = true;
+                Err(())
+            }
+        };
+        selected_polynomial_monomials_internal(
+            egraph,
+            expression,
+            origins,
+            None,
+            &mut tracked_progress,
+        )
+    };
+    let monomials = monomials.ok_or(if progress_exhausted {
+        FinalPolynomialFailure::ProgressExhausted
+    } else {
+        FinalPolynomialFailure::UnrepresentableNormalForm
+    })?;
+    let root_index = usize::from(expression.root());
+    let terms = direct_checked_relations_in_final_spines(
         egraph,
-        expression,
-        origins,
-        Some(context),
-        true,
+        monomials
+            .get(root_index)
+            .ok_or(FinalPolynomialFailure::MalformedSelectedExpression)?
+            .clone(),
+        context,
         progress,
     )?;
-    let root_index = usize::from(expression.root());
-    let terms = monomials.get(root_index)?;
     if terms.is_empty() {
-        progress().ok()?;
-        let zero = build_additive_terms(egraph, *origins.get(root_index)?, Vec::new());
-        return Some(ReplacementPlan::Existing(zero));
+        progress().map_err(|()| FinalPolynomialFailure::ProgressExhausted)?;
+        let zero = build_additive_terms(
+            egraph,
+            *origins.get(root_index).ok_or(FinalPolynomialFailure::MalformedSelectedExpression)?,
+            Vec::new(),
+        );
+        return Ok(ReplacementPlan::Existing(zero));
     }
-    signed_spines_replacement_plan(terms, None)
+    signed_spines_replacement_plan(&terms, None)
+        .ok_or(FinalPolynomialFailure::UnrepresentableNormalForm)
 }
 
 /// Canonicalizes only the already-reviewed central constant scalar factors in
@@ -11368,6 +11390,24 @@ mod tests {
         assert!(matches!(plan, ReplacementPlan::Existing(zero)
             if egraph[egraph.find(zero)].nodes.iter().any(|node| matches!(node, MxxLang::MatrixConstant(spec)
                 if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. }))))));
+    }
+
+    #[test]
+    fn final_polynomial_reports_progress_and_unsupported_plan_separately() {
+        let existing = ReplacementPlan::Existing(Id::from(0));
+        let unsupported = ReplacementPlan::Switch(vec![existing.clone()].into_boxed_slice());
+        let mut progress = || Ok(());
+        assert_eq!(
+            replacement_plan_signed_spines(&unsupported, &mut progress),
+            Err(FinalPolynomialFailure::UnrepresentableReplacementPlan)
+        );
+
+        let equivalent = ReplacementPlan::Equivalent(vec![existing].into_boxed_slice());
+        let mut exhausted = || Err(());
+        assert_eq!(
+            replacement_plan_signed_spines(&equivalent, &mut exhausted),
+            Err(FinalPolynomialFailure::ProgressExhausted)
+        );
     }
 
     #[test]

@@ -17,10 +17,8 @@ use super::{
     identity::{AtomicRelationRole, AtomicSourceId, AtomicSourceKey},
     language::MxxLang,
     relation::{
-        AddNormalizationProbe, PointwiseAddSwitchProbe, PointwiseAddSwitchReject,
-        PointwiseDirectProbe, SelectedNodeRef, pointwise_add_switch_probe,
-        probe_exact_additive_normalization, selected_multi_switch_structural_probe,
-        selected_product_structural_probe,
+        PointwiseAddSwitchProbe, PointwiseAddSwitchReject, PointwiseDirectProbe,
+        pointwise_add_switch_probe,
     },
 };
 use egg::{EGraph, Id, Language, RecExpr};
@@ -157,13 +155,15 @@ pub fn extract_best_proposal<I: BoundInput>(
         &EGraph<MxxLang, MxxAnalysis>,
     ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
 ) -> Result<ExtractedProposal, OperationalSimulationError> {
-    extract_best_proposal_with_origins(egraph, root, bound_input, control, classify)
+    extract_best_proposal_with_origins(egraph, root, bound_input, control, classify, true)
         .map(|extracted| extracted.proposal)
 }
 
 /// Internal form of [`extract_best_proposal`] which retains the selected
 /// e-class origin beside every emitted expression-local node for one local
-/// normalization epoch.
+/// normalization epoch. `emit_detailed_large_diagnostic` controls only the
+/// read-only path trace; the cheap Large summary and extraction result are
+/// independent of it.
 pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     root: Id,
@@ -174,6 +174,7 @@ pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
         &MxxLang,
         &EGraph<MxxLang, MxxAnalysis>,
     ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
+    emit_detailed_large_diagnostic: bool,
 ) -> Result<ExtractedProposalWithOrigins, OperationalSimulationError> {
     let class_count = egraph.number_of_classes();
     let mut classes = Vec::with_capacity(class_count);
@@ -348,9 +349,24 @@ pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
             selected_large_source_id = ?root_candidate.first_large_source.map(|source| source.0),
             "selected Large residual reaches final extraction"
         );
-        if root_candidate.first_large_source.is_none() && tracing::enabled!(tracing::Level::INFO) {
-            let diagnostic =
-                selected_large_diagnostic(egraph, root, None, &candidates, bound_input);
+    }
+    let source_less_info_enabled = selected_large &&
+        root_candidate.first_large_source.is_none() &&
+        tracing::enabled!(tracing::Level::INFO);
+    let debug_enabled = selected_large && tracing::enabled!(tracing::Level::DEBUG);
+    let detailed_diagnostic = (emit_detailed_large_diagnostic &&
+        (source_less_info_enabled || debug_enabled))
+        .then(|| {
+            selected_large_diagnostic(
+                egraph,
+                root,
+                root_candidate.first_large_source,
+                &candidates,
+                bound_input,
+            )
+        });
+    if let Some(diagnostic) = detailed_diagnostic.as_ref() {
+        if source_less_info_enabled {
             tracing::info!(
                 event = "operational_selected_large_without_atomic_source",
                 selected_root = usize::from(egraph.find(root)),
@@ -358,26 +374,19 @@ pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
                 "selected Large residual has no atomic-source witness"
             );
         }
-    }
-    if tracing::enabled!(tracing::Level::DEBUG) && selected_large {
-        let diagnostic = selected_large_diagnostic(
-            egraph,
-            root,
-            root_candidate.first_large_source,
-            &candidates,
-            bound_input,
-        );
-        tracing::debug!(
-            selected_cost = ?root_candidate.cost,
-            selected_large_source_id = ?root_candidate.first_large_source.map(|source| source.0),
-            selected_large_source_kind = ?root_candidate
-                .first_large_source
-                .and_then(|source| selected_atomic_source_kind(egraph, source)),
-            selected_large_path = ?diagnostic,
-            egraph_classes = egraph.number_of_classes(),
-            egraph_nodes = egraph.nodes().len(),
-            "selected Large residual"
-        );
+        if debug_enabled {
+            tracing::debug!(
+                selected_cost = ?root_candidate.cost,
+                selected_large_source_id = ?root_candidate.first_large_source.map(|source| source.0),
+                selected_large_source_kind = ?root_candidate
+                    .first_large_source
+                    .and_then(|source| selected_atomic_source_kind(egraph, source)),
+                selected_large_path = ?diagnostic,
+                egraph_classes = egraph.number_of_classes(),
+                egraph_nodes = egraph.nodes().len(),
+                "selected Large residual"
+            );
+        }
     }
     Ok(ExtractedProposalWithOrigins {
         proposal: ExtractedProposal {
@@ -396,8 +405,6 @@ pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
 struct SelectedLargePathStep {
     operator: &'static str,
     selected_cost: ProposalCost,
-    add_normalization: Option<AddNormalizationProbe>,
-    normalized_cost: Option<ProposalCost>,
     /// The bounded outcome for every inspected eligible structure.  This is
     /// the authoritative pointwise diagnostic; it never substitutes one
     /// direct candidate's rejection for the whole e-class result.
@@ -436,8 +443,6 @@ impl fmt::Debug for SelectedLargePathStep {
             .debug_struct("SelectedLargePathStep")
             .field("operator", &self.operator)
             .field("selected_cost", &self.selected_cost)
-            .field("add_normalization", &self.add_normalization)
-            .field("normalized_cost", &self.normalized_cost)
             .field("pointwise_add_switch_probe", &self.pointwise_add_switch_probe)
             .field("pointwise_first_direct_reject", &self.pointwise_first_direct_reject)
             .field("pointwise_negative_fixed_views", &self.pointwise_negative_fixed_views)
@@ -2187,18 +2192,6 @@ fn selected_large_path_from<I: BoundInput>(
             break;
         };
         let node = &candidate.node;
-        let add_normalization = match node {
-            MxxLang::MatrixAdd(_) => {
-                Some(probe_exact_additive_normalization(egraph, current, node))
-            }
-            _ => None,
-        };
-        let normalized_cost = match &add_normalization {
-            Some(AddNormalizationProbe::NormalizedAlternativeNotSelected(normalized)) => {
-                diagnostic_node_cost(egraph, current, normalized, candidates, bound_input)
-            }
-            _ => None,
-        };
         let pointwise_add_switch_probe = matches!(node, MxxLang::MatrixAdd(_))
             .then(|| pointwise_add_switch_probe(egraph, current));
         let pointwise_first_direct_reject = pointwise_add_switch_probe.as_ref().and_then(|probe| {
@@ -2298,8 +2291,6 @@ fn selected_large_path_from<I: BoundInput>(
         steps.push(SelectedLargePathStep {
             operator: node.operator_name(),
             selected_cost: candidate.cost.clone(),
-            add_normalization,
-            normalized_cost,
             pointwise_add_switch_probe,
             pointwise_first_direct_reject,
             pointwise_negative_fixed_views,
@@ -2357,42 +2348,6 @@ fn selected_large_child(
                 Some(source) => candidate.first_large_source == Some(source),
                 None => true,
             }
-    })
-}
-
-/// Computes the ordinary extraction cost of an already-existing normalized
-/// Add alternative without invoking the relation classifier or allocating
-/// any cache.  Add and typed zero have no relation-redex classification, so
-/// this is exactly the cost used by the extractor for these probe alternatives.
-fn diagnostic_node_cost<I: BoundInput>(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    class: Id,
-    node: &MxxLang,
-    candidates: &[Option<Candidate>],
-    bound_input: &I,
-) -> Option<ProposalCost> {
-    let (unsatisfied_relation_redexes, unsatisfied_structural_redexes, child_hidden, node_count) =
-        selected_child_obligations(egraph, node, candidates)?;
-    let semantic_bound = matches!(&egraph[class].data.sort, Ok(MxxSort::Matrix(_)))
-        .then(|| {
-            let children = CandidateChildBounds { egraph, candidates };
-            BoundEvaluator::evaluate_selected_node(bound_input, class, node, &children)
-        })
-        .transpose()
-        .ok()
-        .flatten()?;
-    Some(ProposalCost {
-        unsatisfied_relation_redexes,
-        local_checked_relation_count: 0,
-        local_checked_structural_count: 0,
-        unsatisfied_structural_redexes,
-        hidden_structural_redexes: if matches!(node, MxxLang::MatrixAdd(_)) {
-            unsatisfied_structural_redexes
-        } else {
-            child_hidden
-        },
-        large_residual: matches!(semantic_bound.coefficient_class, BoundClass::Large),
-        node_count,
     })
 }
 
@@ -2485,18 +2440,6 @@ fn proposal_cost<I: BoundInput>(
         return Ok(None);
     };
     let classification = classify(class, node, egraph)?;
-    let selected_structural_normalization = match node {
-        MxxLang::MatrixMultiply(factors) => {
-            let lookup = |handle| {
-                let origin = egraph.find(handle);
-                let candidate = candidates.get(usize::from(origin))?.as_ref()?;
-                Some(SelectedNodeRef { node: &candidate.node, origin })
-            };
-            selected_product_structural_probe(egraph, class, factors, lookup)
-        }
-        MxxLang::MatrixAdd(_) => selected_multi_switch_structural_probe(egraph, class, node),
-        _ => None,
-    };
     let semantic_bound = matches!(&egraph[class].data.sort, Ok(MxxSort::Matrix(_)))
         .then(|| {
             let children = CandidateChildBounds { egraph, candidates };
@@ -2514,10 +2457,8 @@ fn proposal_cost<I: BoundInput>(
             unsatisfied_relation_redexes: child_relation
                 .saturating_add(u64::from(classification.relation_redex)),
             local_checked_relation_count: classification.local_checked_relation_count,
-            local_checked_structural_count: u64::from(selected_structural_normalization.is_some()),
-            unsatisfied_structural_redexes: child_structural.saturating_add(u64::from(
-                selected_structural_normalization.is_some_and(|probe| !probe.satisfied),
-            )),
+            local_checked_structural_count: 0,
+            unsatisfied_structural_redexes: child_structural,
             // At an addition all selected structural work below it is hidden exactly once;
             // an enclosing addition replaces this value with the same descendant count.
             hidden_structural_redexes: if matches!(node, MxxLang::MatrixAdd(_)) {
@@ -2574,8 +2515,7 @@ mod tests {
         },
         relation::{
             PointwiseAddSwitchReject, RelationApplier, RelationRegistration, RelationSearcher,
-            RewriteContext, SharedRewriteBudget, materialize_selected_product_switch_redex,
-            selected_product_switch_redex,
+            RewriteContext, SharedRewriteBudget,
         },
     };
     use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef, types::ConcreteMatrixType};
@@ -4365,51 +4305,6 @@ mod tests {
     }
 
     #[test]
-    fn normalized_diagnostic_cost_matches_ordinary_add_cost() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let (term, term_source) = matrix_atom(&mut egraph, "term");
-        let (residual, residual_source) = matrix_atom(&mut egraph, "residual");
-        let negated = egraph.add(MxxLang::MatrixNegate([term]));
-        let root = egraph.add(MxxLang::MatrixAdd(vec![term, negated, residual].into_boxed_slice()));
-        let normalized = egraph.add(MxxLang::MatrixAdd(vec![residual].into_boxed_slice()));
-        egraph.union(root, normalized);
-        egraph.rebuild();
-        let root = egraph.find(root);
-        let normalized = egraph[root]
-            .nodes
-            .iter()
-            .find(|node| matches!(node, MxxLang::MatrixAdd(terms) if terms.len() == 1))
-            .expect("normalized Add remains in the root e-class");
-        let candidates = diagnostic_candidates(&egraph, &[]);
-        let mut input = SemanticInput {
-            atom_classes: BTreeMap::from([
-                (term_source, BoundClass::bounded(1_u8.into())),
-                (residual_source, BoundClass::bounded(2_u8.into())),
-            ]),
-            ..Default::default()
-        };
-        populate_matrix_types(&mut input, &egraph);
-        let diagnostic = diagnostic_node_cost(&egraph, root, normalized, &candidates, &input)
-            .expect("normalized Add has selected finite children");
-        let mut invalid = |_| panic!("fixture has a finite DAG representative");
-        let mut bound_error = |error| panic!("fixture has valid bounds: {error:?}");
-        let ordinary = proposal_cost(
-            &egraph,
-            root,
-            normalized,
-            &candidates,
-            &input,
-            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
-            &mut |_, _, _| Ok(ProposalNodeClassification::default()),
-        )
-        .expect("ordinary Add cost succeeds")
-        .expect("children are selected")
-        .0;
-
-        assert_eq!(diagnostic, ordinary);
-    }
-
-    #[test]
     fn extraction_prefers_two_chunk_affine_preimage_boundary_over_public_large_sources() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let (s, s_source) = typed_matrix_atom(&mut egraph, "s", 1, 1, None);
@@ -5370,6 +5265,7 @@ mod tests {
             &NoBounds,
             &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
             &mut |_, _, _| Ok(ProposalNodeClassification::default()),
+            true,
         )
         .expect("shared DAG extracts");
 
@@ -5382,79 +5278,18 @@ mod tests {
     }
 
     #[test]
-    fn extraction_prefers_a_materialized_product_switch_over_the_compact_raw_product() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let selector = egraph.add(MxxLang::IntConst(0.into()));
-        let left = egraph.add(MxxLang::IntConst(2.into()));
-        let right = egraph.add(MxxLang::IntConst(3.into()));
-        let fixed = egraph.add(MxxLang::IntConst(5.into()));
-        let selected = egraph.add(MxxLang::Switch(vec![selector, left, right].into_boxed_slice()));
-        let root = egraph.add(MxxLang::MatrixMultiply(vec![selected, fixed].into_boxed_slice()));
-        egraph.rebuild();
-        let extract = |egraph: &EGraph<MxxLang, MxxAnalysis>| {
-            let mut invalid = |_| panic!("fixture has a finite selected DAG");
-            let mut bound_error = |error| panic!("non-matrix fixture has no bound: {error:?}");
-            extract_best_proposal_with_origins(
-                egraph,
-                root,
-                &NoBounds,
-                &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
-                &mut |_, _, _| Ok(ProposalNodeClassification::default()),
-            )
-            .expect("selected proposal")
-        };
-        let raw = extract(&egraph);
-        assert_eq!(raw.proposal.cost.unsatisfied_structural_redexes, 1);
-        let product_index = usize::from(raw.proposal.expression.root());
-        let redex = selected_product_switch_redex(
-            &egraph,
-            &raw.proposal.expression,
-            &raw.origins,
-            product_index,
-        )
-        .expect("raw product normalization");
-        let context = RewriteContext::new(SharedRewriteBudget::new());
-        let (origin, replacement) =
-            materialize_selected_product_switch_redex(&mut egraph, redex, &context)
-                .expect("materialized outer Switch");
-        assert!(egraph.union(origin, replacement));
-        egraph.rebuild();
-
-        let normalized = extract(&egraph);
-        assert_eq!(normalized.proposal.cost.unsatisfied_structural_redexes, 0);
-        assert!(matches!(
-            normalized.proposal.expression[normalized.proposal.expression.root()],
-            MxxLang::Switch(_)
-        ));
-        assert!(
-            selected_product_switch_redex(
-                &egraph,
-                &normalized.proposal.expression,
-                &normalized.origins,
-                usize::from(normalized.proposal.expression.root()),
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
     fn local_structural_preference_precedes_propagated_work() {
-        // A ProductAdd whose exact expansion already exists has no remaining
-        // structural obligation, but retains one root-local checked recipe.
-        // Its expanded Add can expose two descendant ProductSwitch obligations.
-        // Keep this comparison capped and synthetic: it characterizes only the
-        // extraction stage order, without constructing a Tall-sized family.
-        let satisfied_raw_product_add =
+        let satisfied_local_recipe =
             ProposalCost { local_checked_structural_count: 1, node_count: 3, ..Default::default() };
         let expanded_add_with_descendant_work =
             ProposalCost { unsatisfied_structural_redexes: 2, node_count: 7, ..Default::default() };
 
-        assert_eq!(satisfied_raw_product_add.unsatisfied_structural_redexes, 0);
-        assert_eq!(satisfied_raw_product_add.local_checked_structural_count, 1);
+        assert_eq!(satisfied_local_recipe.unsatisfied_structural_redexes, 0);
+        assert_eq!(satisfied_local_recipe.local_checked_structural_count, 1);
         assert_eq!(expanded_add_with_descendant_work.local_checked_structural_count, 0);
         assert_eq!(expanded_add_with_descendant_work.unsatisfied_structural_redexes, 2);
         assert!(
-            expanded_add_with_descendant_work < satisfied_raw_product_add,
+            expanded_add_with_descendant_work < satisfied_local_recipe,
             "local structural preference precedes propagated structural obligations"
         );
     }

@@ -14,12 +14,9 @@ use super::{
     language::MxxLang,
     lower::{GraphLowerer, LoweredValue, LoweringControl},
     relation::{
-        RelationApplier, RelationSearcher, RewriteContext, SelectedMultiSwitchRedex,
-        SelectedProductAddRedex, SelectedProductSwitchRedex, SharedRewriteBudget,
-        materialize_selected_multi_switch_redex, materialize_selected_product_add_redex,
-        materialize_selected_product_switch_redex, note_selected_multi_switch_union,
-        prepare_selected_multi_switch_redex, selected_multi_switch_redex,
-        selected_product_add_redex, selected_product_switch_redex,
+        RelationApplier, RelationSearcher, ReplacementPlan, RewriteContext, SharedRewriteBudget,
+        materialize_selected_polynomial_redex, selected_polynomial_monomials,
+        selected_polynomial_redexes,
     },
 };
 use crate::{OperationalDecoderKind, ProtocolDecl, StageId};
@@ -43,19 +40,19 @@ use tracing::{debug, error, info};
 
 const PROGRESS_TIME_CADENCE: Duration = Duration::from_secs(1);
 
+fn emit_detailed_large_diagnostic_for_epoch(epoch: u64) -> bool {
+    epoch == 0 || epoch.is_power_of_two()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum SelectedNormalizationRedex {
-    Add(SelectedMultiSwitchRedex),
-    ProductAdd(SelectedProductAddRedex),
-    Product(SelectedProductSwitchRedex),
+    Polynomial((egg::Id, ReplacementPlan)),
 }
 
 impl SelectedNormalizationRedex {
     fn origin(&self) -> egg::Id {
         match self {
-            Self::Add(redex) => redex.origin,
-            Self::ProductAdd(redex) => redex.origin,
-            Self::Product(redex) => redex.origin,
+            Self::Polynomial((origin, _)) => *origin,
         }
     }
 }
@@ -529,18 +526,21 @@ pub fn check_operational_noise_candidate_with_progress(
             };
             let mut selected_roots =
                 roots.iter().map(|root| lowerer.egraph.find(*root)).collect::<BTreeSet<_>>();
-            // This is deliberately outside egg saturation: only Add nodes in
-            // the deterministic selected DAG may materialize a same-selector
-            // Switch distribution. This finite protocol makes no universal
-            // termination claim from selected-redex counts: it freezes one
-            // selected snapshot, materializes its complete batch, requires at
-            // least one new union, rebuilds, and then extracts again.
+            // This is deliberately outside egg saturation: one deterministic
+            // selected DAG is expanded to its canonical ordered polynomial,
+            // including exact Switch scope hoisting from its stored cases.
+            // This finite protocol makes no universal termination claim from
+            // selected-redex counts: it freezes one selected snapshot,
+            // materializes its complete batch, requires at least one new
+            // union, rebuilds, and then extracts again.
             let mut normalization_epoch = 0_u64;
             let mut egraph_mutation_epoch = 0_u64;
             let (terminal_egraph_mutation_epoch, terminal_selected) = 'joint_fixed_point: loop {
-                // Ordinary saturation may expose a fresh selected multi-Switch
-                // shape.  Recurrence is meaningful only within one selected
-                // phase, so its epoch-local guard resets at this boundary.
+                // Ordinary saturation may expose a fresh selected polynomial
+                // or a Switch whose common terms or ordered factors can move
+                // outside its stored cases. Recurrence is meaningful only
+                // within one selected phase, so its epoch-local guard resets
+                // at this boundary.
                 let mut selected_phase_unions = 0_u64;
                 loop {
                     let extraction_started = Instant::now();
@@ -568,6 +568,7 @@ pub fn check_operational_noise_candidate_with_progress(
                                         .local_checked_relation_count,
                                 })
                             },
+                            emit_detailed_large_diagnostic_for_epoch(normalization_epoch),
                         )?;
                         selected.push((*root, proposal));
                     }
@@ -638,131 +639,49 @@ pub fn check_operational_noise_candidate_with_progress(
 
                     let mut seen_origins = BTreeSet::new();
                     let mut redexes = Vec::new();
-                    let mut product_with_product_descendant_count = 0_usize;
-                    let mut product_with_product_in_switch_case_count = 0_usize;
+                    let mut selected_polynomial_evaluation_count = 0_usize;
                     for (root, extracted) in &selected {
                         debug_assert_eq!(
                             extracted.proposal.expression.as_ref().len(),
                             extracted.origins.len(),
                             "selected expression and origin records stay aligned"
                         );
-                        let mut subtree_has_product_redex =
-                            Vec::with_capacity(extracted.proposal.expression.as_ref().len());
-                        for (expression_index, (node, origin)) in extracted
-                            .proposal
-                            .expression
-                            .as_ref()
-                            .iter()
-                            .zip(extracted.origins.iter())
-                            .enumerate()
-                        {
-                            debug_assert_eq!(expression_index, subtree_has_product_redex.len());
-                            let has_product_descendant = node.children().iter().any(|child| {
-                                subtree_has_product_redex
-                                    .get(usize::from(*child))
-                                    .copied()
-                                    .unwrap_or(false)
-                            });
-                            let redex = selected_multi_switch_redex(&lowerer.egraph, *origin, node)
-                                .map(SelectedNormalizationRedex::Add)
-                                .or_else(|| {
-                                    selected_product_switch_redex(
-                                        &lowerer.egraph,
-                                        &extracted.proposal.expression,
-                                        &extracted.origins,
-                                        expression_index,
-                                    )
-                                    .map(SelectedNormalizationRedex::Product)
-                                    .or_else(|| {
-                                        selected_product_add_redex(
-                                            &lowerer.egraph,
-                                            &extracted.proposal.expression,
-                                            &extracted.origins,
-                                            expression_index,
-                                        )
-                                        .map(SelectedNormalizationRedex::ProductAdd)
-                                    })
-                                });
-                            let is_product_redex = matches!(
-                                redex,
-                                Some(
-                                    SelectedNormalizationRedex::Product(_) |
-                                        SelectedNormalizationRedex::ProductAdd(_)
+                        selected_polynomial_evaluation_count += 1;
+                        let mut selected_polynomial_progress =
+                            || context.reserve(1).then_some(()).ok_or(());
+                        let selected_polynomial = selected_polynomial_monomials(
+                            &lowerer.egraph,
+                            &extracted.proposal.expression,
+                            &extracted.origins,
+                            &mut selected_polynomial_progress,
+                        );
+                        let selected_polynomial_redexes =
+                            selected_polynomial.as_ref().and_then(|monomials| {
+                                selected_polynomial_redexes(
+                                    &lowerer.egraph,
+                                    &extracted.proposal.expression,
+                                    &extracted.origins,
+                                    usize::from(extracted.proposal.expression.root()),
+                                    monomials,
+                                    &mut selected_polynomial_progress,
                                 )
-                            );
-                            let product_in_switch_case = is_product_redex &&
-                                matches!(node, MxxLang::MatrixMultiply(factors) if factors.iter().any(|factor| {
-                                    matches!(
-                                        extracted.proposal.expression.as_ref().get(usize::from(*factor)),
-                                        Some(MxxLang::Switch(cases)) if cases[1..].iter().any(|case| {
-                                            subtree_has_product_redex
-                                                .get(usize::from(*case))
-                                                .copied()
-                                                .unwrap_or(false)
-                                        })
-                                    )
-                                }));
-                            if let Some(redex) = redex &&
-                                seen_origins.insert(redex.origin())
-                            {
-                                if matches!(
-                                    redex,
-                                    SelectedNormalizationRedex::Product(_) |
-                                        SelectedNormalizationRedex::ProductAdd(_)
-                                ) {
-                                    product_with_product_descendant_count +=
-                                        usize::from(has_product_descendant);
-                                    product_with_product_in_switch_case_count +=
-                                        usize::from(product_in_switch_case);
+                            });
+                        if let Some(selected_polynomial_redexes) = selected_polynomial_redexes {
+                            for redex in selected_polynomial_redexes {
+                                let redex = SelectedNormalizationRedex::Polynomial(redex);
+                                if seen_origins.insert(redex.origin()) {
+                                    redexes.push((*root, redex));
                                 }
-                                redexes.push((*root, redex));
                             }
-                            subtree_has_product_redex
-                                .push(is_product_redex || has_product_descendant);
                         }
                     }
                     redexes.sort_unstable();
                     let measure = redexes.len();
-                    let add_redex_count = redexes
-                        .iter()
-                        .filter(|(_, redex)| matches!(redex, SelectedNormalizationRedex::Add(_)))
-                        .count();
-                    let product_switch_redex_count = redexes
-                        .iter()
-                        .filter(|(_, redex)| {
-                            matches!(redex, SelectedNormalizationRedex::Product(_))
-                        })
-                        .count();
-                    let product_add_redex_count = redexes
-                        .iter()
-                        .filter(|(_, redex)| {
-                            matches!(redex, SelectedNormalizationRedex::ProductAdd(_))
-                        })
-                        .count();
-                    let product_redex_count =
-                        product_switch_redex_count.saturating_add(product_add_redex_count);
-                    let representative_product_shape =
-                        redexes.iter().find_map(|(_, redex)| match redex {
-                            SelectedNormalizationRedex::Product(redex) => {
-                                Some(redex.diagnostic_shape())
-                            }
-                            SelectedNormalizationRedex::Add(_) |
-                            SelectedNormalizationRedex::ProductAdd(_) => None,
-                        });
                     info!(
                         epoch = normalization_epoch,
                         selected_redex_count = measure,
                         batch_size = measure,
-                        add_redex_count,
-                        product_redex_count,
-                        product_switch_redex_count,
-                        product_add_redex_count,
-                        product_with_product_descendant_count,
-                        product_with_product_in_switch_case_count,
-                        representative_product_case_count =
-                            representative_product_shape.map(|shape| shape.0),
-                        representative_product_factor_count =
-                            representative_product_shape.map(|shape| shape.1),
+                        selected_polynomial_evaluation_count,
                         egraph_nodes = lowerer.egraph.total_size(),
                         extraction_milliseconds = extraction_started.elapsed().as_millis() as u64,
                         "selected relation normalization epoch"
@@ -858,25 +777,8 @@ pub fn check_operational_noise_candidate_with_progress(
                     let mut pending_unions = Vec::with_capacity(redexes.len());
                     for (_, redex) in redexes {
                         let equality = match redex {
-                            SelectedNormalizationRedex::Add(redex) => {
-                                prepare_selected_multi_switch_redex(&lowerer.egraph, redex)
-                                    .and_then(|prepared| {
-                                        materialize_selected_multi_switch_redex(
-                                            &mut lowerer.egraph,
-                                            prepared,
-                                            &context,
-                                        )
-                                    })
-                            }
-                            SelectedNormalizationRedex::Product(redex) => {
-                                materialize_selected_product_switch_redex(
-                                    &mut lowerer.egraph,
-                                    redex,
-                                    &context,
-                                )
-                            }
-                            SelectedNormalizationRedex::ProductAdd(redex) => {
-                                materialize_selected_product_add_redex(
+                            SelectedNormalizationRedex::Polynomial(redex) => {
+                                materialize_selected_polynomial_redex(
                                     &mut lowerer.egraph,
                                     redex,
                                     &context,
@@ -914,7 +816,7 @@ pub fn check_operational_noise_candidate_with_progress(
                     for (origin, replacement) in pending_unions {
                         if lowerer.egraph.union(origin, replacement) {
                             union_count += 1;
-                            note_selected_multi_switch_union(&context);
+                            context.note_rewrite(true);
                         }
                     }
                     if union_count == 0 {
@@ -1856,6 +1758,16 @@ fn shared_round_div(numerator: &BigInt, denominator: &BigInt) -> BigInt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detailed_large_diagnostic_uses_a_power_of_two_epoch_cadence() {
+        let emitted = (0_u64..=140)
+            .filter(|epoch| emit_detailed_large_diagnostic_for_epoch(*epoch))
+            .collect::<Vec<_>>();
+        assert_eq!(emitted, vec![0, 1, 2, 4, 8, 16, 32, 64, 128]);
+        assert!(!emit_detailed_large_diagnostic_for_epoch(3));
+        assert!(!emit_detailed_large_diagnostic_for_epoch(140));
+    }
 
     #[test]
     fn selected_phase_postcondition_restarts_completes_or_fails_without_spinning() {

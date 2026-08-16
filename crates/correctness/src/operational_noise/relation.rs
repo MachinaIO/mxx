@@ -1227,6 +1227,34 @@ pub(crate) struct SelectedPolynomialPlans {
     pub(crate) preferred: Vec<ReplacementPlan>,
 }
 
+fn prioritize_selected_concrete_representatives(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    selected_indices: &mut BTreeMap<Id, Vec<usize>>,
+    monomials: &[Vec<SelectedSignedSpine>],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<()> {
+    for (origin, indices) in selected_indices {
+        let mut representative = None;
+        for (position, index) in indices.iter().copied().enumerate() {
+            progress().ok()?;
+            let candidate = monomials.get(index)?;
+            if !candidate.is_empty() &&
+                !matches!(candidate.as_slice(), [(spine, false)] if spine.as_ref() == [*origin]) &&
+                candidate
+                    .iter()
+                    .all(|(spine, _)| spine.iter().all(|factor| egraph.find(*factor) != *origin))
+            {
+                representative = Some(position);
+                break;
+            }
+        }
+        if let Some(position) = representative {
+            indices.swap(0, position);
+        }
+    }
+    Some(())
+}
+
 /// Collects selected polynomial rewrites in one child-before-parent pass.
 pub(crate) fn selected_polynomial_redexes_mut(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
@@ -1245,6 +1273,12 @@ pub(crate) fn selected_polynomial_redexes_mut(
         let origin = egraph.find(*origins.get(index)?);
         selected_indices.entry(origin).or_default().push(index);
     }
+    prioritize_selected_concrete_representatives(
+        egraph,
+        &mut selected_indices,
+        monomials,
+        progress,
+    )?;
 
     struct Candidate {
         origin: Id,
@@ -1535,7 +1569,10 @@ fn selected_spine_peel_term(
 }
 
 fn selected_peel_terms_to_spines(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
     terms: &[PeelTerm],
+    selected_indices: &BTreeMap<Id, Vec<usize>>,
+    monomials: &[Vec<SelectedSignedSpine>],
     progress: &mut dyn FnMut() -> Result<(), ()>,
 ) -> Option<Vec<(Box<[Id]>, bool)>> {
     let mut spines = Vec::new();
@@ -1543,8 +1580,28 @@ fn selected_peel_terms_to_spines(
         match term {
             PeelTerm::Concrete { base, negative } => {
                 progress().ok()?;
-                spines.try_reserve(1).ok()?;
-                spines.push((vec![*base].into_boxed_slice(), *negative));
+                let base = egraph.find(*base);
+                let restored = selected_indices
+                    .get(&base)
+                    .and_then(|indices| indices.first())
+                    .and_then(|index| monomials.get(*index))
+                    .filter(|candidate| {
+                        !candidate.is_empty() &&
+                            !matches!(candidate.as_slice(), [(spine, false)] if spine.as_ref() == [base]) &&
+                            candidate.iter().all(|(spine, _)| {
+                                spine.iter().all(|factor| egraph.find(*factor) != base)
+                            })
+                    });
+                if let Some(restored) = restored {
+                    spines.try_reserve(restored.len()).ok()?;
+                    for (spine, restored_negative) in restored {
+                        progress().ok()?;
+                        spines.push((copy_ids(spine, progress)?, *negative != *restored_negative));
+                    }
+                } else {
+                    spines.try_reserve(1).ok()?;
+                    spines.push((vec![base].into_boxed_slice(), *negative));
+                }
             }
             PeelTerm::ProductFactor { prefix, terms, suffix, negative } => {
                 for (base, base_negative) in terms {
@@ -2042,7 +2099,13 @@ fn selected_same_selector_add_hoist_plan_with_views(
             total_fixed_count = total_fixed_count.checked_add(fixed_count)?;
             total_unmatched_fixed_count =
                 total_unmatched_fixed_count.checked_add(unmatched_fixed_count)?;
-            let mut combined = selected_peel_terms_to_spines(&actual, progress)?;
+            let mut combined = selected_peel_terms_to_spines(
+                egraph,
+                &actual,
+                selected_indices,
+                monomials,
+                progress,
+            )?;
             for term in unmatched_fixed {
                 progress().ok()?;
                 combined.try_reserve(1).ok()?;
@@ -15503,6 +15566,194 @@ mod tests {
         let before = egraph.total_size();
         assert!(pointwise_add_switch_cancellation_plan(&egraph, root).is_none());
         assert_eq!(egraph.total_size(), before);
+    }
+
+    #[test]
+    fn selected_peel_concrete_restores_one_selected_level_with_order_and_xor_sign() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (left, _) = matrix_atom(&mut egraph, "restore-left", None);
+        let (right, _) = matrix_atom(&mut egraph, "restore-right", None);
+        let (base, _) = matrix_atom(&mut egraph, "restore-base", None);
+        let (alias, _) = matrix_atom(&mut egraph, "restore-alias", None);
+        egraph.union(base, alias);
+        egraph.rebuild();
+        let base = egraph.find(base);
+        let mut selected_indices = BTreeMap::from([(base, vec![0, 1])]);
+        let monomials = vec![
+            vec![(vec![base].into_boxed_slice(), false)],
+            vec![
+                (vec![egraph.find(left), egraph.find(right)].into_boxed_slice(), false),
+                (vec![egraph.find(right)].into_boxed_slice(), true),
+            ],
+        ];
+        prioritize_selected_concrete_representatives(
+            &egraph,
+            &mut selected_indices,
+            &monomials,
+            &mut || Ok(()),
+        )
+        .expect("the selected sibling representative scan completes");
+        assert_eq!(
+            selected_indices[&base],
+            vec![1, 0],
+            "a peel-generated base uses the first nontrivial selected sibling in O(1)"
+        );
+        let terms = vec![PeelTerm::Concrete { base: alias, negative: true }];
+        let restored = selected_peel_terms_to_spines(
+            &egraph,
+            &terms,
+            &selected_indices,
+            &monomials,
+            &mut || Ok(()),
+        )
+        .expect("one selected level restores");
+        assert_eq!(
+            restored,
+            vec![
+                (vec![egraph.find(left), egraph.find(right)].into_boxed_slice(), true),
+                (vec![egraph.find(right)].into_boxed_slice(), false),
+            ],
+            "the selected representative keeps ordered factors and XORs only the outer sign"
+        );
+    }
+
+    #[test]
+    fn selected_peel_concrete_keeps_trivial_self_and_switch_representatives_opaque() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (left, _) = matrix_atom(&mut egraph, "restore-switch-left", None);
+        let (right, _) = matrix_atom(&mut egraph, "restore-switch-right", None);
+        let switch = egraph.add(MxxLang::Switch(vec![selector, left, right].into_boxed_slice()));
+        egraph.rebuild();
+        let switch = egraph.find(switch);
+        let selected_indices = BTreeMap::from([(switch, vec![0])]);
+        let monomials = vec![vec![(vec![switch].into_boxed_slice(), false)]];
+        let terms = vec![PeelTerm::Concrete { base: switch, negative: false }];
+        assert_eq!(
+            selected_peel_terms_to_spines(
+                &egraph,
+                &terms,
+                &selected_indices,
+                &monomials,
+                &mut || Ok(()),
+            ),
+            Some(vec![(vec![switch].into_boxed_slice(), false)]),
+            "a Switch is not opened and no case product is enumerated"
+        );
+
+        let self_containing =
+            vec![vec![(vec![switch, egraph.find(left)].into_boxed_slice(), false)]];
+        assert_eq!(
+            selected_peel_terms_to_spines(
+                &egraph,
+                &terms,
+                &selected_indices,
+                &self_containing,
+                &mut || Ok(()),
+            ),
+            Some(vec![(vec![switch].into_boxed_slice(), false)]),
+            "a self-containing representative cannot recursively restore itself"
+        );
+    }
+
+    #[test]
+    fn selected_peel_concrete_preserves_noncentral_order_and_central_scalar_cancellation() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (left, _) = matrix_atom(&mut egraph, "restore-order-left", None);
+        let (right, _) = matrix_atom(&mut egraph, "restore-order-right", None);
+        let gadget = regular_scalar_gadget(&mut egraph);
+        let scalar = scalar_polynomial_constant(&mut egraph, &[9]);
+        let (base, _) = matrix_atom(&mut egraph, "restore-order-base", None);
+        egraph.rebuild();
+        let base = egraph.find(base);
+        let selected_indices = BTreeMap::from([(base, vec![0])]);
+        let terms = vec![PeelTerm::Concrete { base, negative: false }];
+
+        let reversed = vec![vec![
+            (vec![egraph.find(left), egraph.find(right)].into_boxed_slice(), false),
+            (vec![egraph.find(right), egraph.find(left)].into_boxed_slice(), true),
+        ]];
+        let mut restored = selected_peel_terms_to_spines(
+            &egraph,
+            &terms,
+            &selected_indices,
+            &reversed,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        canonicalize_central_constant_scalar_spines(&egraph, &mut restored, &mut || Ok(()))
+            .unwrap();
+        cancel_signed_spines(&mut restored);
+        assert_eq!(restored.len(), 2, "noncentral factor reversal is not cancellation");
+
+        let scalar_reordered = vec![vec![
+            (vec![egraph.find(gadget), egraph.find(scalar)].into_boxed_slice(), false),
+            (vec![egraph.find(scalar), egraph.find(gadget)].into_boxed_slice(), true),
+        ]];
+        let mut restored = selected_peel_terms_to_spines(
+            &egraph,
+            &terms,
+            &selected_indices,
+            &scalar_reordered,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        canonicalize_central_constant_scalar_spines(&egraph, &mut restored, &mut || Ok(()))
+            .unwrap();
+        cancel_signed_spines(&mut restored);
+        assert!(restored.is_empty(), "the reviewed constant scalar y commutes with G");
+    }
+
+    #[test]
+    fn selected_peel_concrete_restoration_is_transactional_on_interruption() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (base, _) = matrix_atom(&mut egraph, "restore-transaction-base", None);
+        let factors = (0..12)
+            .map(|index| matrix_atom(&mut egraph, &format!("restore-transaction-{index}"), None).0)
+            .collect::<Vec<_>>();
+        egraph.rebuild();
+        let base = egraph.find(base);
+        let selected_indices = BTreeMap::from([(base, vec![0])]);
+        let monomials = vec![vec![(
+            factors
+                .iter()
+                .map(|factor| egraph.find(*factor))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            false,
+        )]];
+        let terms = vec![PeelTerm::Concrete { base, negative: false }];
+        let before = egraph.total_size();
+        let mut full_calls = 0;
+        assert!(
+            selected_peel_terms_to_spines(
+                &egraph,
+                &terms,
+                &selected_indices,
+                &monomials,
+                &mut || {
+                    full_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_some()
+        );
+        let mut calls = 0;
+        assert!(
+            selected_peel_terms_to_spines(
+                &egraph,
+                &terms,
+                &selected_indices,
+                &monomials,
+                &mut || {
+                    calls += 1;
+                    (calls < full_calls).then_some(()).ok_or(())
+                },
+            )
+            .is_none()
+        );
+        assert_eq!(terms, vec![PeelTerm::Concrete { base, negative: false }]);
+        assert_eq!(egraph.total_size(), before, "restoration planning remains read-only");
     }
 
     #[test]

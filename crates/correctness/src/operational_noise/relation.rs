@@ -13,7 +13,7 @@ use super::{
     family,
     identity::{
         AtomicRelationRole, AtomicSourceId, AtomicSourceKey, Axis, BinderId, MatrixConstantValue,
-        SamplerIdentity, TrapdoorDescriptorId,
+        TrapdoorDescriptorId,
     },
     language::MxxLang,
 };
@@ -61,8 +61,6 @@ pub enum RelationFailure {
     InvalidRelationProducer { source: AtomicSourceId },
     MismatchedType { source: AtomicSourceId },
     MismatchedLayout { source: AtomicSourceId },
-    MismatchedTrapdoor { source: AtomicSourceId },
-    MismatchedTarget { source: AtomicSourceId },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -5473,7 +5471,6 @@ fn atomic_source_kind(source: &AtomicSourceKey) -> &'static str {
         AtomicSourceKey::GraphWire(_) => "graph-wire",
         AtomicSourceKey::ExplicitLarge(_) => "explicit-large",
         AtomicSourceKey::SequentialState(_) => "sequential-state",
-        AtomicSourceKey::SequentialRecurrence { .. } => "sequential-recurrence",
         AtomicSourceKey::Sampler(_) => "sampler",
     }
 }
@@ -7230,120 +7227,6 @@ fn preflight_registration(
     if expected_public != actual_public {
         return Err(RelationFailure::MismatchedPublic { source: source.source });
     }
-    if matches!(
-        source_descriptor.relation_role,
-        Some(
-            AtomicRelationRole::DecomposedHash |
-                AtomicRelationRole::SmallDecomposedHash { range_proved: true }
-        )
-    ) {
-        let AtomicSourceKey::Sampler(sampler_id) = source_descriptor.key else {
-            return Err(RelationFailure::InvalidRelationProducer { source: source.source });
-        };
-        let Some(SamplerIdentity::DecomposedHash {
-            public,
-            target: sampler_target,
-            arguments,
-            matrix_type,
-            base,
-            digit_count,
-            small,
-            ..
-        }) = egraph.analysis.symbols.samplers.get(sampler_id.0)
-        else {
-            return Err(RelationFailure::InvalidRelationProducer { source: source.source });
-        };
-        if egraph.find(*public) != expected_public ||
-            egraph.find(*sampler_target) != target ||
-            !matrix_types_equal(matrix_type, source_matrix)
-        {
-            return Err(RelationFailure::MismatchedTarget { source: source.source });
-        }
-        let public_is_exact_gadget = egraph[expected_public].nodes.iter().any(|node| {
-            let MxxLang::MatrixConstant(spec_id) = node else { return false };
-            egraph.analysis.symbols.matrix_constants.get(spec_id.0).is_some_and(|spec| {
-                matrix_types_equal(&spec.matrix_type, public_matrix) &&
-                    matches!(
-                        &spec.value,
-                        MatrixConstantValue::Gadget { base: spec_base, small: spec_small }
-                        if spec_base == base && spec_small == small
-                    )
-            })
-        });
-        if !public_is_exact_gadget {
-            return Err(RelationFailure::MismatchedPublic { source: source.source });
-        }
-        let target_is_exact_hash = egraph[target].nodes.iter().any(|node| {
-            let MxxLang::HashPlain { query, arguments: hash_arguments } = node else {
-                return false;
-            };
-            egraph.analysis.symbols.hash_queries.get(query.0).is_some_and(|query| {
-                matrix_types_equal(&query.matrix_type, target_matrix) &&
-                    same_canonical_indices(egraph, hash_arguments, arguments)
-            })
-        });
-        let layout_is_exact = resolved_constant(&source_matrix.rows)
-            .zip(resolved_constant(&public_matrix.rows))
-            .zip(resolved_constant(digit_count))
-            .is_some_and(|((source_rows, public_rows), digits)| {
-                digits > BigInt::zero() && source_rows == public_rows * digits
-            });
-        if !target_is_exact_hash || !layout_is_exact {
-            return Err(RelationFailure::MismatchedTarget { source: source.source });
-        }
-    }
-    if matches!(
-        source_descriptor.relation_role,
-        Some(
-            AtomicRelationRole::GadgetDecomposition |
-                AtomicRelationRole::SmallGadgetDecomposition { range_proved: true }
-        )
-    ) {
-        let AtomicSourceKey::Sampler(sampler_id) = source_descriptor.key else {
-            return Err(RelationFailure::InvalidRelationProducer { source: source.source });
-        };
-        let Some(SamplerIdentity::GadgetDecomposition {
-            public,
-            target: sampler_target,
-            base,
-            digit_count,
-            small,
-            ..
-        }) = egraph.analysis.symbols.samplers.get(sampler_id.0)
-        else {
-            return Err(RelationFailure::InvalidRelationProducer { source: source.source });
-        };
-        let public_is_exact_gadget = egraph[expected_public].nodes.iter().any(|node| {
-            let MxxLang::MatrixConstant(spec_id) = node else { return false };
-            egraph.analysis.symbols.matrix_constants.get(spec_id.0).is_some_and(|spec| {
-                matrix_types_equal(&spec.matrix_type, public_matrix) &&
-                    matches!(&spec.value,
-                        MatrixConstantValue::Gadget { base: spec_base, small: spec_small }
-                        if spec_base == base && spec_small == small)
-            })
-        });
-        let layout_is_exact = resolved_constant(&source_matrix.rows)
-            .zip(resolved_constant(&target_matrix.rows))
-            .zip(resolved_constant(digit_count))
-            .is_some_and(|((source_rows, target_rows), digits)| {
-                digits > BigInt::zero() && source_rows == target_rows * digits
-            });
-        if egraph.find(*public) != expected_public ||
-            egraph.find(*sampler_target) != target ||
-            !public_is_exact_gadget ||
-            !layout_is_exact
-        {
-            return Err(RelationFailure::MismatchedTarget { source: source.source });
-        }
-    }
-    if !registration.trapdoor.is_none_or(|trapdoor_id| {
-        egraph.analysis.symbols.trapdoors.get(trapdoor_id.0).is_some_and(|trapdoor| {
-            egraph.find(trapdoor.public) == expected_public &&
-                matrix_types_equal(&trapdoor.matrix_type, public_matrix)
-        })
-    }) {
-        return Err(RelationFailure::MismatchedTrapdoor { source: source.source });
-    }
     Ok(())
 }
 
@@ -7810,8 +7693,8 @@ mod tests {
         AtomicSourceDescriptor, AtomicSourceKey, BinderDescriptor, BinderKey,
         CanonicalResidueConvention, GraphWireSourceKey, HashQuerySpec, HashQuerySpecId,
         IntegerSourceDomain, MatrixConstantSpec, MatrixConstantSpecId, OccurrenceScope, ProgramKey,
-        ResolvedIndexRange, ResolvedIntExpr, ResolvedMatrixType, SamplerDescriptorId, SliceSpec,
-        SliceSpecId, WireSourceKey,
+        ResolvedIndexRange, ResolvedIntExpr, ResolvedMatrixType, SamplerDescriptorId,
+        SamplerIdentity, SliceSpec, SliceSpecId, WireSourceKey,
     };
     use std::{
         collections::BTreeMap,
@@ -10376,7 +10259,7 @@ mod tests {
                 },
                 coordinate_binders: Box::new([]),
             },
-            indices: Box::new([selector]),
+            indices: Box::new([ResolvedIntExpr::Const(BigInt::from(usize::from(selector)))]),
             minimum: ResolvedIntExpr::Const(0.into()),
             maximum: ResolvedIntExpr::Const(1.into()),
         });

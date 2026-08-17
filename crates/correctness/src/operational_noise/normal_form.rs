@@ -9,7 +9,7 @@ use super::{
     bound::{BoundClass, MatrixBound, MatrixMetadata, product_bound},
     identity::{
         AtomicSourceKey, Axis, BinderKey, CrtSpec, ResolvedIndexRange, ResolvedIntExpr,
-        ResolvedMatrixType, SliceSpec, TrapdoorSourceKey,
+        ResolvedMatrixType, SliceSpec, TrapdoorSourceKey, substitute_resolved_int_expr,
     },
     normal_form_ops::{IntegerInterval, ScaleScalar, ViewSpec},
 };
@@ -1001,66 +1001,6 @@ impl ExpressionDag {
     }
 }
 
-fn substitute_binder_expr(
-    value: &ResolvedIntExpr,
-    binder: &BinderKey,
-    replacement: &ResolvedIntExpr,
-) -> ResolvedIntExpr {
-    if value == &ResolvedIntExpr::Binder(binder.clone()) {
-        return replacement.clone();
-    }
-    match value {
-        ResolvedIntExpr::Const(_) | ResolvedIntExpr::Parameter(_) | ResolvedIntExpr::Binder(_) => {
-            value.clone()
-        }
-        ResolvedIntExpr::Source { source, coordinates } => ResolvedIntExpr::Source {
-            source: source.clone(),
-            coordinates: coordinates
-                .iter()
-                .map(|coordinate| substitute_binder_expr(coordinate, binder, replacement))
-                .collect(),
-        },
-        ResolvedIntExpr::Add(left, right) => ResolvedIntExpr::Add(
-            Box::new(substitute_binder_expr(left, binder, replacement)),
-            Box::new(substitute_binder_expr(right, binder, replacement)),
-        ),
-        ResolvedIntExpr::Sub(left, right) => ResolvedIntExpr::Sub(
-            Box::new(substitute_binder_expr(left, binder, replacement)),
-            Box::new(substitute_binder_expr(right, binder, replacement)),
-        ),
-        ResolvedIntExpr::Mul(left, right) => ResolvedIntExpr::Mul(
-            Box::new(substitute_binder_expr(left, binder, replacement)),
-            Box::new(substitute_binder_expr(right, binder, replacement)),
-        ),
-        ResolvedIntExpr::Div(left, right) => ResolvedIntExpr::Div(
-            Box::new(substitute_binder_expr(left, binder, replacement)),
-            Box::new(substitute_binder_expr(right, binder, replacement)),
-        ),
-        ResolvedIntExpr::EuclideanDiv(left, right) => ResolvedIntExpr::EuclideanDiv(
-            Box::new(substitute_binder_expr(left, binder, replacement)),
-            Box::new(substitute_binder_expr(right, binder, replacement)),
-        ),
-        ResolvedIntExpr::EuclideanRemainder(left, right) => ResolvedIntExpr::EuclideanRemainder(
-            Box::new(substitute_binder_expr(left, binder, replacement)),
-            Box::new(substitute_binder_expr(right, binder, replacement)),
-        ),
-        ResolvedIntExpr::RoundDiv(left, right) => ResolvedIntExpr::RoundDiv(
-            Box::new(substitute_binder_expr(left, binder, replacement)),
-            Box::new(substitute_binder_expr(right, binder, replacement)),
-        ),
-        ResolvedIntExpr::Log2Ceil(value) => {
-            ResolvedIntExpr::Log2Ceil(Box::new(substitute_binder_expr(value, binder, replacement)))
-        }
-        ResolvedIntExpr::ExtractCoefficient { input, position, canonical_exclusive_upper } => {
-            ResolvedIntExpr::ExtractCoefficient {
-                input: Box::new(substitute_binder_expr(input, binder, replacement)),
-                position: Box::new(substitute_binder_expr(position, binder, replacement)),
-                canonical_exclusive_upper: canonical_exclusive_upper.clone(),
-            }
-        }
-    }
-}
-
 fn substitute_factor_identity(
     value: &FactorIdentity,
     binder: &BinderKey,
@@ -1071,7 +1011,7 @@ fn substitute_factor_identity(
         .coordinates
         .iter()
         .map(|(owner, coordinate)| {
-            (owner.clone(), substitute_binder_expr(coordinate, binder, replacement))
+            (owner.clone(), substitute_resolved_int_expr(coordinate, binder, replacement))
         })
         .collect();
     value.public = value.public.map(|source| substitute_atomic_source(source, binder, replacement));
@@ -1086,7 +1026,7 @@ fn substitute_factor_identity(
             tag,
         },
         FactorOwner::Scalar(identity) => {
-            FactorOwner::Scalar(substitute_binder_expr(&identity, binder, replacement))
+            FactorOwner::Scalar(substitute_resolved_int_expr(&identity, binder, replacement))
         }
         owner => owner,
     };
@@ -1137,8 +1077,8 @@ fn substitute_slice_spec(
     replacement: &ResolvedIntExpr,
 ) -> SliceSpec {
     let map_range = |range: ResolvedIndexRange| ResolvedIndexRange {
-        start: substitute_binder_expr(&range.start, binder, replacement),
-        end: substitute_binder_expr(&range.end, binder, replacement),
+        start: substitute_resolved_int_expr(&range.start, binder, replacement),
+        end: substitute_resolved_int_expr(&range.end, binder, replacement),
     };
     SliceSpec { rows: spec.rows.map(map_range), columns: spec.columns.map(map_range) }
 }
@@ -1152,12 +1092,12 @@ fn substitute_crt_spec(
         plaintext_moduli: spec
             .plaintext_moduli
             .iter()
-            .map(|value| substitute_binder_expr(value, binder, replacement))
+            .map(|value| substitute_resolved_int_expr(value, binder, replacement))
             .collect(),
         reconstruction_coefficients: spec
             .reconstruction_coefficients
             .iter()
-            .map(|value| substitute_binder_expr(value, binder, replacement))
+            .map(|value| substitute_resolved_int_expr(value, binder, replacement))
             .collect(),
     }
 }
@@ -2550,5 +2490,281 @@ mod tests {
             dag.normalize(invalid_dynamic, &RelationRegistry::default()),
             Err(NormalFormError::InvalidFamilyDomain)
         ));
+    }
+
+    fn relation_key(public: FactorIdentity, target: FactorIdentity) -> FullRelationKey {
+        FullRelationKey {
+            source: "named".into(),
+            ordered_indices: Box::new([]),
+            public,
+            target,
+            matrix_type: None,
+            layout: None,
+            trapdoor: None,
+            selector: None,
+        }
+    }
+
+    fn associated_product_fixture(
+        right_associated: bool,
+        reverse_leaf_insertion: bool,
+    ) -> (ExpressionDag, TermId, RelationRegistry) {
+        let a = FactorIdentity::named("assoc-A");
+        let b = FactorIdentity::named("assoc-B");
+        let k = FactorIdentity::named("assoc-K");
+        let p = FactorIdentity::named("assoc-P");
+        let mut dag = ExpressionDag::new();
+        let (a_id, b_id, k_id, p_id) = if reverse_leaf_insertion {
+            let p_id = dag.push(ExpressionNode::Atom(SymbolicFactor::large(p.clone()))).unwrap();
+            let k_id = dag
+                .push(ExpressionNode::Atom(
+                    SymbolicFactor::relation_live(k.clone(), bound(1)).unwrap(),
+                ))
+                .unwrap();
+            let b_id = dag.push(ExpressionNode::Atom(SymbolicFactor::large(b.clone()))).unwrap();
+            let a_id = dag.push(ExpressionNode::Atom(SymbolicFactor::large(a.clone()))).unwrap();
+            (a_id, b_id, k_id, p_id)
+        } else {
+            let a_id = dag.push(ExpressionNode::Atom(SymbolicFactor::large(a.clone()))).unwrap();
+            let b_id = dag.push(ExpressionNode::Atom(SymbolicFactor::large(b.clone()))).unwrap();
+            let k_id = dag
+                .push(ExpressionNode::Atom(
+                    SymbolicFactor::relation_live(k.clone(), bound(1)).unwrap(),
+                ))
+                .unwrap();
+            let p_id = dag.push(ExpressionNode::Atom(SymbolicFactor::large(p.clone()))).unwrap();
+            (a_id, b_id, k_id, p_id)
+        };
+        let root = if right_associated {
+            let inner =
+                dag.push(ExpressionNode::Product(vec![b_id, k_id].into_boxed_slice())).unwrap();
+            dag.push(ExpressionNode::Product(vec![a_id, inner].into_boxed_slice())).unwrap()
+        } else {
+            let inner =
+                dag.push(ExpressionNode::Product(vec![a_id, b_id].into_boxed_slice())).unwrap();
+            dag.push(ExpressionNode::Product(vec![inner, k_id].into_boxed_slice())).unwrap()
+        };
+        let mut registry = RelationRegistry::default();
+        registry
+            .register(RelationRegistration {
+                key: relation_key(b, p.clone()),
+                preimage: k,
+                target: p_id,
+            })
+            .unwrap();
+        (dag, root, registry)
+    }
+
+    #[test]
+    fn prefix_suffix_and_nested_target_relations_reach_one_fixed_point() {
+        let a = FactorIdentity::named("fixed-A");
+        let b = FactorIdentity::named("fixed-B");
+        let k = FactorIdentity::named("fixed-K");
+        let c = FactorIdentity::named("fixed-C");
+        let l = FactorIdentity::named("fixed-L");
+        let p = FactorIdentity::named("fixed-P");
+        let q = FactorIdentity::named("fixed-Q");
+        let d = FactorIdentity::named("fixed-D");
+        let mut dag = ExpressionDag::new();
+        let atom = |dag: &mut ExpressionDag, factor: SymbolicFactor| {
+            dag.push(ExpressionNode::Atom(factor)).unwrap()
+        };
+        let a_id = atom(&mut dag, SymbolicFactor::large(a.clone()));
+        let b_id = atom(&mut dag, SymbolicFactor::large(b.clone()));
+        let k_id = atom(&mut dag, SymbolicFactor::relation_live(k.clone(), bound(1)).unwrap());
+        let c_id = atom(&mut dag, SymbolicFactor::large(c.clone()));
+        let l_id = atom(&mut dag, SymbolicFactor::relation_live(l.clone(), bound(1)).unwrap());
+        let q_id = atom(&mut dag, SymbolicFactor::large(q.clone()));
+        let d_id = atom(&mut dag, SymbolicFactor::large(d.clone()));
+        let nested_target =
+            dag.push(ExpressionNode::Product(vec![c_id, l_id].into_boxed_slice())).unwrap();
+        let root = dag
+            .push(ExpressionNode::Product(vec![a_id, b_id, k_id, d_id].into_boxed_slice()))
+            .unwrap();
+        let mut registry = RelationRegistry::default();
+        registry
+            .register(RelationRegistration {
+                key: relation_key(c.clone(), q.clone()),
+                preimage: l,
+                target: q_id,
+            })
+            .unwrap();
+        registry
+            .register(RelationRegistration {
+                key: relation_key(b, p),
+                preimage: k,
+                target: nested_target,
+            })
+            .unwrap();
+
+        let normalized = dag.normalize(root, &registry).unwrap();
+        let key = normalized.exact_terms().keys().next().unwrap();
+        assert_eq!(
+            key.factors(),
+            &[
+                FactorIdentity::named("fixed-A"),
+                FactorIdentity::named("fixed-Q"),
+                FactorIdentity::named("fixed-D")
+            ]
+        );
+        assert!(normalized.exact_terms().keys().all(|key| {
+            key.factors().iter().all(|factor| {
+                !matches!(factor, FactorIdentity { kind: FactorKind::Test(name), .. } if &**name == "fixed-B" || &**name == "fixed-K" || &**name == "fixed-P")
+            })
+        }));
+    }
+
+    #[test]
+    fn association_and_insertion_order_preserve_nf_bound_and_counters() {
+        let (left_dag, left_root, left_registry) = associated_product_fixture(false, false);
+        let (right_dag, right_root, right_registry) = associated_product_fixture(true, true);
+        let (left_nf, left_counters) =
+            left_dag.normalize_with_counters(left_root, &left_registry).unwrap();
+        let (right_nf, right_counters) =
+            right_dag.normalize_with_counters(right_root, &right_registry).unwrap();
+        assert_eq!(left_nf, right_nf);
+        assert_eq!(left_nf.bounded_summary(), right_nf.bounded_summary());
+        assert_eq!(left_counters, right_counters);
+        assert_eq!(left_counters.relation_candidates, 1);
+        assert_eq!(left_counters.relations_applied, 1);
+
+        let mut first = ExpressionDag::new();
+        let a = first
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("add-A"))))
+            .unwrap();
+        let b = first
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("add-B"))))
+            .unwrap();
+        let neg_a = first.push(ExpressionNode::Negate(a)).unwrap();
+        let first_inner =
+            first.push(ExpressionNode::Add(vec![b, neg_a].into_boxed_slice())).unwrap();
+        let first_root =
+            first.push(ExpressionNode::Add(vec![a, first_inner].into_boxed_slice())).unwrap();
+
+        let mut second = ExpressionDag::new();
+        let b2 = second
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("add-B"))))
+            .unwrap();
+        let a2 = second
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("add-A"))))
+            .unwrap();
+        let neg_a2 = second.push(ExpressionNode::Negate(a2)).unwrap();
+        let second_inner =
+            second.push(ExpressionNode::Add(vec![a2, b2].into_boxed_slice())).unwrap();
+        let second_root = second
+            .push(ExpressionNode::Add(vec![neg_a2, second_inner].into_boxed_slice()))
+            .unwrap();
+        let (first_nf, first_counters) =
+            first.normalize_with_counters(first_root, &RelationRegistry::default()).unwrap();
+        let (second_nf, second_counters) =
+            second.normalize_with_counters(second_root, &RelationRegistry::default()).unwrap();
+        assert_eq!(first_nf, second_nf);
+        assert_eq!(first_nf.bounded_summary(), second_nf.bounded_summary());
+        assert_eq!(first_counters, second_counters);
+    }
+
+    #[test]
+    fn relation_registration_permutations_ignore_mismatches_and_report_same_ambiguity() {
+        let public = FactorIdentity::named("perm-B");
+        let preimage = FactorIdentity::named("perm-K");
+        let first_target = FactorIdentity::named("perm-P");
+        let second_target = FactorIdentity::named("perm-Q");
+        let mut dag = ExpressionDag::new();
+        let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
+        let k = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+            ))
+            .unwrap();
+        let p =
+            dag.push(ExpressionNode::Atom(SymbolicFactor::large(first_target.clone()))).unwrap();
+        let q =
+            dag.push(ExpressionNode::Atom(SymbolicFactor::large(second_target.clone()))).unwrap();
+        let root = dag.push(ExpressionNode::Product(vec![b, k].into_boxed_slice())).unwrap();
+        let good = RelationRegistration {
+            key: relation_key(public.clone(), first_target.clone()),
+            preimage: preimage.clone(),
+            target: p,
+        };
+        let mismatched = RelationRegistration {
+            key: FullRelationKey {
+                source: "wrong-owner".into(),
+                target: second_target.clone(),
+                ..good.key.clone()
+            },
+            preimage: preimage.clone(),
+            target: q,
+        };
+        let alternate =
+            RelationRegistration { key: relation_key(public, second_target), preimage, target: q };
+
+        let mut mismatch_only = RelationRegistry::default();
+        mismatch_only.register(good.clone()).unwrap();
+        mismatch_only.register(mismatched.clone()).unwrap();
+        let mismatch_nf = dag.normalize(root, &mismatch_only).unwrap();
+        assert_eq!(mismatch_nf.exact_terms().keys().next().unwrap().factors(), &[first_target]);
+
+        let mut first = RelationRegistry::default();
+        first.register(good.clone()).unwrap();
+        first.register(mismatched.clone()).unwrap();
+        first.register(alternate.clone()).unwrap();
+        let mut second = RelationRegistry::default();
+        second.register(alternate).unwrap();
+        second.register(mismatched).unwrap();
+        second.register(good).unwrap();
+        let first_error = dag.normalize(root, &first).unwrap_err();
+        let second_error = dag.normalize(root, &second).unwrap_err();
+        assert_eq!(first_error, second_error);
+        assert!(matches!(first_error, NormalFormError::AmbiguousRelation { .. }));
+    }
+
+    #[test]
+    fn immutable_dag_normalization_is_deterministic_across_sixteen_threads() {
+        let (dag, root, registry) = associated_product_fixture(true, true);
+        std::thread::scope(|scope| {
+            let handles = (0..16)
+                .map(|_| scope.spawn(|| dag.normalize_with_counters(root, &registry)))
+                .collect::<Vec<_>>();
+            let results = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap().unwrap())
+                .collect::<Vec<_>>();
+            let (expected_nf, expected_counters) = &results[0];
+            for (nf, counters) in &results[1..] {
+                assert_eq!(nf, expected_nf);
+                assert_eq!(counters, expected_counters);
+            }
+        });
+    }
+
+    #[test]
+    fn first_large_witness_uses_canonical_key_order_not_insertion_order() {
+        let build = |reverse: bool| {
+            let mut dag = ExpressionDag::new();
+            let a = dag
+                .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named(
+                    "witness-A",
+                ))))
+                .unwrap();
+            let b = dag
+                .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named(
+                    "witness-B",
+                ))))
+                .unwrap();
+            let root = if reverse {
+                dag.push(ExpressionNode::Add(vec![b, a].into_boxed_slice())).unwrap()
+            } else {
+                dag.push(ExpressionNode::Add(vec![a, b].into_boxed_slice())).unwrap()
+            };
+            dag.normalize(root, &RelationRegistry::default())
+                .unwrap()
+                .first_large_witness()
+                .unwrap()
+        };
+        let forward = build(false);
+        let reverse = build(true);
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.factor_index, 0);
+        assert_eq!(forward.identity, FactorIdentity::named("witness-A"));
     }
 }

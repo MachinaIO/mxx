@@ -10,16 +10,17 @@ use super::{
     analysis::{IntegerDomain, MxxAnalysis, MxxSort},
     identity::{
         AtomicSourceDescriptor, AtomicSourceId, AtomicSourceKey, BinderId, BinderKey,
-        ResolvedIntExpr, SamplerDescriptorId, SamplerIdentity, SequentialRecurrenceDescriptor,
-        SequentialRecurrenceId, TrapdoorDescriptorId, TrapdoorIdentity,
+        CanonicalTermIdentity, ResolvedIntExpr, SamplerDescriptorId, SamplerIdentity,
+        TrapdoorDescriptorId, TrapdoorIdentity, substitute_resolved_int_expr,
     },
     language::MxxLang,
     lower::LoweredInt,
+    normal_form::FactorIdentity,
 };
 use egg::{EGraph, Id, Language};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Adds one runtime Switch, retaining every case through the authoritative
 /// maximum selector value. Invalid or unavailable selector facts preserve the
@@ -263,6 +264,265 @@ pub fn shared_element<T>(
     Ok((representative, domain, binders))
 }
 
+fn binder_key(egraph: &EGraph<MxxLang, MxxAnalysis>, binder: BinderId) -> BinderKey {
+    egraph
+        .analysis
+        .symbols
+        .binders
+        .get(binder.0)
+        .expect("every binder node has an interned descriptor")
+        .key
+        .clone()
+}
+
+fn canonical_replacement_identity(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    replacement: Id,
+) -> Option<ResolvedIntExpr> {
+    fn visit(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        term: Id,
+        active: &mut HashSet<Id>,
+    ) -> Option<ResolvedIntExpr> {
+        let term = egraph.find(term);
+        if !active.insert(term) {
+            return None;
+        }
+        let mut result = None;
+        for node in &egraph[term].nodes {
+            let identity = match node {
+                MxxLang::IntConst(value) => Some(ResolvedIntExpr::Const(value.clone())),
+                MxxLang::IntParameter(value) => Some(ResolvedIntExpr::Parameter(value.clone())),
+                MxxLang::IntBinder(BinderId(id)) => egraph
+                    .analysis
+                    .symbols
+                    .binders
+                    .get(*id)
+                    .map(|descriptor| ResolvedIntExpr::Binder(descriptor.key.clone())),
+                MxxLang::Atom { source, indices } => {
+                    let descriptor = egraph.analysis.symbols.atomic_sources.get(source.0)?;
+                    let coordinates = indices
+                        .iter()
+                        .map(|index| visit(egraph, *index, active))
+                        .collect::<Option<Box<_>>>()?;
+                    Some(ResolvedIntExpr::Source { source: descriptor.key.clone(), coordinates })
+                }
+                MxxLang::IntAdd([left, right]) => {
+                    binary(egraph, *left, *right, active, ResolvedIntExpr::Add)
+                }
+                MxxLang::IntSub([left, right]) => {
+                    binary(egraph, *left, *right, active, ResolvedIntExpr::Sub)
+                }
+                MxxLang::IntMul([left, right]) => {
+                    binary(egraph, *left, *right, active, ResolvedIntExpr::Mul)
+                }
+                MxxLang::IntExactDiv([left, right]) => {
+                    binary(egraph, *left, *right, active, ResolvedIntExpr::Div)
+                }
+                MxxLang::IntEuclideanDiv([left, right]) => {
+                    binary(egraph, *left, *right, active, ResolvedIntExpr::EuclideanDiv)
+                }
+                MxxLang::IntEuclideanRemainder([left, right]) => {
+                    binary(egraph, *left, *right, active, ResolvedIntExpr::EuclideanRemainder)
+                }
+                MxxLang::IntRoundDiv([left, right]) => {
+                    binary(egraph, *left, *right, active, ResolvedIntExpr::RoundDiv)
+                }
+                MxxLang::IntLog2Ceil([input]) => {
+                    Some(ResolvedIntExpr::Log2Ceil(Box::new(visit(egraph, *input, active)?)))
+                }
+                MxxLang::ExtractCoefficient {
+                    canonical_exclusive_upper,
+                    input: [input, position],
+                } => Some(ResolvedIntExpr::ExtractCoefficient {
+                    input: Box::new(visit(egraph, *input, active)?),
+                    position: Box::new(visit(egraph, *position, active)?),
+                    canonical_exclusive_upper: canonical_exclusive_upper.clone(),
+                }),
+                _ => None,
+            }?;
+            if result.as_ref().is_some_and(|previous| previous != &identity) {
+                active.remove(&term);
+                return None;
+            }
+            result = Some(identity);
+        }
+        active.remove(&term);
+        result
+    }
+
+    fn binary(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        left: Id,
+        right: Id,
+        active: &mut HashSet<Id>,
+        make: fn(Box<ResolvedIntExpr>, Box<ResolvedIntExpr>) -> ResolvedIntExpr,
+    ) -> Option<ResolvedIntExpr> {
+        Some(make(Box::new(visit(egraph, left, active)?), Box::new(visit(egraph, right, active)?)))
+    }
+
+    visit(egraph, replacement, &mut HashSet::new())
+}
+
+fn substitute_indices(
+    indices: &[ResolvedIntExpr],
+    binder: &BinderKey,
+    replacement: Option<&ResolvedIntExpr>,
+) -> Box<[ResolvedIntExpr]> {
+    let Some(replacement) = replacement else {
+        return indices.to_vec().into_boxed_slice();
+    };
+    indices.iter().map(|index| substitute_resolved_int_expr(index, binder, replacement)).collect()
+}
+
+fn substitute_canonical_identity(
+    identity: &CanonicalTermIdentity,
+    binder: &BinderKey,
+    replacement: Option<&ResolvedIntExpr>,
+) -> CanonicalTermIdentity {
+    let Some(replacement) = replacement else {
+        return identity.clone();
+    };
+    match identity {
+        CanonicalTermIdentity::Factor(factor) => CanonicalTermIdentity::Factor(FactorIdentity {
+            coordinates: factor
+                .coordinates
+                .iter()
+                .map(|(owner, value)| {
+                    (owner.clone(), substitute_resolved_int_expr(value, binder, replacement))
+                })
+                .collect(),
+            ..factor.clone()
+        }),
+        // A graph source identifies the originating occurrence.  Its
+        // coordinate binders are provenance, while the varying coordinate
+        // values are carried by `indices` and are substituted separately.
+        CanonicalTermIdentity::Source(_) => identity.clone(),
+    }
+}
+
+fn substitute_sampler_identity(
+    sampler: &SamplerIdentity,
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    binder: BinderId,
+    replacement: Option<&ResolvedIntExpr>,
+) -> SamplerIdentity {
+    let binder = binder_key(egraph, binder);
+    let map = |value: &ResolvedIntExpr| {
+        replacement.map_or_else(
+            || value.clone(),
+            |replacement| substitute_resolved_int_expr(value, &binder, replacement),
+        )
+    };
+    match sampler {
+        SamplerIdentity::Gaussian { source, indices, max_coefficient_bound } => {
+            SamplerIdentity::Gaussian {
+                source: source.clone(),
+                indices: substitute_indices(indices, &binder, replacement),
+                max_coefficient_bound: map(max_coefficient_bound),
+            }
+        }
+        SamplerIdentity::UniformInterval { source, indices, minimum, maximum } => {
+            SamplerIdentity::UniformInterval {
+                source: source.clone(),
+                indices: substitute_indices(indices, &binder, replacement),
+                minimum: map(minimum),
+                maximum: map(maximum),
+            }
+        }
+        SamplerIdentity::Preimage { source, indices, public, trapdoor, target, cutoff } => {
+            SamplerIdentity::Preimage {
+                source: source.clone(),
+                indices: substitute_indices(indices, &binder, replacement),
+                public: substitute_canonical_identity(public, &binder, replacement),
+                trapdoor: *trapdoor,
+                target: substitute_canonical_identity(target, &binder, replacement),
+                cutoff: map(cutoff),
+            }
+        }
+        SamplerIdentity::DecomposedHash {
+            source,
+            indices,
+            public,
+            target,
+            arguments,
+            matrix_type,
+            base,
+            digit_count,
+            small,
+            range_proved,
+        } => SamplerIdentity::DecomposedHash {
+            source: source.clone(),
+            indices: substitute_indices(indices, &binder, replacement),
+            public: substitute_canonical_identity(public, &binder, replacement),
+            target: substitute_canonical_identity(target, &binder, replacement),
+            arguments: arguments
+                .iter()
+                .map(|argument| substitute_canonical_identity(argument, &binder, replacement))
+                .collect(),
+            matrix_type: matrix_type.clone(),
+            base: map(base),
+            digit_count: map(digit_count),
+            small: *small,
+            range_proved: *range_proved,
+        },
+        SamplerIdentity::GadgetDecomposition {
+            source,
+            indices,
+            public,
+            target,
+            base,
+            digit_count,
+            small,
+            range_proved,
+        } => SamplerIdentity::GadgetDecomposition {
+            source: source.clone(),
+            indices: substitute_indices(indices, &binder, replacement),
+            public: substitute_canonical_identity(public, &binder, replacement),
+            target: substitute_canonical_identity(target, &binder, replacement),
+            base: map(base),
+            digit_count: map(digit_count),
+            small: *small,
+            range_proved: *range_proved,
+        },
+    }
+}
+
+fn replace_sampler_trapdoor(
+    sampler: SamplerIdentity,
+    trapdoor: TrapdoorDescriptorId,
+) -> SamplerIdentity {
+    let SamplerIdentity::Preimage { source, indices, public, target, cutoff, .. } = sampler else {
+        return sampler;
+    };
+    SamplerIdentity::Preimage { source, indices, public, trapdoor, target, cutoff }
+}
+
+fn substitute_trapdoor_identity(
+    trapdoor: &TrapdoorIdentity,
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    binder: BinderId,
+    replacement: Option<&ResolvedIntExpr>,
+) -> TrapdoorIdentity {
+    let binder_key = binder_key(egraph, binder);
+    let map = |value: &ResolvedIntExpr| {
+        replacement.map_or_else(
+            || value.clone(),
+            |replacement| substitute_resolved_int_expr(value, &binder_key, replacement),
+        )
+    };
+    TrapdoorIdentity {
+        source: trapdoor.source.clone(),
+        indices: substitute_indices(&trapdoor.indices, &binder_key, replacement),
+        matrix_type: trapdoor.matrix_type.clone(),
+        public: substitute_canonical_identity(&trapdoor.public, &binder_key, replacement),
+        sigma_bits: trapdoor.sigma_bits,
+        gadget_base: map(&trapdoor.gadget_base),
+        digit_count: map(&trapdoor.digit_count),
+        preimage_cutoff: map(&trapdoor.preimage_cutoff),
+    }
+}
+
 /// Instantiates one shared representative by replacing only its owning binder.
 /// Other binder nodes are retained, so nested independent domains stay symbolic.
 pub fn instantiate_shared_element<E>(
@@ -272,6 +532,30 @@ pub fn instantiate_shared_element<E>(
     replacement: Id,
     progress: &mut dyn FnMut() -> Result<(), E>,
 ) -> Result<Id, E> {
+    instantiate_shared_element_with_identity(
+        egraph,
+        representative,
+        binder,
+        replacement,
+        None,
+        progress,
+    )
+}
+
+/// Instantiates one shared representative using the lowerer's canonical
+/// scalar identity for the replacement.  The identity is supplied outside
+/// this structural copying routine so descriptor substitution never depends
+/// on an arbitrary e-class representative enode.
+pub fn instantiate_shared_element_with_identity<E>(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    representative: Id,
+    binder: BinderId,
+    replacement: Id,
+    stable_replacement: Option<ResolvedIntExpr>,
+    progress: &mut dyn FnMut() -> Result<(), E>,
+) -> Result<Id, E> {
+    let stable_replacement =
+        stable_replacement.or_else(|| canonical_replacement_identity(egraph, replacement));
     // Snapshot exactly one raw representative per reachable e-class before
     // adding anything. Sampler and trapdoor records hold extra e-class edges,
     // so their complete descriptor closure belongs to the same snapshot.
@@ -280,8 +564,6 @@ pub fn instantiate_shared_element<E>(
         std::collections::HashMap::<AtomicSourceId, AtomicSourceDescriptor>::new();
     let mut samplers = std::collections::HashMap::<SamplerDescriptorId, SamplerIdentity>::new();
     let mut trapdoors = std::collections::HashMap::<TrapdoorDescriptorId, TrapdoorIdentity>::new();
-    let mut recurrences =
-        std::collections::HashMap::<SequentialRecurrenceId, SequentialRecurrenceDescriptor>::new();
     let mut pending = vec![representative];
     while let Some(id) = pending.pop() {
         if nodes.contains_key(&id) {
@@ -307,62 +589,17 @@ pub fn instantiate_shared_element<E>(
                         .get(sampler_id.0)
                         .expect("every sampler Atom has an interned descriptor")
                         .clone();
-                    match &sampler {
-                        SamplerIdentity::Gaussian { indices, .. } |
-                        SamplerIdentity::UniformInterval { indices, .. } => {
-                            pending.extend(indices.iter().copied());
-                        }
-                        SamplerIdentity::Preimage {
-                            indices,
-                            public,
-                            trapdoor: trapdoor_id,
-                            target,
-                            ..
-                        } => {
-                            pending.extend(indices.iter().copied());
-                            pending.extend([*public, *target]);
-                            let trapdoor = egraph
-                                .analysis
-                                .symbols
-                                .trapdoors
-                                .get(trapdoor_id.0)
-                                .expect("every preimage sampler trapdoor is interned")
-                                .clone();
-                            pending.extend(trapdoor.indices.iter().copied());
-                            pending.push(trapdoor.public);
-                            trapdoors.insert(*trapdoor_id, trapdoor);
-                        }
-                        SamplerIdentity::DecomposedHash {
-                            indices,
-                            public,
-                            target,
-                            arguments,
-                            ..
-                        } => {
-                            pending.extend(indices.iter().copied());
-                            pending.extend([*public, *target]);
-                            pending.extend(arguments.iter().copied());
-                        }
-                        SamplerIdentity::GadgetDecomposition {
-                            indices, public, target, ..
-                        } => {
-                            pending.extend(indices.iter().copied());
-                            pending.extend([*public, *target]);
+                    // Canonical sampler metadata is no longer an e-graph
+                    // edge closure.  Its ordered indices and operands are
+                    // typed identities, so only ordinary MxxLang children
+                    // belong to this structural copy walk.
+                    if let SamplerIdentity::Preimage { trapdoor, .. } = &sampler {
+                        if let Some(descriptor) = egraph.analysis.symbols.trapdoors.get(trapdoor.0)
+                        {
+                            trapdoors.insert(*trapdoor, descriptor.clone());
                         }
                     }
                     samplers.insert(*sampler_id, sampler);
-                }
-                AtomicSourceKey::SequentialRecurrence { recurrence: recurrence_id, .. } => {
-                    let recurrence = egraph
-                        .analysis
-                        .symbols
-                        .sequential_recurrences
-                        .get(recurrence_id.0)
-                        .expect("every sequential recurrence Atom has an interned descriptor")
-                        .clone();
-                    pending.extend(recurrence.initial.iter().copied());
-                    pending.extend(recurrence.transition.iter().copied());
-                    recurrences.insert(*recurrence_id, recurrence);
                 }
                 _ => {}
             }
@@ -395,59 +632,6 @@ pub fn instantiate_shared_element<E>(
                 for child in node.children().iter().rev() {
                     work.push(Visit::Enter(*child));
                 }
-                if let MxxLang::Atom { source, .. } = node &&
-                    let Some(AtomicSourceDescriptor {
-                        key: AtomicSourceKey::Sampler(sampler),
-                        ..
-                    }) = source_descriptors.get(source)
-                {
-                    let sampler = &samplers[sampler];
-                    let mut references = Vec::new();
-                    match sampler {
-                        SamplerIdentity::Gaussian { indices, .. } |
-                        SamplerIdentity::UniformInterval { indices, .. } => {
-                            references.extend(indices.iter().copied());
-                        }
-                        SamplerIdentity::Preimage { indices, public, trapdoor, target, .. } => {
-                            references.extend(indices.iter().copied());
-                            references.extend([*public, *target]);
-                            let trapdoor = &trapdoors[trapdoor];
-                            references.extend(trapdoor.indices.iter().copied());
-                            references.push(trapdoor.public);
-                        }
-                        SamplerIdentity::DecomposedHash {
-                            indices,
-                            public,
-                            target,
-                            arguments,
-                            ..
-                        } => {
-                            references.extend(indices.iter().copied());
-                            references.extend([*public, *target]);
-                            references.extend(arguments.iter().copied());
-                        }
-                        SamplerIdentity::GadgetDecomposition {
-                            indices, public, target, ..
-                        } => {
-                            references.extend(indices.iter().copied());
-                            references.extend([*public, *target]);
-                        }
-                    }
-                    for term in references.into_iter().rev() {
-                        work.push(Visit::Enter(term));
-                    }
-                } else if let MxxLang::Atom { source, .. } = node &&
-                    let Some(AtomicSourceDescriptor {
-                        key: AtomicSourceKey::SequentialRecurrence { recurrence, .. },
-                        ..
-                    }) = source_descriptors.get(source)
-                {
-                    let recurrence = &recurrences[recurrence];
-                    for term in recurrence.initial.iter().chain(recurrence.transition.iter()).rev()
-                    {
-                        work.push(Visit::Enter(*term));
-                    }
-                }
                 continue;
             }
             Visit::Exit(id) => id,
@@ -462,114 +646,35 @@ pub fn instantiate_shared_element<E>(
             let Some(descriptor) = source_descriptors.get(source) &&
             let AtomicSourceKey::Sampler(sampler_id) = descriptor.key
         {
-            let sampler = match samplers[&sampler_id].clone() {
-                SamplerIdentity::Gaussian { source, indices, max_coefficient_bound } => {
-                    SamplerIdentity::Gaussian {
-                        source,
-                        indices: indices.iter().map(|term| remap(*term)).collect(),
-                        max_coefficient_bound,
-                    }
+            let sampler = substitute_sampler_identity(
+                &samplers[&sampler_id],
+                egraph,
+                binder,
+                stable_replacement.as_ref(),
+            );
+            let sampler = match sampler {
+                SamplerIdentity::Preimage { trapdoor, .. } => {
+                    let descriptor = trapdoors[&trapdoor].clone();
+                    let descriptor = substitute_trapdoor_identity(
+                        &descriptor,
+                        egraph,
+                        binder,
+                        stable_replacement.as_ref(),
+                    );
+                    let trapdoor =
+                        TrapdoorDescriptorId(egraph.analysis.symbols.trapdoors.intern(descriptor));
+                    replace_sampler_trapdoor(sampler, trapdoor)
                 }
-                SamplerIdentity::UniformInterval { source, indices, minimum, maximum } => {
-                    SamplerIdentity::UniformInterval {
-                        source,
-                        indices: indices.iter().map(|term| remap(*term)).collect(),
-                        minimum,
-                        maximum,
-                    }
-                }
-                SamplerIdentity::Preimage { source, indices, public, trapdoor, target, cutoff } => {
-                    let trapdoor = trapdoors[&trapdoor].clone();
-                    let trapdoor = TrapdoorDescriptorId(egraph.analysis.symbols.trapdoors.intern(
-                        TrapdoorIdentity {
-                            indices: trapdoor.indices.iter().map(|term| remap(*term)).collect(),
-                            public: remap(trapdoor.public),
-                            ..trapdoor
-                        },
-                    ));
-                    SamplerIdentity::Preimage {
-                        source,
-                        indices: indices.iter().map(|term| remap(*term)).collect(),
-                        public: remap(public),
-                        trapdoor,
-                        target: remap(target),
-                        cutoff,
-                    }
-                }
-                SamplerIdentity::DecomposedHash {
-                    source,
-                    indices,
-                    public,
-                    target,
-                    arguments,
-                    matrix_type,
-                    base,
-                    digit_count,
-                    small,
-                    range_proved,
-                } => SamplerIdentity::DecomposedHash {
-                    source,
-                    indices: indices.iter().map(|term| remap(*term)).collect(),
-                    public: remap(public),
-                    target: remap(target),
-                    arguments: arguments.iter().map(|term| remap(*term)).collect(),
-                    matrix_type,
-                    base,
-                    digit_count,
-                    small,
-                    range_proved,
-                },
-                SamplerIdentity::GadgetDecomposition {
-                    source,
-                    indices,
-                    public,
-                    target,
-                    base,
-                    digit_count,
-                    small,
-                    range_proved,
-                } => SamplerIdentity::GadgetDecomposition {
-                    source,
-                    indices: indices.iter().map(|term| remap(*term)).collect(),
-                    public: remap(public),
-                    target: remap(target),
-                    base,
-                    digit_count,
-                    small,
-                    range_proved,
-                },
-            };
-            let indices = match &sampler {
-                SamplerIdentity::Gaussian { indices, .. } |
-                SamplerIdentity::UniformInterval { indices, .. } |
-                SamplerIdentity::Preimage { indices, .. } |
-                SamplerIdentity::DecomposedHash { indices, .. } |
-                SamplerIdentity::GadgetDecomposition { indices, .. } => indices.clone(),
+                sampler => sampler,
             };
             let sampler = egraph.analysis.symbols.samplers.intern(sampler);
             let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
                 key: AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)),
                 ..descriptor.clone()
             });
-            egraph.add(MxxLang::Atom { source: AtomicSourceId(source), indices })
-        } else if let MxxLang::Atom { source, indices } = node &&
-            let Some(descriptor) = source_descriptors.get(source) &&
-            let AtomicSourceKey::SequentialRecurrence { recurrence, carried_index } =
-                descriptor.key
-        {
-            let recurrence = recurrences[&recurrence].clone();
-            let recurrence =
-                SequentialRecurrenceId(egraph.analysis.symbols.sequential_recurrences.intern(
-                    SequentialRecurrenceDescriptor {
-                        initial: recurrence.initial.iter().map(|term| remap(*term)).collect(),
-                        transition: recurrence.transition.iter().map(|term| remap(*term)).collect(),
-                        ..recurrence
-                    },
-                ));
-            let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
-                key: AtomicSourceKey::SequentialRecurrence { recurrence, carried_index },
-                ..descriptor.clone()
-            });
+            let MxxLang::Atom { indices, .. } = node else {
+                unreachable!("sampler descriptor branch only handles atoms")
+            };
             egraph.add(MxxLang::Atom {
                 source: AtomicSourceId(source),
                 indices: indices.iter().map(|term| remap(*term)).collect(),
@@ -1007,14 +1112,15 @@ fn matrix_vector_product(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::identity::CanonicalTermIdentity, *};
     use crate::operational_noise::{
         analysis::MxxAnalysis,
         identity::{
             AtomicRelationRole, AtomicSourceDescriptor, BinderDescriptor, GraphWireSourceKey,
-            OccurrenceFrame, OccurrenceScope, ProgramKey, ResolvedMatrixType, TrapdoorSourceKey,
-            WireSourceKey,
+            OccurrenceScope, ProgramKey, ResolvedMatrixType, TrapdoorDescriptorId,
+            TrapdoorIdentity, TrapdoorSourceKey, WireSourceKey,
         },
+        normal_form::FactorIdentity,
     };
 
     fn evaluate(recurrence: &VectorRecurrence) -> Result<Box<[BigUint]>, RecurrenceFailure> {
@@ -1156,6 +1262,33 @@ mod tests {
             let expected = egraph.add(MxxLang::IntConst(expected.into()));
             assert_eq!(egraph.find(instantiated), egraph.find(expected));
         }
+    }
+
+    #[test]
+    fn replacement_identity_is_independent_of_eclass_insertion_order() {
+        fn build(reverse: bool) -> (EGraph<MxxLang, MxxAnalysis>, Id) {
+            let mut egraph = EGraph::new(MxxAnalysis::default());
+            let (two, three) = if reverse {
+                let three = egraph.add(MxxLang::IntConst(3.into()));
+                let two = egraph.add(MxxLang::IntConst(2.into()));
+                (two, three)
+            } else {
+                let two = egraph.add(MxxLang::IntConst(2.into()));
+                let three = egraph.add(MxxLang::IntConst(3.into()));
+                (two, three)
+            };
+            let sum = egraph.add(MxxLang::IntAdd([two, three]));
+            egraph.rebuild();
+            (egraph, sum)
+        }
+
+        let (first, first_sum) = build(false);
+        let (second, second_sum) = build(true);
+        assert_eq!(
+            canonical_replacement_identity(&first, first_sum),
+            canonical_replacement_identity(&second, second_sum),
+            "scalar replacement identity must not depend on representative enode or insertion order"
+        );
     }
 
     #[test]
@@ -1405,7 +1538,7 @@ mod tests {
             maximum: 7.into(),
         }));
         let replacement_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
-            key: replacement_owner,
+            key: replacement_owner.clone(),
             minimum: 0.into(),
             maximum: 7.into(),
         }));
@@ -1415,24 +1548,19 @@ mod tests {
             rows: ResolvedIntExpr::Const(1.into()),
             columns: ResolvedIntExpr::Const(1.into()),
         };
-        let matrix_source = analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
-            key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from("matrix")),
-            sort: MxxSort::Matrix(matrix_type.clone()),
-            integer_domain: None,
-            canonical_residue_convention: None,
-            relation_role: None,
-        });
         let mut egraph = EGraph::new(analysis);
         let owner_term = egraph.add(MxxLang::IntBinder(owner_id));
         let replacement = egraph.add(MxxLang::IntBinder(replacement_id));
-        let public = egraph
-            .add(MxxLang::Atom { source: AtomicSourceId(matrix_source), indices: Box::new([]) });
+        let public_identity = CanonicalTermIdentity::Factor(FactorIdentity::atomic(
+            AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from("matrix")),
+            [],
+        ));
         let trapdoor =
             TrapdoorDescriptorId(egraph.analysis.symbols.trapdoors.intern(TrapdoorIdentity {
                 source: TrapdoorSourceKey::ProtocolInput(crate::ProtocolInputId::from("trapdoor")),
                 indices: Box::new([]),
                 matrix_type: matrix_type.clone(),
-                public,
+                public: public_identity.clone(),
                 sigma_bits: 0,
                 gadget_base: ResolvedIntExpr::Const(2.into()),
                 digit_count: ResolvedIntExpr::Const(1.into()),
@@ -1443,11 +1571,14 @@ mod tests {
             wire: mxx_ir_core::WireRef { node: mxx_ir_core::NodeId(3), port: mxx_ir_core::Port(0) },
         };
         let sampler = egraph.analysis.symbols.samplers.intern(SamplerIdentity::Preimage {
-            source: GraphWireSourceKey { wire, coordinate_binders: vec![owner].into_boxed_slice() },
-            indices: vec![owner_term].into_boxed_slice(),
-            public,
+            source: GraphWireSourceKey {
+                wire,
+                coordinate_binders: vec![owner.clone()].into_boxed_slice(),
+            },
+            indices: vec![ResolvedIntExpr::Binder(owner.clone())].into_boxed_slice(),
+            public: public_identity.clone(),
             trapdoor,
-            target: public,
+            target: public_identity.clone(),
             cutoff: ResolvedIntExpr::Const(1.into()),
         });
         let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
@@ -1495,110 +1626,11 @@ mod tests {
         };
         assert_eq!(indices.len(), 1);
         assert_eq!(egraph.find(indices[0]), egraph.find(replacement));
-        assert_eq!(egraph.find(recorded[0]), egraph.find(indices[0]));
-        assert_eq!(egraph.find(*recorded_public), egraph.find(public));
-        assert_eq!(egraph.find(*target), egraph.find(public));
+        assert_eq!(recorded[0], ResolvedIntExpr::Binder(replacement_owner.clone()));
+        assert_eq!(recorded_public, &public_identity);
+        assert_eq!(target, &public_identity);
         let trapdoor = egraph.analysis.symbols.trapdoors.get(trapdoor.0).unwrap();
-        assert_eq!(egraph.find(trapdoor.public), egraph.find(public));
-    }
-
-    #[test]
-    fn nested_parallel_sequential_descriptor_uses_the_selected_outer_index() {
-        let mut analysis = MxxAnalysis::default();
-        let root_scope = OccurrenceScope {
-            program: ProgramKey::Ideal,
-            definition: mxx_ir_core::FrozenGraphScopeId::Root,
-            path: Box::new([]),
-        };
-        let outer = BinderKey {
-            loop_scope: root_scope.clone(),
-            loop_node: mxx_ir_core::NodeId(10),
-            slot: 0,
-        };
-        let outer_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
-            key: outer,
-            minimum: 0.into(),
-            maximum: 7.into(),
-        }));
-        let matrix_type = ResolvedMatrixType {
-            modulus: ResolvedIntExpr::Const(17.into()),
-            ring_dimension: ResolvedIntExpr::Const(1.into()),
-            rows: ResolvedIntExpr::Const(1.into()),
-            columns: ResolvedIntExpr::Const(1.into()),
-        };
-        let mut egraph = EGraph::new(analysis);
-        let outer_term = egraph.add(MxxLang::IntBinder(outer_id));
-        let replacement = egraph.add(MxxLang::IntConst(4.into()));
-        let initial = egraph.add(MxxLang::LiftConstantPolynomial {
-            matrix_type: matrix_type.clone(),
-            input: [outer_term],
-        });
-        let transition = egraph.add(MxxLang::LiftConstantPolynomial {
-            matrix_type: matrix_type.clone(),
-            input: [outer_term],
-        });
-        let sequential_scope = OccurrenceScope {
-            program: ProgramKey::Ideal,
-            definition: mxx_ir_core::FrozenGraphScopeId::Root,
-            path: Box::new([OccurrenceFrame::ParallelLoop {
-                parent: mxx_ir_core::FrozenGraphScopeId::Root,
-                owner: mxx_ir_core::NodeId(10),
-            }]),
-        };
-        let recurrence = SequentialRecurrenceId(
-            egraph.analysis.symbols.sequential_recurrences.intern(SequentialRecurrenceDescriptor {
-                loop_scope: sequential_scope,
-                loop_node: mxx_ir_core::NodeId(11),
-                count: ResolvedIntExpr::Const(3.into()),
-                initial: vec![initial].into_boxed_slice(),
-                transition: vec![transition].into_boxed_slice(),
-                output_types: vec![matrix_type.clone()].into_boxed_slice(),
-            }),
-        );
-        let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
-            key: AtomicSourceKey::SequentialRecurrence { recurrence, carried_index: 0 },
-            sort: MxxSort::Matrix(matrix_type),
-            integer_domain: None,
-            canonical_residue_convention: None,
-            relation_role: None,
-        });
-        let representative =
-            egraph.add(MxxLang::Atom { source: AtomicSourceId(source), indices: Box::new([]) });
-
-        let instantiated = instantiate_shared_element(
-            &mut egraph,
-            representative,
-            outer_id,
-            replacement,
-            &mut || Ok::<(), ()>(()),
-        )
-        .unwrap();
-        let MxxLang::Atom { source, .. } = &egraph[instantiated].nodes[0] else {
-            panic!("instantiated sequential recurrence remains an Atom");
-        };
-        let AtomicSourceKey::SequentialRecurrence { recurrence, carried_index } = egraph
-            .analysis
-            .symbols
-            .atomic_sources
-            .get(source.0)
-            .expect("instantiated source is interned")
-            .key
-        else {
-            panic!("sequential recurrence source");
-        };
-        assert_eq!(carried_index, 0);
-        let descriptor = egraph
-            .analysis
-            .symbols
-            .sequential_recurrences
-            .get(recurrence.0)
-            .expect("instantiated recurrence is interned");
-        for term in descriptor.initial.iter().chain(descriptor.transition.iter()) {
-            let MxxLang::LiftConstantPolynomial { input, .. } = egraph.id_to_node(*term) else {
-                panic!("recurrence term remains a lifted constant polynomial");
-            };
-            assert_eq!(egraph.find(input[0]), egraph.find(replacement));
-        }
+        assert_eq!(trapdoor.public, public_identity);
     }
 
     #[test]

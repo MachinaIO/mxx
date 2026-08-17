@@ -82,14 +82,7 @@ impl<'a> Normalizer<'a> {
         self.counters.nodes_processed = self.counters.nodes_processed.saturating_add(1);
         let result = match self.dag.node(id)?.clone() {
             ExpressionNode::Zero => PolynomialNF::zero(),
-            ExpressionNode::Atom(mut factor) => {
-                factor.relation_live = self.registry.reaches_preimage(&factor.key);
-                if matches!(factor.bound, BoundClass::ExactZero) {
-                    PolynomialNF::zero()
-                } else {
-                    PolynomialNF::from_monomial(Monomial::from_factor(factor))
-                }
-            }
+            ExpressionNode::Atom(factor) => self.normalize_atom(factor),
             ExpressionNode::Add(children) => {
                 let mut value = PolynomialNF::zero();
                 for child in children {
@@ -97,7 +90,20 @@ impl<'a> Normalizer<'a> {
                 }
                 value
             }
-            ExpressionNode::Negate(child) => self.normalize_term(child)?.negate(),
+            ExpressionNode::Negate(child) => {
+                // `normalize_term` owns a large enum-dispatch frame.  Shared
+                // DAG edges are already complete here, so re-entering that
+                // frame for a memo hit needlessly consumes stack and makes a
+                // shallow shared Add/Negate shape overflow the test thread's
+                // fixed stack.  Keep the shared-child fast path explicit.
+                let child = self
+                    .memo
+                    .get(&child)
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| self.normalize_term(child))?;
+                child.negate()
+            }
             ExpressionNode::Product(children) => {
                 let mut value = PolynomialNF::one();
                 for child in children {
@@ -320,9 +326,16 @@ impl<'a> Normalizer<'a> {
                 for position in 0..term.monomial.factors.len().saturating_sub(1) {
                     let left = &term.monomial.factors[position];
                     let right = &term.monomial.factors[position + 1];
+                    let Some(registration) = self.registry.resolve(left, right)? else { continue };
+                    // Count semantic relation candidates, not every adjacent
+                    // factor boundary visited by a particular association of
+                    // the same product.  The latter would make diagnostics
+                    // depend on whether `A*(B*K)` was written as
+                    // `(A*B)*K`, even though both normalize to the same
+                    // canonical polynomial and perform the same checked
+                    // replacement.
                     self.counters.relation_candidates =
                         self.counters.relation_candidates.saturating_add(1);
-                    let Some(registration) = self.registry.resolve(left, right)? else { continue };
                     self.counters.relations_applied =
                         self.counters.relations_applied.saturating_add(1);
                     if self.relation_stack.contains(&registration.key) {
@@ -336,7 +349,23 @@ impl<'a> Normalizer<'a> {
                             key: registration.key.clone(),
                         });
                     }
-                    let target = self.normalize_term(registration.target)?;
+                    let target = match self.memo.get(&registration.target).cloned() {
+                        Some(target) => target,
+                        None => match self.dag.node(registration.target)?.clone() {
+                            ExpressionNode::Atom(factor) => {
+                                // Relation targets are commonly atoms.  They
+                                // are complete without another recursive DAG
+                                // dispatch frame; memoize the same canonical
+                                // result and preserve node accounting.
+                                self.counters.nodes_processed =
+                                    self.counters.nodes_processed.saturating_add(1);
+                                let target = self.normalize_atom(factor);
+                                self.memo.insert(registration.target, target.clone());
+                                target
+                            }
+                            _ => self.normalize_term(registration.target)?,
+                        },
+                    };
                     let prefix = Monomial {
                         factors: term.monomial.factors[..position].to_vec().into_boxed_slice(),
                     };
@@ -370,6 +399,15 @@ impl<'a> Normalizer<'a> {
             if !changed {
                 return Ok(value);
             }
+        }
+    }
+
+    fn normalize_atom(&self, mut factor: super::SymbolicFactor) -> PolynomialNF {
+        factor.relation_live = self.registry.reaches_preimage(&factor.key);
+        if matches!(factor.bound, BoundClass::ExactZero) {
+            PolynomialNF::zero()
+        } else {
+            PolynomialNF::from_monomial(Monomial::from_factor(factor))
         }
     }
 

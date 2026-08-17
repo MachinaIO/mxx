@@ -1085,14 +1085,14 @@ enum SelectedSamplerNonIndexContract {
         maximum: super::identity::ResolvedIntExpr,
     },
     Preimage {
-        public_eclass: usize,
+        public: super::identity::CanonicalTermIdentity,
         trapdoor_id: u32,
-        target_eclass: usize,
+        target: super::identity::CanonicalTermIdentity,
         cutoff: super::identity::ResolvedIntExpr,
     },
     DecomposedHash {
-        public_eclass: usize,
-        target_eclass: usize,
+        public: super::identity::CanonicalTermIdentity,
+        target: super::identity::CanonicalTermIdentity,
         arguments: SelectedCanonicalEclasses,
         matrix_type: super::identity::ResolvedMatrixType,
         base: super::identity::ResolvedIntExpr,
@@ -1101,8 +1101,8 @@ enum SelectedSamplerNonIndexContract {
         range_proved: bool,
     },
     GadgetDecomposition {
-        public_eclass: usize,
-        target_eclass: usize,
+        public: super::identity::CanonicalTermIdentity,
+        target: super::identity::CanonicalTermIdentity,
         base: super::identity::ResolvedIntExpr,
         digit_count: super::identity::ResolvedIntExpr,
         small: bool,
@@ -1459,6 +1459,8 @@ struct SelectedAtomSource {
 struct SelectedCanonicalEclasses {
     retained: Box<[usize]>,
     views: Box<[SelectedIntegerEClassView]>,
+    typed_indices: Box<[super::identity::ResolvedIntExpr]>,
+    typed_operands: Box<[super::identity::CanonicalTermIdentity]>,
     omitted_count: usize,
 }
 
@@ -1495,16 +1497,16 @@ enum SelectedSamplerIdentity {
     Preimage {
         source_key: super::identity::GraphWireSourceKey,
         indices: SelectedCanonicalEclasses,
-        public_eclass: usize,
+        public: super::identity::CanonicalTermIdentity,
         trapdoor_id: u32,
-        target_eclass: usize,
+        target: super::identity::CanonicalTermIdentity,
         cutoff: super::identity::ResolvedIntExpr,
     },
     DecomposedHash {
         source_key: super::identity::GraphWireSourceKey,
         indices: SelectedCanonicalEclasses,
-        public_eclass: usize,
-        target_eclass: usize,
+        public: super::identity::CanonicalTermIdentity,
+        target: super::identity::CanonicalTermIdentity,
         arguments: SelectedCanonicalEclasses,
         matrix_type: super::identity::ResolvedMatrixType,
         base: super::identity::ResolvedIntExpr,
@@ -1528,8 +1530,8 @@ struct SelectedGadgetDecomposition {
 /// deterministic occurrences to denote the same sampled decomposition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SelectedGadgetDecompositionSemanticKey {
-    public_eclass: usize,
-    target_eclass: usize,
+    public: super::identity::CanonicalTermIdentity,
+    target: super::identity::CanonicalTermIdentity,
     base: super::identity::ResolvedIntExpr,
     digit_count: super::identity::ResolvedIntExpr,
     small: bool,
@@ -1961,23 +1963,31 @@ fn selected_atom_source(
     })
 }
 
-fn selected_canonical_eclasses(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    candidates: &[Option<Candidate>],
-    ids: &[Id],
+fn selected_resolved_indices(
+    indices: &[super::identity::ResolvedIntExpr],
+) -> SelectedCanonicalEclasses {
+    // Canonical sampler coordinates are already owner-resolved values.  They
+    // must not be converted back into e-class numbers for a diagnostic view;
+    // the empty e-class projection is complete because no coordinates were
+    // dropped from the typed identity.
+    SelectedCanonicalEclasses {
+        retained: Box::new([]),
+        views: Box::new([]),
+        typed_indices: indices.to_vec().into_boxed_slice(),
+        typed_operands: Box::new([]),
+        omitted_count: indices.len().saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
+    }
+}
+
+fn selected_canonical_operands(
+    operands: &[super::identity::CanonicalTermIdentity],
 ) -> SelectedCanonicalEclasses {
     SelectedCanonicalEclasses {
-        retained: ids
-            .iter()
-            .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
-            .map(|id| usize::from(egraph.find(*id)))
-            .collect(),
-        views: ids
-            .iter()
-            .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
-            .map(|id| selected_integer_eclass_view(egraph, candidates, *id))
-            .collect(),
-        omitted_count: ids.len().saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
+        retained: Box::new([]),
+        views: Box::new([]),
+        typed_indices: Box::new([]),
+        typed_operands: operands.to_vec().into_boxed_slice(),
+        omitted_count: operands.len().saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
     }
 }
 
@@ -2022,8 +2032,8 @@ fn selected_integer_eclass_view(
 }
 
 fn selected_sampler_identity(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    candidates: &[Option<Candidate>],
+    _egraph: &EGraph<MxxLang, MxxAnalysis>,
+    _candidates: &[Option<Candidate>],
     sampler: &super::identity::SamplerIdentity,
 ) -> SelectedSamplerIdentity {
     use super::identity::SamplerIdentity;
@@ -2031,14 +2041,14 @@ fn selected_sampler_identity(
         SamplerIdentity::Gaussian { source, indices, max_coefficient_bound } => {
             SelectedSamplerIdentity::Gaussian {
                 source_key: source.clone(),
-                indices: selected_canonical_eclasses(egraph, candidates, indices),
+                indices: selected_resolved_indices(indices),
                 max_coefficient_bound: max_coefficient_bound.clone(),
             }
         }
         SamplerIdentity::UniformInterval { source, indices, minimum, maximum } => {
             SelectedSamplerIdentity::UniformInterval {
                 source_key: source.clone(),
-                indices: selected_canonical_eclasses(egraph, candidates, indices),
+                indices: selected_resolved_indices(indices),
                 minimum: minimum.clone(),
                 maximum: maximum.clone(),
             }
@@ -2046,10 +2056,10 @@ fn selected_sampler_identity(
         SamplerIdentity::Preimage { source, indices, public, trapdoor, target, cutoff } => {
             SelectedSamplerIdentity::Preimage {
                 source_key: source.clone(),
-                indices: selected_canonical_eclasses(egraph, candidates, indices),
-                public_eclass: usize::from(egraph.find(*public)),
+                indices: selected_resolved_indices(indices),
+                public: public.clone(),
                 trapdoor_id: trapdoor.0,
-                target_eclass: usize::from(egraph.find(*target)),
+                target: target.clone(),
                 cutoff: cutoff.clone(),
             }
         }
@@ -2064,12 +2074,13 @@ fn selected_sampler_identity(
             digit_count,
             small,
             range_proved,
+            ..
         } => SelectedSamplerIdentity::DecomposedHash {
             source_key: source.clone(),
-            indices: selected_canonical_eclasses(egraph, candidates, indices),
-            public_eclass: usize::from(egraph.find(*public)),
-            target_eclass: usize::from(egraph.find(*target)),
-            arguments: selected_canonical_eclasses(egraph, candidates, arguments),
+            indices: selected_resolved_indices(indices),
+            public: public.clone(),
+            target: target.clone(),
+            arguments: selected_canonical_operands(arguments),
             matrix_type: matrix_type.clone(),
             base: base.clone(),
             digit_count: digit_count.clone(),
@@ -2085,18 +2096,17 @@ fn selected_sampler_identity(
             digit_count,
             small,
             range_proved,
+            ..
         } => SelectedSamplerIdentity::GadgetDecomposition(SelectedGadgetDecomposition {
             source_key: source.0.clone(),
             semantic: SelectedGadgetDecompositionSemanticKey {
-                public_eclass: usize::from(egraph.find(*public)),
-                target_eclass: usize::from(egraph.find(*target)),
+                public: public.clone(),
+                target: target.clone(),
                 base: base.clone(),
                 digit_count: digit_count.clone(),
                 small: *small,
                 range_proved: *range_proved,
-                ordered_coordinate_eclasses: selected_canonical_eclasses(
-                    egraph, candidates, indices,
-                ),
+                ordered_coordinate_eclasses: selected_resolved_indices(indices),
             },
         }),
     }
@@ -2233,21 +2243,17 @@ fn sampler_non_index_contract(
                 maximum: maximum.clone(),
             }
         }
-        SelectedSamplerIdentity::Preimage {
-            public_eclass,
-            trapdoor_id,
-            target_eclass,
-            cutoff,
-            ..
-        } => SelectedSamplerNonIndexContract::Preimage {
-            public_eclass: *public_eclass,
-            trapdoor_id: *trapdoor_id,
-            target_eclass: *target_eclass,
-            cutoff: cutoff.clone(),
-        },
+        SelectedSamplerIdentity::Preimage { public, trapdoor_id, target, cutoff, .. } => {
+            SelectedSamplerNonIndexContract::Preimage {
+                public: public.clone(),
+                trapdoor_id: *trapdoor_id,
+                target: target.clone(),
+                cutoff: cutoff.clone(),
+            }
+        }
         SelectedSamplerIdentity::DecomposedHash {
-            public_eclass,
-            target_eclass,
+            public,
+            target,
             arguments,
             matrix_type,
             base,
@@ -2256,8 +2262,8 @@ fn sampler_non_index_contract(
             range_proved,
             ..
         } => SelectedSamplerNonIndexContract::DecomposedHash {
-            public_eclass: *public_eclass,
-            target_eclass: *target_eclass,
+            public: public.clone(),
+            target: target.clone(),
             arguments: arguments.clone(),
             matrix_type: matrix_type.clone(),
             base: base.clone(),
@@ -2268,8 +2274,8 @@ fn sampler_non_index_contract(
         SelectedSamplerIdentity::GadgetDecomposition(gadget) => {
             let semantic = &gadget.semantic;
             SelectedSamplerNonIndexContract::GadgetDecomposition {
-                public_eclass: semantic.public_eclass,
-                target_eclass: semantic.target_eclass,
+                public: semantic.public.clone(),
+                target: semantic.target.clone(),
                 base: semantic.base.clone(),
                 digit_count: semantic.digit_count.clone(),
                 small: semantic.small,
@@ -2715,7 +2721,6 @@ fn selected_atomic_source_kind(
         AtomicSourceKey::GraphWire(_) => "graph-wire",
         AtomicSourceKey::ExplicitLarge(_) => "explicit-large",
         AtomicSourceKey::SequentialState(_) => "sequential-state",
-        AtomicSourceKey::SequentialRecurrence { .. } => "sequential-recurrence",
         AtomicSourceKey::Sampler(_) => "sampler",
     })
 }
@@ -3056,7 +3061,28 @@ fn selected_first_large_source(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        super::identity::{CanonicalTermIdentity, ResolvedIntExpr},
+        *,
+    };
+
+    fn resolved_index(id: Id) -> ResolvedIntExpr {
+        ResolvedIntExpr::Const(BigInt::from(usize::from(id)))
+    }
+
+    fn term_identity(id: Id) -> CanonicalTermIdentity {
+        CanonicalTermIdentity::Source(GraphWireSourceKey {
+            wire: WireSourceKey {
+                scope: OccurrenceScope {
+                    program: ProgramKey::Ideal,
+                    definition: FrozenGraphScopeId::Root,
+                    path: Box::new([]),
+                },
+                wire: WireRef { node: NodeId(usize::from(id) as u64), port: Port(0) },
+            },
+            coordinate_binders: Box::new([]),
+        })
+    }
     use crate::operational_noise::{
         analysis::{MxxAnalysis, MxxSort, resolved_constant},
         bound::{BoundEvaluationError, ResolvedMatrixConstant},
@@ -3064,8 +3090,8 @@ mod tests {
             AtomicRelationRole, AtomicSourceDescriptor, AtomicSourceKey, BinderDescriptor,
             BinderId, BinderKey, CanonicalResidueConvention, CrtSpecId, GraphWireSourceKey,
             HashQuerySpec, HashTagPart, MatrixConstantSpecId, OccurrenceScope, ProgramKey,
-            ResolvedIndexRange, ResolvedIntExpr, ResolvedMatrixType, SamplerDescriptorId,
-            SamplerIdentity, SliceSpec, SliceSpecId, WireSourceKey,
+            ResolvedIndexRange, ResolvedMatrixType, SamplerDescriptorId, SamplerIdentity,
+            SliceSpec, SliceSpecId, WireSourceKey,
         },
         relation::{
             PointwiseAddSwitchReject, RelationApplier, RelationRegistration, RelationSearcher,
@@ -3320,9 +3346,9 @@ mod tests {
         let sampler =
             egraph.analysis.symbols.samplers.intern(SamplerIdentity::GadgetDecomposition {
                 source: source.clone().into(),
-                indices: vec![coordinate].into(),
-                public,
-                target,
+                indices: vec![resolved_index(coordinate)].into(),
+                public: term_identity(public),
+                target: term_identity(target),
                 base: ResolvedIntExpr::Const(base.into()),
                 digit_count: ResolvedIntExpr::Const(2.into()),
                 small: false,
@@ -3712,7 +3738,7 @@ mod tests {
             &mut egraph,
             SamplerIdentity::Gaussian {
                 source: gaussian_source.clone(),
-                indices: vec![first_index, second_index].into(),
+                indices: vec![resolved_index(first_index), resolved_index(second_index)].into(),
                 max_coefficient_bound: ResolvedIntExpr::Const(7.into()),
             },
             vec![first_index, second_index].into(),
@@ -3721,7 +3747,7 @@ mod tests {
             &mut egraph,
             SamplerIdentity::UniformInterval {
                 source: uniform_source.clone(),
-                indices: vec![second_index].into(),
+                indices: vec![resolved_index(second_index)].into(),
                 minimum: ResolvedIntExpr::Const((-2).into()),
                 maximum: ResolvedIntExpr::Const(9.into()),
             },
@@ -3742,10 +3768,7 @@ mod tests {
             panic!("Gaussian variant is retained")
         };
         assert_eq!(source_key, gaussian_source);
-        assert_eq!(
-            indices.retained.as_ref(),
-            &[usize::from(egraph.find(first_index)), usize::from(egraph.find(second_index))]
-        );
+        assert!(indices.retained.is_empty());
         assert_eq!(indices.omitted_count, 0);
         assert_eq!(max_coefficient_bound, ResolvedIntExpr::Const(7.into()));
         let SelectedSamplerIdentity::UniformInterval { source_key, indices, minimum, maximum } =
@@ -3754,7 +3777,7 @@ mod tests {
             panic!("UniformInterval variant is retained")
         };
         assert_eq!(source_key, uniform_source);
-        assert_eq!(indices.retained.as_ref(), &[usize::from(egraph.find(second_index))]);
+        assert!(indices.retained.is_empty());
         assert_eq!(indices.omitted_count, 0);
         assert_eq!(minimum, ResolvedIntExpr::Const((-2).into()));
         assert_eq!(maximum, ResolvedIntExpr::Const(9.into()));
@@ -3763,7 +3786,7 @@ mod tests {
 
     #[test]
     fn decomposed_hash_non_index_argument_cap_is_incomplete_even_when_prefixes_match() {
-        let source_key = |wire_node| GraphWireSourceKey {
+        let make_source_key = |wire_node| GraphWireSourceKey {
             wire: WireSourceKey {
                 scope: OccurrenceScope {
                     program: ProgramKey::Ideal,
@@ -3777,6 +3800,8 @@ mod tests {
         let prefix = SelectedCanonicalEclasses {
             retained: (0..MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN).collect(),
             views: Box::new([]),
+            typed_indices: Box::new([]),
+            typed_operands: Box::new([]),
             omitted_count: 1,
         };
         let sampler = |source_key| SelectedSamplerIdentity::DecomposedHash {
@@ -3784,10 +3809,12 @@ mod tests {
             indices: SelectedCanonicalEclasses {
                 retained: Box::new([]),
                 views: Box::new([]),
+                typed_indices: Box::new([]),
+                typed_operands: Box::new([]),
                 omitted_count: 0,
             },
-            public_eclass: 1,
-            target_eclass: 2,
+            public: CanonicalTermIdentity::Source(make_source_key(90)),
+            target: CanonicalTermIdentity::Source(make_source_key(91)),
             arguments: prefix.clone(),
             matrix_type: scalar_matrix_type(),
             base: ResolvedIntExpr::Const(2.into()),
@@ -3795,8 +3822,8 @@ mod tests {
             small: false,
             range_proved: true,
         };
-        let first = sampler(source_key(79));
-        let second = sampler(source_key(80));
+        let first = sampler(make_source_key(79));
+        let second = sampler(make_source_key(80));
         assert_eq!(
             sampler_non_index_contract(&first),
             sampler_non_index_contract(&second),
@@ -3843,7 +3870,7 @@ mod tests {
             &mut egraph,
             SamplerIdentity::Gaussian {
                 source: sampler_source,
-                indices: vec![producer_index].into(),
+                indices: vec![resolved_index(producer_index)].into(),
                 max_coefficient_bound: ResolvedIntExpr::Const(1.into()),
             },
             vec![consumer_index].into(),
@@ -3861,17 +3888,10 @@ mod tests {
         else {
             panic!("Gaussian sampler")
         };
-        let stored = stored.views.first().expect("stored producer index");
         assert_eq!(actual.operator, "int-binder");
-        assert_eq!(stored.operator, "int-binder");
         assert_eq!(actual.binder.as_ref().expect("consumer binder").key, consumer_key);
-        assert_eq!(stored.binder.as_ref().expect("producer binder").key, producer_key);
-        assert_ne!(actual.canonical_eclass, stored.canonical_eclass);
-        assert_ne!(
-            actual.integer_domain, stored.integer_domain,
-            "affine domains retain their distinct BinderKey owners"
-        );
-        assert_eq!(actual.scalar_provenance, stored.scalar_provenance);
+        assert!(stored.views.is_empty());
+        assert_eq!(stored.omitted_count, 0);
         assert_eq!(egraph.total_size(), before_nodes, "diagnostic must not add e-nodes");
         assert_eq!(egraph.number_of_classes(), before_classes, "diagnostic must not add classes");
     }
@@ -4290,7 +4310,7 @@ mod tests {
         };
         let sampler = || SamplerIdentity::UniformInterval {
             source: source_key.clone(),
-            indices: vec![producer].into(),
+            indices: vec![resolved_index(producer)].into(),
             minimum: ResolvedIntExpr::Const((-1).into()),
             maximum: ResolvedIntExpr::Const(1.into()),
         };
@@ -4335,10 +4355,8 @@ mod tests {
                 .first()
                 .expect("matching sampler is found below each selected case");
             assert_eq!(case.sampler_source_key, source_key);
-            assert_eq!(
-                case.stored_canonical_index_views[0].canonical_eclass,
-                usize::from(egraph.find(producer)),
-            );
+            assert!(case.stored_canonical_index_views.is_empty());
+            assert_eq!(case.stored_omitted_index_count, 0);
             assert_eq!(
                 case.actual_canonical_index_views[0].canonical_eclass,
                 usize::from(egraph.find(actual)),
@@ -4367,7 +4385,7 @@ mod tests {
         };
         let sampler = || SamplerIdentity::UniformInterval {
             source: source_key.clone(),
-            indices: vec![producer].into(),
+            indices: vec![resolved_index(producer)].into(),
             minimum: ResolvedIntExpr::Const((-1).into()),
             maximum: ResolvedIntExpr::Const(1.into()),
         };
@@ -4422,7 +4440,7 @@ mod tests {
             &mut egraph,
             SamplerIdentity::UniformInterval {
                 source: other_source_key,
-                indices: vec![producer].into(),
+                indices: vec![resolved_index(producer)].into(),
                 minimum: ResolvedIntExpr::Const((-1).into()),
                 maximum: ResolvedIntExpr::Const(1.into()),
             },
@@ -4440,7 +4458,7 @@ mod tests {
             &mut egraph,
             SamplerIdentity::UniformInterval {
                 source: source_key.clone(),
-                indices: over_cap_indices.clone().into_boxed_slice(),
+                indices: over_cap_indices.iter().copied().map(resolved_index).collect(),
                 minimum: ResolvedIntExpr::Const((-1).into()),
                 maximum: ResolvedIntExpr::Const(1.into()),
             },
@@ -4549,7 +4567,7 @@ mod tests {
         };
         let sampler = || SamplerIdentity::UniformInterval {
             source: source_key.clone(),
-            indices: vec![producer].into(),
+            indices: vec![resolved_index(producer)].into(),
             minimum: ResolvedIntExpr::Const((-1).into()),
             maximum: ResolvedIntExpr::Const(1.into()),
         };
@@ -4654,7 +4672,7 @@ mod tests {
         };
         let sampler = || SamplerIdentity::UniformInterval {
             source: source_key.clone(),
-            indices: vec![producer].into(),
+            indices: vec![resolved_index(producer)].into(),
             minimum: ResolvedIntExpr::Const((-1).into()),
             maximum: ResolvedIntExpr::Const(1.into()),
         };

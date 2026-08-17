@@ -1315,18 +1315,18 @@ fn graph_wire_coordinates_are_authoritative(
                     ..
                 } => {
                     // The occurrence is audit-only; relation identity is the
-                    // sampler descriptor plus its checked atom children.
+                    // sampler descriptor plus its checked canonical children.
                     return recorded_indices.len() == indices.len() &&
                         recorded_indices.iter().zip(indices).all(|(recorded, actual)| {
-                            egraph.find(*recorded) == egraph.find(*actual)
+                            resolved_runtime_index(egraph, *actual)
+                                .is_some_and(|actual| recorded == &actual)
                         });
                 }
             };
             if recorded.len() != indices.len() ||
-                recorded
-                    .iter()
-                    .zip(indices)
-                    .any(|(recorded, actual)| egraph.find(*recorded) != egraph.find(*actual))
+                recorded.iter().zip(indices).any(|(recorded, actual)| {
+                    resolved_runtime_index(egraph, *actual).is_none_or(|actual| recorded != &actual)
+                })
             {
                 return false;
             }
@@ -1367,6 +1367,22 @@ fn graph_wire_coordinates_are_authoritative(
             .iter()
             .any(|node| matches!(node, MxxLang::IntBinder(binder) if binder.0 as usize == id))
     })
+}
+
+fn resolved_runtime_index(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    id: egg::Id,
+) -> Option<ResolvedIntExpr> {
+    match egraph[egraph.find(id)].nodes.first()? {
+        MxxLang::IntConst(value) => Some(ResolvedIntExpr::Const(value.clone())),
+        MxxLang::IntBinder(binder) => egraph
+            .analysis
+            .symbols
+            .binders
+            .get(binder.0)
+            .map(|descriptor| ResolvedIntExpr::Binder(descriptor.key.clone())),
+        _ => None,
+    }
 }
 
 fn prospective_provenance_owned_elements(

@@ -1109,12 +1109,8 @@ pub fn check_operational_noise_candidate_with_progress(
             let LoweredRootSet::Egraph(_roots) = &root_set else {
                 unreachable!("DAG roots returned above")
             };
-            let registrations = lowerer.relation_registrations();
             let budget = control.rewrite_budget();
             let context = RewriteContext::new(budget);
-            for registration in registrations {
-                context.register(registration);
-            }
             let iterations = run_ordinary_relation_saturation(&mut lowerer.egraph, &context)
                 .map_err(|source| OperationalSimulationError::Relation {
                     site: site(&stage, wire, "relation rewrite"),
@@ -2759,12 +2755,6 @@ fn relation_error(
             .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
         super::relation::RelationFailure::MismatchedPublic { source } => key(source)
             .map(|source| super::error::RelationError::RelationPublicMismatch { source })
-            .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
-        super::relation::RelationFailure::MismatchedTrapdoor { source } => key(source)
-            .map(|source| super::error::RelationError::RelationTrapdoorMismatch { source })
-            .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
-        super::relation::RelationFailure::MismatchedTarget { source } => key(source)
-            .map(|source| super::error::RelationError::RelationTargetMismatch { source })
             .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
         super::relation::RelationFailure::UnavailableRelation { source } => key(source)
             .map(|source| super::error::RelationError::SmallDecompositionRangeNotProved { source })

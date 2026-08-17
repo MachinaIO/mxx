@@ -14,9 +14,9 @@ use super::{
     error::{LowerError, SelectorOnlyConsumer},
     family::{self, FamilyCoverageStorage, FamilyLoweringValue},
     identity::{
-        BinderKey, CanonicalResidueConvention, OccurrenceScope, ResolvedIntExpr,
-        SamplerDescriptorId, SamplerIdentity, SequentialStateKey, TrapdoorDescriptorId,
-        TrapdoorIdentity, TrapdoorSourceKey, WireSourceKey,
+        BinderKey, CanonicalResidueConvention, CanonicalTermIdentity, OccurrenceScope,
+        ResolvedIntExpr, SamplerDescriptorId, SamplerIdentity, SequentialStateKey,
+        TrapdoorDescriptorId, TrapdoorIdentity, TrapdoorSourceKey, WireSourceKey,
     },
     language::MxxLang,
     normal_form::{
@@ -180,8 +180,7 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
             }
             // A carried-state placeholder is meaningful only inside the
             // descriptor-owned simultaneous transition overlay below.
-            super::identity::AtomicSourceKey::SequentialState(_) |
-            super::identity::AtomicSourceKey::SequentialRecurrence { .. } => {
+            super::identity::AtomicSourceKey::SequentialState(_) => {
                 return Err(BoundEvaluationError::SequentialStateOutsideOverlay { term });
             }
         };
@@ -1133,76 +1132,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         &self.relation_registry
     }
 
-    /// Builds the complete relation registry from the exact sampler descriptors
-    /// owned by this lowerer's e-graph.  No caller may reconstruct a sampler
-    /// relation from a source node number or a cutoff estimate.
-    pub fn relation_registrations(&self) -> Vec<super::relation::RelationRegistration> {
-        self.egraph
-            .analysis
-            .symbols
-            .samplers
-            .values
-            .iter()
-            .enumerate()
-            .filter_map(|(id, sampler)| match sampler {
-                SamplerIdentity::Preimage { public, trapdoor, target, indices, .. } => {
-                    super::relation::RelationRegistration {
-                        source: super::identity::AtomicSourceId(
-                            self.egraph
-                                .analysis
-                                .symbols
-                                .atomic_sources
-                                .values
-                                .iter()
-                                .position(|source| {
-                                    matches!(
-                                        source.key,
-                                        super::identity::AtomicSourceKey::Sampler(
-                                            super::identity::SamplerDescriptorId(source_id)
-                                        ) if source_id == id as u32
-                                    )
-                                })
-                                .expect("lowered sampler has an atom source")
-                                as u32,
-                        ),
-                        expected_public: *public,
-                        target: *target,
-                        trapdoor: Some(*trapdoor),
-                        indices: indices.clone(),
-                    }
-                }
-                .into(),
-                SamplerIdentity::DecomposedHash { public, target, indices, .. } |
-                SamplerIdentity::GadgetDecomposition { public, target, indices, .. } => {
-                    Some(super::relation::RelationRegistration {
-                        source: super::identity::AtomicSourceId(
-                            self.egraph
-                                .analysis
-                                .symbols
-                                .atomic_sources
-                                .values
-                                .iter()
-                                .position(|source| {
-                                    matches!(source.key,
-                                        super::identity::AtomicSourceKey::Sampler(
-                                            super::identity::SamplerDescriptorId(source_id)
-                                        ) if source_id == id as u32
-                                    )
-                                })
-                                .expect("lowered sampler has an atom source")
-                                as u32,
-                        ),
-                        expected_public: *public,
-                        target: *target,
-                        trapdoor: None,
-                        indices: indices.clone(),
-                    })
-                }
-                SamplerIdentity::Gaussian { .. } | SamplerIdentity::UniformInterval { .. } => None,
-            })
-            .collect()
-    }
-
     /// Returns the one production view used by the bound evaluator.  It reads
     /// canonical e-graph analysis and exact lowering descriptors only.
     pub fn production_bound_view(&self) -> ProductionBoundInput<'_, 'a, 'control> {
@@ -1591,22 +1520,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                 let digit_count = digit_count.clone();
                                 let preimage_max_coefficient_bound =
                                     preimage_max_coefficient_bound.clone();
-                                let public = LoweringWire {
-                                    source: WireSourceKey {
-                                        scope: wire.source.scope.clone(),
-                                        wire: WireRef {
-                                            node: wire.source.wire.node,
-                                            port: mxx_ir_core::Port(0),
-                                        },
-                                    },
-                                    indices: wire.indices.clone(),
-                                };
-                                let public = self.atom_for_wire(
-                                    &public,
-                                    &environment,
-                                    WireType::Matrix(matrix_type.clone()),
-                                    None,
-                                )?;
                                 let source = TrapdoorSourceKey::GraphWire(
                                     super::identity::GraphWireSourceKey {
                                         wire: wire.source.clone(),
@@ -1622,11 +1535,32 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                     indices: environment
                                         .active_coordinates
                                         .iter()
-                                        .map(|coordinate| coordinate.index.term)
-                                        .collect(),
+                                        .map(|coordinate| {
+                                            coordinate.index.stable_identity.clone().ok_or(
+                                                LowerError::NonExactIdentityIndex {
+                                                    expression: IntExpr::constant(0),
+                                                },
+                                            )
+                                        })
+                                        .collect::<Result<Box<[_]>, _>>()?,
                                     matrix_type: self
                                         .resolve_matrix_type(&matrix_type, &environment)?,
-                                    public,
+                                    public: CanonicalTermIdentity::Source(
+                                        super::identity::GraphWireSourceKey {
+                                            wire: WireSourceKey {
+                                                scope: wire.source.scope.clone(),
+                                                wire: WireRef {
+                                                    node: wire.source.wire.node,
+                                                    port: mxx_ir_core::Port(0),
+                                                },
+                                            },
+                                            coordinate_binders: environment
+                                                .active_coordinates
+                                                .iter()
+                                                .map(|coordinate| coordinate.binder.clone())
+                                                .collect(),
+                                        },
+                                    ),
                                     sigma_bits: self.resolve_real(&sigma, &environment)?.to_bits(),
                                     gadget_base: self.resolve_int(&gadget_base, &environment)?,
                                     digit_count: self.resolve_int(&digit_count, &environment)?,
@@ -3292,7 +3226,15 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 .collect(),
         };
         let indices =
-            environment.active_coordinates.iter().map(|coordinate| coordinate.index.term).collect();
+            environment
+                .active_coordinates
+                .iter()
+                .map(|coordinate| {
+                    coordinate.index.stable_identity.clone().ok_or(
+                        LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) },
+                    )
+                })
+                .collect::<Result<Box<[_]>, _>>()?;
         let sampler = match kind {
             NodeKind::GaussianSample { max_coefficient_bound, .. } => {
                 let max_coefficient_bound =
@@ -3529,32 +3471,29 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             });
         }
         let matrix_type = self.resolve_matrix_type(matrix_type, environment)?;
-        let public = self.egraph.analysis.symbols.atomic_sources.intern(
-            super::identity::AtomicSourceDescriptor {
-                key: super::identity::AtomicSourceKey::ProtocolInput(public_input.clone()),
-                sort: MxxSort::Matrix(matrix_type.clone()),
-                integer_domain: None,
-                canonical_residue_convention: None,
-                relation_role: None,
-            },
-        );
-        let public = self.egraph.add(MxxLang::Atom {
-            source: super::identity::AtomicSourceId(public),
-            indices: environment
-                .active_coordinates
-                .iter()
-                .map(|coordinate| coordinate.index.term)
-                .collect(),
-        });
         let descriptor = TrapdoorIdentity {
             source: TrapdoorSourceKey::ProtocolInput(input),
             indices: environment
                 .active_coordinates
                 .iter()
-                .map(|coordinate| coordinate.index.term)
-                .collect(),
+                .map(|coordinate| {
+                    coordinate.index.stable_identity.clone().ok_or(
+                        LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) },
+                    )
+                })
+                .collect::<Result<Box<[_]>, _>>()?,
             matrix_type,
-            public,
+            public: CanonicalTermIdentity::Source(super::identity::GraphWireSourceKey {
+                wire: WireSourceKey {
+                    scope: wire.source.scope.clone(),
+                    wire: WireRef { node: wire.source.wire.node, port: mxx_ir_core::Port(0) },
+                },
+                coordinate_binders: environment
+                    .active_coordinates
+                    .iter()
+                    .map(|coordinate| coordinate.binder.clone())
+                    .collect(),
+            }),
             sigma_bits: self.resolve_real(sigma, environment)?.to_bits(),
             gadget_base: self.resolve_int(gadget_base, environment)?,
             digit_count: self.resolve_int(digit_count, environment)?,
@@ -5064,11 +5003,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let scope = domain.binder.loop_scope.clone();
         let node = domain.binder.loop_node;
         let control = &mut self.control;
-        family::instantiate_shared_element(
+        family::instantiate_shared_element_with_identity(
             &mut self.egraph,
             *representative,
             super::identity::BinderId(binder_id),
             index.term,
+            index.stable_identity.clone(),
             &mut || {
                 if let Some(control) = control.as_deref_mut() {
                     control.work(&scope, node)?;
@@ -5234,18 +5174,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 count: IntExpr::constant(logical_count.clone()),
             }
         })?;
-        let binder_id = self
-            .egraph
-            .analysis
-            .symbols
-            .binders
-            .values
-            .iter()
-            .position(|descriptor| &descriptor.key == binder)
-            .and_then(|id| u32::try_from(id).ok())
-            .ok_or_else(|| LowerError::InvalidFamilyCount {
-                count: IntExpr::constant(logical_count.clone()),
-            })?;
         let template =
             self.egraph.analysis.symbols.trapdoors.get(representative.0).cloned().ok_or(
                 LowerError::FamilyProducerNotResolved {
@@ -5255,24 +5183,18 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     },
                 },
             )?;
-        let mut instantiate = |term| {
-            family::instantiate_shared_element(
-                &mut self.egraph,
-                term,
-                super::identity::BinderId(binder_id),
-                index.term,
-                &mut || Ok::<(), LowerError>(()),
-            )
-        };
-        let public = instantiate(template.public)?;
+        let replacement = index.stable_identity.clone().ok_or_else(|| {
+            LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) }
+        })?;
         let indices = template
             .indices
             .iter()
-            .copied()
-            .map(&mut instantiate)
-            .collect::<Result<Vec<_>, _>>()?;
-        let descriptor =
-            TrapdoorIdentity { public, indices: indices.into_boxed_slice(), ..template };
+            .map(|value| super::identity::substitute_resolved_int_expr(value, binder, &replacement))
+            .collect::<Box<[_]>>();
+        // The public operand is stable provenance, not a matrix e-graph atom.
+        // Its graph occurrence is shared by every family lane; only the
+        // ordered coordinate expressions vary with the selected binder.
+        let descriptor = TrapdoorIdentity { indices, ..template };
         let descriptor = self.egraph.analysis.symbols.trapdoors.intern(descriptor);
         Ok(LoweredValue::Trapdoor(TrapdoorDescriptorId(descriptor)))
     }
@@ -7566,7 +7488,6 @@ mod tests {
                     [SamplerIdentity::Gaussian { max_coefficient_bound: ResolvedIntExpr::Const(value), .. }]
                         if value == &BigInt::from(5)
                 ));
-                assert!(gaussian.relation_registrations().is_empty());
                 assert_eq!(
                     dag_bound(gaussian, gaussian_term),
                     BoundClass::Bounded { maximum_absolute_coefficient: 5_u8.into() },
@@ -7597,7 +7518,6 @@ mod tests {
                         ..
                     }] if minimum == &BigInt::from(-3) && maximum == &BigInt::from(2)
                 ));
-                assert!(interval.relation_registrations().is_empty());
                 assert_eq!(
                     dag_bound(interval, interval_term),
                     BoundClass::Bounded { maximum_absolute_coefficient: 3_u8.into() },
@@ -7791,14 +7711,6 @@ mod tests {
                 lowerer.egraph.find(decomposition),
                 "the same atom source and ordered coordinates hash-cons into one e-class"
             );
-            let registrations = lowerer.relation_registrations();
-            assert!(registrations.iter().any(|registration| {
-                registration.source == super::super::identity::AtomicSourceId(atom_source) &&
-                    registration.expected_public == public &&
-                    registration.target == target &&
-                    registration.indices.as_ref() == indices.as_ref()
-            }));
-
             assert_eq!(
                 BoundEvaluator::new(&lowerer.production_bound_view())
                     .evaluate(decomposition)
@@ -9043,14 +8955,10 @@ mod tests {
         assert_eq!(descriptor.gadget_base, ResolvedIntExpr::Const(BigInt::from(2)));
         assert_eq!(descriptor.digit_count, ResolvedIntExpr::Const(BigInt::from(3)));
         assert_eq!(descriptor.preimage_cutoff, ResolvedIntExpr::Const(BigInt::from(5)));
-        let MxxLang::Atom { source, .. } =
-            lowerer.egraph[lowerer.egraph.find(descriptor.public)].nodes.first().unwrap()
-        else {
-            panic!("public protocol atom")
-        };
-        assert!(
-            matches!(lowerer.egraph.analysis.symbols.atomic_sources.get(source.0).unwrap().key, super::super::identity::AtomicSourceKey::ProtocolInput(ref id) if id == &crate::ProtocolInputId::from("public"))
-        );
+        assert!(matches!(
+            descriptor.public,
+            super::super::identity::CanonicalTermIdentity::Source(_)
+        ));
     }
 
     #[test]

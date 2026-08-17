@@ -6,7 +6,7 @@
 //! the sole owner of compact job-local IDs; no lowering cache is an identity
 //! authority.
 
-use super::analysis::MxxSort;
+use super::{analysis::MxxSort, normal_form::FactorIdentity};
 use crate::{ProtocolInputId, StageId};
 #[cfg(test)]
 use mxx_ir_core::Port;
@@ -112,12 +112,6 @@ pub enum AtomicSourceKey {
     /// runtime sampler: the recurrence descriptor below binds it to the
     /// previous iteration's state when the bound phase evaluates the loop.
     SequentialState(SequentialStateKey),
-    /// The final value of one carried output after a symbolic sequential
-    /// recurrence.  Its full transition remains in `SymbolTables`.
-    SequentialRecurrence {
-        recurrence: SequentialRecurrenceId,
-        carried_index: usize,
-    },
     Sampler(SamplerDescriptorId),
 }
 
@@ -236,6 +230,67 @@ impl ResolvedIntExpr {
             IntExpr::Log2Ceil(value) => {
                 Some(Self::Log2Ceil(Box::new(Self::from_closed_expr(value)?)))
             }
+        }
+    }
+}
+
+/// Substitute one owner-resolved loop binder without consulting an e-graph.
+/// This is used for structural family and trapdoor instantiation; binder
+/// ownership is preserved in every untouched coordinate and nested source.
+pub(crate) fn substitute_resolved_int_expr(
+    value: &ResolvedIntExpr,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> ResolvedIntExpr {
+    match value {
+        ResolvedIntExpr::Binder(candidate) if candidate == binder => replacement.clone(),
+        ResolvedIntExpr::Source { source, coordinates } => ResolvedIntExpr::Source {
+            source: source.clone(),
+            coordinates: coordinates
+                .iter()
+                .map(|coordinate| substitute_resolved_int_expr(coordinate, binder, replacement))
+                .collect(),
+        },
+        ResolvedIntExpr::Add(left, right) => ResolvedIntExpr::Add(
+            Box::new(substitute_resolved_int_expr(left, binder, replacement)),
+            Box::new(substitute_resolved_int_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::Sub(left, right) => ResolvedIntExpr::Sub(
+            Box::new(substitute_resolved_int_expr(left, binder, replacement)),
+            Box::new(substitute_resolved_int_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::Mul(left, right) => ResolvedIntExpr::Mul(
+            Box::new(substitute_resolved_int_expr(left, binder, replacement)),
+            Box::new(substitute_resolved_int_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::Div(left, right) => ResolvedIntExpr::Div(
+            Box::new(substitute_resolved_int_expr(left, binder, replacement)),
+            Box::new(substitute_resolved_int_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::EuclideanDiv(left, right) => ResolvedIntExpr::EuclideanDiv(
+            Box::new(substitute_resolved_int_expr(left, binder, replacement)),
+            Box::new(substitute_resolved_int_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::EuclideanRemainder(left, right) => ResolvedIntExpr::EuclideanRemainder(
+            Box::new(substitute_resolved_int_expr(left, binder, replacement)),
+            Box::new(substitute_resolved_int_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::RoundDiv(left, right) => ResolvedIntExpr::RoundDiv(
+            Box::new(substitute_resolved_int_expr(left, binder, replacement)),
+            Box::new(substitute_resolved_int_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::Log2Ceil(value) => ResolvedIntExpr::Log2Ceil(Box::new(
+            substitute_resolved_int_expr(value, binder, replacement),
+        )),
+        ResolvedIntExpr::ExtractCoefficient { input, position, canonical_exclusive_upper } => {
+            ResolvedIntExpr::ExtractCoefficient {
+                input: Box::new(substitute_resolved_int_expr(input, binder, replacement)),
+                position: Box::new(substitute_resolved_int_expr(position, binder, replacement)),
+                canonical_exclusive_upper: canonical_exclusive_upper.clone(),
+            }
+        }
+        ResolvedIntExpr::Const(_) | ResolvedIntExpr::Parameter(_) | ResolvedIntExpr::Binder(_) => {
+            value.clone()
         }
     }
 }
@@ -400,12 +455,26 @@ compact_id!(
     SliceSpecId,
     HashQuerySpecId,
     CrtSpecId,
-    SequentialRecurrenceId,
     SamplerDescriptorId,
 );
 
-/// A source-level sampler record retains the exact operand e-classes for a
-/// later relation pass; lowering never guesses a relation from a matrix shape.
+/// A canonical reference to an operand carried by a sampler descriptor.
+///
+/// Sampler metadata must not retain an e-graph class: e-class numbering is
+/// local to a particular rewrite run and is not an owner-aware identity.
+/// Production descriptors use a [`FactorIdentity`] for an exact atom or a
+/// stable graph source when the operand is only needed as provenance.  The
+/// two cases are explicit so a caller cannot silently substitute one kind for
+/// another or cross an e-graph/DAG arena boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum CanonicalTermIdentity {
+    Factor(FactorIdentity),
+    Source(GraphWireSourceKey),
+}
+
+/// A source-level sampler record retains typed, owner-aware operand identities
+/// for a later relation pass; lowering never guesses a relation from a matrix
+/// shape or an e-graph class number.
 ///
 /// A `GadgetDecomposition` is deterministic, so its graph-wire occurrence is
 /// audit metadata rather than part of the produced value's identity.  The
@@ -415,22 +484,22 @@ pub enum SamplerIdentity {
     /// A non-relation sampler with an explicit, nonnegative coefficient cap.
     Gaussian {
         source: GraphWireSourceKey,
-        indices: Box<[egg::Id]>,
+        indices: Box<[ResolvedIntExpr]>,
         max_coefficient_bound: ResolvedIntExpr,
     },
     /// A non-relation sampler with an explicit closed integer interval.
     UniformInterval {
         source: GraphWireSourceKey,
-        indices: Box<[egg::Id]>,
+        indices: Box<[ResolvedIntExpr]>,
         minimum: ResolvedIntExpr,
         maximum: ResolvedIntExpr,
     },
     Preimage {
         source: GraphWireSourceKey,
-        indices: Box<[egg::Id]>,
-        public: egg::Id,
+        indices: Box<[ResolvedIntExpr]>,
+        public: CanonicalTermIdentity,
         trapdoor: TrapdoorDescriptorId,
-        target: egg::Id,
+        target: CanonicalTermIdentity,
         cutoff: ResolvedIntExpr,
     },
     /// A decomposed hash sampler is registered against its exact gadget and
@@ -438,10 +507,10 @@ pub enum SamplerIdentity {
     /// every runtime tag integer, so equal shapes never substitute identities.
     DecomposedHash {
         source: GraphWireSourceKey,
-        indices: Box<[egg::Id]>,
-        public: egg::Id,
-        target: egg::Id,
-        arguments: Box<[egg::Id]>,
+        indices: Box<[ResolvedIntExpr]>,
+        public: CanonicalTermIdentity,
+        target: CanonicalTermIdentity,
+        arguments: Box<[CanonicalTermIdentity]>,
         matrix_type: ResolvedMatrixType,
         base: ResolvedIntExpr,
         digit_count: ResolvedIntExpr,
@@ -450,9 +519,9 @@ pub enum SamplerIdentity {
     },
     GadgetDecomposition {
         source: GadgetDecompositionAuditOccurrence,
-        indices: Box<[egg::Id]>,
-        public: egg::Id,
-        target: egg::Id,
+        indices: Box<[ResolvedIntExpr]>,
+        public: CanonicalTermIdentity,
+        target: CanonicalTermIdentity,
         base: ResolvedIntExpr,
         digit_count: ResolvedIntExpr,
         small: bool,
@@ -460,36 +529,15 @@ pub enum SamplerIdentity {
     },
 }
 
-/// The deferred, fixed-size transition for one sequential-loop occurrence.
-///
-/// `initial` and `transition` are e-class terms, so the later bound phase can
-/// evaluate a recurrence without replaying graph lowering or unrolling a loop.
-/// The state placeholders occurring in `transition` are exactly the keys
-/// formed from the same loop occurrence and `0..carried_count`.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct SequentialRecurrenceDescriptor {
-    pub loop_scope: OccurrenceScope,
-    pub loop_node: NodeId,
-    pub count: ResolvedIntExpr,
-    pub initial: Box<[egg::Id]>,
-    pub transition: Box<[egg::Id]>,
-    pub output_types: Box<[ResolvedMatrixType]>,
-}
-
 /// A trapdoor is a structural lowering value, not an `MxxLang` node.  Its
-/// e-class fields are canonicalized by the caller with `egraph.find` before
-/// semantic comparison; this interner only removes raw structural duplicates.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct TrapdoorIdentity {
     pub source: TrapdoorSourceKey,
-    pub indices: Box<[egg::Id]>,
+    pub indices: Box<[ResolvedIntExpr]>,
     pub matrix_type: ResolvedMatrixType,
-    /// Descriptor-only reference to the public matrix input.  This remains an
-    /// e-graph ID solely because trapdoor metadata is still consumed by the
-    /// scalar-era relation/bound interfaces; it is never a matrix carrier or
-    /// a lowering result.  Migrating this field to a typed canonical matrix
-    /// identity is the next identity-slice boundary.
-    pub public: egg::Id,
+    /// Stable identity of the public matrix input.  Trapdoor construction must
+    /// not materialize a matrix `MxxLang::Atom` merely to populate metadata.
+    pub public: CanonicalTermIdentity,
     pub sigma_bits: u64,
     pub gadget_base: ResolvedIntExpr,
     pub digit_count: ResolvedIntExpr,
@@ -556,7 +604,6 @@ pub struct SymbolTables {
     /// Normal lowering emits `IntConst` after request closure.
     pub integer_parameters: BTreeMap<String, BigInt>,
     pub trapdoors: Interner<TrapdoorIdentity>,
-    pub sequential_recurrences: Interner<SequentialRecurrenceDescriptor>,
     pub samplers: Interner<SamplerIdentity>,
     pub matrix_constants: Interner<MatrixConstantSpec>,
     pub slices: Interner<SliceSpec>,
@@ -705,34 +752,37 @@ mod tests {
                              base: i64,
                              digit_count: i64,
                              small: bool,
-                             indices: Box<[egg::Id]>,
+                             indices: Box<[usize]>,
                              range_proved: bool| {
             SamplerIdentity::GadgetDecomposition {
                 source: source.into(),
-                indices,
-                public: egg::Id::from(public),
-                target: egg::Id::from(target),
+                indices: indices
+                    .iter()
+                    .map(|index| ResolvedIntExpr::Const(BigInt::from(*index)))
+                    .collect(),
+                public: CanonicalTermIdentity::Source(occurrence(public as u64)),
+                target: CanonicalTermIdentity::Source(occurrence(target as u64)),
                 base: ResolvedIntExpr::Const(base.into()),
                 digit_count: ResolvedIntExpr::Const(digit_count.into()),
                 small,
                 range_proved,
             }
         };
-        let first = decomposition(occurrence(11), 7, 9, 32, 2, false, vec![3.into()].into(), false);
+        let first = decomposition(occurrence(11), 7, 9, 32, 2, false, vec![3].into(), false);
         let same_value_other_occurrence =
-            decomposition(occurrence(12), 7, 9, 32, 2, false, vec![3.into()].into(), false);
+            decomposition(occurrence(12), 7, 9, 32, 2, false, vec![3].into(), false);
         let different_target =
-            decomposition(occurrence(12), 7, 10, 32, 2, false, vec![3.into()].into(), false);
+            decomposition(occurrence(12), 7, 10, 32, 2, false, vec![3].into(), false);
         let different_base =
-            decomposition(occurrence(12), 7, 9, 64, 2, false, vec![3.into()].into(), false);
+            decomposition(occurrence(12), 7, 9, 64, 2, false, vec![3].into(), false);
         let different_digit_count =
-            decomposition(occurrence(12), 7, 9, 32, 3, false, vec![3.into()].into(), false);
+            decomposition(occurrence(12), 7, 9, 32, 3, false, vec![3].into(), false);
         let different_small =
-            decomposition(occurrence(12), 7, 9, 32, 2, true, vec![3.into()].into(), false);
+            decomposition(occurrence(12), 7, 9, 32, 2, true, vec![3].into(), false);
         let different_indices =
-            decomposition(occurrence(12), 7, 9, 32, 2, false, vec![4.into()].into(), false);
+            decomposition(occurrence(12), 7, 9, 32, 2, false, vec![4].into(), false);
         let different_range_proved =
-            decomposition(occurrence(12), 7, 9, 32, 2, false, vec![3.into()].into(), true);
+            decomposition(occurrence(12), 7, 9, 32, 2, false, vec![3].into(), true);
 
         let mut samplers = Interner::default();
         let first_id = samplers.intern(first);
@@ -786,16 +836,6 @@ mod tests {
         });
         assert_ne!(first_state, second_state);
         assert_ne!(first_state, other_loop);
-        assert_ne!(
-            AtomicSourceKey::SequentialRecurrence {
-                recurrence: SequentialRecurrenceId(3),
-                carried_index: 0,
-            },
-            AtomicSourceKey::SequentialRecurrence {
-                recurrence: SequentialRecurrenceId(3),
-                carried_index: 1,
-            },
-        );
     }
 
     #[test]

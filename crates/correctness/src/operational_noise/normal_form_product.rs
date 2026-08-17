@@ -1,4 +1,4 @@
-//! The sole ordered-product constructor for the egg-independent normal form.
+//! The sole ordered-product constructor for the typed normal form.
 //!
 //! This is deliberately a child of `normal_form`: it may use the storage
 //! invariants of `PolynomialNF`, while sibling operation modules cannot reach
@@ -57,7 +57,200 @@ impl<'a> Normalizer<'a> {
     }
 
     pub(crate) fn normalize(&mut self, root: TermId) -> Result<PolynomialNF, NormalFormError> {
-        self.normalize_term(root)
+        self.normalize_dispatch(root)
+    }
+
+    fn normalize_dispatch(&mut self, root: TermId) -> Result<PolynomialNF, NormalFormError> {
+        if self.requires_iterative_walk(root)? {
+            self.normalize_term_iterative(root)
+        } else {
+            self.normalize_term(root)
+        }
+    }
+
+    fn requires_iterative_walk(&self, root: TermId) -> Result<bool, NormalFormError> {
+        let mut work = vec![(root, 0usize)];
+        let mut seen = BTreeSet::new();
+        while let Some((id, depth)) = work.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if depth >= 512 {
+                return Ok(true);
+            }
+            work.extend(self.dag.node(id)?.children().into_iter().map(|child| (child, depth + 1)));
+        }
+        Ok(false)
+    }
+
+    fn normalize_term_iterative(&mut self, root: TermId) -> Result<PolynomialNF, NormalFormError> {
+        enum Visit {
+            Enter(TermId),
+            Exit(TermId),
+        }
+        let mut work = vec![Visit::Enter(root)];
+        let mut values = BTreeMap::<TermId, PolynomialNF>::new();
+        let mut visiting = BTreeSet::<TermId>::new();
+        while let Some(visit) = work.pop() {
+            let (id, exit) = match visit {
+                Visit::Enter(id) => (id, false),
+                Visit::Exit(id) => (id, true),
+            };
+            if self.memo.contains_key(&id) || values.contains_key(&id) {
+                continue;
+            }
+            if !exit {
+                if !visiting.insert(id) {
+                    return Err(NormalFormError::CyclicExpression { term: id });
+                }
+                work.push(Visit::Exit(id));
+                work.extend(self.dag.node(id)?.children().into_iter().rev().map(Visit::Enter));
+                continue;
+            }
+            let child = |child: TermId,
+                         values: &BTreeMap<TermId, PolynomialNF>,
+                         memo: &BTreeMap<TermId, PolynomialNF>| {
+                values
+                    .get(&child)
+                    .or_else(|| memo.get(&child))
+                    .cloned()
+                    .ok_or(NormalFormError::InvalidTermId)
+            };
+            self.counters.nodes_processed = self.counters.nodes_processed.saturating_add(1);
+            let result = match self.dag.node(id)?.clone() {
+                ExpressionNode::Zero => PolynomialNF::zero(),
+                ExpressionNode::Atom(factor) => self.normalize_atom(factor),
+                ExpressionNode::Add(children) => {
+                    let mut value = PolynomialNF::zero();
+                    for child_id in children {
+                        value = value.add(child(child_id, &values, &self.memo)?)?;
+                    }
+                    value
+                }
+                ExpressionNode::Negate(child_id) => child(child_id, &values, &self.memo)?.negate(),
+                ExpressionNode::Product(children) => {
+                    let mut value = PolynomialNF::one();
+                    for child_id in children {
+                        value = self
+                            .product_and_normalize(value, child(child_id, &values, &self.memo)?)?;
+                    }
+                    value
+                }
+                ExpressionNode::Switch { selector, cases, reachable } |
+                ExpressionNode::Select { selector, cases, reachable } => {
+                    if reachable.is_empty() || reachable.iter().any(|index| *index >= cases.len()) {
+                        return Err(NormalFormError::InvalidSwitchReachability);
+                    }
+                    let mut seen = BTreeSet::new();
+                    if reachable.iter().any(|index| !seen.insert(*index)) {
+                        return Err(NormalFormError::AmbiguousSwitchMapping);
+                    }
+                    self.counters.switch_cases_processed =
+                        self.counters.switch_cases_processed.saturating_add(reachable.len() as u64);
+                    let normalized = reachable
+                        .iter()
+                        .map(|index| child(cases[*index], &values, &self.memo))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let fingerprints = reachable
+                        .iter()
+                        .map(|index| {
+                            dag_structure_fingerprint(self.dag, cases[*index], &mut BTreeSet::new())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    switch_normalize(
+                        selector,
+                        normalized.into_boxed_slice(),
+                        reachable.iter().map(|index| BigUint::from(*index)).collect(),
+                        fingerprints.into_iter().map(Into::into).collect(),
+                    )?
+                }
+                ExpressionNode::FamilyGetStatic { cases, index } => {
+                    let Some(case) = cases.get(index) else {
+                        return Err(NormalFormError::InvalidFamilyIndex)
+                    };
+                    child(*case, &values, &self.memo)?
+                }
+                ExpressionNode::FamilyGetDynamic {
+                    selector,
+                    cases,
+                    stored_indices,
+                    domain_upper,
+                } => {
+                    if cases.is_empty() ||
+                        stored_indices.len() != cases.len() ||
+                        domain_upper.is_zero() ||
+                        stored_indices.iter().any(|index| index >= &domain_upper) ||
+                        stored_indices.iter().collect::<BTreeSet<_>>().len() !=
+                            stored_indices.len() ||
+                        stored_indices.iter().max().map(|index| index + BigUint::from(1_u8)) !=
+                            Some(domain_upper.clone())
+                    {
+                        return Err(NormalFormError::InvalidFamilyDomain);
+                    }
+                    self.counters.switch_cases_processed =
+                        self.counters.switch_cases_processed.saturating_add(cases.len() as u64);
+                    let normalized = cases
+                        .iter()
+                        .map(|case| child(*case, &values, &self.memo))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let fingerprints = cases
+                        .iter()
+                        .map(|case| {
+                            dag_structure_fingerprint(self.dag, *case, &mut BTreeSet::new())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    switch_normalize(
+                        selector,
+                        normalized.into_boxed_slice(),
+                        stored_indices,
+                        fingerprints.into_iter().map(Into::into).collect(),
+                    )?
+                }
+                ExpressionNode::MatrixScale { input, scalar } => child(input, &values, &self.memo)?
+                    .matrix_scale_nf(scalar)
+                    .map_err(operation_error)?,
+                ExpressionNode::Transpose(input) => {
+                    child(input, &values, &self.memo)?.transpose_nf().map_err(operation_error)?
+                }
+                ExpressionNode::Slice { input, spec } => {
+                    child(input, &values, &self.memo)?.slice_nf(&spec).map_err(operation_error)?
+                }
+                ExpressionNode::Tensor { left, right } => child(left, &values, &self.memo)?
+                    .tensor_nf(&child(right, &values, &self.memo)?)
+                    .map_err(operation_error)?,
+                ExpressionNode::LiftConstantPolynomial { input, matrix_type, domain } => {
+                    child(input, &values, &self.memo)?
+                        .lift_constant_polynomial_nf(matrix_type, &domain)
+                        .map_err(operation_error)?
+                }
+                ExpressionNode::View { input, view, output_type } => {
+                    child(input, &values, &self.memo)?
+                        .view_nf(&view, output_type)
+                        .map_err(operation_error)?
+                }
+                ExpressionNode::CrtRecompose { inputs, spec, output_type } => {
+                    let inputs = inputs
+                        .iter()
+                        .map(|input| child(*input, &values, &self.memo))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    PolynomialNF::crt_recompose_nf(&inputs, &spec, output_type)
+                        .map_err(operation_error)?
+                }
+                ExpressionNode::Concat { inputs, axis, output_type } => {
+                    let inputs = inputs
+                        .iter()
+                        .map(|input| child(*input, &values, &self.memo))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    PolynomialNF::concat_nf(&inputs, axis, output_type).map_err(operation_error)?
+                }
+            };
+            visiting.remove(&id);
+            values.insert(id, result);
+        }
+        values
+            .remove(&root)
+            .or_else(|| self.memo.get(&root).cloned())
+            .ok_or(NormalFormError::InvalidTermId)
     }
 
     pub(crate) fn normalize_with_counters(
@@ -363,7 +556,7 @@ impl<'a> Normalizer<'a> {
                                 self.memo.insert(registration.target, target.clone());
                                 target
                             }
-                            _ => self.normalize_term(registration.target)?,
+                            _ => self.normalize_dispatch(registration.target)?,
                         },
                     };
                     let prefix = Monomial {

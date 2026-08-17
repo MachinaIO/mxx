@@ -246,7 +246,7 @@
       "error_tag": "Lower.MissingIntegerAnalysis",
       "tall_reachability": "reachable",
       "classification": "graph_lowering",
-      "rationale": "A dynamic family selector requires an integer e-class domain before range validation."
+      "rationale": "A dynamic family selector requires an integer scalar domain before range validation."
     },
     {
       "error_tag": "Lower.MissingProtocolInputBinding",
@@ -429,100 +429,10 @@
       "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
     },
     {
-      "error_tag": "Analysis.EClassSortConflict",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.MatrixTypeMismatch",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.MatrixShapeMismatch",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.InvalidMatrixDimension",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.InvalidConstantMatrix",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.InvalidSliceRange",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.InvalidConcatAxisOrShape",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.InvalidTensorShape",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.InvalidCrtSpecification",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.InvalidGadgetLayout",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.InvalidHashQuery",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.InvalidTrapdoorDescriptor",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.InvalidSamplerDescriptor",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.UnknownCanonicalResidueRange",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
-      "error_tag": "Analysis.InvalidKnownZeroRows",
-      "tall_reachability": "reachable",
-      "classification": "egraph_analysis",
-      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
-    },
-    {
       "error_tag": "Bound.NormalForm",
       "tall_reachability": "reachable",
       "classification": "normalization",
-      "rationale": "Tall matrix roots use the deterministic egg-independent normalizer; this preserves its typed failure instead of manufacturing a synthetic bound."
+      "rationale": "Tall matrix roots use the deterministic typed normalizer; this preserves its typed failure instead of manufacturing a synthetic bound."
     }
   ]
 }

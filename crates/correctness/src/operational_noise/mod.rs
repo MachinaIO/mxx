@@ -1,15 +1,12 @@
 //! Deterministic operational-noise simulation for closed protocol graphs.
 //!
-//! This module lowers a frozen Graph IR program into an egg-independent matrix
-//! expression DAG for deterministic normal-form evaluation. Scalar and legacy
-//! differential paths remain separate until their scheduled removal.
+//! This module lowers a frozen Graph IR program into a typed matrix expression
+//! DAG for deterministic normal-form evaluation.
 
-pub mod analysis;
 pub mod bound;
 pub mod error;
 pub mod family;
 pub mod identity;
-pub mod language;
 pub mod lower;
 pub mod normal_form;
 pub(crate) mod normal_form_family;

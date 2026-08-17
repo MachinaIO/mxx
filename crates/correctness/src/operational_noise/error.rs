@@ -5,10 +5,9 @@
 //! outside the phase enums prevents every rule from carrying a second, inconsistent location.
 
 use super::{
-    analysis::MxxSort,
-    identity::{AtomicSourceKey, BinderKey, OccurrenceFrame, ProgramKey, WireSourceKey},
+    identity::{BinderKey, OccurrenceFrame, ProgramKey, WireSourceKey},
     normal_form::NormalFormError,
-    scalar::ScalarId,
+    scalar::{ScalarId, ScalarSort},
 };
 use crate::{
     OperationalDecoderKind, ProtocolInputId, StageId, StageInputName, TrapdoorContractMismatch,
@@ -278,7 +277,7 @@ operational_error_registry! {
         FamilyElementLoweringMismatch {
             expected: WireType,
             actual_category: LoweredValueCategory,
-            actual_sort: Option<MxxSort>,
+            actual_sort: Option<ScalarSort>,
             producer: WireSourceKey,
         },
         NegativeSamplerCutoff { cutoff: BigInt },
@@ -290,33 +289,26 @@ operational_error_registry! {
         SelectorOnlyValueUsedByForbiddenConsumer { consumer: SelectorOnlyConsumer },
     }
 
-    Analysis => AnalysisError {
-        EClassSortConflict { expected: MxxSort, actual: MxxSort },
-        MatrixTypeMismatch { expected: MxxSort, actual: MxxSort },
-        MatrixShapeMismatch { expected: MxxSort, actual: MxxSort },
-        InvalidMatrixDimension { matrix: MxxSort, dimension: IntExpr },
-        InvalidConstantMatrix { matrix: MxxSort, value: NodeKind },
-        InvalidSliceRange { range: IntExpr },
-        InvalidConcatAxisOrShape { expected: MxxSort, actual: MxxSort },
-        InvalidTensorShape { expected: MxxSort, actual: MxxSort },
-        InvalidCrtSpecification { plaintext_moduli: Box<[IntExpr]> },
-        InvalidGadgetLayout { base: IntExpr, digit_count: IntExpr },
-        InvalidHashQuery { source: AtomicSourceKey },
-        InvalidTrapdoorDescriptor {
-            trapdoor_input: ProtocolInputId,
-            public_input: ProtocolInputId,
-            mismatch: TrapdoorContractMismatch,
-        },
-        InvalidSamplerDescriptor { source: AtomicSourceKey },
-        UnknownCanonicalResidueRange { matrix: MxxSort },
-        InvalidKnownZeroRows { known_zero_rows: BigUint, row_count: BigUint },
-    }
-
     Bound => BoundError {
         NormalForm { source: NormalFormError },
     }
 
 }
+
+/// Internal scalar-transfer failure.  This is returned by the typed scalar
+/// construction helpers and is not a simulation-phase wrapper.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AnalysisError {
+    UnknownCanonicalResidueRange { matrix: ScalarSort },
+}
+
+impl fmt::Display for AnalysisError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "AnalysisError::{self:?}")
+    }
+}
+
+impl std::error::Error for AnalysisError {}
 
 /// Public, fail-closed result for one operational-noise simulation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -324,7 +316,6 @@ pub enum OperationalSimulationError {
     Request(RequestError),
     Target(TargetError),
     Lower { site: ErrorSite, source: LowerError },
-    Analysis { site: ErrorSite, source: AnalysisError },
     Bound { site: ErrorSite, source: BoundError },
 }
 

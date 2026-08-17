@@ -8,15 +8,15 @@
 #[cfg(test)]
 use super::normal_form::RelationRegistry;
 use super::{
-    analysis::{IntegerDomain, IntegerInterval},
     family::{FamilyCoverageError, FamilyLoweringValue},
     identity::{BinderKey, ResolvedIntExpr},
     normal_form::{ExpressionDag, FactorIdentity, NormalFormError, TermId},
+    scalar::{IntegerDomain, IntegerInterval, resolved_constant},
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
 
-/// Matrix-family values are DAG terms, not legacy e-graph identifiers.
+/// Matrix-family values are DAG terms, not scalar identifiers.
 pub(crate) type MatrixTermFamily = FamilyLoweringValue<TermId>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,9 +45,7 @@ pub(crate) fn static_matrix_term(
     let super::family::FamilyCoverageStorage::ExactStored { elements } = &family.storage else {
         return Ok(None);
     };
-    let ResolvedIntExpr::Const(index) = index else {
-        return Ok(None);
-    };
+    let Some(index) = resolved_constant(index) else { return Ok(None) };
     let index = index.clone();
     let Some(index) = index.to_usize() else {
         return Err(FamilyCoverageError::StaticIndexOutOfRange {
@@ -173,7 +171,6 @@ fn recurrence_count(domain: &IntegerDomain) -> Result<BigUint, TermRecurrenceErr
 mod tests {
     use super::*;
     use crate::operational_noise::{
-        analysis::MxxSort,
         bound::{BoundClass, MatrixBound},
         family::{CoverageBinderDomain, FamilyCoverageStorage, LoopDomainKey},
         identity::{OccurrenceScope, ProgramKey},
@@ -181,6 +178,7 @@ mod tests {
             ExpressionNode, FactorKind, FactorOwner, FullRelationKey, RelationRegistration,
             SymbolicFactor,
         },
+        scalar::ScalarSort,
     };
     use mxx_ir_core::NodeId;
 
@@ -212,7 +210,7 @@ mod tests {
     fn shared_family_validates_count_without_materializing_cases() {
         let owner = binder(1);
         let family = MatrixTermFamily {
-            element_type: MxxSort::Int,
+            element_type: ScalarSort::Int,
             storage: FamilyCoverageStorage::SharedTemplate {
                 domain: LoopDomainKey { binder: owner.clone(), logical_count: 30_720_u64.into() },
                 representative: TermId(0),
@@ -231,7 +229,7 @@ mod tests {
     #[test]
     fn static_matrix_term_rejects_index_above_stored_count() {
         let family = MatrixTermFamily {
-            element_type: MxxSort::Int,
+            element_type: ScalarSort::Int,
             storage: FamilyCoverageStorage::ExactStored { elements: vec![TermId(0)].into() },
         };
         assert!(matches!(

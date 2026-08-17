@@ -9,7 +9,8 @@
 use super::{
     error::AnalysisError,
     identity::{
-        AtomicSourceId, BinderKey, CanonicalResidueConvention, ResolvedIntExpr, ResolvedMatrixType,
+        AtomicSourceId, BinderKey, CanonicalResidueConvention, ResolvedIntBinaryOperation,
+        ResolvedIntExpr, ResolvedIntExprArena, ResolvedIntExprArenaNode, ResolvedMatrixType,
         SymbolTables,
     },
 };
@@ -411,16 +412,6 @@ pub struct DirectExtractFact {
     pub canonical_upper: Option<BigUint>,
 }
 
-/// Semantic key used by the coefficient-extraction bridge while the matrix
-/// DAG and scalar arena are joined.  It contains only stable identities, never
-/// a runtime scalar ID or a debug rendering.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct ScalarExtractKey {
-    pub operation: ScalarOperation,
-    pub matrix: super::normal_form::MatrixValueIdentityId,
-    pub position: ResolvedIntExpr,
-}
-
 /// Facts attached to one scalar entry.  They are not part of the structural
 /// key, allowing only the explicitly conservative direct-extraction merge.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -524,7 +515,7 @@ impl ScalarFacts {
 
     /// Pure bottom-up transfer for every scalar operation emitted by Graph IR.
     /// The transfer consumes already computed child facts and never consults a
-    /// rewrite class or runtime observation.
+    /// typed scalar identity or runtime observation.
     pub fn transfer(
         node: &ScalarNode,
         children: &[&ScalarFacts],
@@ -570,7 +561,7 @@ impl ScalarFacts {
                     .atomic_sources
                     .get(source.0)
                     .ok_or(ScalarTransferError::MissingSource)?;
-                let sort = convert_sort(descriptor.sort.clone());
+                let sort = descriptor.sort.clone();
                 match sort {
                     ScalarSort::Int => {
                         let domain = descriptor
@@ -865,6 +856,323 @@ impl ScalarFacts {
     }
 }
 
+/// Computes the closed integer domain of a coefficient extracted from a
+/// matrix using the authoritative residue convention and optional exclusive
+/// upper premise.
+pub fn extract_coefficient_domain(
+    matrix: &ResolvedMatrixType,
+    modulus: &BigUint,
+    authoritative_upper: Option<&BigUint>,
+    convention: CanonicalResidueConvention,
+) -> Result<IntegerDomain, AnalysisError> {
+    if modulus.is_zero() {
+        return Err(AnalysisError::UnknownCanonicalResidueRange {
+            matrix: ScalarSort::Matrix(matrix.clone()),
+        });
+    }
+    if let Some(upper) = authoritative_upper {
+        if convention != CanonicalResidueConvention::Nonnegative ||
+            upper.is_zero() ||
+            upper > modulus
+        {
+            return Err(AnalysisError::UnknownCanonicalResidueRange {
+                matrix: ScalarSort::Matrix(matrix.clone()),
+            });
+        }
+        return Ok(IntegerDomain::IntervalOnly(IntegerInterval {
+            minimum: BigInt::zero(),
+            maximum: BigInt::from(upper - BigUint::one()),
+        }));
+    }
+    let (minimum, maximum) = match convention {
+        CanonicalResidueConvention::Nonnegative => {
+            (BigInt::zero(), BigInt::from(modulus - BigUint::one()))
+        }
+        CanonicalResidueConvention::Centered => {
+            let floor = modulus / BigUint::from(2_u8);
+            let ceil = (modulus + BigUint::one()) / BigUint::from(2_u8);
+            (-BigInt::from(floor), BigInt::from(ceil) - BigInt::one())
+        }
+    };
+    IntegerInterval::new(minimum, maximum).map(IntegerDomain::IntervalOnly).ok_or(
+        AnalysisError::UnknownCanonicalResidueRange { matrix: ScalarSort::Matrix(matrix.clone()) },
+    )
+}
+
+/// Constructs scalar facts at the sole matrix-to-scalar extraction boundary.
+pub fn direct_extract_facts(
+    matrix: ResolvedMatrixType,
+    modulus: BigUint,
+    authoritative_upper: Option<&BigUint>,
+) -> Result<ScalarFacts, AnalysisError> {
+    let domain = extract_coefficient_domain(
+        &matrix,
+        &modulus,
+        authoritative_upper,
+        CanonicalResidueConvention::Nonnegative,
+    )?;
+    let upper = domain.interval().ok().and_then(|interval| {
+        (interval.minimum == BigInt::zero())
+            .then(|| (&interval.maximum + BigInt::one()).to_biguint())
+            .flatten()
+    });
+    let mut facts =
+        ScalarFacts::scalar(ScalarSort::Int, Some(domain), ScalarProvenance::SelectorOnly);
+    facts.direct_extract = Some(DirectExtractFact { canonical_upper: upper });
+    Ok(facts)
+}
+
+pub(crate) fn resolved_constant(expression: &ResolvedIntExpr) -> Option<BigInt> {
+    if let ResolvedIntExpr::Arena(arena) = expression {
+        return resolved_arena_constant(arena);
+    }
+    enum Work<'a> {
+        Enter(&'a ResolvedIntExpr),
+        Add,
+        Sub,
+        Mul,
+        Div,
+        RoundDiv,
+        Log2Ceil,
+    }
+    let mut values = Vec::new();
+    let mut work = vec![Work::Enter(expression)];
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(ResolvedIntExpr::Const(value)) => values.push(value.clone()),
+            Work::Enter(ResolvedIntExpr::Parameter(_) | ResolvedIntExpr::Binder(_)) |
+            Work::Enter(
+                ResolvedIntExpr::Source { .. } |
+                ResolvedIntExpr::EuclideanDiv(_, _) |
+                ResolvedIntExpr::EuclideanRemainder(_, _) |
+                ResolvedIntExpr::ExtractMatrixCoefficient { .. } |
+                ResolvedIntExpr::Arena(_),
+            ) => return None,
+            Work::Enter(ResolvedIntExpr::Add(left, right)) => {
+                work.extend([Work::Add, Work::Enter(right), Work::Enter(left)])
+            }
+            Work::Enter(ResolvedIntExpr::Sub(left, right)) => {
+                work.extend([Work::Sub, Work::Enter(right), Work::Enter(left)])
+            }
+            Work::Enter(ResolvedIntExpr::Mul(left, right)) => {
+                work.extend([Work::Mul, Work::Enter(right), Work::Enter(left)])
+            }
+            Work::Enter(ResolvedIntExpr::Div(left, right)) => {
+                work.extend([Work::Div, Work::Enter(right), Work::Enter(left)])
+            }
+            Work::Enter(ResolvedIntExpr::RoundDiv(left, right)) => {
+                work.extend([Work::RoundDiv, Work::Enter(right), Work::Enter(left)])
+            }
+            Work::Enter(ResolvedIntExpr::Log2Ceil(value)) => {
+                work.extend([Work::Log2Ceil, Work::Enter(value)])
+            }
+            Work::Add | Work::Sub | Work::Mul | Work::Div | Work::RoundDiv => {
+                let right = values.pop()?;
+                let left = values.pop()?;
+                let value = match item {
+                    Work::Add => left + right,
+                    Work::Sub => left - right,
+                    Work::Mul => left * right,
+                    Work::Div => exact_quotient(&left, &right).ok()?,
+                    Work::RoundDiv => evaluate_round_div(&left, &right).ok()?,
+                    _ => unreachable!(),
+                };
+                values.push(value);
+            }
+            Work::Log2Ceil => {
+                let value = values.pop()?;
+                (value >= BigInt::one()).then(|| values.push(log2_ceil(&value)))?;
+            }
+        }
+    }
+    (values.len() == 1).then(|| values.pop()).flatten()
+}
+
+/// Evaluates a descriptor-local identity without materializing a nested tree.
+/// This is deliberately a semantic helper for closed-domain consumers; the
+/// arena itself remains the canonical exported representation.
+fn resolved_arena_constant(arena: &ResolvedIntExprArena) -> Option<BigInt> {
+    let mut values = vec![None; arena.nodes.len()];
+    for (index, node) in arena.nodes.iter().enumerate() {
+        values[index] = match node {
+            ResolvedIntExprArenaNode::Const(value) => Some(value.clone()),
+            ResolvedIntExprArenaNode::Parameter(_) |
+            ResolvedIntExprArenaNode::Binder(_) |
+            ResolvedIntExprArenaNode::Source { .. } |
+            ResolvedIntExprArenaNode::ExtractMatrixCoefficient { .. } => None,
+            ResolvedIntExprArenaNode::Binary { operation, children } => {
+                let left = values[children[0] as usize].clone()?;
+                let right = values[children[1] as usize].clone()?;
+                match operation {
+                    ResolvedIntBinaryOperation::Add => Some(left + right),
+                    ResolvedIntBinaryOperation::Sub => Some(left - right),
+                    ResolvedIntBinaryOperation::Mul => Some(left * right),
+                    ResolvedIntBinaryOperation::Div => exact_quotient(&left, &right).ok(),
+                    ResolvedIntBinaryOperation::EuclideanDiv => {
+                        Some(euclidean_div_rem(&left, &right).ok()?.0)
+                    }
+                    ResolvedIntBinaryOperation::EuclideanRemainder => {
+                        Some(euclidean_div_rem(&left, &right).ok()?.1)
+                    }
+                    ResolvedIntBinaryOperation::RoundDiv => evaluate_round_div(&left, &right).ok(),
+                }
+            }
+            ResolvedIntExprArenaNode::Log2Ceil(child) => {
+                let value = values[*child as usize].clone()?;
+                (value >= BigInt::one()).then(|| log2_ceil(&value))
+            }
+        };
+    }
+    values.get(arena.root as usize).cloned().flatten()
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum AffineSymbol {
+    Parameter(String),
+    Binder(BinderKey),
+}
+
+#[derive(Debug, Default)]
+struct AffineForm {
+    constant: BigInt,
+    coefficients: BTreeMap<AffineSymbol, BigInt>,
+}
+
+impl AffineForm {
+    fn add_symbol(&mut self, symbol: AffineSymbol, coefficient: BigInt) {
+        use std::collections::btree_map::Entry;
+        if coefficient.is_zero() {
+            return;
+        }
+        match self.coefficients.entry(symbol) {
+            Entry::Vacant(entry) => {
+                entry.insert(coefficient);
+            }
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() += coefficient;
+                if entry.get().is_zero() {
+                    entry.remove();
+                }
+            }
+        }
+    }
+}
+
+fn resolved_structurally_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> bool {
+    if let (Some(left), Some(right)) = (
+        super::identity::resolved_expr_as_arena(left),
+        super::identity::resolved_expr_as_arena(right),
+    ) {
+        return left == right;
+    }
+    let mut work = vec![(left, right)];
+    while let Some((left, right)) = work.pop() {
+        match (left, right) {
+            (ResolvedIntExpr::Const(left), ResolvedIntExpr::Const(right)) if left == right => {}
+            (ResolvedIntExpr::Parameter(left), ResolvedIntExpr::Parameter(right))
+                if left == right => {}
+            (ResolvedIntExpr::Binder(left), ResolvedIntExpr::Binder(right)) if left == right => {}
+            (ResolvedIntExpr::Add(left_a, left_b), ResolvedIntExpr::Add(right_a, right_b)) |
+            (ResolvedIntExpr::Sub(left_a, left_b), ResolvedIntExpr::Sub(right_a, right_b)) |
+            (ResolvedIntExpr::Mul(left_a, left_b), ResolvedIntExpr::Mul(right_a, right_b)) |
+            (ResolvedIntExpr::Div(left_a, left_b), ResolvedIntExpr::Div(right_a, right_b)) |
+            (
+                ResolvedIntExpr::RoundDiv(left_a, left_b),
+                ResolvedIntExpr::RoundDiv(right_a, right_b),
+            ) => {
+                work.push((left_b, right_b));
+                work.push((left_a, right_a));
+            }
+            (ResolvedIntExpr::Log2Ceil(left), ResolvedIntExpr::Log2Ceil(right)) => {
+                work.push((left, right));
+            }
+            (
+                ResolvedIntExpr::Source { source: left_source, coordinates: left_coordinates },
+                ResolvedIntExpr::Source { source: right_source, coordinates: right_coordinates },
+            ) if left_source == right_source &&
+                left_coordinates.len() == right_coordinates.len() =>
+            {
+                work.extend(left_coordinates.iter().zip(right_coordinates.iter()));
+            }
+            (
+                ResolvedIntExpr::ExtractMatrixCoefficient {
+                    matrix: left_matrix,
+                    position: left_position,
+                },
+                ResolvedIntExpr::ExtractMatrixCoefficient {
+                    matrix: right_matrix,
+                    position: right_position,
+                },
+            ) if left_matrix == right_matrix => work.push((left_position, right_position)),
+            (ResolvedIntExpr::Arena(left), ResolvedIntExpr::Arena(right)) if left == right => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn resolved_affine_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> bool {
+    let mut form = AffineForm::default();
+    let mut work = vec![(right, -BigInt::one()), (left, BigInt::one())];
+    while let Some((expression, scale)) = work.pop() {
+        if scale.is_zero() {
+            continue;
+        }
+        match expression {
+            ResolvedIntExpr::Const(value) => form.constant += scale * value,
+            ResolvedIntExpr::Parameter(parameter) => {
+                form.add_symbol(AffineSymbol::Parameter(parameter.clone()), scale);
+            }
+            ResolvedIntExpr::Binder(binder) => {
+                form.add_symbol(AffineSymbol::Binder(binder.clone()), scale);
+            }
+            ResolvedIntExpr::Add(left, right) => {
+                work.push((right, scale.clone()));
+                work.push((left, scale));
+            }
+            ResolvedIntExpr::Sub(left, right) => {
+                work.push((right, -scale.clone()));
+                work.push((left, scale));
+            }
+            ResolvedIntExpr::Mul(left, right) => match (&**left, &**right) {
+                (_, ResolvedIntExpr::Const(constant)) => work.push((left, scale * constant)),
+                (ResolvedIntExpr::Const(constant), _) => work.push((right, scale * constant)),
+                _ => return false,
+            },
+            ResolvedIntExpr::Div(_, _) |
+            ResolvedIntExpr::EuclideanDiv(_, _) |
+            ResolvedIntExpr::EuclideanRemainder(_, _) |
+            ResolvedIntExpr::RoundDiv(_, _) |
+            ResolvedIntExpr::Log2Ceil(_) |
+            ResolvedIntExpr::Source { .. } |
+            ResolvedIntExpr::ExtractMatrixCoefficient { .. } |
+            ResolvedIntExpr::Arena(_) => return false,
+        }
+    }
+    form.constant.is_zero() && form.coefficients.is_empty()
+}
+
+pub(crate) fn resolved_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> bool {
+    resolved_structurally_equal(left, right) ||
+        resolved_constant(left).zip(resolved_constant(right)).is_some_and(|(l, r)| l == r) ||
+        resolved_affine_equal(left, right)
+}
+
+pub(crate) fn matrix_types_equal(left: &ResolvedMatrixType, right: &ResolvedMatrixType) -> bool {
+    resolved_equal(&left.modulus, &right.modulus) &&
+        resolved_equal(&left.ring_dimension, &right.ring_dimension) &&
+        resolved_equal(&left.rows, &right.rows) &&
+        resolved_equal(&left.columns, &right.columns)
+}
+
+pub(crate) fn sorts_equal(left: &ScalarSort, right: &ScalarSort) -> bool {
+    match (left, right) {
+        (ScalarSort::Matrix(left), ScalarSort::Matrix(right)) => matrix_types_equal(left, right),
+        (ScalarSort::Bytes(left), ScalarSort::Bytes(right)) => resolved_equal(left, right),
+        _ => left == right,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScalarTransferError {
     Arity,
@@ -963,8 +1271,7 @@ pub enum ScalarNode {
     RealSqrt([ScalarId; 1]),
     Switch(Box<[ScalarId]>),
     ExtractCoefficient {
-        canonical_exclusive_upper: Option<BigUint>,
-        matrix: super::normal_form::MatrixValueIdentityId,
+        matrix: super::normal_form::ResolvedMatrixValueIdentity,
         position: ScalarId,
     },
 }
@@ -1001,9 +1308,8 @@ pub enum ScalarIdentityNode {
         input: ScalarIdentityId,
     },
     ExtractCoefficient {
-        matrix: super::normal_form::MatrixValueIdentityId,
+        matrix: super::normal_form::ResolvedMatrixValueIdentity,
         position: ScalarIdentityId,
-        canonical_exclusive_upper: Option<BigUint>,
     },
 }
 
@@ -1031,14 +1337,12 @@ pub enum ScalarOperation {
     RealMul,
     RealDiv,
     RealSqrt,
-    ExtractCoefficient,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScalarEntry {
     pub node: ScalarNode,
     pub identity: ScalarIdentityId,
-    pub identity_expr: ResolvedIntExpr,
     pub analysis: ScalarFacts,
 }
 
@@ -1050,50 +1354,7 @@ pub struct ScalarStore {
     identity_index: BTreeMap<ScalarIdentityNode, ScalarIdentityId>,
 }
 
-fn dispose_resolved_int_expr(root: ResolvedIntExpr) {
-    let mut work = vec![root];
-    while let Some(expr) = work.pop() {
-        match expr {
-            ResolvedIntExpr::Source { coordinates, .. } => work.extend(coordinates.into_vec()),
-            ResolvedIntExpr::Add(left, right) |
-            ResolvedIntExpr::Sub(left, right) |
-            ResolvedIntExpr::Mul(left, right) |
-            ResolvedIntExpr::Div(left, right) |
-            ResolvedIntExpr::EuclideanDiv(left, right) |
-            ResolvedIntExpr::EuclideanRemainder(left, right) |
-            ResolvedIntExpr::RoundDiv(left, right) => {
-                work.push(*left);
-                work.push(*right);
-            }
-            ResolvedIntExpr::Log2Ceil(value) => work.push(*value),
-            ResolvedIntExpr::ExtractCoefficient { input, position, .. } => {
-                work.push(*input);
-                work.push(*position);
-            }
-            ResolvedIntExpr::Const(_) |
-            ResolvedIntExpr::Parameter(_) |
-            ResolvedIntExpr::Binder(_) => {}
-        }
-    }
-}
-
-impl Drop for ScalarStore {
-    fn drop(&mut self) {
-        let entries = std::mem::take(&mut self.entries);
-        for entry in entries {
-            let ScalarEntry { node, identity, identity_expr, analysis } = entry;
-            drop(node);
-            let _ = identity;
-            drop(analysis);
-            dispose_resolved_int_expr(identity_expr);
-        }
-    }
-}
-
 impl ScalarStore {
-    /// Reusing a semantic identity is exact for every scalar operation.  The
-    /// coefficient-extraction boundary is the sole named exception: its
-    /// external direct-extraction premise may be absent or present at
     /// different strengths, so the proof upper is joined conservatively by
     /// taking the minimum present upper.  Sort, provenance, and residue
     /// convention remain invariant and cannot be joined away.
@@ -1120,7 +1381,6 @@ impl ScalarStore {
     pub fn intern_node(
         &mut self,
         node: ScalarNode,
-        identity_expr: ResolvedIntExpr,
         symbols: &SymbolTables,
     ) -> Result<ScalarId, ScalarTransferError> {
         let child_ids = scalar_children(&node);
@@ -1137,13 +1397,12 @@ impl ScalarStore {
                 facts,
                 matches!(node, ScalarNode::ExtractCoefficient { .. }),
             );
-            dispose_resolved_int_expr(identity_expr);
             merge?;
             return Ok(id);
         }
         let id = ScalarId(self.entries.len() as u32);
         self.by_identity.insert(identity, id);
-        self.entries.push(ScalarEntry { node, identity, identity_expr, analysis: facts });
+        self.entries.push(ScalarEntry { node, identity, analysis: facts });
         Ok(id)
     }
 
@@ -1210,149 +1469,13 @@ impl ScalarStore {
                 selector: identity(*ids.first().ok_or(ScalarTransferError::Arity)?)?,
                 cases: ids[1..].iter().map(|id| identity(*id)).collect::<Result<Box<_>, _>>()?,
             },
-            ScalarNode::ExtractCoefficient { matrix, position, .. } => {
+            ScalarNode::ExtractCoefficient { matrix, position } => {
                 ScalarIdentityNode::ExtractCoefficient {
-                    matrix: *matrix,
+                    matrix: matrix.clone(),
                     position: identity(*position)?,
-                    canonical_exclusive_upper: None,
                 }
             }
         })
-    }
-
-    pub fn intern(
-        &mut self,
-        node: ScalarNode,
-        identity: ResolvedIntExpr,
-        facts: ScalarFacts,
-    ) -> Result<ScalarId, ScalarTransferError> {
-        let identity_id = self.intern_expr_identity(&identity);
-        if let Some(id) = self.by_identity.get(&identity_id).copied() {
-            let merge = Self::merge_repeated_facts(
-                &mut self.entries[id.0 as usize].analysis,
-                facts,
-                matches!(node, ScalarNode::ExtractCoefficient { .. }),
-            );
-            dispose_resolved_int_expr(identity);
-            merge?;
-            return Ok(id);
-        }
-        let id = ScalarId(self.entries.len() as u32);
-        self.by_identity.insert(identity_id, id);
-        self.entries.push(ScalarEntry {
-            node,
-            identity: identity_id,
-            identity_expr: identity,
-            analysis: facts,
-        });
-        Ok(id)
-    }
-
-    fn intern_expr_identity(&mut self, value: &ResolvedIntExpr) -> ScalarIdentityId {
-        // Resolve the expression graph in explicit postorder.  This keeps the
-        // identity arena shallow without making stack depth proportional to a
-        // user-controlled expression depth.
-        let mut work = vec![(value, false)];
-        let mut resolved = HashMap::<usize, ScalarIdentityId>::new();
-        while let Some((current, expanded)) = work.pop() {
-            let key = current as *const ResolvedIntExpr as usize;
-            if resolved.contains_key(&key) {
-                continue;
-            }
-            if !expanded {
-                work.push((current, true));
-                match current {
-                    ResolvedIntExpr::Source { coordinates, .. } => {
-                        for coordinate in coordinates.iter().rev() {
-                            work.push((coordinate, false));
-                        }
-                    }
-                    ResolvedIntExpr::Add(left, right) |
-                    ResolvedIntExpr::Sub(left, right) |
-                    ResolvedIntExpr::Mul(left, right) |
-                    ResolvedIntExpr::Div(left, right) |
-                    ResolvedIntExpr::EuclideanDiv(left, right) |
-                    ResolvedIntExpr::EuclideanRemainder(left, right) |
-                    ResolvedIntExpr::RoundDiv(left, right) => {
-                        work.push((right, false));
-                        work.push((left, false));
-                    }
-                    ResolvedIntExpr::Log2Ceil(input) => work.push((input, false)),
-                    ResolvedIntExpr::ExtractCoefficient { input, position, .. } => {
-                        work.push((position, false));
-                        work.push((input, false));
-                    }
-                    ResolvedIntExpr::Const(_) |
-                    ResolvedIntExpr::Parameter(_) |
-                    ResolvedIntExpr::Binder(_) => {}
-                }
-                continue;
-            }
-            let child = |child: &ResolvedIntExpr| {
-                *resolved
-                    .get(&(child as *const ResolvedIntExpr as usize))
-                    .expect("postorder child identity")
-            };
-            let node = match current {
-                ResolvedIntExpr::Const(value) => ScalarIdentityNode::Const(value.clone()),
-                ResolvedIntExpr::Parameter(value) => ScalarIdentityNode::Parameter(value.clone()),
-                ResolvedIntExpr::Binder(value) => ScalarIdentityNode::Binder(value.clone()),
-                ResolvedIntExpr::Source { source, coordinates } => ScalarIdentityNode::Source {
-                    source: source.clone(),
-                    coordinates: coordinates.iter().map(child).collect(),
-                },
-                ResolvedIntExpr::Add(left, right) => ScalarIdentityNode::Binary {
-                    operation: ScalarOperation::Add,
-                    left: child(left),
-                    right: child(right),
-                },
-                ResolvedIntExpr::Sub(left, right) => ScalarIdentityNode::Binary {
-                    operation: ScalarOperation::Sub,
-                    left: child(left),
-                    right: child(right),
-                },
-                ResolvedIntExpr::Mul(left, right) => ScalarIdentityNode::Binary {
-                    operation: ScalarOperation::Mul,
-                    left: child(left),
-                    right: child(right),
-                },
-                ResolvedIntExpr::Div(left, right) => ScalarIdentityNode::Binary {
-                    operation: ScalarOperation::ExactDiv,
-                    left: child(left),
-                    right: child(right),
-                },
-                ResolvedIntExpr::EuclideanDiv(left, right) => ScalarIdentityNode::Binary {
-                    operation: ScalarOperation::EuclideanDiv,
-                    left: child(left),
-                    right: child(right),
-                },
-                ResolvedIntExpr::EuclideanRemainder(left, right) => ScalarIdentityNode::Binary {
-                    operation: ScalarOperation::EuclideanRemainder,
-                    left: child(left),
-                    right: child(right),
-                },
-                ResolvedIntExpr::RoundDiv(left, right) => ScalarIdentityNode::Binary {
-                    operation: ScalarOperation::RoundDiv,
-                    left: child(left),
-                    right: child(right),
-                },
-                ResolvedIntExpr::Log2Ceil(input) => ScalarIdentityNode::Unary {
-                    operation: ScalarOperation::Log2Ceil,
-                    input: child(input),
-                },
-                ResolvedIntExpr::ExtractCoefficient { position, .. } => {
-                    // Matrix identities are carried by the scalar entry's typed node;
-                    // extraction proof strength is a fact, not a semantic key.
-                    ScalarIdentityNode::ExtractCoefficient {
-                        matrix: super::normal_form::MatrixValueIdentityId(0),
-                        position: child(position),
-                        canonical_exclusive_upper: None,
-                    }
-                }
-            };
-            resolved.insert(key, self.intern_identity(node));
-        }
-        *resolved.get(&(value as *const ResolvedIntExpr as usize)).expect("root identity")
     }
 
     fn intern_identity(&mut self, node: ScalarIdentityNode) -> ScalarIdentityId {
@@ -1384,8 +1507,120 @@ impl ScalarStore {
         self.get(id).map(|entry| &entry.analysis)
     }
 
-    pub fn identity(&self, id: ScalarId) -> Option<&ResolvedIntExpr> {
-        self.get(id).map(|entry| &entry.identity_expr)
+    /// Returns the canonical scalar identity as a descriptor-local arena.
+    /// The descriptor contains no scalar-store IDs and is safe to drop at
+    /// arbitrary expression depth.
+    pub fn identity(&self, id: ScalarId) -> Option<ResolvedIntExpr> {
+        let root = self.get(id)?.identity;
+        let mut order = Vec::new();
+        let mut positions = HashMap::new();
+        let mut work = vec![(root, false)];
+        while let Some((current, expanded)) = work.pop() {
+            if positions.contains_key(&current) {
+                continue;
+            }
+            let node = self.identity_node(current)?;
+            if !expanded {
+                work.push((current, true));
+                match node {
+                    ScalarIdentityNode::Source { coordinates, .. } => {
+                        work.extend(coordinates.iter().rev().map(|id| (*id, false)))
+                    }
+                    ScalarIdentityNode::Unary { input, .. } => work.push((*input, false)),
+                    ScalarIdentityNode::Binary { left, right, .. } => {
+                        work.push((*right, false));
+                        work.push((*left, false));
+                    }
+                    ScalarIdentityNode::Switch { selector, cases } => {
+                        work.extend(cases.iter().rev().map(|id| (*id, false)));
+                        work.push((*selector, false));
+                    }
+                    ScalarIdentityNode::BitExtract { input, .. } |
+                    ScalarIdentityNode::ExtractCoefficient { position: input, .. } => {
+                        work.push((*input, false));
+                    }
+                    ScalarIdentityNode::Const(_) |
+                    ScalarIdentityNode::Bool(_) |
+                    ScalarIdentityNode::Real(_) |
+                    ScalarIdentityNode::Parameter(_) |
+                    ScalarIdentityNode::Binder(_) => {}
+                }
+            } else {
+                positions.insert(current, order.len());
+                order.push(current);
+            }
+        }
+        self.identity_arena(root, &order, &positions)
+    }
+
+    fn identity_arena(
+        &self,
+        root: ScalarIdentityId,
+        order: &[ScalarIdentityId],
+        positions: &HashMap<ScalarIdentityId, usize>,
+    ) -> Option<ResolvedIntExpr> {
+        let child = |id: ScalarIdentityId| u32::try_from(*positions.get(&id)?).ok();
+        let nodes = order
+            .iter()
+            .map(|id| match self.identity_node(*id)? {
+                ScalarIdentityNode::Const(value) => {
+                    Some(ResolvedIntExprArenaNode::Const(value.clone()))
+                }
+                ScalarIdentityNode::Parameter(value) => {
+                    Some(ResolvedIntExprArenaNode::Parameter(value.clone()))
+                }
+                ScalarIdentityNode::Binder(value) => {
+                    Some(ResolvedIntExprArenaNode::Binder(value.clone()))
+                }
+                ScalarIdentityNode::Source { source, coordinates } => {
+                    Some(ResolvedIntExprArenaNode::Source {
+                        source: source.clone(),
+                        coordinates: coordinates
+                            .iter()
+                            .map(|id| child(*id))
+                            .collect::<Option<Box<_>>>()?,
+                    })
+                }
+                ScalarIdentityNode::Binary { operation, left, right } => {
+                    let operation = match operation {
+                        ScalarOperation::Add => ResolvedIntBinaryOperation::Add,
+                        ScalarOperation::Sub => ResolvedIntBinaryOperation::Sub,
+                        ScalarOperation::Mul => ResolvedIntBinaryOperation::Mul,
+                        ScalarOperation::ExactDiv => ResolvedIntBinaryOperation::Div,
+                        ScalarOperation::EuclideanDiv => ResolvedIntBinaryOperation::EuclideanDiv,
+                        ScalarOperation::EuclideanRemainder => {
+                            ResolvedIntBinaryOperation::EuclideanRemainder
+                        }
+                        ScalarOperation::RoundDiv => ResolvedIntBinaryOperation::RoundDiv,
+                        _ => return None,
+                    };
+                    Some(ResolvedIntExprArenaNode::Binary {
+                        operation,
+                        children: [child(*left)?, child(*right)?],
+                    })
+                }
+                ScalarIdentityNode::Unary { operation, input } => {
+                    if *operation != ScalarOperation::Log2Ceil {
+                        return None;
+                    }
+                    Some(ResolvedIntExprArenaNode::Log2Ceil(child(*input)?))
+                }
+                ScalarIdentityNode::ExtractCoefficient { matrix, position } => {
+                    Some(ResolvedIntExprArenaNode::ExtractMatrixCoefficient {
+                        matrix: Box::new(matrix.clone()),
+                        position: child(*position)?,
+                    })
+                }
+                ScalarIdentityNode::BitExtract { .. } |
+                ScalarIdentityNode::Switch { .. } |
+                ScalarIdentityNode::Bool(_) |
+                ScalarIdentityNode::Real(_) => return None,
+            })
+            .collect::<Option<Box<_>>>()?;
+        Some(ResolvedIntExpr::Arena(Box::new(ResolvedIntExprArena {
+            nodes,
+            root: u32::try_from(*positions.get(&root)?).ok()?,
+        })))
     }
 
     pub fn len(&self) -> usize {
@@ -1404,133 +1639,40 @@ impl ScalarStore {
         self.identities.get(id.0 as usize)
     }
 
-    /// Inserts a coefficient extraction without making the matrix expression
-    /// a scalar node.  This is the only temporary bridge needed by the matrix
-    /// DAG until the lowerer is migrated to `ScalarNode::ExtractCoefficient`.
+    /// Inserts a coefficient extraction at the matrix/scalar boundary. The
+    /// position is an existing typed scalar entry; its canonical identity is
+    /// read from this arena, so the node and its semantic key cannot diverge.
     pub fn intern_extract(
         &mut self,
-        key: ScalarExtractKey,
-        extracted_facts: super::analysis::AnalysisData,
+        matrix: super::normal_form::ResolvedMatrixValueIdentity,
+        position: ScalarId,
+        facts: ScalarFacts,
     ) -> Result<ScalarId, ScalarTransferError> {
-        let integer_domain = convert_integer_domain(extracted_facts.integer_domain);
-        let facts = ScalarFacts {
-            sort: extracted_facts.sort.clone().map(|sort| match sort {
-                super::analysis::MxxSort::Int => ScalarSort::Int,
-                super::analysis::MxxSort::Bool => ScalarSort::Bool,
-                super::analysis::MxxSort::Real => ScalarSort::Real,
-                super::analysis::MxxSort::Bytes(length) => ScalarSort::Bytes(length),
-                super::analysis::MxxSort::TypedBlob { type_name, schema_hash } => {
-                    ScalarSort::TypedBlob { type_name, schema_hash }
-                }
-                super::analysis::MxxSort::Matrix(matrix) => ScalarSort::Matrix(matrix),
-            }),
-            integer_domain,
-            scalar_provenance: extracted_facts.scalar_provenance.map(
-                |provenance| match provenance {
-                    super::analysis::ScalarProvenance::Ordinary => ScalarProvenance::Ordinary,
-                    super::analysis::ScalarProvenance::SelectorOnly => {
-                        ScalarProvenance::SelectorOnly
-                    }
-                },
-            ),
-            possible_false: extracted_facts.possible_false,
-            possible_true: extracted_facts.possible_true,
-            real_constant_bits: extracted_facts.real_constant_bits,
-            canonical_coefficient_exclusive_upper: extracted_facts
-                .canonical_coefficient_exclusive_upper,
-            canonical_residue_convention: extracted_facts.canonical_residue_convention,
-            direct_extract: extracted_facts
-                .direct_extract
-                .map(|fact| DirectExtractFact { canonical_upper: fact.canonical_upper }),
-        };
-        let position_identity = self.intern_expr_identity(&key.position);
+        let position_identity = self
+            .get(position)
+            .map(|entry| entry.identity)
+            .ok_or(ScalarTransferError::MissingChild)?;
         // The external proof upper is deliberately excluded from this key:
         // the same extraction with two proof strengths is one semantic scalar,
         // and the facts merge conservatively below.
         let extraction_identity = self.intern_identity(ScalarIdentityNode::ExtractCoefficient {
-            matrix: key.matrix,
+            matrix: matrix.clone(),
             position: position_identity,
-            canonical_exclusive_upper: None,
         });
         if let Some(id) = self.by_identity.get(&extraction_identity).copied() {
             let merge =
                 Self::merge_repeated_facts(&mut self.entries[id.0 as usize].analysis, facts, true);
-            dispose_resolved_int_expr(key.position);
             merge?;
             return Ok(id);
         }
-        let position_id = self.intern(
-            ScalarNode::IntConst(BigInt::zero()),
-            ResolvedIntExpr::Const(BigInt::zero()),
-            ScalarFacts::scalar(
-                ScalarSort::Int,
-                Some(IntegerDomain::exact(0)),
-                ScalarProvenance::Ordinary,
-            ),
-        )?;
         let id = ScalarId(self.entries.len() as u32);
         self.by_identity.insert(extraction_identity, id);
         self.entries.push(ScalarEntry {
-            node: ScalarNode::ExtractCoefficient {
-                canonical_exclusive_upper: facts
-                    .direct_extract
-                    .as_ref()
-                    .and_then(|fact| fact.canonical_upper.clone()),
-                matrix: key.matrix,
-                position: position_id,
-            },
+            node: ScalarNode::ExtractCoefficient { matrix, position },
             identity: extraction_identity,
-            identity_expr: ResolvedIntExpr::ExtractCoefficient {
-                input: Box::new(ResolvedIntExpr::Const(BigInt::zero())),
-                position: Box::new(key.position),
-                canonical_exclusive_upper: None,
-            },
             analysis: facts,
         });
         Ok(id)
-    }
-}
-
-fn convert_integer_domain(domain: Option<super::analysis::IntegerDomain>) -> Option<IntegerDomain> {
-    domain.map(|domain| match domain {
-        super::analysis::IntegerDomain::Exact(value) => IntegerDomain::Exact(value),
-        super::analysis::IntegerDomain::IntervalOnly(interval) => {
-            IntegerDomain::IntervalOnly(IntegerInterval {
-                minimum: interval.minimum,
-                maximum: interval.maximum,
-            })
-        }
-        super::analysis::IntegerDomain::Affine { constant, coefficients, binders } => {
-            IntegerDomain::Affine {
-                constant,
-                coefficients,
-                binders: binders
-                    .into_iter()
-                    .map(|(binder, interval)| {
-                        (
-                            binder,
-                            IntegerInterval {
-                                minimum: interval.minimum,
-                                maximum: interval.maximum,
-                            },
-                        )
-                    })
-                    .collect(),
-            }
-        }
-    })
-}
-
-fn convert_sort(sort: super::analysis::MxxSort) -> ScalarSort {
-    match sort {
-        super::analysis::MxxSort::Int => ScalarSort::Int,
-        super::analysis::MxxSort::Bool => ScalarSort::Bool,
-        super::analysis::MxxSort::Real => ScalarSort::Real,
-        super::analysis::MxxSort::Bytes(length) => ScalarSort::Bytes(length),
-        super::analysis::MxxSort::TypedBlob { type_name, schema_hash } => {
-            ScalarSort::TypedBlob { type_name, schema_hash }
-        }
-        super::analysis::MxxSort::Matrix(matrix) => ScalarSort::Matrix(matrix),
     }
 }
 
@@ -1719,7 +1861,7 @@ mod tests {
         let mut symbols = SymbolTables::default();
         let source_id = symbols.atomic_sources.intern(AtomicSourceDescriptor {
             key: super::super::identity::AtomicSourceKey::ProtocolInput(ProtocolInputId::from("x")),
-            sort: super::super::analysis::MxxSort::Int,
+            sort: ScalarSort::Int,
             integer_domain: Some(super::super::identity::IntegerSourceDomain {
                 minimum: 0.into(),
                 maximum: 7.into(),
@@ -1743,7 +1885,7 @@ mod tests {
     fn source_transfer_is_sort_specific_and_matrix_is_boundary_only() {
         let mut symbols = SymbolTables::default();
         let (bytes_id, blob_id, matrix_id) = {
-            let mut source = |name: &str, sort: super::super::analysis::MxxSort| {
+            let mut source = |name: &str, sort: ScalarSort| {
                 symbols.atomic_sources.intern(AtomicSourceDescriptor {
                     key: super::super::identity::AtomicSourceKey::ProtocolInput(
                         ProtocolInputId::from(name),
@@ -1754,16 +1896,10 @@ mod tests {
                     relation_role: None,
                 })
             };
-            let bytes_id = source(
-                "bytes",
-                super::super::analysis::MxxSort::Bytes(ResolvedIntExpr::Const(4.into())),
-            );
+            let bytes_id = source("bytes", ScalarSort::Bytes(ResolvedIntExpr::Const(4.into())));
             let blob_id = source(
                 "blob",
-                super::super::analysis::MxxSort::TypedBlob {
-                    type_name: "TestBlob".to_owned(),
-                    schema_hash: [7; 32],
-                },
+                ScalarSort::TypedBlob { type_name: "TestBlob".to_owned(), schema_hash: [7; 32] },
             );
             let matrix = ResolvedMatrixType {
                 modulus: ResolvedIntExpr::Const(17.into()),
@@ -1771,7 +1907,7 @@ mod tests {
                 rows: ResolvedIntExpr::Const(1.into()),
                 columns: ResolvedIntExpr::Const(1.into()),
             };
-            let matrix_id = source("matrix", super::super::analysis::MxxSort::Matrix(matrix));
+            let matrix_id = source("matrix", ScalarSort::Matrix(matrix));
             (bytes_id, blob_id, matrix_id)
         };
         for (source_id, expected) in [
@@ -1810,7 +1946,7 @@ mod tests {
             let mut symbols = SymbolTables::default();
             let first = symbols.atomic_sources.intern(AtomicSourceDescriptor {
                 key: source_key.clone(),
-                sort: super::super::analysis::MxxSort::Int,
+                sort: ScalarSort::Int,
                 integer_domain: Some(super::super::identity::IntegerSourceDomain {
                     minimum: 0.into(),
                     maximum: first_maximum.into(),
@@ -1820,7 +1956,7 @@ mod tests {
             });
             let second = symbols.atomic_sources.intern(AtomicSourceDescriptor {
                 key: source_key.clone(),
-                sort: super::super::analysis::MxxSort::Int,
+                sort: ScalarSort::Int,
                 integer_domain: Some(super::super::identity::IntegerSourceDomain {
                     minimum: 0.into(),
                     maximum: second_maximum.into(),
@@ -1828,20 +1964,16 @@ mod tests {
                 canonical_residue_convention: None,
                 relation_role: None,
             });
-            let identity =
-                ResolvedIntExpr::Source { source: source_key.clone(), coordinates: Box::new([]) };
             let mut store = ScalarStore::default();
             store
                 .intern_node(
                     ScalarNode::Source { source: AtomicSourceId(first), indices: Box::new([]) },
-                    identity.clone(),
                     &symbols,
                 )
                 .unwrap();
             assert_eq!(
                 store.intern_node(
                     ScalarNode::Source { source: AtomicSourceId(second), indices: Box::new([]) },
-                    identity,
                     &symbols,
                 ),
                 Err(ScalarTransferError::FactConflict)
@@ -1850,76 +1982,68 @@ mod tests {
     }
 
     #[test]
-    fn repeated_operation_requires_exact_transferred_facts() {
-        let mut store = ScalarStore::default();
-        let identity = ResolvedIntExpr::Add(
-            Box::new(ResolvedIntExpr::Const(1.into())),
-            Box::new(ResolvedIntExpr::Const(2.into())),
-        );
-        let node = ScalarNode::IntAdd([ScalarId(0), ScalarId(1)]);
-        let first = store.intern(node.clone(), identity.clone(), integer(3)).unwrap();
-        assert_eq!(
-            store.intern(node, identity, integer(4)),
-            Err(ScalarTransferError::FactConflict)
-        );
-        assert_eq!(store.len(), 1);
-        assert_eq!(store.get(first).unwrap().analysis, integer(3));
-    }
-
-    #[test]
     fn semantic_identity_is_shallow_and_direct_extract_proofs_merge() {
         let mut store = ScalarStore::default();
-        let mut identity = ResolvedIntExpr::Const(0.into());
-        for _ in 0..2048 {
-            identity = ResolvedIntExpr::Add(
-                Box::new(identity),
-                Box::new(ResolvedIntExpr::Const(1.into())),
-            );
-        }
-        let id =
-            store.intern(ScalarNode::IntConst(1.into()), identity.clone(), integer(1)).unwrap();
-        assert_eq!(store.identity(id), Some(&identity));
-        assert!(store.identity_len() >= 2049);
-
-        let same = store
-            .intern(ScalarNode::IntParameter("not-the-node-key".to_owned()), identity, integer(1))
-            .unwrap();
-        assert_eq!(id, same);
+        let symbols = SymbolTables::default();
+        let id = store.intern_node(ScalarNode::IntConst(1.into()), &symbols).unwrap();
+        assert!(matches!(store.identity(id), Some(ResolvedIntExpr::Arena(_))));
         assert_eq!(store.len(), 1);
 
-        let key = ScalarExtractKey {
-            operation: ScalarOperation::ExtractCoefficient,
-            matrix: super::super::normal_form::MatrixValueIdentityId(11),
-            position: ResolvedIntExpr::Const(2.into()),
+        let position = store.intern_node(ScalarNode::IntConst(2.into()), &symbols).unwrap();
+        let matrix = super::super::normal_form::ResolvedMatrixValueIdentity {
+            nodes: vec![super::super::normal_form::ResolvedMatrixValueIdentityNode {
+                operation: super::super::normal_form::MatrixValueOperation::Atom,
+                children: Box::new([]),
+                owner: None,
+                selector: None,
+            }]
+            .into_boxed_slice(),
+            root: 0,
         };
-        let matrix = super::super::identity::ResolvedMatrixType {
+        let five = BigUint::from(5_u8);
+        let matrix_type = super::super::identity::ResolvedMatrixType {
             modulus: ResolvedIntExpr::Const(17.into()),
             ring_dimension: ResolvedIntExpr::Const(1.into()),
             rows: ResolvedIntExpr::Const(1.into()),
             columns: ResolvedIntExpr::Const(1.into()),
         };
-        let five = BigUint::from(5_u8);
-        let mut first = super::super::analysis::MxxAnalysis::direct_extract_data(
-            matrix.clone(),
-            BigUint::from(17_u8),
-            None,
-        )
-        .unwrap();
+        let mut first =
+            super::direct_extract_facts(matrix_type.clone(), BigUint::from(17_u8), None).unwrap();
         first.direct_extract = None;
-        let first_id = store.intern_extract(key.clone(), first).unwrap();
-        let second = super::super::analysis::MxxAnalysis::direct_extract_data(
-            matrix,
-            BigUint::from(17_u8),
-            Some(&five),
-        )
-        .unwrap();
-        let second_id = store.intern_extract(key, second).unwrap();
+        let first_id = store.intern_extract(matrix.clone(), position, first).unwrap();
+        let second =
+            super::direct_extract_facts(matrix_type, BigUint::from(17_u8), Some(&five)).unwrap();
+        let second_id = store.intern_extract(matrix, position, second).unwrap();
         assert_eq!(first_id, second_id);
         assert_eq!(
             store.get(first_id).unwrap().analysis.direct_extract.as_ref().unwrap().canonical_upper,
             Some(five)
         );
         assert_eq!(store.get(first_id).unwrap().analysis.canonical_residue_convention, None);
+
+        let different_matrix = super::super::normal_form::ResolvedMatrixValueIdentity {
+            nodes: vec![super::super::normal_form::ResolvedMatrixValueIdentityNode {
+                operation: super::super::normal_form::MatrixValueOperation::Negate,
+                children: Box::new([]),
+                owner: None,
+                selector: None,
+            }]
+            .into_boxed_slice(),
+            root: 0,
+        };
+        let distinct = super::direct_extract_facts(
+            super::super::identity::ResolvedMatrixType {
+                modulus: ResolvedIntExpr::Const(17.into()),
+                ring_dimension: ResolvedIntExpr::Const(1.into()),
+                rows: ResolvedIntExpr::Const(1.into()),
+                columns: ResolvedIntExpr::Const(1.into()),
+            },
+            BigUint::from(17_u8),
+            None,
+        )
+        .unwrap();
+        let distinct_id = store.intern_extract(different_matrix, position, distinct).unwrap();
+        assert_ne!(first_id, distinct_id);
     }
 
     #[test]
@@ -1929,35 +2053,236 @@ mod tests {
             .stack_size(128 * 1024)
             .spawn(|| {
                 let mut store = ScalarStore::default();
-                let build_branch = || {
-                    let mut branch = ResolvedIntExpr::Const(1.into());
-                    for _ in 0..4096 {
-                        branch = ResolvedIntExpr::Add(
-                            Box::new(branch),
-                            Box::new(ResolvedIntExpr::Const(1.into())),
-                        );
-                    }
-                    branch
-                };
-                let diamond =
-                    ResolvedIntExpr::Add(Box::new(build_branch()), Box::new(build_branch()));
+                let symbols = SymbolTables::default();
+                let one = store.intern_node(ScalarNode::IntConst(1.into()), &symbols).unwrap();
+                let mut branch = one;
+                for _ in 0..4096 {
+                    branch =
+                        store.intern_node(ScalarNode::IntAdd([branch, one]), &symbols).unwrap();
+                }
                 let first =
-                    store.intern(ScalarNode::IntConst(1.into()), diamond, integer(1)).unwrap();
-                let duplicate =
-                    ResolvedIntExpr::Add(Box::new(build_branch()), Box::new(build_branch()));
-                let second = store
-                    .intern(
-                        ScalarNode::IntParameter("duplicate-diamond".to_owned()),
-                        duplicate,
-                        integer(1),
-                    )
-                    .unwrap();
+                    store.intern_node(ScalarNode::IntAdd([branch, branch]), &symbols).unwrap();
+                let second =
+                    store.intern_node(ScalarNode::IntAdd([branch, branch]), &symbols).unwrap();
                 assert_eq!(first, second);
-                assert_eq!(store.len(), 1);
-                assert_eq!(store.identity_len(), 4098);
-                assert!(store.identity(first).is_some());
+                assert_eq!(store.len(), 4098);
+                assert!(store.identity_node(store.get(first).unwrap().identity).is_some());
+                let identity = store.identity(first).expect("deep identity descriptor");
+                assert!(matches!(identity, ResolvedIntExpr::Arena(_)));
+                drop(identity);
             })
             .expect("spawn scalar identity depth test");
         worker.join().expect("scalar identity depth test panicked");
+    }
+
+    #[test]
+    fn deep_identity_arena_substitutes_owned_binder_without_expansion() {
+        let worker = thread::Builder::new()
+            .name("scalar-identity-substitution-depth-test".to_owned())
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                use super::super::identity::{
+                    BinderKey, OccurrenceScope, ProgramKey, ResolvedIntBinaryOperation,
+                    ResolvedIntExprArena, ResolvedIntExprArenaNode,
+                };
+                let binder = BinderKey {
+                    loop_scope: OccurrenceScope {
+                        program: ProgramKey::Ideal,
+                        definition: mxx_ir_core::FrozenGraphScopeId::Root,
+                        path: Box::new([]),
+                    },
+                    loop_node: mxx_ir_core::NodeId(0),
+                    slot: 0,
+                };
+                let mut nodes = vec![ResolvedIntExprArenaNode::Binder(binder.clone())];
+                let mut current = 0_u32;
+                for _ in 0..4096 {
+                    let next = nodes.len() as u32;
+                    nodes.push(ResolvedIntExprArenaNode::Binary {
+                        operation: ResolvedIntBinaryOperation::Add,
+                        children: [current, current],
+                    });
+                    current = next;
+                }
+                let expression = ResolvedIntExpr::Arena(Box::new(ResolvedIntExprArena {
+                    nodes: nodes.into_boxed_slice(),
+                    root: current,
+                }));
+                let substituted = super::super::identity::substitute_resolved_int_expr(
+                    &expression,
+                    &binder,
+                    &ResolvedIntExpr::Const(7.into()),
+                );
+                assert!(matches!(substituted, ResolvedIntExpr::Arena(_)));
+                drop(substituted);
+                drop(expression);
+            })
+            .expect("spawn scalar identity substitution depth test");
+        worker.join().expect("scalar identity substitution depth test panicked");
+    }
+
+    #[test]
+    fn arena_substitution_splices_compound_replacement_and_preserves_context() {
+        use super::super::identity::{
+            BinderKey, OccurrenceScope, ProgramKey, ResolvedIntBinaryOperation,
+            ResolvedIntExprArena, ResolvedIntExprArenaNode,
+        };
+        let binder = BinderKey {
+            loop_scope: OccurrenceScope {
+                program: ProgramKey::Ideal,
+                definition: mxx_ir_core::FrozenGraphScopeId::Root,
+                path: Box::new([]),
+            },
+            loop_node: mxx_ir_core::NodeId(0),
+            slot: 0,
+        };
+        let expression = ResolvedIntExpr::Arena(Box::new(ResolvedIntExprArena {
+            nodes: vec![
+                ResolvedIntExprArenaNode::Binder(binder.clone()),
+                ResolvedIntExprArenaNode::Const(1.into()),
+                ResolvedIntExprArenaNode::Binary {
+                    operation: ResolvedIntBinaryOperation::Add,
+                    children: [0, 1],
+                },
+            ]
+            .into_boxed_slice(),
+            root: 2,
+        }));
+        let replacement = ResolvedIntExpr::Add(
+            Box::new(ResolvedIntExpr::Const(2.into())),
+            Box::new(ResolvedIntExpr::Const(3.into())),
+        );
+        let substituted = super::super::identity::substitute_resolved_int_expr(
+            &expression,
+            &binder,
+            &replacement,
+        );
+        let expected = ResolvedIntExpr::Arena(Box::new(ResolvedIntExprArena {
+            nodes: vec![
+                ResolvedIntExprArenaNode::Const(2.into()),
+                ResolvedIntExprArenaNode::Const(3.into()),
+                ResolvedIntExprArenaNode::Binary {
+                    operation: ResolvedIntBinaryOperation::Add,
+                    children: [0, 1],
+                },
+                ResolvedIntExprArenaNode::Const(1.into()),
+                ResolvedIntExprArenaNode::Binary {
+                    operation: ResolvedIntBinaryOperation::Add,
+                    children: [2, 3],
+                },
+            ]
+            .into_boxed_slice(),
+            root: 4,
+        }));
+        assert_eq!(substituted, expected);
+        assert_eq!(
+            super::super::identity::resolved_expr_as_arena(&substituted),
+            super::super::identity::resolved_expr_as_arena(&expected)
+        );
+    }
+
+    #[test]
+    fn arena_substitution_handles_extraction_positions_and_canonical_sharing() {
+        use super::super::identity::{
+            BinderKey, OccurrenceScope, ProgramKey, ResolvedIntBinaryOperation,
+            ResolvedIntExprArena, ResolvedIntExprArenaNode,
+        };
+        let binder = BinderKey {
+            loop_scope: OccurrenceScope {
+                program: ProgramKey::Ideal,
+                definition: mxx_ir_core::FrozenGraphScopeId::Root,
+                path: Box::new([]),
+            },
+            loop_node: mxx_ir_core::NodeId(1),
+            slot: 0,
+        };
+        let matrix = super::super::normal_form::ResolvedMatrixValueIdentity {
+            nodes: vec![super::super::normal_form::ResolvedMatrixValueIdentityNode {
+                operation: super::super::normal_form::MatrixValueOperation::Atom,
+                children: Box::new([]),
+                owner: None,
+                selector: None,
+            }]
+            .into_boxed_slice(),
+            root: 0,
+        };
+        let extracted = ResolvedIntExpr::Arena(Box::new(ResolvedIntExprArena {
+            nodes: vec![
+                ResolvedIntExprArenaNode::Binder(binder.clone()),
+                ResolvedIntExprArenaNode::ExtractMatrixCoefficient {
+                    matrix: Box::new(matrix),
+                    position: 0,
+                },
+            ]
+            .into_boxed_slice(),
+            root: 1,
+        }));
+        let substituted = super::super::identity::substitute_resolved_int_expr(
+            &extracted,
+            &binder,
+            &ResolvedIntExpr::Const(7.into()),
+        );
+        let ResolvedIntExpr::Arena(substituted) = substituted else {
+            panic!("extraction substitution must remain an arena")
+        };
+        let ResolvedIntExprArenaNode::ExtractMatrixCoefficient { position, .. } =
+            &substituted.nodes[substituted.root as usize]
+        else {
+            panic!("extraction root was not preserved")
+        };
+        assert!(matches!(
+            &substituted.nodes[*position as usize],
+            ResolvedIntExprArenaNode::Const(value) if value == &7.into()
+        ));
+
+        let binder_plus_one = ResolvedIntExpr::Arena(Box::new(ResolvedIntExprArena {
+            nodes: vec![
+                ResolvedIntExprArenaNode::Binder(binder.clone()),
+                ResolvedIntExprArenaNode::Const(1.into()),
+                ResolvedIntExprArenaNode::Binary {
+                    operation: ResolvedIntBinaryOperation::Add,
+                    children: [0, 1],
+                },
+            ]
+            .into_boxed_slice(),
+            root: 2,
+        }));
+        let one_plus_one = ResolvedIntExpr::Arena(Box::new(ResolvedIntExprArena {
+            nodes: vec![
+                ResolvedIntExprArenaNode::Const(1.into()),
+                ResolvedIntExprArenaNode::Binary {
+                    operation: ResolvedIntBinaryOperation::Add,
+                    children: [0, 0],
+                },
+            ]
+            .into_boxed_slice(),
+            root: 1,
+        }));
+        let substituted = super::super::identity::substitute_resolved_int_expr(
+            &binder_plus_one,
+            &binder,
+            &ResolvedIntExpr::Const(1.into()),
+        );
+        assert_eq!(
+            super::super::identity::resolved_expr_as_arena(&substituted),
+            super::super::identity::resolved_expr_as_arena(&one_plus_one)
+        );
+
+        let separately_built = ResolvedIntExpr::Arena(Box::new(ResolvedIntExprArena {
+            nodes: vec![
+                ResolvedIntExprArenaNode::Const(1.into()),
+                ResolvedIntExprArenaNode::Const(1.into()),
+                ResolvedIntExprArenaNode::Binary {
+                    operation: ResolvedIntBinaryOperation::Add,
+                    children: [0, 1],
+                },
+            ]
+            .into_boxed_slice(),
+            root: 2,
+        }));
+        assert_eq!(
+            super::super::identity::resolved_expr_as_arena(&separately_built),
+            super::super::identity::resolved_expr_as_arena(&one_plus_one)
+        );
     }
 }

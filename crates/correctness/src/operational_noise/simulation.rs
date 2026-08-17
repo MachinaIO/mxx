@@ -7,9 +7,9 @@
 
 use super::{
     OperationalAcceptanceReport, OperationalSimulationDiagnostics, OperationalSimulationReport,
-    analysis::{MxxAnalysis, ResourceBudget},
     bound::MatrixBound,
     error::{OperationalSimulationError, TargetError},
+    identity::SymbolTables,
     lower::{GraphLowerer, LoweredValue, LoweringControl},
     normal_form::{
         BoundedSummary, ExpressionDag, ExpressionNode, NormalFormError, NormalizationCounters,
@@ -50,7 +50,7 @@ struct DagProgressStats {
 
 /// Counts the unique DAG nodes that the normalizer can reach from a root set.
 /// This is deliberately a structural walk over the already lowered DAG; it
-/// never uses lowered wire occurrences or the old e-graph size as a proxy for
+/// never uses lowered wire occurrences or scalar-store size as a proxy for
 /// normal-form work.
 fn dag_progress_stats(
     dag: &ExpressionDag,
@@ -297,10 +297,6 @@ impl<'a> SimulationControl<'a> {
         self.progress_site = Some((program, scope, node));
     }
 
-    fn analysis_budget(&self) -> ResourceBudget {
-        ResourceBudget::from_shared(Arc::clone(&self.owned_elements))
-    }
-
     pub(crate) fn reserve_owned_elements(
         &mut self,
         requested: usize,
@@ -476,11 +472,13 @@ pub fn check_operational_noise_candidate_with_progress(
         &mut control,
         |control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
-            let analysis =
-                MxxAnalysis::with_resource_budget(Default::default(), control.analysis_budget());
             let mut lowering_control = LoweringControlAdapter { control };
-            let mut lowerer =
-                GraphLowerer::new_with_control(protocol, request, analysis, &mut lowering_control);
+            let mut lowerer = GraphLowerer::new_with_control(
+                protocol,
+                request,
+                SymbolTables::default(),
+                &mut lowering_control,
+            );
             let lowered = lowerer.lower_stage_wire(&stage, wire);
             let lowerer = lowerer.into_uncontrolled();
             let value = match lowered {

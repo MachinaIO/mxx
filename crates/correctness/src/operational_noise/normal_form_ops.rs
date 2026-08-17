@@ -1,4 +1,4 @@
-//! First operation-table transfer rules for the egg-independent normal form.
+//! First operation-table transfer rules for the typed normal form.
 //!
 //! The operations here are pure NF-to-NF transfers.  They consume the typed
 //! owner identities and matrix bounds already produced by lowering; no second

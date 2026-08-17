@@ -6,7 +6,10 @@
 //! the sole owner of compact job-local IDs; no lowering cache is an identity
 //! authority.
 
-use super::{normal_form::FactorIdentity, scalar::ScalarSort};
+use super::{
+    normal_form::{FactorIdentity, ResolvedMatrixValueIdentity},
+    scalar::ScalarSort,
+};
 use crate::{ProtocolInputId, StageId};
 #[cfg(test)]
 use mxx_ir_core::Port;
@@ -138,7 +141,7 @@ pub struct IntegerSourceDomain {
     pub maximum: BigInt,
 }
 
-/// Closed sampler role used to construct relation provenance directly on an Atom e-class.
+/// Closed sampler role used to construct relation provenance directly on an atomic source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum AtomicRelationRole {
     Preimage,
@@ -148,11 +151,10 @@ pub enum AtomicRelationRole {
     SmallDecomposedHash { range_proved: bool },
 }
 
-/// The complete descriptor for an `MxxLang::Atom`.
+/// The complete descriptor for one atomic source.
 ///
-/// Egg's `Analysis::make` receives only the compact `AtomicSourceId`; keeping
-/// the sort beside its stable key in this one interner is therefore necessary
-/// to type the atom without a lowering-side type cache.
+/// Keeping the sort beside its stable key in this interner gives lowering and
+/// normalization one typed source table without a second type cache.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct AtomicSourceDescriptor {
     pub key: AtomicSourceKey,
@@ -162,9 +164,8 @@ pub struct AtomicSourceDescriptor {
     pub relation_role: Option<AtomicRelationRole>,
 }
 
-/// The source of a trapdoor descriptor.  Trapdoors are structural lowering
-/// values, rather than ordinary egg-language values, but obey the same source
-/// identity rule as atoms.
+/// The source of a trapdoor descriptor. Trapdoors are structural lowering
+/// values and obey the same source identity rule as atoms.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum TrapdoorSourceKey {
     ProtocolInput(ProtocolInputId),
@@ -192,11 +193,42 @@ pub enum ResolvedIntExpr {
     EuclideanRemainder(Box<Self>, Box<Self>),
     RoundDiv(Box<Self>, Box<Self>),
     Log2Ceil(Box<Self>),
-    ExtractCoefficient {
-        input: Box<Self>,
+    ExtractMatrixCoefficient {
+        matrix: Box<ResolvedMatrixValueIdentity>,
         position: Box<Self>,
-        canonical_exclusive_upper: Option<BigUint>,
     },
+    /// Descriptor-local postorder form used for very deep scalar identities.
+    /// Child indices are local to this immutable descriptor and never expose
+    /// a scalar-store handle.
+    Arena(Box<ResolvedIntExprArena>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ResolvedIntExprArena {
+    pub nodes: Box<[ResolvedIntExprArenaNode]>,
+    pub root: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ResolvedIntExprArenaNode {
+    Const(BigInt),
+    Parameter(String),
+    Binder(BinderKey),
+    Source { source: AtomicSourceKey, coordinates: Box<[u32]> },
+    Binary { operation: ResolvedIntBinaryOperation, children: [u32; 2] },
+    Log2Ceil(u32),
+    ExtractMatrixCoefficient { matrix: Box<ResolvedMatrixValueIdentity>, position: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ResolvedIntBinaryOperation {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    EuclideanDiv,
+    EuclideanRemainder,
+    RoundDiv,
 }
 
 impl ResolvedIntExpr {
@@ -234,7 +266,7 @@ impl ResolvedIntExpr {
     }
 }
 
-/// Substitute one owner-resolved loop binder without consulting an e-graph.
+/// Substitute one owner-resolved loop binder without consulting a global rewrite engine.
 /// This is used for structural family and trapdoor instantiation; binder
 /// ownership is preserved in every untouched coordinate and nested source.
 pub(crate) fn substitute_resolved_int_expr(
@@ -282,16 +314,538 @@ pub(crate) fn substitute_resolved_int_expr(
         ResolvedIntExpr::Log2Ceil(value) => ResolvedIntExpr::Log2Ceil(Box::new(
             substitute_resolved_int_expr(value, binder, replacement),
         )),
-        ResolvedIntExpr::ExtractCoefficient { input, position, canonical_exclusive_upper } => {
-            ResolvedIntExpr::ExtractCoefficient {
-                input: Box::new(substitute_resolved_int_expr(input, binder, replacement)),
+        ResolvedIntExpr::ExtractMatrixCoefficient { matrix, position } => {
+            ResolvedIntExpr::ExtractMatrixCoefficient {
+                matrix: Box::new(substitute_resolved_matrix_identity(matrix, binder, replacement)),
                 position: Box::new(substitute_resolved_int_expr(position, binder, replacement)),
-                canonical_exclusive_upper: canonical_exclusive_upper.clone(),
             }
         }
         ResolvedIntExpr::Const(_) | ResolvedIntExpr::Parameter(_) | ResolvedIntExpr::Binder(_) => {
             value.clone()
         }
+        ResolvedIntExpr::Arena(arena) => substitute_resolved_int_arena(arena, binder, replacement)
+            .expect("arena substitution root"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ArenaAppendKey {
+    Expression(usize),
+    ArenaNode(usize, u32),
+}
+
+struct ArenaAppendBuilder {
+    nodes: Vec<ResolvedIntExprArenaNode>,
+    completed: HashMap<ArenaAppendKey, u32>,
+    interned: BTreeMap<ResolvedIntExprArenaNode, u32>,
+}
+
+/// Returns a descriptor-local arena for semantic comparison and substitution
+/// helpers.  This is an internal normalization step, never a persistent
+/// identity authority or a nested-expression export.
+pub(crate) fn resolved_expr_as_arena(expression: &ResolvedIntExpr) -> Option<ResolvedIntExprArena> {
+    let mut builder = ArenaAppendBuilder::new();
+    let root = builder.append_expression(expression)?;
+    Some(ResolvedIntExprArena { nodes: builder.nodes.into_boxed_slice(), root })
+}
+
+impl ArenaAppendBuilder {
+    fn new() -> Self {
+        Self { nodes: Vec::new(), completed: HashMap::new(), interned: BTreeMap::new() }
+    }
+
+    fn intern_node(&mut self, node: ResolvedIntExprArenaNode) -> u32 {
+        if let Some(index) = self.interned.get(&node) {
+            return *index;
+        }
+        let index = self.nodes.len() as u32;
+        self.interned.insert(node.clone(), index);
+        self.nodes.push(node);
+        index
+    }
+
+    /// Imports an arbitrary resolved expression into one descriptor-local
+    /// postorder arena.  The work list also flattens nested arenas, so a
+    /// compound replacement never discards the source expression or falls
+    /// back to a recursive value representation.
+    fn append_expression(&mut self, expression: &ResolvedIntExpr) -> Option<u32> {
+        enum Work<'a> {
+            ExpressionEnter(&'a ResolvedIntExpr),
+            ExpressionExit(&'a ResolvedIntExpr),
+            ArenaEnter(&'a ResolvedIntExprArena, u32),
+            ArenaExit(&'a ResolvedIntExprArena, u32),
+            Alias(&'a ResolvedIntExpr, &'a ResolvedIntExprArena),
+        }
+        let expression_key = ArenaAppendKey::Expression(expression as *const _ as usize);
+        if let Some(index) = self.completed.get(&expression_key) {
+            return Some(*index);
+        }
+        let mut work = vec![Work::ExpressionEnter(expression)];
+        while let Some(task) = work.pop() {
+            match task {
+                Work::ExpressionEnter(value) => {
+                    let key = ArenaAppendKey::Expression(value as *const _ as usize);
+                    if self.completed.contains_key(&key) {
+                        continue;
+                    }
+                    if let ResolvedIntExpr::Arena(arena) = value {
+                        work.push(Work::Alias(value, arena));
+                        work.push(Work::ArenaEnter(arena, arena.root));
+                        continue;
+                    }
+                    work.push(Work::ExpressionExit(value));
+                    match value {
+                        ResolvedIntExpr::Source { coordinates, .. } => {
+                            work.extend(coordinates.iter().rev().map(Work::ExpressionEnter));
+                        }
+                        ResolvedIntExpr::Add(left, right) |
+                        ResolvedIntExpr::Sub(left, right) |
+                        ResolvedIntExpr::Mul(left, right) |
+                        ResolvedIntExpr::Div(left, right) |
+                        ResolvedIntExpr::EuclideanDiv(left, right) |
+                        ResolvedIntExpr::EuclideanRemainder(left, right) |
+                        ResolvedIntExpr::RoundDiv(left, right) => {
+                            work.push(Work::ExpressionEnter(right));
+                            work.push(Work::ExpressionEnter(left));
+                        }
+                        ResolvedIntExpr::Log2Ceil(input) => {
+                            work.push(Work::ExpressionEnter(input));
+                        }
+                        ResolvedIntExpr::ExtractMatrixCoefficient { position, .. } => {
+                            work.push(Work::ExpressionEnter(position));
+                        }
+                        ResolvedIntExpr::Const(_) |
+                        ResolvedIntExpr::Parameter(_) |
+                        ResolvedIntExpr::Binder(_) => {}
+                        ResolvedIntExpr::Arena(_) => {}
+                    }
+                }
+                Work::ExpressionExit(value) => {
+                    let index = match value {
+                        ResolvedIntExpr::Const(value) => self
+                            .intern_node(ResolvedIntExprArenaNode::Const(value.clone()))
+                            as usize,
+                        ResolvedIntExpr::Parameter(value) => self
+                            .intern_node(ResolvedIntExprArenaNode::Parameter(value.clone()))
+                            as usize,
+                        ResolvedIntExpr::Binder(value) => self
+                            .intern_node(ResolvedIntExprArenaNode::Binder(value.clone()))
+                            as usize,
+                        ResolvedIntExpr::Source { source, coordinates } => {
+                            let coordinates = coordinates
+                                .iter()
+                                .map(|coordinate| {
+                                    self.completed
+                                        .get(&ArenaAppendKey::Expression(
+                                            coordinate as *const _ as usize,
+                                        ))
+                                        .copied()
+                                })
+                                .collect::<Option<Box<_>>>()
+                                .expect("source expression children");
+                            self.intern_node(ResolvedIntExprArenaNode::Source {
+                                source: source.clone(),
+                                coordinates,
+                            }) as usize
+                        }
+                        ResolvedIntExpr::Add(left, right) |
+                        ResolvedIntExpr::Sub(left, right) |
+                        ResolvedIntExpr::Mul(left, right) |
+                        ResolvedIntExpr::Div(left, right) |
+                        ResolvedIntExpr::EuclideanDiv(left, right) |
+                        ResolvedIntExpr::EuclideanRemainder(left, right) |
+                        ResolvedIntExpr::RoundDiv(left, right) => {
+                            let children = [
+                                *self
+                                    .completed
+                                    .get(&ArenaAppendKey::Expression(
+                                        left.as_ref() as *const _ as usize
+                                    ))
+                                    .expect("left expression child"),
+                                *self
+                                    .completed
+                                    .get(&ArenaAppendKey::Expression(
+                                        right.as_ref() as *const _ as usize
+                                    ))
+                                    .expect("right expression child"),
+                            ];
+                            let operation = match value {
+                                ResolvedIntExpr::Add(_, _) => ResolvedIntBinaryOperation::Add,
+                                ResolvedIntExpr::Sub(_, _) => ResolvedIntBinaryOperation::Sub,
+                                ResolvedIntExpr::Mul(_, _) => ResolvedIntBinaryOperation::Mul,
+                                ResolvedIntExpr::Div(_, _) => ResolvedIntBinaryOperation::Div,
+                                ResolvedIntExpr::EuclideanDiv(_, _) => {
+                                    ResolvedIntBinaryOperation::EuclideanDiv
+                                }
+                                ResolvedIntExpr::EuclideanRemainder(_, _) => {
+                                    ResolvedIntBinaryOperation::EuclideanRemainder
+                                }
+                                ResolvedIntExpr::RoundDiv(_, _) => {
+                                    ResolvedIntBinaryOperation::RoundDiv
+                                }
+                                _ => unreachable!(),
+                            };
+                            self.intern_node(ResolvedIntExprArenaNode::Binary {
+                                operation,
+                                children,
+                            }) as usize
+                        }
+                        ResolvedIntExpr::Log2Ceil(input) => {
+                            let input = *self
+                                .completed
+                                .get(&ArenaAppendKey::Expression(
+                                    input.as_ref() as *const _ as usize
+                                ))
+                                .expect("log2 expression child");
+                            self.intern_node(ResolvedIntExprArenaNode::Log2Ceil(input)) as usize
+                        }
+                        ResolvedIntExpr::ExtractMatrixCoefficient { matrix, position } => {
+                            let position = *self
+                                .completed
+                                .get(&ArenaAppendKey::Expression(
+                                    position.as_ref() as *const _ as usize
+                                ))
+                                .expect("extract expression child");
+                            self.intern_node(ResolvedIntExprArenaNode::ExtractMatrixCoefficient {
+                                matrix: matrix.clone(),
+                                position,
+                            }) as usize
+                        }
+                        ResolvedIntExpr::Arena(_) => return None,
+                    } as u32;
+                    self.completed
+                        .insert(ArenaAppendKey::Expression(value as *const _ as usize), index);
+                }
+                Work::ArenaEnter(arena, index) => {
+                    let key = ArenaAppendKey::ArenaNode(arena as *const _ as usize, index);
+                    if self.completed.contains_key(&key) {
+                        continue;
+                    }
+                    work.push(Work::ArenaExit(arena, index));
+                    match arena.nodes.get(index as usize)? {
+                        ResolvedIntExprArenaNode::Source { coordinates, .. } => work.extend(
+                            coordinates.iter().rev().map(|child| Work::ArenaEnter(arena, *child)),
+                        ),
+                        ResolvedIntExprArenaNode::Binary { children, .. } => {
+                            work.push(Work::ArenaEnter(arena, children[1]));
+                            work.push(Work::ArenaEnter(arena, children[0]));
+                        }
+                        ResolvedIntExprArenaNode::Log2Ceil(child) => {
+                            work.push(Work::ArenaEnter(arena, *child));
+                        }
+                        ResolvedIntExprArenaNode::ExtractMatrixCoefficient { position, .. } => {
+                            work.push(Work::ArenaEnter(arena, *position));
+                        }
+                        ResolvedIntExprArenaNode::Const(_) |
+                        ResolvedIntExprArenaNode::Parameter(_) |
+                        ResolvedIntExprArenaNode::Binder(_) => {}
+                    }
+                }
+                Work::ArenaExit(arena, index) => {
+                    let source = arena.nodes.get(index as usize)?;
+                    let node = match source {
+                        ResolvedIntExprArenaNode::Const(value) => {
+                            ResolvedIntExprArenaNode::Const(value.clone())
+                        }
+                        ResolvedIntExprArenaNode::Parameter(value) => {
+                            ResolvedIntExprArenaNode::Parameter(value.clone())
+                        }
+                        ResolvedIntExprArenaNode::Binder(value) => {
+                            ResolvedIntExprArenaNode::Binder(value.clone())
+                        }
+                        ResolvedIntExprArenaNode::Source { source, coordinates } => {
+                            ResolvedIntExprArenaNode::Source {
+                                source: source.clone(),
+                                coordinates: coordinates
+                                    .iter()
+                                    .map(|child| {
+                                        self.completed
+                                            .get(&ArenaAppendKey::ArenaNode(
+                                                arena as *const _ as usize,
+                                                *child,
+                                            ))
+                                            .copied()
+                                    })
+                                    .collect::<Option<Box<_>>>()?,
+                            }
+                        }
+                        ResolvedIntExprArenaNode::Binary { operation, children } => {
+                            ResolvedIntExprArenaNode::Binary {
+                                operation: *operation,
+                                children: [
+                                    *self.completed.get(&ArenaAppendKey::ArenaNode(
+                                        arena as *const _ as usize,
+                                        children[0],
+                                    ))?,
+                                    *self.completed.get(&ArenaAppendKey::ArenaNode(
+                                        arena as *const _ as usize,
+                                        children[1],
+                                    ))?,
+                                ],
+                            }
+                        }
+                        ResolvedIntExprArenaNode::Log2Ceil(child) => {
+                            ResolvedIntExprArenaNode::Log2Ceil(*self.completed.get(
+                                &ArenaAppendKey::ArenaNode(arena as *const _ as usize, *child),
+                            )?)
+                        }
+                        ResolvedIntExprArenaNode::ExtractMatrixCoefficient { matrix, position } => {
+                            ResolvedIntExprArenaNode::ExtractMatrixCoefficient {
+                                matrix: matrix.clone(),
+                                position: *self.completed.get(&ArenaAppendKey::ArenaNode(
+                                    arena as *const _ as usize,
+                                    *position,
+                                ))?,
+                            }
+                        }
+                    };
+                    let output = self.intern_node(node);
+                    self.completed.insert(
+                        ArenaAppendKey::ArenaNode(arena as *const _ as usize, index),
+                        output,
+                    );
+                }
+                Work::Alias(expression, arena) => {
+                    let index = *self
+                        .completed
+                        .get(&ArenaAppendKey::ArenaNode(arena as *const _ as usize, arena.root))?;
+                    self.completed
+                        .insert(ArenaAppendKey::Expression(expression as *const _ as usize), index);
+                }
+            }
+        }
+        self.completed.get(&expression_key).copied()
+    }
+}
+
+fn substitute_resolved_int_arena(
+    arena: &ResolvedIntExprArena,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> Option<ResolvedIntExpr> {
+    let mut builder = ArenaAppendBuilder::new();
+    let mut mapped = vec![None; arena.nodes.len()];
+    let mut work = vec![(arena.root, false)];
+    while let Some((index, expanded)) = work.pop() {
+        if mapped[index as usize].is_some() {
+            continue;
+        }
+        let node = &arena.nodes[index as usize];
+        if !expanded {
+            work.push((index, true));
+            match node {
+                ResolvedIntExprArenaNode::Source { coordinates, .. } => {
+                    work.extend(coordinates.iter().rev().map(|child| (*child, false)));
+                }
+                ResolvedIntExprArenaNode::Binary { children, .. } => {
+                    work.push((children[1], false));
+                    work.push((children[0], false));
+                }
+                ResolvedIntExprArenaNode::Log2Ceil(child) => work.push((*child, false)),
+                ResolvedIntExprArenaNode::ExtractMatrixCoefficient { position, .. } => {
+                    work.push((*position, false));
+                }
+                ResolvedIntExprArenaNode::Const(_) |
+                ResolvedIntExprArenaNode::Parameter(_) |
+                ResolvedIntExprArenaNode::Binder(_) => {}
+            }
+            continue;
+        }
+        let output = match node {
+            ResolvedIntExprArenaNode::Binder(candidate) if candidate == binder => builder
+                .append_expression(replacement)
+                .expect("replacement expression can be represented"),
+            ResolvedIntExprArenaNode::Const(value) => {
+                builder.intern_node(ResolvedIntExprArenaNode::Const(value.clone()))
+            }
+            ResolvedIntExprArenaNode::Parameter(value) => {
+                builder.intern_node(ResolvedIntExprArenaNode::Parameter(value.clone()))
+            }
+            ResolvedIntExprArenaNode::Binder(value) => {
+                builder.intern_node(ResolvedIntExprArenaNode::Binder(value.clone()))
+            }
+            ResolvedIntExprArenaNode::Source { source, coordinates } => {
+                builder.intern_node(ResolvedIntExprArenaNode::Source {
+                    source: source.clone(),
+                    coordinates: coordinates
+                        .iter()
+                        .map(|child| mapped[*child as usize])
+                        .collect::<Option<Box<_>>>()?,
+                })
+            }
+            ResolvedIntExprArenaNode::Binary { operation, children } => {
+                builder.intern_node(ResolvedIntExprArenaNode::Binary {
+                    operation: *operation,
+                    children: [mapped[children[0] as usize]?, mapped[children[1] as usize]?],
+                })
+            }
+            ResolvedIntExprArenaNode::Log2Ceil(child) => {
+                builder.intern_node(ResolvedIntExprArenaNode::Log2Ceil(mapped[*child as usize]?))
+            }
+            ResolvedIntExprArenaNode::ExtractMatrixCoefficient { matrix, position } => builder
+                .intern_node(ResolvedIntExprArenaNode::ExtractMatrixCoefficient {
+                    matrix: Box::new(substitute_resolved_matrix_identity(
+                        matrix,
+                        binder,
+                        replacement,
+                    )),
+                    position: mapped[*position as usize]?,
+                }),
+        };
+        mapped[index as usize] = Some(output);
+    }
+    Some(ResolvedIntExpr::Arena(Box::new(ResolvedIntExprArena {
+        nodes: builder.nodes.into_boxed_slice(),
+        root: mapped[arena.root as usize]?,
+    })))
+}
+
+pub(crate) fn substitute_resolved_matrix_identity(
+    value: &ResolvedMatrixValueIdentity,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> ResolvedMatrixValueIdentity {
+    use super::{normal_form::MatrixValueOperation, normal_form_ops::ScaleScalar};
+    let substitute_range = |range: &ResolvedIndexRange| ResolvedIndexRange {
+        start: substitute_resolved_int_expr(&range.start, binder, replacement),
+        end: substitute_resolved_int_expr(&range.end, binder, replacement),
+    };
+    let substitute_slice = |spec: &SliceSpec| SliceSpec {
+        rows: spec.rows.as_ref().map(substitute_range),
+        columns: spec.columns.as_ref().map(substitute_range),
+    };
+    let substitute_factor =
+        |factor: &FactorIdentity| substitute_factor_identity(factor, binder, replacement);
+    let operation = |operation: &MatrixValueOperation| match operation {
+        MatrixValueOperation::MatrixScale {
+            scalar: ScaleScalar::Exact { key, value, matrix_type },
+        } => MatrixValueOperation::MatrixScale {
+            scalar: ScaleScalar::Exact {
+                key: substitute_factor(key),
+                value: value.clone(),
+                matrix_type: matrix_type.clone(),
+            },
+        },
+        MatrixValueOperation::Slice { spec } => {
+            MatrixValueOperation::Slice { spec: substitute_slice(spec) }
+        }
+        MatrixValueOperation::CrtRecompose { spec, output_type } => {
+            MatrixValueOperation::CrtRecompose {
+                spec: CrtSpec {
+                    plaintext_moduli: spec
+                        .plaintext_moduli
+                        .iter()
+                        .map(|value| substitute_resolved_int_expr(value, binder, replacement))
+                        .collect(),
+                    reconstruction_coefficients: spec
+                        .reconstruction_coefficients
+                        .iter()
+                        .map(|value| substitute_resolved_int_expr(value, binder, replacement))
+                        .collect(),
+                },
+                output_type: output_type.clone(),
+            }
+        }
+        MatrixValueOperation::View { view, output_type } => {
+            let view = match view {
+                super::normal_form_ops::ViewSpec::CoefficientPreserving {
+                    view: super::normal_form_ops::CoefficientPreservingView::Slice(spec),
+                } => super::normal_form_ops::ViewSpec::CoefficientPreserving {
+                    view: super::normal_form_ops::CoefficientPreservingView::Slice(
+                        substitute_slice(spec),
+                    ),
+                },
+                other => other.clone(),
+            };
+            MatrixValueOperation::View { view, output_type: output_type.clone() }
+        }
+        other => other.clone(),
+    };
+    ResolvedMatrixValueIdentity {
+        nodes: value
+            .nodes
+            .iter()
+            .map(|node| super::normal_form::ResolvedMatrixValueIdentityNode {
+                operation: operation(&node.operation),
+                children: node.children.clone(),
+                owner: node.owner.as_ref().map(substitute_factor),
+                selector: node.selector.as_ref().map(substitute_factor),
+            })
+            .collect(),
+        root: value.root,
+    }
+}
+
+fn substitute_factor_identity(
+    value: &FactorIdentity,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> FactorIdentity {
+    use super::normal_form::{FactorLayoutIdentity, FactorOwner};
+    let owner = match &value.owner {
+        FactorOwner::Scalar(identity) => {
+            FactorOwner::Scalar(substitute_resolved_int_expr(identity, binder, replacement))
+        }
+        FactorOwner::HashPlain { query, arguments } => FactorOwner::HashPlain {
+            query: Box::new(substitute_factor_identity(query, binder, replacement)),
+            arguments: arguments
+                .iter()
+                .map(|argument| match argument {
+                    super::normal_form::HashPlainArgumentIdentity::Exact(factor) => {
+                        super::normal_form::HashPlainArgumentIdentity::Exact(
+                            substitute_factor_identity(factor, binder, replacement),
+                        )
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
+        },
+        FactorOwner::Derived { parent, tag } => FactorOwner::Derived {
+            parent: Box::new(substitute_factor_identity(parent, binder, replacement)),
+            tag: tag.clone(),
+        },
+        other => other.clone(),
+    };
+    FactorIdentity {
+        owner,
+        kind: value.kind.clone(),
+        port: value.port,
+        coordinates: value
+            .coordinates
+            .iter()
+            .map(|(owner, identity)| {
+                (owner.clone(), substitute_resolved_int_expr(identity, binder, replacement))
+            })
+            .collect(),
+        public: value.public.clone(),
+        layout: value.layout.as_ref().map(|layout| FactorLayoutIdentity {
+            matrix: ResolvedMatrixType {
+                modulus: substitute_resolved_int_expr(&layout.matrix.modulus, binder, replacement),
+                ring_dimension: substitute_resolved_int_expr(
+                    &layout.matrix.ring_dimension,
+                    binder,
+                    replacement,
+                ),
+                rows: substitute_resolved_int_expr(&layout.matrix.rows, binder, replacement),
+                columns: substitute_resolved_int_expr(&layout.matrix.columns, binder, replacement),
+            },
+            view: layout.view.as_ref().map(|view| SliceSpec {
+                rows: view.rows.as_ref().map(|range| ResolvedIndexRange {
+                    start: substitute_resolved_int_expr(&range.start, binder, replacement),
+                    end: substitute_resolved_int_expr(&range.end, binder, replacement),
+                }),
+                columns: view.columns.as_ref().map(|range| ResolvedIndexRange {
+                    start: substitute_resolved_int_expr(&range.start, binder, replacement),
+                    end: substitute_resolved_int_expr(&range.end, binder, replacement),
+                }),
+            }),
+        }),
+        selector: value
+            .selector
+            .as_ref()
+            .map(|selector| Box::new(substitute_factor_identity(selector, binder, replacement))),
+        trapdoor: value.trapdoor.clone(),
+        selector_mapping: value.selector_mapping.clone(),
     }
 }
 
@@ -460,12 +1014,12 @@ compact_id!(
 
 /// A canonical reference to an operand carried by a sampler descriptor.
 ///
-/// Sampler metadata must not retain an e-graph class: e-class numbering is
-/// local to a particular rewrite run and is not an owner-aware identity.
+/// Sampler metadata must not retain a job-local scalar handle: such numbering is
+/// local to one lowering run and is not an owner-aware identity.
 /// Production descriptors use a [`FactorIdentity`] for an exact atom or a
 /// stable graph source when the operand is only needed as provenance.  The
 /// two cases are explicit so a caller cannot silently substitute one kind for
-/// another or cross an e-graph/DAG arena boundary.
+/// another or cross a scalar/DAG arena boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum CanonicalTermIdentity {
     Factor(FactorIdentity),
@@ -474,7 +1028,7 @@ pub enum CanonicalTermIdentity {
 
 /// A source-level sampler record retains typed, owner-aware operand identities
 /// for a later relation pass; lowering never guesses a relation from a matrix
-/// shape or an e-graph class number.
+/// shape or a job-local scalar handle.
 ///
 /// A `GadgetDecomposition` is deterministic, so its graph-wire occurrence is
 /// audit metadata rather than part of the produced value's identity.  The
@@ -503,7 +1057,7 @@ pub enum SamplerIdentity {
         cutoff: ResolvedIntExpr,
     },
     /// A decomposed hash sampler is registered against its exact gadget and
-    /// plain-hash e-classes.  The ordered hash arguments include the key and
+    /// plain-hash typed identities.  The ordered hash arguments include the key and
     /// every runtime tag integer, so equal shapes never substitute identities.
     DecomposedHash {
         source: GraphWireSourceKey,
@@ -529,14 +1083,14 @@ pub enum SamplerIdentity {
     },
 }
 
-/// A trapdoor is a structural lowering value, not an `MxxLang` node.  Its
+/// A trapdoor is a structural lowering value, not a scalar node. Its
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct TrapdoorIdentity {
     pub source: TrapdoorSourceKey,
     pub indices: Box<[ResolvedIntExpr]>,
     pub matrix_type: ResolvedMatrixType,
     /// Stable identity of the public matrix input.  Trapdoor construction must
-    /// not materialize a matrix `MxxLang::Atom` merely to populate metadata.
+    /// not materialize a scalar node merely to populate metadata.
     pub public: CanonicalTermIdentity,
     pub sigma_bits: u64,
     pub gadget_base: ResolvedIntExpr,
@@ -592,10 +1146,10 @@ where
     }
 }
 
-/// The sole owner of job-local identity descriptors for one rewrite job.
+/// The sole owner of job-local identity descriptors for one lowering job.
 ///
 /// Relation provenance and integer ranges deliberately do not appear here:
-/// they are analysis data owned by the e-graph, not a second identity cache.
+/// they are transfer facts owned by the scalar store, not a second identity cache.
 #[derive(Clone, Debug, Default)]
 pub struct SymbolTables {
     pub atomic_sources: Interner<AtomicSourceDescriptor>,

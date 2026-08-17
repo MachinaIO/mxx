@@ -2,11 +2,10 @@
 //!
 //! A lowering wire is a concrete graph occurrence plus its active symbolic coordinates.  The
 //! single memo below is the only owner of graph-wire lowering results; integer ranges and
-//! selector provenance remain exclusively in the e-graph analysis.
+//! selector provenance remain exclusively in the typed scalar store.
 
 use super::{
     OperationalCheckRequest,
-    analysis::{MxxAnalysis, resolved_constant},
     bound::{BoundClass, MatrixBound, MatrixMetadata, ResolvedMatrixConstant, gadget_digit_bound},
     error::{LowerError, SelectorOnlyConsumer},
     family::{self, FamilyCoverageStorage, FamilyLoweringValue},
@@ -25,8 +24,8 @@ use super::{
         PolynomialNFOperations, ScaleScalar, ViewSpec,
     },
     scalar::{
-        IntegerDomain, ScalarExtractKey, ScalarId, ScalarNode, ScalarOperation, ScalarProvenance,
-        ScalarSort, ScalarStore,
+        IntegerDomain, ScalarId, ScalarNode, ScalarOperation, ScalarProvenance, ScalarSort,
+        ScalarStore, direct_extract_facts, matrix_types_equal, resolved_constant, sorts_equal,
     },
 };
 use crate::{
@@ -50,7 +49,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 ///
 /// The resolver receives the exact occurrence and lexical environment, so it can enter a
 /// child scope or select one family element without introducing a second family cache.  It must
-/// return the next concrete wire to lower; the caller remains the sole memo/e-graph owner.
+/// return the next concrete wire to lower; the caller remains the sole memo owner.
 pub trait FamilyResolver {
     fn resolve(
         &mut self,
@@ -243,7 +242,6 @@ pub const fn node_dispatch(kind: &NodeKind) -> NodeDispatch {
 #[derive(Clone, Debug)]
 pub struct LoweredInt {
     pub scalar: ScalarId,
-    pub stable_identity: Option<ResolvedIntExpr>,
 }
 
 /// One active loop coordinate, ordered outermost to innermost.
@@ -263,7 +261,6 @@ pub struct LoweringWire {
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 enum FamilyIndexKey {
     Stable(ResolvedIntExpr),
-    RuntimeScalar(ScalarId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -272,27 +269,9 @@ struct LoweringWireKey {
     indices: Box<[FamilyIndexKey]>,
 }
 
-impl From<&LoweringWire> for LoweringWireKey {
-    fn from(value: &LoweringWire) -> Self {
-        Self {
-            source: value.source.clone(),
-            indices: value
-                .indices
-                .iter()
-                .map(|index| {
-                    index
-                        .stable_identity
-                        .clone()
-                        .map_or(FamilyIndexKey::RuntimeScalar(index.scalar), FamilyIndexKey::Stable)
-                })
-                .collect(),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum LoweredValue {
-    /// A matrix expression in the single egg-independent lowering DAG.
+    /// A matrix expression in the single typed lowering DAG.
     Matrix(TermId),
     MatrixFamily(FamilyLoweringValue<TermId>),
     /// A typed scalar/domain value owned by this lowering job.
@@ -407,7 +386,7 @@ enum LoweringFrame {
     },
 }
 
-/// The sole mutable owner for one lowering/rewrite job.
+/// The sole mutable owner for one lowering job.
 pub struct GraphLowerer<'a, 'control> {
     pub protocol: &'a ProtocolDecl,
     pub request: &'a OperationalCheckRequest,
@@ -431,12 +410,12 @@ impl<'a> GraphLowerer<'a, '_> {
     pub fn new(
         protocol: &'a ProtocolDecl,
         request: &'a OperationalCheckRequest,
-        analysis: MxxAnalysis,
+        symbols: SymbolTables,
     ) -> Self {
         Self {
             protocol,
             request,
-            symbols: analysis.symbols,
+            symbols,
             dag: ExpressionDag::new(),
             relation_registry: RelationRegistry::default(),
             memo: HashMap::new(),
@@ -456,13 +435,13 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
     pub fn new_with_control(
         protocol: &'a ProtocolDecl,
         request: &'a OperationalCheckRequest,
-        analysis: MxxAnalysis,
+        symbols: SymbolTables,
         control: &'control mut dyn LoweringControl,
     ) -> Self {
         Self {
             protocol,
             request,
-            symbols: analysis.symbols,
+            symbols,
             dag: ExpressionDag::new(),
             relation_registry: RelationRegistry::default(),
             memo: HashMap::new(),
@@ -493,7 +472,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         }
     }
 
-    /// Reads the canonical e-class facts without creating a second evaluator or cache.
+    /// Reads canonical scalar facts without creating a second evaluator or cache.
     pub fn integer_analysis(&self, scalar: ScalarId) -> Option<(&IntegerDomain, ScalarProvenance)> {
         let data = self.scalar_store.facts(scalar)?;
         if data.sort != Ok(ScalarSort::Int) {
@@ -505,8 +484,20 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
     fn canonical_term_identity(&self, scalar: ScalarId) -> Result<ResolvedIntExpr, LowerError> {
         self.scalar_store
             .identity(scalar)
-            .cloned()
             .ok_or(LowerError::MissingIntegerAnalysis { term: scalar })
+    }
+
+    fn lowering_wire_key(&self, wire: &LoweringWire) -> Result<LoweringWireKey, LowerError> {
+        Ok(LoweringWireKey {
+            source: wire.source.clone(),
+            indices: wire
+                .indices
+                .iter()
+                .map(|index| {
+                    self.canonical_scalar_identity(index.scalar).map(FamilyIndexKey::Stable)
+                })
+                .collect::<Result<Box<_>, _>>()?,
+        })
     }
 
     fn canonical_scalar_identity(&self, scalar: ScalarId) -> Result<ResolvedIntExpr, LowerError> {
@@ -606,7 +597,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
     /// Begins one memoized wire lowering.  A repeated active key is a graph dependency cycle;
     /// completed keys return their one stored result without repeating graph work.
     pub fn begin_wire(&mut self, wire: &LoweringWire) -> Result<Option<LoweredValue>, LowerError> {
-        let key = LoweringWireKey::from(wire);
+        let key = self.lowering_wire_key(wire)?;
         if let Some(value) = self.memo.get(&key) {
             return Ok(Some(value.clone()));
         }
@@ -618,7 +609,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
     }
 
     pub fn finish_wire(&mut self, wire: &LoweringWire, value: LoweredValue) {
-        let key = LoweringWireKey::from(wire);
+        let key = self.lowering_wire_key(wire).expect("lowered scalar identity");
         self.active.remove(&key);
         self.memo.insert(key, value);
     }
@@ -975,11 +966,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                         .active_coordinates
                                         .iter()
                                         .map(|coordinate| {
-                                            coordinate.index.stable_identity.clone().ok_or(
-                                                LowerError::NonExactIdentityIndex {
-                                                    expression: IntExpr::constant(0),
-                                                },
-                                            )
+                                            self.canonical_scalar_identity(coordinate.index.scalar)
                                         })
                                         .collect::<Result<Box<[_]>, _>>()?,
                                     matrix_type: self
@@ -1164,12 +1151,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                 );
                                 let parameter_bindings = call.bindings.clone();
                                 for (name, expression) in &parameter_bindings {
-                                    let value = self
-                                        .lower_int_expr(expression, &environment)?
-                                        .stable_identity
-                                        .ok_or_else(|| LowerError::NonExactIdentityIndex {
-                                            expression: expression.clone(),
-                                        })?;
+                                    let lowered = self.lower_int_expr(expression, &environment)?;
+                                    let value = self.canonical_scalar_identity(lowered.scalar)?;
                                     child.parameters.insert(name.clone(), value);
                                 }
                                 let output = *child_outputs
@@ -1794,12 +1777,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             minimum: BigInt::zero(),
             maximum: count_range.minimum - BigInt::from(1_u8),
         });
-        let identity = ResolvedIntExpr::Binder(binder.clone());
         let scalar = self
             .scalar_store
-            .intern_node(ScalarNode::IntBinder(binder.clone()), identity.clone(), &self.symbols)
+            .intern_node(ScalarNode::IntBinder(binder.clone()), &self.symbols)
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
-        let index = LoweredInt { scalar, stable_identity: Some(identity) };
+        let index = LoweredInt { scalar };
         let mut indexed_wire = wire.clone();
         indexed_wire.indices = wire.indices.iter().cloned().chain([index.clone()]).collect();
         let mut indexed_environment = environment.clone();
@@ -1897,12 +1879,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             relation_role,
         };
         let source = self.symbols.atomic_sources.intern(descriptor);
-        let coordinates = environment
-            .active_coordinates
-            .iter()
-            .map(|coordinate| self.canonical_scalar_identity(coordinate.index.scalar))
-            .collect::<Result<Box<_>, _>>()?;
-        let identity = ResolvedIntExpr::Source { source: key, coordinates };
         self.scalar_store
             .intern_node(
                 ScalarNode::Source {
@@ -1913,13 +1889,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         .map(|coordinate| coordinate.index.scalar)
                         .collect(),
                 },
-                identity,
                 &self.symbols,
             )
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)
     }
 
-    /// Lowers a matrix source directly into the job DAG.  The scalar e-graph is
+    /// Lowers a matrix source directly into the job DAG.  Scalar operands are
     /// intentionally not used as an intermediate matrix representation here.
     fn matrix_atom_for_wire(
         &mut self,
@@ -1974,9 +1949,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             .active_coordinates
             .iter()
             .map(|coordinate| {
-                let index = coordinate.index.stable_identity.clone().ok_or_else(|| {
-                    LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) }
-                })?;
+                let index = self.canonical_scalar_identity(coordinate.index.scalar)?;
                 Ok((coordinate.binder.clone(), index))
             })
             .collect::<Result<Box<[_]>, LowerError>>()?;
@@ -2326,14 +2299,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             .map(|coordinate| {
                 Ok((
                     coordinate.binder.clone(),
-                    coordinate
-                        .index
-                        .stable_identity
-                        .clone()
-                        .or_else(|| self.canonical_scalar_identity(coordinate.index.scalar).ok())
-                        .ok_or(LowerError::MissingIntegerAnalysis {
-                            term: coordinate.index.scalar,
-                        })?,
+                    self.canonical_scalar_identity(coordinate.index.scalar)?,
                 ))
             })
             .collect::<Result<Box<_>, LowerError>>()?;
@@ -2418,21 +2384,15 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             rows: ResolvedIntExpr::Const(concrete.rows.into()),
             columns: ResolvedIntExpr::Const(concrete.columns.into()),
         };
-        let data = MxxAnalysis::direct_extract_data(resolved_matrix, modulus, authoritative_upper)
+        let data = direct_extract_facts(resolved_matrix, modulus, authoritative_upper)
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
-        let position_identity = position
-            .stable_identity
-            .clone()
-            .or_else(|| self.canonical_scalar_identity(position.scalar).ok())
-            .ok_or(LowerError::MissingIntegerAnalysis { term: position.scalar })?;
         let scalar = self
             .scalar_store
             .intern_extract(
-                ScalarExtractKey {
-                    operation: ScalarOperation::ExtractCoefficient,
-                    matrix: facts.identity,
-                    position: position_identity,
-                },
+                self.dag
+                    .resolved_identity(facts.identity)
+                    .ok_or(LowerError::UnsupportedMatrixProductExpansion)?,
+                position.scalar,
                 data,
             )
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
@@ -2566,7 +2526,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     .as_ref()
                     .and_then(|domain| domain.interval().ok())
                     .ok_or(LowerError::UnsupportedMatrixProductExpansion)?;
-                let interval = super::analysis::IntegerInterval {
+                let interval = super::scalar::IntegerInterval {
                     minimum: interval.minimum,
                     maximum: interval.maximum,
                 };
@@ -2639,9 +2599,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 .map(|coordinate| {
                     Ok((
                         coordinate.binder.clone(),
-                        coordinate.index.stable_identity.clone().ok_or(
-                            LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) },
-                        )?,
+                        self.canonical_scalar_identity(coordinate.index.scalar)?,
                     ))
                 })
                 .collect::<Result<Box<[_]>, LowerError>>()?,
@@ -2701,16 +2659,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 .map(|coordinate| coordinate.binder.clone())
                 .collect(),
         };
-        let indices =
-            environment
-                .active_coordinates
-                .iter()
-                .map(|coordinate| {
-                    coordinate.index.stable_identity.clone().ok_or(
-                        LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) },
-                    )
-                })
-                .collect::<Result<Box<[_]>, _>>()?;
+        let indices = environment
+            .active_coordinates
+            .iter()
+            .map(|coordinate| self.canonical_scalar_identity(coordinate.index.scalar))
+            .collect::<Result<Box<[_]>, _>>()?;
         let sampler = match kind {
             NodeKind::GaussianSample { max_coefficient_bound, .. } => {
                 let max_coefficient_bound =
@@ -2809,8 +2762,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             (Some((lower, upper)), ScalarSort::Int) => {
                 let lower = self.resolve_int(lower, environment)?;
                 let upper = self.resolve_int(upper, environment)?;
-                let (ResolvedIntExpr::Const(minimum), ResolvedIntExpr::Const(maximum)) =
-                    (lower, upper)
+                let (Some(minimum), Some(maximum)) =
+                    (resolved_integer(&lower), resolved_integer(&upper))
                 else {
                     return Err(LowerError::UnboundParameter { parameter: contract.name.clone() });
                 };
@@ -2840,14 +2793,14 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     }
                 })?;
                 let upper = match upper {
-                    Some(upper) => match self.resolve_int(upper, environment)? {
-                        ResolvedIntExpr::Const(upper) => upper.to_biguint().ok_or_else(|| {
+                    Some(upper) => match resolved_integer(&self.resolve_int(upper, environment)?) {
+                        Some(upper) => upper.to_biguint().ok_or_else(|| {
                             LowerError::InvalidExtractCoefficientCanonicalUpper {
                                 upper: num_bigint::BigUint::from(0_u8),
                                 modulus: modulus.clone(),
                             }
                         })?,
-                        _ => {
+                        None => {
                             return Err(LowerError::UnboundParameter {
                                 parameter: contract.name.clone(),
                             })
@@ -2952,11 +2905,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             indices: environment
                 .active_coordinates
                 .iter()
-                .map(|coordinate| {
-                    coordinate.index.stable_identity.clone().ok_or(
-                        LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) },
-                    )
-                })
+                .map(|coordinate| self.canonical_scalar_identity(coordinate.index.scalar))
                 .collect::<Result<Box<[_]>, _>>()?,
             matrix_type,
             public: CanonicalTermIdentity::Source(super::identity::GraphWireSourceKey {
@@ -2997,9 +2946,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     value @ (IntExpr::Const(_) | IntExpr::Var(_) | IntExpr::LoopIndex(_)),
                 ) => {
                     let lowered = match value {
-                        IntExpr::Const(value) => {
-                            self.add_int(value.clone(), ResolvedIntExpr::Const(value.clone()))
-                        }
+                        IntExpr::Const(value) => self.add_int(value.clone()),
                         IntExpr::Var(name) => {
                             let value = environment.parameters.get(name).ok_or_else(|| {
                                 LowerError::UnboundParameter { parameter: name.clone() }
@@ -3030,16 +2977,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                     .and_then(|(domain, _)| domain.interval().ok())
                                     .map_or_else(BigInt::zero, |range| range.maximum),
                             });
-                            let identity = ResolvedIntExpr::Binder(binder.clone());
                             let scalar = self
                                 .scalar_store
-                                .intern_node(
-                                    ScalarNode::IntBinder(binder.clone()),
-                                    identity.clone(),
-                                    &self.symbols,
-                                )
+                                .intern_node(ScalarNode::IntBinder(binder.clone()), &self.symbols)
                                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
-                            LoweredInt { scalar, stable_identity: Some(identity) }
+                            LoweredInt { scalar }
                         }
                         _ => unreachable!(),
                     };
@@ -3072,44 +3014,22 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     let start = values.len() - arity;
                     let children = values.split_off(start);
                     let result = match value {
-                        IntExpr::Add(_, _) => {
-                            self.combine_int(children, ScalarOperation::Add, ResolvedIntExpr::Add)?
+                        IntExpr::Add(_, _) => self.combine_int(children, ScalarOperation::Add)?,
+                        IntExpr::Sub(_, _) => self.combine_int(children, ScalarOperation::Sub)?,
+                        IntExpr::Mul(_, _) => self.combine_int(children, ScalarOperation::Mul)?,
+                        IntExpr::Div(_, _) => {
+                            self.combine_int(children, ScalarOperation::ExactDiv)?
                         }
-                        IntExpr::Sub(_, _) => {
-                            self.combine_int(children, ScalarOperation::Sub, ResolvedIntExpr::Sub)?
+                        IntExpr::RoundDiv(_, _) => {
+                            self.combine_int(children, ScalarOperation::RoundDiv)?
                         }
-                        IntExpr::Mul(_, _) => {
-                            self.combine_int(children, ScalarOperation::Mul, ResolvedIntExpr::Mul)?
-                        }
-                        IntExpr::Div(_, _) => self.combine_int(
-                            children,
-                            ScalarOperation::ExactDiv,
-                            ResolvedIntExpr::Div,
-                        )?,
-                        IntExpr::RoundDiv(_, _) => self.combine_int(
-                            children,
-                            ScalarOperation::RoundDiv,
-                            ResolvedIntExpr::RoundDiv,
-                        )?,
                         IntExpr::Log2Ceil(_) => {
                             let child = children.into_iter().next().expect("one child");
-                            let identity = child
-                                .stable_identity
-                                .map(|value| ResolvedIntExpr::Log2Ceil(Box::new(value)));
                             let scalar = self
                                 .scalar_store
-                                .intern_node(
-                                    ScalarNode::IntLog2Ceil([child.scalar]),
-                                    identity.clone().unwrap_or_else(|| {
-                                        ResolvedIntExpr::Log2Ceil(Box::new(ResolvedIntExpr::Const(
-                                            BigInt::zero(),
-                                        )))
-                                    }),
-                                    &self.symbols,
-                                )
+                                .intern_node(ScalarNode::IntLog2Ceil([child.scalar]), &self.symbols)
                                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
-                            let lowered = LoweredInt { scalar, stable_identity: identity };
-                            lowered
+                            LoweredInt { scalar }
                         }
                         _ => unreachable!(),
                     };
@@ -3122,19 +3042,20 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         })
     }
 
-    fn add_int(&mut self, value: BigInt, identity: ResolvedIntExpr) -> LoweredInt {
+    fn add_int(&mut self, value: BigInt) -> LoweredInt {
         let scalar = self
             .scalar_store
-            .intern_node(ScalarNode::IntConst(value), identity.clone(), &self.symbols)
+            .intern_node(ScalarNode::IntConst(value), &self.symbols)
             .expect("integer constants have a valid scalar transfer");
-        LoweredInt { scalar, stable_identity: Some(identity) }
+        LoweredInt { scalar }
     }
 
     fn add_resolved_int(&mut self, value: ResolvedIntExpr) -> Result<LoweredInt, LowerError> {
         match value {
-            ResolvedIntExpr::Const(value) => {
-                Ok(self.add_int(value.clone(), ResolvedIntExpr::Const(value)))
-            }
+            ResolvedIntExpr::Const(value) => Ok(self.add_int(value.clone())),
+            arena @ ResolvedIntExpr::Arena(_) => resolved_constant(&arena)
+                .map(|value| self.add_int(value))
+                .ok_or(LowerError::UnsupportedMatrixProductExpansion),
             ResolvedIntExpr::Parameter(name) => {
                 let value = self
                     .request
@@ -3146,18 +3067,13 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         _ => None,
                     });
                 if let Some(value) = value {
-                    Ok(self.add_int(value.clone(), ResolvedIntExpr::Const(value)))
+                    Ok(self.add_int(value.clone()))
                 } else {
-                    let identity = ResolvedIntExpr::Parameter(name.clone());
                     let scalar = self
                         .scalar_store
-                        .intern_node(
-                            ScalarNode::IntParameter(name),
-                            identity.clone(),
-                            &self.symbols,
-                        )
+                        .intern_node(ScalarNode::IntParameter(name), &self.symbols)
                         .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
-                    Ok(LoweredInt { scalar, stable_identity: Some(identity) })
+                    Ok(LoweredInt { scalar })
                 }
             }
             ResolvedIntExpr::Binder(_) |
@@ -3170,7 +3086,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             ResolvedIntExpr::EuclideanRemainder(_, _) |
             ResolvedIntExpr::RoundDiv(_, _) |
             ResolvedIntExpr::Log2Ceil(_) |
-            ResolvedIntExpr::ExtractCoefficient { .. } => {
+            ResolvedIntExpr::ExtractMatrixCoefficient { .. } => {
                 Err(LowerError::UnsupportedMatrixProductExpansion)
             }
         }
@@ -3180,18 +3096,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         &mut self,
         children: Vec<LoweredInt>,
         operation: ScalarOperation,
-        identity: impl FnOnce(Box<ResolvedIntExpr>, Box<ResolvedIntExpr>) -> ResolvedIntExpr,
     ) -> Result<LoweredInt, LowerError> {
         let [left, right]: [LoweredInt; 2] =
             children.try_into().map_err(|values: Vec<LoweredInt>| {
                 LowerError::InvalidOperandArity { expected: 2, actual: values.len() }
             })?;
-        let stable_identity = left
-            .stable_identity
-            .zip(right.stable_identity)
-            .map(|(left, right)| identity(Box::new(left), Box::new(right)));
-        let identity = stable_identity
-            .ok_or(LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) })?;
         let scalar = self
             .scalar_store
             .intern_node(
@@ -3213,11 +3122,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     }
                     _ => return Err(LowerError::UnsupportedMatrixProductExpansion),
                 },
-                identity.clone(),
                 &self.symbols,
             )
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
-        Ok(LoweredInt { scalar, stable_identity: Some(identity) })
+        Ok(LoweredInt { scalar })
     }
 
     fn scalar_term(&self, scalar: ScalarId) -> Result<ScalarId, LowerError> {
@@ -3284,8 +3192,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     }
                     [LoweredValue::Matrix(matrix), LoweredValue::Scalar(position)] => {
                         let position = self.scalar_term(*position)?;
-                        let stable_identity = self.canonical_scalar_identity(position).ok();
-                        (*matrix, LoweredInt { scalar: position, stable_identity })
+                        (*matrix, LoweredInt { scalar: position })
                     }
                     _ => {
                         return Err(LowerError::InvalidOperandArity {
@@ -3494,7 +3401,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     SelectorOnlyConsumer::MatrixScale,
                     false,
                 )?;
-                let Some(value) = scalar.stable_identity.as_ref().and_then(resolved_integer) else {
+                let identity = self.canonical_scalar_identity(scalar.scalar)?;
+                let Some(value) = resolved_integer(&identity) else {
                     return Err(LowerError::UnsupportedMatrixProductExpansion);
                 };
                 if value.is_one() {
@@ -3568,37 +3476,22 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 })
                 .collect()
         };
-        let identity_for = |this: &Self, values: &[ScalarId]| {
-            values
-                .iter()
-                .map(|value| this.canonical_scalar_identity(*value))
-                .collect::<Result<Vec<_>, _>>()
-        };
         let scalar = match kind {
             NodeKind::ConstantInt(value) => self
                 .scalar_store
-                .intern_node(
-                    ScalarNode::IntConst(value.clone()),
-                    ResolvedIntExpr::Const(value.clone()),
-                    &self.symbols,
-                )
+                .intern_node(ScalarNode::IntConst(value.clone()), &self.symbols)
                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?,
             NodeKind::EvaluateInt(value) => {
                 return Ok(LoweredValue::Scalar(self.lower_int_expr(value, environment)?.scalar))
             }
             NodeKind::ConstantBool(value) => self
                 .scalar_store
-                .intern_node(
-                    ScalarNode::BoolConst(*value),
-                    ResolvedIntExpr::Const(BigInt::from(*value as u8)),
-                    &self.symbols,
-                )
+                .intern_node(ScalarNode::BoolConst(*value), &self.symbols)
                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?,
             NodeKind::ConstantReal(value) => self
                 .scalar_store
                 .intern_node(
                     ScalarNode::RealConst(self.resolve_real(value, environment)?.to_bits()),
-                    ResolvedIntExpr::Const(BigInt::zero()),
                     &self.symbols,
                 )
                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?,
@@ -3610,30 +3503,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     IntBinaryOp::Multiply => ScalarOperation::Mul,
                     IntBinaryOp::Divide => ScalarOperation::EuclideanDiv,
                     IntBinaryOp::Remainder => ScalarOperation::EuclideanRemainder,
-                };
-                let identity = identity_for(self, &values)?;
-                let identity = match operation {
-                    ScalarOperation::Add => ResolvedIntExpr::Add(
-                        Box::new(identity[0].clone()),
-                        Box::new(identity[1].clone()),
-                    ),
-                    ScalarOperation::Sub => ResolvedIntExpr::Sub(
-                        Box::new(identity[0].clone()),
-                        Box::new(identity[1].clone()),
-                    ),
-                    ScalarOperation::Mul => ResolvedIntExpr::Mul(
-                        Box::new(identity[0].clone()),
-                        Box::new(identity[1].clone()),
-                    ),
-                    ScalarOperation::EuclideanDiv => ResolvedIntExpr::EuclideanDiv(
-                        Box::new(identity[0].clone()),
-                        Box::new(identity[1].clone()),
-                    ),
-                    ScalarOperation::EuclideanRemainder => ResolvedIntExpr::EuclideanRemainder(
-                        Box::new(identity[0].clone()),
-                        Box::new(identity[1].clone()),
-                    ),
-                    _ => unreachable!(),
                 };
                 self.scalar_store
                     .intern_node(
@@ -3649,7 +3518,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             }
                             _ => unreachable!(),
                         },
-                        identity,
                         &self.symbols,
                     )
                     .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?
@@ -3662,40 +3530,28 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     IntCompareOp::LessEqual => ScalarNode::IntLessEqual([values[0], values[1]]),
                 };
                 self.scalar_store
-                    .intern_node(node, ResolvedIntExpr::Const(BigInt::zero()), &self.symbols)
+                    .intern_node(node, &self.symbols)
                     .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?
             }
             NodeKind::BitExtract { bit } => {
                 let input = terms(1)?[0];
                 let bit = self.resolve_int(bit, environment)?;
                 self.scalar_store
-                    .intern_node(
-                        ScalarNode::BitExtract { bit, input: [input] },
-                        ResolvedIntExpr::Const(BigInt::zero()),
-                        &self.symbols,
-                    )
+                    .intern_node(ScalarNode::BitExtract { bit, input: [input] }, &self.symbols)
                     .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?
             }
             NodeKind::BoolToInt => {
                 let values = terms(1)?;
                 self.validate_boolean_consumer(values[0], SelectorOnlyConsumer::BoolToInt, false)?;
                 self.scalar_store
-                    .intern_node(
-                        ScalarNode::BoolToInt([values[0]]),
-                        ResolvedIntExpr::Const(BigInt::zero()),
-                        &self.symbols,
-                    )
+                    .intern_node(ScalarNode::BoolToInt([values[0]]), &self.symbols)
                     .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?
             }
             NodeKind::IntToReal => {
                 let values = terms(1)?;
                 self.validate_integer_consumer(values[0], SelectorOnlyConsumer::IntToReal, false)?;
                 self.scalar_store
-                    .intern_node(
-                        ScalarNode::IntToReal([values[0]]),
-                        ResolvedIntExpr::Const(BigInt::zero()),
-                        &self.symbols,
-                    )
+                    .intern_node(ScalarNode::IntToReal([values[0]]), &self.symbols)
                     .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?
             }
             NodeKind::RealBinary(operation) => {
@@ -3707,16 +3563,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     RealBinaryOp::Divide => ScalarNode::RealDiv([values[0], values[1]]),
                 };
                 self.scalar_store
-                    .intern_node(node, ResolvedIntExpr::Const(BigInt::zero()), &self.symbols)
+                    .intern_node(node, &self.symbols)
                     .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?
             }
             NodeKind::RealSqrt => self
                 .scalar_store
-                .intern_node(
-                    ScalarNode::RealSqrt([terms(1)?[0]]),
-                    ResolvedIntExpr::Const(BigInt::zero()),
-                    &self.symbols,
-                )
+                .intern_node(ScalarNode::RealSqrt([terms(1)?[0]]), &self.symbols)
                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?,
             NodeKind::ExtractCoefficient { position, canonical_input_exclusive_upper } => {
                 let matrix = terms(1)?[0];
@@ -3731,7 +3583,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             NodeKind::LiftIntegerToConstantPolynomial { .. } | NodeKind::CrtRecompose { .. } => {
                 // These operations are matrix-valued and are lowered by the
                 // direct normal-form handlers above.  They must never enter
-                // the scalar e-graph fallback.
+                // the scalar-store fallback.
                 return Err(LowerError::UnsupportedMatrixProductExpansion);
             }
             NodeKind::Input { .. } |
@@ -3899,9 +3751,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     .map(|(argument, producer)| match argument {
                         LoweredValue::Scalar(term)
                             if self.scalar_store.facts(*term).is_some_and(|facts| {
-                                facts.sort.as_ref().is_ok_and(|actual| {
-                                    super::analysis::sorts_equal(&element_type, actual)
-                                })
+                                facts
+                                    .sort
+                                    .as_ref()
+                                    .is_ok_and(|actual| sorts_equal(&element_type, actual))
                             }) =>
                         {
                             self.scalar_term(*term)
@@ -3959,9 +3812,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 }
                 if let [LoweredValue::MatrixFamily(family)] = arguments {
                     let index = self.lower_int_expr(index, environment)?;
-                    if let Some(stable) = index.stable_identity.as_ref() {
+                    let stable = self.canonical_scalar_identity(index.scalar)?;
+                    {
                         if let Some(element) =
-                            normal_form_family::static_matrix_term(family, stable).map_err(
+                            normal_form_family::static_matrix_term(family, &stable).map_err(
                                 |_| LowerError::FamilyAccessOutOfRange {
                                     index: IntExpr::constant(-1),
                                     count: IntExpr::constant(0),
@@ -3980,19 +3834,19 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     });
                 };
                 let index = self.lower_int_expr(index, environment)?;
-                if let Some(element) = family::static_get(family, &index).map_err(|_| {
-                    LowerError::FamilyAccessOutOfRange {
-                        index: index
-                            .clone()
-                            .stable_identity
-                            .and_then(|value| match value {
-                                ResolvedIntExpr::Const(value) => Some(IntExpr::constant(value)),
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| IntExpr::constant(-1)),
-                        count: IntExpr::constant(0),
-                    }
-                })? {
+                let index_identity = self.canonical_scalar_identity(index.scalar)?;
+                if let Some(element) =
+                    family::static_get(family, &index_identity).map_err(|_| {
+                        LowerError::FamilyAccessOutOfRange {
+                            index: self
+                                .canonical_scalar_identity(index.scalar)
+                                .ok()
+                                .and_then(|value| resolved_integer(&value).map(IntExpr::constant))
+                                .unwrap_or_else(|| IntExpr::constant(-1)),
+                            count: IntExpr::constant(0),
+                        }
+                    })?
+                {
                     return Ok(LoweredValue::Scalar(self.scalar_term(element)?));
                 }
                 self.shared_family_element(family, &index)
@@ -4001,10 +3855,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 if let [LoweredValue::MatrixFamily(family), LoweredValue::Scalar(selector)] =
                     arguments
                 {
-                    let selector = LoweredInt {
-                        scalar: self.scalar_term(*selector)?,
-                        stable_identity: Some(self.canonical_scalar_identity(*selector)?),
-                    };
+                    let scalar = self.scalar_term(*selector)?;
+                    let selector = LoweredInt { scalar };
                     return self.matrix_family_element(family, &selector, wire, environment);
                 }
                 if let [
@@ -4012,11 +3864,13 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     LoweredValue::Scalar(selector),
                 ] = arguments
                 {
+                    let scalar = self.scalar_term(*selector)?;
+                    let selector = LoweredInt { scalar };
                     return self.trapdoor_family_element(
                         *representative,
                         binder,
                         logical_count,
-                        &LoweredInt { scalar: self.scalar_term(*selector)?, stable_identity: None },
+                        &selector,
                     );
                 }
                 let [LoweredValue::Family(family), LoweredValue::Scalar(selector)] = arguments
@@ -4026,20 +3880,21 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         actual: arguments.len(),
                     });
                 };
-                let selector = self.scalar_term(*selector)?;
+                let scalar = self.scalar_term(*selector)?;
+                let selector = LoweredInt { scalar };
                 match &family.storage {
                     FamilyCoverageStorage::ExactStored { elements } => {
-                        let term = self.scalar_dynamic_get(family, selector).map_err(|_| {
-                            LowerError::InvalidFamilyCount {
-                                count: IntExpr::constant(elements.len()),
-                            }
-                        })?;
+                        let term =
+                            self.scalar_dynamic_get(family, selector.scalar).map_err(|_| {
+                                LowerError::InvalidFamilyCount {
+                                    count: IntExpr::constant(elements.len()),
+                                }
+                            })?;
                         Ok(LoweredValue::Scalar(term))
                     }
-                    FamilyCoverageStorage::SharedTemplate { .. } => self.shared_family_element(
-                        family,
-                        &LoweredInt { scalar: selector, stable_identity: None },
-                    ),
+                    FamilyCoverageStorage::SharedTemplate { .. } => {
+                        self.shared_family_element(family, &selector)
+                    }
                 }
             }
             NodeKind::Select { .. } => {
@@ -4102,10 +3957,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             });
                         }
                     }
-                    let selector_value = LoweredInt {
-                        scalar: selector,
-                        stable_identity: Some(self.canonical_scalar_identity(selector)?),
-                    };
+                    let selector_value = LoweredInt { scalar: selector };
                     let reachable = self.selector_reachable(selector, matrix_families.len())?;
                     let selector =
                         self.family_selector_identity(first, &selector_value, wire, environment)?;
@@ -4195,7 +4047,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 }
                 let mut families = cases.iter().cloned().collect::<Vec<_>>();
                 if !matches!(output_type, WireType::IndexedFamily { .. }) {
-                    let zero = self.add_int(BigInt::zero(), ResolvedIntExpr::Const(BigInt::zero()));
+                    let zero = self.add_int(BigInt::zero());
                     for value in &mut families {
                         if let LoweredValue::Family(family) = value &&
                             matches!(&family.storage, FamilyCoverageStorage::SharedTemplate { domain, .. } if domain.logical_count == num_bigint::BigUint::from(1_u8))
@@ -4239,11 +4091,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 let children = std::iter::once(selector).chain(terms).collect::<Box<_>>();
                 let scalar = self
                     .scalar_store
-                    .intern_node(
-                        ScalarNode::Switch(children),
-                        ResolvedIntExpr::Const(BigInt::zero()),
-                        &self.symbols,
-                    )
+                    .intern_node(ScalarNode::Switch(children), &self.symbols)
                     .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
                 Ok(LoweredValue::Scalar(scalar))
             }
@@ -4330,11 +4178,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             let children =
                 std::iter::once(selector).chain(cases.iter().copied()).collect::<Box<_>>();
             this.scalar_store
-                .intern_node(
-                    ScalarNode::Switch(children),
-                    ResolvedIntExpr::Const(BigInt::zero()),
-                    &this.symbols,
-                )
+                .intern_node(ScalarNode::Switch(children), &this.symbols)
                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)
         };
         let storage = match &first.storage {
@@ -4420,11 +4264,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let common_binder_domains = common_binder_domains.clone();
         let common_binder_term = self
             .scalar_store
-            .intern_node(
-                ScalarNode::IntBinder(common_domain.binder.clone()),
-                ResolvedIntExpr::Binder(common_domain.binder.clone()),
-                &self.symbols,
-            )
+            .intern_node(ScalarNode::IntBinder(common_domain.binder.clone()), &self.symbols)
             .map_err(|_| ())?;
         for family in families.iter_mut().skip(1) {
             if family.element_type != common_element_type {
@@ -4486,18 +4326,17 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 interval.maximum >= BigInt::from(domain.logical_count.clone())
         }) {
             return Err(LowerError::FamilyAccessOutOfRange {
-                index: index
-                    .stable_identity
-                    .as_ref()
-                    .and_then(|value| match value {
-                        ResolvedIntExpr::Const(value) => Some(IntExpr::constant(value.clone())),
-                        _ => None,
-                    })
+                index: self
+                    .canonical_scalar_identity(index.scalar)
+                    .ok()
+                    .and_then(|value| resolved_integer(&value).map(IntExpr::constant))
                     .unwrap_or_else(|| IntExpr::constant(-1)),
                 count: IntExpr::constant(domain.logical_count.clone()),
             });
         }
-        if index.stable_identity.as_ref() == Some(&ResolvedIntExpr::Binder(domain.binder.clone())) {
+        if self.canonical_scalar_identity(index.scalar).ok() ==
+            Some(ResolvedIntExpr::Binder(domain.binder.clone()))
+        {
             return Ok(LoweredValue::Scalar(*representative));
         }
         let scope = domain.binder.loop_scope.clone();
@@ -4603,17 +4442,13 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 ScalarNode::Switch(ids) => {
                     ScalarNode::Switch(ids.iter().map(|child| remap(*child)).collect())
                 }
-                ScalarNode::ExtractCoefficient { canonical_exclusive_upper, matrix, position } => {
-                    ScalarNode::ExtractCoefficient {
-                        canonical_exclusive_upper,
-                        matrix,
-                        position: remap(position),
-                    }
+                ScalarNode::ExtractCoefficient { matrix, position } => {
+                    ScalarNode::ExtractCoefficient { matrix, position: remap(position) }
                 }
             };
             let rebuilt = self
                 .scalar_store
-                .intern_node(rebuilt, ResolvedIntExpr::Const(BigInt::zero()), &self.symbols)
+                .intern_node(rebuilt, &self.symbols)
                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
             completed.insert(id, rebuilt);
         }
@@ -4636,13 +4471,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 count: IntExpr::constant(domain.logical_count.clone()),
             });
         }
-        if index.stable_identity.as_ref() == Some(&ResolvedIntExpr::Binder(domain.binder.clone())) {
+        if self.canonical_scalar_identity(index.scalar).ok() ==
+            Some(ResolvedIntExpr::Binder(domain.binder.clone()))
+        {
             return Ok(LoweredValue::Matrix(*representative));
         }
-        let replacement = index
-            .stable_identity
-            .clone()
-            .ok_or(LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) })?;
+        let replacement = self.canonical_scalar_identity(index.scalar)?;
         normal_form_family::validate_matrix_term_family(family).map_err(|_| {
             LowerError::InvalidFamilyCount {
                 count: IntExpr::constant(domain.logical_count.clone()),
@@ -4698,9 +4532,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 count: IntExpr::constant(count),
             });
         }
-        if let Some(stable) = index.stable_identity.as_ref() {
+        let stable = self.canonical_scalar_identity(index.scalar)?;
+        {
             if let Some(term) =
-                normal_form_family::static_matrix_term(family, stable).map_err(|_| {
+                normal_form_family::static_matrix_term(family, &stable).map_err(|_| {
                     LowerError::FamilyAccessOutOfRange {
                         index: IntExpr::constant(-1),
                         count: IntExpr::constant(BigUint::from(elements.len())),
@@ -4733,22 +4568,24 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         index: &LoweredInt,
     ) -> Result<LoweredValue, LowerError> {
         match &family.storage {
-            FamilyCoverageStorage::ExactStored { elements } => family::static_get(family, index)
-                .map_err(|_| LowerError::FamilyAccessOutOfRange {
-                    index: IntExpr::constant(-1),
-                    count: IntExpr::constant(elements.len()),
-                })?
-                .map(LoweredValue::Scalar)
-                .map_or_else(
-                    || {
-                        self.scalar_dynamic_get(family, index.scalar)
-                            .map(LoweredValue::Scalar)
-                            .map_err(|_| LowerError::InvalidFamilyCount {
-                                count: IntExpr::constant(elements.len()),
-                            })
-                    },
-                    Ok,
-                ),
+            FamilyCoverageStorage::ExactStored { elements } => {
+                family::static_get(family, &self.canonical_scalar_identity(index.scalar)?)
+                    .map_err(|_| LowerError::FamilyAccessOutOfRange {
+                        index: IntExpr::constant(-1),
+                        count: IntExpr::constant(elements.len()),
+                    })?
+                    .map(LoweredValue::Scalar)
+                    .map_or_else(
+                        || {
+                            self.scalar_dynamic_get(family, index.scalar)
+                                .map(LoweredValue::Scalar)
+                                .map_err(|_| LowerError::InvalidFamilyCount {
+                                    count: IntExpr::constant(elements.len()),
+                                })
+                        },
+                        Ok,
+                    )
+            }
             FamilyCoverageStorage::SharedTemplate { .. } => {
                 self.shared_family_element(family, index)
             }
@@ -4785,11 +4622,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let children =
             std::iter::once(selector).chain(elements.iter().copied()).collect::<Box<_>>();
         self.scalar_store
-            .intern_node(
-                ScalarNode::Switch(children),
-                ResolvedIntExpr::Const(BigInt::zero()),
-                &self.symbols,
-            )
+            .intern_node(ScalarNode::Switch(children), &self.symbols)
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)
     }
 
@@ -4818,15 +4651,13 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 family: WireRef { node: binder.loop_node, port: mxx_ir_core::Port(binder.slot) },
             },
         )?;
-        let replacement = index.stable_identity.clone().ok_or_else(|| {
-            LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) }
-        })?;
+        let replacement = self.canonical_scalar_identity(index.scalar)?;
         let indices = template
             .indices
             .iter()
             .map(|value| super::identity::substitute_resolved_int_expr(value, binder, &replacement))
             .collect::<Box<[_]>>();
-        // The public operand is stable provenance, not a matrix e-graph atom.
+        // The public operand is stable provenance, not a matrix DAG atom.
         // Its graph occurrence is shared by every family lane; only the
         // ordered coordinate expressions vary with the selected binder.
         let descriptor = TrapdoorIdentity { indices, ..template };
@@ -4842,7 +4673,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         if matches!(input_type, WireType::IndexedFamily { .. }) {
             return Ok(value);
         }
-        let zero = self.add_int(BigInt::zero(), ResolvedIntExpr::Const(BigInt::zero()));
+        let zero = self.add_int(BigInt::zero());
         match value {
             LoweredValue::Family(family)
                 if matches!(
@@ -4962,14 +4793,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         });
         let scalar = self
             .scalar_store
-            .intern_node(
-                ScalarNode::IntBinder(binder.clone()),
-                ResolvedIntExpr::Binder(binder.clone()),
-                &self.symbols,
-            )
+            .intern_node(ScalarNode::IntBinder(binder.clone()), &self.symbols)
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
-        let index =
-            LoweredInt { scalar, stable_identity: Some(ResolvedIntExpr::Binder(binder.clone())) };
+        let index = LoweredInt { scalar };
         let mut child = environment.clone();
         child.occurrence.definition = child_definition;
         child.occurrence.path = environment
@@ -4999,15 +4825,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     value => value,
                 },
                 LoopInputMode::ZipOffset { offset } => {
-                    let offset = self.add_int(
-                        BigInt::from(*offset),
-                        ResolvedIntExpr::Const(BigInt::from(*offset)),
-                    );
-                    let offset_index = self.combine_int(
-                        vec![index.clone(), offset],
-                        ScalarOperation::Add,
-                        ResolvedIntExpr::Add,
-                    )?;
+                    let offset = self.add_int(BigInt::from(*offset));
+                    let offset_index =
+                        self.combine_int(vec![index.clone(), offset], ScalarOperation::Add)?;
                     match argument {
                         LoweredValue::Family(family) => {
                             self.family_element(&family, &offset_index)?
@@ -5150,7 +4970,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let actual_sort = self.scalar_store.facts(representative).map(|facts| &facts.sort);
         let sort_matches = match (&element_type, actual_sort) {
             (ScalarSort::Matrix(expected), Some(Ok(ScalarSort::Matrix(actual)))) => {
-                super::analysis::matrix_types_equal(expected, actual)
+                matrix_types_equal(expected, actual)
             }
             (expected, Some(Ok(actual))) => expected == actual,
             (_, Some(Err(_)) | None) => false,
@@ -5251,9 +5071,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             work.push(LoweringFrame::FinishValue { wire, value });
             return Ok(());
         }
-        let count_identity = count.stable_identity.ok_or_else(|| {
-            LowerError::NonExactIdentityIndex { expression: specification.count.clone() }
-        })?;
+        let count_identity = self.canonical_scalar_identity(count.scalar)?;
         self.queue_sequential_matrix_loop(
             wire,
             specification,
@@ -5266,8 +5084,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         )
     }
 
-    /// Queues a matrix recurrence without creating an e-graph matrix atom.
-    /// Integer loop analysis still uses the scalar e-graph, but every carried
+    /// Queues a matrix recurrence without creating a scalar matrix atom.
+    /// Integer transfer still uses the scalar store, but every carried
     /// value and every transition output remains a `TermId` in the job DAG.
     fn queue_sequential_matrix_loop(
         &mut self,
@@ -5331,15 +5149,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         });
         let scalar = self
             .scalar_store
-            .intern_node(
-                ScalarNode::IntBinder(binder.clone()),
-                ResolvedIntExpr::Binder(binder.clone()),
-                &self.symbols,
-            )
+            .intern_node(ScalarNode::IntBinder(binder.clone()), &self.symbols)
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
-        let iteration =
-            LoweredInt { scalar, stable_identity: Some(ResolvedIntExpr::Binder(binder.clone())) };
-        child.binders.push((binder.clone(), iteration.clone()));
+        let iteration = LoweredInt { scalar };
         child.active_coordinates.push(Coordinate { binder: binder.clone(), index: iteration });
 
         let mut initial = Vec::with_capacity(specification.carried_count);
@@ -5485,7 +5297,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             transition: transition.into_boxed_slice(),
             state_factors: state_factors.into_boxed_slice(),
             iteration_binder,
-            count: super::analysis::IntegerDomain::Exact(
+            count: IntegerDomain::Exact(
                 resolved_integer(&count).ok_or(LowerError::UnsupportedMatrixProductExpansion)?,
             ),
         };
@@ -5540,10 +5352,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         expression: &IntExpr,
         environment: &LowerEnv,
     ) -> Result<ResolvedIntExpr, LowerError> {
-        Ok(self
-            .lower_int_expr(expression, environment)?
-            .stable_identity
-            .ok_or_else(|| LowerError::NonExactIdentityIndex { expression: expression.clone() })?)
+        let lowered = self.lower_int_expr(expression, environment)?;
+        self.canonical_scalar_identity(lowered.scalar)
     }
 
     fn resolve_range(
@@ -5616,8 +5426,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
     fn resolve_real(&self, value: &RealExpr, environment: &LowerEnv) -> Result<f64, LowerError> {
         let mut env = mxx_ir_core::ParamEnv::default();
         for (name, value) in &environment.parameters {
-            if let ResolvedIntExpr::Const(value) = value {
-                env.integers.insert(name.clone(), value.clone());
+            if let Some(value) = resolved_integer(value) {
+                env.integers.insert(name.clone(), value);
             }
         }
         for (name, parameter) in &self.request.environment {
@@ -5706,12 +5516,6 @@ mod tests {
                     source: super::super::identity::AtomicSourceId(source),
                     indices: Box::new([]),
                 },
-                ResolvedIntExpr::Source {
-                    source: super::super::identity::AtomicSourceKey::ProtocolInput(
-                        crate::ProtocolInputId::from(name),
-                    ),
-                    coordinates: Box::new([]),
-                },
                 &lowerer.symbols,
             )
             .expect("test source transfers")
@@ -5720,11 +5524,7 @@ mod tests {
     fn test_int(lowerer: &mut GraphLowerer<'_, '_>, value: i64) -> ScalarId {
         lowerer
             .scalar_store
-            .intern_node(
-                ScalarNode::IntConst(value.into()),
-                ResolvedIntExpr::Const(value.into()),
-                &lowerer.symbols,
-            )
+            .intern_node(ScalarNode::IntConst(value.into()), &lowerer.symbols)
             .expect("test integer transfers")
     }
 
@@ -5736,11 +5536,7 @@ mod tests {
         });
         lowerer
             .scalar_store
-            .intern_node(
-                ScalarNode::IntBinder(binder.clone()),
-                ResolvedIntExpr::Binder(binder),
-                &lowerer.symbols,
-            )
+            .intern_node(ScalarNode::IntBinder(binder.clone()), &lowerer.symbols)
             .expect("test binder transfers")
     }
 
@@ -5768,7 +5564,7 @@ mod tests {
     fn matrix_sequential_term_recurrence_handles_zero_one_n_and_relation_exposure() {
         let (protocol, request) = recurrence_lowerer();
         for count in [0_u64, 1, 3] {
-            let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+            let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
             let environment = root_test_environment();
             let matrix = test_resolved_matrix();
             let concrete = concrete_matrix_type(&matrix).unwrap();
@@ -5932,7 +5728,7 @@ mod tests {
                 }))
                 .unwrap()
         };
-        let mut valid = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut valid = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let initial_a = build(&mut valid, &matrix_a, "initial-a");
         let initial_b = build(&mut valid, &matrix_b, "initial-b");
         let transition_a = build(&mut valid, &matrix_a, "transition-a");
@@ -5955,7 +5751,7 @@ mod tests {
             LoweredValue::Matrix(_)
         ));
 
-        let mut swapped = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut swapped = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let initial_a = build(&mut swapped, &matrix_a, "initial-a");
         let initial_b = build(&mut swapped, &matrix_b, "initial-b");
         let transition_a = build(&mut swapped, &matrix_a, "transition-a");
@@ -5985,7 +5781,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "direct-select-switch".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let selector = test_integer_atom(&mut lowerer, "direct-select-range", 0, 1);
         let cases = [10, 20, 30].map(|value| test_int(&mut lowerer, value));
         let environment = root_test_environment();
@@ -6025,7 +5821,7 @@ mod tests {
     #[test]
     fn shared_matrix_family_accepts_bounded_runtime_selector_without_lanes() {
         let (protocol, request) = recurrence_lowerer();
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let owner = super::super::identity::BinderKey {
             loop_scope: root_test_environment().occurrence.clone(),
             loop_node: mxx_ir_core::NodeId(301),
@@ -6067,10 +5863,7 @@ mod tests {
             },
         };
         let selector = test_integer_atom(&mut lowerer, "bounded-runtime-selector", 0, 30_719);
-        let selector = LoweredInt {
-            scalar: selector,
-            stable_identity: lowerer.canonical_scalar_identity(selector).ok(),
-        };
+        let selector = LoweredInt { scalar: selector };
         let before = lowerer.dag.term_count();
         let LoweredValue::Matrix(instantiated) = lowerer
             .shared_matrix_family_element(&family, &selector)
@@ -6123,7 +5916,7 @@ mod tests {
     #[test]
     fn exact_matrix_family_dynamic_checks_upper_and_keeps_reachable_mapping() {
         let (protocol, request) = recurrence_lowerer();
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let matrix = test_resolved_matrix();
         let concrete = concrete_matrix_type(&matrix).unwrap();
         let term = |lowerer: &mut GraphLowerer<'_, '_>, name| {
@@ -6158,10 +5951,7 @@ mod tests {
             indices: Box::new([]),
         };
         let reachable = test_integer_atom(&mut lowerer, "reachable", 0, 0);
-        let reachable = LoweredInt {
-            scalar: reachable,
-            stable_identity: lowerer.canonical_scalar_identity(reachable).ok(),
-        };
+        let reachable = LoweredInt { scalar: reachable };
         let LoweredValue::Matrix(dynamic) =
             lowerer.matrix_family_element(&family, &reachable, &wire, &environment).unwrap()
         else {
@@ -6193,10 +5983,7 @@ mod tests {
         ));
 
         let invalid = test_integer_atom(&mut lowerer, "invalid-upper", 0, 2);
-        let invalid = LoweredInt {
-            scalar: invalid,
-            stable_identity: lowerer.canonical_scalar_identity(invalid).ok(),
-        };
+        let invalid = LoweredInt { scalar: invalid };
         assert!(matches!(
             lowerer.matrix_family_element(&family, &invalid, &wire, &environment),
             Err(LowerError::FamilyAccessOutOfRange { .. })
@@ -6232,14 +6019,10 @@ mod tests {
             layouts: Vec::new(),
             target_id: "scalar-consumer".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let boolean = lowerer
             .scalar_store
-            .intern_node(
-                ScalarNode::BoolConst(true),
-                ResolvedIntExpr::Const(BigInt::one()),
-                &lowerer.symbols,
-            )
+            .intern_node(ScalarNode::BoolConst(true), &lowerer.symbols)
             .unwrap();
         lowerer
             .validate_boolean_consumer(boolean, SelectorOnlyConsumer::BoolToInt, false)
@@ -6260,7 +6043,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "matrix-dag-only".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
             modulus: 17.into(),
             ring_dimension: 1,
@@ -6309,7 +6092,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "matrix-coefficient-bridge".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
             modulus: 17.into(),
             ring_dimension: 1,
@@ -6463,7 +6246,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "matrix-coefficient-structural-facts".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let environment = root_test_environment();
         let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
             modulus: 17.into(),
@@ -6615,7 +6398,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "gadget-validation".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let matrix = MatrixType {
             modulus: IntExpr::constant(17),
             ring_dimension: IntExpr::constant(1),
@@ -6695,7 +6478,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "matrix-term-rejection".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let matrix = super::super::identity::ResolvedMatrixType {
             modulus: ResolvedIntExpr::Const(17.into()),
             ring_dimension: ResolvedIntExpr::Const(1.into()),
@@ -6797,19 +6580,14 @@ mod tests {
                 .unwrap();
             lowerer.dag.push(ExpressionNode::Product(vec![left, right].into_boxed_slice())).unwrap()
         };
-        let mut plain = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut plain = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let plain_root = build(&mut plain);
-        let mut polluted = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut polluted = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let first = test_int(&mut polluted, 9);
         let second = test_int(&mut polluted, 11);
-        let _ = polluted.scalar_store.intern_node(
-            ScalarNode::IntAdd([first, second]),
-            ResolvedIntExpr::Add(
-                Box::new(ResolvedIntExpr::Const(9.into())),
-                Box::new(ResolvedIntExpr::Const(11.into())),
-            ),
-            &polluted.symbols,
-        );
+        let _ = polluted
+            .scalar_store
+            .intern_node(ScalarNode::IntAdd([first, second]), &polluted.symbols);
         let polluted_root = build(&mut polluted);
         let plain_nf = plain.dag.normalize(plain_root, &plain.relation_registry).unwrap();
         let polluted_nf =
@@ -6954,7 +6732,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "sampler".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let LoweredValue::Matrix(term) = lowerer
             .lower_stage_wire(&StageId("encrypt".to_owned()), output)
             .expect("lower sampler")
@@ -6997,7 +6775,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "sampler".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output).map(|_| ())
     }
 
@@ -7033,7 +6811,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "explicit-large-source".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let LoweredValue::Matrix(term) = lowerer
             .lower_stage_wire(&StageId("encrypt".to_owned()), output)
             .expect("lower explicit-large source")
@@ -7140,7 +6918,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "artifact-preimage".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let LoweredValue::Matrix(term) = lowerer
             .lower_stage_wire(&StageId("decrypt".to_owned()), output)
             .expect("artifact aliases producer")
@@ -7178,7 +6956,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "pack-bits".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let LoweredValue::Matrix(term) = lowerer
             .lower_stage_wire(&StageId("encrypt".to_owned()), output)
             .expect("explicit bits lower")
@@ -7261,7 +7039,7 @@ mod tests {
             target_id: "family-pack-semantic-slice-type".to_owned(),
         };
         let output = protocol.bundle.workflow.stages[0].graph.outputs()["output"].value;
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         lowerer
             .lower_stage_wire(&StageId("encrypt".to_owned()), output)
             .expect("family accepts the equivalent one-row slice type");
@@ -7281,11 +7059,12 @@ mod tests {
                 max_coefficient_bound: IntExpr::constant(5),
             },
             |gaussian, gaussian_term| {
-                assert!(matches!(
-                    gaussian.symbols.samplers.values.as_slice(),
-                    [SamplerIdentity::Gaussian { max_coefficient_bound: ResolvedIntExpr::Const(value), .. }]
-                        if value == &BigInt::from(5)
-                ));
+                let [SamplerIdentity::Gaussian { max_coefficient_bound, .. }] =
+                    gaussian.symbols.samplers.values.as_slice()
+                else {
+                    panic!("expected one Gaussian sampler")
+                };
+                assert_eq!(resolved_constant(max_coefficient_bound), Some(BigInt::from(5)));
                 assert_eq!(
                     dag_bound(gaussian, gaussian_term),
                     BoundClass::Bounded { maximum_absolute_coefficient: 5_u8.into() },
@@ -7308,14 +7087,13 @@ mod tests {
                 },
             },
             |interval, interval_term| {
-                assert!(matches!(
-                    interval.symbols.samplers.values.as_slice(),
-                    [SamplerIdentity::UniformInterval {
-                        minimum: ResolvedIntExpr::Const(minimum),
-                        maximum: ResolvedIntExpr::Const(maximum),
-                        ..
-                    }] if minimum == &BigInt::from(-3) && maximum == &BigInt::from(2)
-                ));
+                let [SamplerIdentity::UniformInterval { minimum, maximum, .. }] =
+                    interval.symbols.samplers.values.as_slice()
+                else {
+                    panic!("expected one uniform sampler")
+                };
+                assert_eq!(resolved_constant(minimum), Some(BigInt::from(-3)));
+                assert_eq!(resolved_constant(maximum), Some(BigInt::from(2)));
                 assert_eq!(
                     dag_bound(interval, interval_term),
                     BoundClass::Bounded { maximum_absolute_coefficient: 3_u8.into() },
@@ -7365,7 +7143,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "declared-matrix-product-bound".to_owned(),
         };
-        let lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let product = |ring_dimension, inner_dimension| DeclaredBoundExpr::MatrixProduct {
             ring_dimension: IntExpr::constant(ring_dimension),
             inner_dimension: IntExpr::constant(inner_dimension),
@@ -7390,7 +7168,7 @@ mod tests {
             target_id: "hash".to_owned(),
         };
         let stage = StageId("encrypt".to_owned());
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let LoweredValue::Matrix(lowered) =
             lowerer.lower_stage_wire(&stage, output).expect("lower decomposed hash")
         else {
@@ -7420,7 +7198,7 @@ mod tests {
             target_id: "hash".to_owned(),
         };
         let stage = StageId("encrypt".to_owned());
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let LoweredValue::Matrix(decomposed_hash_dag) =
             lowerer.lower_stage_wire(&stage, output).expect("lower decomposed hash")
         else {
@@ -7449,7 +7227,7 @@ mod tests {
         let mut lowerer = GraphLowerer::new_with_control(
             &protocol,
             &request,
-            MxxAnalysis::default(),
+            SymbolTables::default(),
             &mut control,
         );
         lowerer
@@ -7477,7 +7255,7 @@ mod tests {
             target_id: "hash".to_owned(),
         };
         let stage = StageId("encrypt".to_owned());
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         assert!(matches!(
             lowerer.lower_stage_wire(&stage, output),
             Err(LowerError::InvalidOperandArity { .. })
@@ -7497,7 +7275,7 @@ mod tests {
             target_id: "hash".to_owned(),
         };
         let stage = StageId("encrypt".to_owned());
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let LoweredValue::Matrix(lowered) =
             lowerer.lower_stage_wire(&stage, output).expect("lower small decomposed hash")
         else {
@@ -7551,7 +7329,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "root-constant-matrix".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let LoweredValue::Matrix(term) = lowerer
             .lower_stage_wire(&StageId("encrypt".to_owned()), output)
             .expect("lower zero constant")
@@ -7650,7 +7428,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "parallel-constant-matrix".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let LoweredValue::Matrix(term) = lowerer
             .lower_stage_wire(&StageId("encrypt".to_owned()), output)
             .expect("lower polynomial constant through parallel loop")
@@ -7886,7 +7664,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "parallel-subgraph-alias".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         lowerer
             .lower_stage_wire(&StageId("encrypt".to_owned()), output)
             .expect("bound parallel input lowers through subgraph call");
@@ -8044,7 +7822,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "frozen-zip-family".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         assert!(matches!(
             lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output),
             Ok(LoweredValue::Scalar(_))
@@ -8060,7 +7838,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "frozen-zip-family".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         assert!(matches!(
             lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output),
             Ok(LoweredValue::Scalar(_))
@@ -8233,7 +8011,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "frozen-zip-matrix-family".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         assert!(matches!(
             lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output),
             Ok(LoweredValue::Matrix(_))
@@ -8250,7 +8028,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "frozen-zip-matrix-family".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         assert!(matches!(
             lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output),
             Ok(LoweredValue::Matrix(_))
@@ -8361,7 +8139,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "nested-protocol-input".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let LoweredValue::Matrix(term) = lowerer
             .lower_stage_wire(&StageId("encrypt".to_owned()), output)
             .expect("nested protocol input")
@@ -8381,31 +8159,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_and_stable_indices_have_distinct_memo_keys() {
-        let source = WireSourceKey {
-            scope: OccurrenceScope {
-                program: super::super::identity::ProgramKey::Ideal,
-                definition: mxx_ir_core::FrozenGraphScopeId::Root,
-                path: Box::new([]),
-            },
-            wire: WireRef { node: mxx_ir_core::NodeId(1), port: mxx_ir_core::Port(0) },
-        };
-        let stable = LoweringWire {
-            source: source.clone(),
-            indices: Box::new([LoweredInt {
-                scalar: ScalarId(0),
-                stable_identity: Some(ResolvedIntExpr::Const(BigInt::from(3))),
-            }]),
-        };
-        let runtime = LoweringWire {
-            source,
-            indices: Box::new([LoweredInt { scalar: ScalarId(3), stable_identity: None }]),
-        };
-
-        assert_ne!(LoweringWireKey::from(&stable), LoweringWireKey::from(&runtime));
-    }
-
-    #[test]
     fn completed_shared_dependency_is_reused_but_an_active_back_edge_is_rejected() {
         let protocol = crate::toy_example::protocol();
         let request = OperationalCheckRequest {
@@ -8413,7 +8166,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "memo-colors".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let wire = LoweringWire {
             source: WireSourceKey {
                 scope: root_test_environment().occurrence,
@@ -8442,7 +8195,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "shared-select".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let scope = root_test_environment().occurrence;
         let first =
             BinderKey { loop_scope: scope.clone(), loop_node: mxx_ir_core::NodeId(1), slot: 0 };
@@ -8603,7 +8356,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "trapdoor-input".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         let LoweredValue::Trapdoor(id) =
             lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output).unwrap()
         else {
@@ -8614,9 +8367,9 @@ mod tests {
             descriptor.source,
             TrapdoorSourceKey::ProtocolInput(crate::ProtocolInputId::from("trapdoor"))
         );
-        assert_eq!(descriptor.gadget_base, ResolvedIntExpr::Const(BigInt::from(2)));
-        assert_eq!(descriptor.digit_count, ResolvedIntExpr::Const(BigInt::from(3)));
-        assert_eq!(descriptor.preimage_cutoff, ResolvedIntExpr::Const(BigInt::from(5)));
+        assert_eq!(resolved_constant(&descriptor.gadget_base), Some(BigInt::from(2)));
+        assert_eq!(resolved_constant(&descriptor.digit_count), Some(BigInt::from(3)));
+        assert_eq!(resolved_constant(&descriptor.preimage_cutoff), Some(BigInt::from(5)));
         assert!(matches!(
             descriptor.public,
             super::super::identity::CanonicalTermIdentity::Source(_)
@@ -8631,7 +8384,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "trapdoor-input".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         assert!(matches!(
             lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output),
             Err(LowerError::MissingProtocolInputBinding { input })
@@ -8663,7 +8416,7 @@ mod tests {
             layouts: Vec::new(),
             target_id: "trapdoor-input".to_owned(),
         };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
         assert!(matches!(
             lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output),
             Err(LowerError::MissingProtocolInputBinding { input })
@@ -8689,7 +8442,7 @@ mod tests {
             .stack_size(1024 * 1024)
             .spawn(move || {
                 let stage = StageId("encrypt".to_owned());
-                let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+                let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
                 lowerer.lower_stage_wire(&stage, output).expect("deep lowering succeeds");
                 (lowerer.scalar_store_len(), lowerer.symbols.binders.values.len())
             })

@@ -12,9 +12,8 @@ use super::{
         ResolvedIntExpr, SamplerDescriptorId, SamplerIdentity, SymbolTables, TrapdoorDescriptorId,
         TrapdoorIdentity,
     },
-    lower::LoweredInt,
     normal_form::FactorIdentity,
-    scalar::{IntegerDomain, ScalarId, ScalarNode, ScalarSort, ScalarStore},
+    scalar::{IntegerDomain, ScalarId, ScalarNode, ScalarSort, ScalarStore, resolved_constant},
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
@@ -41,114 +40,19 @@ pub(crate) fn add_runtime_switch(
     children.push(selector);
     children.extend_from_slice(&cases[..retained]);
     store
-        .intern_node(
-            ScalarNode::Switch(children.into_boxed_slice()),
-            ResolvedIntExpr::Const(BigInt::zero()),
-            symbols,
-        )
+        .intern_node(ScalarNode::Switch(children.into_boxed_slice()), symbols)
         .map_err(|_| FamilyCoverageError::ScalarConstructionFailed)
 }
 
-/// Performs binder substitution over a resolved identity without recursive descent.
+/// Performs binder substitution through the shared iterative identity engine.
+/// Arena descriptors are flattened and rebuilt there, so family construction
+/// cannot accidentally retain an opaque, unsubstituted descriptor.
 fn substitute_resolved_iterative(
     value: &ResolvedIntExpr,
     binder: &BinderKey,
     replacement: &ResolvedIntExpr,
 ) -> ResolvedIntExpr {
-    enum Visit<'a> {
-        Enter(&'a ResolvedIntExpr),
-        Exit(&'a ResolvedIntExpr),
-    }
-    let mut completed = HashMap::<usize, ResolvedIntExpr>::new();
-    let mut work = vec![Visit::Enter(value)];
-    while let Some(visit) = work.pop() {
-        let (key, expression) = match visit {
-            Visit::Enter(expression) => {
-                let key = expression as *const ResolvedIntExpr as usize;
-                if completed.contains_key(&key) {
-                    continue;
-                }
-                if let ResolvedIntExpr::Binder(candidate) = expression {
-                    completed.insert(
-                        key,
-                        if candidate == binder { replacement.clone() } else { expression.clone() },
-                    );
-                    continue;
-                }
-                work.push(Visit::Exit(expression));
-                match expression {
-                    ResolvedIntExpr::Source { coordinates, .. } => {
-                        work.extend(coordinates.iter().rev().map(Visit::Enter))
-                    }
-                    ResolvedIntExpr::Add(left, right) |
-                    ResolvedIntExpr::Sub(left, right) |
-                    ResolvedIntExpr::Mul(left, right) |
-                    ResolvedIntExpr::Div(left, right) |
-                    ResolvedIntExpr::EuclideanDiv(left, right) |
-                    ResolvedIntExpr::EuclideanRemainder(left, right) |
-                    ResolvedIntExpr::RoundDiv(left, right) => {
-                        work.push(Visit::Enter(right));
-                        work.push(Visit::Enter(left));
-                    }
-                    ResolvedIntExpr::Log2Ceil(input) => work.push(Visit::Enter(input)),
-                    ResolvedIntExpr::ExtractCoefficient { input, position, .. } => {
-                        work.push(Visit::Enter(position));
-                        work.push(Visit::Enter(input));
-                    }
-                    ResolvedIntExpr::Const(_) | ResolvedIntExpr::Parameter(_) => {}
-                    ResolvedIntExpr::Binder(_) => unreachable!(),
-                }
-                continue;
-            }
-            Visit::Exit(expression) => (expression as *const ResolvedIntExpr as usize, expression),
-        };
-        let child = |child: &ResolvedIntExpr| {
-            completed
-                .get(&(child as *const ResolvedIntExpr as usize))
-                .cloned()
-                .expect("identity child")
-        };
-        let rebuilt = match expression {
-            ResolvedIntExpr::Source { source, coordinates } => ResolvedIntExpr::Source {
-                source: source.clone(),
-                coordinates: coordinates.iter().map(child).collect(),
-            },
-            ResolvedIntExpr::Add(left, right) => {
-                ResolvedIntExpr::Add(Box::new(child(left)), Box::new(child(right)))
-            }
-            ResolvedIntExpr::Sub(left, right) => {
-                ResolvedIntExpr::Sub(Box::new(child(left)), Box::new(child(right)))
-            }
-            ResolvedIntExpr::Mul(left, right) => {
-                ResolvedIntExpr::Mul(Box::new(child(left)), Box::new(child(right)))
-            }
-            ResolvedIntExpr::Div(left, right) => {
-                ResolvedIntExpr::Div(Box::new(child(left)), Box::new(child(right)))
-            }
-            ResolvedIntExpr::EuclideanDiv(left, right) => {
-                ResolvedIntExpr::EuclideanDiv(Box::new(child(left)), Box::new(child(right)))
-            }
-            ResolvedIntExpr::EuclideanRemainder(left, right) => {
-                ResolvedIntExpr::EuclideanRemainder(Box::new(child(left)), Box::new(child(right)))
-            }
-            ResolvedIntExpr::RoundDiv(left, right) => {
-                ResolvedIntExpr::RoundDiv(Box::new(child(left)), Box::new(child(right)))
-            }
-            ResolvedIntExpr::Log2Ceil(input) => ResolvedIntExpr::Log2Ceil(Box::new(child(input))),
-            ResolvedIntExpr::ExtractCoefficient { input, position, canonical_exclusive_upper } => {
-                ResolvedIntExpr::ExtractCoefficient {
-                    input: Box::new(child(input)),
-                    position: Box::new(child(position)),
-                    canonical_exclusive_upper: canonical_exclusive_upper.clone(),
-                }
-            }
-            ResolvedIntExpr::Const(_) |
-            ResolvedIntExpr::Parameter(_) |
-            ResolvedIntExpr::Binder(_) => expression.clone(),
-        };
-        completed.insert(key, rebuilt);
-    }
-    completed.remove(&(value as *const ResolvedIntExpr as usize)).expect("identity root")
+    super::identity::substitute_resolved_int_expr(value, binder, replacement)
 }
 
 /// The owner of a parallel-loop logical count.  Output ports are deliberately
@@ -318,14 +222,12 @@ pub fn validate_family_index(
 /// static index; all other values must use [`dynamic_get`].
 pub fn static_get<T>(
     family: &FamilyLoweringValue<T>,
-    index: &LoweredInt,
+    identity: &ResolvedIntExpr,
 ) -> Result<Option<T>, FamilyCoverageError>
 where
     T: Copy,
 {
-    let Some(ResolvedIntExpr::Const(value)) = index.stable_identity.as_ref() else {
-        return Ok(None);
-    };
+    let Some(value) = resolved_constant(identity) else { return Ok(None) };
     let FamilyCoverageStorage::ExactStored { elements } = &family.storage else {
         return Ok(None);
     };
@@ -547,9 +449,8 @@ pub fn instantiate_shared_element<E>(
     stable_replacement: Option<ResolvedIntExpr>,
     progress: &mut dyn FnMut() -> Result<(), E>,
 ) -> Result<ScalarId, E> {
-    let stable_replacement = stable_replacement.or_else(|| store.identity(replacement).cloned());
+    let stable_replacement = stable_replacement.or_else(|| store.identity(replacement));
     let mut nodes = HashMap::<ScalarId, ScalarNode>::new();
-    let mut identities = HashMap::<ScalarId, ResolvedIntExpr>::new();
     let mut pending = vec![representative];
     while let Some(id) = pending.pop() {
         if nodes.contains_key(&id) || id == replacement {
@@ -562,10 +463,6 @@ pub fn instantiate_shared_element<E>(
             Err(panic) => panic,
         };
         pending.extend(store.children(id).unwrap_or_default().into_vec());
-        identities.insert(
-            id,
-            store.identity(id).cloned().unwrap_or(ResolvedIntExpr::Const(BigInt::zero())),
-        );
         nodes.insert(id, node);
     }
     enum Visit {
@@ -615,33 +512,10 @@ pub fn instantiate_shared_element<E>(
             }
         }
         let rebuilt = remap_scalar_node(node, &remap, binder, stable_replacement.as_ref(), symbols);
-        let identity = stable_replacement.as_ref().map_or_else(
-            || identities.get(&id).expect("snapshotted scalar identity").clone(),
-            |replacement| {
-                substitute_resolved_iterative(
-                    identities.get(&id).expect("snapshotted scalar identity"),
-                    binder,
-                    replacement,
-                )
-            },
-        );
-        let identity = match (rebuilt.as_ref(), identity) {
-            (
-                Some(ScalarNode::Source { source, .. }),
-                ResolvedIntExpr::Source { source: old_source, coordinates },
-            ) => {
-                if let Some(descriptor) = symbols.atomic_sources.get(source.0) {
-                    ResolvedIntExpr::Source { source: descriptor.key.clone(), coordinates }
-                } else {
-                    ResolvedIntExpr::Source { source: old_source, coordinates }
-                }
-            }
-            (_, identity) => identity,
-        };
         let rebuilt = match rebuilt {
-            Some(node) => store
-                .intern_node(node, identity, symbols)
-                .map_err(|_| panic!("scalar transfer failed")),
+            Some(node) => {
+                store.intern_node(node, symbols).map_err(|_| panic!("scalar transfer failed"))
+            }
             None => Ok(replacement),
         }?;
         completed.insert(id, rebuilt);
@@ -696,12 +570,8 @@ fn remap_scalar_node(
         ScalarNode::Switch(ids) => {
             ScalarNode::Switch(ids.iter().map(|id| remap(*id)).collect::<Box<[_]>>())
         }
-        ScalarNode::ExtractCoefficient { canonical_exclusive_upper, matrix, position } => {
-            ScalarNode::ExtractCoefficient {
-                canonical_exclusive_upper: canonical_exclusive_upper.clone(),
-                matrix: *matrix,
-                position: remap(*position),
-            }
+        ScalarNode::ExtractCoefficient { matrix, position } => {
+            ScalarNode::ExtractCoefficient { matrix: matrix.clone(), position: remap(*position) }
         }
     })
 }
@@ -1156,13 +1026,7 @@ mod tests {
     }
 
     fn int(store: &mut ScalarStore, symbols: &SymbolTables, value: i64) -> ScalarId {
-        store
-            .intern_node(
-                ScalarNode::IntConst(value.into()),
-                ResolvedIntExpr::Const(value.into()),
-                symbols,
-            )
-            .unwrap()
+        store.intern_node(ScalarNode::IntConst(value.into()), symbols).unwrap()
     }
 
     #[test]
@@ -1237,30 +1101,11 @@ mod tests {
         for key in [owner.clone(), foreign.clone()] {
             symbols.binders.intern(BinderDescriptor { key, minimum: 0.into(), maximum: 7.into() });
         }
-        let owner_id = store
-            .intern_node(
-                ScalarNode::IntBinder(owner.clone()),
-                ResolvedIntExpr::Binder(owner.clone()),
-                &symbols,
-            )
-            .unwrap();
-        let foreign_id = store
-            .intern_node(
-                ScalarNode::IntBinder(foreign.clone()),
-                ResolvedIntExpr::Binder(foreign.clone()),
-                &symbols,
-            )
-            .unwrap();
-        let representative = store
-            .intern_node(
-                ScalarNode::IntAdd([owner_id, foreign_id]),
-                ResolvedIntExpr::Add(
-                    Box::new(ResolvedIntExpr::Binder(owner.clone())),
-                    Box::new(ResolvedIntExpr::Binder(foreign.clone())),
-                ),
-                &symbols,
-            )
-            .unwrap();
+        let owner_id = store.intern_node(ScalarNode::IntBinder(owner.clone()), &symbols).unwrap();
+        let foreign_id =
+            store.intern_node(ScalarNode::IntBinder(foreign.clone()), &symbols).unwrap();
+        let representative =
+            store.intern_node(ScalarNode::IntAdd([owner_id, foreign_id]), &symbols).unwrap();
         let replacement = int(&mut store, &symbols, 5);
         let instantiated = instantiate_shared_element(
             &mut store,

@@ -1,9 +1,9 @@
-//! Egg-independent expression DAG and ordered polynomial normal form.
+//! Typed expression DAG and ordered polynomial normal form.
 //!
 //! `TermId` is only a job-local edge into [`ExpressionDag`].  It is never used
 //! as a canonical equality key: symbolic equality is defined by the complete
 //! owner-aware [`FactorIdentity`] carried by a factor and by ordered factor
-//! lists.  This keeps the normal form independent of e-graph insertion order.
+//! lists.  This keeps the normal form independent of scalar-store insertion order.
 
 use super::{
     bound::{
@@ -15,6 +15,7 @@ use super::{
         ResolvedMatrixType, SliceSpec, TrapdoorSourceKey, substitute_resolved_int_expr,
     },
     normal_form_ops::{IntegerInterval, ScaleScalar, ViewSpec},
+    scalar::resolved_constant,
 };
 use mxx_ir_core::{Port, types::ConcreteMatrixType};
 use num_bigint::{BigInt, BigUint};
@@ -71,6 +72,23 @@ pub enum MatrixValueOperation {
 pub struct MatrixValueIdentityNode {
     pub operation: MatrixValueOperation,
     pub children: Box<[MatrixValueIdentityId]>,
+    pub owner: Option<FactorIdentity>,
+    pub selector: Option<FactorIdentity>,
+}
+
+/// A matrix expression identity exported from an expression DAG. Children are
+/// descriptor-local postorder indices, so this value is independent of the
+/// job-local `TermId` and identity-arena insertion order.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ResolvedMatrixValueIdentity {
+    pub nodes: Box<[ResolvedMatrixValueIdentityNode]>,
+    pub root: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ResolvedMatrixValueIdentityNode {
+    pub operation: MatrixValueOperation,
+    pub children: Box<[u32]>,
     pub owner: Option<FactorIdentity>,
     pub selector: Option<FactorIdentity>,
 }
@@ -735,14 +753,8 @@ fn slice_concrete_type(
     spec: &SliceSpec,
 ) -> Option<ConcreteMatrixType> {
     if let Some(range) = spec.rows.as_ref() {
-        let start = match &range.start {
-            ResolvedIntExpr::Const(value) => value.to_usize()?,
-            _ => return None,
-        };
-        let end = match &range.end {
-            ResolvedIntExpr::Const(value) => value.to_usize()?,
-            _ => return None,
-        };
+        let start = resolved_constant(&range.start)?.to_usize()?;
+        let end = resolved_constant(&range.end)?.to_usize()?;
         let matrix_ref = matrix.as_mut()?;
         if start >= end || end > matrix_ref.rows {
             return None;
@@ -750,14 +762,8 @@ fn slice_concrete_type(
         matrix_ref.rows = end - start;
     }
     if let Some(range) = spec.columns.as_ref() {
-        let start = match &range.start {
-            ResolvedIntExpr::Const(value) => value.to_usize()?,
-            _ => return None,
-        };
-        let end = match &range.end {
-            ResolvedIntExpr::Const(value) => value.to_usize()?,
-            _ => return None,
-        };
+        let start = resolved_constant(&range.start)?.to_usize()?;
+        let end = resolved_constant(&range.end)?.to_usize()?;
         let matrix_ref = matrix.as_mut()?;
         if start >= end || end > matrix_ref.columns {
             return None;
@@ -791,6 +797,51 @@ impl ExpressionDag {
 
     pub fn identity_node(&self, id: MatrixValueIdentityId) -> Option<&MatrixValueIdentityNode> {
         self.identity_nodes.get(id.0 as usize)
+    }
+
+    /// Materializes one canonical matrix identity as a descriptor-local
+    /// postorder arena. The source DAG IDs are used only during traversal and
+    /// never appear in the returned structural key.
+    pub fn resolved_identity(
+        &self,
+        root: MatrixValueIdentityId,
+    ) -> Option<ResolvedMatrixValueIdentity> {
+        let mut order = Vec::<MatrixValueIdentityId>::new();
+        let mut positions = BTreeMap::<MatrixValueIdentityId, u32>::new();
+        let mut work = vec![(root, false)];
+        while let Some((id, expanded)) = work.pop() {
+            if positions.contains_key(&id) {
+                continue;
+            }
+            let node = self.identity_node(id)?;
+            if !expanded {
+                work.push((id, true));
+                for child in node.children.iter().rev() {
+                    work.push((*child, false));
+                }
+            } else {
+                let index = u32::try_from(order.len()).ok()?;
+                positions.insert(id, index);
+                order.push(id);
+            }
+        }
+        let nodes = order
+            .iter()
+            .map(|id| {
+                let node = self.identity_node(*id).expect("identity traversal node");
+                Some(ResolvedMatrixValueIdentityNode {
+                    operation: node.operation.clone(),
+                    children: node
+                        .children
+                        .iter()
+                        .map(|child| positions.get(child).copied())
+                        .collect::<Option<Box<[_]>>>()?,
+                    owner: node.owner.clone(),
+                    selector: node.selector.clone(),
+                })
+            })
+            .collect::<Option<Box<[_]>>>()?;
+        Some(ResolvedMatrixValueIdentity { nodes, root: positions[&root] })
     }
 
     fn intern_identity(&mut self, node: MatrixValueIdentityNode) -> MatrixValueIdentityId {
@@ -992,110 +1043,175 @@ impl ExpressionDag {
         if let Some(term) = memo.get(&memo_key) {
             return Ok(*term);
         }
-        let node = self.node(root)?.clone();
-        let rebuilt = match node {
-            ExpressionNode::Zero | ExpressionNode::Atom(_) => unreachable!("fast path handled"),
-            ExpressionNode::Add(children) => ExpressionNode::Add(
-                children
-                    .iter()
-                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
-                    .collect::<Result<Box<_>, _>>()?,
-            ),
-            ExpressionNode::Negate(child) => {
-                ExpressionNode::Negate(self.substitute_binder(child, binder, replacement, memo)?)
+        enum Visit {
+            Enter(TermId),
+            Exit(TermId),
+        }
+        let mut built = BTreeMap::<TermId, TermId>::new();
+        let mut known = BTreeMap::<TermId, TermId>::new();
+        for ((term, cached_binder, cached_replacement), value) in memo.iter() {
+            if cached_binder == binder && cached_replacement == replacement {
+                known.insert(*term, *value);
             }
-            ExpressionNode::Product(children) => ExpressionNode::Product(
-                children
-                    .iter()
-                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
-                    .collect::<Result<Box<_>, _>>()?,
-            ),
-            ExpressionNode::Switch { selector, cases, reachable } => ExpressionNode::Switch {
-                selector: substitute_factor_identity(&selector, binder, replacement),
-                cases: cases
-                    .iter()
-                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
-                    .collect::<Result<Box<_>, _>>()?,
-                reachable,
-            },
-            ExpressionNode::Select { selector, cases, reachable } => ExpressionNode::Select {
-                selector: substitute_factor_identity(&selector, binder, replacement),
-                cases: cases
-                    .iter()
-                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
-                    .collect::<Result<Box<_>, _>>()?,
-                reachable,
-            },
-            ExpressionNode::FamilyGetStatic { cases, index } => ExpressionNode::FamilyGetStatic {
-                cases: cases
-                    .iter()
-                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
-                    .collect::<Result<Box<_>, _>>()?,
-                index,
-            },
-            ExpressionNode::FamilyGetDynamic { selector, cases, stored_indices, domain_upper } => {
-                ExpressionNode::FamilyGetDynamic {
+        }
+        let mut work = vec![Visit::Enter(root)];
+        while let Some(visit) = work.pop() {
+            let (id, exit) = match visit {
+                Visit::Enter(id) => (id, false),
+                Visit::Exit(id) => (id, true),
+            };
+            if built.contains_key(&id) || known.contains_key(&id) {
+                continue;
+            }
+            if !exit {
+                work.push(Visit::Exit(id));
+                let children = self.node(id)?.children();
+                work.extend(children.into_iter().rev().map(Visit::Enter));
+                continue;
+            }
+            let mapped =
+                |child: TermId| built.get(&child).copied().or_else(|| known.get(&child).copied());
+            let node = self.node(id)?.clone();
+            let rebuilt = match node {
+                ExpressionNode::Zero => ExpressionNode::Zero,
+                ExpressionNode::Atom(mut factor) => {
+                    factor.key = substitute_factor_identity(&factor.key, binder, replacement);
+                    factor.trapdoor = factor
+                        .trapdoor
+                        .map(|source| substitute_trapdoor_source(source, binder, replacement));
+                    factor.key.trapdoor = factor
+                        .key
+                        .trapdoor
+                        .clone()
+                        .map(|source| substitute_trapdoor_source(source, binder, replacement));
+                    factor.switch = factor.switch.map(|switch| {
+                        Arc::new(SwitchData {
+                            selector: substitute_factor_identity(
+                                &switch.selector,
+                                binder,
+                                replacement,
+                            ),
+                            cases: switch
+                                .cases
+                                .iter()
+                                .map(|case| substitute_nf(case, binder, replacement))
+                                .collect(),
+                            case_indices: switch.case_indices.clone(),
+                            case_fingerprints: switch.case_fingerprints.clone(),
+                        })
+                    });
+                    ExpressionNode::Atom(factor)
+                }
+                ExpressionNode::Add(children) => ExpressionNode::Add(
+                    children
+                        .iter()
+                        .map(|child| mapped(*child).ok_or(NormalFormError::InvalidTermId))
+                        .collect::<Result<Box<_>, _>>()?,
+                ),
+                ExpressionNode::Negate(child) => {
+                    ExpressionNode::Negate(mapped(child).ok_or(NormalFormError::InvalidTermId)?)
+                }
+                ExpressionNode::Product(children) => ExpressionNode::Product(
+                    children
+                        .iter()
+                        .map(|child| mapped(*child).ok_or(NormalFormError::InvalidTermId))
+                        .collect::<Result<Box<_>, _>>()?,
+                ),
+                ExpressionNode::Switch { selector, cases, reachable } => ExpressionNode::Switch {
                     selector: substitute_factor_identity(&selector, binder, replacement),
                     cases: cases
                         .iter()
-                        .map(|child| self.substitute_binder(*child, binder, replacement, memo))
+                        .map(|child| mapped(*child).ok_or(NormalFormError::InvalidTermId))
+                        .collect::<Result<Box<_>, _>>()?,
+                    reachable,
+                },
+                ExpressionNode::Select { selector, cases, reachable } => ExpressionNode::Select {
+                    selector: substitute_factor_identity(&selector, binder, replacement),
+                    cases: cases
+                        .iter()
+                        .map(|child| mapped(*child).ok_or(NormalFormError::InvalidTermId))
+                        .collect::<Result<Box<_>, _>>()?,
+                    reachable,
+                },
+                ExpressionNode::FamilyGetStatic { cases, index } => {
+                    ExpressionNode::FamilyGetStatic {
+                        cases: cases
+                            .iter()
+                            .map(|child| mapped(*child).ok_or(NormalFormError::InvalidTermId))
+                            .collect::<Result<Box<_>, _>>()?,
+                        index,
+                    }
+                }
+                ExpressionNode::FamilyGetDynamic {
+                    selector,
+                    cases,
+                    stored_indices,
+                    domain_upper,
+                } => ExpressionNode::FamilyGetDynamic {
+                    selector: substitute_factor_identity(&selector, binder, replacement),
+                    cases: cases
+                        .iter()
+                        .map(|child| mapped(*child).ok_or(NormalFormError::InvalidTermId))
                         .collect::<Result<Box<_>, _>>()?,
                     stored_indices,
                     domain_upper,
+                },
+                ExpressionNode::MatrixScale { input, scalar } => ExpressionNode::MatrixScale {
+                    input: mapped(input).ok_or(NormalFormError::InvalidTermId)?,
+                    scalar: substitute_scale_scalar(scalar, binder, replacement),
+                },
+                ExpressionNode::Transpose(input) => {
+                    ExpressionNode::Transpose(mapped(input).ok_or(NormalFormError::InvalidTermId)?)
                 }
-            }
-            ExpressionNode::MatrixScale { input, scalar } => ExpressionNode::MatrixScale {
-                input: self.substitute_binder(input, binder, replacement, memo)?,
-                scalar: substitute_scale_scalar(scalar, binder, replacement),
-            },
-            ExpressionNode::Transpose(input) => ExpressionNode::Transpose(self.substitute_binder(
-                input,
-                binder,
-                replacement,
-                memo,
-            )?),
-            ExpressionNode::Slice { input, spec } => ExpressionNode::Slice {
-                input: self.substitute_binder(input, binder, replacement, memo)?,
-                spec: substitute_slice_spec(spec, binder, replacement),
-            },
-            ExpressionNode::Tensor { left, right } => ExpressionNode::Tensor {
-                left: self.substitute_binder(left, binder, replacement, memo)?,
-                right: self.substitute_binder(right, binder, replacement, memo)?,
-            },
-            ExpressionNode::LiftConstantPolynomial { input, matrix_type, domain } => {
-                ExpressionNode::LiftConstantPolynomial {
-                    input: self.substitute_binder(input, binder, replacement, memo)?,
-                    matrix_type,
-                    domain,
+                ExpressionNode::Slice { input, spec } => ExpressionNode::Slice {
+                    input: mapped(input).ok_or(NormalFormError::InvalidTermId)?,
+                    spec: substitute_slice_spec(spec, binder, replacement),
+                },
+                ExpressionNode::Tensor { left, right } => ExpressionNode::Tensor {
+                    left: mapped(left).ok_or(NormalFormError::InvalidTermId)?,
+                    right: mapped(right).ok_or(NormalFormError::InvalidTermId)?,
+                },
+                ExpressionNode::LiftConstantPolynomial { input, matrix_type, domain } => {
+                    ExpressionNode::LiftConstantPolynomial {
+                        input: mapped(input).ok_or(NormalFormError::InvalidTermId)?,
+                        matrix_type,
+                        domain,
+                    }
                 }
-            }
-            ExpressionNode::View { input, view, output_type } => ExpressionNode::View {
-                input: self.substitute_binder(input, binder, replacement, memo)?,
-                view,
-                output_type,
-            },
-            ExpressionNode::CrtRecompose { inputs, spec, output_type } => {
-                ExpressionNode::CrtRecompose {
+                ExpressionNode::View { input, view, output_type } => ExpressionNode::View {
+                    input: mapped(input).ok_or(NormalFormError::InvalidTermId)?,
+                    view,
+                    output_type,
+                },
+                ExpressionNode::CrtRecompose { inputs, spec, output_type } => {
+                    ExpressionNode::CrtRecompose {
+                        inputs: inputs
+                            .iter()
+                            .map(|child| mapped(*child).ok_or(NormalFormError::InvalidTermId))
+                            .collect::<Result<Box<_>, _>>()?,
+                        spec: substitute_crt_spec(spec, binder, replacement),
+                        output_type,
+                    }
+                }
+                ExpressionNode::Concat { inputs, axis, output_type } => ExpressionNode::Concat {
                     inputs: inputs
                         .iter()
-                        .map(|child| self.substitute_binder(*child, binder, replacement, memo))
+                        .map(|child| mapped(*child).ok_or(NormalFormError::InvalidTermId))
                         .collect::<Result<Box<_>, _>>()?,
-                    spec: substitute_crt_spec(spec, binder, replacement),
+                    axis,
                     output_type,
-                }
-            }
-            ExpressionNode::Concat { inputs, axis, output_type } => ExpressionNode::Concat {
-                inputs: inputs
-                    .iter()
-                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
-                    .collect::<Result<Box<_>, _>>()?,
-                axis,
-                output_type,
-            },
-        };
-        let result = self.push(rebuilt)?;
-        memo.insert(memo_key, result);
-        Ok(result)
+                },
+            };
+            let result = self.push(rebuilt)?;
+            memo.insert((id, binder.clone(), replacement.clone()), result);
+            built.insert(id, result);
+            known.insert(id, result);
+        }
+        built
+            .get(&root)
+            .copied()
+            .or_else(|| known.get(&root).copied())
+            .ok_or(NormalFormError::InvalidTermId)
     }
 
     /// Replaces owner-resolved placeholder factors in a DAG subtree.  The
@@ -1975,6 +2091,7 @@ impl std::error::Error for NormalFormError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
     fn bound(value: u64) -> MatrixBound {
         MatrixBound {
             matrix_type: ConcreteMatrixType {
@@ -1997,6 +2114,72 @@ mod tests {
             matrix_type: ConcreteMatrixType { modulus: 17.into(), ring_dimension, rows, columns },
             coefficient_class: BoundClass::bounded(value.into()),
         }
+    }
+
+    #[test]
+    fn deep_substitution_and_normalization_use_explicit_work_stacks() {
+        thread::Builder::new()
+            .name("normal-form-depth-test".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut dag = ExpressionDag::new();
+                let atom = dag
+                    .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named(
+                        "deep-normal-form",
+                    ))))
+                    .unwrap();
+                let mut root = atom;
+                for _ in 0..4096 {
+                    root = dag.push(ExpressionNode::Negate(root)).unwrap();
+                }
+                let binder = super::super::identity::BinderKey {
+                    loop_scope: super::super::identity::OccurrenceScope {
+                        program: super::super::identity::ProgramKey::Ideal,
+                        definition: mxx_ir_core::FrozenGraphScopeId::Root,
+                        path: Box::new([]),
+                    },
+                    loop_node: mxx_ir_core::NodeId(0),
+                    slot: 0,
+                };
+                let mut memo = BTreeMap::new();
+                let substituted = dag
+                    .substitute_binder(root, &binder, &ResolvedIntExpr::Const(1.into()), &mut memo)
+                    .unwrap();
+                assert_ne!(substituted, root);
+                dag.normalize(substituted, &RelationRegistry::default()).unwrap();
+            })
+            .expect("spawn normal-form depth test")
+            .join()
+            .expect("normal-form depth test panicked");
+    }
+
+    #[test]
+    fn resolved_matrix_identity_ignores_unrelated_dag_insertions() {
+        let left = FactorIdentity::named("descriptor-left");
+        let right = FactorIdentity::named("descriptor-right");
+        let unrelated = FactorIdentity::named("descriptor-unrelated");
+        let mut first = ExpressionDag::new();
+        let first_left =
+            first.push(ExpressionNode::Atom(SymbolicFactor::large(left.clone()))).unwrap();
+        let first_right =
+            first.push(ExpressionNode::Atom(SymbolicFactor::large(right.clone()))).unwrap();
+        let first_root = first
+            .push(ExpressionNode::Product(vec![first_left, first_right].into_boxed_slice()))
+            .unwrap();
+        let first_identity =
+            first.resolved_identity(first.facts(first_root).unwrap().identity).unwrap();
+
+        let mut second = ExpressionDag::new();
+        second.push(ExpressionNode::Atom(SymbolicFactor::large(unrelated))).unwrap();
+        let second_left = second.push(ExpressionNode::Atom(SymbolicFactor::large(left))).unwrap();
+        let second_right = second.push(ExpressionNode::Atom(SymbolicFactor::large(right))).unwrap();
+        let second_root = second
+            .push(ExpressionNode::Product(vec![second_left, second_right].into_boxed_slice()))
+            .unwrap();
+        let second_identity =
+            second.resolved_identity(second.facts(second_root).unwrap().identity).unwrap();
+
+        assert_eq!(first_identity, second_identity);
     }
     #[test]
     fn zero_annihilates_large() {
@@ -2542,6 +2725,58 @@ mod tests {
             summary.as_matrix_bound().unwrap().coefficient_class,
             BoundClass::bounded(2_u8.into())
         );
+    }
+
+    #[test]
+    fn deep_relation_target_uses_stack_safe_normalization_dispatch() {
+        thread::Builder::new()
+            .name("normal-form-relation-depth-test".to_owned())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let public = FactorIdentity::named("deep-relation-B");
+                let preimage = FactorIdentity::named("deep-relation-K");
+                let target = FactorIdentity::named("deep-relation-E");
+                let mut dag = ExpressionDag::new();
+                let b =
+                    dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
+                let k = dag
+                    .push(ExpressionNode::Atom(
+                        SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+                    ))
+                    .unwrap();
+                let mut deep_target = dag
+                    .push(ExpressionNode::Atom(
+                        SymbolicFactor::bounded(target.clone(), bound(2)).unwrap(),
+                    ))
+                    .unwrap();
+                for _ in 0..4096 {
+                    deep_target = dag.push(ExpressionNode::Negate(deep_target)).unwrap();
+                }
+                let root =
+                    dag.push(ExpressionNode::Product(vec![b, k].into_boxed_slice())).unwrap();
+                let key = FullRelationKey {
+                    source: "named".into(),
+                    ordered_indices: Box::new([]),
+                    public,
+                    target,
+                    matrix_type: None,
+                    layout: None,
+                    trapdoor: None,
+                    selector: None,
+                };
+                let mut registry = RelationRegistry::default();
+                registry
+                    .register(RelationRegistration { key, preimage, target: deep_target })
+                    .unwrap();
+                let summary = dag.normalize_bounded(root, &registry).unwrap();
+                assert_eq!(
+                    summary.as_matrix_bound().unwrap().coefficient_class,
+                    BoundClass::bounded(2_u8.into())
+                );
+            })
+            .expect("spawn relation depth test")
+            .join()
+            .expect("relation depth test panicked");
     }
 
     #[test]

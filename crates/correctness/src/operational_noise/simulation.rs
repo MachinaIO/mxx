@@ -501,7 +501,7 @@ pub fn check_operational_noise_candidate_with_progress(
             let roots = match value {
                 LoweredValue::Matrix(root) => LoweredRootSet::Dag(root),
                 LoweredValue::MatrixFamily(family) => LoweredRootSet::MatrixFamily(family),
-                LoweredValue::Term(_) | LoweredValue::Family(_) => {
+                LoweredValue::Term(_) | LoweredValue::Scalar(_) | LoweredValue::Family(_) => {
                     // Scalar lowering remains available to resolve selectors, loop domains, and
                     // matrix metadata, but a residual accepted by this checker must be a matrix
                     // expression DAG (or a matrix family backed by that DAG).  In particular,
@@ -1325,7 +1325,6 @@ mod tests {
                 columns: 1,
             },
             coefficient_class: class,
-            metadata: super::super::bound::MatrixMetadata::unknown(),
         }
     }
 

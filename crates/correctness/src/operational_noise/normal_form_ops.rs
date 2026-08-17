@@ -39,11 +39,14 @@ impl From<NormalFormError> for OperationError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct IntegerInterval {
     pub minimum: BigInt,
     pub maximum: BigInt,
     pub selector_only: bool,
+    /// Selector provenance that came directly from coefficient extraction.
+    /// Ordinary selector arithmetic never fills this field.
+    pub direct_extract_upper: Option<BigUint>,
 }
 
 impl IntegerInterval {
@@ -51,11 +54,17 @@ impl IntegerInterval {
         if minimum > maximum {
             return Err(OperationError::InvalidIntegerDomain);
         }
-        Ok(Self { minimum, maximum, selector_only: false })
+        Ok(Self { minimum, maximum, selector_only: false, direct_extract_upper: None })
     }
 
     pub fn selector_only(mut self) -> Self {
         self.selector_only = true;
+        self
+    }
+
+    pub fn selector_only_direct_extract(mut self, upper: BigUint) -> Self {
+        self.selector_only = true;
+        self.direct_extract_upper = Some(upper);
         self
     }
 
@@ -64,13 +73,13 @@ impl IntegerInterval {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ScaleScalar {
     Exact { key: FactorIdentity, value: BigInt, matrix_type: ConcreteMatrixType },
     Interval(IntegerInterval),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ViewSpec {
     Identity,
     Rotation { exponent: BigInt },
@@ -78,7 +87,7 @@ pub enum ViewSpec {
     CoefficientPreserving { view: CoefficientPreservingView },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum CoefficientPreservingView {
     Slice(SliceSpec),
 }
@@ -250,18 +259,14 @@ impl PolynomialNFOperations for PolynomialNF {
         matrix_type: ConcreteMatrixType,
         domain: &IntegerInterval,
     ) -> Result<PolynomialNF, OperationError> {
-        if domain.selector_only {
+        if domain.selector_only && domain.direct_extract_upper.is_none() {
             return Err(OperationError::SelectorOnlyInteger);
         }
         let cap = domain.maximum_absolute();
         if cap.is_zero() || self.is_exact_zero() {
             return Ok(PolynomialNF::zero());
         }
-        let bound = MatrixBound {
-            matrix_type,
-            coefficient_class: BoundClass::bounded(cap),
-            metadata: MatrixMetadata { is_constant_polynomial: true, known_zero_rows: None },
-        };
+        let bound = MatrixBound { matrix_type, coefficient_class: BoundClass::bounded(cap) };
         let mut output = PolynomialNF::zero();
         for term in self.exact_terms().values() {
             output.insert(
@@ -311,8 +316,8 @@ impl PolynomialNFOperations for PolynomialNF {
                     matrix_bound: Some(MatrixBound {
                         matrix_type,
                         coefficient_class: BoundClass::bounded(value.magnitude().clone()),
-                        metadata: MatrixMetadata::unknown(),
                     }),
+                    matrix_value_metadata: MatrixMetadata::unknown(),
                     switch: None,
                 };
                 let mut output = PolynomialNF::zero();
@@ -389,7 +394,6 @@ impl PolynomialNFOperations for PolynomialNF {
             BoundedSummary::Bounded(bound) => {
                 let mut bound = bound.clone();
                 bound.matrix_type = output_type;
-                bound.metadata.known_zero_rows = None;
                 BoundedSummary::Bounded(bound)
             }
         };
@@ -555,7 +559,6 @@ impl AdditionalOperations for PolynomialNF {
         let bound = MatrixBound {
             matrix_type: output_type,
             coefficient_class: BoundClass::bounded(maximum),
-            metadata: MatrixMetadata::unknown(),
         };
         let combined = bits
             .iter()
@@ -608,8 +611,8 @@ impl AdditionalOperations for PolynomialNF {
                     matrix_bound: Some(MatrixBound {
                         matrix_type: output_type,
                         coefficient_class: BoundClass::bounded(range),
-                        metadata: MatrixMetadata::unknown(),
                     }),
+                    matrix_value_metadata: MatrixMetadata::unknown(),
                     switch: None,
                 };
                 let mut output = PolynomialNF::zero();
@@ -683,19 +686,19 @@ impl AdditionalOperations for PolynomialNF {
                 matrix_bound: Some(MatrixBound {
                     matrix_type: matrix_type.clone(),
                     coefficient_class: BoundClass::Large,
-                    metadata: MatrixMetadata::unknown(),
                 }),
+                matrix_value_metadata: MatrixMetadata {
+                    canonical_coefficient_exclusive_upper: None,
+                    is_constant_polynomial,
+                    known_zero_rows: None,
+                },
                 switch: None,
             };
             let mut output = PolynomialNF::zero();
             output.insert(Monomial::from_factor(factor), BigInt::from(1))?;
             return Ok(output);
         }
-        Ok(PolynomialNF::bounded(MatrixBound {
-            matrix_type,
-            coefficient_class: class,
-            metadata: MatrixMetadata { is_constant_polynomial, known_zero_rows: None },
-        })?)
+        Ok(PolynomialNF::bounded(MatrixBound { matrix_type, coefficient_class: class })?)
     }
 }
 
@@ -814,7 +817,7 @@ fn transpose_factor(mut factor: SymbolicFactor) -> Result<SymbolicFactor, Operat
             factor.key = (**parent).clone();
             if let Some(bound) = factor.matrix_bound.as_mut() {
                 std::mem::swap(&mut bound.matrix_type.rows, &mut bound.matrix_type.columns);
-                bound.metadata.known_zero_rows = None;
+                factor.matrix_value_metadata.known_zero_rows = None;
             }
             factor.relation_live = false;
             return Ok(factor);
@@ -826,7 +829,7 @@ fn transpose_factor(mut factor: SymbolicFactor) -> Result<SymbolicFactor, Operat
     };
     if let Some(bound) = factor.matrix_bound.as_mut() {
         std::mem::swap(&mut bound.matrix_type.rows, &mut bound.matrix_type.columns);
-        bound.metadata.known_zero_rows = None;
+        factor.matrix_value_metadata.known_zero_rows = None;
     }
     factor.relation_live = false;
     Ok(factor)
@@ -852,6 +855,7 @@ fn structural_factor(
         relation_live: false,
         trapdoor: None,
         matrix_bound,
+        matrix_value_metadata: MatrixMetadata::unknown(),
         switch: None,
     }
 }
@@ -862,7 +866,6 @@ fn transpose_summary(summary: &BoundedSummary) -> Result<BoundedSummary, Operati
         BoundedSummary::Bounded(bound) => {
             let mut bound = bound.clone();
             std::mem::swap(&mut bound.matrix_type.rows, &mut bound.matrix_type.columns);
-            bound.metadata.known_zero_rows = None;
             Ok(summary_from_bound(bound))
         }
     }
@@ -880,13 +883,7 @@ fn tensor_bound(left: &MatrixBound, right: &MatrixBound) -> Result<MatrixBound, 
             BoundClass::Bounded { maximum_absolute_coefficient: coeff_left },
             BoundClass::Bounded { maximum_absolute_coefficient: coeff_right },
         ) => BoundClass::bounded(
-            coeff_left *
-                coeff_right *
-                if left_metadata_constant(left, right) {
-                    BigUint::from(1_u8)
-                } else {
-                    BigUint::from(left.matrix_type.ring_dimension)
-                },
+            coeff_left * coeff_right * BigUint::from(left.matrix_type.ring_dimension),
         ),
         _ => BoundClass::Large,
     };
@@ -909,16 +906,7 @@ fn tensor_bound(left: &MatrixBound, right: &MatrixBound) -> Result<MatrixBound, 
                 .ok_or(OperationError::InvalidShape)?,
         },
         coefficient_class,
-        metadata: MatrixMetadata {
-            is_constant_polynomial: left.metadata.is_constant_polynomial &&
-                right.metadata.is_constant_polynomial,
-            known_zero_rows: None,
-        },
     })
-}
-
-fn left_metadata_constant(left: &MatrixBound, right: &MatrixBound) -> bool {
-    left.metadata.is_constant_polynomial || right.metadata.is_constant_polynomial
 }
 
 fn scale_summary(summary: BoundedSummary, scalar: &BigInt) -> BoundedSummary {
@@ -931,10 +919,7 @@ fn scale_summary(summary: BoundedSummary, scalar: &BigInt) -> BoundedSummary {
 fn clear_zero_rows(summary: BoundedSummary) -> BoundedSummary {
     match summary {
         BoundedSummary::ExactZero => BoundedSummary::ExactZero,
-        BoundedSummary::Bounded(mut bound) => {
-            bound.metadata.known_zero_rows = None;
-            BoundedSummary::Bounded(bound)
-        }
+        BoundedSummary::Bounded(bound) => BoundedSummary::Bounded(bound),
     }
 }
 
@@ -945,7 +930,6 @@ fn slice_bound(mut bound: MatrixBound, spec: &SliceSpec) -> Result<MatrixBound, 
     if let Some(range) = &spec.columns {
         bound.matrix_type.columns = range_length(range, bound.matrix_type.columns)?;
     }
-    bound.metadata.known_zero_rows = None;
     Ok(bound)
 }
 
@@ -1007,7 +991,6 @@ mod tests {
         MatrixBound {
             matrix_type: matrix_type(1, 1),
             coefficient_class: BoundClass::bounded(value.into()),
-            metadata: MatrixMetadata::unknown(),
         }
     }
 
@@ -1017,7 +1000,23 @@ mod tests {
             MatrixBound {
                 matrix_type: matrix_type(rows, columns),
                 coefficient_class: BoundClass::bounded(bound.into()),
-                metadata: MatrixMetadata::unknown(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn finite_with_metadata(
+        name: &str,
+        rows: usize,
+        columns: usize,
+        bound: u64,
+        _metadata: MatrixMetadata,
+    ) -> PolynomialNF {
+        PolynomialNF::bounded_factor(
+            FactorIdentity::named(name),
+            MatrixBound {
+                matrix_type: matrix_type(rows, columns),
+                coefficient_class: BoundClass::bounded(bound.into()),
             },
         )
         .unwrap()
@@ -1163,21 +1162,16 @@ mod tests {
         let domain = IntegerInterval::new((-2).into(), 3.into()).unwrap();
         let lifted = input.lift_constant_polynomial_nf(matrix_type(1, 1), &domain).unwrap();
         let lifted_bound = lifted.bounded_summary().as_matrix_bound().unwrap();
-        assert!(lifted_bound.metadata.is_constant_polynomial);
+        assert_eq!(lifted_bound.coefficient_class, BoundClass::bounded(3_u64.into()));
 
         let scaled_input = PolynomialNF::bounded(MatrixBound {
             matrix_type: matrix_type(1, 1),
             coefficient_class: BoundClass::bounded(2_u64.into()),
-            metadata: MatrixMetadata {
-                is_constant_polynomial: false,
-                known_zero_rows: Some(1_u64.into()),
-            },
         })
         .unwrap();
         let scaled = scaled_input.matrix_scale_nf(ScaleScalar::Interval(domain.clone())).unwrap();
         let scaled_bound = scaled.bounded_summary().as_matrix_bound().unwrap();
         assert_eq!(scaled_bound.coefficient_class, BoundClass::bounded(6_u64.into()));
-        assert_eq!(scaled_bound.metadata.known_zero_rows, None);
         assert_eq!(
             input.matrix_scale_nf(ScaleScalar::Interval(domain.selector_only())),
             Err(OperationError::SelectorOnlyInteger)
@@ -1205,6 +1199,55 @@ mod tests {
                 .unwrap()
                 .is_exact_zero()
         );
+    }
+
+    #[test]
+    fn direct_extract_lift_preserves_authoritative_upper() {
+        let input = finite("input", 1, 1, 1);
+        let domain = IntegerInterval::new(0.into(), 6.into())
+            .unwrap()
+            .selector_only_direct_extract(7_u8.into());
+        let _lifted = input.lift_constant_polynomial_nf(matrix_type(1, 1), &domain).unwrap();
+        assert_eq!(
+            input.lift_constant_polynomial_nf(
+                matrix_type(1, 1),
+                &IntegerInterval::new(0.into(), 6.into()).unwrap().selector_only(),
+            ),
+            Err(OperationError::SelectorOnlyInteger)
+        );
+    }
+
+    #[test]
+    fn coefficient_preserving_views_keep_metadata_but_arithmetic_clears_it() {
+        let metadata = MatrixMetadata {
+            canonical_coefficient_exclusive_upper: Some(11_u8.into()),
+            is_constant_polynomial: true,
+            known_zero_rows: Some(1_u8.into()),
+        };
+        let input = finite_with_metadata("input", 2, 2, 3, metadata);
+        let slice = SliceSpec {
+            rows: None,
+            columns: Some(ResolvedIndexRange {
+                start: ResolvedIntExpr::Const(0.into()),
+                end: ResolvedIntExpr::Const(1.into()),
+            }),
+        };
+        let sliced = input.slice_nf(&slice).unwrap();
+        assert_eq!(
+            sliced.bounded_summary().as_matrix_bound().unwrap().matrix_type,
+            matrix_type(2, 1)
+        );
+
+        let transposed = input.transpose_nf().unwrap();
+        assert_eq!(
+            transposed.bounded_summary().as_matrix_bound().unwrap().matrix_type,
+            matrix_type(2, 2)
+        );
+
+        let sum = input.clone().add(finite("other", 2, 2, 2)).unwrap();
+        assert!(sum.bounded_summary().as_matrix_bound().is_some());
+        let negated = input.negate();
+        assert!(negated.bounded_summary().as_matrix_bound().is_some());
     }
 
     #[test]
@@ -1330,7 +1373,6 @@ mod tests {
                 columns: 1,
             },
             coefficient_class: BoundClass::bounded(2_u64.into()),
-            metadata: MatrixMetadata::unknown(),
         })
         .unwrap();
         let right = PolynomialNF::bounded(MatrixBound {
@@ -1341,7 +1383,6 @@ mod tests {
                 columns: 1,
             },
             coefficient_class: BoundClass::bounded(3_u64.into()),
-            metadata: MatrixMetadata::unknown(),
         })
         .unwrap();
         let tensor = left.tensor_nf(&right).unwrap();

@@ -25,6 +25,7 @@ use super::{
         AdditionalOperations, BoolBit, CoefficientPreservingView, IntegerInterval,
         PolynomialNFOperations, ScaleScalar, ViewSpec,
     },
+    scalar::{ScalarExtractKey, ScalarId, ScalarOperation, ScalarStore},
 };
 use crate::{
     DeclaredBoundExpr, InputValueContract, ProtocolDecl, ProtocolInputDestination, StageId,
@@ -295,6 +296,8 @@ pub enum LoweredValue {
     MatrixFamily(FamilyLoweringValue<TermId>),
     /// A scalar/domain analysis term. Matrix values must not use this path in production.
     Term(Id),
+    /// A typed scalar owned by this lowering job, not an e-graph node.
+    Scalar(ScalarId),
     Family(FamilyLoweringValue),
     Trapdoor(TrapdoorDescriptorId),
     TrapdoorFamily {
@@ -423,6 +426,7 @@ pub struct GraphLowerer<'a, 'control> {
     /// is a symbol table, not an e-class traversal: every derived scalar is
     /// registered at its construction boundary.
     scalar_identities: HashMap<Id, ResolvedIntExpr>,
+    scalar_store: ScalarStore,
     active: HashSet<LoweringWireKey>,
     control: Option<&'control mut dyn LoweringControl>,
 }
@@ -442,6 +446,7 @@ impl<'a> GraphLowerer<'a, '_> {
             memo: HashMap::new(),
             family_substitution_memo: BTreeMap::new(),
             scalar_identities: HashMap::new(),
+            scalar_store: ScalarStore::default(),
             active: HashSet::new(),
             control: None,
         }
@@ -467,6 +472,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             memo: HashMap::new(),
             family_substitution_memo: BTreeMap::new(),
             scalar_identities: HashMap::new(),
+            scalar_store: ScalarStore::default(),
             active: HashSet::new(),
             control: Some(control),
         }
@@ -485,6 +491,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             memo: self.memo,
             family_substitution_memo: self.family_substitution_memo,
             scalar_identities: self.scalar_identities,
+            scalar_store: self.scalar_store,
             active: self.active,
             control: None,
         }
@@ -1538,6 +1545,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         LoweredValue::Matrix(_) | LoweredValue::MatrixFamily(_) => {
                             return Err(LowerError::UnsupportedMatrixProductExpansion)
                         }
+                        LoweredValue::Scalar(_) => {
+                            return Err(LowerError::UnsupportedMatrixProductExpansion)
+                        }
                         LoweredValue::Family(family) => self.family_element(&family, &index)?,
                         LoweredValue::Trapdoor(_) | LoweredValue::TrapdoorFamily { .. } => {
                             return Err(LowerError::FamilyProducerNotResolved {
@@ -1674,6 +1684,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                 .ok_or(LowerError::UnsupportedMatrixProductExpansion)
                             }
                             LoweredValue::Matrix(_) | LoweredValue::MatrixFamily(_) => {
+                                Err(LowerError::UnsupportedMatrixProductExpansion)
+                            }
+                            LoweredValue::Scalar(_) => {
                                 Err(LowerError::UnsupportedMatrixProductExpansion)
                             }
                             LoweredValue::Family(_) |
@@ -2185,14 +2198,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             matrix_type: concrete_matrix_type(&matrix)
                 .ok_or(LowerError::UnsupportedMatrixProductExpansion)?,
             coefficient_class,
-            metadata: protocol_contract
-                .map(|(_, metadata)| metadata)
-                .unwrap_or_else(MatrixMetadata::unknown),
         };
-        self.push_matrix_atom(
+        self.push_matrix_atom_with_metadata(
             factor_key,
             bound,
             matches!(relation_role, Some(super::identity::AtomicRelationRole::Preimage)),
+            protocol_contract.map(|(_, metadata)| metadata).unwrap_or_else(MatrixMetadata::unknown),
         )
     }
 
@@ -2240,8 +2251,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     return Err(LowerError::UnsupportedMatrixProductExpansion);
                 }
                 Ok(Some((
-                    BoundClass::bounded(upper - BigUint::one()),
+                    BoundClass::bounded(upper.clone() - BigUint::one()),
                     MatrixMetadata {
+                        canonical_coefficient_exclusive_upper: Some(upper.clone()),
                         is_constant_polynomial: *is_constant_polynomial,
                         known_zero_rows: None,
                     },
@@ -2331,11 +2343,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         }
     }
 
-    fn push_matrix_atom(
+    fn push_matrix_atom_with_metadata(
         &mut self,
         key: FactorIdentity,
         bound: MatrixBound,
         relation_live: bool,
+        metadata: MatrixMetadata,
     ) -> Result<TermId, LowerError> {
         let factor = if relation_live {
             SymbolicFactor::relation_live(key, bound)
@@ -2346,6 +2359,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             SymbolicFactor::bounded(key, bound)
                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?
         };
+        let mut factor = factor;
+        factor.matrix_value_metadata = metadata;
         self.dag
             .push(ExpressionNode::Atom(factor))
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)
@@ -2383,60 +2398,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         &self,
         term: TermId,
     ) -> Result<mxx_ir_core::types::ConcreteMatrixType, LowerError> {
-        let node =
-            self.dag.node(term).map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
-        match node {
-            ExpressionNode::Atom(factor) => factor
-                .matrix_bound
-                .as_ref()
-                .map(|bound| bound.matrix_type.clone())
-                .ok_or(LowerError::UnsupportedMatrixProductExpansion),
-            ExpressionNode::Add(children) | ExpressionNode::Product(children) => children
-                .first()
-                .copied()
-                .ok_or(LowerError::UnsupportedMatrixProductExpansion)
-                .and_then(|child| self.dag_matrix_type(child)),
-            ExpressionNode::Negate(child) |
-            ExpressionNode::MatrixScale { input: child, .. } |
-            ExpressionNode::Slice { input: child, .. } |
-            ExpressionNode::View { input: child, .. } => self.dag_matrix_type(*child),
-            ExpressionNode::Transpose(child) => {
-                let mut matrix = self.dag_matrix_type(*child)?;
-                std::mem::swap(&mut matrix.rows, &mut matrix.columns);
-                Ok(matrix)
-            }
-            ExpressionNode::Tensor { left, right } => {
-                let left = self.dag_matrix_type(*left)?;
-                let right = self.dag_matrix_type(*right)?;
-                if left.modulus != right.modulus || left.ring_dimension != right.ring_dimension {
-                    return Err(LowerError::UnsupportedMatrixProductExpansion);
-                }
-                Ok(mxx_ir_core::types::ConcreteMatrixType {
-                    modulus: left.modulus,
-                    ring_dimension: left.ring_dimension,
-                    rows: left
-                        .rows
-                        .checked_mul(right.rows)
-                        .ok_or(LowerError::UnsupportedMatrixProductExpansion)?,
-                    columns: left
-                        .columns
-                        .checked_mul(right.columns)
-                        .ok_or(LowerError::UnsupportedMatrixProductExpansion)?,
-                })
-            }
-            ExpressionNode::LiftConstantPolynomial { matrix_type, .. } |
-            ExpressionNode::CrtRecompose { output_type: matrix_type, .. } |
-            ExpressionNode::Concat { output_type: matrix_type, .. } => Ok(matrix_type.clone()),
-            ExpressionNode::Switch { cases, .. } |
-            ExpressionNode::Select { cases, .. } |
-            ExpressionNode::FamilyGetStatic { cases, .. } |
-            ExpressionNode::FamilyGetDynamic { cases, .. } => cases
-                .first()
-                .copied()
-                .ok_or(LowerError::UnsupportedMatrixProductExpansion)
-                .and_then(|child| self.dag_matrix_type(child)),
-            ExpressionNode::Zero => Err(LowerError::UnsupportedMatrixProductExpansion),
-        }
+        self.dag
+            .facts(term)
+            .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?
+            .concrete_type
+            .clone()
+            .ok_or(LowerError::UnsupportedMatrixProductExpansion)
     }
 
     fn graph_factor_identity(
@@ -2488,11 +2455,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         matrix_type: mxx_ir_core::types::ConcreteMatrixType,
     ) -> Result<TermId, LowerError> {
         if value.is_exact_zero() {
-            let bound = MatrixBound {
-                matrix_type,
-                coefficient_class: BoundClass::ExactZero,
-                metadata: MatrixMetadata::unknown(),
-            };
+            let bound = MatrixBound { matrix_type, coefficient_class: BoundClass::ExactZero };
             let factor = SymbolicFactor::bounded(fallback, bound)
                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
             return self
@@ -2519,6 +2482,58 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         self.dag
             .push(ExpressionNode::Atom(factor))
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)
+    }
+
+    fn lower_extract_coefficient_dag(
+        &mut self,
+        matrix: TermId,
+        position: LoweredInt,
+        explicit_upper: Option<&BigUint>,
+        _environment: &LowerEnv,
+    ) -> Result<LoweredValue, LowerError> {
+        let concrete = self.dag_matrix_type(matrix)?;
+        let modulus = concrete.modulus.to_biguint().ok_or(
+            LowerError::InvalidExtractCoefficientCanonicalUpper {
+                upper: BigUint::zero(),
+                modulus: BigUint::zero(),
+            },
+        )?;
+        let facts =
+            self.dag.facts(matrix).map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
+        let explicit_upper = explicit_upper.cloned();
+        let authoritative_upper = explicit_upper
+            .as_ref()
+            .or(facts.metadata.canonical_coefficient_exclusive_upper.as_ref());
+        if let Some(upper) = authoritative_upper {
+            if upper.is_zero() || upper > &modulus {
+                return Err(LowerError::InvalidExtractCoefficientCanonicalUpper {
+                    upper: upper.clone(),
+                    modulus,
+                });
+            }
+        }
+        let resolved_matrix = super::identity::ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(concrete.modulus.clone()),
+            ring_dimension: ResolvedIntExpr::Const(concrete.ring_dimension.into()),
+            rows: ResolvedIntExpr::Const(concrete.rows.into()),
+            columns: ResolvedIntExpr::Const(concrete.columns.into()),
+        };
+        let data = MxxAnalysis::direct_extract_data(resolved_matrix, modulus, authoritative_upper)
+            .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
+        let position_identity = position
+            .stable_identity
+            .clone()
+            .or_else(|| self.canonical_scalar_identity(position.term).ok())
+            .ok_or(LowerError::MissingIntegerAnalysis { term: position.term })?;
+        let scalar = self.scalar_store.intern(
+            ScalarExtractKey {
+                operation: ScalarOperation::ExtractCoefficient,
+                matrix: facts.identity,
+                position: position_identity,
+            },
+            data,
+        );
+        Ok(LoweredValue::Scalar(scalar))
     }
 
     fn lower_matrix_constant_dag(
@@ -2636,14 +2651,48 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         matrix_type: &MatrixType,
         environment: &LowerEnv,
     ) -> Result<LoweredValue, LowerError> {
-        let LoweredValue::Term(term) = input else {
-            return Err(LowerError::UnsupportedMatrixProductExpansion);
+        let (interval, direct_extract_upper, selector_only) = match input {
+            LoweredValue::Term(term) => {
+                let term = self.scalar_term(*term)?;
+                let interval = self
+                    .integer_analysis(term)
+                    .and_then(|(domain, _)| domain.interval().ok())
+                    .ok_or(LowerError::UnsupportedMatrixProductExpansion)?;
+                let data = &self.egraph[self.egraph.find(term)].data;
+                (
+                    interval,
+                    data.direct_extract.as_ref().and_then(|fact| fact.canonical_upper.clone()),
+                    data.scalar_provenance == Some(ScalarProvenance::SelectorOnly),
+                )
+            }
+            LoweredValue::Scalar(id) => {
+                let entry = self
+                    .scalar_store
+                    .get(*id)
+                    .ok_or(LowerError::UnsupportedMatrixProductExpansion)?;
+                let interval = entry
+                    .analysis
+                    .integer_domain
+                    .as_ref()
+                    .and_then(|domain| domain.interval().ok())
+                    .ok_or(LowerError::UnsupportedMatrixProductExpansion)?;
+                (
+                    interval,
+                    entry
+                        .analysis
+                        .direct_extract
+                        .as_ref()
+                        .and_then(|fact| fact.canonical_upper.clone()),
+                    entry.analysis.scalar_provenance == Some(ScalarProvenance::SelectorOnly),
+                )
+            }
+            _ => return Err(LowerError::UnsupportedMatrixProductExpansion),
         };
-        let term = self.scalar_term(*term)?;
-        let interval = self
-            .integer_analysis(term)
-            .and_then(|(domain, _)| domain.interval().ok())
-            .ok_or(LowerError::UnsupportedMatrixProductExpansion)?;
+        if selector_only && direct_extract_upper.is_none() {
+            return Err(LowerError::SelectorOnlyValueUsedByForbiddenConsumer {
+                consumer: SelectorOnlyConsumer::LiftConstantPolynomial,
+            });
+        }
         let matrix_type =
             concrete_matrix_type(&self.resolve_matrix_type(matrix_type, environment)?)
                 .ok_or(LowerError::UnsupportedMatrixProductExpansion)?;
@@ -2653,11 +2702,14 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             coefficient_class: BoundClass::bounded(
                 interval.minimum.magnitude().max(interval.maximum.magnitude()).clone(),
             ),
-            metadata: MatrixMetadata::unknown(),
         })
         .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
         let domain = IntegerInterval::new(interval.minimum.clone(), interval.maximum.clone())
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
+        let domain = match direct_extract_upper {
+            Some(upper) => domain.selector_only_direct_extract(upper),
+            None => domain,
+        };
         let nf = source
             .lift_constant_polynomial_nf(matrix_type.clone(), &domain)
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
@@ -2707,7 +2759,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             matrix_type: concrete_matrix_type(&matrix)
                 .ok_or(LowerError::UnsupportedMatrixProductExpansion)?,
             coefficient_class: BoundClass::bounded(coefficient),
-            metadata: MatrixMetadata::unknown(),
         };
         let trapdoor_source = self
             .egraph
@@ -3352,6 +3403,32 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 .collect::<Result<Vec<_>, _>>()
         };
         match kind {
+            NodeKind::ExtractCoefficient { position, canonical_input_exclusive_upper }
+                if arguments.iter().any(|value| matches!(value, LoweredValue::Matrix(_))) =>
+            {
+                let (matrix, position) = match arguments {
+                    [LoweredValue::Matrix(matrix)] => {
+                        (*matrix, self.lower_int_expr(position, environment)?)
+                    }
+                    [LoweredValue::Matrix(matrix), LoweredValue::Term(position)] => {
+                        let position = self.scalar_term(*position)?;
+                        let stable_identity = self.canonical_scalar_identity(position).ok();
+                        (*matrix, LoweredInt { term: position, stable_identity })
+                    }
+                    _ => {
+                        return Err(LowerError::InvalidOperandArity {
+                            expected: 1,
+                            actual: arguments.len(),
+                        })
+                    }
+                };
+                return self.lower_extract_coefficient_dag(
+                    matrix,
+                    position,
+                    canonical_input_exclusive_upper.as_ref(),
+                    environment,
+                );
+            }
             NodeKind::ConstantMatrix { value: mxx_ir_core::node::ConstantMatrix::Zero, .. } => {
                 if !arguments.is_empty() {
                     return Err(LowerError::InvalidOperandArity {
@@ -3591,6 +3668,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     LoweredValue::Matrix(_) | LoweredValue::MatrixFamily(_) => {
                         Err(LowerError::UnsupportedMatrixProductExpansion)
                     }
+                    LoweredValue::Scalar(_) => Err(LowerError::UnsupportedMatrixProductExpansion),
                     LoweredValue::Trapdoor(_) | LoweredValue::TrapdoorFamily { .. } => {
                         Err(LowerError::InvalidOperandSort {
                             expected: WireType::Matrix(MatrixType {
@@ -3929,6 +4007,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             })
                         }
                         LoweredValue::Matrix(_) => {
+                            Err(LowerError::UnsupportedMatrixProductExpansion)
+                        }
+                        LoweredValue::Scalar(_) => {
                             Err(LowerError::UnsupportedMatrixProductExpansion)
                         }
                         LoweredValue::MatrixFamily(_) => {
@@ -4287,6 +4368,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             LoweredValue::Matrix(_) => Some(super::error::LoweredValueCategory::Term),
             LoweredValue::MatrixFamily(_) => Some(super::error::LoweredValueCategory::Family),
             LoweredValue::Term(_) => Some(super::error::LoweredValueCategory::Term),
+            LoweredValue::Scalar(_) => Some(super::error::LoweredValueCategory::Term),
             LoweredValue::Family(_) => Some(super::error::LoweredValueCategory::Family),
             LoweredValue::Trapdoor(_) => Some(super::error::LoweredValueCategory::Trapdoor),
             LoweredValue::TrapdoorFamily { .. } => {
@@ -5170,8 +5252,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 matrix_bound: Some(MatrixBound {
                     matrix_type: concrete,
                     coefficient_class: BoundClass::Large,
-                    metadata: MatrixMetadata::unknown(),
                 }),
+                matrix_value_metadata: MatrixMetadata::unknown(),
                 switch: None,
             };
             let placeholder = self
@@ -5518,17 +5600,15 @@ mod tests {
             let environment = root_test_environment();
             let matrix = test_resolved_matrix();
             let concrete = concrete_matrix_type(&matrix).unwrap();
-            let bound = |class| MatrixBound {
-                matrix_type: concrete.clone(),
-                coefficient_class: class,
-                metadata: MatrixMetadata::unknown(),
-            };
+            let bound =
+                |class| MatrixBound { matrix_type: concrete.clone(), coefficient_class: class };
             let large_matrix = |key| SymbolicFactor {
                 key,
                 bound: BoundClass::Large,
                 relation_live: false,
                 trapdoor: None,
                 matrix_bound: Some(bound(BoundClass::Large)),
+                matrix_value_metadata: MatrixMetadata::unknown(),
                 switch: None,
             };
             let initial = lowerer
@@ -5674,8 +5754,8 @@ mod tests {
                     matrix_bound: Some(MatrixBound {
                         matrix_type: concrete,
                         coefficient_class: BoundClass::Large,
-                        metadata: MatrixMetadata::unknown(),
                     }),
+                    matrix_value_metadata: MatrixMetadata::unknown(),
                     switch: None,
                 }))
                 .unwrap()
@@ -5785,8 +5865,8 @@ mod tests {
                 matrix_bound: Some(MatrixBound {
                     matrix_type: concrete,
                     coefficient_class: BoundClass::Large,
-                    metadata: MatrixMetadata::unknown(),
                 }),
+                matrix_value_metadata: MatrixMetadata::unknown(),
                 switch: None,
             }))
             .unwrap();
@@ -5878,8 +5958,8 @@ mod tests {
                     matrix_bound: Some(MatrixBound {
                         matrix_type: concrete.clone(),
                         coefficient_class: BoundClass::Large,
-                        metadata: MatrixMetadata::unknown(),
                     }),
+                    matrix_value_metadata: MatrixMetadata::unknown(),
                     switch: None,
                 }))
                 .unwrap()
@@ -6011,8 +6091,8 @@ mod tests {
                 matrix_bound: Some(MatrixBound {
                     matrix_type: matrix_type.clone(),
                     coefficient_class: BoundClass::bounded(1_u8.into()),
-                    metadata: MatrixMetadata::unknown(),
                 }),
+                matrix_value_metadata: MatrixMetadata::unknown(),
                 switch: None,
             }))
             .expect("matrix atom");
@@ -6034,10 +6114,316 @@ mod tests {
         }
         assert!(
             lowerer.egraph.classes().all(|class| {
-                class.nodes.iter().all(|node| matches!(node, MxxLang::IntConst(_)))
+                class
+                    .nodes
+                    .iter()
+                    .all(|node| matches!(node, MxxLang::IntConst(_) | MxxLang::IntParameter(_)))
             }),
             "matrix DAG operations must not construct matrix expression e-nodes"
         );
+    }
+
+    #[test]
+    fn coefficient_extraction_bridges_matrix_dag_to_authoritative_scalar_facts() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "matrix-coefficient-bridge".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
+            modulus: 17.into(),
+            ring_dimension: 1,
+            rows: 1,
+            columns: 1,
+        };
+        let matrix = lowerer
+            .dag
+            .push(ExpressionNode::Atom(SymbolicFactor {
+                key: FactorIdentity::atomic(
+                    super::super::identity::AtomicSourceKey::ProtocolInput(crate::ProtocolInputId(
+                        "coefficient-source".to_owned(),
+                    )),
+                    [],
+                ),
+                bound: BoundClass::bounded(6_u8.into()),
+                relation_live: false,
+                trapdoor: None,
+                matrix_bound: Some(MatrixBound {
+                    matrix_type: matrix_type.clone(),
+                    coefficient_class: BoundClass::bounded(6_u8.into()),
+                }),
+                matrix_value_metadata: MatrixMetadata {
+                    canonical_coefficient_exclusive_upper: Some(7_u8.into()),
+                    is_constant_polynomial: false,
+                    known_zero_rows: None,
+                },
+                switch: None,
+            }))
+            .unwrap();
+        let environment = root_test_environment();
+        let value = lowerer
+            .lower_node(
+                &NodeKind::ExtractCoefficient {
+                    position: IntExpr::constant(0),
+                    canonical_input_exclusive_upper: None,
+                },
+                &[LoweredValue::Matrix(matrix)],
+                &environment,
+            )
+            .unwrap();
+        let LoweredValue::Scalar(term) = value else { panic!("coefficient must be scalar") };
+        let entry = lowerer.scalar_store.get(term).unwrap();
+        assert_eq!(
+            entry.analysis.integer_domain.as_ref().unwrap().interval().unwrap().maximum,
+            BigInt::from(6)
+        );
+        assert_eq!(entry.analysis.scalar_provenance, Some(ScalarProvenance::SelectorOnly));
+        assert_eq!(
+            entry.analysis.direct_extract,
+            Some(super::super::analysis::DirectExtractFact { canonical_upper: Some(7_u8.into()) })
+        );
+
+        let fallback_matrix = lowerer
+            .dag
+            .push(ExpressionNode::Atom(SymbolicFactor {
+                key: FactorIdentity::atomic(
+                    super::super::identity::AtomicSourceKey::ProtocolInput(crate::ProtocolInputId(
+                        "fallback-source".to_owned(),
+                    )),
+                    [],
+                ),
+                bound: BoundClass::Large,
+                relation_live: false,
+                trapdoor: None,
+                matrix_bound: Some(MatrixBound {
+                    matrix_type: matrix_type.clone(),
+                    coefficient_class: BoundClass::Large,
+                }),
+                matrix_value_metadata: MatrixMetadata::unknown(),
+                switch: None,
+            }))
+            .unwrap();
+        let LoweredValue::Scalar(fallback) = lowerer
+            .lower_node(
+                &NodeKind::ExtractCoefficient {
+                    position: IntExpr::constant(0),
+                    canonical_input_exclusive_upper: Some(5_u8.into()),
+                },
+                &[LoweredValue::Matrix(fallback_matrix)],
+                &environment,
+            )
+            .unwrap()
+        else {
+            panic!("coefficient must be scalar")
+        };
+        assert_eq!(
+            lowerer
+                .scalar_store
+                .get(fallback)
+                .unwrap()
+                .analysis
+                .integer_domain
+                .as_ref()
+                .unwrap()
+                .interval()
+                .unwrap()
+                .maximum,
+            BigInt::from(4)
+        );
+
+        let LoweredValue::Scalar(full_modulus) = lowerer
+            .lower_node(
+                &NodeKind::ExtractCoefficient {
+                    position: IntExpr::constant(0),
+                    canonical_input_exclusive_upper: None,
+                },
+                &[LoweredValue::Matrix(fallback_matrix)],
+                &environment,
+            )
+            .unwrap()
+        else {
+            panic!("coefficient must be scalar")
+        };
+        assert_eq!(
+            lowerer
+                .scalar_store
+                .get(full_modulus)
+                .unwrap()
+                .analysis
+                .integer_domain
+                .as_ref()
+                .unwrap()
+                .interval()
+                .unwrap()
+                .maximum,
+            BigInt::from(16)
+        );
+        assert_eq!(fallback, full_modulus);
+        assert!(matches!(
+            lowerer.lower_node(
+                &NodeKind::ExtractCoefficient {
+                    position: IntExpr::constant(0),
+                    canonical_input_exclusive_upper: Some(18_u8.into()),
+                },
+                &[LoweredValue::Matrix(fallback_matrix)],
+                &environment,
+            ),
+            Err(LowerError::InvalidExtractCoefficientCanonicalUpper { .. })
+        ));
+    }
+
+    #[test]
+    fn coefficient_extraction_uses_shared_structural_facts_for_all_matrix_nodes() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "matrix-coefficient-structural-facts".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let environment = root_test_environment();
+        let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
+            modulus: 17.into(),
+            ring_dimension: 1,
+            rows: 2,
+            columns: 2,
+        };
+        let source = FactorIdentity::atomic(
+            super::super::identity::AtomicSourceKey::ProtocolInput(crate::ProtocolInputId(
+                "shared-structural-source".to_owned(),
+            )),
+            [],
+        );
+        let atom = lowerer
+            .dag
+            .push(ExpressionNode::Atom(SymbolicFactor {
+                key: source.clone(),
+                bound: BoundClass::bounded(6_u8.into()),
+                relation_live: false,
+                trapdoor: None,
+                matrix_bound: Some(MatrixBound {
+                    matrix_type: matrix_type.clone(),
+                    coefficient_class: BoundClass::bounded(6_u8.into()),
+                }),
+                matrix_value_metadata: MatrixMetadata {
+                    canonical_coefficient_exclusive_upper: Some(7_u8.into()),
+                    is_constant_polynomial: false,
+                    known_zero_rows: None,
+                },
+                switch: None,
+            }))
+            .unwrap();
+        let transpose = lowerer.dag.push(ExpressionNode::Transpose(atom)).unwrap();
+        let slice = lowerer
+            .dag
+            .push(ExpressionNode::Slice {
+                input: transpose,
+                spec: super::super::identity::SliceSpec {
+                    rows: Some(super::super::identity::ResolvedIndexRange {
+                        start: ResolvedIntExpr::Const(0.into()),
+                        end: ResolvedIntExpr::Const(1.into()),
+                    }),
+                    columns: None,
+                },
+            })
+            .unwrap();
+        let view = lowerer
+            .dag
+            .push(ExpressionNode::View {
+                input: slice,
+                view: ViewSpec::Identity,
+                output_type: mxx_ir_core::types::ConcreteMatrixType {
+                    modulus: 17.into(),
+                    ring_dimension: 1,
+                    rows: 1,
+                    columns: 2,
+                },
+            })
+            .unwrap();
+        let add =
+            lowerer.dag.push(ExpressionNode::Add(vec![atom, view].into_boxed_slice())).unwrap();
+        let product =
+            lowerer.dag.push(ExpressionNode::Product(vec![atom, atom].into_boxed_slice())).unwrap();
+        let static_family = lowerer
+            .dag
+            .push(ExpressionNode::FamilyGetStatic { cases: vec![atom, view].into(), index: 1 })
+            .unwrap();
+        let dynamic_family = lowerer
+            .dag
+            .push(ExpressionNode::FamilyGetDynamic {
+                selector: FactorIdentity::scalar_selector(ResolvedIntExpr::Parameter("j".into())),
+                cases: vec![atom, view].into(),
+                stored_indices: vec![0_u8.into(), 1_u8.into()].into(),
+                domain_upper: 2_u8.into(),
+            })
+            .unwrap();
+        let select = lowerer
+            .dag
+            .push(ExpressionNode::Select {
+                selector: FactorIdentity::scalar_selector(ResolvedIntExpr::Parameter("s".into())),
+                cases: vec![atom, view].into(),
+                reachable: vec![0, 1].into(),
+            })
+            .unwrap();
+        let position = lowerer.lower_int_expr(&IntExpr::constant(0), &environment).unwrap();
+        for term in [transpose, slice, view, static_family, dynamic_family, select] {
+            let LoweredValue::Scalar(id) = lowerer
+                .lower_extract_coefficient_dag(term, position.clone(), None, &environment)
+                .unwrap()
+            else {
+                panic!("derived matrix extraction must produce a typed scalar")
+            };
+            assert_eq!(
+                lowerer
+                    .scalar_store
+                    .get(id)
+                    .unwrap()
+                    .analysis
+                    .integer_domain
+                    .as_ref()
+                    .unwrap()
+                    .interval()
+                    .unwrap()
+                    .maximum,
+                BigInt::from(6)
+            );
+        }
+        for term in [add, product] {
+            let LoweredValue::Scalar(id) = lowerer
+                .lower_extract_coefficient_dag(term, position.clone(), None, &environment)
+                .unwrap()
+            else {
+                panic!("arithmetic extraction must fall back to a typed scalar")
+            };
+            assert_eq!(
+                lowerer
+                    .scalar_store
+                    .get(id)
+                    .unwrap()
+                    .analysis
+                    .integer_domain
+                    .as_ref()
+                    .unwrap()
+                    .interval()
+                    .unwrap()
+                    .maximum,
+                BigInt::from(16)
+            );
+        }
+        let mut deep = atom;
+        for _ in 0..256 {
+            deep = lowerer.dag.push(ExpressionNode::Transpose(deep)).unwrap();
+        }
+        assert!(lowerer.lower_extract_coefficient_dag(deep, position, None, &environment).is_ok());
+
+        let same_transpose = lowerer.dag.push(ExpressionNode::Transpose(atom)).unwrap();
+        assert_eq!(
+            lowerer.dag.facts(transpose).unwrap().identity,
+            lowerer.dag.facts(same_transpose).unwrap().identity
+        );
+        assert!(lowerer.scalar_store.len() >= 1);
     }
 
     #[test]
@@ -6070,8 +6456,8 @@ mod tests {
                         columns: 2,
                     },
                     coefficient_class: BoundClass::Large,
-                    metadata: MatrixMetadata::unknown(),
                 }),
+                matrix_value_metadata: MatrixMetadata::unknown(),
                 switch: None,
             }))
             .unwrap();
@@ -6208,8 +6594,8 @@ mod tests {
                     matrix_bound: Some(MatrixBound {
                         matrix_type: matrix.clone(),
                         coefficient_class: BoundClass::Large,
-                        metadata: MatrixMetadata::unknown(),
                     }),
+                    matrix_value_metadata: MatrixMetadata::unknown(),
                     switch: None,
                 }))
                 .unwrap();
@@ -6223,8 +6609,8 @@ mod tests {
                     matrix_bound: Some(MatrixBound {
                         matrix_type: matrix,
                         coefficient_class: BoundClass::Large,
-                        metadata: MatrixMetadata::unknown(),
                     }),
+                    matrix_value_metadata: MatrixMetadata::unknown(),
                     switch: None,
                 }))
                 .unwrap();
@@ -7803,7 +8189,7 @@ mod tests {
         let factor = dag_atom(&lowerer, term);
         let bound = factor.matrix_bound.as_ref().expect("protocol matrix bound");
         assert_eq!(bound.coefficient_class, BoundClass::bounded(6_u8.into()));
-        assert!(bound.metadata.is_constant_polynomial);
+        assert!(factor.matrix_value_metadata.is_constant_polynomial);
     }
 
     #[test]

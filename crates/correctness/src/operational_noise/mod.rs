@@ -15,6 +15,7 @@ pub mod normal_form;
 pub(crate) mod normal_form_family;
 pub(crate) mod normal_form_ops;
 mod normal_form_relation;
+pub(crate) mod scalar;
 pub mod simulation;
 
 use std::collections::BTreeSet;

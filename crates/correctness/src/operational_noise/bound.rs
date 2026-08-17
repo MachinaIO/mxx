@@ -62,25 +62,53 @@ pub(crate) fn gadget_matrix_bound(base: &BigInt, small: bool) -> Option<BoundCla
     Some(BoundClass::bounded(base.to_biguint().expect("positive gadget base") - BigUint::one()))
 }
 
-/// Metadata that has a proof-preserving matrix transfer rule.
+/// Facts about the represented matrix value, independent of its noise bound.
+///
+/// A coefficient cap here is a semantic contract for coefficient extraction;
+/// it is not the bound used by noise arithmetic.  Keeping this as a distinct
+/// typed value prevents a finite noise summary from being accidentally reused
+/// as a canonical selector range.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MatrixMetadata {
+pub struct MatrixValueMetadata {
+    /// Authoritative exclusive upper bound for nonnegative coefficients.
+    pub canonical_coefficient_exclusive_upper: Option<BigUint>,
+    /// Whether every polynomial coefficient is a constant polynomial.
     pub is_constant_polynomial: bool,
+    /// Number of rows proved to be identically zero.
     pub known_zero_rows: Option<BigUint>,
 }
 
-impl MatrixMetadata {
+impl MatrixValueMetadata {
     pub const fn unknown() -> Self {
-        Self { is_constant_polynomial: false, known_zero_rows: None }
+        Self {
+            canonical_coefficient_exclusive_upper: None,
+            is_constant_polynomial: false,
+            known_zero_rows: None,
+        }
     }
 }
+
+/// Short internal name retained while the remaining operation table is
+/// migrated to the explicit value-metadata terminology.
+pub type MatrixMetadata = MatrixValueMetadata;
 
 /// A coefficient bound and the concrete matrix shape to which it applies.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MatrixBound {
     pub matrix_type: ConcreteMatrixType,
     pub coefficient_class: BoundClass,
-    pub metadata: MatrixMetadata,
+}
+
+/// The value facts that are relevant to a matrix-product bound transfer.
+///
+/// This is deliberately passed separately from [`MatrixBound`].  A noise
+/// bound is not a proof about the represented value, and must never be reused
+/// as one.  Callers that do not have value facts use the conservative default.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MatrixProductFacts {
+    pub left_is_constant_polynomial: bool,
+    pub right_is_constant_polynomial: bool,
+    pub right_known_zero_rows: Option<BigUint>,
 }
 
 /// A resolved matrix constant consumed by the normal-form operation table.
@@ -108,6 +136,15 @@ pub fn product_bound(
     left: &MatrixBound,
     right: &MatrixBound,
 ) -> Result<MatrixBound, BoundArithmeticError> {
+    product_bound_with_facts(left, right, &MatrixProductFacts::default())
+}
+
+/// Product transfer with explicitly supplied value facts.
+pub fn product_bound_with_facts(
+    left: &MatrixBound,
+    right: &MatrixBound,
+    facts: &MatrixProductFacts,
+) -> Result<MatrixBound, BoundArithmeticError> {
     if left.matrix_type.modulus != right.matrix_type.modulus ||
         left.matrix_type.ring_dimension != right.matrix_type.ring_dimension
     {
@@ -130,7 +167,7 @@ pub fn product_bound(
             });
         }
         let rows = BigUint::from(right.matrix_type.rows);
-        let known_zero_rows = right.metadata.known_zero_rows.clone().unwrap_or_default();
+        let known_zero_rows = facts.right_known_zero_rows.clone().unwrap_or_default();
         if known_zero_rows > rows {
             return Err(BoundArithmeticError::InvalidKnownZeroRows {
                 known_zero_rows,
@@ -147,12 +184,11 @@ pub fn product_bound(
             BigUint::from(left.matrix_type.columns) - known_zero_rows,
         )
     };
-    let ring_factor =
-        if left.metadata.is_constant_polynomial || right.metadata.is_constant_polynomial {
-            BigUint::one()
-        } else {
-            BigUint::from(left.matrix_type.ring_dimension)
-        };
+    let ring_factor = if facts.left_is_constant_polynomial || facts.right_is_constant_polynomial {
+        BigUint::one()
+    } else {
+        BigUint::from(left.matrix_type.ring_dimension)
+    };
     Ok(MatrixBound {
         matrix_type,
         coefficient_class: multiply_classes(
@@ -160,11 +196,6 @@ pub fn product_bound(
             &right.coefficient_class,
             &(effective_inner * ring_factor),
         ),
-        metadata: MatrixMetadata {
-            is_constant_polynomial: left.metadata.is_constant_polynomial &&
-                right.metadata.is_constant_polynomial,
-            known_zero_rows: None,
-        },
     })
 }
 
@@ -188,29 +219,25 @@ mod tests {
     }
 
     fn bounded(matrix_type: ConcreteMatrixType, value: u64) -> MatrixBound {
-        MatrixBound {
-            matrix_type,
-            coefficient_class: BoundClass::bounded(value.into()),
-            metadata: MatrixMetadata::unknown(),
-        }
+        MatrixBound { matrix_type, coefficient_class: BoundClass::bounded(value.into()) }
     }
 
     #[test]
     fn product_uses_proved_zero_rows() {
         let left = bounded(matrix(2, 3), 2);
-        let mut right = bounded(matrix(3, 4), 5);
-        right.metadata.known_zero_rows = Some(1_u8.into());
-        let actual = product_bound(&left, &right).unwrap();
+        let right = bounded(matrix(3, 4), 5);
+        let actual = product_bound_with_facts(
+            &left,
+            &right,
+            &MatrixProductFacts { right_known_zero_rows: Some(1_u8.into()), ..Default::default() },
+        )
+        .unwrap();
         assert_eq!(actual.coefficient_class, BoundClass::bounded(20_u8.into()));
     }
 
     #[test]
     fn product_preserves_large_and_zero_annihilation() {
-        let left = MatrixBound {
-            matrix_type: matrix(1, 1),
-            coefficient_class: BoundClass::Large,
-            metadata: MatrixMetadata::unknown(),
-        };
+        let left = MatrixBound { matrix_type: matrix(1, 1), coefficient_class: BoundClass::Large };
         let right = bounded(matrix(1, 1), 3);
         assert_eq!(product_bound(&left, &right).unwrap().coefficient_class, BoundClass::Large);
 

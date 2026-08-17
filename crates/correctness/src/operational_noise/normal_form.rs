@@ -6,7 +6,10 @@
 //! lists.  This keeps the normal form independent of e-graph insertion order.
 
 use super::{
-    bound::{BoundClass, MatrixBound, MatrixMetadata, product_bound},
+    bound::{
+        BoundClass, MatrixBound, MatrixMetadata, MatrixProductFacts, product_bound,
+        product_bound_with_facts,
+    },
     identity::{
         AtomicSourceKey, Axis, BinderKey, CrtSpec, ResolvedIndexRange, ResolvedIntExpr,
         ResolvedMatrixType, SliceSpec, TrapdoorSourceKey, substitute_resolved_int_expr,
@@ -15,7 +18,7 @@ use super::{
 };
 use mxx_ir_core::{Port, types::ConcreteMatrixType};
 use num_bigint::{BigInt, BigUint};
-use num_traits::Zero;
+use num_traits::{ToPrimitive, Zero};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -37,6 +40,48 @@ pub struct FactorLayoutIdentity {
 /// Stable index into one job-local expression DAG.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct TermId(pub u32);
+
+/// Hash-consed structural identity handle.  It is not a DAG `TermId` and is
+/// never exposed as a semantic node number outside this job-local arena.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct MatrixValueIdentityId(pub u32);
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum MatrixValueOperation {
+    Zero,
+    Atom,
+    Add,
+    Negate,
+    Product,
+    Switch { reachable: Box<[usize]> },
+    Select { reachable: Box<[usize]> },
+    FamilyGetStatic { index: usize },
+    FamilyGetDynamic { stored_indices: Box<[BigUint]>, domain_upper: BigUint },
+    MatrixScale { scalar: ScaleScalar },
+    Transpose,
+    Slice { spec: SliceSpec },
+    Tensor,
+    LiftConstantPolynomial { matrix_type: ConcreteMatrixType, domain: IntegerInterval },
+    View { view: ViewSpec, output_type: ConcreteMatrixType },
+    CrtRecompose { spec: CrtSpec, output_type: ConcreteMatrixType },
+    Concat { axis: Axis, output_type: ConcreteMatrixType },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct MatrixValueIdentityNode {
+    pub operation: MatrixValueOperation,
+    pub children: Box<[MatrixValueIdentityId]>,
+    pub owner: Option<FactorIdentity>,
+    pub selector: Option<FactorIdentity>,
+}
+
+/// Facts computed once when an expression enters the job-local DAG.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MatrixValueFacts {
+    pub concrete_type: Option<ConcreteMatrixType>,
+    pub metadata: MatrixMetadata,
+    pub identity: MatrixValueIdentityId,
+}
 
 /// Typed kind of one owner-resolved symbolic factor.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -193,6 +238,8 @@ pub struct SymbolicFactor {
     /// multiplied into a summary.  The class above remains the symbolic
     /// contract exposed to canonical equality; this field is never a key.
     pub matrix_bound: Option<MatrixBound>,
+    /// Value facts are intentionally separate from the noise bound.
+    pub matrix_value_metadata: MatrixMetadata,
     pub switch: Option<Arc<SwitchData>>,
 }
 
@@ -204,6 +251,7 @@ impl SymbolicFactor {
             relation_live: false,
             trapdoor: None,
             matrix_bound: None,
+            matrix_value_metadata: MatrixMetadata::unknown(),
             switch: None,
         }
     }
@@ -218,6 +266,7 @@ impl SymbolicFactor {
             relation_live: false,
             trapdoor: None,
             matrix_bound: Some(bound),
+            matrix_value_metadata: MatrixMetadata::unknown(),
             switch: None,
         })
     }
@@ -232,6 +281,7 @@ impl SymbolicFactor {
             relation_live: true,
             trapdoor: None,
             matrix_bound: Some(bound),
+            matrix_value_metadata: MatrixMetadata::unknown(),
             switch: None,
         })
     }
@@ -248,7 +298,15 @@ impl SymbolicFactor {
         matrix_bound: Option<MatrixBound>,
         data: Arc<SwitchData>,
     ) -> Self {
-        Self { key, bound, relation_live: false, trapdoor: None, matrix_bound, switch: Some(data) }
+        Self {
+            key,
+            bound,
+            relation_live: false,
+            trapdoor: None,
+            matrix_bound,
+            matrix_value_metadata: MatrixMetadata::unknown(),
+            switch: Some(data),
+        }
     }
 }
 
@@ -651,6 +709,46 @@ pub enum ExpressionNode {
 #[derive(Clone, Debug, Default)]
 pub struct ExpressionDag {
     nodes: Vec<ExpressionNode>,
+    facts: Vec<MatrixValueFacts>,
+    identity_nodes: Vec<MatrixValueIdentityNode>,
+    identity_index: BTreeMap<MatrixValueIdentityNode, MatrixValueIdentityId>,
+}
+
+fn slice_concrete_type(
+    mut matrix: Option<ConcreteMatrixType>,
+    spec: &SliceSpec,
+) -> Option<ConcreteMatrixType> {
+    if let Some(range) = spec.rows.as_ref() {
+        let start = match &range.start {
+            ResolvedIntExpr::Const(value) => value.to_usize()?,
+            _ => return None,
+        };
+        let end = match &range.end {
+            ResolvedIntExpr::Const(value) => value.to_usize()?,
+            _ => return None,
+        };
+        let matrix_ref = matrix.as_mut()?;
+        if start >= end || end > matrix_ref.rows {
+            return None;
+        }
+        matrix_ref.rows = end - start;
+    }
+    if let Some(range) = spec.columns.as_ref() {
+        let start = match &range.start {
+            ResolvedIntExpr::Const(value) => value.to_usize()?,
+            _ => return None,
+        };
+        let end = match &range.end {
+            ResolvedIntExpr::Const(value) => value.to_usize()?,
+            _ => return None,
+        };
+        let matrix_ref = matrix.as_mut()?;
+        if start >= end || end > matrix_ref.columns {
+            return None;
+        }
+        matrix_ref.columns = end - start;
+    }
+    matrix
 }
 
 impl ExpressionDag {
@@ -663,15 +761,122 @@ impl ExpressionDag {
         if node.children().iter().any(|child| child.0 as usize >= self.nodes.len()) {
             return Err(NormalFormError::InvalidTermId);
         }
+        let facts = self.derive_facts(&node)?;
         self.nodes.push(node);
+        self.facts.push(facts);
         Ok(id)
     }
     pub fn node(&self, id: TermId) -> Result<&ExpressionNode, NormalFormError> {
         self.nodes.get(id.0 as usize).ok_or(NormalFormError::InvalidTermId)
     }
+    pub fn facts(&self, id: TermId) -> Result<&MatrixValueFacts, NormalFormError> {
+        self.facts.get(id.0 as usize).ok_or(NormalFormError::InvalidTermId)
+    }
+
+    pub fn identity_node(&self, id: MatrixValueIdentityId) -> Option<&MatrixValueIdentityNode> {
+        self.identity_nodes.get(id.0 as usize)
+    }
+
+    fn intern_identity(&mut self, node: MatrixValueIdentityNode) -> MatrixValueIdentityId {
+        if let Some(id) = self.identity_index.get(&node).copied() {
+            return id;
+        }
+        let id = MatrixValueIdentityId(self.identity_nodes.len() as u32);
+        self.identity_index.insert(node.clone(), id);
+        self.identity_nodes.push(node);
+        id
+    }
+
+    fn derive_facts(&mut self, node: &ExpressionNode) -> Result<MatrixValueFacts, NormalFormError> {
+        let children = node.children();
+        let inputs =
+            children.iter().map(|child| self.facts(*child)).collect::<Result<Vec<_>, _>>()?;
+        let child_ids = inputs.iter().map(|fact| fact.identity).collect::<Vec<_>>();
+        let operation = node.operation_identity_tag();
+        let selector = match node {
+            ExpressionNode::Switch { selector, .. } |
+            ExpressionNode::Select { selector, .. } |
+            ExpressionNode::FamilyGetDynamic { selector, .. } => Some(selector.clone()),
+            _ => None,
+        };
+        let concrete_type = match node {
+            ExpressionNode::Transpose(_) => inputs.first().and_then(|fact| {
+                let mut matrix = fact.concrete_type.clone()?;
+                std::mem::swap(&mut matrix.rows, &mut matrix.columns);
+                Some(matrix)
+            }),
+            ExpressionNode::Tensor { .. } => {
+                let left = inputs.first().and_then(|fact| fact.concrete_type.clone());
+                let right = inputs.get(1).and_then(|fact| fact.concrete_type.clone());
+                match (left, right) {
+                    (Some(left), Some(right))
+                        if left.modulus == right.modulus &&
+                            left.ring_dimension == right.ring_dimension =>
+                    {
+                        let rows = left.rows.checked_mul(right.rows);
+                        let columns = left.columns.checked_mul(right.columns);
+                        rows.zip(columns).map(|(rows, columns)| ConcreteMatrixType {
+                            modulus: left.modulus,
+                            ring_dimension: left.ring_dimension,
+                            rows,
+                            columns,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            ExpressionNode::Slice { spec, .. } => slice_concrete_type(
+                inputs.first().and_then(|fact| fact.concrete_type.clone()),
+                spec,
+            ),
+            _ => node
+                .explicit_matrix_type()
+                .cloned()
+                .or_else(|| inputs.first().and_then(|fact| fact.concrete_type.clone())),
+        };
+        let metadata = match node {
+            ExpressionNode::Atom(factor) => factor.matrix_value_metadata.clone(),
+            ExpressionNode::Transpose(_) |
+            ExpressionNode::Slice { .. } |
+            ExpressionNode::View { .. } => inputs
+                .first()
+                .map(|fact| fact.metadata.clone())
+                .unwrap_or_else(MatrixMetadata::unknown),
+            ExpressionNode::FamilyGetStatic { index, .. } => inputs
+                .get(*index)
+                .map(|fact| fact.metadata.clone())
+                .unwrap_or_else(MatrixMetadata::unknown),
+            ExpressionNode::FamilyGetDynamic { cases, .. } => {
+                merge_reachable_metadata(&inputs, &(0..cases.len()).collect::<Vec<_>>())
+            }
+            ExpressionNode::Switch { .. } | ExpressionNode::Select { .. } => {
+                merge_reachable_metadata(&inputs, node.reachable_indices())
+            }
+            ExpressionNode::LiftConstantPolynomial { domain, .. } => MatrixMetadata {
+                canonical_coefficient_exclusive_upper: domain.direct_extract_upper.clone(),
+                is_constant_polynomial: true,
+                known_zero_rows: None,
+            },
+            _ => MatrixMetadata::unknown(),
+        };
+        let identity = self.intern_identity(MatrixValueIdentityNode {
+            operation,
+            children: child_ids.into_boxed_slice(),
+            owner: match node {
+                ExpressionNode::Atom(factor) => Some(factor.key.clone()),
+                _ => None,
+            },
+            selector,
+        });
+        Ok(MatrixValueFacts { concrete_type, metadata, identity })
+    }
     #[cfg(test)]
     pub(crate) fn term_count(&self) -> usize {
         self.nodes.len()
+    }
+    #[cfg(test)]
+    pub(crate) fn identity_count(&self) -> usize {
+        self.identity_nodes.len()
     }
     pub fn normalize(
         &self,
@@ -1117,7 +1322,92 @@ fn substitute_scale_scalar(
     }
 }
 
+/// Proof-only extraction caps are facts, not value identity.  Keep the
+/// structural scale domain while removing that analysis annotation before it
+/// enters the matrix identity interner.
+fn identity_interval(interval: &IntegerInterval) -> IntegerInterval {
+    let mut identity = interval.clone();
+    identity.direct_extract_upper = None;
+    identity
+}
+
+fn scale_identity_scalar(scalar: &ScaleScalar) -> ScaleScalar {
+    match scalar {
+        ScaleScalar::Exact { key, value, matrix_type } => ScaleScalar::Exact {
+            key: key.clone(),
+            value: value.clone(),
+            matrix_type: matrix_type.clone(),
+        },
+        ScaleScalar::Interval(interval) => ScaleScalar::Interval(identity_interval(interval)),
+    }
+}
+
 impl ExpressionNode {
+    fn operation_identity_tag(&self) -> MatrixValueOperation {
+        match self {
+            Self::Zero => MatrixValueOperation::Zero,
+            Self::Atom(_) => MatrixValueOperation::Atom,
+            Self::Add(_) => MatrixValueOperation::Add,
+            Self::Negate(_) => MatrixValueOperation::Negate,
+            Self::Product(_) => MatrixValueOperation::Product,
+            Self::Switch { reachable, .. } => {
+                MatrixValueOperation::Switch { reachable: reachable.clone() }
+            }
+            Self::Select { reachable, .. } => {
+                MatrixValueOperation::Select { reachable: reachable.clone() }
+            }
+            Self::FamilyGetStatic { index, .. } => {
+                MatrixValueOperation::FamilyGetStatic { index: *index }
+            }
+            Self::FamilyGetDynamic { stored_indices, domain_upper, .. } => {
+                MatrixValueOperation::FamilyGetDynamic {
+                    stored_indices: stored_indices.clone(),
+                    domain_upper: domain_upper.clone(),
+                }
+            }
+            Self::MatrixScale { scalar, .. } => {
+                MatrixValueOperation::MatrixScale { scalar: scale_identity_scalar(scalar) }
+            }
+            Self::Transpose(_) => MatrixValueOperation::Transpose,
+            Self::Slice { spec, .. } => MatrixValueOperation::Slice { spec: spec.clone() },
+            Self::Tensor { .. } => MatrixValueOperation::Tensor,
+            Self::LiftConstantPolynomial { matrix_type, domain, .. } => {
+                MatrixValueOperation::LiftConstantPolynomial {
+                    matrix_type: matrix_type.clone(),
+                    domain: identity_interval(domain),
+                }
+            }
+            Self::View { view, output_type, .. } => {
+                MatrixValueOperation::View { view: view.clone(), output_type: output_type.clone() }
+            }
+            Self::CrtRecompose { spec, output_type, .. } => MatrixValueOperation::CrtRecompose {
+                spec: spec.clone(),
+                output_type: output_type.clone(),
+            },
+            Self::Concat { axis, output_type, .. } => {
+                MatrixValueOperation::Concat { axis: *axis, output_type: output_type.clone() }
+            }
+        }
+    }
+
+    fn explicit_matrix_type(&self) -> Option<&ConcreteMatrixType> {
+        match self {
+            Self::Atom(factor) => factor.matrix_bound.as_ref().map(|bound| &bound.matrix_type),
+            Self::LiftConstantPolynomial { matrix_type, .. } |
+            Self::View { output_type: matrix_type, .. } |
+            Self::CrtRecompose { output_type: matrix_type, .. } |
+            Self::Concat { output_type: matrix_type, .. } => Some(matrix_type),
+            _ => None,
+        }
+    }
+
+    fn reachable_indices(&self) -> &[usize] {
+        match self {
+            Self::Switch { reachable, .. } | Self::Select { reachable, .. } => reachable,
+            _ => &[],
+        }
+    }
+
     fn children(&self) -> Vec<TermId> {
         match self {
             Self::Zero | Self::Atom(_) => Vec::new(),
@@ -1138,6 +1428,26 @@ impl ExpressionNode {
     }
 }
 
+fn merge_reachable_metadata(inputs: &[&MatrixValueFacts], reachable: &[usize]) -> MatrixMetadata {
+    let mut selected = reachable.iter().filter_map(|index| inputs.get(*index));
+    let Some(first) = selected.next() else { return MatrixMetadata::unknown() };
+    let mut metadata = first.metadata.clone();
+    for fact in selected {
+        metadata.canonical_coefficient_exclusive_upper = metadata
+            .canonical_coefficient_exclusive_upper
+            .take()
+            .zip(fact.metadata.canonical_coefficient_exclusive_upper.clone())
+            .map(|(left, right)| left.max(right));
+        metadata.is_constant_polynomial &= fact.metadata.is_constant_polynomial;
+        metadata.known_zero_rows = metadata
+            .known_zero_rows
+            .take()
+            .zip(fact.metadata.known_zero_rows.clone())
+            .and_then(|(left, right)| (left == right).then_some(left));
+    }
+    metadata
+}
+
 fn bound_kind(bound: &BoundClass) -> &'static str {
     match bound {
         BoundClass::ExactZero => "zero",
@@ -1151,7 +1461,7 @@ fn factor_structural_fingerprint(factor: &SymbolicFactor) -> String {
         // The coefficient cap is intentionally absent: it is a bound, not a
         // symbolic identity. Matrix shape and proof metadata remain part of
         // the resolved factor contract.
-        (&bound.matrix_type, &bound.metadata)
+        &bound.matrix_type
     });
     let switch = factor
         .switch
@@ -1291,7 +1601,6 @@ pub(crate) fn add_summary(
             Ok(BoundedSummary::Bounded(MatrixBound {
                 matrix_type: left.matrix_type,
                 coefficient_class: class,
-                metadata: MatrixMetadata::unknown(),
             }))
         }
     }
@@ -1310,11 +1619,27 @@ pub(crate) fn monomial_bound(monomial: &Monomial) -> Result<MatrixBound, NormalF
     let Some(mut result) = first.matrix_bound.clone() else {
         return Err(NormalFormError::MissingMatrixBound);
     };
+    let mut left_metadata = first.matrix_value_metadata.clone();
     for factor in &monomial.factors[1..] {
         let Some(next) = factor.matrix_bound.as_ref() else {
             return Err(NormalFormError::MissingMatrixBound);
         };
-        result = product_bound(&result, next).map_err(NormalFormError::bound)?;
+        result = product_bound_with_facts(
+            &result,
+            next,
+            &MatrixProductFacts {
+                left_is_constant_polynomial: left_metadata.is_constant_polynomial,
+                right_is_constant_polynomial: factor.matrix_value_metadata.is_constant_polynomial,
+                right_known_zero_rows: factor.matrix_value_metadata.known_zero_rows.clone(),
+            },
+        )
+        .map_err(NormalFormError::bound)?;
+        left_metadata = MatrixMetadata {
+            canonical_coefficient_exclusive_upper: None,
+            is_constant_polynomial: left_metadata.is_constant_polynomial &&
+                factor.matrix_value_metadata.is_constant_polynomial,
+            known_zero_rows: None,
+        };
     }
     Ok(result)
 }
@@ -1506,7 +1831,6 @@ fn maximum_bound(
             Ok(summary_from_bound(MatrixBound {
                 matrix_type: existing.matrix_type,
                 coefficient_class,
-                metadata: MatrixMetadata::unknown(),
             }))
         }
     }
@@ -1644,7 +1968,6 @@ mod tests {
                 columns: 1,
             },
             coefficient_class: BoundClass::bounded(value.into()),
-            metadata: MatrixMetadata::unknown(),
         }
     }
 
@@ -1657,7 +1980,6 @@ mod tests {
         MatrixBound {
             matrix_type: ConcreteMatrixType { modulus: 17.into(), ring_dimension, rows, columns },
             coefficient_class: BoundClass::bounded(value.into()),
-            metadata: MatrixMetadata::unknown(),
         }
     }
     #[test]
@@ -1722,6 +2044,26 @@ mod tests {
         let root = dag.push(ExpressionNode::Add(vec![a, b].into_boxed_slice())).unwrap();
         let nf = dag.normalize(root, &RelationRegistry::default()).unwrap();
         assert_eq!(nf.exact_terms().values().next().unwrap().multiplicity, 2.into());
+    }
+
+    #[test]
+    fn deep_expression_dag_uses_shallow_identity_arena_and_reuses_shared_values() {
+        let mut dag = ExpressionDag::new();
+        let zero = dag.push(ExpressionNode::Zero).unwrap();
+        let depth = 4096;
+        let first_transpose = dag.push(ExpressionNode::Transpose(zero)).unwrap();
+        let mut current = first_transpose;
+        for _ in 1..depth {
+            current = dag.push(ExpressionNode::Transpose(current)).unwrap();
+        }
+        let duplicate = dag.push(ExpressionNode::Transpose(zero)).unwrap();
+
+        assert_eq!(dag.term_count(), depth + 2);
+        assert_eq!(dag.identity_count(), depth + 1);
+        assert_eq!(
+            dag.facts(duplicate).unwrap().identity,
+            dag.facts(first_transpose).unwrap().identity
+        );
     }
 
     #[test]

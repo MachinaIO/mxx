@@ -893,6 +893,33 @@ impl MxxAnalysis {
         }
         Ok(IntegerDomain::IntervalOnly(IntegerInterval { minimum, maximum }))
     }
+
+    /// Constructs the scalar facts for a coefficient extracted from a matrix
+    /// held by the normal-form DAG.  This bridge intentionally accepts the
+    /// already-resolved matrix contract instead of requiring a matrix node in
+    /// `MxxLang`; callers may inject the resulting scalar facts into the
+    /// temporary scalar store without creating a matrix e-node.
+    pub fn direct_extract_data(
+        matrix: ResolvedMatrixType,
+        modulus: BigUint,
+        authoritative_upper: Option<&BigUint>,
+    ) -> Result<AnalysisData, AnalysisError> {
+        let domain = Self::extract_coefficient_domain(
+            &matrix,
+            &modulus,
+            authoritative_upper,
+            CanonicalResidueConvention::Nonnegative,
+        )?;
+        let upper = domain.interval().ok().and_then(|interval| {
+            (interval.minimum == BigInt::zero())
+                .then(|| (&interval.maximum + BigInt::one()).to_biguint())
+                .flatten()
+        });
+        let mut data =
+            AnalysisData::scalar(MxxSort::Int, Some(domain), ScalarProvenance::SelectorOnly);
+        data.direct_extract = Some(DirectExtractFact { canonical_upper: upper });
+        Ok(data)
+    }
 }
 
 impl Analysis<MxxLang> for MxxAnalysis {
@@ -1811,27 +1838,8 @@ fn extract_coefficient_data(
     let matrix_data = &egraph[children[0]].data;
     let canonical_exclusive_upper =
         canonical_exclusive_upper.or(matrix_data.canonical_coefficient_exclusive_upper.as_ref());
-    let Ok(domain) = MxxAnalysis::extract_coefficient_domain(
-        matrix,
-        &modulus,
-        canonical_exclusive_upper,
-        // Runtime extraction returns the canonical nonnegative residue.  A missing
-        // narrower contract therefore has the authoritative full-modulus range.
-        CanonicalResidueConvention::Nonnegative,
-    ) else {
-        return invalid_analysis_data();
-    };
-    let mut data =
-        AnalysisData::scalar(MxxSort::Int, Some(domain.clone()), ScalarProvenance::SelectorOnly);
-    let interval = domain.interval().ok();
-    data.direct_extract = Some(DirectExtractFact {
-        canonical_upper: interval.and_then(|interval| {
-            (interval.minimum == BigInt::zero())
-                .then(|| (&interval.maximum + BigInt::one()).to_biguint())
-                .flatten()
-        }),
-    });
-    data
+    MxxAnalysis::direct_extract_data(matrix.clone(), modulus, canonical_exclusive_upper)
+        .unwrap_or_else(|_| invalid_analysis_data())
 }
 
 #[cfg(test)]

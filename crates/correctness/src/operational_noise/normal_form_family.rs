@@ -159,7 +159,7 @@ fn recurrence_count(domain: &IntegerDomain) -> Result<BigUint, TermRecurrenceErr
         IntegerDomain::Exact(value) if value.sign() != num_bigint::Sign::Minus => {
             value.to_biguint().ok_or(TermRecurrenceError::InvalidCount)
         }
-        IntegerDomain::IntervalOnly(IntegerInterval { minimum, maximum })
+        IntegerDomain::IntervalOnly(IntegerInterval { minimum, maximum, .. })
             if minimum == maximum && minimum.sign() != num_bigint::Sign::Minus =>
         {
             minimum.to_biguint().ok_or(TermRecurrenceError::InvalidCount)
@@ -174,7 +174,7 @@ mod tests {
     use super::*;
     use crate::operational_noise::{
         analysis::MxxSort,
-        bound::{BoundClass, MatrixBound, MatrixMetadata},
+        bound::{BoundClass, MatrixBound},
         family::{CoverageBinderDomain, FamilyCoverageStorage, LoopDomainKey},
         identity::{OccurrenceScope, ProgramKey},
         normal_form::{
@@ -193,7 +193,6 @@ mod tests {
                 columns: 1,
             },
             coefficient_class: BoundClass::bounded(value.into()),
-            metadata: MatrixMetadata::unknown(),
         }
     }
 

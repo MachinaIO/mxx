@@ -11,15 +11,14 @@ use super::{
     },
     identity::{Axis, CrtSpec, ResolvedIndexRange, ResolvedIntExpr, SliceSpec},
     normal_form::{
-        BoundedSummary, FactorIdentity, FactorOwner, HashPlainArgumentIdentity, Monomial,
-        NormalFormError, PolynomialNF, SymbolicFactor, monomial_bound, scale_by_multiplicity,
-        summary_from_bound_with_facts,
+        BoundedSummary, CompositeDescriptor, CompositeIdentity, FactorIdentity, FactorOwner,
+        HashPlainArgumentIdentity, Monomial, NormalFormError, PolynomialNF, SymbolicFactor,
+        centered_residue, monomial_bound, scale_by_multiplicity, summary_from_bound_with_facts,
     },
 };
 use mxx_ir_core::types::ConcreteMatrixType;
 use num_bigint::{BigInt, BigUint};
 use num_traits::{ToPrimitive, Zero};
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationError {
     NormalForm(NormalFormError),
@@ -78,12 +77,6 @@ impl IntegerInterval {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum ScaleScalar {
-    Exact { key: FactorIdentity, value: BigInt, matrix_type: ConcreteMatrixType },
-    Interval(IntegerInterval),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ViewSpec {
     Identity,
     Rotation { exponent: BigInt },
@@ -117,7 +110,6 @@ pub trait PolynomialNFOperations {
         matrix_type: ConcreteMatrixType,
         domain: &IntegerInterval,
     ) -> Result<PolynomialNF, OperationError>;
-    fn matrix_scale_nf(&self, scalar: ScaleScalar) -> Result<PolynomialNF, OperationError>;
     fn view_nf(
         &self,
         view: &ViewSpec,
@@ -183,7 +175,7 @@ impl PolynomialNFOperations for PolynomialNF {
             let bound = bound.map(|bound| slice_bound(bound, spec)).transpose()?;
             output.insert(
                 Monomial::from_factor(structural_factor(
-                    &format!("slice:{spec:?}"),
+                    CompositeDescriptor::Slice(spec.clone()),
                     &term.monomial,
                     bound,
                 )),
@@ -219,11 +211,7 @@ impl PolynomialNFOperations for PolynomialNF {
                 };
                 output.insert(
                     Monomial::from_factor(structural_factor(
-                        &format!(
-                            "tensor:left={:?}:right={:?}",
-                            left.monomial.key(),
-                            right.monomial.key()
-                        ),
+                        CompositeDescriptor::Tensor,
                         &combined,
                         bound,
                     )),
@@ -276,7 +264,7 @@ impl PolynomialNFOperations for PolynomialNF {
         for term in self.exact_terms().values() {
             output.insert(
                 Monomial::from_factor(structural_factor(
-                    "lift-constant-polynomial",
+                    CompositeDescriptor::Generic("lift-constant-polynomial".into()),
                     &term.monomial,
                     Some(bound.clone()),
                 )),
@@ -290,87 +278,6 @@ impl PolynomialNFOperations for PolynomialNF {
             }
         };
         Ok(PolynomialNF::from_parts(output.exact_terms().clone(), summary))
-    }
-
-    fn matrix_scale_nf(&self, scalar: ScaleScalar) -> Result<PolynomialNF, OperationError> {
-        match scalar {
-            ScaleScalar::Exact { key, value, matrix_type } => {
-                if value.is_zero() || self.is_exact_zero() {
-                    return Ok(PolynomialNF::zero());
-                }
-                if matrix_type.rows != 1 || matrix_type.columns != 1 {
-                    return Err(OperationError::InvalidShape);
-                }
-                if let BoundedSummary::Bounded(bound) = self.bounded_summary() {
-                    if bound.matrix_type.modulus != matrix_type.modulus ||
-                        bound.matrix_type.ring_dimension != matrix_type.ring_dimension
-                    {
-                        return Err(OperationError::InvalidShape);
-                    }
-                }
-                let mut scalar_key = key;
-                scalar_key.owner = FactorOwner::Derived {
-                    parent: Box::new(scalar_key.clone()),
-                    tag: format!("central-scalar:{value}:{matrix_type:?}")
-                        .into_bytes()
-                        .into_boxed_slice(),
-                };
-                let scalar_bound = MatrixBound {
-                    matrix_type: matrix_type.clone(),
-                    coefficient_class: BoundClass::bounded(value.magnitude().clone()),
-                };
-                let factor = SymbolicFactor {
-                    key: scalar_key,
-                    bound: BoundClass::bounded(value.magnitude().clone()),
-                    relation_live: false,
-                    trapdoor: None,
-                    matrix_bound: Some(scalar_bound),
-                    matrix_type: matrix_type.clone(),
-                    polynomial_facts: PolynomialFacts::new(1, matrix_type.ring_dimension)
-                        .expect("constant polynomial support"),
-                    matrix_value_metadata: MatrixMetadata {
-                        canonical_coefficient_exclusive_upper: None,
-                        is_constant_polynomial: true,
-                        known_zero_rows: None,
-                        polynomial: PolynomialFacts::new(1, matrix_type.ring_dimension).ok(),
-                    },
-                    switch: None,
-                };
-                let mut output = PolynomialNF::zero();
-                for term in self.exact_terms().values() {
-                    output.insert(
-                        Monomial::from_factors(
-                            std::iter::once(factor.clone())
-                                .chain(term.monomial.factors().iter().cloned()),
-                        ),
-                        term.multiplicity.clone(),
-                    )?;
-                }
-                Ok(PolynomialNF::from_parts(
-                    output.exact_terms().clone(),
-                    clear_zero_rows(scale_summary(self.bounded_summary().clone(), &value)),
-                ))
-            }
-            ScaleScalar::Interval(domain) => {
-                if domain.selector_only {
-                    return Err(OperationError::SelectorOnlyInteger);
-                }
-                if !self.exact_terms().is_empty() {
-                    return Err(OperationError::IntervalScaleOfExactSignal);
-                }
-                let scale = domain.maximum_absolute();
-                if scale.is_zero() || self.is_exact_zero() {
-                    return Ok(PolynomialNF::zero());
-                }
-                Ok(PolynomialNF::from_parts(
-                    Default::default(),
-                    clear_zero_rows(scale_summary(
-                        self.bounded_summary().clone(),
-                        &BigInt::from(scale),
-                    )),
-                ))
-            }
-        }
     }
 
     fn view_nf(
@@ -392,16 +299,14 @@ impl PolynomialNFOperations for PolynomialNF {
             }
         }
         validate_shape(self, &output_type).map_err(|_| OperationError::InvalidView)?;
-        let operation = match view {
-            ViewSpec::Rotation { exponent } => format!("rotation:{exponent}"),
-            ViewSpec::Permutation { indices } => format!("permutation:{indices:?}"),
-            ViewSpec::CoefficientPreserving { view } => format!("coefficient-preserving:{view:?}"),
-            ViewSpec::Identity => unreachable!(),
-        };
         let mut output = PolynomialNF::zero();
         for term in self.exact_terms().values() {
             output.insert(
-                Monomial::from_factor(structural_factor(&operation, &term.monomial, None)),
+                Monomial::from_factor(structural_factor(
+                    CompositeDescriptor::View(view.clone()),
+                    &term.monomial,
+                    None,
+                )),
                 term.multiplicity.clone(),
             )?;
         }
@@ -468,17 +373,20 @@ impl AdditionalOperations for PolynomialNF {
             return Err(OperationError::InvalidConcat);
         }
         if inputs.iter().any(|input| !input.exact_terms().is_empty()) {
-            let fingerprints = inputs.iter().map(nf_fingerprint).collect::<Vec<_>>();
             let mut output = PolynomialNF::zero();
             for (input_index, input) in inputs.iter().enumerate() {
                 for term in input.exact_terms().values() {
-                    let tag = format!(
-                        "concat:axis={axis:?}:arity={}:input={input_index}:shapes={:?}:all={fingerprints:?}",
-                        inputs.len(),
-                        shape_of_nf(input).ok(),
-                    );
                     output.insert(
-                        Monomial::from_factor(structural_factor(&tag, &term.monomial, None)),
+                        Monomial::from_factor(structural_factor(
+                            CompositeDescriptor::Concat {
+                                axis,
+                                arity: inputs.len(),
+                                input_index,
+                                output_type: output_type.clone(),
+                            },
+                            &term.monomial,
+                            None,
+                        )),
                         term.multiplicity.clone(),
                     )?;
                 }
@@ -520,7 +428,11 @@ impl AdditionalOperations for PolynomialNF {
                 .flat_map(|input| input.exact_terms().values())
                 .next()
                 .ok_or(OperationError::InvalidConcat)?;
-            let factor = structural_factor("concat", &first.monomial, None);
+            let factor = structural_factor(
+                CompositeDescriptor::Generic("concat".into()),
+                &first.monomial,
+                None,
+            );
             let mut output = PolynomialNF::zero();
             output.insert(Monomial::from_factor(factor), BigInt::from(1))?;
             return Ok(output);
@@ -590,7 +502,7 @@ impl AdditionalOperations for PolynomialNF {
             let mut output = PolynomialNF::zero();
             output.insert(
                 Monomial::from_factor(structural_factor(
-                    "pack-bits",
+                    CompositeDescriptor::Generic("pack-bits".into()),
                     &Monomial::from_factors(
                         combined
                             .into_iter()
@@ -717,6 +629,10 @@ impl AdditionalOperations for PolynomialNF {
                 (BoundClass::bounded(1_u8.into()), false, None)
             }
             ResolvedMatrixConstant::Polynomial { coefficients } => {
+                let coefficients = coefficients
+                    .iter()
+                    .map(|coefficient| centered_residue(coefficient, &matrix_type.modulus))
+                    .collect::<Vec<_>>();
                 if coefficients.iter().all(|coefficient| coefficient.is_zero()) {
                     return Ok(PolynomialNF::zero());
                 }
@@ -738,6 +654,27 @@ impl AdditionalOperations for PolynomialNF {
             }
         };
         let scalar_shape = matrix_type.rows == 1 && matrix_type.columns == 1;
+        if scalar_shape &&
+            matches!(constant, ResolvedMatrixConstant::Polynomial { .. }) &&
+            is_constant_polynomial &&
+            matches!(
+                constant,
+                ResolvedMatrixConstant::Polynomial { coefficients }
+                    if coefficients.first().is_some_and(|coefficient| {
+                        centered_residue(coefficient, &matrix_type.modulus) == BigInt::from(1_u8)
+                    })
+            )
+        {
+            return Ok(PolynomialNF::one());
+        }
+        let key = match constant {
+            ResolvedMatrixConstant::Polynomial { coefficients }
+                if scalar_shape && is_constant_polynomial && !coefficients.is_empty() =>
+            {
+                FactorIdentity::constant_polynomial(&matrix_type, &coefficients[0])
+            }
+            _ => key,
+        };
         let support_upper = support_upper.or_else(|| {
             scalar_shape.then(|| PolynomialFacts::new(1, matrix_type.ring_dimension).ok()).flatten()
         });
@@ -783,14 +720,6 @@ fn shape_of_nf(input: &PolynomialNF) -> Result<ConcreteMatrixType, OperationErro
         .find_map(|term| monomial_bound(&term.monomial).ok())
         .map(|bound| bound.matrix_type)
         .ok_or(OperationError::InvalidConcat)
-}
-
-fn nf_fingerprint(input: &PolynomialNF) -> String {
-    format!(
-        "exact={:?};bounded={:?}",
-        input.exact_terms().keys().collect::<Vec<_>>(),
-        input.bounded_summary()
-    )
 }
 
 fn concat_shape(
@@ -909,17 +838,17 @@ fn transpose_factor(mut factor: SymbolicFactor) -> Result<SymbolicFactor, Operat
 }
 
 fn structural_factor(
-    operation: &str,
+    descriptor: CompositeDescriptor,
     monomial: &Monomial,
     bound: Option<MatrixBound>,
 ) -> SymbolicFactor {
     let factors = monomial.factors();
     let first = factors.first().expect("non-empty structural monomial");
     let mut key = first.key.clone();
-    key.owner = FactorOwner::Derived {
-        parent: Box::new(first.key.clone()),
-        tag: format!("{operation}:{:?}", monomial.key()).into_bytes().into_boxed_slice(),
-    };
+    key.owner = FactorOwner::Composite(Box::new(CompositeIdentity {
+        descriptor,
+        operands: monomial.iter_factors().map(|factor| factor.key.clone()).collect(),
+    }));
     let (class, matrix_bound, matrix_type, polynomial_facts) = bound
         .map(|bound| {
             let matrix_type = bound.matrix_type.clone();
@@ -993,23 +922,6 @@ fn tensor_bound(left: &MatrixBound, right: &MatrixBound) -> Result<MatrixBound, 
     })
 }
 
-fn scale_summary(summary: BoundedSummary, scalar: &BigInt) -> BoundedSummary {
-    match summary {
-        BoundedSummary::ExactZero => BoundedSummary::ExactZero,
-        BoundedSummary::Bounded(bound) => summary_from_bound_with_facts(
-            scale_by_multiplicity(bound.bound.clone(), scalar),
-            bound.polynomial.clone(),
-        ),
-    }
-}
-
-fn clear_zero_rows(summary: BoundedSummary) -> BoundedSummary {
-    match summary {
-        BoundedSummary::ExactZero => BoundedSummary::ExactZero,
-        BoundedSummary::Bounded(bound) => BoundedSummary::Bounded(bound),
-    }
-}
-
 fn slice_bound(mut bound: MatrixBound, spec: &SliceSpec) -> Result<MatrixBound, OperationError> {
     if let Some(range) = &spec.rows {
         bound.matrix_type.rows = range_length(range, bound.matrix_type.rows)?;
@@ -1064,8 +976,8 @@ mod tests {
     use crate::operational_noise::{
         identity::{ResolvedIndexRange, ResolvedIntExpr},
         normal_form::{
-            ExpressionDag, ExpressionNode, FactorIdentity, FullRelationKey, RelationRegistration,
-            RelationRegistry, SymbolicFactor,
+            ExpressionDag, ExpressionNode, FactorIdentity, FullRelationKey, RelationPattern,
+            RelationRegistration, RelationRegistry, SymbolicFactor,
             normal_form_product::{Normalizer, product_bound_only},
         },
     };
@@ -1160,6 +1072,7 @@ mod tests {
         let mut registry = RelationRegistry::default();
         registry
             .register(RelationRegistration {
+                pattern: RelationPattern::ordered(public.clone(), preimage.clone()),
                 key: FullRelationKey {
                     source: "named".into(),
                     ordered_indices: Box::new([]),
@@ -1246,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn lift_marks_constant_polynomial_and_scale_clears_zero_rows() {
+    fn lift_marks_constant_polynomial() {
         let input = finite("input", 1, 1, 1);
         let domain = IntegerInterval::new((-2).into(), 3.into()).unwrap();
         let lifted = input
@@ -1256,42 +1169,6 @@ mod tests {
             .unwrap();
         let lifted_bound = lifted.bounded_summary().as_matrix_bound().unwrap();
         assert_eq!(lifted_bound.coefficient_class, BoundClass::bounded(3_u64.into()));
-
-        let scaled_input = PolynomialNF::bounded(MatrixBound {
-            matrix_type: matrix_type(1, 1),
-            coefficient_class: BoundClass::bounded(2_u64.into()),
-        })
-        .unwrap();
-        let scaled = scaled_input.matrix_scale_nf(ScaleScalar::Interval(domain.clone())).unwrap();
-        let scaled_bound = scaled.bounded_summary().as_matrix_bound().unwrap();
-        assert_eq!(scaled_bound.coefficient_class, BoundClass::bounded(6_u64.into()));
-        assert_eq!(
-            input.matrix_scale_nf(ScaleScalar::Interval(domain.selector_only())),
-            Err(OperationError::SelectorOnlyInteger)
-        );
-    }
-
-    #[test]
-    fn matrix_scale_zero_first_and_interval_rejects_exact_signal() {
-        let input = finite("input", 2, 2, 4);
-        let zero = IntegerInterval::new(0.into(), 0.into()).unwrap();
-        assert!(input.matrix_scale_nf(ScaleScalar::Interval(zero)).unwrap().is_exact_zero());
-        let signal = PolynomialNF::exact_factor(FactorIdentity::named("signal"));
-        let interval = IntegerInterval::new(0.into(), 3.into()).unwrap();
-        assert_eq!(
-            signal.matrix_scale_nf(ScaleScalar::Interval(interval)),
-            Err(OperationError::IntervalScaleOfExactSignal)
-        );
-        assert!(
-            signal
-                .matrix_scale_nf(ScaleScalar::Exact {
-                    key: FactorIdentity::named("s"),
-                    value: 0.into(),
-                    matrix_type: matrix_type(1, 1),
-                })
-                .unwrap()
-                .is_exact_zero()
-        );
     }
 
     #[test]
@@ -1549,22 +1426,6 @@ mod tests {
             tensor.bounded_summary().as_matrix_bound().unwrap().coefficient_class,
             BoundClass::bounded(18_u64.into())
         );
-        let signal = PolynomialNF::exact_factor(FactorIdentity::named("signal"));
-        let plus = signal
-            .matrix_scale_nf(ScaleScalar::Exact {
-                key: FactorIdentity::named("scalar"),
-                value: 2.into(),
-                matrix_type: matrix_type(1, 1),
-            })
-            .unwrap();
-        let minus = PolynomialNF::exact_factor(FactorIdentity::named("signal"))
-            .matrix_scale_nf(ScaleScalar::Exact {
-                key: FactorIdentity::named("scalar"),
-                value: (-2).into(),
-                matrix_type: matrix_type(1, 1),
-            })
-            .unwrap();
-        assert_ne!(plus.exact_terms().keys().next(), minus.exact_terms().keys().next());
     }
 
     #[test]
@@ -1636,6 +1497,50 @@ mod tests {
             constant.exact_terms().values().next().unwrap().monomial.factors()[0].clone();
         assert!(constant_factor.matrix_value_metadata.is_constant_polynomial);
         assert_eq!(constant_factor.polynomial_facts.support_upper, 1);
+        assert_eq!(
+            constant_factor.key,
+            FactorIdentity::constant_polynomial(
+                &ConcreteMatrixType { modulus: 17.into(), ring_dimension: 4, rows: 1, columns: 1 },
+                &3.into(),
+            )
+        );
+
+        let centered = PolynomialNF::matrix_constant_nf(
+            FactorIdentity::named("centered"),
+            &ResolvedMatrixConstant::Polynomial {
+                coefficients: vec![20.into(), 0.into(), 0.into(), 0.into()].into(),
+            },
+            ConcreteMatrixType { modulus: 17.into(), ring_dimension: 4, rows: 1, columns: 1 },
+        )
+        .unwrap();
+        let centered_factor =
+            centered.exact_terms().values().next().unwrap().monomial.factors()[0].clone();
+        assert_eq!(centered_factor.bound, BoundClass::bounded(3_u8.into()));
+        assert_eq!(
+            centered_factor.key,
+            FactorIdentity::constant_polynomial(
+                &ConcreteMatrixType { modulus: 17.into(), ring_dimension: 4, rows: 1, columns: 1 },
+                &3.into(),
+            )
+        );
+        let centered_zero = PolynomialNF::matrix_constant_nf(
+            FactorIdentity::named("centered-zero"),
+            &ResolvedMatrixConstant::Polynomial {
+                coefficients: vec![17.into(), 0.into(), 0.into(), 0.into()].into(),
+            },
+            ConcreteMatrixType { modulus: 17.into(), ring_dimension: 4, rows: 1, columns: 1 },
+        )
+        .unwrap();
+        assert!(centered_zero.is_exact_zero());
+        let centered_one = PolynomialNF::matrix_constant_nf(
+            FactorIdentity::named("centered-one"),
+            &ResolvedMatrixConstant::Polynomial {
+                coefficients: vec![18.into(), 0.into(), 0.into(), 0.into()].into(),
+            },
+            ConcreteMatrixType { modulus: 17.into(), ring_dimension: 4, rows: 1, columns: 1 },
+        )
+        .unwrap();
+        assert_eq!(centered_one, PolynomialNF::one());
 
         let too_wide = PolynomialNF::matrix_constant_nf(
             FactorIdentity::named("too-wide"),

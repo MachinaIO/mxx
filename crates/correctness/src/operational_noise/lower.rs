@@ -15,13 +15,13 @@ use super::{
         TrapdoorDescriptorId, TrapdoorIdentity, TrapdoorSourceKey, WireSourceKey,
     },
     normal_form::{
-        ExpressionDag, ExpressionNode, FactorIdentity, FactorKind, FactorOwner, RelationRegistry,
-        SymbolicFactor, TermId,
+        ExpressionDag, ExpressionNode, FactorIdentity, FactorKind, FactorOwner, RelationPattern,
+        RelationRegistry, SymbolicFactor, TermId, centered_residue,
     },
     normal_form_family,
     normal_form_ops::{
         AdditionalOperations, BoolBit, CoefficientPreservingView, IntegerInterval,
-        PolynomialNFOperations, ScaleScalar, ViewSpec,
+        PolynomialNFOperations, ViewSpec,
     },
     scalar::{
         IntegerDomain, ScalarId, ScalarNode, ScalarOperation, ScalarProvenance, ScalarSort,
@@ -1500,6 +1500,14 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             .trapdoors
                             .get(trapdoor.0)
                             .map(|descriptor| descriptor.source.clone());
+                        let public_central = matches!(
+                            self.dag.node(*public),
+                            Ok(ExpressionNode::Atom(factor)) if factor.is_central_scalar()
+                        );
+                        let preimage_central = matches!(
+                            self.dag.node(preimage),
+                            Ok(ExpressionNode::Atom(factor)) if factor.is_central_scalar()
+                        );
                         let registration = super::normal_form::RelationRegistration {
                             key: super::normal_form::FullRelationKey {
                                 source: preimage_key.owner.clone(),
@@ -1513,11 +1521,25 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                     (selector, public_key.selector_mapping.clone())
                                 }),
                             },
-                            preimage: preimage_key,
+                            preimage: preimage_key.clone(),
                             target: *target,
+                            pattern: RelationPattern::new(
+                                [
+                                    public_central.then(|| public_key.clone()),
+                                    preimage_central.then(|| preimage_key.clone()),
+                                ]
+                                .into_iter()
+                                .flatten(),
+                                [
+                                    (!public_central).then(|| public_key.clone()),
+                                    (!preimage_central).then(|| preimage_key.clone()),
+                                ]
+                                .into_iter()
+                                .flatten(),
+                            ),
                         };
                         self.relation_registry
-                            .register(registration)
+                            .register_pattern(registration.pattern.clone(), registration)
                             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
                         let value = LoweredValue::Matrix(preimage);
                         self.finish_wire(&wire, value.clone());
@@ -3398,12 +3420,58 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 let scalar = self.lower_int_expr(scalar, environment)?;
                 self.validate_integer_consumer(
                     scalar.scalar,
-                    SelectorOnlyConsumer::MatrixScale,
+                    SelectorOnlyConsumer::NoiseBoundArithmetic,
                     false,
                 )?;
                 let identity = self.canonical_scalar_identity(scalar.scalar)?;
-                let Some(value) = resolved_integer(&identity) else {
-                    return Err(LowerError::UnsupportedMatrixProductExpansion);
+                let value = if let Some(value) = resolved_integer(&identity) {
+                    value
+                } else {
+                    let interval = self
+                        .integer_analysis(scalar.scalar)
+                        .and_then(|(domain, _)| domain.interval().ok())
+                        .ok_or(LowerError::UnsupportedMatrixProductExpansion)?;
+                    let input_type = self.dag_matrix_type(*matrix)?;
+                    let scalar_type = mxx_ir_core::types::ConcreteMatrixType {
+                        modulus: input_type.modulus.clone(),
+                        ring_dimension: input_type.ring_dimension,
+                        rows: 1,
+                        columns: 1,
+                    };
+                    let maximum = interval.minimum.magnitude().max(interval.maximum.magnitude());
+                    if maximum.is_zero() {
+                        return self
+                            .dag
+                            .push(ExpressionNode::Zero)
+                            .map(LoweredValue::Matrix)
+                            .map_err(|_| LowerError::UnsupportedMatrixProductExpansion);
+                    }
+                    let scalar_factor = SymbolicFactor::bounded_with_metadata(
+                        FactorIdentity::runtime_scalar(scalar_type.clone(), identity),
+                        MatrixBound {
+                            matrix_type: scalar_type.clone(),
+                            coefficient_class: BoundClass::bounded(maximum.clone()),
+                        },
+                        MatrixMetadata {
+                            canonical_coefficient_exclusive_upper: None,
+                            is_constant_polynomial: true,
+                            known_zero_rows: None,
+                            polynomial: Some(
+                                super::bound::PolynomialFacts::new(1, scalar_type.ring_dimension)
+                                    .expect("scalar support"),
+                            ),
+                        },
+                    )
+                    .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
+                    let scalar = self
+                        .dag
+                        .push(ExpressionNode::Atom(scalar_factor))
+                        .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
+                    return self
+                        .dag
+                        .push(ExpressionNode::Product(vec![scalar, *matrix].into_boxed_slice()))
+                        .map(LoweredValue::Matrix)
+                        .map_err(|_| LowerError::UnsupportedMatrixProductExpansion);
                 };
                 if value.is_one() {
                     return Ok(LoweredValue::Matrix(*matrix));
@@ -3415,20 +3483,48 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         .map(LoweredValue::Matrix)
                         .map_err(|_| LowerError::UnsupportedMatrixProductExpansion);
                 }
-                let key = self.dag_factor_key(*matrix)?;
-                let matrix_type = self.dag_matrix_type(*matrix)?;
-                let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
-                    modulus: matrix_type.modulus,
-                    ring_dimension: matrix_type.ring_dimension,
+                let input_type = self.dag_matrix_type(*matrix)?;
+                let scalar_type = mxx_ir_core::types::ConcreteMatrixType {
+                    modulus: input_type.modulus.clone(),
+                    ring_dimension: input_type.ring_dimension,
                     rows: 1,
                     columns: 1,
                 };
+                let value = centered_residue(&value, &scalar_type.modulus);
+                if value.is_zero() {
+                    return self
+                        .dag
+                        .push(ExpressionNode::Zero)
+                        .map(LoweredValue::Matrix)
+                        .map_err(|_| LowerError::UnsupportedMatrixProductExpansion);
+                }
+                if value == BigInt::from(1_u8) {
+                    return Ok(LoweredValue::Matrix(*matrix));
+                }
+                let scalar_factor = SymbolicFactor::bounded_with_metadata(
+                    FactorIdentity::constant_polynomial(&scalar_type, &value),
+                    MatrixBound {
+                        matrix_type: scalar_type.clone(),
+                        coefficient_class: BoundClass::bounded(value.magnitude().clone()),
+                    },
+                    MatrixMetadata {
+                        canonical_coefficient_exclusive_upper: None,
+                        is_constant_polynomial: true,
+                        known_zero_rows: None,
+                        polynomial: Some(
+                            super::bound::PolynomialFacts::new(1, scalar_type.ring_dimension)
+                                .expect("constant support"),
+                        ),
+                    },
+                )
+                .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
+                let scalar = self
+                    .dag
+                    .push(ExpressionNode::Atom(scalar_factor))
+                    .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
                 return self
                     .dag
-                    .push(ExpressionNode::MatrixScale {
-                        input: *matrix,
-                        scalar: ScaleScalar::Exact { key, value, matrix_type },
-                    })
+                    .push(ExpressionNode::Product(vec![scalar, *matrix].into_boxed_slice()))
                     .map(LoweredValue::Matrix)
                     .map_err(|_| LowerError::UnsupportedMatrixProductExpansion);
             }
@@ -5627,11 +5723,27 @@ mod tests {
                 lowerer.dag.push(ExpressionNode::Add(vec![state, product].into())).unwrap();
             let target_term = lowerer
                 .dag
-                .push(ExpressionNode::Atom(SymbolicFactor::large(target.clone())))
+                .push(ExpressionNode::Atom(SymbolicFactor::large_with_metadata(
+                    target.clone(),
+                    bound(BoundClass::Large),
+                    MatrixMetadata {
+                        canonical_coefficient_exclusive_upper: None,
+                        is_constant_polynomial: true,
+                        known_zero_rows: None,
+                        polynomial: Some(
+                            super::super::bound::PolynomialFacts::new(1, concrete.ring_dimension)
+                                .unwrap(),
+                        ),
+                    },
+                )))
                 .unwrap();
             lowerer
                 .relation_registry
                 .register(super::super::normal_form::RelationRegistration {
+                    pattern: super::super::normal_form::RelationPattern::new(
+                        [public.clone(), preimage.clone()],
+                        [],
+                    ),
                     key: super::super::normal_form::FullRelationKey {
                         source: "named".into(),
                         ordered_indices: Box::new([]),
@@ -6110,6 +6222,86 @@ mod tests {
             assert!(matches!(value, LoweredValue::Matrix(_)));
         }
         assert!(lowerer.scalar_store.len() >= 1, "matrix DAG keeps scalar constants typed");
+    }
+
+    #[test]
+    fn runtime_interval_matrix_scale_emits_a_ring_typed_scalar_factor() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "runtime-interval-scale".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, SymbolTables::default());
+        let mut environment = root_test_environment();
+        let binder = BinderKey {
+            loop_scope: environment.occurrence.clone(),
+            loop_node: mxx_ir_core::NodeId(777),
+            slot: 0,
+        };
+        let source = test_integer_atom(&mut lowerer, "runtime-scale", -3, 5);
+        environment.binders.push((binder.clone(), LoweredInt { scalar: source }));
+        let matrix = |lowerer: &mut GraphLowerer<'_, '_>, modulus: i64| {
+            let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
+                modulus: modulus.into(),
+                ring_dimension: 1,
+                rows: 2,
+                columns: 2,
+            };
+            lowerer
+                .dag
+                .push(ExpressionNode::Atom(SymbolicFactor::large_typed(
+                    FactorIdentity::named(format!("runtime-scale-{modulus}").as_str()),
+                    matrix_type,
+                )))
+                .unwrap()
+        };
+        let extract_scalar = |lowerer: &GraphLowerer<'_, '_>, term: TermId| {
+            let ExpressionNode::Product(children) = lowerer.dag.node(term).unwrap() else {
+                panic!("interval scale must lower to an ordinary product")
+            };
+            let ExpressionNode::Atom(factor) = lowerer.dag.node(children[0]).unwrap() else {
+                panic!("ordinary product must expose its scalar atom first")
+            };
+            factor.clone()
+        };
+        let first_matrix = matrix(&mut lowerer, 17);
+        let LoweredValue::Matrix(first_term) = lowerer
+            .lower_node(
+                &NodeKind::MatrixScale { scalar: IntExpr::LoopIndex(0) },
+                &[LoweredValue::Matrix(first_matrix)],
+                &environment,
+            )
+            .unwrap()
+        else {
+            panic!("interval scale must lower to a matrix term")
+        };
+        let first_scalar = extract_scalar(&lowerer, first_term);
+        assert!(first_scalar.is_central_scalar());
+        assert_eq!(first_scalar.matrix_type.rows, 1);
+        assert_eq!(first_scalar.matrix_type.columns, 1);
+        assert_eq!(first_scalar.bound, BoundClass::bounded(5_u8.into()));
+        assert_eq!(first_scalar.polynomial_facts.support_upper, 1);
+        assert!(first_scalar.matrix_value_metadata.is_constant_polynomial);
+
+        let second_matrix = matrix(&mut lowerer, 19);
+        let LoweredValue::Matrix(second_term) = lowerer
+            .lower_node(
+                &NodeKind::MatrixScale { scalar: IntExpr::LoopIndex(0) },
+                &[LoweredValue::Matrix(second_matrix)],
+                &environment,
+            )
+            .unwrap()
+        else {
+            panic!("interval scale must lower to a matrix term")
+        };
+        let second_scalar = extract_scalar(&lowerer, second_term);
+        assert_ne!(first_scalar.key, second_scalar.key);
+        assert!(matches!(
+            first_scalar.key.owner,
+            FactorOwner::RuntimeScalar { ref matrix_type, .. }
+                if matrix_type.modulus == 17.into()
+        ));
     }
 
     #[test]

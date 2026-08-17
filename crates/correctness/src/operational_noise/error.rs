@@ -75,7 +75,6 @@ pub enum SelectorOnlyConsumer {
     IntToReal,
     LiftConstantPolynomial,
     HashTag,
-    MatrixScale,
     MatrixDimension,
     LoopCount,
     SliceRange,

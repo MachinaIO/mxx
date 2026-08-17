@@ -175,8 +175,8 @@ mod tests {
         family::{CoverageBinderDomain, FamilyCoverageStorage, LoopDomainKey},
         identity::{OccurrenceScope, ProgramKey},
         normal_form::{
-            ExpressionNode, FactorKind, FactorOwner, FullRelationKey, RelationRegistration,
-            SymbolicFactor,
+            ExpressionNode, FactorKind, FactorOwner, FullRelationKey, RelationPattern,
+            RelationRegistration, SymbolicFactor,
         },
         scalar::ScalarSort,
     };
@@ -331,6 +331,7 @@ mod tests {
         let mut registry = RelationRegistry::default();
         registry
             .register(RelationRegistration {
+                pattern: RelationPattern::ordered(public.clone(), preimage.clone()),
                 key: FullRelationKey {
                     source: "named".into(),
                     ordered_indices: Box::new([]),

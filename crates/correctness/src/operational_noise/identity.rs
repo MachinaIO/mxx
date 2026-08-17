@@ -705,7 +705,7 @@ pub(crate) fn substitute_resolved_matrix_identity(
     binder: &BinderKey,
     replacement: &ResolvedIntExpr,
 ) -> ResolvedMatrixValueIdentity {
-    use super::{normal_form::MatrixValueOperation, normal_form_ops::ScaleScalar};
+    use super::normal_form::MatrixValueOperation;
     let substitute_range = |range: &ResolvedIndexRange| ResolvedIndexRange {
         start: substitute_resolved_int_expr(&range.start, binder, replacement),
         end: substitute_resolved_int_expr(&range.end, binder, replacement),
@@ -717,15 +717,6 @@ pub(crate) fn substitute_resolved_matrix_identity(
     let substitute_factor =
         |factor: &FactorIdentity| substitute_factor_identity(factor, binder, replacement);
     let operation = |operation: &MatrixValueOperation| match operation {
-        MatrixValueOperation::MatrixScale {
-            scalar: ScaleScalar::Exact { key, value, matrix_type },
-        } => MatrixValueOperation::MatrixScale {
-            scalar: ScaleScalar::Exact {
-                key: substitute_factor(key),
-                value: value.clone(),
-                matrix_type: matrix_type.clone(),
-            },
-        },
         MatrixValueOperation::Slice { spec } => {
             MatrixValueOperation::Slice { spec: substitute_slice(spec) }
         }
@@ -786,6 +777,10 @@ fn substitute_factor_identity(
         FactorOwner::Scalar(identity) => {
             FactorOwner::Scalar(substitute_resolved_int_expr(identity, binder, replacement))
         }
+        FactorOwner::RuntimeScalar { matrix_type, value } => FactorOwner::RuntimeScalar {
+            matrix_type: matrix_type.clone(),
+            value: substitute_resolved_int_expr(value, binder, replacement),
+        },
         FactorOwner::HashPlain { query, arguments } => FactorOwner::HashPlain {
             query: Box::new(substitute_factor_identity(query, binder, replacement)),
             arguments: arguments
@@ -797,6 +792,16 @@ fn substitute_factor_identity(
                         )
                     }
                     other => other.clone(),
+                })
+                .collect(),
+        },
+        FactorOwner::Switch { selector, mapping, cases } => FactorOwner::Switch {
+            selector: Box::new(substitute_factor_identity(selector, binder, replacement)),
+            mapping: mapping.clone(),
+            cases: cases
+                .iter()
+                .map(|case| {
+                    super::normal_form::substitute_switch_case_identity(case, binder, replacement)
                 })
                 .collect(),
         },

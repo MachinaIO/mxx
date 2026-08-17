@@ -9,8 +9,8 @@
 
 use super::{
     BoundClass, BoundedSummary, ExpressionDag, ExpressionNode, FullRelationKey, Monomial,
-    NormalFormError, PolynomialNF, RelationRegistry, TermId, add_summary,
-    dag_structure_fingerprint, monomial_value_summary, product_value_summary,
+    NormalFormError, PolynomialNF, RelationRegistry, SwitchCaseIdentity, TermId, add_summary,
+    case_identity_after_normalization, monomial_value_summary, product_value_summary,
     scale_by_multiplicity, summary_from_bound_with_facts, switch_normalize,
 };
 use crate::operational_noise::normal_form_ops::{
@@ -151,17 +151,15 @@ impl<'a> Normalizer<'a> {
                         .iter()
                         .map(|index| child(cases[*index], &values, &self.memo))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let fingerprints = reachable
+                    let identities = reachable
                         .iter()
-                        .map(|index| {
-                            dag_structure_fingerprint(self.dag, cases[*index], &mut BTreeSet::new())
-                        })
+                        .map(|index| self.case_identity(cases[*index]))
                         .collect::<Result<Vec<_>, _>>()?;
                     switch_normalize(
                         selector,
                         normalized.into_boxed_slice(),
                         reachable.iter().map(|index| BigUint::from(*index)).collect(),
-                        fingerprints.into_iter().map(Into::into).collect(),
+                        identities.into_boxed_slice(),
                     )?
                 }
                 ExpressionNode::FamilyGetStatic { cases, index } => {
@@ -193,22 +191,17 @@ impl<'a> Normalizer<'a> {
                         .iter()
                         .map(|case| child(*case, &values, &self.memo))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let fingerprints = cases
+                    let identities = cases
                         .iter()
-                        .map(|case| {
-                            dag_structure_fingerprint(self.dag, *case, &mut BTreeSet::new())
-                        })
+                        .map(|case| self.case_identity(*case))
                         .collect::<Result<Vec<_>, _>>()?;
                     switch_normalize(
                         selector,
                         normalized.into_boxed_slice(),
                         stored_indices,
-                        fingerprints.into_iter().map(Into::into).collect(),
+                        identities.into_boxed_slice(),
                     )?
                 }
-                ExpressionNode::MatrixScale { input, scalar } => child(input, &values, &self.memo)?
-                    .matrix_scale_nf(scalar)
-                    .map_err(operation_error)?,
                 ExpressionNode::Transpose(input) => {
                     child(input, &values, &self.memo)?.transpose_nf().map_err(operation_error)?
                 }
@@ -320,17 +313,15 @@ impl<'a> Normalizer<'a> {
                     .iter()
                     .map(|index| self.normalize_term(cases[*index]))
                     .collect::<Result<Vec<_>, _>>()?;
-                let fingerprints = reachable
+                let identities = reachable
                     .iter()
-                    .map(|index| {
-                        dag_structure_fingerprint(self.dag, cases[*index], &mut BTreeSet::new())
-                    })
+                    .map(|index| self.case_identity(cases[*index]))
                     .collect::<Result<Vec<_>, _>>()?;
                 switch_normalize(
                     selector,
                     normalized.into_boxed_slice(),
                     reachable.iter().map(|index| BigUint::from(*index)).collect(),
-                    fingerprints.into_iter().map(Into::into).collect(),
+                    identities.into_boxed_slice(),
                 )?
             }
             ExpressionNode::FamilyGetStatic { cases, index } => {
@@ -356,19 +347,16 @@ impl<'a> Normalizer<'a> {
                     .iter()
                     .map(|case| self.normalize_term(*case))
                     .collect::<Result<Vec<_>, _>>()?;
-                let fingerprints = cases
+                let identities = cases
                     .iter()
-                    .map(|case| dag_structure_fingerprint(self.dag, *case, &mut BTreeSet::new()))
+                    .map(|case| self.case_identity(*case))
                     .collect::<Result<Vec<_>, _>>()?;
                 switch_normalize(
                     selector,
                     normalized.into_boxed_slice(),
                     stored_indices,
-                    fingerprints.into_iter().map(Into::into).collect(),
+                    identities.into_boxed_slice(),
                 )?
-            }
-            ExpressionNode::MatrixScale { input, scalar } => {
-                self.normalize_term(input)?.matrix_scale_nf(scalar).map_err(operation_error)?
             }
             ExpressionNode::Transpose(input) => {
                 self.normalize_term(input)?.transpose_nf().map_err(operation_error)?
@@ -444,14 +432,20 @@ impl<'a> Normalizer<'a> {
                     .expect("switch position was collected from switch data")
                     .clone();
                 let mut cases = Vec::with_capacity(switch.cases.len());
-                let mut fingerprints = Vec::with_capacity(switch.cases.len());
+                let mut identities = Vec::with_capacity(switch.cases.len());
                 let mut changed_case = false;
-                for switch_case in &switch.cases {
+                for (case_index, switch_case) in switch.cases.iter().enumerate() {
                     let exposed = self.expose_single_switch_products(switch_case.clone())?;
                     let case = self.apply_relations(exposed)?;
                     changed_case |= case != *switch_case;
-                    fingerprints
-                        .push(format!("case={:?}", case.exact_terms.keys()).into_boxed_str());
+                    let identity = if !case.exact_terms().is_empty() ||
+                        matches!(case.bounded_summary(), BoundedSummary::ExactZero)
+                    {
+                        case_identity_after_normalization(&switch.case_identities[case_index])
+                    } else {
+                        switch.case_identities[case_index].clone()
+                    };
+                    identities.push(identity);
                     cases.push(case);
                 }
                 if changed_case {
@@ -459,7 +453,7 @@ impl<'a> Normalizer<'a> {
                         switch.selector.clone(),
                         cases.into_boxed_slice(),
                         switch.case_indices.clone(),
-                        fingerprints.into_boxed_slice(),
+                        identities.into_boxed_slice(),
                     )?;
                     value = value.add(scale_nf(normalized_switch, &term.multiplicity)?)?;
                 } else {
@@ -478,10 +472,13 @@ impl<'a> Normalizer<'a> {
                 .expect("switch position was collected from switch data")
                 .clone();
             let mut cases = Vec::with_capacity(switch.cases.len());
-            let mut fingerprints = Vec::with_capacity(switch.cases.len());
-            for switch_case in &switch.cases {
+            let mut identities = Vec::with_capacity(switch.cases.len());
+            for (case_index, switch_case) in switch.cases.iter().enumerate() {
                 let mut case = PolynomialNF::one();
+                let mut prefix_factors = Vec::new();
+                let mut suffix_factors = Vec::new();
                 for factor in &factors[..switch_position] {
+                    prefix_factors.push(factor.key.clone());
                     case = self.product_and_normalize(
                         case,
                         PolynomialNF::from_monomial(Monomial::from_factor(factor.clone())),
@@ -489,19 +486,24 @@ impl<'a> Normalizer<'a> {
                 }
                 case = self.product_and_normalize(case, switch_case.clone())?;
                 for factor in &factors[switch_position + 1..] {
+                    suffix_factors.push(factor.key.clone());
                     case = self.product_and_normalize(
                         case,
                         PolynomialNF::from_monomial(Monomial::from_factor(factor.clone())),
                     )?;
                 }
                 cases.push(case.clone());
-                fingerprints.push(format!("case={:?}", case.exact_terms.keys()).into_boxed_str());
+                identities.push(SwitchCaseIdentity::Product {
+                    prefix: prefix_factors.into_boxed_slice(),
+                    case: Box::new(switch.case_identities[case_index].clone()),
+                    suffix: suffix_factors.into_boxed_slice(),
+                });
             }
             let normalized_switch = switch_normalize(
                 switch.selector.clone(),
                 cases.into_boxed_slice(),
                 switch.case_indices.clone(),
-                fingerprints.into_boxed_slice(),
+                identities.into_boxed_slice(),
             )?;
             value = value.add(scale_nf(normalized_switch, &term.multiplicity)?)?;
         }
@@ -517,41 +519,32 @@ impl<'a> Normalizer<'a> {
             let keys = value.exact_terms.keys().cloned().collect::<Vec<_>>();
             for key in keys {
                 let Some(term) = value.exact_terms.remove(&key) else { continue };
-                let factors = term.monomial.factors();
-                for position in 0..factors.len().saturating_sub(1) {
-                    let left = &factors[position];
-                    let right = &factors[position + 1];
-                    let Some(registration) = self.registry.resolve(left, right)? else { continue };
-                    // Count semantic relation candidates, not every adjacent
-                    // factor boundary visited by a particular association of
-                    // the same product.  The latter would make diagnostics
-                    // depend on whether `A*(B*K)` was written as
-                    // `(A*B)*K`, even though both normalize to the same
-                    // canonical polynomial and perform the same checked
-                    // replacement.
-                    self.counters.relation_candidates =
-                        self.counters.relation_candidates.saturating_add(1);
-                    self.counters.relations_applied =
-                        self.counters.relations_applied.saturating_add(1);
-                    if self.relation_stack.contains(&registration.key) {
-                        return Err(NormalFormError::CyclicRelationDependency {
-                            key: registration.key.clone(),
-                        });
-                    }
-                    self.relation_stack.push(registration.key.clone());
-                    if self.visiting.contains(&registration.target) {
-                        return Err(NormalFormError::CyclicRelationDependency {
-                            key: registration.key.clone(),
-                        });
-                    }
+                let Some(relation_match) = self.registry.resolve_pattern(
+                    term.monomial.central_factors(),
+                    term.monomial.ordered_factors(),
+                )?
+                else {
+                    value.exact_terms.insert(key, term);
+                    continue;
+                };
+                let registration = relation_match.registration;
+                self.counters.relation_candidates =
+                    self.counters.relation_candidates.saturating_add(1);
+                self.counters.relations_applied = self.counters.relations_applied.saturating_add(1);
+                if self.relation_stack.contains(&registration.key) ||
+                    self.visiting.contains(&registration.target)
+                {
+                    return Err(NormalFormError::CyclicRelationDependency {
+                        key: registration.key.clone(),
+                    });
+                }
+                let relation_stack_len = self.relation_stack.len();
+                self.relation_stack.push(registration.key.clone());
+                let relation_result = (|| -> Result<PolynomialNF, NormalFormError> {
                     let target = match self.memo.get(&registration.target).cloned() {
                         Some(target) => target,
                         None => match self.dag.node(registration.target)?.clone() {
                             ExpressionNode::Atom(factor) => {
-                                // Relation targets are commonly atoms.  They
-                                // are complete without another recursive DAG
-                                // dispatch frame; memoize the same canonical
-                                // result and preserve node accounting.
                                 self.counters.nodes_processed =
                                     self.counters.nodes_processed.saturating_add(1);
                                 let target = self.normalize_atom(factor);
@@ -561,8 +554,45 @@ impl<'a> Normalizer<'a> {
                             _ => self.normalize_dispatch(registration.target)?,
                         },
                     };
-                    let prefix = Monomial::from_factors(factors[..position].iter().cloned());
-                    let suffix = Monomial::from_factors(factors[position + 2..].iter().cloned());
+                    if relation_match.pattern.ordered_word.is_empty() &&
+                        target.exact_terms().values().any(|target_term| {
+                            !target_term.monomial.ordered_factors().is_empty()
+                        })
+                    {
+                        return Err(NormalFormError::InvalidCentralRelationTarget {
+                            key: registration.key.clone(),
+                        });
+                    }
+                    if relation_match.pattern.ordered_word.is_empty() &&
+                        target.bounded_summary().as_matrix_bound().is_some_and(|bound| {
+                            bound.matrix_type.rows != 1 || bound.matrix_type.columns != 1
+                        })
+                    {
+                        return Err(NormalFormError::InvalidCentralRelationTarget {
+                            key: registration.key.clone(),
+                        });
+                    }
+                    let consumed =
+                        relation_match.central_indices.iter().copied().collect::<BTreeSet<_>>();
+                    let residual_central = term
+                        .monomial
+                        .central_factors()
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| !consumed.contains(index))
+                        .map(|(_, factor)| factor.clone());
+                    let prefix = Monomial::from_factors(
+                        residual_central.chain(
+                            term.monomial.ordered_factors()[..relation_match.ordered_start]
+                                .iter()
+                                .cloned(),
+                        ),
+                    );
+                    let suffix_start =
+                        relation_match.ordered_start + relation_match.pattern.ordered_word.len();
+                    let suffix = Monomial::from_factors(
+                        term.monomial.ordered_factors()[suffix_start..].iter().cloned(),
+                    );
                     let mut expanded = PolynomialNF::zero();
                     for target_term in target.exact_terms.values() {
                         expanded.insert(
@@ -576,16 +606,13 @@ impl<'a> Normalizer<'a> {
                     }
                     expanded = self.apply_relations(expanded)?;
                     expanded.fold_finite_non_live_terms(&mut self.counters.bounded_fold_count)?;
-                    self.relation_stack.pop();
-                    value = value.add(expanded)?;
-                    changed = true;
-                    break;
-                }
-                if !changed {
-                    value.exact_terms.insert(key, term);
-                } else {
-                    break;
-                }
+                    Ok(expanded)
+                })();
+                self.relation_stack.truncate(relation_stack_len);
+                let expanded = relation_result?;
+                value = value.add(expanded)?;
+                changed = true;
+                break;
             }
             if !changed {
                 return Ok(value);
@@ -602,16 +629,27 @@ impl<'a> Normalizer<'a> {
         }
     }
 
+    fn case_identity(&self, id: TermId) -> Result<SwitchCaseIdentity, NormalFormError> {
+        let facts = self.dag.facts(id)?;
+        let identity = self
+            .dag
+            .resolved_identity(facts.identity)
+            .ok_or(NormalFormError::MissingMatrixBound)?;
+        Ok(SwitchCaseIdentity::Matrix(identity))
+    }
+
     fn remaining_relation_candidates(
         &self,
         normalized: &PolynomialNF,
     ) -> Result<u64, NormalFormError> {
         let mut remaining = 0_u64;
         for term in normalized.exact_terms().values() {
-            for pair in term.monomial.factors().windows(2) {
-                if self.registry.resolve(&pair[0], &pair[1])?.is_some() {
-                    remaining = remaining.saturating_add(1);
-                }
+            if self
+                .registry
+                .resolve_pattern(term.monomial.central_factors(), term.monomial.ordered_factors())?
+                .is_some()
+            {
+                remaining = remaining.saturating_add(1);
             }
         }
         Ok(remaining)

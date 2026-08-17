@@ -84,7 +84,6 @@ fn dag_progress_stats(
                 pending.extend(children.iter().copied());
             }
             ExpressionNode::Negate(child) |
-            ExpressionNode::MatrixScale { input: child, .. } |
             ExpressionNode::Transpose(child) |
             ExpressionNode::Slice { input: child, .. } |
             ExpressionNode::LiftConstantPolynomial { input: child, .. } |

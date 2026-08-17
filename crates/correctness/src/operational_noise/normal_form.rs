@@ -14,14 +14,14 @@ use super::{
         AtomicSourceKey, Axis, BinderKey, CrtSpec, ResolvedIndexRange, ResolvedIntExpr,
         ResolvedMatrixType, SliceSpec, TrapdoorSourceKey, substitute_resolved_int_expr,
     },
-    normal_form_ops::{IntegerInterval, ScaleScalar, ViewSpec},
+    normal_form_ops::{IntegerInterval, ViewSpec},
     scalar::resolved_constant,
 };
 use mxx_ir_core::{Port, types::ConcreteMatrixType};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{ToPrimitive, Zero};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt,
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -31,7 +31,9 @@ use std::{
 pub(crate) mod normal_form_product;
 pub(crate) use normal_form_product::NormalizationCounters;
 
-pub use super::normal_form_relation::{FullRelationKey, RelationRegistration, RelationRegistry};
+pub use super::normal_form_relation::{
+    FullRelationKey, RelationPattern, RelationRegistration, RelationRegistry,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FactorLayoutIdentity {
@@ -59,7 +61,6 @@ pub enum MatrixValueOperation {
     Select { reachable: Box<[usize]> },
     FamilyGetStatic { index: usize },
     FamilyGetDynamic { stored_indices: Box<[BigUint]>, domain_upper: BigUint },
-    MatrixScale { scalar: ScaleScalar },
     Transpose,
     Slice { spec: SliceSpec },
     Tensor,
@@ -94,6 +95,26 @@ pub struct ResolvedMatrixValueIdentityNode {
     pub selector: Option<FactorIdentity>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum SwitchCaseTransform {
+    Normalization,
+    Product(Box<[SwitchCaseIdentity]>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum SwitchCaseIdentity {
+    Matrix(ResolvedMatrixValueIdentity),
+    Derived {
+        source: Box<SwitchCaseIdentity>,
+        transform: SwitchCaseTransform,
+    },
+    Product {
+        prefix: Box<[FactorIdentity]>,
+        case: Box<SwitchCaseIdentity>,
+        suffix: Box<[FactorIdentity]>,
+    },
+}
+
 /// Facts computed once when an expression enters the job-local DAG.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MatrixValueFacts {
@@ -123,6 +144,21 @@ pub enum HashPlainArgumentIdentity {
     ExactZero,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum CompositeDescriptor {
+    Generic(Box<str>),
+    Slice(SliceSpec),
+    Tensor,
+    View(ViewSpec),
+    Concat { axis: Axis, arity: usize, input_index: usize, output_type: ConcreteMatrixType },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct CompositeIdentity {
+    pub descriptor: CompositeDescriptor,
+    pub operands: Box<[FactorIdentity]>,
+}
+
 /// The owner of a factor.  All production variants are existing typed
 /// identity components; the named variant exists only for unit fixtures.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -133,6 +169,19 @@ pub enum FactorOwner {
     /// deliberately does not mention the graph output node that materialized
     /// the selector, so equal selectors share one barrier identity.
     Scalar(ResolvedIntExpr),
+    /// A scalar constant polynomial. Its owner includes the resolved ring
+    /// and centered residue, so graph scales and explicit 1x1 `[v]` constants
+    /// share one semantic identity.
+    ConstantPolynomial {
+        matrix_type: ConcreteMatrixType,
+        value: BigInt,
+    },
+    /// A runtime integer scalar with its owning matrix ring.  The symbolic
+    /// value is retained because its interval is a bound, not identity.
+    RuntimeScalar {
+        matrix_type: ConcreteMatrixType,
+        value: ResolvedIntExpr,
+    },
     /// A plain hash query together with its ordered, canonical scalar input
     /// identities.  The query and argument identities are part of the key;
     /// no compact arena ID or debug rendering is persistent identity.
@@ -140,6 +189,12 @@ pub enum FactorOwner {
         query: Box<FactorIdentity>,
         arguments: Box<[HashPlainArgumentIdentity]>,
     },
+    Switch {
+        selector: Box<FactorIdentity>,
+        mapping: Box<[BigUint]>,
+        cases: Box<[SwitchCaseIdentity]>,
+    },
+    Composite(Box<CompositeIdentity>),
     Derived {
         parent: Box<FactorIdentity>,
         tag: Box<[u8]>,
@@ -174,6 +229,21 @@ pub struct FactorIdentity {
 }
 
 impl FactorIdentity {
+    pub fn constant_polynomial(matrix_type: &ConcreteMatrixType, value: &BigInt) -> Self {
+        let value = centered_residue(value, &matrix_type.modulus);
+        Self {
+            owner: FactorOwner::ConstantPolynomial { matrix_type: matrix_type.clone(), value },
+            kind: FactorKind::Signal,
+            port: Port(0),
+            coordinates: Box::new([]),
+            public: None,
+            layout: None,
+            selector: None,
+            trapdoor: None,
+            selector_mapping: Box::new([]),
+        }
+    }
+
     pub fn atomic(
         source: AtomicSourceKey,
         coordinates: impl IntoIterator<Item = (BinderKey, ResolvedIntExpr)>,
@@ -205,6 +275,20 @@ impl FactorIdentity {
         }
     }
 
+    pub fn runtime_scalar(matrix_type: ConcreteMatrixType, value: ResolvedIntExpr) -> Self {
+        Self {
+            owner: FactorOwner::RuntimeScalar { matrix_type, value },
+            kind: FactorKind::Signal,
+            port: Port(0),
+            coordinates: Box::new([]),
+            public: None,
+            layout: None,
+            selector: None,
+            trapdoor: None,
+            selector_mapping: Box::new([]),
+        }
+    }
+
     pub fn trapdoor(
         source: TrapdoorSourceKey,
         coordinates: impl IntoIterator<Item = (BinderKey, ResolvedIntExpr)>,
@@ -225,10 +309,14 @@ impl FactorIdentity {
     fn switch_barrier(
         selector: FactorIdentity,
         selector_mapping: Box<[BigUint]>,
-        fingerprint: Box<[u8]>,
+        cases: Box<[SwitchCaseIdentity]>,
     ) -> Self {
         Self {
-            owner: FactorOwner::Derived { parent: Box::new(selector.clone()), tag: fingerprint },
+            owner: FactorOwner::Switch {
+                selector: Box::new(selector.clone()),
+                mapping: selector_mapping.clone(),
+                cases,
+            },
             kind: FactorKind::SwitchBarrier,
             port: Port(0),
             coordinates: Box::new([]),
@@ -259,6 +347,12 @@ impl FactorIdentity {
             selector_mapping: Box::new([]),
         }
     }
+}
+
+pub(crate) fn centered_residue(value: &BigInt, modulus: &BigInt) -> BigInt {
+    let modulus = modulus.clone();
+    let residue = ((value % &modulus) + &modulus) % &modulus;
+    if residue.clone() * 2_u8 > modulus { residue - modulus } else { residue }
 }
 
 /// A symbolic factor.  Bounds and relation liveness are contracts, not part
@@ -441,10 +535,9 @@ pub struct SwitchData {
     /// Source-case mapping in the order represented by `cases`.  The values
     /// are semantic indices, never DAG `TermId`s.
     pub case_indices: Box<[BigUint]>,
-    /// Full owner-resolved source structure for each case.  This is a compact
-    /// fingerprint, not an expression-tree cache; numeric coefficient caps
-    /// are deliberately omitted from it.
-    pub case_fingerprints: Box<[Box<str>]>,
+    /// Full owner-resolved structural identity for each reachable case. It is
+    /// independent of numeric coefficient caps and job-local graph IDs.
+    pub case_identities: Box<[SwitchCaseIdentity]>,
 }
 
 /// One monomial with a significant factor order.
@@ -466,6 +559,12 @@ impl Monomial {
     }
     pub fn iter_factors(&self) -> impl Iterator<Item = &SymbolicFactor> {
         self.central_factors.iter().chain(self.ordered_factors.iter())
+    }
+    pub(crate) fn central_factors(&self) -> &[SymbolicFactor] {
+        &self.central_factors
+    }
+    pub(crate) fn ordered_factors(&self) -> &[SymbolicFactor] {
+        &self.ordered_factors
     }
     pub(crate) fn from_factors(factors: impl IntoIterator<Item = SymbolicFactor>) -> Self {
         let mut central = Vec::new();
@@ -859,10 +958,6 @@ pub enum ExpressionNode {
         stored_indices: Box<[BigUint]>,
         domain_upper: BigUint,
     },
-    MatrixScale {
-        input: TermId,
-        scalar: ScaleScalar,
-    },
     Transpose(TermId),
     Slice {
         input: TermId,
@@ -1064,9 +1159,7 @@ impl ExpressionDag {
                 .map(|fact| fact.concrete_type.clone())
                 .or_else(|| Some(zero_concrete_type())),
             ExpressionNode::Product(children) => product_matrix_type(&inputs, children.len()),
-            ExpressionNode::Negate(_) | ExpressionNode::MatrixScale { .. } => {
-                inputs.first().map(|fact| fact.concrete_type.clone())
-            }
+            ExpressionNode::Negate(_) => inputs.first().map(|fact| fact.concrete_type.clone()),
             ExpressionNode::Transpose(_) => inputs.first().and_then(|fact| {
                 let mut matrix = fact.concrete_type.clone();
                 std::mem::swap(&mut matrix.rows, &mut matrix.columns);
@@ -1263,7 +1356,7 @@ impl ExpressionDag {
                             .map(|case| substitute_nf(case, binder, replacement))
                             .collect(),
                         case_indices: switch.case_indices.clone(),
-                        case_fingerprints: switch.case_fingerprints.clone(),
+                        case_identities: switch.case_identities.clone(),
                     })
                 });
                 let result = self.push(ExpressionNode::Atom(factor))?;
@@ -1339,7 +1432,7 @@ impl ExpressionDag {
                                 .map(|case| substitute_nf(case, binder, replacement))
                                 .collect(),
                             case_indices: switch.case_indices.clone(),
-                            case_fingerprints: switch.case_fingerprints.clone(),
+                            case_identities: switch.case_identities.clone(),
                         })
                     });
                     ExpressionNode::Atom(factor)
@@ -1397,10 +1490,6 @@ impl ExpressionDag {
                         .collect::<Result<Box<_>, _>>()?,
                     stored_indices,
                     domain_upper,
-                },
-                ExpressionNode::MatrixScale { input, scalar } => ExpressionNode::MatrixScale {
-                    input: mapped(input).ok_or(NormalFormError::InvalidTermId)?,
-                    scalar: substitute_scale_scalar(scalar, binder, replacement),
                 },
                 ExpressionNode::Transpose(input) => {
                     ExpressionNode::Transpose(mapped(input).ok_or(NormalFormError::InvalidTermId)?)
@@ -1528,10 +1617,6 @@ impl ExpressionDag {
                     domain_upper,
                 }
             }
-            ExpressionNode::MatrixScale { input, scalar } => ExpressionNode::MatrixScale {
-                input: self.substitute_factors(input, replacements, memo)?,
-                scalar,
-            },
             ExpressionNode::Transpose(input) => {
                 ExpressionNode::Transpose(self.substitute_factors(input, replacements, memo)?)
             }
@@ -1607,9 +1692,56 @@ fn substitute_factor_identity(
         FactorOwner::Scalar(identity) => {
             FactorOwner::Scalar(substitute_resolved_int_expr(&identity, binder, replacement))
         }
+        FactorOwner::RuntimeScalar { matrix_type, value } => FactorOwner::RuntimeScalar {
+            matrix_type: matrix_type.clone(),
+            value: substitute_resolved_int_expr(&value, binder, replacement),
+        },
+        FactorOwner::Switch { selector, mapping, cases } => FactorOwner::Switch {
+            selector: Box::new(substitute_factor_identity(&selector, binder, replacement)),
+            mapping,
+            cases: cases
+                .iter()
+                .map(|case| substitute_switch_case_identity(case, binder, replacement))
+                .collect(),
+        },
         owner => owner,
     };
     value
+}
+
+pub(crate) fn substitute_switch_case_identity(
+    case: &SwitchCaseIdentity,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> SwitchCaseIdentity {
+    match case {
+        SwitchCaseIdentity::Matrix(identity) => SwitchCaseIdentity::Matrix(
+            super::identity::substitute_resolved_matrix_identity(identity, binder, replacement),
+        ),
+        SwitchCaseIdentity::Derived { source, transform } => SwitchCaseIdentity::Derived {
+            source: Box::new(substitute_switch_case_identity(source, binder, replacement)),
+            transform: match transform {
+                SwitchCaseTransform::Normalization => SwitchCaseTransform::Normalization,
+                SwitchCaseTransform::Product(cases) => SwitchCaseTransform::Product(
+                    cases
+                        .iter()
+                        .map(|case| substitute_switch_case_identity(case, binder, replacement))
+                        .collect(),
+                ),
+            },
+        },
+        SwitchCaseIdentity::Product { prefix, case, suffix } => SwitchCaseIdentity::Product {
+            prefix: prefix
+                .iter()
+                .map(|factor| substitute_factor_identity(factor, binder, replacement))
+                .collect(),
+            case: Box::new(substitute_switch_case_identity(case, binder, replacement)),
+            suffix: suffix
+                .iter()
+                .map(|factor| substitute_factor_identity(factor, binder, replacement))
+                .collect(),
+        },
+    }
 }
 
 fn substitute_atomic_source(
@@ -1681,39 +1813,10 @@ fn substitute_crt_spec(
     }
 }
 
-fn substitute_scale_scalar(
-    scalar: ScaleScalar,
-    binder: &BinderKey,
-    replacement: &ResolvedIntExpr,
-) -> ScaleScalar {
-    match scalar {
-        ScaleScalar::Exact { key, value, matrix_type } => ScaleScalar::Exact {
-            key: substitute_factor_identity(&key, binder, replacement),
-            value,
-            matrix_type,
-        },
-        ScaleScalar::Interval(interval) => ScaleScalar::Interval(interval),
-    }
-}
-
-/// Proof-only extraction caps are facts, not value identity.  Keep the
-/// structural scale domain while removing that analysis annotation before it
-/// enters the matrix identity interner.
 fn identity_interval(interval: &IntegerInterval) -> IntegerInterval {
     let mut identity = interval.clone();
     identity.direct_extract_upper = None;
     identity
-}
-
-fn scale_identity_scalar(scalar: &ScaleScalar) -> ScaleScalar {
-    match scalar {
-        ScaleScalar::Exact { key, value, matrix_type } => ScaleScalar::Exact {
-            key: key.clone(),
-            value: value.clone(),
-            matrix_type: matrix_type.clone(),
-        },
-        ScaleScalar::Interval(interval) => ScaleScalar::Interval(identity_interval(interval)),
-    }
 }
 
 impl ExpressionNode {
@@ -1738,9 +1841,6 @@ impl ExpressionNode {
                     stored_indices: stored_indices.clone(),
                     domain_upper: domain_upper.clone(),
                 }
-            }
-            Self::MatrixScale { scalar, .. } => {
-                MatrixValueOperation::MatrixScale { scalar: scale_identity_scalar(scalar) }
             }
             Self::Transpose(_) => MatrixValueOperation::Transpose,
             Self::Slice { spec, .. } => MatrixValueOperation::Slice { spec: spec.clone() },
@@ -1791,7 +1891,6 @@ impl ExpressionNode {
             Self::Select { cases, .. } |
             Self::FamilyGetStatic { cases, .. } |
             Self::FamilyGetDynamic { cases, .. } => cases.to_vec(),
-            Self::MatrixScale { input, .. } |
             Self::Transpose(input) |
             Self::Slice { input, .. } |
             Self::LiftConstantPolynomial { input, .. } |
@@ -1861,8 +1960,7 @@ fn transfer_polynomial_facts(
         ExpressionNode::Negate(child) |
         ExpressionNode::Transpose(child) |
         ExpressionNode::Slice { input: child, .. } |
-        ExpressionNode::View { input: child, .. } |
-        ExpressionNode::MatrixScale { input: child, .. } => {
+        ExpressionNode::View { input: child, .. } => {
             let _ = child;
             input_support(0)
         }
@@ -1895,130 +1993,6 @@ fn transfer_polynomial_facts(
         ExpressionNode::Concat { .. } => ring_dimension,
     };
     Some(cap(support))
-}
-
-fn bound_kind(bound: &BoundClass) -> &'static str {
-    match bound {
-        BoundClass::ExactZero => "zero",
-        BoundClass::Bounded { .. } => "bounded",
-        BoundClass::Large => "large",
-    }
-}
-
-fn factor_structural_fingerprint(factor: &SymbolicFactor) -> String {
-    let shape = &factor.matrix_type;
-    let switch = factor
-        .switch
-        .as_ref()
-        .map(|data| (&data.selector, &data.case_indices, &data.case_fingerprints));
-    format!(
-        "factor(key={:?},kind={},live={},trapdoor={:?},shape={:?},switch={:?})",
-        factor.key,
-        bound_kind(&factor.bound),
-        factor.relation_live,
-        factor.trapdoor,
-        shape,
-        switch
-    )
-}
-
-/// Fingerprint the owner-resolved DAG structure without retaining the DAG or
-/// using its numeric IDs.  In particular, bounded atoms retain their complete
-/// factor provenance while their numeric coefficient caps do not participate.
-fn dag_structure_fingerprint(
-    dag: &ExpressionDag,
-    id: TermId,
-    visiting: &mut BTreeSet<TermId>,
-) -> Result<String, NormalFormError> {
-    if !visiting.insert(id) {
-        return Err(NormalFormError::CyclicExpression { term: id });
-    }
-    let node = dag.node(id)?.clone();
-    let result = match node {
-        ExpressionNode::Zero => "zero".to_owned(),
-        ExpressionNode::Atom(factor) => factor_structural_fingerprint(&factor),
-        ExpressionNode::Add(children) => {
-            let children = children
-                .iter()
-                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
-                .collect::<Result<Vec<_>, _>>()?;
-            format!("add({children:?})")
-        }
-        ExpressionNode::Negate(child) => {
-            format!("neg({})", dag_structure_fingerprint(dag, child, visiting)?)
-        }
-        ExpressionNode::Product(children) => {
-            let children = children
-                .iter()
-                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
-                .collect::<Result<Vec<_>, _>>()?;
-            format!("product({children:?})")
-        }
-        ExpressionNode::Switch { selector, cases, reachable } |
-        ExpressionNode::Select { selector, cases, reachable } => {
-            let cases = reachable
-                .iter()
-                .map(|index| dag_structure_fingerprint(dag, cases[*index], visiting))
-                .collect::<Result<Vec<_>, _>>()?;
-            format!("select(selector={selector:?},indices={reachable:?},cases={cases:?})")
-        }
-        ExpressionNode::FamilyGetStatic { cases, index } => {
-            let cases = cases
-                .iter()
-                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
-                .collect::<Result<Vec<_>, _>>()?;
-            format!("family-static(index={index},cases={cases:?})")
-        }
-        ExpressionNode::FamilyGetDynamic { selector, cases, stored_indices, domain_upper } => {
-            let cases = cases
-                .iter()
-                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
-                .collect::<Result<Vec<_>, _>>()?;
-            format!(
-                "family-dynamic(selector={selector:?},indices={stored_indices:?},domain={domain_upper:?},cases={cases:?})"
-            )
-        }
-        ExpressionNode::MatrixScale { input, scalar } => format!(
-            "scale(scalar={scalar:?},input={})",
-            dag_structure_fingerprint(dag, input, visiting)?
-        ),
-        ExpressionNode::Transpose(input) => {
-            format!("transpose({})", dag_structure_fingerprint(dag, input, visiting)?)
-        }
-        ExpressionNode::Slice { input, spec } => format!(
-            "slice(spec={spec:?},input={})",
-            dag_structure_fingerprint(dag, input, visiting)?
-        ),
-        ExpressionNode::Tensor { left, right } => format!(
-            "tensor(left={},right={})",
-            dag_structure_fingerprint(dag, left, visiting)?,
-            dag_structure_fingerprint(dag, right, visiting)?
-        ),
-        ExpressionNode::LiftConstantPolynomial { input, matrix_type, domain } => format!(
-            "lift(type={matrix_type:?},domain={domain:?},input={})",
-            dag_structure_fingerprint(dag, input, visiting)?
-        ),
-        ExpressionNode::View { input, view, output_type } => format!(
-            "view(type={output_type:?},view={view:?},input={})",
-            dag_structure_fingerprint(dag, input, visiting)?
-        ),
-        ExpressionNode::CrtRecompose { inputs, spec, output_type } => format!(
-            "crt(type={output_type:?},spec={spec:?},inputs={:?})",
-            inputs
-                .iter()
-                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
-                .collect::<Result<Vec<_>, _>>()?
-        ),
-        ExpressionNode::Concat { inputs, axis, output_type } => format!(
-            "concat(axis={axis:?},type={output_type:?},inputs={:?})",
-            inputs
-                .iter()
-                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
-                .collect::<Result<Vec<_>, _>>()?
-        ),
-    };
-    visiting.remove(&id);
-    Ok(result)
 }
 
 pub(crate) fn add_summary(
@@ -2170,19 +2144,17 @@ fn switch_normalize(
     selector: FactorIdentity,
     cases: Box<[PolynomialNF]>,
     case_indices: Box<[BigUint]>,
-    case_fingerprints: Box<[Box<str>]>,
+    case_identities: Box<[SwitchCaseIdentity]>,
 ) -> Result<PolynomialNF, NormalFormError> {
-    if cases.is_empty() ||
-        cases.len() != case_indices.len() ||
-        cases.len() != case_fingerprints.len()
+    if cases.is_empty() || cases.len() != case_indices.len() || cases.len() != case_identities.len()
     {
         return Err(NormalFormError::InvalidSwitchReachability);
     }
     if cases
         .iter()
-        .zip(case_fingerprints.iter())
+        .zip(case_identities.iter())
         .skip(1)
-        .all(|(case, fingerprint)| case == &cases[0] && fingerprint == &case_fingerprints[0])
+        .all(|(case, identity)| case == &cases[0] && identity == &case_identities[0])
     {
         return Ok(cases[0].clone());
     }
@@ -2204,8 +2176,7 @@ fn switch_normalize(
         .map(|case| case.clone().subtract(common.clone()))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let same_structure =
-        case_fingerprints.iter().all(|fingerprint| fingerprint == &case_fingerprints[0]);
+    let same_structure = case_identities.iter().all(|identity| identity == &case_identities[0]);
     if same_structure && residuals.iter().all(|case| case.exact_terms.is_empty()) {
         let mut maximum = BoundedSummary::ExactZero;
         for case in &residuals {
@@ -2269,7 +2240,7 @@ fn switch_normalize(
                 selector,
                 middle.into_boxed_slice(),
                 case_indices.clone(),
-                case_fingerprints.clone(),
+                case_identities.clone(),
             )?;
             let mut output = PolynomialNF::one();
             output = normal_form_product::product(output, PolynomialNF::from_monomial(prefix))?;
@@ -2280,11 +2251,11 @@ fn switch_normalize(
     }
 
     let data =
-        Arc::new(SwitchData { selector: selector.clone(), cases, case_indices, case_fingerprints });
+        Arc::new(SwitchData { selector: selector.clone(), cases, case_indices, case_identities });
     let key = FactorIdentity::switch_barrier(
         selector,
         data.case_indices.clone(),
-        switch_fingerprint(&data.case_indices, &data.case_fingerprints),
+        data.case_identities.clone(),
     );
     let (bound, matrix_bound, polynomial_facts) = switch_bound(&data.cases)?;
     let matrix_type = data
@@ -2302,19 +2273,22 @@ fn switch_normalize(
     ))))
 }
 
-fn switch_fingerprint(indices: &[BigUint], cases: &[Box<str>]) -> Box<[u8]> {
-    let mut fingerprint = Vec::new();
-    for index in indices {
-        let bytes = index.to_bytes_be();
-        fingerprint.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-        fingerprint.extend_from_slice(&bytes);
+pub(crate) fn case_identity_after_normalization(source: &SwitchCaseIdentity) -> SwitchCaseIdentity {
+    SwitchCaseIdentity::Derived {
+        source: Box::new(source.clone()),
+        transform: SwitchCaseTransform::Normalization,
     }
-    for case in cases {
-        let bytes = case.as_bytes();
-        fingerprint.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-        fingerprint.extend_from_slice(bytes);
-    }
-    fingerprint.into_boxed_slice()
+}
+
+pub(crate) fn case_identity_after_product(
+    cases: impl IntoIterator<Item = SwitchCaseIdentity>,
+) -> Option<SwitchCaseIdentity> {
+    let cases = cases.into_iter().collect::<Vec<_>>();
+    let source = cases.first()?.clone();
+    Some(SwitchCaseIdentity::Derived {
+        source: Box::new(source),
+        transform: SwitchCaseTransform::Product(cases.into_boxed_slice()),
+    })
 }
 
 fn maximum_value_summary(
@@ -2438,31 +2412,33 @@ fn combine_same_selector_switches(
         return Err(NormalFormError::AmbiguousSwitchMapping);
     }
     let mut cases = Vec::with_capacity(switches[0].cases.len());
-    let mut case_fingerprints = Vec::with_capacity(switches[0].cases.len());
+    let mut case_identities = Vec::with_capacity(switches[0].cases.len());
     for index in 0..switches[0].cases.len() {
         let mut case = PolynomialNF::one();
         let factors = monomial.factors();
-        let mut fingerprint_parts = Vec::with_capacity(factors.len());
         for factor in factors.iter() {
             if let Some(switch) = &factor.switch {
                 case = normal_form_product::product(case, switch.cases[index].clone())?;
-                fingerprint_parts.push(switch.case_fingerprints[index].to_string());
             } else {
                 case = normal_form_product::product(
                     case,
                     PolynomialNF::from_monomial(Monomial::from_factor(factor.clone())),
                 )?;
-                fingerprint_parts.push(factor_structural_fingerprint(factor));
             }
         }
         cases.push(case);
-        case_fingerprints.push(format!("product({fingerprint_parts:?}").into_boxed_str());
+        case_identities.push(
+            case_identity_after_product(
+                switches.iter().map(|switch| switch.case_identities[index].clone()),
+            )
+            .expect("same-selector product has at least one switch"),
+        );
     }
     Ok(Some(switch_normalize(
         selector,
         cases.into_boxed_slice(),
         switches[0].case_indices.clone(),
-        case_fingerprints.into_iter().collect(),
+        case_identities.into_iter().collect(),
     )?))
 }
 
@@ -2491,6 +2467,7 @@ pub enum NormalFormError {
     InvalidSupportUpper { support_upper: usize, ring_dimension: usize },
     BoundArithmetic,
     AmbiguousRelation { keys: Vec<FactorIdentity> },
+    InvalidCentralRelationTarget { key: FullRelationKey },
     ConflictingRelationTarget { key: FullRelationKey },
     CyclicExpression { term: TermId },
     CyclicRelationDependency { key: FullRelationKey },
@@ -2735,10 +2712,180 @@ mod tests {
             selector: None,
         };
         let mut registry = RelationRegistry::default();
-        registry.register(RelationRegistration { key, preimage, target: p }).unwrap();
+        registry
+            .register(RelationRegistration {
+                pattern: RelationPattern::ordered(key.public.clone(), preimage.clone()),
+                key,
+                preimage,
+                target: p,
+            })
+            .unwrap();
         let nf = dag.normalize(root, &registry).unwrap();
         assert_eq!(nf.exact_terms().len(), 1);
         assert_eq!(nf.exact_terms().keys().next().unwrap().factors(), &[target]);
+    }
+
+    #[test]
+    fn central_relation_matches_all_three_scalar_positions() {
+        let public = FactorIdentity::named("central-B");
+        let preimage = FactorIdentity::named("central-K");
+        let target = FactorIdentity::named("central-P");
+        let scalar = FactorIdentity::constant_polynomial(&bound(17).matrix_type, &3.into());
+        let matrix = rectangular_bound(1, 2, 2, 1).matrix_type;
+        let scalar_factor = SymbolicFactor::bounded_with_metadata(
+            scalar.clone(),
+            MatrixBound {
+                matrix_type: bound(17).matrix_type,
+                coefficient_class: BoundClass::bounded(3_u8.into()),
+            },
+            MatrixMetadata {
+                canonical_coefficient_exclusive_upper: None,
+                is_constant_polynomial: true,
+                known_zero_rows: None,
+                polynomial: Some(PolynomialFacts::new(1, 1).unwrap()),
+            },
+        )
+        .unwrap();
+        let mut dag = ExpressionDag::new();
+        let b = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large_typed(public.clone(), matrix.clone())))
+            .unwrap();
+        let k = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage.clone(), rectangular_bound(1, 2, 2, 1))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let c = dag.push(ExpressionNode::Atom(scalar_factor)).unwrap();
+        let p = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large_typed(target.clone(), matrix.clone())))
+            .unwrap();
+        let mut registry = RelationRegistry::default();
+        registry
+            .register(RelationRegistration {
+                pattern: RelationPattern::ordered(public.clone(), preimage.clone()),
+                key: FullRelationKey {
+                    source: "named".into(),
+                    ordered_indices: Box::new([]),
+                    public: public.clone(),
+                    target: target.clone(),
+                    matrix_type: Some(matrix.clone()),
+                    layout: None,
+                    trapdoor: None,
+                    selector: None,
+                },
+                preimage,
+                target: p,
+            })
+            .unwrap();
+        let irrelevant_public = FactorIdentity::named("irrelevant-public");
+        let irrelevant_preimage = FactorIdentity::named("irrelevant-preimage");
+        let irrelevant_target = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large_typed(
+                FactorIdentity::named("irrelevant-target"),
+                matrix.clone(),
+            )))
+            .unwrap();
+        registry
+            .register(RelationRegistration {
+                pattern: RelationPattern::ordered(
+                    irrelevant_public.clone(),
+                    irrelevant_preimage.clone(),
+                ),
+                key: FullRelationKey {
+                    source: irrelevant_preimage.owner.clone(),
+                    ordered_indices: Box::new([]),
+                    public: irrelevant_public,
+                    target: FactorIdentity::named("irrelevant-target"),
+                    matrix_type: Some(matrix.clone()),
+                    layout: None,
+                    trapdoor: None,
+                    selector: None,
+                },
+                preimage: irrelevant_preimage,
+                target: irrelevant_target,
+            })
+            .unwrap();
+        for factors in [[b, c, k], [c, b, k], [b, k, c]] {
+            let root = dag.push(ExpressionNode::Product(factors.into())).unwrap();
+            let nf = dag.normalize(root, &registry).unwrap();
+            assert!(nf.exact_terms().keys().any(|key| {
+                key.factors().iter().any(|factor| factor == &target) &&
+                    key.factors().iter().any(|factor| factor == &scalar)
+            }));
+        }
+    }
+
+    #[test]
+    fn central_relation_consumes_the_trapdoor_validated_occurrence() {
+        let matrix = bound(17).matrix_type;
+        let public = FactorIdentity::named("duplicate-central-B");
+        let preimage = FactorIdentity::named("duplicate-central-K");
+        let target = FactorIdentity::named("duplicate-central-P");
+        let correct = TrapdoorSourceKey::ProtocolInput(crate::ProtocolInputId::from("correct"));
+        let wrong = TrapdoorSourceKey::ProtocolInput(crate::ProtocolInputId::from("wrong"));
+        let mut dag = ExpressionDag::new();
+        let b = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large_typed(public.clone(), matrix.clone())))
+            .unwrap();
+        let wrong_k = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage.clone(), bound(1))
+                    .unwrap()
+                    .with_trapdoor(wrong),
+            ))
+            .unwrap();
+        let correct_k = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage.clone(), bound(1))
+                    .unwrap()
+                    .with_trapdoor(correct.clone()),
+            ))
+            .unwrap();
+        let p = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large_typed(target.clone(), matrix.clone())))
+            .unwrap();
+        let root = dag
+            .push(ExpressionNode::Product(vec![b, wrong_k, correct_k].into_boxed_slice()))
+            .unwrap();
+        let mut registry = RelationRegistry::default();
+        registry
+            .register(RelationRegistration {
+                pattern: RelationPattern::new(
+                    [public.clone(), {
+                        let mut key = preimage.clone();
+                        key.trapdoor = Some(correct.clone());
+                        key
+                    }],
+                    [],
+                ),
+                key: FullRelationKey {
+                    source: preimage.owner.clone(),
+                    ordered_indices: Box::new([]),
+                    public,
+                    target: target.clone(),
+                    matrix_type: Some(matrix),
+                    layout: None,
+                    trapdoor: Some(correct),
+                    selector: None,
+                },
+                preimage: {
+                    let mut key = preimage;
+                    key.trapdoor = Some(TrapdoorSourceKey::ProtocolInput(
+                        crate::ProtocolInputId::from("correct"),
+                    ));
+                    key
+                },
+                target: p,
+            })
+            .unwrap();
+        let normalized = dag.normalize(root, &registry).unwrap();
+        assert!(
+            normalized
+                .exact_terms()
+                .keys()
+                .any(|key| { key.factors().iter().any(|factor| factor == &target) })
+        );
     }
 
     #[test]
@@ -2766,7 +2913,14 @@ mod tests {
             selector: None,
         };
         let mut registry = RelationRegistry::default();
-        registry.register(RelationRegistration { key, preimage, target: p }).unwrap();
+        registry
+            .register(RelationRegistration {
+                pattern: RelationPattern::ordered(key.public.clone(), preimage.clone()),
+                key,
+                preimage,
+                target: p,
+            })
+            .unwrap();
 
         let (normalized, counters) = dag.normalize_with_counters(root, &registry).unwrap();
         assert_eq!(normalized.exact_terms().len(), 1);
@@ -2885,6 +3039,7 @@ mod tests {
         let mut registry = RelationRegistry::default();
         registry
             .register(RelationRegistration {
+                pattern: RelationPattern::ordered(key.public.clone(), preimage.clone()),
                 key: key.clone(),
                 preimage: preimage.clone(),
                 target: p,
@@ -2892,6 +3047,7 @@ mod tests {
             .unwrap();
         registry
             .register(RelationRegistration {
+                pattern: RelationPattern::ordered(key.public.clone(), preimage.clone()),
                 key: key.clone(),
                 preimage: preimage.clone(),
                 target: p,
@@ -2906,6 +3062,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             registry.register(RelationRegistration {
+                pattern: RelationPattern::ordered(key.public.clone(), preimage.clone()),
                 key: key.clone(),
                 preimage: preimage.clone(),
                 target: conflicting
@@ -2915,6 +3072,7 @@ mod tests {
         let correct_key = FullRelationKey { source: "named".into(), ..key.clone() };
         registry
             .register(RelationRegistration {
+                pattern: RelationPattern::ordered(correct_key.public.clone(), preimage.clone()),
                 key: correct_key.clone(),
                 preimage: preimage.clone(),
                 target: p,
@@ -2922,7 +3080,12 @@ mod tests {
             .unwrap();
         let alternate_key = FullRelationKey { target: FactorIdentity::named("Q"), ..correct_key };
         registry
-            .register(RelationRegistration { key: alternate_key, preimage, target: conflicting })
+            .register(RelationRegistration {
+                pattern: RelationPattern::ordered(alternate_key.public.clone(), preimage.clone()),
+                key: alternate_key,
+                preimage,
+                target: conflicting,
+            })
             .unwrap();
         assert!(matches!(
             dag.normalize(root, &registry),
@@ -2961,7 +3124,14 @@ mod tests {
             selector: None,
         };
         let mut registry = RelationRegistry::default();
-        registry.register(RelationRegistration { key, preimage, target: target_product }).unwrap();
+        registry
+            .register(RelationRegistration {
+                pattern: RelationPattern::ordered(key.public.clone(), preimage.clone()),
+                key,
+                preimage,
+                target: target_product,
+            })
+            .unwrap();
         assert!(matches!(
             dag.normalize(root, &registry),
             Err(NormalFormError::CyclicRelationDependency { .. })
@@ -3012,6 +3182,7 @@ mod tests {
         let mut registry = RelationRegistry::default();
         registry
             .register(RelationRegistration {
+                pattern: RelationPattern::ordered(key.public.clone(), preimage.clone()),
                 key: key.clone(),
                 preimage: preimage.clone(),
                 target: p,
@@ -3039,7 +3210,12 @@ mod tests {
         let root = matching_dag.push(ExpressionNode::Product(vec![b, k].into())).unwrap();
         let mut matching_registry = RelationRegistry::default();
         matching_registry
-            .register(RelationRegistration { key, preimage: FactorIdentity::named("K"), target: p })
+            .register(RelationRegistration {
+                pattern: RelationPattern::ordered(key.public.clone(), FactorIdentity::named("K")),
+                key,
+                preimage: FactorIdentity::named("K"),
+                target: p,
+            })
             .unwrap();
         assert!(matching_dag.normalize(root, &matching_registry).is_ok());
     }
@@ -3095,6 +3271,7 @@ mod tests {
         {
             registry
                 .register(RelationRegistration {
+                    pattern: RelationPattern::ordered(public.clone(), preimage.clone()),
                     key: FullRelationKey {
                         source: "named".into(),
                         ordered_indices: Box::new([]),
@@ -3139,6 +3316,12 @@ mod tests {
                 vec![targets[1].clone(), extras[1].clone()]
             ]
         );
+        assert!(
+            switch
+                .case_identities
+                .iter()
+                .all(|identity| { matches!(identity, SwitchCaseIdentity::Derived { .. }) })
+        );
     }
 
     #[test]
@@ -3168,7 +3351,14 @@ mod tests {
             selector: None,
         };
         let mut registry = RelationRegistry::default();
-        registry.register(RelationRegistration { key, preimage, target: e }).unwrap();
+        registry
+            .register(RelationRegistration {
+                pattern: RelationPattern::ordered(key.public.clone(), preimage.clone()),
+                key,
+                preimage,
+                target: e,
+            })
+            .unwrap();
         let summary = dag.normalize_bounded(root, &registry).unwrap();
         assert_eq!(
             summary.as_matrix_bound().unwrap().coefficient_class,
@@ -3215,7 +3405,12 @@ mod tests {
                 };
                 let mut registry = RelationRegistry::default();
                 registry
-                    .register(RelationRegistration { key, preimage, target: deep_target })
+                    .register(RelationRegistration {
+                        pattern: RelationPattern::ordered(key.public.clone(), preimage.clone()),
+                        key,
+                        preimage,
+                        target: deep_target,
+                    })
                     .unwrap();
                 let summary = dag.normalize_bounded(root, &registry).unwrap();
                 assert_eq!(
@@ -3278,7 +3473,7 @@ mod tests {
                 term.monomial.factors().iter().find_map(|factor| factor.switch.clone())
             })
             .unwrap();
-        assert_ne!(left_barrier.case_fingerprints, right_barrier.case_fingerprints);
+        assert_ne!(left_barrier.case_identities, right_barrier.case_identities);
         let difference = left.add(right.negate()).unwrap();
         assert_eq!(difference.exact_terms.len(), 2);
         assert!(
@@ -3591,6 +3786,7 @@ mod tests {
         let mut registry = RelationRegistry::default();
         registry
             .register(RelationRegistration {
+                pattern: RelationPattern::ordered(b.clone(), k.clone()),
                 key: relation_key(b, p.clone()),
                 preimage: k,
                 target: p_id,
@@ -3630,6 +3826,7 @@ mod tests {
         let mut registry = RelationRegistry::default();
         registry
             .register(RelationRegistration {
+                pattern: RelationPattern::ordered(c.clone(), l.clone()),
                 key: relation_key(c.clone(), q.clone()),
                 preimage: l,
                 target: q_id,
@@ -3637,6 +3834,7 @@ mod tests {
             .unwrap();
         registry
             .register(RelationRegistration {
+                pattern: RelationPattern::ordered(b.clone(), k.clone()),
                 key: relation_key(b, p),
                 preimage: k,
                 target: nested_target,
@@ -3728,11 +3926,13 @@ mod tests {
             dag.push(ExpressionNode::Atom(SymbolicFactor::large(second_target.clone()))).unwrap();
         let root = dag.push(ExpressionNode::Product(vec![b, k].into_boxed_slice())).unwrap();
         let good = RelationRegistration {
+            pattern: RelationPattern::ordered(public.clone(), preimage.clone()),
             key: relation_key(public.clone(), first_target.clone()),
             preimage: preimage.clone(),
             target: p,
         };
         let mismatched = RelationRegistration {
+            pattern: RelationPattern::ordered(public.clone(), preimage.clone()),
             key: FullRelationKey {
                 source: "wrong-owner".into(),
                 target: second_target.clone(),
@@ -3741,8 +3941,12 @@ mod tests {
             preimage: preimage.clone(),
             target: q,
         };
-        let alternate =
-            RelationRegistration { key: relation_key(public, second_target), preimage, target: q };
+        let alternate = RelationRegistration {
+            pattern: RelationPattern::ordered(public.clone(), preimage.clone()),
+            key: relation_key(public, second_target),
+            preimage,
+            target: q,
+        };
 
         let mut mismatch_only = RelationRegistry::default();
         mismatch_only.register(good.clone()).unwrap();

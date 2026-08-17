@@ -1612,16 +1612,15 @@ pub enum NormalFormError {
 }
 
 impl NormalFormError {
-    fn bound(error: super::bound::BoundEvaluationError) -> Self {
+    fn bound(error: super::bound::BoundArithmeticError) -> Self {
         match error {
-            super::bound::BoundEvaluationError::IncompatibleMatrixProduct { left, right } => {
+            super::bound::BoundArithmeticError::IncompatibleMatrixProduct { left, right } => {
                 Self::IncompatibleMatrixProduct { left, right }
             }
-            super::bound::BoundEvaluationError::InvalidKnownZeroRows {
+            super::bound::BoundArithmeticError::InvalidKnownZeroRows {
                 known_zero_rows,
                 row_count,
             } => Self::InvalidKnownZeroRows { known_zero_rows, row_count },
-            _ => Self::BoundArithmetic,
         }
     }
 }

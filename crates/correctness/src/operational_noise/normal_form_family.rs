@@ -194,6 +194,18 @@ mod tests {
         }
     }
 
+    fn relation_matrix_bound(value: u64) -> MatrixBound {
+        MatrixBound {
+            matrix_type: mxx_ir_core::types::ConcreteMatrixType {
+                modulus: 17.into(),
+                ring_dimension: 1,
+                rows: 2,
+                columns: 2,
+            },
+            coefficient_class: BoundClass::bounded(value.into()),
+        }
+    }
+
     fn binder(node: u32) -> BinderKey {
         BinderKey {
             loop_scope: OccurrenceScope {
@@ -309,7 +321,7 @@ mod tests {
         let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
         let k = dag
             .push(ExpressionNode::Atom(
-                SymbolicFactor::relation_live(preimage.clone(), matrix_bound(1)).unwrap(),
+                SymbolicFactor::relation_live(preimage.clone(), relation_matrix_bound(1)).unwrap(),
             ))
             .unwrap();
         let product = dag.push(ExpressionNode::Product(vec![b, k].into())).unwrap();

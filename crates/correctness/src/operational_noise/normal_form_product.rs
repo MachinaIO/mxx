@@ -8,10 +8,10 @@
 //! its owning normalization context.
 
 use super::{
-    BoundClass, BoundedSummary, ExpressionDag, ExpressionNode, FullRelationKey, MatrixBound,
-    Monomial, NormalFormError, PolynomialNF, RelationRegistry, TermId, add_summary,
-    dag_structure_fingerprint, monomial_bound, scale_by_multiplicity, summary_from_bound,
-    switch_normalize,
+    BoundClass, BoundedSummary, ExpressionDag, ExpressionNode, FullRelationKey, Monomial,
+    NormalFormError, PolynomialNF, RelationRegistry, TermId, add_summary,
+    dag_structure_fingerprint, monomial_value_summary, product_value_summary,
+    scale_by_multiplicity, summary_from_bound_with_facts, switch_normalize,
 };
 use crate::operational_noise::normal_form_ops::{
     AdditionalOperations, CrtRecompose, PolynomialNFOperations,
@@ -429,15 +429,16 @@ impl<'a> Normalizer<'a> {
         let keys = value.exact_terms.keys().cloned().collect::<Vec<_>>();
         for key in keys {
             let Some(term) = value.exact_terms.remove(&key) else { continue };
+            let factors = term.monomial.factors();
             let switch_positions = term
                 .monomial
-                .factors
+                .factors()
                 .iter()
                 .enumerate()
                 .filter_map(|(index, factor)| factor.switch.as_ref().map(|_| index))
                 .collect::<Vec<_>>();
-            if switch_positions.len() == 1 && term.monomial.factors.len() == 1 {
-                let switch = term.monomial.factors[0]
+            if switch_positions.len() == 1 && factors.len() == 1 {
+                let switch = factors[0]
                     .switch
                     .as_ref()
                     .expect("switch position was collected from switch data")
@@ -471,7 +472,7 @@ impl<'a> Normalizer<'a> {
                 continue;
             }
             let switch_position = switch_positions[0];
-            let switch = term.monomial.factors[switch_position]
+            let switch = factors[switch_position]
                 .switch
                 .as_ref()
                 .expect("switch position was collected from switch data")
@@ -480,14 +481,14 @@ impl<'a> Normalizer<'a> {
             let mut fingerprints = Vec::with_capacity(switch.cases.len());
             for switch_case in &switch.cases {
                 let mut case = PolynomialNF::one();
-                for factor in &term.monomial.factors[..switch_position] {
+                for factor in &factors[..switch_position] {
                     case = self.product_and_normalize(
                         case,
                         PolynomialNF::from_monomial(Monomial::from_factor(factor.clone())),
                     )?;
                 }
                 case = self.product_and_normalize(case, switch_case.clone())?;
-                for factor in &term.monomial.factors[switch_position + 1..] {
+                for factor in &factors[switch_position + 1..] {
                     case = self.product_and_normalize(
                         case,
                         PolynomialNF::from_monomial(Monomial::from_factor(factor.clone())),
@@ -516,9 +517,10 @@ impl<'a> Normalizer<'a> {
             let keys = value.exact_terms.keys().cloned().collect::<Vec<_>>();
             for key in keys {
                 let Some(term) = value.exact_terms.remove(&key) else { continue };
-                for position in 0..term.monomial.factors.len().saturating_sub(1) {
-                    let left = &term.monomial.factors[position];
-                    let right = &term.monomial.factors[position + 1];
+                let factors = term.monomial.factors();
+                for position in 0..factors.len().saturating_sub(1) {
+                    let left = &factors[position];
+                    let right = &factors[position + 1];
                     let Some(registration) = self.registry.resolve(left, right)? else { continue };
                     // Count semantic relation candidates, not every adjacent
                     // factor boundary visited by a particular association of
@@ -559,12 +561,8 @@ impl<'a> Normalizer<'a> {
                             _ => self.normalize_dispatch(registration.target)?,
                         },
                     };
-                    let prefix = Monomial {
-                        factors: term.monomial.factors[..position].to_vec().into_boxed_slice(),
-                    };
-                    let suffix = Monomial {
-                        factors: term.monomial.factors[position + 2..].to_vec().into_boxed_slice(),
-                    };
+                    let prefix = Monomial::from_factors(factors[..position].iter().cloned());
+                    let suffix = Monomial::from_factors(factors[position + 2..].iter().cloned());
                     let mut expanded = PolynomialNF::zero();
                     for target_term in target.exact_terms.values() {
                         expanded.insert(
@@ -572,7 +570,7 @@ impl<'a> Normalizer<'a> {
                             &term.multiplicity * &target_term.multiplicity,
                         )?;
                     }
-                    if let Some(summary) = target.bounded_summary.as_matrix_bound() {
+                    if let Some(summary) = target.bounded_summary.as_value() {
                         expanded.bounded_summary =
                             reconnect_summary(summary, &prefix, &suffix, &term.multiplicity)?;
                     }
@@ -630,21 +628,24 @@ fn operation_error(
 }
 
 fn reconnect_summary(
-    target: &MatrixBound,
+    target: &super::BoundedValueSummary,
     prefix: &Monomial,
     suffix: &Monomial,
     multiplicity: &BigInt,
 ) -> Result<BoundedSummary, NormalFormError> {
-    let mut bound = target.clone();
-    if !prefix.factors.is_empty() {
-        bound = super::product_bound(&monomial_bound(prefix)?, &bound)
-            .map_err(NormalFormError::bound)?;
+    let mut value = target.clone();
+    if !prefix.factors().is_empty() {
+        let prefix = monomial_value_summary(prefix)?;
+        value = product_value_summary(&prefix, &value)?;
     }
-    if !suffix.factors.is_empty() {
-        bound = super::product_bound(&bound, &monomial_bound(suffix)?)
-            .map_err(NormalFormError::bound)?;
+    if !suffix.factors().is_empty() {
+        let suffix = monomial_value_summary(suffix)?;
+        value = product_value_summary(&value, &suffix)?;
     }
-    Ok(summary_from_bound(scale_by_multiplicity(bound, multiplicity)))
+    Ok(summary_from_bound_with_facts(
+        scale_by_multiplicity(value.bound, multiplicity),
+        value.polynomial,
+    ))
 }
 
 /// Product used by `ExpressionDag` after all children have been normalized.
@@ -699,12 +700,16 @@ fn product_bound_only_inner(
             if monomial.factors().iter().all(|factor| {
                 !factor.relation_live &&
                     !matches!(factor.bound, BoundClass::Large) &&
-                    factor.switch.is_none()
+                    factor.switch.is_none() &&
+                    !factor.is_central_scalar()
             }) {
-                let bound = monomial_bound(&monomial)?;
+                let value = monomial_value_summary(&monomial)?;
                 out.bounded_summary = add_summary(
                     out.bounded_summary,
-                    BoundedSummary::Bounded(scale_by_multiplicity(bound, &multiplicity)),
+                    summary_from_bound_with_facts(
+                        scale_by_multiplicity(value.bound, &multiplicity),
+                        value.polynomial,
+                    ),
                 )?;
                 if let Some(count) = fold_count.as_deref_mut() {
                     *count = count.saturating_add(1);
@@ -759,9 +764,8 @@ fn product_summary(
             Ok(BoundedSummary::ExactZero)
         }
         (BoundedSummary::Bounded(left), BoundedSummary::Bounded(right)) => {
-            Ok(BoundedSummary::Bounded(
-                super::product_bound(&left, &right).map_err(NormalFormError::bound)?,
-            ))
+            let value = product_value_summary(&left, &right)?;
+            Ok(summary_from_bound_with_facts(value.bound, value.polynomial))
         }
     }
 }
@@ -774,8 +778,10 @@ fn scale_nf(
         term.multiplicity *= multiplicity;
     }
     if let BoundedSummary::Bounded(bound) = &value.bounded_summary {
-        value.bounded_summary =
-            summary_from_bound(scale_by_multiplicity(bound.clone(), multiplicity));
+        value.bounded_summary = summary_from_bound_with_facts(
+            scale_by_multiplicity(bound.bound.clone(), multiplicity),
+            bound.polynomial.clone(),
+        );
     }
     Ok(value)
 }

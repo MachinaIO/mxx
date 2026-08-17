@@ -76,6 +76,29 @@ pub struct MatrixValueMetadata {
     pub is_constant_polynomial: bool,
     /// Number of rows proved to be identically zero.
     pub known_zero_rows: Option<BigUint>,
+    /// Facts about the coefficient support of scalar polynomials.  Absence is
+    /// deliberately conservative: a caller must use the ring dimension.
+    pub polynomial: Option<PolynomialFacts>,
+}
+
+/// Typed facts for a polynomial value.  `support_upper` is always validated
+/// against the owning ring dimension before it enters a normal-form factor.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct PolynomialFacts {
+    pub support_upper: usize,
+}
+
+impl PolynomialFacts {
+    pub fn new(support_upper: usize, ring_dimension: usize) -> Result<Self, BoundArithmeticError> {
+        if support_upper > ring_dimension {
+            return Err(BoundArithmeticError::InvalidSupportUpper { support_upper, ring_dimension });
+        }
+        Ok(Self { support_upper })
+    }
+
+    pub fn conservative(ring_dimension: usize) -> Self {
+        Self { support_upper: ring_dimension }
+    }
 }
 
 impl MatrixValueMetadata {
@@ -84,6 +107,7 @@ impl MatrixValueMetadata {
             canonical_coefficient_exclusive_upper: None,
             is_constant_polynomial: false,
             known_zero_rows: None,
+            polynomial: None,
         }
     }
 }
@@ -109,6 +133,8 @@ pub struct MatrixProductFacts {
     pub left_is_constant_polynomial: bool,
     pub right_is_constant_polynomial: bool,
     pub right_known_zero_rows: Option<BigUint>,
+    pub left_support_upper: Option<usize>,
+    pub right_support_upper: Option<usize>,
 }
 
 /// A resolved matrix constant consumed by the normal-form operation table.
@@ -129,6 +155,7 @@ pub enum ResolvedMatrixConstant {
 pub enum BoundArithmeticError {
     IncompatibleMatrixProduct { left: ConcreteMatrixType, right: ConcreteMatrixType },
     InvalidKnownZeroRows { known_zero_rows: BigUint, row_count: BigUint },
+    InvalidSupportUpper { support_upper: usize, ring_dimension: usize },
 }
 
 /// The sole deterministic matrix-product transfer helper.
@@ -153,12 +180,40 @@ pub fn product_bound_with_facts(
             right: right.matrix_type.clone(),
         });
     }
+    for support_upper in [facts.left_support_upper, facts.right_support_upper].into_iter().flatten()
+    {
+        if support_upper > left.matrix_type.ring_dimension {
+            return Err(BoundArithmeticError::InvalidSupportUpper {
+                support_upper,
+                ring_dimension: left.matrix_type.ring_dimension,
+            });
+        }
+    }
     let left_scalar = left.matrix_type.rows == 1 && left.matrix_type.columns == 1;
     let right_scalar = right.matrix_type.rows == 1 && right.matrix_type.columns == 1;
-    let (matrix_type, effective_inner) = if left_scalar {
-        (right.matrix_type.clone(), BigUint::one())
+    let left_support = facts
+        .left_support_upper
+        .map(BigUint::from)
+        .unwrap_or_else(|| BigUint::from(left.matrix_type.ring_dimension));
+    let right_support = facts
+        .right_support_upper
+        .map(BigUint::from)
+        .unwrap_or_else(|| BigUint::from(right.matrix_type.ring_dimension));
+    let left_support =
+        if facts.left_is_constant_polynomial { BigUint::one() } else { left_support };
+    let right_support =
+        if facts.right_is_constant_polynomial { BigUint::one() } else { right_support };
+    let ring_dimension = BigUint::from(left.matrix_type.ring_dimension);
+    let (matrix_type, coefficient_factor) = if left_scalar && right_scalar {
+        // The left scalar acts on the right scalar, so its proved support is
+        // part of this coefficient transfer.  Canonical monomial folding
+        // applies central factors one at a time and therefore remains
+        // association-independent even when the support product is capped.
+        (right.matrix_type.clone(), left_support)
+    } else if left_scalar {
+        (right.matrix_type.clone(), left_support)
     } else if right_scalar {
-        (left.matrix_type.clone(), BigUint::one())
+        (left.matrix_type.clone(), right_support)
     } else {
         if left.matrix_type.columns != right.matrix_type.rows {
             return Err(BoundArithmeticError::IncompatibleMatrixProduct {
@@ -174,6 +229,13 @@ pub fn product_bound_with_facts(
                 row_count: rows,
             });
         }
+        let inner = BigUint::from(left.matrix_type.columns) - known_zero_rows;
+        let ring_factor = if facts.left_is_constant_polynomial || facts.right_is_constant_polynomial
+        {
+            BigUint::one()
+        } else {
+            ring_dimension
+        };
         (
             ConcreteMatrixType {
                 modulus: left.matrix_type.modulus.clone(),
@@ -181,20 +243,15 @@ pub fn product_bound_with_facts(
                 rows: left.matrix_type.rows,
                 columns: right.matrix_type.columns,
             },
-            BigUint::from(left.matrix_type.columns) - known_zero_rows,
+            inner * ring_factor,
         )
-    };
-    let ring_factor = if facts.left_is_constant_polynomial || facts.right_is_constant_polynomial {
-        BigUint::one()
-    } else {
-        BigUint::from(left.matrix_type.ring_dimension)
     };
     Ok(MatrixBound {
         matrix_type,
         coefficient_class: multiply_classes(
             &left.coefficient_class,
             &right.coefficient_class,
-            &(effective_inner * ring_factor),
+            &coefficient_factor,
         ),
     })
 }
@@ -216,6 +273,10 @@ mod tests {
 
     fn matrix(rows: usize, columns: usize) -> ConcreteMatrixType {
         ConcreteMatrixType { modulus: 17.into(), ring_dimension: 1, rows, columns }
+    }
+
+    fn matrix_ring(ring_dimension: usize, rows: usize, columns: usize) -> ConcreteMatrixType {
+        ConcreteMatrixType { modulus: 17.into(), ring_dimension, rows, columns }
     }
 
     fn bounded(matrix_type: ConcreteMatrixType, value: u64) -> MatrixBound {
@@ -254,6 +315,87 @@ mod tests {
             product_bound(&row, &scalar).unwrap().coefficient_class,
             BoundClass::bounded(15_u8.into())
         );
+    }
+
+    #[test]
+    fn scalar_support_uses_one_or_proved_support_instead_of_ring_dimension() {
+        let scalar = bounded(matrix_ring(4, 1, 1), 3);
+        let row = bounded(matrix_ring(4, 1, 2), 5);
+        let support_one = product_bound_with_facts(
+            &scalar,
+            &row,
+            &MatrixProductFacts { left_support_upper: Some(1), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(support_one.coefficient_class, BoundClass::bounded(15_u8.into()));
+        let conservative = product_bound(&scalar, &row).unwrap();
+        assert_eq!(conservative.coefficient_class, BoundClass::bounded(60_u8.into()));
+    }
+
+    #[test]
+    fn scalar_by_scalar_multiplies_both_support_upper_bounds() {
+        let left = bounded(matrix_ring(8, 1, 1), 2);
+        let right = bounded(matrix_ring(8, 1, 1), 3);
+        let product = product_bound_with_facts(
+            &left,
+            &right,
+            &MatrixProductFacts {
+                left_support_upper: Some(2),
+                right_support_upper: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(product.coefficient_class, BoundClass::bounded(12_u8.into()));
+    }
+
+    #[test]
+    fn ordinary_product_uses_capped_support_geometry_and_rejects_invalid_support() {
+        let left = bounded(matrix_ring(4, 2, 3), 2);
+        let right = bounded(matrix_ring(4, 3, 2), 3);
+        let ordinary = product_bound(&left, &right).unwrap();
+        assert_eq!(ordinary.coefficient_class, BoundClass::bounded(72_u8.into()));
+        let error = product_bound_with_facts(
+            &left,
+            &right,
+            &MatrixProductFacts { right_support_upper: Some(5), ..Default::default() },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            BoundArithmeticError::InvalidSupportUpper { support_upper: 5, ring_dimension: 4 }
+        );
+    }
+
+    #[test]
+    fn ordinary_row_column_product_uses_inner_geometry() {
+        let left = bounded(matrix_ring(4, 1, 3), 2);
+        let right = bounded(matrix_ring(4, 3, 1), 3);
+        let product = product_bound_with_facts(
+            &left,
+            &right,
+            &MatrixProductFacts {
+                left_support_upper: Some(2),
+                right_support_upper: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((product.matrix_type.rows, product.matrix_type.columns), (1, 1));
+        assert_eq!(product.coefficient_class, BoundClass::bounded(72_u8.into()));
+    }
+
+    #[test]
+    fn polynomial_facts_are_bounded_and_zero_large_are_preserved() {
+        assert_eq!(PolynomialFacts::new(3, 4).unwrap().support_upper, 3);
+        assert_eq!(
+            PolynomialFacts::new(5, 4).unwrap_err(),
+            BoundArithmeticError::InvalidSupportUpper { support_upper: 5, ring_dimension: 4 }
+        );
+        let large =
+            MatrixBound { matrix_type: matrix_ring(4, 1, 1), coefficient_class: BoundClass::Large };
+        let zero = bounded(matrix_ring(4, 1, 1), 0);
+        assert_eq!(product_bound(&zero, &large).unwrap().coefficient_class, BoundClass::ExactZero);
     }
 
     #[test]

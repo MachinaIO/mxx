@@ -7,7 +7,7 @@
 
 use super::{
     bound::{
-        BoundClass, MatrixBound, MatrixMetadata, MatrixProductFacts, product_bound,
+        BoundClass, MatrixBound, MatrixMetadata, MatrixProductFacts, PolynomialFacts,
         product_bound_with_facts,
     },
     identity::{
@@ -23,6 +23,7 @@ use num_traits::{ToPrimitive, Zero};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    ops::{Deref, DerefMut},
     sync::Arc,
 };
 
@@ -96,9 +97,11 @@ pub struct ResolvedMatrixValueIdentityNode {
 /// Facts computed once when an expression enters the job-local DAG.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MatrixValueFacts {
-    pub concrete_type: Option<ConcreteMatrixType>,
+    pub concrete_type: ConcreteMatrixType,
     pub metadata: MatrixMetadata,
+    pub polynomial: super::bound::PolynomialFacts,
     pub identity: MatrixValueIdentityId,
+    pub is_zero: bool,
 }
 
 /// Typed kind of one owner-resolved symbolic factor.
@@ -272,19 +275,36 @@ pub struct SymbolicFactor {
     /// multiplied into a summary.  The class above remains the symbolic
     /// contract exposed to canonical equality; this field is never a key.
     pub matrix_bound: Option<MatrixBound>,
+    /// The resolved matrix shape is mandatory even when the numeric bound is
+    /// Large; a missing finite cap must never erase type information.
+    pub matrix_type: ConcreteMatrixType,
+    /// Conservative support facts are mandatory for every typed factor.
+    pub polynomial_facts: PolynomialFacts,
     /// Value facts are intentionally separate from the noise bound.
     pub matrix_value_metadata: MatrixMetadata,
     pub switch: Option<Arc<SwitchData>>,
 }
 
+#[cfg(test)]
+fn test_placeholder_matrix_type() -> ConcreteMatrixType {
+    ConcreteMatrixType { modulus: 17.into(), ring_dimension: 1, rows: 2, columns: 2 }
+}
+
 impl SymbolicFactor {
+    #[cfg(test)]
     pub fn large(key: FactorIdentity) -> Self {
+        Self::large_typed(key, test_placeholder_matrix_type())
+    }
+
+    pub fn large_typed(key: FactorIdentity, matrix_type: ConcreteMatrixType) -> Self {
         Self {
             key,
             bound: BoundClass::Large,
             relation_live: false,
             trapdoor: None,
             matrix_bound: None,
+            matrix_type: matrix_type.clone(),
+            polynomial_facts: PolynomialFacts::conservative(matrix_type.ring_dimension),
             matrix_value_metadata: MatrixMetadata::unknown(),
             switch: None,
         }
@@ -294,30 +314,94 @@ impl SymbolicFactor {
         if matches!(bound.coefficient_class, BoundClass::Large) {
             return Err(NormalFormError::LargeFactorCannotBeBounded);
         }
+        let matrix_type = bound.matrix_type.clone();
+        let polynomial_facts = PolynomialFacts::conservative(matrix_type.ring_dimension);
         Ok(Self {
             key,
             bound: bound.coefficient_class.clone(),
             relation_live: false,
             trapdoor: None,
             matrix_bound: Some(bound),
+            matrix_type,
+            polynomial_facts,
             matrix_value_metadata: MatrixMetadata::unknown(),
             switch: None,
         })
+    }
+
+    pub(crate) fn bounded_with_metadata(
+        key: FactorIdentity,
+        bound: MatrixBound,
+        matrix_value_metadata: MatrixMetadata,
+    ) -> Result<Self, NormalFormError> {
+        if matches!(bound.coefficient_class, BoundClass::Large) {
+            return Err(NormalFormError::LargeFactorCannotBeBounded);
+        }
+        let matrix_type = bound.matrix_type.clone();
+        let polynomial_facts = matrix_value_metadata
+            .polynomial
+            .clone()
+            .unwrap_or_else(|| PolynomialFacts::conservative(matrix_type.ring_dimension));
+        Ok(Self {
+            key,
+            bound: bound.coefficient_class.clone(),
+            relation_live: false,
+            trapdoor: None,
+            matrix_bound: Some(bound),
+            matrix_type,
+            polynomial_facts,
+            matrix_value_metadata,
+            switch: None,
+        })
+    }
+
+    pub(crate) fn large_with_metadata(
+        key: FactorIdentity,
+        matrix_bound: MatrixBound,
+        matrix_value_metadata: MatrixMetadata,
+    ) -> Self {
+        let matrix_type = matrix_bound.matrix_type.clone();
+        let polynomial_facts = matrix_value_metadata
+            .polynomial
+            .clone()
+            .unwrap_or_else(|| PolynomialFacts::conservative(matrix_type.ring_dimension));
+        Self {
+            key,
+            bound: BoundClass::Large,
+            relation_live: false,
+            trapdoor: None,
+            matrix_bound: Some(matrix_bound),
+            matrix_type,
+            polynomial_facts,
+            matrix_value_metadata,
+            switch: None,
+        }
     }
 
     pub fn relation_live(key: FactorIdentity, bound: MatrixBound) -> Result<Self, NormalFormError> {
         if matches!(bound.coefficient_class, BoundClass::Large) {
             return Err(NormalFormError::RelationLiveRequiresFiniteBound);
         }
+        let matrix_type = bound.matrix_type.clone();
+        let polynomial_facts = PolynomialFacts::conservative(matrix_type.ring_dimension);
         Ok(Self {
             key,
             bound: bound.coefficient_class.clone(),
             relation_live: true,
             trapdoor: None,
             matrix_bound: Some(bound),
+            matrix_type,
+            polynomial_facts,
             matrix_value_metadata: MatrixMetadata::unknown(),
             switch: None,
         })
+    }
+
+    /// Centrality is a typed shape property.  Support, constant-polynomial
+    /// status, bound class, relation liveness, and Switch provenance do not
+    /// alter whether a 1x1 value belongs to the matrix center.
+    pub(crate) fn is_central_scalar(&self) -> bool {
+        self.matrix_type.rows == 1 && self.matrix_type.columns == 1
     }
 
     pub fn with_trapdoor(mut self, trapdoor: TrapdoorSourceKey) -> Self {
@@ -330,6 +414,8 @@ impl SymbolicFactor {
         key: FactorIdentity,
         bound: BoundClass,
         matrix_bound: Option<MatrixBound>,
+        matrix_type: ConcreteMatrixType,
+        polynomial_facts: PolynomialFacts,
         data: Arc<SwitchData>,
     ) -> Self {
         Self {
@@ -338,6 +424,8 @@ impl SymbolicFactor {
             relation_live: false,
             trapdoor: None,
             matrix_bound,
+            matrix_type,
+            polynomial_facts,
             matrix_value_metadata: MatrixMetadata::unknown(),
             switch: Some(data),
         }
@@ -362,47 +450,92 @@ pub struct SwitchData {
 /// One monomial with a significant factor order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Monomial {
-    factors: Box<[SymbolicFactor]>,
+    central_factors: Box<[SymbolicFactor]>,
+    ordered_factors: Box<[SymbolicFactor]>,
 }
 
 impl Monomial {
     pub fn one() -> Self {
-        Self { factors: Box::new([]) }
+        Self::from_factors([])
     }
     pub fn from_factor(factor: SymbolicFactor) -> Self {
-        Self { factors: Box::new([factor]) }
+        Self::from_factors([factor])
     }
-    pub fn factors(&self) -> &[SymbolicFactor] {
-        &self.factors
+    pub fn factors(&self) -> Vec<SymbolicFactor> {
+        self.central_factors.iter().chain(self.ordered_factors.iter()).cloned().collect()
+    }
+    pub fn iter_factors(&self) -> impl Iterator<Item = &SymbolicFactor> {
+        self.central_factors.iter().chain(self.ordered_factors.iter())
     }
     pub(crate) fn from_factors(factors: impl IntoIterator<Item = SymbolicFactor>) -> Self {
-        Self { factors: factors.into_iter().collect() }
+        let mut central = Vec::new();
+        let mut ordered = Vec::new();
+        for factor in factors {
+            if factor.is_central_scalar() {
+                central.push(factor);
+            } else {
+                ordered.push(factor);
+            }
+        }
+        central.sort_by(|left, right| left.key.cmp(&right.key));
+        Self {
+            central_factors: central.into_boxed_slice(),
+            ordered_factors: ordered.into_boxed_slice(),
+        }
     }
     pub fn key(&self) -> MonomialKey {
-        MonomialKey(self.factors.iter().map(|factor| factor.key.clone()).collect())
+        MonomialKey {
+            central_factors: self.central_factors.iter().map(|factor| factor.key.clone()).collect(),
+            ordered_factors: self.ordered_factors.iter().map(|factor| factor.key.clone()).collect(),
+        }
     }
     fn concat(&self, other: &Self) -> Self {
-        let mut factors = Vec::with_capacity(self.factors.len() + other.factors.len());
-        factors.extend(self.factors.iter().cloned());
-        factors.extend(other.factors.iter().cloned());
-        Self { factors: factors.into_boxed_slice() }
+        let mut factors = self.factors();
+        factors.extend(other.factors());
+        Self::from_factors(factors)
     }
 }
 
 /// Canonical ordered factor identity list.  No bound or TermId participates.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct MonomialKey(Box<[FactorIdentity]>);
+pub struct MonomialKey {
+    central_factors: Box<[FactorIdentity]>,
+    ordered_factors: Box<[FactorIdentity]>,
+}
 
 impl MonomialKey {
-    pub fn factors(&self) -> &[FactorIdentity] {
-        &self.0
+    pub fn factors(&self) -> Vec<FactorIdentity> {
+        self.central_factors.iter().chain(self.ordered_factors.iter()).cloned().collect()
+    }
+    pub fn iter_factors(&self) -> impl Iterator<Item = &FactorIdentity> {
+        self.central_factors.iter().chain(self.ordered_factors.iter())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundedValueSummary {
+    pub bound: MatrixBound,
+    pub polynomial: PolynomialFacts,
+}
+
+impl Deref for BoundedValueSummary {
+    type Target = MatrixBound;
+
+    fn deref(&self) -> &Self::Target {
+        &self.bound
+    }
+}
+
+impl DerefMut for BoundedValueSummary {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.bound
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BoundedSummary {
     ExactZero,
-    Bounded(MatrixBound),
+    Bounded(BoundedValueSummary),
 }
 
 impl BoundedSummary {
@@ -411,7 +544,14 @@ impl BoundedSummary {
     }
     pub fn as_matrix_bound(&self) -> Option<&MatrixBound> {
         match self {
-            Self::Bounded(bound) => Some(bound),
+            Self::Bounded(summary) => Some(&summary.bound),
+            Self::ExactZero => None,
+        }
+    }
+
+    pub fn as_value(&self) -> Option<&BoundedValueSummary> {
+        match self {
+            Self::Bounded(summary) => Some(summary),
             Self::ExactZero => None,
         }
     }
@@ -446,19 +586,20 @@ impl PolynomialNF {
         Self::from_monomial(Monomial::one())
     }
 
+    #[cfg(test)]
     pub fn exact_factor(key: FactorIdentity) -> Self {
-        Self::from_monomial(Monomial::from_factor(SymbolicFactor::large(key)))
+        Self::exact_factor_typed(key, test_placeholder_matrix_type())
+    }
+
+    pub fn exact_factor_typed(key: FactorIdentity, matrix_type: ConcreteMatrixType) -> Self {
+        Self::from_monomial(Monomial::from_factor(SymbolicFactor::large_typed(key, matrix_type)))
     }
 
     pub fn bounded(bound: MatrixBound) -> Result<Self, NormalFormError> {
         if matches!(bound.coefficient_class, BoundClass::Large) {
             return Err(NormalFormError::LargeBoundCannotBeSummarized);
         }
-        let summary = if matches!(bound.coefficient_class, BoundClass::ExactZero) {
-            BoundedSummary::ExactZero
-        } else {
-            BoundedSummary::Bounded(bound)
-        };
+        let summary = summary_from_bound(bound);
         Ok(Self { exact_terms: BTreeMap::new(), bounded_summary: summary })
     }
 
@@ -521,7 +662,7 @@ impl PolynomialNF {
 
     pub fn first_large_witness(&self) -> Option<LargeWitness> {
         self.exact_terms.values().find_map(|term| {
-            term.monomial.factors.iter().enumerate().find_map(|(index, factor)| {
+            term.monomial.factors().iter().enumerate().find_map(|(index, factor)| {
                 matches!(factor.bound, BoundClass::Large).then(|| LargeWitness {
                     monomial: term.monomial.key(),
                     factor_index: index,
@@ -552,15 +693,22 @@ impl PolynomialNF {
         let keys = self.exact_terms.keys().cloned().collect::<Vec<_>>();
         for key in keys {
             let Some(term) = self.exact_terms.remove(&key) else { continue };
-            if term.monomial.factors.iter().any(|factor| matches!(factor.bound, BoundClass::Large))
+            if term
+                .monomial
+                .factors()
+                .iter()
+                .any(|factor| matches!(factor.bound, BoundClass::Large))
             {
                 self.exact_terms.insert(key, term);
                 continue;
             }
-            let bound = monomial_bound(&term.monomial)?;
+            let value = monomial_value_summary(&term.monomial)?;
             self.bounded_summary = add_summary(
                 self.bounded_summary.clone(),
-                summary_from_bound(scale_by_multiplicity(bound, &term.multiplicity)),
+                summary_from_bound_with_facts(
+                    scale_by_multiplicity(value.bound, &term.multiplicity),
+                    value.polynomial,
+                ),
             )?;
             *fold_count = fold_count.saturating_add(1);
         }
@@ -577,15 +725,16 @@ impl PolynomialNF {
     }
 
     fn from_monomial(monomial: Monomial) -> Self {
-        if monomial.factors.iter().all(|factor| {
+        if monomial.factors().iter().all(|factor| {
             !factor.relation_live &&
                 !matches!(factor.bound, BoundClass::Large) &&
-                factor.switch.is_none()
+                factor.switch.is_none() &&
+                !factor.is_central_scalar()
         }) {
-            if let Ok(bound) = monomial_bound(&monomial) {
+            if let Ok(value) = monomial_value_summary(&monomial) {
                 return Self {
                     exact_terms: BTreeMap::new(),
-                    bounded_summary: summary_from_bound(bound),
+                    bounded_summary: summary_from_bound_with_facts(value.bound, value.polynomial),
                 };
             }
         }
@@ -607,11 +756,11 @@ impl PolynomialNF {
         if let Some(existing) = self.exact_terms.get_mut(&key) {
             if existing
                 .monomial
-                .factors
+                .factors()
                 .iter()
                 .map(|f| (&f.bound, f.relation_live, &f.trapdoor, &f.matrix_bound))
                 .ne(monomial
-                    .factors
+                    .factors()
                     .iter()
                     .map(|f| (&f.bound, f.relation_live, &f.trapdoor, &f.matrix_bound)))
             {
@@ -634,24 +783,29 @@ impl PolynomialNF {
         fold_count: &mut u64,
     ) -> Result<Self, NormalFormError> {
         for term in terms.values() {
-            if term.monomial.factors.iter().any(|factor| matches!(factor.bound, BoundClass::Large))
+            if term
+                .monomial
+                .factors()
+                .iter()
+                .any(|factor| matches!(factor.bound, BoundClass::Large))
             {
                 return Err(NormalFormError::BoundedSummaryMixedWithLarge);
             }
             let product = match summary {
                 BoundedSummary::ExactZero => BoundedSummary::ExactZero,
                 BoundedSummary::Bounded(left) => {
-                    if term.monomial.factors.is_empty() {
-                        BoundedSummary::Bounded(scale_by_multiplicity(
-                            left.clone(),
-                            &term.multiplicity,
-                        ))
+                    if term.monomial.factors().is_empty() {
+                        summary_from_bound_with_facts(
+                            scale_by_multiplicity(left.bound.clone(), &term.multiplicity),
+                            left.polynomial.clone(),
+                        )
                     } else {
-                        let factor_bound = monomial_bound(&term.monomial)?;
-                        BoundedSummary::Bounded(scale_by_multiplicity(
-                            product_bound(left, &factor_bound).map_err(NormalFormError::bound)?,
-                            &term.multiplicity,
-                        ))
+                        let factor_summary = monomial_value_summary(&term.monomial)?;
+                        let product = product_value_summary(left, &factor_summary)?;
+                        summary_from_bound_with_facts(
+                            scale_by_multiplicity(product.bound, &term.multiplicity),
+                            product.polynomial,
+                        )
                     }
                 }
             };
@@ -773,6 +927,39 @@ fn slice_concrete_type(
     matrix
 }
 
+fn zero_concrete_type() -> ConcreteMatrixType {
+    ConcreteMatrixType { modulus: 1_u8.into(), ring_dimension: 1, rows: 0, columns: 0 }
+}
+
+fn product_matrix_type(inputs: &[&MatrixValueFacts], count: usize) -> Option<ConcreteMatrixType> {
+    let mut nonzero = inputs.iter().take(count).filter(|fact| !fact.is_zero);
+    let Some(first) = nonzero.next() else { return Some(zero_concrete_type()) };
+    let mut current = first.concrete_type.clone();
+    for fact in nonzero {
+        let next = &fact.concrete_type;
+        if current.modulus != next.modulus || current.ring_dimension != next.ring_dimension {
+            return None;
+        }
+        let current_scalar = current.rows == 1 && current.columns == 1;
+        let next_scalar = next.rows == 1 && next.columns == 1;
+        current = if current_scalar {
+            next.clone()
+        } else if next_scalar {
+            current
+        } else if current.columns == next.rows {
+            ConcreteMatrixType {
+                modulus: current.modulus.clone(),
+                ring_dimension: current.ring_dimension,
+                rows: current.rows,
+                columns: next.columns,
+            }
+        } else {
+            return None;
+        };
+    }
+    Some(current)
+}
+
 impl ExpressionDag {
     pub fn new() -> Self {
         Self::default()
@@ -867,14 +1054,30 @@ impl ExpressionDag {
             _ => None,
         };
         let concrete_type = match node {
+            // Addition/family shape agreement is checked by the operation
+            // transfer when a concrete bound is available.  Keep the first
+            // typed input here so coefficient extraction can still carry its
+            // shared structural facts through a deferred shape contract.
+            ExpressionNode::Add(_) => inputs
+                .iter()
+                .find(|fact| !fact.is_zero)
+                .map(|fact| fact.concrete_type.clone())
+                .or_else(|| Some(zero_concrete_type())),
+            ExpressionNode::Product(children) => product_matrix_type(&inputs, children.len()),
+            ExpressionNode::Negate(_) | ExpressionNode::MatrixScale { .. } => {
+                inputs.first().map(|fact| fact.concrete_type.clone())
+            }
             ExpressionNode::Transpose(_) => inputs.first().and_then(|fact| {
-                let mut matrix = fact.concrete_type.clone()?;
+                let mut matrix = fact.concrete_type.clone();
                 std::mem::swap(&mut matrix.rows, &mut matrix.columns);
                 Some(matrix)
             }),
+            ExpressionNode::Tensor { .. } if inputs.iter().any(|fact| fact.is_zero) => {
+                Some(zero_concrete_type())
+            }
             ExpressionNode::Tensor { .. } => {
-                let left = inputs.first().and_then(|fact| fact.concrete_type.clone());
-                let right = inputs.get(1).and_then(|fact| fact.concrete_type.clone());
+                let left = inputs.first().map(|fact| fact.concrete_type.clone());
+                let right = inputs.get(1).map(|fact| fact.concrete_type.clone());
                 match (left, right) {
                     (Some(left), Some(right))
                         if left.modulus == right.modulus &&
@@ -892,14 +1095,28 @@ impl ExpressionDag {
                     _ => None,
                 }
             }
-            ExpressionNode::Slice { spec, .. } => slice_concrete_type(
-                inputs.first().and_then(|fact| fact.concrete_type.clone()),
-                spec,
-            ),
+            ExpressionNode::Slice { .. } if inputs.first().is_some_and(|fact| fact.is_zero) => {
+                Some(zero_concrete_type())
+            }
+            ExpressionNode::Slice { spec, .. } => {
+                slice_concrete_type(inputs.first().map(|fact| fact.concrete_type.clone()), spec)
+            }
+            ExpressionNode::FamilyGetStatic { index, .. } => inputs
+                .get(*index)
+                .map(|fact| fact.concrete_type.clone())
+                .or_else(|| Some(zero_concrete_type())),
+            ExpressionNode::FamilyGetDynamic { .. } |
+            ExpressionNode::Switch { .. } |
+            ExpressionNode::Select { .. } => inputs
+                .iter()
+                .find(|fact| !fact.is_zero)
+                .map(|fact| fact.concrete_type.clone())
+                .or_else(|| Some(zero_concrete_type())),
             _ => node
                 .explicit_matrix_type()
                 .cloned()
-                .or_else(|| inputs.first().and_then(|fact| fact.concrete_type.clone())),
+                .or_else(|| inputs.first().map(|fact| fact.concrete_type.clone()))
+                .or_else(|| Some(zero_concrete_type())),
         };
         let metadata = match node {
             ExpressionNode::Atom(factor) => factor.matrix_value_metadata.clone(),
@@ -913,19 +1130,38 @@ impl ExpressionDag {
                 .get(*index)
                 .map(|fact| fact.metadata.clone())
                 .unwrap_or_else(MatrixMetadata::unknown),
-            ExpressionNode::FamilyGetDynamic { cases, .. } => {
-                merge_reachable_metadata(&inputs, &(0..cases.len()).collect::<Vec<_>>())
-            }
+            ExpressionNode::FamilyGetDynamic { cases, .. } => merge_reachable_metadata(
+                &inputs,
+                &(0..cases.len()).collect::<Vec<_>>(),
+                concrete_type.as_ref().map(|matrix| matrix.ring_dimension),
+            ),
             ExpressionNode::Switch { .. } | ExpressionNode::Select { .. } => {
-                merge_reachable_metadata(&inputs, node.reachable_indices())
+                merge_reachable_metadata(
+                    &inputs,
+                    node.reachable_indices(),
+                    concrete_type.as_ref().map(|matrix| matrix.ring_dimension),
+                )
             }
             ExpressionNode::LiftConstantPolynomial { domain, .. } => MatrixMetadata {
                 canonical_coefficient_exclusive_upper: domain.direct_extract_upper.clone(),
                 is_constant_polynomial: true,
                 known_zero_rows: None,
+                polynomial: None,
             },
             _ => MatrixMetadata::unknown(),
         };
+        let mut metadata = metadata;
+        let concrete_type = concrete_type.ok_or(NormalFormError::MissingMatrixBound)?;
+        metadata.polynomial = transfer_polynomial_facts(
+            node,
+            &inputs,
+            Some(&concrete_type),
+            metadata.polynomial.clone(),
+        );
+        let polynomial = metadata.polynomial.clone().unwrap_or_else(|| {
+            super::bound::PolynomialFacts::conservative(concrete_type.ring_dimension)
+        });
+        metadata.polynomial = Some(polynomial.clone());
         let identity = self.intern_identity(MatrixValueIdentityNode {
             operation,
             children: child_ids.into_boxed_slice(),
@@ -935,7 +1171,13 @@ impl ExpressionDag {
             },
             selector,
         });
-        Ok(MatrixValueFacts { concrete_type, metadata, identity })
+        Ok(MatrixValueFacts {
+            is_zero: matches!(node, ExpressionNode::Zero),
+            concrete_type,
+            metadata,
+            polynomial,
+            identity,
+        })
     }
     #[cfg(test)]
     pub(crate) fn term_count(&self) -> usize {
@@ -1398,7 +1640,7 @@ fn substitute_nf(
         .values()
         .map(|term| {
             let monomial =
-                Monomial::from_factors(term.monomial.factors.iter().cloned().map(|mut factor| {
+                Monomial::from_factors(term.monomial.factors().into_iter().map(|mut factor| {
                     factor.key = substitute_factor_identity(&factor.key, binder, replacement);
                     factor
                 }));
@@ -1524,7 +1766,7 @@ impl ExpressionNode {
 
     fn explicit_matrix_type(&self) -> Option<&ConcreteMatrixType> {
         match self {
-            Self::Atom(factor) => factor.matrix_bound.as_ref().map(|bound| &bound.matrix_type),
+            Self::Atom(factor) => Some(&factor.matrix_type),
             Self::LiftConstantPolynomial { matrix_type, .. } |
             Self::View { output_type: matrix_type, .. } |
             Self::CrtRecompose { output_type: matrix_type, .. } |
@@ -1560,7 +1802,11 @@ impl ExpressionNode {
     }
 }
 
-fn merge_reachable_metadata(inputs: &[&MatrixValueFacts], reachable: &[usize]) -> MatrixMetadata {
+fn merge_reachable_metadata(
+    inputs: &[&MatrixValueFacts],
+    reachable: &[usize],
+    ring_dimension: Option<usize>,
+) -> MatrixMetadata {
     let mut selected = reachable.iter().filter_map(|index| inputs.get(*index));
     let Some(first) = selected.next() else { return MatrixMetadata::unknown() };
     let mut metadata = first.metadata.clone();
@@ -1576,8 +1822,79 @@ fn merge_reachable_metadata(inputs: &[&MatrixValueFacts], reachable: &[usize]) -
             .take()
             .zip(fact.metadata.known_zero_rows.clone())
             .and_then(|(left, right)| (left == right).then_some(left));
+        metadata.polynomial =
+            match (metadata.polynomial.take(), fact.metadata.polynomial.clone(), ring_dimension) {
+                (Some(left), Some(right), Some(ring_dimension)) => {
+                    Some(super::bound::PolynomialFacts {
+                        support_upper: left
+                            .support_upper
+                            .max(right.support_upper)
+                            .min(ring_dimension),
+                    })
+                }
+                _ => None,
+            };
     }
     metadata
+}
+
+fn support_of_input(input: &MatrixValueFacts) -> Option<usize> {
+    input.metadata.polynomial.as_ref().map(|facts| facts.support_upper)
+}
+
+fn transfer_polynomial_facts(
+    node: &ExpressionNode,
+    inputs: &[&MatrixValueFacts],
+    concrete_type: Option<&ConcreteMatrixType>,
+    current: Option<super::bound::PolynomialFacts>,
+) -> Option<super::bound::PolynomialFacts> {
+    let ring_dimension = concrete_type?.ring_dimension;
+    let cap = |support_upper: usize| super::bound::PolynomialFacts {
+        support_upper: support_upper.min(ring_dimension),
+    };
+    let input_support = |index: usize| {
+        inputs.get(index).and_then(|input| support_of_input(input)).unwrap_or(ring_dimension)
+    };
+    let support = match node {
+        ExpressionNode::Zero => 0,
+        ExpressionNode::Atom(_) => return current.or_else(|| Some(cap(ring_dimension))),
+        ExpressionNode::Negate(child) |
+        ExpressionNode::Transpose(child) |
+        ExpressionNode::Slice { input: child, .. } |
+        ExpressionNode::View { input: child, .. } |
+        ExpressionNode::MatrixScale { input: child, .. } => {
+            let _ = child;
+            input_support(0)
+        }
+        ExpressionNode::LiftConstantPolynomial { .. } => 1,
+        ExpressionNode::Add(children) => {
+            children.iter().enumerate().fold(0_usize, |sum, (index, _)| {
+                sum.saturating_add(input_support(index)).min(ring_dimension)
+            })
+        }
+        ExpressionNode::Product(children) => {
+            let mut support = input_support(0);
+            for index in 1..children.len() {
+                let next = input_support(index);
+                support = support.checked_mul(next).unwrap_or(ring_dimension).min(ring_dimension);
+            }
+            support
+        }
+        ExpressionNode::Switch { reachable, .. } | ExpressionNode::Select { reachable, .. } => {
+            reachable.iter().map(|index| input_support(*index)).max().unwrap_or(ring_dimension)
+        }
+        ExpressionNode::FamilyGetStatic { index, .. } => input_support(*index),
+        ExpressionNode::FamilyGetDynamic { cases, .. } => cases
+            .iter()
+            .enumerate()
+            .map(|(index, _)| input_support(index))
+            .max()
+            .unwrap_or(ring_dimension),
+        ExpressionNode::Tensor { .. } |
+        ExpressionNode::CrtRecompose { .. } |
+        ExpressionNode::Concat { .. } => ring_dimension,
+    };
+    Some(cap(support))
 }
 
 fn bound_kind(bound: &BoundClass) -> &'static str {
@@ -1589,12 +1906,7 @@ fn bound_kind(bound: &BoundClass) -> &'static str {
 }
 
 fn factor_structural_fingerprint(factor: &SymbolicFactor) -> String {
-    let shape = factor.matrix_bound.as_ref().map(|bound| {
-        // The coefficient cap is intentionally absent: it is a bound, not a
-        // symbolic identity. Matrix shape and proof metadata remain part of
-        // the resolved factor contract.
-        &bound.matrix_type
-    });
+    let shape = &factor.matrix_type;
     let switch = factor
         .switch
         .as_ref()
@@ -1716,13 +2028,13 @@ pub(crate) fn add_summary(
     match (left, right) {
         (BoundedSummary::ExactZero, value) | (value, BoundedSummary::ExactZero) => Ok(value),
         (BoundedSummary::Bounded(left), BoundedSummary::Bounded(right)) => {
-            if left.matrix_type != right.matrix_type {
+            if left.bound.matrix_type != right.bound.matrix_type {
                 return Err(NormalFormError::IncompatibleMatrixAddition {
-                    left: left.matrix_type,
-                    right: right.matrix_type,
+                    left: left.bound.matrix_type,
+                    right: right.bound.matrix_type,
                 });
             }
-            let class = match (left.coefficient_class, right.coefficient_class) {
+            let class = match (left.bound.coefficient_class, right.bound.coefficient_class) {
                 (BoundClass::ExactZero, value) | (value, BoundClass::ExactZero) => value,
                 (
                     BoundClass::Bounded { maximum_absolute_coefficient: left },
@@ -1730,67 +2042,128 @@ pub(crate) fn add_summary(
                 ) => BoundClass::bounded(left + right),
                 _ => return Err(NormalFormError::LargeBoundCannotBeSummarized),
             };
-            Ok(BoundedSummary::Bounded(MatrixBound {
-                matrix_type: left.matrix_type,
-                coefficient_class: class,
-            }))
+            let ring_dimension = left.bound.matrix_type.ring_dimension;
+            Ok(summary_from_bound_with_facts(
+                MatrixBound {
+                    matrix_type: left.bound.matrix_type.clone(),
+                    coefficient_class: class,
+                },
+                PolynomialFacts {
+                    support_upper: left
+                        .polynomial
+                        .support_upper
+                        .saturating_add(right.polynomial.support_upper)
+                        .min(ring_dimension),
+                },
+            ))
         }
     }
 }
 
 pub(crate) fn summary_from_bound(bound: MatrixBound) -> BoundedSummary {
+    let polynomial = PolynomialFacts::conservative(bound.matrix_type.ring_dimension);
+    summary_from_bound_with_facts(bound, polynomial)
+}
+
+pub(crate) fn summary_from_bound_with_facts(
+    bound: MatrixBound,
+    polynomial: PolynomialFacts,
+) -> BoundedSummary {
     if matches!(bound.coefficient_class, BoundClass::ExactZero) {
         BoundedSummary::ExactZero
     } else {
-        BoundedSummary::Bounded(bound)
+        BoundedSummary::Bounded(BoundedValueSummary { bound, polynomial })
     }
 }
 
-pub(crate) fn monomial_bound(monomial: &Monomial) -> Result<MatrixBound, NormalFormError> {
-    let Some(first) = monomial.factors.first() else { return Err(NormalFormError::EmptyMonomial) };
-    let Some(mut result) = first.matrix_bound.clone() else {
-        return Err(NormalFormError::MissingMatrixBound);
+/// Transfer both the coefficient bound and the polynomial-support fact for a
+/// product.  Keeping these together is important: a summary which drops the
+/// support fact cannot safely participate in a later central product.
+pub(crate) fn product_value_summary(
+    left: &BoundedValueSummary,
+    right: &BoundedValueSummary,
+) -> Result<BoundedValueSummary, NormalFormError> {
+    let left_type = &left.bound.matrix_type;
+    let right_type = &right.bound.matrix_type;
+    let left_scalar = left_type.rows == 1 && left_type.columns == 1;
+    let right_scalar = right_type.rows == 1 && right_type.columns == 1;
+    let bound = product_bound_with_facts(
+        &left.bound,
+        &right.bound,
+        &MatrixProductFacts {
+            left_support_upper: Some(left.polynomial.support_upper),
+            right_support_upper: Some(right.polynomial.support_upper),
+            ..Default::default()
+        },
+    )
+    .map_err(NormalFormError::bound)?;
+    let ring_dimension = left_type.ring_dimension;
+    let support_product = left
+        .polynomial
+        .support_upper
+        .checked_mul(right.polynomial.support_upper)
+        .unwrap_or(ring_dimension)
+        .min(ring_dimension);
+    let support_upper = if left_scalar || right_scalar {
+        support_product
+    } else {
+        left_type.columns.checked_mul(support_product).unwrap_or(ring_dimension).min(ring_dimension)
     };
-    let mut left_metadata = first.matrix_value_metadata.clone();
-    for factor in &monomial.factors[1..] {
-        let Some(next) = factor.matrix_bound.as_ref() else {
-            return Err(NormalFormError::MissingMatrixBound);
-        };
-        result = product_bound_with_facts(
-            &result,
-            next,
-            &MatrixProductFacts {
-                left_is_constant_polynomial: left_metadata.is_constant_polynomial,
-                right_is_constant_polynomial: factor.matrix_value_metadata.is_constant_polynomial,
-                right_known_zero_rows: factor.matrix_value_metadata.known_zero_rows.clone(),
-            },
-        )
-        .map_err(NormalFormError::bound)?;
-        left_metadata = MatrixMetadata {
-            canonical_coefficient_exclusive_upper: None,
-            is_constant_polynomial: left_metadata.is_constant_polynomial &&
-                factor.matrix_value_metadata.is_constant_polynomial,
-            known_zero_rows: None,
-        };
+    Ok(BoundedValueSummary { bound, polynomial: PolynomialFacts { support_upper } })
+}
+
+pub(crate) fn monomial_value_summary(
+    monomial: &Monomial,
+) -> Result<BoundedValueSummary, NormalFormError> {
+    let first = monomial
+        .ordered_factors
+        .first()
+        .or_else(|| monomial.central_factors.first())
+        .ok_or(NormalFormError::EmptyMonomial)?;
+    let value_summary = |factor: &SymbolicFactor| -> Result<BoundedValueSummary, NormalFormError> {
+        let bound = factor.matrix_bound.clone().ok_or(NormalFormError::MissingMatrixBound)?;
+        Ok(BoundedValueSummary { bound, polynomial: factor.polynomial_facts.clone() })
+    };
+    let mut result = value_summary(first)?;
+
+    // First compute the ordered noncentral word.  Central factors are then
+    // applied one-by-one in canonical sorted order; this preserves each
+    // factor's own support multiplier instead of losing it to an intermediate
+    // ring-dimension cap.
+    for factor in monomial.ordered_factors.iter().skip(1) {
+        let next = value_summary(factor)?;
+        result = product_value_summary(&result, &next)?;
+    }
+    let central_start = if monomial.ordered_factors.is_empty() { 1 } else { 0 };
+    for factor in monomial.central_factors.iter().skip(central_start) {
+        let next = value_summary(factor)?;
+        result = product_value_summary(&next, &result)?;
     }
     Ok(result)
 }
 
-fn polynomial_bound(value: &PolynomialNF) -> Result<Option<MatrixBound>, NormalFormError> {
+pub(crate) fn monomial_bound(monomial: &Monomial) -> Result<MatrixBound, NormalFormError> {
+    Ok(monomial_value_summary(monomial)?.bound)
+}
+
+fn polynomial_value_summary(
+    value: &PolynomialNF,
+) -> Result<Option<BoundedValueSummary>, NormalFormError> {
     if value.first_large_witness().is_some() {
         return Ok(None);
     }
     let mut summary = value.bounded_summary.clone();
     for term in value.exact_terms.values() {
+        let term_value = monomial_value_summary(&term.monomial)?;
         summary = add_summary(
             summary,
-            summary_from_bound(scale_by_multiplicity(
-                monomial_bound(&term.monomial)?,
-                &term.multiplicity,
-            )),
+            summary_from_bound_with_facts(
+                scale_by_multiplicity(term_value.bound, &term.multiplicity),
+                term_value.polynomial,
+            ),
         )?;
     }
-    Ok(summary.as_matrix_bound().cloned())
+    Ok(summary.as_value().cloned())
 }
 
 fn switch_normalize(
@@ -1836,13 +2209,15 @@ fn switch_normalize(
     if same_structure && residuals.iter().all(|case| case.exact_terms.is_empty()) {
         let mut maximum = BoundedSummary::ExactZero;
         for case in &residuals {
-            if let Some(bound) = polynomial_bound(case)? {
-                maximum = maximum_bound(maximum, bound)?;
+            if let Some(value) = polynomial_value_summary(case)? {
+                maximum = maximum_value_summary(maximum, value)?;
             }
         }
         return common.add(match maximum {
             BoundedSummary::ExactZero => PolynomialNF::zero(),
-            BoundedSummary::Bounded(bound) => PolynomialNF::bounded(bound)?,
+            BoundedSummary::Bounded(bound) => {
+                PolynomialNF::from_parts(BTreeMap::new(), BoundedSummary::Bounded(bound))
+            }
         });
     }
 
@@ -1860,37 +2235,34 @@ fn switch_normalize(
             .iter()
             .map(|case| case.exact_terms.values().next().unwrap().monomial.clone())
             .collect::<Vec<_>>();
-        let prefix_len = (0..monomials[0].factors.len())
+        let first_factors = monomials[0].factors();
+        let prefix_len = (0..first_factors.len())
             .take_while(|index| {
-                monomials.iter().all(|monomial| {
-                    monomial.factors[*index].key == monomials[0].factors[*index].key
-                })
+                monomials
+                    .iter()
+                    .all(|monomial| monomial.factors()[*index].key == first_factors[*index].key)
             })
             .count();
-        let suffix_len = (0..monomials[0].factors.len().saturating_sub(prefix_len))
+        let suffix_len = (0..first_factors.len().saturating_sub(prefix_len))
             .take_while(|offset| {
-                let first = &monomials[0].factors[monomials[0].factors.len() - 1 - offset].key;
+                let first = &first_factors[first_factors.len() - 1 - offset].key;
                 monomials.iter().all(|monomial| {
-                    monomial.factors[monomial.factors.len() - 1 - offset].key == *first
+                    let factors = monomial.factors();
+                    factors[factors.len() - 1 - offset].key == *first
                 })
             })
             .count();
         if prefix_len != 0 || suffix_len != 0 {
-            let prefix = Monomial {
-                factors: monomials[0].factors[..prefix_len].to_vec().into_boxed_slice(),
-            };
-            let suffix_start = monomials[0].factors.len() - suffix_len;
-            let suffix = Monomial {
-                factors: monomials[0].factors[suffix_start..].to_vec().into_boxed_slice(),
-            };
+            let prefix = Monomial::from_factors(first_factors[..prefix_len].iter().cloned());
+            let suffix_start = first_factors.len() - suffix_len;
+            let suffix = Monomial::from_factors(first_factors[suffix_start..].iter().cloned());
             let middle = monomials
                 .iter()
                 .map(|monomial| {
-                    PolynomialNF::from_monomial(Monomial {
-                        factors: monomial.factors[prefix_len..suffix_start]
-                            .to_vec()
-                            .into_boxed_slice(),
-                    })
+                    let factors = monomial.factors();
+                    PolynomialNF::from_monomial(Monomial::from_factors(
+                        factors[prefix_len..suffix_start].iter().cloned(),
+                    ))
                 })
                 .collect::<Vec<_>>();
             let inner = switch_normalize(
@@ -1914,11 +2286,18 @@ fn switch_normalize(
         data.case_indices.clone(),
         switch_fingerprint(&data.case_indices, &data.case_fingerprints),
     );
-    let (bound, matrix_bound) = switch_bound(&data.cases)?;
+    let (bound, matrix_bound, polynomial_facts) = switch_bound(&data.cases)?;
+    let matrix_type = data
+        .cases
+        .iter()
+        .find_map(polynomial_matrix_type)
+        .ok_or(NormalFormError::MissingMatrixBound)?;
     common.add(PolynomialNF::from_monomial(Monomial::from_factor(SymbolicFactor::switch(
         key,
         bound,
         matrix_bound,
+        matrix_type,
+        polynomial_facts,
         data,
     ))))
 }
@@ -1938,51 +2317,105 @@ fn switch_fingerprint(indices: &[BigUint], cases: &[Box<str>]) -> Box<[u8]> {
     fingerprint.into_boxed_slice()
 }
 
-fn maximum_bound(
+fn maximum_value_summary(
     current: BoundedSummary,
-    candidate: MatrixBound,
+    candidate: BoundedValueSummary,
 ) -> Result<BoundedSummary, NormalFormError> {
     match current {
-        BoundedSummary::ExactZero => Ok(summary_from_bound(candidate)),
+        BoundedSummary::ExactZero => {
+            Ok(summary_from_bound_with_facts(candidate.bound, candidate.polynomial))
+        }
         BoundedSummary::Bounded(existing) => {
             if existing.matrix_type != candidate.matrix_type {
                 return Err(NormalFormError::IncompatibleMatrixAddition {
-                    left: existing.matrix_type,
-                    right: candidate.matrix_type,
+                    left: existing.matrix_type.clone(),
+                    right: candidate.matrix_type.clone(),
                 });
             }
-            let coefficient_class = match (existing.coefficient_class, candidate.coefficient_class)
-            {
-                (BoundClass::ExactZero, value) | (value, BoundClass::ExactZero) => value,
-                (
-                    BoundClass::Bounded { maximum_absolute_coefficient: left },
-                    BoundClass::Bounded { maximum_absolute_coefficient: right },
-                ) => BoundClass::bounded(left.max(right)),
-                _ => BoundClass::Large,
-            };
-            Ok(summary_from_bound(MatrixBound {
-                matrix_type: existing.matrix_type,
-                coefficient_class,
-            }))
+            let coefficient_class =
+                match (existing.coefficient_class.clone(), candidate.coefficient_class.clone()) {
+                    (BoundClass::ExactZero, value) | (value, BoundClass::ExactZero) => value,
+                    (
+                        BoundClass::Bounded { maximum_absolute_coefficient: left },
+                        BoundClass::Bounded { maximum_absolute_coefficient: right },
+                    ) => BoundClass::bounded(left.max(right)),
+                    _ => BoundClass::Large,
+                };
+            Ok(summary_from_bound_with_facts(
+                MatrixBound { matrix_type: existing.matrix_type.clone(), coefficient_class },
+                PolynomialFacts {
+                    support_upper: existing
+                        .polynomial
+                        .support_upper
+                        .max(candidate.polynomial.support_upper),
+                },
+            ))
         }
     }
 }
 
+fn combine_symbolic_matrix_types(
+    left: &ConcreteMatrixType,
+    right: &ConcreteMatrixType,
+) -> Option<ConcreteMatrixType> {
+    if left.modulus != right.modulus || left.ring_dimension != right.ring_dimension {
+        return None;
+    }
+    let left_scalar = left.rows == 1 && left.columns == 1;
+    let right_scalar = right.rows == 1 && right.columns == 1;
+    if left_scalar {
+        Some(right.clone())
+    } else if right_scalar {
+        Some(left.clone())
+    } else if left.columns == right.rows {
+        Some(ConcreteMatrixType {
+            modulus: left.modulus.clone(),
+            ring_dimension: left.ring_dimension,
+            rows: left.rows,
+            columns: right.columns,
+        })
+    } else {
+        None
+    }
+}
+
+fn monomial_matrix_type(monomial: &Monomial) -> Option<ConcreteMatrixType> {
+    let mut factors = monomial.factors().into_iter();
+    let first = factors.next()?.matrix_type;
+    factors
+        .try_fold(first, |left, factor| combine_symbolic_matrix_types(&left, &factor.matrix_type))
+}
+
+fn polynomial_matrix_type(value: &PolynomialNF) -> Option<ConcreteMatrixType> {
+    value.bounded_summary.as_matrix_bound().map(|bound| bound.matrix_type.clone()).or_else(|| {
+        value.exact_terms.values().find_map(|term| monomial_matrix_type(&term.monomial))
+    })
+}
+
 fn switch_bound(
     cases: &[PolynomialNF],
-) -> Result<(BoundClass, Option<MatrixBound>), NormalFormError> {
+) -> Result<(BoundClass, Option<MatrixBound>, PolynomialFacts), NormalFormError> {
+    let ring_dimension = cases
+        .iter()
+        .find_map(polynomial_matrix_type)
+        .map(|matrix| matrix.ring_dimension)
+        .ok_or(NormalFormError::MissingMatrixBound)?;
     let mut maximum = BoundedSummary::ExactZero;
     for case in cases {
         if case.first_large_witness().is_some() {
-            return Ok((BoundClass::Large, None));
+            return Ok((BoundClass::Large, None, PolynomialFacts::conservative(ring_dimension)));
         }
-        if let Some(bound) = polynomial_bound(case)? {
-            maximum = maximum_bound(maximum, bound)?;
+        if let Some(value) = polynomial_value_summary(case)? {
+            maximum = maximum_value_summary(maximum, value)?;
         }
     }
     Ok(match maximum {
-        BoundedSummary::ExactZero => (BoundClass::ExactZero, None),
-        BoundedSummary::Bounded(bound) => (bound.coefficient_class.clone(), Some(bound)),
+        BoundedSummary::ExactZero => {
+            (BoundClass::ExactZero, None, PolynomialFacts { support_upper: 0 })
+        }
+        BoundedSummary::Bounded(bound) => {
+            (bound.coefficient_class.clone(), Some(bound.bound), bound.polynomial)
+        }
     })
 }
 
@@ -1990,7 +2423,7 @@ fn combine_same_selector_switches(
     monomial: &Monomial,
 ) -> Result<Option<PolynomialNF>, NormalFormError> {
     let switches =
-        monomial.factors.iter().filter_map(|factor| factor.switch.clone()).collect::<Vec<_>>();
+        monomial.factors().iter().filter_map(|factor| factor.switch.clone()).collect::<Vec<_>>();
     if switches.len() < 2 {
         return Ok(None);
     }
@@ -2008,8 +2441,9 @@ fn combine_same_selector_switches(
     let mut case_fingerprints = Vec::with_capacity(switches[0].cases.len());
     for index in 0..switches[0].cases.len() {
         let mut case = PolynomialNF::one();
-        let mut fingerprint_parts = Vec::with_capacity(monomial.factors.len());
-        for factor in monomial.factors.iter() {
+        let factors = monomial.factors();
+        let mut fingerprint_parts = Vec::with_capacity(factors.len());
+        for factor in factors.iter() {
             if let Some(switch) = &factor.switch {
                 case = normal_form_product::product(case, switch.cases[index].clone())?;
                 fingerprint_parts.push(switch.case_fingerprints[index].to_string());
@@ -2054,6 +2488,7 @@ pub enum NormalFormError {
     IncompatibleMatrixAddition { left: ConcreteMatrixType, right: ConcreteMatrixType },
     IncompatibleMatrixProduct { left: ConcreteMatrixType, right: ConcreteMatrixType },
     InvalidKnownZeroRows { known_zero_rows: BigUint, row_count: BigUint },
+    InvalidSupportUpper { support_upper: usize, ring_dimension: usize },
     BoundArithmetic,
     AmbiguousRelation { keys: Vec<FactorIdentity> },
     ConflictingRelationTarget { key: FullRelationKey },
@@ -2077,6 +2512,10 @@ impl NormalFormError {
                 known_zero_rows,
                 row_count,
             } => Self::InvalidKnownZeroRows { known_zero_rows, row_count },
+            super::bound::BoundArithmeticError::InvalidSupportUpper {
+                support_upper,
+                ring_dimension,
+            } => Self::InvalidSupportUpper { support_upper, ring_dimension },
         }
     }
 }
@@ -2102,6 +2541,10 @@ mod tests {
             },
             coefficient_class: BoundClass::bounded(value.into()),
         }
+    }
+
+    fn relation_bound(value: u64) -> MatrixBound {
+        rectangular_bound(value, 2, 2, 1)
     }
 
     fn rectangular_bound(
@@ -2216,19 +2659,21 @@ mod tests {
 
     #[test]
     fn product_retains_all_bounded_cross_terms_around_live_factors() {
-        let left = PolynomialNF::relation_live_factor(FactorIdentity::named("K"), bound(1))
-            .unwrap()
-            .add(PolynomialNF::bounded(bound(2)).unwrap())
-            .unwrap();
-        let right = PolynomialNF::relation_live_factor(FactorIdentity::named("K2"), bound(1))
-            .unwrap()
-            .add(PolynomialNF::bounded(bound(3)).unwrap())
-            .unwrap();
+        let left =
+            PolynomialNF::relation_live_factor(FactorIdentity::named("K"), relation_bound(1))
+                .unwrap()
+                .add(PolynomialNF::bounded(rectangular_bound(2, 2, 2, 1)).unwrap())
+                .unwrap();
+        let right =
+            PolynomialNF::relation_live_factor(FactorIdentity::named("K2"), relation_bound(1))
+                .unwrap()
+                .add(PolynomialNF::bounded(rectangular_bound(3, 2, 2, 1)).unwrap())
+                .unwrap();
         let product = normal_form_product::product_bound_only(left, right).unwrap();
         assert_eq!(product.exact_terms().len(), 1);
         assert_eq!(
             product.bounded_summary().as_matrix_bound().unwrap().coefficient_class,
-            BoundClass::bounded(11_u8.into())
+            BoundClass::bounded(22_u8.into())
         );
     }
     #[test]
@@ -2274,7 +2719,7 @@ mod tests {
         let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
         let k = dag
             .push(ExpressionNode::Atom(
-                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+                SymbolicFactor::relation_live(preimage.clone(), relation_bound(1)).unwrap(),
             ))
             .unwrap();
         let p = dag.push(ExpressionNode::Atom(SymbolicFactor::large(target.clone()))).unwrap();
@@ -2305,7 +2750,7 @@ mod tests {
         let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
         let k = dag
             .push(ExpressionNode::Atom(
-                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+                SymbolicFactor::relation_live(preimage.clone(), relation_bound(1)).unwrap(),
             ))
             .unwrap();
         let p = dag.push(ExpressionNode::Atom(SymbolicFactor::large(target.clone()))).unwrap();
@@ -2403,7 +2848,8 @@ mod tests {
         let finished = finite.finish_relation_live().unwrap();
         assert!(finished.validate_bounded_only().is_ok());
         let live =
-            PolynomialNF::relation_live_factor(FactorIdentity::named("K"), bound(1)).unwrap();
+            PolynomialNF::relation_live_factor(FactorIdentity::named("K"), relation_bound(1))
+                .unwrap();
         assert!(live.finish_relation_live().unwrap().validate_bounded_only().is_ok());
         let large = PolynomialNF::exact_factor(FactorIdentity::named("L"));
         assert!(matches!(
@@ -2421,7 +2867,7 @@ mod tests {
         let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
         let k = dag
             .push(ExpressionNode::Atom(
-                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+                SymbolicFactor::relation_live(preimage.clone(), relation_bound(1)).unwrap(),
             ))
             .unwrap();
         let p = dag.push(ExpressionNode::Atom(SymbolicFactor::large(target.clone()))).unwrap();
@@ -2493,7 +2939,7 @@ mod tests {
         let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
         let k = dag
             .push(ExpressionNode::Atom(
-                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+                SymbolicFactor::relation_live(preimage.clone(), relation_bound(1)).unwrap(),
             ))
             .unwrap();
         let target_product = dag.push(ExpressionNode::Product(vec![b, k].into())).unwrap();
@@ -2527,7 +2973,8 @@ mod tests {
         let mut dag = ExpressionDag::new();
         let live = dag
             .push(ExpressionNode::Atom(
-                SymbolicFactor::relation_live(FactorIdentity::named("K"), bound(1)).unwrap(),
+                SymbolicFactor::relation_live(FactorIdentity::named("K"), relation_bound(1))
+                    .unwrap(),
             ))
             .unwrap();
         assert!(dag.normalize_bounded(live, &RelationRegistry::default()).is_ok());
@@ -2545,7 +2992,7 @@ mod tests {
         let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
         let k = dag
             .push(ExpressionNode::Atom(
-                SymbolicFactor::relation_live(preimage.clone(), bound(1))
+                SymbolicFactor::relation_live(preimage.clone(), relation_bound(1))
                     .unwrap()
                     .with_trapdoor(wrong_trapdoor),
             ))
@@ -2581,7 +3028,9 @@ mod tests {
             .unwrap();
         let k = matching_dag
             .push(ExpressionNode::Atom(
-                SymbolicFactor::relation_live(preimage, bound(1)).unwrap().with_trapdoor(trapdoor),
+                SymbolicFactor::relation_live(preimage, relation_bound(1))
+                    .unwrap()
+                    .with_trapdoor(trapdoor),
             ))
             .unwrap();
         let p = matching_dag
@@ -2609,7 +3058,7 @@ mod tests {
         for (preimage, target) in preimages.iter().zip(targets.iter()) {
             cases.push(
                 dag.push(ExpressionNode::Atom(
-                    SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+                    SymbolicFactor::relation_live(preimage.clone(), relation_bound(1)).unwrap(),
                 ))
                 .unwrap(),
             );
@@ -2701,7 +3150,7 @@ mod tests {
         let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
         let k = dag
             .push(ExpressionNode::Atom(
-                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+                SymbolicFactor::relation_live(preimage.clone(), relation_bound(1)).unwrap(),
             ))
             .unwrap();
         let e = dag
@@ -2741,7 +3190,7 @@ mod tests {
                     dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
                 let k = dag
                     .push(ExpressionNode::Atom(
-                        SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+                        SymbolicFactor::relation_live(preimage.clone(), relation_bound(1)).unwrap(),
                     ))
                     .unwrap();
                 let mut deep_target = dag
@@ -2818,21 +3267,24 @@ mod tests {
         let left_barrier = left
             .exact_terms
             .values()
-            .find_map(|term| term.monomial.factors.iter().find_map(|factor| factor.switch.clone()))
+            .find_map(|term| {
+                term.monomial.factors().iter().find_map(|factor| factor.switch.clone())
+            })
             .unwrap();
         let right_barrier = right
             .exact_terms
             .values()
-            .find_map(|term| term.monomial.factors.iter().find_map(|factor| factor.switch.clone()))
+            .find_map(|term| {
+                term.monomial.factors().iter().find_map(|factor| factor.switch.clone())
+            })
             .unwrap();
         assert_ne!(left_barrier.case_fingerprints, right_barrier.case_fingerprints);
         let difference = left.add(right.negate()).unwrap();
         assert_eq!(difference.exact_terms.len(), 2);
         assert!(
-            difference
-                .exact_terms
-                .values()
-                .all(|term| { term.monomial.factors.iter().any(|factor| factor.switch.is_some()) })
+            difference.exact_terms.values().all(|term| {
+                term.monomial.factors().iter().any(|factor| factor.switch.is_some())
+            })
         );
     }
 
@@ -2869,7 +3321,7 @@ mod tests {
             .next()
             .unwrap()
             .monomial
-            .factors
+            .factors()
             .iter()
             .find_map(|factor| factor.switch.clone())
             .unwrap();
@@ -2877,7 +3329,7 @@ mod tests {
         for (case, expected) in same_data.cases.iter().zip(expected_cases) {
             let term = case.exact_terms.values().next().unwrap();
             assert_eq!(
-                term.monomial.factors.iter().map(|factor| factor.key.clone()).collect::<Vec<_>>(),
+                term.monomial.factors().iter().map(|factor| factor.key.clone()).collect::<Vec<_>>(),
                 expected.into_iter().map(FactorIdentity::named).collect::<Vec<_>>()
             );
         }
@@ -2887,10 +3339,10 @@ mod tests {
         let different_nf = dag.normalize(different, &RelationRegistry::default()).unwrap();
         assert_eq!(different_nf.exact_terms.len(), 1);
         let different_term = different_nf.exact_terms.values().next().unwrap();
-        assert_eq!(different_term.monomial.factors.len(), 2);
+        assert_eq!(different_term.monomial.factors().len(), 2);
         assert_ne!(
-            different_term.monomial.factors[0].switch.as_ref().unwrap().selector,
-            different_term.monomial.factors[1].switch.as_ref().unwrap().selector
+            different_term.monomial.factors()[0].switch.as_ref().unwrap().selector,
+            different_term.monomial.factors()[1].switch.as_ref().unwrap().selector
         );
 
         let reversed = make_switch(&mut dag, FactorIdentity::named("s"), ["R0", "R1"]);
@@ -2943,7 +3395,7 @@ mod tests {
                 .next()
                 .unwrap()
                 .monomial
-                .factors
+                .factors()
                 .iter()
                 .any(|factor| factor.switch.is_some())
         );
@@ -2963,10 +3415,10 @@ mod tests {
         let normalized = dag.normalize(noncollision, &RelationRegistry::default()).unwrap();
         assert_eq!(normalized.exact_terms().len(), 1);
         let term = normalized.exact_terms().values().next().unwrap();
-        assert_eq!(term.monomial.factors.len(), 2);
+        assert_eq!(term.monomial.factors().len(), 2);
         assert_ne!(
-            term.monomial.factors[0].switch.as_ref().unwrap().selector,
-            term.monomial.factors[1].switch.as_ref().unwrap().selector
+            term.monomial.factors()[0].switch.as_ref().unwrap().selector,
+            term.monomial.factors()[1].switch.as_ref().unwrap().selector
         );
     }
 
@@ -3065,7 +3517,7 @@ mod tests {
             .next()
             .unwrap()
             .monomial
-            .factors
+            .factors()
             .iter()
             .find_map(|factor| factor.switch.clone())
             .unwrap();
@@ -3110,7 +3562,7 @@ mod tests {
             let p_id = dag.push(ExpressionNode::Atom(SymbolicFactor::large(p.clone()))).unwrap();
             let k_id = dag
                 .push(ExpressionNode::Atom(
-                    SymbolicFactor::relation_live(k.clone(), bound(1)).unwrap(),
+                    SymbolicFactor::relation_live(k.clone(), relation_bound(1)).unwrap(),
                 ))
                 .unwrap();
             let b_id = dag.push(ExpressionNode::Atom(SymbolicFactor::large(b.clone()))).unwrap();
@@ -3121,7 +3573,7 @@ mod tests {
             let b_id = dag.push(ExpressionNode::Atom(SymbolicFactor::large(b.clone()))).unwrap();
             let k_id = dag
                 .push(ExpressionNode::Atom(
-                    SymbolicFactor::relation_live(k.clone(), bound(1)).unwrap(),
+                    SymbolicFactor::relation_live(k.clone(), relation_bound(1)).unwrap(),
                 ))
                 .unwrap();
             let p_id = dag.push(ExpressionNode::Atom(SymbolicFactor::large(p.clone()))).unwrap();
@@ -3163,9 +3615,11 @@ mod tests {
         };
         let a_id = atom(&mut dag, SymbolicFactor::large(a.clone()));
         let b_id = atom(&mut dag, SymbolicFactor::large(b.clone()));
-        let k_id = atom(&mut dag, SymbolicFactor::relation_live(k.clone(), bound(1)).unwrap());
+        let k_id =
+            atom(&mut dag, SymbolicFactor::relation_live(k.clone(), relation_bound(1)).unwrap());
         let c_id = atom(&mut dag, SymbolicFactor::large(c.clone()));
-        let l_id = atom(&mut dag, SymbolicFactor::relation_live(l.clone(), bound(1)).unwrap());
+        let l_id =
+            atom(&mut dag, SymbolicFactor::relation_live(l.clone(), relation_bound(1)).unwrap());
         let q_id = atom(&mut dag, SymbolicFactor::large(q.clone()));
         let d_id = atom(&mut dag, SymbolicFactor::large(d.clone()));
         let nested_target =
@@ -3265,7 +3719,7 @@ mod tests {
         let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
         let k = dag
             .push(ExpressionNode::Atom(
-                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+                SymbolicFactor::relation_live(preimage.clone(), relation_bound(1)).unwrap(),
             ))
             .unwrap();
         let p =
@@ -3358,5 +3812,118 @@ mod tests {
         assert_eq!(forward, reverse);
         assert_eq!(forward.factor_index, 0);
         assert_eq!(forward.identity, FactorIdentity::named("witness-A"));
+    }
+
+    fn central_factor(name: &str) -> SymbolicFactor {
+        central_factor_with(name, 3, 1)
+    }
+
+    fn central_factor_with(name: &str, coefficient: u64, support_upper: usize) -> SymbolicFactor {
+        let matrix_type =
+            ConcreteMatrixType { modulus: 17.into(), ring_dimension: 4, rows: 1, columns: 1 };
+        SymbolicFactor::bounded_with_metadata(
+            FactorIdentity::named(name),
+            MatrixBound {
+                matrix_type: matrix_type.clone(),
+                coefficient_class: BoundClass::bounded(coefficient.into()),
+            },
+            MatrixMetadata {
+                canonical_coefficient_exclusive_upper: None,
+                is_constant_polynomial: true,
+                known_zero_rows: None,
+                polynomial: Some(crate::operational_noise::bound::PolynomialFacts {
+                    support_upper,
+                }),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn central_scalars_are_sorted_while_noncentral_factors_keep_order() {
+        let a = SymbolicFactor::large(FactorIdentity::named("A"));
+        let b = SymbolicFactor::large(FactorIdentity::named("B"));
+        let c = central_factor("c");
+        let d = central_factor("d");
+        let cab = Monomial::from_factors([c.clone(), a.clone(), b.clone()]);
+        let acb = Monomial::from_factors([a.clone(), c.clone(), b.clone()]);
+        let abc = Monomial::from_factors([a.clone(), b.clone(), c.clone()]);
+        assert_eq!(cab.key(), acb.key());
+        assert_eq!(cab.key(), abc.key());
+        assert_ne!(
+            Monomial::from_factors([a.clone(), b.clone()]).key(),
+            Monomial::from_factors([b.clone(), a.clone()]).key()
+        );
+
+        let cd_a = Monomial::from_factors([c.clone(), d.clone(), a.clone()]);
+        let dc_a = Monomial::from_factors([d.clone(), c.clone(), a.clone()]);
+        assert_eq!(cd_a.key(), dc_a.key());
+
+        let associated = Monomial::from_factors([c.clone(), a.clone()])
+            .concat(&Monomial::from_factors([d.clone(), b.clone()]));
+        assert_eq!(associated.key(), Monomial::from_factors([d, a, c, b]).key());
+    }
+
+    #[test]
+    fn finite_central_scalar_folds_at_root() {
+        let nf = PolynomialNF::from_monomial(Monomial::from_factor(central_factor("c")));
+        assert_eq!(nf.exact_terms().len(), 1);
+        let finished = nf.finish_relation_live().unwrap();
+        assert!(finished.exact_terms().is_empty());
+        assert_eq!(
+            finished.bounded_summary().as_matrix_bound().unwrap().coefficient_class,
+            BoundClass::bounded(3_u8.into())
+        );
+    }
+
+    #[test]
+    fn central_scalar_association_is_canonical_before_final_fold() {
+        let c = PolynomialNF::from_monomial(Monomial::from_factor(central_factor_with("c", 2, 2)));
+        let d = PolynomialNF::from_monomial(Monomial::from_factor(central_factor_with("d", 3, 3)));
+        let a = PolynomialNF::relation_live_factor(
+            FactorIdentity::named("A"),
+            rectangular_bound(5, 2, 2, 4),
+        )
+        .unwrap();
+
+        let central_root = normal_form_product::product(c.clone(), d.clone())
+            .unwrap()
+            .finish_relation_live()
+            .unwrap();
+        assert_eq!(central_root.exact_terms().len(), 0);
+        assert_eq!(
+            central_root.bounded_summary().as_matrix_bound().unwrap().coefficient_class,
+            BoundClass::bounded(18_u8.into())
+        );
+        let central_reverse = normal_form_product::product(d.clone(), c.clone())
+            .unwrap()
+            .finish_relation_live()
+            .unwrap();
+        assert_eq!(central_root.bounded_summary(), central_reverse.bounded_summary());
+
+        let left = normal_form_product::product(
+            normal_form_product::product(c.clone(), d.clone()).unwrap(),
+            a.clone(),
+        )
+        .unwrap()
+        .finish_relation_live()
+        .unwrap();
+        let middle = normal_form_product::product(
+            c.clone(),
+            normal_form_product::product(d.clone(), a.clone()).unwrap(),
+        )
+        .unwrap()
+        .finish_relation_live()
+        .unwrap();
+        let right = normal_form_product::product(d, normal_form_product::product(c, a).unwrap())
+            .unwrap()
+            .finish_relation_live()
+            .unwrap();
+        assert_eq!(left.bounded_summary(), middle.bounded_summary());
+        assert_eq!(left.bounded_summary(), right.bounded_summary());
+        assert_eq!(
+            left.bounded_summary().as_matrix_bound().unwrap().coefficient_class,
+            BoundClass::bounded(180_u8.into())
+        );
     }
 }

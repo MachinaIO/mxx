@@ -7,13 +7,12 @@
 
 use super::{
     OperationalAcceptanceReport, OperationalSimulationDiagnostics, OperationalSimulationReport,
-    bound::MatrixBound,
     error::{OperationalSimulationError, TargetError},
     identity::SymbolTables,
     lower::{GraphLowerer, LoweredValue, LoweringControl},
     normal_form::{
-        BoundedSummary, ExpressionDag, ExpressionNode, NormalFormError, NormalizationCounters,
-        RelationRegistry, TermId,
+        BoundedSummary, BoundedValueSummary, ExpressionDag, ExpressionNode, NormalFormError,
+        NormalizationCounters, RelationRegistry, TermId,
     },
 };
 use crate::{OperationalDecoderKind, ProtocolDecl, StageId};
@@ -130,7 +129,7 @@ fn normalize_matrix_family(
             std::slice::from_ref(representative)
         }
     };
-    let mut maximum: Option<MatrixBound> = None;
+    let mut maximum: Option<BoundedValueSummary> = None;
     let mut counters = NormalizationCounters::default();
     for root in roots {
         let (summary, root_counters) = normalize_matrix_root(dag, relations, *root)?;
@@ -148,15 +147,19 @@ fn normalize_matrix_family(
             counters.relations_remaining.saturating_add(root_counters.relations_remaining);
         counters.switch_cases_processed =
             counters.switch_cases_processed.saturating_add(root_counters.switch_cases_processed);
-        if let Some(bound) = summary.as_matrix_bound() {
+        if let Some(bound) = summary.as_value() {
             maximum = Some(match maximum {
                 Some(current) => {
                     let current_value = current
+                        .bound
                         .coefficient_class
                         .maximum_absolute_coefficient()
                         .unwrap_or_default();
-                    let next_value =
-                        bound.coefficient_class.maximum_absolute_coefficient().unwrap_or_default();
+                    let next_value = bound
+                        .bound
+                        .coefficient_class
+                        .maximum_absolute_coefficient()
+                        .unwrap_or_default();
                     (next_value > current_value).then_some(bound.clone()).unwrap_or(current)
                 }
                 None => bound.clone(),
@@ -1254,6 +1257,7 @@ fn shared_round_div(numerator: &BigInt, denominator: &BigInt) -> BigInt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operational_noise::bound::MatrixBound;
 
     #[test]
     fn dag_progress_counts_unique_reachable_nodes_and_switch_cases() {

@@ -1589,10 +1589,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             let arguments = arguments
                                 .iter()
                                 .map(|term| {
-                                    Ok(super::normal_form::PolynomialNF::exact_factor(
+                                    Ok(super::normal_form::PolynomialNF::exact_factor_typed(
                                         FactorIdentity::scalar_selector(
                                             self.canonical_scalar_identity(*term)?,
                                         ),
+                                        concrete.clone(),
                                     ))
                                 })
                                 .collect::<Result<Vec<_>, LowerError>>()?;
@@ -2129,6 +2130,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         canonical_coefficient_exclusive_upper: Some(upper.clone()),
                         is_constant_polynomial: *is_constant_polynomial,
                         known_zero_rows: None,
+                        polynomial: None,
                     },
                 )))
             }
@@ -2227,13 +2229,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             SymbolicFactor::relation_live(key, bound)
                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?
         } else if matches!(bound.coefficient_class, BoundClass::Large) {
-            SymbolicFactor::large(key)
+            SymbolicFactor::large_with_metadata(key, bound, metadata.clone())
         } else {
-            SymbolicFactor::bounded(key, bound)
+            SymbolicFactor::bounded_with_metadata(key, bound, metadata.clone())
                 .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?
         };
-        let mut factor = factor;
-        factor.matrix_value_metadata = metadata;
         self.dag
             .push(ExpressionNode::Atom(factor))
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)
@@ -2249,7 +2249,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let factor = if relation_live {
             SymbolicFactor::relation_live(key, bound)
         } else if matches!(bound.coefficient_class, BoundClass::Large) {
-            Ok(SymbolicFactor::large(key))
+            Ok(SymbolicFactor::large_with_metadata(key, bound, MatrixMetadata::unknown()))
         } else {
             SymbolicFactor::bounded(key, bound)
         }
@@ -2271,12 +2271,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         &self,
         term: TermId,
     ) -> Result<mxx_ir_core::types::ConcreteMatrixType, LowerError> {
-        self.dag
+        Ok(self
+            .dag
             .facts(term)
             .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?
             .concrete_type
-            .clone()
-            .ok_or(LowerError::UnsupportedMatrixProductExpansion)
+            .clone())
     }
 
     fn graph_factor_identity(
@@ -3670,7 +3670,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             format!("pack-bit:{position}").as_bytes(),
                         )?;
                         Ok(BoolBit {
-                            value: super::normal_form::PolynomialNF::exact_factor(key.clone()),
+                            value: super::normal_form::PolynomialNF::exact_factor_typed(
+                                key.clone(),
+                                concrete.clone(),
+                            ),
                             identity: key,
                             maximum: if data.possible_true {
                                 BigUint::from(1_u8)
@@ -5196,9 +5199,13 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 relation_live: false,
                 trapdoor: None,
                 matrix_bound: Some(MatrixBound {
-                    matrix_type: concrete,
+                    matrix_type: concrete.clone(),
                     coefficient_class: BoundClass::Large,
                 }),
+                matrix_type: concrete.clone(),
+                polynomial_facts: crate::operational_noise::bound::PolynomialFacts::conservative(
+                    concrete.ring_dimension,
+                ),
                 matrix_value_metadata: MatrixMetadata::unknown(),
                 switch: None,
             };
@@ -5454,6 +5461,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operational_noise::normal_form::monomial_bound;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
@@ -5576,6 +5584,10 @@ mod tests {
                 relation_live: false,
                 trapdoor: None,
                 matrix_bound: Some(bound(BoundClass::Large)),
+                matrix_type: concrete.clone(),
+                polynomial_facts: super::super::bound::PolynomialFacts::conservative(
+                    concrete.ring_dimension,
+                ),
                 matrix_value_metadata: MatrixMetadata::unknown(),
                 switch: None,
             };
@@ -5720,9 +5732,13 @@ mod tests {
                     relation_live: false,
                     trapdoor: None,
                     matrix_bound: Some(MatrixBound {
-                        matrix_type: concrete,
+                        matrix_type: concrete.clone(),
                         coefficient_class: BoundClass::Large,
                     }),
+                    matrix_type: concrete.clone(),
+                    polynomial_facts: super::super::bound::PolynomialFacts::conservative(
+                        concrete.ring_dimension,
+                    ),
                     matrix_value_metadata: MatrixMetadata::unknown(),
                     switch: None,
                 }))
@@ -5839,9 +5855,13 @@ mod tests {
                 relation_live: false,
                 trapdoor: None,
                 matrix_bound: Some(MatrixBound {
-                    matrix_type: concrete,
+                    matrix_type: concrete.clone(),
                     coefficient_class: BoundClass::Large,
                 }),
+                matrix_type: concrete.clone(),
+                polynomial_facts: super::super::bound::PolynomialFacts::conservative(
+                    concrete.ring_dimension,
+                ),
                 matrix_value_metadata: MatrixMetadata::unknown(),
                 switch: None,
             }))
@@ -5931,6 +5951,10 @@ mod tests {
                         matrix_type: concrete.clone(),
                         coefficient_class: BoundClass::Large,
                     }),
+                    matrix_type: concrete.clone(),
+                    polynomial_facts: super::super::bound::PolynomialFacts::conservative(
+                        concrete.ring_dimension,
+                    ),
                     matrix_value_metadata: MatrixMetadata::unknown(),
                     switch: None,
                 }))
@@ -6061,6 +6085,10 @@ mod tests {
                     matrix_type: matrix_type.clone(),
                     coefficient_class: BoundClass::bounded(1_u8.into()),
                 }),
+                matrix_type: matrix_type.clone(),
+                polynomial_facts: super::super::bound::PolynomialFacts::conservative(
+                    matrix_type.ring_dimension,
+                ),
                 matrix_value_metadata: MatrixMetadata::unknown(),
                 switch: None,
             }))
@@ -6115,10 +6143,15 @@ mod tests {
                     matrix_type: matrix_type.clone(),
                     coefficient_class: BoundClass::bounded(6_u8.into()),
                 }),
+                matrix_type: matrix_type.clone(),
+                polynomial_facts: super::super::bound::PolynomialFacts::conservative(
+                    matrix_type.ring_dimension,
+                ),
                 matrix_value_metadata: MatrixMetadata {
                     canonical_coefficient_exclusive_upper: Some(7_u8.into()),
                     is_constant_polynomial: false,
                     known_zero_rows: None,
+                    polynomial: None,
                 },
                 switch: None,
             }))
@@ -6165,6 +6198,10 @@ mod tests {
                     matrix_type: matrix_type.clone(),
                     coefficient_class: BoundClass::Large,
                 }),
+                matrix_type: matrix_type.clone(),
+                polynomial_facts: super::super::bound::PolynomialFacts::conservative(
+                    matrix_type.ring_dimension,
+                ),
                 matrix_value_metadata: MatrixMetadata::unknown(),
                 switch: None,
             }))
@@ -6271,10 +6308,15 @@ mod tests {
                     matrix_type: matrix_type.clone(),
                     coefficient_class: BoundClass::bounded(6_u8.into()),
                 }),
+                matrix_type: matrix_type.clone(),
+                polynomial_facts: super::super::bound::PolynomialFacts::conservative(
+                    matrix_type.ring_dimension,
+                ),
                 matrix_value_metadata: MatrixMetadata {
                     canonical_coefficient_exclusive_upper: Some(7_u8.into()),
                     is_constant_polynomial: false,
                     known_zero_rows: None,
+                    polynomial: None,
                 },
                 switch: None,
             }))
@@ -6421,6 +6463,13 @@ mod tests {
                     },
                     coefficient_class: BoundClass::Large,
                 }),
+                matrix_type: mxx_ir_core::types::ConcreteMatrixType {
+                    modulus: 17.into(),
+                    ring_dimension: 1,
+                    rows: 3,
+                    columns: 2,
+                },
+                polynomial_facts: super::super::bound::PolynomialFacts::conservative(1),
                 matrix_value_metadata: MatrixMetadata::unknown(),
                 switch: None,
             }))
@@ -6559,6 +6608,10 @@ mod tests {
                         matrix_type: matrix.clone(),
                         coefficient_class: BoundClass::Large,
                     }),
+                    matrix_type: matrix.clone(),
+                    polynomial_facts: super::super::bound::PolynomialFacts::conservative(
+                        matrix.ring_dimension,
+                    ),
                     matrix_value_metadata: MatrixMetadata::unknown(),
                     switch: None,
                 }))
@@ -6571,9 +6624,11 @@ mod tests {
                     relation_live: false,
                     trapdoor: None,
                     matrix_bound: Some(MatrixBound {
-                        matrix_type: matrix,
+                        matrix_type: matrix.clone(),
                         coefficient_class: BoundClass::Large,
                     }),
+                    matrix_type: matrix,
+                    polynomial_facts: super::super::bound::PolynomialFacts::conservative(1),
                     matrix_value_metadata: MatrixMetadata::unknown(),
                     switch: None,
                 }))
@@ -6757,12 +6812,16 @@ mod tests {
             }
             _ => {}
         }
-        lowerer
+        let normalized = lowerer
             .expression_dag()
-            .normalize_bounded(term, lowerer.normal_form_relations())
-            .expect("finite DAG bound")
-            .as_matrix_bound()
-            .expect("bounded matrix summary")
+            .normalize(term, lowerer.normal_form_relations())
+            .expect("finite DAG bound");
+        if let Some(summary) = normalized.bounded_summary().as_matrix_bound() {
+            return summary.coefficient_class.clone();
+        }
+        let exact = normalized.exact_terms().values().next().expect("finite exact term");
+        monomial_bound(&exact.monomial)
+            .expect("finite exact matrix bound")
             .coefficient_class
             .clone()
     }

@@ -1014,6 +1014,21 @@ pub fn check_operational_noise_candidate_with_progress(
                 LoweredValue::Matrix(root) => LoweredRootSet::Dag(root),
                 LoweredValue::MatrixFamily(family) => LoweredRootSet::MatrixFamily(family),
                 LoweredValue::Term(root) => {
+                    // The scalar e-graph is retained only for integer/bool/real domains.  A
+                    // matrix root must have been lowered into the expression DAG; never route a
+                    // legacy matrix enode through relation saturation or extraction.
+                    let scalar = matches!(
+                        lowerer.egraph[lowerer.egraph.find(root)].data.sort,
+                        Ok(super::analysis::MxxSort::Int) |
+                            Ok(super::analysis::MxxSort::Bool) |
+                            Ok(super::analysis::MxxSort::Real)
+                    );
+                    if !scalar {
+                        return Err(OperationalSimulationError::Lower {
+                            site: site(&stage, wire, "scalar root classification"),
+                            source: super::error::LowerError::UnsupportedMatrixProductExpansion,
+                        });
+                    }
                     control.reserve_owned_elements(1)?;
                     LoweredRootSet::Egraph(vec![root].into_boxed_slice())
                 }
@@ -1026,6 +1041,20 @@ pub fn check_operational_noise_candidate_with_progress(
                     })?;
                     match family.storage {
                         super::family::FamilyCoverageStorage::ExactStored { elements } => {
+                            if elements.iter().any(|element| {
+                                !matches!(
+                                    lowerer.egraph[lowerer.egraph.find(*element)].data.sort,
+                                    Ok(super::analysis::MxxSort::Int) |
+                                        Ok(super::analysis::MxxSort::Bool) |
+                                        Ok(super::analysis::MxxSort::Real)
+                                )
+                            }) {
+                                return Err(OperationalSimulationError::Lower {
+                                    site: site(&stage, wire, "scalar family classification"),
+                                    source:
+                                        super::error::LowerError::UnsupportedMatrixProductExpansion,
+                                });
+                            }
                             LoweredRootSet::Egraph(elements)
                         }
                         super::family::FamilyCoverageStorage::SharedTemplate {
@@ -1033,6 +1062,18 @@ pub fn check_operational_noise_candidate_with_progress(
                             representative,
                             binder_domains,
                         } => {
+                            if !matches!(
+                                lowerer.egraph[lowerer.egraph.find(representative)].data.sort,
+                                Ok(super::analysis::MxxSort::Int) |
+                                    Ok(super::analysis::MxxSort::Bool) |
+                                    Ok(super::analysis::MxxSort::Real)
+                            ) {
+                                return Err(OperationalSimulationError::Lower {
+                                    site: site(&stage, wire, "scalar family classification"),
+                                    source:
+                                        super::error::LowerError::UnsupportedMatrixProductExpansion,
+                                });
+                            }
                             validate_shared_representative(
                                 &lowerer.egraph,
                                 representative,

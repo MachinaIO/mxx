@@ -8,15 +8,15 @@ use super::{
     OperationalCheckRequest,
     analysis::{IntegerDomain, MxxAnalysis, MxxSort, ScalarProvenance, resolved_constant},
     bound::{
-        BoundClass, BoundEvaluationControl, BoundEvaluationError, BoundEvaluator, BoundInput,
-        MatrixBound, MatrixMetadata, ResolvedMatrixConstant, gadget_digit_bound,
+        BoundClass, BoundEvaluationControl, BoundEvaluationError, BoundInput, MatrixBound,
+        MatrixMetadata, ResolvedMatrixConstant, gadget_digit_bound,
     },
     error::{LowerError, SelectorOnlyConsumer},
     family::{self, FamilyCoverageStorage, FamilyLoweringValue},
     identity::{
         BinderKey, CanonicalResidueConvention, OccurrenceScope, ResolvedIntExpr,
-        SamplerDescriptorId, SamplerIdentity, SequentialRecurrenceDescriptor, SequentialStateKey,
-        TrapdoorDescriptorId, TrapdoorIdentity, TrapdoorSourceKey, WireSourceKey,
+        SamplerDescriptorId, SamplerIdentity, SequentialStateKey, TrapdoorDescriptorId,
+        TrapdoorIdentity, TrapdoorSourceKey, WireSourceKey,
     },
     language::MxxLang,
     normal_form::{
@@ -46,120 +46,6 @@ use mxx_ir_core::{
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-
-/// Constructs the sole lowered representation of a binary matrix product.
-/// It expands only uniquely represented structural sums; ambiguity, cycles,
-/// and empty sums are typed lowering failures.
-fn lowered_matrix_product(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    left: Id,
-    right: Id,
-) -> Result<Id, LowerError> {
-    let left_terms = lowered_signed_summands(egraph, left, false, &mut HashSet::new())
-        .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
-    let right_terms = lowered_signed_summands(egraph, right, false, &mut HashSet::new())
-        .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
-    let mut products = Vec::with_capacity(left_terms.len().saturating_mul(right_terms.len()));
-    for (left_negative, left) in &left_terms {
-        for (right_negative, right) in &right_terms {
-            let Ok(mut factors) = lowered_product_factors(egraph, *left, &mut HashSet::new())
-            else {
-                return Err(LowerError::UnsupportedMatrixProductExpansion);
-            };
-            let Ok(right_factors) = lowered_product_factors(egraph, *right, &mut HashSet::new())
-            else {
-                return Err(LowerError::UnsupportedMatrixProductExpansion);
-            };
-            factors.extend(right_factors);
-            if factors.is_empty() {
-                return Err(LowerError::UnsupportedMatrixProductExpansion);
-            }
-            let product = egraph.add(MxxLang::MatrixMultiply(factors.into()));
-            products.push(if *left_negative ^ *right_negative {
-                egraph.add(MxxLang::MatrixNegate([product]))
-            } else {
-                product
-            });
-        }
-    }
-    match products.as_slice() {
-        [] => Err(LowerError::UnsupportedMatrixProductExpansion),
-        [product] => Ok(*product),
-        _ => Ok(egraph.add(MxxLang::MatrixAdd(products.into()))),
-    }
-}
-
-fn lowered_signed_summands(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    term: Id,
-    negative: bool,
-    active: &mut HashSet<Id>,
-) -> Result<Vec<(bool, Id)>, ()> {
-    let term = egraph.find(term);
-    if !active.insert(term) {
-        return Err(());
-    }
-    let result = match lowered_unique_structure(egraph, term, |node| match node {
-        MxxLang::MatrixNegate([input]) => Some(*input),
-        _ => None,
-    })? {
-        Some(input) => lowered_signed_summands(egraph, input, !negative, active),
-        None => match lowered_unique_structure(egraph, term, |node| match node {
-            MxxLang::MatrixAdd(terms) => Some(terms.clone()),
-            _ => None,
-        })? {
-            Some(terms) if terms.is_empty() => Err(()),
-            Some(terms) => terms.into_iter().try_fold(Vec::new(), |mut out, child| {
-                out.extend(lowered_signed_summands(egraph, child, negative, active)?);
-                Ok(out)
-            }),
-            None => Ok(vec![(negative, term)]),
-        },
-    };
-    active.remove(&term);
-    result
-}
-
-fn lowered_product_factors(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    term: Id,
-    active: &mut HashSet<Id>,
-) -> Result<Vec<Id>, ()> {
-    let term = egraph.find(term);
-    if !active.insert(term) {
-        return Err(());
-    }
-    let result = match lowered_unique_structure(egraph, term, |node| match node {
-        MxxLang::MatrixMultiply(factors) => Some(factors.clone()),
-        _ => None,
-    })? {
-        Some(factors) if factors.is_empty() => Err(()),
-        Some(factors) => factors.into_iter().try_fold(Vec::new(), |mut out, factor| {
-            out.extend(lowered_product_factors(egraph, factor, active)?);
-            Ok(out)
-        }),
-        None => Ok(vec![term]),
-    };
-    active.remove(&term);
-    result
-}
-
-fn lowered_unique_structure<T: Eq>(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    term: Id,
-    mut select: impl FnMut(&MxxLang) -> Option<T>,
-) -> Result<Option<T>, ()> {
-    let mut found = None;
-    for node in &egraph[egraph.find(term)].nodes {
-        let Some(candidate) = select(node) else { continue };
-        match &found {
-            Some(previous) if previous != &candidate => return Err(()),
-            Some(_) => {}
-            None => found = Some(candidate),
-        }
-    }
-    Ok(found)
-}
 
 /// Structural-family dispatch is deliberately outside ordinary expression lowering.
 ///
@@ -223,9 +109,6 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
         source: super::identity::AtomicSourceId,
         term: Id,
     ) -> Result<MatrixBound, BoundEvaluationError> {
-        if self.lowerer.sequential_recurrence(source).is_some() {
-            return self.evaluate_sequential_recurrence(source, term);
-        }
         let descriptor = self
             .lowerer
             .egraph
@@ -591,166 +474,6 @@ impl ProductionBoundInput<'_, '_, '_> {
             }
         }
     }
-
-    /// Evaluates a graph-owned sequential descriptor without rebuilding its
-    /// body or materializing any logical iteration/lane graph.  Each numeric
-    /// iteration evaluates the one fixed transition with a read-only overlay
-    /// of every *previous* carried bound, and commits the complete next vector
-    /// only after all outputs succeed.
-    fn evaluate_sequential_recurrence(
-        &self,
-        source: super::identity::AtomicSourceId,
-        term: Id,
-    ) -> Result<MatrixBound, BoundEvaluationError> {
-        let (descriptor, carried_index) = self
-            .lowerer
-            .sequential_recurrence(source)
-            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
-        let count = resolved_nonnegative(&descriptor.count)
-            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
-        if descriptor.initial.len() != descriptor.transition.len() ||
-            descriptor.transition.len() != descriptor.output_types.len() ||
-            carried_index >= descriptor.transition.len()
-        {
-            return Err(BoundEvaluationError::InvalidMatrixConstant { term });
-        }
-        let mut state = descriptor
-            .initial
-            .iter()
-            .map(|initial| BoundEvaluator::new(self).evaluate_allow_large(*initial))
-            .collect::<Result<Vec<_>, _>>()?;
-        if count.is_zero() {
-            return state
-                .get(carried_index)
-                .cloned()
-                .ok_or(BoundEvaluationError::InvalidMatrixConstant { term });
-        }
-        let state_sources = self.sequential_state_sources(descriptor, term)?;
-        let mut iteration = num_bigint::BigUint::zero();
-        while iteration < count {
-            let overlay =
-                SequentialBoundInput { base: self, states: &state_sources, values: &state };
-            let next = descriptor
-                .transition
-                .iter()
-                .map(|transition| BoundEvaluator::new(&overlay).evaluate_allow_large(*transition))
-                .collect::<Result<Vec<_>, _>>()?;
-            // The `next` vector is constructed from the unmodified `state`;
-            // replacing it here is the sole simultaneous-commit boundary.
-            state = next;
-            iteration += num_bigint::BigUint::from(1_u8);
-        }
-        state
-            .get(carried_index)
-            .cloned()
-            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })
-    }
-
-    fn sequential_state_sources(
-        &self,
-        descriptor: &SequentialRecurrenceDescriptor,
-        term: Id,
-    ) -> Result<Vec<super::identity::AtomicSourceId>, BoundEvaluationError> {
-        (0..descriptor.transition.len())
-            .map(|carried_index| {
-                self.lowerer
-                    .egraph
-                    .analysis
-                    .symbols
-                    .atomic_sources
-                    .values
-                    .iter()
-                    .enumerate()
-                    .find_map(|(source, descriptor_candidate)| {
-                        matches!(
-                            &descriptor_candidate.key,
-                            super::identity::AtomicSourceKey::SequentialState(state)
-                            if state.loop_scope == descriptor.loop_scope &&
-                                state.loop_node == descriptor.loop_node &&
-                                state.carried_index == carried_index
-                        )
-                        .then_some(super::identity::AtomicSourceId(source as u32))
-                    })
-                    .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })
-            })
-            .collect()
-    }
-}
-
-/// A recurrence transition delegates every ordinary fact to the production
-/// input, overriding only the descriptor's carried-state atoms.  It owns no
-/// cache; each [`BoundEvaluator`] remains the sole owner of its bound memo.
-struct SequentialBoundInput<'a, 'protocol, 'control> {
-    base: &'a ProductionBoundInput<'a, 'protocol, 'control>,
-    states: &'a [super::identity::AtomicSourceId],
-    values: &'a [MatrixBound],
-}
-
-impl BoundInput for SequentialBoundInput<'_, '_, '_> {
-    fn node(&self, term: Id) -> Option<&MxxLang> {
-        self.base.node(term)
-    }
-    fn matrix_type(
-        &self,
-        term: Id,
-    ) -> Result<mxx_ir_core::types::ConcreteMatrixType, BoundEvaluationError> {
-        self.base.matrix_type(term)
-    }
-    fn atom_bound(
-        &self,
-        source: super::identity::AtomicSourceId,
-        term: Id,
-    ) -> Result<MatrixBound, BoundEvaluationError> {
-        self.states
-            .iter()
-            .position(|candidate| *candidate == source)
-            .map(|index| self.values[index].clone())
-            .map_or_else(|| self.base.atom_bound(source, term), Ok)
-    }
-    fn matrix_constant(
-        &self,
-        spec: super::identity::MatrixConstantSpecId,
-        term: Id,
-    ) -> Result<
-        (mxx_ir_core::types::ConcreteMatrixType, ResolvedMatrixConstant),
-        BoundEvaluationError,
-    > {
-        self.base.matrix_constant(spec, term)
-    }
-    fn scalar_maximum_absolute(
-        &self,
-        term: Id,
-    ) -> Result<num_bigint::BigUint, BoundEvaluationError> {
-        self.base.scalar_maximum_absolute(term)
-    }
-    fn lift_constant_polynomial_class(
-        &self,
-        term: Id,
-        input: Id,
-    ) -> Result<BoundClass, BoundEvaluationError> {
-        self.base.lift_constant_polynomial_class(term, input)
-    }
-    fn crt_coefficients(
-        &self,
-        spec: super::identity::CrtSpecId,
-        term: Id,
-    ) -> Result<Box<[BigInt]>, BoundEvaluationError> {
-        self.base.crt_coefficients(spec, term)
-    }
-    fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError> {
-        self.base.validate_pack(term, bit_count)
-    }
-    fn pack_bit_maximum(&self, term: Id, bit: Id) -> Result<BigUint, BoundEvaluationError> {
-        self.base.pack_bit_maximum(term, bit)
-    }
-    fn switch_reachable_cases(
-        &self,
-        term: Id,
-        selector: Id,
-        case_count: usize,
-    ) -> Result<Box<[bool]>, BoundEvaluationError> {
-        self.base.switch_reachable_cases(term, selector, case_count)
-    }
 }
 
 fn resolved_integer(value: &ResolvedIntExpr) -> Option<BigInt> {
@@ -1052,10 +775,6 @@ enum LoweringFrame {
         environment: LowerEnv,
         matrix_type: MatrixType,
         variant: HashVariant,
-        tag_prefix: Vec<u8>,
-        tag_expressions: Vec<IntExpr>,
-        tag_decimal_expressions: Vec<IntExpr>,
-        tag_u64_le_expressions: Vec<IntExpr>,
         base: Option<IntExpr>,
         digit_count: Option<IntExpr>,
         output_type: WireType,
@@ -1078,16 +797,6 @@ enum LoweringFrame {
         binder: BinderKey,
         logical_count: num_bigint::BigUint,
         maximum: BigInt,
-    },
-    FinishSequentialLoop {
-        wire: LoweringWire,
-        environment: LowerEnv,
-        count: ResolvedIntExpr,
-        initial: Vec<Id>,
-        output_types: Vec<super::identity::ResolvedMatrixType>,
-        output_type: WireType,
-        carried_index: usize,
-        dependency_count: usize,
     },
     FinishSequentialMatrixLoop {
         wire: LoweringWire,
@@ -1561,29 +1270,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         ProductionBoundInput { lowerer: self, control: Some(control) }
     }
 
-    /// Returns the complete, graph-owned recurrence for one compact sequential
-    /// output.  Consumers receive the descriptor and selected carried slot
-    /// together, rather than re-identifying a loop from a node number or
-    /// replaying the loop body.  In particular, this API never expands the
-    /// count into iterations or lanes.
-    pub fn sequential_recurrence(
-        &self,
-        source: super::identity::AtomicSourceId,
-    ) -> Option<(&SequentialRecurrenceDescriptor, usize)> {
-        let descriptor = self.egraph.analysis.symbols.atomic_sources.get(source.0)?;
-        let super::identity::AtomicSourceKey::SequentialRecurrence { recurrence, carried_index } =
-            descriptor.key
-        else {
-            return None;
-        };
-        self.egraph
-            .analysis
-            .symbols
-            .sequential_recurrences
-            .get(recurrence.0)
-            .map(|descriptor| (descriptor, carried_index))
-    }
-
     /// Starts the one job-wide, non-recursive lowering traversal at a workflow-stage wire.
     /// Structural family producers are deliberately routed through `FamilyResolver`; ordinary
     /// graph dependencies are visited in producer order without using the Rust call stack.
@@ -1779,10 +1465,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             if let NodeKind::HashSample {
                                 matrix_type,
                                 variant,
-                                tag_prefix,
-                                tag_expressions,
-                                tag_decimal_expressions,
-                                tag_u64_le_expressions,
+                                tag_prefix: _,
+                                tag_expressions: _,
+                                tag_decimal_expressions: _,
+                                tag_u64_le_expressions: _,
                                 base,
                                 digit_count,
                             } = node.kind()
@@ -1801,10 +1487,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                     environment: environment.clone(),
                                     matrix_type: matrix_type.clone(),
                                     variant: *variant,
-                                    tag_prefix: tag_prefix.clone(),
-                                    tag_expressions: tag_expressions.clone(),
-                                    tag_decimal_expressions: tag_decimal_expressions.clone(),
-                                    tag_u64_le_expressions: tag_u64_le_expressions.clone(),
                                     base: base.clone(),
                                     digit_count: digit_count.clone(),
                                     output_type: node.output_types()
@@ -2324,58 +2006,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
                 }
-                LoweringFrame::FinishSequentialLoop {
-                    wire,
-                    environment,
-                    count,
-                    initial,
-                    output_types,
-                    output_type,
-                    carried_index,
-                    dependency_count,
-                } => {
-                    if values.len() < dependency_count {
-                        return Err(LowerError::InvalidOperandArity {
-                            expected: dependency_count,
-                            actual: values.len(),
-                        });
-                    }
-                    let transition_values = values.split_off(values.len() - dependency_count);
-                    if count == ResolvedIntExpr::Const(BigInt::from(1_u8)) {
-                        let value = transition_values.get(carried_index).cloned().ok_or(
-                            LowerError::InvalidOutputPort {
-                                wire: wire.source.wire,
-                                output_count: transition_values.len(),
-                            },
-                        )?;
-                        let value = self.normalize_singleton_for_input(value, &output_type)?;
-                        self.finish_wire(&wire, value.clone());
-                        values.push(value);
-                        continue;
-                    }
-                    let transitions = transition_values
-                        .into_iter()
-                        .map(|value| match value {
-                            LoweredValue::Term(term) => Ok(term),
-                            _ => Err(LowerError::InvalidOperandArity {
-                                expected: dependency_count,
-                                actual: dependency_count,
-                            }),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let value = self.finish_sequential_loop(
-                        &wire,
-                        &environment,
-                        count,
-                        initial,
-                        transitions,
-                        output_types,
-                        output_type,
-                        carried_index,
-                    )?;
-                    self.finish_wire(&wire, value.clone());
-                    values.push(value);
-                }
                 LoweringFrame::FinishSequentialMatrixLoop {
                     wire,
                     environment,
@@ -2443,7 +2073,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     let value =
                         values.pop().ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
                     let value = match value {
-                        LoweredValue::Term(term) => LoweredValue::Term(term),
+                        LoweredValue::Term(term) => LoweredValue::Term(self.scalar_term(term)?),
                         LoweredValue::Matrix(_) | LoweredValue::MatrixFamily(_) => {
                             return Err(LowerError::UnsupportedMatrixProductExpansion)
                         }
@@ -2541,84 +2171,13 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         values.push(value);
                         continue;
                     }
-                    let [
-                        LoweredValue::Term(public),
-                        LoweredValue::Trapdoor(trapdoor),
-                        LoweredValue::Term(target),
-                    ] = arguments.as_slice()
-                    else {
-                        return Err(LowerError::InvalidOperandArity {
-                            expected: 3,
-                            actual: arguments.len(),
-                        });
-                    };
-                    let (WireType::Matrix(matrix) | WireType::Preimage(matrix)) = output_type
-                    else {
-                        return Err(LowerError::InvalidOperandSort {
-                            expected: WireType::Matrix(MatrixType {
-                                modulus: IntExpr::constant(1),
-                                ring_dimension: IntExpr::constant(1),
-                                rows: IntExpr::constant(1),
-                                columns: IntExpr::constant(1),
-                            }),
-                            actual: output_type,
-                        });
-                    };
-                    let resolved_cutoff = self.resolve_int(&cutoff, &environment)?;
-                    let resolved_matrix = self.resolve_matrix_type(&matrix, &environment)?;
-                    let sampler =
-                        self.egraph.analysis.symbols.samplers.intern(SamplerIdentity::Preimage {
-                            source: super::identity::GraphWireSourceKey {
-                                wire: wire.source.clone(),
-                                coordinate_binders: environment
-                                    .active_coordinates
-                                    .iter()
-                                    .map(|coordinate| coordinate.binder.clone())
-                                    .collect(),
-                            },
-                            indices: environment
-                                .active_coordinates
-                                .iter()
-                                .map(|coordinate| coordinate.index.term)
-                                .collect(),
-                            public: *public,
-                            trapdoor: *trapdoor,
-                            target: *target,
-                            cutoff: resolved_cutoff,
-                        });
-                    let source = self.egraph.analysis.symbols.atomic_sources.intern(
-                        super::identity::AtomicSourceDescriptor {
-                            key: super::identity::AtomicSourceKey::Sampler(SamplerDescriptorId(
-                                sampler,
-                            )),
-                            sort: MxxSort::Matrix(resolved_matrix),
-                            integer_domain: None,
-                            canonical_residue_convention: None,
-                            relation_role: Some(super::identity::AtomicRelationRole::Preimage),
-                        },
-                    );
-                    let value = LoweredValue::Term(
-                        self.egraph.add(MxxLang::Atom {
-                            source: super::identity::AtomicSourceId(source),
-                            indices: environment
-                                .active_coordinates
-                                .iter()
-                                .map(|coordinate| coordinate.index.term)
-                                .collect(),
-                        }),
-                    );
-                    self.finish_wire(&wire, value.clone());
-                    values.push(value);
+                    return Err(LowerError::UnsupportedMatrixProductExpansion);
                 }
                 LoweringFrame::FinishHashSample {
                     wire,
                     environment,
                     matrix_type,
                     variant,
-                    tag_prefix,
-                    tag_expressions,
-                    tag_decimal_expressions,
-                    tag_u64_le_expressions,
                     base,
                     digit_count,
                     output_type,
@@ -2634,7 +2193,25 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     let arguments = arguments
                         .into_iter()
                         .map(|value| match value {
-                            LoweredValue::Term(term) => Ok(term),
+                            LoweredValue::Term(term) => {
+                                let term = self.egraph.find(term);
+                                let sort = self.egraph[term].data.sort.as_ref().ok();
+                                // Hash inputs are scalar/domain values that are consumed by the
+                                // matrix source descriptor.  Bytes is intentionally allowed here
+                                // as a non-matrix source domain; it is never emitted as a matrix
+                                // carrier or passed to scalar arithmetic.
+                                matches!(
+                                    sort,
+                                    Some(
+                                        MxxSort::Bytes(_) |
+                                            MxxSort::Int |
+                                            MxxSort::Bool |
+                                            MxxSort::Real
+                                    )
+                                )
+                                .then_some(term)
+                                .ok_or(LowerError::UnsupportedMatrixProductExpansion)
+                            }
                             LoweredValue::Matrix(_) | LoweredValue::MatrixFamily(_) => {
                                 Err(LowerError::UnsupportedMatrixProductExpansion)
                             }
@@ -2754,280 +2331,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         values.push(value);
                         continue;
                     }
-                    let Some(key) = arguments.first() else {
-                        return Err(LowerError::InvalidOperandArity { expected: 1, actual: 0 });
-                    };
-                    if !matches!(
-                        self.egraph[self.egraph.find(*key)].data.sort,
-                        Ok(MxxSort::Bytes(_))
-                    ) || arguments.iter().skip(1).any(|argument| {
-                        !matches!(
-                            self.egraph[self.egraph.find(*argument)].data.sort,
-                            Ok(MxxSort::Int)
-                        )
-                    }) {
-                        return Err(LowerError::InvalidOperandSort {
-                            expected: WireType::Int,
-                            actual: WireType::Int,
-                        });
-                    }
-                    let (WireType::Matrix(output_matrix) | WireType::Preimage(output_matrix)) =
-                        output_type
-                    else {
-                        return Err(LowerError::InvalidOperandSort {
-                            expected: WireType::Matrix(matrix_type),
-                            actual: output_type,
-                        });
-                    };
-                    if output_matrix != matrix_type {
-                        return Err(LowerError::InvalidOperandSort {
-                            expected: WireType::Matrix(matrix_type),
-                            actual: WireType::Matrix(output_matrix),
-                        });
-                    }
-                    let output_matrix = self.resolve_matrix_type(&output_matrix, &environment)?;
-                    let mut tag_program = Vec::new();
-                    if !tag_prefix.is_empty() {
-                        tag_program.push(super::identity::HashTagPart::Literal(
-                            tag_prefix.into_boxed_slice(),
-                        ));
-                    }
-                    for expression in &tag_expressions {
-                        tag_program.push(super::identity::HashTagPart::BinaryStatic(
-                            self.resolve_int(expression, &environment)?,
-                        ));
-                    }
-                    for expression in &tag_decimal_expressions {
-                        tag_program.push(super::identity::HashTagPart::DecimalStatic(
-                            self.resolve_int(expression, &environment)?,
-                        ));
-                    }
-                    for expression in &tag_u64_le_expressions {
-                        tag_program.push(super::identity::HashTagPart::U64LeStatic(
-                            self.resolve_int(expression, &environment)?,
-                        ));
-                    }
-                    for argument in 1..arguments.len() {
-                        let argument = u16::try_from(argument).map_err(|_| {
-                            LowerError::InvalidOperandArity {
-                                expected: u16::MAX as usize,
-                                actual: arguments.len(),
-                            }
-                        })?;
-                        tag_program.push(super::identity::HashTagPart::BinaryArgument { argument });
-                    }
-                    let (target, public, base, digit_count, small) = match variant {
-                        HashVariant::Plain => {
-                            if base.is_some() || digit_count.is_some() {
-                                return Err(LowerError::InvalidOperandArity {
-                                    expected: 0,
-                                    actual: 1,
-                                });
-                            }
-                            let query = self.egraph.analysis.symbols.hash_queries.intern(
-                                super::identity::HashQuerySpec {
-                                    matrix_type: output_matrix.clone(),
-                                    tag_program: tag_program.into_boxed_slice(),
-                                },
-                            );
-                            (
-                                self.egraph.add(MxxLang::HashPlain {
-                                    query: super::identity::HashQuerySpecId(query),
-                                    arguments: arguments.clone().into_boxed_slice(),
-                                }),
-                                None,
-                                None,
-                                None,
-                                false,
-                            )
-                        }
-                        HashVariant::Decomposed | HashVariant::SmallDecomposed => {
-                            let (Some(base), Some(digit_count)) = (base, digit_count) else {
-                                return Err(LowerError::InvalidOperandArity {
-                                    expected: 2,
-                                    actual: 0,
-                                });
-                            };
-                            let base = self.resolve_int(&base, &environment)?;
-                            let digit_count = self.resolve_int(&digit_count, &environment)?;
-                            let Some(base_value) = resolved_integer(&base) else {
-                                return Err(LowerError::NonExactIdentityIndex {
-                                    expression: IntExpr::constant(0),
-                                });
-                            };
-                            let Some(digit_count_value) = resolved_nonnegative(&digit_count) else {
-                                return Err(LowerError::NonExactIdentityIndex {
-                                    expression: IntExpr::constant(0),
-                                });
-                            };
-                            let Some(rows) = resolved_nonnegative(&output_matrix.rows) else {
-                                return Err(LowerError::NonExactIdentityIndex {
-                                    expression: matrix_type.rows.clone(),
-                                });
-                            };
-                            let Some(output_rows) = rows.to_usize() else {
-                                return Err(LowerError::NonExactIdentityIndex {
-                                    expression: matrix_type.rows.clone(),
-                                });
-                            };
-                            let Some(digit_count_usize) = digit_count_value.to_usize() else {
-                                return Err(LowerError::NonExactIdentityIndex {
-                                    expression: IntExpr::constant(0),
-                                });
-                            };
-                            if base_value <= BigInt::from(1) ||
-                                digit_count_usize == 0 ||
-                                output_rows == 0 ||
-                                output_rows % digit_count_usize != 0
-                            {
-                                return Err(LowerError::InvalidOperandArity {
-                                    expected: digit_count_usize,
-                                    actual: output_rows,
-                                });
-                            }
-                            let small = variant == HashVariant::SmallDecomposed;
-                            let Some(modulus) = resolved_integer(&output_matrix.modulus) else {
-                                return Err(LowerError::NonExactIdentityIndex {
-                                    expression: matrix_type.modulus.clone(),
-                                });
-                            };
-                            let Some(ring_dimension) =
-                                resolved_nonnegative(&output_matrix.ring_dimension)
-                                    .and_then(|value| value.to_usize())
-                            else {
-                                return Err(LowerError::NonExactIdentityIndex {
-                                    expression: matrix_type.ring_dimension.clone(),
-                                });
-                            };
-                            let layout_matches = self.request.layouts.iter().any(|layout| {
-                                let layout_modulus = layout
-                                    .crt_moduli
-                                    .iter()
-                                    .fold(BigInt::from(1), |product, modulus| {
-                                        product * BigInt::from(*modulus)
-                                    });
-                                layout.ring_dimension == ring_dimension &&
-                                    layout_modulus == modulus &&
-                                    layout.base == base_value &&
-                                    (if small {
-                                        layout.small_digit_count
-                                    } else {
-                                        layout.regular_digit_count
-                                    }) == digit_count_usize
-                            });
-                            if !layout_matches {
-                                return Err(LowerError::InvalidOperandArity {
-                                    expected: 1,
-                                    actual: 0,
-                                });
-                            }
-                            let plain_rows = output_rows / digit_count_usize;
-                            let mut plain_matrix = output_matrix.clone();
-                            plain_matrix.rows = ResolvedIntExpr::Const(BigInt::from(plain_rows));
-                            let mut gadget_matrix = plain_matrix.clone();
-                            gadget_matrix.columns =
-                                ResolvedIntExpr::Const(BigInt::from(output_rows));
-                            let query = self.egraph.analysis.symbols.hash_queries.intern(
-                                super::identity::HashQuerySpec {
-                                    matrix_type: plain_matrix,
-                                    tag_program: tag_program.into_boxed_slice(),
-                                },
-                            );
-                            let target = self.egraph.add(MxxLang::HashPlain {
-                                query: super::identity::HashQuerySpecId(query),
-                                arguments: arguments.clone().into_boxed_slice(),
-                            });
-                            let gadget = self.egraph.analysis.symbols.matrix_constants.intern(
-                                super::identity::MatrixConstantSpec {
-                                    matrix_type: gadget_matrix,
-                                    value: super::identity::MatrixConstantValue::Gadget {
-                                        base: base.clone(),
-                                        small,
-                                    },
-                                },
-                            );
-                            let public = self.egraph.add(MxxLang::MatrixConstant(
-                                super::identity::MatrixConstantSpecId(gadget),
-                            ));
-                            (target, Some(public), Some(base), Some(digit_count), small)
-                        }
-                    };
-                    let value = if let Some(public) = public {
-                        let range_proved = if small {
-                            base.as_ref()
-                                .and_then(resolved_nonnegative)
-                                .zip(
-                                    self.egraph[self.egraph.find(target)]
-                                        .data
-                                        .canonical_coefficient_exclusive_upper
-                                        .as_ref(),
-                                )
-                                .is_some_and(|(limit, upper)| {
-                                    super::identity::canonical_range_within_limit(
-                                        Some(upper),
-                                        &limit,
-                                    )
-                                })
-                        } else {
-                            false
-                        };
-                        let sampler = self.egraph.analysis.symbols.samplers.intern(
-                            SamplerIdentity::DecomposedHash {
-                                source: super::identity::GraphWireSourceKey {
-                                    wire: wire.source.clone(),
-                                    coordinate_binders: environment
-                                        .active_coordinates
-                                        .iter()
-                                        .map(|coordinate| coordinate.binder.clone())
-                                        .collect(),
-                                },
-                                indices: environment
-                                    .active_coordinates
-                                    .iter()
-                                    .map(|coordinate| coordinate.index.term)
-                                    .collect(),
-                                public,
-                                target,
-                                arguments: arguments.into_boxed_slice(),
-                                matrix_type: output_matrix.clone(),
-                                base: base.expect("decomposed hash base"),
-                                digit_count: digit_count.expect("decomposed hash digits"),
-                                small,
-                                range_proved,
-                            },
-                        );
-                        let source = self.egraph.analysis.symbols.atomic_sources.intern(
-                            super::identity::AtomicSourceDescriptor {
-                                key: super::identity::AtomicSourceKey::Sampler(
-                                    SamplerDescriptorId(sampler),
-                                ),
-                                sort: MxxSort::Matrix(output_matrix),
-                                integer_domain: None,
-                                canonical_residue_convention: None,
-                                relation_role: Some(if small {
-                                    super::identity::AtomicRelationRole::SmallDecomposedHash {
-                                        range_proved,
-                                    }
-                                } else {
-                                    super::identity::AtomicRelationRole::DecomposedHash
-                                }),
-                            },
-                        );
-                        LoweredValue::Term(
-                            self.egraph.add(MxxLang::Atom {
-                                source: super::identity::AtomicSourceId(source),
-                                indices: environment
-                                    .active_coordinates
-                                    .iter()
-                                    .map(|coordinate| coordinate.index.term)
-                                    .collect(),
-                            }),
-                        )
-                    } else {
-                        LoweredValue::Term(target)
-                    };
-                    self.finish_wire(&wire, value.clone());
-                    values.push(value);
+                    return Err(LowerError::UnsupportedMatrixProductExpansion);
                 }
                 LoweringFrame::FinishGadgetDecompose {
                     wire,
@@ -3037,6 +2341,16 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     small,
                     output_type,
                 } => {
+                    let argument = values
+                        .pop()
+                        .ok_or(LowerError::InvalidOperandArity { expected: 1, actual: 0 })?;
+                    self.validate_gadget_decompose(
+                        &base,
+                        &digit_count,
+                        &environment,
+                        &output_type,
+                        &argument,
+                    )?;
                     if matches!(output_type, WireType::Matrix(_) | WireType::Preimage(_)) {
                         let value = LoweredValue::Matrix(self.matrix_atom_for_wire(
                             &wire,
@@ -3050,122 +2364,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                 super::identity::AtomicRelationRole::GadgetDecomposition
                             }),
                         )?);
-                        let _ = values.pop();
                         self.finish_wire(&wire, value.clone());
                         values.push(value);
                         continue;
                     }
-                    let LoweredValue::Term(target) = values
-                        .pop()
-                        .ok_or(LowerError::InvalidOperandArity { expected: 1, actual: 0 })?
-                    else {
-                        return Err(LowerError::InvalidOperandArity { expected: 1, actual: 0 });
-                    };
-                    let (WireType::Matrix(matrix) | WireType::Preimage(matrix)) = output_type
-                    else {
-                        return Err(LowerError::InvalidOperandSort {
-                            expected: WireType::Int,
-                            actual: output_type,
-                        });
-                    };
-                    let output_matrix = self.resolve_matrix_type(&matrix, &environment)?;
-                    let base = self.resolve_int(&base, &environment)?;
-                    let digit_count = self.resolve_int(&digit_count, &environment)?;
-                    let Some(base_limit) = resolved_nonnegative(&base) else {
-                        return Err(LowerError::NonExactIdentityIndex {
-                            expression: IntExpr::constant(0),
-                        });
-                    };
-                    let range_proved = small &&
-                        super::identity::canonical_range_within_limit(
-                            self.egraph[self.egraph.find(target)]
-                                .data
-                                .canonical_coefficient_exclusive_upper
-                                .as_ref(),
-                            &base_limit,
-                        );
-                    let Some(digits) =
-                        resolved_nonnegative(&digit_count).and_then(|v| v.to_usize())
-                    else {
-                        return Err(LowerError::NonExactIdentityIndex {
-                            expression: IntExpr::constant(0),
-                        });
-                    };
-                    let Some(output_rows) = resolved_nonnegative(&output_matrix.rows) else {
-                        return Err(LowerError::NonExactIdentityIndex {
-                            expression: matrix.rows.clone(),
-                        });
-                    };
-                    let Some(target_rows) = output_rows
-                        .to_usize()
-                        .filter(|rows| digits != 0 && rows % digits == 0)
-                        .map(|rows| rows / digits)
-                    else {
-                        return Err(LowerError::InvalidOperandArity { expected: digits, actual: 0 });
-                    };
-                    let mut gadget_matrix = output_matrix.clone();
-                    gadget_matrix.rows = ResolvedIntExpr::Const(BigInt::from(target_rows));
-                    gadget_matrix.columns = ResolvedIntExpr::Const(BigInt::from(output_rows));
-                    let gadget = self.egraph.analysis.symbols.matrix_constants.intern(
-                        super::identity::MatrixConstantSpec {
-                            matrix_type: gadget_matrix,
-                            value: super::identity::MatrixConstantValue::Gadget {
-                                base: base.clone(),
-                                small,
-                            },
-                        },
-                    );
-                    let public = self.egraph.add(MxxLang::MatrixConstant(
-                        super::identity::MatrixConstantSpecId(gadget),
-                    ));
-                    let indices: Box<[Id]> = environment
-                        .active_coordinates
-                        .iter()
-                        .map(|coordinate| coordinate.index.term)
-                        .collect();
-                    let sampler = self.egraph.analysis.symbols.samplers.intern(
-                        SamplerIdentity::GadgetDecomposition {
-                            source: super::identity::GraphWireSourceKey {
-                                wire: wire.source.clone(),
-                                coordinate_binders: environment
-                                    .active_coordinates
-                                    .iter()
-                                    .map(|coordinate| coordinate.binder.clone())
-                                    .collect(),
-                            }
-                            .into(),
-                            indices: indices.clone(),
-                            public,
-                            target,
-                            base,
-                            digit_count,
-                            small,
-                            range_proved,
-                        },
-                    );
-                    let source = self.egraph.analysis.symbols.atomic_sources.intern(
-                        super::identity::AtomicSourceDescriptor {
-                            key: super::identity::AtomicSourceKey::Sampler(SamplerDescriptorId(
-                                sampler,
-                            )),
-                            sort: MxxSort::Matrix(output_matrix),
-                            integer_domain: None,
-                            canonical_residue_convention: None,
-                            relation_role: Some(if small {
-                                super::identity::AtomicRelationRole::SmallGadgetDecomposition {
-                                    range_proved,
-                                }
-                            } else {
-                                super::identity::AtomicRelationRole::GadgetDecomposition
-                            }),
-                        },
-                    );
-                    let value = LoweredValue::Term(self.egraph.add(MxxLang::Atom {
-                        source: super::identity::AtomicSourceId(source),
-                        indices,
-                    }));
-                    self.finish_wire(&wire, value.clone());
-                    values.push(value);
+                    return Err(LowerError::UnsupportedMatrixProductExpansion);
                 }
             }
         }
@@ -3970,8 +3173,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let LoweredValue::Term(term) = input else {
             return Err(LowerError::UnsupportedMatrixProductExpansion);
         };
+        let term = self.scalar_term(*term)?;
         let interval = self
-            .integer_analysis(*term)
+            .integer_analysis(term)
             .and_then(|(domain, _)| domain.interval().ok())
             .ok_or(LowerError::UnsupportedMatrixProductExpansion)?;
         let matrix_type =
@@ -4570,6 +3774,19 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         Ok(LoweredInt { term, stable_identity })
     }
 
+    /// A `Term` is an e-graph scalar/domain value.  Matrix expressions are
+    /// DAG terms and must be rejected at this boundary, even if a stale or
+    /// malformed matrix enode was manually inserted into the scalar e-graph.
+    fn scalar_term(&self, term: Id) -> Result<Id, LowerError> {
+        let term = self.egraph.find(term);
+        matches!(
+            self.egraph[term].data.sort.as_ref().ok(),
+            Some(MxxSort::Int | MxxSort::Bool | MxxSort::Real)
+        )
+        .then_some(term)
+        .ok_or(LowerError::UnsupportedMatrixProductExpansion)
+    }
+
     fn register_scalar_node_identity(
         &mut self,
         kind: &NodeKind,
@@ -4577,7 +3794,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         term: Id,
     ) -> Result<(), LowerError> {
         let scalar = |value: &LoweredValue| match value {
-            LoweredValue::Term(term) => self.canonical_scalar_identity(*term),
+            LoweredValue::Term(term) => {
+                self.scalar_term(*term).and_then(|term| self.canonical_scalar_identity(term))
+            }
             _ => Err(LowerError::MissingIntegerAnalysis { term }),
         };
         let identity = match kind {
@@ -4897,7 +4116,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             arguments
                 .iter()
                 .map(|value| match value {
-                    LoweredValue::Term(term) => Ok(*term),
+                    LoweredValue::Term(term) => self.scalar_term(*term),
                     LoweredValue::Matrix(_) | LoweredValue::MatrixFamily(_) => {
                         Err(LowerError::UnsupportedMatrixProductExpansion)
                     }
@@ -4930,61 +4149,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 .collect()
         };
         let term = match kind {
-            NodeKind::ConstantMatrix { matrix_type, value } => {
-                terms(0)?;
-                let value = match value {
-                    mxx_ir_core::node::ConstantMatrix::Zero => {
-                        super::identity::MatrixConstantValue::Zero
-                    }
-                    mxx_ir_core::node::ConstantMatrix::Identity => {
-                        super::identity::MatrixConstantValue::Identity
-                    }
-                    mxx_ir_core::node::ConstantMatrix::UnitRow { index } => {
-                        super::identity::MatrixConstantValue::UnitRow {
-                            index: self.resolve_int(index, environment)?,
-                        }
-                    }
-                    mxx_ir_core::node::ConstantMatrix::UnitColumn { index } => {
-                        super::identity::MatrixConstantValue::UnitColumn {
-                            index: self.resolve_int(index, environment)?,
-                        }
-                    }
-                    mxx_ir_core::node::ConstantMatrix::Gadget { base, small } => {
-                        super::identity::MatrixConstantValue::Gadget {
-                            base: self.resolve_int(base, environment)?,
-                            small: *small,
-                        }
-                    }
-                    mxx_ir_core::node::ConstantMatrix::PowerOfBase { base, exponent } => {
-                        super::identity::MatrixConstantValue::PowerOfBase {
-                            base: self.resolve_int(base, environment)?,
-                            exponent: self.resolve_int(exponent, environment)?,
-                        }
-                    }
-                    mxx_ir_core::node::ConstantMatrix::Rotation { exponent } => {
-                        super::identity::MatrixConstantValue::Rotation {
-                            exponent: self.resolve_int(exponent, environment)?,
-                        }
-                    }
-                    mxx_ir_core::node::ConstantMatrix::Polynomial { coefficients } => {
-                        super::identity::MatrixConstantValue::Polynomial {
-                            coefficients: coefficients
-                                .iter()
-                                .map(|coefficient| self.resolve_int(coefficient, environment))
-                                .collect::<Result<Box<_>, _>>()?,
-                        }
-                    }
-                };
-                let matrix_type = self.resolve_matrix_type(matrix_type, environment)?;
-                let spec = self
-                    .egraph
-                    .analysis
-                    .symbols
-                    .matrix_constants
-                    .intern(super::identity::MatrixConstantSpec { matrix_type, value });
-                self.egraph
-                    .add(MxxLang::MatrixConstant(super::identity::MatrixConstantSpecId(spec)))
-            }
             NodeKind::ConstantInt(value) => self.egraph.add(MxxLang::IntConst(value.clone())),
             NodeKind::EvaluateInt(value) => {
                 return Ok(LoweredValue::Term(self.lower_int_expr(value, environment)?.term))
@@ -5081,131 +4245,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 }
             }
             NodeKind::RealSqrt => self.egraph.add(MxxLang::RealSqrt([terms(1)?[0]])),
-            NodeKind::MatrixBinary(operation) => {
-                let values = terms(2)?;
-                match operation {
-                    MatrixBinaryOp::Add => {
-                        self.egraph.add(MxxLang::MatrixAdd(values.into_boxed_slice()))
-                    }
-                    MatrixBinaryOp::Subtract => {
-                        if self.egraph.find(values[0]) == self.egraph.find(values[1]) {
-                            let canonical = self.egraph.find(values[0]);
-                            let Ok(MxxSort::Matrix(matrix_type)) =
-                                self.egraph[canonical].data.sort.clone()
-                            else {
-                                return Err(LowerError::InvalidOperandSort {
-                                    expected: WireType::Matrix(MatrixType {
-                                        modulus: IntExpr::constant(1),
-                                        ring_dimension: IntExpr::constant(1),
-                                        rows: IntExpr::constant(1),
-                                        columns: IntExpr::constant(1),
-                                    }),
-                                    actual: WireType::Int,
-                                });
-                            };
-                            let zero = self.egraph.analysis.symbols.matrix_constants.intern(
-                                super::identity::MatrixConstantSpec {
-                                    matrix_type,
-                                    value: super::identity::MatrixConstantValue::Zero,
-                                },
-                            );
-                            self.egraph.add(MxxLang::MatrixConstant(
-                                super::identity::MatrixConstantSpecId(zero),
-                            ))
-                        } else {
-                            let negate = self.egraph.add(MxxLang::MatrixNegate([values[1]]));
-                            self.egraph
-                                .add(MxxLang::MatrixAdd(vec![values[0], negate].into_boxed_slice()))
-                        }
-                    }
-                    MatrixBinaryOp::Multiply => {
-                        lowered_matrix_product(&mut self.egraph, values[0], values[1])?
-                    }
-                }
-            }
-            NodeKind::MatrixNegate => self.egraph.add(MxxLang::MatrixNegate([terms(1)?[0]])),
-            NodeKind::MatrixScale { scalar } => {
-                let matrix = terms(1)?[0];
-                let scalar = self.lower_int_expr(scalar, environment)?;
-                self.validate_integer_consumer(
-                    scalar.term,
-                    SelectorOnlyConsumer::MatrixScale,
-                    false,
-                )?;
-                if scalar
-                    .stable_identity
-                    .as_ref()
-                    .and_then(resolved_integer)
-                    .is_some_and(|value| value.is_one())
-                {
-                    return Ok(LoweredValue::Term(matrix));
-                }
-                self.egraph.add(MxxLang::MatrixScale([scalar.term, matrix]))
-            }
-            NodeKind::Transpose => self.egraph.add(MxxLang::MatrixTranspose([terms(1)?[0]])),
-            NodeKind::Slice { rows, columns } => {
-                let spec = super::identity::SliceSpec {
-                    rows: rows
-                        .as_ref()
-                        .map(|range| self.resolve_range(range, environment))
-                        .transpose()?,
-                    columns: columns
-                        .as_ref()
-                        .map(|range| self.resolve_range(range, environment))
-                        .transpose()?,
-                };
-                let input = self.egraph.find(terms(1)?[0]);
-                let is_full_axis = |range: Option<&super::identity::ResolvedIndexRange>,
-                                    extent: &ResolvedIntExpr| {
-                    let Some(range) = range else { return true };
-                    let (Some(start), Some(end), Some(extent)) = (
-                        resolved_constant(&range.start),
-                        resolved_constant(&range.end),
-                        resolved_constant(extent),
-                    ) else {
-                        return false;
-                    };
-                    start.is_zero() && end == extent && extent.is_positive()
-                };
-                if let Ok(MxxSort::Matrix(matrix)) = &self.egraph[input].data.sort &&
-                    is_full_axis(spec.rows.as_ref(), &matrix.rows) &&
-                    is_full_axis(spec.columns.as_ref(), &matrix.columns)
-                {
-                    return Ok(LoweredValue::Term(input));
-                }
-                let id = self.egraph.analysis.symbols.slices.intern(spec);
-                self.egraph.add(MxxLang::MatrixSlice {
-                    spec: super::identity::SliceSpecId(id),
-                    input: [input],
-                })
-            }
-            NodeKind::Tensor => {
-                let values = terms(2)?;
-                self.egraph.add(MxxLang::MatrixTensor([values[0], values[1]]))
-            }
-            NodeKind::Concat { axis } => {
-                let values = arguments
-                    .iter()
-                    .map(|value| match value {
-                        LoweredValue::Term(value) => Ok(*value),
-                        LoweredValue::Matrix(_) | LoweredValue::MatrixFamily(_) => {
-                            Err(LowerError::UnsupportedMatrixProductExpansion)
-                        }
-                        LoweredValue::Trapdoor(_) | LoweredValue::TrapdoorFamily { .. } => {
-                            Err(LowerError::InvalidOperandArity { expected: 0, actual: 1 })
-                        }
-                        LoweredValue::Family(_) => {
-                            Err(LowerError::InvalidOperandArity { expected: 0, actual: 1 })
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let axis = match axis {
-                    ConcatAxis::Rows => super::identity::Axis::Rows,
-                    ConcatAxis::Columns => super::identity::Axis::Columns,
-                    ConcatAxis::Diagonal => super::identity::Axis::Diagonal,
-                };
-                self.egraph.add(MxxLang::MatrixConcat { axis, inputs: values.into_boxed_slice() })
-            }
             NodeKind::ExtractCoefficient { position, canonical_input_exclusive_upper } => {
                 let matrix = terms(1)?[0];
                 let position = self.lower_int_expr(position, environment)?;
@@ -5259,7 +4298,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     inputs: arguments
                         .iter()
                         .map(|value| match value {
-                            LoweredValue::Term(value) => Ok(*value),
+                            LoweredValue::Term(value) => self.scalar_term(*value),
                             LoweredValue::Matrix(_) => {
                                 Err(LowerError::UnsupportedMatrixProductExpansion)
                             }
@@ -5296,6 +4335,17 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             NodeKind::FamilyGetDynamic |
             NodeKind::Select { .. } |
             NodeKind::ThresholdDecode { .. } => unreachable!("closed dispatch was checked above"),
+            // Matrix values are represented by `LoweredValue::Matrix` and never enter this
+            // scalar constructor.  Keeping a typed rejection here makes malformed callers
+            // fail closed without retaining an MxxLang matrix fallback.
+            NodeKind::ConstantMatrix { .. } |
+            NodeKind::MatrixBinary(_) |
+            NodeKind::MatrixNegate |
+            NodeKind::MatrixScale { .. } |
+            NodeKind::Transpose |
+            NodeKind::Slice { .. } |
+            NodeKind::Tensor |
+            NodeKind::Concat { .. } => return Err(LowerError::UnsupportedMatrixProductExpansion),
         };
         self.register_scalar_node_identity(kind, arguments, term)?;
         Ok(LoweredValue::Term(term))
@@ -5435,7 +4485,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                     super::analysis::sorts_equal(&element_type, actual)
                                 }) =>
                         {
-                            Ok(*term)
+                            self.scalar_term(*term)
                         }
                         LoweredValue::Term(term) => {
                             Err(LowerError::FamilyElementLoweringMismatch {
@@ -5526,7 +4576,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         count: IntExpr::constant(0),
                     }
                 })? {
-                    return Ok(LoweredValue::Term(element));
+                    return Ok(LoweredValue::Term(self.scalar_term(element)?));
                 }
                 self.shared_family_element(family, &index)
             }
@@ -5535,7 +4585,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     arguments
                 {
                     let selector = LoweredInt {
-                        term: *selector,
+                        term: self.scalar_term(*selector)?,
                         stable_identity: Some(self.canonical_scalar_identity(*selector)?),
                     };
                     return self.matrix_family_element(family, &selector, wire, environment);
@@ -5549,7 +4599,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         *representative,
                         binder,
                         logical_count,
-                        &LoweredInt { term: *selector, stable_identity: None },
+                        &LoweredInt { term: self.scalar_term(*selector)?, stable_identity: None },
                     );
                 }
                 let [LoweredValue::Family(family), LoweredValue::Term(selector)] = arguments else {
@@ -5558,9 +4608,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         actual: arguments.len(),
                     });
                 };
+                let selector = self.scalar_term(*selector)?;
                 match &family.storage {
                     FamilyCoverageStorage::ExactStored { elements } => {
-                        let term = family::dynamic_get(&mut self.egraph, family, *selector)
+                        let term = family::dynamic_get(&mut self.egraph, family, selector)
                             .map_err(|_| LowerError::InvalidFamilyCount {
                                 count: IntExpr::constant(elements.len()),
                             })?;
@@ -5568,7 +4619,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     }
                     FamilyCoverageStorage::SharedTemplate { .. } => self.shared_family_element(
                         family,
-                        &LoweredInt { term: *selector, stable_identity: None },
+                        &LoweredInt { term: selector, stable_identity: None },
                     ),
                 }
             }
@@ -5579,9 +4630,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         actual: arguments.len(),
                     });
                 };
+                let selector = self.scalar_term(*selector)?;
                 if cases.iter().all(|value| matches!(value, LoweredValue::Matrix(_))) {
-                    let reachable = self.selector_reachable(*selector, cases.len())?;
-                    let selector_identity = self.scalar_selector_identity(*selector)?;
+                    let reachable = self.selector_reachable(selector, cases.len())?;
+                    let selector_identity = self.scalar_selector_identity(selector)?;
                     let matrix_cases = cases
                         .iter()
                         .map(|value| match value {
@@ -5632,10 +4684,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         }
                     }
                     let selector_value = LoweredInt {
-                        term: *selector,
-                        stable_identity: Some(self.canonical_scalar_identity(*selector)?),
+                        term: selector,
+                        stable_identity: Some(self.canonical_scalar_identity(selector)?),
                     };
-                    let reachable = self.selector_reachable(*selector, matrix_families.len())?;
+                    let reachable = self.selector_reachable(selector, matrix_families.len())?;
                     let selector =
                         self.family_selector_identity(first, &selector_value, wire, environment)?;
                     let storage = match &first.storage {
@@ -5747,7 +4799,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             actual: output_type.clone(),
                         }
                     })?;
-                    return family::select_family(&mut self.egraph, *selector, &families)
+                    return family::select_family(&mut self.egraph, selector, &families)
                         .map(LoweredValue::Family)
                         .map_err(|_| LowerError::IncompatibleFamilyCoverage {
                             expected: output_type.clone(),
@@ -5757,7 +4809,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 let terms = families
                     .iter()
                     .map(|value| match value {
-                        LoweredValue::Term(term) => Ok(*term),
+                        LoweredValue::Term(term) => self.scalar_term(*term),
                         _ => Err(LowerError::IncompatibleFamilyCoverage {
                             expected: output_type.clone(),
                             actual: output_type.clone(),
@@ -5766,7 +4818,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(LoweredValue::Term(family::add_runtime_switch(
                     &mut self.egraph,
-                    *selector,
+                    selector,
                     &terms,
                 )))
             }
@@ -6618,6 +5670,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             });
         }
         let matrix_output = matches!(output_type, WireType::Matrix(_) | WireType::Preimage(_));
+        if !matrix_output {
+            return Err(LowerError::UnsupportedMatrixProductExpansion);
+        }
         let matrix_arguments = arguments
             .iter()
             .take(specification.carried_count)
@@ -6637,177 +5692,16 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let count_identity = count.stable_identity.ok_or_else(|| {
             LowerError::NonExactIdentityIndex { expression: specification.count.clone() }
         })?;
-        let single_iteration = count_identity == ResolvedIntExpr::Const(BigInt::from(1_u8));
-        if matrix_output {
-            return self.queue_sequential_matrix_loop(
-                wire,
-                specification,
-                arguments,
-                environment,
-                output_type,
-                count_identity,
-                count_range.maximum,
-                work,
-            );
-        }
-        let (child_definition, child_inputs, child_outputs, parent_arguments) = {
-            let graph = self.graph_for_program(&environment.occurrence.program)?;
-            let parent = graph
-                .scope(&wire.source.scope.definition)
-                .ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
-            let node = parent
-                .node(wire.source.wire.node)
-                .ok_or(LowerError::MissingNode { node: wire.source.wire.node })?;
-            let parent_arguments =
-                parent.arguments(node).ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
-            let child_definition = graph
-                .child_scope_id(&wire.source.scope.definition, wire.source.wire.node)
-                .ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
-            let child = graph
-                .scope(&child_definition)
-                .ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
-            (child_definition, child.inputs().to_vec(), child.outputs().to_vec(), parent_arguments)
-        };
-        if child_inputs.len() != arguments.len() ||
-            parent_arguments.len() != arguments.len() ||
-            child_outputs.len() != specification.carried_count
-        {
-            return Err(LowerError::InvalidOperandArity {
-                expected: child_inputs.len(),
-                actual: arguments.len(),
-            });
-        }
-        let mut child = environment.clone();
-        child.occurrence.definition = child_definition;
-        child.occurrence.path = environment
-            .occurrence
-            .path
-            .iter()
-            .cloned()
-            .chain([super::identity::OccurrenceFrame::SequentialLoop {
-                parent: wire.source.scope.definition.clone(),
-                owner: wire.source.wire.node,
-            }])
-            .collect();
-        let binder = BinderKey {
-            loop_scope: environment.occurrence.clone(),
-            loop_node: wire.source.wire.node,
-            slot: specification.index_slot,
-        };
-        let maximum = count_range.maximum - BigInt::from(1_u8);
-        let binder_id =
-            self.egraph.analysis.symbols.binders.intern(super::identity::BinderDescriptor {
-                key: binder.clone(),
-                minimum: BigInt::zero(),
-                maximum,
-            });
-        let iteration = LoweredInt {
-            term: self.egraph.add(MxxLang::IntBinder(super::identity::BinderId(binder_id))),
-            stable_identity: Some(ResolvedIntExpr::Binder(binder.clone())),
-        };
-        child.binders.push((binder.clone(), iteration.clone()));
-        child.active_coordinates.push(Coordinate { binder: binder.clone(), index: iteration });
-        let mut initial = Vec::with_capacity(specification.carried_count);
-        let mut output_types = Vec::with_capacity(specification.carried_count);
-        for position in 0..specification.carried_count {
-            if single_iteration {
-                let input_type = {
-                    let graph = self.graph_for_program(&child.occurrence.program)?;
-                    let scope = graph
-                        .scope(&child.occurrence.definition)
-                        .ok_or(LowerError::MissingWire { wire: child_inputs[position] })?;
-                    let input_node = scope
-                        .node(child_inputs[position].node)
-                        .ok_or(LowerError::MissingNode { node: child_inputs[position].node })?;
-                    input_node.output_types()[child_inputs[position].port.0 as usize].clone()
-                };
-                let value =
-                    self.normalize_singleton_for_input(arguments[position].clone(), &input_type)?;
-                child.state_inputs.insert(
-                    WireSourceKey { scope: child.occurrence.clone(), wire: child_inputs[position] },
-                    value,
-                );
-                continue;
-            }
-            let LoweredValue::Term(initial_term) = arguments[position] else {
-                return Err(LowerError::InvalidOperandArity {
-                    expected: specification.carried_count,
-                    actual: arguments.len(),
-                });
-            };
-            initial.push(initial_term);
-            let graph = self.graph_for_program(&child.occurrence.program)?;
-            let scope = graph
-                .scope(&child.occurrence.definition)
-                .ok_or(LowerError::MissingWire { wire: child_inputs[position] })?;
-            let input_node = scope
-                .node(child_inputs[position].node)
-                .ok_or(LowerError::MissingNode { node: child_inputs[position].node })?;
-            let ty = input_node.output_types()[child_inputs[position].port.0 as usize].clone();
-            let (WireType::Matrix(matrix) | WireType::Preimage(matrix)) = ty else {
-                return Err(LowerError::InvalidOperandSort {
-                    expected: output_type.clone(),
-                    actual: ty,
-                });
-            };
-            let matrix_type = self.resolve_matrix_type(&matrix, &child)?;
-            output_types.push(matrix_type.clone());
-            let state = self.egraph.analysis.symbols.atomic_sources.intern(
-                super::identity::AtomicSourceDescriptor {
-                    key: super::identity::AtomicSourceKey::SequentialState(SequentialStateKey {
-                        loop_scope: environment.occurrence.clone(),
-                        loop_node: wire.source.wire.node,
-                        carried_index: position,
-                    }),
-                    sort: MxxSort::Matrix(matrix_type),
-                    integer_domain: None,
-                    canonical_residue_convention: None,
-                    relation_role: None,
-                },
-            );
-            child.state_inputs.insert(
-                WireSourceKey { scope: child.occurrence.clone(), wire: child_inputs[position] },
-                LoweredValue::Term(self.egraph.add(MxxLang::Atom {
-                    source: super::identity::AtomicSourceId(state),
-                    indices: Box::new([]),
-                })),
-            );
-        }
-        for (input, argument) in child_inputs
-            .iter()
-            .copied()
-            .skip(specification.carried_count)
-            .zip(arguments.iter().skip(specification.carried_count).cloned())
-        {
-            child
-                .state_inputs
-                .insert(WireSourceKey { scope: child.occurrence.clone(), wire: input }, argument);
-        }
-        for (name, expression) in &specification.bindings {
-            let value = self.resolve_int(expression, &child)?;
-            child.parameters.insert(name.clone(), value);
-        }
-        let dependency_count = child_outputs.len();
-        work.push(LoweringFrame::FinishSequentialLoop {
+        self.queue_sequential_matrix_loop(
             wire,
+            specification,
+            arguments,
             environment,
-            count: count_identity,
-            initial,
-            output_types,
             output_type,
-            carried_index,
-            dependency_count,
-        });
-        for output in child_outputs.into_iter().rev() {
-            work.push(LoweringFrame::Enter {
-                wire: LoweringWire {
-                    source: WireSourceKey { scope: child.occurrence.clone(), wire: output },
-                    indices: Box::new([]),
-                },
-                environment: child.clone(),
-            });
-        }
-        Ok(())
+            count_identity,
+            count_range.maximum,
+            work,
+        )
     }
 
     /// Queues a matrix recurrence without creating an e-graph matrix atom.
@@ -6979,65 +5873,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         Ok(())
     }
 
-    fn finish_sequential_loop(
-        &mut self,
-        wire: &LoweringWire,
-        environment: &LowerEnv,
-        count: ResolvedIntExpr,
-        initial: Vec<Id>,
-        transition: Vec<Id>,
-        output_types: Vec<super::identity::ResolvedMatrixType>,
-        output_type: WireType,
-        carried_index: usize,
-    ) -> Result<LoweredValue, LowerError> {
-        if count == ResolvedIntExpr::Const(BigInt::from(1_u8)) {
-            return transition.get(carried_index).copied().map(LoweredValue::Term).ok_or(
-                LowerError::InvalidOutputPort {
-                    wire: wire.source.wire,
-                    output_count: transition.len(),
-                },
-            );
-        }
-        let recurrence = self.egraph.analysis.symbols.sequential_recurrences.intern(
-            SequentialRecurrenceDescriptor {
-                loop_scope: environment.occurrence.clone(),
-                loop_node: wire.source.wire.node,
-                count,
-                initial: initial.into_boxed_slice(),
-                transition: transition.into_boxed_slice(),
-                output_types: output_types.into_boxed_slice(),
-            },
-        );
-        let (WireType::Matrix(matrix) | WireType::Preimage(matrix)) = output_type else {
-            return Err(LowerError::InvalidOperandSort {
-                expected: WireType::Matrix(MatrixType {
-                    modulus: IntExpr::constant(1),
-                    ring_dimension: IntExpr::constant(1),
-                    rows: IntExpr::constant(1),
-                    columns: IntExpr::constant(1),
-                }),
-                actual: output_type,
-            });
-        };
-        let resolved_matrix = self.resolve_matrix_type(&matrix, environment)?;
-        let source = self.egraph.analysis.symbols.atomic_sources.intern(
-            super::identity::AtomicSourceDescriptor {
-                key: super::identity::AtomicSourceKey::SequentialRecurrence {
-                    recurrence: super::identity::SequentialRecurrenceId(recurrence),
-                    carried_index,
-                },
-                sort: MxxSort::Matrix(resolved_matrix),
-                integer_domain: None,
-                canonical_residue_convention: None,
-                relation_role: None,
-            },
-        );
-        Ok(LoweredValue::Term(self.egraph.add(MxxLang::Atom {
-            source: super::identity::AtomicSourceId(source),
-            indices: Box::new([]),
-        })))
-    }
-
     fn finish_sequential_matrix_loop(
         &mut self,
         wire: &LoweringWire,
@@ -7168,6 +6003,49 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         })
     }
 
+    fn validate_gadget_decompose(
+        &mut self,
+        base: &IntExpr,
+        digit_count: &IntExpr,
+        environment: &LowerEnv,
+        output_type: &WireType,
+        argument: &LoweredValue,
+    ) -> Result<(), LowerError> {
+        if !matches!(argument, LoweredValue::Matrix(_)) {
+            return Err(LowerError::UnsupportedMatrixProductExpansion);
+        }
+        let (WireType::Matrix(matrix) | WireType::Preimage(matrix)) = output_type else {
+            return Err(LowerError::UnsupportedMatrixProductExpansion);
+        };
+        let resolved_matrix = self.resolve_matrix_type(matrix, environment)?;
+        let base = self.resolve_int(base, environment)?;
+        let digit_count = self.resolve_int(digit_count, environment)?;
+        let Some(base_value) = resolved_integer(&base) else {
+            return Err(LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) });
+        };
+        let Some(digit_count_value) =
+            resolved_nonnegative(&digit_count).and_then(|value| value.to_usize())
+        else {
+            return Err(LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) });
+        };
+        let Some(output_rows) =
+            resolved_nonnegative(&resolved_matrix.rows).and_then(|value| value.to_usize())
+        else {
+            return Err(LowerError::NonExactIdentityIndex { expression: matrix.rows.clone() });
+        };
+        if base_value <= BigInt::from(1) ||
+            digit_count_value == 0 ||
+            output_rows == 0 ||
+            output_rows % digit_count_value != 0
+        {
+            return Err(LowerError::InvalidOperandArity {
+                expected: digit_count_value,
+                actual: output_rows,
+            });
+        }
+        Ok(())
+    }
+
     fn resolve_real(&self, value: &RealExpr, environment: &LowerEnv) -> Result<f64, LowerError> {
         let mut env = mxx_ir_core::ParamEnv::default();
         for (name, value) in &environment.parameters {
@@ -7235,30 +6113,6 @@ mod tests {
         }
     }
 
-    fn test_matrix_atom(egraph: &mut EGraph<MxxLang, MxxAnalysis>, name: &str) -> Id {
-        let matrix_type = super::super::identity::ResolvedMatrixType {
-            modulus: ResolvedIntExpr::Const(17.into()),
-            ring_dimension: ResolvedIntExpr::Const(1.into()),
-            rows: ResolvedIntExpr::Const(1.into()),
-            columns: ResolvedIntExpr::Const(1.into()),
-        };
-        let source = egraph.analysis.symbols.atomic_sources.intern(
-            super::super::identity::AtomicSourceDescriptor {
-                key: super::super::identity::AtomicSourceKey::ProtocolInput(
-                    crate::ProtocolInputId::from(name),
-                ),
-                sort: MxxSort::Matrix(matrix_type),
-                integer_domain: None,
-                canonical_residue_convention: None,
-                relation_role: None,
-            },
-        );
-        egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(source),
-            indices: Box::new([]),
-        })
-    }
-
     fn test_integer_atom(
         egraph: &mut EGraph<MxxLang, MxxAnalysis>,
         name: &str,
@@ -7294,115 +6148,6 @@ mod tests {
         }
     }
 
-    fn add_explicit_large(lowerer: &mut GraphLowerer<'_, '_>) -> Id {
-        let scope = root_test_environment().occurrence;
-        let source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
-            super::super::identity::AtomicSourceDescriptor {
-                key: super::super::identity::AtomicSourceKey::ExplicitLarge(
-                    super::super::identity::GraphWireSourceKey {
-                        wire: WireSourceKey {
-                            scope,
-                            wire: WireRef {
-                                node: mxx_ir_core::NodeId(98),
-                                port: mxx_ir_core::Port(0),
-                            },
-                        },
-                        coordinate_binders: Box::new([]),
-                    },
-                ),
-                sort: MxxSort::Matrix(test_resolved_matrix()),
-                integer_domain: None,
-                canonical_residue_convention: None,
-                relation_role: None,
-            },
-        );
-        lowerer.egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(source),
-            indices: Box::new([]),
-        })
-    }
-
-    fn add_bounded_polynomial(lowerer: &mut GraphLowerer<'_, '_>, coefficient: i64) -> Id {
-        let spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
-            super::super::identity::MatrixConstantSpec {
-                matrix_type: test_resolved_matrix(),
-                value: super::super::identity::MatrixConstantValue::Polynomial {
-                    coefficients: vec![ResolvedIntExpr::Const(coefficient.into())].into(),
-                },
-            },
-        );
-        lowerer
-            .egraph
-            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)))
-    }
-
-    fn add_recurrence_states(lowerer: &mut GraphLowerer<'_, '_>, count: usize) -> Vec<Id> {
-        let scope = root_test_environment().occurrence;
-        (0..count)
-            .map(|carried_index| {
-                let source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
-                    super::super::identity::AtomicSourceDescriptor {
-                        key: super::super::identity::AtomicSourceKey::SequentialState(
-                            SequentialStateKey {
-                                loop_scope: scope.clone(),
-                                loop_node: mxx_ir_core::NodeId(99),
-                                carried_index,
-                            },
-                        ),
-                        sort: MxxSort::Matrix(test_resolved_matrix()),
-                        integer_domain: None,
-                        canonical_residue_convention: None,
-                        relation_role: None,
-                    },
-                );
-                lowerer.egraph.add(MxxLang::Atom {
-                    source: super::super::identity::AtomicSourceId(source),
-                    indices: Box::new([]),
-                })
-            })
-            .collect()
-    }
-
-    fn add_recurrence_roots(
-        lowerer: &mut GraphLowerer<'_, '_>,
-        count: u64,
-        initial: Vec<Id>,
-        transition: Vec<Id>,
-    ) -> Vec<Id> {
-        let scope = root_test_environment().occurrence;
-        let carried_count = transition.len();
-        let recurrence = lowerer.egraph.analysis.symbols.sequential_recurrences.intern(
-            SequentialRecurrenceDescriptor {
-                loop_scope: scope.clone(),
-                loop_node: mxx_ir_core::NodeId(99),
-                count: ResolvedIntExpr::Const(count.into()),
-                initial: initial.into(),
-                transition: transition.into(),
-                output_types: vec![test_resolved_matrix(); carried_count].into(),
-            },
-        );
-        (0..carried_count)
-            .map(|carried_index| {
-                let source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
-                    super::super::identity::AtomicSourceDescriptor {
-                        key: super::super::identity::AtomicSourceKey::SequentialRecurrence {
-                            recurrence: super::super::identity::SequentialRecurrenceId(recurrence),
-                            carried_index,
-                        },
-                        sort: MxxSort::Matrix(test_resolved_matrix()),
-                        integer_domain: None,
-                        canonical_residue_convention: None,
-                        relation_role: None,
-                    },
-                );
-                lowerer.egraph.add(MxxLang::Atom {
-                    source: super::super::identity::AtomicSourceId(source),
-                    indices: Box::new([]),
-                })
-            })
-            .collect()
-    }
-
     fn recurrence_lowerer() -> (ProtocolDecl, OperationalCheckRequest) {
         (
             crate::toy_example::protocol(),
@@ -7412,67 +6157,6 @@ mod tests {
                 target_id: "recurrence-bound".to_owned(),
             },
         )
-    }
-
-    #[test]
-    fn sequential_recurrence_consumes_large_through_zero_scale() {
-        let (protocol, request) = recurrence_lowerer();
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let initial = add_explicit_large(&mut lowerer);
-        let state = add_recurrence_states(&mut lowerer, 1).remove(0);
-        let zero = lowerer.egraph.add(MxxLang::IntConst(0.into()));
-        let transition = lowerer.egraph.add(MxxLang::MatrixScale([zero, state]));
-        let root = add_recurrence_roots(&mut lowerer, 1, vec![initial], vec![transition]).remove(0);
-
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view())
-                .evaluate(root)
-                .unwrap()
-                .coefficient_class,
-            BoundClass::ExactZero,
-        );
-    }
-
-    #[test]
-    fn sequential_recurrence_keeps_zero_count_large_for_final_rejection() {
-        let (protocol, request) = recurrence_lowerer();
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let initial = add_explicit_large(&mut lowerer);
-        let state = add_recurrence_states(&mut lowerer, 1).remove(0);
-        let root = add_recurrence_roots(&mut lowerer, 0, vec![initial], vec![state]).remove(0);
-
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view())
-                .evaluate_allow_large(root)
-                .unwrap()
-                .coefficient_class,
-            BoundClass::Large,
-        );
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view()).evaluate(root),
-            Err(BoundEvaluationError::UnconsumedLargeTerm { term: root }),
-        );
-    }
-
-    #[test]
-    fn sequential_recurrence_preserves_bounded_and_simultaneous_multistate_values() {
-        let (protocol, request) = recurrence_lowerer();
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let one = add_bounded_polynomial(&mut lowerer, 1);
-        let three = add_bounded_polynomial(&mut lowerer, 3);
-        let states = add_recurrence_states(&mut lowerer, 2);
-        let roots =
-            add_recurrence_roots(&mut lowerer, 1, vec![one, three], vec![states[1], states[0]]);
-
-        for (root, expected) in roots.into_iter().zip([3_u8, 1_u8]) {
-            assert_eq!(
-                BoundEvaluator::new(&lowerer.production_bound_view())
-                    .evaluate(root)
-                    .unwrap()
-                    .coefficient_class,
-                BoundClass::bounded(expected.into()),
-            );
-        }
     }
 
     #[test]
@@ -7688,288 +6372,6 @@ mod tests {
             ),
             Err(LowerError::UnsupportedMatrixProductExpansion)
         ));
-    }
-
-    #[test]
-    fn sequential_recurrence_does_not_consume_large_through_negation() {
-        let (protocol, request) = recurrence_lowerer();
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let initial = add_explicit_large(&mut lowerer);
-        let state = add_recurrence_states(&mut lowerer, 1).remove(0);
-        let transition = lowerer.egraph.add(MxxLang::MatrixNegate([state]));
-        let root = add_recurrence_roots(&mut lowerer, 1, vec![initial], vec![transition]).remove(0);
-
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view()).evaluate(root),
-            Err(BoundEvaluationError::UnconsumedLargeTerm { term: root }),
-        );
-    }
-
-    #[test]
-    fn lowered_matrix_product_expands_ordered_nested_sums_and_preserves_signs() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let a = test_matrix_atom(&mut egraph, "a");
-        let b = test_matrix_atom(&mut egraph, "b");
-        let c = test_matrix_atom(&mut egraph, "c");
-        let d = test_matrix_atom(&mut egraph, "d");
-        let nested = egraph.add(MxxLang::MatrixAdd(vec![a, b].into()));
-        let left = egraph.add(MxxLang::MatrixAdd(vec![nested, c].into()));
-        let right = egraph.add(MxxLang::MatrixAdd(vec![d, a].into()));
-        let root = lowered_matrix_product(&mut egraph, left, right).unwrap();
-        let MxxLang::MatrixAdd(terms) = &egraph[egraph.find(root)].nodes[0] else {
-            panic!("both sides expand")
-        };
-        assert_eq!(terms.len(), 6);
-        let first = &egraph[egraph.find(terms[0])].nodes[0];
-        assert!(matches!(first, MxxLang::MatrixMultiply(factors)
-            if egraph.find(factors[0]) == egraph.find(a) && egraph.find(factors[1]) == egraph.find(d)));
-
-        let negative_a = egraph.add(MxxLang::MatrixNegate([a]));
-        let negative_d = egraph.add(MxxLang::MatrixNegate([d]));
-        let signed = egraph.add(MxxLang::MatrixAdd(vec![d, negative_d].into()));
-        let signed_root = lowered_matrix_product(&mut egraph, negative_a, signed).unwrap();
-        assert!(matches!(egraph[egraph.find(signed_root)].nodes[0], MxxLang::MatrixAdd(_)));
-    }
-
-    #[test]
-    fn lowered_matrix_product_rejects_empty_ambiguous_and_cyclic_structures() {
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "product-expansion-rejection".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let a = test_matrix_atom(&mut lowerer.egraph, "a");
-        let b = test_matrix_atom(&mut lowerer.egraph, "b");
-        let zero_type = match &lowerer.egraph[lowerer.egraph.find(a)].data.sort {
-            Ok(MxxSort::Matrix(matrix_type)) => matrix_type.clone(),
-            _ => unreachable!("test atom is matrix"),
-        };
-        let zero_spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
-            super::super::identity::MatrixConstantSpec {
-                matrix_type: zero_type,
-                value: super::super::identity::MatrixConstantValue::Zero,
-            },
-        );
-        let zero = lowerer
-            .egraph
-            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(zero_spec)));
-        let zero_product = lowerer
-            .lower_node(
-                &NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-                &[LoweredValue::Term(zero), LoweredValue::Term(a)],
-                &root_test_environment(),
-            )
-            .unwrap();
-        assert!(matches!(zero_product, LoweredValue::Term(_)));
-        let empty = lowerer.egraph.add(MxxLang::MatrixAdd(Box::new([])));
-        assert!(matches!(
-            lowerer.lower_node(
-                &NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-                &[LoweredValue::Term(empty), LoweredValue::Term(b)],
-                &root_test_environment(),
-            ),
-            Err(LowerError::UnsupportedMatrixProductExpansion)
-        ));
-
-        let first = lowerer.egraph.add(MxxLang::MatrixAdd(vec![a, b].into()));
-        let second = lowerer.egraph.add(MxxLang::MatrixAdd(vec![b, a].into()));
-        lowerer.egraph.union(first, second);
-        lowerer.egraph.rebuild();
-        assert!(matches!(
-            lowerer.lower_node(
-                &NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-                &[LoweredValue::Term(first), LoweredValue::Term(b)],
-                &root_test_environment(),
-            ),
-            Err(LowerError::UnsupportedMatrixProductExpansion)
-        ));
-
-        let cyclic = lowerer.egraph.add(MxxLang::MatrixAdd(vec![a].into()));
-        lowerer.egraph.union(cyclic, a);
-        lowerer.egraph.rebuild();
-        assert!(matches!(
-            lowerer.lower_node(
-                &NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-                &[LoweredValue::Term(cyclic), LoweredValue::Term(b)],
-                &root_test_environment(),
-            ),
-            Err(LowerError::UnsupportedMatrixProductExpansion)
-        ));
-    }
-
-    #[test]
-    fn extract_coefficient_uses_direct_upper_and_rejects_oversized_upper() {
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "extract-upper".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let matrix_type = super::super::identity::ResolvedMatrixType {
-            modulus: ResolvedIntExpr::Const(BigInt::from(17)),
-            ring_dimension: ResolvedIntExpr::Const(BigInt::from(1)),
-            rows: ResolvedIntExpr::Const(BigInt::from(1)),
-            columns: ResolvedIntExpr::Const(BigInt::from(1)),
-        };
-        let atom_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
-            super::super::identity::AtomicSourceDescriptor {
-                key: super::super::identity::AtomicSourceKey::ProtocolInput(
-                    crate::ProtocolInputId::from("extract-input"),
-                ),
-                sort: MxxSort::Matrix(matrix_type),
-                integer_domain: None,
-                canonical_residue_convention: None,
-                relation_role: None,
-            },
-        );
-        let matrix = lowerer.egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(atom_source),
-            indices: Box::new([]),
-        });
-        let environment = root_test_environment();
-        let kind = NodeKind::ExtractCoefficient {
-            position: IntExpr::constant(0),
-            canonical_input_exclusive_upper: Some(4_u8.into()),
-        };
-        let LoweredValue::Term(extract) =
-            lowerer.lower_node(&kind, &[LoweredValue::Term(matrix)], &environment).unwrap()
-        else {
-            unreachable!()
-        };
-        assert_eq!(
-            lowerer.integer_analysis(extract).unwrap().0.interval().unwrap(),
-            super::super::analysis::IntegerInterval::new(0.into(), 3.into()).unwrap()
-        );
-
-        let invalid = NodeKind::ExtractCoefficient {
-            position: IntExpr::constant(0),
-            canonical_input_exclusive_upper: Some(18_u8.into()),
-        };
-        assert!(matches!(
-            lowerer.lower_node(&invalid, &[LoweredValue::Term(matrix)], &environment),
-            Err(LowerError::InvalidExtractCoefficientCanonicalUpper { upper, modulus })
-                if upper == 18_u8.into() && modulus == 17_u8.into()
-        ));
-    }
-
-    #[test]
-    fn lowering_remainder_reuses_only_a_proved_in_range_dividend() {
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "remainder-identity".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let environment = root_test_environment();
-        let lower_remainder = |lowerer: &mut GraphLowerer<'_, '_>, dividend, divisor| {
-            let LoweredValue::Term(term) = lowerer
-                .lower_node(
-                    &NodeKind::IntBinary(IntBinaryOp::Remainder),
-                    &[LoweredValue::Term(dividend), LoweredValue::Term(divisor)],
-                    &environment,
-                )
-                .expect("remainder lowers")
-            else {
-                panic!("remainder is an integer term")
-            };
-            term
-        };
-
-        let matrix_type = super::super::identity::ResolvedMatrixType {
-            modulus: ResolvedIntExpr::Const(1009.into()),
-            ring_dimension: ResolvedIntExpr::Const(1.into()),
-            rows: ResolvedIntExpr::Const(1.into()),
-            columns: ResolvedIntExpr::Const(1.into()),
-        };
-        let matrix_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
-            super::super::identity::AtomicSourceDescriptor {
-                key: super::super::identity::AtomicSourceKey::ProtocolInput(
-                    crate::ProtocolInputId::from("remainder-extract-input"),
-                ),
-                sort: MxxSort::Matrix(matrix_type),
-                integer_domain: None,
-                canonical_residue_convention: None,
-                relation_role: None,
-            },
-        );
-        let matrix = lowerer.egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(matrix_source),
-            indices: Box::new([]),
-        });
-        let LoweredValue::Term(extract) = lowerer
-            .lower_node(
-                &NodeKind::ExtractCoefficient {
-                    position: IntExpr::constant(0),
-                    canonical_input_exclusive_upper: Some(280_u16.into()),
-                },
-                &[LoweredValue::Term(matrix)],
-                &environment,
-            )
-            .expect("authoritative Tall-shaped extraction lowers")
-        else {
-            panic!("extraction is an integer term")
-        };
-        let divisor = lowerer.egraph.add(MxxLang::IntConst(512.into()));
-        let extract_data = lowerer.egraph[lowerer.egraph.find(extract)].data.clone();
-        let folded = lower_remainder(&mut lowerer, extract, divisor);
-        assert_eq!(lowerer.egraph.find(folded), lowerer.egraph.find(extract));
-        let folded_data = &lowerer.egraph[lowerer.egraph.find(folded)].data;
-        assert_eq!(folded_data.integer_domain, extract_data.integer_domain);
-        assert_eq!(folded_data.scalar_provenance, Some(ScalarProvenance::SelectorOnly));
-        assert_eq!(folded_data.direct_extract, extract_data.direct_extract);
-
-        let ordinary = test_integer_atom(&mut lowerer.egraph, "ordinary-in-range", 0, 279);
-        let ordinary_folded = lower_remainder(&mut lowerer, ordinary, divisor);
-        assert_eq!(
-            lowerer.egraph.find(ordinary_folded),
-            lowerer.egraph.find(ordinary),
-            "the identity depends on the authoritative interval, not selector provenance"
-        );
-
-        for (name, minimum, maximum, divisor_value) in [
-            ("boundary", 0, 512, 512),
-            ("negative-minimum", -1, 279, 512),
-            ("zero-divisor", 0, 0, 0),
-            ("negative-divisor", 0, 0, -1),
-        ] {
-            let dividend = test_integer_atom(&mut lowerer.egraph, name, minimum, maximum);
-            let divisor = lowerer.egraph.add(MxxLang::IntConst(divisor_value.into()));
-            let remainder = lower_remainder(&mut lowerer, dividend, divisor);
-            assert_ne!(lowerer.egraph.find(remainder), lowerer.egraph.find(dividend), "{name}");
-            assert!(
-                lowerer.egraph[lowerer.egraph.find(remainder)]
-                    .nodes
-                    .iter()
-                    .any(|node| matches!(node, MxxLang::IntEuclideanRemainder(_)))
-            );
-        }
-
-        let LoweredValue::Term(selector_divisor) = lowerer
-            .lower_node(
-                &NodeKind::ExtractCoefficient {
-                    position: IntExpr::constant(0),
-                    canonical_input_exclusive_upper: Some(513_u16.into()),
-                },
-                &[LoweredValue::Term(matrix)],
-                &environment,
-            )
-            .expect("selector-only divisor extraction lowers")
-        else {
-            panic!("extraction is an integer term")
-        };
-        let dividend = test_integer_atom(&mut lowerer.egraph, "selector-divisor-input", 0, 1);
-        let remainder = lower_remainder(&mut lowerer, dividend, selector_divisor);
-        assert_ne!(lowerer.egraph.find(remainder), lowerer.egraph.find(dividend));
-        assert!(
-            lowerer.egraph[lowerer.egraph.find(remainder)]
-                .nodes
-                .iter()
-                .any(|node| matches!(node, MxxLang::IntEuclideanRemainder(_)))
-        );
     }
 
     #[test]
@@ -8192,54 +6594,6 @@ mod tests {
     }
 
     #[test]
-    fn concrete_matrix_type_evaluates_closed_dimensions_and_rejects_unresolved_binders() {
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "closed-matrix-dimensions".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let one_column = super::super::identity::ResolvedMatrixType {
-            modulus: ResolvedIntExpr::Const(1009.into()),
-            ring_dimension: ResolvedIntExpr::Const(8.into()),
-            rows: ResolvedIntExpr::Const(1.into()),
-            columns: ResolvedIntExpr::Const(1.into()),
-        };
-        let constant = |lowerer: &mut GraphLowerer<'_, '_>| {
-            let spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
-                super::super::identity::MatrixConstantSpec {
-                    matrix_type: one_column.clone(),
-                    value: super::super::identity::MatrixConstantValue::Zero,
-                },
-            );
-            lowerer
-                .egraph
-                .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)))
-        };
-        let left = constant(&mut lowerer);
-        let right = constant(&mut lowerer);
-        let concat = lowerer.egraph.add(MxxLang::MatrixConcat {
-            axis: super::super::identity::Axis::Columns,
-            inputs: Box::new([left, right]),
-        });
-        assert_eq!(lowerer.production_bound_view().matrix_type(concat).unwrap().columns, 2);
-
-        let binder = BinderKey {
-            loop_scope: root_test_environment().occurrence,
-            loop_node: mxx_ir_core::NodeId(1),
-            slot: 0,
-        };
-        assert!(
-            concrete_matrix_type(&super::super::identity::ResolvedMatrixType {
-                columns: ResolvedIntExpr::Binder(binder),
-                ..one_column
-            })
-            .is_none()
-        );
-    }
-
-    #[test]
     fn resolved_integer_requires_closed_exact_operations() {
         let constant = |value| Box::new(ResolvedIntExpr::Const(BigInt::from(value)));
         assert_eq!(
@@ -8261,281 +6615,6 @@ mod tests {
     }
 
     #[test]
-    fn matrix_scale_elides_only_closed_identity_scalars() {
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "matrix-scale-identity".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let matrix_type = super::super::identity::ResolvedMatrixType {
-            modulus: ResolvedIntExpr::Const(17.into()),
-            ring_dimension: ResolvedIntExpr::Const(1.into()),
-            rows: ResolvedIntExpr::Const(1.into()),
-            columns: ResolvedIntExpr::Const(1.into()),
-        };
-        let relation_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
-            super::super::identity::AtomicSourceDescriptor {
-                key: super::super::identity::AtomicSourceKey::ProtocolInput(
-                    crate::ProtocolInputId::from("scale-preimage"),
-                ),
-                sort: MxxSort::Matrix(matrix_type),
-                integer_domain: None,
-                canonical_residue_convention: None,
-                relation_role: Some(super::super::identity::AtomicRelationRole::Preimage),
-            },
-        );
-        let environment = root_test_environment();
-        let matrix = lowerer.egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(relation_source),
-            indices: Box::new([]),
-        });
-        let scale = |scalar| NodeKind::MatrixScale { scalar };
-        let identity = lowerer
-            .lower_node(
-                &scale(IntExpr::Sub(
-                    Box::new(IntExpr::constant(2)),
-                    Box::new(IntExpr::constant(1)),
-                )),
-                &[LoweredValue::Term(matrix)],
-                &environment,
-            )
-            .expect("closed arithmetic identity scale lowers");
-        assert!(
-            matches!(identity, LoweredValue::Term(term) if lowerer.egraph.find(term) == lowerer.egraph.find(matrix))
-        );
-        assert!(!lowerer.egraph[lowerer.egraph.find(matrix)].data.relation_provenance.is_empty());
-        for scalar in [IntExpr::constant(0), IntExpr::constant(2)] {
-            let LoweredValue::Term(term) = lowerer
-                .lower_node(&scale(scalar), &[LoweredValue::Term(matrix)], &environment)
-                .expect("non-identity scale lowers")
-            else {
-                unreachable!()
-            };
-            assert!(matches!(
-                lowerer.egraph[lowerer.egraph.find(term)].nodes.first(),
-                Some(MxxLang::MatrixScale(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn full_closed_slices_lower_to_their_input_without_slice_nodes() {
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "full-slice-identity".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let matrix_type = super::super::identity::ResolvedMatrixType {
-            modulus: ResolvedIntExpr::Const(17.into()),
-            ring_dimension: ResolvedIntExpr::Const(1.into()),
-            rows: ResolvedIntExpr::Const(3.into()),
-            columns: ResolvedIntExpr::Const(2.into()),
-        };
-        let spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
-            super::super::identity::MatrixConstantSpec {
-                matrix_type,
-                value: super::super::identity::MatrixConstantValue::Zero,
-            },
-        );
-        let matrix = lowerer
-            .egraph
-            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)));
-        let range = |start, end| mxx_ir_core::node::IndexRange {
-            start: IntExpr::constant(start),
-            end: IntExpr::constant(end),
-        };
-        let slice_nodes = |lowerer: &GraphLowerer<'_, '_>| {
-            lowerer
-                .egraph
-                .classes()
-                .flat_map(|class| class.nodes.iter())
-                .filter(|node| matches!(node, MxxLang::MatrixSlice { .. }))
-                .count()
-        };
-        let before = slice_nodes(&lowerer);
-        for kind in [
-            NodeKind::Slice { rows: Some(range(0, 3)), columns: None },
-            NodeKind::Slice { rows: None, columns: Some(range(0, 2)) },
-            NodeKind::Slice { rows: Some(range(0, 3)), columns: Some(range(0, 2)) },
-            NodeKind::Slice { rows: None, columns: None },
-        ] {
-            let LoweredValue::Term(slice) = lowerer
-                .lower_node(&kind, &[LoweredValue::Term(matrix)], &root_test_environment())
-                .expect("full slice lowers")
-            else {
-                panic!("full slice is a matrix term")
-            };
-            assert_eq!(lowerer.egraph.find(slice), lowerer.egraph.find(matrix));
-        }
-        assert_eq!(slice_nodes(&lowerer), before, "full views add no MatrixSlice node");
-    }
-
-    #[test]
-    fn proper_or_symbolic_extent_slices_retain_matrix_slice_nodes() {
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "proper-slice-retained".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let matrix = |lowerer: &mut GraphLowerer<'_, '_>, rows| {
-            let spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
-                super::super::identity::MatrixConstantSpec {
-                    matrix_type: super::super::identity::ResolvedMatrixType {
-                        modulus: ResolvedIntExpr::Const(17.into()),
-                        ring_dimension: ResolvedIntExpr::Const(1.into()),
-                        rows,
-                        columns: ResolvedIntExpr::Const(2.into()),
-                    },
-                    value: super::super::identity::MatrixConstantValue::Zero,
-                },
-            );
-            lowerer
-                .egraph
-                .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)))
-        };
-        let range = |start, end| mxx_ir_core::node::IndexRange {
-            start: IntExpr::constant(start),
-            end: IntExpr::constant(end),
-        };
-        for rows in [Some(range(0, 2)), Some(range(1, 3))] {
-            let input = matrix(&mut lowerer, ResolvedIntExpr::Const(3.into()));
-            let LoweredValue::Term(slice) = lowerer
-                .lower_node(
-                    &NodeKind::Slice { rows, columns: None },
-                    &[LoweredValue::Term(input)],
-                    &root_test_environment(),
-                )
-                .expect("proper slice lowers")
-            else {
-                panic!("proper slice is a matrix term")
-            };
-            assert_ne!(lowerer.egraph.find(slice), lowerer.egraph.find(input));
-            assert!(
-                lowerer.egraph[lowerer.egraph.find(slice)]
-                    .nodes
-                    .iter()
-                    .any(|node| matches!(node, MxxLang::MatrixSlice { .. }))
-            );
-        }
-        let symbolic_rows = ResolvedIntExpr::Binder(BinderKey {
-            loop_scope: root_test_environment().occurrence,
-            loop_node: mxx_ir_core::NodeId(7),
-            slot: 0,
-        });
-        let input = matrix(&mut lowerer, symbolic_rows);
-        let LoweredValue::Term(slice) = lowerer
-            .lower_node(
-                &NodeKind::Slice { rows: Some(range(0, 3)), columns: None },
-                &[LoweredValue::Term(input)],
-                &root_test_environment(),
-            )
-            .expect("symbolic-extent slice lowers conservatively")
-        else {
-            panic!("symbolic-extent slice is a matrix term")
-        };
-        assert_ne!(lowerer.egraph.find(slice), lowerer.egraph.find(input));
-        assert!(
-            lowerer.egraph[lowerer.egraph.find(slice)]
-                .nodes
-                .iter()
-                .any(|node| matches!(node, MxxLang::MatrixSlice { .. }))
-        );
-    }
-
-    #[test]
-    fn plain_extract_uses_authoritative_source_full_modulus_fallback() {
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "extract-fallback".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let matrix_type = super::super::identity::ResolvedMatrixType {
-            modulus: ResolvedIntExpr::Const(BigInt::from(17)),
-            ring_dimension: ResolvedIntExpr::Const(BigInt::from(1)),
-            rows: ResolvedIntExpr::Const(BigInt::from(1)),
-            columns: ResolvedIntExpr::Const(BigInt::from(1)),
-        };
-        let atom_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
-            super::super::identity::AtomicSourceDescriptor {
-                key: super::super::identity::AtomicSourceKey::ProtocolInput(
-                    crate::ProtocolInputId::from("fallback-input"),
-                ),
-                sort: MxxSort::Matrix(matrix_type),
-                integer_domain: None,
-                canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
-                relation_role: None,
-            },
-        );
-        let matrix = lowerer.egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(atom_source),
-            indices: Box::new([]),
-        });
-        let kind = NodeKind::ExtractCoefficient {
-            position: IntExpr::constant(0),
-            canonical_input_exclusive_upper: None,
-        };
-        let LoweredValue::Term(extract) = lowerer
-            .lower_node(&kind, &[LoweredValue::Term(matrix)], &root_test_environment())
-            .unwrap()
-        else {
-            unreachable!()
-        };
-        assert_eq!(
-            lowerer.integer_analysis(extract).unwrap().0.interval().unwrap(),
-            super::super::analysis::IntegerInterval::new(0.into(), 16.into()).unwrap()
-        );
-        let lift = NodeKind::LiftIntegerToConstantPolynomial {
-            matrix_type: MatrixType {
-                modulus: IntExpr::constant(17),
-                ring_dimension: IntExpr::constant(1),
-                rows: IntExpr::constant(1),
-                columns: IntExpr::constant(1),
-            },
-        };
-        let LoweredValue::Term(lifted) = lowerer
-            .lower_node(&lift, &[LoweredValue::Term(extract)], &root_test_environment())
-            .expect("a direct canonical extraction may be lifted")
-        else {
-            unreachable!()
-        };
-        assert_eq!(
-            lowerer.egraph[lowerer.egraph.find(lifted)].data.canonical_coefficient_exclusive_upper,
-            Some(17_u8.into()),
-        );
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view())
-                .evaluate(lifted)
-                .expect("integer domain is the lifted coefficient bound")
-                .coefficient_class,
-            BoundClass::bounded(16_u8.into()),
-        );
-        assert_eq!(
-            lowerer.validate_integer_consumer(extract, SelectorOnlyConsumer::MatrixScale, false,),
-            Err(LowerError::SelectorOnlyValueUsedByForbiddenConsumer {
-                consumer: SelectorOnlyConsumer::MatrixScale,
-            })
-        );
-        let zero = lowerer.egraph.add(MxxLang::IntConst(0.into()));
-        let laundered = lowerer.egraph.add(MxxLang::IntAdd([extract, zero]));
-        assert_eq!(
-            lowerer.validate_integer_consumer(
-                laundered,
-                SelectorOnlyConsumer::LiftConstantPolynomial,
-                false,
-            ),
-            Err(LowerError::InvalidOperandSort { expected: WireType::Int, actual: WireType::Int })
-        );
-    }
-
-    #[test]
     fn scalar_consumer_validation_uses_the_consumed_boolean_sort() {
         let protocol = crate::toy_example::protocol();
         let request = OperationalCheckRequest {
@@ -8554,6 +6633,283 @@ mod tests {
             lowerer.validate_boolean_consumer(integer, SelectorOnlyConsumer::BoolToInt, false,),
             Err(LowerError::InvalidOperandSort { expected: WireType::Bool, actual: WireType::Int })
         );
+    }
+
+    #[test]
+    fn matrix_operations_have_only_dag_lowered_values() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "matrix-dag-only".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
+            modulus: 17.into(),
+            ring_dimension: 1,
+            rows: 1,
+            columns: 1,
+        };
+        let matrix = lowerer
+            .dag
+            .push(ExpressionNode::Atom(SymbolicFactor {
+                key: FactorIdentity::named("matrix-dag-only"),
+                bound: BoundClass::bounded(1_u8.into()),
+                relation_live: false,
+                trapdoor: None,
+                matrix_bound: Some(MatrixBound {
+                    matrix_type: matrix_type.clone(),
+                    coefficient_class: BoundClass::bounded(1_u8.into()),
+                    metadata: MatrixMetadata::unknown(),
+                }),
+                switch: None,
+            }))
+            .expect("matrix atom");
+        let scalar = IntExpr::constant(1);
+        for (kind, args) in [
+            (
+                NodeKind::MatrixBinary(MatrixBinaryOp::Add),
+                vec![LoweredValue::Matrix(matrix), LoweredValue::Matrix(matrix)],
+            ),
+            (NodeKind::MatrixNegate, vec![LoweredValue::Matrix(matrix)]),
+            (NodeKind::Transpose, vec![LoweredValue::Matrix(matrix)]),
+            (NodeKind::Tensor, vec![LoweredValue::Matrix(matrix), LoweredValue::Matrix(matrix)]),
+            (NodeKind::MatrixScale { scalar: scalar.clone() }, vec![LoweredValue::Matrix(matrix)]),
+        ] {
+            let value = lowerer
+                .lower_node(&kind, &args, &root_test_environment())
+                .expect("matrix operation lowers through DAG");
+            assert!(matches!(value, LoweredValue::Matrix(_)));
+        }
+        assert!(lowerer.egraph.classes().all(|class| {
+            class.nodes.iter().all(|node| {
+                !matches!(
+                    node,
+                    MxxLang::MatrixConstant(_) |
+                        MxxLang::MatrixAdd(_) |
+                        MxxLang::MatrixMultiply(_) |
+                        MxxLang::MatrixNegate(_) |
+                        MxxLang::MatrixScale(_) |
+                        MxxLang::MatrixTranspose(_) |
+                        MxxLang::MatrixSlice { .. } |
+                        MxxLang::MatrixTensor(_) |
+                        MxxLang::MatrixConcat { .. }
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn gadget_decompose_dag_path_validates_base_digits_rows_and_input_category() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "gadget-validation".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(3),
+            columns: IntExpr::constant(2),
+        };
+        let matrix_term = lowerer
+            .dag
+            .push(ExpressionNode::Atom(SymbolicFactor {
+                key: FactorIdentity::named("gadget-input"),
+                bound: BoundClass::Large,
+                relation_live: false,
+                trapdoor: None,
+                matrix_bound: Some(MatrixBound {
+                    matrix_type: mxx_ir_core::types::ConcreteMatrixType {
+                        modulus: 17.into(),
+                        ring_dimension: 1,
+                        rows: 3,
+                        columns: 2,
+                    },
+                    coefficient_class: BoundClass::Large,
+                    metadata: MatrixMetadata::unknown(),
+                }),
+                switch: None,
+            }))
+            .unwrap();
+        let valid = LoweredValue::Matrix(matrix_term);
+        let environment = root_test_environment();
+        assert!(
+            lowerer
+                .validate_gadget_decompose(
+                    &IntExpr::constant(4),
+                    &IntExpr::constant(3),
+                    &environment,
+                    &WireType::Matrix(matrix.clone()),
+                    &valid,
+                )
+                .is_ok()
+        );
+        for (base, digits, output_rows) in [
+            (1, 3, 3), // non-positive/unit base
+            (4, 0, 3), // zero digit count
+            (4, 2, 3), // non-divisible rows
+        ] {
+            let mut malformed = matrix.clone();
+            malformed.rows = IntExpr::constant(output_rows);
+            assert!(
+                lowerer
+                    .validate_gadget_decompose(
+                        &IntExpr::constant(base),
+                        &IntExpr::constant(digits),
+                        &environment,
+                        &WireType::Matrix(malformed),
+                        &valid,
+                    )
+                    .is_err()
+            );
+        }
+        let scalar = LoweredValue::Term(lowerer.egraph.add(MxxLang::IntConst(1.into())));
+        assert_eq!(
+            lowerer.validate_gadget_decompose(
+                &IntExpr::constant(4),
+                &IntExpr::constant(3),
+                &environment,
+                &WireType::Matrix(matrix),
+                &scalar,
+            ),
+            Err(LowerError::UnsupportedMatrixProductExpansion)
+        );
+    }
+
+    #[test]
+    fn malformed_matrix_terms_and_matrix_families_are_rejected_at_scalar_boundaries() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "matrix-term-rejection".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let matrix = super::super::identity::ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(1.into()),
+            columns: ResolvedIntExpr::Const(1.into()),
+        };
+        let spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
+            super::super::identity::MatrixConstantSpec {
+                matrix_type: matrix.clone(),
+                value: super::super::identity::MatrixConstantValue::Zero,
+            },
+        );
+        let malformed = lowerer
+            .egraph
+            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)));
+        let scalar = lowerer.egraph.add(MxxLang::IntConst(1.into()));
+        assert!(matches!(
+            lowerer.lower_node(
+                &NodeKind::IntBinary(IntBinaryOp::Add),
+                &[LoweredValue::Term(malformed), LoweredValue::Term(scalar)],
+                &root_test_environment(),
+            ),
+            Err(LowerError::UnsupportedMatrixProductExpansion)
+        ));
+
+        let family = FamilyLoweringValue {
+            element_type: MxxSort::Matrix(matrix),
+            storage: FamilyCoverageStorage::ExactStored {
+                elements: vec![malformed].into_boxed_slice(),
+            },
+        };
+        let wire = LoweringWire {
+            source: WireSourceKey {
+                scope: root_test_environment().occurrence,
+                wire: WireRef { node: mxx_ir_core::NodeId(7), port: mxx_ir_core::Port(0) },
+            },
+            indices: Box::new([]),
+        };
+        assert!(matches!(
+            lowerer.lower_structural_node(
+                &wire,
+                &NodeKind::PackPolynomialCoefficients {
+                    matrix_type: MatrixType {
+                        modulus: IntExpr::constant(17),
+                        ring_dimension: IntExpr::constant(1),
+                        rows: IntExpr::constant(1),
+                        columns: IntExpr::constant(1),
+                    },
+                    coefficient_bits: IntExpr::constant(1),
+                },
+                &[LoweredValue::Family(family)],
+                &root_test_environment(),
+                WireType::Matrix(MatrixType {
+                    modulus: IntExpr::constant(17),
+                    ring_dimension: IntExpr::constant(1),
+                    rows: IntExpr::constant(1),
+                    columns: IntExpr::constant(1),
+                }),
+            ),
+            Err(LowerError::PackRequiresExplicitBooleanFamily { .. })
+        ));
+    }
+
+    #[test]
+    fn matrix_normal_form_is_independent_of_unrelated_scalar_egraph_insertions() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "matrix-nf-determinism".to_owned(),
+        };
+        let build = |lowerer: &mut GraphLowerer<'_, '_>| {
+            let matrix = mxx_ir_core::types::ConcreteMatrixType {
+                modulus: 17.into(),
+                ring_dimension: 1,
+                rows: 1,
+                columns: 1,
+            };
+            let left = lowerer
+                .dag
+                .push(ExpressionNode::Atom(SymbolicFactor {
+                    key: FactorIdentity::named("nf-left"),
+                    bound: BoundClass::Large,
+                    relation_live: false,
+                    trapdoor: None,
+                    matrix_bound: Some(MatrixBound {
+                        matrix_type: matrix.clone(),
+                        coefficient_class: BoundClass::Large,
+                        metadata: MatrixMetadata::unknown(),
+                    }),
+                    switch: None,
+                }))
+                .unwrap();
+            let right = lowerer
+                .dag
+                .push(ExpressionNode::Atom(SymbolicFactor {
+                    key: FactorIdentity::named("nf-right"),
+                    bound: BoundClass::Large,
+                    relation_live: false,
+                    trapdoor: None,
+                    matrix_bound: Some(MatrixBound {
+                        matrix_type: matrix,
+                        coefficient_class: BoundClass::Large,
+                        metadata: MatrixMetadata::unknown(),
+                    }),
+                    switch: None,
+                }))
+                .unwrap();
+            lowerer.dag.push(ExpressionNode::Product(vec![left, right].into_boxed_slice())).unwrap()
+        };
+        let mut plain = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let plain_root = build(&mut plain);
+        let mut polluted = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let first = polluted.egraph.add(MxxLang::IntConst(9.into()));
+        let second = polluted.egraph.add(MxxLang::IntConst(11.into()));
+        let _ = polluted.egraph.add(MxxLang::IntAdd([first, second]));
+        let polluted_root = build(&mut polluted);
+        let plain_nf = plain.dag.normalize(plain_root, &plain.relation_registry).unwrap();
+        let polluted_nf =
+            polluted.dag.normalize(polluted_root, &polluted.relation_registry).unwrap();
+        assert_eq!(plain_nf.exact_terms(), polluted_nf.exact_terms());
+        assert_eq!(plain_nf.bounded_summary(), polluted_nf.bounded_summary());
     }
 
     fn hash_layout() -> super::super::OperationalGadgetLayout {
@@ -9020,151 +7376,6 @@ mod tests {
             vec![trapdoor],
             vec![WireType::Matrix(matrix)],
             0,
-        );
-    }
-
-    #[test]
-    fn zero_sampler_annihilates_explicit_large_and_equal_subtraction_is_zero() {
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "zero-large".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let matrix_type = super::super::identity::ResolvedMatrixType {
-            modulus: ResolvedIntExpr::Const(17.into()),
-            ring_dimension: ResolvedIntExpr::Const(1.into()),
-            rows: ResolvedIntExpr::Const(1.into()),
-            columns: ResolvedIntExpr::Const(1.into()),
-        };
-        let graph_source = super::super::identity::GraphWireSourceKey {
-            wire: WireSourceKey {
-                scope: root_test_environment().occurrence,
-                wire: WireRef { node: mxx_ir_core::NodeId(7), port: mxx_ir_core::Port(0) },
-            },
-            coordinate_binders: Box::new([]),
-        };
-        let sampler = lowerer.egraph.analysis.symbols.samplers.intern(SamplerIdentity::Gaussian {
-            source: graph_source.clone(),
-            indices: Box::new([]),
-            max_coefficient_bound: ResolvedIntExpr::Const(0.into()),
-        });
-        let zero_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
-            super::super::identity::AtomicSourceDescriptor {
-                key: super::super::identity::AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)),
-                sort: MxxSort::Matrix(matrix_type.clone()),
-                integer_domain: None,
-                canonical_residue_convention: None,
-                relation_role: None,
-            },
-        );
-        let large_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
-            super::super::identity::AtomicSourceDescriptor {
-                key: super::super::identity::AtomicSourceKey::ExplicitLarge(graph_source),
-                sort: MxxSort::Matrix(matrix_type),
-                integer_domain: None,
-                canonical_residue_convention: None,
-                relation_role: None,
-            },
-        );
-        let zero = lowerer.egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(zero_source),
-            indices: Box::new([]),
-        });
-        let large = lowerer.egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(large_source),
-            indices: Box::new([]),
-        });
-        let product = lowerer.egraph.add(MxxLang::MatrixMultiply([zero, large].into()));
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view())
-                .evaluate(product)
-                .unwrap()
-                .coefficient_class,
-            BoundClass::ExactZero,
-        );
-        let LoweredValue::Term(cancelled) = lowerer
-            .lower_node(
-                &NodeKind::MatrixBinary(MatrixBinaryOp::Subtract),
-                &[LoweredValue::Term(large), LoweredValue::Term(large)],
-                &root_test_environment(),
-            )
-            .unwrap()
-        else {
-            panic!("matrix subtraction")
-        };
-        assert!(matches!(
-            lowerer.egraph[lowerer.egraph.find(cancelled)].nodes.first(),
-            Some(MxxLang::MatrixConstant(_))
-        ));
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view())
-                .evaluate(cancelled)
-                .unwrap()
-                .coefficient_class,
-            BoundClass::ExactZero,
-        );
-        let other_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
-            super::super::identity::AtomicSourceDescriptor {
-                key: super::super::identity::AtomicSourceKey::ExplicitLarge(
-                    super::super::identity::GraphWireSourceKey {
-                        wire: WireSourceKey {
-                            scope: root_test_environment().occurrence,
-                            wire: WireRef {
-                                node: mxx_ir_core::NodeId(8),
-                                port: mxx_ir_core::Port(0),
-                            },
-                        },
-                        coordinate_binders: Box::new([]),
-                    },
-                ),
-                sort: lowerer.egraph[lowerer.egraph.find(large)].data.sort.clone().unwrap(),
-                integer_domain: None,
-                canonical_residue_convention: None,
-                relation_role: None,
-            },
-        );
-        let other = lowerer.egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(other_source),
-            indices: Box::new([]),
-        });
-        let LoweredValue::Term(not_cancelled) = lowerer
-            .lower_node(
-                &NodeKind::MatrixBinary(MatrixBinaryOp::Subtract),
-                &[LoweredValue::Term(large), LoweredValue::Term(other)],
-                &root_test_environment(),
-            )
-            .unwrap()
-        else {
-            panic!("matrix subtraction")
-        };
-        assert!(matches!(
-            lowerer.egraph[lowerer.egraph.find(not_cancelled)].nodes.first(),
-            Some(MxxLang::MatrixAdd(_))
-        ));
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view()).evaluate(not_cancelled),
-            Err(BoundEvaluationError::UnconsumedLargeTerm { term: not_cancelled }),
-        );
-        let selector = lowerer.egraph.add(MxxLang::IntConst(0.into()));
-        let selected_zero = lowerer
-            .egraph
-            .add(MxxLang::Switch(vec![selector, cancelled, large].into_boxed_slice()));
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view())
-                .evaluate(selected_zero)
-                .unwrap()
-                .coefficient_class,
-            BoundClass::ExactZero,
-        );
-        let out_of_range = lowerer.egraph.add(MxxLang::IntConst(2.into()));
-        let invalid_switch = lowerer
-            .egraph
-            .add(MxxLang::Switch(vec![out_of_range, cancelled, large].into_boxed_slice()));
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view()).evaluate(invalid_switch),
-            Err(BoundEvaluationError::InvalidSwitchReachability { term: invalid_switch }),
         );
     }
 
@@ -9773,95 +7984,6 @@ mod tests {
             }
         );
         assert_eq!(dag_bound(&lowerer, term), BoundClass::ExactZero);
-    }
-
-    #[test]
-    fn constant_matrix_variants_use_resolved_interned_specs() {
-        let matrix = MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(2),
-            rows: IntExpr::constant(2),
-            columns: IntExpr::constant(2),
-        };
-        let variants = vec![
-            mxx_ir_core::node::ConstantMatrix::Zero,
-            mxx_ir_core::node::ConstantMatrix::Identity,
-            mxx_ir_core::node::ConstantMatrix::UnitRow { index: IntExpr::constant(1) },
-            mxx_ir_core::node::ConstantMatrix::UnitColumn { index: IntExpr::constant(1) },
-            mxx_ir_core::node::ConstantMatrix::Gadget { base: IntExpr::constant(2), small: true },
-            mxx_ir_core::node::ConstantMatrix::PowerOfBase {
-                base: IntExpr::constant(3),
-                exponent: IntExpr::constant(4),
-            },
-            mxx_ir_core::node::ConstantMatrix::Rotation { exponent: IntExpr::constant(-1) },
-            mxx_ir_core::node::ConstantMatrix::Polynomial {
-                coefficients: vec![IntExpr::constant(-5), IntExpr::constant(3)],
-            },
-        ];
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "constant-matrix-variants".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let environment = root_test_environment();
-        for (position, value) in variants.into_iter().enumerate() {
-            let lowered = lowerer
-                .lower_node(
-                    &NodeKind::ConstantMatrix { matrix_type: matrix.clone(), value },
-                    &[],
-                    &environment,
-                )
-                .expect("lower matrix constant variant");
-            if position == 0 {
-                let LoweredValue::Matrix(term) = lowered else {
-                    panic!("zero matrix constant is a DAG term")
-                };
-                assert!(matches!(lowerer.expression_dag().node(term), Ok(ExpressionNode::Zero)));
-            } else {
-                let LoweredValue::Term(term) = lowered else {
-                    panic!("nonzero matrix constant is a scalar analysis term")
-                };
-                assert!(matches!(
-                    lowerer.egraph[lowerer.egraph.find(term)].nodes.first(),
-                    Some(MxxLang::MatrixConstant(_))
-                ));
-            }
-        }
-        assert!(matches!(
-            lowerer.egraph.analysis.symbols.matrix_constants.values.as_slice(),
-            [
-                super::super::identity::MatrixConstantSpec {
-                    value: super::super::identity::MatrixConstantValue::Identity,
-                    ..
-                },
-                super::super::identity::MatrixConstantSpec {
-                    value: super::super::identity::MatrixConstantValue::UnitRow { .. },
-                    ..
-                },
-                super::super::identity::MatrixConstantSpec {
-                    value: super::super::identity::MatrixConstantValue::UnitColumn { .. },
-                    ..
-                },
-                super::super::identity::MatrixConstantSpec {
-                    value: super::super::identity::MatrixConstantValue::Gadget { small: true, .. },
-                    ..
-                },
-                super::super::identity::MatrixConstantSpec {
-                    value: super::super::identity::MatrixConstantValue::PowerOfBase { .. },
-                    ..
-                },
-                super::super::identity::MatrixConstantSpec {
-                    value: super::super::identity::MatrixConstantValue::Rotation { .. },
-                    ..
-                },
-                super::super::identity::MatrixConstantSpec {
-                    value: super::super::identity::MatrixConstantValue::Polynomial { .. },
-                    ..
-                },
-            ]
-        ));
     }
 
     #[test]

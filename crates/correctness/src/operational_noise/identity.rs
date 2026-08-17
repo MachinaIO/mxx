@@ -484,6 +484,11 @@ pub struct TrapdoorIdentity {
     pub source: TrapdoorSourceKey,
     pub indices: Box<[egg::Id]>,
     pub matrix_type: ResolvedMatrixType,
+    /// Descriptor-only reference to the public matrix input.  This remains an
+    /// e-graph ID solely because trapdoor metadata is still consumed by the
+    /// scalar-era relation/bound interfaces; it is never a matrix carrier or
+    /// a lowering result.  Migrating this field to a typed canonical matrix
+    /// identity is the next identity-slice boundary.
     pub public: egg::Id,
     pub sigma_bits: u64,
     pub gadget_base: ResolvedIntExpr,

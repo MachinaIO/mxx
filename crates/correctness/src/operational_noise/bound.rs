@@ -9,7 +9,7 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Zero};
 
 /// Whether a matrix has a numeric centered-coefficient bound.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum BoundClass {
     ExactZero,
     Bounded { maximum_absolute_coefficient: BigUint },

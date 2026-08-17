@@ -6,7 +6,7 @@
 //! the sole owner of compact job-local IDs; no lowering cache is an identity
 //! authority.
 
-use super::{analysis::MxxSort, normal_form::FactorIdentity};
+use super::{normal_form::FactorIdentity, scalar::ScalarSort};
 use crate::{ProtocolInputId, StageId};
 #[cfg(test)]
 use mxx_ir_core::Port;
@@ -156,7 +156,7 @@ pub enum AtomicRelationRole {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct AtomicSourceDescriptor {
     pub key: AtomicSourceKey,
-    pub sort: MxxSort,
+    pub sort: ScalarSort,
     pub integer_domain: Option<IntegerSourceDomain>,
     pub canonical_residue_convention: Option<CanonicalResidueConvention>,
     pub relation_role: Option<AtomicRelationRole>,
@@ -843,21 +843,21 @@ mod tests {
         let mut interner = Interner::default();
         let first = interner.intern(AtomicSourceDescriptor {
             key: AtomicSourceKey::ProtocolInput(ProtocolInputId::from("key")),
-            sort: MxxSort::Int,
+            sort: ScalarSort::Int,
             integer_domain: Some(IntegerSourceDomain { minimum: 0.into(), maximum: 7.into() }),
             canonical_residue_convention: None,
             relation_role: None,
         });
         let second = interner.intern(AtomicSourceDescriptor {
             key: AtomicSourceKey::ProtocolInput(ProtocolInputId::from("key")),
-            sort: MxxSort::Int,
+            sort: ScalarSort::Int,
             integer_domain: Some(IntegerSourceDomain { minimum: 0.into(), maximum: 7.into() }),
             canonical_residue_convention: None,
             relation_role: None,
         });
         let third = interner.intern(AtomicSourceDescriptor {
             key: AtomicSourceKey::ProtocolInput(ProtocolInputId::from("other")),
-            sort: MxxSort::Int,
+            sort: ScalarSort::Int,
             integer_domain: Some(IntegerSourceDomain { minimum: 0.into(), maximum: 7.into() }),
             canonical_residue_convention: None,
             relation_role: None,

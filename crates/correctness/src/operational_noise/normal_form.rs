@@ -93,6 +93,15 @@ pub enum FactorKind {
     Test(Box<str>),
 }
 
+/// Typed identity of one plain-hash argument. Finite summaries remain value
+/// contracts rather than being converted to debug text.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum HashPlainArgumentIdentity {
+    Exact(FactorIdentity),
+    Bounded { matrix_type: ConcreteMatrixType, coefficient_class: BoundClass },
+    ExactZero,
+}
+
 /// The owner of a factor.  All production variants are existing typed
 /// identity components; the named variant exists only for unit fixtures.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -103,6 +112,13 @@ pub enum FactorOwner {
     /// deliberately does not mention the graph output node that materialized
     /// the selector, so equal selectors share one barrier identity.
     Scalar(ResolvedIntExpr),
+    /// A plain hash query together with its ordered, canonical scalar input
+    /// identities.  The query and argument identities are part of the key;
+    /// no compact arena ID or debug rendering is persistent identity.
+    HashPlain {
+        query: Box<FactorIdentity>,
+        arguments: Box<[HashPlainArgumentIdentity]>,
+    },
     Derived {
         parent: Box<FactorIdentity>,
         tag: Box<[u8]>,

@@ -373,7 +373,7 @@ impl<'a> SimulationControl<'a> {
 
 /// Checks one closed protocol candidate using production lowering, normal-form
 /// normalization, and bound validation. Unsupported graph facts remain typed
-/// errors; this entry point has no legacy or heuristic fallback.
+/// errors; this entry point has no compatibility or heuristic fallback.
 pub fn check_operational_noise_candidate(
     protocol: &ProtocolDecl,
     request: &super::OperationalCheckRequest,
@@ -495,13 +495,13 @@ pub fn check_operational_noise_candidate_with_progress(
             control.work(
                 lowerer.lowered_wire_count() as u64,
                 None,
-                Some(lowerer.egraph.total_size() as u64),
+                Some(lowerer.scalar_store_len() as u64),
             )?;
             control.diagnostics_mut().lowered_term_count = lowerer.lowered_wire_count() as u64;
             let roots = match value {
                 LoweredValue::Matrix(root) => LoweredRootSet::Dag(root),
                 LoweredValue::MatrixFamily(family) => LoweredRootSet::MatrixFamily(family),
-                LoweredValue::Term(_) | LoweredValue::Scalar(_) | LoweredValue::Family(_) => {
+                LoweredValue::Scalar(_) | LoweredValue::Family(_) => {
                     // Scalar lowering remains available to resolve selectors, loop domains, and
                     // matrix metadata, but a residual accepted by this checker must be a matrix
                     // expression DAG (or a matrix family backed by that DAG).  In particular,

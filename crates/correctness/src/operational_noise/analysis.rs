@@ -29,26 +29,8 @@ use std::{
     },
 };
 
-/// The complete sort carried by every checker e-class.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum MxxSort {
-    Int,
-    Bool,
-    Real,
-    Bytes(ResolvedIntExpr),
-    TypedBlob { type_name: String, schema_hash: [u8; 32] },
-    Matrix(ResolvedMatrixType),
-}
-
-impl MxxSort {
-    pub const fn is_scalar(&self) -> bool {
-        matches!(self, Self::Int | Self::Bool | Self::Real)
-    }
-
-    pub const fn permits_scalar_provenance(&self) -> bool {
-        matches!(self, Self::Int | Self::Bool)
-    }
-}
+/// The scalar sort vocabulary is shared with the typed lowering arena.
+pub type MxxSort = super::scalar::ScalarSort;
 
 /// A closed inclusive integer interval.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]

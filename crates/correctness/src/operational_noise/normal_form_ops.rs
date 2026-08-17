@@ -8,8 +8,9 @@ use super::{
     bound::{BoundClass, MatrixBound, MatrixMetadata, ResolvedMatrixConstant, gadget_matrix_bound},
     identity::{Axis, CrtSpec, ResolvedIndexRange, ResolvedIntExpr, SliceSpec},
     normal_form::{
-        BoundedSummary, FactorIdentity, FactorOwner, Monomial, NormalFormError, PolynomialNF,
-        SymbolicFactor, monomial_bound, scale_by_multiplicity, summary_from_bound,
+        BoundedSummary, FactorIdentity, FactorOwner, HashPlainArgumentIdentity, Monomial,
+        NormalFormError, PolynomialNF, SymbolicFactor, monomial_bound, scale_by_multiplicity,
+        summary_from_bound,
     },
 };
 use mxx_ir_core::types::ConcreteMatrixType;
@@ -590,16 +591,33 @@ impl AdditionalOperations for PolynomialNF {
         if output_type.rows == 0 || output_type.columns == 0 || output_type.modulus.is_zero() {
             return Err(OperationError::InvalidHash);
         }
+        let argument_keys = arguments
+            .iter()
+            .map(|argument| {
+                let mut terms = argument.exact_terms().values();
+                if let Some(term) = terms.next() {
+                    if terms.next().is_some() ||
+                        term.multiplicity != BigInt::from(1_u8) ||
+                        !argument.bounded_summary().is_exact_zero() ||
+                        term.monomial.factors().len() != 1
+                    {
+                        return Err(OperationError::InvalidHash);
+                    }
+                    return Ok(HashPlainArgumentIdentity::Exact(
+                        term.monomial.factors()[0].key.clone(),
+                    ));
+                }
+                match argument.bounded_summary() {
+                    BoundedSummary::ExactZero => Ok(HashPlainArgumentIdentity::ExactZero),
+                    BoundedSummary::Bounded(bound) => Ok(HashPlainArgumentIdentity::Bounded {
+                        matrix_type: bound.matrix_type.clone(),
+                        coefficient_class: bound.coefficient_class.clone(),
+                    }),
+                }
+            })
+            .collect::<Result<Box<_>, _>>()?;
         let mut key = query.clone();
-        key.owner = FactorOwner::Derived {
-            parent: Box::new(query),
-            tag: format!(
-                "hash-plain:arguments={:?}",
-                arguments.iter().map(nf_fingerprint).collect::<Vec<_>>()
-            )
-            .into_bytes()
-            .into_boxed_slice(),
-        };
+        key.owner = FactorOwner::HashPlain { query: Box::new(query), arguments: argument_keys };
         match hard_range {
             Some(range) if range.is_zero() => Ok(PolynomialNF::zero()),
             Some(range) => {
@@ -1313,6 +1331,61 @@ mod tests {
             .unwrap()
             .first_large_witness()
             .is_some()
+        );
+    }
+
+    #[test]
+    fn plain_hash_identity_preserves_ordered_canonical_scalar_arguments() {
+        let query = FactorIdentity::named("query");
+        let scalar = |value: i64| {
+            PolynomialNF::exact_factor(FactorIdentity::scalar_selector(ResolvedIntExpr::Const(
+                value.into(),
+            )))
+        };
+        let first = PolynomialNF::hash_plain_nf(
+            query.clone(),
+            &[scalar(3), scalar(5)],
+            matrix_type(1, 1),
+            None,
+        )
+        .unwrap();
+        let equal = PolynomialNF::hash_plain_nf(
+            query.clone(),
+            &[scalar(3), scalar(5)],
+            matrix_type(1, 1),
+            None,
+        )
+        .unwrap();
+        let changed = PolynomialNF::hash_plain_nf(
+            query.clone(),
+            &[scalar(3), scalar(7)],
+            matrix_type(1, 1),
+            None,
+        )
+        .unwrap();
+        let reordered =
+            PolynomialNF::hash_plain_nf(query, &[scalar(5), scalar(3)], matrix_type(1, 1), None)
+                .unwrap();
+        assert_eq!(first.exact_terms(), equal.exact_terms());
+        assert_ne!(first.exact_terms(), changed.exact_terms());
+        assert_ne!(first.exact_terms(), reordered.exact_terms());
+        let key = first.exact_terms().keys().next().unwrap();
+        let arguments = match &key.factors()[0].owner {
+            FactorOwner::HashPlain { arguments, .. } => arguments,
+            owner => panic!("unexpected plain-hash owner: {owner:?}"),
+        };
+        assert_eq!(arguments.len(), 2);
+        assert_eq!(
+            arguments[0],
+            HashPlainArgumentIdentity::Exact(FactorIdentity::scalar_selector(
+                ResolvedIntExpr::Const(3.into()),
+            ))
+        );
+        assert_eq!(
+            arguments[1],
+            HashPlainArgumentIdentity::Exact(FactorIdentity::scalar_selector(
+                ResolvedIntExpr::Const(5.into()),
+            ))
         );
     }
 

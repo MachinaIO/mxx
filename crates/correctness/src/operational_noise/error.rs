@@ -8,6 +8,7 @@ use super::{
     analysis::MxxSort,
     identity::{AtomicSourceKey, BinderKey, OccurrenceFrame, ProgramKey, WireSourceKey},
     normal_form::NormalFormError,
+    scalar::ScalarId,
 };
 use crate::{
     OperationalDecoderKind, ProtocolInputId, StageId, StageInputName, TrapdoorContractMismatch,
@@ -268,7 +269,7 @@ operational_error_registry! {
         InvalidRoundDivDenominator { divisor: IntExpr },
         InvalidLog2CeilArgument { argument: IntExpr },
         IntervalOperationNotSupported { expression: IntExpr },
-        MissingIntegerAnalysis { term: egg::Id },
+        MissingIntegerAnalysis { term: ScalarId },
         InvalidFamilyCount { count: IntExpr },
         FamilyProducerNotResolved { family: WireRef },
         IncompatibleFamilyCoverage { expected: WireType, actual: WireType },

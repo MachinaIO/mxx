@@ -7,34 +7,31 @@
 //! omit only a suffix proved unreachable by the selector's authoritative interval.
 
 use super::{
-    analysis::{IntegerDomain, MxxAnalysis, MxxSort},
     identity::{
-        AtomicSourceDescriptor, AtomicSourceId, AtomicSourceKey, BinderId, BinderKey,
-        CanonicalTermIdentity, ResolvedIntExpr, SamplerDescriptorId, SamplerIdentity,
-        TrapdoorDescriptorId, TrapdoorIdentity, substitute_resolved_int_expr,
+        AtomicSourceDescriptor, AtomicSourceId, AtomicSourceKey, BinderKey, CanonicalTermIdentity,
+        ResolvedIntExpr, SamplerDescriptorId, SamplerIdentity, SymbolTables, TrapdoorDescriptorId,
+        TrapdoorIdentity,
     },
-    language::MxxLang,
     lower::LoweredInt,
     normal_form::FactorIdentity,
+    scalar::{IntegerDomain, ScalarId, ScalarNode, ScalarSort, ScalarStore},
 };
-use egg::{EGraph, Id, Language};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 /// Adds one runtime Switch, retaining every case through the authoritative
 /// maximum selector value. Invalid or unavailable selector facts preserve the
 /// complete physical case list for the owning validation path.
 pub(crate) fn add_runtime_switch(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    selector: Id,
-    cases: &[Id],
-) -> Id {
-    let selector = egraph.find(selector);
-    let retained = egraph[selector]
-        .data
-        .integer_domain
-        .as_ref()
+    store: &mut ScalarStore,
+    symbols: &SymbolTables,
+    selector: ScalarId,
+    cases: &[ScalarId],
+) -> Result<ScalarId, FamilyCoverageError> {
+    let retained = store
+        .facts(selector)
+        .and_then(|facts| facts.integer_domain.as_ref())
         .and_then(|domain| domain.interval().ok())
         .filter(|interval| interval.minimum >= BigInt::zero())
         .and_then(|interval| interval.maximum.to_usize())
@@ -42,8 +39,116 @@ pub(crate) fn add_runtime_switch(
         .unwrap_or(cases.len());
     let mut children = Vec::with_capacity(retained + 1);
     children.push(selector);
-    children.extend(cases[..retained].iter().map(|case| egraph.find(*case)));
-    egraph.add(MxxLang::Switch(children.into_boxed_slice()))
+    children.extend_from_slice(&cases[..retained]);
+    store
+        .intern_node(
+            ScalarNode::Switch(children.into_boxed_slice()),
+            ResolvedIntExpr::Const(BigInt::zero()),
+            symbols,
+        )
+        .map_err(|_| FamilyCoverageError::ScalarConstructionFailed)
+}
+
+/// Performs binder substitution over a resolved identity without recursive descent.
+fn substitute_resolved_iterative(
+    value: &ResolvedIntExpr,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> ResolvedIntExpr {
+    enum Visit<'a> {
+        Enter(&'a ResolvedIntExpr),
+        Exit(&'a ResolvedIntExpr),
+    }
+    let mut completed = HashMap::<usize, ResolvedIntExpr>::new();
+    let mut work = vec![Visit::Enter(value)];
+    while let Some(visit) = work.pop() {
+        let (key, expression) = match visit {
+            Visit::Enter(expression) => {
+                let key = expression as *const ResolvedIntExpr as usize;
+                if completed.contains_key(&key) {
+                    continue;
+                }
+                if let ResolvedIntExpr::Binder(candidate) = expression {
+                    completed.insert(
+                        key,
+                        if candidate == binder { replacement.clone() } else { expression.clone() },
+                    );
+                    continue;
+                }
+                work.push(Visit::Exit(expression));
+                match expression {
+                    ResolvedIntExpr::Source { coordinates, .. } => {
+                        work.extend(coordinates.iter().rev().map(Visit::Enter))
+                    }
+                    ResolvedIntExpr::Add(left, right) |
+                    ResolvedIntExpr::Sub(left, right) |
+                    ResolvedIntExpr::Mul(left, right) |
+                    ResolvedIntExpr::Div(left, right) |
+                    ResolvedIntExpr::EuclideanDiv(left, right) |
+                    ResolvedIntExpr::EuclideanRemainder(left, right) |
+                    ResolvedIntExpr::RoundDiv(left, right) => {
+                        work.push(Visit::Enter(right));
+                        work.push(Visit::Enter(left));
+                    }
+                    ResolvedIntExpr::Log2Ceil(input) => work.push(Visit::Enter(input)),
+                    ResolvedIntExpr::ExtractCoefficient { input, position, .. } => {
+                        work.push(Visit::Enter(position));
+                        work.push(Visit::Enter(input));
+                    }
+                    ResolvedIntExpr::Const(_) | ResolvedIntExpr::Parameter(_) => {}
+                    ResolvedIntExpr::Binder(_) => unreachable!(),
+                }
+                continue;
+            }
+            Visit::Exit(expression) => (expression as *const ResolvedIntExpr as usize, expression),
+        };
+        let child = |child: &ResolvedIntExpr| {
+            completed
+                .get(&(child as *const ResolvedIntExpr as usize))
+                .cloned()
+                .expect("identity child")
+        };
+        let rebuilt = match expression {
+            ResolvedIntExpr::Source { source, coordinates } => ResolvedIntExpr::Source {
+                source: source.clone(),
+                coordinates: coordinates.iter().map(child).collect(),
+            },
+            ResolvedIntExpr::Add(left, right) => {
+                ResolvedIntExpr::Add(Box::new(child(left)), Box::new(child(right)))
+            }
+            ResolvedIntExpr::Sub(left, right) => {
+                ResolvedIntExpr::Sub(Box::new(child(left)), Box::new(child(right)))
+            }
+            ResolvedIntExpr::Mul(left, right) => {
+                ResolvedIntExpr::Mul(Box::new(child(left)), Box::new(child(right)))
+            }
+            ResolvedIntExpr::Div(left, right) => {
+                ResolvedIntExpr::Div(Box::new(child(left)), Box::new(child(right)))
+            }
+            ResolvedIntExpr::EuclideanDiv(left, right) => {
+                ResolvedIntExpr::EuclideanDiv(Box::new(child(left)), Box::new(child(right)))
+            }
+            ResolvedIntExpr::EuclideanRemainder(left, right) => {
+                ResolvedIntExpr::EuclideanRemainder(Box::new(child(left)), Box::new(child(right)))
+            }
+            ResolvedIntExpr::RoundDiv(left, right) => {
+                ResolvedIntExpr::RoundDiv(Box::new(child(left)), Box::new(child(right)))
+            }
+            ResolvedIntExpr::Log2Ceil(input) => ResolvedIntExpr::Log2Ceil(Box::new(child(input))),
+            ResolvedIntExpr::ExtractCoefficient { input, position, canonical_exclusive_upper } => {
+                ResolvedIntExpr::ExtractCoefficient {
+                    input: Box::new(child(input)),
+                    position: Box::new(child(position)),
+                    canonical_exclusive_upper: canonical_exclusive_upper.clone(),
+                }
+            }
+            ResolvedIntExpr::Const(_) |
+            ResolvedIntExpr::Parameter(_) |
+            ResolvedIntExpr::Binder(_) => expression.clone(),
+        };
+        completed.insert(key, rebuilt);
+    }
+    completed.remove(&(value as *const ResolvedIntExpr as usize)).expect("identity root")
 }
 
 /// The owner of a parallel-loop logical count.  Output ports are deliberately
@@ -64,7 +169,7 @@ pub struct CoverageBinderDomain {
 
 /// The only two compact representations of a supported operational family.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FamilyCoverageStorage<T = Id> {
+pub enum FamilyCoverageStorage<T = ScalarId> {
     /// Physical element references present in the Graph IR or manifest.
     ExactStored { elements: Box<[T]> },
     /// One symbolic representative over every binder in `binder_domains`.
@@ -77,8 +182,8 @@ pub enum FamilyCoverageStorage<T = Id> {
 
 /// A family residual together with its single closed element sort.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FamilyLoweringValue<T = Id> {
-    pub element_type: MxxSort,
+pub struct FamilyLoweringValue<T = ScalarId> {
+    pub element_type: ScalarSort,
     pub storage: FamilyCoverageStorage<T>,
 }
 
@@ -91,8 +196,9 @@ pub enum FamilyCoverageError {
     SharedCountMismatch { count: BigUint, domain_size: BigUint },
     StaticIndexOutOfRange { index: BigInt, count: BigUint },
     DynamicIndexOutOfRange { minimum: BigInt, maximum: BigInt, count: BigUint },
-    ElementTypeMismatch { expected: MxxSort, actual: MxxSort },
+    ElementTypeMismatch { expected: ScalarSort, actual: ScalarSort },
     StorageMismatch,
+    ScalarConstructionFailed,
     SelectorCaseCountMismatch { expected: usize, actual: usize },
     NonAffineSharedMaximum,
 }
@@ -237,20 +343,30 @@ where
     })
 }
 
-/// Builds one ordered physical `Switch`.  Its work is linear in physical
-/// cases and never in a symbolic template's logical count.
+/// Builds one ordered physical `Switch`. Its work is linear in stored cases.
 pub fn dynamic_get(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    family: &FamilyLoweringValue<Id>,
-    selector: Id,
-) -> Result<Id, FamilyCoverageError> {
+    store: &mut ScalarStore,
+    symbols: &SymbolTables,
+    family: &FamilyLoweringValue<ScalarId>,
+    selector: ScalarId,
+) -> Result<ScalarId, FamilyCoverageError> {
     let FamilyCoverageStorage::ExactStored { elements } = &family.storage else {
         return Err(FamilyCoverageError::StorageMismatch);
     };
     if elements.is_empty() {
         return Err(FamilyCoverageError::EmptyExactStorage);
     }
-    Ok(add_runtime_switch(egraph, selector, elements))
+    let count = BigUint::from(elements.len());
+    let index =
+        store.facts(selector).and_then(|facts| facts.integer_domain.as_ref()).ok_or_else(|| {
+            FamilyCoverageError::DynamicIndexOutOfRange {
+                minimum: BigInt::from(-1),
+                maximum: BigInt::from(-1),
+                count: count.clone(),
+            }
+        })?;
+    validate_family_index(index, &count)?;
+    add_runtime_switch(store, symbols, selector, elements)
 }
 
 /// Resolves an element without enumerating a shared template.  The lowerer is
@@ -264,106 +380,6 @@ pub fn shared_element<T>(
     Ok((representative, domain, binders))
 }
 
-fn binder_key(egraph: &EGraph<MxxLang, MxxAnalysis>, binder: BinderId) -> BinderKey {
-    egraph
-        .analysis
-        .symbols
-        .binders
-        .get(binder.0)
-        .expect("every binder node has an interned descriptor")
-        .key
-        .clone()
-}
-
-fn canonical_replacement_identity(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    replacement: Id,
-) -> Option<ResolvedIntExpr> {
-    fn visit(
-        egraph: &EGraph<MxxLang, MxxAnalysis>,
-        term: Id,
-        active: &mut HashSet<Id>,
-    ) -> Option<ResolvedIntExpr> {
-        let term = egraph.find(term);
-        if !active.insert(term) {
-            return None;
-        }
-        let mut result = None;
-        for node in &egraph[term].nodes {
-            let identity = match node {
-                MxxLang::IntConst(value) => Some(ResolvedIntExpr::Const(value.clone())),
-                MxxLang::IntParameter(value) => Some(ResolvedIntExpr::Parameter(value.clone())),
-                MxxLang::IntBinder(BinderId(id)) => egraph
-                    .analysis
-                    .symbols
-                    .binders
-                    .get(*id)
-                    .map(|descriptor| ResolvedIntExpr::Binder(descriptor.key.clone())),
-                MxxLang::Atom { source, indices } => {
-                    let descriptor = egraph.analysis.symbols.atomic_sources.get(source.0)?;
-                    let coordinates = indices
-                        .iter()
-                        .map(|index| visit(egraph, *index, active))
-                        .collect::<Option<Box<_>>>()?;
-                    Some(ResolvedIntExpr::Source { source: descriptor.key.clone(), coordinates })
-                }
-                MxxLang::IntAdd([left, right]) => {
-                    binary(egraph, *left, *right, active, ResolvedIntExpr::Add)
-                }
-                MxxLang::IntSub([left, right]) => {
-                    binary(egraph, *left, *right, active, ResolvedIntExpr::Sub)
-                }
-                MxxLang::IntMul([left, right]) => {
-                    binary(egraph, *left, *right, active, ResolvedIntExpr::Mul)
-                }
-                MxxLang::IntExactDiv([left, right]) => {
-                    binary(egraph, *left, *right, active, ResolvedIntExpr::Div)
-                }
-                MxxLang::IntEuclideanDiv([left, right]) => {
-                    binary(egraph, *left, *right, active, ResolvedIntExpr::EuclideanDiv)
-                }
-                MxxLang::IntEuclideanRemainder([left, right]) => {
-                    binary(egraph, *left, *right, active, ResolvedIntExpr::EuclideanRemainder)
-                }
-                MxxLang::IntRoundDiv([left, right]) => {
-                    binary(egraph, *left, *right, active, ResolvedIntExpr::RoundDiv)
-                }
-                MxxLang::IntLog2Ceil([input]) => {
-                    Some(ResolvedIntExpr::Log2Ceil(Box::new(visit(egraph, *input, active)?)))
-                }
-                MxxLang::ExtractCoefficient {
-                    canonical_exclusive_upper,
-                    input: [input, position],
-                } => Some(ResolvedIntExpr::ExtractCoefficient {
-                    input: Box::new(visit(egraph, *input, active)?),
-                    position: Box::new(visit(egraph, *position, active)?),
-                    canonical_exclusive_upper: canonical_exclusive_upper.clone(),
-                }),
-                _ => None,
-            }?;
-            if result.as_ref().is_some_and(|previous| previous != &identity) {
-                active.remove(&term);
-                return None;
-            }
-            result = Some(identity);
-        }
-        active.remove(&term);
-        result
-    }
-
-    fn binary(
-        egraph: &EGraph<MxxLang, MxxAnalysis>,
-        left: Id,
-        right: Id,
-        active: &mut HashSet<Id>,
-        make: fn(Box<ResolvedIntExpr>, Box<ResolvedIntExpr>) -> ResolvedIntExpr,
-    ) -> Option<ResolvedIntExpr> {
-        Some(make(Box::new(visit(egraph, left, active)?), Box::new(visit(egraph, right, active)?)))
-    }
-
-    visit(egraph, replacement, &mut HashSet::new())
-}
-
 fn substitute_indices(
     indices: &[ResolvedIntExpr],
     binder: &BinderKey,
@@ -372,7 +388,7 @@ fn substitute_indices(
     let Some(replacement) = replacement else {
         return indices.to_vec().into_boxed_slice();
     };
-    indices.iter().map(|index| substitute_resolved_int_expr(index, binder, replacement)).collect()
+    indices.iter().map(|index| substitute_resolved_iterative(index, binder, replacement)).collect()
 }
 
 fn substitute_canonical_identity(
@@ -389,7 +405,7 @@ fn substitute_canonical_identity(
                 .coordinates
                 .iter()
                 .map(|(owner, value)| {
-                    (owner.clone(), substitute_resolved_int_expr(value, binder, replacement))
+                    (owner.clone(), substitute_resolved_iterative(value, binder, replacement))
                 })
                 .collect(),
             ..factor.clone()
@@ -403,15 +419,13 @@ fn substitute_canonical_identity(
 
 fn substitute_sampler_identity(
     sampler: &SamplerIdentity,
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    binder: BinderId,
+    binder: &BinderKey,
     replacement: Option<&ResolvedIntExpr>,
 ) -> SamplerIdentity {
-    let binder = binder_key(egraph, binder);
     let map = |value: &ResolvedIntExpr| {
         replacement.map_or_else(
             || value.clone(),
-            |replacement| substitute_resolved_int_expr(value, &binder, replacement),
+            |replacement| substitute_resolved_iterative(value, &binder, replacement),
         )
     };
     match sampler {
@@ -500,22 +514,20 @@ fn replace_sampler_trapdoor(
 
 fn substitute_trapdoor_identity(
     trapdoor: &TrapdoorIdentity,
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    binder: BinderId,
+    binder: &BinderKey,
     replacement: Option<&ResolvedIntExpr>,
 ) -> TrapdoorIdentity {
-    let binder_key = binder_key(egraph, binder);
     let map = |value: &ResolvedIntExpr| {
         replacement.map_or_else(
             || value.clone(),
-            |replacement| substitute_resolved_int_expr(value, &binder_key, replacement),
+            |replacement| substitute_resolved_iterative(value, binder, replacement),
         )
     };
     TrapdoorIdentity {
         source: trapdoor.source.clone(),
-        indices: substitute_indices(&trapdoor.indices, &binder_key, replacement),
+        indices: substitute_indices(&trapdoor.indices, binder, replacement),
         matrix_type: trapdoor.matrix_type.clone(),
-        public: substitute_canonical_identity(&trapdoor.public, &binder_key, replacement),
+        public: substitute_canonical_identity(&trapdoor.public, binder, replacement),
         sigma_bits: trapdoor.sigma_bits,
         gadget_base: map(&trapdoor.gadget_base),
         digit_count: map(&trapdoor.digit_count),
@@ -524,98 +536,43 @@ fn substitute_trapdoor_identity(
 }
 
 /// Instantiates one shared representative by replacing only its owning binder.
-/// Other binder nodes are retained, so nested independent domains stay symbolic.
+/// The explicit postorder walk keeps nested independent binders symbolic and
+/// never materializes a logical family lane.
 pub fn instantiate_shared_element<E>(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    representative: Id,
-    binder: BinderId,
-    replacement: Id,
-    progress: &mut dyn FnMut() -> Result<(), E>,
-) -> Result<Id, E> {
-    instantiate_shared_element_with_identity(
-        egraph,
-        representative,
-        binder,
-        replacement,
-        None,
-        progress,
-    )
-}
-
-/// Instantiates one shared representative using the lowerer's canonical
-/// scalar identity for the replacement.  The identity is supplied outside
-/// this structural copying routine so descriptor substitution never depends
-/// on an arbitrary e-class representative enode.
-pub fn instantiate_shared_element_with_identity<E>(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    representative: Id,
-    binder: BinderId,
-    replacement: Id,
+    store: &mut ScalarStore,
+    symbols: &mut SymbolTables,
+    representative: ScalarId,
+    binder: &BinderKey,
+    replacement: ScalarId,
     stable_replacement: Option<ResolvedIntExpr>,
     progress: &mut dyn FnMut() -> Result<(), E>,
-) -> Result<Id, E> {
-    let stable_replacement =
-        stable_replacement.or_else(|| canonical_replacement_identity(egraph, replacement));
-    // Snapshot exactly one raw representative per reachable e-class before
-    // adding anything. Sampler and trapdoor records hold extra e-class edges,
-    // so their complete descriptor closure belongs to the same snapshot.
-    let mut nodes = std::collections::HashMap::<Id, MxxLang>::new();
-    let mut source_descriptors =
-        std::collections::HashMap::<AtomicSourceId, AtomicSourceDescriptor>::new();
-    let mut samplers = std::collections::HashMap::<SamplerDescriptorId, SamplerIdentity>::new();
-    let mut trapdoors = std::collections::HashMap::<TrapdoorDescriptorId, TrapdoorIdentity>::new();
+) -> Result<ScalarId, E> {
+    let stable_replacement = stable_replacement.or_else(|| store.identity(replacement).cloned());
+    let mut nodes = HashMap::<ScalarId, ScalarNode>::new();
+    let mut identities = HashMap::<ScalarId, ResolvedIntExpr>::new();
     let mut pending = vec![representative];
     while let Some(id) = pending.pop() {
-        if nodes.contains_key(&id) {
+        if nodes.contains_key(&id) || id == replacement {
             continue;
         }
         progress()?;
-        let node = egraph.id_to_node(id).clone();
-        pending.extend(node.children().iter().copied());
-        if let MxxLang::Atom { source, .. } = &node {
-            let descriptor = egraph
-                .analysis
-                .symbols
-                .atomic_sources
-                .get(source.0)
-                .expect("every Atom source is interned")
-                .clone();
-            match &descriptor.key {
-                AtomicSourceKey::Sampler(sampler_id) => {
-                    let sampler = egraph
-                        .analysis
-                        .symbols
-                        .samplers
-                        .get(sampler_id.0)
-                        .expect("every sampler Atom has an interned descriptor")
-                        .clone();
-                    // Canonical sampler metadata is no longer an e-graph
-                    // edge closure.  Its ordered indices and operands are
-                    // typed identities, so only ordinary MxxLang children
-                    // belong to this structural copy walk.
-                    if let SamplerIdentity::Preimage { trapdoor, .. } = &sampler {
-                        if let Some(descriptor) = egraph.analysis.symbols.trapdoors.get(trapdoor.0)
-                        {
-                            trapdoors.insert(*trapdoor, descriptor.clone());
-                        }
-                    }
-                    samplers.insert(*sampler_id, sampler);
-                }
-                _ => {}
-            }
-            source_descriptors.insert(*source, descriptor);
-        }
+        let node = store.node(id).cloned().ok_or_else(|| panic!("missing scalar node"));
+        let node = match node {
+            Ok(node) => node,
+            Err(panic) => panic,
+        };
+        pending.extend(store.children(id).unwrap_or_default().into_vec());
+        identities.insert(
+            id,
+            store.identity(id).cloned().unwrap_or(ResolvedIntExpr::Const(BigInt::zero())),
+        );
         nodes.insert(id, node);
     }
-
     enum Visit {
-        Enter(Id),
-        Exit(Id),
+        Enter(ScalarId),
+        Exit(ScalarId),
     }
-    // Replacement is already an e-class in this e-graph.  Treat it as an
-    // opaque leaf: copying it would both duplicate work and accidentally
-    // substitute owner binders that are intentionally inside its value.
-    let mut completed = std::collections::HashMap::<Id, Id>::from([(replacement, replacement)]);
+    let mut completed = HashMap::from([(replacement, replacement)]);
     let mut work = vec![Visit::Enter(representative)];
     while let Some(visit) = work.pop() {
         let id = match visit {
@@ -623,14 +580,16 @@ pub fn instantiate_shared_element_with_identity<E>(
                 if completed.contains_key(&id) {
                     continue;
                 }
-                if matches!(nodes[&id], MxxLang::IntBinder(candidate) if candidate == binder) {
+                if matches!(nodes.get(&id), Some(ScalarNode::IntBinder(candidate)) if candidate == binder)
+                {
                     completed.insert(id, replacement);
                     continue;
                 }
                 work.push(Visit::Exit(id));
-                let node = &nodes[&id];
-                for child in node.children().iter().rev() {
-                    work.push(Visit::Enter(*child));
+                for child in store.children(id).unwrap_or_default().iter().rev() {
+                    if !completed.contains_key(child) {
+                        work.push(Visit::Enter(*child));
+                    }
                 }
                 continue;
             }
@@ -640,84 +599,153 @@ pub fn instantiate_shared_element_with_identity<E>(
             continue;
         }
         progress()?;
-        let node = &nodes[&id];
-        let remap = |term| completed[&term];
-        let rebuilt = if let MxxLang::Atom { source, .. } = node &&
-            let Some(descriptor) = source_descriptors.get(source) &&
-            let AtomicSourceKey::Sampler(sampler_id) = descriptor.key
-        {
-            let sampler = substitute_sampler_identity(
-                &samplers[&sampler_id],
-                egraph,
-                binder,
-                stable_replacement.as_ref(),
-            );
-            let sampler = match sampler {
-                SamplerIdentity::Preimage { trapdoor, .. } => {
-                    let descriptor = trapdoors[&trapdoor].clone();
-                    let descriptor = substitute_trapdoor_identity(
-                        &descriptor,
-                        egraph,
-                        binder,
-                        stable_replacement.as_ref(),
-                    );
-                    let trapdoor =
-                        TrapdoorDescriptorId(egraph.analysis.symbols.trapdoors.intern(descriptor));
-                    replace_sampler_trapdoor(sampler, trapdoor)
-                }
-                sampler => sampler,
-            };
-            let sampler = egraph.analysis.symbols.samplers.intern(sampler);
-            let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
-                key: AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)),
-                ..descriptor.clone()
-            });
-            let MxxLang::Atom { indices, .. } = node else {
-                unreachable!("sampler descriptor branch only handles atoms")
-            };
-            egraph.add(MxxLang::Atom {
-                source: AtomicSourceId(source),
-                indices: indices.iter().map(|term| remap(*term)).collect(),
-            })
-        } else if let MxxLang::Switch(children) = node {
-            let remapped = children.iter().map(|term| remap(*term)).collect::<Vec<_>>();
-            let (selector, cases) =
-                remapped.split_first().expect("stored Switch nodes have a selector");
-            // A substituted exact selector has the ordinary runtime Switch
-            // meaning: select its zero-based case instead of retaining every
-            // unreachable branch in the instantiated representative.
-            match egraph[egraph.find(*selector)]
-                .data
-                .integer_domain
-                .as_ref()
-                .and_then(|domain| match domain {
-                    IntegerDomain::Exact(value) => Some(value),
-                    IntegerDomain::Affine { .. } | IntegerDomain::IntervalOnly(_) => None,
-                })
+        let node = nodes.get(&id).expect("snapshotted scalar node");
+        let remap = |child: ScalarId| *completed.get(&child).expect("postorder child");
+        if let ScalarNode::Switch(children) = node {
+            let remapped = children.iter().map(|child| remap(*child)).collect::<Vec<_>>();
+            if let Some(index) = store
+                .facts(remapped[0])
+                .and_then(|facts| facts.integer_domain.as_ref())
+                .and_then(|domain| domain.exact_value())
                 .and_then(|value| value.to_usize())
-                .and_then(|index| cases.get(index))
+                .and_then(|index| remapped.get(index + 1).copied())
             {
-                Some(selected) => *selected,
-                // An out-of-range exact selector cannot be selected safely.
-                // Keep the invalid Switch structural so the owning generic
-                // validation path rejects it rather than guessing a branch.
-                None => add_runtime_switch(egraph, *selector, cases),
+                completed.insert(id, index);
+                continue;
             }
-        } else {
-            egraph.add(node.clone().map_children(remap))
+        }
+        let rebuilt = remap_scalar_node(node, &remap, binder, stable_replacement.as_ref(), symbols);
+        let identity = stable_replacement.as_ref().map_or_else(
+            || identities.get(&id).expect("snapshotted scalar identity").clone(),
+            |replacement| {
+                substitute_resolved_iterative(
+                    identities.get(&id).expect("snapshotted scalar identity"),
+                    binder,
+                    replacement,
+                )
+            },
+        );
+        let identity = match (rebuilt.as_ref(), identity) {
+            (
+                Some(ScalarNode::Source { source, .. }),
+                ResolvedIntExpr::Source { source: old_source, coordinates },
+            ) => {
+                if let Some(descriptor) = symbols.atomic_sources.get(source.0) {
+                    ResolvedIntExpr::Source { source: descriptor.key.clone(), coordinates }
+                } else {
+                    ResolvedIntExpr::Source { source: old_source, coordinates }
+                }
+            }
+            (_, identity) => identity,
         };
+        let rebuilt = match rebuilt {
+            Some(node) => store
+                .intern_node(node, identity, symbols)
+                .map_err(|_| panic!("scalar transfer failed")),
+            None => Ok(replacement),
+        }?;
         completed.insert(id, rebuilt);
     }
-    Ok(completed[&representative])
+    Ok(*completed.get(&representative).expect("representative completed"))
 }
 
-/// Selects a compact family.  Exact storage evaluates only stored references;
-/// template storage combines representatives pointwise under one selector.
+fn remap_scalar_node(
+    node: &ScalarNode,
+    remap: &impl Fn(ScalarId) -> ScalarId,
+    binder: &BinderKey,
+    replacement: Option<&ResolvedIntExpr>,
+    symbols: &mut SymbolTables,
+) -> Option<ScalarNode> {
+    let map2 = |ids: &[ScalarId; 2]| [remap(ids[0]), remap(ids[1])];
+    let map1 = |ids: &[ScalarId; 1]| [remap(ids[0])];
+    Some(match node {
+        ScalarNode::Source { source, indices } => ScalarNode::Source {
+            source: substitute_source(*source, binder, replacement, symbols),
+            indices: indices.iter().map(|id| remap(*id)).collect(),
+        },
+        ScalarNode::IntConst(value) => ScalarNode::IntConst(value.clone()),
+        ScalarNode::IntParameter(value) => ScalarNode::IntParameter(value.clone()),
+        ScalarNode::IntBinder(value) => ScalarNode::IntBinder(value.clone()),
+        ScalarNode::IntAdd(ids) => ScalarNode::IntAdd(map2(ids)),
+        ScalarNode::IntSub(ids) => ScalarNode::IntSub(map2(ids)),
+        ScalarNode::IntMul(ids) => ScalarNode::IntMul(map2(ids)),
+        ScalarNode::IntExactDiv(ids) => ScalarNode::IntExactDiv(map2(ids)),
+        ScalarNode::IntEuclideanDiv(ids) => ScalarNode::IntEuclideanDiv(map2(ids)),
+        ScalarNode::IntEuclideanRemainder(ids) => ScalarNode::IntEuclideanRemainder(map2(ids)),
+        ScalarNode::IntRoundDiv(ids) => ScalarNode::IntRoundDiv(map2(ids)),
+        ScalarNode::IntLog2Ceil(ids) => ScalarNode::IntLog2Ceil(map1(ids)),
+        ScalarNode::BoolConst(value) => ScalarNode::BoolConst(*value),
+        ScalarNode::IntEqual(ids) => ScalarNode::IntEqual(map2(ids)),
+        ScalarNode::IntLess(ids) => ScalarNode::IntLess(map2(ids)),
+        ScalarNode::IntLessEqual(ids) => ScalarNode::IntLessEqual(map2(ids)),
+        ScalarNode::BitExtract { bit, input } => ScalarNode::BitExtract {
+            bit: replacement.map_or_else(
+                || bit.clone(),
+                |replacement| substitute_resolved_iterative(bit, binder, replacement),
+            ),
+            input: map1(input),
+        },
+        ScalarNode::BoolToInt(ids) => ScalarNode::BoolToInt(map1(ids)),
+        ScalarNode::RealConst(bits) => ScalarNode::RealConst(*bits),
+        ScalarNode::IntToReal(ids) => ScalarNode::IntToReal(map1(ids)),
+        ScalarNode::RealAdd(ids) => ScalarNode::RealAdd(map2(ids)),
+        ScalarNode::RealSub(ids) => ScalarNode::RealSub(map2(ids)),
+        ScalarNode::RealMul(ids) => ScalarNode::RealMul(map2(ids)),
+        ScalarNode::RealDiv(ids) => ScalarNode::RealDiv(map2(ids)),
+        ScalarNode::RealSqrt(ids) => ScalarNode::RealSqrt(map1(ids)),
+        ScalarNode::Switch(ids) => {
+            ScalarNode::Switch(ids.iter().map(|id| remap(*id)).collect::<Box<[_]>>())
+        }
+        ScalarNode::ExtractCoefficient { canonical_exclusive_upper, matrix, position } => {
+            ScalarNode::ExtractCoefficient {
+                canonical_exclusive_upper: canonical_exclusive_upper.clone(),
+                matrix: *matrix,
+                position: remap(*position),
+            }
+        }
+    })
+}
+
+fn substitute_source(
+    source: AtomicSourceId,
+    binder: &BinderKey,
+    replacement: Option<&ResolvedIntExpr>,
+    symbols: &mut SymbolTables,
+) -> AtomicSourceId {
+    let Some(descriptor) = symbols.atomic_sources.get(source.0).cloned() else {
+        return source;
+    };
+    let AtomicSourceKey::Sampler(sampler_id) = descriptor.key else {
+        return source;
+    };
+    let Some(mut sampler) = symbols.samplers.get(sampler_id.0).cloned() else {
+        return source;
+    };
+    if let SamplerIdentity::Preimage { trapdoor, .. } = &sampler {
+        if let Some(descriptor) = symbols.trapdoors.get(trapdoor.0).cloned() {
+            let descriptor = substitute_trapdoor_identity(&descriptor, binder, replacement);
+            let trapdoor = TrapdoorDescriptorId(symbols.trapdoors.intern(descriptor));
+            sampler = replace_sampler_trapdoor(sampler, trapdoor);
+        }
+    }
+    sampler = substitute_sampler_identity(&sampler, binder, replacement);
+    let sampler = SamplerDescriptorId(symbols.samplers.intern(sampler));
+    AtomicSourceId(
+        symbols.atomic_sources.intern(AtomicSourceDescriptor {
+            key: AtomicSourceKey::Sampler(sampler),
+            ..descriptor
+        }),
+    )
+}
+
+/// Selects a compact scalar family. Exact storage combines each physical lane
+/// pointwise; shared templates combine only their one representatives.
 pub fn select_family(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    selector: Id,
-    cases: &[FamilyLoweringValue],
-) -> Result<FamilyLoweringValue, FamilyCoverageError> {
+    store: &mut ScalarStore,
+    symbols: &SymbolTables,
+    selector: ScalarId,
+    cases: &[FamilyLoweringValue<ScalarId>],
+) -> Result<FamilyLoweringValue<ScalarId>, FamilyCoverageError> {
     let Some(first) = cases.first() else {
         return Err(FamilyCoverageError::SelectorCaseCountMismatch { expected: 1, actual: 0 });
     };
@@ -754,11 +782,11 @@ pub fn select_family(
                 let mut selected_cases = Vec::with_capacity(cases.len());
                 for case in cases {
                     let FamilyCoverageStorage::ExactStored { elements } = &case.storage else {
-                        unreachable!("storage shape was checked before e-graph mutation");
+                        unreachable!("storage shape was checked before scalar construction");
                     };
                     selected_cases.push(elements[lane]);
                 }
-                selected.push(add_runtime_switch(egraph, selector, &selected_cases));
+                selected.push(add_runtime_switch(store, symbols, selector, &selected_cases)?);
             }
             Ok(FamilyLoweringValue {
                 element_type: first.element_type.clone(),
@@ -787,7 +815,7 @@ pub fn select_family(
                 element_type: first.element_type.clone(),
                 storage: FamilyCoverageStorage::SharedTemplate {
                     domain: domain.clone(),
-                    representative: add_runtime_switch(egraph, selector, &selected_cases),
+                    representative: add_runtime_switch(store, symbols, selector, &selected_cases)?,
                     binder_domains: binder_domains.clone(),
                 },
             })
@@ -1113,438 +1141,149 @@ fn matrix_vector_product(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operational_noise::{
-        analysis::MxxAnalysis,
-        identity::{AtomicSourceDescriptor, BinderDescriptor, OccurrenceScope, ProgramKey},
-    };
+    use crate::operational_noise::identity::{BinderDescriptor, OccurrenceScope, ProgramKey};
 
-    fn evaluate(recurrence: &VectorRecurrence) -> Result<Box<[BigUint]>, RecurrenceFailure> {
-        recurrence.evaluate()
-    }
-
-    fn test_binder(analysis: &mut MxxAnalysis, node: u32) -> BinderId {
-        let scope = OccurrenceScope {
-            program: ProgramKey::Ideal,
-            definition: mxx_ir_core::FrozenGraphScopeId::Root,
-            path: Box::new([]),
-        };
-        BinderId(analysis.symbols.binders.intern(BinderDescriptor {
-            key: BinderKey {
-                loop_scope: scope,
-                loop_node: mxx_ir_core::NodeId(node.into()),
-                slot: 0,
+    fn binder(node: u32, slot: u32) -> BinderKey {
+        BinderKey {
+            loop_scope: OccurrenceScope {
+                program: ProgramKey::Ideal,
+                definition: mxx_ir_core::FrozenGraphScopeId::Root,
+                path: Box::new([]),
             },
-            minimum: 0.into(),
-            maximum: 7.into(),
-        }))
-    }
-
-    fn test_integer_selector(
-        egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-        name: &str,
-        minimum: BigInt,
-        maximum: BigInt,
-    ) -> Id {
-        let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
-            key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(name)),
-            sort: MxxSort::Int,
-            integer_domain: Some(super::super::identity::IntegerSourceDomain { minimum, maximum }),
-            canonical_residue_convention: None,
-            relation_role: None,
-        });
-        egraph.add(MxxLang::Atom { source: AtomicSourceId(source), indices: Box::new([]) })
-    }
-
-    #[test]
-    fn runtime_switch_trims_only_an_authoritative_unreachable_suffix() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let selector = test_integer_selector(&mut egraph, "range-01", 0.into(), 1.into());
-        let cases = [10, 20, 30, 40].map(|value| egraph.add(MxxLang::IntConst(value.into())));
-        let three = add_runtime_switch(&mut egraph, selector, &cases[..3]);
-        let four = add_runtime_switch(&mut egraph, selector, &cases);
-        assert_eq!(egraph.find(three), egraph.find(four));
-        assert!(matches!(egraph.id_to_node(three), MxxLang::Switch(children)
-            if children.as_ref() == [selector, cases[0], cases[1]]));
-        assert_eq!(
-            egraph[egraph.find(three)].data.integer_domain.as_ref().unwrap().interval().unwrap(),
-            super::super::analysis::IntegerInterval::new(10.into(), 20.into()).unwrap(),
-            "analysis sees exactly the retained reachable cases"
-        );
-
-        let shifted = test_integer_selector(&mut egraph, "range-12", 1.into(), 2.into());
-        let shifted_switch = add_runtime_switch(&mut egraph, shifted, &cases);
-        assert!(matches!(egraph.id_to_node(shifted_switch), MxxLang::Switch(children)
-            if children.as_ref() == [shifted, cases[0], cases[1], cases[2]]));
-    }
-
-    #[test]
-    fn runtime_switch_preserves_cases_without_a_valid_strict_upper_bound() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let cases = [10, 20].map(|value| egraph.add(MxxLang::IntConst(value.into())));
-        let selectors = [
-            test_integer_selector(&mut egraph, "negative", (-1).into(), 1.into()),
-            test_integer_selector(&mut egraph, "at-count", 0.into(), 2.into()),
-            test_integer_selector(
-                &mut egraph,
-                "unconvertible",
-                0.into(),
-                BigInt::from(BigUint::one() << (usize::BITS + 1)),
-            ),
-        ];
-        for selector in selectors {
-            let switched = add_runtime_switch(&mut egraph, selector, &cases);
-            assert!(matches!(egraph.id_to_node(switched), MxxLang::Switch(children)
-                if children.len() == cases.len() + 1));
+            loop_node: mxx_ir_core::NodeId(node.into()),
+            slot,
         }
+    }
 
-        let missing = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
-            key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from("missing-domain")),
-            sort: MxxSort::Int,
-            integer_domain: None,
-            canonical_residue_convention: None,
-            relation_role: None,
-        });
-        let missing =
-            egraph.add(MxxLang::Atom { source: AtomicSourceId(missing), indices: Box::new([]) });
-        let switched = add_runtime_switch(&mut egraph, missing, &cases);
-        assert!(matches!(egraph.id_to_node(switched), MxxLang::Switch(children)
-            if children.len() == cases.len() + 1));
+    fn int(store: &mut ScalarStore, symbols: &SymbolTables, value: i64) -> ScalarId {
+        store
+            .intern_node(
+                ScalarNode::IntConst(value.into()),
+                ResolvedIntExpr::Const(value.into()),
+                symbols,
+            )
+            .unwrap()
     }
 
     #[test]
-    fn runtime_switch_is_shared_by_dynamic_get_and_select_family_validation() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let selector = test_integer_selector(&mut egraph, "shared-runtime", 0.into(), 1.into());
-        let elements = [10, 20, 30].map(|value| egraph.add(MxxLang::IntConst(value.into())));
-        let family = FamilyLoweringValue {
-            element_type: MxxSort::Int,
-            storage: FamilyCoverageStorage::ExactStored { elements: Box::new(elements) },
-        };
-        let dynamic = dynamic_get(&mut egraph, &family, selector).unwrap();
-        let direct = add_runtime_switch(&mut egraph, selector, &elements);
-        assert_eq!(egraph.find(dynamic), egraph.find(direct));
-
-        let invalid = FamilyLoweringValue {
-            element_type: MxxSort::Int,
-            storage: FamilyCoverageStorage::ExactStored { elements: Box::new([elements[0]]) },
-        };
-        assert_eq!(
-            select_family(&mut egraph, selector, &[family, invalid]),
-            Err(FamilyCoverageError::SelectorCaseCountMismatch { expected: 3, actual: 1 }),
-            "all original family storage is validated before any suffix can be trimmed"
+    fn runtime_switch_retains_only_authoritatively_reachable_suffix() {
+        let mut store = ScalarStore::default();
+        let symbols = SymbolTables::default();
+        let selector = int(&mut store, &symbols, 1);
+        let cases = [10, 20, 30].map(|value| int(&mut store, &symbols, value));
+        let switched = add_runtime_switch(&mut store, &symbols, selector, &cases).unwrap();
+        assert!(
+            matches!(store.node(switched), Some(ScalarNode::Switch(children)) if children.as_ref() == [selector, cases[0], cases[1]])
         );
     }
 
     #[test]
-    fn shared_template_instantiation_selects_exact_switch_cases() {
-        for (selector_value, expected) in [(0, 10), (1, 20), (2, 30)] {
-            let mut analysis = MxxAnalysis::default();
-            let binder = test_binder(&mut analysis, 1);
-            let mut egraph = EGraph::new(analysis);
-            let selector = egraph.add(MxxLang::IntBinder(binder));
-            let cases = [10, 20, 30].map(|value| egraph.add(MxxLang::IntConst(value.into())));
-            let representative =
-                egraph.add(MxxLang::Switch([selector, cases[0], cases[1], cases[2]].into()));
-            let replacement = egraph.add(MxxLang::IntConst(selector_value.into()));
-            let instantiated = instantiate_shared_element(
-                &mut egraph,
-                representative,
-                binder,
-                replacement,
-                &mut || Ok::<(), ()>(()),
+    fn dynamic_get_and_select_share_scalar_switch_construction() {
+        let mut store = ScalarStore::default();
+        let symbols = SymbolTables::default();
+        let selector = int(&mut store, &symbols, 0);
+        let first = [int(&mut store, &symbols, 10), int(&mut store, &symbols, 11)];
+        let second = [int(&mut store, &symbols, 20), int(&mut store, &symbols, 21)];
+        let family = FamilyLoweringValue {
+            element_type: ScalarSort::Int,
+            storage: FamilyCoverageStorage::ExactStored { elements: first.into() },
+        };
+        let dynamic = dynamic_get(&mut store, &symbols, &family, selector).unwrap();
+        let selected = select_family(
+            &mut store,
+            &symbols,
+            selector,
+            &[
+                family,
+                FamilyLoweringValue {
+                    element_type: ScalarSort::Int,
+                    storage: FamilyCoverageStorage::ExactStored { elements: second.into() },
+                },
+            ],
+        )
+        .unwrap();
+        let FamilyCoverageStorage::ExactStored { elements } = selected.storage else {
+            panic!("exact families remain exact")
+        };
+        assert_eq!(elements.len(), 2);
+        assert!(matches!(store.node(dynamic), Some(ScalarNode::Switch(_))));
+        assert!(matches!(store.node(elements[0]), Some(ScalarNode::Switch(_))));
+    }
+
+    #[test]
+    fn dynamic_get_rejects_negative_and_out_of_range_selectors() {
+        let mut store = ScalarStore::default();
+        let symbols = SymbolTables::default();
+        let cases = [10, 20, 30].map(|value| int(&mut store, &symbols, value));
+        let family = FamilyLoweringValue {
+            element_type: ScalarSort::Int,
+            storage: FamilyCoverageStorage::ExactStored { elements: cases.into() },
+        };
+        for selector_value in [-1, 3] {
+            let selector = int(&mut store, &symbols, selector_value);
+            assert!(matches!(
+                dynamic_get(&mut store, &symbols, &family, selector),
+                Err(FamilyCoverageError::DynamicIndexOutOfRange { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn shared_substitution_replaces_only_the_owner_binder() {
+        let mut store = ScalarStore::default();
+        let mut symbols = SymbolTables::default();
+        let owner = binder(1, 0);
+        let foreign = binder(2, 0);
+        for key in [owner.clone(), foreign.clone()] {
+            symbols.binders.intern(BinderDescriptor { key, minimum: 0.into(), maximum: 7.into() });
+        }
+        let owner_id = store
+            .intern_node(
+                ScalarNode::IntBinder(owner.clone()),
+                ResolvedIntExpr::Binder(owner.clone()),
+                &symbols,
             )
             .unwrap();
-            let expected = egraph.add(MxxLang::IntConst(expected.into()));
-            assert_eq!(egraph.find(instantiated), egraph.find(expected));
-        }
-    }
-
-    #[test]
-    fn replacement_identity_is_independent_of_eclass_insertion_order() {
-        fn build(reverse: bool) -> (EGraph<MxxLang, MxxAnalysis>, Id) {
-            let mut egraph = EGraph::new(MxxAnalysis::default());
-            let (two, three) = if reverse {
-                let three = egraph.add(MxxLang::IntConst(3.into()));
-                let two = egraph.add(MxxLang::IntConst(2.into()));
-                (two, three)
-            } else {
-                let two = egraph.add(MxxLang::IntConst(2.into()));
-                let three = egraph.add(MxxLang::IntConst(3.into()));
-                (two, three)
-            };
-            let sum = egraph.add(MxxLang::IntAdd([two, three]));
-            egraph.rebuild();
-            (egraph, sum)
-        }
-
-        let (first, first_sum) = build(false);
-        let (second, second_sum) = build(true);
-        assert_eq!(
-            canonical_replacement_identity(&first, first_sum),
-            canonical_replacement_identity(&second, second_sum),
-            "scalar replacement identity must not depend on representative enode or insertion order"
-        );
-    }
-
-    #[test]
-    fn shared_template_instantiation_keeps_nonexact_or_invalid_switches_structural() {
-        let mut analysis = MxxAnalysis::default();
-        let owner = test_binder(&mut analysis, 1);
-        let foreign = test_binder(&mut analysis, 2);
-        let mut egraph = EGraph::new(analysis);
-        let owner_selector = egraph.add(MxxLang::IntBinder(owner));
-        let foreign_selector = egraph.add(MxxLang::IntBinder(foreign));
-        let first = egraph.add(MxxLang::IntConst(10.into()));
-        let second = egraph.add(MxxLang::IntConst(20.into()));
-        let nonexact = egraph.add(MxxLang::Switch([foreign_selector, first, second].into()));
-        let replacement = egraph.add(MxxLang::IntConst(1.into()));
-        let instantiated =
-            instantiate_shared_element(&mut egraph, nonexact, owner, replacement, &mut || {
-                Ok::<(), ()>(())
-            })
+        let foreign_id = store
+            .intern_node(
+                ScalarNode::IntBinder(foreign.clone()),
+                ResolvedIntExpr::Binder(foreign.clone()),
+                &symbols,
+            )
             .unwrap();
-        assert!(matches!(egraph.id_to_node(instantiated), MxxLang::Switch(_)));
-
-        let bounded_selector =
-            test_integer_selector(&mut egraph, "instantiated-range", 0.into(), 1.into());
-        let bounded =
-            egraph.add(MxxLang::Switch([bounded_selector, first, second, replacement].into()));
-        let instantiated =
-            instantiate_shared_element(&mut egraph, bounded, owner, replacement, &mut || {
-                Ok::<(), ()>(())
-            })
+        let representative = store
+            .intern_node(
+                ScalarNode::IntAdd([owner_id, foreign_id]),
+                ResolvedIntExpr::Add(
+                    Box::new(ResolvedIntExpr::Binder(owner.clone())),
+                    Box::new(ResolvedIntExpr::Binder(foreign.clone())),
+                ),
+                &symbols,
+            )
             .unwrap();
-        let MxxLang::Switch(children) = egraph.id_to_node(instantiated) else {
-            panic!("non-exact interval remains a Switch")
-        };
-        assert_eq!(children.len(), 3);
-        assert_eq!(egraph.find(children[0]), egraph.find(bounded_selector));
-        assert_eq!(egraph.find(children[1]), egraph.find(first));
-        assert_eq!(egraph.find(children[2]), egraph.find(second));
-
-        let invalid = egraph.add(MxxLang::Switch([owner_selector, first, second].into()));
-        let out_of_range = egraph.add(MxxLang::IntConst(2.into()));
-        let instantiated =
-            instantiate_shared_element(&mut egraph, invalid, owner, out_of_range, &mut || {
-                Ok::<(), ()>(())
-            })
-            .unwrap();
-        assert!(matches!(egraph.id_to_node(instantiated), MxxLang::Switch(_)));
-    }
-
-    #[test]
-    fn shared_template_instantiation_selects_nested_switches_without_replacing_foreign_binders() {
-        let mut analysis = MxxAnalysis::default();
-        let owner = test_binder(&mut analysis, 1);
-        let foreign = test_binder(&mut analysis, 2);
-        let mut egraph = EGraph::new(analysis);
-        let owner_selector = egraph.add(MxxLang::IntBinder(owner));
-        let foreign_selector = egraph.add(MxxLang::IntBinder(foreign));
-        let first = egraph.add(MxxLang::IntConst(10.into()));
-        let second = egraph.add(MxxLang::IntConst(20.into()));
-        let inner = egraph.add(MxxLang::Switch([foreign_selector, first, second].into()));
-        let representative = egraph.add(MxxLang::Switch([owner_selector, first, inner].into()));
-        let replacement = egraph.add(MxxLang::IntConst(1.into()));
+        let replacement = int(&mut store, &symbols, 5);
         let instantiated = instantiate_shared_element(
-            &mut egraph,
+            &mut store,
+            &mut symbols,
             representative,
-            owner,
+            &owner,
             replacement,
+            None,
             &mut || Ok::<(), ()>(()),
         )
         .unwrap();
-        let expression = egraph.id_to_expr(instantiated);
-        assert!(matches!(expression[expression.root()], MxxLang::Switch(_)));
-        assert!(expression.iter().any(|node| node == &MxxLang::IntBinder(foreign)));
-        assert!(!expression.iter().any(|node| node == &MxxLang::IntBinder(owner)));
+        let ScalarNode::IntAdd([left, right]) = store.node(instantiated).unwrap() else {
+            panic!("shared representative retains its operation")
+        };
+        assert_eq!(*left, replacement);
+        assert_eq!(store.node(*right), Some(&ScalarNode::IntBinder(foreign)));
     }
 
     #[test]
-    fn general_recurrence_uses_simultaneous_previous_state() {
-        let recurrence = VectorRecurrence {
-            initial: vec![BigUint::from(2_u8), BigUint::from(5_u8)].into_boxed_slice(),
-            transition: vec![RecurrenceExpr::Previous(1), RecurrenceExpr::Previous(0)]
-                .into_boxed_slice(),
-            count: BigUint::from(3_u8),
-        };
-        assert_eq!(evaluate(&recurrence).unwrap().as_ref(), &[5_u8.into(), 2_u8.into()]);
-    }
-
-    #[test]
-    fn affine_fast_path_handles_large_count() {
-        let recurrence = VectorRecurrence {
-            initial: vec![BigUint::one()].into_boxed_slice(),
-            transition: vec![RecurrenceExpr::Mul(
-                Box::new(RecurrenceExpr::Const(BigUint::from(2_u8))),
-                Box::new(RecurrenceExpr::Previous(0)),
-            )]
-            .into_boxed_slice(),
-            count: BigUint::from(40_u8),
-        };
-        assert_eq!(evaluate(&recurrence).unwrap()[0], BigUint::one() << 40_usize);
-    }
-
-    #[test]
-    fn max_forces_the_general_path_without_a_step_ceiling() {
-        let recurrence = VectorRecurrence {
-            initial: vec![BigUint::one()].into_boxed_slice(),
-            transition: vec![RecurrenceExpr::Max(
-                vec![RecurrenceExpr::Previous(0), RecurrenceExpr::Const(BigUint::from(2_u8))]
-                    .into_boxed_slice(),
-            )]
-            .into_boxed_slice(),
-            count: BigUint::from(101_u8),
-        };
-        assert_eq!(evaluate(&recurrence).unwrap().as_ref(), &[BigUint::from(2_u8)]);
-    }
-
-    #[test]
-    fn shared_template_instantiation_replaces_only_the_owner_binder() {
-        let mut analysis = MxxAnalysis::default();
-        let scope = crate::operational_noise::identity::OccurrenceScope {
-            program: crate::operational_noise::identity::ProgramKey::Ideal,
-            definition: mxx_ir_core::FrozenGraphScopeId::Root,
-            path: Box::new([]),
-        };
-        let owner =
-            BinderKey { loop_scope: scope.clone(), loop_node: mxx_ir_core::NodeId(1), slot: 0 };
-        let outer = BinderKey { loop_scope: scope, loop_node: mxx_ir_core::NodeId(2), slot: 0 };
-        let owner_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
-            key: owner,
-            minimum: 0.into(),
-            maximum: 7.into(),
-        }));
-        let outer_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
-            key: outer,
-            minimum: 0.into(),
-            maximum: 3.into(),
-        }));
-        let mut egraph = EGraph::new(analysis);
-        let owner_term = egraph.add(MxxLang::IntBinder(owner_id));
-        let outer_term = egraph.add(MxxLang::IntBinder(outer_id));
-        let representative = egraph.add(MxxLang::IntAdd([owner_term, outer_term]));
-        let replacement = egraph.add(MxxLang::IntConst(5.into()));
-
-        let mut progress_calls = 0;
-        let instantiated = instantiate_shared_element(
-            &mut egraph,
-            representative,
-            owner_id,
-            replacement,
-            &mut || {
-                progress_calls += 1;
-                Ok::<(), ()>(())
-            },
-        )
-        .unwrap();
-        let expression = egraph.id_to_expr(instantiated);
-
-        assert!(expression.iter().any(|node| node == &MxxLang::IntConst(5.into())));
-        assert!(expression.iter().any(|node| node == &MxxLang::IntBinder(outer_id)));
-        assert!(!expression.iter().any(|node| node == &MxxLang::IntBinder(owner_id)));
-        assert!(progress_calls >= 3, "extraction and copying report bounded work");
-
-        for value in 0..1_000 {
-            egraph.add(MxxLang::IntConst(value.into()));
-        }
-        let new_replacement = egraph.add(MxxLang::IntConst(6.into()));
-        let mut unrelated_progress_calls = 0;
-        instantiate_shared_element(
-            &mut egraph,
-            representative,
-            owner_id,
-            new_replacement,
-            &mut || {
-                unrelated_progress_calls += 1;
-                Ok::<(), ()>(())
-            },
-        )
-        .unwrap();
-        assert!(
-            unrelated_progress_calls <= progress_calls,
-            "unrelated e-classes do not add instantiation work"
-        );
-
-        let mut rejected = || Err::<(), _>("progress stopped");
-        assert_eq!(
-            instantiate_shared_element(
-                &mut egraph,
-                representative,
-                owner_id,
-                replacement,
-                &mut rejected,
-            ),
-            Err("progress stopped")
-        );
-    }
-
-    #[test]
-    fn shared_template_instantiation_reuses_one_nontrivial_replacement_dag() {
-        let mut analysis = MxxAnalysis::default();
-        let scope = crate::operational_noise::identity::OccurrenceScope {
-            program: crate::operational_noise::identity::ProgramKey::Ideal,
-            definition: mxx_ir_core::FrozenGraphScopeId::Root,
-            path: Box::new([]),
-        };
-        let owner = BinderKey { loop_scope: scope, loop_node: mxx_ir_core::NodeId(1), slot: 0 };
-        let owner_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
-            key: owner,
-            minimum: 0.into(),
-            maximum: 7.into(),
-        }));
-        let mut egraph = EGraph::new(analysis);
-        let owner_term = egraph.add(MxxLang::IntBinder(owner_id));
-        let representative = egraph.add(MxxLang::IntAdd([owner_term, owner_term]));
-        let two = egraph.add(MxxLang::IntConst(2.into()));
-        let three = egraph.add(MxxLang::IntConst(3.into()));
-        let replacement = egraph.add(MxxLang::IntAdd([two, three]));
-
-        let instantiated = instantiate_shared_element(
-            &mut egraph,
-            representative,
-            owner_id,
-            replacement,
-            &mut || Ok::<(), ()>(()),
-        )
-        .unwrap();
-        let expression = egraph.id_to_expr(instantiated);
-        assert_eq!(expression.len(), 4, "replacement is appended once, not once per binder");
-        let MxxLang::IntAdd([left, right]) = expression[expression.root()] else {
-            panic!("instantiated template must retain its outer addition");
-        };
-        assert_eq!(left, right, "both binder occurrences must use the same replacement root");
-    }
-
-    #[test]
-    fn shared_affine_maximum_uses_nested_domain_endpoints_without_product() {
-        let scope = crate::operational_noise::identity::OccurrenceScope {
-            program: crate::operational_noise::identity::ProgramKey::Ideal,
-            definition: mxx_ir_core::FrozenGraphScopeId::Root,
-            path: Box::new([]),
-        };
-        let outer =
-            BinderKey { loop_scope: scope.clone(), loop_node: mxx_ir_core::NodeId(1), slot: 0 };
-        let inner = BinderKey { loop_scope: scope, loop_node: mxx_ir_core::NodeId(2), slot: 0 };
-        let retained = vec![
-            CoverageBinderDomain { binder: outer.clone(), minimum: 0.into(), maximum: 4.into() },
-            CoverageBinderDomain { binder: inner.clone(), minimum: 1.into(), maximum: 6.into() },
-        ];
-        let domain = IntegerDomain::Affine {
-            constant: 5.into(),
-            coefficients: BTreeMap::from([(outer.clone(), 3.into()), (inner.clone(), (-2).into())]),
-            binders: BTreeMap::from([
-                (
-                    outer,
-                    crate::operational_noise::analysis::IntegerInterval::new(0.into(), 4.into())
-                        .unwrap(),
-                ),
-                (
-                    inner,
-                    crate::operational_noise::analysis::IntegerInterval::new(1.into(), 6.into())
-                        .unwrap(),
-                ),
-            ]),
-        };
-        assert_eq!(shared_affine_maximum(&domain, &retained).unwrap(), BigInt::from(15));
+    fn family_index_rejects_negative_and_count_upper_bound() {
+        let count = BigUint::from(3_u8);
+        assert!(validate_family_index(&IntegerDomain::exact(2), &count).is_ok());
+        assert!(validate_family_index(&IntegerDomain::exact(-1), &count).is_err());
+        assert!(validate_family_index(&IntegerDomain::exact(3), &count).is_err());
     }
 }

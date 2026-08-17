@@ -37,10 +37,11 @@ impl ScalarSort {
     pub const fn permits_selector_provenance(&self) -> bool {
         matches!(self, Self::Int | Self::Bool)
     }
-}
 
-/// Compatibility-free name used by the rest of the checker for a resolved sort.
-pub type MxxSort = ScalarSort;
+    pub const fn permits_scalar_provenance(&self) -> bool {
+        self.permits_selector_provenance()
+    }
+}
 
 /// A closed inclusive integer interval.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -671,44 +672,73 @@ impl ScalarFacts {
             ScalarNode::IntEqual(_) | ScalarNode::IntLess(_) | ScalarNode::IntLessEqual(_) => {
                 let left = require_int(child(0)?)?;
                 let right = require_int(child(1)?)?;
-                let exact = left.integer_domain.as_ref().and_then(IntegerDomain::exact_value);
-                let other = right.integer_domain.as_ref().and_then(IntegerDomain::exact_value);
-                let (possible_false, possible_true) = match (exact, other) {
-                    (Some(left), Some(right)) => match node {
-                        ScalarNode::IntEqual(_) => (left != right, left == right),
-                        ScalarNode::IntLess(_) => (left >= right, left < right),
-                        ScalarNode::IntLessEqual(_) => (left > right, left <= right),
-                        _ => unreachable!(),
-                    },
-                    _ => (true, true),
+                let left = left
+                    .integer_domain
+                    .as_ref()
+                    .ok_or(ScalarTransferError::Domain)?
+                    .interval()
+                    .map_err(|_| ScalarTransferError::Domain)?;
+                let right = right
+                    .integer_domain
+                    .as_ref()
+                    .ok_or(ScalarTransferError::Domain)?
+                    .interval()
+                    .map_err(|_| ScalarTransferError::Domain)?;
+                let (possible_false, possible_true) = match node {
+                    ScalarNode::IntEqual(_) => {
+                        if left.maximum < right.minimum || right.maximum < left.minimum {
+                            (true, false)
+                        } else if left.is_exact() &&
+                            right.is_exact() &&
+                            left.minimum == right.minimum
+                        {
+                            (false, true)
+                        } else {
+                            (true, true)
+                        }
+                    }
+                    ScalarNode::IntLess(_) => {
+                        if left.maximum < right.minimum {
+                            (false, true)
+                        } else if left.minimum >= right.maximum {
+                            (true, false)
+                        } else {
+                            (true, true)
+                        }
+                    }
+                    ScalarNode::IntLessEqual(_) => {
+                        if left.maximum <= right.minimum {
+                            (false, true)
+                        } else if left.minimum > right.maximum {
+                            (true, false)
+                        } else {
+                            (true, true)
+                        }
+                    }
+                    _ => unreachable!(),
                 };
                 Ok(Self::boolean(possible_false, possible_true, ScalarProvenance::Ordinary))
             }
             ScalarNode::BitExtract { .. } => {
                 let value = require_int(child(0)?)?;
                 let _ = value.scalar_provenance.ok_or(ScalarTransferError::Provenance)?;
-                Ok(Self::scalar(
-                    ScalarSort::Bool,
-                    Some(IntegerDomain::IntervalOnly(IntegerInterval {
-                        minimum: 0.into(),
-                        maximum: 1.into(),
-                    })),
-                    ScalarProvenance::Ordinary,
-                ))
+                Ok(Self::boolean(true, true, ScalarProvenance::Ordinary))
             }
             ScalarNode::BoolToInt(_) => {
                 let value = require_bool(child(0)?)?;
                 if value.scalar_provenance != Some(ScalarProvenance::Ordinary) {
                     return Err(ScalarTransferError::SelectorOnly);
                 }
-                Ok(Self::scalar(
-                    ScalarSort::Int,
-                    Some(IntegerDomain::IntervalOnly(IntegerInterval {
-                        minimum: 0.into(),
-                        maximum: 1.into(),
-                    })),
-                    ScalarProvenance::Ordinary,
-                ))
+                let domain = match (value.possible_false, value.possible_true) {
+                    (true, false) => IntegerDomain::Exact(BigInt::zero()),
+                    (false, true) => IntegerDomain::Exact(BigInt::one()),
+                    (true, true) => IntegerDomain::IntervalOnly(IntegerInterval {
+                        minimum: BigInt::zero(),
+                        maximum: BigInt::one(),
+                    }),
+                    (false, false) => return Err(ScalarTransferError::Domain),
+                };
+                Ok(Self::scalar(ScalarSort::Int, Some(domain), ScalarProvenance::Ordinary))
             }
             ScalarNode::RealConst(bits) => Ok(Self {
                 sort: Ok(ScalarSort::Real),
@@ -846,6 +876,9 @@ pub enum ScalarTransferError {
     MissingBinder,
     MissingChild,
     NeedsMatrixContract,
+    /// The same typed semantic identity was transferred with incompatible
+    /// facts.  Facts are not an insertion-order merge authority.
+    FactConflict,
     Unsupported,
 }
 
@@ -1058,6 +1091,30 @@ impl Drop for ScalarStore {
 }
 
 impl ScalarStore {
+    /// Reusing a semantic identity is exact for every scalar operation.  The
+    /// coefficient-extraction boundary is the sole named exception: its
+    /// external direct-extraction premise may be absent or present at
+    /// different strengths, so the proof upper is joined conservatively by
+    /// taking the minimum present upper.  Sort, provenance, and residue
+    /// convention remain invariant and cannot be joined away.
+    fn merge_repeated_facts(
+        existing: &mut ScalarFacts,
+        incoming: ScalarFacts,
+        allow_direct_extract_join: bool,
+    ) -> Result<(), ScalarTransferError> {
+        if !allow_direct_extract_join {
+            return (*existing == incoming).then_some(()).ok_or(ScalarTransferError::FactConflict);
+        }
+        if existing.sort != incoming.sort ||
+            existing.scalar_provenance != incoming.scalar_provenance ||
+            existing.canonical_residue_convention != incoming.canonical_residue_convention
+        {
+            return Err(ScalarTransferError::FactConflict);
+        }
+        existing.merge_direct_extract(incoming);
+        Ok(())
+    }
+
     /// Inserts one typed scalar node using the transfer table and a shallow
     /// semantic key derived from its typed children.
     pub fn intern_node(
@@ -1075,8 +1132,13 @@ impl ScalarStore {
         let semantic = self.semantic_node(&node, symbols)?;
         let identity = self.intern_identity(semantic);
         if let Some(id) = self.by_identity.get(&identity).copied() {
-            self.entries[id.0 as usize].analysis.merge_direct_extract(facts);
+            let merge = Self::merge_repeated_facts(
+                &mut self.entries[id.0 as usize].analysis,
+                facts,
+                matches!(node, ScalarNode::ExtractCoefficient { .. }),
+            );
             dispose_resolved_int_expr(identity_expr);
+            merge?;
             return Ok(id);
         }
         let id = ScalarId(self.entries.len() as u32);
@@ -1163,12 +1225,17 @@ impl ScalarStore {
         node: ScalarNode,
         identity: ResolvedIntExpr,
         facts: ScalarFacts,
-    ) -> ScalarId {
+    ) -> Result<ScalarId, ScalarTransferError> {
         let identity_id = self.intern_expr_identity(&identity);
         if let Some(id) = self.by_identity.get(&identity_id).copied() {
-            self.entries[id.0 as usize].analysis.merge_direct_extract(facts);
+            let merge = Self::merge_repeated_facts(
+                &mut self.entries[id.0 as usize].analysis,
+                facts,
+                matches!(node, ScalarNode::ExtractCoefficient { .. }),
+            );
             dispose_resolved_int_expr(identity);
-            return id;
+            merge?;
+            return Ok(id);
         }
         let id = ScalarId(self.entries.len() as u32);
         self.by_identity.insert(identity_id, id);
@@ -1178,7 +1245,7 @@ impl ScalarStore {
             identity_expr: identity,
             analysis: facts,
         });
-        id
+        Ok(id)
     }
 
     fn intern_expr_identity(&mut self, value: &ResolvedIntExpr) -> ScalarIdentityId {
@@ -1306,6 +1373,13 @@ impl ScalarStore {
         self.get(id).map(|entry| &entry.node)
     }
 
+    /// Returns the ordered scalar children of an entry for iterative graph
+    /// traversals owned by the lowerer.  The returned slice is detached from
+    /// the arena so callers can mutate the store while traversing.
+    pub fn children(&self, id: ScalarId) -> Option<Box<[ScalarId]>> {
+        self.node(id).map(scalar_children)
+    }
+
     pub fn facts(&self, id: ScalarId) -> Option<&ScalarFacts> {
         self.get(id).map(|entry| &entry.analysis)
     }
@@ -1337,7 +1411,7 @@ impl ScalarStore {
         &mut self,
         key: ScalarExtractKey,
         extracted_facts: super::analysis::AnalysisData,
-    ) -> ScalarId {
+    ) -> Result<ScalarId, ScalarTransferError> {
         let integer_domain = convert_integer_domain(extracted_facts.integer_domain);
         let facts = ScalarFacts {
             sort: extracted_facts.sort.clone().map(|sort| match sort {
@@ -1379,8 +1453,11 @@ impl ScalarStore {
             canonical_exclusive_upper: None,
         });
         if let Some(id) = self.by_identity.get(&extraction_identity).copied() {
-            self.entries[id.0 as usize].analysis.merge_direct_extract(facts);
-            return id;
+            let merge =
+                Self::merge_repeated_facts(&mut self.entries[id.0 as usize].analysis, facts, true);
+            dispose_resolved_int_expr(key.position);
+            merge?;
+            return Ok(id);
         }
         let position_id = self.intern(
             ScalarNode::IntConst(BigInt::zero()),
@@ -1390,7 +1467,7 @@ impl ScalarStore {
                 Some(IntegerDomain::exact(0)),
                 ScalarProvenance::Ordinary,
             ),
-        );
+        )?;
         let id = ScalarId(self.entries.len() as u32);
         self.by_identity.insert(extraction_identity, id);
         self.entries.push(ScalarEntry {
@@ -1410,7 +1487,7 @@ impl ScalarStore {
             },
             analysis: facts,
         });
-        id
+        Ok(id)
     }
 }
 
@@ -1455,75 +1532,6 @@ fn convert_sort(sort: super::analysis::MxxSort) -> ScalarSort {
         }
         super::analysis::MxxSort::Matrix(matrix) => ScalarSort::Matrix(matrix),
     }
-}
-
-/// The direct-extraction domain contract, shared by lowering and scalar tests.
-pub fn extract_coefficient_domain(
-    matrix: &ResolvedMatrixType,
-    modulus: &BigUint,
-    authoritative_upper: Option<&BigUint>,
-    convention: CanonicalResidueConvention,
-) -> Result<IntegerDomain, AnalysisError> {
-    if modulus.is_zero() {
-        return Err(AnalysisError::UnknownCanonicalResidueRange {
-            matrix: super::analysis::MxxSort::Matrix(matrix.clone()),
-        });
-    }
-    if let Some(upper) = authoritative_upper {
-        if convention != CanonicalResidueConvention::Nonnegative ||
-            upper.is_zero() ||
-            upper > modulus
-        {
-            return Err(AnalysisError::UnknownCanonicalResidueRange {
-                matrix: super::analysis::MxxSort::Matrix(matrix.clone()),
-            });
-        }
-        return Ok(IntegerDomain::IntervalOnly(IntegerInterval {
-            minimum: BigInt::zero(),
-            maximum: BigInt::from(upper - BigUint::one()),
-        }));
-    }
-    let (minimum, maximum) = match convention {
-        CanonicalResidueConvention::Nonnegative => {
-            (BigInt::zero(), BigInt::from(modulus - BigUint::one()))
-        }
-        CanonicalResidueConvention::Centered => {
-            let floor = modulus / BigUint::from(2_u8);
-            let ceil = (modulus + BigUint::one()) / BigUint::from(2_u8);
-            (-BigInt::from(floor), BigInt::from(ceil) - BigInt::one())
-        }
-    };
-    Ok(IntegerDomain::IntervalOnly(IntegerInterval { minimum, maximum }))
-}
-
-pub fn direct_extract_facts(
-    matrix: ResolvedMatrixType,
-    modulus: BigUint,
-    authoritative_upper: Option<&BigUint>,
-) -> Result<ScalarFacts, AnalysisError> {
-    let domain = extract_coefficient_domain(
-        &matrix,
-        &modulus,
-        authoritative_upper,
-        CanonicalResidueConvention::Nonnegative,
-    )?;
-    let upper = domain.interval().ok().and_then(|interval| {
-        (interval.minimum == BigInt::zero())
-            .then(|| (&interval.maximum + BigInt::one()).to_biguint())
-            .flatten()
-    });
-    let mut facts = ScalarFacts::scalar(MxxSort::Int, Some(domain), ScalarProvenance::SelectorOnly);
-    facts.direct_extract = Some(DirectExtractFact { canonical_upper: upper });
-    Ok(facts)
-}
-
-/// Compatibility alias for code that only needs the scalar facts record.
-pub type AnalysisData = ScalarFacts;
-
-/// The lowerer owns this symbol table directly; this helper keeps construction
-/// independent of any rewriting library.
-pub fn symbols_default() -> SymbolTables {
-    SymbolTables::default()
 }
 
 #[cfg(test)]
@@ -1794,6 +1802,71 @@ mod tests {
     }
 
     #[test]
+    fn repeated_source_identity_rejects_conflicting_descriptor_facts_in_either_order() {
+        let source_key = super::super::identity::AtomicSourceKey::ProtocolInput(
+            ProtocolInputId::from("same-source"),
+        );
+        for (first_maximum, second_maximum) in [(7_i64, 9_i64), (9_i64, 7_i64)] {
+            let mut symbols = SymbolTables::default();
+            let first = symbols.atomic_sources.intern(AtomicSourceDescriptor {
+                key: source_key.clone(),
+                sort: super::super::analysis::MxxSort::Int,
+                integer_domain: Some(super::super::identity::IntegerSourceDomain {
+                    minimum: 0.into(),
+                    maximum: first_maximum.into(),
+                }),
+                canonical_residue_convention: None,
+                relation_role: None,
+            });
+            let second = symbols.atomic_sources.intern(AtomicSourceDescriptor {
+                key: source_key.clone(),
+                sort: super::super::analysis::MxxSort::Int,
+                integer_domain: Some(super::super::identity::IntegerSourceDomain {
+                    minimum: 0.into(),
+                    maximum: second_maximum.into(),
+                }),
+                canonical_residue_convention: None,
+                relation_role: None,
+            });
+            let identity =
+                ResolvedIntExpr::Source { source: source_key.clone(), coordinates: Box::new([]) };
+            let mut store = ScalarStore::default();
+            store
+                .intern_node(
+                    ScalarNode::Source { source: AtomicSourceId(first), indices: Box::new([]) },
+                    identity.clone(),
+                    &symbols,
+                )
+                .unwrap();
+            assert_eq!(
+                store.intern_node(
+                    ScalarNode::Source { source: AtomicSourceId(second), indices: Box::new([]) },
+                    identity,
+                    &symbols,
+                ),
+                Err(ScalarTransferError::FactConflict)
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_operation_requires_exact_transferred_facts() {
+        let mut store = ScalarStore::default();
+        let identity = ResolvedIntExpr::Add(
+            Box::new(ResolvedIntExpr::Const(1.into())),
+            Box::new(ResolvedIntExpr::Const(2.into())),
+        );
+        let node = ScalarNode::IntAdd([ScalarId(0), ScalarId(1)]);
+        let first = store.intern(node.clone(), identity.clone(), integer(3)).unwrap();
+        assert_eq!(
+            store.intern(node, identity, integer(4)),
+            Err(ScalarTransferError::FactConflict)
+        );
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(first).unwrap().analysis, integer(3));
+    }
+
+    #[test]
     fn semantic_identity_is_shallow_and_direct_extract_proofs_merge() {
         let mut store = ScalarStore::default();
         let mut identity = ResolvedIntExpr::Const(0.into());
@@ -1803,15 +1876,14 @@ mod tests {
                 Box::new(ResolvedIntExpr::Const(1.into())),
             );
         }
-        let id = store.intern(ScalarNode::IntConst(1.into()), identity.clone(), integer(1));
+        let id =
+            store.intern(ScalarNode::IntConst(1.into()), identity.clone(), integer(1)).unwrap();
         assert_eq!(store.identity(id), Some(&identity));
         assert!(store.identity_len() >= 2049);
 
-        let same = store.intern(
-            ScalarNode::IntParameter("not-the-node-key".to_owned()),
-            identity,
-            integer(9),
-        );
+        let same = store
+            .intern(ScalarNode::IntParameter("not-the-node-key".to_owned()), identity, integer(1))
+            .unwrap();
         assert_eq!(id, same);
         assert_eq!(store.len(), 1);
 
@@ -1826,30 +1898,28 @@ mod tests {
             rows: ResolvedIntExpr::Const(1.into()),
             columns: ResolvedIntExpr::Const(1.into()),
         };
-        let seven = BigUint::from(7_u8);
         let five = BigUint::from(5_u8);
         let mut first = super::super::analysis::MxxAnalysis::direct_extract_data(
             matrix.clone(),
             BigUint::from(17_u8),
-            Some(&seven),
+            None,
         )
         .unwrap();
-        first.direct_extract = Some(super::super::analysis::DirectExtractFact {
-            canonical_upper: Some(seven.clone()),
-        });
-        let first_id = store.intern_extract(key.clone(), first);
+        first.direct_extract = None;
+        let first_id = store.intern_extract(key.clone(), first).unwrap();
         let second = super::super::analysis::MxxAnalysis::direct_extract_data(
             matrix,
             BigUint::from(17_u8),
             Some(&five),
         )
         .unwrap();
-        let second_id = store.intern_extract(key, second);
+        let second_id = store.intern_extract(key, second).unwrap();
         assert_eq!(first_id, second_id);
         assert_eq!(
             store.get(first_id).unwrap().analysis.direct_extract.as_ref().unwrap().canonical_upper,
             Some(five)
         );
+        assert_eq!(store.get(first_id).unwrap().analysis.canonical_residue_convention, None);
     }
 
     #[test]
@@ -1871,14 +1941,17 @@ mod tests {
                 };
                 let diamond =
                     ResolvedIntExpr::Add(Box::new(build_branch()), Box::new(build_branch()));
-                let first = store.intern(ScalarNode::IntConst(1.into()), diamond, integer(1));
+                let first =
+                    store.intern(ScalarNode::IntConst(1.into()), diamond, integer(1)).unwrap();
                 let duplicate =
                     ResolvedIntExpr::Add(Box::new(build_branch()), Box::new(build_branch()));
-                let second = store.intern(
-                    ScalarNode::IntParameter("duplicate-diamond".to_owned()),
-                    duplicate,
-                    integer(2),
-                );
+                let second = store
+                    .intern(
+                        ScalarNode::IntParameter("duplicate-diamond".to_owned()),
+                        duplicate,
+                        integer(1),
+                    )
+                    .unwrap();
                 assert_eq!(first, second);
                 assert_eq!(store.len(), 1);
                 assert_eq!(store.identity_len(), 4098);

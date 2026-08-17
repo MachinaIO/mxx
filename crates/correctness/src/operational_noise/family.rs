@@ -63,22 +63,22 @@ pub struct CoverageBinderDomain {
 
 /// The only two compact representations of a supported operational family.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FamilyCoverageStorage {
+pub enum FamilyCoverageStorage<T = Id> {
     /// Physical element references present in the Graph IR or manifest.
-    ExactStored { elements: Box<[Id]> },
+    ExactStored { elements: Box<[T]> },
     /// One symbolic representative over every binder in `binder_domains`.
     SharedTemplate {
         domain: LoopDomainKey,
-        representative: Id,
+        representative: T,
         binder_domains: Box<[CoverageBinderDomain]>,
     },
 }
 
 /// A family residual together with its single closed element sort.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FamilyLoweringValue {
+pub struct FamilyLoweringValue<T = Id> {
     pub element_type: MxxSort,
-    pub storage: FamilyCoverageStorage,
+    pub storage: FamilyCoverageStorage<T>,
 }
 
 /// Closed, local family failures.  The lowering boundary maps these to its
@@ -133,7 +133,7 @@ pub fn shared_affine_maximum(
     Ok(maximum)
 }
 
-impl FamilyLoweringValue {
+impl<T> FamilyLoweringValue<T> {
     /// Validates storage invariants without materializing any logical lane.
     pub fn validate(&self) -> Result<(), FamilyCoverageError> {
         match &self.storage {
@@ -169,18 +169,18 @@ impl FamilyLoweringValue {
         Ok(())
     }
 
-    pub fn exact_elements(&self) -> Option<&[Id]> {
+    pub fn exact_elements(&self) -> Option<&[T]> {
         match &self.storage {
             FamilyCoverageStorage::ExactStored { elements } => Some(elements),
             FamilyCoverageStorage::SharedTemplate { .. } => None,
         }
     }
 
-    pub fn shared_template(&self) -> Option<(&LoopDomainKey, Id, &[CoverageBinderDomain])> {
+    pub fn shared_template(&self) -> Option<(&LoopDomainKey, &T, &[CoverageBinderDomain])> {
         match &self.storage {
             FamilyCoverageStorage::ExactStored { .. } => None,
             FamilyCoverageStorage::SharedTemplate { domain, representative, binder_domains } => {
-                Some((domain, *representative, binder_domains))
+                Some((domain, representative, binder_domains))
             }
         }
     }
@@ -209,10 +209,13 @@ pub fn validate_family_index(
 
 /// Resolves a static physical element.  Only an exact constant identity is a
 /// static index; all other values must use [`dynamic_get`].
-pub fn static_get(
-    family: &FamilyLoweringValue,
+pub fn static_get<T>(
+    family: &FamilyLoweringValue<T>,
     index: &LoweredInt,
-) -> Result<Option<Id>, FamilyCoverageError> {
+) -> Result<Option<T>, FamilyCoverageError>
+where
+    T: Copy,
+{
     let Some(ResolvedIntExpr::Const(value)) = index.stable_identity.as_ref() else {
         return Ok(None);
     };
@@ -237,7 +240,7 @@ pub fn static_get(
 /// cases and never in a symbolic template's logical count.
 pub fn dynamic_get(
     egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    family: &FamilyLoweringValue,
+    family: &FamilyLoweringValue<Id>,
     selector: Id,
 ) -> Result<Id, FamilyCoverageError> {
     let FamilyCoverageStorage::ExactStored { elements } = &family.storage else {
@@ -251,9 +254,9 @@ pub fn dynamic_get(
 
 /// Resolves an element without enumerating a shared template.  The lowerer is
 /// responsible for binding the same symbolic index into the representative.
-pub fn shared_element(
-    family: &FamilyLoweringValue,
-) -> Result<(Id, &LoopDomainKey, &[CoverageBinderDomain]), FamilyCoverageError> {
+pub fn shared_element<T>(
+    family: &FamilyLoweringValue<T>,
+) -> Result<(&T, &LoopDomainKey, &[CoverageBinderDomain]), FamilyCoverageError> {
     let Some((domain, representative, binders)) = family.shared_template() else {
         return Err(FamilyCoverageError::StorageMismatch);
     };

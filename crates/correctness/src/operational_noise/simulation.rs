@@ -8,7 +8,7 @@
 use super::{
     OperationalAcceptanceReport, OperationalSimulationDiagnostics, OperationalSimulationReport,
     analysis::{MxxAnalysis, ResourceBudget},
-    bound::BoundEvaluationError,
+    bound::{BoundEvaluationError, MatrixBound},
     error::{OperationalSimulationError, TargetError},
     extract::{
         ExtractedProposal, ExtractedProposalWithOrigins, ExtractionControl, ProposalCost,
@@ -18,6 +18,10 @@ use super::{
     },
     language::MxxLang,
     lower::{GraphLowerer, LoweredValue, LoweringControl},
+    normal_form::{
+        BoundedSummary, ExpressionDag, ExpressionNode, NormalFormError, NormalizationCounters,
+        RelationRegistry, TermId,
+    },
     relation::{
         RelationApplier, RelationFailure, RelationRegistration, RelationSearcher, ReplacementPlan,
         RewriteContext, SharedRewriteBudget, classify_proposal_node,
@@ -44,6 +48,141 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info};
+
+enum LoweredRootSet {
+    Egraph(Box<[egg::Id]>),
+    Dag(TermId),
+    MatrixFamily(super::family::FamilyLoweringValue<TermId>),
+}
+
+enum NormalizedRootSet {
+    Egraph(Vec<(egg::Id, MatrixBound)>),
+    Dag((BoundedSummary, u64)),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DagProgressStats {
+    reachable_nodes: u64,
+    reachable_switch_cases: u64,
+}
+
+/// Counts the unique DAG nodes that the normalizer can reach from a root set.
+/// This is deliberately a structural walk over the already lowered DAG; it
+/// never uses lowered wire occurrences or the old e-graph size as a proxy for
+/// normal-form work.
+fn dag_progress_stats(
+    dag: &ExpressionDag,
+    roots: impl IntoIterator<Item = TermId>,
+) -> Result<DagProgressStats, NormalFormError> {
+    let mut pending = roots.into_iter().collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut stats = DagProgressStats::default();
+    while let Some(term) = pending.pop() {
+        if !visited.insert(term) {
+            continue;
+        }
+        stats.reachable_nodes = stats.reachable_nodes.saturating_add(1);
+        let node = dag.node(term)?;
+        match node {
+            ExpressionNode::Switch { cases, reachable, .. } |
+            ExpressionNode::Select { cases, reachable, .. } => {
+                stats.reachable_switch_cases =
+                    stats.reachable_switch_cases.saturating_add(reachable.len() as u64);
+                pending.extend(reachable.iter().filter_map(|index| cases.get(*index)).copied());
+            }
+            ExpressionNode::FamilyGetStatic { cases, index } => {
+                if let Some(case) = cases.get(*index) {
+                    pending.push(*case);
+                }
+            }
+            ExpressionNode::FamilyGetDynamic { cases, .. } => pending.extend(cases.iter().copied()),
+            ExpressionNode::Add(children) |
+            ExpressionNode::Product(children) |
+            ExpressionNode::Concat { inputs: children, .. } |
+            ExpressionNode::CrtRecompose { inputs: children, .. } => {
+                pending.extend(children.iter().copied());
+            }
+            ExpressionNode::Negate(child) |
+            ExpressionNode::MatrixScale { input: child, .. } |
+            ExpressionNode::Transpose(child) |
+            ExpressionNode::Slice { input: child, .. } |
+            ExpressionNode::LiftConstantPolynomial { input: child, .. } |
+            ExpressionNode::View { input: child, .. } => pending.push(*child),
+            ExpressionNode::Tensor { left, right } => {
+                pending.push(*left);
+                pending.push(*right);
+            }
+            ExpressionNode::Zero | ExpressionNode::Atom(_) => {}
+        }
+    }
+    Ok(stats)
+}
+
+fn normalize_matrix_root(
+    dag: &ExpressionDag,
+    relations: &RelationRegistry,
+    root: TermId,
+) -> Result<(BoundedSummary, NormalizationCounters), NormalFormError> {
+    let (normalized, counters) = dag.normalize_with_counters(root, relations)?;
+    if let Some(witness) = normalized.first_large_witness() {
+        tracing::debug!(
+            event = "operational_normal_form_first_large",
+            factor_index = witness.factor_index,
+            monomial = ?witness.monomial,
+            identity = ?witness.identity,
+            "normalization retained a Large factor"
+        );
+    }
+    Ok((normalized.validate_bounded_only()?.clone(), counters))
+}
+
+fn normalize_matrix_family(
+    dag: &ExpressionDag,
+    relations: &RelationRegistry,
+    family: &super::family::FamilyLoweringValue<TermId>,
+) -> Result<(BoundedSummary, NormalizationCounters), NormalFormError> {
+    family.validate().map_err(|_| NormalFormError::InvalidFamilyDomain)?;
+    let roots = match &family.storage {
+        super::family::FamilyCoverageStorage::ExactStored { elements } => elements.as_ref(),
+        super::family::FamilyCoverageStorage::SharedTemplate { representative, .. } => {
+            std::slice::from_ref(representative)
+        }
+    };
+    let mut maximum: Option<MatrixBound> = None;
+    let mut counters = NormalizationCounters::default();
+    for root in roots {
+        let (summary, root_counters) = normalize_matrix_root(dag, relations, *root)?;
+        counters.nodes_processed =
+            counters.nodes_processed.saturating_add(root_counters.nodes_processed);
+        counters.exact_term_count =
+            counters.exact_term_count.saturating_add(root_counters.exact_term_count);
+        counters.bounded_fold_count =
+            counters.bounded_fold_count.saturating_add(root_counters.bounded_fold_count);
+        counters.relation_candidates =
+            counters.relation_candidates.saturating_add(root_counters.relation_candidates);
+        counters.relations_applied =
+            counters.relations_applied.saturating_add(root_counters.relations_applied);
+        counters.relations_remaining =
+            counters.relations_remaining.saturating_add(root_counters.relations_remaining);
+        counters.switch_cases_processed =
+            counters.switch_cases_processed.saturating_add(root_counters.switch_cases_processed);
+        if let Some(bound) = summary.as_matrix_bound() {
+            maximum = Some(match maximum {
+                Some(current) => {
+                    let current_value = current
+                        .coefficient_class
+                        .maximum_absolute_coefficient()
+                        .unwrap_or_default();
+                    let next_value =
+                        bound.coefficient_class.maximum_absolute_coefficient().unwrap_or_default();
+                    (next_value > current_value).then_some(bound.clone()).unwrap_or(current)
+                }
+                None => bound.clone(),
+            });
+        }
+    }
+    Ok((maximum.map_or(BoundedSummary::ExactZero, BoundedSummary::Bounded), counters))
+}
 
 const PROGRESS_TIME_CADENCE: Duration = Duration::from_secs(1);
 const SHALLOW_ENODE_CHILD_LOG_LIMIT: usize = 16;
@@ -534,10 +673,6 @@ fn selected_relation_rewrite_delta(
         .ok_or(super::error::RelationError::SelectedNormalizationBatchDidNotUnion { batch_size })
 }
 
-fn accumulated_rewrite_iterations(current: u64, additional: usize) -> u64 {
-    current.saturating_add(additional as u64)
-}
-
 /// Logical checker phase reported by progress events and diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckerPhase {
@@ -545,6 +680,7 @@ pub enum CheckerPhase {
     Lower,
     Rewrite,
     Extract,
+    Normalize,
     Bound,
     Acceptance,
 }
@@ -574,9 +710,21 @@ pub struct ProgressEvent {
     pub processed: u64,
     pub total_or_discovered: Option<u64>,
     pub elapsed_ms: u64,
-    pub egraph_nodes: Option<u64>,
+    /// Number of expression-DAG nodes normalized so far.
+    pub normalization_nodes_processed: u64,
+    /// Number of expression-DAG nodes reachable from the current root set.
+    pub normalization_nodes_total: u64,
+    /// Number of exact terms retained by the current normal form.
+    pub normalization_exact_term_count: u64,
+    /// Number of bounded-only aggregations performed by normalization.
+    pub normalization_bounded_fold_count: u64,
+    /// Number of relation candidates inspected/applied/remaining.
+    pub normalization_relation_candidates: u64,
+    pub normalization_relations_applied: u64,
+    pub normalization_relations_remaining: u64,
+    /// Number of reachable Switch/Select cases processed.
+    pub normalization_switch_cases_processed: u64,
     pub owned_elements: u64,
-    pub rewrite_iterations: u64,
     pub program: Option<String>,
     pub scope: Option<String>,
     pub node: Option<u64>,
@@ -681,12 +829,12 @@ impl<'a> SimulationControl<'a> {
         &mut self,
         units: u64,
         total_or_discovered: Option<u64>,
-        egraph_nodes: Option<u64>,
+        _unused_graph_size: Option<u64>,
     ) -> Result<(), OperationalSimulationError> {
         self.progress.processed = self.progress.processed.saturating_add(units);
         let now = Instant::now();
         if now.duration_since(self.progress.last_emitted) >= PROGRESS_TIME_CADENCE {
-            self.emit(ProgressEventKind::Progress, total_or_discovered, egraph_nodes, now);
+            self.emit(ProgressEventKind::Progress, total_or_discovered, now);
             self.progress.last_emitted = now;
         }
         Ok(())
@@ -695,7 +843,7 @@ impl<'a> SimulationControl<'a> {
     fn begin_phase(&mut self, phase: CheckerPhase) -> Result<Instant, OperationalSimulationError> {
         self.phase = phase;
         self.progress = ProgressState::new(Instant::now());
-        self.emit(ProgressEventKind::Start, None, None, Instant::now());
+        self.emit(ProgressEventKind::Start, None, Instant::now());
         Ok(Instant::now())
     }
 
@@ -703,29 +851,31 @@ impl<'a> SimulationControl<'a> {
         &mut self,
         phase_started: Instant,
         total_or_discovered: Option<u64>,
-        egraph_nodes: Option<u64>,
+        _unused_graph_size: Option<u64>,
     ) -> Result<Duration, OperationalSimulationError> {
         let now = Instant::now();
-        self.emit(ProgressEventKind::Complete, total_or_discovered, egraph_nodes, now);
+        self.emit(ProgressEventKind::Complete, total_or_discovered, now);
         Ok(now.duration_since(phase_started))
     }
 
-    fn emit(
-        &mut self,
-        event: ProgressEventKind,
-        total_or_discovered: Option<u64>,
-        egraph_nodes: Option<u64>,
-        now: Instant,
-    ) {
+    fn emit(&mut self, event: ProgressEventKind, total_or_discovered: Option<u64>, now: Instant) {
         (self.emit_progress)(ProgressEvent {
             phase: self.phase,
             event,
             processed: self.progress.processed,
             total_or_discovered,
             elapsed_ms: now.duration_since(self.started).as_millis() as u64,
-            egraph_nodes,
+            normalization_nodes_processed: self.diagnostics.normalization_node_count,
+            normalization_nodes_total: self.diagnostics.normalization_node_total,
+            normalization_exact_term_count: self.diagnostics.normalization_exact_term_count,
+            normalization_bounded_fold_count: self.diagnostics.normalization_bounded_fold_count,
+            normalization_relation_candidates: self.diagnostics.normalization_relation_count,
+            normalization_relations_applied: self.diagnostics.normalization_relation_applied,
+            normalization_relations_remaining: self.diagnostics.normalization_relation_remaining,
+            normalization_switch_cases_processed: self
+                .diagnostics
+                .normalization_switch_cases_processed,
             owned_elements: self.owned_elements.load(Ordering::Relaxed) as u64,
-            rewrite_iterations: self.diagnostics.rewrite_iteration_count,
             program: self.progress_site.as_ref().map(|(program, _, _)| program.clone()),
             scope: self.progress_site.as_ref().map(|(_, scope, _)| scope.clone()),
             node: self.progress_site.as_ref().map(|(_, _, node)| *node),
@@ -754,8 +904,14 @@ pub fn check_operational_noise_candidate(
                 processed = event.processed,
                 total_or_discovered = ?event.total_or_discovered,
                 owned_elements = event.owned_elements,
-                egraph_nodes = ?event.egraph_nodes,
-                rewrite_iterations = event.rewrite_iterations,
+                normalization_nodes_processed = event.normalization_nodes_processed,
+                normalization_nodes_total = event.normalization_nodes_total,
+                normalization_exact_term_count = event.normalization_exact_term_count,
+                normalization_bounded_fold_count = event.normalization_bounded_fold_count,
+                normalization_relation_candidates = event.normalization_relation_candidates,
+                normalization_relations_applied = event.normalization_relations_applied,
+                normalization_relations_remaining = event.normalization_relations_remaining,
+                normalization_switch_cases_processed = event.normalization_switch_cases_processed,
                 program = ?event.program,
                 scope = ?event.scope,
                 node = ?event.node,
@@ -774,8 +930,14 @@ pub fn check_operational_noise_candidate(
                 elapsed_ms = event.elapsed_ms,
                 processed = event.processed,
                 owned_elements = event.owned_elements,
-                egraph_nodes = ?event.egraph_nodes,
-                rewrite_iterations = event.rewrite_iterations,
+                normalization_nodes_processed = event.normalization_nodes_processed,
+                normalization_nodes_total = event.normalization_nodes_total,
+                normalization_exact_term_count = event.normalization_exact_term_count,
+                normalization_bounded_fold_count = event.normalization_bounded_fold_count,
+                normalization_relation_candidates = event.normalization_relation_candidates,
+                normalization_relations_applied = event.normalization_relations_applied,
+                normalization_relations_remaining = event.normalization_relations_remaining,
+                normalization_switch_cases_processed = event.normalization_switch_cases_processed,
                 "operational noise simulation phase complete"
             ),
         }
@@ -849,9 +1011,11 @@ pub fn check_operational_noise_candidate_with_progress(
             )?;
             control.diagnostics_mut().lowered_term_count = lowerer.lowered_wire_count() as u64;
             let roots = match value {
+                LoweredValue::Matrix(root) => LoweredRootSet::Dag(root),
+                LoweredValue::MatrixFamily(family) => LoweredRootSet::MatrixFamily(family),
                 LoweredValue::Term(root) => {
                     control.reserve_owned_elements(1)?;
-                    vec![root].into_boxed_slice()
+                    LoweredRootSet::Egraph(vec![root].into_boxed_slice())
                 }
                 LoweredValue::Family(family) => {
                     family.validate().map_err(|_| OperationalSimulationError::Lower {
@@ -861,7 +1025,9 @@ pub fn check_operational_noise_candidate_with_progress(
                         },
                     })?;
                     match family.storage {
-                        super::family::FamilyCoverageStorage::ExactStored { elements } => elements,
+                        super::family::FamilyCoverageStorage::ExactStored { elements } => {
+                            LoweredRootSet::Egraph(elements)
+                        }
                         super::family::FamilyCoverageStorage::SharedTemplate {
                             domain,
                             representative,
@@ -877,7 +1043,7 @@ pub fn check_operational_noise_candidate_with_progress(
                                 domain.logical_count.clone(),
                             )?;
                             control.reserve_owned_elements(1)?;
-                            vec![representative].into_boxed_slice()
+                            LoweredRootSet::Egraph(vec![representative].into_boxed_slice())
                         }
                     }
                 }
@@ -894,6 +1060,14 @@ pub fn check_operational_noise_candidate_with_progress(
         },
         |(mut lowerer, roots, stage, wire), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
+            if !matches!(roots, LoweredRootSet::Egraph(_)) {
+                let context = RewriteContext::new(control.rewrite_budget());
+                return Ok((lowerer, roots, stage, wire, context));
+            }
+            let root_set = roots;
+            let LoweredRootSet::Egraph(_roots) = &root_set else {
+                unreachable!("DAG roots returned above")
+            };
             let registrations = lowerer.relation_registrations();
             let budget = control.rewrite_budget();
             let context = RewriteContext::new(budget);
@@ -906,13 +1080,6 @@ pub fn check_operational_noise_candidate_with_progress(
                     source,
                 })?;
             control.work(iterations as u64, None, Some(lowerer.egraph.total_size() as u64))?;
-            let counters = context.counters();
-            control.diagnostics_mut().rewrite_iteration_count = iterations as u64;
-            control.diagnostics_mut().egraph_node_count = lowerer.egraph.total_size() as u64;
-            control.diagnostics_mut().egraph_class_count =
-                lowerer.egraph.number_of_classes() as u64;
-            control.diagnostics_mut().relation_candidate_count = counters.candidates;
-            control.diagnostics_mut().relation_rewrite_count = counters.rewrites;
             if let Some(failure) = context.failure() {
                 return Err(match failure {
                     failure => {
@@ -920,10 +1087,73 @@ pub fn check_operational_noise_candidate_with_progress(
                     }
                 });
             }
-            Ok((lowerer, roots, stage, wire, context))
+            Ok((lowerer, root_set, stage, wire, context))
         },
         |(mut lowerer, roots, stage, wire, context), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
+            if !matches!(roots, LoweredRootSet::Egraph(_)) {
+                control.reserve_owned_elements(1)?;
+                let dag_roots = match &roots {
+                    LoweredRootSet::Dag(root) => vec![*root],
+                    LoweredRootSet::MatrixFamily(family) => match &family.storage {
+                        super::family::FamilyCoverageStorage::ExactStored { elements } => {
+                            elements.to_vec()
+                        }
+                        super::family::FamilyCoverageStorage::SharedTemplate {
+                            representative,
+                            ..
+                        } => vec![*representative],
+                    },
+                    LoweredRootSet::Egraph(_) => unreachable!("checked above"),
+                };
+                let shape = dag_progress_stats(lowerer.expression_dag(), dag_roots)
+                    .map_err(|source| normal_form_error(&stage, wire, source))?;
+                {
+                    let diagnostics = control.diagnostics_mut();
+                    diagnostics.normalization_node_count = shape.reachable_nodes;
+                    diagnostics.normalization_node_total = shape.reachable_nodes;
+                    diagnostics.normalization_switch_cases_processed = shape.reachable_switch_cases;
+                }
+                let normalize_started = control.begin_phase(CheckerPhase::Normalize)?;
+                let normalized = match roots {
+                    LoweredRootSet::Dag(root) => normalize_matrix_root(
+                        lowerer.expression_dag(),
+                        lowerer.normal_form_relations(),
+                        root,
+                    ),
+                    LoweredRootSet::MatrixFamily(family) => normalize_matrix_family(
+                        lowerer.expression_dag(),
+                        lowerer.normal_form_relations(),
+                        &family,
+                    ),
+                    LoweredRootSet::Egraph(_) => unreachable!("checked above"),
+                }
+                .map_err(|source| normal_form_error(&stage, wire, source));
+                control.diagnostics_mut().normalization_milliseconds =
+                    control.complete_phase(normalize_started, None, None)?.as_millis() as u64;
+                let (normalized, counters) = normalized?;
+                {
+                    let diagnostics = control.diagnostics_mut();
+                    diagnostics.normalization_node_count = counters.nodes_processed;
+                    diagnostics.normalization_exact_term_count = counters.exact_term_count;
+                    diagnostics.normalization_bounded_fold_count = counters.bounded_fold_count;
+                    diagnostics.normalization_relation_count = counters.relation_candidates;
+                    diagnostics.normalization_relation_applied = counters.relations_applied;
+                    diagnostics.normalization_relation_remaining = counters.relations_remaining;
+                    diagnostics.normalization_switch_cases_processed =
+                        counters.switch_cases_processed;
+                    diagnostics.final_term_count = counters.exact_term_count;
+                }
+                drop(lowerer);
+                return Ok((
+                    NormalizedRootSet::Dag((normalized, counters.exact_term_count)),
+                    stage,
+                    wire,
+                ));
+            }
+            let LoweredRootSet::Egraph(roots) = roots else {
+                unreachable!("DAG roots returned above")
+            };
             let control = RefCell::new(control);
             let mut invalid_dag = |_| OperationalSimulationError::Lower {
                 site: site(&stage, wire, "extract"),
@@ -1036,15 +1266,6 @@ pub fn check_operational_noise_candidate_with_progress(
                                     None,
                                     Some(lowerer.egraph.total_size() as u64),
                                 )?;
-                                let diagnostics = control.diagnostics_mut();
-                                diagnostics.rewrite_iteration_count =
-                                    accumulated_rewrite_iterations(
-                                        diagnostics.rewrite_iteration_count,
-                                        iterations,
-                                    );
-                                diagnostics.egraph_node_count = lowerer.egraph.total_size() as u64;
-                                diagnostics.egraph_class_count =
-                                    lowerer.egraph.number_of_classes() as u64;
                             }
                             if let Some(failure) = context.failure() {
                                 return Err(relation_error(
@@ -1214,15 +1435,6 @@ pub fn check_operational_noise_candidate_with_progress(
                                     None,
                                     Some(lowerer.egraph.total_size() as u64),
                                 )?;
-                                let diagnostics = control.diagnostics_mut();
-                                diagnostics.rewrite_iteration_count =
-                                    accumulated_rewrite_iterations(
-                                        diagnostics.rewrite_iteration_count,
-                                        iterations,
-                                    );
-                                diagnostics.egraph_node_count = lowerer.egraph.total_size() as u64;
-                                diagnostics.egraph_class_count =
-                                    lowerer.egraph.number_of_classes() as u64;
                             }
                             selected_roots =
                                 roots.iter().map(|root| lowerer.egraph.find(*root)).collect();
@@ -1270,15 +1482,6 @@ pub fn check_operational_noise_candidate_with_progress(
                                     None,
                                     Some(lowerer.egraph.total_size() as u64),
                                 )?;
-                                let diagnostics = control.diagnostics_mut();
-                                diagnostics.rewrite_iteration_count =
-                                    accumulated_rewrite_iterations(
-                                        diagnostics.rewrite_iteration_count,
-                                        iterations,
-                                    );
-                                diagnostics.egraph_node_count = lowerer.egraph.total_size() as u64;
-                                diagnostics.egraph_class_count =
-                                    lowerer.egraph.number_of_classes() as u64;
                             }
                             if let Some(failure) = context.failure() {
                                 return Err(relation_error(
@@ -1584,14 +1787,6 @@ pub fn check_operational_noise_candidate_with_progress(
                                 None,
                                 Some(lowerer.egraph.total_size() as u64),
                             )?;
-                            let diagnostics = control.diagnostics_mut();
-                            diagnostics.rewrite_iteration_count = accumulated_rewrite_iterations(
-                                diagnostics.rewrite_iteration_count,
-                                iterations,
-                            );
-                            diagnostics.egraph_node_count = lowerer.egraph.total_size() as u64;
-                            diagnostics.egraph_class_count =
-                                lowerer.egraph.number_of_classes() as u64;
                         }
                         selected_roots =
                             roots.iter().map(|root| lowerer.egraph.find(*root)).collect();
@@ -1602,9 +1797,6 @@ pub fn check_operational_noise_candidate_with_progress(
                     normalization_epoch += 1;
                 }
             };
-            let counters = context.counters();
-            control.borrow_mut().diagnostics_mut().relation_candidate_count = counters.candidates;
-            control.borrow_mut().diagnostics_mut().relation_rewrite_count = counters.rewrites;
             let final_selected_roots =
                 roots.iter().map(|root| lowerer.egraph.find(*root)).collect::<BTreeSet<_>>();
             let terminal_snapshot_is_current = terminal_egraph_mutation_epoch ==
@@ -1878,10 +2070,21 @@ pub fn check_operational_noise_candidate_with_progress(
             )?;
             control.borrow_mut().diagnostics_mut().final_term_count = term_count as u64;
             drop(lowerer);
-            Ok((bounds, stage, wire))
+            Ok((NormalizedRootSet::Egraph(bounds), stage, wire))
         },
-        |(bounds, stage, wire), control| {
+        |(normalized, stage, wire), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
+            if let NormalizedRootSet::Dag((summary, _exact_term_count)) = normalized {
+                let maximum = summary
+                    .as_matrix_bound()
+                    .and_then(|bound| bound.coefficient_class.maximum_absolute_coefficient())
+                    .unwrap_or_default();
+                control.work(1, None, None)?;
+                return Ok(maximum);
+            }
+            let NormalizedRootSet::Egraph(bounds) = normalized else {
+                unreachable!("all normalized roots handled above")
+            };
             let mut bound = BigUint::zero();
             for (root, result) in bounds {
                 let maximum =
@@ -2552,6 +2755,17 @@ fn relation_error(
     OperationalSimulationError::Relation { site: site(stage, wire, "relation rewrite"), source }
 }
 
+fn normal_form_error(
+    stage: &StageId,
+    wire: WireRef,
+    source: NormalFormError,
+) -> OperationalSimulationError {
+    OperationalSimulationError::Bound {
+        site: site(stage, wire, "normalization"),
+        source: super::error::BoundError::NormalForm { source },
+    }
+}
+
 /// Drives injected stages with the same progress and diagnostics owner used in production.
 #[cfg(test)]
 pub(crate) fn check_with_test_control<Lowered, Rewritten, Extracted>(
@@ -2599,8 +2813,7 @@ fn check_with_control<Lowered, Rewritten, Extracted>(
 
     let phase_started = control.begin_phase(CheckerPhase::Rewrite)?;
     let rewritten = rewrite(lowered, control)?;
-    let elapsed = control.complete_phase(phase_started, None, None)?;
-    control.diagnostics.rewrite_milliseconds = elapsed.as_millis() as u64;
+    control.complete_phase(phase_started, None, None)?;
 
     let phase_started = control.begin_phase(CheckerPhase::Extract)?;
     let extracted = extract(rewritten, control)?;
@@ -3246,6 +3459,26 @@ mod tests {
     }
 
     #[test]
+    fn dag_progress_counts_unique_reachable_nodes_and_switch_cases() {
+        let mut dag = ExpressionDag::new();
+        let left = dag.push(ExpressionNode::Zero).expect("left DAG node");
+        let right = dag.push(ExpressionNode::Zero).expect("right DAG node");
+        let selector = super::super::normal_form::FactorIdentity::named("selector");
+        let root = dag
+            .push(ExpressionNode::Switch {
+                selector,
+                cases: vec![left, right].into_boxed_slice(),
+                reachable: vec![0, 1].into_boxed_slice(),
+            })
+            .expect("switch DAG node");
+
+        assert_eq!(
+            dag_progress_stats(&dag, [root]).expect("DAG stats"),
+            DagProgressStats { reachable_nodes: 3, reachable_switch_cases: 2 }
+        );
+    }
+
+    #[test]
     fn selected_phase_postcondition_restarts_completes_or_fails_without_spinning() {
         assert_eq!(
             selected_phase_postcondition(1, 7, 9),
@@ -3286,12 +3519,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rewrite_iteration_diagnostics_accumulate_saturatingly() {
-        assert_eq!(accumulated_rewrite_iterations(4, 3), 7);
-        assert_eq!(accumulated_rewrite_iterations(u64::MAX - 1, 3), u64::MAX);
-    }
-
     fn boolean_target(q: u32) -> ResolvedAcceptanceTarget {
         ResolvedAcceptanceTarget {
             target_id: "interval".to_owned(),
@@ -3330,6 +3557,56 @@ mod tests {
         assert!(!rejected.accepted, "N == quarter must fail the strict lower condition");
         let accepted = run_acceptance(boolean_target(17), 3);
         assert!(accepted.accepted);
+    }
+
+    fn normal_form_test_bound(class: super::super::bound::BoundClass) -> MatrixBound {
+        MatrixBound {
+            matrix_type: mxx_ir_core::types::ConcreteMatrixType {
+                modulus: 17.into(),
+                ring_dimension: 1,
+                rows: 1,
+                columns: 1,
+            },
+            coefficient_class: class,
+            metadata: super::super::bound::MatrixMetadata::unknown(),
+        }
+    }
+
+    #[test]
+    fn production_normalization_accepts_a_finite_root() {
+        let mut dag = ExpressionDag::new();
+        let root = dag
+            .push(super::super::normal_form::ExpressionNode::Atom(
+                super::super::normal_form::SymbolicFactor::bounded(
+                    super::super::normal_form::FactorIdentity::named("finite"),
+                    normal_form_test_bound(super::super::bound::BoundClass::bounded(3_u8.into())),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let summary = normalize_matrix_root(&dag, &RelationRegistry::default(), root).unwrap();
+        assert_eq!(
+            summary.0.as_matrix_bound().unwrap().coefficient_class.maximum_absolute_coefficient(),
+            Some(3_u8.into())
+        );
+    }
+
+    #[test]
+    fn production_normalization_rejects_exact_large_residual_with_witness() {
+        let mut dag = ExpressionDag::new();
+        let root = dag
+            .push(super::super::normal_form::ExpressionNode::Atom(
+                super::super::normal_form::SymbolicFactor::large(
+                    super::super::normal_form::FactorIdentity::named("large"),
+                ),
+            ))
+            .unwrap();
+        let normalized = dag.normalize(root, &RelationRegistry::default()).unwrap();
+        assert!(normalized.first_large_witness().is_some());
+        assert!(matches!(
+            normalize_matrix_root(&dag, &RelationRegistry::default(), root),
+            Err(NormalFormError::UnconsumedExactTerm { .. })
+        ));
     }
 
     #[test]

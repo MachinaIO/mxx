@@ -292,8 +292,15 @@ impl DiamondParameterSearch {
             noise_bound = %report.noise_bound,
             ciphertext_modulus = %report.ciphertext_modulus,
             lowered_term_count = report.diagnostics.lowered_term_count,
-            egraph_node_count = report.diagnostics.egraph_node_count,
-            relation_rewrite_count = report.diagnostics.relation_rewrite_count,
+            normalization_node_count = report.diagnostics.normalization_node_count,
+            normalization_node_total = report.diagnostics.normalization_node_total,
+            normalization_exact_term_count = report.diagnostics.normalization_exact_term_count,
+            normalization_relation_count = report.diagnostics.normalization_relation_count,
+            normalization_relation_applied = report.diagnostics.normalization_relation_applied,
+            normalization_relation_remaining = report.diagnostics.normalization_relation_remaining,
+            normalization_bounded_fold_count = report.diagnostics.normalization_bounded_fold_count,
+            normalization_switch_cases_processed =
+                report.diagnostics.normalization_switch_cases_processed,
             elapsed_seconds = checker_started.elapsed().as_secs_f64(),
             "finished Diamond WE Rust operational-noise check"
         );

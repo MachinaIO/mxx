@@ -8,9 +8,10 @@
 use super::{
     bound::{BoundClass, MatrixBound, MatrixMetadata, product_bound},
     identity::{
-        AtomicSourceKey, BinderKey, ResolvedIntExpr, ResolvedMatrixType, SliceSpec,
-        TrapdoorSourceKey,
+        AtomicSourceKey, Axis, BinderKey, CrtSpec, ResolvedIndexRange, ResolvedIntExpr,
+        ResolvedMatrixType, SliceSpec, TrapdoorSourceKey,
     },
+    normal_form_ops::{IntegerInterval, ScaleScalar, ViewSpec},
 };
 use mxx_ir_core::{Port, types::ConcreteMatrixType};
 use num_bigint::{BigInt, BigUint};
@@ -23,7 +24,7 @@ use std::{
 
 #[path = "normal_form_product.rs"]
 pub(crate) mod normal_form_product;
-pub(crate) use normal_form_product::product_bound_only;
+pub(crate) use normal_form_product::NormalizationCounters;
 
 pub use super::normal_form_relation::{FullRelationKey, RelationRegistration, RelationRegistry};
 
@@ -53,6 +54,10 @@ pub enum FactorKind {
 pub enum FactorOwner {
     Atomic(AtomicSourceKey),
     Trapdoor(TrapdoorSourceKey),
+    /// Canonical owner-aware scalar identity used by selector barriers.  It
+    /// deliberately does not mention the graph output node that materialized
+    /// the selector, so equal selectors share one barrier identity.
+    Scalar(ResolvedIntExpr),
     Derived {
         parent: Box<FactorIdentity>,
         tag: Box<[u8]>,
@@ -96,6 +101,20 @@ impl FactorIdentity {
             kind: FactorKind::Signal,
             port: Port(0),
             coordinates: coordinates.into_iter().collect(),
+            public: None,
+            layout: None,
+            selector: None,
+            trapdoor: None,
+            selector_mapping: Box::new([]),
+        }
+    }
+
+    pub fn scalar_selector(identity: ResolvedIntExpr) -> Self {
+        Self {
+            owner: FactorOwner::Scalar(identity),
+            kind: FactorKind::Signal,
+            port: Port(0),
+            coordinates: Box::new([]),
             public: None,
             layout: None,
             selector: None,
@@ -424,11 +443,20 @@ impl PolynomialNF {
     /// remains unmatched. A live identity survives only when it is not safely
     /// finite (for example, a malformed Large contract).
     pub fn finish_relation_live(mut self) -> Result<Self, NormalFormError> {
-        self.fold_finite_non_live_terms()?;
+        let mut ignored_fold_count = 0_u64;
+        self.fold_finite_non_live_terms(&mut ignored_fold_count)?;
         Ok(self)
     }
 
-    fn fold_finite_non_live_terms(&mut self) -> Result<(), NormalFormError> {
+    pub(crate) fn finish_relation_live_counted(
+        mut self,
+        fold_count: &mut u64,
+    ) -> Result<Self, NormalFormError> {
+        self.fold_finite_non_live_terms(fold_count)?;
+        Ok(self)
+    }
+
+    fn fold_finite_non_live_terms(&mut self, fold_count: &mut u64) -> Result<(), NormalFormError> {
         let keys = self.exact_terms.keys().cloned().collect::<Vec<_>>();
         for key in keys {
             let Some(term) = self.exact_terms.remove(&key) else { continue };
@@ -442,6 +470,7 @@ impl PolynomialNF {
                 self.bounded_summary.clone(),
                 summary_from_bound(scale_by_multiplicity(bound, &term.multiplicity)),
             )?;
+            *fold_count = fold_count.saturating_add(1);
         }
         Ok(())
     }
@@ -506,10 +535,11 @@ impl PolynomialNF {
         Ok(())
     }
 
-    fn multiply_summary(
+    pub(crate) fn multiply_summary_counted(
         mut self,
         summary: &BoundedSummary,
         terms: &BTreeMap<MonomialKey, SignedMonomial>,
+        fold_count: &mut u64,
     ) -> Result<Self, NormalFormError> {
         for term in terms.values() {
             if term.monomial.factors.iter().any(|factor| matches!(factor.bound, BoundClass::Large))
@@ -533,7 +563,11 @@ impl PolynomialNF {
                     }
                 }
             };
+            let contributes = !matches!(product, BoundedSummary::ExactZero);
             self.bounded_summary = add_summary(self.bounded_summary, product)?;
+            if contributes {
+                *fold_count = fold_count.saturating_add(1);
+            }
         }
         Ok(self)
     }
@@ -579,6 +613,39 @@ pub enum ExpressionNode {
         stored_indices: Box<[BigUint]>,
         domain_upper: BigUint,
     },
+    MatrixScale {
+        input: TermId,
+        scalar: ScaleScalar,
+    },
+    Transpose(TermId),
+    Slice {
+        input: TermId,
+        spec: SliceSpec,
+    },
+    Tensor {
+        left: TermId,
+        right: TermId,
+    },
+    LiftConstantPolynomial {
+        input: TermId,
+        matrix_type: ConcreteMatrixType,
+        domain: IntegerInterval,
+    },
+    View {
+        input: TermId,
+        view: ViewSpec,
+        output_type: ConcreteMatrixType,
+    },
+    CrtRecompose {
+        inputs: Box<[TermId]>,
+        spec: CrtSpec,
+        output_type: ConcreteMatrixType,
+    },
+    Concat {
+        inputs: Box<[TermId]>,
+        axis: Axis,
+        output_type: ConcreteMatrixType,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -602,12 +669,27 @@ impl ExpressionDag {
     pub fn node(&self, id: TermId) -> Result<&ExpressionNode, NormalFormError> {
         self.nodes.get(id.0 as usize).ok_or(NormalFormError::InvalidTermId)
     }
+    #[cfg(test)]
+    pub(crate) fn term_count(&self) -> usize {
+        self.nodes.len()
+    }
     pub fn normalize(
         &self,
         root: TermId,
         registry: &RelationRegistry,
     ) -> Result<PolynomialNF, NormalFormError> {
         normal_form_product::Normalizer::new(self, registry).normalize(root)?.finish_relation_live()
+    }
+
+    /// Normalize one root and return the counters owned by this DAG job.
+    /// Counters are collected at the normalizer's actual traversal and
+    /// relation/folding boundaries; they are not inferred from lowered wires.
+    pub(crate) fn normalize_with_counters(
+        &self,
+        root: TermId,
+        registry: &RelationRegistry,
+    ) -> Result<(PolynomialNF, NormalizationCounters), NormalFormError> {
+        normal_form_product::Normalizer::new(self, registry).normalize_with_counters(root)
     }
 
     /// Strict root gate that additionally rejects any exact residual.
@@ -618,6 +700,480 @@ impl ExpressionDag {
     ) -> Result<BoundedSummary, NormalFormError> {
         let normalized = self.normalize(root, registry)?;
         Ok(normalized.validate_bounded_only()?.clone())
+    }
+
+    /// Bind one owner-resolved loop coordinate in an arbitrary DAG subtree.
+    ///
+    /// This is deliberately a caller-owned memo operation: a lowering job can
+    /// reuse the same memo for every family access without introducing a
+    /// second expression cache.  The walk rebuilds every node shape, including
+    /// nested switches, family accesses, and structural operations; it is not
+    /// limited to atom/zero representatives.
+    pub(crate) fn substitute_binder(
+        &mut self,
+        root: TermId,
+        binder: &BinderKey,
+        replacement: &ResolvedIntExpr,
+        memo: &mut BTreeMap<(TermId, BinderKey, ResolvedIntExpr), TermId>,
+    ) -> Result<TermId, NormalFormError> {
+        // Keep the overwhelmingly common atom/zero path in a small stack
+        // frame.  The general structural dispatcher below is intentionally
+        // separate: its large enum match must not consume the constrained
+        // stack used by the deep lowering stress test.
+        let memo_key = (root, binder.clone(), replacement.clone());
+        if let Some(term) = memo.get(&memo_key) {
+            return Ok(*term);
+        }
+        match self.node(root)?.clone() {
+            ExpressionNode::Zero => {
+                let result = self.push(ExpressionNode::Zero)?;
+                memo.insert(memo_key, result);
+                Ok(result)
+            }
+            ExpressionNode::Atom(mut factor) => {
+                factor.key = substitute_factor_identity(&factor.key, binder, replacement);
+                factor.trapdoor = factor
+                    .trapdoor
+                    .map(|source| substitute_trapdoor_source(source, binder, replacement));
+                factor.key.trapdoor = factor
+                    .key
+                    .trapdoor
+                    .clone()
+                    .map(|source| substitute_trapdoor_source(source, binder, replacement));
+                factor.switch = factor.switch.map(|switch| {
+                    Arc::new(SwitchData {
+                        selector: substitute_factor_identity(&switch.selector, binder, replacement),
+                        cases: switch
+                            .cases
+                            .iter()
+                            .map(|case| substitute_nf(case, binder, replacement))
+                            .collect(),
+                        case_indices: switch.case_indices.clone(),
+                        case_fingerprints: switch.case_fingerprints.clone(),
+                    })
+                });
+                let result = self.push(ExpressionNode::Atom(factor))?;
+                memo.insert(memo_key, result);
+                Ok(result)
+            }
+            _ => self.substitute_binder_complex(root, binder, replacement, memo),
+        }
+    }
+
+    fn substitute_binder_complex(
+        &mut self,
+        root: TermId,
+        binder: &BinderKey,
+        replacement: &ResolvedIntExpr,
+        memo: &mut BTreeMap<(TermId, BinderKey, ResolvedIntExpr), TermId>,
+    ) -> Result<TermId, NormalFormError> {
+        let memo_key = (root, binder.clone(), replacement.clone());
+        if let Some(term) = memo.get(&memo_key) {
+            return Ok(*term);
+        }
+        let node = self.node(root)?.clone();
+        let rebuilt = match node {
+            ExpressionNode::Zero | ExpressionNode::Atom(_) => unreachable!("fast path handled"),
+            ExpressionNode::Add(children) => ExpressionNode::Add(
+                children
+                    .iter()
+                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+            ),
+            ExpressionNode::Negate(child) => {
+                ExpressionNode::Negate(self.substitute_binder(child, binder, replacement, memo)?)
+            }
+            ExpressionNode::Product(children) => ExpressionNode::Product(
+                children
+                    .iter()
+                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+            ),
+            ExpressionNode::Switch { selector, cases, reachable } => ExpressionNode::Switch {
+                selector: substitute_factor_identity(&selector, binder, replacement),
+                cases: cases
+                    .iter()
+                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+                reachable,
+            },
+            ExpressionNode::Select { selector, cases, reachable } => ExpressionNode::Select {
+                selector: substitute_factor_identity(&selector, binder, replacement),
+                cases: cases
+                    .iter()
+                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+                reachable,
+            },
+            ExpressionNode::FamilyGetStatic { cases, index } => ExpressionNode::FamilyGetStatic {
+                cases: cases
+                    .iter()
+                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+                index,
+            },
+            ExpressionNode::FamilyGetDynamic { selector, cases, stored_indices, domain_upper } => {
+                ExpressionNode::FamilyGetDynamic {
+                    selector: substitute_factor_identity(&selector, binder, replacement),
+                    cases: cases
+                        .iter()
+                        .map(|child| self.substitute_binder(*child, binder, replacement, memo))
+                        .collect::<Result<Box<_>, _>>()?,
+                    stored_indices,
+                    domain_upper,
+                }
+            }
+            ExpressionNode::MatrixScale { input, scalar } => ExpressionNode::MatrixScale {
+                input: self.substitute_binder(input, binder, replacement, memo)?,
+                scalar: substitute_scale_scalar(scalar, binder, replacement),
+            },
+            ExpressionNode::Transpose(input) => ExpressionNode::Transpose(self.substitute_binder(
+                input,
+                binder,
+                replacement,
+                memo,
+            )?),
+            ExpressionNode::Slice { input, spec } => ExpressionNode::Slice {
+                input: self.substitute_binder(input, binder, replacement, memo)?,
+                spec: substitute_slice_spec(spec, binder, replacement),
+            },
+            ExpressionNode::Tensor { left, right } => ExpressionNode::Tensor {
+                left: self.substitute_binder(left, binder, replacement, memo)?,
+                right: self.substitute_binder(right, binder, replacement, memo)?,
+            },
+            ExpressionNode::LiftConstantPolynomial { input, matrix_type, domain } => {
+                ExpressionNode::LiftConstantPolynomial {
+                    input: self.substitute_binder(input, binder, replacement, memo)?,
+                    matrix_type,
+                    domain,
+                }
+            }
+            ExpressionNode::View { input, view, output_type } => ExpressionNode::View {
+                input: self.substitute_binder(input, binder, replacement, memo)?,
+                view,
+                output_type,
+            },
+            ExpressionNode::CrtRecompose { inputs, spec, output_type } => {
+                ExpressionNode::CrtRecompose {
+                    inputs: inputs
+                        .iter()
+                        .map(|child| self.substitute_binder(*child, binder, replacement, memo))
+                        .collect::<Result<Box<_>, _>>()?,
+                    spec: substitute_crt_spec(spec, binder, replacement),
+                    output_type,
+                }
+            }
+            ExpressionNode::Concat { inputs, axis, output_type } => ExpressionNode::Concat {
+                inputs: inputs
+                    .iter()
+                    .map(|child| self.substitute_binder(*child, binder, replacement, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+                axis,
+                output_type,
+            },
+        };
+        let result = self.push(rebuilt)?;
+        memo.insert(memo_key, result);
+        Ok(result)
+    }
+
+    /// Replaces owner-resolved placeholder factors in a DAG subtree.  The
+    /// replacement map is supplied by the caller for one recurrence step, so
+    /// every next state observes the same previous state vector.  `memo` is
+    /// intentionally job-local and can be discarded when that vector changes.
+    pub(crate) fn substitute_factors(
+        &mut self,
+        root: TermId,
+        replacements: &BTreeMap<FactorIdentity, TermId>,
+        memo: &mut BTreeMap<TermId, TermId>,
+    ) -> Result<TermId, NormalFormError> {
+        if let Some(term) = memo.get(&root) {
+            return Ok(*term);
+        }
+        let node = self.node(root)?.clone();
+        if let ExpressionNode::Atom(factor) = &node {
+            if let Some(term) = replacements.get(&factor.key) {
+                memo.insert(root, *term);
+                return Ok(*term);
+            }
+        }
+        let rebuilt = match node {
+            ExpressionNode::Zero => ExpressionNode::Zero,
+            ExpressionNode::Atom(factor) => ExpressionNode::Atom(factor),
+            ExpressionNode::Add(children) => ExpressionNode::Add(
+                children
+                    .iter()
+                    .map(|child| self.substitute_factors(*child, replacements, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+            ),
+            ExpressionNode::Negate(child) => {
+                ExpressionNode::Negate(self.substitute_factors(child, replacements, memo)?)
+            }
+            ExpressionNode::Product(children) => ExpressionNode::Product(
+                children
+                    .iter()
+                    .map(|child| self.substitute_factors(*child, replacements, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+            ),
+            ExpressionNode::Switch { selector, cases, reachable } => ExpressionNode::Switch {
+                selector,
+                cases: cases
+                    .iter()
+                    .map(|child| self.substitute_factors(*child, replacements, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+                reachable,
+            },
+            ExpressionNode::Select { selector, cases, reachable } => ExpressionNode::Select {
+                selector,
+                cases: cases
+                    .iter()
+                    .map(|child| self.substitute_factors(*child, replacements, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+                reachable,
+            },
+            ExpressionNode::FamilyGetStatic { cases, index } => ExpressionNode::FamilyGetStatic {
+                cases: cases
+                    .iter()
+                    .map(|child| self.substitute_factors(*child, replacements, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+                index,
+            },
+            ExpressionNode::FamilyGetDynamic { selector, cases, stored_indices, domain_upper } => {
+                ExpressionNode::FamilyGetDynamic {
+                    selector,
+                    cases: cases
+                        .iter()
+                        .map(|child| self.substitute_factors(*child, replacements, memo))
+                        .collect::<Result<Box<_>, _>>()?,
+                    stored_indices,
+                    domain_upper,
+                }
+            }
+            ExpressionNode::MatrixScale { input, scalar } => ExpressionNode::MatrixScale {
+                input: self.substitute_factors(input, replacements, memo)?,
+                scalar,
+            },
+            ExpressionNode::Transpose(input) => {
+                ExpressionNode::Transpose(self.substitute_factors(input, replacements, memo)?)
+            }
+            ExpressionNode::Slice { input, spec } => ExpressionNode::Slice {
+                input: self.substitute_factors(input, replacements, memo)?,
+                spec,
+            },
+            ExpressionNode::Tensor { left, right } => ExpressionNode::Tensor {
+                left: self.substitute_factors(left, replacements, memo)?,
+                right: self.substitute_factors(right, replacements, memo)?,
+            },
+            ExpressionNode::LiftConstantPolynomial { input, matrix_type, domain } => {
+                ExpressionNode::LiftConstantPolynomial {
+                    input: self.substitute_factors(input, replacements, memo)?,
+                    matrix_type,
+                    domain,
+                }
+            }
+            ExpressionNode::View { input, view, output_type } => ExpressionNode::View {
+                input: self.substitute_factors(input, replacements, memo)?,
+                view,
+                output_type,
+            },
+            ExpressionNode::CrtRecompose { inputs, spec, output_type } => {
+                ExpressionNode::CrtRecompose {
+                    inputs: inputs
+                        .iter()
+                        .map(|child| self.substitute_factors(*child, replacements, memo))
+                        .collect::<Result<Box<_>, _>>()?,
+                    spec,
+                    output_type,
+                }
+            }
+            ExpressionNode::Concat { inputs, axis, output_type } => ExpressionNode::Concat {
+                inputs: inputs
+                    .iter()
+                    .map(|child| self.substitute_factors(*child, replacements, memo))
+                    .collect::<Result<Box<_>, _>>()?,
+                axis,
+                output_type,
+            },
+        };
+        let result = self.push(rebuilt)?;
+        memo.insert(root, result);
+        Ok(result)
+    }
+}
+
+fn substitute_binder_expr(
+    value: &ResolvedIntExpr,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> ResolvedIntExpr {
+    if value == &ResolvedIntExpr::Binder(binder.clone()) {
+        return replacement.clone();
+    }
+    match value {
+        ResolvedIntExpr::Const(_) | ResolvedIntExpr::Parameter(_) | ResolvedIntExpr::Binder(_) => {
+            value.clone()
+        }
+        ResolvedIntExpr::Source { source, coordinates } => ResolvedIntExpr::Source {
+            source: source.clone(),
+            coordinates: coordinates
+                .iter()
+                .map(|coordinate| substitute_binder_expr(coordinate, binder, replacement))
+                .collect(),
+        },
+        ResolvedIntExpr::Add(left, right) => ResolvedIntExpr::Add(
+            Box::new(substitute_binder_expr(left, binder, replacement)),
+            Box::new(substitute_binder_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::Sub(left, right) => ResolvedIntExpr::Sub(
+            Box::new(substitute_binder_expr(left, binder, replacement)),
+            Box::new(substitute_binder_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::Mul(left, right) => ResolvedIntExpr::Mul(
+            Box::new(substitute_binder_expr(left, binder, replacement)),
+            Box::new(substitute_binder_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::Div(left, right) => ResolvedIntExpr::Div(
+            Box::new(substitute_binder_expr(left, binder, replacement)),
+            Box::new(substitute_binder_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::EuclideanDiv(left, right) => ResolvedIntExpr::EuclideanDiv(
+            Box::new(substitute_binder_expr(left, binder, replacement)),
+            Box::new(substitute_binder_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::EuclideanRemainder(left, right) => ResolvedIntExpr::EuclideanRemainder(
+            Box::new(substitute_binder_expr(left, binder, replacement)),
+            Box::new(substitute_binder_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::RoundDiv(left, right) => ResolvedIntExpr::RoundDiv(
+            Box::new(substitute_binder_expr(left, binder, replacement)),
+            Box::new(substitute_binder_expr(right, binder, replacement)),
+        ),
+        ResolvedIntExpr::Log2Ceil(value) => {
+            ResolvedIntExpr::Log2Ceil(Box::new(substitute_binder_expr(value, binder, replacement)))
+        }
+        ResolvedIntExpr::ExtractCoefficient { input, position, canonical_exclusive_upper } => {
+            ResolvedIntExpr::ExtractCoefficient {
+                input: Box::new(substitute_binder_expr(input, binder, replacement)),
+                position: Box::new(substitute_binder_expr(position, binder, replacement)),
+                canonical_exclusive_upper: canonical_exclusive_upper.clone(),
+            }
+        }
+    }
+}
+
+fn substitute_factor_identity(
+    value: &FactorIdentity,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> FactorIdentity {
+    let mut value = value.clone();
+    value.coordinates = value
+        .coordinates
+        .iter()
+        .map(|(owner, coordinate)| {
+            (owner.clone(), substitute_binder_expr(coordinate, binder, replacement))
+        })
+        .collect();
+    value.public = value.public.map(|source| substitute_atomic_source(source, binder, replacement));
+    value.selector = value
+        .selector
+        .map(|selector| Box::new(substitute_factor_identity(&selector, binder, replacement)));
+    value.trapdoor =
+        value.trapdoor.map(|source| substitute_trapdoor_source(source, binder, replacement));
+    value.owner = match value.owner {
+        FactorOwner::Derived { parent, tag } => FactorOwner::Derived {
+            parent: Box::new(substitute_factor_identity(&parent, binder, replacement)),
+            tag,
+        },
+        FactorOwner::Scalar(identity) => {
+            FactorOwner::Scalar(substitute_binder_expr(&identity, binder, replacement))
+        }
+        owner => owner,
+    };
+    value
+}
+
+fn substitute_atomic_source(
+    source: AtomicSourceKey,
+    _binder: &BinderKey,
+    _replacement: &ResolvedIntExpr,
+) -> AtomicSourceKey {
+    // Runtime coordinates are carried by FactorIdentity.  Source descriptors
+    // are owner identities and must not be inferred or rewritten by position.
+    source
+}
+
+fn substitute_trapdoor_source(
+    source: TrapdoorSourceKey,
+    _binder: &BinderKey,
+    _replacement: &ResolvedIntExpr,
+) -> TrapdoorSourceKey {
+    source
+}
+
+fn substitute_nf(
+    value: &PolynomialNF,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> PolynomialNF {
+    let exact_terms = value
+        .exact_terms
+        .values()
+        .map(|term| {
+            let monomial =
+                Monomial::from_factors(term.monomial.factors.iter().cloned().map(|mut factor| {
+                    factor.key = substitute_factor_identity(&factor.key, binder, replacement);
+                    factor
+                }));
+            (monomial.key(), SignedMonomial { monomial, multiplicity: term.multiplicity.clone() })
+        })
+        .collect();
+    PolynomialNF::from_parts(exact_terms, value.bounded_summary.clone())
+}
+
+fn substitute_slice_spec(
+    spec: SliceSpec,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> SliceSpec {
+    let map_range = |range: ResolvedIndexRange| ResolvedIndexRange {
+        start: substitute_binder_expr(&range.start, binder, replacement),
+        end: substitute_binder_expr(&range.end, binder, replacement),
+    };
+    SliceSpec { rows: spec.rows.map(map_range), columns: spec.columns.map(map_range) }
+}
+
+fn substitute_crt_spec(
+    spec: CrtSpec,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> CrtSpec {
+    CrtSpec {
+        plaintext_moduli: spec
+            .plaintext_moduli
+            .iter()
+            .map(|value| substitute_binder_expr(value, binder, replacement))
+            .collect(),
+        reconstruction_coefficients: spec
+            .reconstruction_coefficients
+            .iter()
+            .map(|value| substitute_binder_expr(value, binder, replacement))
+            .collect(),
+    }
+}
+
+fn substitute_scale_scalar(
+    scalar: ScaleScalar,
+    binder: &BinderKey,
+    replacement: &ResolvedIntExpr,
+) -> ScaleScalar {
+    match scalar {
+        ScaleScalar::Exact { key, value, matrix_type } => ScaleScalar::Exact {
+            key: substitute_factor_identity(&key, binder, replacement),
+            value,
+            matrix_type,
+        },
+        ScaleScalar::Interval(interval) => ScaleScalar::Interval(interval),
     }
 }
 
@@ -631,6 +1187,13 @@ impl ExpressionNode {
             Self::Select { cases, .. } |
             Self::FamilyGetStatic { cases, .. } |
             Self::FamilyGetDynamic { cases, .. } => cases.to_vec(),
+            Self::MatrixScale { input, .. } |
+            Self::Transpose(input) |
+            Self::Slice { input, .. } |
+            Self::LiftConstantPolynomial { input, .. } |
+            Self::View { input, .. } => vec![*input],
+            Self::Tensor { left, right } => vec![*left, *right],
+            Self::CrtRecompose { inputs, .. } | Self::Concat { inputs, .. } => inputs.to_vec(),
         }
     }
 }
@@ -721,6 +1284,44 @@ fn dag_structure_fingerprint(
                 "family-dynamic(selector={selector:?},indices={stored_indices:?},domain={domain_upper:?},cases={cases:?})"
             )
         }
+        ExpressionNode::MatrixScale { input, scalar } => format!(
+            "scale(scalar={scalar:?},input={})",
+            dag_structure_fingerprint(dag, input, visiting)?
+        ),
+        ExpressionNode::Transpose(input) => {
+            format!("transpose({})", dag_structure_fingerprint(dag, input, visiting)?)
+        }
+        ExpressionNode::Slice { input, spec } => format!(
+            "slice(spec={spec:?},input={})",
+            dag_structure_fingerprint(dag, input, visiting)?
+        ),
+        ExpressionNode::Tensor { left, right } => format!(
+            "tensor(left={},right={})",
+            dag_structure_fingerprint(dag, left, visiting)?,
+            dag_structure_fingerprint(dag, right, visiting)?
+        ),
+        ExpressionNode::LiftConstantPolynomial { input, matrix_type, domain } => format!(
+            "lift(type={matrix_type:?},domain={domain:?},input={})",
+            dag_structure_fingerprint(dag, input, visiting)?
+        ),
+        ExpressionNode::View { input, view, output_type } => format!(
+            "view(type={output_type:?},view={view:?},input={})",
+            dag_structure_fingerprint(dag, input, visiting)?
+        ),
+        ExpressionNode::CrtRecompose { inputs, spec, output_type } => format!(
+            "crt(type={output_type:?},spec={spec:?},inputs={:?})",
+            inputs
+                .iter()
+                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
+                .collect::<Result<Vec<_>, _>>()?
+        ),
+        ExpressionNode::Concat { inputs, axis, output_type } => format!(
+            "concat(axis={axis:?},type={output_type:?},inputs={:?})",
+            inputs
+                .iter()
+                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
+                .collect::<Result<Vec<_>, _>>()?
+        ),
     };
     visiting.remove(&id);
     Ok(result)
@@ -1216,6 +1817,80 @@ mod tests {
     }
 
     #[test]
+    fn normalization_counters_report_real_dag_and_relation_work() {
+        let public = FactorIdentity::named("counter-B");
+        let preimage = FactorIdentity::named("counter-K");
+        let target = FactorIdentity::named("counter-P");
+        let mut dag = ExpressionDag::new();
+        let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
+        let k = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+            ))
+            .unwrap();
+        let p = dag.push(ExpressionNode::Atom(SymbolicFactor::large(target.clone()))).unwrap();
+        let root = dag.push(ExpressionNode::Product(vec![b, k].into_boxed_slice())).unwrap();
+        let key = FullRelationKey {
+            source: "named".into(),
+            ordered_indices: Box::new([]),
+            public: public.clone(),
+            target: target.clone(),
+            matrix_type: None,
+            layout: None,
+            trapdoor: None,
+            selector: None,
+        };
+        let mut registry = RelationRegistry::default();
+        registry.register(RelationRegistration { key, preimage, target: p }).unwrap();
+
+        let (normalized, counters) = dag.normalize_with_counters(root, &registry).unwrap();
+        assert_eq!(normalized.exact_terms().len(), 1);
+        assert_eq!(counters.nodes_processed, 4);
+        assert_eq!(counters.relation_candidates, 1);
+        assert_eq!(counters.relations_applied, 1);
+        assert_eq!(counters.relations_remaining, 0);
+    }
+
+    #[test]
+    fn normalization_counters_report_bounded_product_fold() {
+        let mut dag = ExpressionDag::new();
+        let left = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::bounded(FactorIdentity::named("fold-left"), bound(2)).unwrap(),
+            ))
+            .unwrap();
+        let right = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::bounded(FactorIdentity::named("fold-right"), bound(3)).unwrap(),
+            ))
+            .unwrap();
+        let root = dag.push(ExpressionNode::Product(vec![left, right].into_boxed_slice())).unwrap();
+        let (normalized, counters) =
+            dag.normalize_with_counters(root, &RelationRegistry::default()).unwrap();
+        assert!(normalized.validate_bounded_only().is_ok());
+        assert_eq!(counters.nodes_processed, 3);
+        assert!(counters.bounded_fold_count >= 1);
+    }
+
+    #[test]
+    fn normalization_counters_report_reachable_switch_cases() {
+        let mut dag = ExpressionDag::new();
+        let zero = dag.push(ExpressionNode::Zero).unwrap();
+        let root = dag
+            .push(ExpressionNode::Switch {
+                selector: FactorIdentity::named("counter-selector"),
+                cases: vec![zero, zero].into_boxed_slice(),
+                reachable: vec![0, 1].into_boxed_slice(),
+            })
+            .unwrap();
+        let (normalized, counters) =
+            dag.normalize_with_counters(root, &RelationRegistry::default()).unwrap();
+        assert!(normalized.is_exact_zero());
+        assert_eq!(counters.nodes_processed, 2);
+        assert_eq!(counters.switch_cases_processed, 2);
+    }
+
+    #[test]
     fn exact_zero_factor_atom_is_zero_and_finite_cross_term_uses_shape_and_ring_factor() {
         let zero = SymbolicFactor::bounded(FactorIdentity::named("Z"), bound(0)).unwrap();
         let large = PolynomialNF::exact_factor(FactorIdentity::named("L"));
@@ -1702,6 +2377,65 @@ mod tests {
             dag.normalize(mismatched, &RelationRegistry::default()),
             Err(NormalFormError::AmbiguousSwitchMapping)
         ));
+    }
+
+    #[test]
+    fn scalar_selector_identity_is_shared_by_separate_matrix_select_nodes() {
+        let mut dag = ExpressionDag::new();
+        let make_select = |dag: &mut ExpressionDag, selector: FactorIdentity| {
+            let left = dag
+                .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("L"))))
+                .unwrap();
+            let right = dag
+                .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("R"))))
+                .unwrap();
+            dag.push(ExpressionNode::Select {
+                selector,
+                cases: vec![left, right].into_boxed_slice(),
+                reachable: vec![0, 1].into_boxed_slice(),
+            })
+            .unwrap()
+        };
+        let selector =
+            FactorIdentity::scalar_selector(ResolvedIntExpr::Parameter("selector".to_owned()));
+        let first = make_select(&mut dag, selector.clone());
+        let second = make_select(&mut dag, selector);
+        let cancellation =
+            dag.push(ExpressionNode::Product(vec![first, second].into_boxed_slice())).unwrap();
+        let normalized = dag.normalize(cancellation, &RelationRegistry::default()).unwrap();
+        assert_eq!(normalized.exact_terms().len(), 1);
+        assert!(
+            normalized
+                .exact_terms()
+                .values()
+                .next()
+                .unwrap()
+                .monomial
+                .factors
+                .iter()
+                .any(|factor| factor.switch.is_some())
+        );
+
+        let first = make_select(
+            &mut dag,
+            FactorIdentity::scalar_selector(ResolvedIntExpr::Parameter("selector".to_owned())),
+        );
+        let distinct = make_select(
+            &mut dag,
+            FactorIdentity::scalar_selector(ResolvedIntExpr::Parameter(
+                "distinct-selector".to_owned(),
+            )),
+        );
+        let noncollision =
+            dag.push(ExpressionNode::Product(vec![first, distinct].into_boxed_slice())).unwrap();
+        let normalized = dag.normalize(noncollision, &RelationRegistry::default()).unwrap();
+        assert_eq!(normalized.exact_terms().len(), 1);
+        let term = normalized.exact_terms().values().next().unwrap();
+        assert_eq!(term.monomial.factors.len(), 2);
+        assert_ne!(
+            term.monomial.factors[0].switch.as_ref().unwrap().selector,
+            term.monomial.factors[1].switch.as_ref().unwrap().selector
+        );
     }
 
     #[test]

@@ -30,17 +30,18 @@ pub struct RelationRegistration {
 #[derive(Clone, Debug, Default)]
 pub struct RelationRegistry {
     registrations: BTreeMap<(FactorIdentity, FactorIdentity), Vec<RelationRegistration>>,
+    preimage_index: BTreeSet<FactorIdentity>,
 }
 
 impl RelationRegistry {
     pub(super) fn reaches_preimage(&self, key: &FactorIdentity) -> bool {
-        self.registrations
-            .keys()
-            .any(|(_, preimage)| without_trapdoor(preimage) == without_trapdoor(key))
+        self.preimage_index.contains(&without_trapdoor(key))
     }
 
     pub fn register(&mut self, registration: RelationRegistration) -> Result<(), NormalFormError> {
-        let key = (registration.key.public.clone(), registration.preimage.clone());
+        let normalized_preimage = without_trapdoor(&registration.preimage);
+        let key = (registration.key.public.clone(), normalized_preimage.clone());
+        self.preimage_index.insert(normalized_preimage);
         let entries = self.registrations.entry(key).or_default();
         if let Some(existing) = entries.iter().find(|entry| entry.key == registration.key) {
             if existing.target != registration.target {
@@ -59,16 +60,14 @@ impl RelationRegistry {
         public: &SymbolicFactor,
         preimage: &SymbolicFactor,
     ) -> Result<Option<&RelationRegistration>, NormalFormError> {
+        let key = (public.key.clone(), without_trapdoor(&preimage.key));
         let candidates = self
             .registrations
-            .iter()
-            .filter(|((registered_public, registered_preimage), _)| {
-                registered_public == &public.key &&
-                    without_trapdoor(registered_preimage) == without_trapdoor(&preimage.key)
-            })
-            .flat_map(|(_, entries)| entries.iter())
+            .get(&key)
+            .into_iter()
+            .flat_map(|entries| entries.iter())
             .filter(|entry| {
-                entry.key.source == public.key.owner &&
+                entry.key.source == preimage.key.owner &&
                     entry.key.ordered_indices.as_ref() == public.key.coordinates.as_ref() &&
                     entry.key.public == public.key &&
                     entry.key.layout == public.key.layout &&

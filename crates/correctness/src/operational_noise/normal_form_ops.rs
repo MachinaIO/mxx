@@ -96,15 +96,6 @@ pub struct BoolBit {
 
 /// Typed extension operations used by the next checker integration stage.
 pub trait PolynomialNFOperations {
-    /// Semantic multiplication accepts the job-owned product policy. The
-    /// operation layer does not retain or invent a relation registry.
-    fn multiply_nf_with<F>(
-        &self,
-        other: &PolynomialNF,
-        product: F,
-    ) -> Result<PolynomialNF, OperationError>
-    where
-        F: FnOnce(PolynomialNF, PolynomialNF) -> Result<PolynomialNF, NormalFormError>;
     fn transpose_nf(&self) -> Result<PolynomialNF, OperationError>;
     fn slice_nf(&self, spec: &SliceSpec) -> Result<PolynomialNF, OperationError>;
     fn tensor_nf(&self, other: &PolynomialNF) -> Result<PolynomialNF, OperationError>;
@@ -156,17 +147,6 @@ pub trait AdditionalOperations {
 }
 
 impl PolynomialNFOperations for PolynomialNF {
-    fn multiply_nf_with<F>(
-        &self,
-        other: &PolynomialNF,
-        product: F,
-    ) -> Result<PolynomialNF, OperationError>
-    where
-        F: FnOnce(PolynomialNF, PolynomialNF) -> Result<PolynomialNF, NormalFormError>,
-    {
-        product(self.clone(), other.clone()).map_err(OperationError::NormalForm)
-    }
-
     fn transpose_nf(&self) -> Result<PolynomialNF, OperationError> {
         let mut output = PolynomialNF::zero();
         for term in self.exact_terms().values() {
@@ -1014,7 +994,8 @@ mod tests {
         identity::{ResolvedIndexRange, ResolvedIntExpr},
         normal_form::{
             ExpressionDag, ExpressionNode, FactorIdentity, FullRelationKey, RelationRegistration,
-            RelationRegistry, SymbolicFactor, normal_form_product::Normalizer, product_bound_only,
+            RelationRegistry, SymbolicFactor,
+            normal_form_product::{Normalizer, product_bound_only},
         },
     };
 
@@ -1110,9 +1091,7 @@ mod tests {
         let left = PolynomialNF::exact_factor(public);
         let right = PolynomialNF::relation_live_factor(preimage, matrix_bound(1)).unwrap();
         let mut normalizer = Normalizer::new(&dag, &registry);
-        let result = left
-            .multiply_nf_with(&right, |left, right| normalizer.product_and_normalize(left, right))
-            .unwrap();
+        let result = normalizer.product_and_normalize(left, right).unwrap();
         assert_eq!(result.first_large_witness().unwrap().identity, target);
     }
 

@@ -1,8 +1,8 @@
 //! Deterministic operational-noise simulation for closed protocol graphs.
 //!
-//! This module lowers a frozen Graph IR program into a compact egg expression,
-//! applies only checked relations, and evaluates the extracted expression in
-//! Rust.
+//! This module lowers a frozen Graph IR program into an egg-independent matrix
+//! expression DAG for deterministic normal-form evaluation. Scalar and legacy
+//! differential paths remain separate until their scheduled removal.
 
 pub mod analysis;
 pub mod bound;
@@ -148,14 +148,25 @@ pub enum OperationalAcceptanceReport {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OperationalSimulationDiagnostics {
     pub lowered_term_count: u64,
-    pub egraph_node_count: u64,
-    pub egraph_class_count: u64,
-    pub rewrite_iteration_count: u64,
-    pub relation_candidate_count: u64,
-    pub relation_rewrite_count: u64,
+    /// Number of expression-DAG nodes actually visited by normalization.
+    pub normalization_node_count: u64,
+    /// Number of expression-DAG nodes reachable from the normalization root(s).
+    pub normalization_node_total: u64,
+    /// Number of exact polynomial terms retained at the normalization root(s).
+    pub normalization_exact_term_count: u64,
+    /// Number of relation-boundary candidates inspected by normalization.
+    pub normalization_relation_count: u64,
+    /// Number of relation-boundary candidates rewritten by normalization.
+    pub normalization_relation_applied: u64,
+    /// Number of relation-boundary candidates still present at the root.
+    pub normalization_relation_remaining: u64,
+    /// Number of bounded-only folds performed during normalization.
+    pub normalization_bounded_fold_count: u64,
+    /// Number of reachable Switch/Select cases inspected during normalization.
+    pub normalization_switch_cases_processed: u64,
+    pub normalization_milliseconds: u64,
     pub final_term_count: u64,
     pub lowering_milliseconds: u64,
-    pub rewrite_milliseconds: u64,
     pub bound_milliseconds: u64,
     pub total_milliseconds: u64,
 }

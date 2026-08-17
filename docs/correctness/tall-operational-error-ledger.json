@@ -711,6 +711,12 @@
       "rationale": "Tall residuals use the generic deterministic bound evaluator; this preserves its concrete fail-closed error instead of replacing it with a synthetic integer expression."
     },
     {
+      "error_tag": "Bound.NormalForm",
+      "tall_reachability": "reachable",
+      "classification": "normalization",
+      "rationale": "Tall matrix roots use the deterministic egg-independent normalizer; this preserves its typed failure instead of manufacturing a synthetic bound."
+    },
+    {
       "error_tag": "Bound.SequentialArityMismatch",
       "tall_reachability": "reachable",
       "classification": "noise_bound_evaluation",

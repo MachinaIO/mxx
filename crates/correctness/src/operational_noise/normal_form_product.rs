@@ -13,8 +13,24 @@ use super::{
     dag_structure_fingerprint, monomial_bound, scale_by_multiplicity, summary_from_bound,
     switch_normalize,
 };
+use crate::operational_noise::normal_form_ops::{
+    AdditionalOperations, CrtRecompose, PolynomialNFOperations,
+};
 use num_bigint::{BigInt, BigUint};
+use num_traits::Zero;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Work performed by one deterministic normalizer job.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NormalizationCounters {
+    pub(crate) nodes_processed: u64,
+    pub(crate) exact_term_count: u64,
+    pub(crate) bounded_fold_count: u64,
+    pub(crate) relation_candidates: u64,
+    pub(crate) relations_applied: u64,
+    pub(crate) relations_remaining: u64,
+    pub(crate) switch_cases_processed: u64,
+}
 
 /// Owns every piece of state needed for one deterministic normalization job.
 /// In particular, relation matching never consults a second product cache or
@@ -25,6 +41,7 @@ pub(crate) struct Normalizer<'a> {
     memo: BTreeMap<TermId, PolynomialNF>,
     visiting: BTreeSet<TermId>,
     relation_stack: Vec<FullRelationKey>,
+    counters: NormalizationCounters,
 }
 
 impl<'a> Normalizer<'a> {
@@ -35,11 +52,24 @@ impl<'a> Normalizer<'a> {
             memo: BTreeMap::new(),
             visiting: BTreeSet::new(),
             relation_stack: Vec::new(),
+            counters: NormalizationCounters::default(),
         }
     }
 
     pub(crate) fn normalize(&mut self, root: TermId) -> Result<PolynomialNF, NormalFormError> {
         self.normalize_term(root)
+    }
+
+    pub(crate) fn normalize_with_counters(
+        mut self,
+        root: TermId,
+    ) -> Result<(PolynomialNF, NormalizationCounters), NormalFormError> {
+        let normalized = self.normalize(root)?;
+        let normalized =
+            normalized.finish_relation_live_counted(&mut self.counters.bounded_fold_count)?;
+        self.counters.exact_term_count = normalized.exact_terms().len() as u64;
+        self.counters.relations_remaining = self.remaining_relation_candidates(&normalized)?;
+        Ok((normalized, self.counters))
     }
 
     fn normalize_term(&mut self, id: TermId) -> Result<PolynomialNF, NormalFormError> {
@@ -49,6 +79,7 @@ impl<'a> Normalizer<'a> {
         if !self.visiting.insert(id) {
             return Err(NormalFormError::CyclicExpression { term: id });
         }
+        self.counters.nodes_processed = self.counters.nodes_processed.saturating_add(1);
         let result = match self.dag.node(id)?.clone() {
             ExpressionNode::Zero => PolynomialNF::zero(),
             ExpressionNode::Atom(mut factor) => {
@@ -84,6 +115,8 @@ impl<'a> Normalizer<'a> {
                 if reachable.iter().any(|index| !seen.insert(*index)) {
                     return Err(NormalFormError::AmbiguousSwitchMapping);
                 }
+                self.counters.switch_cases_processed =
+                    self.counters.switch_cases_processed.saturating_add(reachable.len() as u64);
                 let normalized = reachable
                     .iter()
                     .map(|index| self.normalize_term(cases[*index]))
@@ -110,12 +143,16 @@ impl<'a> Normalizer<'a> {
             ExpressionNode::FamilyGetDynamic { selector, cases, stored_indices, domain_upper } => {
                 if cases.is_empty() ||
                     stored_indices.len() != cases.len() ||
-                    domain_upper > BigUint::from(cases.len()) ||
+                    domain_upper.is_zero() ||
                     stored_indices.iter().any(|index| index >= &domain_upper) ||
-                    stored_indices.iter().collect::<BTreeSet<_>>().len() != stored_indices.len()
+                    stored_indices.iter().collect::<BTreeSet<_>>().len() != stored_indices.len() ||
+                    stored_indices.iter().max().map(|index| index + BigUint::from(1_u8)) !=
+                        Some(domain_upper.clone())
                 {
                     return Err(NormalFormError::InvalidFamilyDomain);
                 }
+                self.counters.switch_cases_processed =
+                    self.counters.switch_cases_processed.saturating_add(cases.len() as u64);
                 let normalized = cases
                     .iter()
                     .map(|case| self.normalize_term(*case))
@@ -131,6 +168,41 @@ impl<'a> Normalizer<'a> {
                     fingerprints.into_iter().map(Into::into).collect(),
                 )?
             }
+            ExpressionNode::MatrixScale { input, scalar } => {
+                self.normalize_term(input)?.matrix_scale_nf(scalar).map_err(operation_error)?
+            }
+            ExpressionNode::Transpose(input) => {
+                self.normalize_term(input)?.transpose_nf().map_err(operation_error)?
+            }
+            ExpressionNode::Slice { input, spec } => {
+                self.normalize_term(input)?.slice_nf(&spec).map_err(operation_error)?
+            }
+            ExpressionNode::Tensor { left, right } => self
+                .normalize_term(left)?
+                .tensor_nf(&self.normalize_term(right)?)
+                .map_err(operation_error)?,
+            ExpressionNode::LiftConstantPolynomial { input, matrix_type, domain } => self
+                .normalize_term(input)?
+                .lift_constant_polynomial_nf(matrix_type, &domain)
+                .map_err(operation_error)?,
+            ExpressionNode::View { input, view, output_type } => {
+                self.normalize_term(input)?.view_nf(&view, output_type).map_err(operation_error)?
+            }
+            ExpressionNode::CrtRecompose { inputs, spec, output_type } => {
+                let inputs = inputs
+                    .iter()
+                    .map(|input| self.normalize_term(*input))
+                    .collect::<Result<Vec<_>, _>>()?;
+                PolynomialNF::crt_recompose_nf(&inputs, &spec, output_type)
+                    .map_err(operation_error)?
+            }
+            ExpressionNode::Concat { inputs, axis, output_type } => {
+                let inputs = inputs
+                    .iter()
+                    .map(|input| self.normalize_term(*input))
+                    .collect::<Result<Vec<_>, _>>()?;
+                PolynomialNF::concat_nf(&inputs, axis, output_type).map_err(operation_error)?
+            }
         };
         self.visiting.remove(&id);
         self.memo.insert(id, result.clone());
@@ -142,7 +214,7 @@ impl<'a> Normalizer<'a> {
         left: PolynomialNF,
         right: PolynomialNF,
     ) -> Result<PolynomialNF, NormalFormError> {
-        let value = product_bound_only(left, right)?;
+        let value = product_bound_only_counted(left, right, &mut self.counters.bounded_fold_count)?;
         let value = self.expose_single_switch_products(value)?;
         self.apply_relations(value)
     }
@@ -248,7 +320,11 @@ impl<'a> Normalizer<'a> {
                 for position in 0..term.monomial.factors.len().saturating_sub(1) {
                     let left = &term.monomial.factors[position];
                     let right = &term.monomial.factors[position + 1];
+                    self.counters.relation_candidates =
+                        self.counters.relation_candidates.saturating_add(1);
                     let Some(registration) = self.registry.resolve(left, right)? else { continue };
+                    self.counters.relations_applied =
+                        self.counters.relations_applied.saturating_add(1);
                     if self.relation_stack.contains(&registration.key) {
                         return Err(NormalFormError::CyclicRelationDependency {
                             key: registration.key.clone(),
@@ -279,7 +355,7 @@ impl<'a> Normalizer<'a> {
                             reconnect_summary(summary, &prefix, &suffix, &term.multiplicity)?;
                     }
                     expanded = self.apply_relations(expanded)?;
-                    expanded.fold_finite_non_live_terms()?;
+                    expanded.fold_finite_non_live_terms(&mut self.counters.bounded_fold_count)?;
                     self.relation_stack.pop();
                     value = value.add(expanded)?;
                     changed = true;
@@ -295,6 +371,30 @@ impl<'a> Normalizer<'a> {
                 return Ok(value);
             }
         }
+    }
+
+    fn remaining_relation_candidates(
+        &self,
+        normalized: &PolynomialNF,
+    ) -> Result<u64, NormalFormError> {
+        let mut remaining = 0_u64;
+        for term in normalized.exact_terms().values() {
+            for pair in term.monomial.factors().windows(2) {
+                if self.registry.resolve(&pair[0], &pair[1])?.is_some() {
+                    remaining = remaining.saturating_add(1);
+                }
+            }
+        }
+        Ok(remaining)
+    }
+}
+
+fn operation_error(
+    error: crate::operational_noise::normal_form_ops::OperationError,
+) -> NormalFormError {
+    match error {
+        crate::operational_noise::normal_form_ops::OperationError::NormalForm(error) => error,
+        _ => NormalFormError::BoundArithmetic,
     }
 }
 
@@ -337,6 +437,22 @@ pub(crate) fn product_bound_only(
     left: PolynomialNF,
     right: PolynomialNF,
 ) -> Result<PolynomialNF, NormalFormError> {
+    product_bound_only_inner(left, right, None)
+}
+
+fn product_bound_only_counted(
+    left: PolynomialNF,
+    right: PolynomialNF,
+    fold_count: &mut u64,
+) -> Result<PolynomialNF, NormalFormError> {
+    product_bound_only_inner(left, right, Some(fold_count))
+}
+
+fn product_bound_only_inner(
+    left: PolynomialNF,
+    right: PolynomialNF,
+    mut fold_count: Option<&mut u64>,
+) -> Result<PolynomialNF, NormalFormError> {
     if left.is_exact_zero() || right.is_exact_zero() {
         return Ok(PolynomialNF::zero());
     }
@@ -359,22 +475,46 @@ pub(crate) fn product_bound_only(
                     out.bounded_summary,
                     BoundedSummary::Bounded(scale_by_multiplicity(bound, &multiplicity)),
                 )?;
+                if let Some(count) = fold_count.as_deref_mut() {
+                    *count = count.saturating_add(1);
+                }
             } else {
                 out.insert(monomial, multiplicity)?;
             }
         }
     }
     if !left.bounded_summary.is_exact_zero() {
-        out = out.multiply_summary(&left.bounded_summary, &right.exact_terms)?;
+        if let Some(count) = fold_count.as_deref_mut() {
+            out = out.multiply_summary_counted(&left.bounded_summary, &right.exact_terms, count)?;
+        } else {
+            let mut ignored_fold_count = 0_u64;
+            out = out.multiply_summary_counted(
+                &left.bounded_summary,
+                &right.exact_terms,
+                &mut ignored_fold_count,
+            )?;
+        }
     }
     if !right.bounded_summary.is_exact_zero() {
-        out = out.multiply_summary(&right.bounded_summary, &left.exact_terms)?;
+        if let Some(count) = fold_count.as_deref_mut() {
+            out = out.multiply_summary_counted(&right.bounded_summary, &left.exact_terms, count)?;
+        } else {
+            let mut ignored_fold_count = 0_u64;
+            out = out.multiply_summary_counted(
+                &right.bounded_summary,
+                &left.exact_terms,
+                &mut ignored_fold_count,
+            )?;
+        }
     }
     if !left.bounded_summary.is_exact_zero() && !right.bounded_summary.is_exact_zero() {
         out.bounded_summary = add_summary(
             out.bounded_summary,
             product_summary(left.bounded_summary, right.bounded_summary)?,
         )?;
+        if let Some(count) = fold_count.as_deref_mut() {
+            *count = count.saturating_add(1);
+        }
     }
     Ok(out)
 }

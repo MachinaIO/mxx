@@ -184,12 +184,25 @@ pub enum ResolvedIntExpr {
     Const(BigInt),
     Parameter(String),
     Binder(BinderKey),
+    /// An owner-resolved runtime scalar source.  Unlike a parameter-shaped
+    /// debug string, this retains the producer owner and ordered coordinates.
+    Source {
+        source: AtomicSourceKey,
+        coordinates: Box<[Self]>,
+    },
     Add(Box<Self>, Box<Self>),
     Sub(Box<Self>, Box<Self>),
     Mul(Box<Self>, Box<Self>),
     Div(Box<Self>, Box<Self>),
+    EuclideanDiv(Box<Self>, Box<Self>),
+    EuclideanRemainder(Box<Self>, Box<Self>),
     RoundDiv(Box<Self>, Box<Self>),
     Log2Ceil(Box<Self>),
+    ExtractCoefficient {
+        input: Box<Self>,
+        position: Box<Self>,
+        canonical_exclusive_upper: Option<BigUint>,
+    },
 }
 
 impl ResolvedIntExpr {

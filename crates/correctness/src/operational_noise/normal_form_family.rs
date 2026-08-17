@@ -1,43 +1,27 @@
-//! Compact family and sequential-recurrence transfers for `PolynomialNF`.
+//! Compact TermId family helpers and sequential-recurrence transfers.
 //!
-//! A shared family owns one already-normalized representative and validated
-//! binder domains.  Its logical cardinality is metadata; it is never turned
-//! into a Cartesian list of cases.  Sequential recurrence evaluation keeps
-//! only the current carried state and applies a fixed transition a checked
-//! number of times.
+//! Families retain only physical entries or one shared DAG representative.  A
+//! shared logical domain is metadata and is never expanded into a Cartesian
+//! list.  Sequential recurrences keep only the current carried state and
+//! substitute the complete previous vector simultaneously at each step.
 
+#[cfg(test)]
+use super::normal_form::RelationRegistry;
 use super::{
     analysis::{IntegerDomain, IntegerInterval},
-    family::{CoverageBinderDomain, FamilyCoverageError, LoopDomainKey, shared_affine_maximum},
-    normal_form::{BoundedSummary, NormalFormError, PolynomialNF, product_bound_only},
+    family::{FamilyCoverageError, FamilyLoweringValue},
+    identity::{BinderKey, ResolvedIntExpr},
+    normal_form::{ExpressionDag, FactorIdentity, NormalFormError, TermId},
 };
 use num_bigint::{BigInt, BigUint};
-use num_traits::{One, ToPrimitive, Zero};
+use num_traits::ToPrimitive;
+
+/// Matrix-family values are DAG terms, not legacy e-graph identifiers.
+pub(crate) type MatrixTermFamily = FamilyLoweringValue<TermId>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NormalFormFamilyStorage {
-    ExactStored {
-        elements: Box<[PolynomialNF]>,
-    },
-    SharedTemplate {
-        domain: LoopDomainKey,
-        representative: PolynomialNF,
-        binder_domains: Box<[CoverageBinderDomain]>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NormalFormFamily {
-    pub storage: NormalFormFamilyStorage,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FamilyNFError {
+pub(crate) enum FamilyNFError {
     Coverage(FamilyCoverageError),
-    NormalForm(NormalFormError),
-    InvalidCount,
-    UnboundedFamily,
-    InvalidMaximum,
 }
 
 impl From<FamilyCoverageError> for FamilyNFError {
@@ -46,282 +30,142 @@ impl From<FamilyCoverageError> for FamilyNFError {
     }
 }
 
-impl From<NormalFormError> for FamilyNFError {
-    fn from(error: NormalFormError) -> Self {
-        Self::NormalForm(error)
-    }
+/// Validate a matrix family before any selector or family operation observes it.
+pub(crate) fn validate_matrix_term_family(family: &MatrixTermFamily) -> Result<(), FamilyNFError> {
+    family.validate().map_err(FamilyNFError::Coverage)
 }
 
-impl NormalFormFamily {
-    pub fn validate(&self) -> Result<(), FamilyNFError> {
-        match &self.storage {
-            NormalFormFamilyStorage::ExactStored { elements } => {
-                if elements.is_empty() {
-                    return Err(FamilyCoverageError::EmptyExactStorage.into());
-                }
-            }
-            NormalFormFamilyStorage::SharedTemplate { domain, binder_domains, .. } => {
-                let mut owner_size = None;
-                for binder in binder_domains {
-                    if binder.maximum < binder.minimum {
-                        return Err(FamilyCoverageError::InvalidBinderDomain {
-                            minimum: binder.minimum.clone(),
-                            maximum: binder.maximum.clone(),
-                        }
-                        .into());
-                    }
-                    let width = (&binder.maximum - &binder.minimum + BigInt::one())
-                        .to_biguint()
-                        .ok_or(FamilyNFError::InvalidCount)?;
-                    if binder.binder == domain.binder {
-                        owner_size = Some(width);
-                    }
-                }
-                if owner_size.as_ref() != Some(&domain.logical_count) {
-                    return Err(FamilyCoverageError::SharedCountMismatch {
-                        count: domain.logical_count.clone(),
-                        domain_size: owner_size.unwrap_or_else(BigUint::zero),
-                    }
-                    .into());
-                }
-            }
+/// Resolve a statically known index from physically stored matrix entries.
+/// Shared templates deliberately return `None`: their representative must be
+/// instantiated with the owner-aware binder rather than enumerated here.
+pub(crate) fn static_matrix_term(
+    family: &MatrixTermFamily,
+    index: &ResolvedIntExpr,
+) -> Result<Option<TermId>, FamilyNFError> {
+    let super::family::FamilyCoverageStorage::ExactStored { elements } = &family.storage else {
+        return Ok(None);
+    };
+    let ResolvedIntExpr::Const(index) = index else {
+        return Ok(None);
+    };
+    let index = index.clone();
+    let Some(index) = index.to_usize() else {
+        return Err(FamilyCoverageError::StaticIndexOutOfRange {
+            index,
+            count: BigUint::from(elements.len()),
         }
-        Ok(())
-    }
-
-    pub fn logical_count(&self) -> Result<BigUint, FamilyNFError> {
-        self.validate()?;
-        Ok(match &self.storage {
-            NormalFormFamilyStorage::ExactStored { elements } => BigUint::from(elements.len()),
-            NormalFormFamilyStorage::SharedTemplate { domain, .. } => domain.logical_count.clone(),
-        })
-    }
-
-    /// Static access is physical-only; a shared template has no stored case to
-    /// return and therefore cannot be silently enumerated.
-    pub fn static_get(&self, index: usize) -> Result<Option<&PolynomialNF>, FamilyNFError> {
-        self.validate()?;
-        match &self.storage {
-            NormalFormFamilyStorage::ExactStored { elements } => {
-                elements.get(index).map(Some).ok_or_else(|| {
-                    FamilyCoverageError::StaticIndexOutOfRange {
-                        index: BigInt::from(index),
-                        count: BigUint::from(elements.len()),
-                    }
-                    .into()
-                })
-            }
-            NormalFormFamilyStorage::SharedTemplate { .. } => Ok(None),
+        .into());
+    };
+    elements.get(index).copied().map(Some).ok_or_else(|| {
+        FamilyCoverageError::StaticIndexOutOfRange {
+            index: BigInt::from(index),
+            count: BigUint::from(elements.len()),
         }
-    }
-
-    /// Returns the one representative used for a shared family.  The caller
-    /// must bind an owner-aware index; this method never materializes cases.
-    pub fn shared_template(
-        &self,
-    ) -> Result<Option<(&PolynomialNF, &LoopDomainKey, &[CoverageBinderDomain])>, FamilyNFError>
-    {
-        self.validate()?;
-        Ok(match &self.storage {
-            NormalFormFamilyStorage::ExactStored { .. } => None,
-            NormalFormFamilyStorage::SharedTemplate { domain, representative, binder_domains } => {
-                Some((representative, domain, binder_domains))
-            }
-        })
-    }
-
-    /// Normalizes a shared representative once, retaining its validated
-    /// domains and logical count unchanged.
-    pub fn normalize_shared(&mut self) -> Result<(), FamilyNFError> {
-        if let NormalFormFamilyStorage::SharedTemplate { representative, .. } = &mut self.storage {
-            *representative = representative.clone().finish_relation_live()?;
-        }
-        self.validate()
-    }
-
-    /// Computes a maximum over stored physical cases, or returns the single
-    /// shared representative bound.  No logical family expansion occurs.
-    pub fn maximum_bound(&self) -> Result<BoundedSummary, FamilyNFError> {
-        self.validate()?;
-        match &self.storage {
-            NormalFormFamilyStorage::ExactStored { elements } => {
-                let mut result = BoundedSummary::ExactZero;
-                for element in elements {
-                    result = maximum_summary(result, element.validate_bounded_only()?.clone())?;
-                }
-                Ok(result)
-            }
-            NormalFormFamilyStorage::SharedTemplate { representative, .. } => {
-                Ok(representative.validate_bounded_only()?.clone())
-            }
-        }
-    }
-
-    /// Uses the existing affine endpoint rule for a shared selector domain.
-    /// The returned value is a bound on the selector expression, not a family
-    /// case list.
-    pub fn shared_selector_maximum(
-        &self,
-        selector_domain: &IntegerDomain,
-    ) -> Result<BigInt, FamilyNFError> {
-        let Some((_, _, binder_domains)) = self.shared_template()? else {
-            return Err(FamilyNFError::Coverage(FamilyCoverageError::StorageMismatch));
-        };
-        Ok(shared_affine_maximum(selector_domain, binder_domains)?)
-    }
+        .into()
+    })
 }
 
-fn maximum_summary(
-    current: BoundedSummary,
-    candidate: BoundedSummary,
-) -> Result<BoundedSummary, FamilyNFError> {
-    match (current, candidate) {
-        (BoundedSummary::ExactZero, value) | (value, BoundedSummary::ExactZero) => Ok(value),
-        (BoundedSummary::Bounded(mut current), BoundedSummary::Bounded(candidate)) => {
-            if current.matrix_type != candidate.matrix_type {
-                return Err(FamilyNFError::InvalidMaximum);
-            }
-            current.coefficient_class =
-                match (current.coefficient_class, candidate.coefficient_class) {
-                    (super::bound::BoundClass::ExactZero, value) |
-                    (value, super::bound::BoundClass::ExactZero) => value,
-                    (
-                        super::bound::BoundClass::Bounded { maximum_absolute_coefficient: left },
-                        super::bound::BoundClass::Bounded { maximum_absolute_coefficient: right },
-                    ) => super::bound::BoundClass::bounded(left.max(right)),
-                    _ => return Err(FamilyNFError::UnboundedFamily),
-                };
-            Ok(BoundedSummary::Bounded(current))
-        }
-    }
+/// A matrix recurrence represented entirely by the job-owned expression DAG.
+/// `state_factors` are owner-resolved placeholders installed in the loop body;
+/// every transition step substitutes the complete previous vector at once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TermSequentialRecurrence {
+    pub(crate) initial: Box<[TermId]>,
+    pub(crate) transition: Box<[TermId]>,
+    pub(crate) state_factors: Box<[FactorIdentity]>,
+    /// The owner-resolved iteration binder, when the recurrence came from a
+    /// graph loop.  Its concrete value is substituted before state substitution.
+    pub(crate) iteration_binder: Option<BinderKey>,
+    pub(crate) count: IntegerDomain,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RecurrenceExpr {
-    Constant(PolynomialNF),
-    Previous(usize),
-    Add(Box<Self>, Box<Self>),
-    Multiply(Box<Self>, Box<Self>),
-    Max(Box<[Self]>),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SequentialRecurrence {
-    pub initial: Box<[PolynomialNF]>,
-    pub transition: Box<[RecurrenceExpr]>,
-    pub count: IntegerDomain,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RecurrenceError {
+pub(crate) enum TermRecurrenceError {
     ArityMismatch { expected: usize, actual: usize },
-    PreviousOutOfRange { index: usize, state_size: usize },
     InvalidCount,
     MissingDomain,
     NormalForm(NormalFormError),
 }
 
-impl From<NormalFormError> for RecurrenceError {
+impl From<NormalFormError> for TermRecurrenceError {
     fn from(error: NormalFormError) -> Self {
         Self::NormalForm(error)
     }
 }
 
-impl SequentialRecurrence {
-    pub fn evaluate(&self) -> Result<Box<[PolynomialNF]>, RecurrenceError> {
-        self.evaluate_with_product(|left, right| product_bound_only(left, right))
-    }
-
-    /// Evaluate with an explicit product policy. The default path is
-    /// deliberately bound-only; a semantic caller supplies the job-owned
-    /// normalizer so relation targets are handled at the same boundary as
-    /// DAG products.
-    pub fn evaluate_with_product<F>(
+impl TermSequentialRecurrence {
+    pub(crate) fn evaluate(
         &self,
-        mut product: F,
-    ) -> Result<Box<[PolynomialNF]>, RecurrenceError>
-    where
-        F: FnMut(PolynomialNF, PolynomialNF) -> Result<PolynomialNF, NormalFormError>,
-    {
-        if self.initial.len() != self.transition.len() {
-            return Err(RecurrenceError::ArityMismatch {
+        dag: &mut ExpressionDag,
+    ) -> Result<Box<[TermId]>, TermRecurrenceError> {
+        if self.initial.len() != self.transition.len() ||
+            self.initial.len() != self.state_factors.len()
+        {
+            return Err(TermRecurrenceError::ArityMismatch {
                 expected: self.initial.len(),
-                actual: self.transition.len(),
+                actual: self.transition.len().max(self.state_factors.len()),
             });
         }
-        let count = recurrence_count(&self.count)?;
-        let count = count.to_usize().ok_or(RecurrenceError::InvalidCount)?;
+        let count =
+            recurrence_count(&self.count)?.to_usize().ok_or(TermRecurrenceError::InvalidCount)?;
         let mut state = self.initial.to_vec();
-        for _ in 0..count {
-            let next = self
+        for step in 0..count {
+            let mut binder_memo = std::collections::BTreeMap::new();
+            let transition = self
                 .transition
                 .iter()
-                .map(|expression| evaluate_expression(expression, &state, &mut product))
+                .map(|term| {
+                    self.iteration_binder.as_ref().map_or(Ok(*term), |binder| {
+                        dag.substitute_binder(
+                            *term,
+                            binder,
+                            &ResolvedIntExpr::Const(step.into()),
+                            &mut binder_memo,
+                        )
+                    })
+                })
                 .collect::<Result<Vec<_>, _>>()?;
-            state = next;
+            let replacements = self
+                .state_factors
+                .iter()
+                .cloned()
+                .zip(state.iter().copied())
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let mut factor_memo = std::collections::BTreeMap::new();
+            state = transition
+                .iter()
+                .map(|term| dag.substitute_factors(*term, &replacements, &mut factor_memo))
+                .collect::<Result<Vec<_>, _>>()?;
         }
         Ok(state.into_boxed_slice())
     }
+
+    #[cfg(test)]
+    pub(crate) fn evaluate_normalized(
+        &self,
+        dag: &mut ExpressionDag,
+        registry: &RelationRegistry,
+    ) -> Result<Box<[super::normal_form::PolynomialNF]>, TermRecurrenceError> {
+        self.evaluate(dag)?
+            .iter()
+            .map(|term| dag.normalize(*term, registry).map_err(Into::into))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Vec::into_boxed_slice)
+    }
 }
 
-fn recurrence_count(domain: &IntegerDomain) -> Result<BigUint, RecurrenceError> {
+fn recurrence_count(domain: &IntegerDomain) -> Result<BigUint, TermRecurrenceError> {
     match domain {
         IntegerDomain::Exact(value) if value.sign() != num_bigint::Sign::Minus => {
-            value.to_biguint().ok_or(RecurrenceError::InvalidCount)
+            value.to_biguint().ok_or(TermRecurrenceError::InvalidCount)
         }
         IntegerDomain::IntervalOnly(IntegerInterval { minimum, maximum })
             if minimum == maximum && minimum.sign() != num_bigint::Sign::Minus =>
         {
-            minimum.to_biguint().ok_or(RecurrenceError::InvalidCount)
+            minimum.to_biguint().ok_or(TermRecurrenceError::InvalidCount)
         }
-        IntegerDomain::Affine { .. } => Err(RecurrenceError::MissingDomain),
-        _ => Err(RecurrenceError::InvalidCount),
-    }
-}
-
-fn evaluate_expression(
-    expression: &RecurrenceExpr,
-    state: &[PolynomialNF],
-    product: &mut impl FnMut(PolynomialNF, PolynomialNF) -> Result<PolynomialNF, NormalFormError>,
-) -> Result<PolynomialNF, RecurrenceError> {
-    match expression {
-        RecurrenceExpr::Constant(value) => Ok(value.clone()),
-        RecurrenceExpr::Previous(index) => state
-            .get(*index)
-            .cloned()
-            .ok_or(RecurrenceError::PreviousOutOfRange { index: *index, state_size: state.len() }),
-        RecurrenceExpr::Add(left, right) => Ok(evaluate_expression(left, state, product)?
-            .add(evaluate_expression(right, state, product)?)?),
-        RecurrenceExpr::Multiply(left, right) => {
-            let left = evaluate_expression(left, state, product)?;
-            let right = evaluate_expression(right, state, product)?;
-            Ok(product(left, right)?)
-        }
-        RecurrenceExpr::Max(children) => {
-            let mut result = BoundedSummary::ExactZero;
-            let mut representative = None;
-            for child in children.iter() {
-                let value = evaluate_expression(child, state, product)?;
-                if representative.is_none() {
-                    representative = Some(value.clone());
-                }
-                result = maximum_summary(result, value.validate_bounded_only()?.clone()).map_err(
-                    |error| match error {
-                        FamilyNFError::NormalForm(error) => RecurrenceError::NormalForm(error),
-                        _ => RecurrenceError::NormalForm(NormalFormError::BoundArithmetic),
-                    },
-                )?;
-            }
-            match (representative, result) {
-                (Some(representative), summary) => {
-                    if !representative.exact_terms().is_empty() {
-                        return Ok(representative);
-                    }
-                    Ok(PolynomialNF::from_parts(Default::default(), summary))
-                }
-                (None, _) => Ok(PolynomialNF::zero()),
-            }
-        }
+        IntegerDomain::Affine { .. } => Err(TermRecurrenceError::MissingDomain),
+        _ => Err(TermRecurrenceError::InvalidCount),
     }
 }
 
@@ -329,12 +173,13 @@ fn evaluate_expression(
 mod tests {
     use super::*;
     use crate::operational_noise::{
+        analysis::MxxSort,
         bound::{BoundClass, MatrixBound, MatrixMetadata},
-        family::CoverageBinderDomain,
-        identity::{BinderKey, OccurrenceScope, ProgramKey},
+        family::{CoverageBinderDomain, FamilyCoverageStorage, LoopDomainKey},
+        identity::{OccurrenceScope, ProgramKey},
         normal_form::{
-            ExpressionDag, ExpressionNode, FactorIdentity, FullRelationKey, RelationRegistration,
-            RelationRegistry, SymbolicFactor, normal_form_product::Normalizer,
+            ExpressionNode, FactorKind, FactorOwner, FullRelationKey, RelationRegistration,
+            SymbolicFactor,
         },
     };
     use mxx_ir_core::NodeId;
@@ -365,12 +210,13 @@ mod tests {
     }
 
     #[test]
-    fn shared_template_keeps_30720_logical_cases_compact() {
+    fn shared_family_validates_count_without_materializing_cases() {
         let owner = binder(1);
-        let family = NormalFormFamily {
-            storage: NormalFormFamilyStorage::SharedTemplate {
+        let family = MatrixTermFamily {
+            element_type: MxxSort::Int,
+            storage: FamilyCoverageStorage::SharedTemplate {
                 domain: LoopDomainKey { binder: owner.clone(), logical_count: 30_720_u64.into() },
-                representative: PolynomialNF::bounded(matrix_bound(4)).unwrap(),
+                representative: TermId(0),
                 binder_domains: vec![CoverageBinderDomain {
                     binder: owner,
                     minimum: 0.into(),
@@ -379,142 +225,98 @@ mod tests {
                 .into(),
             },
         };
-        assert_eq!(family.logical_count().unwrap(), BigUint::from(30_720_u64));
-        assert!(family.shared_template().unwrap().is_some());
-        assert_eq!(
-            family.maximum_bound().unwrap().as_matrix_bound().unwrap().coefficient_class,
-            BoundClass::bounded(4_u64.into())
-        );
-        let mut normalized = family.clone();
-        normalized.normalize_shared().unwrap();
-        assert!(normalized.shared_template().unwrap().is_some());
+        validate_matrix_term_family(&family).unwrap();
+        assert!(matches!(static_matrix_term(&family, &ResolvedIntExpr::Const(0.into())), Ok(None)));
     }
 
     #[test]
-    fn exact_storage_supports_physical_static_access_only() {
-        let family = NormalFormFamily {
-            storage: NormalFormFamilyStorage::ExactStored {
-                elements: vec![PolynomialNF::bounded(matrix_bound(1)).unwrap()].into(),
-            },
+    fn static_matrix_term_rejects_index_above_stored_count() {
+        let family = MatrixTermFamily {
+            element_type: MxxSort::Int,
+            storage: FamilyCoverageStorage::ExactStored { elements: vec![TermId(0)].into() },
         };
-        assert!(family.static_get(0).unwrap().is_some());
         assert!(matches!(
-            family.static_get(1),
+            static_matrix_term(&family, &ResolvedIntExpr::Const(1.into())),
             Err(FamilyNFError::Coverage(FamilyCoverageError::StaticIndexOutOfRange { .. }))
         ));
-        assert_eq!(family.logical_count().unwrap(), BigUint::from(1_u8));
     }
 
     #[test]
-    fn shared_affine_endpoint_rule_uses_sign_endpoints() {
-        let outer = binder(1);
-        let inner = binder(2);
-        let family = NormalFormFamily {
-            storage: NormalFormFamilyStorage::SharedTemplate {
-                domain: LoopDomainKey { binder: outer.clone(), logical_count: 5_u64.into() },
-                representative: PolynomialNF::bounded(matrix_bound(1)).unwrap(),
-                binder_domains: vec![
-                    CoverageBinderDomain {
-                        binder: outer.clone(),
-                        minimum: 0.into(),
-                        maximum: 4.into(),
-                    },
-                    CoverageBinderDomain {
-                        binder: inner.clone(),
-                        minimum: 1.into(),
-                        maximum: 6.into(),
-                    },
-                ]
-                .into(),
-            },
+    fn shared_template_substitution_rebuilds_nested_dag_once() {
+        let owner = binder(7);
+        let mut key = FactorIdentity::named("nested");
+        key.coordinates = vec![(owner.clone(), ResolvedIntExpr::Binder(owner.clone()))].into();
+        let atom = SymbolicFactor::large(key);
+        let mut dag = ExpressionDag::new();
+        let leaf = dag.push(ExpressionNode::Atom(atom)).unwrap();
+        let product = dag.push(ExpressionNode::Product(vec![leaf, leaf].into())).unwrap();
+        let root = dag.push(ExpressionNode::Add(vec![product, leaf].into())).unwrap();
+        let replacement = ResolvedIntExpr::Const(13.into());
+        let mut memo = std::collections::BTreeMap::new();
+        let rebound = dag.substitute_binder(root, &owner, &replacement, &mut memo).unwrap();
+        let ExpressionNode::Add(children) = dag.node(rebound).unwrap() else {
+            panic!("nested template lost its outer structure")
         };
-        let domain = IntegerDomain::Affine {
-            constant: 5.into(),
-            coefficients: std::collections::BTreeMap::from([
-                (outer, 3.into()),
-                (inner, (-2).into()),
-            ]),
-            binders: std::collections::BTreeMap::from([
-                (binder(1), IntegerInterval::new(0.into(), 4.into()).unwrap()),
-                (binder(2), IntegerInterval::new(1.into(), 6.into()).unwrap()),
-            ]),
+        let ExpressionNode::Product(product) = dag.node(children[0]).unwrap() else {
+            panic!("nested template lost its product")
         };
-        assert_eq!(family.shared_selector_maximum(&domain).unwrap(), BigInt::from(15));
-    }
-
-    #[test]
-    fn sequential_recurrence_handles_zero_one_and_n_steps_without_history() {
-        let initial = PolynomialNF::bounded(matrix_bound(1)).unwrap();
-        let transition = RecurrenceExpr::Add(
-            Box::new(RecurrenceExpr::Previous(0)),
-            Box::new(RecurrenceExpr::Constant(PolynomialNF::bounded(matrix_bound(2)).unwrap())),
-        );
-        for (count, expected) in [(0_u64, 1_u64), (1, 3), (4, 9)] {
-            let recurrence = SequentialRecurrence {
-                initial: vec![initial.clone()].into(),
-                transition: vec![transition.clone()].into(),
-                count: IntegerDomain::Exact(count.into()),
+        for term in [product[0], product[1], children[1]] {
+            let ExpressionNode::Atom(factor) = dag.node(term).unwrap() else {
+                panic!("nested template did not rebuild an atom")
             };
-            assert_eq!(
-                recurrence.evaluate().unwrap()[0]
-                    .bounded_summary()
-                    .as_matrix_bound()
-                    .unwrap()
-                    .coefficient_class,
-                BoundClass::bounded(expected.into())
-            );
+            assert_eq!(factor.key.coordinates[0].1, replacement);
         }
+        assert_eq!(memo.len(), 3, "shared sub-DAG should be substituted once per source node");
     }
 
     #[test]
-    fn recurrence_rejects_missing_or_negative_count_domain() {
-        let recurrence = SequentialRecurrence {
-            initial: vec![PolynomialNF::bounded(matrix_bound(1)).unwrap()].into(),
-            transition: vec![RecurrenceExpr::Previous(0)].into(),
-            count: IntegerDomain::Affine {
-                constant: 0.into(),
-                coefficients: Default::default(),
-                binders: Default::default(),
-            },
+    fn stored_dynamic_mapping_does_not_enumerate_unstored_indices() {
+        let selector = FactorIdentity::named("selector");
+        let mut dag = ExpressionDag::new();
+        let first = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("first"))))
+            .unwrap();
+        let second = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("second"))))
+            .unwrap();
+        let dynamic = dag
+            .push(ExpressionNode::FamilyGetDynamic {
+                selector,
+                cases: vec![first, second].into(),
+                stored_indices: vec![1_u8.into(), 3_u8.into()].into(),
+                domain_upper: 4_u8.into(),
+            })
+            .unwrap();
+        let ExpressionNode::FamilyGetDynamic { cases, .. } = dag.node(dynamic).unwrap() else {
+            panic!("dynamic access was not retained as a family barrier")
         };
-        assert_eq!(recurrence.evaluate(), Err(RecurrenceError::MissingDomain));
-        let negative =
-            SequentialRecurrence { count: IntegerDomain::Exact((-1).into()), ..recurrence };
-        assert_eq!(negative.evaluate(), Err(RecurrenceError::InvalidCount));
+        assert_eq!(cases.len(), 2);
+        let normal = dag.normalize(dynamic, &RelationRegistry::default()).unwrap();
+        assert_eq!(normal.exact_terms().len(), 1);
     }
 
     #[test]
-    fn recurrence_multiply_and_max_use_current_state_only() {
-        let recurrence = SequentialRecurrence {
-            initial: vec![PolynomialNF::bounded(matrix_bound(2)).unwrap()].into(),
-            transition: vec![RecurrenceExpr::Max(
-                vec![
-                    RecurrenceExpr::Multiply(
-                        Box::new(RecurrenceExpr::Previous(0)),
-                        Box::new(RecurrenceExpr::Constant(
-                            PolynomialNF::bounded(matrix_bound(2)).unwrap(),
-                        )),
-                    ),
-                    RecurrenceExpr::Constant(PolynomialNF::bounded(matrix_bound(3)).unwrap()),
-                ]
-                .into(),
-            )]
-            .into(),
-            count: IntegerDomain::Exact(1.into()),
-        };
-        let result = recurrence.evaluate().unwrap();
-        assert_eq!(
-            result[0].bounded_summary().as_matrix_bound().unwrap().coefficient_class,
-            BoundClass::bounded(4_u64.into())
-        );
-    }
-
-    #[test]
-    fn recurrence_product_closure_applies_registered_relation() {
+    fn term_recurrence_zero_one_n_and_relation_are_dag_owned() {
+        let state_key = FactorIdentity::named("state");
         let public = FactorIdentity::named("B");
         let preimage = FactorIdentity::named("K");
         let target = FactorIdentity::named("P");
         let mut dag = ExpressionDag::new();
+        let initial = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::bounded(FactorIdentity::named("initial"), matrix_bound(1)).unwrap(),
+            ))
+            .unwrap();
+        let state =
+            dag.push(ExpressionNode::Atom(SymbolicFactor::large(state_key.clone()))).unwrap();
+        let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
+        let k = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage.clone(), matrix_bound(1)).unwrap(),
+            ))
+            .unwrap();
+        let product = dag.push(ExpressionNode::Product(vec![b, k].into())).unwrap();
+        let transition = dag.push(ExpressionNode::Add(vec![state, product].into())).unwrap();
         let target_term =
             dag.push(ExpressionNode::Atom(SymbolicFactor::large(target.clone()))).unwrap();
         let mut registry = RelationRegistry::default();
@@ -530,24 +332,93 @@ mod tests {
                     trapdoor: None,
                     selector: None,
                 },
-                preimage: preimage.clone(),
+                preimage,
                 target: target_term,
             })
             .unwrap();
-        let k = PolynomialNF::relation_live_factor(preimage, matrix_bound(1)).unwrap();
-        let recurrence = SequentialRecurrence {
-            initial: vec![PolynomialNF::exact_factor(public)].into(),
-            transition: vec![RecurrenceExpr::Multiply(
-                Box::new(RecurrenceExpr::Previous(0)),
-                Box::new(RecurrenceExpr::Constant(k)),
-            )]
-            .into(),
+        let recurrence = TermSequentialRecurrence {
+            initial: vec![initial].into(),
+            transition: vec![transition].into(),
+            state_factors: vec![state_key].into(),
+            iteration_binder: None,
             count: IntegerDomain::Exact(1.into()),
         };
-        let mut normalizer = Normalizer::new(&dag, &registry);
-        let result = recurrence
-            .evaluate_with_product(|left, right| normalizer.product_and_normalize(left, right))
+        let mut one_dag = dag.clone();
+        let one = recurrence.evaluate_normalized(&mut one_dag, &registry).unwrap();
+        assert_eq!(one[0].first_large_witness().unwrap().identity, target);
+
+        let zero = TermSequentialRecurrence {
+            count: IntegerDomain::Exact(0.into()),
+            ..recurrence.clone()
+        };
+        let mut zero_dag = dag.clone();
+        assert_eq!(zero.evaluate(&mut zero_dag).unwrap()[0], initial);
+
+        let n = TermSequentialRecurrence { count: IntegerDomain::Exact(3.into()), ..recurrence };
+        let mut n_dag = dag;
+        assert_ne!(n.evaluate(&mut n_dag).unwrap()[0], initial);
+    }
+
+    #[test]
+    fn term_recurrence_binds_each_iteration_before_state_substitution() {
+        let owner = binder(19);
+        let state_key = FactorIdentity::named("x");
+        let mut error_key = FactorIdentity::named("e");
+        error_key.coordinates =
+            vec![(owner.clone(), ResolvedIntExpr::Binder(owner.clone()))].into();
+        let mut dag = ExpressionDag::new();
+        let initial = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::bounded(FactorIdentity::named("initial"), matrix_bound(1)).unwrap(),
+            ))
             .unwrap();
-        assert_eq!(result[0].first_large_witness().unwrap().identity, target);
+        let state =
+            dag.push(ExpressionNode::Atom(SymbolicFactor::large(state_key.clone()))).unwrap();
+        let error =
+            dag.push(ExpressionNode::Atom(SymbolicFactor::large(error_key.clone()))).unwrap();
+        let negated = dag.push(ExpressionNode::Negate(state)).unwrap();
+        let transition = dag.push(ExpressionNode::Add(vec![negated, error].into())).unwrap();
+        let recurrence = TermSequentialRecurrence {
+            initial: vec![initial].into(),
+            transition: vec![transition].into(),
+            state_factors: vec![state_key].into(),
+            iteration_binder: Some(owner),
+            count: IntegerDomain::Exact(2.into()),
+        };
+        let terms = recurrence.evaluate(&mut dag).unwrap();
+
+        fn collect_error_coordinates(
+            dag: &ExpressionDag,
+            term: TermId,
+            owner: &FactorOwner,
+            kind: &FactorKind,
+            coordinates: &mut std::collections::BTreeSet<Box<[(BinderKey, ResolvedIntExpr)]>>,
+        ) {
+            match dag.node(term).unwrap() {
+                ExpressionNode::Atom(factor)
+                    if &factor.key.owner == owner && &factor.key.kind == kind =>
+                {
+                    coordinates.insert(factor.key.coordinates.clone());
+                }
+                ExpressionNode::Add(children) | ExpressionNode::Product(children) => {
+                    for child in children {
+                        collect_error_coordinates(dag, *child, owner, kind, coordinates);
+                    }
+                }
+                ExpressionNode::Negate(child) => {
+                    collect_error_coordinates(dag, *child, owner, kind, coordinates);
+                }
+                _ => {}
+            }
+        }
+        let mut coordinates = std::collections::BTreeSet::new();
+        collect_error_coordinates(
+            &dag,
+            terms[0],
+            &error_key.owner,
+            &error_key.kind,
+            &mut coordinates,
+        );
+        assert_eq!(coordinates.len(), 2, "e_0 and e_1 must remain distinct");
     }
 }

@@ -7,6 +7,7 @@
 use super::{
     analysis::MxxSort,
     identity::{AtomicSourceKey, BinderKey, OccurrenceFrame, ProgramKey, WireSourceKey},
+    normal_form::NormalFormError,
 };
 use crate::{
     OperationalDecoderKind, ProtocolInputId, StageId, StageInputName, TrapdoorContractMismatch,
@@ -352,6 +353,7 @@ operational_error_registry! {
     }
 
     Bound => BoundError {
+        NormalForm { source: NormalFormError },
         NegativeSequentialSamplerCutoff { cutoff: BigInt },
         UnconsumedLargeTerm { source: AtomicSourceKey },
         LargeValueUsedAsNoise { source: AtomicSourceKey },

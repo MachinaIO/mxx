@@ -1619,6 +1619,12 @@ pub(crate) fn resolved_constant(expression: &ResolvedIntExpr) -> Option<BigInt> 
             Work::Enter(ResolvedIntExpr::Parameter(_) | ResolvedIntExpr::Binder(_)) => {
                 return None;
             }
+            Work::Enter(
+                ResolvedIntExpr::Source { .. } |
+                ResolvedIntExpr::EuclideanDiv(_, _) |
+                ResolvedIntExpr::EuclideanRemainder(_, _) |
+                ResolvedIntExpr::ExtractCoefficient { .. },
+            ) => return None,
             Work::Enter(ResolvedIntExpr::Add(left, right)) => {
                 work.extend([Work::Add, Work::Enter(right), Work::Enter(left)]);
             }
@@ -1722,6 +1728,29 @@ fn resolved_structurally_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) 
             (ResolvedIntExpr::Log2Ceil(left), ResolvedIntExpr::Log2Ceil(right)) => {
                 work.push((left, right));
             }
+            (
+                ResolvedIntExpr::Source { source: left_source, coordinates: left_coordinates },
+                ResolvedIntExpr::Source { source: right_source, coordinates: right_coordinates },
+            ) if left_source == right_source &&
+                left_coordinates.len() == right_coordinates.len() =>
+            {
+                work.extend(left_coordinates.iter().zip(right_coordinates.iter()));
+            }
+            (
+                ResolvedIntExpr::ExtractCoefficient {
+                    input: left_input,
+                    position: left_position,
+                    canonical_exclusive_upper: left_upper,
+                },
+                ResolvedIntExpr::ExtractCoefficient {
+                    input: right_input,
+                    position: right_position,
+                    canonical_exclusive_upper: right_upper,
+                },
+            ) if left_upper == right_upper => {
+                work.push((left_position, right_position));
+                work.push((left_input, right_input));
+            }
             _ => return false,
         }
     }
@@ -1760,8 +1789,12 @@ fn resolved_affine_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> boo
                 _ => return false,
             },
             ResolvedIntExpr::Div(_, _) |
+            ResolvedIntExpr::EuclideanDiv(_, _) |
+            ResolvedIntExpr::EuclideanRemainder(_, _) |
             ResolvedIntExpr::RoundDiv(_, _) |
-            ResolvedIntExpr::Log2Ceil(_) => return false,
+            ResolvedIntExpr::Log2Ceil(_) |
+            ResolvedIntExpr::Source { .. } |
+            ResolvedIntExpr::ExtractCoefficient { .. } => return false,
         }
     }
     form.constant.is_zero() && form.coefficients.is_empty()

@@ -12,6 +12,10 @@ pub mod family;
 pub mod identity;
 pub mod language;
 pub mod lower;
+pub mod normal_form;
+pub(crate) mod normal_form_family;
+pub(crate) mod normal_form_ops;
+mod normal_form_relation;
 pub mod relation;
 pub mod simulation;
 

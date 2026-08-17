@@ -1,0 +1,1820 @@
+//! Egg-independent expression DAG and ordered polynomial normal form.
+//!
+//! `TermId` is only a job-local edge into [`ExpressionDag`].  It is never used
+//! as a canonical equality key: symbolic equality is defined by the complete
+//! owner-aware [`FactorIdentity`] carried by a factor and by ordered factor
+//! lists.  This keeps the normal form independent of e-graph insertion order.
+
+use super::{
+    bound::{BoundClass, MatrixBound, MatrixMetadata, product_bound},
+    identity::{
+        AtomicSourceKey, BinderKey, ResolvedIntExpr, ResolvedMatrixType, SliceSpec,
+        TrapdoorSourceKey,
+    },
+};
+use mxx_ir_core::{Port, types::ConcreteMatrixType};
+use num_bigint::{BigInt, BigUint};
+use num_traits::Zero;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+};
+
+#[path = "normal_form_product.rs"]
+pub(crate) mod normal_form_product;
+pub(crate) use normal_form_product::product_bound_only;
+
+pub use super::normal_form_relation::{FullRelationKey, RelationRegistration, RelationRegistry};
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct FactorLayoutIdentity {
+    pub matrix: ResolvedMatrixType,
+    pub view: Option<SliceSpec>,
+}
+
+/// Stable index into one job-local expression DAG.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct TermId(pub u32);
+
+/// Typed kind of one owner-resolved symbolic factor.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum FactorKind {
+    Signal,
+    RelationTarget,
+    SwitchBarrier,
+    #[cfg(test)]
+    Test(Box<str>),
+}
+
+/// The owner of a factor.  All production variants are existing typed
+/// identity components; the named variant exists only for unit fixtures.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum FactorOwner {
+    Atomic(AtomicSourceKey),
+    Trapdoor(TrapdoorSourceKey),
+    Derived {
+        parent: Box<FactorIdentity>,
+        tag: Box<[u8]>,
+    },
+    #[cfg(test)]
+    Named(Box<str>),
+}
+
+#[cfg(test)]
+impl From<&str> for FactorOwner {
+    fn from(value: &str) -> Self {
+        Self::Named(value.into())
+    }
+}
+
+/// Complete owner-resolved identity of one exact symbolic factor.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct FactorIdentity {
+    pub owner: FactorOwner,
+    pub kind: FactorKind,
+    pub port: Port,
+    /// Runtime coordinates are paired with their introducing binders.  A
+    /// production identity cannot carry an unowned coordinate or binder.
+    pub coordinates: Box<[(BinderKey, ResolvedIntExpr)]>,
+    pub public: Option<AtomicSourceKey>,
+    pub layout: Option<FactorLayoutIdentity>,
+    pub selector: Option<Box<FactorIdentity>>,
+    /// Actual trapdoor provenance is symbolic identity, never a lookup wildcard.
+    pub trapdoor: Option<TrapdoorSourceKey>,
+    /// Ordered reachable-case mapping for selector-owned barriers.
+    pub selector_mapping: Box<[BigUint]>,
+}
+
+impl FactorIdentity {
+    pub fn atomic(
+        source: AtomicSourceKey,
+        coordinates: impl IntoIterator<Item = (BinderKey, ResolvedIntExpr)>,
+    ) -> Self {
+        Self {
+            owner: FactorOwner::Atomic(source),
+            kind: FactorKind::Signal,
+            port: Port(0),
+            coordinates: coordinates.into_iter().collect(),
+            public: None,
+            layout: None,
+            selector: None,
+            trapdoor: None,
+            selector_mapping: Box::new([]),
+        }
+    }
+
+    pub fn trapdoor(
+        source: TrapdoorSourceKey,
+        coordinates: impl IntoIterator<Item = (BinderKey, ResolvedIntExpr)>,
+    ) -> Self {
+        Self {
+            owner: FactorOwner::Trapdoor(source.clone()),
+            kind: FactorKind::Signal,
+            port: Port(0),
+            coordinates: coordinates.into_iter().collect(),
+            public: None,
+            layout: None,
+            selector: None,
+            trapdoor: Some(source.clone()),
+            selector_mapping: Box::new([]),
+        }
+    }
+
+    fn switch_barrier(
+        selector: FactorIdentity,
+        selector_mapping: Box<[BigUint]>,
+        fingerprint: Box<[u8]>,
+    ) -> Self {
+        Self {
+            owner: FactorOwner::Derived { parent: Box::new(selector.clone()), tag: fingerprint },
+            kind: FactorKind::SwitchBarrier,
+            port: Port(0),
+            coordinates: Box::new([]),
+            public: None,
+            layout: None,
+            selector: Some(Box::new(selector)),
+            trapdoor: None,
+            selector_mapping,
+        }
+    }
+
+    pub fn coordinates(&self) -> &[(BinderKey, ResolvedIntExpr)] {
+        &self.coordinates
+    }
+
+    #[cfg(test)]
+    pub fn named(name: impl Into<Box<str>>) -> Self {
+        let name = name.into();
+        Self {
+            owner: FactorOwner::Named("named".into()),
+            kind: FactorKind::Test(name),
+            port: Port(0),
+            coordinates: Box::new([]),
+            public: None,
+            layout: None,
+            selector: None,
+            trapdoor: None,
+            selector_mapping: Box::new([]),
+        }
+    }
+}
+
+/// A symbolic factor.  Bounds and relation liveness are contracts, not part
+/// of symbolic identity, so equal keys can never become distinct monomials.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymbolicFactor {
+    pub key: FactorIdentity,
+    pub bound: BoundClass,
+    pub relation_live: bool,
+    /// Actual trapdoor provenance carried by the factor.  This is distinct
+    /// from the preimage factor identity used to look up a relation.
+    pub trapdoor: Option<TrapdoorSourceKey>,
+    /// Full shape/metadata contract used whenever this finite factor is
+    /// multiplied into a summary.  The class above remains the symbolic
+    /// contract exposed to canonical equality; this field is never a key.
+    pub matrix_bound: Option<MatrixBound>,
+    pub switch: Option<Arc<SwitchData>>,
+}
+
+impl SymbolicFactor {
+    pub fn large(key: FactorIdentity) -> Self {
+        Self {
+            key,
+            bound: BoundClass::Large,
+            relation_live: false,
+            trapdoor: None,
+            matrix_bound: None,
+            switch: None,
+        }
+    }
+
+    pub fn bounded(key: FactorIdentity, bound: MatrixBound) -> Result<Self, NormalFormError> {
+        if matches!(bound.coefficient_class, BoundClass::Large) {
+            return Err(NormalFormError::LargeFactorCannotBeBounded);
+        }
+        Ok(Self {
+            key,
+            bound: bound.coefficient_class.clone(),
+            relation_live: false,
+            trapdoor: None,
+            matrix_bound: Some(bound),
+            switch: None,
+        })
+    }
+
+    pub fn relation_live(key: FactorIdentity, bound: MatrixBound) -> Result<Self, NormalFormError> {
+        if matches!(bound.coefficient_class, BoundClass::Large) {
+            return Err(NormalFormError::RelationLiveRequiresFiniteBound);
+        }
+        Ok(Self {
+            key,
+            bound: bound.coefficient_class.clone(),
+            relation_live: true,
+            trapdoor: None,
+            matrix_bound: Some(bound),
+            switch: None,
+        })
+    }
+
+    pub fn with_trapdoor(mut self, trapdoor: TrapdoorSourceKey) -> Self {
+        self.key.trapdoor = Some(trapdoor.clone());
+        self.trapdoor = Some(trapdoor);
+        self
+    }
+
+    fn switch(
+        key: FactorIdentity,
+        bound: BoundClass,
+        matrix_bound: Option<MatrixBound>,
+        data: Arc<SwitchData>,
+    ) -> Self {
+        Self { key, bound, relation_live: false, trapdoor: None, matrix_bound, switch: Some(data) }
+    }
+}
+
+/// A selector barrier retains only reachable, already-normalized cases.  Its
+/// structural identity is independent of numeric bounds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwitchData {
+    pub selector: FactorIdentity,
+    pub cases: Box<[PolynomialNF]>,
+    /// Source-case mapping in the order represented by `cases`.  The values
+    /// are semantic indices, never DAG `TermId`s.
+    pub case_indices: Box<[BigUint]>,
+    /// Full owner-resolved source structure for each case.  This is a compact
+    /// fingerprint, not an expression-tree cache; numeric coefficient caps
+    /// are deliberately omitted from it.
+    pub case_fingerprints: Box<[Box<str>]>,
+}
+
+/// One monomial with a significant factor order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Monomial {
+    factors: Box<[SymbolicFactor]>,
+}
+
+impl Monomial {
+    pub fn one() -> Self {
+        Self { factors: Box::new([]) }
+    }
+    pub fn from_factor(factor: SymbolicFactor) -> Self {
+        Self { factors: Box::new([factor]) }
+    }
+    pub fn factors(&self) -> &[SymbolicFactor] {
+        &self.factors
+    }
+    pub(crate) fn from_factors(factors: impl IntoIterator<Item = SymbolicFactor>) -> Self {
+        Self { factors: factors.into_iter().collect() }
+    }
+    pub fn key(&self) -> MonomialKey {
+        MonomialKey(self.factors.iter().map(|factor| factor.key.clone()).collect())
+    }
+    fn concat(&self, other: &Self) -> Self {
+        let mut factors = Vec::with_capacity(self.factors.len() + other.factors.len());
+        factors.extend(self.factors.iter().cloned());
+        factors.extend(other.factors.iter().cloned());
+        Self { factors: factors.into_boxed_slice() }
+    }
+}
+
+/// Canonical ordered factor identity list.  No bound or TermId participates.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct MonomialKey(Box<[FactorIdentity]>);
+
+impl MonomialKey {
+    pub fn factors(&self) -> &[FactorIdentity] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BoundedSummary {
+    ExactZero,
+    Bounded(MatrixBound),
+}
+
+impl BoundedSummary {
+    pub fn is_exact_zero(&self) -> bool {
+        matches!(self, Self::ExactZero)
+    }
+    pub fn as_matrix_bound(&self) -> Option<&MatrixBound> {
+        match self {
+            Self::Bounded(bound) => Some(bound),
+            Self::ExactZero => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedMonomial {
+    pub monomial: Monomial,
+    pub multiplicity: BigInt,
+}
+
+/// A canonical sum of ordered monomials plus one finite noise summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolynomialNF {
+    exact_terms: BTreeMap<MonomialKey, SignedMonomial>,
+    bounded_summary: BoundedSummary,
+}
+
+impl Default for PolynomialNF {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+impl PolynomialNF {
+    pub fn zero() -> Self {
+        Self { exact_terms: BTreeMap::new(), bounded_summary: BoundedSummary::ExactZero }
+    }
+
+    /// Multiplicative identity used only as the seed for ordered products.
+    pub fn one() -> Self {
+        Self::from_monomial(Monomial::one())
+    }
+
+    pub fn exact_factor(key: FactorIdentity) -> Self {
+        Self::from_monomial(Monomial::from_factor(SymbolicFactor::large(key)))
+    }
+
+    pub fn bounded(bound: MatrixBound) -> Result<Self, NormalFormError> {
+        if matches!(bound.coefficient_class, BoundClass::Large) {
+            return Err(NormalFormError::LargeBoundCannotBeSummarized);
+        }
+        let summary = if matches!(bound.coefficient_class, BoundClass::ExactZero) {
+            BoundedSummary::ExactZero
+        } else {
+            BoundedSummary::Bounded(bound)
+        };
+        Ok(Self { exact_terms: BTreeMap::new(), bounded_summary: summary })
+    }
+
+    pub fn relation_live_factor(
+        key: FactorIdentity,
+        bound: MatrixBound,
+    ) -> Result<Self, NormalFormError> {
+        Ok(Self::from_monomial(Monomial::from_factor(SymbolicFactor::relation_live(key, bound)?)))
+    }
+
+    /// Finite non-relation factors are noise and are folded at construction.
+    pub fn bounded_factor(
+        key: FactorIdentity,
+        bound: MatrixBound,
+    ) -> Result<Self, NormalFormError> {
+        Ok(Self::from_monomial(Monomial::from_factor(SymbolicFactor::bounded(key, bound)?)))
+    }
+
+    pub fn exact_terms(&self) -> &BTreeMap<MonomialKey, SignedMonomial> {
+        &self.exact_terms
+    }
+    pub fn bounded_summary(&self) -> &BoundedSummary {
+        &self.bounded_summary
+    }
+    pub(crate) fn from_parts(
+        exact_terms: BTreeMap<MonomialKey, SignedMonomial>,
+        bounded_summary: BoundedSummary,
+    ) -> Self {
+        Self { exact_terms, bounded_summary }
+    }
+    pub fn is_exact_zero(&self) -> bool {
+        self.exact_terms.is_empty() && self.bounded_summary.is_exact_zero()
+    }
+
+    pub fn add(mut self, other: Self) -> Result<Self, NormalFormError> {
+        self.bounded_summary = add_summary(self.bounded_summary, other.bounded_summary)?;
+        for term in other.exact_terms.into_values() {
+            self.insert(term.monomial, term.multiplicity)?;
+        }
+        Ok(self)
+    }
+
+    pub fn sum<I>(children: I) -> Result<Self, NormalFormError>
+    where
+        I: IntoIterator<Item = Result<Self, NormalFormError>>,
+    {
+        children.into_iter().try_fold(Self::zero(), |left, right| left.add(right?))
+    }
+
+    pub fn negate(mut self) -> Self {
+        for term in self.exact_terms.values_mut() {
+            term.multiplicity = -std::mem::take(&mut term.multiplicity);
+        }
+        self
+    }
+
+    pub fn subtract(self, other: Self) -> Result<Self, NormalFormError> {
+        self.add(other.negate())
+    }
+
+    pub fn first_large_witness(&self) -> Option<LargeWitness> {
+        self.exact_terms.values().find_map(|term| {
+            term.monomial.factors.iter().enumerate().find_map(|(index, factor)| {
+                matches!(factor.bound, BoundClass::Large).then(|| LargeWitness {
+                    monomial: term.monomial.key(),
+                    factor_index: index,
+                    identity: factor.key.clone(),
+                })
+            })
+        })
+    }
+
+    /// Finish relation processing at the root and fold every finite term that
+    /// remains unmatched. A live identity survives only when it is not safely
+    /// finite (for example, a malformed Large contract).
+    pub fn finish_relation_live(mut self) -> Result<Self, NormalFormError> {
+        self.fold_finite_non_live_terms()?;
+        Ok(self)
+    }
+
+    fn fold_finite_non_live_terms(&mut self) -> Result<(), NormalFormError> {
+        let keys = self.exact_terms.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            let Some(term) = self.exact_terms.remove(&key) else { continue };
+            if term.monomial.factors.iter().any(|factor| matches!(factor.bound, BoundClass::Large))
+            {
+                self.exact_terms.insert(key, term);
+                continue;
+            }
+            let bound = monomial_bound(&term.monomial)?;
+            self.bounded_summary = add_summary(
+                self.bounded_summary.clone(),
+                summary_from_bound(scale_by_multiplicity(bound, &term.multiplicity)),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Final acceptance gate for the root residual.
+    pub fn validate_bounded_only(&self) -> Result<&BoundedSummary, NormalFormError> {
+        if let Some((key, term)) = self.exact_terms.iter().next() {
+            let _ = term;
+            return Err(NormalFormError::UnconsumedExactTerm { key: key.clone() });
+        }
+        Ok(&self.bounded_summary)
+    }
+
+    fn from_monomial(monomial: Monomial) -> Self {
+        if monomial.factors.iter().all(|factor| {
+            !factor.relation_live &&
+                !matches!(factor.bound, BoundClass::Large) &&
+                factor.switch.is_none()
+        }) {
+            if let Ok(bound) = monomial_bound(&monomial) {
+                return Self {
+                    exact_terms: BTreeMap::new(),
+                    bounded_summary: summary_from_bound(bound),
+                };
+            }
+        }
+        let key = monomial.key();
+        let mut exact_terms = BTreeMap::new();
+        exact_terms.insert(key, SignedMonomial { monomial, multiplicity: BigInt::from(1) });
+        Self { exact_terms, bounded_summary: BoundedSummary::ExactZero }
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        monomial: Monomial,
+        multiplicity: BigInt,
+    ) -> Result<(), NormalFormError> {
+        if multiplicity.is_zero() {
+            return Ok(());
+        }
+        let key = monomial.key();
+        if let Some(existing) = self.exact_terms.get_mut(&key) {
+            if existing
+                .monomial
+                .factors
+                .iter()
+                .map(|f| (&f.bound, f.relation_live, &f.trapdoor, &f.matrix_bound))
+                .ne(monomial
+                    .factors
+                    .iter()
+                    .map(|f| (&f.bound, f.relation_live, &f.trapdoor, &f.matrix_bound)))
+            {
+                return Err(NormalFormError::ConflictingFactorContracts { key });
+            }
+            existing.multiplicity += multiplicity;
+            if existing.multiplicity.is_zero() {
+                self.exact_terms.remove(&key);
+            }
+        } else {
+            self.exact_terms.insert(key, SignedMonomial { monomial, multiplicity });
+        }
+        Ok(())
+    }
+
+    fn multiply_summary(
+        mut self,
+        summary: &BoundedSummary,
+        terms: &BTreeMap<MonomialKey, SignedMonomial>,
+    ) -> Result<Self, NormalFormError> {
+        for term in terms.values() {
+            if term.monomial.factors.iter().any(|factor| matches!(factor.bound, BoundClass::Large))
+            {
+                return Err(NormalFormError::BoundedSummaryMixedWithLarge);
+            }
+            let product = match summary {
+                BoundedSummary::ExactZero => BoundedSummary::ExactZero,
+                BoundedSummary::Bounded(left) => {
+                    if term.monomial.factors.is_empty() {
+                        BoundedSummary::Bounded(scale_by_multiplicity(
+                            left.clone(),
+                            &term.multiplicity,
+                        ))
+                    } else {
+                        let factor_bound = monomial_bound(&term.monomial)?;
+                        BoundedSummary::Bounded(scale_by_multiplicity(
+                            product_bound(left, &factor_bound).map_err(NormalFormError::bound)?,
+                            &term.multiplicity,
+                        ))
+                    }
+                }
+            };
+            self.bounded_summary = add_summary(self.bounded_summary, product)?;
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LargeWitness {
+    pub monomial: MonomialKey,
+    pub factor_index: usize,
+    pub identity: FactorIdentity,
+}
+
+/// Expression node.  Terms are immutable after insertion, making DFS memo
+/// and visiting-state cycle detection sufficient for honest producer DAGs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExpressionNode {
+    Zero,
+    Atom(SymbolicFactor),
+    Add(Box<[TermId]>),
+    Negate(TermId),
+    Product(Box<[TermId]>),
+    Switch {
+        selector: FactorIdentity,
+        cases: Box<[TermId]>,
+        reachable: Box<[usize]>,
+    },
+    /// Select is the canonical single-selector spelling used by lowered
+    /// protocol families.  It has the same checked semantics as Switch;
+    /// keeping the two spellings explicit avoids making callers encode a
+    /// protocol operation as an arbitrary product or add node.
+    Select {
+        selector: FactorIdentity,
+        cases: Box<[TermId]>,
+        reachable: Box<[usize]>,
+    },
+    FamilyGetStatic {
+        cases: Box<[TermId]>,
+        index: usize,
+    },
+    FamilyGetDynamic {
+        selector: FactorIdentity,
+        cases: Box<[TermId]>,
+        stored_indices: Box<[BigUint]>,
+        domain_upper: BigUint,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExpressionDag {
+    nodes: Vec<ExpressionNode>,
+}
+
+impl ExpressionDag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn push(&mut self, node: ExpressionNode) -> Result<TermId, NormalFormError> {
+        let id =
+            TermId(u32::try_from(self.nodes.len()).map_err(|_| NormalFormError::TooManyTerms)?);
+        if node.children().iter().any(|child| child.0 as usize >= self.nodes.len()) {
+            return Err(NormalFormError::InvalidTermId);
+        }
+        self.nodes.push(node);
+        Ok(id)
+    }
+    pub fn node(&self, id: TermId) -> Result<&ExpressionNode, NormalFormError> {
+        self.nodes.get(id.0 as usize).ok_or(NormalFormError::InvalidTermId)
+    }
+    pub fn normalize(
+        &self,
+        root: TermId,
+        registry: &RelationRegistry,
+    ) -> Result<PolynomialNF, NormalFormError> {
+        normal_form_product::Normalizer::new(self, registry).normalize(root)?.finish_relation_live()
+    }
+
+    /// Strict root gate that additionally rejects any exact residual.
+    pub fn normalize_bounded(
+        &self,
+        root: TermId,
+        registry: &RelationRegistry,
+    ) -> Result<BoundedSummary, NormalFormError> {
+        let normalized = self.normalize(root, registry)?;
+        Ok(normalized.validate_bounded_only()?.clone())
+    }
+}
+
+impl ExpressionNode {
+    fn children(&self) -> Vec<TermId> {
+        match self {
+            Self::Zero | Self::Atom(_) => Vec::new(),
+            Self::Add(children) | Self::Product(children) => children.to_vec(),
+            Self::Negate(child) => vec![*child],
+            Self::Switch { cases, .. } |
+            Self::Select { cases, .. } |
+            Self::FamilyGetStatic { cases, .. } |
+            Self::FamilyGetDynamic { cases, .. } => cases.to_vec(),
+        }
+    }
+}
+
+fn bound_kind(bound: &BoundClass) -> &'static str {
+    match bound {
+        BoundClass::ExactZero => "zero",
+        BoundClass::Bounded { .. } => "bounded",
+        BoundClass::Large => "large",
+    }
+}
+
+fn factor_structural_fingerprint(factor: &SymbolicFactor) -> String {
+    let shape = factor.matrix_bound.as_ref().map(|bound| {
+        // The coefficient cap is intentionally absent: it is a bound, not a
+        // symbolic identity. Matrix shape and proof metadata remain part of
+        // the resolved factor contract.
+        (&bound.matrix_type, &bound.metadata)
+    });
+    let switch = factor
+        .switch
+        .as_ref()
+        .map(|data| (&data.selector, &data.case_indices, &data.case_fingerprints));
+    format!(
+        "factor(key={:?},kind={},live={},trapdoor={:?},shape={:?},switch={:?})",
+        factor.key,
+        bound_kind(&factor.bound),
+        factor.relation_live,
+        factor.trapdoor,
+        shape,
+        switch
+    )
+}
+
+/// Fingerprint the owner-resolved DAG structure without retaining the DAG or
+/// using its numeric IDs.  In particular, bounded atoms retain their complete
+/// factor provenance while their numeric coefficient caps do not participate.
+fn dag_structure_fingerprint(
+    dag: &ExpressionDag,
+    id: TermId,
+    visiting: &mut BTreeSet<TermId>,
+) -> Result<String, NormalFormError> {
+    if !visiting.insert(id) {
+        return Err(NormalFormError::CyclicExpression { term: id });
+    }
+    let node = dag.node(id)?.clone();
+    let result = match node {
+        ExpressionNode::Zero => "zero".to_owned(),
+        ExpressionNode::Atom(factor) => factor_structural_fingerprint(&factor),
+        ExpressionNode::Add(children) => {
+            let children = children
+                .iter()
+                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
+                .collect::<Result<Vec<_>, _>>()?;
+            format!("add({children:?})")
+        }
+        ExpressionNode::Negate(child) => {
+            format!("neg({})", dag_structure_fingerprint(dag, child, visiting)?)
+        }
+        ExpressionNode::Product(children) => {
+            let children = children
+                .iter()
+                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
+                .collect::<Result<Vec<_>, _>>()?;
+            format!("product({children:?})")
+        }
+        ExpressionNode::Switch { selector, cases, reachable } |
+        ExpressionNode::Select { selector, cases, reachable } => {
+            let cases = reachable
+                .iter()
+                .map(|index| dag_structure_fingerprint(dag, cases[*index], visiting))
+                .collect::<Result<Vec<_>, _>>()?;
+            format!("select(selector={selector:?},indices={reachable:?},cases={cases:?})")
+        }
+        ExpressionNode::FamilyGetStatic { cases, index } => {
+            let cases = cases
+                .iter()
+                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
+                .collect::<Result<Vec<_>, _>>()?;
+            format!("family-static(index={index},cases={cases:?})")
+        }
+        ExpressionNode::FamilyGetDynamic { selector, cases, stored_indices, domain_upper } => {
+            let cases = cases
+                .iter()
+                .map(|child| dag_structure_fingerprint(dag, *child, visiting))
+                .collect::<Result<Vec<_>, _>>()?;
+            format!(
+                "family-dynamic(selector={selector:?},indices={stored_indices:?},domain={domain_upper:?},cases={cases:?})"
+            )
+        }
+    };
+    visiting.remove(&id);
+    Ok(result)
+}
+
+pub(crate) fn add_summary(
+    left: BoundedSummary,
+    right: BoundedSummary,
+) -> Result<BoundedSummary, NormalFormError> {
+    match (left, right) {
+        (BoundedSummary::ExactZero, value) | (value, BoundedSummary::ExactZero) => Ok(value),
+        (BoundedSummary::Bounded(left), BoundedSummary::Bounded(right)) => {
+            if left.matrix_type != right.matrix_type {
+                return Err(NormalFormError::IncompatibleMatrixAddition {
+                    left: left.matrix_type,
+                    right: right.matrix_type,
+                });
+            }
+            let class = match (left.coefficient_class, right.coefficient_class) {
+                (BoundClass::ExactZero, value) | (value, BoundClass::ExactZero) => value,
+                (
+                    BoundClass::Bounded { maximum_absolute_coefficient: left },
+                    BoundClass::Bounded { maximum_absolute_coefficient: right },
+                ) => BoundClass::bounded(left + right),
+                _ => return Err(NormalFormError::LargeBoundCannotBeSummarized),
+            };
+            Ok(BoundedSummary::Bounded(MatrixBound {
+                matrix_type: left.matrix_type,
+                coefficient_class: class,
+                metadata: MatrixMetadata::unknown(),
+            }))
+        }
+    }
+}
+
+pub(crate) fn summary_from_bound(bound: MatrixBound) -> BoundedSummary {
+    if matches!(bound.coefficient_class, BoundClass::ExactZero) {
+        BoundedSummary::ExactZero
+    } else {
+        BoundedSummary::Bounded(bound)
+    }
+}
+
+pub(crate) fn monomial_bound(monomial: &Monomial) -> Result<MatrixBound, NormalFormError> {
+    let Some(first) = monomial.factors.first() else { return Err(NormalFormError::EmptyMonomial) };
+    let Some(mut result) = first.matrix_bound.clone() else {
+        return Err(NormalFormError::MissingMatrixBound);
+    };
+    for factor in &monomial.factors[1..] {
+        let Some(next) = factor.matrix_bound.as_ref() else {
+            return Err(NormalFormError::MissingMatrixBound);
+        };
+        result = product_bound(&result, next).map_err(NormalFormError::bound)?;
+    }
+    Ok(result)
+}
+
+fn polynomial_bound(value: &PolynomialNF) -> Result<Option<MatrixBound>, NormalFormError> {
+    if value.first_large_witness().is_some() {
+        return Ok(None);
+    }
+    let mut summary = value.bounded_summary.clone();
+    for term in value.exact_terms.values() {
+        summary = add_summary(
+            summary,
+            summary_from_bound(scale_by_multiplicity(
+                monomial_bound(&term.monomial)?,
+                &term.multiplicity,
+            )),
+        )?;
+    }
+    Ok(summary.as_matrix_bound().cloned())
+}
+
+fn switch_normalize(
+    selector: FactorIdentity,
+    cases: Box<[PolynomialNF]>,
+    case_indices: Box<[BigUint]>,
+    case_fingerprints: Box<[Box<str>]>,
+) -> Result<PolynomialNF, NormalFormError> {
+    if cases.is_empty() ||
+        cases.len() != case_indices.len() ||
+        cases.len() != case_fingerprints.len()
+    {
+        return Err(NormalFormError::InvalidSwitchReachability);
+    }
+    if cases
+        .iter()
+        .zip(case_fingerprints.iter())
+        .skip(1)
+        .all(|(case, fingerprint)| case == &cases[0] && fingerprint == &case_fingerprints[0])
+    {
+        return Ok(cases[0].clone());
+    }
+
+    // Hoist exact additive terms common to every reachable case. Numeric
+    // bounded summaries deliberately never participate in this comparison.
+    let mut common = PolynomialNF::zero();
+    for (key, term) in &cases[0].exact_terms {
+        if cases.iter().skip(1).all(|case| {
+            case.exact_terms.get(key).is_some_and(|candidate| {
+                candidate.multiplicity == term.multiplicity && candidate.monomial == term.monomial
+            })
+        }) {
+            common.insert(term.monomial.clone(), term.multiplicity.clone())?;
+        }
+    }
+    let residuals = cases
+        .iter()
+        .map(|case| case.clone().subtract(common.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let same_structure =
+        case_fingerprints.iter().all(|fingerprint| fingerprint == &case_fingerprints[0]);
+    if same_structure && residuals.iter().all(|case| case.exact_terms.is_empty()) {
+        let mut maximum = BoundedSummary::ExactZero;
+        for case in &residuals {
+            if let Some(bound) = polynomial_bound(case)? {
+                maximum = maximum_bound(maximum, bound)?;
+            }
+        }
+        return common.add(match maximum {
+            BoundedSummary::ExactZero => PolynomialNF::zero(),
+            BoundedSummary::Bounded(bound) => PolynomialNF::bounded(bound)?,
+        });
+    }
+
+    // Hoist common ordered prefix/suffix only for one symbolic monomial (or
+    // exact zero) per case. This never compares bounded summary values.
+    if residuals.iter().all(|case| {
+        case.bounded_summary.is_exact_zero() &&
+            case.exact_terms.len() == 1 &&
+            case.exact_terms
+                .values()
+                .next()
+                .is_some_and(|term| term.multiplicity == BigInt::from(1))
+    }) {
+        let monomials = residuals
+            .iter()
+            .map(|case| case.exact_terms.values().next().unwrap().monomial.clone())
+            .collect::<Vec<_>>();
+        let prefix_len = (0..monomials[0].factors.len())
+            .take_while(|index| {
+                monomials.iter().all(|monomial| {
+                    monomial.factors[*index].key == monomials[0].factors[*index].key
+                })
+            })
+            .count();
+        let suffix_len = (0..monomials[0].factors.len().saturating_sub(prefix_len))
+            .take_while(|offset| {
+                let first = &monomials[0].factors[monomials[0].factors.len() - 1 - offset].key;
+                monomials.iter().all(|monomial| {
+                    monomial.factors[monomial.factors.len() - 1 - offset].key == *first
+                })
+            })
+            .count();
+        if prefix_len != 0 || suffix_len != 0 {
+            let prefix = Monomial {
+                factors: monomials[0].factors[..prefix_len].to_vec().into_boxed_slice(),
+            };
+            let suffix_start = monomials[0].factors.len() - suffix_len;
+            let suffix = Monomial {
+                factors: monomials[0].factors[suffix_start..].to_vec().into_boxed_slice(),
+            };
+            let middle = monomials
+                .iter()
+                .map(|monomial| {
+                    PolynomialNF::from_monomial(Monomial {
+                        factors: monomial.factors[prefix_len..suffix_start]
+                            .to_vec()
+                            .into_boxed_slice(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let inner = switch_normalize(
+                selector,
+                middle.into_boxed_slice(),
+                case_indices.clone(),
+                case_fingerprints.clone(),
+            )?;
+            let mut output = PolynomialNF::one();
+            output = normal_form_product::product(output, PolynomialNF::from_monomial(prefix))?;
+            output = normal_form_product::product(output, inner)?;
+            output = normal_form_product::product(output, PolynomialNF::from_monomial(suffix))?;
+            return common.add(output);
+        }
+    }
+
+    let data =
+        Arc::new(SwitchData { selector: selector.clone(), cases, case_indices, case_fingerprints });
+    let key = FactorIdentity::switch_barrier(
+        selector,
+        data.case_indices.clone(),
+        switch_fingerprint(&data.case_indices, &data.case_fingerprints),
+    );
+    let (bound, matrix_bound) = switch_bound(&data.cases)?;
+    common.add(PolynomialNF::from_monomial(Monomial::from_factor(SymbolicFactor::switch(
+        key,
+        bound,
+        matrix_bound,
+        data,
+    ))))
+}
+
+fn switch_fingerprint(indices: &[BigUint], cases: &[Box<str>]) -> Box<[u8]> {
+    let mut fingerprint = Vec::new();
+    for index in indices {
+        let bytes = index.to_bytes_be();
+        fingerprint.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        fingerprint.extend_from_slice(&bytes);
+    }
+    for case in cases {
+        let bytes = case.as_bytes();
+        fingerprint.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        fingerprint.extend_from_slice(bytes);
+    }
+    fingerprint.into_boxed_slice()
+}
+
+fn maximum_bound(
+    current: BoundedSummary,
+    candidate: MatrixBound,
+) -> Result<BoundedSummary, NormalFormError> {
+    match current {
+        BoundedSummary::ExactZero => Ok(summary_from_bound(candidate)),
+        BoundedSummary::Bounded(existing) => {
+            if existing.matrix_type != candidate.matrix_type {
+                return Err(NormalFormError::IncompatibleMatrixAddition {
+                    left: existing.matrix_type,
+                    right: candidate.matrix_type,
+                });
+            }
+            let coefficient_class = match (existing.coefficient_class, candidate.coefficient_class)
+            {
+                (BoundClass::ExactZero, value) | (value, BoundClass::ExactZero) => value,
+                (
+                    BoundClass::Bounded { maximum_absolute_coefficient: left },
+                    BoundClass::Bounded { maximum_absolute_coefficient: right },
+                ) => BoundClass::bounded(left.max(right)),
+                _ => BoundClass::Large,
+            };
+            Ok(summary_from_bound(MatrixBound {
+                matrix_type: existing.matrix_type,
+                coefficient_class,
+                metadata: MatrixMetadata::unknown(),
+            }))
+        }
+    }
+}
+
+fn switch_bound(
+    cases: &[PolynomialNF],
+) -> Result<(BoundClass, Option<MatrixBound>), NormalFormError> {
+    let mut maximum = BoundedSummary::ExactZero;
+    for case in cases {
+        if case.first_large_witness().is_some() {
+            return Ok((BoundClass::Large, None));
+        }
+        if let Some(bound) = polynomial_bound(case)? {
+            maximum = maximum_bound(maximum, bound)?;
+        }
+    }
+    Ok(match maximum {
+        BoundedSummary::ExactZero => (BoundClass::ExactZero, None),
+        BoundedSummary::Bounded(bound) => (bound.coefficient_class.clone(), Some(bound)),
+    })
+}
+
+fn combine_same_selector_switches(
+    monomial: &Monomial,
+) -> Result<Option<PolynomialNF>, NormalFormError> {
+    let switches =
+        monomial.factors.iter().filter_map(|factor| factor.switch.clone()).collect::<Vec<_>>();
+    if switches.len() < 2 {
+        return Ok(None);
+    }
+    let selector = switches[0].selector.clone();
+    if switches.iter().any(|switch| switch.selector != selector) {
+        return Ok(None);
+    }
+    if switches.iter().any(|switch| switch.cases.len() != switches[0].cases.len()) {
+        return Err(NormalFormError::AmbiguousSwitchMapping);
+    }
+    if switches.iter().any(|switch| switch.case_indices != switches[0].case_indices) {
+        return Err(NormalFormError::AmbiguousSwitchMapping);
+    }
+    let mut cases = Vec::with_capacity(switches[0].cases.len());
+    let mut case_fingerprints = Vec::with_capacity(switches[0].cases.len());
+    for index in 0..switches[0].cases.len() {
+        let mut case = PolynomialNF::one();
+        let mut fingerprint_parts = Vec::with_capacity(monomial.factors.len());
+        for factor in monomial.factors.iter() {
+            if let Some(switch) = &factor.switch {
+                case = normal_form_product::product(case, switch.cases[index].clone())?;
+                fingerprint_parts.push(switch.case_fingerprints[index].to_string());
+            } else {
+                case = normal_form_product::product(
+                    case,
+                    PolynomialNF::from_monomial(Monomial::from_factor(factor.clone())),
+                )?;
+                fingerprint_parts.push(factor_structural_fingerprint(factor));
+            }
+        }
+        cases.push(case);
+        case_fingerprints.push(format!("product({fingerprint_parts:?}").into_boxed_str());
+    }
+    Ok(Some(switch_normalize(
+        selector,
+        cases.into_boxed_slice(),
+        switches[0].case_indices.clone(),
+        case_fingerprints.into_iter().collect(),
+    )?))
+}
+
+pub(crate) fn scale_by_multiplicity(mut bound: MatrixBound, multiplicity: &BigInt) -> MatrixBound {
+    let absolute = multiplicity.magnitude().clone();
+    if let BoundClass::Bounded { maximum_absolute_coefficient } = &mut bound.coefficient_class {
+        *maximum_absolute_coefficient *= absolute;
+    }
+    bound
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NormalFormError {
+    InvalidTermId,
+    TooManyTerms,
+    EmptyMonomial,
+    LargeFactorCannotBeBounded,
+    LargeBoundCannotBeSummarized,
+    RelationLiveRequiresFiniteBound,
+    MissingMatrixBound,
+    BoundedSummaryMixedWithLarge,
+    ConflictingFactorContracts { key: MonomialKey },
+    IncompatibleMatrixAddition { left: ConcreteMatrixType, right: ConcreteMatrixType },
+    IncompatibleMatrixProduct { left: ConcreteMatrixType, right: ConcreteMatrixType },
+    InvalidKnownZeroRows { known_zero_rows: BigUint, row_count: BigUint },
+    BoundArithmetic,
+    AmbiguousRelation { keys: Vec<FactorIdentity> },
+    ConflictingRelationTarget { key: FullRelationKey },
+    CyclicExpression { term: TermId },
+    CyclicRelationDependency { key: FullRelationKey },
+    UnconsumedRelationLive { key: MonomialKey },
+    UnconsumedExactTerm { key: MonomialKey },
+    InvalidSwitchReachability,
+    AmbiguousSwitchMapping,
+    InvalidFamilyIndex,
+    InvalidFamilyDomain,
+}
+
+impl NormalFormError {
+    fn bound(error: super::bound::BoundEvaluationError) -> Self {
+        match error {
+            super::bound::BoundEvaluationError::IncompatibleMatrixProduct { left, right } => {
+                Self::IncompatibleMatrixProduct { left, right }
+            }
+            super::bound::BoundEvaluationError::InvalidKnownZeroRows {
+                known_zero_rows,
+                row_count,
+            } => Self::InvalidKnownZeroRows { known_zero_rows, row_count },
+            _ => Self::BoundArithmetic,
+        }
+    }
+}
+
+impl fmt::Display for NormalFormError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+impl std::error::Error for NormalFormError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn bound(value: u64) -> MatrixBound {
+        MatrixBound {
+            matrix_type: ConcreteMatrixType {
+                modulus: 17.into(),
+                ring_dimension: 1,
+                rows: 1,
+                columns: 1,
+            },
+            coefficient_class: BoundClass::bounded(value.into()),
+            metadata: MatrixMetadata::unknown(),
+        }
+    }
+
+    fn rectangular_bound(
+        value: u64,
+        rows: usize,
+        columns: usize,
+        ring_dimension: usize,
+    ) -> MatrixBound {
+        MatrixBound {
+            matrix_type: ConcreteMatrixType { modulus: 17.into(), ring_dimension, rows, columns },
+            coefficient_class: BoundClass::bounded(value.into()),
+            metadata: MatrixMetadata::unknown(),
+        }
+    }
+    #[test]
+    fn zero_annihilates_large() {
+        assert!(
+            normal_form_product::product(
+                PolynomialNF::zero(),
+                PolynomialNF::exact_factor(FactorIdentity::named("L")),
+            )
+            .unwrap()
+            .is_exact_zero()
+        );
+    }
+    #[test]
+    fn signs_cancel_and_order_is_preserved() {
+        let a = PolynomialNF::exact_factor(FactorIdentity::named("A"));
+        let b = PolynomialNF::exact_factor(FactorIdentity::named("B"));
+        assert!(a.clone().subtract(a.clone().negate().negate()).unwrap().is_exact_zero());
+        assert_ne!(
+            normal_form_product::product(a.clone(), b.clone()).unwrap(),
+            normal_form_product::product(b, a).unwrap()
+        );
+    }
+    #[test]
+    fn bounded_terms_fold() {
+        let x = PolynomialNF::bounded(bound(2))
+            .unwrap()
+            .add(PolynomialNF::bounded(bound(3)).unwrap())
+            .unwrap();
+        assert_eq!(
+            x.bounded_summary().as_matrix_bound().unwrap().coefficient_class,
+            BoundClass::bounded(5_u8.into())
+        );
+    }
+
+    #[test]
+    fn product_retains_all_bounded_cross_terms_around_live_factors() {
+        let left = PolynomialNF::relation_live_factor(FactorIdentity::named("K"), bound(1))
+            .unwrap()
+            .add(PolynomialNF::bounded(bound(2)).unwrap())
+            .unwrap();
+        let right = PolynomialNF::relation_live_factor(FactorIdentity::named("K2"), bound(1))
+            .unwrap()
+            .add(PolynomialNF::bounded(bound(3)).unwrap())
+            .unwrap();
+        let product = normal_form_product::product_bound_only(left, right).unwrap();
+        assert_eq!(product.exact_terms().len(), 1);
+        assert_eq!(
+            product.bounded_summary().as_matrix_bound().unwrap().coefficient_class,
+            BoundClass::bounded(11_u8.into())
+        );
+    }
+    #[test]
+    fn dag_term_ids_are_not_symbolic_keys() {
+        let mut dag = ExpressionDag::new();
+        let a = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("A"))))
+            .unwrap();
+        let b = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("A"))))
+            .unwrap();
+        let root = dag.push(ExpressionNode::Add(vec![a, b].into_boxed_slice())).unwrap();
+        let nf = dag.normalize(root, &RelationRegistry::default()).unwrap();
+        assert_eq!(nf.exact_terms().values().next().unwrap().multiplicity, 2.into());
+    }
+
+    #[test]
+    fn relation_rewrites_leftmost_ordered_boundary() {
+        let public = FactorIdentity::named("B");
+        let preimage = FactorIdentity::named("K");
+        let target = FactorIdentity::named("P");
+        let mut dag = ExpressionDag::new();
+        let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
+        let k = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+            ))
+            .unwrap();
+        let p = dag.push(ExpressionNode::Atom(SymbolicFactor::large(target.clone()))).unwrap();
+        let root = dag.push(ExpressionNode::Product(vec![b, k].into_boxed_slice())).unwrap();
+        let key = FullRelationKey {
+            source: "named".into(),
+            ordered_indices: Box::new([]),
+            public: public.clone(),
+            target: target.clone(),
+            matrix_type: None,
+            layout: None,
+            trapdoor: None,
+            selector: None,
+        };
+        let mut registry = RelationRegistry::default();
+        registry.register(RelationRegistration { key, preimage, target: p }).unwrap();
+        let nf = dag.normalize(root, &registry).unwrap();
+        assert_eq!(nf.exact_terms().len(), 1);
+        assert_eq!(nf.exact_terms().keys().next().unwrap().factors(), &[target]);
+    }
+
+    #[test]
+    fn exact_zero_factor_atom_is_zero_and_finite_cross_term_uses_shape_and_ring_factor() {
+        let zero = SymbolicFactor::bounded(FactorIdentity::named("Z"), bound(0)).unwrap();
+        let large = PolynomialNF::exact_factor(FactorIdentity::named("L"));
+        let mut dag = ExpressionDag::new();
+        let zero_id = dag.push(ExpressionNode::Atom(zero)).unwrap();
+        let large_id = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("L"))))
+            .unwrap();
+        let product = dag.push(ExpressionNode::Product(vec![zero_id, large_id].into())).unwrap();
+        assert!(dag.normalize(product, &RelationRegistry::default()).unwrap().is_exact_zero());
+
+        let summary = PolynomialNF::bounded(rectangular_bound(2, 2, 2, 3)).unwrap();
+        let finite = PolynomialNF::relation_live_factor(
+            FactorIdentity::named("K"),
+            rectangular_bound(3, 2, 4, 3),
+        )
+        .unwrap();
+        let folded = normal_form_product::product(summary, finite).unwrap();
+        let matrix = folded.bounded_summary().as_matrix_bound().unwrap();
+        assert_eq!((matrix.matrix_type.rows, matrix.matrix_type.columns), (2, 4));
+        assert_eq!(matrix.coefficient_class, BoundClass::bounded(36_u8.into()));
+        assert!(
+            normal_form_product::product(large, PolynomialNF::bounded(bound(2)).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn final_finish_folds_unmatched_finite_and_rejects_large_residuals() {
+        let finite = PolynomialNF::bounded_factor(FactorIdentity::named("E"), bound(4)).unwrap();
+        let finished = finite.finish_relation_live().unwrap();
+        assert!(finished.validate_bounded_only().is_ok());
+        let live =
+            PolynomialNF::relation_live_factor(FactorIdentity::named("K"), bound(1)).unwrap();
+        assert!(live.finish_relation_live().unwrap().validate_bounded_only().is_ok());
+        let large = PolynomialNF::exact_factor(FactorIdentity::named("L"));
+        assert!(matches!(
+            large.validate_bounded_only(),
+            Err(NormalFormError::UnconsumedExactTerm { .. })
+        ));
+    }
+
+    #[test]
+    fn relation_full_key_mismatch_is_not_applicable_and_conflicts_fail_closed() {
+        let public = FactorIdentity::named("B");
+        let preimage = FactorIdentity::named("K");
+        let target = FactorIdentity::named("P");
+        let mut dag = ExpressionDag::new();
+        let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
+        let k = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+            ))
+            .unwrap();
+        let p = dag.push(ExpressionNode::Atom(SymbolicFactor::large(target.clone()))).unwrap();
+        let root = dag.push(ExpressionNode::Product(vec![b, k].into())).unwrap();
+        let key = FullRelationKey {
+            source: "wrong-owner".into(),
+            ordered_indices: Box::new([]),
+            public: public.clone(),
+            target: target.clone(),
+            matrix_type: None,
+            layout: None,
+            trapdoor: None,
+            selector: None,
+        };
+        let mut registry = RelationRegistry::default();
+        registry
+            .register(RelationRegistration {
+                key: key.clone(),
+                preimage: preimage.clone(),
+                target: p,
+            })
+            .unwrap();
+        registry
+            .register(RelationRegistration {
+                key: key.clone(),
+                preimage: preimage.clone(),
+                target: p,
+            })
+            .unwrap();
+        assert!(matches!(
+            dag.normalize_bounded(root, &registry),
+            Err(NormalFormError::UnconsumedExactTerm { .. })
+        ));
+        let conflicting = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("Q"))))
+            .unwrap();
+        assert!(matches!(
+            registry.register(RelationRegistration {
+                key: key.clone(),
+                preimage: preimage.clone(),
+                target: conflicting
+            }),
+            Err(NormalFormError::ConflictingRelationTarget { .. })
+        ));
+        let correct_key = FullRelationKey { source: "named".into(), ..key.clone() };
+        registry
+            .register(RelationRegistration {
+                key: correct_key.clone(),
+                preimage: preimage.clone(),
+                target: p,
+            })
+            .unwrap();
+        let alternate_key = FullRelationKey { target: FactorIdentity::named("Q"), ..correct_key };
+        registry
+            .register(RelationRegistration { key: alternate_key, preimage, target: conflicting })
+            .unwrap();
+        assert!(matches!(
+            dag.normalize(root, &registry),
+            Err(NormalFormError::AmbiguousRelation { .. })
+        ));
+    }
+
+    #[test]
+    fn active_relation_key_covers_reconnected_target_fixed_point() {
+        let public = FactorIdentity::named("B");
+        let preimage = FactorIdentity::named("K");
+        let target = FactorIdentity::named("P");
+        let mut dag = ExpressionDag::new();
+        let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
+        let k = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+            ))
+            .unwrap();
+        let target_product = dag.push(ExpressionNode::Product(vec![b, k].into())).unwrap();
+        let prefix = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("A"))))
+            .unwrap();
+        let suffix = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("D"))))
+            .unwrap();
+        let root = dag.push(ExpressionNode::Product(vec![prefix, b, k, suffix].into())).unwrap();
+        let key = FullRelationKey {
+            source: "named".into(),
+            ordered_indices: Box::new([]),
+            public: public.clone(),
+            target,
+            matrix_type: None,
+            layout: None,
+            trapdoor: None,
+            selector: None,
+        };
+        let mut registry = RelationRegistry::default();
+        registry.register(RelationRegistration { key, preimage, target: target_product }).unwrap();
+        assert!(matches!(
+            dag.normalize(root, &registry),
+            Err(NormalFormError::CyclicRelationDependency { .. })
+        ));
+    }
+
+    #[test]
+    fn dag_root_normalize_cannot_omit_relation_live_finalization() {
+        let mut dag = ExpressionDag::new();
+        let live = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(FactorIdentity::named("K"), bound(1)).unwrap(),
+            ))
+            .unwrap();
+        assert!(dag.normalize_bounded(live, &RelationRegistry::default()).is_ok());
+    }
+
+    #[test]
+    fn relation_matching_uses_actual_trapdoor_provenance() {
+        let public = FactorIdentity::named("B");
+        let preimage = FactorIdentity::named("K");
+        let target = FactorIdentity::named("P");
+        let trapdoor = TrapdoorSourceKey::ProtocolInput(crate::ProtocolInputId::from("td"));
+        let wrong_trapdoor =
+            TrapdoorSourceKey::ProtocolInput(crate::ProtocolInputId::from("wrong-td"));
+        let mut dag = ExpressionDag::new();
+        let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
+        let k = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage.clone(), bound(1))
+                    .unwrap()
+                    .with_trapdoor(wrong_trapdoor),
+            ))
+            .unwrap();
+        let p = dag.push(ExpressionNode::Atom(SymbolicFactor::large(target.clone()))).unwrap();
+        let root = dag.push(ExpressionNode::Product(vec![b, k].into())).unwrap();
+        let key = FullRelationKey {
+            source: "named".into(),
+            ordered_indices: Box::new([]),
+            public,
+            target,
+            matrix_type: None,
+            layout: None,
+            trapdoor: Some(trapdoor.clone()),
+            selector: None,
+        };
+        let mut registry = RelationRegistry::default();
+        registry
+            .register(RelationRegistration {
+                key: key.clone(),
+                preimage: preimage.clone(),
+                target: p,
+            })
+            .unwrap();
+        assert!(matches!(
+            dag.normalize_bounded(root, &registry),
+            Err(NormalFormError::UnconsumedExactTerm { .. })
+        ));
+
+        let mut matching_dag = ExpressionDag::new();
+        let b = matching_dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(key.public.clone())))
+            .unwrap();
+        let k = matching_dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage, bound(1)).unwrap().with_trapdoor(trapdoor),
+            ))
+            .unwrap();
+        let p = matching_dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(key.target.clone())))
+            .unwrap();
+        let root = matching_dag.push(ExpressionNode::Product(vec![b, k].into())).unwrap();
+        let mut matching_registry = RelationRegistry::default();
+        matching_registry
+            .register(RelationRegistration { key, preimage: FactorIdentity::named("K"), target: p })
+            .unwrap();
+        assert!(matching_dag.normalize(root, &matching_registry).is_ok());
+    }
+
+    #[test]
+    fn product_exposes_single_switch_for_case_local_relations() {
+        let public = FactorIdentity::named("B");
+        let selector = FactorIdentity::named("s");
+        let preimages = [FactorIdentity::named("K0"), FactorIdentity::named("K1")];
+        let targets = [FactorIdentity::named("P0"), FactorIdentity::named("P1")];
+        let extras = [FactorIdentity::named("U0"), FactorIdentity::named("U1")];
+        let mut dag = ExpressionDag::new();
+        let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
+        let mut cases = Vec::new();
+        let mut target_terms = Vec::new();
+        for (preimage, target) in preimages.iter().zip(targets.iter()) {
+            cases.push(
+                dag.push(ExpressionNode::Atom(
+                    SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+                ))
+                .unwrap(),
+            );
+            target_terms.push(
+                dag.push(ExpressionNode::Atom(SymbolicFactor::large(target.clone()))).unwrap(),
+            );
+        }
+        let switched = dag
+            .push(ExpressionNode::Switch {
+                selector: selector.clone(),
+                cases: cases.into_boxed_slice(),
+                reachable: vec![0, 1].into_boxed_slice(),
+            })
+            .unwrap();
+        let extra_cases = extras
+            .iter()
+            .map(|extra| {
+                dag.push(ExpressionNode::Atom(SymbolicFactor::large(extra.clone()))).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let switched_extra = dag
+            .push(ExpressionNode::Switch {
+                selector,
+                cases: extra_cases.into_boxed_slice(),
+                reachable: vec![0, 1].into_boxed_slice(),
+            })
+            .unwrap();
+        let root = dag
+            .push(ExpressionNode::Product(vec![b, switched, switched_extra].into_boxed_slice()))
+            .unwrap();
+        let mut registry = RelationRegistry::default();
+        for ((preimage, target), target_term) in
+            preimages.iter().zip(targets.iter()).zip(target_terms)
+        {
+            registry
+                .register(RelationRegistration {
+                    key: FullRelationKey {
+                        source: "named".into(),
+                        ordered_indices: Box::new([]),
+                        public: public.clone(),
+                        target: target.clone(),
+                        matrix_type: None,
+                        layout: None,
+                        trapdoor: None,
+                        selector: None,
+                    },
+                    preimage: preimage.clone(),
+                    target: target_term,
+                })
+                .unwrap();
+        }
+        let normalized = dag.normalize(root, &registry).unwrap();
+        let switch = normalized
+            .exact_terms()
+            .values()
+            .flat_map(|term| term.monomial.factors())
+            .find_map(|factor| factor.switch.clone())
+            .expect("single selector must remain a barrier");
+        let case_keys = switch
+            .cases
+            .iter()
+            .map(|case| {
+                case.exact_terms()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .monomial
+                    .factors()
+                    .iter()
+                    .map(|factor| factor.key.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            case_keys,
+            vec![
+                vec![targets[0].clone(), extras[0].clone()],
+                vec![targets[1].clone(), extras[1].clone()]
+            ]
+        );
+    }
+
+    #[test]
+    fn finite_relation_target_is_folded_before_root_returns() {
+        let public = FactorIdentity::named("B");
+        let preimage = FactorIdentity::named("K");
+        let target = FactorIdentity::named("E");
+        let mut dag = ExpressionDag::new();
+        let b = dag.push(ExpressionNode::Atom(SymbolicFactor::large(public.clone()))).unwrap();
+        let k = dag
+            .push(ExpressionNode::Atom(
+                SymbolicFactor::relation_live(preimage.clone(), bound(1)).unwrap(),
+            ))
+            .unwrap();
+        let e = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::bounded(target.clone(), bound(2)).unwrap()))
+            .unwrap();
+        let root = dag.push(ExpressionNode::Product(vec![b, k].into())).unwrap();
+        let key = FullRelationKey {
+            source: "named".into(),
+            ordered_indices: Box::new([]),
+            public,
+            target,
+            matrix_type: None,
+            layout: None,
+            trapdoor: None,
+            selector: None,
+        };
+        let mut registry = RelationRegistry::default();
+        registry.register(RelationRegistration { key, preimage, target: e }).unwrap();
+        let summary = dag.normalize_bounded(root, &registry).unwrap();
+        assert_eq!(
+            summary.as_matrix_bound().unwrap().coefficient_class,
+            BoundClass::bounded(2_u8.into())
+        );
+    }
+
+    #[test]
+    fn switch_does_not_hoist_distinct_noise_with_equal_bounds() {
+        let mut dag = ExpressionDag::new();
+        let common = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("X"))))
+            .unwrap();
+        let noise = |dag: &mut ExpressionDag, name: &str| {
+            dag.push(ExpressionNode::Atom(
+                SymbolicFactor::bounded(FactorIdentity::named(name), bound(2)).unwrap(),
+            ))
+            .unwrap()
+        };
+        let n0 = noise(&mut dag, "N0");
+        let n1 = noise(&mut dag, "N1");
+        let n2 = noise(&mut dag, "N2");
+        let n3 = noise(&mut dag, "N3");
+        let first = dag.push(ExpressionNode::Add(vec![common, n0].into_boxed_slice())).unwrap();
+        let second = dag.push(ExpressionNode::Add(vec![common, n1].into_boxed_slice())).unwrap();
+        let first_switch = dag
+            .push(ExpressionNode::Switch {
+                selector: FactorIdentity::named("selector"),
+                cases: vec![first, second].into_boxed_slice(),
+                reachable: vec![0, 1].into_boxed_slice(),
+            })
+            .unwrap();
+        let third = dag.push(ExpressionNode::Add(vec![common, n2].into_boxed_slice())).unwrap();
+        let fourth = dag.push(ExpressionNode::Add(vec![common, n3].into_boxed_slice())).unwrap();
+        let second_switch = dag
+            .push(ExpressionNode::Switch {
+                selector: FactorIdentity::named("selector"),
+                cases: vec![third, fourth].into_boxed_slice(),
+                reachable: vec![0, 1].into_boxed_slice(),
+            })
+            .unwrap();
+        let left = dag.normalize(first_switch, &RelationRegistry::default()).unwrap();
+        let right = dag.normalize(second_switch, &RelationRegistry::default()).unwrap();
+        let left_barrier = left
+            .exact_terms
+            .values()
+            .find_map(|term| term.monomial.factors.iter().find_map(|factor| factor.switch.clone()))
+            .unwrap();
+        let right_barrier = right
+            .exact_terms
+            .values()
+            .find_map(|term| term.monomial.factors.iter().find_map(|factor| factor.switch.clone()))
+            .unwrap();
+        assert_ne!(left_barrier.case_fingerprints, right_barrier.case_fingerprints);
+        let difference = left.add(right.negate()).unwrap();
+        assert_eq!(difference.exact_terms.len(), 2);
+        assert!(
+            difference
+                .exact_terms
+                .values()
+                .all(|term| { term.monomial.factors.iter().any(|factor| factor.switch.is_some()) })
+        );
+    }
+
+    #[test]
+    fn same_selector_is_casewise_for_three_factors_and_different_selectors_are_barriers() {
+        let mut dag = ExpressionDag::new();
+        let make_switch = |dag: &mut ExpressionDag, selector: FactorIdentity, names: [&str; 2]| {
+            let left = dag
+                .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named(names[0]))))
+                .unwrap();
+            let right = dag
+                .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named(names[1]))))
+                .unwrap();
+            dag.push(ExpressionNode::Switch {
+                selector,
+                cases: vec![left, right].into_boxed_slice(),
+                reachable: vec![0, 1].into_boxed_slice(),
+            })
+            .unwrap()
+        };
+        let selector = FactorIdentity::named("s");
+        let a = make_switch(&mut dag, selector.clone(), ["A0", "A1"]);
+        let b = make_switch(&mut dag, selector.clone(), ["B0", "B1"]);
+        let c = make_switch(&mut dag, selector.clone(), ["C0", "C1"]);
+        let same = dag.push(ExpressionNode::Product(vec![a, b, c].into_boxed_slice())).unwrap();
+        assert_eq!(
+            dag.normalize(same, &RelationRegistry::default()).unwrap().exact_terms().len(),
+            1
+        );
+        let same_nf = dag.normalize(same, &RelationRegistry::default()).unwrap();
+        let same_data = same_nf
+            .exact_terms
+            .values()
+            .next()
+            .unwrap()
+            .monomial
+            .factors
+            .iter()
+            .find_map(|factor| factor.switch.clone())
+            .unwrap();
+        let expected_cases = [["A0", "B0", "C0"], ["A1", "B1", "C1"]];
+        for (case, expected) in same_data.cases.iter().zip(expected_cases) {
+            let term = case.exact_terms.values().next().unwrap();
+            assert_eq!(
+                term.monomial.factors.iter().map(|factor| factor.key.clone()).collect::<Vec<_>>(),
+                expected.into_iter().map(FactorIdentity::named).collect::<Vec<_>>()
+            );
+        }
+        let other = make_switch(&mut dag, FactorIdentity::named("t"), ["T0", "T1"]);
+        let different =
+            dag.push(ExpressionNode::Product(vec![a, other].into_boxed_slice())).unwrap();
+        let different_nf = dag.normalize(different, &RelationRegistry::default()).unwrap();
+        assert_eq!(different_nf.exact_terms.len(), 1);
+        let different_term = different_nf.exact_terms.values().next().unwrap();
+        assert_eq!(different_term.monomial.factors.len(), 2);
+        assert_ne!(
+            different_term.monomial.factors[0].switch.as_ref().unwrap().selector,
+            different_term.monomial.factors[1].switch.as_ref().unwrap().selector
+        );
+
+        let reversed = make_switch(&mut dag, FactorIdentity::named("s"), ["R0", "R1"]);
+        let reversed_node = match dag.node(reversed).unwrap() {
+            ExpressionNode::Switch { selector, cases, .. } => dag
+                .push(ExpressionNode::Switch {
+                    selector: selector.clone(),
+                    cases: cases.clone(),
+                    reachable: vec![1, 0].into_boxed_slice(),
+                })
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        let mismatched = dag.push(ExpressionNode::Product(vec![a, reversed_node].into())).unwrap();
+        assert!(matches!(
+            dag.normalize(mismatched, &RelationRegistry::default()),
+            Err(NormalFormError::AmbiguousSwitchMapping)
+        ));
+    }
+
+    #[test]
+    fn switch_hoists_common_additive_and_ordered_prefix_suffix() {
+        let mut dag = ExpressionDag::new();
+        let common = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("A"))))
+            .unwrap();
+        let x0 = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("X0"))))
+            .unwrap();
+        let x1 = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("X1"))))
+            .unwrap();
+        let add0 = dag.push(ExpressionNode::Add(vec![common, x0].into_boxed_slice())).unwrap();
+        let add1 = dag.push(ExpressionNode::Add(vec![common, x1].into_boxed_slice())).unwrap();
+        let sum_switch = dag
+            .push(ExpressionNode::Switch {
+                selector: FactorIdentity::named("s"),
+                cases: vec![add0, add1].into_boxed_slice(),
+                reachable: vec![0, 1].into_boxed_slice(),
+            })
+            .unwrap();
+        assert_eq!(
+            dag.normalize(sum_switch, &RelationRegistry::default()).unwrap().exact_terms().len(),
+            2
+        );
+        let prefix = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("P"))))
+            .unwrap();
+        let suffix = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("D"))))
+            .unwrap();
+        let left =
+            dag.push(ExpressionNode::Product(vec![prefix, x0, suffix].into_boxed_slice())).unwrap();
+        let right =
+            dag.push(ExpressionNode::Product(vec![prefix, x1, suffix].into_boxed_slice())).unwrap();
+        let product_switch = dag
+            .push(ExpressionNode::Switch {
+                selector: FactorIdentity::named("s"),
+                cases: vec![left, right].into_boxed_slice(),
+                reachable: vec![0, 1].into_boxed_slice(),
+            })
+            .unwrap();
+        let product = dag.normalize(product_switch, &RelationRegistry::default()).unwrap();
+        assert_eq!(product.exact_terms().len(), 1);
+        assert_eq!(product.exact_terms().keys().next().unwrap().factors().len(), 3);
+    }
+
+    #[test]
+    fn family_static_and_dynamic_access_are_validated_without_enumeration() {
+        let mut dag = ExpressionDag::new();
+        let first = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("F0"))))
+            .unwrap();
+        let second = dag
+            .push(ExpressionNode::Atom(SymbolicFactor::large(FactorIdentity::named("F1"))))
+            .unwrap();
+        let static_case = dag
+            .push(ExpressionNode::FamilyGetStatic {
+                cases: vec![first, second].into_boxed_slice(),
+                index: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            dag.normalize(static_case, &RelationRegistry::default())
+                .unwrap()
+                .first_large_witness()
+                .unwrap()
+                .identity,
+            FactorIdentity::named("F1")
+        );
+        let invalid_static = dag
+            .push(ExpressionNode::FamilyGetStatic {
+                cases: vec![first, second].into_boxed_slice(),
+                index: 2,
+            })
+            .unwrap();
+        assert!(matches!(
+            dag.normalize(invalid_static, &RelationRegistry::default()),
+            Err(NormalFormError::InvalidFamilyIndex)
+        ));
+        let dynamic = dag
+            .push(ExpressionNode::FamilyGetDynamic {
+                selector: FactorIdentity::named("s"),
+                cases: vec![first, second].into_boxed_slice(),
+                stored_indices: vec![0_u8.into(), 1_u8.into()].into_boxed_slice(),
+                domain_upper: 2_u8.into(),
+            })
+            .unwrap();
+        let dynamic_nf = dag.normalize(dynamic, &RelationRegistry::default()).unwrap();
+        let dynamic_data = dynamic_nf
+            .exact_terms
+            .values()
+            .next()
+            .unwrap()
+            .monomial
+            .factors
+            .iter()
+            .find_map(|factor| factor.switch.clone())
+            .unwrap();
+        assert_eq!(dynamic_data.case_indices, vec![0_u8.into(), 1_u8.into()].into_boxed_slice());
+        let invalid_dynamic = dag
+            .push(ExpressionNode::FamilyGetDynamic {
+                selector: FactorIdentity::named("s"),
+                cases: vec![first, second].into_boxed_slice(),
+                stored_indices: vec![0_u8.into(), 1_u8.into()].into_boxed_slice(),
+                domain_upper: 3_u8.into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            dag.normalize(invalid_dynamic, &RelationRegistry::default()),
+            Err(NormalFormError::InvalidFamilyDomain)
+        ));
+    }
+}

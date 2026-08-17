@@ -131,6 +131,37 @@ Before any new exact-signal cancellation or Switch-normalization change:
 
 ## Source map
 
+## Egg-free migration ledger
+
+The first egg-independent boundary is now present in `operational_noise::normal_form`.
+`TermId` indexes only an immutable, job-local `ExpressionDag`; canonical maps use complete
+owner-aware `FactorIdentity` and ordered `MonomialKey` values. `PolynomialNF` performs zero-first
+ordered distribution, signed cancellation, finite bounded aggregation, and deterministic first-
+`Large` diagnostics. `RelationRegistry` compares the full relation key and applies only the
+leftmost `B*K -> P` replacement, retaining an active key stack for cycle rejection.
+
+Simplicity audit: these are three necessary boundaries (DAG edge identity, symbolic factor
+identity, and canonical polynomial storage). Reusing egg IDs would make equality depend on
+insertion order; using the existing selected-expression table would retain e-graph ownership and
+force a second extraction authority; keeping bounded terms as expression trees would prevent
+local aggregation. No protocol, node, fixture, numeric-bound identity, producer-rank field, or
+new persistent cache is introduced. The existing egg checker remains the production path until
+the Stage 4–6 cutover connects this boundary and deletes its legacy implementation.
+
+Stage 4 adds canonical `Switch`/`Select` normalization and stored-family access checks. A switch
+barrier is identified by its selector and ordered reachable-case structural fingerprints; its
+bound is kept separately as the maximum reachable-case bound, so equal numeric bounds cannot
+merge distinct noise. Same-selector products are combined case-wise (including three or more
+factors), while different selectors remain ordered barriers and are never Cartesian-expanded.
+Common exact additive terms and the restricted single-symbolic-monomial prefix/suffix are hoisted;
+other cases remain behind a barrier. Static family access selects one stored case, and dynamic
+access validates only the stored domain mapping (`U <= count`, with `U > count` rejected), without
+logical enumeration. Bounded summaries are excluded from structural fingerprints.
+
+Stage 4 simplicity audit: `Select` shares the existing `Switch` node semantics rather than adding
+a second normalizer; case-wise products reuse `PolynomialNF::product`; family validation uses the
+existing DAG children and memo, with no cache, protocol/node fixture, or numeric-bound identity.
+
 - `crates/correctness/src/operational_noise/relation.rs`: exact relation matching, selected
   polynomial evaluation, replacement plans, and Switch normalization.
 - `crates/correctness/src/operational_noise/simulation.rs`: fixed-point ordering, redex batches,

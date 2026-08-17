@@ -2525,7 +2525,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             .clone()
             .or_else(|| self.canonical_scalar_identity(position.term).ok())
             .ok_or(LowerError::MissingIntegerAnalysis { term: position.term })?;
-        let scalar = self.scalar_store.intern(
+        let scalar = self.scalar_store.intern_extract(
             ScalarExtractKey {
                 operation: ScalarOperation::ExtractCoefficient,
                 matrix: facts.identity,
@@ -2676,6 +2676,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     .as_ref()
                     .and_then(|domain| domain.interval().ok())
                     .ok_or(LowerError::UnsupportedMatrixProductExpansion)?;
+                let interval = super::analysis::IntegerInterval {
+                    minimum: interval.minimum,
+                    maximum: interval.maximum,
+                };
                 (
                     interval,
                     entry
@@ -2683,7 +2687,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         .direct_extract
                         .as_ref()
                         .and_then(|fact| fact.canonical_upper.clone()),
-                    entry.analysis.scalar_provenance == Some(ScalarProvenance::SelectorOnly),
+                    entry.analysis.scalar_provenance ==
+                        Some(super::scalar::ScalarProvenance::SelectorOnly),
                 )
             }
             _ => return Err(LowerError::UnsupportedMatrixProductExpansion),
@@ -6179,10 +6184,13 @@ mod tests {
             entry.analysis.integer_domain.as_ref().unwrap().interval().unwrap().maximum,
             BigInt::from(6)
         );
-        assert_eq!(entry.analysis.scalar_provenance, Some(ScalarProvenance::SelectorOnly));
+        assert_eq!(
+            entry.analysis.scalar_provenance,
+            Some(super::super::scalar::ScalarProvenance::SelectorOnly)
+        );
         assert_eq!(
             entry.analysis.direct_extract,
-            Some(super::super::analysis::DirectExtractFact { canonical_upper: Some(7_u8.into()) })
+            Some(super::super::scalar::DirectExtractFact { canonical_upper: Some(7_u8.into()) })
         );
 
         let fallback_matrix = lowerer

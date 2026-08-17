@@ -20,8 +20,9 @@ use mxx_correctness::{
     OperationalDecoderTarget, OutputRef, StageId,
     operational_noise::{
         OperationalCheckRequest, OperationalGadgetLayout, OperationalSimulationError,
-        OperationalSimulationReport, ProgressEventKind, bound::BoundEvaluationError,
+        OperationalSimulationReport, ProgressEventKind,
         check_operational_noise_candidate_with_progress, error::BoundError,
+        normal_form::NormalFormError,
     },
     operational_protocol_from_graphs,
 };
@@ -2033,8 +2034,7 @@ fn single_lwe_public_lut_raw_signal_is_an_unconsumed_large_term() {
     let error = single_lwe_public_lut_signal_check(|signal| signal)
         .expect_err("an uncancelled public-LUT signal must remain Large");
     let OperationalSimulationError::Bound {
-        source:
-            BoundError::EvaluationFailed { source: BoundEvaluationError::UnconsumedLargeTerm { .. } },
+        source: BoundError::NormalForm { source: NormalFormError::UnconsumedExactTerm { .. } },
         ..
     } = error
     else {

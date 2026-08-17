@@ -96,19 +96,6 @@ pub enum LoweredValueCategory {
     TrapdoorFamily,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RelationRewriteBlockReason {
-    DifferentSelector,
-    TransformedOperand,
-}
-
-/// Describes a matrix operand pair at the point a numeric product transfer fails.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MatrixProductOperands {
-    pub left: WireType,
-    pub right: WireType,
-}
-
 /// The only machine-readable registry of phase error variants.
 ///
 /// Production gets exactly the closed enums below. Tests additionally get the corresponding
@@ -324,53 +311,8 @@ operational_error_registry! {
         InvalidKnownZeroRows { known_zero_rows: BigUint, row_count: BigUint },
     }
 
-    Relation => RelationError {
-        UnknownRelationSource { source: super::identity::AtomicSourceId },
-        MissingRelationRegistration { source: AtomicSourceKey },
-        InvalidRelationSource { source: AtomicSourceKey },
-        MismatchedRelationIndices { source: AtomicSourceKey },
-        RelationTypeMismatch { source: AtomicSourceKey },
-        RelationLayoutMismatch { source: AtomicSourceKey },
-        RelationPublicMismatch { source: AtomicSourceKey },
-        RelationTrapdoorMismatch { source: AtomicSourceKey },
-        RelationTargetMismatch { source: AtomicSourceKey },
-        BlockedRelationRewrite { reason: RelationRewriteBlockReason },
-        RewriteDidNotSaturate { reason: String },
-        SelectedNormalizationBatchDidNotUnion { batch_size: usize },
-        InvalidRelationProducer { producer: WireSourceKey },
-        MismatchedRelationIndex { expected: AtomicSourceKey, actual: AtomicSourceKey },
-        MismatchedRelationType { expected: WireType, actual: WireType },
-        MismatchedRelationLayout { expected: IntExpr, actual: IntExpr },
-        MismatchedHashQueryIdentity { expected: AtomicSourceKey, actual: AtomicSourceKey },
-        MismatchedPreimagePublicIdentity { expected: AtomicSourceKey, actual: AtomicSourceKey },
-        MismatchedTrapdoorIdentity { expected: AtomicSourceKey, actual: AtomicSourceKey },
-        MismatchedRelationTargetIdentity { expected: AtomicSourceKey, actual: AtomicSourceKey },
-        SmallDecompositionRangeNotProved { source: AtomicSourceKey },
-        AmbiguousRelationSource { candidates: Box<[AtomicSourceKey]> },
-        DifferentSelectorRelationBlocked { left: AtomicSourceKey, right: AtomicSourceKey },
-        TransformedRelationOperand { operand: WireSourceKey },
-        RelationRewriteWouldChangeFactorOrder { left: AtomicSourceKey, right: AtomicSourceKey },
-    }
-
     Bound => BoundError {
         NormalForm { source: NormalFormError },
-        NegativeSequentialSamplerCutoff { cutoff: BigInt },
-        UnconsumedLargeTerm { source: AtomicSourceKey },
-        LargeValueUsedAsNoise { source: AtomicSourceKey },
-        IncompatibleMatrixProduct { operands: MatrixProductOperands },
-        InvalidProductMode { operands: MatrixProductOperands },
-        UnresolvedExtraction {
-            unsatisfied_relation_redexes: u64,
-            unsatisfied_structural_redexes: u64,
-        },
-        EvaluationFailed { source: super::bound::BoundEvaluationError },
-        SequentialArityMismatch { expected: usize, actual: usize },
-        SequentialSchemaMismatch { expected: WireType, actual: WireType },
-        RelationBearingSequentialState { source: AtomicSourceKey },
-        LargeSequentialState { source: AtomicSourceKey },
-        UnsupportedRecurrenceExpression { expression: IntExpr },
-        SequentialMetadataNotInvariant { expected: WireType, actual: WireType },
-        SharedFamilyMaximumNotProved { count: BigUint },
     }
 
 }
@@ -382,7 +324,6 @@ pub enum OperationalSimulationError {
     Target(TargetError),
     Lower { site: ErrorSite, source: LowerError },
     Analysis { site: ErrorSite, source: AnalysisError },
-    Relation { site: ErrorSite, source: RelationError },
     Bound { site: ErrorSite, source: BoundError },
 }
 

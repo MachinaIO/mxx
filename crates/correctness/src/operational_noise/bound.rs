@@ -212,30 +212,11 @@ pub trait BoundEvaluationControl {
 pub struct BoundEvaluator<'a, I> {
     input: &'a I,
     memo: BTreeMap<Id, MatrixBound>,
-    selected_children: Option<&'a dyn SelectedChildBounds>,
-}
-
-/// Read-only access to the already-selected child bounds of one extraction
-/// candidate.  Extraction implements this over its existing candidate table;
-/// it is not a second memo or an analysis-owned cache.
-pub(crate) trait SelectedChildBounds {
-    fn child_bound(&self, term: Id) -> Option<&MatrixBound>;
 }
 
 impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
     pub fn new(input: &'a I) -> Self {
-        Self { input, memo: BTreeMap::new(), selected_children: None }
-    }
-
-    /// Applies the exact same node transfer used by final evaluation to one
-    /// extraction candidate whose child bounds have already been selected.
-    pub(crate) fn evaluate_selected_node(
-        input: &'a I,
-        term: Id,
-        node: &MxxLang,
-        children: &'a dyn SelectedChildBounds,
-    ) -> Result<MatrixBound, BoundEvaluationError> {
-        Self { input, memo: BTreeMap::new(), selected_children: Some(children) }.finish(term, node)
+        Self { input, memo: BTreeMap::new() }
     }
 
     pub fn memo(&self) -> &BTreeMap<Id, MatrixBound> {
@@ -298,10 +279,7 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
     }
 
     fn child(&self, term: Id) -> Result<&MatrixBound, BoundEvaluationError> {
-        self.memo
-            .get(&term)
-            .or_else(|| self.selected_children.and_then(|children| children.child_bound(term)))
-            .ok_or(BoundEvaluationError::ExtractedExpressionCycle { term })
+        self.memo.get(&term).ok_or(BoundEvaluationError::ExtractedExpressionCycle { term })
     }
 
     fn matrix_children(&self, node: &MxxLang, term: Id) -> Result<Vec<Id>, BoundEvaluationError> {

@@ -162,15 +162,29 @@ Stage 4 simplicity audit: `Select` shares the existing `Switch` node semantics r
 a second normalizer; case-wise products reuse `PolynomialNF::product`; family validation uses the
 existing DAG children and memo, with no cache, protocol/node fixture, or numeric-bound identity.
 
-- `crates/correctness/src/operational_noise/relation.rs`: exact relation matching, selected
-  polynomial evaluation, replacement plans, and Switch normalization.
-- `crates/correctness/src/operational_noise/simulation.rs`: fixed-point ordering, redex batches,
-  mutation epochs, progress counters, and terminal selected-snapshot reuse.
-- `crates/correctness/src/operational_noise/extract.rs`: deterministic selected expression and
-  ephemeral first-`Large` diagnostics.
+Stage 6 cutover: production matrix simulation no longer has an e-graph root variant. A residual
+must be a `TermId` expression DAG or a stored matrix family backed by that DAG; scalar terms may
+still be lowered internally for selectors and metadata, but never enter matrix normalization or
+bound acceptance. The final `Large` rejection is `normal_form::validate_bounded_only` as invoked by
+simulation. The old selected-polynomial scheduler, final-leaf extraction adapter, and
+e-graph relation adapter were deleted, together with their simulation-only tests. NF normalization
+now owns relation application and first-`Large` validation directly. This removes the second
+production authority and avoids accepting a bound from a stale e-class representative.
+
+Stage 6 simplicity audit: the deleted extraction/rewrite machinery had no remaining production
+consumer after the matrix root cutover. Relation matching is reused through `RelationRegistry` in
+the NF product constructor; no compatibility shim, alternate cache, or scalar e-graph acceptance
+path was retained.
+
+- `crates/correctness/src/operational_noise/normal_form_relation.rs`: owner-aware exact relation
+  registration and deterministic lookup used by the NF product constructor.
+- `crates/correctness/src/operational_noise/simulation.rs`: NF normalization ordering, progress
+  counters, and terminal first-`Large` validation.
+- `crates/correctness/src/operational_noise/normal_form.rs`: bounded-only final validation and
+  deterministic rejection of any remaining exact term, including `Large`.
 - `crates/correctness/src/operational_noise/lower.rs`: authoritative protocol-input contracts,
   recurrence overlays, and source provenance.
-- `crates/correctness/src/operational_noise/bound.rs`: zero-first transfer, finite-bound arithmetic,
-  and strict final rejection of unconsumed `Large`.
+- `crates/correctness/src/operational_noise/bound.rs`: reusable finite-bound arithmetic helpers and
+  legacy evaluator unit coverage pending its NF migration.
 - `crates/gadgets/tests/test_gpu_tall_bgg_nested_rns_modq_arith.rs`: Tall integration evidence and
   focused Public-LUT/noiseless fixtures.

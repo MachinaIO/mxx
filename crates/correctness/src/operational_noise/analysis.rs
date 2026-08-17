@@ -513,6 +513,7 @@ pub(crate) fn visit_relation_provenance(
 
 /// Iterates the shared provenance DAG and stops before visiting a node when
 /// the job-wide budget callback rejects the next unit of work.
+#[cfg(test)]
 pub(crate) fn try_visit_relation_provenance(
     values: &[RelationProvenance],
     mut reserve_visit: impl FnMut() -> bool,
@@ -1406,14 +1407,17 @@ fn prospective_provenance_owned_elements(
     }
 }
 
+#[cfg(test)]
 const PROVENANCE_WORK_CHUNK_SIZE: usize = 64;
 
+#[cfg(test)]
 struct ProvenanceWorkChunk {
     values: [Option<usize>; PROVENANCE_WORK_CHUNK_SIZE],
     len: usize,
     previous: Option<Box<ProvenanceWorkChunk>>,
 }
 
+#[cfg(test)]
 impl ProvenanceWorkChunk {
     fn empty() -> Self {
         Self { values: [None; PROVENANCE_WORK_CHUNK_SIZE], len: 0, previous: None }

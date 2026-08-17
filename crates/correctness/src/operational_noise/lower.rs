@@ -3738,54 +3738,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     input: [matrix, position.term],
                 })
             }
-            NodeKind::LiftIntegerToConstantPolynomial { matrix_type: ty } => {
-                let input = terms(1)?[0];
-                let direct_extract =
-                    self.egraph[self.egraph.find(input)].data.direct_extract.is_some();
-                self.validate_integer_consumer(
-                    input,
-                    SelectorOnlyConsumer::LiftConstantPolynomial,
-                    direct_extract,
-                )?;
-                let matrix_type = self.resolve_matrix_type(ty, environment)?;
-                self.egraph.add(MxxLang::LiftConstantPolynomial { matrix_type, input: [input] })
-            }
-            NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => {
-                let spec = super::identity::CrtSpec {
-                    plaintext_moduli: plaintext_moduli
-                        .iter()
-                        .map(|value| self.resolve_int(value, environment))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_boxed_slice(),
-                    reconstruction_coefficients: reconstruction_coefficients
-                        .iter()
-                        .map(|value| self.resolve_int(value, environment))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_boxed_slice(),
-                };
-                let id = self.egraph.analysis.symbols.crts.intern(spec);
-                self.egraph.add(MxxLang::CrtRecompose {
-                    spec: super::identity::CrtSpecId(id),
-                    inputs: arguments
-                        .iter()
-                        .map(|value| match value {
-                            LoweredValue::Term(value) => self.scalar_term(*value),
-                            LoweredValue::Matrix(_) => {
-                                Err(LowerError::UnsupportedMatrixProductExpansion)
-                            }
-                            LoweredValue::MatrixFamily(_) => {
-                                Err(LowerError::UnsupportedMatrixProductExpansion)
-                            }
-                            LoweredValue::Trapdoor(_) | LoweredValue::TrapdoorFamily { .. } => {
-                                Err(LowerError::InvalidOperandArity { expected: 0, actual: 1 })
-                            }
-                            LoweredValue::Family(_) => {
-                                Err(LowerError::InvalidOperandArity { expected: 0, actual: 1 })
-                            }
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_boxed_slice(),
-                })
+            NodeKind::LiftIntegerToConstantPolynomial { .. } | NodeKind::CrtRecompose { .. } => {
+                // These operations are matrix-valued and are lowered by the
+                // direct normal-form handlers above.  They must never enter
+                // the scalar e-graph fallback.
+                return Err(LowerError::UnsupportedMatrixProductExpansion);
             }
             NodeKind::Input { .. } |
             NodeKind::GadgetTrapdoor { .. } |
@@ -4295,66 +4252,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             }
             NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_) => {
                 unreachable!("loop lowering is scheduled on the outer continuation stack")
-            }
-            NodeKind::PackPolynomialCoefficients { matrix_type, coefficient_bits } => {
-                let [LoweredValue::Family(family)] = arguments else {
-                    return Err(LowerError::InvalidOperandArity {
-                        expected: 1,
-                        actual: arguments.len(),
-                    });
-                };
-                if family.element_type != MxxSort::Bool {
-                    return Err(LowerError::PackRequiresExplicitBooleanFamily {
-                        actual: output_type,
-                    });
-                }
-                let FamilyCoverageStorage::ExactStored { elements } = &family.storage else {
-                    return Err(LowerError::PackRequiresExplicitBooleanFamily {
-                        actual: output_type,
-                    });
-                };
-                let matrix_type = self.resolve_matrix_type(matrix_type, environment)?;
-                let coefficient_bits = self.resolve_int(coefficient_bits, environment)?;
-                let Some(coefficient_bits_value) = resolved_integer(&coefficient_bits) else {
-                    return Err(LowerError::InvalidPackBitCount {
-                        coefficient_bits: BigInt::from(-1),
-                        modulus: resolved_integer(&matrix_type.modulus)
-                            .unwrap_or_else(|| BigInt::from(-1)),
-                    });
-                };
-                let Some(coefficient_bits_usize) = coefficient_bits_value.to_usize() else {
-                    return Err(LowerError::InvalidPackBitCount {
-                        coefficient_bits: coefficient_bits_value,
-                        modulus: resolved_integer(&matrix_type.modulus)
-                            .unwrap_or_else(|| BigInt::from(-1)),
-                    });
-                };
-                let ring_dimension = resolved_nonnegative(&matrix_type.ring_dimension)
-                    .and_then(|value| value.to_usize())
-                    .ok_or_else(|| LowerError::InvalidPackBitCount {
-                        coefficient_bits: coefficient_bits_value.clone(),
-                        modulus: resolved_integer(&matrix_type.modulus)
-                            .unwrap_or_else(|| BigInt::from(-1)),
-                    })?;
-                let expected =
-                    ring_dimension.checked_mul(coefficient_bits_usize).ok_or_else(|| {
-                        LowerError::InvalidPackBitCount {
-                            coefficient_bits: coefficient_bits_value.clone(),
-                            modulus: resolved_integer(&matrix_type.modulus)
-                                .unwrap_or_else(|| BigInt::from(-1)),
-                        }
-                    })?;
-                if coefficient_bits_usize == 0 || elements.len() != expected {
-                    return Err(LowerError::InvalidPackBitWidth {
-                        expected,
-                        actual: elements.len(),
-                    });
-                }
-                Ok(LoweredValue::Term(self.egraph.add(MxxLang::PackPolynomialCoefficients {
-                    matrix_type,
-                    coefficient_bits,
-                    bits: elements.clone(),
-                })))
             }
             NodeKind::SubgraphCall(_) | NodeKind::ThresholdDecode { .. } => unreachable!(),
             _ => unreachable!("only structural nodes reach structural lowering"),
@@ -6135,22 +6032,12 @@ mod tests {
                 .expect("matrix operation lowers through DAG");
             assert!(matches!(value, LoweredValue::Matrix(_)));
         }
-        assert!(lowerer.egraph.classes().all(|class| {
-            class.nodes.iter().all(|node| {
-                !matches!(
-                    node,
-                    MxxLang::MatrixConstant(_) |
-                        MxxLang::MatrixAdd(_) |
-                        MxxLang::MatrixMultiply(_) |
-                        MxxLang::MatrixNegate(_) |
-                        MxxLang::MatrixScale(_) |
-                        MxxLang::MatrixTranspose(_) |
-                        MxxLang::MatrixSlice { .. } |
-                        MxxLang::MatrixTensor(_) |
-                        MxxLang::MatrixConcat { .. }
-                )
-            })
-        }));
+        assert!(
+            lowerer.egraph.classes().all(|class| {
+                class.nodes.iter().all(|node| matches!(node, MxxLang::IntConst(_)))
+            }),
+            "matrix DAG operations must not construct matrix expression e-nodes"
+        );
     }
 
     #[test]
@@ -6234,7 +6121,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_matrix_terms_and_matrix_families_are_rejected_at_scalar_boundaries() {
+    fn matrix_family_metadata_is_rejected_at_scalar_boundaries() {
         let protocol = crate::toy_example::protocol();
         let request = OperationalCheckRequest {
             environment: Vec::new(),
@@ -6248,29 +6135,20 @@ mod tests {
             rows: ResolvedIntExpr::Const(1.into()),
             columns: ResolvedIntExpr::Const(1.into()),
         };
-        let spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
-            super::super::identity::MatrixConstantSpec {
-                matrix_type: matrix.clone(),
-                value: super::super::identity::MatrixConstantValue::Zero,
-            },
-        );
-        let malformed = lowerer
-            .egraph
-            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)));
         let scalar = lowerer.egraph.add(MxxLang::IntConst(1.into()));
         assert!(matches!(
             lowerer.lower_node(
                 &NodeKind::IntBinary(IntBinaryOp::Add),
-                &[LoweredValue::Term(malformed), LoweredValue::Term(scalar)],
+                &[LoweredValue::Term(scalar), LoweredValue::Term(scalar)],
                 &root_test_environment(),
             ),
-            Err(LowerError::UnsupportedMatrixProductExpansion)
+            Ok(LoweredValue::Term(_))
         ));
 
         let family = FamilyLoweringValue {
             element_type: MxxSort::Matrix(matrix),
             storage: FamilyCoverageStorage::ExactStored {
-                elements: vec![malformed].into_boxed_slice(),
+                elements: vec![scalar].into_boxed_slice(),
             },
         };
         let wire = LoweringWire {

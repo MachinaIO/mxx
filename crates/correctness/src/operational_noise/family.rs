@@ -1112,15 +1112,10 @@ fn matrix_vector_product(
 
 #[cfg(test)]
 mod tests {
-    use super::{super::identity::CanonicalTermIdentity, *};
+    use super::*;
     use crate::operational_noise::{
         analysis::MxxAnalysis,
-        identity::{
-            AtomicRelationRole, AtomicSourceDescriptor, BinderDescriptor, GraphWireSourceKey,
-            OccurrenceScope, ProgramKey, ResolvedMatrixType, TrapdoorDescriptorId,
-            TrapdoorIdentity, TrapdoorSourceKey, WireSourceKey,
-        },
-        normal_form::FactorIdentity,
+        identity::{AtomicSourceDescriptor, BinderDescriptor, OccurrenceScope, ProgramKey},
     };
 
     fn evaluate(recurrence: &VectorRecurrence) -> Result<Box<[BigUint]>, RecurrenceFailure> {
@@ -1518,119 +1513,6 @@ mod tests {
             panic!("instantiated template must retain its outer addition");
         };
         assert_eq!(left, right, "both binder occurrences must use the same replacement root");
-    }
-
-    #[test]
-    fn shared_sampler_instantiation_reinterns_cross_owner_descriptor_terms() {
-        let mut analysis = MxxAnalysis::default();
-        let scope = OccurrenceScope {
-            program: ProgramKey::Ideal,
-            definition: mxx_ir_core::FrozenGraphScopeId::Root,
-            path: Box::new([]),
-        };
-        let owner =
-            BinderKey { loop_scope: scope.clone(), loop_node: mxx_ir_core::NodeId(1), slot: 0 };
-        let replacement_owner =
-            BinderKey { loop_scope: scope.clone(), loop_node: mxx_ir_core::NodeId(2), slot: 0 };
-        let owner_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
-            key: owner.clone(),
-            minimum: 0.into(),
-            maximum: 7.into(),
-        }));
-        let replacement_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
-            key: replacement_owner.clone(),
-            minimum: 0.into(),
-            maximum: 7.into(),
-        }));
-        let matrix_type = ResolvedMatrixType {
-            modulus: ResolvedIntExpr::Const(17.into()),
-            ring_dimension: ResolvedIntExpr::Const(1.into()),
-            rows: ResolvedIntExpr::Const(1.into()),
-            columns: ResolvedIntExpr::Const(1.into()),
-        };
-        let mut egraph = EGraph::new(analysis);
-        let owner_term = egraph.add(MxxLang::IntBinder(owner_id));
-        let replacement = egraph.add(MxxLang::IntBinder(replacement_id));
-        let public_identity = CanonicalTermIdentity::Factor(FactorIdentity::atomic(
-            AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from("matrix")),
-            [],
-        ));
-        let trapdoor =
-            TrapdoorDescriptorId(egraph.analysis.symbols.trapdoors.intern(TrapdoorIdentity {
-                source: TrapdoorSourceKey::ProtocolInput(crate::ProtocolInputId::from("trapdoor")),
-                indices: Box::new([]),
-                matrix_type: matrix_type.clone(),
-                public: public_identity.clone(),
-                sigma_bits: 0,
-                gadget_base: ResolvedIntExpr::Const(2.into()),
-                digit_count: ResolvedIntExpr::Const(1.into()),
-                preimage_cutoff: ResolvedIntExpr::Const(1.into()),
-            }));
-        let wire = WireSourceKey {
-            scope: scope.clone(),
-            wire: mxx_ir_core::WireRef { node: mxx_ir_core::NodeId(3), port: mxx_ir_core::Port(0) },
-        };
-        let sampler = egraph.analysis.symbols.samplers.intern(SamplerIdentity::Preimage {
-            source: GraphWireSourceKey {
-                wire,
-                coordinate_binders: vec![owner.clone()].into_boxed_slice(),
-            },
-            indices: vec![ResolvedIntExpr::Binder(owner.clone())].into_boxed_slice(),
-            public: public_identity.clone(),
-            trapdoor,
-            target: public_identity.clone(),
-            cutoff: ResolvedIntExpr::Const(1.into()),
-        });
-        let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
-            key: AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)),
-            sort: MxxSort::Matrix(matrix_type),
-            integer_domain: None,
-            canonical_residue_convention: None,
-            relation_role: Some(AtomicRelationRole::Preimage),
-        });
-        let representative = egraph.add(MxxLang::Atom {
-            source: AtomicSourceId(source),
-            indices: vec![owner_term].into_boxed_slice(),
-        });
-        let instantiated = instantiate_shared_element(
-            &mut egraph,
-            representative,
-            owner_id,
-            replacement,
-            &mut || Ok::<(), ()>(()),
-        )
-        .unwrap();
-        assert!(egraph[instantiated].data.sort.is_ok());
-        let MxxLang::Atom { source, indices } = &egraph[instantiated].nodes[0] else {
-            panic!("instantiated sampler remains an Atom");
-        };
-        let AtomicSourceKey::Sampler(sampler) = egraph
-            .analysis
-            .symbols
-            .atomic_sources
-            .get(source.0)
-            .expect("instantiated source is interned")
-            .key
-        else {
-            panic!("sampler source")
-        };
-        let SamplerIdentity::Preimage {
-            indices: recorded,
-            public: recorded_public,
-            trapdoor,
-            target,
-            ..
-        } = egraph.analysis.symbols.samplers.get(sampler.0).expect("descriptor is interned")
-        else {
-            panic!("preimage descriptor")
-        };
-        assert_eq!(indices.len(), 1);
-        assert_eq!(egraph.find(indices[0]), egraph.find(replacement));
-        assert_eq!(recorded[0], ResolvedIntExpr::Binder(replacement_owner.clone()));
-        assert_eq!(recorded_public, &public_identity);
-        assert_eq!(target, &public_identity);
-        let trapdoor = egraph.analysis.symbols.trapdoors.get(trapdoor.0).unwrap();
-        assert_eq!(trapdoor.public, public_identity);
     }
 
     #[test]

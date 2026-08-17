@@ -218,6 +218,7 @@ impl TestConfig {
         {
             return Err("invalid Tall nested-RNS GPU test configuration".to_owned());
         }
+        validate_error_sigma(config.run_mode, config.error_sigma)?;
         if let Some((crt_depth, log_ring_dimension)) = config.selected_parameters &&
             (crt_depth == 0 ||
                 u32::try_from(log_ring_dimension).is_err() ||
@@ -356,6 +357,55 @@ impl TallRunMode {
 fn env_f64(name: &str, default: f64) -> Result<f64, String> {
     env::var(name)
         .map_or(Ok(default), |value| value.parse().map_err(|_| format!("{name} must be a number")))
+}
+
+fn validate_error_sigma(run_mode: TallRunMode, error_sigma: f64) -> Result<(), String> {
+    if !error_sigma.is_finite() || error_sigma < 0.0 {
+        return Err("MXX_TALL_NESTED_RNS_ERROR_SIGMA must be finite and nonnegative".to_owned());
+    }
+    if matches!(run_mode, TallRunMode::Simulation | TallRunMode::Benchmark | TallRunMode::Full) &&
+        error_sigma == 0.0
+    {
+        return Err(format!(
+            "MXX_TALL_NESTED_RNS_ERROR_SIGMA must be greater than zero in {run_mode:?} mode; use zero-noise mode for an exact noiseless smoke test"
+        ));
+    }
+    Ok(())
+}
+
+fn log_invocation(config: &TestConfig, selected: Option<&PreparedCandidate>) {
+    let command =
+        env::args_os().map(|argument| argument.to_string_lossy().into_owned()).collect::<Vec<_>>();
+    let environment = env::vars()
+        .filter(|(name, _)| {
+            name.starts_with("MXX_TALL_NESTED_RNS_") ||
+                matches!(
+                    name.as_str(),
+                    "CUDA_VISIBLE_DEVICES" | "CUDA_DEVICE_ORDER" | "RUST_LOG"
+                )
+        })
+        .collect::<BTreeMap<_, _>>();
+    info!(
+        ?command,
+        ?environment,
+        requested_mode = ?config.run_mode,
+        configured_selected_parameters = ?config.selected_parameters,
+        error_sigma = config.error_sigma,
+        "Tall nested-RNS reproducibility invocation"
+    );
+    if let Some(selected) = selected {
+        info!(
+            selected_crt_depth = selected.parameters.to_crt().2,
+            selected_ring_dimension = selected.parameters.ring_dimension(),
+            selected_log_ring_dimension = selected.parameters.ring_dimension().ilog2(),
+            selected_security_bits = selected.achieved_security_bits,
+            selected_operational_noise_bound = ?selected
+                .operational_report
+                .as_ref()
+                .map(|report| &report.noise_bound),
+            "Tall nested-RNS selected parameters"
+        );
+    }
 }
 
 fn build_modq_multiplication_circuit(
@@ -1779,6 +1829,18 @@ fn selected_parameters_produce_exactly_one_candidate() {
     assert_eq!(candidate_dimensions(1, 16, 3, 8, Some((7, 5))), vec![(7, 5)]);
 }
 
+#[test]
+fn noisy_modes_require_positive_error_sigma_but_zero_noise_does_not() {
+    for mode in [TallRunMode::Simulation, TallRunMode::Benchmark, TallRunMode::Full] {
+        assert!(validate_error_sigma(mode, 0.0).is_err(), "{mode:?} must reject zero sigma");
+        validate_error_sigma(mode, f64::MIN_POSITIVE).expect("positive sigma is valid");
+    }
+    validate_error_sigma(TallRunMode::ZeroNoise, 0.0)
+        .expect("zero-noise mode intentionally permits zero sigma");
+    validate_error_sigma(TallRunMode::Graph, 0.0)
+        .expect("graph-only mode may inspect a noiseless graph");
+}
+
 fn single_lwe_public_lut_signal_check(
     residual_from_signal: impl FnOnce(mxx_dsl::Mat) -> mxx_dsl::Mat,
 ) -> Result<OperationalSimulationReport, OperationalSimulationError> {
@@ -2012,7 +2074,7 @@ fn noiseless_runtime_config() -> TestConfig {
         trapdoor_sigma: 4.578,
         benchmark_warmups: 1,
         benchmark_iterations: 1,
-        run_mode: TallRunMode::Full,
+        run_mode: TallRunMode::ZeroNoise,
         parameter_simulation_parallelism: 1,
         // Keep the 31,232-preimage smoke run observable without logging once
         // per preimage (about 122 quantitative progress reports).
@@ -2089,6 +2151,7 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
         .try_init();
     let requested_config = TestConfig::from_env().expect("valid GPU Tall nested-RNS configuration");
     let requested_mode = requested_config.run_mode;
+    log_invocation(&requested_config, None);
     let (config, selected) = match requested_mode {
         TallRunMode::ZeroNoise => {
             let config = noiseless_runtime_config();
@@ -2128,6 +2191,7 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
         }
     };
     info!(?config, ?requested_mode, "effective GPU Tall nested-RNS integration configuration");
+    log_invocation(&config, Some(&selected));
     if requested_mode == TallRunMode::Graph {
         info!("completed Tall graph-only mode");
         return;

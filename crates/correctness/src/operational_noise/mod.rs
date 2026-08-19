@@ -1,25 +1,32 @@
 //! Deterministic operational-noise simulation for closed protocol graphs.
 //!
-//! This module lowers a frozen Graph IR program into a typed matrix expression
-//! DAG for deterministic normal-form evaluation.
+//! This module validates and analyzes frozen Graph IR through the production arenas.
+
+// The production adapter consumes real plans directly. Legacy identity, family, scalar, and
+// egg-era normal-form authorities are intentionally not compiled.
+pub(crate) mod arena;
+pub(crate) mod facts;
+pub(crate) mod job;
+pub(crate) mod lower;
+pub(crate) mod monomial;
+pub(crate) mod normal_form;
+pub(crate) mod program;
+pub(crate) mod protocol;
+pub(crate) mod relation;
+pub(crate) mod report;
 
 pub mod bound;
 pub mod error;
-pub mod family;
-pub mod identity;
-pub mod lower;
-pub mod normal_form;
-pub(crate) mod normal_form_family;
-pub(crate) mod normal_form_ops;
-mod normal_form_relation;
-pub(crate) mod scalar;
 pub mod simulation;
 
 use std::collections::BTreeSet;
 
 use num_bigint::{BigInt, BigUint};
 
-pub use error::{OperationalSimulationError, RequestError};
+pub use error::{
+    OperationalSimulationError, ProductionArenaContext, ProductionError, ProductionMatrixType,
+    ProductionPhase, ProductionRootRole, ProductionValueType, RequestError,
+};
 pub use simulation::{
     ProgressEvent, ProgressEventKind, check_operational_noise_candidate,
     check_operational_noise_candidate_with_progress,
@@ -158,8 +165,6 @@ pub struct OperationalSimulationDiagnostics {
     pub normalization_relation_remaining: u64,
     /// Number of bounded-only folds performed during normalization.
     pub normalization_bounded_fold_count: u64,
-    /// Number of reachable Switch/Select cases inspected during normalization.
-    pub normalization_switch_cases_processed: u64,
     pub normalization_milliseconds: u64,
     pub final_term_count: u64,
     pub lowering_milliseconds: u64,

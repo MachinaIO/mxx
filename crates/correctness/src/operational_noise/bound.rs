@@ -2,7 +2,7 @@
 //!
 //! This module intentionally contains no expression graph, extracted-node, or evaluator
 //! abstraction.  Bounds are attached to typed normal-form factors and are combined by the
-//! deterministic constructors in `normal_form` and `normal_form_product`.
+//! deterministic constructors in `normal_form`.
 
 use mxx_ir_core::types::ConcreteMatrixType;
 use num_bigint::{BigInt, BigUint};
@@ -35,31 +35,6 @@ impl BoundClass {
             Self::Large => None,
         }
     }
-}
-
-/// The exact coefficient cap of one gadget-decomposition digit.
-pub(crate) fn gadget_digit_bound(base: &BigInt, small: bool) -> Option<BoundClass> {
-    if base <= &BigInt::one() {
-        return None;
-    }
-    let absolute = base.to_biguint().expect("positive gadget base");
-    Some(BoundClass::bounded(if small {
-        absolute - BigUint::one()
-    } else {
-        (absolute / BigUint::from(2_u8)).max(BigUint::one())
-    }))
-}
-
-/// The coefficient class of a gadget matrix.  Regular gadget matrices are exact signal factors;
-/// only the explicitly small representation has a finite digit-range cap.
-pub(crate) fn gadget_matrix_bound(base: &BigInt, small: bool) -> Option<BoundClass> {
-    if base <= &BigInt::one() {
-        return None;
-    }
-    if !small {
-        return Some(BoundClass::Large);
-    }
-    Some(BoundClass::bounded(base.to_biguint().expect("positive gadget base") - BigUint::one()))
 }
 
 /// Facts about the represented matrix value, independent of its noise bound.
@@ -109,6 +84,121 @@ impl MatrixValueMetadata {
             known_zero_rows: None,
             polynomial: None,
         }
+    }
+
+    /// Join value facts from alternative representations of one value.
+    ///
+    /// A family/packed value is sound only when a fact is true for every
+    /// reachable alternative.  In particular, a coefficient cap is retained
+    /// only when every alternative supplies one; the common cap is the
+    /// maximum, never the first child's cap.  Polynomial support is joined in
+    /// the same (upper-bound) lattice.  `known_zero_rows` is a count-only
+    /// legacy contract, so the only information that can be carried across
+    /// alternatives without row identities is the conservative minimum.
+    pub fn join<'a>(metadata: impl IntoIterator<Item = &'a Self>) -> Self {
+        let mut iter = metadata.into_iter();
+        let Some(first) = iter.next() else { return Self::unknown() };
+        let mut joined = first.clone();
+        for next in iter {
+            joined.canonical_coefficient_exclusive_upper = match (
+                joined.canonical_coefficient_exclusive_upper.take(),
+                next.canonical_coefficient_exclusive_upper.clone(),
+            ) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                _ => None,
+            };
+            joined.is_constant_polynomial &= next.is_constant_polynomial;
+            joined.known_zero_rows =
+                match (joined.known_zero_rows.take(), next.known_zero_rows.clone()) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    _ => None,
+                };
+            joined.polynomial = match (joined.polynomial.take(), next.polynomial.clone()) {
+                (Some(left), Some(right)) => Some(PolynomialFacts {
+                    support_upper: left.support_upper.max(right.support_upper),
+                }),
+                _ => None,
+            };
+        }
+        joined
+    }
+
+    /// Transfer facts through addition.  This is deliberately separate from
+    /// the noise-bound transfer: a finite noise cap is not a value contract.
+    pub fn add(&self, other: &Self, ring_dimension: usize) -> Self {
+        let polynomial =
+            self.polynomial.as_ref().zip(other.polynomial.as_ref()).map(|(left, right)| {
+                PolynomialFacts {
+                    support_upper: left
+                        .support_upper
+                        .saturating_add(right.support_upper)
+                        .min(ring_dimension),
+                }
+            });
+        Self {
+            // Addition can wrap/reduce in the owning ring.  Unless a
+            // dedicated canonical-residue proof is supplied, no input cap
+            // remains an authoritative extraction contract.
+            canonical_coefficient_exclusive_upper: None,
+            is_constant_polynomial: self.is_constant_polynomial && other.is_constant_polynomial,
+            known_zero_rows: self
+                .known_zero_rows
+                .as_ref()
+                .zip(other.known_zero_rows.as_ref())
+                .map(|(left, right)| left.min(right).clone()),
+            polynomial,
+        }
+    }
+
+    pub fn negate(&self) -> Self {
+        self.clone()
+    }
+
+    pub fn transpose(&self) -> Self {
+        let mut result = self.clone();
+        // The metadata has only a row count, not a row-position map.  A
+        // transpose turns rows into columns, so retaining this field would
+        // claim facts about unrelated output rows.
+        result.known_zero_rows = None;
+        result
+    }
+
+    pub fn product(&self, other: &Self, ring_dimension: usize) -> Self {
+        let polynomial =
+            self.polynomial.as_ref().zip(other.polynomial.as_ref()).map(|(left, right)| {
+                PolynomialFacts {
+                    support_upper: left
+                        .support_upper
+                        .checked_mul(right.support_upper)
+                        .unwrap_or(ring_dimension)
+                        .min(ring_dimension),
+                }
+            });
+        Self {
+            // Matrix products use convolution and inner-dimension sums; a
+            // coefficient cap alone is not a canonical residue range.
+            canonical_coefficient_exclusive_upper: None,
+            is_constant_polynomial: self.is_constant_polynomial && other.is_constant_polynomial,
+            known_zero_rows: None,
+            polynomial,
+        }
+    }
+
+    pub fn tensor(&self, other: &Self, ring_dimension: usize) -> Self {
+        let mut result = self.product(other, ring_dimension);
+        result.known_zero_rows = None;
+        result
+    }
+
+    pub fn concat<'a>(metadata: impl IntoIterator<Item = &'a Self>, ring_dimension: usize) -> Self {
+        let mut result = Self::join(metadata);
+        result.polynomial = result.polynomial.map(|facts| PolynomialFacts {
+            support_upper: facts.support_upper.min(ring_dimension),
+        });
+        // A concat changes row positions; without an explicit row-position
+        // map no zero-row claim can be transferred soundly.
+        result.known_zero_rows = None;
+        result
     }
 }
 
@@ -256,6 +346,59 @@ pub fn product_bound_with_facts(
     })
 }
 
+/// Transfer the coefficient cap of a Kronecker/tensor product.  A tensor
+/// multiplies every coefficient pair, and therefore carries one ring-size
+/// factor unless either operand is proved constant in the polynomial ring.
+/// This is the sole tensor-bound rule used by both normal-form evaluation and
+/// family-contract propagation.
+pub fn tensor_bound_with_facts(
+    left: &MatrixBound,
+    right: &MatrixBound,
+    facts: &MatrixProductFacts,
+) -> Result<MatrixBound, BoundArithmeticError> {
+    if left.matrix_type.modulus != right.matrix_type.modulus ||
+        left.matrix_type.ring_dimension != right.matrix_type.ring_dimension
+    {
+        return Err(BoundArithmeticError::IncompatibleMatrixProduct {
+            left: left.matrix_type.clone(),
+            right: right.matrix_type.clone(),
+        });
+    }
+    let coefficient_class = match (&left.coefficient_class, &right.coefficient_class) {
+        (BoundClass::ExactZero, _) | (_, BoundClass::ExactZero) => BoundClass::ExactZero,
+        (
+            BoundClass::Bounded { maximum_absolute_coefficient: left_coeff },
+            BoundClass::Bounded { maximum_absolute_coefficient: right_coeff },
+        ) => BoundClass::bounded(
+            left_coeff *
+                right_coeff *
+                if facts.left_is_constant_polynomial || facts.right_is_constant_polynomial {
+                    BigUint::from(1_u8)
+                } else {
+                    BigUint::from(left.matrix_type.ring_dimension)
+                },
+        ),
+        _ => BoundClass::Large,
+    };
+    let matrix_type = ConcreteMatrixType {
+        modulus: left.matrix_type.modulus.clone(),
+        ring_dimension: left.matrix_type.ring_dimension,
+        rows: left.matrix_type.rows.checked_mul(right.matrix_type.rows).ok_or(
+            BoundArithmeticError::IncompatibleMatrixProduct {
+                left: left.matrix_type.clone(),
+                right: right.matrix_type.clone(),
+            },
+        )?,
+        columns: left.matrix_type.columns.checked_mul(right.matrix_type.columns).ok_or(
+            BoundArithmeticError::IncompatibleMatrixProduct {
+                left: left.matrix_type.clone(),
+                right: right.matrix_type.clone(),
+            },
+        )?,
+    };
+    Ok(MatrixBound { matrix_type, coefficient_class })
+}
+
 fn multiply_classes(left: &BoundClass, right: &BoundClass, factor: &BigUint) -> BoundClass {
     match (left, right) {
         (BoundClass::ExactZero, _) | (_, BoundClass::ExactZero) => BoundClass::ExactZero,
@@ -386,6 +529,23 @@ mod tests {
     }
 
     #[test]
+    fn tensor_uses_ring_factor_without_constant_polynomial_fact() {
+        let left = bounded(matrix_ring(3, 2, 1), 2);
+        let right = bounded(matrix_ring(3, 1, 2), 5);
+        let conservative =
+            tensor_bound_with_facts(&left, &right, &MatrixProductFacts::default()).unwrap();
+        assert_eq!((conservative.matrix_type.rows, conservative.matrix_type.columns), (2, 2));
+        assert_eq!(conservative.coefficient_class, BoundClass::bounded(30_u8.into()));
+        let constant = tensor_bound_with_facts(
+            &left,
+            &right,
+            &MatrixProductFacts { left_is_constant_polynomial: true, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(constant.coefficient_class, BoundClass::bounded(10_u8.into()));
+    }
+
+    #[test]
     fn polynomial_facts_are_bounded_and_zero_large_are_preserved() {
         assert_eq!(PolynomialFacts::new(3, 4).unwrap().support_upper, 3);
         assert_eq!(
@@ -399,15 +559,52 @@ mod tests {
     }
 
     #[test]
-    fn gadget_bounds_reject_invalid_bases() {
-        for small in [false, true] {
-            for base in [-2, 0, 1] {
-                assert_eq!(gadget_digit_bound(&base.into(), small), None);
-                assert_eq!(gadget_matrix_bound(&base.into(), small), None);
+    fn metadata_join_is_conservative_across_alternatives() {
+        let first = MatrixMetadata {
+            canonical_coefficient_exclusive_upper: Some(7_u8.into()),
+            is_constant_polynomial: true,
+            known_zero_rows: Some(3_u8.into()),
+            polynomial: Some(PolynomialFacts { support_upper: 2 }),
+        };
+        let second = MatrixMetadata {
+            canonical_coefficient_exclusive_upper: Some(11_u8.into()),
+            is_constant_polynomial: false,
+            known_zero_rows: Some(1_u8.into()),
+            polynomial: Some(PolynomialFacts { support_upper: 4 }),
+        };
+        assert_eq!(
+            MatrixMetadata::join([&first, &second]),
+            MatrixMetadata {
+                canonical_coefficient_exclusive_upper: Some(11_u8.into()),
+                is_constant_polynomial: false,
+                known_zero_rows: Some(1_u8.into()),
+                polynomial: Some(PolynomialFacts { support_upper: 4 }),
             }
-        }
-        assert_eq!(gadget_matrix_bound(&4.into(), false), Some(BoundClass::Large));
-        assert_eq!(gadget_matrix_bound(&4.into(), true), Some(BoundClass::bounded(3_u8.into())));
-        assert_eq!(gadget_digit_bound(&4.into(), false), Some(BoundClass::bounded(2_u8.into())));
+        );
+        let missing = MatrixMetadata { canonical_coefficient_exclusive_upper: None, ..first };
+        assert_eq!(
+            MatrixMetadata::join([&missing, &second]).canonical_coefficient_exclusive_upper,
+            None
+        );
+    }
+
+    #[test]
+    fn operation_metadata_does_not_reuse_an_input_canonical_cap() {
+        let left = MatrixMetadata {
+            canonical_coefficient_exclusive_upper: Some(7_u8.into()),
+            is_constant_polynomial: true,
+            known_zero_rows: Some(1_u8.into()),
+            polynomial: Some(PolynomialFacts { support_upper: 1 }),
+        };
+        let right = MatrixMetadata {
+            canonical_coefficient_exclusive_upper: Some(9_u8.into()),
+            is_constant_polynomial: true,
+            known_zero_rows: Some(1_u8.into()),
+            polynomial: Some(PolynomialFacts { support_upper: 2 }),
+        };
+        let product = left.product(&right, 8);
+        assert_eq!(product.canonical_coefficient_exclusive_upper, None);
+        assert_eq!(product.polynomial, Some(PolynomialFacts { support_upper: 2 }));
+        assert_eq!(left.transpose().known_zero_rows, None);
     }
 }

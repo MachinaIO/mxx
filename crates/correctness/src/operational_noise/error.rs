@@ -1,31 +1,17 @@
 //! Typed failures emitted by the operational-noise checker.
 //!
-//! A diagnostic has two complementary parts. [`ErrorSite`] says where the checker was working
-//! when it failed, while the phase-specific enum says what closed rule failed. Keeping the site
-//! outside the phase enums prevents every rule from carrying a second, inconsistent location.
+//! Production failures carry only stable semantic categories and bounded diagnostics; arena IDs
+//! and legacy lowering identities never cross the production boundary.
 
 use super::{
-    identity::{BinderKey, OccurrenceFrame, ProgramKey, WireSourceKey},
-    normal_form::NormalFormError,
-    scalar::{ScalarId, ScalarSort},
+    arena::{ResolvedMatrixType, ResolvedValueType},
+    lower::ProductionAdapterError,
+    report::{ReportError, RootRole},
 };
-use crate::{
-    OperationalDecoderKind, ProtocolInputId, StageId, StageInputName, TrapdoorContractMismatch,
-};
+use crate::{OperationalDecoderKind, StageId};
 use mxx_ir_core::{FrozenGraphScopeId, IntExpr, NodeId, WireRef, WireType, node::NodeKind};
 use num_bigint::{BigInt, BigUint};
 use std::fmt;
-
-/// Identifies the graph occurrence and operation which owns a non-target failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ErrorSite {
-    pub program: ProgramKey,
-    pub scope_definition: FrozenGraphScopeId,
-    pub occurrence_path: Box<[OccurrenceFrame]>,
-    pub node: NodeId,
-    pub output_port: Option<u32>,
-    pub operation: String,
-}
 
 /// Names a stage output in a closed decoder declaration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,31 +54,20 @@ pub struct DecoderSnapshot {
     pub output_bool: Option<bool>,
 }
 
-/// Names the consumer that is not permitted to turn a selector-only integer into a noise value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SelectorOnlyConsumer {
-    BoolToInt,
-    IntToReal,
-    LiftConstantPolynomial,
-    HashTag,
-    MatrixDimension,
-    LoopCount,
-    SliceRange,
-    SamplerCutoff,
-    GadgetParameter,
-    NoiseBoundArithmetic,
+/// Bounded semantic context for one exact residual term. No proof-local identity is retained.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactResidualTermDiagnostic {
+    pub coefficient: String,
+    pub central_factors: Box<[ExactResidualFactorDiagnostic]>,
+    pub ordered_factors: Box<[ExactResidualFactorDiagnostic]>,
+    pub relation: String,
 }
 
-/// The lowering-level category of a value that cannot serve as one family element.
-///
-/// This is deliberately separate from [`WireType`]: a family and a trapdoor have no scalar
-/// wire type, so reporting either as `Int` would hide the failed structural producer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LoweredValueCategory {
-    Term,
-    Family,
-    Trapdoor,
-    TrapdoorFamily,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactResidualFactorDiagnostic {
+    pub class: String,
+    pub operation: String,
+    pub detail: String,
 }
 
 /// The only machine-readable registry of phase error variants.
@@ -233,102 +208,315 @@ operational_error_registry! {
         BooleanIntervalModulusBelowFour { target_id: String, actual: BigInt },
     }
 
-    Lower => LowerError {
-        MissingWire { wire: WireRef },
-        MissingNode { node: NodeId },
-        CyclicGraphDependency { wire: WireRef },
-        InvalidOutputPort { wire: WireRef, output_count: usize },
-        InvalidOperandArity { expected: usize, actual: usize },
-        InvalidOperandSort { expected: WireType, actual: WireType },
-        UnsupportedMatrixProductExpansion,
-        MissingChildBinding { definition: FrozenGraphScopeId, input: WireRef },
-        MissingProtocolInputBinding { input: ProtocolInputId },
-        ArtifactProducerMissing { consumer: StageId, input: StageInputName },
-        ArtifactProducerAmbiguous {
-            consumer: StageId,
-            input: StageInputName,
-            candidates: Box<[StageOutputRef]>,
-        },
-        ArtifactTypeMismatch { expected: WireType, actual: WireType },
-        InvalidProtocolTrapdoorContract {
-            trapdoor_input: ProtocolInputId,
-            public_input: ProtocolInputId,
-            mismatch: TrapdoorContractMismatch,
-        },
-        InvalidExtractCoefficientCanonicalUpper { upper: BigUint, modulus: BigUint },
-        UnboundParameter { parameter: String },
-        UnboundBinder { binder: BinderKey },
-        EmptyBinderDomain { binder: BinderKey, count: BigInt },
-        NonAffineLoopExpression { expression: IntExpr },
-        NonExactIdentityIndex { expression: IntExpr },
-        ExactDivisionNotProved { dividend: IntExpr, divisor: IntExpr },
-        DivisionByZeroDomain { divisor: IntExpr },
-        NonExactEuclideanDomain { divisor: IntExpr },
-        InvalidRoundDivDenominator { divisor: IntExpr },
-        InvalidLog2CeilArgument { argument: IntExpr },
-        IntervalOperationNotSupported { expression: IntExpr },
-        MissingIntegerAnalysis { term: ScalarId },
-        InvalidFamilyCount { count: IntExpr },
-        FamilyProducerNotResolved { family: WireRef },
-        IncompatibleFamilyCoverage { expected: WireType, actual: WireType },
-        FamilyAccessOutOfRange { index: IntExpr, count: IntExpr },
-        FamilyElementTypeMismatch { expected: WireType, actual: WireType },
-        FamilyElementLoweringMismatch {
-            expected: WireType,
-            actual_category: LoweredValueCategory,
-            actual_sort: Option<ScalarSort>,
-            producer: WireSourceKey,
-        },
-        NegativeSamplerCutoff { cutoff: BigInt },
-        InvalidUniformInterval { minimum: BigInt, maximum: BigInt },
-        PackRequiresExplicitBooleanFamily { actual: WireType },
-        InvalidPackBitCount { coefficient_bits: BigInt, modulus: BigInt },
-        InvalidPackBitWidth { expected: usize, actual: usize },
-        InvalidRealOperation { operation: NodeKind },
-        SelectorOnlyValueUsedByForbiddenConsumer { consumer: SelectorOnlyConsumer },
-    }
-
-    Bound => BoundError {
-        NormalForm { source: NormalFormError },
-    }
-
 }
 
-/// Internal scalar-transfer failure.  This is returned by the typed scalar
-/// construction helpers and is not a simulation-phase wrapper.
+/// Stable, proof-free production failure categories.
+///
+/// The production boundary must not expose arena IDs, relation keys, or proof capabilities.  It
+/// also must not collapse failures into an unstructured display string: callers need to
+/// distinguish an unsupported/ill-typed graph from a residual exact term and from a missing
+/// numeric contract.  Details are intentionally limited to closed semantic values and human
+/// diagnostics owned by the boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductionPhase {
+    Adapter,
+    Job,
+    Report,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductionRootRole {
+    Residual,
+    Decoder,
+}
+
+/// A concrete matrix contract carried by a production-boundary diagnostic.
+///
+/// This is deliberately separate from the job-local arena type: no arena token or expression ID
+/// can escape through a public production error.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AnalysisError {
-    UnknownCanonicalResidueRange { matrix: ScalarSort },
+pub struct ProductionMatrixType {
+    pub modulus: BigUint,
+    pub ring_dimension: usize,
+    pub rows: usize,
+    pub columns: usize,
 }
 
-impl fmt::Display for AnalysisError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "AnalysisError::{self:?}")
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProductionValueType {
+    Bool,
+    Int,
+    Real,
+    Bytes,
+    Matrix(ProductionMatrixType),
+    Trapdoor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionArenaContext {
+    pub stage: StageId,
+    pub occurrence: FrozenGraphScopeId,
+    pub occurrence_path: u64,
+    pub node: NodeId,
+    pub port: u32,
+    pub operation: String,
+    pub expected_output: ProductionValueType,
+    pub actual_inputs: Box<[ProductionValueType]>,
+    pub reason: String,
+}
+
+fn production_matrix_type(matrix: ResolvedMatrixType) -> ProductionMatrixType {
+    ProductionMatrixType {
+        modulus: matrix.modulus,
+        ring_dimension: matrix.ring_dimension,
+        rows: matrix.rows,
+        columns: matrix.columns,
     }
 }
 
-impl std::error::Error for AnalysisError {}
+fn production_value_type(value_type: ResolvedValueType) -> ProductionValueType {
+    match value_type {
+        ResolvedValueType::Bool => ProductionValueType::Bool,
+        ResolvedValueType::Int => ProductionValueType::Int,
+        ResolvedValueType::Real => ProductionValueType::Real,
+        ResolvedValueType::Bytes => ProductionValueType::Bytes,
+        ResolvedValueType::Matrix(matrix) => {
+            ProductionValueType::Matrix(production_matrix_type(matrix))
+        }
+        ResolvedValueType::Trapdoor => ProductionValueType::Trapdoor,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProductionError {
+    MissingStage,
+    MissingWire,
+    UnsupportedNode {
+        kind: String,
+    },
+    UnsupportedWireType {
+        actual: WireType,
+    },
+    InvalidOperandArity {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidOperandType {
+        expected: WireType,
+        actual: WireType,
+    },
+    IntegerExpression {
+        reason: String,
+    },
+    Structural {
+        reason: String,
+    },
+    MissingSelectorRange,
+    Descriptor {
+        reason: String,
+    },
+    Arena {
+        reason: String,
+    },
+    ArenaContext(ProductionArenaContext),
+    Job {
+        reason: String,
+    },
+    ScalarRoot {
+        role: ProductionRootRole,
+    },
+    TrapdoorRoot {
+        role: ProductionRootRole,
+    },
+    TupleRoot {
+        role: ProductionRootRole,
+    },
+    ExactResidual {
+        role: ProductionRootRole,
+        exact_term_count: u64,
+        diagnostics: Box<[ExactResidualTermDiagnostic]>,
+    },
+    KnownLargeResidual {
+        role: ProductionRootRole,
+    },
+    MissingNumericContract {
+        role: ProductionRootRole,
+    },
+    NonPositiveModulus,
+    BooleanIntervalModulusBelowFour {
+        actual: BigUint,
+    },
+    ThresholdOverflow,
+    Internal {
+        phase: ProductionPhase,
+        detail: String,
+    },
+}
+
+impl fmt::Display for ProductionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ProductionError::{self:?}")
+    }
+}
+
+impl std::error::Error for ProductionError {}
+
+impl ProductionError {
+    /// Keep the temporary adapter/report bridge typed even when its source error has not yet
+    /// acquired a direct conversion.  The detail is diagnostic only; classification remains the
+    /// stable `phase` field and never participates in identity or acceptance.
+    pub fn internal(phase: ProductionPhase, detail: impl Into<String>) -> Self {
+        Self::Internal { phase, detail: detail.into() }
+    }
+}
+
+impl From<ProductionAdapterError> for ProductionError {
+    fn from(error: ProductionAdapterError) -> Self {
+        match error {
+            ProductionAdapterError::MissingStage { .. } => Self::MissingStage,
+            ProductionAdapterError::MissingWire { .. } => Self::MissingWire,
+            ProductionAdapterError::UnsupportedNode { kind, .. } => Self::UnsupportedNode { kind },
+            ProductionAdapterError::UnsupportedWireType { wire_type, .. } => {
+                Self::UnsupportedWireType { actual: wire_type }
+            }
+            ProductionAdapterError::IntegerExpression { reason, .. } => {
+                Self::IntegerExpression { reason }
+            }
+            ProductionAdapterError::Structural { reason, .. } => Self::Structural { reason },
+            ProductionAdapterError::MissingSelectorRange { .. } => Self::MissingSelectorRange,
+            ProductionAdapterError::Descriptor { reason } => Self::Descriptor { reason },
+            ProductionAdapterError::Arena(error) => Self::Arena { reason: error.to_string() },
+            ProductionAdapterError::ArenaContext {
+                wire,
+                operation,
+                expected_output,
+                actual_inputs,
+                source,
+            } => Self::ArenaContext(ProductionArenaContext {
+                stage: wire.stage,
+                occurrence: wire.occurrence.definition,
+                occurrence_path: wire.occurrence.path,
+                node: wire.wire.node,
+                port: wire.wire.port.0,
+                operation,
+                expected_output: production_value_type(expected_output),
+                actual_inputs: actual_inputs
+                    .into_vec()
+                    .into_iter()
+                    .map(production_value_type)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                reason: source.to_string(),
+            }),
+            ProductionAdapterError::Job(error) => Self::Job { reason: error.to_string() },
+        }
+    }
+}
+
+impl From<ReportError> for ProductionError {
+    fn from(error: ReportError) -> Self {
+        let role = |role: RootRole| match role {
+            RootRole::Residual => ProductionRootRole::Residual,
+            RootRole::Decoder => ProductionRootRole::Decoder,
+        };
+        match error {
+            ReportError::Job(error) => Self::Job { reason: error.to_string() },
+            ReportError::ScalarRoot { role: root_role, .. } => {
+                Self::ScalarRoot { role: role(root_role) }
+            }
+            ReportError::TrapdoorRoot { role: root_role } => {
+                Self::TrapdoorRoot { role: role(root_role) }
+            }
+            ReportError::TupleRoot { role: root_role, .. } => {
+                Self::TupleRoot { role: role(root_role) }
+            }
+            ReportError::ExactResidual { witness } => Self::ExactResidual {
+                role: role(witness.role),
+                exact_term_count: witness.exact_term_count,
+                diagnostics: witness
+                    .exact_terms
+                    .iter()
+                    .map(|term| ExactResidualTermDiagnostic {
+                        coefficient: term.coefficient.clone(),
+                        central_factors: term
+                            .central_factors
+                            .iter()
+                            .map(|factor| ExactResidualFactorDiagnostic {
+                                class: factor.class.to_owned(),
+                                operation: factor.operation.to_owned(),
+                                detail: factor.detail.clone(),
+                            })
+                            .collect(),
+                        ordered_factors: term
+                            .ordered_factors
+                            .iter()
+                            .map(|factor| ExactResidualFactorDiagnostic {
+                                class: factor.class.to_owned(),
+                                operation: factor.operation.to_owned(),
+                                detail: factor.detail.clone(),
+                            })
+                            .collect(),
+                        relation: term.relation.clone(),
+                    })
+                    .collect(),
+            },
+            ReportError::KnownLargeResidual { witness } => {
+                Self::KnownLargeResidual { role: role(witness.role) }
+            }
+            ReportError::MissingResidual { witness } => {
+                Self::MissingNumericContract { role: role(witness.role) }
+            }
+            ReportError::NonPositiveModulus { .. } => Self::NonPositiveModulus,
+            ReportError::BooleanIntervalModulusBelowFour { actual, .. } => {
+                Self::BooleanIntervalModulusBelowFour { actual }
+            }
+            ReportError::ThresholdOverflow => Self::ThresholdOverflow,
+        }
+    }
+}
 
 /// Public, fail-closed result for one operational-noise simulation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationalSimulationError {
+    Production(ProductionError),
     Request(RequestError),
     Target(TargetError),
-    Lower { site: ErrorSite, source: LowerError },
-    Bound { site: ErrorSite, source: BoundError },
 }
 
 impl fmt::Display for OperationalSimulationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "OperationalSimulationError::{self:?}")
+        match self {
+            Self::Production(error) => write!(formatter, "{error}"),
+            _ => write!(formatter, "OperationalSimulationError::{self:?}"),
+        }
     }
 }
 
 impl std::error::Error for OperationalSimulationError {}
 
+impl From<ProductionError> for OperationalSimulationError {
+    fn from(error: ProductionError) -> Self {
+        Self::Production(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ALL_OPERATIONAL_ERROR_TAGS;
+    use super::{
+        ALL_OPERATIONAL_ERROR_TAGS, ProductionError, ProductionMatrixType, ProductionRootRole,
+        ProductionValueType,
+    };
+    use crate::{
+        StageId,
+        operational_noise::{
+            arena::ResolvedMatrixType,
+            lower::ProductionAdapterError,
+            protocol::{PlannedWire, ProgramOccurrence},
+            report::{BoundClass, ReportError, RootRole, RootWitness},
+        },
+    };
+    use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};
+    use num_bigint::BigUint;
     use std::collections::BTreeSet;
 
     #[test]
@@ -364,6 +552,102 @@ mod tests {
         assert_eq!(
             ledger_tags, registered,
             "ledger must contain every registered tag exactly once"
+        );
+    }
+
+    #[test]
+    fn report_conversion_preserves_exact_residual_category_without_proof_data() {
+        let error = ProductionError::from(ReportError::ExactResidual {
+            witness: RootWitness {
+                role: RootRole::Residual,
+                exact_term_count: 7,
+                bound: BoundClass::Large,
+                exact_terms: Box::new([]),
+            },
+        });
+        assert_eq!(
+            error,
+            ProductionError::ExactResidual {
+                role: ProductionRootRole::Residual,
+                exact_term_count: 7,
+                diagnostics: Box::new([]),
+            }
+        );
+    }
+
+    #[test]
+    fn exact_residual_conversion_keeps_bounded_semantic_term_diagnostics() {
+        let error = ProductionError::from(ReportError::ExactResidual {
+            witness: RootWitness {
+                role: RootRole::Residual,
+                exact_term_count: 1,
+                bound: BoundClass::Large,
+                exact_terms: Box::new([super::super::job::ExactTermDiagnostic {
+                    coefficient: "-7".to_owned(),
+                    central_factors: Box::new([super::super::job::FactorDiagnostic {
+                        class: "public",
+                        operation: "source",
+                        detail: "source".to_owned(),
+                    }]),
+                    ordered_factors: Box::new([super::super::job::FactorDiagnostic {
+                        class: "sampler",
+                        operation: "preimage",
+                        detail: "preimage".to_owned(),
+                    }]),
+                    relation: "candidate-validation-mismatch".to_owned(),
+                }]),
+            },
+        });
+        let ProductionError::ExactResidual { diagnostics, .. } = error else {
+            panic!("expected exact residual");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].coefficient, "-7");
+        assert_eq!(diagnostics[0].central_factors[0].class, "public");
+        assert_eq!(diagnostics[0].ordered_factors[0].operation, "preimage");
+        assert_eq!(diagnostics[0].ordered_factors[0].detail, "preimage");
+        assert_eq!(diagnostics[0].relation, "candidate-validation-mismatch");
+    }
+
+    #[test]
+    fn arena_conversion_preserves_typed_matrix_transfer_context() {
+        let matrix = || ResolvedMatrixType::new(BigUint::from(1009_u16), 8, 1, 2).unwrap();
+        let error = ProductionError::from(ProductionAdapterError::ArenaContext {
+            wire: PlannedWire {
+                stage: StageId("encoding".to_owned()),
+                occurrence: ProgramOccurrence { definition: FrozenGraphScopeId::Root, path: 167 },
+                wire: WireRef { node: NodeId(5), port: Port(0) },
+            },
+            operation: "Matrix(Multiply)".to_owned(),
+            expected_output: ResolvedMatrixType::new(BigUint::from(1009_u16), 8, 1, 2)
+                .map(super::ResolvedValueType::Matrix)
+                .unwrap(),
+            actual_inputs: vec![
+                super::ResolvedValueType::Matrix(matrix()),
+                super::ResolvedValueType::Matrix(
+                    ResolvedMatrixType::new(BigUint::from(1009_u16), 8, 1, 1).unwrap(),
+                ),
+            ]
+            .into_boxed_slice(),
+            source: super::super::arena::ArenaError::IncompatibleMatrixTypes,
+        });
+        let ProductionError::ArenaContext(context) = error else {
+            panic!("typed arena context must remain structured at the production boundary")
+        };
+        assert_eq!(context.stage, StageId("encoding".to_owned()));
+        assert_eq!(context.occurrence_path, 167);
+        assert_eq!(context.node, NodeId(5));
+        assert_eq!(context.port, 0);
+        assert_eq!(context.operation, "Matrix(Multiply)");
+        assert_eq!(context.actual_inputs.len(), 2);
+        assert_eq!(
+            context.expected_output,
+            ProductionValueType::Matrix(ProductionMatrixType {
+                modulus: BigUint::from(1009_u16),
+                ring_dimension: 8,
+                rows: 1,
+                columns: 2,
+            })
         );
     }
 }

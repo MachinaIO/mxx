@@ -299,8 +299,6 @@ impl DiamondParameterSearch {
             normalization_relation_applied = report.diagnostics.normalization_relation_applied,
             normalization_relation_remaining = report.diagnostics.normalization_relation_remaining,
             normalization_bounded_fold_count = report.diagnostics.normalization_bounded_fold_count,
-            normalization_switch_cases_processed =
-                report.diagnostics.normalization_switch_cases_processed,
             elapsed_seconds = checker_started.elapsed().as_secs_f64(),
             "finished Diamond WE Rust operational-noise check"
         );
@@ -511,13 +509,7 @@ mod tests {
             .expect_err("the current Diamond residual is rejected during typed lowering");
         assert!(matches!(
             error,
-            mxx_correctness::operational_noise::OperationalSimulationError::Lower {
-                source: mxx_correctness::operational_noise::error::LowerError::InvalidOperandSort {
-                    expected: mxx_ir_core::WireType::Int,
-                    actual: mxx_ir_core::WireType::Int,
-                },
-                ..
-            }
+            mxx_correctness::operational_noise::OperationalSimulationError::Production(_)
         ));
     }
 

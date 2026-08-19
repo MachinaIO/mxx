@@ -539,7 +539,9 @@ impl Ring {
     ) -> Mat {
         let ty = self.matrix_type(shape);
         let tag = tag.into();
-        let pending = key.pending.clone();
+        let pending = Pending::merge([key.pending.clone(), tag.pending]);
+        let mut arguments = vec![key.value];
+        arguments.extend(tag.dynamic);
         let node = NodeHandle::new(
             NodeKind::HashSample {
                 matrix_type: ty.clone(),
@@ -551,7 +553,7 @@ impl Ring {
                 base,
                 digit_count,
             },
-            vec![key.value],
+            arguments,
             vec![WireType::Matrix(ty.clone())],
         );
         Mat { value: node.output(0).expect("hash output"), matrix_type: ty, pending }
@@ -649,12 +651,14 @@ impl Ring {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default)]
 pub struct HashTag {
     prefix: Vec<u8>,
     binary: Vec<IntExpr>,
     decimal: Vec<IntExpr>,
     u64_le: Vec<IntExpr>,
+    dynamic: Vec<ValueHandle>,
+    pending: Pending,
 }
 
 impl HashTag {
@@ -709,6 +713,13 @@ impl HashTagPart for LoopIndex {
 impl HashTagPart for IntExpr {
     fn append_to(self, tag: &mut HashTag) {
         tag.u64_le.push(self);
+    }
+}
+
+impl HashTagPart for Int {
+    fn append_to(self, tag: &mut HashTag) {
+        tag.dynamic.push(self.value);
+        tag.pending = Pending::merge([std::mem::take(&mut tag.pending), self.pending]);
     }
 }
 
@@ -4551,6 +4562,29 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_integer_hash_tag_is_an_explicit_argument_and_preserves_pending_metadata() {
+        let ring = Ring::new(17, 8);
+        let row = Int::constant(7).add(Int::constant(0)).semantic_anchor("hash-row").unwrap();
+        let mut tag = HashTag::from(b"dynamic-hash/v1:".as_slice());
+        tag.push(row);
+        let sample = ring.hash_matrix(ring.bytes_input("key", 32), tag, (1, 1));
+        let built =
+            DslContext::new("dynamic-hash-tag").output("sample", sample).unwrap().build().unwrap();
+
+        let hash = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+            .expect("hash sample");
+        assert_eq!(hash.arguments().len(), 2);
+        assert!(matches!(hash.arguments()[1].wire_type(), WireType::Int));
+        assert_eq!(built.anchors.get("hash-row").expect("dynamic tag anchor").len(), 1);
+        built.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
     fn semantic_anchor_resolves_to_the_frozen_output_without_an_ir_node() {
         let ring = Ring::new(17, 8);
         let input = ring.input("input", (2, 2));
@@ -4675,6 +4709,23 @@ mod tests {
                 .flat_map(|scope| scope.nodes())
                 .any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
         );
+    }
+
+    #[test]
+    fn generated_index_family_gather_has_no_explicit_family_pack() {
+        let context = DslContext::new("generated-index-family-gather");
+        let values = context.int_family_input("values", 8);
+        let indices =
+            Parallel::range(2).map_values(|index| index.as_int().mul(Int::constant(3))).unwrap();
+        let gathered = values.parallel_gather(indices).unwrap();
+        let built = context.int_family_output("gathered", gathered).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+
+        let all_nodes =
+            built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
+        assert!(all_nodes.iter().any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))));
+        assert!(all_nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic)));
+        assert!(!all_nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyPack { .. })));
     }
 
     #[test]

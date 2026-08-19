@@ -21,13 +21,12 @@ use mxx_correctness::{
     operational_noise::{
         OperationalCheckRequest, OperationalGadgetLayout, OperationalSimulationError,
         OperationalSimulationReport, ProgressEventKind,
-        check_operational_noise_candidate_with_progress, error::BoundError,
-        normal_form::NormalFormError,
+        check_operational_noise_candidate_with_progress,
     },
     operational_protocol_from_graphs,
 };
 use mxx_dsl::{
-    Bool, BuiltGraph, DslContext, Family, IdealSpec, Ring, SemanticAnchor, parallel_zip,
+    Bool, BuiltGraph, DslContext, IdealSpec, Int, Parallel, Ring, SemanticAnchor, parallel_zip,
 };
 use mxx_gadgets::{
     circuit::{PolyCircuit, PolyGateKind},
@@ -486,7 +485,9 @@ fn run_tall_operational_check(
     for node in encoding.graph.root_scope().nodes() {
         let NodeKind::Input { name, .. } = node.kind() else { continue };
         let Some(indices) = name.strip_prefix("plaintext_") else { continue };
-        let Some((input_index, _slot_index)) = indices.split_once('_') else { continue };
+        // Plaintexts are checker-visible indexed-family inputs. Accept the family name directly;
+        // the suffixed form remains understood for older graph fixtures.
+        let input_index = indices.split_once('_').map_or(indices, |(input_index, _)| input_index);
         let input_index = input_index
             .parse::<usize>()
             .map_err(|_| format!("invalid nested-RNS plaintext input name {name}"))?;
@@ -599,7 +600,6 @@ fn run_tall_operational_check(
                 normalization_relation_candidates = event.normalization_relation_candidates,
                 normalization_relations_applied = event.normalization_relations_applied,
                 normalization_relations_remaining = event.normalization_relations_remaining,
-                normalization_switch_cases_processed = event.normalization_switch_cases_processed,
                 program = ?event.program,
                 scope = ?event.scope,
                 node = ?event.node,
@@ -619,7 +619,6 @@ fn run_tall_operational_check(
                 normalization_relation_candidates = event.normalization_relation_candidates,
                 normalization_relations_applied = event.normalization_relations_applied,
                 normalization_relations_remaining = event.normalization_relations_remaining,
-                normalization_switch_cases_processed = event.normalization_switch_cases_processed,
                 program = ?event.program,
                 scope = ?event.scope,
                 node = ?event.node,
@@ -759,7 +758,7 @@ fn prepare_candidate(
     let lookup_entries = lookup_preprocessing.into_entries();
     let mut lookup_preimage_start = 0usize;
     for (lookup_index, entry) in lookup_entries.iter().enumerate() {
-        let table_length = entry.compiler.preprocessing_row_count();
+        let table_length = entry.compiler.table_length();
         let lookup_preimage_end = lookup_preimage_start.saturating_add(table_length);
         info!(
             lookup_index,
@@ -771,7 +770,7 @@ fn prepare_candidate(
         lookup_preimage_start = lookup_preimage_end;
     }
     let lookup_preimage_count =
-        lookup_entries.iter().map(|entry| entry.compiler.preprocessing_row_count()).sum::<usize>();
+        lookup_entries.iter().map(|entry| entry.compiler.table_length()).sum::<usize>();
     let lookup_compilers =
         lookup_entries.iter().map(|entry| entry.compiler.clone()).collect::<Vec<_>>();
     let preprocessing_preimage_count = lookup_preimage_count;
@@ -945,9 +944,12 @@ fn validate_tall_preprocessing_manifest(
     required.extend((0..input_count).map(|index| format!("{INPUT_PUBLIC_KEY_PREFIX}_{index}")));
     for compiler in lookup_compilers {
         let names = LweLookupArtifactNames::for_compiler(compiler);
-        let low_chunk = names.low_chunk(0);
-        let high_chunk = names.high_chunk(0);
-        required.extend([names.output_public_key, low_chunk, high_chunk]);
+        required.extend([
+            names.output_public_key,
+            names.low_matrices,
+            names.high_matrices,
+            names.output_plaintexts,
+        ]);
     }
     for key in rotations {
         let names = TallRotationEncodingArtifactNames::for_key(key);
@@ -982,29 +984,24 @@ fn build_encoding_graph(
     let public_keys =
         imported_public_keys(&ring, &production, circuit.num_input(), layout.public_key_columns());
     let plaintexts = (0..circuit.num_input())
-        .map(|input| {
-            Family::pack(
-                (0..physical_slots)
-                    .map(|slot| ring.input(format!("plaintext_{input}_{slot}"), (1, 1)))
-                    .collect(),
-            )
-            .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|input| ring.input_family(format!("plaintext_{input}"), physical_slots, (1, 1)))
+        .collect::<Vec<_>>();
     // The online protocol owns exactly one fresh Tall secret matrix.  The
     // family below contains row views of that one `physical_slots × n` sample,
     // not independently sampled per-slot secrets.
     let tall_secret = ring.uniform_interval((physical_slots, layout.secret_dimension), -1, 1);
-    let secret_rows = Family::pack(
-        (0..physical_slots)
-            .map(|slot| {
-                tall_secret
-                    .clone()
-                    .slice(Some(IndexRange { start: slot.into(), end: (slot + 1).into() }), None)
-            })
-            .collect(),
-    )
-    .map_err(|error| error.to_string())?;
+    let secret_rows = Parallel::range(physical_slots)
+        .map_values(move |slot| {
+            let start = slot.expression();
+            tall_secret.clone().slice(
+                Some(IndexRange {
+                    end: IntExpr::Add(Box::new(start.clone()), Box::new(IntExpr::constant(1))),
+                    start,
+                }),
+                None,
+            )
+        })
+        .map_err(|error| error.to_string())?;
     let sample = BggTallEncodingSampler {
         layout: layout.clone(),
         gaussian_sigma: Some(
@@ -1135,17 +1132,27 @@ fn build_encoding_graph(
     let BggTallPlaintext::Diagonal(output_plaintexts) = output.plaintext else {
         return Err("nested-RNS output plaintext is hidden".to_owned());
     };
-    let anchor_indices = (0..physical_slots).step_by(parameters.to_crt().2).collect::<Vec<_>>();
-    let encoding_rows =
-        Family::pack(anchor_indices.iter().map(|slot| output.rows.get_static(*slot)).collect())
-            .map_err(|error| error.to_string())?;
-    let output_plaintexts = Family::pack(
-        anchor_indices.iter().map(|slot| output_plaintexts.get_static(*slot)).collect(),
-    )
-    .map_err(|error| error.to_string())?;
-    let residual_secret_rows =
-        Family::pack(anchor_indices.iter().map(|slot| secret_rows.get_static(*slot)).collect())
-            .map_err(|error| error.to_string())?;
+    let crt_depth = parameters.to_crt().2;
+    let anchor_count = physical_slots.div_ceil(crt_depth);
+    // Keep the anchor selection as one generated gather family. A packed list of static gets
+    // lowers to an opaque explicit family and prevents the checker from beta-reducing the source
+    // row expression; this generated index map retains one shared mapped-index authority.
+    let anchor_index_family = Parallel::range(anchor_count)
+        .map_values(|index| index.as_int().mul(Int::constant(crt_depth)))
+        .map_err(|error| error.to_string())?;
+    let encoding_rows = output
+        .rows
+        .clone()
+        .parallel_gather(anchor_index_family.clone())
+        .map_err(|error| error.to_string())?;
+    let output_plaintexts = output_plaintexts
+        .clone()
+        .parallel_gather(anchor_index_family.clone())
+        .map_err(|error| error.to_string())?;
+    let residual_secret_rows = secret_rows
+        .clone()
+        .parallel_gather(anchor_index_family)
+        .map_err(|error| error.to_string())?;
     let output_public_key = ring.artifact_input(
         production.clone(),
         OUTPUT_PUBLIC_KEY_ARTIFACT,
@@ -1570,20 +1577,29 @@ fn encoding_inputs(
     let matrices = encoded
         .into_par_iter()
         .enumerate()
-        .flat_map_iter(|(input, lanes)| {
-            lanes.into_iter().enumerate().map(move |(slot, value)| (input, slot, value))
-        })
-        .map(|(input, slot, value)| {
-            let polynomial = DCRTPoly::from_biguint_to_constant(&selected.parameters, value);
-            let cpu = DCRTPolyMatrix::from_poly_vec_row(&selected.parameters, vec![polynomial]);
+        .map(|(input, lanes)| {
+            let rows = lanes
+                .into_iter()
+                .map(|value| vec![DCRTPoly::from_biguint_to_constant(&selected.parameters, value)])
+                .collect::<Vec<_>>();
+            let cpu = DCRTPolyMatrix::from_poly_vec(&selected.parameters, rows);
             (
-                format!("plaintext_{input}_{slot}"),
-                RuntimeValue::matrix(GpuDCRTPolyMatrix::from_cpu_matrix(gpu_parameters, &cpu)),
+                format!("plaintext_{input}"),
+                RuntimeValue::IndexedFamily(
+                    (0..cpu.row_size())
+                        .map(|slot| {
+                            RuntimeValue::matrix(GpuDCRTPolyMatrix::from_cpu_matrix(
+                                gpu_parameters,
+                                &cpu.slice(slot, slot + 1, 0, 1),
+                            ))
+                        })
+                        .collect(),
+                ),
             )
         })
         .collect::<Vec<_>>();
-    for (name, matrix) in matrices {
-        inputs.insert(name, matrix);
+    for (name, family) in matrices {
+        inputs.insert(name, family);
     }
     Ok(inputs)
 }
@@ -2033,12 +2049,8 @@ fn single_lwe_public_lut_signal_check(
 fn single_lwe_public_lut_raw_signal_is_an_unconsumed_large_term() {
     let error = single_lwe_public_lut_signal_check(|signal| signal)
         .expect_err("an uncancelled public-LUT signal must remain Large");
-    let OperationalSimulationError::Bound {
-        source: BoundError::NormalForm { source: NormalFormError::UnconsumedExactTerm { .. } },
-        ..
-    } = error
-    else {
-        panic!("raw public-LUT signal must reject as an unconsumed Large term: {error:?}")
+    let OperationalSimulationError::Production(_) = error else {
+        panic!("raw public-LUT signal must reject as an unconsumed exact residual: {error:?}")
     };
 }
 

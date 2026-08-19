@@ -1,21 +1,16 @@
 //! Shared execution controls and exact decoder acceptance for operational simulation.
 //!
-//! The graph-specific stages remain injected here: this driver owns diagnostics and the
-//! progress cadence for a checker job.
-//! It deliberately does not manufacture a bound when lowering or relation rewriting is
-//! unavailable.
+//! The production stages own graph reachability, lowering, normalization, and bound
+//! classification; this driver owns target validation, diagnostics, and progress cadence.
 
 use super::{
-    OperationalAcceptanceReport, OperationalSimulationDiagnostics, OperationalSimulationReport,
+    OperationalSimulationDiagnostics, OperationalSimulationReport,
     error::{OperationalSimulationError, TargetError},
-    identity::SymbolTables,
-    lower::{GraphLowerer, LoweredValue, LoweringControl},
-    normal_form::{
-        BoundedSummary, BoundedValueSummary, ExpressionDag, ExpressionNode, NormalFormError,
-        NormalizationCounters, RelationRegistry, TermId,
-    },
+    lower::ProductionAdapter,
+    protocol::ProtocolPlan,
+    report::{ReportTarget, analyze_roots},
 };
-use crate::{OperationalDecoderKind, ProtocolDecl, StageId};
+use crate::{OperationalDecoderKind, ProtocolDecl};
 use mxx_ir_core::{
     FrozenGraphScopeId, Graph, IntExpr, ParamEnv, Port, WireRef, WireType,
     node::{IntBinaryOp, IntCompareOp, NodeKind},
@@ -23,7 +18,7 @@ use mxx_ir_core::{
 use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -31,142 +26,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info};
-
-enum LoweredRootSet {
-    Dag(TermId),
-    MatrixFamily(super::family::FamilyLoweringValue<TermId>),
-}
-
-enum NormalizedRootSet {
-    Dag((BoundedSummary, u64)),
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct DagProgressStats {
-    reachable_nodes: u64,
-    reachable_switch_cases: u64,
-}
-
-/// Counts the unique DAG nodes that the normalizer can reach from a root set.
-/// This is deliberately a structural walk over the already lowered DAG; it
-/// never uses lowered wire occurrences or scalar-store size as a proxy for
-/// normal-form work.
-fn dag_progress_stats(
-    dag: &ExpressionDag,
-    roots: impl IntoIterator<Item = TermId>,
-) -> Result<DagProgressStats, NormalFormError> {
-    let mut pending = roots.into_iter().collect::<Vec<_>>();
-    let mut visited = BTreeSet::new();
-    let mut stats = DagProgressStats::default();
-    while let Some(term) = pending.pop() {
-        if !visited.insert(term) {
-            continue;
-        }
-        stats.reachable_nodes = stats.reachable_nodes.saturating_add(1);
-        let node = dag.node(term)?;
-        match node {
-            ExpressionNode::Switch { cases, reachable, .. } |
-            ExpressionNode::Select { cases, reachable, .. } => {
-                stats.reachable_switch_cases =
-                    stats.reachable_switch_cases.saturating_add(reachable.len() as u64);
-                pending.extend(reachable.iter().filter_map(|index| cases.get(*index)).copied());
-            }
-            ExpressionNode::FamilyGetStatic { cases, index } => {
-                if let Some(case) = cases.get(*index) {
-                    pending.push(*case);
-                }
-            }
-            ExpressionNode::FamilyGetDynamic { cases, .. } => pending.extend(cases.iter().copied()),
-            ExpressionNode::Add(children) |
-            ExpressionNode::Product(children) |
-            ExpressionNode::Concat { inputs: children, .. } |
-            ExpressionNode::CrtRecompose { inputs: children, .. } => {
-                pending.extend(children.iter().copied());
-            }
-            ExpressionNode::Negate(child) |
-            ExpressionNode::Transpose(child) |
-            ExpressionNode::Slice { input: child, .. } |
-            ExpressionNode::LiftConstantPolynomial { input: child, .. } |
-            ExpressionNode::View { input: child, .. } => pending.push(*child),
-            ExpressionNode::Tensor { left, right } => {
-                pending.push(*left);
-                pending.push(*right);
-            }
-            ExpressionNode::Zero | ExpressionNode::Atom(_) => {}
-        }
-    }
-    Ok(stats)
-}
-
-fn normalize_matrix_root(
-    dag: &ExpressionDag,
-    relations: &RelationRegistry,
-    root: TermId,
-) -> Result<(BoundedSummary, NormalizationCounters), NormalFormError> {
-    let (normalized, counters) = dag.normalize_with_counters(root, relations)?;
-    if let Some(witness) = normalized.first_large_witness() {
-        tracing::debug!(
-            event = "operational_normal_form_first_large",
-            factor_index = witness.factor_index,
-            monomial = ?witness.monomial,
-            identity = ?witness.identity,
-            "normalization retained a Large factor"
-        );
-    }
-    Ok((normalized.validate_bounded_only()?.clone(), counters))
-}
-
-fn normalize_matrix_family(
-    dag: &ExpressionDag,
-    relations: &RelationRegistry,
-    family: &super::family::FamilyLoweringValue<TermId>,
-) -> Result<(BoundedSummary, NormalizationCounters), NormalFormError> {
-    family.validate().map_err(|_| NormalFormError::InvalidFamilyDomain)?;
-    let roots = match &family.storage {
-        super::family::FamilyCoverageStorage::ExactStored { elements } => elements.as_ref(),
-        super::family::FamilyCoverageStorage::SharedTemplate { representative, .. } => {
-            std::slice::from_ref(representative)
-        }
-    };
-    let mut maximum: Option<BoundedValueSummary> = None;
-    let mut counters = NormalizationCounters::default();
-    for root in roots {
-        let (summary, root_counters) = normalize_matrix_root(dag, relations, *root)?;
-        counters.nodes_processed =
-            counters.nodes_processed.saturating_add(root_counters.nodes_processed);
-        counters.exact_term_count =
-            counters.exact_term_count.saturating_add(root_counters.exact_term_count);
-        counters.bounded_fold_count =
-            counters.bounded_fold_count.saturating_add(root_counters.bounded_fold_count);
-        counters.relation_candidates =
-            counters.relation_candidates.saturating_add(root_counters.relation_candidates);
-        counters.relations_applied =
-            counters.relations_applied.saturating_add(root_counters.relations_applied);
-        counters.relations_remaining =
-            counters.relations_remaining.saturating_add(root_counters.relations_remaining);
-        counters.switch_cases_processed =
-            counters.switch_cases_processed.saturating_add(root_counters.switch_cases_processed);
-        if let Some(bound) = summary.as_value() {
-            maximum = Some(match maximum {
-                Some(current) => {
-                    let current_value = current
-                        .bound
-                        .coefficient_class
-                        .maximum_absolute_coefficient()
-                        .unwrap_or_default();
-                    let next_value = bound
-                        .bound
-                        .coefficient_class
-                        .maximum_absolute_coefficient()
-                        .unwrap_or_default();
-                    (next_value > current_value).then_some(bound.clone()).unwrap_or(current)
-                }
-                None => bound.clone(),
-            });
-        }
-    }
-    Ok((maximum.map_or(BoundedSummary::ExactZero, BoundedSummary::Bounded), counters))
-}
 
 const PROGRESS_TIME_CADENCE: Duration = Duration::from_secs(1);
 /// Logical checker phase reported by progress events and diagnostics.
@@ -216,8 +75,6 @@ pub struct ProgressEvent {
     pub normalization_relation_candidates: u64,
     pub normalization_relations_applied: u64,
     pub normalization_relations_remaining: u64,
-    /// Number of reachable Switch/Select cases processed.
-    pub normalization_switch_cases_processed: u64,
     pub owned_elements: u64,
     pub program: Option<String>,
     pub scope: Option<String>,
@@ -235,27 +92,6 @@ pub enum ProgressEventKind {
 struct ProgressState {
     processed: u64,
     last_emitted: Instant,
-}
-
-/// Shares the production progress owner with graph lowering.
-struct LoweringControlAdapter<'a, 'control> {
-    control: &'a mut SimulationControl<'control>,
-}
-
-impl LoweringControl for LoweringControlAdapter<'_, '_> {
-    fn work(
-        &mut self,
-        scope: &super::identity::OccurrenceScope,
-        node: mxx_ir_core::NodeId,
-    ) -> Result<(), super::error::LowerError> {
-        self.control.set_progress_site(
-            format!("{:?}", scope.program),
-            format!("{:?}", scope.definition),
-            node.0 as u64,
-        );
-        let _ = self.control.work(1, None, None);
-        Ok(())
-    }
 }
 
 impl ProgressState {
@@ -287,10 +123,6 @@ impl<'a> SimulationControl<'a> {
             progress_site: None,
             emit_progress,
         }
-    }
-
-    pub(crate) fn diagnostics_mut(&mut self) -> &mut OperationalSimulationDiagnostics {
-        &mut self.diagnostics
     }
 
     /// Attaches the currently processed graph occurrence to cadence events.
@@ -358,9 +190,6 @@ impl<'a> SimulationControl<'a> {
             normalization_relation_candidates: self.diagnostics.normalization_relation_count,
             normalization_relations_applied: self.diagnostics.normalization_relation_applied,
             normalization_relations_remaining: self.diagnostics.normalization_relation_remaining,
-            normalization_switch_cases_processed: self
-                .diagnostics
-                .normalization_switch_cases_processed,
             owned_elements: self.owned_elements.load(Ordering::Relaxed) as u64,
             program: self.progress_site.as_ref().map(|(program, _, _)| program.clone()),
             scope: self.progress_site.as_ref().map(|(_, scope, _)| scope.clone()),
@@ -397,7 +226,6 @@ pub fn check_operational_noise_candidate(
                 normalization_relation_candidates = event.normalization_relation_candidates,
                 normalization_relations_applied = event.normalization_relations_applied,
                 normalization_relations_remaining = event.normalization_relations_remaining,
-                normalization_switch_cases_processed = event.normalization_switch_cases_processed,
                 program = ?event.program,
                 scope = ?event.scope,
                 node = ?event.node,
@@ -423,7 +251,6 @@ pub fn check_operational_noise_candidate(
                 normalization_relation_candidates = event.normalization_relation_candidates,
                 normalization_relations_applied = event.normalization_relations_applied,
                 normalization_relations_remaining = event.normalization_relations_remaining,
-                normalization_switch_cases_processed = event.normalization_switch_cases_processed,
                 "operational noise simulation phase complete"
             ),
         }
@@ -466,130 +293,60 @@ pub fn check_operational_noise_candidate_with_progress(
     request
         .validate(protocol.params.iter().map(|parameter| parameter.name.clone()))
         .map_err(OperationalSimulationError::Request)?;
-    let (target, stage, wire) = resolve_target(protocol, request, &mut control)?;
+    let target = resolve_target(protocol, request, &mut control)?;
     control.work(1, None, None)?;
     control.complete_phase(target_started, None, None)?;
-    check_with_control(
-        target,
-        &mut control,
-        |control| {
-            control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
-            let mut lowering_control = LoweringControlAdapter { control };
-            let mut lowerer = GraphLowerer::new_with_control(
-                protocol,
-                request,
-                SymbolTables::default(),
-                &mut lowering_control,
-            );
-            let lowered = lowerer.lower_stage_wire(&stage, wire);
-            let lowerer = lowerer.into_uncontrolled();
-            let value = match lowered {
-                Ok(value) => value,
-                Err(source) => {
-                    return Err(OperationalSimulationError::Lower {
-                        site: site(&stage, wire, "lower"),
-                        source,
-                    });
+    // Production authority: once the request and decoder target have been validated,
+    // all graph reachability, lowering, relation registration, normalization, and reporting go
+    // through the job-local arenas.
+    let parameters = request
+        .environment
+        .iter()
+        .filter_map(|(name, value)| match value {
+            super::OperationalParameterValue::Integer(value) => Some((name.clone(), value.clone())),
+            super::OperationalParameterValue::Rational { .. } => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let plan = ProtocolPlan::build(protocol, &request.target_id).map_err(|error| {
+        OperationalSimulationError::from(super::error::ProductionError::internal(
+            super::error::ProductionPhase::Adapter,
+            error.to_string(),
+        ))
+    })?;
+    let (mut job, roots) = ProductionAdapter::new(protocol, &plan, parameters)
+        .map_err(|error| {
+            OperationalSimulationError::from(super::error::ProductionError::from(error))
+        })?
+        .lower()
+        .map_err(|error| {
+            OperationalSimulationError::from(super::error::ProductionError::from(error))
+        })?;
+    let report = analyze_roots(
+        &mut job,
+        &roots,
+        &ReportTarget {
+            target_id: target.target_id.clone(),
+            plaintext_modulus: match target.kind {
+                ResolvedDecoderKind::Threshold { ref plaintext_modulus } => {
+                    plaintext_modulus.clone()
                 }
-            };
-            control.work(
-                lowerer.lowered_wire_count() as u64,
-                None,
-                Some(lowerer.scalar_store_len() as u64),
-            )?;
-            control.diagnostics_mut().lowered_term_count = lowerer.lowered_wire_count() as u64;
-            let roots = match value {
-                LoweredValue::Matrix(root) => LoweredRootSet::Dag(root),
-                LoweredValue::MatrixFamily(family) => LoweredRootSet::MatrixFamily(family),
-                LoweredValue::Scalar(_) | LoweredValue::Family(_) => {
-                    // Scalar lowering remains available to resolve selectors, loop domains, and
-                    // matrix metadata, but a residual accepted by this checker must be a matrix
-                    // expression DAG (or a matrix family backed by that DAG).  In particular,
-                    // scalar roots never enter matrix normal-form acceptance.
-                    return Err(OperationalSimulationError::Lower {
-                        site: site(&stage, wire, "residual normal-form root"),
-                        source: super::error::LowerError::UnsupportedMatrixProductExpansion,
-                    });
-                }
-                LoweredValue::Trapdoor(_) | LoweredValue::TrapdoorFamily { .. } => {
-                    return Err(OperationalSimulationError::Lower {
-                        site: site(&stage, wire, "lower residual"),
-                        source: super::error::LowerError::FamilyProducerNotResolved {
-                            family: wire,
-                        },
-                    });
-                }
-            };
-            Ok((lowerer, roots, stage.clone(), wire))
-        },
-        |(lowerer, roots, stage, wire), control| {
-            control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
-            control.reserve_owned_elements(1)?;
-            let dag_roots = match &roots {
-                LoweredRootSet::Dag(root) => vec![*root],
-                LoweredRootSet::MatrixFamily(family) => match &family.storage {
-                    super::family::FamilyCoverageStorage::ExactStored { elements } => {
-                        elements.to_vec()
-                    }
-                    super::family::FamilyCoverageStorage::SharedTemplate {
-                        representative, ..
-                    } => vec![*representative],
-                },
-            };
-            let shape = dag_progress_stats(lowerer.expression_dag(), dag_roots)
-                .map_err(|source| normal_form_error(&stage, wire, source))?;
-            {
-                let diagnostics = control.diagnostics_mut();
-                diagnostics.normalization_node_count = shape.reachable_nodes;
-                diagnostics.normalization_node_total = shape.reachable_nodes;
-                diagnostics.normalization_switch_cases_processed = shape.reachable_switch_cases;
-            }
-            let normalized = match roots {
-                LoweredRootSet::Dag(root) => normalize_matrix_root(
-                    lowerer.expression_dag(),
-                    lowerer.normal_form_relations(),
-                    root,
-                ),
-                LoweredRootSet::MatrixFamily(family) => normalize_matrix_family(
-                    lowerer.expression_dag(),
-                    lowerer.normal_form_relations(),
-                    &family,
-                ),
-            }
-            .map_err(|source| normal_form_error(&stage, wire, source));
-            let (normalized, counters) = normalized?;
-            {
-                let diagnostics = control.diagnostics_mut();
-                diagnostics.normalization_node_count = counters.nodes_processed;
-                diagnostics.normalization_exact_term_count = counters.exact_term_count;
-                diagnostics.normalization_bounded_fold_count = counters.bounded_fold_count;
-                diagnostics.normalization_relation_count = counters.relation_candidates;
-                diagnostics.normalization_relation_applied = counters.relations_applied;
-                diagnostics.normalization_relation_remaining = counters.relations_remaining;
-                diagnostics.normalization_switch_cases_processed = counters.switch_cases_processed;
-                diagnostics.final_term_count = counters.exact_term_count;
-            }
-            drop(lowerer);
-            Ok((NormalizedRootSet::Dag((normalized, counters.exact_term_count)), stage, wire))
-        },
-        |(normalized, stage, wire), control| {
-            control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
-            let NormalizedRootSet::Dag((summary, _exact_term_count)) = normalized;
-            let maximum = summary
-                .as_matrix_bound()
-                .and_then(|bound| bound.coefficient_class.maximum_absolute_coefficient())
-                .unwrap_or_default();
-            control.work(1, None, None)?;
-            Ok(maximum)
+                ResolvedDecoderKind::BooleanInterval => BigUint::from(2_u8),
+            },
+            ciphertext_modulus: target.ciphertext_modulus,
+            boolean_interval: matches!(target.kind, ResolvedDecoderKind::BooleanInterval),
         },
     )
+    .map_err(|error| {
+        OperationalSimulationError::from(super::error::ProductionError::from(error))
+    })?;
+    Ok(report.into_simulation_report())
 }
 
 fn resolve_target(
     protocol: &ProtocolDecl,
     request: &super::OperationalCheckRequest,
     control: &mut SimulationControl<'_>,
-) -> Result<(ResolvedAcceptanceTarget, StageId, WireRef), OperationalSimulationError> {
+) -> Result<ResolvedAcceptanceTarget, OperationalSimulationError> {
     let mut target = None;
     let mut declarations = Vec::new();
     for candidate in &protocol.bundle.operational_decoder_targets {
@@ -919,11 +676,7 @@ fn resolve_target(
             ResolvedDecoderKind::Threshold { plaintext_modulus }
         }
     };
-    Ok((
-        ResolvedAcceptanceTarget { target_id: target.target_id.clone(), ciphertext_modulus, kind },
-        stage.id.clone(),
-        wire,
-    ))
+    Ok(ResolvedAcceptanceTarget { target_id: target.target_id.clone(), ciphertext_modulus, kind })
 }
 
 fn node_kind_and_arguments<const N: usize>(
@@ -1105,283 +858,9 @@ fn wire_consumes(
     Ok(false)
 }
 
-fn site(stage: &StageId, wire: WireRef, operation: &str) -> super::error::ErrorSite {
-    super::error::ErrorSite {
-        program: super::identity::ProgramKey::WorkflowStage(stage.clone()),
-        scope_definition: FrozenGraphScopeId::Root,
-        occurrence_path: Box::new([]),
-        node: wire.node,
-        output_port: Some(wire.port.0),
-        operation: operation.to_owned(),
-    }
-}
-
-fn normal_form_error(
-    stage: &StageId,
-    wire: WireRef,
-    source: NormalFormError,
-) -> OperationalSimulationError {
-    OperationalSimulationError::Bound {
-        site: site(stage, wire, "normalization"),
-        source: super::error::BoundError::NormalForm { source },
-    }
-}
-
-/// Drives injected stages with the same progress and diagnostics owner used in production.
-#[cfg(test)]
-pub(crate) fn check_with_test_control<Lowered, Normalized>(
-    target: ResolvedAcceptanceTarget,
-    emit_progress: &mut dyn FnMut(ProgressEvent),
-    lower: impl FnMut(&mut SimulationControl<'_>) -> Result<Lowered, OperationalSimulationError>,
-    normalize: impl FnMut(
-        Lowered,
-        &mut SimulationControl<'_>,
-    ) -> Result<Normalized, OperationalSimulationError>,
-    bound: impl FnMut(
-        Normalized,
-        &mut SimulationControl<'_>,
-    ) -> Result<BigUint, OperationalSimulationError>,
-) -> Result<OperationalSimulationReport, OperationalSimulationError> {
-    let mut control = SimulationControl::new(emit_progress);
-    check_with_control(target, &mut control, lower, normalize, bound)
-}
-
-fn check_with_control<Lowered, Normalized>(
-    target: ResolvedAcceptanceTarget,
-    control: &mut SimulationControl<'_>,
-    mut lower: impl FnMut(&mut SimulationControl<'_>) -> Result<Lowered, OperationalSimulationError>,
-    mut normalize: impl FnMut(
-        Lowered,
-        &mut SimulationControl<'_>,
-    ) -> Result<Normalized, OperationalSimulationError>,
-    mut bound: impl FnMut(
-        Normalized,
-        &mut SimulationControl<'_>,
-    ) -> Result<BigUint, OperationalSimulationError>,
-) -> Result<OperationalSimulationReport, OperationalSimulationError> {
-    let phase_started = control.begin_phase(CheckerPhase::Lower)?;
-    let lowered = lower(control)?;
-    let elapsed = control.complete_phase(phase_started, None, None)?;
-    control.diagnostics.lowering_milliseconds = elapsed.as_millis() as u64;
-
-    let phase_started = control.begin_phase(CheckerPhase::Normalize)?;
-    let normalized = normalize(lowered, control)?;
-    let elapsed = control.complete_phase(phase_started, None, None)?;
-    control.diagnostics.normalization_milliseconds = elapsed.as_millis() as u64;
-
-    let phase_started = control.begin_phase(CheckerPhase::Bound)?;
-    let noise_bound = bound(normalized, control)?;
-    let elapsed = control.complete_phase(phase_started, None, None)?;
-    control.diagnostics.bound_milliseconds = elapsed.as_millis() as u64;
-
-    let phase_started = control.begin_phase(CheckerPhase::Acceptance)?;
-    let (accepted, acceptance) = check_acceptance(&target, &noise_bound)?;
-    control.complete_phase(phase_started, None, None)?;
-    control.diagnostics.total_milliseconds = control.started.elapsed().as_millis() as u64;
-
-    Ok(OperationalSimulationReport {
-        target_id: target.target_id,
-        noise_bound,
-        ciphertext_modulus: target.ciphertext_modulus,
-        accepted,
-        acceptance,
-        diagnostics: control.diagnostics.clone(),
-    })
-}
-
-fn check_acceptance(
-    target: &ResolvedAcceptanceTarget,
-    noise_bound: &BigUint,
-) -> Result<(bool, OperationalAcceptanceReport), OperationalSimulationError> {
-    match &target.kind {
-        ResolvedDecoderKind::Threshold { plaintext_modulus } => {
-            let threshold_left = BigUint::from(2_u8) * plaintext_modulus * noise_bound;
-            let margin = BigInt::from(target.ciphertext_modulus.clone()) -
-                BigInt::from(threshold_left.clone());
-            let accepted = threshold_left < target.ciphertext_modulus;
-            Ok((
-                accepted,
-                OperationalAcceptanceReport::Threshold {
-                    plaintext_modulus: plaintext_modulus.clone(),
-                    threshold_left,
-                    margin,
-                },
-            ))
-        }
-        ResolvedDecoderKind::BooleanInterval => {
-            if target.ciphertext_modulus < BigUint::from(4_u8) {
-                return Err(OperationalSimulationError::Target(
-                    TargetError::BooleanIntervalModulusBelowFour {
-                        target_id: target.target_id.clone(),
-                        actual: BigInt::from(target.ciphertext_modulus.clone()),
-                    },
-                ));
-            }
-            let q = BigInt::from(target.ciphertext_modulus.clone());
-            let noise = BigInt::from(noise_bound.clone());
-            let quarter = shared_round_div(&(&q - BigInt::from(2_u8)), &BigInt::from(4_u8));
-            let half = &q / BigInt::from(2_u8);
-            let false_lower_margin = &quarter - &noise;
-            let false_upper_margin = &q - (BigInt::from(3_u8) * &quarter + &noise);
-            let true_lower_margin = &half - (&quarter + &noise);
-            let true_upper_margin = BigInt::from(3_u8) * &quarter - (&half + &noise);
-            let accepted = false_lower_margin > BigInt::zero() &&
-                false_upper_margin > BigInt::zero() &&
-                true_lower_margin >= BigInt::zero() &&
-                true_upper_margin >= BigInt::zero();
-            Ok((
-                accepted,
-                OperationalAcceptanceReport::BooleanInterval {
-                    quarter,
-                    false_lower_margin,
-                    false_upper_margin,
-                    true_lower_margin,
-                    true_upper_margin,
-                },
-            ))
-        }
-    }
-}
-
-/// Delegates the tie rule to Graph IR rather than selecting a Rust division convention here.
-fn shared_round_div(numerator: &BigInt, denominator: &BigInt) -> BigInt {
-    IntExpr::RoundDiv(
-        Box::new(IntExpr::constant(numerator.clone())),
-        Box::new(IntExpr::constant(denominator.clone())),
-    )
-    .evaluate(&ParamEnv::default())
-    .expect("positive constant RoundDiv denominator")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operational_noise::bound::MatrixBound;
-
-    #[test]
-    fn dag_progress_counts_unique_reachable_nodes_and_switch_cases() {
-        let mut dag = ExpressionDag::new();
-        let left = dag.push(ExpressionNode::Zero).expect("left DAG node");
-        let right = dag.push(ExpressionNode::Zero).expect("right DAG node");
-        let selector = super::super::normal_form::FactorIdentity::named("selector");
-        let root = dag
-            .push(ExpressionNode::Switch {
-                selector,
-                cases: vec![left, right].into_boxed_slice(),
-                reachable: vec![0, 1].into_boxed_slice(),
-            })
-            .expect("switch DAG node");
-
-        assert_eq!(
-            dag_progress_stats(&dag, [root]).expect("DAG stats"),
-            DagProgressStats { reachable_nodes: 3, reachable_switch_cases: 2 }
-        );
-    }
-
-    fn boolean_target(q: u32) -> ResolvedAcceptanceTarget {
-        ResolvedAcceptanceTarget {
-            target_id: "interval".to_owned(),
-            ciphertext_modulus: q.into(),
-            kind: ResolvedDecoderKind::BooleanInterval,
-        }
-    }
-
-    fn run_acceptance(target: ResolvedAcceptanceTarget, noise: u32) -> OperationalSimulationReport {
-        check_with_test_control(
-            target,
-            &mut |_| {},
-            |_| Ok(()),
-            |_, _| Ok(()),
-            |_, _| Ok(noise.into()),
-        )
-        .expect("acceptance result")
-    }
-
-    #[test]
-    fn boolean_interval_uses_graph_round_division_for_every_q_mod_four() {
-        for (q, expected_quarter) in [(16, 4), (17, 4), (18, 4), (19, 4), (29, 7)] {
-            let report = run_acceptance(boolean_target(q), 0);
-            let OperationalAcceptanceReport::BooleanInterval { quarter, .. } = report.acceptance
-            else {
-                panic!("boolean target must report interval acceptance");
-            };
-            assert_eq!(quarter, BigInt::from(expected_quarter));
-        }
-    }
-
-    #[test]
-    fn boolean_interval_preserves_strict_and_nonstrict_inequalities() {
-        let rejected = run_acceptance(boolean_target(17), 4);
-        assert!(!rejected.accepted, "N == quarter must fail the strict lower condition");
-        let accepted = run_acceptance(boolean_target(17), 3);
-        assert!(accepted.accepted);
-    }
-
-    fn normal_form_test_bound(class: super::super::bound::BoundClass) -> MatrixBound {
-        MatrixBound {
-            matrix_type: mxx_ir_core::types::ConcreteMatrixType {
-                modulus: 17.into(),
-                ring_dimension: 1,
-                rows: 1,
-                columns: 1,
-            },
-            coefficient_class: class,
-        }
-    }
-
-    #[test]
-    fn production_normalization_accepts_a_finite_root() {
-        let mut dag = ExpressionDag::new();
-        let root = dag
-            .push(super::super::normal_form::ExpressionNode::Atom(
-                super::super::normal_form::SymbolicFactor::bounded(
-                    super::super::normal_form::FactorIdentity::named("finite"),
-                    normal_form_test_bound(super::super::bound::BoundClass::bounded(3_u8.into())),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
-        let summary = normalize_matrix_root(&dag, &RelationRegistry::default(), root).unwrap();
-        assert_eq!(
-            summary.0.as_matrix_bound().unwrap().coefficient_class.maximum_absolute_coefficient(),
-            Some(3_u8.into())
-        );
-    }
-
-    #[test]
-    fn production_normalization_rejects_exact_large_residual_with_witness() {
-        let mut dag = ExpressionDag::new();
-        let root = dag
-            .push(super::super::normal_form::ExpressionNode::Atom(
-                super::super::normal_form::SymbolicFactor::large(
-                    super::super::normal_form::FactorIdentity::named("large"),
-                ),
-            ))
-            .unwrap();
-        let normalized = dag.normalize(root, &RelationRegistry::default()).unwrap();
-        assert!(normalized.first_large_witness().is_some());
-        assert!(matches!(
-            normalize_matrix_root(&dag, &RelationRegistry::default(), root),
-            Err(NormalFormError::UnconsumedExactTerm { .. })
-        ));
-    }
-
-    #[test]
-    fn threshold_rejects_equality() {
-        let report = run_acceptance(
-            ResolvedAcceptanceTarget {
-                target_id: "threshold".to_owned(),
-                ciphertext_modulus: 12_u8.into(),
-                kind: ResolvedDecoderKind::Threshold { plaintext_modulus: 2_u8.into() },
-            },
-            3,
-        );
-        assert!(!report.accepted);
-        assert!(matches!(
-            report.acceptance,
-            OperationalAcceptanceReport::Threshold { margin, .. } if margin.is_zero()
-        ));
-    }
 
     #[test]
     fn closed_target_rejects_a_same_modulus_decoder_that_does_not_consume_the_residual() {

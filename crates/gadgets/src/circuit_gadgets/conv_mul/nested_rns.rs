@@ -28,19 +28,6 @@ impl<P: Poly + 'static> NegacyclicConvolutionContext<P> for NestedRnsPolyContext
         &self,
         diagonal: usize,
         num_slots: usize,
-    ) -> Vec<SubCircuitParamValue> {
-        <Self as NegacyclicConvolutionContext<P>>::q_level_diagonal_product_param_bindings_for_lanes(
-            self,
-            diagonal,
-            num_slots,
-            self.q_moduli_depth,
-        )
-    }
-
-    fn q_level_diagonal_product_param_bindings_for_lanes(
-        &self,
-        diagonal: usize,
-        num_slots: usize,
         lanes: usize,
     ) -> Vec<SubCircuitParamValue> {
         assert!(lanes > 0, "nested-RNS convolution requires at least one active CRT lane");

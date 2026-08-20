@@ -468,7 +468,9 @@ impl NegacyclicConvolutionContext<DCRTPoly> for ScalarArithmeticContext {
         &self,
         diagonal: usize,
         num_slots: usize,
+        lanes_per_coefficient: usize,
     ) -> Vec<SubCircuitParamValue> {
+        assert_eq!(lanes_per_coefficient, 1);
         vec![
             SubCircuitParamValue::SlotTransfer(SlotTransferSpec::repeated(
                 diagonal,

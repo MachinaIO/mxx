@@ -6,7 +6,9 @@
         &self,
         diagonal: usize,
         num_slots: usize,
+        lanes_per_coefficient: usize,
     ) -> Vec<SubCircuitParamValue> {
+        assert_eq!(lanes_per_coefficient, self.num_limbs);
         let rhs_binding =
             SubCircuitParamValue::SlotTransfer(SlotTransferSpec::rotation(diagonal, num_slots));
         let negative_scalar = u32::try_from(self.modulus_u64.saturating_sub(1))

@@ -339,6 +339,7 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
                 nested_rns.as_ref(),
                 1,
                 num_slots,
+                window.depth,
                 &helper_input_norms,
                 &helper_input_norms,
             ));

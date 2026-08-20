@@ -37,16 +37,8 @@ pub trait NegacyclicConvolutionContext<P: Poly>: ModularArithmeticContext<P> {
         &self,
         diagonal: usize,
         num_slots: usize,
+        lanes_per_coefficient: usize,
     ) -> Vec<SubCircuitParamValue>;
-
-    fn q_level_diagonal_product_param_bindings_for_lanes(
-        &self,
-        diagonal: usize,
-        num_slots: usize,
-        _lanes_per_coefficient: usize,
-    ) -> Vec<SubCircuitParamValue> {
-        self.q_level_diagonal_product_param_bindings(diagonal, num_slots)
-    }
 
     fn reduce_q_level_row(
         &self,
@@ -169,14 +161,6 @@ fn rhs_rotation_plan(num_slots: usize, diagonal: usize) -> Vec<(u32, Option<Vec<
             (u32::try_from(src_slot).expect("source slot index must fit in u32"), None)
         })
         .collect()
-}
-
-fn q_level_diagonal_product_param_bindings<P: Poly, C: NegacyclicConvolutionContext<P>>(
-    ctx: &C,
-    diagonal: usize,
-    num_slots: usize,
-) -> Vec<SubCircuitParamValue> {
-    ctx.q_level_diagonal_product_param_bindings(diagonal, num_slots)
 }
 
 fn q_level_diagonal_product_subcircuit<P: Poly + 'static, C: NegacyclicConvolutionContext<P>>(
@@ -329,6 +313,7 @@ pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_subcircuit<P: Poly 
     template_ctx: &impl NegacyclicConvolutionContext<P>,
     row_count: usize,
     num_slots: usize,
+    lanes_per_coefficient: usize,
     lhs_input_norms: &[BigUint],
     rhs_input_norms: &[BigUint],
 ) -> PolyCircuit<P> {
@@ -355,10 +340,10 @@ pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_subcircuit<P: Poly 
         (0..num_slots)
             .into_par_iter()
             .map(|diagonal| {
-                let bindings = q_level_diagonal_product_param_bindings::<P, _>(
-                    ctx.as_ref(),
+                let bindings = ctx.q_level_diagonal_product_param_bindings(
                     diagonal,
                     num_slots,
+                    lanes_per_coefficient,
                 );
                 circuit_ref.intern_binding_set(&bindings)
             })
@@ -391,6 +376,7 @@ pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit<
     template_ctx: &impl NegacyclicConvolutionContext<P>,
     row_count: usize,
     num_slots: usize,
+    lanes_per_coefficient: usize,
     lhs_input_norms: &[BigUint],
     rhs_input_norms: &[BigUint],
 ) -> PolyCircuit<P> {
@@ -417,10 +403,10 @@ pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit<
         (0..num_slots)
             .into_par_iter()
             .map(|diagonal| {
-                let bindings = q_level_diagonal_product_param_bindings::<P, _>(
-                    ctx.as_ref(),
+                let bindings = ctx.q_level_diagonal_product_param_bindings(
                     diagonal,
                     num_slots,
+                    lanes_per_coefficient,
                 );
                 circuit_ref.intern_binding_set(&bindings)
             })
@@ -496,7 +482,7 @@ where
     let instantiate_start = Instant::now();
     let mut diagonal_terms = Vec::with_capacity(num_slots);
     for (diagonal, output_template) in diagonal_output_templates.into_iter().enumerate() {
-        let bindings = lhs.context().q_level_diagonal_product_param_bindings_for_lanes(
+        let bindings = lhs.context().q_level_diagonal_product_param_bindings(
             diagonal,
             num_slots,
             lhs.crt_window().depth,
@@ -585,7 +571,7 @@ where
     let instantiate_start = Instant::now();
     let mut diagonal_terms = Vec::with_capacity(num_slots);
     for (diagonal, output_template) in diagonal_output_templates.into_iter().enumerate() {
-        let bindings = lhs.context().q_level_diagonal_product_param_bindings_for_lanes(
+        let bindings = lhs.context().q_level_diagonal_product_param_bindings(
             diagonal,
             num_slots,
             lhs.crt_window().depth,
@@ -854,6 +840,77 @@ mod tests {
             DCRTPolyParams::new(2, 3, 10, 5),
             CrtWindow::new(1, 2, 3),
         );
+    }
+
+    #[test]
+    fn decomposed_nested_rns_convolution_respects_a_nonzero_partial_window_at_runtime() {
+        let parameters = DCRTPolyParams::new(2, 3, 10, 5);
+        let num_slots = parameters.ring_dimension() as usize;
+        let window = CrtWindow::new(1, 2, 3);
+        let build = |use_decomposed_helper: bool| {
+            let mut circuit = PolyCircuit::<DCRTPoly>::new();
+            let context = nested_context(&mut circuit, &parameters, None);
+            let gadget_len = window.depth * (context.p_moduli.len() + 1);
+            let left_row = (0..gadget_len)
+                .map(|_| NestedRnsPoly::input(context.clone(), num_slots, window, &mut circuit))
+                .collect::<Vec<_>>();
+            let right = NestedRnsPoly::input(context.clone(), num_slots, window, &mut circuit);
+            let product = if use_decomposed_helper {
+                right.conv_mul_right_decomposed(&parameters, &left_row, num_slots, &mut circuit)
+            } else {
+                let right_decomposed = right.gadget_decompose(&mut circuit);
+                let terms = left_row
+                    .iter()
+                    .zip(&right_decomposed)
+                    .map(|(left, right_term)| {
+                        negacyclic_conv_mul(&parameters, &mut circuit, left, right_term, num_slots)
+                    })
+                    .collect();
+                reduce_terms_pairwise(terms, &mut circuit)
+            };
+            let output = product.reconstruct(&mut circuit);
+            circuit.output([output]);
+            (context, gadget_len, circuit)
+        };
+
+        let (automatic_context, gadget_len, automatic) = build(true);
+        let (manual_context, manual_gadget_len, manual) = build(false);
+        assert_eq!(manual_gadget_len, gadget_len);
+        let modulus = active_modulus(&parameters, window);
+        let left_coefficients = (0..gadget_len)
+            .map(|entry| {
+                [BigUint::from(entry + 1), BigUint::from(2 * entry + 3)]
+                    .into_iter()
+                    .map(|value| value % &modulus)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let right_coefficients = vec![BigUint::from(7u8), BigUint::from(11u8)];
+        let encode_inputs = |context: &NestedRnsPolyContext| {
+            let mut inputs = left_coefficients
+                .iter()
+                .flat_map(|coefficients| {
+                    encode_slot_inputs(&parameters, context, coefficients, window)
+                })
+                .collect::<Vec<_>>();
+            inputs.extend(encode_slot_inputs(&parameters, context, &right_coefficients, window));
+            inputs
+        };
+        let automatic_output = execute_slot_output(
+            "nested-rns-decomposed-convolution-partial-window-runtime",
+            &parameters,
+            &automatic,
+            &encode_inputs(&automatic_context),
+            num_slots,
+        );
+        let manual_output = execute_slot_output(
+            "nested-rns-manual-decomposed-convolution-partial-window-runtime",
+            &parameters,
+            &manual,
+            &encode_inputs(&manual_context),
+            num_slots,
+        );
+        assert_eq!(automatic_output, manual_output);
     }
 
     fn build_manual_sparse_convolution(

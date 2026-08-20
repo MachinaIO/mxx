@@ -877,6 +877,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             right.ctx.as_ref(),
             row_count,
             num_slots,
+            right.window.depth,
             &lhs_input_norms,
             &rhs_input_norms,
         );

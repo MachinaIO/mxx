@@ -7,7 +7,7 @@ use crate::{
     },
     circuit_gadgets::{
         arith::{
-            BinaryPlannerResult, DecomposeArithmeticGadget, ModularArithmeticContext,
+            BinaryPlannerResult, CrtWindow, DecomposeArithmeticGadget, ModularArithmeticContext,
             ModularArithmeticGadget, ModularArithmeticPlanner,
         },
         conv_mul::{NegacyclicConvolutionContext, RingGswConvolution},
@@ -468,7 +468,9 @@ impl NegacyclicConvolutionContext<DCRTPoly> for ScalarArithmeticContext {
         &self,
         diagonal: usize,
         num_slots: usize,
+        lanes_per_coefficient: usize,
     ) -> Vec<SubCircuitParamValue> {
+        assert_eq!(lanes_per_coefficient, 1);
         vec![
             SubCircuitParamValue::SlotTransfer(SlotTransferSpec::repeated(
                 diagonal,
@@ -524,12 +526,8 @@ impl ModularArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
         &self.context
     }
 
-    fn level_offset(&self) -> usize {
-        0
-    }
-
-    fn enable_levels(&self) -> Option<usize> {
-        Some(1)
+    fn crt_window(&self) -> CrtWindow {
+        CrtWindow::full(1)
     }
 
     fn max_plaintexts(&self) -> &[BigUint] {
@@ -543,15 +541,13 @@ impl ModularArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
     fn input(
         context: Arc<Self::Context>,
         num_coefficient_slots: usize,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Self {
         Self::input_with_metadata(
             context,
             num_coefficient_slots,
-            enable_levels,
-            level_offset,
+            window,
             vec![BigUint::from(1u8)],
             vec![BigUint::from(1u8)],
             circuit,
@@ -561,14 +557,12 @@ impl ModularArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
     fn input_with_metadata(
         context: Arc<Self::Context>,
         _num_coefficient_slots: usize,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
         max_plaintexts: Vec<BigUint>,
         p_max_traces: Vec<BigUint>,
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Self {
-        assert_eq!(enable_levels.unwrap_or(1), 1);
-        assert_eq!(level_offset.unwrap_or(0), 0);
+        assert_eq!(window, CrtWindow::full(1));
         Self { context, wire: circuit.input(1).as_single_wire(), max_plaintexts, p_max_traces }
     }
 
@@ -598,18 +592,14 @@ impl ModularArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
     fn sparse_level_poly_with_metadata(
         context: Arc<Self::Context>,
         _num_coefficient_slots: usize,
-        active_levels: usize,
-        enable_levels: Option<usize>,
-        level_offset: usize,
+        window: CrtWindow,
         target_q_idx: usize,
         target_row: BatchedWire,
         max_plaintext: BigUint,
         p_max_trace: BigUint,
         _circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Self {
-        assert_eq!(active_levels, 1);
-        assert_eq!(enable_levels.unwrap_or(1), 1);
-        assert_eq!(level_offset, 0);
+        assert_eq!(window, CrtWindow::full(1));
         assert_eq!(target_q_idx, 0);
         Self {
             context,
@@ -692,27 +682,21 @@ impl ModularArithmeticPlanner<DCRTPoly> for ScalarArithmeticEntry {
         (entry.max_plaintexts.clone(), entry.p_max_traces.clone())
     }
 
-    fn normalized_metadata(
-        _context: &Self::Context,
-        _enable_levels: Option<usize>,
-        _level_offset: Option<usize>,
-    ) -> Self::Metadata {
+    fn normalized_metadata(_context: &Self::Context, _window: CrtWindow) -> Self::Metadata {
         (vec![BigUint::from(1u8)], vec![BigUint::from(1u8)])
     }
 
     fn input_with_planner_metadata(
         context: Arc<Self::Context>,
         num_coefficient_slots: usize,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
         metadata: &Self::Metadata,
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Self {
         Self::input_with_metadata(
             context,
             num_coefficient_slots,
-            enable_levels,
-            level_offset,
+            window,
             metadata.0.clone(),
             metadata.1.clone(),
             circuit,
@@ -756,8 +740,7 @@ impl DecomposeArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
     fn gadget_matrix<M: PolyMatrix<P = DCRTPoly>>(
         parameters: &DCRTPolyParams,
         _context: &Self::Context,
-        _enable_levels: Option<usize>,
-        _level_offset: Option<usize>,
+        _window: CrtWindow,
     ) -> M {
         M::identity(parameters, 1, None)
     }
@@ -766,28 +749,22 @@ impl DecomposeArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
         _parameters: &DCRTPolyParams,
         _context: &Self::Context,
         target: &M,
-        _enable_levels: Option<usize>,
-        _level_offset: Option<usize>,
+        _window: CrtWindow,
     ) -> M {
         target.clone()
     }
 
-    fn gadget_decomposition_norm_bound(
-        _context: &Self::Context,
-        _enable_levels: Option<usize>,
-        _level_offset: Option<usize>,
-    ) -> BigUint {
+    fn gadget_decomposition_norm_bound(_context: &Self::Context, _window: CrtWindow) -> BigUint {
         BigUint::from(1u8)
     }
 
     fn gadget_vector(
         context: Arc<Self::Context>,
         num_coefficient_slots: usize,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Vec<Self> {
-        vec![Self::input(context, num_coefficient_slots, enable_levels, level_offset, circuit)]
+        vec![Self::input(context, num_coefficient_slots, window, circuit)]
     }
 
     fn gadget_decompose(&self, _circuit: &mut PolyCircuit<DCRTPoly>) -> Vec<Self> {

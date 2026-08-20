@@ -1451,7 +1451,8 @@ mod tests {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let mut facts = FactStore::new(&expressions);
-        let source_family = programs.source_family(&mut expressions, source("source"), None).unwrap();
+        let source_family =
+            programs.source_family(&mut expressions, source("source"), None).unwrap();
         let index = expressions
             .intern(
                 ValueOperator::Constant(super::super::arena::TypedConstant::int(1)),
@@ -1899,10 +1900,18 @@ mod tests {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let direct = programs
-            .source_family(&mut expressions, source_with_domain("identity-direct", direct_domain), None)
+            .source_family(
+                &mut expressions,
+                source_with_domain("identity-direct", direct_domain),
+                None,
+            )
             .unwrap();
         let offset = programs
-            .source_family(&mut expressions, source_with_domain("identity-offset", offset_domain), None)
+            .source_family(
+                &mut expressions,
+                source_with_domain("identity-offset", offset_domain),
+                None,
+            )
             .unwrap();
         let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
         let one = expressions
@@ -1984,8 +1993,10 @@ mod tests {
     fn zip_offset_rejects_unfinalized_and_out_of_domain_maps() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
-        let direct = programs.source_family(&mut expressions, source("boundary-direct"), None).unwrap();
-        let offset = programs.source_family(&mut expressions, source("boundary-offset"), None).unwrap();
+        let direct =
+            programs.source_family(&mut expressions, source("boundary-direct"), None).unwrap();
+        let offset =
+            programs.source_family(&mut expressions, source("boundary-offset"), None).unwrap();
         let outer_argument = expressions.intern_argument(1, ResolvedValueType::Int).unwrap();
         assert_eq!(
             programs.finalize(
@@ -2124,7 +2135,11 @@ mod tests {
             .source_family(&mut expressions, source_with_domain("binder-select-left", domain), None)
             .unwrap();
         let right = programs
-            .source_family(&mut expressions, source_with_domain("binder-select-right", domain), None)
+            .source_family(
+                &mut expressions,
+                source_with_domain("binder-select-right", domain),
+                None,
+            )
             .unwrap();
         let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
         let range = TrustedIndexRange { minimum: 0, maximum_exclusive: 2 };

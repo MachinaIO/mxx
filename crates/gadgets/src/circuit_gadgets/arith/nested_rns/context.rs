@@ -97,26 +97,14 @@ impl NestedRnsPolyContext {
 
     pub(crate) fn full_reduce_output_metadata(
         &self,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
     ) -> (Vec<BigUint>, Vec<BigUint>) {
-        let level_offset = level_offset.unwrap_or(0);
-        let input_count = enable_levels.unwrap_or_else(|| {
-            self.q_moduli_depth
-                .checked_sub(level_offset)
-                .expect("level_offset must not exceed q_moduli_depth")
-        });
-        assert!(
-            level_offset + input_count <= self.q_moduli_depth,
-            "active range exceeds q_moduli_depth: level_offset={level_offset}, enable_levels={input_count}, q_moduli_depth={}",
-            self.q_moduli_depth
-        );
-        let max_plaintexts = self.full_reduce_max_plaintexts
-            [level_offset..level_offset + input_count]
+        let window = CrtWindow::new(window.offset, window.depth, self.q_moduli_depth);
+        let max_plaintexts = self.full_reduce_max_plaintexts[window.offset..window.end()]
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        let p_max_traces = vec![self.reduced_p_max_trace(); input_count];
+        let p_max_traces = vec![self.reduced_p_max_trace(); window.depth];
         (max_plaintexts, p_max_traces)
     }
 
@@ -292,7 +280,6 @@ impl NestedRnsPolyContext {
             p_moduli.iter().map(|&p_i| &p_full / BigUint::from(p_i)).collect::<Vec<_>>();
         let gadget_values =
             precompute_nested_rns_gadget_values(&active_q_moduli, &p_full, &p_over_pis);
-
         if dummy_scalar {
             let dummy_lut = dummy_lut();
             let dummy_lut_id = circuit.register_public_lookup(dummy_lut);
@@ -361,7 +348,6 @@ impl NestedRnsPolyContext {
             let lut_x_to_y_lut = PublicLutProgram::new(lut_x_to_y_len as u64, y.clone())
                 .expect("nested-RNS CRT conversion lookup program is valid");
             lut_x_to_y.push(lut_x_to_y_lut);
-
             let lut_x_to_real_len = lut_mod_p_map_size as usize;
             let lut_x_to_real_lut = PublicLutProgram::new(
                 lut_x_to_real_len as u64,

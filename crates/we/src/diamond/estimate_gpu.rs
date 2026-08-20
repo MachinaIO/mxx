@@ -8,8 +8,9 @@ use mxx_bench_estimator::{
 };
 use mxx_ir_core::{
     ParamEnv,
+    expr::IntExpr,
     node::{ConstantMatrix, HashVariant, MatrixBinaryOp, NodeKind},
-    types::{ConcreteMatrixType, ConcreteWireType},
+    types::{ConcreteMatrixType, ConcreteWireType, MatrixType},
 };
 use mxx_primitives::{
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
@@ -161,6 +162,44 @@ impl DiamondGpuMeasurementBackend {
             .first()
             .and_then(ConcreteWireType::matrix_type)
             .ok_or(DiamondGpuMeasurementError::MatrixArgument)
+    }
+
+    fn evaluate_matrix_type(
+        matrix_type: &MatrixType,
+        bindings: &ParamEnv,
+    ) -> Result<ConcreteMatrixType, DiamondGpuMeasurementError> {
+        let evaluate_positive =
+            |expression: &IntExpr, label: &str| -> Result<usize, DiamondGpuMeasurementError> {
+                let value = expression
+                    .evaluate(bindings)
+                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?;
+                let value = usize::try_from(value).map_err(|_| {
+                    DiamondGpuMeasurementError::Expression(format!(
+                        "constant-polynomial lift {label} is not usize"
+                    ))
+                })?;
+                if value == 0 {
+                    return Err(DiamondGpuMeasurementError::Expression(format!(
+                        "constant-polynomial lift {label} must be positive"
+                    )));
+                }
+                Ok(value)
+            };
+        let modulus = matrix_type
+            .modulus
+            .evaluate(bindings)
+            .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?;
+        if modulus <= BigInt::one() {
+            return Err(DiamondGpuMeasurementError::Expression(
+                "constant-polynomial lift modulus must exceed one".to_owned(),
+            ));
+        }
+        Ok(ConcreteMatrixType {
+            modulus,
+            ring_dimension: evaluate_positive(&matrix_type.ring_dimension, "ring dimension")?,
+            rows: evaluate_positive(&matrix_type.rows, "row count")?,
+            columns: evaluate_positive(&matrix_type.columns, "column count")?,
+        })
     }
 
     fn cache_key(node: &MeasurementNode<'_>, bindings: &ParamEnv) -> String {
@@ -645,11 +684,7 @@ impl DiamondGpuMeasurementBackend {
                 })
             }
             NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
-                let output = matrix_type.evaluate(bindings).ok_or_else(|| {
-                    DiamondGpuMeasurementError::Expression(
-                        "constant-polynomial lift matrix type is unavailable".to_owned(),
-                    )
-                })?;
+                let output = Self::evaluate_matrix_type(matrix_type, bindings)?;
                 self.measure_placements(node, bindings, |this| {
                     let identity = this
                         .backend

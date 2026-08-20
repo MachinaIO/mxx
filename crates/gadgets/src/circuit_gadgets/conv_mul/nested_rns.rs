@@ -28,8 +28,10 @@ impl<P: Poly + 'static> NegacyclicConvolutionContext<P> for NestedRnsPolyContext
         &self,
         diagonal: usize,
         num_slots: usize,
+        lanes: usize,
     ) -> Vec<SubCircuitParamValue> {
-        let lanes = self.q_moduli_depth;
+        assert!(lanes > 0, "nested-RNS convolution requires at least one active CRT lane");
+        assert!(lanes <= self.q_moduli_depth, "active CRT lanes exceed the context depth");
         let rhs_binding = SubCircuitParamValue::SlotTransfer(SlotTransferSpec::rotation(
             diagonal * lanes,
             num_slots * lanes,
@@ -83,8 +85,7 @@ impl<P: Poly + 'static> RingGswConvolution<P> for NestedRnsPoly<P> {
 
     fn q_level_row_max_plaintext_norms(&self, physical_q_row: usize) -> Vec<BigUint> {
         assert_eq!(physical_q_row, 0, "packed nested-RNS has one physical q row");
-        let active_levels =
-            self.enable_levels.unwrap_or(self.ctx.q_moduli_depth - self.level_offset);
+        let active_levels = self.window.depth;
         let trace = self.p_max_traces[..active_levels].iter().max().cloned().unwrap_or_default();
         self.ctx.lookup_input_ranges_for_trace(&trace);
         vec![trace; self.ctx.p_moduli.len()]
@@ -101,8 +102,7 @@ impl<P: Poly + 'static> RingGswConvolution<P> for NestedRnsPoly<P> {
             template.ctx.clone(),
             BatchedWire::from_batches(q_level_outputs.into_iter().next().unwrap()),
             template.num_coefficient_slots,
-            Some(template.level_offset),
-            template.enable_levels,
+            template.window,
             max_plaintexts,
         )
         .with_p_max_traces(p_max_traces)
@@ -122,8 +122,7 @@ impl<P: Poly + 'static> RingGswConvolution<P> for NestedRnsPoly<P> {
             template.ctx.clone(),
             BatchedWire::from_batches(q_level_output),
             template.num_coefficient_slots,
-            Some(template.level_offset),
-            template.enable_levels,
+            template.window,
             (0..active_levels)
                 .map(|q_idx| {
                     if q_idx == target_q_idx { max_plaintext.clone() } else { BigUint::from(0u64) }

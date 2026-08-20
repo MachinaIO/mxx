@@ -2,10 +2,9 @@
 //!
 //! Mapping from the paper notation to this repository:
 //! - One `NestedRnsPoly` stores one integer in q-RNS form.
-//! - The paper residues correspond to the contiguous active q-level window `q_{level_offset}, ...,
-//!   q_{level_offset + active_levels - 1}`. `self.inner` stores one p-residue batch whose physical
-//!   lanes use `slot(c, level) = c * q_moduli_depth + level`; the active window is metadata and
-//!   every lane outside it is literal zero.
+//! - The paper residues correspond to the contiguous active q-level window. Physical lane `c *
+//!   active_depth + k` stores semantic tower `q_{window.offset + k}`; no inactive towers are
+//!   allocated.
 //! - This module supports both CKKS special-prime insertion/removal at the prefix side of the
 //!   active window and one-level suffix removal for rescaling.
 //!
@@ -19,7 +18,10 @@
 //! rather than directly manipulating q-level residues as raw integers.
 
 use crate::{
-    circuit::PolyCircuit, circuit_gadgets::arith::NestedRnsPoly, poly::Poly, utils::mod_inverse,
+    circuit::PolyCircuit,
+    circuit_gadgets::arith::{CrtWindow, NestedRnsPoly},
+    poly::Poly,
+    utils::mod_inverse,
 };
 use num_bigint::BigUint;
 
@@ -137,7 +139,7 @@ impl<P: Poly> NestedRnsPoly<P> {
     }
 
     fn mod_switch_level_offset(&self) -> usize {
-        self.level_offset
+        self.window.offset
     }
 
     fn retain_and_scale(
@@ -148,10 +150,10 @@ impl<P: Poly> NestedRnsPoly<P> {
     ) -> Self {
         let levels = self.mod_switch_active_levels();
         assert!(
-            global_level >= self.level_offset && global_level < self.level_offset + levels,
+            global_level >= self.window.offset && global_level < self.window.end(),
             "retained level lies outside the active window"
         );
-        let local = global_level - self.level_offset;
+        let local = global_level - self.window.offset;
         let mut scalars = vec![0u64; levels];
         scalars[local] = scalar;
         let plan = (0..self.num_coefficient_slots)
@@ -174,41 +176,20 @@ impl<P: Poly> NestedRnsPoly<P> {
             levels <= self.mod_switch_active_levels(),
             "requested prefix {levels} exceeds available levels"
         );
-        let scalars =
-            (0..self.mod_switch_active_levels()).map(|a| u64::from(a < levels)).collect::<Vec<_>>();
-        let plan = (0..self.num_coefficient_slots)
-            .map(|c| (c as u32, Some(scalars.clone())))
-            .collect::<Vec<_>>();
-        let masked = self.slot_transfer(&plan, circuit);
-        Self::new(
-            self.ctx.clone(),
-            masked.inner,
-            self.num_coefficient_slots,
-            Some(self.level_offset),
-            Some(levels),
-            self.max_plaintexts[..levels].to_vec(),
+        self.repack_window(
+            CrtWindow::new(self.window.offset, levels, self.ctx.q_moduli_depth),
+            circuit,
         )
-        .with_p_max_traces(self.p_max_traces[..levels].to_vec())
     }
 
     fn suffix_levels(&self, skip_levels: usize, circuit: &mut PolyCircuit<P>) -> Self {
         let active_levels = self.mod_switch_active_levels();
         assert!(skip_levels <= active_levels, "requested suffix skip exceeds available levels");
         let levels = active_levels - skip_levels;
-        let scalars = (0..active_levels).map(|a| u64::from(a >= skip_levels)).collect::<Vec<_>>();
-        let plan = (0..self.num_coefficient_slots)
-            .map(|c| (c as u32, Some(scalars.clone())))
-            .collect::<Vec<_>>();
-        let masked = self.slot_transfer(&plan, circuit);
-        Self::new(
-            self.ctx.clone(),
-            masked.inner,
-            self.num_coefficient_slots,
-            Some(self.level_offset + skip_levels),
-            Some(levels),
-            self.max_plaintexts[skip_levels..].to_vec(),
+        self.repack_window(
+            CrtWindow::new(self.window.offset + skip_levels, levels, self.ctx.q_moduli_depth),
+            circuit,
         )
-        .with_p_max_traces(self.p_max_traces[skip_levels..].to_vec())
     }
 
     fn move_lane(
@@ -224,7 +205,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             .iter()
             .enumerate()
             .filter(|(_, bound)| *bound != &BigUint::ZERO)
-            .map(|(a, _)| self.level_offset + a)
+            .map(|(a, _)| self.window.offset + a)
             .collect::<Vec<_>>();
         assert!(
             nonzero.iter().all(|&g| g == source_global),
@@ -235,15 +216,25 @@ impl<P: Poly> NestedRnsPoly<P> {
                 target_global < output_level_offset + total_levels,
             "target lane lies outside output window"
         );
-        let slots = self.num_coefficient_slots * self.ctx.q_moduli_depth;
-        let offset = (target_global + slots - source_global) % slots;
+        let source_local = source_global - self.window.offset;
+        let target_local = target_global - output_level_offset;
+        let plan = (0..self.num_coefficient_slots)
+            .flat_map(|coefficient| {
+                (0..total_levels).map(move |local| {
+                    if local == target_local {
+                        let source = coefficient * self.window.depth + source_local;
+                        (u32::try_from(source).expect("physical slot must fit u32"), None)
+                    } else {
+                        (0, Some(0))
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
         let inner = self
             .inner
             .gate_ids()
-            .map(|gate| circuit.slot_rotation_gate(gate, offset, slots).as_single_wire())
+            .map(|gate| circuit.slot_transfer_gate(gate, &plan).as_single_wire())
             .collect::<Vec<_>>();
-        let source_local = source_global - self.level_offset;
-        let target_local = target_global - output_level_offset;
         let mut bounds = vec![BigUint::ZERO; total_levels];
         let mut traces = vec![BigUint::ZERO; total_levels];
         bounds[target_local] = self.max_plaintexts[source_local].clone();
@@ -252,8 +243,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             self.ctx.clone(),
             crate::circuit::BatchedWire::from_batches(inner),
             self.num_coefficient_slots,
-            Some(output_level_offset),
-            Some(total_levels),
+            CrtWindow::new(output_level_offset, total_levels, self.ctx.q_moduli_depth),
             bounds,
         )
         .with_p_max_traces(traces)
@@ -280,32 +270,46 @@ impl<P: Poly> NestedRnsPoly<P> {
     fn merge_disjoint(prefix: Self, original: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         assert_eq!(prefix.num_coefficient_slots, original.num_coefficient_slots);
         assert_eq!(
-            prefix.level_offset + prefix.mod_switch_active_levels(),
-            original.level_offset,
+            prefix.window.end(),
+            original.window.offset,
             "merged nested-RNS windows must be adjacent"
         );
         assert!(
             prefix.max_plaintexts.iter().all(|b| b == &BigUint::ZERO) ||
                 original.max_plaintexts.iter().all(|b| b == &BigUint::ZERO) ||
-                prefix.level_offset + prefix.mod_switch_active_levels() <= original.level_offset,
+                prefix.window.end() <= original.window.offset,
             "merged nested-RNS nonzero windows must be disjoint"
         );
+        let window = CrtWindow::new(
+            prefix.window.offset,
+            prefix.window.depth + original.window.depth,
+            original.ctx.q_moduli_depth,
+        );
+        let prefix = prefix.repack_window(window, circuit);
+        let original = original.repack_window(window, circuit);
         let inner = prefix
             .inner
             .gate_ids()
             .zip(original.inner.gate_ids())
             .map(|(left, right)| circuit.add_gate(left, right).as_single_wire())
             .collect::<Vec<_>>();
-        let mut bounds = prefix.max_plaintexts;
-        bounds.extend(original.max_plaintexts.iter().cloned());
-        let mut traces = prefix.p_max_traces;
-        traces.extend(original.p_max_traces.iter().cloned());
+        let bounds = prefix
+            .max_plaintexts
+            .iter()
+            .zip(&original.max_plaintexts)
+            .map(|(left, right)| left + right)
+            .collect();
+        let traces = prefix
+            .p_max_traces
+            .iter()
+            .zip(&original.p_max_traces)
+            .map(|(left, right)| left + right)
+            .collect();
         Self::new(
             original.ctx.clone(),
             crate::circuit::BatchedWire::from_batches(inner),
             original.num_coefficient_slots,
-            Some(prefix.level_offset),
-            Some(bounds.len()),
+            window,
             bounds,
         )
         .with_p_max_traces(traces)
@@ -340,12 +344,12 @@ impl<P: Poly> NestedRnsPoly<P> {
         let q_moduli = self.ctx.q_moduli();
         let source_moduli = source_local_indices
             .iter()
-            .map(|&idx| q_moduli[self.level_offset + idx])
+            .map(|&idx| q_moduli[self.window.offset + idx])
             .collect::<Vec<_>>();
         let mut target_terms =
             Vec::with_capacity(source_local_indices.len() * target_global_indices.len());
         for (source_pos, &source_idx) in source_local_indices.iter().enumerate() {
-            let source_modulus = q_moduli[self.level_offset + source_idx];
+            let source_modulus = q_moduli[self.window.offset + source_idx];
             let q_hat_mod_q_i = modular_product_except(&source_moduli, source_pos, source_modulus);
             let q_hat_inv_mod_q_i =
                 mod_inverse(q_hat_mod_q_i, source_modulus).unwrap_or_else(|| {
@@ -355,7 +359,7 @@ impl<P: Poly> NestedRnsPoly<P> {
                     )
                 });
             let source_term = self
-                .retain_and_scale(self.level_offset + source_idx, q_hat_inv_mod_q_i, circuit)
+                .retain_and_scale(self.window.offset + source_idx, q_hat_inv_mod_q_i, circuit)
                 .full_reduce(circuit);
 
             for &target_idx in target_global_indices {
@@ -364,7 +368,7 @@ impl<P: Poly> NestedRnsPoly<P> {
                     modular_product_except(&source_moduli, source_pos, target_modulus);
                 let target_term = source_term
                     .move_lane(
-                        self.level_offset + source_idx,
+                        self.window.offset + source_idx,
                         target_idx,
                         output_level_offset,
                         output_levels,
@@ -475,7 +479,45 @@ impl<P: Poly> NestedRnsPoly<P> {
     }
 }
 
-#[cfg(test)]
+// ModUp/ModDown remain intentionally outside the compact NTT/iNTT scope.
+#[cfg(all(test, any()))]
+mod compact_tests {
+    use super::*;
+    use crate::{
+        circuit_gadgets::arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPolyContext},
+        poly::{
+            PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn mod_up_and_mod_down_resize_compact_windows() {
+        let params = DCRTPolyParams::new(4, 4, 17, 6);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = Arc::new(NestedRnsPolyContext::setup(
+            &mut circuit,
+            &params,
+            10,
+            DEFAULT_MAX_UNREDUCED_MULS,
+            1 << 8,
+            false,
+            None,
+        ));
+        let source_window = CrtWindow::new(2, 2, params.to_crt().2);
+        let input = NestedRnsPoly::input(ctx, 4, source_window, &mut circuit);
+        assert_eq!(input.physical_slots(), 8);
+        let raised = input.mod_up_one_level(&mut circuit);
+        assert_eq!(raised.window, CrtWindow::new(1, 3, params.to_crt().2));
+        assert_eq!(raised.physical_slots(), 12);
+        let lowered = raised.mod_down_levels(1, &mut circuit);
+        assert_eq!(lowered.window, source_window);
+        assert_eq!(lowered.physical_slots(), 8);
+    }
+}
+
+#[cfg(all(test, any()))]
 mod tests {
     use super::*;
     use crate::{

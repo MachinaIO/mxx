@@ -30,9 +30,11 @@ use mxx_dsl::{
 };
 use mxx_gadgets::{
     circuit::{PolyCircuit, PolyGateKind},
-    circuit_gadgets::arith::nested_rns::{
-        NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_with_offset,
-        minimum_p_moduli_bits,
+    circuit_gadgets::arith::{
+        CrtWindow,
+        nested_rns::{
+            NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly, minimum_p_moduli_bits,
+        },
     },
 };
 use mxx_ir_core::{
@@ -433,8 +435,7 @@ fn build_modq_multiplication_circuit(
             NestedRnsPoly::input(
                 nested.clone(),
                 evaluation_slots,
-                Some(nested.q_moduli_depth),
-                Some(0),
+                CrtWindow::full(nested.q_moduli_depth),
                 &mut circuit,
             )
         })
@@ -1601,13 +1602,12 @@ fn encoding_inputs(
     let encoded = operands
         .iter()
         .flat_map(|coefficients| {
-            encode_nested_rns_poly_with_offset::<DCRTPoly>(
+            encode_nested_rns_poly::<DCRTPoly>(
                 selected.nested.p_moduli_bits,
                 selected.nested.max_unreduced_muls,
                 &selected.parameters,
                 coefficients,
-                0,
-                Some(selected.nested.q_moduli_depth),
+                CrtWindow::full(selected.nested.q_moduli_depth),
             )
         })
         .collect::<Vec<_>>();

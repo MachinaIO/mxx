@@ -314,12 +314,12 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
     circuit: &mut PolyCircuit<P>,
 ) -> [NestedRnsPoly<P>; 2] {
     let nested_rns = rhs_top.context().clone();
-    let active_levels = <NestedRnsPolyContext as ModularArithmeticContext<P>>::active_levels(
+    let window = <NestedRnsPolyContext as ModularArithmeticContext<P>>::validate_window(
         nested_rns.as_ref(),
-        rhs_top.enable_levels(),
-        Some(rhs_top.level_offset()),
+        rhs_top.crt_window(),
     );
-    let level_offset = rhs_top.level_offset();
+    let active_levels = window.depth;
+    let level_offset = window.offset;
     let chunk_width = nested_rns.p_moduli.len() + 1;
     let gadget_len = active_levels * chunk_width;
     let width = lhs_row0.len();
@@ -328,11 +328,7 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
     let (decomposed_row_subcircuit_id, output_template) = {
         let mut helper_circuit = circuit.fresh_sub_circuit();
         let helper_ctx = Arc::new(nested_rns.as_ref().clone());
-        let helper_metadata = NestedRnsPoly::<P>::normalized_metadata(
-            helper_ctx.as_ref(),
-            Some(active_levels),
-            Some(level_offset),
-        );
+        let helper_metadata = NestedRnsPoly::<P>::normalized_metadata(helper_ctx.as_ref(), window);
         let helper_trace_bound =
             helper_metadata.p_max_traces.iter().max().cloned().unwrap_or(BigUint::ZERO);
         helper_ctx.lookup_input_ranges_for_trace(&helper_trace_bound);
@@ -343,6 +339,7 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
                 nested_rns.as_ref(),
                 1,
                 num_slots,
+                window.depth,
                 &helper_input_norms,
                 &helper_input_norms,
             ));
@@ -373,9 +370,7 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
                 NestedRnsPoly::sparse_level_poly_from_row_with_metadata(
                     helper_ctx.clone(),
                     num_slots,
-                    active_levels,
-                    Some(active_levels),
-                    level_offset,
+                    window,
                     target_q_idx,
                     target_row,
                     max_plaintext,

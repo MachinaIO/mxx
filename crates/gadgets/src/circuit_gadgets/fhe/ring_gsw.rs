@@ -1,7 +1,7 @@
 use crate::{
     circuit::{BatchedWire, PolyCircuit, gate::GateId},
     circuit_gadgets::arith::{
-        BinaryPlannerResult, DecomposeArithmeticGadget, ModularArithmeticContext,
+        BinaryPlannerResult, CrtWindow, DecomposeArithmeticGadget, ModularArithmeticContext,
         ModularArithmeticGadget, ModularArithmeticPlanner,
     },
     matrix::PolyMatrix,
@@ -17,7 +17,7 @@ use tracing::debug;
 pub(super) const MUL_COLUMN_SUBCIRCUIT_BATCH: usize = 8;
 
 pub(super) fn validate_num_slots<P: Poly>(params: &P::Params, num_slots: usize) {
-    assert!(num_slots > 0, "num_slots must be positive");
+    assert!(num_slots.is_power_of_two(), "num_slots must be a power of two");
     assert!(
         num_slots <= params.ring_dimension() as usize,
         "num_slots {} exceeds ring dimension {}",
@@ -126,7 +126,8 @@ impl<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>> Rin
     }
 
     pub fn gadget_len(&self) -> usize {
-        self.arith_ctx.gadget_len(Some(self.active_levels), Some(self.level_offset))
+        self.arith_ctx
+            .gadget_len(CrtWindow { offset: self.level_offset, depth: self.active_levels })
     }
 
     /// Number of scalar polynomial matrices used to bind one flattened
@@ -164,8 +165,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         A::input_with_planner_metadata(
             ctx,
             template.num_coefficient_slots(),
-            template.enable_levels(),
-            Some(template.level_offset()),
+            template.crt_window(),
             &metadata,
             circuit,
         )
@@ -216,16 +216,15 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         params: &P::Params,
         num_slots: usize,
         arith_ctx: Arc<A::Context>,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
     ) -> Self {
         validate_num_slots::<P>(params, num_slots);
-        let level_offset = level_offset.unwrap_or(0);
-        let active_levels = arith_ctx.active_levels(enable_levels, Some(level_offset));
-        assert!(active_levels > 0, "RingGswContext requires at least one active q level");
+        let window = arith_ctx.validate_window(window);
+        let level_offset = window.offset;
+        let active_levels = window.depth;
         let setup_start = Instant::now();
         let registered_arith_ctx = arith_ctx;
-        let width = 2 * registered_arith_ctx.gadget_len(Some(active_levels), Some(level_offset));
+        let width = 2 * registered_arith_ctx.gadget_len(window);
         let mul_subcircuit_start = Instant::now();
         let (mul_subcircuit, mul_output_template) = Self::mul_subcircuit(
             circuit,
@@ -277,8 +276,10 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         let start = Instant::now();
         let mut circuit = Self::helper_circuit(source_circuit);
         let arith_ctx = Arc::new(template_ctx.clone());
-        let normalized_metadata =
-            A::normalized_metadata(arith_ctx.as_ref(), Some(active_levels), Some(level_offset));
+        let normalized_metadata = A::normalized_metadata(
+            arith_ctx.as_ref(),
+            CrtWindow { offset: level_offset, depth: active_levels },
+        );
         let chunk_width = template_ctx.decomposition_len();
         let gadget_len = active_levels * chunk_width;
         assert_eq!(
@@ -397,8 +398,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -409,8 +409,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -421,8 +420,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -433,8 +431,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -533,8 +530,10 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         let start = Instant::now();
         let mut circuit = Self::helper_circuit(source_circuit);
         let arith_ctx = Arc::new(template_ctx.clone());
-        let normalized_metadata =
-            A::normalized_metadata(arith_ctx.as_ref(), Some(active_levels), Some(level_offset));
+        let normalized_metadata = A::normalized_metadata(
+            arith_ctx.as_ref(),
+            CrtWindow { offset: level_offset, depth: active_levels },
+        );
 
         let column_helper_start = Instant::now();
         let mul_column_subcircuit_id = circuit.register_sub_circuit(mul_column_subcircuit);
@@ -551,8 +550,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -563,8 +561,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -575,8 +572,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -587,8 +583,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -693,8 +688,10 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         let start = Instant::now();
         let mut circuit = Self::helper_circuit(source_circuit);
         let arith_ctx = Arc::new(template_ctx.clone());
-        let normalized_metadata =
-            A::normalized_metadata(arith_ctx.as_ref(), Some(active_levels), Some(level_offset));
+        let normalized_metadata = A::normalized_metadata(
+            arith_ctx.as_ref(),
+            CrtWindow { offset: level_offset, depth: active_levels },
+        );
 
         let batch_helper_start = Instant::now();
         let batch_subcircuit_id = circuit.register_sub_circuit(batch_subcircuit);
@@ -724,8 +721,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -736,8 +732,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -748,8 +743,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -760,8 +754,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -863,7 +856,8 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         let start = Instant::now();
         let mut circuit = Self::helper_circuit(source_circuit);
         let arith_ctx = Arc::new(template_ctx.clone());
-        let gadget_len = arith_ctx.gadget_len(Some(active_levels), Some(level_offset));
+        let gadget_len =
+            arith_ctx.gadget_len(CrtWindow { offset: level_offset, depth: active_levels });
         assert_eq!(
             width,
             2 * gadget_len,
@@ -871,16 +865,17 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             width,
             gadget_len
         );
-        let normalized_metadata =
-            A::normalized_metadata(arith_ctx.as_ref(), Some(active_levels), Some(level_offset));
+        let normalized_metadata = A::normalized_metadata(
+            arith_ctx.as_ref(),
+            CrtWindow { offset: level_offset, depth: active_levels },
+        );
         let input_start = Instant::now();
         let lhs_row0 = (0..width)
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -891,8 +886,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     &normalized_metadata,
                     &mut circuit,
                 )
@@ -901,16 +895,14 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         let rhs_top = A::input_with_planner_metadata(
             arith_ctx.clone(),
             num_slots,
-            Some(active_levels),
-            Some(level_offset),
+            CrtWindow { offset: level_offset, depth: active_levels },
             &normalized_metadata,
             &mut circuit,
         );
         let rhs_bottom = A::input_with_planner_metadata(
             arith_ctx.clone(),
             num_slots,
-            Some(active_levels),
-            Some(level_offset),
+            CrtWindow { offset: level_offset, depth: active_levels },
             &normalized_metadata,
             &mut circuit,
         );
@@ -962,8 +954,7 @@ mod tests {
             &parameters,
             1,
             arithmetic,
-            Some(1),
-            Some(0),
+            CrtWindow::full(1),
         ));
         let left = RingGswCiphertext::<DCRTPoly, ScalarArithmeticEntry>::input(
             context.clone(),
@@ -1020,8 +1011,7 @@ mod tests {
             &parameters,
             1,
             arithmetic,
-            Some(1),
-            Some(0),
+            CrtWindow::full(1),
         ))
     }
 
@@ -1493,8 +1483,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     circuit,
                 )
             })
@@ -1504,8 +1493,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 A::input(
                     arith_ctx.clone(),
                     num_slots,
-                    Some(active_levels),
-                    Some(level_offset),
+                    CrtWindow { offset: level_offset, depth: active_levels },
                     circuit,
                 )
             })
@@ -1531,14 +1519,9 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                     "RingGswCiphertext entries must share the RingGswContext arithmetic context"
                 );
                 assert_eq!(
-                    entry.level_offset(),
-                    self.ctx.level_offset,
-                    "RingGswCiphertext entries must share the RingGswContext q-level offset"
-                );
-                assert_eq!(
-                    entry.enable_levels(),
-                    Some(self.ctx.active_levels),
-                    "RingGswCiphertext entries must share the RingGswContext active-level configuration"
+                    entry.crt_window(),
+                    CrtWindow { offset: self.ctx.level_offset, depth: self.ctx.active_levels },
+                    "RingGswCiphertext entries must share the RingGswContext CRT window"
                 );
                 assert_eq!(
                     entry.active_q_moduli().len(),
@@ -1609,8 +1592,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         let gadget_constants = A::gadget_constant_coeffs::<M>(
             &first.ctx.params,
             first.ctx.arith_ctx.as_ref(),
-            Some(first.ctx.active_levels),
-            Some(first.ctx.level_offset),
+            CrtWindow { offset: first.ctx.level_offset, depth: first.ctx.active_levels },
         );
         assert_eq!(
             gadget_constants.len(),
@@ -1629,8 +1611,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             &first.ctx.params,
             first.ctx.arith_ctx.as_ref(),
             scaled,
-            Some(first.ctx.active_levels),
-            Some(first.ctx.level_offset),
+            CrtWindow { offset: first.ctx.level_offset, depth: first.ctx.active_levels },
         );
         assert_eq!(
             scaled_g_inverse.len(),

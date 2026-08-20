@@ -1,8 +1,9 @@
 use crate::{
     circuit::PolyCircuit,
     circuit_gadgets::{
-        arith::nested_rns::{
-            NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_with_offset,
+        arith::{
+            CrtWindow,
+            nested_rns::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
         },
         fhe::{
             ring_gsw::RingGswCiphertext,
@@ -134,21 +135,19 @@ fn test_gpu_packed_nested_rns_addition_matches_cpu_matrices() {
     let context =
         Arc::new(NestedRnsPolyContext::setup(&mut circuit, &parameters, 6, 2, 16, false, None));
     let coefficient_slots = 2;
-    let left =
-        NestedRnsPoly::input(context.clone(), coefficient_slots, Some(2), None, &mut circuit);
-    let right =
-        NestedRnsPoly::input(context.clone(), coefficient_slots, Some(2), None, &mut circuit);
+    let window = CrtWindow::full(context.q_moduli_depth);
+    let left = NestedRnsPoly::input(context.clone(), coefficient_slots, window, &mut circuit);
+    let right = NestedRnsPoly::input(context.clone(), coefficient_slots, window, &mut circuit);
     let sum = left.add(&right, &mut circuit);
     circuit.output([sum.inner]);
 
     let encode = |values: &[BigUint]| {
-        encode_nested_rns_poly_with_offset::<DCRTPoly>(
+        encode_nested_rns_poly::<DCRTPoly>(
             context.p_moduli_bits,
             context.max_unreduced_muls,
             &parameters,
             values,
-            0,
-            Some(2),
+            window,
         )
         .into_iter()
         .map(|lanes| {
@@ -227,8 +226,7 @@ fn test_gpu_ring_gsw_arithmetic_executes_through_dsl_ir_runtime_and_decrypts() {
             &parameters,
             ring_dimension as usize,
             nested_rns,
-            Some(active_levels),
-            Some(0),
+            CrtWindow::new(0, active_levels, parameters.to_crt().2),
         ));
     let inputs = (0..2)
         .map(|_| RingGswCiphertext::input(context.clone(), None, &mut circuit))
@@ -265,10 +263,10 @@ fn test_gpu_ring_gsw_arithmetic_executes_through_dsl_ir_runtime_and_decrypts() {
             );
             ciphertext_inputs_from_native(
                 &parameters,
+                &parameters,
                 context.nested_rns.as_ref(),
                 &ciphertext,
-                context.level_offset,
-                Some(context.active_levels),
+                CrtWindow { offset: context.level_offset, depth: context.active_levels },
             )
         })
         .collect::<Vec<_>>();

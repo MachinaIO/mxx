@@ -877,12 +877,25 @@ impl CheckerJob {
                 )
             }
             super::arena::ValueOperator::OpaqueFamilyElement { .. } => "family-element".to_owned(),
-            super::arena::ValueOperator::Argument { .. } => "argument".to_owned(),
-            super::arena::ValueOperator::Constant(_) => "constant".to_owned(),
+            super::arena::ValueOperator::Constant(constant) => {
+                format!("constant({:?})", constant.value)
+            }
             super::arena::ValueOperator::Matrix(operation) => {
                 self.matrix_operation_detail(expression, node, operation, depth)?
             }
-            super::arena::ValueOperator::Scalar(_) => "scalar-op".to_owned(),
+            super::arena::ValueOperator::Scalar(operation) => {
+                let inputs = node
+                    .inputs
+                    .iter()
+                    .take(3)
+                    .map(|input| self.expression_detail(*input, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(",");
+                format!("scalar({operation:?})[{inputs}]")
+            }
+            super::arena::ValueOperator::Argument { position, .. } => {
+                format!("arg{position}")
+            }
             super::arena::ValueOperator::Trapdoor(_) => "trapdoor-transform".to_owned(),
             super::arena::ValueOperator::IndexMap { .. } => "index-map".to_owned(),
             super::arena::ValueOperator::ExplicitElement { .. } => "explicit-element".to_owned(),

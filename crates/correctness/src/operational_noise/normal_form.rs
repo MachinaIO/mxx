@@ -1028,10 +1028,18 @@ impl<'a> Normalizer<'a> {
                 }
                 self.transform_nf(scope_proof, input, ValueOperator::Matrix(operation.clone()))
             }
-            // Binder-open coordinates are structural semantic inputs. They are never rewritten
-            // by polynomial identities; cancellation still works because the complete node is
-            // retained as one atom and its negation uses the same semantic ID.
-            MatrixOperation::IndexedSlice { .. } => Ok(self.atom_nf(semantic)?),
+            // Binder-open coordinates are structural semantic inputs; the atom below carries
+            // the complete node. Coordinates are first reduced to their range-proved canonical
+            // affine form so rotation-composed views of the same row share one semantic ID and
+            // their q-scale +/- pairs cancel exactly.
+            MatrixOperation::IndexedSlice { .. } => {
+                if let Some(canonical) =
+                    self.canonical_indexed_slice(scope_proof, node, operation, children)?
+                {
+                    return Ok(self.atom_nf(canonical)?);
+                }
+                Ok(self.atom_nf(semantic)?)
+            }
             MatrixOperation::View { output, layout } => {
                 let input_type = self.expressions.value_type(node.inputs[0])?;
                 if let ResolvedValueType::Matrix(input_type) = input_type {
@@ -1188,6 +1196,231 @@ impl<'a> Normalizer<'a> {
             return Ok(None);
         }
         Ok(Some(source))
+    }
+
+    /// Canonicalize the four binder-open Int coordinates of one indexed slice by exact
+    /// range-aware affine reduction. Rotation-style index compositions materialize the same
+    /// source row as `(a*i + b + k*m) mod m`; the binder's trusted range proves which multiple
+    /// of `m` is active, so the remainder is removed as an integer identity. Semantically equal
+    /// but syntactically different slices then intern to one node, and their modulus-scale
+    /// +/- pairs cancel exactly instead of surviving as unfoldable Large residuals.
+    fn canonical_indexed_slice(
+        &mut self,
+        scope_proof: &mut ScopeProof,
+        node: &ExprNode,
+        operation: &MatrixOperation,
+        children: &[Arc<AnalyzedValue>],
+    ) -> Result<Option<ScopedExprId>, NormalizeError> {
+        let Some(range) = self.scope_argument_range() else {
+            return Ok(None);
+        };
+        if range.minimum >= range.maximum_exclusive {
+            return Ok(None);
+        }
+        let mut inputs = Vec::with_capacity(node.inputs.len());
+        let mut changed = false;
+        for (position, input) in node.inputs.iter().copied().enumerate() {
+            if position == 0 {
+                inputs.push(self.expressions.scoped_from_proof(scope_proof, input)?);
+                continue;
+            }
+            let Some((argument, a, b)) = self.range_reduced_affine_form(input, range)? else {
+                inputs.push(self.expressions.scoped_from_proof(scope_proof, input)?);
+                continue;
+            };
+            let canonical = self.intern_affine_index(scope_proof, argument, &a, &b)?;
+            if canonical.expression() != input {
+                changed = true;
+            }
+            inputs.push(canonical);
+        }
+        if !changed {
+            return Ok(None);
+        }
+        let rewritten = self.expressions.intern_scoped_transform(
+            scope_proof,
+            ValueOperator::Matrix(operation.clone()),
+            &inputs,
+        )?;
+        // The rewritten atom shares the source matrix, so it shares the source's value-level
+        // transfer; record it so a term retaining this factor keeps a usable bound.
+        if let Some(bound) = children.first().map(|value| value.coefficient_bound.clone()) {
+            self.expression_bounds.entry(rewritten.expression()).or_insert(bound);
+        }
+        Ok(Some(rewritten))
+    }
+
+    /// The trusted range of this scope's single Int binder, when it has one.
+    fn scope_argument_range(&self) -> Option<super::arena::TrustedIndexRange> {
+        let program = self.programs.program(self.scope).ok()?;
+        let [input] = program.signature.inputs.as_ref() else {
+            return None;
+        };
+        if input.value_type != ResolvedValueType::Int {
+            return None;
+        }
+        input.trusted_index_range
+    }
+
+    /// Exact affine form `a * argument + b` of one binder-open Int expression, with
+    /// range-proved remainder elimination: `x mod m` reduces to `x - k*m` only when the
+    /// binder's trusted range confines `x` to the single window `[k*m, (k+1)*m)`. Every
+    /// non-provable shape returns `None`, keeping the original expression (fail closed).
+    #[allow(clippy::type_complexity)]
+    fn range_reduced_affine_form(
+        &self,
+        expression: ExprId,
+        range: super::arena::TrustedIndexRange,
+    ) -> Result<Option<(Option<ExprId>, BigInt, BigInt)>, NormalizeError> {
+        let node = self.expressions.node(expression)?;
+        let merge_arguments = |left: Option<ExprId>, right: Option<ExprId>| match (left, right) {
+            (None, argument) | (argument, None) => Some(argument),
+            (Some(left), Some(right)) if left == right => Some(Some(left)),
+            _ => None,
+        };
+        match &node.operator {
+            ValueOperator::Argument { position: 0, value_type } => {
+                if *value_type != ResolvedValueType::Int {
+                    return Ok(None);
+                }
+                Ok(Some((Some(expression), BigInt::from(1_u8), BigInt::from(0_u8))))
+            }
+            ValueOperator::Constant(TypedConstant {
+                value: super::arena::ConstantValue::Int(value),
+                ..
+            }) => Ok(Some((None, BigInt::from(0_u8), value.clone()))),
+            ValueOperator::Scalar(operation) => match operation {
+                ScalarOperation::Negate if node.inputs.len() == 1 => {
+                    let Some((argument, a, b)) =
+                        self.range_reduced_affine_form(node.inputs[0], range)?
+                    else {
+                        return Ok(None);
+                    };
+                    Ok(Some((argument, -a, -b)))
+                }
+                ScalarOperation::Add | ScalarOperation::Subtract if node.inputs.len() == 2 => {
+                    let Some((left_argument, left_a, left_b)) =
+                        self.range_reduced_affine_form(node.inputs[0], range)?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((right_argument, right_a, right_b)) =
+                        self.range_reduced_affine_form(node.inputs[1], range)?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(argument) = merge_arguments(left_argument, right_argument) else {
+                        return Ok(None);
+                    };
+                    if matches!(operation, ScalarOperation::Add) {
+                        Ok(Some((argument, left_a + right_a, left_b + right_b)))
+                    } else {
+                        Ok(Some((argument, left_a - right_a, left_b - right_b)))
+                    }
+                }
+                ScalarOperation::Multiply if node.inputs.len() == 2 => {
+                    let Some((left_argument, left_a, left_b)) =
+                        self.range_reduced_affine_form(node.inputs[0], range)?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((right_argument, right_a, right_b)) =
+                        self.range_reduced_affine_form(node.inputs[1], range)?
+                    else {
+                        return Ok(None);
+                    };
+                    if left_a.is_zero() {
+                        Ok(Some((right_argument, right_a * &left_b, right_b * left_b)))
+                    } else if right_a.is_zero() {
+                        Ok(Some((left_argument, left_a * &right_b, left_b * right_b)))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                ScalarOperation::Remainder if node.inputs.len() == 2 => {
+                    let Some((argument, a, b)) =
+                        self.range_reduced_affine_form(node.inputs[0], range)?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((None, modulus_a, modulus)) =
+                        self.range_reduced_affine_form(node.inputs[1], range)?
+                    else {
+                        return Ok(None);
+                    };
+                    if !modulus_a.is_zero() || modulus <= BigInt::from(0_u8) {
+                        return Ok(None);
+                    }
+                    let first = BigInt::from(range.minimum);
+                    let last = BigInt::from(range.maximum_exclusive) - BigInt::from(1_u8);
+                    let (minimum, maximum) = if argument.is_none() || a.is_zero() {
+                        (b.clone(), b.clone())
+                    } else {
+                        let low = &a * &first + &b;
+                        let high = &a * &last + &b;
+                        if low <= high { (low, high) } else { (high, low) }
+                    };
+                    let window = floor_div(&minimum, &modulus);
+                    if floor_div(&maximum, &modulus) != window {
+                        return Ok(None);
+                    }
+                    Ok(Some((argument, a, b - window * modulus)))
+                }
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// Intern the canonical expression for `a * argument + b`: `Const(b)` for constants, the
+    /// bare argument for the identity map, otherwise `Add/Subtract(Multiply(argument, a), |b|)`.
+    fn intern_affine_index(
+        &mut self,
+        scope_proof: &mut ScopeProof,
+        argument: Option<ExprId>,
+        a: &BigInt,
+        b: &BigInt,
+    ) -> Result<ScopedExprId, NormalizeError> {
+        let Some(argument) = argument.filter(|_| !a.is_zero()) else {
+            return self.intern_scoped_int_constant(scope_proof, b);
+        };
+        let argument = self.expressions.scoped_from_proof(scope_proof, argument)?;
+        let base = if *a == BigInt::from(1_u8) {
+            argument
+        } else {
+            let factor = self.intern_scoped_int_constant(scope_proof, a)?;
+            self.expressions.intern_scoped_transform(
+                scope_proof,
+                ValueOperator::Scalar(ScalarOperation::Multiply),
+                &[argument, factor],
+            )?
+        };
+        if b.is_zero() {
+            return Ok(base);
+        }
+        let (operation, magnitude) = if *b < BigInt::from(0_u8) {
+            (ScalarOperation::Subtract, -b.clone())
+        } else {
+            (ScalarOperation::Add, b.clone())
+        };
+        let offset = self.intern_scoped_int_constant(scope_proof, &magnitude)?;
+        Ok(self.expressions.intern_scoped_transform(
+            scope_proof,
+            ValueOperator::Scalar(operation),
+            &[base, offset],
+        )?)
+    }
+
+    fn intern_scoped_int_constant(
+        &mut self,
+        scope_proof: &mut ScopeProof,
+        value: &BigInt,
+    ) -> Result<ScopedExprId, NormalizeError> {
+        Ok(self.expressions.intern_scoped_transform(
+            scope_proof,
+            ValueOperator::Constant(TypedConstant::int(value.clone())),
+            &[],
+        )?)
     }
 
     fn transform_nf(
@@ -3192,18 +3425,25 @@ fn coefficient_bound(bound: &BoundClass) -> CoefficientBound {
 fn sampler_bound(operation: &SamplerOperation) -> NumericContract<CoefficientBound> {
     match operation {
         SamplerOperation::UniformResidue { .. } => NumericContract::Known(CoefficientBound::Large),
-        SamplerOperation::UniformInterval { minimum, maximum, .. } => {
+        SamplerOperation::UniformInterval { output, minimum, maximum } => {
             let upper = minimum.abs().max(maximum.abs());
-            NumericContract::Known(CoefficientBound::finite(upper.magnitude().clone()))
+            // An interval that reaches the centered halfway point carries no more information
+            // than a uniform residue; report it as Large instead of a modulus-scale finite
+            // bound. Small designed intervals (ternary secrets, bits) keep their exact bound.
+            if upper.magnitude() * 2_u8 >= output.modulus {
+                NumericContract::Known(CoefficientBound::Large)
+            } else {
+                NumericContract::Known(CoefficientBound::finite(upper.magnitude().clone()))
+            }
         }
         SamplerOperation::Gaussian { max_coefficient_bound, .. } |
-        SamplerOperation::Trapdoor {
-            preimage_max_coefficient_bound: max_coefficient_bound,
-            ..
-        } |
         SamplerOperation::Preimage { max_coefficient_bound, .. } => NumericContract::Known(
             CoefficientBound::finite(max_coefficient_bound.magnitude().clone()),
         ),
+        // The matrix-valued trapdoor sample port is the uniform public matrix `B`; its
+        // `preimage_max_coefficient_bound` is metadata for preimages sampled against this
+        // trapdoor later, never a bound on `B` itself.
+        SamplerOperation::Trapdoor { .. } => NumericContract::Known(CoefficientBound::Large),
         SamplerOperation::Hash { variant, base, .. } => match variant {
             // Plain hashes are intentionally explicit large residuals.  A finite value is
             // accepted only when the caller supplied an authoritative fact, which is handled
@@ -3271,6 +3511,12 @@ fn add_bounds(
         result = add_known_bounds(&result, bound);
     }
     Ok(NumericContract::Known(result))
+}
+
+/// Floor division for a strictly positive divisor, matching `div_euclid` on integers.
+fn floor_div(value: &BigInt, divisor: &BigInt) -> BigInt {
+    let quotient = value / divisor;
+    if (value - &quotient * divisor) < BigInt::from(0_u8) { quotient - 1 } else { quotient }
 }
 
 fn add_known_bounds(left: &CoefficientBound, right: &CoefficientBound) -> CoefficientBound {

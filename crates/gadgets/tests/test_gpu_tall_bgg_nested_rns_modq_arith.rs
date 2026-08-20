@@ -19,8 +19,8 @@ use mxx_correctness::{
     EndpointSemanticBinding, EndpointSpecId, ExactMatrixInputMetadata, OperationalDecoderKind,
     OperationalDecoderTarget, OutputRef, StageId,
     operational_noise::{
-        OperationalCheckRequest, OperationalGadgetLayout, OperationalSimulationError,
-        OperationalSimulationReport, ProgressEventKind,
+        OperationalAcceptanceReport, OperationalCheckRequest, OperationalGadgetLayout,
+        OperationalSimulationError, OperationalSimulationReport, ProgressEventKind,
         check_operational_noise_candidate_with_progress,
     },
     operational_protocol_from_graphs,
@@ -125,7 +125,7 @@ impl TestConfig {
         // practical basis width for the multi-level search below. Keeping the base at half that
         // width minimizes the gadget representation without an independent tuning knob; the
         // nested-RNS p basis is selected from the concrete q basis below.
-        let crt_modulus_bits = env_usize("MXX_TALL_NESTED_RNS_CRT_MODULUS_BITS", 10)?;
+        let crt_modulus_bits = env_usize("MXX_TALL_NESTED_RNS_CRT_MODULUS_BITS", 28)?;
         let selected_crt_depth = env_optional_usize("MXX_TALL_NESTED_RNS_SELECTED_CRT_DEPTH")?;
         let selected_log_ring_dimension =
             env_optional_usize("MXX_TALL_NESTED_RNS_SELECTED_LOG_RING_DIMENSION")?;
@@ -141,14 +141,14 @@ impl TestConfig {
         };
         let config = Self {
             mul_count: env_usize("MXX_TALL_NESTED_RNS_MUL_COUNT", 1)?,
-            min_crt_depth: env_usize("MXX_TALL_NESTED_RNS_MIN_CRT_DEPTH", 1)?,
-            max_crt_depth: env_usize("MXX_TALL_NESTED_RNS_MAX_CRT_DEPTH", 16)?,
-            min_log_ring_dimension: env_usize("MXX_TALL_NESTED_RNS_MIN_LOG_RING_DIMENSION", 3)?,
-            max_log_ring_dimension: env_usize("MXX_TALL_NESTED_RNS_MAX_LOG_RING_DIMENSION", 3)?,
+            min_crt_depth: env_usize("MXX_TALL_NESTED_RNS_MIN_CRT_DEPTH", 2)?,
+            max_crt_depth: env_usize("MXX_TALL_NESTED_RNS_MAX_CRT_DEPTH", 40)?,
+            min_log_ring_dimension: env_usize("MXX_TALL_NESTED_RNS_MIN_LOG_RING_DIMENSION", 5)?,
+            max_log_ring_dimension: env_usize("MXX_TALL_NESTED_RNS_MAX_LOG_RING_DIMENSION", 16)?,
             selected_parameters,
             // n = 8 is intentionally an execution smoke parameter and has no positive lattice
             // security estimate. A caller may request a positive target, which will reject it.
-            security_bits: env_u64("MXX_TALL_NESTED_RNS_SECURITY_BITS", 0)?,
+            security_bits: env_u64("MXX_TALL_NESTED_RNS_SECURITY_BITS", 100)?,
             crt_modulus_bits,
             gadget_base_bits: env_usize(
                 "MXX_TALL_NESTED_RNS_GADGET_BASE_BITS",
@@ -156,9 +156,9 @@ impl TestConfig {
             )?,
             // The multiplication's full-reduce intermediate exceeds the one-product p basis;
             // retain the two-product budget required by the nested-RNS bound check.
-            max_unreduced_muls: env_usize("MXX_TALL_NESTED_RNS_MAX_UNREDUCED_MULS", 2)?,
-            scale: env_u64("MXX_TALL_NESTED_RNS_SCALE", 1 << 10)?,
-            error_sigma: env_f64("MXX_TALL_NESTED_RNS_ERROR_SIGMA", 1.0)?,
+            max_unreduced_muls: env_usize("MXX_TALL_NESTED_RNS_MAX_UNREDUCED_MULS", 1)?,
+            scale: env_u64("MXX_TALL_NESTED_RNS_SCALE", 1 << 6)?,
+            error_sigma: env_f64("MXX_TALL_NESTED_RNS_ERROR_SIGMA", 4.0)?,
             trapdoor_sigma: env_f64("MXX_TALL_NESTED_RNS_TRAPDOOR_SIGMA", 4.578)?,
             benchmark_warmups: env_usize("MXX_TALL_NESTED_RNS_BENCH_WARMUPS", 1)?,
             benchmark_iterations: env_usize("MXX_TALL_NESTED_RNS_BENCH_ITERATIONS", 2)?,
@@ -451,6 +451,36 @@ fn gate_kind_counts(circuit: &PolyCircuit<DCRTPoly>) -> HashMap<PolyGateKind, us
     counts
 }
 
+/// `log2` of an arbitrary-precision unsigned value for human-readable noise-margin logs.
+fn log2_biguint(value: &BigUint) -> f64 {
+    if value.is_zero() {
+        return f64::NEG_INFINITY;
+    }
+    let bits = value.bits();
+    if bits <= 53 {
+        return (value.iter_u64_digits().next().unwrap_or(0) as f64).log2();
+    }
+    let shift = bits - 53;
+    let top = (value >> shift).iter_u64_digits().next().unwrap_or(0) as f64;
+    top.log2() + shift as f64
+}
+
+/// The evaluated noise bound and the decoder rule's maximum acceptable noise, both in bits.
+/// Threshold decode accepts `2 * p * noise < q`, so the acceptable-noise budget is `q / (2p)`;
+/// the boolean interval accepts noise inside the quarter-width band around each residue.
+fn acceptance_log2(report: &OperationalSimulationReport) -> (f64, f64) {
+    let noise_bound_log2 = log2_biguint(&report.noise_bound);
+    let noise_threshold_log2 = match &report.acceptance {
+        OperationalAcceptanceReport::Threshold { plaintext_modulus, .. } => {
+            log2_biguint(&report.ciphertext_modulus) - 1.0 - log2_biguint(plaintext_modulus)
+        }
+        OperationalAcceptanceReport::BooleanInterval { quarter, .. } => {
+            log2_biguint(quarter.magnitude())
+        }
+    };
+    (noise_bound_log2, noise_threshold_log2)
+}
+
 fn run_tall_operational_check(
     preprocessing: &BuiltGraph,
     encoding: &BuiltGraph,
@@ -634,10 +664,14 @@ fn run_tall_operational_check(
         );
         simulation_error.to_string()
     })?;
+    let (noise_bound_log2, noise_threshold_log2) = acceptance_log2(&report);
     info!(
         elapsed = ?evaluation_started.elapsed(),
         accepted = report.accepted,
         noise_bound = %report.noise_bound,
+        noise_bound_log2 = (noise_bound_log2 * 10.0).round() / 10.0,
+        noise_threshold_log2 = (noise_threshold_log2 * 10.0).round() / 10.0,
+        excess_log2 = ((noise_bound_log2 - noise_threshold_log2) * 10.0).round() / 10.0,
         "evaluated Tall parameter request with Rust operational checker"
     );
     Ok(report)
@@ -1309,10 +1343,14 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
                 .as_ref()
                 .ok_or_else(|| "operational candidate omitted its checker report".to_owned())?;
             let accepted = operational_report.accepted;
+            let (noise_bound_log2, noise_threshold_log2) = acceptance_log2(operational_report);
             info!(
                 crt_depth = *crt_depth,
                 ring_dimension = 1usize << *log_ring_dimension,
                 operational_noise_bound = %operational_report.noise_bound,
+                noise_bound_log2 = (noise_bound_log2 * 10.0).round() / 10.0,
+                noise_threshold_log2 = (noise_threshold_log2 * 10.0).round() / 10.0,
+                excess_log2 = ((noise_bound_log2 - noise_threshold_log2) * 10.0).round() / 10.0,
                 diagnostics = ?operational_report.diagnostics,
                 accepted,
                 "evaluated Tall BGG+ operational candidate"

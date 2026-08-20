@@ -3648,7 +3648,10 @@ impl<'a> ProductionAdapter<'a> {
             MatrixConstantKind::UnitRow { .. } | MatrixConstantKind::UnitColumn { .. } => {
                 (false, self.centered_bound(&BigInt::from(1_u8), matrix))
             }
-            MatrixConstantKind::Gadget { .. } => (false, self.safe_matrix_bound(matrix)),
+            // Gadget entries are powers of the base up to `base^(digits-1)`, i.e. modulus
+            // scale; treat the matrix as Large so a surviving `G` factor is never silently
+            // folded at a finite bound.
+            MatrixConstantKind::Gadget { .. } => (false, CoefficientBound::Large),
             MatrixConstantKind::PowerOfBase { base, exponent } => {
                 let bound = exponent
                     .to_u32()

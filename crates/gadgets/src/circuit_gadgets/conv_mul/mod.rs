@@ -630,7 +630,6 @@ mod tests {
     };
     use num_traits::One;
 
-    const P_MODULI_BITS: usize = 5;
     const SCALE: u64 = 1 << 8;
 
     fn nested_context(
@@ -638,10 +637,15 @@ mod tests {
         parameters: &DCRTPolyParams,
         q_level: Option<usize>,
     ) -> Arc<NestedRnsPolyContext> {
+        let p_moduli_bits = crate::circuit_gadgets::arith::minimum_p_moduli_bits(
+            *parameters.to_crt().0.iter().max().expect("nonempty CRT basis"),
+            crate::circuit_gadgets::arith::DEFAULT_MAX_UNREDUCED_MULS,
+        )
+        .expect("test parameters support a p basis");
         Arc::new(NestedRnsPolyContext::setup(
             circuit,
             parameters,
-            P_MODULI_BITS,
+            p_moduli_bits,
             crate::circuit_gadgets::arith::DEFAULT_MAX_UNREDUCED_MULS,
             SCALE,
             false,

@@ -914,7 +914,6 @@ mod tests {
     const ACTIVE_LEVELS: usize = 1;
     const CRT_BITS: usize = 10;
     const BASE_BITS: u32 = 5;
-    const P_MODULI_BITS: usize = 5;
     const MAX_UNREDUCED_MULS: usize = 2;
     const SCALE: u64 = 16;
 
@@ -922,6 +921,16 @@ mod tests {
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<NestedRnsRingGswContext<DCRTPoly>>) {
         test_context_with_unreduced_mul_budget(circuit, MAX_UNREDUCED_MULS, SCALE)
+    }
+
+    /// Smallest p-basis width for the given parameters and unreduced-multiplication budget,
+    /// so budget changes never silently starve these tests.
+    fn test_p_moduli_bits(params: &DCRTPolyParams, max_unreduced_muls: usize) -> usize {
+        crate::circuit_gadgets::arith::minimum_p_moduli_bits(
+            *params.to_crt().0.iter().max().expect("nonempty CRT basis"),
+            max_unreduced_muls,
+        )
+        .expect("test parameters support a p basis")
     }
 
     fn test_context_with_unreduced_mul_budget(
@@ -933,7 +942,7 @@ mod tests {
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             circuit,
             &params,
-            P_MODULI_BITS,
+            test_p_moduli_bits(&params, max_unreduced_muls),
             max_unreduced_muls,
             scale,
             false,
@@ -1298,7 +1307,7 @@ mod tests {
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
             &params,
-            P_MODULI_BITS,
+            test_p_moduli_bits(&params, MAX_UNREDUCED_MULS),
             MAX_UNREDUCED_MULS,
             SCALE,
             false,

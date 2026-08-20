@@ -104,6 +104,9 @@ struct TestConfig {
     selected_parameters: Option<(usize, usize)>,
     security_bits: u64,
     crt_modulus_bits: usize,
+    /// Explicit nested-RNS p-basis width. `None` selects the smallest width supporting the
+    /// configured unreduced-multiplication budget for the candidate's q basis.
+    p_moduli_bits: Option<usize>,
     gadget_base_bits: usize,
     max_unreduced_muls: usize,
     scale: u64,
@@ -152,13 +155,14 @@ impl TestConfig {
             // security estimate. A caller may request a positive target, which will reject it.
             security_bits: env_u64("MXX_TALL_NESTED_RNS_SECURITY_BITS", 100)?,
             crt_modulus_bits,
+            p_moduli_bits: env_optional_usize("MXX_TALL_NESTED_RNS_P_MODULI_BITS")?,
             gadget_base_bits: env_usize(
                 "MXX_TALL_NESTED_RNS_GADGET_BASE_BITS",
                 crt_modulus_bits.div_ceil(2),
             )?,
-            // The multiplication's full-reduce intermediate exceeds the one-product p basis;
-            // retain the two-product budget required by the nested-RNS bound check.
-            max_unreduced_muls: env_usize("MXX_TALL_NESTED_RNS_MAX_UNREDUCED_MULS", 1)?,
+            // A multiplication consumes the product of two full-reduce outputs, so the
+            // two-product budget closes the reduce/multiply loop at any multiplication depth.
+            max_unreduced_muls: env_usize("MXX_TALL_NESTED_RNS_MAX_UNREDUCED_MULS", 2)?,
             scale: env_u64("MXX_TALL_NESTED_RNS_SCALE", 1 << 6)?,
             error_sigma: env_f64("MXX_TALL_NESTED_RNS_ERROR_SIGMA", 4.0)?,
             trapdoor_sigma: env_f64("MXX_TALL_NESTED_RNS_TRAPDOOR_SIGMA", 4.578)?,
@@ -686,11 +690,14 @@ fn prepare_candidate(
 ) -> Result<PreparedCandidate, String> {
     let ring_dimension = parameters.ring_dimension() as usize;
     let (q_moduli, _, _) = parameters.to_crt();
-    let p_modulus_bits = minimum_p_moduli_bits(
-        *q_moduli.iter().max().expect("CRT basis is nonempty"),
-        config.max_unreduced_muls,
-    )
-    .ok_or_else(|| "no nested-RNS p-modulus basis supports the selected q basis".to_owned())?;
+    let p_modulus_bits = match config.p_moduli_bits {
+        Some(bits) => bits,
+        None => minimum_p_moduli_bits(
+            *q_moduli.iter().max().expect("CRT basis is nonempty"),
+            config.max_unreduced_muls,
+        )
+        .ok_or_else(|| "no nested-RNS p-modulus basis supports the selected q basis".to_owned())?,
+    };
     let CircuitBundle { circuit, nested } =
         build_modq_multiplication_circuit(&parameters, config, ring_dimension, p_modulus_bits);
     let scalar_circuit = build_modq_multiplication_circuit(&parameters, config, 1, p_modulus_bits);
@@ -2126,6 +2133,7 @@ fn noiseless_runtime_config() -> TestConfig {
         selected_parameters: Some((1, 1)),
         security_bits: 0,
         crt_modulus_bits: 10,
+        p_moduli_bits: None,
         gadget_base_bits: 5,
         max_unreduced_muls: 2,
         scale: 16,

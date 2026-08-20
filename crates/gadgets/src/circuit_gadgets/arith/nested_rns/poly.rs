@@ -2135,11 +2135,20 @@ mod full_reduce_tests {
         test_utils::{PolyVec, execute_polyvec_circuit},
     };
 
-    const P_MODULI_BITS: usize = 5;
     const SCALE: u64 = 1 << 8;
 
     fn parameters() -> DCRTPolyParams {
         DCRTPolyParams::new(2, 3, 12, 6)
+    }
+
+    /// Smallest p-basis width supporting the full-reduce test parameters under the default
+    /// unreduced-multiplication budget.
+    fn test_p_moduli_bits() -> usize {
+        super::super::encoding::minimum_p_moduli_bits(
+            *parameters().to_crt().0.iter().max().expect("nonempty CRT basis"),
+            DEFAULT_MAX_UNREDUCED_MULS,
+        )
+        .expect("test parameters support a p basis")
     }
 
     fn run_explicit_full_reduce(values: &[BigUint], window: CrtWindow) -> Vec<BigUint> {
@@ -2148,7 +2157,7 @@ mod full_reduce_tests {
         let context = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
             &parameters,
-            P_MODULI_BITS,
+            test_p_moduli_bits(),
             DEFAULT_MAX_UNREDUCED_MULS,
             SCALE,
             false,
@@ -2244,11 +2253,20 @@ mod tests {
     };
     use num_traits::{One, ToPrimitive, Zero};
 
-    const P_MODULI_BITS: usize = 5;
     const SCALE: u64 = 1 << 8;
 
     fn test_parameters() -> DCRTPolyParams {
         DCRTPolyParams::new(2, 3, 12, 6)
+    }
+
+    /// Smallest p-basis width supporting the shared test parameters under the default
+    /// unreduced-multiplication budget, so budget changes never silently starve these tests.
+    fn test_p_moduli_bits() -> usize {
+        super::super::encoding::minimum_p_moduli_bits(
+            *test_parameters().to_crt().0.iter().max().expect("nonempty CRT basis"),
+            DEFAULT_MAX_UNREDUCED_MULS,
+        )
+        .expect("test parameters support a p basis")
     }
 
     fn create_context(
@@ -2259,7 +2277,7 @@ mod tests {
         let context = Arc::new(NestedRnsPolyContext::setup(
             circuit,
             &parameters,
-            P_MODULI_BITS,
+            test_p_moduli_bits(),
             DEFAULT_MAX_UNREDUCED_MULS,
             SCALE,
             false,
@@ -3007,7 +3025,7 @@ mod tests {
         let window = CrtWindow::new(0, 2, depth);
         let value = BigUint::from(12345u64);
         let expected = encode_nested_rns_poly::<DCRTPoly>(
-            P_MODULI_BITS,
+            test_p_moduli_bits(),
             DEFAULT_MAX_UNREDUCED_MULS,
             &parameters,
             std::slice::from_ref(&value),
@@ -3024,7 +3042,7 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let actual = encode_nested_rns_poly_compact_bytes::<DCRTPoly>(
-            P_MODULI_BITS,
+            test_p_moduli_bits(),
             DEFAULT_MAX_UNREDUCED_MULS,
             &parameters,
             std::slice::from_ref(&value),
@@ -3033,7 +3051,7 @@ mod tests {
         assert_eq!(actual, expected);
 
         let offset = encode_nested_rns_poly::<DCRTPoly>(
-            P_MODULI_BITS,
+            test_p_moduli_bits(),
             DEFAULT_MAX_UNREDUCED_MULS,
             &parameters,
             &[BigUint::from(1u64)],

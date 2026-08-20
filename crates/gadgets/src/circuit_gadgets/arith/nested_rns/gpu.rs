@@ -50,8 +50,17 @@ mod tests {
     };
     use num_bigint::BigUint;
 
-    const P_MODULI_BITS: usize = 6;
     const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
+
+    /// Smallest p-basis width for the given parameters under the shared budget, so budget
+    /// changes never silently starve these tests.
+    fn test_p_moduli_bits(params: &DCRTPolyParams) -> usize {
+        crate::circuit_gadgets::arith::minimum_p_moduli_bits(
+            *params.to_crt().0.iter().max().expect("nonempty CRT basis"),
+            MAX_UNREDUCED_MULS,
+        )
+        .expect("test parameters support a p basis")
+    }
     const BASE_BITS: u32 = 6;
 
     #[test]
@@ -79,14 +88,14 @@ mod tests {
         for input in [12345u64, 23456u64, 34567u64] {
             let values = [BigUint::from(input), BigUint::from(input + 7)];
             let expected = encode_nested_rns_poly::<DCRTPoly>(
-                P_MODULI_BITS,
+                test_p_moduli_bits(&cpu_params),
                 MAX_UNREDUCED_MULS,
                 &cpu_params,
                 &values,
                 q_level,
             );
             let actual_bytes = encode_nested_rns_poly_compact_bytes::<GpuDCRTPoly>(
-                P_MODULI_BITS,
+                test_p_moduli_bits(&cpu_params),
                 MAX_UNREDUCED_MULS,
                 &gpu_params,
                 &values,

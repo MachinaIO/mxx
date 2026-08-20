@@ -8,6 +8,14 @@ use num_traits::One;
 /// Lower bound on the CRT product required to tolerate the configured unreduced multiplication
 /// budget.
 ///
+/// The budget base is the worst-case magnitude of one `full_reduce` output under the canonical
+/// (non-centered) representatives this implementation uses: `(sum(p_i) + k) * q_max`, matching
+/// `full_reduce_output_max_plaintext_bound`. Requiring `p_full > base^muls` with `muls = 2`
+/// therefore covers a product of two freshly reduced operands, which closes the
+/// reduce -> multiply -> reduce loop at any multiplication depth. (Boneh-Kim Theorem 2 gives
+/// `(k + sum(p_i)) * q / 4` for centered representatives; the canonical loop is 4x larger, which
+/// this base reflects instead of assuming a centering the circuits do not perform.)
+///
 /// `sample_crt_primes` uses exactly this bound when choosing the synthetic p-moduli for a
 /// nested-RNS context, so exposing it here keeps the budget calculation shared between setup code
 /// and tests.
@@ -18,7 +26,7 @@ pub(crate) fn sample_crt_primes_mul_budget_bound(
 ) -> BigUint {
     let modulus_count =
         u64::try_from(modulus_count).expect("p_moduli length must fit in u64 for bound tracking");
-    BigUint::from(sum_p_moduli + modulus_count) * BigUint::from(q_max) / BigUint::from(2u64)
+    BigUint::from(sum_p_moduli + modulus_count) * BigUint::from(q_max)
 }
 
 /// Euclidean gcd helper used while enforcing pairwise-coprime synthetic p-moduli.

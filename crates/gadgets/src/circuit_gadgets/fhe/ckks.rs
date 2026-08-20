@@ -671,7 +671,6 @@ mod tests {
 
     const BASE_BITS: u32 = 6;
     const CRT_DEPTH: usize = 12;
-    const P_MODULI_BITS: usize = 7;
     const SCALE: u64 = 1 << 8;
     const NUM_SLOTS: usize = 2;
     const RELIN_EXTRA_LEVELS: usize = 6;
@@ -679,6 +678,16 @@ mod tests {
     const CKKS_MUL_DEPTH: usize = 1;
     const CKKS_MUL_TEST_CRT_DEPTH: usize = NUM_LEFT_MODULI + CKKS_MUL_DEPTH + RELIN_EXTRA_LEVELS;
     const INPUT_ERROR_SIGMA: f64 = 4.0;
+
+    /// Smallest p-basis width for the given parameters and unreduced-multiplication budget,
+    /// so budget changes never silently starve these tests.
+    fn test_p_moduli_bits(params: &DCRTPolyParams, max_unreduced_muls: usize) -> usize {
+        crate::circuit_gadgets::arith::minimum_p_moduli_bits(
+            *params.to_crt().0.iter().max().expect("nonempty CRT basis"),
+            max_unreduced_muls,
+        )
+        .expect("test parameters support a p basis")
+    }
 
     fn create_test_context_with_params(
         circuit: &mut PolyCircuit<DCRTPoly>,
@@ -698,7 +707,7 @@ mod tests {
             circuit,
             params,
             NUM_SLOTS,
-            P_MODULI_BITS,
+            test_p_moduli_bits(params, DEFAULT_MAX_UNREDUCED_MULS),
             DEFAULT_MAX_UNREDUCED_MULS,
             scale,
             false,
@@ -2219,7 +2228,7 @@ mod tests {
             &mut circuit,
             &params,
             num_slots,
-            P_MODULI_BITS,
+            test_p_moduli_bits(&params, 4),
             4,
             SCALE,
             false,

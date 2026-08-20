@@ -78,6 +78,7 @@ pub enum WireType {
         sigma: crate::expr::RealExpr,
         gadget_base: IntExpr,
         digit_count: IntExpr,
+        preimage_max_coefficient_bound: IntExpr,
     },
     Preimage(MatrixType),
     IndexedFamily {
@@ -109,6 +110,8 @@ pub enum ConcreteWireType {
         #[serde(with = "serde_support::bigint")]
         gadget_base: BigInt,
         digit_count: usize,
+        #[serde(with = "serde_support::bigint")]
+        preimage_max_coefficient_bound: BigInt,
     },
     Preimage(ConcreteMatrixType),
     IndexedFamily {

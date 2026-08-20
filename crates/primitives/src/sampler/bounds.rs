@@ -1,15 +1,48 @@
-//! Analytical bounds shared by trapdoor samplers and higher-level simulators.
+//! Hard coefficient cutoffs and checks shared by samplers and runtimes.
 
+use crate::{
+    element::PolyElem,
+    matrix::PolyMatrix,
+    poly::{Poly, PolyParams},
+};
 use bigdecimal::BigDecimal;
+use num_bigint::{BigUint, ToBigInt};
 use num_traits::{FromPrimitive, Zero};
+use rayon::prelude::*;
 
-pub fn high_probability_envelope_from_sigma(sigma: &BigDecimal) -> BigDecimal {
-    assert!(*sigma >= BigDecimal::zero(), "sigma must be nonnegative");
-    sigma * BigDecimal::from(13u64) / BigDecimal::from(2u64)
+/// Returns the authoritative integer cutoff `floor(6.5 * sigma_bound)`.
+///
+/// `sigma_bound` is an exact rational upper bound supplied by configuration. Runtime sampling and
+/// emitted correctness statements consume the resulting integer rather than independently
+/// re-evaluating a floating-point sigma.
+pub fn hard_cutoff_from_sigma_bound(sigma_bound: &BigDecimal) -> BigUint {
+    assert!(*sigma_bound >= BigDecimal::zero(), "sigma bound must be nonnegative");
+    (sigma_bound * BigDecimal::from(13u64) / BigDecimal::from(2u64))
+        .to_bigint()
+        .expect("nonnegative finite BigDecimal must convert to BigInt")
+        .to_biguint()
+        .expect("nonnegative cutoff must convert to BigUint")
 }
 
-pub fn maximum_coefficient_bound_from_sigma(sigma: &BigDecimal) -> BigDecimal {
-    high_probability_envelope_from_sigma(sigma)
+pub fn centered_coefficient_abs(value: &BigUint, modulus: &BigUint) -> BigUint {
+    debug_assert!(value < modulus, "ring residue must be reduced");
+    let negative_magnitude = modulus - value;
+    value.min(&negative_magnitude).clone()
+}
+
+pub fn matrix_within_coefficient_bound<M: PolyMatrix>(
+    matrix: &M,
+    max_coefficient_bound: &BigUint,
+) -> bool {
+    let modulus = matrix.params().modulus().into();
+    (0..matrix.row_size()).into_par_iter().all(|row| {
+        (0..matrix.col_size()).all(|column| {
+            matrix.entry(row, column).coeffs().into_iter().all(|coefficient| {
+                centered_coefficient_abs(coefficient.value(), modulus.as_ref()) <=
+                    *max_coefficient_bound
+            })
+        })
+    })
 }
 
 pub fn compute_preimage_sigma(
@@ -31,18 +64,17 @@ pub fn compute_preimage_sigma(
     c_0 * sigma.clone() * ((base + 1) * sigma) * term
 }
 
-pub fn compute_preimage_norm(
-    ring_dim_sqrt: &BigDecimal,
-    m_g: u64,
-    base: &BigDecimal,
-    b_nrow: Option<usize>,
-    sigma: Option<f64>,
-) -> BigDecimal {
-    high_probability_envelope_from_sigma(&compute_preimage_sigma(
-        ring_dim_sqrt,
-        m_g,
-        base,
-        b_nrow,
-        sigma,
-    ))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn hard_cutoff_uses_exact_floor_of_thirteen_halves_sigma() {
+        assert_eq!(
+            hard_cutoff_from_sigma_bound(&BigDecimal::from_str("4.578").unwrap()),
+            BigUint::from(29u8)
+        );
+        assert_eq!(hard_cutoff_from_sigma_bound(&BigDecimal::zero()), BigUint::zero());
+    }
 }

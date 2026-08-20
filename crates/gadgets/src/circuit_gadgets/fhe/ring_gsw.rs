@@ -163,6 +163,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         let metadata = A::metadata(template);
         A::input_with_planner_metadata(
             ctx,
+            template.num_coefficient_slots(),
             template.enable_levels(),
             Some(template.level_offset()),
             &metadata,
@@ -303,6 +304,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         let batch_subcircuit = Arc::new(Self::mul_columns_batch_subcircuit(
             source_circuit,
             template_ctx,
+            num_slots,
             active_levels,
             level_offset,
             width,
@@ -314,6 +316,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             Arc::new(Self::mul_columns_batch_subcircuit(
                 source_circuit,
                 template_ctx,
+                num_slots,
                 active_levels,
                 level_offset,
                 width,
@@ -324,6 +327,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         let super_batch_subcircuit = Arc::new(Self::mul_super_batch_subcircuit(
             source_circuit,
             template_ctx,
+            num_slots,
             active_levels,
             level_offset,
             width,
@@ -343,6 +347,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 Arc::new(Self::mul_columns_batch_subcircuit(
                     source_circuit,
                     template_ctx,
+                    num_slots,
                     active_levels,
                     level_offset,
                     width,
@@ -355,6 +360,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 Arc::new(Self::mul_columns_batch_subcircuit(
                     source_circuit,
                     template_ctx,
+                    num_slots,
                     active_levels,
                     level_offset,
                     width,
@@ -365,6 +371,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             Some(circuit.register_sub_circuit(Arc::new(Self::mul_super_batch_subcircuit(
                 source_circuit,
                 template_ctx,
+                num_slots,
                 active_levels,
                 level_offset,
                 width,
@@ -389,6 +396,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -400,6 +408,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -411,6 +420,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -422,6 +432,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -505,6 +516,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
     pub(super) fn mul_columns_batch_subcircuit(
         source_circuit: &PolyCircuit<P>,
         template_ctx: &A::Context,
+        num_slots: usize,
         active_levels: usize,
         level_offset: usize,
         width: usize,
@@ -538,6 +550,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -549,6 +562,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -560,6 +574,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -571,6 +586,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -652,6 +668,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
     pub(super) fn mul_super_batch_subcircuit(
         source_circuit: &PolyCircuit<P>,
         template_ctx: &A::Context,
+        num_slots: usize,
         active_levels: usize,
         level_offset: usize,
         width: usize,
@@ -706,6 +723,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -717,6 +735,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -728,6 +747,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -739,6 +759,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -857,6 +878,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -868,6 +890,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .map(|_| {
                 A::input_with_planner_metadata(
                     arith_ctx.clone(),
+                    num_slots,
                     Some(active_levels),
                     Some(level_offset),
                     &normalized_metadata,
@@ -877,6 +900,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .collect::<Vec<_>>();
         let rhs_top = A::input_with_planner_metadata(
             arith_ctx.clone(),
+            num_slots,
             Some(active_levels),
             Some(level_offset),
             &normalized_metadata,
@@ -884,6 +908,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         );
         let rhs_bottom = A::input_with_planner_metadata(
             arith_ctx.clone(),
+            num_slots,
             Some(active_levels),
             Some(level_offset),
             &normalized_metadata,
@@ -1160,6 +1185,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         let [row0, row1] = Self::input_rows(
             ctx.arith_ctx.clone(),
             ctx.width(),
+            ctx.num_slots,
             ctx.active_levels,
             ctx.level_offset,
             circuit,
@@ -1457,15 +1483,32 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
     fn input_rows(
         arith_ctx: Arc<A::Context>,
         width: usize,
+        num_slots: usize,
         active_levels: usize,
         level_offset: usize,
         circuit: &mut PolyCircuit<P>,
     ) -> [Vec<A>; 2] {
         let row0 = (0..width)
-            .map(|_| A::input(arith_ctx.clone(), Some(active_levels), Some(level_offset), circuit))
+            .map(|_| {
+                A::input(
+                    arith_ctx.clone(),
+                    num_slots,
+                    Some(active_levels),
+                    Some(level_offset),
+                    circuit,
+                )
+            })
             .collect::<Vec<_>>();
         let row1 = (0..width)
-            .map(|_| A::input(arith_ctx.clone(), Some(active_levels), Some(level_offset), circuit))
+            .map(|_| {
+                A::input(
+                    arith_ctx.clone(),
+                    num_slots,
+                    Some(active_levels),
+                    Some(level_offset),
+                    circuit,
+                )
+            })
             .collect::<Vec<_>>();
         [row0, row1]
     }

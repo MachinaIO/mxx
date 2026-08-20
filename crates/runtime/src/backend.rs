@@ -8,7 +8,7 @@ use std::{fmt::Debug, sync::Arc};
 
 pub mod poly;
 #[cfg(feature = "gpu")]
-mod poly_gpu;
+pub mod poly_gpu;
 
 #[derive(Clone, Debug)]
 pub struct PreimageRequest<M, T> {
@@ -16,6 +16,7 @@ pub struct PreimageRequest<M, T> {
     pub sigma: f64,
     pub gadget_base: BigInt,
     pub digit_count: usize,
+    pub max_coefficient_bound: BigInt,
     pub trapdoor: Arc<T>,
     pub public: Arc<M>,
     pub target: Arc<M>,
@@ -55,6 +56,10 @@ pub trait Backend {
     }
     fn matrix_is_on_active_placement(&self, _value: &Self::Matrix) -> bool {
         true
+    }
+    /// Waits only for releases queued on backend-owned release streams.
+    fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
+        Ok(())
     }
     fn matrix_to_placements(
         &mut self,
@@ -119,7 +124,7 @@ pub trait Backend {
     ) -> Result<Self::Matrix, Self::Error>;
     fn add_batch(
         &mut self,
-        inputs: Vec<(Self::Matrix, Self::Matrix)>,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(left, right)| self.add(&left, &right)).collect()
     }
@@ -130,7 +135,7 @@ pub trait Backend {
     ) -> Result<Self::Matrix, Self::Error>;
     fn sub_batch(
         &mut self,
-        inputs: Vec<(Self::Matrix, Self::Matrix)>,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(left, right)| self.sub(&left, &right)).collect()
     }
@@ -141,14 +146,14 @@ pub trait Backend {
     ) -> Result<Self::Matrix, Self::Error>;
     fn multiply_batch(
         &mut self,
-        inputs: Vec<(Self::Matrix, Self::Matrix)>,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(left, right)| self.multiply(&left, &right)).collect()
     }
     fn negate(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error>;
     fn negate_batch(
         &mut self,
-        inputs: Vec<Self::Matrix>,
+        inputs: Vec<Arc<Self::Matrix>>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|value| self.negate(&value)).collect()
     }
@@ -159,7 +164,7 @@ pub trait Backend {
     ) -> Result<Self::Matrix, Self::Error>;
     fn scale_integer_batch(
         &mut self,
-        inputs: Vec<(Self::Matrix, BigInt)>,
+        inputs: Vec<(Arc<Self::Matrix>, BigInt)>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(value, scalar)| self.scale_integer(&value, &scalar)).collect()
     }
@@ -180,13 +185,6 @@ pub trait Backend {
         inputs: &[&Self::Matrix],
         axis: ConcatAxis,
     ) -> Result<Self::Matrix, Self::Error>;
-    fn reshape(
-        &mut self,
-        value: &Self::Matrix,
-        rows: usize,
-        columns: usize,
-    ) -> Result<Self::Matrix, Self::Error>;
-
     fn sample_uniform(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -196,6 +194,7 @@ pub trait Backend {
         &mut self,
         ty: &ConcreteMatrixType,
         sigma: f64,
+        max_coefficient_bound: &BigInt,
     ) -> Result<Self::Matrix, Self::Error>;
     fn sample_hash(
         &mut self,
@@ -203,6 +202,7 @@ pub trait Backend {
         key: [u8; 32],
         tag: &[u8],
         variant: HashVariant,
+        gadget_layout: Option<(&BigInt, usize)>,
     ) -> Result<Self::Matrix, Self::Error>;
     fn sample_trapdoor(
         &mut self,
@@ -217,6 +217,7 @@ pub trait Backend {
         sigma: f64,
         gadget_base: &BigInt,
         digit_count: usize,
+        max_coefficient_bound: &BigInt,
         trapdoor: &Self::Trapdoor,
         public: &Self::Matrix,
         target: &Self::Matrix,
@@ -233,12 +234,28 @@ pub trait Backend {
                     request.sigma,
                     &request.gadget_base,
                     request.digit_count,
+                    &request.max_coefficient_bound,
                     request.trapdoor.as_ref(),
                     request.public.as_ref(),
                     request.target.as_ref(),
                 )
             })
             .collect()
+    }
+    fn sample_preimage_batches_by_placement(
+        &mut self,
+        batches: Vec<(usize, Vec<PreimageRequest<Self::Matrix, Self::Trapdoor>>)>,
+    ) -> Result<Vec<(usize, Vec<Self::Matrix>)>, Self::Error> {
+        let original = self.active_placement();
+        let result = batches
+            .into_iter()
+            .map(|(placement, requests)| {
+                assert!(self.set_active_placement(placement), "backend rejected its own placement");
+                self.sample_preimage_batch(requests).map(|outputs| (placement, outputs))
+            })
+            .collect();
+        assert!(self.set_active_placement(original), "backend rejected its active placement");
+        result
     }
     fn validate_gadget_layout(
         &self,
@@ -279,6 +296,9 @@ pub trait Backend {
     ) -> Result<Self::Matrix, Self::Error>;
 
     fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8>;
+    fn matrices_to_bytes(&self, values: &[&Self::Matrix]) -> Vec<Vec<u8>> {
+        values.iter().map(|value| self.matrix_to_bytes(value)).collect()
+    }
     fn matrix_from_bytes(
         &self,
         ty: &ConcreteMatrixType,
@@ -384,6 +404,30 @@ impl<B: Backend> Clone for RuntimeValue<B> {
                 }
             }
             Self::IndexedFamily(values) => Self::IndexedFamily(values.clone()),
+        }
+    }
+}
+
+impl<B: Backend> RuntimeValue<B> {
+    pub(crate) fn releases_backend_resources_on_drop(&self) -> bool {
+        match self {
+            Self::Matrix(matrix) => Arc::strong_count(matrix) == 1,
+            Self::Trapdoor { secret, public, .. } => {
+                Arc::strong_count(public) == 1 ||
+                    secret.as_ref().is_some_and(|secret| Arc::strong_count(secret) == 1)
+            }
+            Self::IndexedFamily(values) => {
+                values.iter().any(Self::releases_backend_resources_on_drop)
+            }
+            Self::Int(_) |
+            Self::Real(_) |
+            Self::Bool(_) |
+            Self::Bytes(_) |
+            Self::TypedBlob(_) |
+            Self::LazyArtifact { .. } |
+            Self::LazyArtifactFamily { .. } |
+            Self::StagedArtifact { .. } |
+            Self::StagedArtifactFamily { .. } => false,
         }
     }
 }

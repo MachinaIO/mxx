@@ -75,10 +75,12 @@ unsafe extern "C" {
         moduli_len: usize,
         gpu_ids: *const c_int,
         gpu_ids_len: usize,
+        stream_pool_size: usize,
         out_ctx: *mut *mut GpuContextOpaque,
     ) -> c_int;
     fn gpu_context_destroy(ctx: *mut GpuContextOpaque);
     fn gpu_context_get_N(ctx: *const GpuContextOpaque, out_n: *mut c_int) -> c_int;
+    fn gpu_context_fence_releases(ctx: *const GpuContextOpaque) -> c_int;
 
     pub(crate) fn gpu_event_set_wait(events: *mut GpuEventSetOpaque) -> c_int;
     pub(crate) fn gpu_event_set_destroy(events: *mut GpuEventSetOpaque);
@@ -92,7 +94,13 @@ unsafe extern "C" {
         out_mat: *mut *mut GpuMatrixOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_destroy(mat: *mut GpuMatrixOpaque);
+    pub(crate) fn gpu_matrix_wait(mat: *const GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_copy(dst: *mut GpuMatrixOpaque, src: *const GpuMatrixOpaque) -> c_int;
+    pub(crate) fn gpu_matrix_copy_peer(
+        dst: *mut GpuMatrixOpaque,
+        src: *const GpuMatrixOpaque,
+        out_copied: *mut c_int,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_load_rns_batch(
         mat: *mut GpuMatrixOpaque,
         bytes: *const u8,
@@ -120,6 +128,22 @@ unsafe extern "C" {
         out_max_coeff_bits: *mut u16,
         out_bytes_per_coeff: *mut u16,
         out_payload_len: *mut usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_store_compact_bytes_batch(
+        matrices: *const *mut GpuMatrixOpaque,
+        matrix_count: usize,
+        payload_outputs: *const *mut u8,
+        payload_capacities: *const usize,
+        out_max_coeff_bits: *mut u16,
+        out_bytes_per_coeff: *mut u16,
+        out_payload_lengths: *mut usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_batch_within_coefficient_bound(
+        matrices: *const *const GpuMatrixOpaque,
+        matrix_count: usize,
+        bound_words: *const u64,
+        bound_word_count: usize,
+        accepted_out: *mut u8,
     ) -> c_int;
     pub(crate) fn gpu_matrix_load_compact_bytes(
         mat: *mut GpuMatrixOpaque,
@@ -161,6 +185,30 @@ unsafe extern "C" {
         out: *mut GpuMatrixOpaque,
         lhs: *const GpuMatrixOpaque,
         scalar: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_binary_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        left: *const *const GpuMatrixOpaque,
+        right: *const *const GpuMatrixOpaque,
+        matrix_count: usize,
+        operation: c_int,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_negate_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        inputs: *const *const GpuMatrixOpaque,
+        matrix_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_mul_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        left: *const *const GpuMatrixOpaque,
+        right: *const *const GpuMatrixOpaque,
+        matrix_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_mul_scalar_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        matrices: *const *const GpuMatrixOpaque,
+        scalars: *const *const GpuMatrixOpaque,
+        matrix_count: usize,
     ) -> c_int;
     pub(crate) fn gpu_matrix_crt_recompose(
         out: *mut GpuMatrixOpaque,
@@ -244,21 +292,38 @@ unsafe extern "C" {
         out: *mut GpuMatrixOpaque,
         dist_type: c_int,
         sigma: f64,
+        max_coefficient_bound: u64,
+        coefficient_modulus: u64,
         seed: GpuRngSeed,
     ) -> c_int;
     pub(crate) fn gpu_matrix_sample_distribution_columns(
         out: *mut GpuMatrixOpaque,
         dist_type: c_int,
         sigma: f64,
+        max_coefficient_bound: u64,
+        coefficient_modulus: u64,
         seed: GpuRngSeed,
         full_ncol: usize,
         col_offset: usize,
     ) -> c_int;
     pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque) -> c_int;
+    pub(crate) fn gpu_matrix_intt_batch(
+        matrices: *const *mut GpuMatrixOpaque,
+        matrix_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_intt_out_of_place_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        inputs: *const *const GpuMatrixOpaque,
+        matrix_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_ntt_batch(
+        matrices: *const *mut GpuMatrixOpaque,
+        matrix_count: usize,
+    ) -> c_int;
     fn gpu_device_synchronize() -> c_int;
     fn gpu_device_count(out_count: *mut c_int) -> c_int;
-    // fn gpu_device_mem_info(device: c_int, out_free: *mut usize, out_total: *mut usize) -> c_int;
+    fn gpu_device_mem_info(device: c_int, out_free: *mut usize, out_total: *mut usize) -> c_int;
 
     fn gpu_last_error() -> *const c_char;
 
@@ -295,38 +360,22 @@ pub fn gpu_device_sync() {
     check_status(status, "gpu_device_synchronize");
 }
 
-// #[derive(Clone, Copy, Debug)]
-// pub(crate) struct GpuMemoryInfo {
-//     pub device: c_int,
-//     pub free: usize,
-//     pub total: usize,
-// }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMemoryInfo {
+    pub free: usize,
+    pub total: usize,
+}
 
-// pub(crate) fn gpu_memory_infos() -> Result<Vec<GpuMemoryInfo>, String> {
-//     let mut count: c_int = 0;
-//     let status = unsafe { gpu_device_count(&mut count) };
-//     if status != 0 {
-//         return Err(last_error_string());
-//     }
-//     if count < 0 {
-//         return Err("invalid GPU device count".to_string());
-//     }
-//     if count == 0 {
-//         return Ok(Vec::new());
-//     }
-
-//     let mut infos = Vec::with_capacity(count as usize);
-//     for device in 0..count {
-//         let mut free: usize = 0;
-//         let mut total: usize = 0;
-//         let status = unsafe { gpu_device_mem_info(device, &mut free, &mut total) };
-//         if status != 0 {
-//             return Err(last_error_string());
-//         }
-//         infos.push(GpuMemoryInfo { device, free, total });
-//     }
-//     Ok(infos)
-// }
+/// Returns the CUDA allocator-visible memory counters for one detected device.
+pub fn gpu_memory_info(device: i32) -> Result<GpuMemoryInfo, String> {
+    let mut free = 0;
+    let mut total = 0;
+    let status = unsafe { gpu_device_mem_info(device, &mut free, &mut total) };
+    if status != 0 {
+        return Err(last_error_string());
+    }
+    Ok(GpuMemoryInfo { free, total })
+}
 
 fn available_gpu_ids() -> Vec<i32> {
     let mut count: c_int = 0;
@@ -381,20 +430,25 @@ impl<T> PinnedHostBuffer<T> {
         }
     }
 
-    // pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
-    //     if self.len == 0 {
-    //         &mut []
-    //     } else {
-    //         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    //     }
-    // }
-
-    // pub(crate) fn len(&self) -> usize {
-    //     self.len
-    // }
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.len == 0 {
+            &mut []
+        } else {
+            unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+    }
 }
 
 impl<T: Copy> PinnedHostBuffer<T> {
+    pub(crate) fn zeroed(len: usize) -> Self {
+        if len == 0 {
+            return Self::new();
+        }
+        let ptr = pinned_alloc::<T>(len);
+        unsafe { ptr::write_bytes(ptr.as_ptr(), 0, len) };
+        Self { ptr, len, cap: len }
+    }
+
     pub(crate) fn from_slice(slice: &[T]) -> Self {
         if slice.is_empty() {
             return Self::new();
@@ -405,10 +459,12 @@ impl<T: Copy> PinnedHostBuffer<T> {
         }
         Self { ptr, len: slice.len(), cap: slice.len() }
     }
+}
 
-    // pub(crate) fn to_vec(&self) -> Vec<T> {
-    //     self.as_slice().to_vec()
-    // }
+impl<T: Debug> Debug for PinnedHostBuffer<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_slice().fmt(formatter)
+    }
 }
 
 impl<T: Copy> Clone for PinnedHostBuffer<T> {
@@ -554,6 +610,10 @@ impl PolyParams for GpuDCRTPolyParams {
             dnum: 1,
             ctx,
         }
+    }
+
+    fn fence_released_memory(&self) {
+        self.ctx.fence_released_memory();
     }
 }
 
@@ -704,6 +764,7 @@ impl GpuContext {
                 moduli.len(),
                 gpu_ids_ptr,
                 gpu_ids_len,
+                crate::env::cuda_stream_pool_size(),
                 &mut ctx_ptr as *mut *mut GpuContextOpaque,
             )
         };
@@ -719,6 +780,12 @@ impl GpuContext {
 
     pub(crate) fn raw_ptr(&self) -> *mut GpuContextOpaque {
         self.raw
+    }
+
+    /// Waits only for releases queued on this context's release streams.
+    pub fn fence_released_memory(&self) {
+        let status = unsafe { gpu_context_fence_releases(self.raw) };
+        check_status(status, "gpu_context_fence_releases");
     }
 }
 
@@ -1440,7 +1507,8 @@ mod tests {
             "Reconstructed polynomial does not match original (FinRingDist)"
         );
 
-        let original_cpu_poly = sampler.sample_poly(&params, &DistType::GaussDist { sigma: 3.2 });
+        let original_cpu_poly = sampler
+            .sample_poly(&params, &DistType::GaussDist { sigma: 3.2, max_coefficient_bound: None });
         let original_poly = gpu_poly_from_cpu(&original_cpu_poly, &gpu_params);
         let bytes = original_poly.to_compact_bytes();
         let reconstructed_poly = GpuDCRTPoly::from_compact_bytes(&gpu_params, &bytes);

@@ -1,3 +1,15 @@
+//! Lane-packed nested-RNS arithmetic.
+//!
+//! Every p-residue wire uses coefficient-major physical slots
+//! `slot(coefficient, q_level) = coefficient * q_moduli_depth + q_level`. Arithmetic and LUT
+//! helpers preserve q-level lanes; only reconstruction and modulus-basis conversion aggregate or
+//! move lanes. Inactive lanes are exact zero.
+//!
+//! Per-lane constants, masks, full reduction, and non-rotation slot transfers are represented as
+//! identity slot-transfer gates. Under BGG lowering these require slot-transfer preprocessing
+//! artifacts. Reconstruction adds one explicit transfer per active q-level, and convolution adds
+//! compact `RepeatedLanes` transfers; coefficient rotations remain artifact-free rotations.
+
 #[cfg(feature = "gpu")]
 mod gpu;
 
@@ -8,14 +20,14 @@ mod poly;
 
 use crate::{
     circuit::{
-        BatchedWire, PolyCircuit, PublicLut, SubCircuitParamSpec, SubCircuitParamValue,
-        gate::GateId,
+        BatchedWire, LutExpr, PolyCircuit, PublicLutProgram, SubCircuitInputMaxPlaintextNormRange,
+        SubCircuitParamSpec, SubCircuitParamValue, gate::GateId,
     },
     circuit_gadgets::conv_mul::{
         negacyclic_conv_mul_right_decomposed_term_many_subcircuit, negacyclic_conv_mul_right_sparse,
     },
     poly::{Poly, PolyParams},
-    utils::{mod_inverse, round_div},
+    utils::mod_inverse,
 };
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
@@ -27,7 +39,7 @@ use encoding::sample_crt_primes;
 pub use encoding::{
     encode_nested_rns_poly, encode_nested_rns_poly_compact_bytes,
     encode_nested_rns_poly_compact_bytes_with_offset, encode_nested_rns_poly_with_offset,
-    nested_rns_gadget_decomposed, nested_rns_gadget_vector,
+    minimum_p_moduli_bits, nested_rns_gadget_decomposed, nested_rns_gadget_vector,
 };
 
 pub const DEFAULT_MAX_UNREDUCED_MULS: usize = 2;
@@ -56,10 +68,6 @@ pub struct NestedRnsPolyContext {
     lazy_reduce_id: usize,
     decomposition_terms_id: usize,
     gadget_decompose_id: usize,
-    full_reduce_id: usize,
-    full_reduce_bindings: Vec<Vec<SubCircuitParamValue>>,
-    mul_lazy_reduce_id: usize,
-    mul_right_sparse_id: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,23 +81,52 @@ struct NestedRnsRegisteredSubcircuitIds {
     lazy_reduce_id: usize,
     decomposition_terms_id: usize,
     gadget_decompose_id: usize,
-    full_reduce_id: usize,
-    mul_lazy_reduce_id: usize,
-    mul_right_sparse_id: usize,
 }
 
 #[derive(Debug, Clone)]
 /// Circuit-level nested-RNS polynomial representation.
 ///
-/// `inner` stores one batched p-residue vector per active q-level. `max_plaintexts` and
-/// `p_max_traces` are conservative metadata carried alongside the wires so later helpers know when
-/// a lazy reduce or full reduce is required without changing the arithmetic semantics.
+/// `inner` stores the p-residue wires once. Each wire uses coefficient-major slots
+/// `slot(c, level) = c * q_moduli_depth + level`; inactive q-level lanes are exact zero.
+/// `max_plaintexts` and `p_max_traces` remain active-window-local metadata.
 pub struct NestedRnsPoly<P: Poly> {
     pub ctx: Arc<NestedRnsPolyContext>,
-    pub inner: Vec<BatchedWire>,
+    pub inner: BatchedWire,
+    pub num_coefficient_slots: usize,
     pub level_offset: usize,
     pub enable_levels: Option<usize>,
     pub max_plaintexts: Vec<BigUint>,
     pub(crate) p_max_traces: Vec<BigUint>,
     _p: PhantomData<P>,
+}
+
+/// Reconstruction output whose authoritative values live only at q1 anchors.
+///
+/// For a coefficient-major packed value with `D` q-level lanes, coefficient `c`
+/// is available exclusively at physical slot `c * D`.  The other lanes are an
+/// implementation byproduct of the cyclic rotations and must not be consumed as
+/// reconstructed coefficients.  This deliberately differs from
+/// [`NestedRnsPoly::reconstruct`], which produces a value valid in every lane.
+#[derive(Debug, Clone, Copy)]
+pub struct Q1AnchorReconstruction {
+    anchor_wire: GateId,
+    coefficient_slots: usize,
+    q_moduli_depth: usize,
+}
+
+impl Q1AnchorReconstruction {
+    /// Returns the circuit wire carrying the anchor-only reconstruction.
+    pub fn anchor_wire(self) -> GateId {
+        self.anchor_wire
+    }
+
+    /// Returns the sole authoritative physical slot for coefficient `coefficient`.
+    pub fn anchor_slot(self, coefficient: usize) -> usize {
+        assert!(
+            coefficient < self.coefficient_slots,
+            "q1 anchor coefficient index {coefficient} exceeds {} slots",
+            self.coefficient_slots
+        );
+        coefficient * self.q_moduli_depth
+    }
 }

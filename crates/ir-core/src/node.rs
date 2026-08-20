@@ -3,7 +3,7 @@ use crate::{
     expr::{IntExpr, RealExpr},
     types::WireType,
 };
-use num_bigint::BigInt;
+use num_bigint::{BigInt, BigUint};
 use serde::{Deserialize, Serialize};
 
 /// Executable operation represented by a declarative graph node.
@@ -54,17 +54,22 @@ pub enum NodeKind {
     Concat {
         axis: ConcatAxis,
     },
-    Reshape {
-        rows: IntExpr,
-        columns: IntExpr,
+    /// Samples every coefficient uniformly from the full residue ring `R_q`.
+    ///
+    /// The modulus belongs to `matrix_type`, so this operation remains meaningful
+    /// before a concrete parameter environment is selected.
+    UniformResidueSample {
+        matrix_type: crate::types::MatrixType,
     },
-    UniformSample {
+    /// Samples every coefficient from an explicit integer interval.
+    UniformIntervalSample {
         matrix_type: crate::types::MatrixType,
         range: SampleRange,
     },
     GaussianSample {
         matrix_type: crate::types::MatrixType,
         sigma: RealExpr,
+        max_coefficient_bound: IntExpr,
     },
     HashSample {
         matrix_type: crate::types::MatrixType,
@@ -85,21 +90,25 @@ pub enum NodeKind {
         sigma: RealExpr,
         gadget_base: IntExpr,
         digit_count: IntExpr,
+        preimage_max_coefficient_bound: IntExpr,
     },
     PreimageSample {
         matrix_type: crate::types::MatrixType,
+        max_coefficient_bound: IntExpr,
     },
     GadgetDecompose {
         base: IntExpr,
         small: bool,
-        #[serde(default)]
-        digit_count: Option<IntExpr>,
+        digit_count: IntExpr,
     },
     ExtractCoefficient {
         position: IntExpr,
+        /// Compile-time-only exclusive upper bound for a canonical input.
+        canonical_input_exclusive_upper: Option<BigUint>,
     },
-    ConstantCoefficient {
-        position: IntExpr,
+    /// Lifts an integer into the constant coefficient of a scalar polynomial.
+    LiftIntegerToConstantPolynomial {
+        matrix_type: crate::types::MatrixType,
     },
     ThresholdDecode {
         plaintext_modulus: IntExpr,
@@ -120,6 +129,7 @@ pub enum NodeKind {
     },
     SubgraphCall(SubgraphCall),
     ParallelLoop(ParallelLoop),
+    SequentialLoop(SequentialLoop),
     FamilyPack {
         count: IntExpr,
     },
@@ -213,6 +223,14 @@ pub enum HashVariant {
 pub struct SubgraphCall {
     pub definition: String,
     pub bindings: Vec<(String, IntExpr)>,
+    /// Per-argument canonical coefficient exclusive upper bounds.
+    ///
+    /// A `Some(U)` states that the corresponding argument is a constant
+    /// polynomial whose canonical coefficient is in `0..U`.  It is an
+    /// authoritative producer contract, rather than a value observed while
+    /// executing the graph.  Every call argument, including synthetic
+    /// constants, has one entry; an argument without this contract is `None`.
+    pub canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -223,6 +241,19 @@ pub struct ParallelLoop {
     pub index_slot: u32,
     pub bindings: Vec<(String, IntExpr)>,
     pub input_modes: Vec<LoopInputMode>,
+}
+
+/// A structural loop whose body consumes and returns a carried state.
+///
+/// Arguments are ordered as the initial carried values followed by loop-invariant values. The
+/// body receives values in the same order and returns exactly `carried_count` values. Iteration
+/// outputs replace the carried inputs for the next iteration; the node exposes the final state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SequentialLoop {
+    pub count: IntExpr,
+    pub index_slot: u32,
+    pub bindings: Vec<(String, IntExpr)>,
+    pub carried_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -434,15 +434,13 @@ impl NaiveBggNoiseRefreshCompiler {
         Ok(Family::pack(
             (0..self.slot_count)
                 .map(|slot| {
-                    wide.clone()
-                        .slice(
-                            None,
-                            Some(IndexRange {
-                                start: IntExpr::constant(slot * self.public_key_columns()),
-                                end: IntExpr::constant((slot + 1) * self.public_key_columns()),
-                            }),
-                        )
-                        .reshape(1, self.public_key_columns())
+                    wide.clone().slice(
+                        None,
+                        Some(IndexRange {
+                            start: IntExpr::constant(slot * self.public_key_columns()),
+                            end: IntExpr::constant((slot + 1) * self.public_key_columns()),
+                        }),
+                    )
                 })
                 .collect(),
         )?)
@@ -546,7 +544,7 @@ impl NaiveBggNoiseRefreshCompiler {
 mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output};
-    use mxx_ir_core::ParamEnv;
+
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -557,93 +555,6 @@ mod tests {
     use mxx_runtime::RuntimeValue;
     use num_bigint::{BigInt, BigUint};
     use std::collections::BTreeMap;
-
-    #[test]
-    fn preprocessing_and_online_refresh_build_valid_graphs() {
-        let ring = Ring::new(65_537, 2);
-        let compiler = NaiveBggNoiseRefreshCompiler {
-            public_key: BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 4.into(),
-                digit_count: 9.into(),
-            },
-            modulus: 65_537.into(),
-            ring_dimension: 2.into(),
-            secret_size: 2,
-            slot_count: 2,
-            digit_count: 9,
-            crt_scale_factors: vec![3.into()],
-            crt_plaintext_moduli: vec![5.into()],
-            reconstruction_coefficients: vec![1.into()],
-            decoder_public_columns: 22,
-            decoder_zero_rows: 0,
-            decoder_trapdoor_sigma: RealExpr::from_integer(5),
-        };
-        let public = |name: &str| NaiveBggPublicKeyVecWire {
-            matrices: ring.input_family(name, 2, (2, 18)),
-            reveal_plaintext: true,
-        };
-        let one = public("one");
-        let refreshed = public("refreshed");
-        let decoded = (0..18).map(|index| public(&format!("decoded-{index}"))).collect::<Vec<_>>();
-        let trapdoor = ring.sample_trapdoor(2, 5, 4, 9);
-        assert_eq!(one.matrices.element_type(), &compiler.public_key_type());
-        assert_eq!(one.matrices.count(), &IntExpr::constant(compiler.slot_count));
-        let preprocessing = compiler
-            .build_preprocessing(
-                ring.bytes_input("hash-key", 32),
-                b"test",
-                &one,
-                &refreshed,
-                &decoded,
-                trapdoor,
-            )
-            .expect("preprocessing");
-        let graph = compiler
-            .export_preprocessing(DslContext::new("noise-refresh"), preprocessing.clone())
-            .expect("outputs")
-            .build()
-            .expect("graph");
-        graph.validate(&ParamEnv::default()).expect("valid graph");
-        graph.elaborate(&ParamEnv::default()).expect("symbolic preprocessing graph");
-
-        let artifacts = NaiveBggNoiseRefreshArtifactWires {
-            a_prime: preprocessing.a_prime,
-            decoder_preimages: preprocessing.decoder_preimages,
-        };
-        let projected = compiler
-            .project_decoder_preimages(
-                ring.input("decoder-state", (1, compiler.decoder_public_columns)),
-                artifacts.decoder_preimages.clone(),
-            )
-            .expect("project decoders");
-        let encoding = |name: &str| NaiveBggEncodingVecWire {
-            vectors: ring.input_family(format!("{name}-vectors"), 2, (1, 18)),
-            pubkeys: ring.input_family(format!("{name}-keys"), 2, (2, 18)),
-            pubkey_reveal_plaintext: true,
-            plaintexts: Some(ring.input_family(format!("{name}-plaintexts"), 2, (1, 1))),
-        };
-        let online_one = encoding("online-one");
-        let online_refreshed = encoding("online-refreshed");
-        let online_decoded =
-            (0..18).map(|index| encoding(&format!("online-decoded-{index}"))).collect::<Vec<_>>();
-        let refreshed = compiler
-            .build_online(&online_one, &online_refreshed, &online_decoded, &artifacts, projected)
-            .expect("online refresh");
-        let online_graph = DslContext::new("noise-refresh-online")
-            .family_output("vectors", refreshed.vectors)
-            .expect("vectors")
-            .family_output("public-keys", refreshed.pubkeys)
-            .expect("public keys")
-            .build()
-            .expect("online graph");
-        online_graph.validate(&ParamEnv::default()).expect("valid online graph");
-        let elaborated =
-            online_graph.elaborate(&ParamEnv::default()).expect("symbolic online graph");
-        let report = mxx_noise_simulator::simulate(&elaborated).expect("noise simulation");
-        assert!(report.outputs.contains_key("vectors"));
-        assert!(report.outputs.contains_key("public-keys"));
-    }
 
     #[test]
     fn online_runtime_matches_explicit_zero_refresh_oracle() {

@@ -1,8 +1,12 @@
 //! Declarative BGG+ encoding graph values.
 
 use crate::{BggPublicKeyCompiler, BggPublicKeyType, BggPublicKeyWire};
-use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Pending};
-use mxx_ir_core::{ValueHandle, WireType};
+use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Pending, Ring};
+use mxx_ir_core::{
+    IntExpr, RealExpr, ValueHandle, WireType,
+    node::{ConcatAxis, IndexRange},
+};
+use rayon::prelude::*;
 use thiserror::Error;
 
 #[derive(Clone)]
@@ -189,19 +193,181 @@ fn binary_plaintext(
     lhs.plaintext.clone().zip(rhs.plaintext.clone()).map(|(lhs, rhs)| operation(lhs, rhs))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BggSamplerLayout {
+    pub modulus: IntExpr,
+    pub ring_dimension: IntExpr,
+    pub secret_dimension: usize,
+    pub digit_count: usize,
+    pub gadget_base: IntExpr,
+}
+
+impl BggSamplerLayout {
+    pub fn ring(&self) -> Ring {
+        Ring::new(self.modulus.clone(), self.ring_dimension.clone())
+    }
+
+    pub fn public_key_columns(&self) -> usize {
+        self.secret_dimension
+            .checked_mul(self.digit_count)
+            .expect("BGG+ public-key column count overflow")
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum BggSampleError {
+    #[error("BGG+ sampling requires public_keys.len() == plaintexts.len() + 1")]
+    InputCountMismatch,
+    #[error("BGG+ sampler received an incompatible matrix type")]
+    MatrixTypeMismatch,
+    #[error("BGG+ sampler families must have matching slot counts")]
+    SlotCountMismatch,
+    #[error("BGG+ Gaussian sampling requires both a sigma and an explicit coefficient cutoff")]
+    MissingGaussianBound,
+    #[error(transparent)]
+    Dsl(#[from] mxx_dsl::DslError),
+}
+
+#[derive(Clone)]
+pub struct BggEncodingSampler {
+    pub layout: BggSamplerLayout,
+    pub gaussian_sigma: Option<RealExpr>,
+    pub gaussian_max_coefficient_bound: Option<IntExpr>,
+}
+
+impl BggEncodingSampler {
+    /// Builds the packed relation `sA - ([1|x_1|...|x_t] tensor sG) + e`, then
+    /// exposes its column slices. This preserves the executable dataflow of the
+    /// original sampler; the symbolic layer represents Concat and Tensor
+    /// directly without changing the runtime formula.
+    pub fn sample(
+        &self,
+        secret: Mat,
+        public_keys: &[BggPublicKeyWire],
+        plaintexts: &[Mat],
+    ) -> Result<Vec<BggEncodingWire>, BggSampleError> {
+        if public_keys.len() != plaintexts.len() + 1 {
+            return Err(BggSampleError::InputCountMismatch);
+        }
+        let count = public_keys.len();
+        let columns = self.layout.public_key_columns();
+        let ring = self.layout.ring();
+        let secret_type = ring.matrix_type((1, self.layout.secret_dimension));
+        let public_key_type = ring.matrix_type((self.layout.secret_dimension, columns));
+        let plaintext_type = ring.matrix_type((1, 1));
+        if !same_matrix_type(secret.matrix_type(), &secret_type) ||
+            public_keys
+                .par_iter()
+                .any(|key| !same_matrix_type(key.matrix.matrix_type(), &public_key_type)) ||
+            plaintexts
+                .par_iter()
+                .any(|plaintext| !same_matrix_type(plaintext.matrix_type(), &plaintext_type))
+        {
+            return Err(BggSampleError::MatrixTypeMismatch);
+        }
+        let all_public_keys = Mat::concat(
+            ConcatAxis::Columns,
+            public_keys.iter().map(|key| key.matrix.clone()).collect(),
+        );
+        let one = ring.identity(1);
+        let mut extended_plaintexts = Vec::with_capacity(count);
+        extended_plaintexts.push(one);
+        extended_plaintexts.extend(plaintexts.iter().cloned());
+        let encoded_plaintexts = Mat::concat(ConcatAxis::Columns, extended_plaintexts.clone());
+        let gadget = ring.gadget(
+            self.layout.secret_dimension,
+            self.layout.gadget_base.clone(),
+            self.layout.digit_count,
+        );
+        let packed_vector = secret.clone() * all_public_keys -
+            encoded_plaintexts.tensor(secret.clone() * gadget) +
+            match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
+                (Some(sigma), Some(bound)) => {
+                    ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
+                }
+                (None, None) => ring.zero((1, columns * count)),
+                _ => return Err(BggSampleError::MissingGaussianBound),
+            };
+        Ok((0..count)
+            .map(|index| BggEncodingWire {
+                vector: packed_vector.clone().slice(
+                    None,
+                    Some(IndexRange {
+                        start: (columns * index).into(),
+                        end: (columns * (index + 1)).into(),
+                    }),
+                ),
+                pubkey: public_keys[index].clone(),
+                plaintext: public_keys[index]
+                    .reveal_plaintext
+                    .then(|| extended_plaintexts[index].clone()),
+            })
+            .collect())
+    }
+}
+
+pub(crate) fn same_matrix_type(
+    lhs: &mxx_ir_core::types::MatrixType,
+    rhs: &mxx_ir_core::types::MatrixType,
+) -> bool {
+    lhs.modulus.canonicalize() == rhs.modulus.canonicalize() &&
+        lhs.ring_dimension.canonicalize() == rhs.ring_dimension.canonicalize() &&
+        lhs.rows.canonicalize() == rhs.rows.canonicalize() &&
+        lhs.columns.canonicalize() == rhs.columns.canonicalize()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{execute_graph, matrix_output, row};
+    use crate::{
+        BggPublicKeySampler,
+        test_utils::{execute_graph, matrix_output, row},
+    };
     use mxx_dsl::{DslContext, Ring, Subgraph};
-    use mxx_ir_core::{ParamEnv, node::NodeKind};
+    use mxx_ir_core::{
+        ParamEnv,
+        node::{ConcatAxis, NodeKind},
+    };
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{PolyParams, dcrt::params::DCRTPolyParams},
+        poly::{
+            Poly, PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+        sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
     use mxx_runtime::RuntimeValue;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
+
+    fn concrete_layout(parameters: &DCRTPolyParams, secret_dimension: usize) -> BggSamplerLayout {
+        BggSamplerLayout {
+            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
+            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+            secret_dimension,
+            digit_count: parameters.modulus_digits(),
+            gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
+        }
+    }
+    fn scalar(parameters: &DCRTPolyParams, rotation: usize) -> DCRTPolyMatrix {
+        DCRTPolyMatrix::from_poly_vec(
+            parameters,
+            vec![vec![DCRTPoly::const_rotate_poly(parameters, rotation)]],
+        )
+    }
+    fn secret(parameters: &DCRTPolyParams, dimension: usize) -> DCRTPolyMatrix {
+        DCRTPolyMatrix::from_poly_vec_row(
+            parameters,
+            (0..dimension)
+                .map(|index| {
+                    DCRTPoly::const_rotate_poly(
+                        parameters,
+                        index % parameters.ring_dimension() as usize,
+                    )
+                })
+                .collect(),
+        )
+    }
 
     #[test]
     fn repeated_bgg_encoding_schema_defines_a_subgraph() {
@@ -303,11 +469,7 @@ mod tests {
         );
         assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixBinary(_))));
 
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
-        let vector = elaborated.wire(&elaborated.outputs["vector"]).expect("vector output");
-        assert!(
-            elaborated.expressions.get(vector.expression.expect("vector expression")).is_some()
-        );
+        built.validate(&ParamEnv::default()).expect("valid executable graph");
     }
 
     #[test]
@@ -375,5 +537,145 @@ mod tests {
         assert_eq!(matrix_output(&result, "vector"), &expected_vector);
         assert_eq!(matrix_output(&result, "public"), &lhs_public.mul_decompose(&rhs_public));
         assert_eq!(matrix_output(&result, "plaintext"), &(lhs_plaintext * rhs_plaintext));
+    }
+    #[test]
+    fn bgg_sampling_builds_a_packed_executable_graph() {
+        let layout = BggSamplerLayout {
+            modulus: 257.into(),
+            ring_dimension: 8.into(),
+            secret_dimension: 2,
+            digit_count: 4,
+            gadget_base: 4.into(),
+        };
+        let ring = layout.ring();
+        let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
+            ring.bytes_input("hash-key", 32),
+            b"bgg-test".to_vec(),
+            &[true],
+        );
+        let encodings = BggEncodingSampler {
+            layout,
+            gaussian_sigma: Some(3.into()),
+            gaussian_max_coefficient_bound: Some(19.into()),
+        }
+        .sample(ring.input("secret", (1, 2)), &public_keys, &[ring.input("plaintext", (1, 1))])
+        .expect("compatible sampler inputs");
+        let built = DslContext::new("bgg-sampling")
+            .private_output("constant", encodings[0].vector.clone())
+            .expect("constant output")
+            .private_output("message", encodings[1].vector.clone())
+            .expect("message output")
+            .build()
+            .expect("build");
+        let concat_count = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind(), NodeKind::Concat { axis: ConcatAxis::Columns }))
+            .count();
+        let tensor_count = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind(), NodeKind::Tensor))
+            .count();
+        let gaussian_types = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                NodeKind::GaussianSample { matrix_type, .. } => Some(matrix_type),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(concat_count, 2, "packed public keys and packed plaintext row");
+        assert_eq!(tensor_count, 1, "one packed plaintext/secret-gadget tensor");
+        assert_eq!(gaussian_types.len(), 1, "one packed error sample");
+        assert_eq!(gaussian_types[0].columns.canonicalize(), IntExpr::constant(16));
+        built.validate(&ParamEnv::default()).expect("valid executable graph");
+    }
+    #[test]
+    fn runtime_public_keys_and_encodings_match_the_bgg_sampling_formula() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let layout = concrete_layout(&parameters, 2);
+        let key = [23u8; 32];
+        let tag = b"bgg-ir-sampler";
+        let ring = layout.ring();
+        let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
+            ring.bytes_input("key", key.len()),
+            tag.to_vec(),
+            &[false, true],
+        );
+        let encodings = BggEncodingSampler {
+            layout: layout.clone(),
+            gaussian_sigma: None,
+            gaussian_max_coefficient_bound: None,
+        }
+        .sample(
+            ring.input("secret", (1, layout.secret_dimension)),
+            &public_keys,
+            &[ring.input("plaintext-0", (1, 1)), ring.input("plaintext-1", (1, 1))],
+        )
+        .unwrap();
+        let mut context = DslContext::new("bgg-sampler-runtime");
+        for index in 0..public_keys.len() {
+            context = context
+                .output(format!("public-{index}"), public_keys[index].matrix.clone())
+                .unwrap()
+                .output(format!("vector-{index}"), encodings[index].vector.clone())
+                .unwrap();
+        }
+        let graph = context.build().unwrap();
+
+        let secret_value = secret(&parameters, layout.secret_dimension);
+        let plaintext_values = [scalar(&parameters, 2), scalar(&parameters, 3)];
+        let result = execute_graph(
+            graph,
+            parameters.clone(),
+            BTreeMap::from([
+                ("key".to_owned(), RuntimeValue::Bytes(key.to_vec())),
+                ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
+                ("plaintext-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
+                ("plaintext-1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
+            ]),
+        );
+
+        let packed = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
+            &parameters,
+            key,
+            tag,
+            layout.secret_dimension,
+            layout.public_key_columns() * public_keys.len(),
+            DistType::FinRingDist,
+        );
+        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
+        let encoded_plaintexts = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![
+                DCRTPoly::const_one(&parameters),
+                plaintext_values[0].entry(0, 0),
+                plaintext_values[1].entry(0, 0),
+            ],
+        );
+        let vectors = secret_value.clone() * packed.clone() -
+            encoded_plaintexts.tensor(&(secret_value * gadget));
+        for index in 0..public_keys.len() {
+            let start = layout.public_key_columns() * index;
+            let end = layout.public_key_columns() * (index + 1);
+            assert_eq!(
+                matrix_output(&result, &format!("public-{index}")),
+                &packed.slice_columns(start, end)
+            );
+            assert_eq!(
+                matrix_output(&result, &format!("vector-{index}")),
+                &vectors.slice_columns(start, end)
+            );
+        }
+        assert!(encodings[0].plaintext.is_some());
+        assert!(encodings[1].plaintext.is_none());
+        assert!(encodings[2].plaintext.is_some());
     }
 }

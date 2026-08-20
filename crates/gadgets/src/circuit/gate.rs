@@ -52,8 +52,23 @@ pub enum SubCircuitParamKind {
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlotTransferSpec {
     Explicit(Vec<(u32, Option<u32>)>),
-    Rotation { diagonal: u32, num_slots: u32 },
-    Repeated { src_slot: u32, num_slots: u32, prefix_len: u32, prefix_scalar: Option<u32> },
+    Rotation {
+        diagonal: u32,
+        num_slots: u32,
+    },
+    Repeated {
+        src_slot: u32,
+        num_slots: u32,
+        prefix_len: u32,
+        prefix_scalar: Option<u32>,
+    },
+    RepeatedLanes {
+        src_block: u32,
+        num_blocks: u32,
+        lanes: u32,
+        prefix_blocks: u32,
+        prefix_scalar: Option<u32>,
+    },
 }
 
 impl SlotTransferSpec {
@@ -78,6 +93,28 @@ impl SlotTransferSpec {
             src_slot: u32::try_from(src_slot).expect("repeated source slot must fit in u32"),
             num_slots: u32::try_from(num_slots).expect("repeated slot count must fit in u32"),
             prefix_len: u32::try_from(prefix_len).expect("repeated prefix length must fit in u32"),
+            prefix_scalar,
+        }
+    }
+
+    pub fn repeated_lanes(
+        src_block: usize,
+        num_blocks: usize,
+        lanes: usize,
+        prefix_blocks: usize,
+        prefix_scalar: Option<u32>,
+    ) -> Self {
+        assert!(lanes > 0, "repeated-lanes lane count must be positive");
+        assert!(src_block < num_blocks, "repeated-lanes source block must exist");
+        assert!(prefix_blocks <= num_blocks, "repeated-lanes prefix exceeds block count");
+        Self::RepeatedLanes {
+            src_block: u32::try_from(src_block)
+                .expect("repeated-lanes source block must fit in u32"),
+            num_blocks: u32::try_from(num_blocks)
+                .expect("repeated-lanes block count must fit in u32"),
+            lanes: u32::try_from(lanes).expect("repeated-lanes lane count must fit in u32"),
+            prefix_blocks: u32::try_from(prefix_blocks)
+                .expect("repeated-lanes prefix block count must fit in u32"),
             prefix_scalar,
         }
     }
@@ -139,6 +176,36 @@ impl SlotTransferSpec {
                         .collect()
                 }
             }
+            Self::RepeatedLanes { src_block, num_blocks, lanes, prefix_blocks, prefix_scalar } => {
+                let num_blocks = usize::try_from(*num_blocks)
+                    .expect("repeated-lanes block count must fit in usize");
+                let lanes =
+                    usize::try_from(*lanes).expect("repeated-lanes lane count must fit in usize");
+                let src_block = usize::try_from(*src_block)
+                    .expect("repeated-lanes source block must fit in usize");
+                let prefix_blocks = usize::try_from(*prefix_blocks)
+                    .expect("repeated-lanes prefix block count must fit in usize");
+                let num_slots =
+                    num_blocks.checked_mul(lanes).expect("repeated-lanes slot count overflow");
+                let build = |dst_slot: usize| {
+                    let dst_block = dst_slot / lanes;
+                    let lane = dst_slot % lanes;
+                    let src_slot = src_block
+                        .checked_mul(lanes)
+                        .and_then(|base| base.checked_add(lane))
+                        .expect("repeated-lanes source slot overflow");
+                    (
+                        u32::try_from(src_slot)
+                            .expect("repeated-lanes source slot must fit in u32"),
+                        if dst_block < prefix_blocks { *prefix_scalar } else { None },
+                    )
+                };
+                if num_slots >= 1024 {
+                    (0..num_slots).into_par_iter().map(build).collect()
+                } else {
+                    (0..num_slots).map(build).collect()
+                }
+            }
         }
     }
 
@@ -155,7 +222,9 @@ impl SlotTransferSpec {
                 values.iter().map(|(_, scalar)| scalar.unwrap_or(1)).max().unwrap_or(1)
             }
             Self::Rotation { .. } => 1,
-            Self::Repeated { prefix_scalar, .. } => prefix_scalar.map_or(1, |scalar| scalar.max(1)),
+            Self::Repeated { prefix_scalar, .. } | Self::RepeatedLanes { prefix_scalar, .. } => {
+                prefix_scalar.map_or(1, |scalar| scalar.max(1))
+            }
         }
     }
 }

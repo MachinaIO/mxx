@@ -41,6 +41,9 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
     fn params_for_device(&self, _device_id: i32) -> Self {
         self.clone()
     }
+    /// Waits for releases queued on accelerator release streams.
+    /// CPU parameter types leave this as a no-op.
+    fn fence_released_memory(&self) {}
     /// Return CRT reconstruction coefficients for each CRT modulus.
     fn reconst_coeffs(&self) -> Vec<BigUint> {
         let (moduli, _, _) = self.to_crt();

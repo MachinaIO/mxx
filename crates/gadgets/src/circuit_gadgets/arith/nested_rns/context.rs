@@ -1,11 +1,7 @@
 use super::*;
 use crate::circuit_gadgets::arith::ModularArithmeticContext;
 
-/// Pack one q-level worth of p-residue wires into the repository's `BatchedWire` shape.
-///
-/// Both `NestedRnsPolyContext` and `NestedRnsPoly<P>` construct one batch per active q-level.
-/// Keeping the conversion here lets `poly.rs` import the exact same helper without reimplementing
-/// the batching rule.
+/// Pack the p-residue wires of one lane-packed nested-RNS value into a `BatchedWire`.
 pub(super) fn nested_rns_level_from_wires<I, W>(wires: I) -> BatchedWire
 where
     I: IntoIterator<Item = W>,
@@ -18,38 +14,9 @@ where
 ///
 /// `NestedRnsPolyContext::setup` allocates all helper LUTs and sub-circuits in one pass. This tiny
 /// LUT preserves the previous initialization flow without changing any call sites.
-fn dummy_lut<P: Poly + 'static>(params: &P::Params) -> PublicLut<P> {
-    PublicLut::new(
-        params,
-        1,
-        |params, x| {
-            if x != 0 {
-                return None;
-            }
-            let y_elem = P::from_usize_to_constant(params, 0)
-                .coeffs()
-                .into_iter()
-                .next()
-                .expect("constant-term coefficient must exist");
-            Some((0, y_elem))
-        },
-        None,
-    )
-}
-
-/// Convert one integer constant into the `(row_idx, coeff)` format expected by `PublicLut::new`.
-///
-/// Several setup-time LUT constructors start from a `BigUint` semantic value, then need the maximum
-/// coefficient row representation that the lookup API consumes.
-fn max_output_row_from_biguint<P: Poly>(
-    params: &P::Params,
-    idx: usize,
-    value: BigUint,
-) -> (u64, P::Elem) {
-    let poly = P::from_biguint_to_constant(params, value);
-    let coeff =
-        poly.coeffs().into_iter().max().expect("max_output_row requires at least one coefficient");
-    (u64::try_from(idx).expect("row index must fit in u64"), coeff)
+fn dummy_lut() -> PublicLutProgram {
+    PublicLutProgram::new(1, LutExpr::constant(0))
+        .expect("the constant-zero lookup program is valid")
 }
 
 // Conservative output bound for the integer represented by one q-level after full_reduce.
@@ -85,6 +52,18 @@ fn lut_mod_p_map_size(p_i: u64, max_p_modulus: u64, modulus_count: usize) -> u12
     (p_i as u128 * max_p_modulus as u128).max(p_i as u128 * (2 * modulus_count) as u128)
 }
 
+/// Every mod-p lookup receives wires governed by the context-wide trace invariant, not merely
+/// one canonical p_i residue. Therefore every physical table uses the same authoritative input
+/// coefficient domain. The expression remains parameter-generic and is exactly the capacity
+/// tracked by `lut_mod_p_max_map_size`.
+fn lut_mod_p_table_len(max_p_modulus: u64, modulus_count: usize) -> u128 {
+    lut_mod_p_map_size(max_p_modulus, max_p_modulus, modulus_count)
+}
+
+fn lookup_input_coefficient_fits(bound: &BigUint, table_len: &BigUint) -> bool {
+    bound < table_len
+}
+
 /// Precompute the gadget vector residues used by decomposition and reconstruction helpers.
 ///
 /// The returned rows are consumed by the encoding helpers in `encoding.rs` and by the full-reduce
@@ -111,78 +90,7 @@ fn precompute_nested_rns_gadget_values(
         .collect()
 }
 
-/// Flatten the per-level full-reduce scalar tables into sub-circuit parameter bindings.
-///
-/// `build_full_reduce_bindings` computes the raw `y` and `v` scalars in matrix form; this helper
-/// converts one q-level worth of those scalars into the exact binding order expected by the
-/// pre-registered full-reduce sub-circuit.
-fn full_reduce_param_bindings(
-    scalars_y: &[Vec<u32>],
-    scalars_v: &[u32],
-) -> Vec<SubCircuitParamValue> {
-    let (mut y_bindings, v_bindings) = rayon::join(
-        || {
-            scalars_y
-                .par_iter()
-                .flat_map_iter(|row| {
-                    row.iter().map(|scalar| SubCircuitParamValue::SmallScalarMul(vec![*scalar]))
-                })
-                .collect::<Vec<_>>()
-        },
-        || {
-            scalars_v
-                .par_iter()
-                .map(|scalar| SubCircuitParamValue::SmallScalarMul(vec![*scalar]))
-                .collect::<Vec<_>>()
-        },
-    );
-    let total_len = y_bindings.len() + v_bindings.len();
-    y_bindings.reserve(v_bindings.len());
-    y_bindings.extend(v_bindings);
-    debug_assert_eq!(y_bindings.len(), total_len);
-    y_bindings
-}
-
-/// Precompute all parameter bindings for the full-reduce helper sub-circuit.
-///
-/// Every active q-level shares the same circuit shape but uses different CRT residues. Precomputing
-/// the bindings once inside the context lets `NestedRnsPoly::full_reduce` call the helper by id
-/// without recomputing these scalar tables each time.
-fn build_full_reduce_bindings(
-    p_moduli: &[u64],
-    q_moduli: &[u64],
-    p_full: &BigUint,
-    p_over_pis: &[BigUint],
-) -> Vec<Vec<SubCircuitParamValue>> {
-    let p_moduli_depth = p_moduli.len();
-    let q_moduli_depth = q_moduli.len();
-    let mut scalars_y = vec![vec![vec![0; p_moduli_depth]; p_moduli_depth]; q_moduli_depth];
-    let mut scalars_v = vec![vec![0; p_moduli_depth]; q_moduli_depth];
-
-    for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
-        for (q_idx, &q_k) in q_moduli.iter().enumerate() {
-            let q_k_big = BigUint::from(q_k);
-            for (p_j_idx, p_over_pj) in p_over_pis.iter().enumerate() {
-                let p_over_pj_mod_qk =
-                    (p_over_pj % &q_k_big).to_u64().expect("CRT residue must fit in u64");
-                scalars_y[q_idx][p_i_idx][p_j_idx] = (p_over_pj_mod_qk % p_i) as u32;
-            }
-            let p_mod_qk = (p_full % &q_k_big).to_u64().expect("CRT residue must fit in u64");
-            scalars_v[q_idx][p_i_idx] = (p_mod_qk % p_i) as u32;
-        }
-    }
-
-    (0..q_moduli_depth)
-        .into_par_iter()
-        .map(|q_idx| full_reduce_param_bindings(&scalars_y[q_idx], &scalars_v[q_idx]))
-        .collect()
-}
-
 impl NestedRnsPolyContext {
-    pub(crate) fn zero_level_batch<P: Poly>(&self, circuit: &mut PolyCircuit<P>) -> BatchedWire {
-        nested_rns_level_from_wires((0..self.p_moduli.len()).map(|_| circuit.const_zero_gate()))
-    }
-
     pub fn q_moduli(&self) -> &[u64] {
         &self.q_moduli
     }
@@ -193,7 +101,11 @@ impl NestedRnsPolyContext {
         level_offset: Option<usize>,
     ) -> (Vec<BigUint>, Vec<BigUint>) {
         let level_offset = level_offset.unwrap_or(0);
-        let input_count = enable_levels.unwrap_or(self.q_moduli_depth);
+        let input_count = enable_levels.unwrap_or_else(|| {
+            self.q_moduli_depth
+                .checked_sub(level_offset)
+                .expect("level_offset must not exceed q_moduli_depth")
+        });
         assert!(
             level_offset + input_count <= self.q_moduli_depth,
             "active range exceeds q_moduli_depth: level_offset={level_offset}, enable_levels={input_count}, q_moduli_depth={}",
@@ -218,6 +130,82 @@ impl NestedRnsPolyContext {
 
     pub(crate) fn trace_capacity_bound(&self) -> BigUint {
         self.lut_mod_p_max_map_size.clone()
+    }
+
+    /// Return the per-input maximum coefficients for a nested-RNS lookup call.
+    ///
+    /// Nested-RNS stores only one trace bound per active q-level.  That bound has the explicit
+    /// invariant that every canonical, nonnegative constant coefficient presented to a residue
+    /// lookup is at most that trace.  A call covers all active q-levels at once, so its one
+    /// authoritative bound is their maximum.  Validate it against every actual per-residue LUT:
+    /// comparing only with the largest table would incorrectly admit a value that does not fit a
+    /// smaller `p_i` table.
+    pub(crate) fn lookup_input_ranges_for_trace(
+        &self,
+        trace: &BigUint,
+    ) -> Vec<SubCircuitInputMaxPlaintextNormRange> {
+        for &p_i in &self.p_moduli {
+            let table_len = self.lut_mod_p_max_map_size.clone();
+            assert!(
+                lookup_input_coefficient_fits(trace, &table_len),
+                "nested-RNS lookup input bound {trace} does not fit the p={p_i} table of length {table_len}"
+            );
+        }
+        SubCircuitInputMaxPlaintextNormRange::compress(&vec![trace.clone(); self.p_moduli.len()])
+    }
+
+    /// Return exact per-residue bounds for products of canonical residues.
+    ///
+    /// Each input is in `[0, p_i - 1]`; multiplication therefore presents at most
+    /// `(p_i - 1)^2` to the subsequent reduction lookup.  This is intentionally calculated per
+    /// residue rather than widened to the largest modulus.
+    pub(crate) fn canonical_residue_product_input_ranges(
+        &self,
+    ) -> Vec<SubCircuitInputMaxPlaintextNormRange> {
+        let norms = self
+            .p_moduli
+            .iter()
+            .map(|&p_i| {
+                let residue_max = BigUint::from(p_i - 1);
+                &residue_max * &residue_max
+            })
+            .collect::<Vec<_>>();
+        self.checked_lookup_input_ranges(norms)
+    }
+
+    /// Return exact per-residue bounds for a canonical residue times a canonical scalar.
+    pub(crate) fn canonical_residue_scaled_input_ranges(
+        &self,
+    ) -> Vec<SubCircuitInputMaxPlaintextNormRange> {
+        self.canonical_residue_product_input_ranges()
+    }
+
+    /// Full reduction has at most `k * (p_i - 1)` in the accumulated reduced terms and adds
+    /// `k * p_i` before subtracting a nonnegative term, giving `2 * k * p_i - 1`.
+    pub(crate) fn full_reduce_raw_input_ranges(&self) -> Vec<SubCircuitInputMaxPlaintextNormRange> {
+        let k = BigUint::from(self.p_moduli.len());
+        self.checked_lookup_input_ranges(
+            self.p_moduli
+                .iter()
+                .map(|&p_i| BigUint::from(2u8) * &k * BigUint::from(p_i) - BigUint::from(1u8))
+                .collect(),
+        )
+    }
+
+    /// Construct and validate a complete input contract without scanning lookup table entries.
+    pub(crate) fn checked_lookup_input_ranges(
+        &self,
+        norms: Vec<BigUint>,
+    ) -> Vec<SubCircuitInputMaxPlaintextNormRange> {
+        assert_eq!(norms.len(), self.p_moduli.len());
+        for (&p_i, norm) in self.p_moduli.iter().zip(&norms) {
+            let table_len = self.lut_mod_p_max_map_size.clone();
+            assert!(
+                lookup_input_coefficient_fits(norm, &table_len),
+                "nested-RNS lookup input bound {norm} does not fit the p={p_i} table of length {table_len}"
+            );
+        }
+        SubCircuitInputMaxPlaintextNormRange::compress(&norms)
     }
 
     fn register_local_support_subcircuits<P: Poly + 'static>(
@@ -254,19 +242,6 @@ impl NestedRnsPolyContext {
                     lut_real_to_v_id,
                 ),
             ),
-            full_reduce_id: circuit.register_sub_circuit(Self::full_reduce_subcircuit::<P>(
-                p_moduli,
-                lut_mod_p_ids,
-                lut_x_to_y_ids,
-                lut_x_to_real_ids,
-                lut_real_to_v_id,
-            )),
-            mul_lazy_reduce_id: circuit.register_sub_circuit(
-                Self::mul_lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids),
-            ),
-            mul_right_sparse_id: circuit.register_sub_circuit(
-                Self::mul_right_sparse_subcircuit::<P>(p_moduli, lut_mod_p_ids),
-            ),
         }
     }
 
@@ -280,16 +255,17 @@ impl NestedRnsPolyContext {
         q_level: Option<usize>,
     ) -> Self {
         let (q_moduli, _q_moduli_bits, max_q_moduli_depth) = params.to_crt();
-        let q_moduli_depth = q_level.unwrap_or(max_q_moduli_depth);
+        let requested_q_level = q_level.unwrap_or(max_q_moduli_depth);
         assert!(
-            q_moduli_depth <= max_q_moduli_depth,
+            requested_q_level <= max_q_moduli_depth,
             "q_level exceeds q_moduli_depth: q_level={}, q_moduli_depth={}",
-            q_moduli_depth,
+            requested_q_level,
             max_q_moduli_depth
         );
-        let q_moduli_min = q_moduli.iter().min().expect("there should be at least one q modulus");
-        let q_moduli_max = q_moduli.iter().max().expect("there should be at least one q modulus");
-        let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max, max_unreduced_muls);
+        let q_moduli_depth = max_q_moduli_depth;
+        let q_moduli_min = *q_moduli.iter().min().expect("there should be at least one q modulus");
+        let q_moduli_max = *q_moduli.iter().max().expect("there should be at least one q modulus");
+        let p_moduli = sample_crt_primes(p_moduli_bits, q_moduli_max, max_unreduced_muls);
         debug!(
             "NestedRnsPolyContext setup: p_moduli = {:?}, q_moduli = {:?}, scale = {}, max_unreduced_muls = {}",
             p_moduli, q_moduli, scale, max_unreduced_muls
@@ -305,8 +281,8 @@ impl NestedRnsPolyContext {
             max_p_modulus
         );
         let lut_mod_p_max_map_size =
-            BigUint::from(lut_mod_p_map_size(max_p_modulus, max_p_modulus, p_moduli_depth));
-        let active_q_moduli = q_moduli.iter().take(q_moduli_depth).copied().collect::<Vec<_>>();
+            BigUint::from(lut_mod_p_table_len(max_p_modulus, p_moduli_depth));
+        let active_q_moduli = q_moduli;
         let p_full = p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
         let full_reduce_max_plaintexts = active_q_moduli
             .iter()
@@ -318,7 +294,7 @@ impl NestedRnsPolyContext {
             precompute_nested_rns_gadget_values(&active_q_moduli, &p_full, &p_over_pis);
 
         if dummy_scalar {
-            let dummy_lut = dummy_lut::<P>(params);
+            let dummy_lut = dummy_lut();
             let dummy_lut_id = circuit.register_public_lookup(dummy_lut);
             let lut_mod_p_ids = vec![dummy_lut_id; p_moduli_depth];
             let lut_x_to_y_ids = vec![dummy_lut_id; p_moduli_depth];
@@ -334,8 +310,6 @@ impl NestedRnsPolyContext {
                 &lut_x_to_real_ids,
                 lut_real_to_v_id,
             );
-            let full_reduce_bindings =
-                build_full_reduce_bindings(&p_moduli, &active_q_moduli, &p_full, &p_over_pis);
             return Self {
                 p_moduli_bits,
                 max_unreduced_muls,
@@ -354,10 +328,6 @@ impl NestedRnsPolyContext {
                 lazy_reduce_id: registered_ids.lazy_reduce_id,
                 decomposition_terms_id: registered_ids.decomposition_terms_id,
                 gadget_decompose_id: registered_ids.gadget_decompose_id,
-                full_reduce_id: registered_ids.full_reduce_id,
-                full_reduce_bindings,
-                mul_lazy_reduce_id: registered_ids.mul_lazy_reduce_id,
-                mul_right_sparse_id: registered_ids.mul_right_sparse_id,
             };
         }
 
@@ -366,133 +336,46 @@ impl NestedRnsPolyContext {
         let mut lut_x_to_real = Vec::with_capacity(p_moduli_depth);
 
         for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
-            let lut_mod_p_map_size = lut_mod_p_map_size(p_i, max_p_modulus, p_moduli.len());
+            let lut_mod_p_map_size = lut_mod_p_table_len(max_p_modulus, p_moduli.len());
             debug_assert!(
-                lut_mod_p_map_size < *q_moduli_min as u128,
+                lut_mod_p_map_size < q_moduli_min as u128,
                 "LUT size exceeds q modulus size; increase q_moduli_bits or decrease p_moduli_bits"
             );
             let lut_mod_p_len = lut_mod_p_map_size as usize;
-            let max_mod_p_row = max_output_row_from_biguint::<P>(
-                params,
-                (p_i - 1) as usize,
-                BigUint::from(p_i - 1),
-            );
-            let lut_mod_p_lut = PublicLut::<P>::new(
-                params,
-                lut_mod_p_len as u64,
-                move |params, t| {
-                    if t >= lut_mod_p_len as u64 {
-                        return None;
-                    }
-                    let output = BigUint::from(t % p_i);
-                    let y_elem = P::from_biguint_to_constant(params, output)
-                        .coeffs()
-                        .into_iter()
-                        .next()
-                        .expect("constant-term coefficient must exist");
-                    Some((t, y_elem))
-                },
-                Some(max_mod_p_row),
-            );
+            let input = LutExpr::input();
+            let lut_mod_p_lut =
+                PublicLutProgram::new(lut_mod_p_len as u64, input.clone().modulo(p_i))
+                    .expect("nested-RNS modulus lookup program is valid");
             lut_mod_p.push(lut_mod_p_lut);
 
             let p_moduli_big = BigUint::from(p_i);
             let p_over_pi_mod_pi = (&p_over_pis[p_i_idx] % &p_moduli_big)
                 .to_u64()
                 .expect("CRT residue must fit in u64");
-            let p_over_pi_inv = Arc::new(BigUint::from(
+            let p_over_pi_inv = BigUint::from(
                 mod_inverse(p_over_pi_mod_pi, p_i).expect("CRT moduli must be coprime"),
-            ));
-            let max_idx_mod_pi =
-                (((p_i - 1) as u128 * p_over_pi_mod_pi as u128) % p_i as u128) as usize;
-            let max_x_to_y_row =
-                max_output_row_from_biguint::<P>(params, max_idx_mod_pi, BigUint::from(p_i - 1));
-            let max_x_to_real_value = round_div((p_i - 1) * scale, p_i);
-            let max_x_to_real_row = max_output_row_from_biguint::<P>(
-                params,
-                max_idx_mod_pi,
-                BigUint::from(max_x_to_real_value),
             );
 
-            let p_moduli_big = Arc::new(p_moduli_big);
             let lut_x_to_y_len = lut_mod_p_map_size as usize;
-            let lut_x_to_y_lut = PublicLut::<P>::new(
-                params,
-                lut_x_to_y_len as u64,
-                {
-                    let p_over_pi_inv = Arc::clone(&p_over_pi_inv);
-                    let p_moduli_big = Arc::clone(&p_moduli_big);
-                    move |params, t| {
-                        if t >= lut_x_to_y_len as u64 {
-                            return None;
-                        }
-                        let input = BigUint::from(t);
-                        let output = (&input * p_over_pi_inv.as_ref()) % p_moduli_big.as_ref();
-                        let y_elem = P::from_biguint_to_constant(params, output)
-                            .coeffs()
-                            .into_iter()
-                            .next()
-                            .expect("constant-term coefficient must exist");
-                        Some((t, y_elem))
-                    }
-                },
-                Some(max_x_to_y_row),
-            );
+            let y = input.clone().mul(LutExpr::constant(p_over_pi_inv)).modulo(p_i);
+            let lut_x_to_y_lut = PublicLutProgram::new(lut_x_to_y_len as u64, y.clone())
+                .expect("nested-RNS CRT conversion lookup program is valid");
             lut_x_to_y.push(lut_x_to_y_lut);
 
             let lut_x_to_real_len = lut_mod_p_map_size as usize;
-            let lut_x_to_real_lut = PublicLut::<P>::new(
-                params,
+            let lut_x_to_real_lut = PublicLutProgram::new(
                 lut_x_to_real_len as u64,
-                {
-                    let p_over_pi_inv = Arc::clone(&p_over_pi_inv);
-                    let p_moduli_big = Arc::clone(&p_moduli_big);
-                    move |params, t| {
-                        if t >= lut_x_to_real_len as u64 {
-                            return None;
-                        }
-                        let input = BigUint::from(t);
-                        let y = ((&input * p_over_pi_inv.as_ref()) % p_moduli_big.as_ref())
-                            .to_u64()
-                            .expect("y must fit in u64");
-                        let output = BigUint::from(round_div(y * scale, p_i));
-                        let y_elem = P::from_biguint_to_constant(params, output)
-                            .coeffs()
-                            .into_iter()
-                            .next()
-                            .expect("constant-term coefficient must exist");
-                        Some((t, y_elem))
-                    }
-                },
-                Some(max_x_to_real_row),
-            );
+                y.mul(LutExpr::constant(scale)).round_div(p_i),
+            )
+            .expect("nested-RNS scaled lookup program is valid");
             lut_x_to_real.push(lut_x_to_real_lut);
         }
 
         let max_real = scale * p_moduli_depth as u64;
         let lut_real_to_v_len = max_real as usize + 1;
-        let max_real_to_v_row = max_output_row_from_biguint::<P>(
-            params,
-            max_real as usize,
-            BigUint::from(round_div(max_real, scale)),
-        );
-        let lut_real_to_v_lut = PublicLut::<P>::new(
-            params,
-            lut_real_to_v_len as u64,
-            move |params, t| {
-                if t >= lut_real_to_v_len as u64 {
-                    return None;
-                }
-                let output = BigUint::from(round_div(t, scale));
-                let y_elem = P::from_biguint_to_constant(params, output)
-                    .coeffs()
-                    .into_iter()
-                    .next()
-                    .expect("constant-term coefficient must exist");
-                Some((t, y_elem))
-            },
-            Some(max_real_to_v_row),
-        );
+        let lut_real_to_v_lut =
+            PublicLutProgram::new(lut_real_to_v_len as u64, LutExpr::input().round_div(scale))
+                .expect("nested-RNS rounding lookup program is valid");
 
         let lut_mod_p_ids = lut_mod_p
             .iter()
@@ -518,8 +401,6 @@ impl NestedRnsPolyContext {
             &lut_x_to_real_ids,
             lut_real_to_v_id,
         );
-        let full_reduce_bindings =
-            build_full_reduce_bindings(&p_moduli, &active_q_moduli, &p_full, &p_over_pis);
         Self {
             p_moduli_bits,
             max_unreduced_muls,
@@ -538,18 +419,15 @@ impl NestedRnsPolyContext {
             lazy_reduce_id: registered_ids.lazy_reduce_id,
             decomposition_terms_id: registered_ids.decomposition_terms_id,
             gadget_decompose_id: registered_ids.gadget_decompose_id,
-            full_reduce_id: registered_ids.full_reduce_id,
-            full_reduce_bindings,
-            mul_lazy_reduce_id: registered_ids.mul_lazy_reduce_id,
-            mul_right_sparse_id: registered_ids.mul_right_sparse_id,
         }
     }
 
     pub(crate) fn reduce_q_level_row<P: Poly>(
         &self,
         row: &[GateId],
+        input_norms: &[BigUint],
         circuit: &mut PolyCircuit<P>,
-    ) -> Vec<GateId> {
+    ) -> (Vec<GateId>, Vec<BigUint>) {
         assert_eq!(
             row.len(),
             self.p_moduli.len(),
@@ -557,53 +435,48 @@ impl NestedRnsPolyContext {
             row.len(),
             self.p_moduli.len()
         );
-        circuit
-            .call_sub_circuit(self.lazy_reduce_id, row.iter().copied())
+        assert_eq!(input_norms.len(), self.p_moduli.len());
+        let outputs = circuit
+            .call_sub_circuit_with_max_plaintext_norms(
+                self.lazy_reduce_id,
+                row.iter().copied(),
+                self.checked_lookup_input_ranges(input_norms.to_vec()),
+            )
             .into_iter()
             .map(BatchedWire::as_single_wire)
-            .collect()
+            .collect();
+        let output_norms = self.p_moduli.iter().map(|&p_i| BigUint::from(p_i - 1)).collect();
+        (outputs, output_norms)
     }
 
     pub(crate) fn mul_q_level_rows<P: Poly>(
         &self,
         left: &[GateId],
         right: &[GateId],
+        left_norms: &[BigUint],
+        right_norms: &[BigUint],
         circuit: &mut PolyCircuit<P>,
     ) -> Vec<GateId> {
         assert_eq!(left.len(), self.p_moduli.len(), "left q-level row depth mismatch");
         assert_eq!(right.len(), self.p_moduli.len(), "right q-level row depth mismatch");
+        assert_eq!(left_norms.len(), self.p_moduli.len());
+        assert_eq!(right_norms.len(), self.p_moduli.len());
+        let products = left
+            .iter()
+            .zip(right)
+            .map(|(&lhs, &rhs)| circuit.mul_gate(lhs, rhs).as_single_wire())
+            .collect::<Vec<_>>();
+        let product_norms =
+            left_norms.iter().zip(right_norms).map(|(lhs, rhs)| lhs * rhs).collect::<Vec<_>>();
         circuit
-            .call_sub_circuit(
-                self.mul_lazy_reduce_id,
-                left.iter().copied().chain(right.iter().copied()),
+            .call_sub_circuit_with_max_plaintext_norms(
+                self.lazy_reduce_id,
+                products,
+                self.checked_lookup_input_ranges(product_norms),
             )
             .into_iter()
             .map(BatchedWire::as_single_wire)
             .collect()
-    }
-
-    fn mul_lazy_reduce_subcircuit<P: Poly>(
-        p_moduli: &[u64],
-        lut_mod_p_ids: &[usize],
-    ) -> PolyCircuit<P> {
-        let mut circuit = PolyCircuit::<P>::new();
-        let mul_circuit = Self::mul_without_reduce_subcircuit::<P>(p_moduli);
-        let reduce_circuit = Self::lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
-        let p_moduli_depth = p_moduli.len();
-        let inputs = circuit.input(p_moduli_depth * 2);
-        let mul_circuit_id = circuit.register_sub_circuit(mul_circuit);
-        let prod = circuit.call_sub_circuit(mul_circuit_id, inputs.gate_ids());
-        let reduce_circuit_id = circuit.register_sub_circuit(reduce_circuit);
-        let reduced = circuit.call_sub_circuit(reduce_circuit_id, &prod);
-        circuit.output(reduced);
-        circuit
-    }
-
-    fn mul_right_sparse_subcircuit<P: Poly>(
-        p_moduli: &[u64],
-        lut_mod_p_ids: &[usize],
-    ) -> PolyCircuit<P> {
-        Self::mul_lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids)
     }
 
     fn add_without_reduce_subcircuit<P: Poly>(p_moduli: &[u64]) -> PolyCircuit<P> {
@@ -614,19 +487,6 @@ impl NestedRnsPolyContext {
         let right = inputs.slice(p_moduli_depth..inputs.len()).to_vec();
         let outputs = (0..p_moduli_depth)
             .map(|p_idx| circuit.add_gate(left[p_idx], right[p_idx]))
-            .collect::<Vec<_>>();
-        circuit.output(outputs);
-        circuit
-    }
-
-    fn mul_without_reduce_subcircuit<P: Poly>(p_moduli: &[u64]) -> PolyCircuit<P> {
-        let mut circuit = PolyCircuit::<P>::new();
-        let p_moduli_depth = p_moduli.len();
-        let inputs = circuit.input(p_moduli_depth * 2);
-        let left = inputs.slice(0..p_moduli_depth).to_vec();
-        let right = inputs.slice(p_moduli_depth..inputs.len()).to_vec();
-        let outputs = (0..p_moduli_depth)
-            .map(|p_idx| circuit.mul_gate(left[p_idx], right[p_idx]))
             .collect::<Vec<_>>();
         circuit.output(outputs);
         circuit
@@ -655,17 +515,41 @@ impl NestedRnsPolyContext {
         let mut circuit = PolyCircuit::<P>::new();
         let p_moduli_depth = lut_x_to_y_ids.len();
         let inputs = circuit.input(p_moduli_depth);
-        let mut outputs = Vec::with_capacity(p_moduli_depth + 1);
-        let mut real_sum = circuit.const_zero_gate();
-        for p_idx in 0..p_moduli_depth {
-            let y_i = circuit.public_lookup_gate(inputs.at(p_idx), lut_x_to_y_ids[p_idx]);
+        let outputs = Self::decomposition_term_gates(
+            &mut circuit,
+            &inputs.gate_ids().collect::<Vec<_>>(),
+            lut_x_to_y_ids,
+            lut_x_to_real_ids,
+            lut_real_to_v_id,
+        );
+        circuit.output(outputs);
+        circuit
+    }
+
+    fn decomposition_term_gates<P: Poly>(
+        circuit: &mut PolyCircuit<P>,
+        inputs: &[GateId],
+        lut_x_to_y_ids: &[usize],
+        lut_x_to_real_ids: &[usize],
+        lut_real_to_v_id: usize,
+    ) -> Vec<BatchedWire> {
+        assert_eq!(inputs.len(), lut_x_to_y_ids.len());
+        assert_eq!(inputs.len(), lut_x_to_real_ids.len());
+        let (first_input, remaining_inputs) =
+            inputs.split_first().expect("nested-RNS decomposition requires at least one p modulus");
+        let mut outputs = Vec::with_capacity(inputs.len() + 1);
+        let first_y = circuit.public_lookup_gate(*first_input, lut_x_to_y_ids[0]);
+        outputs.push(first_y);
+        let mut real_sum = circuit.public_lookup_gate(*first_input, lut_x_to_real_ids[0]);
+        for (offset, input) in remaining_inputs.iter().enumerate() {
+            let p_idx = offset + 1;
+            let y_i = circuit.public_lookup_gate(*input, lut_x_to_y_ids[p_idx]);
             outputs.push(y_i);
-            let real_i = circuit.public_lookup_gate(inputs.at(p_idx), lut_x_to_real_ids[p_idx]);
+            let real_i = circuit.public_lookup_gate(*input, lut_x_to_real_ids[p_idx]);
             real_sum = circuit.add_gate(real_sum, real_i);
         }
         outputs.push(circuit.public_lookup_gate(real_sum, lut_real_to_v_id));
-        circuit.output(outputs);
-        circuit
+        outputs
     }
 
     fn gadget_decompose_subcircuit<P: Poly>(
@@ -678,89 +562,40 @@ impl NestedRnsPolyContext {
         let mut circuit = PolyCircuit::<P>::new();
         let p_moduli_depth = p_moduli.len();
         let inputs = circuit.input(p_moduli_depth);
-        let decomposition_terms_id =
-            circuit.register_sub_circuit(Self::decomposition_terms_subcircuit::<P>(
-                lut_x_to_y_ids,
-                lut_x_to_real_ids,
-                lut_real_to_v_id,
-            ));
         let lazy_reduce_id = circuit
             .register_sub_circuit(Self::lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids));
-        let decomposition_terms =
-            circuit.call_sub_circuit(decomposition_terms_id, inputs.gate_ids());
+        let decomposition_terms = Self::decomposition_term_gates(
+            &mut circuit,
+            &inputs.gate_ids().collect::<Vec<_>>(),
+            lut_x_to_y_ids,
+            lut_x_to_real_ids,
+            lut_real_to_v_id,
+        );
         let ys = decomposition_terms[..p_moduli_depth].to_vec();
         let w = decomposition_terms[p_moduli_depth];
         let mut outputs = Vec::with_capacity((p_moduli_depth + 1) * p_moduli_depth);
-        for y_i in ys {
+        for (p_idx, y_i) in ys.into_iter().enumerate() {
             let repeated = vec![y_i; p_moduli_depth];
-            outputs.extend(circuit.call_sub_circuit(lazy_reduce_id, &repeated));
+            outputs.extend(circuit.call_sub_circuit_with_max_plaintext_norms(
+                lazy_reduce_id,
+                &repeated,
+                SubCircuitInputMaxPlaintextNormRange::compress(&vec![
+                    BigUint::from(
+                        p_moduli[p_idx] - 1
+                    );
+                    p_moduli_depth
+                ]),
+            ));
         }
-        outputs.extend(circuit.call_sub_circuit(lazy_reduce_id, &vec![w; p_moduli_depth]));
+        outputs.extend(circuit.call_sub_circuit_with_max_plaintext_norms(
+            lazy_reduce_id,
+            &vec![w; p_moduli_depth],
+            SubCircuitInputMaxPlaintextNormRange::compress(&vec![
+                BigUint::from(p_moduli_depth);
+                p_moduli_depth
+            ]),
+        ));
         circuit.output(outputs);
-        circuit
-    }
-
-    fn full_reduce_subcircuit<P: Poly>(
-        p_moduli: &[u64],
-        lut_mod_p_ids: &[usize],
-        lut_x_to_y_ids: &[usize],
-        lut_x_to_real_ids: &[usize],
-        lut_real_to_v_id: usize,
-    ) -> PolyCircuit<P> {
-        let mut circuit = PolyCircuit::<P>::new();
-        let p_moduli_depth = p_moduli.len();
-        let inputs = circuit.input(p_moduli_depth);
-        let x = inputs;
-        let scalar_y_param_ids = (0..p_moduli_depth)
-            .map(|p_idx| {
-                let max_scalar =
-                    u32::try_from(p_moduli[p_idx] - 1).expect("p modulus must fit in u32");
-                (0..p_moduli_depth)
-                    .map(|_| {
-                        circuit.register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul {
-                            max_scalar,
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let scalar_v_param_ids = (0..p_moduli_depth)
-            .map(|p_idx| {
-                let max_scalar =
-                    u32::try_from(p_moduli[p_idx] - 1).expect("p modulus must fit in u32");
-                circuit
-                    .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar })
-            })
-            .collect::<Vec<_>>();
-
-        let ys = (0..p_moduli_depth)
-            .map(|p_idx| circuit.public_lookup_gate(x.at(p_idx), lut_x_to_y_ids[p_idx]))
-            .collect::<Vec<_>>();
-        let reals = (0..p_moduli_depth)
-            .map(|p_idx| circuit.public_lookup_gate(x.at(p_idx), lut_x_to_real_ids[p_idx]))
-            .collect::<Vec<_>>();
-        let mut real_sum = circuit.const_zero_gate();
-        for &real in reals.iter() {
-            real_sum = circuit.add_gate(real_sum, real);
-        }
-        let v = circuit.public_lookup_gate(real_sum, lut_real_to_v_id);
-        let mut p_i_sums = Vec::with_capacity(p_moduli_depth);
-        for p_idx in 0..p_moduli_depth {
-            let mut p_i_sum = circuit.const_zero_gate();
-            for p_j_idx in 0..p_moduli_depth {
-                let y_j = ys[p_j_idx];
-                let term = circuit.small_scalar_mul_param(y_j, scalar_y_param_ids[p_idx][p_j_idx]);
-                let term_mod_p = circuit.public_lookup_gate(term, lut_mod_p_ids[p_idx]);
-                p_i_sum = circuit.add_gate(p_i_sum, term_mod_p);
-            }
-            let term = circuit.small_scalar_mul_param(v, scalar_v_param_ids[p_idx]);
-            let p_i_const = circuit.const_digits(&[p_moduli.len() as u32 * p_moduli[p_idx] as u32]);
-            let sum = circuit.add_gate(p_i_sum, p_i_const);
-            let p_i_sum = circuit.sub_gate(sum, term);
-            let p_i_sum_mod_p = circuit.public_lookup_gate(p_i_sum, lut_mod_p_ids[p_idx]);
-            p_i_sums.push(p_i_sum_mod_p);
-        }
-        circuit.output(p_i_sums);
         circuit
     }
 
@@ -828,5 +663,23 @@ impl<P: Poly + 'static> ModularArithmeticContext<P> for NestedRnsPolyContext {
 
     fn plaintext_capacity_bound(&self) -> BigUint {
         self.p_full.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mod_p_table_domain_accepts_its_largest_input_coefficient() {
+        let table_len = BigUint::from(lut_mod_p_table_len(29, 3));
+        let largest_valid = &table_len - BigUint::from(1u8);
+        assert!(lookup_input_coefficient_fits(&largest_valid, &table_len));
+    }
+
+    #[test]
+    fn mod_p_table_domain_rejects_the_first_larger_input_coefficient() {
+        let table_len = BigUint::from(lut_mod_p_table_len(29, 3));
+        assert!(!lookup_input_coefficient_fits(&table_len, &table_len));
     }
 }

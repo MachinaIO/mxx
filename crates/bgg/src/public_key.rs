@@ -1,7 +1,10 @@
 //! Declarative BGG+ public-key graph values.
 
-use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Pending, Ring};
-use mxx_ir_core::{IntExpr, ValueHandle};
+use crate::{boolean::BggPublicKeyFamily, encoding::BggSamplerLayout};
+use mxx_dsl::{
+    Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel, Pending, Ring,
+};
+use mxx_ir_core::{IntExpr, ValueHandle, node::IndexRange};
 
 #[derive(Clone)]
 pub struct BggPublicKeyWire {
@@ -83,8 +86,17 @@ impl BggPublicKeyCompiler {
     pub fn mul(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
         let decomposed =
             rhs.matrix.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat();
+        self.mul_with_decomposition(lhs, rhs, decomposed)
+    }
+
+    pub(crate) fn mul_with_decomposition(
+        &self,
+        lhs: &BggPublicKeyWire,
+        rhs: &BggPublicKeyWire,
+        decomposed_rhs: Mat,
+    ) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: lhs.matrix.clone() * decomposed,
+            matrix: lhs.matrix.clone() * decomposed_rhs,
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
         }
     }
@@ -125,6 +137,75 @@ impl BggPublicKeyCompiler {
         let rows = input.matrix.matrix_type().rows.clone();
         let gadget = self.ring.gadget(rows, self.base.clone(), self.digit_count.clone());
         (gadget * scalar.clone()).decompose(self.base.clone(), self.digit_count.clone()).as_mat()
+    }
+}
+
+#[derive(Clone)]
+pub struct BggPublicKeySampler {
+    pub layout: BggSamplerLayout,
+}
+
+impl BggPublicKeySampler {
+    /// Samples one packed public matrix and exposes a dynamically sized family of slices.
+    ///
+    /// Every member reveals its plaintext relation. Use [`Self::sample`] when the family size and
+    /// reveal policy are both statically known while constructing the graph.
+    pub fn sample_family(
+        &self,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+        count: impl Into<IntExpr>,
+        public_key_columns: impl Into<IntExpr>,
+    ) -> Result<BggPublicKeyFamily, DslError> {
+        let count = count.into();
+        let columns = public_key_columns.into();
+        let packed = self.layout.ring().hash_matrix(
+            hash_key,
+            tag,
+            (
+                IntExpr::constant(self.layout.secret_dimension),
+                IntExpr::Mul(Box::new(columns.clone()), Box::new(count.clone())),
+            ),
+        );
+        let matrices = Parallel::range(count).map_values(|index| {
+            let start = IntExpr::Mul(Box::new(columns.clone()), Box::new(index.expression()));
+            packed.clone().slice(
+                None,
+                Some(IndexRange {
+                    start: start.clone(),
+                    end: IntExpr::Add(Box::new(start), Box::new(columns.clone())),
+                }),
+            )
+        })?;
+        Ok(BggPublicKeyFamily { matrices, reveal_plaintext: true })
+    }
+
+    /// Samples the packed public matrices once and exposes deterministic slices.
+    pub fn sample(
+        &self,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+        reveal_plaintexts: &[bool],
+    ) -> Vec<BggPublicKeyWire> {
+        let count = reveal_plaintexts.len() + 1;
+        let columns = self.layout.public_key_columns();
+        let packed = self.layout.ring().hash_matrix(
+            hash_key,
+            tag,
+            (self.layout.secret_dimension, columns * count),
+        );
+        (0..count)
+            .map(|index| BggPublicKeyWire {
+                matrix: packed.clone().slice(
+                    None,
+                    Some(IndexRange {
+                        start: (columns * index).into(),
+                        end: (columns * (index + 1)).into(),
+                    }),
+                ),
+                reveal_plaintext: index == 0 || reveal_plaintexts[index - 1],
+            })
+            .collect()
     }
 }
 

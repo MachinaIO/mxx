@@ -17,7 +17,7 @@ use crate::{
     },
 };
 use keccak_asm::Keccak256;
-use mxx_dsl::{BoundedMetadata, Family, Mat, Ring, VirtualMat};
+use mxx_dsl::{Family, Mat, Ring};
 use mxx_ir_core::RealExpr;
 use num_bigint::BigUint;
 use rayon::prelude::*;
@@ -42,46 +42,26 @@ pub struct NativeRingGswDslInputs {
 }
 
 /// Declares the executable inputs used by [`native_ring_gsw_scalar_bindings`]
-/// and separates modulus-scale signal from native encryption error.
+/// for native Ring-GSW ciphertext entries.
 ///
 /// The values are not sampled by the graph: obfuscation samples the private
 /// seed ciphertext natively and binds the resulting nested-RNS values at
-/// execution. Top-row entries are pure Large signal. Bottom-row entries are
-/// reinterpreted as Large signal plus the bounded `eR` term from the noisy
-/// public key and binary ciphertext randomizer. Unknown dependencies keep the
-/// simulator on conservative addition rather than assuming CLT independence.
+/// execution. Correctness proofs reason about the native encryption error in
+/// the application-specific proof rather than attaching symbolic annotations
+/// to executable wires.
 pub fn declare_native_ring_gsw_dsl_inputs(
     ring: &Ring,
     prefix: &str,
     wire_count: usize,
     slot_count: usize,
-    ciphertext_error_norm: RealExpr,
+    _ciphertext_error_norm: RealExpr,
 ) -> Result<NativeRingGswDslInputs, mxx_dsl::DslError> {
     assert!(wire_count.is_multiple_of(2), "Ring-GSW ciphertext must have two equally sized rows");
-    let bottom_row_start = wire_count / 2;
     let mut scalar_families = Vec::with_capacity(wire_count);
     let mut input_names = Vec::with_capacity(wire_count);
     for wire in 0..wire_count {
         let name = format!("{prefix}-{wire}");
-        let scalar_type = ring.matrix_type((1, 1));
-        let error_norm = ciphertext_error_norm.clone();
-        let family = ring.input_family(name.clone(), slot_count, (1, 1)).parallel_map(
-            move |_, scalar| {
-                let signal =
-                    VirtualMat::large(format!("{name}:nested-rns-signal"), scalar_type.clone());
-                if wire < bottom_row_start {
-                    scalar.assume(signal)
-                } else {
-                    let error = VirtualMat::bounded(
-                        format!("{name}:native-encryption-error"),
-                        scalar_type.clone(),
-                        BoundedMetadata::conservative(error_norm.clone()),
-                    );
-                    scalar.assume(signal + error)
-                }
-                .expect("native Ring-GSW scalar assumption is shape preserving")
-            },
-        )?;
+        let family = ring.input_family(name.clone(), slot_count, (1, 1));
         scalar_families.push(family);
         input_names.push(format!("{prefix}-{wire}"));
     }
@@ -244,7 +224,14 @@ where
         .get_row(0);
     let error = error_sigma.filter(|sigma| *sigma != 0.0).map(|sigma| {
         let uniform_sampler = US::new();
-        uniform_sampler.sample_uniform(params, 1, col_len, DistType::GaussDist { sigma }).get_row(0)
+        uniform_sampler
+            .sample_uniform(
+                params,
+                1,
+                col_len,
+                DistType::GaussDist { sigma, max_coefficient_bound: None },
+            )
+            .get_row(0)
     });
     let b = a
         .par_iter()
@@ -447,53 +434,40 @@ where
         .map(|row| {
             row.par_iter()
                 .map(|poly| {
-                    let coeff_encodings = poly
-                        .coeffs_biguints()
-                        .into_par_iter()
-                        .map(|coeff| {
-                            encode_nested_rns_poly_with_offset::<P>(
-                                ctx.p_moduli_bits,
-                                ctx.max_unreduced_muls,
-                                params,
-                                &coeff,
-                                level_offset,
-                                enable_levels,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let encoded_len = coeff_encodings.first().map(|encoded| encoded.len()).expect(
-                        "native Ring-GSW ciphertext polynomials must have at least one slot",
-                    );
-                    assert!(
-                        coeff_encodings.iter().all(|encoded| encoded.len() == encoded_len),
-                        "all nested-RNS coefficient encodings must have the same gate length"
-                    );
-                    (0..encoded_len)
-                        .into_par_iter()
-                        .map(|gate_idx| {
-                            let diagonal = coeff_encodings
-                                .iter()
-                                .map(|encoded| encoded[gate_idx].clone())
-                                .collect::<Vec<_>>();
-                            let zero = P::const_zero(params);
-                            M::from_poly_vec(
-                                params,
-                                (0..diagonal.len())
-                                    .map(|row_idx| {
-                                        (0..diagonal.len())
-                                            .map(|col_idx| {
-                                                if row_idx == col_idx {
-                                                    diagonal[row_idx].clone()
-                                                } else {
-                                                    zero.clone()
-                                                }
-                                            })
-                                            .collect()
-                                    })
-                                    .collect(),
-                            )
-                        })
-                        .collect::<Vec<_>>()
+                    let coefficients = poly.coeffs_biguints();
+                    encode_nested_rns_poly_with_offset::<P>(
+                        ctx.p_moduli_bits,
+                        ctx.max_unreduced_muls,
+                        params,
+                        &coefficients,
+                        level_offset,
+                        enable_levels,
+                    )
+                    .into_par_iter()
+                    .map(|diagonal| {
+                        let diagonal = diagonal
+                            .into_iter()
+                            .map(|value| P::from_biguint_to_constant(params, value))
+                            .collect::<Vec<_>>();
+                        let zero = P::const_zero(params);
+                        M::from_poly_vec(
+                            params,
+                            (0..diagonal.len())
+                                .map(|row_idx| {
+                                    (0..diagonal.len())
+                                        .map(|col_idx| {
+                                            if row_idx == col_idx {
+                                                diagonal[row_idx].clone()
+                                            } else {
+                                                zero.clone()
+                                            }
+                                        })
+                                        .collect()
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
         })
@@ -637,7 +611,6 @@ mod tests {
     const ACTIVE_LEVELS: usize = 1;
     const CRT_BITS: usize = 10;
     const BASE_BITS: u32 = 5;
-    const P_MODULI_BITS: usize = 5;
     const MAX_UNREDUCED_MULS: usize = 2;
     const SCALE: u64 = 16;
 
@@ -645,6 +618,16 @@ mod tests {
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<NestedRnsRingGswContext<DCRTPoly>>) {
         test_context_with_unreduced_mul_budget(circuit, MAX_UNREDUCED_MULS, SCALE)
+    }
+
+    /// Smallest p-basis width for the given parameters and unreduced-multiplication budget,
+    /// so budget changes never silently starve these tests.
+    fn test_p_moduli_bits(params: &DCRTPolyParams, max_unreduced_muls: usize) -> usize {
+        crate::circuit_gadgets::arith::minimum_p_moduli_bits(
+            *params.to_crt().0.iter().max().expect("nonempty CRT basis"),
+            max_unreduced_muls,
+        )
+        .expect("test parameters support a p basis")
     }
 
     fn test_context_with_unreduced_mul_budget(
@@ -656,7 +639,7 @@ mod tests {
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             circuit,
             &params,
-            P_MODULI_BITS,
+            test_p_moduli_bits(&params, max_unreduced_muls),
             max_unreduced_muls,
             scale,
             false,
@@ -711,7 +694,7 @@ mod tests {
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
             &params,
-            P_MODULI_BITS,
+            test_p_moduli_bits(&params, MAX_UNREDUCED_MULS),
             MAX_UNREDUCED_MULS,
             SCALE,
             false,
@@ -815,9 +798,6 @@ mod tests {
             .build()
             .unwrap();
         graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
-        let elaborated = graph.elaborate(&mxx_ir_core::ParamEnv::default()).unwrap();
-        let bounded_atoms = elaborated.atoms.values().filter(|atom| !atom.is_large()).count();
-        assert_eq!(bounded_atoms, scalar_inputs.len() / 2);
     }
 
     #[test]
@@ -1072,7 +1052,7 @@ mod tests {
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
             &params,
-            P_MODULI_BITS,
+            test_p_moduli_bits(&params, MAX_UNREDUCED_MULS),
             MAX_UNREDUCED_MULS,
             SCALE,
             false,

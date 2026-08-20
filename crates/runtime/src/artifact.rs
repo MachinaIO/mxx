@@ -24,7 +24,7 @@ pub struct ArtifactKey {
     pub index: Option<usize>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ArtifactPayload {
     Matrix(Vec<u8>),
     Bytes(Vec<u8>),
@@ -150,6 +150,47 @@ impl MemoryArtifactStore {
 
     pub fn manifest(&self, production: &ProductionId) -> Option<&Manifest> {
         self.manifests.get(production)
+    }
+
+    /// Clones every payload named by an already committed manifest.
+    ///
+    /// Durable persistence remains caller-owned; this method only exposes the
+    /// exact in-memory payload set needed by an application or integration
+    /// test to serialize its own checkpoint.
+    pub fn snapshot_manifest_payloads(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<Vec<(ArtifactKey, ArtifactPayload)>, MemoryArtifactError> {
+        if self.manifests.get(&manifest.production_id) != Some(manifest) {
+            return Err(MemoryArtifactError::MissingManifest(manifest.production_id.clone()));
+        }
+        let mut payloads = Vec::new();
+        for (name, descriptor) in &manifest.artifacts {
+            let indices: Box<dyn Iterator<Item = Option<usize>>> = match descriptor.family_count {
+                Some(count) => Box::new((0..count).map(Some)),
+                None => Box::new(std::iter::once(None)),
+            };
+            for index in indices {
+                let key = ArtifactKey {
+                    production: manifest.production_id.clone(),
+                    name: name.clone(),
+                    index,
+                };
+                let (artifact_type, confidentiality, layout, payload) = self
+                    .entries
+                    .get(&key)
+                    .ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
+                if artifact_type != &descriptor.artifact_type ||
+                    confidentiality != &descriptor.confidentiality ||
+                    layout != &descriptor.layout ||
+                    !payload_matches(artifact_type, payload)
+                {
+                    return Err(MemoryArtifactError::DescriptorMismatch(key));
+                }
+                payloads.push((key, payload.clone()));
+            }
+        }
+        Ok(payloads)
     }
 
     pub fn session_status(&self, production: &ProductionId) -> Option<SessionStatus> {
@@ -783,5 +824,70 @@ mod tests {
             store.store_manifest(manifest),
             Err(MemoryArtifactError::InvalidManifest(_))
         ));
+    }
+
+    #[test]
+    fn manifest_snapshot_contains_every_scalar_and_family_payload() {
+        let production = ProductionId { spec_hash: SpecHash([20; 32]), execution_nonce: [21; 32] };
+        let scalar = ManifestArtifact {
+            artifact_type: ArtifactType::Bytes { length: 1 },
+            family_count: None,
+            confidentiality: ArtifactConfidentiality::Private,
+            content_hash: None,
+            layout: None,
+        };
+        let family = ManifestArtifact {
+            artifact_type: ArtifactType::Bytes { length: 1 },
+            family_count: Some(2),
+            confidentiality: ArtifactConfidentiality::Public,
+            content_hash: None,
+            layout: Some("lane".to_owned()),
+        };
+        let manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([
+                ("family".to_owned(), family.clone()),
+                ("scalar".to_owned(), scalar.clone()),
+            ]),
+        };
+        let mut store = MemoryArtifactStore::default();
+        store
+            .store(
+                ArtifactKey {
+                    production: production.clone(),
+                    name: "scalar".to_owned(),
+                    index: None,
+                },
+                &scalar.artifact_type,
+                scalar.confidentiality,
+                scalar.layout.as_deref(),
+                ArtifactPayload::Bytes(vec![1]),
+            )
+            .expect("scalar payload");
+        for index in 0..2 {
+            store
+                .store(
+                    ArtifactKey {
+                        production: production.clone(),
+                        name: "family".to_owned(),
+                        index: Some(index),
+                    },
+                    &family.artifact_type,
+                    family.confidentiality,
+                    family.layout.as_deref(),
+                    ArtifactPayload::Bytes(vec![index as u8]),
+                )
+                .expect("family payload");
+        }
+        store.store_manifest(manifest.clone()).expect("manifest");
+
+        let snapshot = store.snapshot_manifest_payloads(&manifest).expect("snapshot");
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(snapshot[0].0.name, "family");
+        assert_eq!(snapshot[0].0.index, Some(0));
+        assert_eq!(snapshot[1].0.index, Some(1));
+        assert_eq!(snapshot[2].0.name, "scalar");
+        assert_eq!(snapshot[2].0.index, None);
     }
 }

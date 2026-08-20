@@ -279,6 +279,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -373,9 +389,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.180"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libm"
@@ -391,6 +407,12 @@ checksum = "7f78c730aaa7d0b9336a299029ea49f9ee53b0ed06e9202e8cb7db9bae7b8c82"
 dependencies = [
  "cc",
 ]
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lock_api"
@@ -428,11 +450,13 @@ version = "0.1.0"
 dependencies = [
  "mxx-dsl",
  "mxx-ir-core",
+ "mxx-primitives",
  "mxx-runtime",
  "num-bigint",
  "num-traits",
  "serde",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -443,11 +467,10 @@ dependencies = [
  "mxx-dsl",
  "mxx-gadgets",
  "mxx-ir-core",
- "mxx-ir-symbolic",
- "mxx-noise-simulator",
  "mxx-primitives",
  "mxx-runtime",
  "num-bigint",
+ "num-traits",
  "rayon",
  "serial_test",
  "sha2",
@@ -455,14 +478,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "mxx-correctness"
+version = "0.1.0"
+dependencies = [
+ "mxx-dsl",
+ "mxx-ir-core",
+ "num-bigint",
+ "num-traits",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mxx-dsl"
 version = "0.1.0"
 dependencies = [
- "bigdecimal",
  "mxx-ir-core",
- "mxx-ir-symbolic",
- "mxx-noise-simulator",
  "num-bigint",
+ "serde",
  "serde_json",
  "thiserror",
 ]
@@ -495,11 +533,15 @@ dependencies = [
  "digest",
  "itertools",
  "keccak-asm",
+ "mxx-bench-estimator",
+ "mxx-bgg",
+ "mxx-correctness",
  "mxx-dsl",
  "mxx-ir-core",
  "mxx-primitives",
  "mxx-runtime",
  "num-bigint",
+ "num-integer",
  "num-traits",
  "rand 0.9.2",
  "rayon",
@@ -514,23 +556,6 @@ dependencies = [
 [[package]]
 name = "mxx-io"
 version = "0.1.0"
-dependencies = [
- "bigdecimal",
- "digest",
- "keccak-asm",
- "mxx-bgg",
- "mxx-dsl",
- "mxx-gadgets",
- "mxx-ir-core",
- "mxx-ir-symbolic",
- "mxx-noise-simulator",
- "mxx-primitives",
- "mxx-runtime",
- "num-bigint",
- "rand 0.9.2",
- "rayon",
- "thiserror",
-]
 
 [[package]]
 name = "mxx-ir-core"
@@ -543,38 +568,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
-]
-
-[[package]]
-name = "mxx-ir-symbolic"
-version = "0.1.0"
-dependencies = [
- "mxx-ir-core",
- "num-bigint",
- "num-integer",
- "num-traits",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
-]
-
-[[package]]
-name = "mxx-noise-simulator"
-version = "0.1.0"
-dependencies = [
- "bigdecimal",
- "mxx-dsl",
- "mxx-ir-core",
- "mxx-ir-symbolic",
- "mxx-primitives",
- "num-bigint",
- "num-traits",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -618,27 +611,32 @@ dependencies = [
  "serial_test",
  "sha2",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
 name = "mxx-we"
 version = "0.1.0"
 dependencies = [
- "bigdecimal",
  "keccak-asm",
  "mxx-bench-estimator",
  "mxx-bgg",
+ "mxx-correctness",
  "mxx-dsl",
  "mxx-gadgets",
  "mxx-ir-core",
- "mxx-ir-symbolic",
- "mxx-noise-simulator",
  "mxx-primitives",
  "mxx-runtime",
  "num-bigint",
+ "num-integer",
+ "num-traits",
  "rand 0.9.2",
+ "serial_test",
+ "sha2",
+ "tempfile",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -856,6 +854,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -996,6 +1007,19 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom",
+ "once_cell",
+ "rustix",
+ "windows-sys",
+]
 
 [[package]]
 name = "termcolor"

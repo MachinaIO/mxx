@@ -8,6 +8,14 @@ use num_traits::One;
 /// Lower bound on the CRT product required to tolerate the configured unreduced multiplication
 /// budget.
 ///
+/// The budget base is the worst-case magnitude of one `full_reduce` output under the canonical
+/// (non-centered) representatives this implementation uses: `(sum(p_i) + k) * q_max`, matching
+/// `full_reduce_output_max_plaintext_bound`. Requiring `p_full > base^muls` with `muls = 2`
+/// therefore covers a product of two freshly reduced operands, which closes the
+/// reduce -> multiply -> reduce loop at any multiplication depth. (Boneh-Kim Theorem 2 gives
+/// `(k + sum(p_i)) * q / 4` for centered representatives; the canonical loop is 4x larger, which
+/// this base reflects instead of assuming a centering the circuits do not perform.)
+///
 /// `sample_crt_primes` uses exactly this bound when choosing the synthetic p-moduli for a
 /// nested-RNS context, so exposing it here keeps the budget calculation shared between setup code
 /// and tests.
@@ -18,7 +26,7 @@ pub(crate) fn sample_crt_primes_mul_budget_bound(
 ) -> BigUint {
     let modulus_count =
         u64::try_from(modulus_count).expect("p_moduli length must fit in u64 for bound tracking");
-    BigUint::from(sum_p_moduli + modulus_count) * BigUint::from(q_max) / BigUint::from(2u64)
+    BigUint::from(sum_p_moduli + modulus_count) * BigUint::from(q_max)
 }
 
 /// Euclidean gcd helper used while enforcing pairwise-coprime synthetic p-moduli.
@@ -41,8 +49,27 @@ pub(crate) fn sample_crt_primes(
     q_max: u64,
     max_unreduced_muls: usize,
 ) -> Vec<u64> {
+    try_sample_crt_primes(max_bit_width, q_max, max_unreduced_muls).unwrap_or_else(|| {
+        panic!(
+            "failed to find enough pairwise coprime integers with bit width {max_bit_width} to satisfy q_max {q_max} and max_unreduced_muls {max_unreduced_muls}"
+        )
+    })
+}
+
+/// Returns the smallest p-modulus bit width whose deterministic CRT basis supports the requested
+/// q modulus and unreduced multiplication budget.
+pub fn minimum_p_moduli_bits(q_max: u64, max_unreduced_muls: usize) -> Option<usize> {
+    (2..usize::BITS as usize)
+        .find(|&bits| try_sample_crt_primes(bits, q_max, max_unreduced_muls).is_some())
+}
+
+fn try_sample_crt_primes(
+    max_bit_width: usize,
+    q_max: u64,
+    max_unreduced_muls: usize,
+) -> Option<Vec<u64>> {
     let lower = 3u64;
-    let upper = 1u64 << max_bit_width;
+    let upper = 1u64.checked_shl(u32::try_from(max_bit_width).ok()?)?;
     let mut results: Vec<u64> = Vec::new();
     let mut sum = 0u64;
     let mut prod = BigUint::one();
@@ -61,13 +88,7 @@ pub(crate) fn sample_crt_primes(
         }
     }
 
-    if !prod_reached {
-        panic!(
-            "failed to find enough pairwise coprime integers with bit width {max_bit_width} to satisfy q_max {q_max} and max_unreduced_muls {max_unreduced_muls}"
-        );
-    }
-
-    results
+    prod_reached.then_some(results)
 }
 
 /// Resolve the q-window and synthetic p-moduli used by the pure encoding helpers.
@@ -341,14 +362,14 @@ pub fn encode_nested_rns_poly_compact_bytes<P: Poly>(
     p_moduli_bits: usize,
     max_unreduced_muls: usize,
     params: &P::Params,
-    input: &BigUint,
+    values: &[BigUint],
     q_level: Option<usize>,
-) -> Vec<Vec<u8>> {
+) -> Vec<Vec<Vec<u8>>> {
     encode_nested_rns_poly_compact_bytes_with_offset::<P>(
         p_moduli_bits,
         max_unreduced_muls,
         params,
-        input,
+        values,
         0,
         q_level,
     )
@@ -358,26 +379,38 @@ pub fn encode_nested_rns_poly_compact_bytes_with_offset<P: Poly>(
     p_moduli_bits: usize,
     max_unreduced_muls: usize,
     params: &P::Params,
-    input: &BigUint,
+    values: &[BigUint],
     q_level_offset: usize,
     q_level: Option<usize>,
-) -> Vec<Vec<u8>> {
-    let (q_moduli, active_q_level, p_moduli) =
+) -> Vec<Vec<Vec<u8>>> {
+    let (q_moduli, _, p_moduli) =
         resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, max_unreduced_muls, params, q_level);
-    let input_mod_q = q_moduli
-        .iter()
-        .skip(q_level_offset)
-        .take(active_q_level)
-        .map(|&q_i| input % BigUint::from(q_i))
-        .collect::<Vec<_>>();
+    let active_q_level = q_level.unwrap_or_else(|| {
+        q_moduli
+            .len()
+            .checked_sub(q_level_offset)
+            .expect("q_level_offset must not exceed q modulus depth")
+    });
+    assert!(q_level_offset + active_q_level <= q_moduli.len());
+    assert!(!values.is_empty(), "nested-RNS encoding requires coefficient values");
     let p_moduli_depth = p_moduli.len();
-    let output_count = active_q_level * p_moduli_depth;
-
-    map_nested_rns_outputs_with_params::<P, _, _>(params, output_count, |idx, local_params| {
-        let q_idx = idx / p_moduli_depth;
-        let p_idx = idx % p_moduli_depth;
-        let residue = &input_mod_q[q_idx] % p_moduli[p_idx];
-        P::from_biguint_to_constant(local_params, residue).to_compact_bytes()
+    let lanes = q_moduli.len();
+    map_nested_rns_outputs_with_params::<P, _, _>(params, p_moduli_depth, |p_idx, local_params| {
+        values
+            .iter()
+            .flat_map(|value| {
+                let q_moduli = &q_moduli;
+                let p_i = p_moduli[p_idx];
+                (0..lanes).map(move |g| {
+                    let residue = if g < q_level_offset || g >= q_level_offset + active_q_level {
+                        BigUint::ZERO
+                    } else {
+                        (value % BigUint::from(q_moduli[g])) % p_i
+                    };
+                    P::from_biguint_to_constant(local_params, residue).to_compact_bytes()
+                })
+            })
+            .collect()
     })
 }
 
@@ -385,14 +418,14 @@ pub fn encode_nested_rns_poly<P: Poly>(
     p_moduli_bits: usize,
     max_unreduced_muls: usize,
     params: &P::Params,
-    input: &BigUint,
+    values: &[BigUint],
     q_level: Option<usize>,
-) -> Vec<P> {
+) -> Vec<Vec<BigUint>> {
     encode_nested_rns_poly_with_offset::<P>(
         p_moduli_bits,
         max_unreduced_muls,
         params,
-        input,
+        values,
         0,
         q_level,
     )
@@ -402,19 +435,37 @@ pub fn encode_nested_rns_poly_with_offset<P: Poly>(
     p_moduli_bits: usize,
     max_unreduced_muls: usize,
     params: &P::Params,
-    input: &BigUint,
+    values: &[BigUint],
     q_level_offset: usize,
     q_level: Option<usize>,
-) -> Vec<P> {
-    let (q_moduli, active_q_level, p_moduli) =
+) -> Vec<Vec<BigUint>> {
+    let (q_moduli, _, p_moduli) =
         resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, max_unreduced_muls, params, q_level);
-    let p_moduli_depth = p_moduli.len();
-    let mut polys = vec![Vec::with_capacity(p_moduli_depth); active_q_level];
-    for (q_idx, &q_i) in q_moduli.iter().skip(q_level_offset).take(active_q_level).enumerate() {
-        let input_qi = input % BigUint::from(q_i);
-        for &p_i in &p_moduli {
-            polys[q_idx].push(P::from_biguint_to_constant(params, &input_qi % p_i));
-        }
-    }
-    polys.into_iter().flatten().collect::<Vec<_>>()
+    let active_q_level = q_level.unwrap_or_else(|| {
+        q_moduli
+            .len()
+            .checked_sub(q_level_offset)
+            .expect("q_level_offset must not exceed q modulus depth")
+    });
+    assert!(q_level_offset + active_q_level <= q_moduli.len());
+    assert!(!values.is_empty(), "nested-RNS encoding requires coefficient values");
+    let lanes = q_moduli.len();
+    p_moduli
+        .into_par_iter()
+        .map(|p_i| {
+            values
+                .iter()
+                .flat_map(|value| {
+                    let q_moduli = &q_moduli;
+                    (0..lanes).map(move |g| {
+                        if g < q_level_offset || g >= q_level_offset + active_q_level {
+                            BigUint::ZERO
+                        } else {
+                            (value % BigUint::from(q_moduli[g])) % p_i
+                        }
+                    })
+                })
+                .collect()
+        })
+        .collect()
 }

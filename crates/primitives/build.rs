@@ -12,6 +12,7 @@ fn main() {
     println!("cargo::rustc-link-lib=dylib=gomp");
 
     if env::var("CARGO_FEATURE_GPU").is_ok() {
+        println!("cargo::rerun-if-env-changed=CUDA_ARCH");
         println!("cargo::rerun-if-changed=cuda/src/Runtime.cu");
         println!("cargo::rerun-if-changed=cuda/src/ChaCha.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/Matrix.cu");
@@ -19,10 +20,13 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixNTT.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixData.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixArith.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixArithBatch.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixNTTBatch.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixDecompose.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSampling.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixTrapdoor.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerde.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerdeBatch.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixCrt.cu");
         println!("cargo::rerun-if-changed=cuda/include/Runtime.cuh");
         println!("cargo::rerun-if-changed=cuda/include/ChaCha.cuh");

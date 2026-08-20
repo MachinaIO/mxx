@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::sampler::bounds::matrix_within_coefficient_bound;
 use crate::{
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{Poly, PolyParams, dcrt::gpu::GpuDCRTPolyParams},
@@ -6,6 +8,7 @@ use crate::{
         gpu::{GpuDCRTPolyUniformSampler, random_gpu_rng_seed},
     },
 };
+use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::{
     sync::{Arc, Mutex},
@@ -66,11 +69,20 @@ impl PartialEq for GpuDCRTTrapdoor {
 impl Eq for GpuDCRTTrapdoor {}
 
 impl GpuDCRTTrapdoor {
+    /// Waits for every matrix required to consume this trapdoor.
+    pub fn wait_until_ready(&self) {
+        self.r.wait_until_ready();
+        self.e.wait_until_ready();
+        self.a_mat_coeff.wait_until_ready();
+        self.b_mat_coeff.wait_until_ready();
+        self.d_mat_coeff.wait_until_ready();
+    }
+
     pub fn new(params: &GpuDCRTPolyParams, size: usize, sigma: f64) -> Self {
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();
-        let dist = DistType::GaussDist { sigma };
-        let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
+        let dist = DistType::GaussDist { sigma, max_coefficient_bound: None };
+        let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist.clone());
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
         let a_mat_coeff = coeff_cached_matrix(&(&r * &r.transpose()));
         let b_mat_coeff = coeff_cached_matrix(&(&r * &e.transpose()));
@@ -186,7 +198,8 @@ where
     pub params: &'a <<M as PolyMatrix>::P as Poly>::Params,
     pub trapdoor: &'a T,
     pub public_matrix: &'a M,
-    pub target: M,
+    pub target: &'a M,
+    pub max_coefficient_bound: BigUint,
 }
 
 impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
@@ -323,18 +336,48 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             request_count = requests.len(),
             "gpu preimage: start multi-target sharded dispatch"
         );
-        let results = requests
-            .into_par_iter()
-            .map(|request| {
-                let out = self.preimage(
-                    &request.params,
-                    &request.trapdoor,
-                    &request.public_matrix,
-                    &request.target,
-                );
-                (request.entry_idx, out)
-            })
-            .collect::<Vec<_>>();
+        let common_bound = requests
+            .first()
+            .map(|request| request.max_coefficient_bound.clone())
+            .expect("preimage batch must not be empty");
+        assert!(
+            requests.iter().all(|request| request.max_coefficient_bound == common_bound),
+            "GPU preimage batch requires one common coefficient cutoff"
+        );
+        let mut pending = requests;
+        let mut results = Vec::with_capacity(pending.len());
+        while !pending.is_empty() {
+            let sampled = pending
+                .into_par_iter()
+                .map(|request| {
+                    let candidate = self.preimage(
+                        request.params,
+                        request.trapdoor,
+                        request.public_matrix,
+                        request.target,
+                    );
+                    (request, candidate)
+                })
+                .collect::<Vec<_>>();
+            let (requests, mut candidates): (Vec<_>, Vec<_>) = sampled.into_iter().unzip();
+            let accepted =
+                GpuDCRTPolyMatrix::batch_within_coefficient_bound(&mut candidates, &common_bound);
+            pending = Vec::new();
+            let mut accepted_candidates = Vec::new();
+            for ((request, candidate), accepted) in
+                requests.into_iter().zip(candidates).zip(accepted)
+            {
+                if accepted {
+                    accepted_candidates.push((request.entry_idx, candidate));
+                } else {
+                    pending.push(request);
+                }
+            }
+            let (entry_indices, mut matrices): (Vec<_>, Vec<_>) =
+                accepted_candidates.into_iter().unzip();
+            GpuDCRTPolyMatrix::ntt_batch_in_place(&mut matrices);
+            results.extend(entry_indices.into_iter().zip(matrices));
+        }
         tracing::debug!("gpu preimage: finished multi-target sharded dispatch");
         results
     }
@@ -354,7 +397,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let k = params.modulus_digits();
         let s = preimage_smoothing_parameter(self.base, self.sigma, d, n, k);
 
-        let dist = DistType::GaussDist { sigma: s };
+        let dist = DistType::GaussDist { sigma: s, max_coefficient_bound: None };
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let preimage_right = uniform_sampler.sample_uniform(params, ext_ncol, target_ncol, dist);
         let t = target - &(ext_matrix * &preimage_right);
@@ -392,7 +435,7 @@ fn sample_pert_square_mat_gpu_native_parts(
         params,
         dk,
         padded_ncol,
-        DistType::GaussDist { sigma: sigma_large },
+        DistType::GaussDist { sigma: sigma_large, max_coefficient_bound: None },
     );
     tracing::debug!("gpu preimage sample_pert: sampled p2");
     let tp2 = GpuDCRTPolyMatrix::mul_vertical_pair(&trapdoor.r, &trapdoor.e, &p2);
@@ -429,10 +472,10 @@ mod tests {
                 params::DCRTPolyParams,
             },
         },
-        sampler::bounds::{compute_preimage_sigma, maximum_coefficient_bound_from_sigma},
+        sampler::bounds::{compute_preimage_sigma, hard_cutoff_from_sigma_bound},
     };
     use bigdecimal::{BigDecimal, FromPrimitive};
-    use num_bigint::{BigInt, BigUint};
+    use num_bigint::BigUint;
     use serial_test::serial as sequential;
 
     const SIGMA: f64 = 4.578;
@@ -653,6 +696,57 @@ mod tests {
         assert!(larger_s > default_s);
     }
 
+    #[test]
+    #[sequential]
+    fn test_gpu_batched_preimages_respect_exact_request_cutoff() {
+        gpu_device_sync();
+        let size = 2usize;
+        let cpu_params = gpu_test_params();
+        let params = gpu_params_from_cpu(&cpu_params);
+        let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (trapdoor, public_matrix) = sampler.trapdoor(&params, size);
+        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+        let targets = (0..2)
+            .map(|_| uniform_sampler.sample_uniform(&params, size, 1, DistType::FinRingDist))
+            .collect::<Vec<_>>();
+
+        let ring_dim_sqrt = BigDecimal::from_u32(params.ring_dimension())
+            .expect("ring dimension should convert to BigDecimal")
+            .sqrt()
+            .expect("ring dimension sqrt should exist");
+        let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
+        let preimage_sigma = compute_preimage_sigma(
+            &ring_dim_sqrt,
+            (size * params.modulus_digits()) as u64,
+            &base,
+            None,
+            Some(SIGMA),
+        );
+        let cutoff = hard_cutoff_from_sigma_bound(&preimage_sigma);
+        let requests = targets
+            .iter()
+            .enumerate()
+            .map(|(entry_idx, target)| GpuPreimageRequest {
+                entry_idx,
+                params: &params,
+                trapdoor: &trapdoor,
+                public_matrix: &public_matrix,
+                target,
+                max_coefficient_bound: cutoff.clone(),
+            })
+            .collect();
+
+        let mut outputs = sampler.preimage_batched_sharded(requests);
+        outputs.sort_unstable_by_key(|(entry_idx, _)| *entry_idx);
+        for (expected_idx, ((entry_idx, preimage), target)) in
+            outputs.iter().zip(&targets).enumerate()
+        {
+            assert_eq!(*entry_idx, expected_idx);
+            assert_eq!(&public_matrix * preimage, *target);
+            assert!(matrix_within_coefficient_bound(&preimage.to_cpu_matrix(), &cutoff));
+        }
+    }
+
     fn assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(
         sigma: f64,
         bound_sigma: Option<f64>,
@@ -672,7 +766,7 @@ mod tests {
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
         let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, bound_sigma);
-        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
+        let preimage_bound = hard_cutoff_from_sigma_bound(&preimage_sigma);
         let modulus = params.modulus();
 
         for sample_idx in 0..4usize {
@@ -687,9 +781,8 @@ mod tests {
                         let value = coeff.value().clone();
                         let neg = modulus.as_ref() - &value;
                         let centered_abs = if value < neg { value } else { neg };
-                        let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_bound,
+                            centered_abs <= preimage_bound,
                             "preimage coeff exceeds preimage maximum coefficient bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
                             sample_idx,
                             i,
@@ -734,7 +827,7 @@ mod tests {
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
         let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, None);
-        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
+        let preimage_bound = hard_cutoff_from_sigma_bound(&preimage_sigma);
         let modulus = params.modulus();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
@@ -760,9 +853,8 @@ mod tests {
                         let value = coeff.value().clone();
                         let neg = modulus.as_ref() - &value;
                         let centered_abs = if value < neg { value } else { neg };
-                        let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_bound,
+                            centered_abs <= preimage_bound,
                             "p_hat coeff exceeds preimage maximum coefficient bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
                             sample_idx,
                             i,
@@ -799,7 +891,7 @@ mod tests {
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << base_params.base_bits(), 0);
         let m_g = (size * base_params.modulus_digits()) as u64;
         let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, None);
-        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
+        let preimage_bound = hard_cutoff_from_sigma_bound(&preimage_sigma);
         let modulus = base_params.modulus();
 
         struct DeviceCase {
@@ -859,9 +951,8 @@ mod tests {
                         let value = coeff.value().clone();
                         let neg = modulus.as_ref() - &value;
                         let centered_abs = if value < neg { value } else { neg };
-                        let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_bound,
+                            centered_abs <= preimage_bound,
                             "restored preimage coeff exceeds preimage maximum coefficient bound (src_device={}, dst_device={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={})",
                             case.src_device,
                             case.dst_device,

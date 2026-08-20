@@ -1,15 +1,19 @@
 //! LWE-based public lookup-table evaluation expressed with the declarative DSL.
 
 use crate::{
-    BggEncodingWire, BggPolyEncodingWire, BggPublicKeyWire, CircuitCompileError,
-    NaiveBggEncodingVecWire, NaiveBggPublicKeyVecWire,
+    BggEncodingWire, BggPublicKeyWire, CircuitCompileError, NaiveBggEncodingVecWire,
+    NaiveBggPublicKeyVecWire,
+    tall_encoding::{BggTallEncodingWire, BggTallPlaintext},
 };
-use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Ring, Trapdoor, parallel_zip};
+use mxx_dsl::{
+    Bytes, DslContext, DslError, Family, HashTag, Int, Mat, Ring, Trapdoor, parallel_zip,
+};
 use mxx_gadgets::{
-    Poly, PolyElem,
+    Poly,
     circuit::{
         ArithmeticCircuitLowering, CircuitLowerError, CircuitLoweringTypes, GateInstance,
-        PolyCircuit, PolyGateKind, PublicLookupLowering, SlotOperationLowering, lower_circuit,
+        PolyCircuit, PolyGateKind, PublicLookupLowering, PublicLutProgram, SlotOperationLowering,
+        lower_circuit,
     },
 };
 use mxx_ir_core::{
@@ -17,11 +21,14 @@ use mxx_ir_core::{
     artifact::{ArtifactConfidentiality, ProductionId},
     types::MatrixType,
 };
-use num_bigint::{BigInt, Sign};
+use num_bigint::{BigInt, BigUint, Sign};
+use num_traits::Zero;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
+
+const LWE_LOOKUP_ARTIFACT_SEMANTIC_VERSION: u32 = 2;
 
 struct LweLookupIdentityCollector {
     identities: Vec<LweLookupIdentity>,
@@ -158,9 +165,14 @@ impl LweLookupIdentity {
         format!("A_LT_{}_slot{}", self.gate_token(), self.slot_index()).into_bytes()
     }
 
-    fn low_matrix_tag(&self, row: usize) -> Vec<u8> {
-        format!("LWE_R_G_{}_{}_{}_slot{}", self.gate_token(), self.lookup, row, self.slot_index())
-            .into_bytes()
+    fn low_matrix_tag_prefix(&self) -> Vec<u8> {
+        format!(
+            "mxx-bgg/lwe-lookup-low/v2:{}:{}:slot{}:row:",
+            self.gate_token(),
+            self.lookup,
+            self.slot_index()
+        )
+        .into_bytes()
     }
 }
 
@@ -172,11 +184,14 @@ struct LweLookupEntry {
 
 /// A dense public LUT materialized in input order.
 ///
-/// Rows must be a permutation of `0..len`; row identity determines the
-/// historical `K_low` hash tag while artifact families remain in input order.
+/// Rows must be a permutation of `0..len`; row identity determines the `K_low` hash tag while
+/// artifact families remain in input order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LweLookupTable {
     entries: Vec<LweLookupEntry>,
+    /// Exclusive canonical upper bound for every output, when every static
+    /// table value is nonnegative. This is table metadata, not a new IR value.
+    canonical_output_exclusive_upper: Option<BigUint>,
 }
 
 impl LweLookupTable {
@@ -191,6 +206,7 @@ impl LweLookupTable {
             return Err(LweLookupCompileError::EmptyTable);
         }
         let mut seen = vec![false; entries.len()];
+        let mut canonical_output_maximum = Some(BigUint::zero());
         for entry in &entries {
             if entry.row >= entries.len() {
                 return Err(LweLookupCompileError::RowOutOfRange {
@@ -201,19 +217,23 @@ impl LweLookupTable {
             if std::mem::replace(&mut seen[entry.row], true) {
                 return Err(LweLookupCompileError::DuplicateRow(entry.row));
             }
+            match (canonical_output_maximum.as_mut(), entry.output.to_biguint()) {
+                (Some(maximum), Some(output)) => *maximum = maximum.clone().max(output),
+                (_, None) => canonical_output_maximum = None,
+                (None, Some(_)) => {}
+            }
         }
         if let Some(row) = seen.iter().position(|present| !present) {
             return Err(LweLookupCompileError::MissingRow(row));
         }
-        Ok(Self { entries })
+        let canonical_output_exclusive_upper =
+            canonical_output_maximum.map(|maximum| maximum + BigUint::from(1u8));
+        Ok(Self { entries, canonical_output_exclusive_upper })
     }
 
-    pub fn from_public_lut<P: Poly>(
-        parameters: &P::Params,
-        table: &mxx_gadgets::circuit::PublicLut<P>,
-    ) -> Result<Self, LweLookupCompileError> {
+    pub fn from_public_lut(table: &PublicLutProgram) -> Result<Self, LweLookupCompileError> {
         let mut entries = vec![None; table.len()];
-        for (input, (row, output)) in table.entries(parameters) {
+        for (input, (row, output)) in table.entries() {
             let input = usize::try_from(input)
                 .map_err(|_| LweLookupCompileError::InputOutOfRange(input))?;
             let row =
@@ -221,7 +241,7 @@ impl LweLookupTable {
             if input >= entries.len() {
                 return Err(LweLookupCompileError::InputOutOfRange(input as u64));
             }
-            entries[input] = Some((row, BigInt::from_biguint(Sign::Plus, output.value().clone())));
+            entries[input] = Some((row, output));
         }
         Self::new(
             entries
@@ -240,9 +260,17 @@ impl LweLookupTable {
         self.entries.is_empty()
     }
 
+    fn canonical_output_exclusive_upper_for_modulus(&self, modulus: &IntExpr) -> Option<BigUint> {
+        let upper = self.canonical_output_exclusive_upper.as_ref()?;
+        let IntExpr::Const(modulus) = modulus else {
+            return None;
+        };
+        (upper <= &modulus.to_biguint()?).then(|| upper.clone())
+    }
+
     fn commitment(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(b"mxx-bgg/lwe-lookup-table/v1");
+        hasher.update(b"mxx-bgg/lwe-lookup-table/v2");
         update_commitment_usize(&mut hasher, self.entries.len());
         for (input, entry) in self.entries.iter().enumerate() {
             update_commitment_usize(&mut hasher, input);
@@ -274,13 +302,14 @@ pub struct LweLookupArtifactNames {
     pub output_public_key: String,
     pub low_matrices: String,
     pub high_matrices: String,
+    pub output_plaintexts: String,
 }
 
 impl LweLookupArtifactNames {
     pub fn for_compiler(compiler: &LweLookupCompiler) -> Self {
         let identity = &compiler.identity;
         let prefix = format!(
-            "lwe_lookup_{}_{}_slot{}",
+            "lwe_lookup_v2_{}_{}_slot{}",
             identity.gate_token(),
             identity.lookup,
             identity.slot_index()
@@ -289,6 +318,7 @@ impl LweLookupArtifactNames {
             output_public_key: format!("{prefix}_output_public_key"),
             low_matrices: format!("{prefix}_low_matrices"),
             high_matrices: format!("{prefix}_high_matrices"),
+            output_plaintexts: format!("{prefix}_output_plaintexts"),
         }
     }
 }
@@ -296,6 +326,7 @@ impl LweLookupArtifactNames {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LweLookupArtifacts {
     production_id: ProductionId,
+    semantic_version: u32,
     table_length: usize,
     table_commitment: [u8; 32],
 }
@@ -304,6 +335,7 @@ impl LweLookupArtifacts {
     pub fn for_compiler(production_id: ProductionId, compiler: &LweLookupCompiler) -> Self {
         Self {
             production_id,
+            semantic_version: LWE_LOOKUP_ARTIFACT_SEMANTIC_VERSION,
             table_length: compiler.table.len(),
             table_commitment: compiler.table.commitment(),
         }
@@ -323,13 +355,37 @@ pub struct LweLookupPreprocessingWires {
     pub output_public_key: Mat,
     pub low_matrices: Family<Mat>,
     pub high_matrices: Family<Mat>,
+    /// Public LUT outputs indexed by the logical input value.
+    pub output_plaintexts: Family<Mat>,
 }
 
 #[derive(Clone)]
 pub struct LweLookupArtifactWires {
     pub output_public_key: Mat,
+    /// Logical lookup family indexed directly by the table input `x`.
+    ///
+    /// The producer and evaluator share this table-length domain; no physical chunk coordinate is
+    /// part of the checker-visible graph identity.
     pub low_matrices: Family<Mat>,
     pub high_matrices: Family<Mat>,
+    /// The authoritative public output plaintext family, indexed by the lookup input.
+    pub output_plaintexts: Family<Mat>,
+}
+
+#[derive(Clone)]
+pub struct LweLookupPreprocessingEntry {
+    pub compiler: LweLookupCompiler,
+    pub wires: LweLookupPreprocessingWires,
+}
+
+impl LweLookupPreprocessingEntry {
+    pub fn export(&self, context: DslContext) -> Result<DslContext, LweLookupCompileError> {
+        self.compiler.export_preprocessing(
+            context,
+            self.wires.clone(),
+            &LweLookupArtifactNames::for_compiler(&self.compiler),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -349,6 +405,16 @@ impl NaiveLweLookupPreprocessingEntry {
         }
         Ok(context)
     }
+}
+
+pub struct LweLookupPreprocessingLowering<P: Poly> {
+    parameters: P::Params,
+    hash_key: Bytes,
+    trapdoor: Trapdoor,
+    gadget_base: IntExpr,
+    digit_count: IntExpr,
+    call_path_prefix: Vec<usize>,
+    entries: Vec<LweLookupPreprocessingEntry>,
 }
 
 pub struct NaiveLweLookupPreprocessingLowering<P: Poly> {
@@ -419,6 +485,8 @@ pub enum LweLookupCompileError {
     CircuitTableBinding,
     #[error("lookup artifacts were produced for a different lookup table")]
     ArtifactTableCommitment,
+    #[error("lookup artifact semantic version {actual} does not match required version {expected}")]
+    ArtifactSemanticVersion { expected: u32, actual: u32 },
     #[error("more than one LWE lookup invocation has the same structural identity")]
     DuplicateInvocation,
     #[error("the circuit gate has no bound LWE lookup invocation")]
@@ -437,11 +505,11 @@ impl LweLookupInvocation {
     pub fn bind<P: Poly>(
         compiler: LweLookupCompiler,
         artifacts: LweLookupArtifacts,
-        parameters: &P::Params,
+        _parameters: &P::Params,
         circuit: &PolyCircuit<P>,
     ) -> Result<Self, LweLookupCompileError> {
         let circuit_table = circuit.lookup_table(compiler.identity.lookup);
-        let materialized = LweLookupTable::from_public_lut(parameters, circuit_table.as_ref())?;
+        let materialized = LweLookupTable::from_public_lut(circuit_table.as_ref())?;
         if materialized != compiler.table {
             return Err(LweLookupCompileError::CircuitTableMismatch);
         }
@@ -479,6 +547,12 @@ impl NaiveLweLookupInvocation {
 }
 
 impl LweLookupCompiler {
+    /// Number of rows in this public LUT, and therefore the number of high preimages required
+    /// when its preprocessing artifacts are generated.
+    pub fn table_length(&self) -> usize {
+        self.table.len()
+    }
+
     /// Builds `K_high = Preimage_B(A_lt - yG - (A_z - xG)K_low)`.
     pub fn preprocess(
         &self,
@@ -504,53 +578,58 @@ impl LweLookupCompiler {
             HashTag::from(self.identity.output_public_key_tag()),
             shape(&self.public_key_type),
         );
-        let input_scalars = Family::pack(
-            (0..self.table.len())
-                .map(|input| ring.polynomial([IntExpr::constant(input)]))
-                .collect(),
+        let gadget = ring.gadget(
+            self.public_key_type.rows.clone(),
+            self.gadget_base.clone(),
+            self.digit_count.clone(),
+        );
+        let rows = Family::pack(
+            self.table.entries.iter().map(|entry| Int::constant(entry.row)).collect(),
         )?;
-        let output_scalars = Family::pack(
+        let output_plaintexts = Family::pack(
             self.table
                 .entries
                 .iter()
                 .map(|entry| ring.polynomial([IntExpr::constant(entry.output.clone())]))
                 .collect(),
         )?;
-        let low_inputs = Family::pack(
-            self.table
-                .entries
-                .iter()
-                .map(|entry| {
-                    ring.hash_decomposed(
-                        hash_key.clone(),
-                        HashTag::from(self.identity.low_matrix_tag(entry.row)),
-                        shape(&self.low_matrix_type),
-                        self.gadget_base.clone(),
-                        self.digit_count.clone(),
-                    )
-                })
-                .collect(),
-        )?;
-        let gadget = ring.gadget(
-            self.public_key_type.rows.clone(),
-            self.gadget_base.clone(),
-            self.digit_count.clone(),
-        );
         let input_public_key = input_public_key.matrix.clone();
         let output_for_loop = output_public_key.clone();
         let trapdoor = trapdoor.clone();
+        let gadget = gadget.clone();
         let high_shape = shape(&self.high_matrix_type);
-        let (low_matrices, high_matrices) = parallel_zip(
-            (input_scalars, output_scalars, low_inputs),
-            move |_, (input_scalar, output_scalar, low)| {
+        let low_shape = shape(&self.low_matrix_type);
+        let scalar_type = ring.matrix_type((1, 1));
+        let low_tag_prefix = self.identity.low_matrix_tag_prefix();
+        let gadget_base = self.gadget_base.clone();
+        let digit_count = self.digit_count.clone();
+        let (low_matrices, high_matrices) =
+            parallel_zip((rows, output_plaintexts.clone()), move |index, (row, output)| {
+                let input_scalar = index
+                    .as_int()
+                    .add(Int::constant(0))
+                    .lift_to_constant_polynomial(scalar_type.clone());
+                let mut low_tag = HashTag::from(low_tag_prefix.clone());
+                low_tag.push(row);
+                let low = ring.hash_decomposed(
+                    hash_key.clone(),
+                    low_tag,
+                    low_shape.clone(),
+                    gadget_base.clone(),
+                    digit_count.clone(),
+                );
                 let extended_input = input_public_key.clone() - gadget.clone() * input_scalar;
-                let target = output_for_loop.clone() - gadget.clone() * output_scalar;
+                let target = output_for_loop.clone() - gadget.clone() * output;
                 let adjusted_target = target - extended_input * low.clone();
                 let high = trapdoor.sample_preimage(adjusted_target, high_shape.clone()).as_mat();
                 (low, high)
-            },
-        )?;
-        Ok(LweLookupPreprocessingWires { output_public_key, low_matrices, high_matrices })
+            })?;
+        Ok(LweLookupPreprocessingWires {
+            output_public_key,
+            low_matrices,
+            high_matrices,
+            output_plaintexts,
+        })
     }
 
     pub fn export_preprocessing(
@@ -562,7 +641,8 @@ impl LweLookupCompiler {
         Ok(context
             .public_output(names.output_public_key.clone(), wires.output_public_key)?
             .public_family_output(names.low_matrices.clone(), wires.low_matrices)?
-            .public_family_output(names.high_matrices.clone(), wires.high_matrices)?)
+            .public_family_output(names.high_matrices.clone(), wires.high_matrices)?
+            .public_family_output(names.output_plaintexts.clone(), wires.output_plaintexts)?)
     }
 
     pub fn import_artifacts(
@@ -574,27 +654,38 @@ impl LweLookupCompiler {
         let ring = self.ring();
         let names = LweLookupArtifactNames::for_compiler(self);
         Ok(LweLookupArtifactWires {
-            output_public_key: ring.artifact_input(
-                artifacts.production_id.clone(),
-                names.output_public_key,
-                shape(&self.public_key_type),
-                ArtifactConfidentiality::Public,
-            ),
+            output_public_key: self.import_output_public_key(artifacts),
             low_matrices: ring.family_artifact_input(
                 artifacts.production_id.clone(),
                 names.low_matrices,
-                self.table.len(),
+                artifacts.table_length,
                 shape(&self.low_matrix_type),
                 ArtifactConfidentiality::Public,
             ),
             high_matrices: ring.family_artifact_input(
                 artifacts.production_id.clone(),
                 names.high_matrices,
-                self.table.len(),
+                artifacts.table_length,
                 shape(&self.high_matrix_type),
                 ArtifactConfidentiality::Public,
             ),
+            output_plaintexts: ring.family_artifact_input(
+                artifacts.production_id.clone(),
+                names.output_plaintexts,
+                artifacts.table_length,
+                shape(&ring.matrix_type((1, 1))),
+                ArtifactConfidentiality::Public,
+            ),
         })
+    }
+
+    fn import_output_public_key(&self, artifacts: &LweLookupArtifacts) -> Mat {
+        self.ring().artifact_input(
+            artifacts.production_id.clone(),
+            LweLookupArtifactNames::for_compiler(self).output_public_key,
+            shape(&self.public_key_type),
+            ArtifactConfidentiality::Public,
+        )
     }
 
     pub fn public_key(&self, artifacts: &LweLookupArtifactWires) -> BggPublicKeyWire {
@@ -610,16 +701,15 @@ impl LweLookupCompiler {
     ) -> Result<BggEncodingWire, LweLookupCompileError> {
         let plaintext = input.plaintext.clone().ok_or(LweLookupCompileError::MissingPlaintext)?;
         self.validate_artifact_wires(artifacts)?;
-        let input_index = plaintext.extract_coefficient(0);
+        // The lookup is only defined for inputs inside the table, so the table length is the
+        // canonical upper bound of the selector coefficient.
+        let input_index = plaintext.extract_coefficient_with_canonical_input_exclusive_upper(
+            0,
+            Some(BigUint::from(self.table.len())),
+        );
         let low = artifacts.low_matrices.get(input_index.clone());
         let high = artifacts.high_matrices.get(input_index.clone());
-        let output_plaintext = input_index.select(
-            self.table
-                .entries
-                .iter()
-                .map(|entry| self.ring().polynomial([IntExpr::constant(entry.output.clone())]))
-                .collect(),
-        )?;
+        let output_plaintext = artifacts.output_plaintexts.get(input_index.clone());
         Ok(BggEncodingWire {
             vector: c_b.clone() * high + input.vector.clone() * low,
             pubkey: self.public_key(artifacts),
@@ -627,45 +717,67 @@ impl LweLookupCompiler {
         })
     }
 
-    pub fn poly_encoding(
+    /// Evaluates one shared public LUT helper family over every tall encoding row.
+    pub fn tall_encoding(
         &self,
-        input: &BggPolyEncodingWire,
-        c_b_by_slot: &Family<Mat>,
+        input: &BggTallEncodingWire,
+        c_b_rows: &Family<Mat>,
         artifacts: &LweLookupArtifactWires,
-    ) -> Result<BggPolyEncodingWire, LweLookupCompileError> {
-        let plaintexts = input.plaintexts.clone().ok_or(LweLookupCompileError::MissingPlaintext)?;
-        if input.vectors.count() != plaintexts.count() ||
-            input.vectors.count() != c_b_by_slot.count()
+    ) -> Result<BggTallEncodingWire, LweLookupCompileError> {
+        let BggTallPlaintext::Diagonal(input_plaintexts) = &input.plaintext else {
+            return Err(LweLookupCompileError::MissingPlaintext);
+        };
+        let expected_c_b_type = MatrixType {
+            modulus: self.high_matrix_type.modulus.clone(),
+            ring_dimension: self.high_matrix_type.ring_dimension.clone(),
+            rows: IntExpr::constant(1),
+            columns: self.high_matrix_type.rows.clone(),
+        };
+        if input.rows.count() != input_plaintexts.count() || input.rows.count() != c_b_rows.count()
         {
             return Err(LweLookupCompileError::SlotCountMismatch);
         }
-        let compiler = self.clone();
+        if !same_matrix_type(c_b_rows.element_type(), &expected_c_b_type) {
+            return Err(LweLookupCompileError::MatrixTypeMismatch);
+        }
+        self.validate_artifact_wires(artifacts)?;
+
         let output_public_key = self.public_key(artifacts);
-        let artifacts = artifacts.clone();
-        let (vectors, plaintexts) = parallel_zip(
-            (input.vectors.clone(), plaintexts, c_b_by_slot.clone()),
-            move |_, (vector, plaintext, c_b)| {
-                let output = compiler
-                    .encoding(
-                        &BggEncodingWire {
-                            vector,
-                            pubkey: compiler.public_key(&artifacts),
-                            plaintext: Some(plaintext),
-                        },
-                        &c_b,
-                        &artifacts,
-                    )
-                    .expect("validated lookup families");
-                (output.vector, output.plaintext.expect("lookup reveals its output"))
+        let artifact_rows = artifacts.clone();
+        let (rows, plaintexts) = parallel_zip(
+            (input.rows.clone(), input_plaintexts.clone(), c_b_rows.clone()),
+            move |_, (input_row, plaintext, c_b)| {
+                let input_index = plaintext
+                    .extract_coefficient_with_canonical_input_exclusive_upper(
+                        0,
+                        input.canonical_input_exclusive_upper.clone(),
+                    );
+                let low = artifact_rows.low_matrices.get(input_index.clone());
+                let high = artifact_rows.high_matrices.get(input_index.clone());
+                let output_plaintext = artifact_rows.output_plaintexts.get(input_index.clone());
+                (c_b * high + input_row * low, output_plaintext)
             },
         )?;
-        Ok(BggPolyEncodingWire { vectors, pubkey: output_public_key, plaintexts: Some(plaintexts) })
+        Ok(BggTallEncodingWire {
+            rows,
+            pubkey: output_public_key,
+            plaintext: BggTallPlaintext::Diagonal(plaintexts),
+            canonical_input_exclusive_upper: self
+                .table
+                .canonical_output_exclusive_upper_for_modulus(&self.high_matrix_type.modulus),
+        })
     }
 
     fn validate_artifacts(
         &self,
         artifacts: &LweLookupArtifacts,
     ) -> Result<(), LweLookupCompileError> {
+        if artifacts.semantic_version != LWE_LOOKUP_ARTIFACT_SEMANTIC_VERSION {
+            return Err(LweLookupCompileError::ArtifactSemanticVersion {
+                expected: LWE_LOOKUP_ARTIFACT_SEMANTIC_VERSION,
+                actual: artifacts.semantic_version,
+            });
+        }
         if artifacts.table_length != self.table.len() {
             return Err(LweLookupCompileError::ArtifactLength {
                 expected: self.table.len(),
@@ -720,7 +832,12 @@ impl LweLookupCompiler {
             artifacts.low_matrices.count() != &count ||
             !same_matrix_type(artifacts.low_matrices.element_type(), &self.low_matrix_type) ||
             artifacts.high_matrices.count() != &count ||
-            !same_matrix_type(artifacts.high_matrices.element_type(), &self.high_matrix_type)
+            !same_matrix_type(artifacts.high_matrices.element_type(), &self.high_matrix_type) ||
+            artifacts.output_plaintexts.count() != &count ||
+            !same_matrix_type(
+                artifacts.output_plaintexts.element_type(),
+                &self.ring().matrix_type((1, 1)),
+            )
         {
             return Err(LweLookupCompileError::ArtifactFamilyLayout);
         }
@@ -744,17 +861,14 @@ fn same_matrix_type(lhs: &MatrixType, rhs: &MatrixType) -> bool {
 }
 
 fn lookup_compiler_for_circuit<P: Poly>(
-    parameters: &P::Params,
+    _parameters: &P::Params,
     circuit: &PolyCircuit<P>,
     identity: LweLookupIdentity,
     public_key_type: MatrixType,
     gadget_base: IntExpr,
     digit_count: IntExpr,
 ) -> Result<LweLookupCompiler, LweLookupCompileError> {
-    let table = LweLookupTable::from_public_lut(
-        parameters,
-        circuit.lookup_table(identity.lookup).as_ref(),
-    )?;
+    let table = LweLookupTable::from_public_lut(circuit.lookup_table(identity.lookup).as_ref())?;
     let public_columns = public_key_type.columns.clone();
     let high_rows = IntExpr::Mul(
         Box::new(public_key_type.rows.clone()),
@@ -777,6 +891,74 @@ fn lookup_compiler_for_circuit<P: Poly>(
         gadget_base,
         digit_count,
     })
+}
+
+impl<P: Poly> LweLookupPreprocessingLowering<P> {
+    pub fn new(
+        parameters: P::Params,
+        hash_key: Bytes,
+        trapdoor: Trapdoor,
+        gadget_base: IntExpr,
+        digit_count: IntExpr,
+        call_path_prefix: Vec<usize>,
+    ) -> Self {
+        Self {
+            parameters,
+            hash_key,
+            trapdoor,
+            gadget_base,
+            digit_count,
+            call_path_prefix,
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn entries(&self) -> &[LweLookupPreprocessingEntry] {
+        &self.entries
+    }
+
+    pub fn into_entries(self) -> Vec<LweLookupPreprocessingEntry> {
+        self.entries
+    }
+}
+
+impl<P: Poly> CircuitLoweringTypes for LweLookupPreprocessingLowering<P> {
+    type Wire = BggPublicKeyWire;
+    type Error = CircuitCompileError;
+}
+
+impl<P: Poly> PublicLookupLowering<P> for LweLookupPreprocessingLowering<P> {
+    fn public_lookup(
+        &mut self,
+        circuit: &PolyCircuit<P>,
+        lookup_id: usize,
+        input: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let mut identity = identity_for_gate(gate, lookup_id);
+        let mut call_path = self.call_path_prefix.clone();
+        call_path.extend(identity.call_path);
+        identity.call_path = call_path;
+        let compiler = lookup_compiler_for_circuit(
+            &self.parameters,
+            circuit,
+            identity,
+            input.matrix.matrix_type().clone(),
+            self.gadget_base.clone(),
+            self.digit_count.clone(),
+        )
+        .map_err(|source| CircuitCompileError::LweLookup {
+            gate: gate.local_gate().index(),
+            source,
+        })?;
+        let wires = compiler.preprocess(self.hash_key.clone(), input, &self.trapdoor).map_err(
+            |source| CircuitCompileError::LweLookup { gate: gate.local_gate().index(), source },
+        )?;
+        let output =
+            BggPublicKeyWire { matrix: wires.output_public_key.clone(), reveal_plaintext: true };
+        self.entries.push(LweLookupPreprocessingEntry { compiler, wires });
+        Ok(output)
+    }
 }
 
 impl<P: Poly> NaiveLweLookupPreprocessingLowering<P> {
@@ -874,6 +1056,25 @@ impl<P: Poly> PublicLookupLowering<P> for NaiveLweLookupPreprocessingLowering<P>
     }
 }
 
+pub fn bind_lwe_lookup_invocations<P: Poly>(
+    parameters: &P::Params,
+    circuit: &PolyCircuit<P>,
+    production: ProductionId,
+    compilers: impl IntoIterator<Item = LweLookupCompiler>,
+) -> Result<Vec<LweLookupInvocation>, LweLookupCompileError> {
+    compilers
+        .into_iter()
+        .map(|compiler| {
+            LweLookupInvocation::bind(
+                compiler.clone(),
+                LweLookupArtifacts::for_compiler(production.clone(), &compiler),
+                parameters,
+                circuit,
+            )
+        })
+        .collect()
+}
+
 pub fn bind_naive_lwe_lookup_invocations<P: Poly>(
     parameters: &P::Params,
     circuit: &PolyCircuit<P>,
@@ -925,10 +1126,11 @@ pub struct LweLookupEncodingLowering {
     c_b: Mat,
 }
 
+/// Public-LUT lowering for tall BGG+ encodings sharing one helper family.
 #[derive(Clone)]
-pub struct LweLookupPolyEncodingLowering {
+pub struct LweLookupTallEncodingLowering {
     invocations: BTreeMap<LweLookupIdentity, LweLookupInvocation>,
-    c_b_by_slot: Family<Mat>,
+    c_b_rows: Family<Mat>,
 }
 
 #[derive(Clone)]
@@ -959,12 +1161,13 @@ impl LweLookupEncodingLowering {
     }
 }
 
-impl LweLookupPolyEncodingLowering {
+impl LweLookupTallEncodingLowering {
+    /// Creates a tall lowering from gate invocations and caller-supplied `C_B` rows.
     pub fn new(
         invocations: impl IntoIterator<Item = LweLookupInvocation>,
-        c_b_by_slot: Family<Mat>,
+        c_b_rows: Family<Mat>,
     ) -> Result<Self, LweLookupCompileError> {
-        Ok(Self { invocations: collect_invocations(invocations)?, c_b_by_slot })
+        Ok(Self { invocations: collect_invocations(invocations)?, c_b_rows })
     }
 }
 
@@ -1024,11 +1227,15 @@ impl<P: Poly> PublicLookupLowering<P> for LweLookupPublicKeyLowering {
         gate: GateInstance<'_>,
     ) -> Result<Self::Wire, Self::Error> {
         let invocation = invocation_for_gate(&self.invocations, circuit, lookup_id, gate)?;
-        let artifacts = invocation
+        invocation
             .compiler
-            .import_artifacts(&invocation.artifacts)
+            .validate_layout()
+            .and_then(|_| invocation.compiler.validate_artifacts(&invocation.artifacts))
             .map_err(|source| lookup_error(gate, source))?;
-        Ok(invocation.compiler.public_key(&artifacts))
+        Ok(BggPublicKeyWire {
+            matrix: invocation.compiler.import_output_public_key(&invocation.artifacts),
+            reveal_plaintext: true,
+        })
     }
 }
 
@@ -1057,12 +1264,12 @@ impl<P: Poly> PublicLookupLowering<P> for LweLookupEncodingLowering {
     }
 }
 
-impl CircuitLoweringTypes for LweLookupPolyEncodingLowering {
-    type Wire = BggPolyEncodingWire;
+impl CircuitLoweringTypes for LweLookupTallEncodingLowering {
+    type Wire = BggTallEncodingWire;
     type Error = CircuitCompileError;
 }
 
-impl<P: Poly> PublicLookupLowering<P> for LweLookupPolyEncodingLowering {
+impl<P: Poly> PublicLookupLowering<P> for LweLookupTallEncodingLowering {
     fn public_lookup(
         &mut self,
         circuit: &PolyCircuit<P>,
@@ -1077,7 +1284,7 @@ impl<P: Poly> PublicLookupLowering<P> for LweLookupPolyEncodingLowering {
             .map_err(|source| lookup_error(gate, source))?;
         invocation
             .compiler
-            .poly_encoding(input, &self.c_b_by_slot, &artifacts)
+            .tall_encoding(input, &self.c_b_rows, &artifacts)
             .map_err(|source| lookup_error(gate, source))
     }
 }
@@ -1244,28 +1451,35 @@ fn lookup_error(gate: GateInstance<'_>, source: LweLookupCompileError) -> Circui
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BggEncodingCompiler, BggPublicKeyCompiler};
+    use crate::{
+        BggEncodingCompiler, BggPublicKeyCompiler, BggTallEncodingCompiler,
+        test_utils::{matrix_output, row},
+    };
     use mxx_dsl::DslContext;
-    use mxx_gadgets::circuit::{PolyCircuit, PublicLut};
+    use mxx_gadgets::circuit::{LutExpr, PolyCircuit, PublicLutProgram};
     use mxx_ir_core::{
         ParamEnv,
-        artifact::{ArtifactType, SpecHash},
-        node::NodeKind,
+        artifact::{ArtifactConfidentiality, SpecHash},
+        node::{IntBinaryOp, MatrixBinaryOp, NodeKind},
+        types::WireType,
     };
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
-            Poly as ConcretePoly, PolyParams,
+            PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
     };
     use mxx_runtime::{
-        RuntimeValue,
-        artifact::{ArtifactPayload, ArtifactStore, MemoryArtifactStore},
-        backend::{Backend, poly::cpu_backend},
-        execute,
-        transcript::SamplingMode,
+        ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
+        execute, execute_with_config, transcript::SamplingMode,
     };
+    use num_bigint::BigUint;
+    use std::num::NonZeroUsize;
+
+    fn identity_lut(length: u64) -> PublicLutProgram {
+        PublicLutProgram::new(length, LutExpr::input()).expect("identity LUT")
+    }
 
     fn matrix_type(parameters: &DCRTPolyParams, rows: usize, columns: usize) -> MatrixType {
         MatrixType {
@@ -1303,7 +1517,7 @@ mod tests {
             slot: Some(2),
         };
         assert_eq!(identity.output_public_key_tag(), b"A_LT_9_slot2");
-        assert_eq!(identity.low_matrix_tag(3), b"LWE_R_G_9_4_3_slot2");
+        assert_eq!(identity.low_matrix_tag_prefix(), b"mxx-bgg/lwe-lookup-low/v2:9:4:slot2:row:");
         assert!(matches!(
             LweLookupTable::new([(0, BigInt::from(1)), (0, BigInt::from(2))]),
             Err(LweLookupCompileError::DuplicateRow(0))
@@ -1315,21 +1529,605 @@ mod tests {
     }
 
     #[test]
-    fn lookup_identity_collection_matches_the_lowering_identity() {
+    fn v1_lookup_artifact_metadata_is_rejected() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let lookup = compiler(
+            &parameters,
+            LweLookupIdentity {
+                call_path: Vec::new(),
+                gate: 9,
+                occurrence: 0,
+                lookup: 4,
+                slot: Some(2),
+            },
+            LweLookupTable::new([(0, BigInt::from(1)), (1, BigInt::from(0))]).unwrap(),
+        );
+        let production_id = ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] };
+        let mut artifacts = LweLookupArtifacts::for_compiler(production_id, &lookup);
+        artifacts.semantic_version = 1;
+
+        assert!(matches!(
+            lookup.import_artifacts(&artifacts),
+            Err(LweLookupCompileError::ArtifactSemanticVersion { expected: 2, actual: 1 })
+        ));
+        let names = LweLookupArtifactNames::for_compiler(&lookup);
+        assert!(names.output_public_key.starts_with("lwe_lookup_v2_"));
+        assert!(names.low_matrices.starts_with("lwe_lookup_v2_"));
+        assert!(names.high_matrices.starts_with("lwe_lookup_v2_"));
+    }
+
+    #[test]
+    fn preprocessing_is_one_logical_table_length_parallel_producer() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let digits = parameters.modulus_digits();
+        let lookup = compiler(
+            &parameters,
+            LweLookupIdentity { call_path: vec![3], gate: 7, occurrence: 1, lookup: 2, slot: None },
+            LweLookupTable::new([(2, BigInt::from(5)), (0, BigInt::from(4)), (1, BigInt::from(6))])
+                .unwrap(),
+        );
+        let ring = lookup.ring();
+        let trapdoor = ring.sample_trapdoor(
+            1,
+            5,
+            lookup.gadget_base.clone(),
+            lookup.digit_count.clone(),
+            1_000_000,
+        );
+        let wires = lookup
+            .preprocess(
+                ring.bytes_input("hash-key", 32),
+                &BggPublicKeyWire { matrix: ring.zero((1, digits)), reveal_plaintext: true },
+                &trapdoor,
+            )
+            .unwrap();
+        let names = LweLookupArtifactNames::for_compiler(&lookup);
+        let built = lookup
+            .export_preprocessing(
+                DslContext::new("logical-lwe-lookup-preprocessing"),
+                wires,
+                &names,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+
+        let loops = built
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(loops.len(), 1);
+        let NodeKind::ParallelLoop(spec) = loops[0].kind() else { unreachable!() };
+        assert_eq!(spec.count, IntExpr::constant(3));
+        assert_eq!(loops[0].output_types().len(), 2);
+        assert!(loops[0].output_types().iter().all(|output| {
+            matches!(
+                output,
+                WireType::IndexedFamily { element, count }
+                    if matches!(element.as_ref(), WireType::Matrix(_)) &&
+                        count == &IntExpr::constant(3)
+            )
+        }));
+
+        for node in built.graph.scopes().values().flat_map(|scope| scope.nodes()) {
+            assert!(!matches!(node.kind(), NodeKind::FamilyGetStatic { .. }));
+            assert!(!matches!(node.kind(), NodeKind::Select { .. }));
+            assert!(!matches!(
+                node.kind(),
+                NodeKind::IntBinary(IntBinaryOp::Divide | IntBinaryOp::Remainder)
+            ));
+            if matches!(node.kind(), NodeKind::FamilyPack { .. }) {
+                assert!(matches!(
+                    node.output_types().first(),
+                    Some(WireType::IndexedFamily { element, .. })
+                        if matches!(element.as_ref(), WireType::Int) ||
+                            matches!(element.as_ref(), WireType::Matrix(matrix)
+                                if matrix.rows == IntExpr::constant(1) &&
+                                    matrix.columns == IntExpr::constant(1))
+                ));
+            }
+        }
+        let dynamic_hashes = built
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .filter(|node| {
+                matches!(node.kind(), NodeKind::HashSample { tag_prefix, .. }
+                    if tag_prefix.starts_with(b"mxx-bgg/lwe-lookup-low/v2:"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dynamic_hashes.len(), 1);
+        assert_eq!(dynamic_hashes[0].arguments().len(), 2);
+        assert!(matches!(dynamic_hashes[0].arguments()[1].wire_type(), WireType::Int));
+    }
+
+    #[test]
+    fn shuffled_preprocessing_rows_have_distinct_v2_hashes_and_satisfy_the_lwe_equation() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let digits = parameters.modulus_digits();
+        let table =
+            LweLookupTable::new([(2, BigInt::from(5)), (0, BigInt::from(4)), (1, BigInt::from(6))])
+                .unwrap();
+        let lookup = compiler(
+            &parameters,
+            LweLookupIdentity {
+                call_path: Vec::new(),
+                gate: 5,
+                occurrence: 0,
+                lookup: 1,
+                slot: None,
+            },
+            table.clone(),
+        );
+        let ring = lookup.ring();
+        let trapdoor = ring.sample_trapdoor(
+            1,
+            5,
+            lookup.gadget_base.clone(),
+            lookup.digit_count.clone(),
+            1_000_000,
+        );
+        let input_public_key =
+            BggPublicKeyWire { matrix: ring.zero((1, digits)), reveal_plaintext: true };
+        let wires = lookup
+            .preprocess(ring.bytes_input("hash-key", 32), &input_public_key, &trapdoor)
+            .unwrap();
+        let outputs = Family::pack(
+            table.entries.iter().map(|entry| Int::constant(entry.output.clone())).collect(),
+        )
+        .unwrap();
+        let scalar_type = ring.matrix_type((1, 1));
+        let gadget = ring.gadget(1, lookup.gadget_base.clone(), lookup.digit_count.clone());
+        let public_b = trapdoor.public_matrix();
+        let input_a = input_public_key.matrix;
+        let output_a = wires.output_public_key.clone();
+        let residuals = parallel_zip(
+            (wires.low_matrices.clone(), wires.high_matrices.clone(), outputs),
+            move |index, (low, high, output)| {
+                let x = index
+                    .as_int()
+                    .add(Int::constant(0))
+                    .lift_to_constant_polynomial(scalar_type.clone());
+                let y = output.lift_to_constant_polynomial(scalar_type.clone());
+                public_b.clone() * high -
+                    (output_a.clone() -
+                        gadget.clone() * y -
+                        (input_a.clone() - gadget.clone() * x) * low)
+            },
+        )
+        .unwrap();
+        let validated = DslContext::new("shuffled-logical-lwe-preprocessing")
+            .family_output("low", wires.low_matrices)
+            .unwrap()
+            .family_output("residual", residuals)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+
+        let execute_once = |parameters: &DCRTPolyParams| {
+            let mut backend = cpu_backend([parameters.clone()]);
+            let mut store = MemoryArtifactStore::default();
+            let mut result = execute_with_config(
+                &validated,
+                &mut backend,
+                BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x6d; 32]))]),
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig {
+                    max_parallel_instances: NonZeroUsize::new(2).unwrap(),
+                    ..ExecutionConfig::default()
+                },
+            )
+            .unwrap();
+            let low = {
+                let RuntimeValue::IndexedFamily(values) =
+                    result.materialize_output("low", &backend, &mut store).unwrap()
+                else {
+                    panic!("low output must be a family")
+                };
+                values
+                    .iter()
+                    .map(|value| {
+                        let RuntimeValue::Matrix(matrix) = value else {
+                            panic!("low family member must be a matrix")
+                        };
+                        matrix.as_ref().clone()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(low.len(), 3);
+            let RuntimeValue::IndexedFamily(residuals) =
+                result.materialize_output("residual", &backend, &mut store).unwrap()
+            else {
+                panic!("residual output must be a family")
+            };
+            let zero = DCRTPolyMatrix::zero(parameters, 1, parameters.modulus_digits());
+            assert_eq!(residuals.len(), 3);
+            assert!(residuals.iter().all(|value| {
+                matches!(value, RuntimeValue::Matrix(matrix) if matrix.as_ref() == &zero)
+            }));
+            result.cleanup_staged(&mut store).unwrap();
+            low
+        };
+
+        let first = execute_once(&parameters);
+        let second = execute_once(&parameters);
+        assert_eq!(first, second);
+        assert_ne!(first[0], first[1]);
+        assert_ne!(first[0], first[2]);
+        assert_ne!(first[1], first[2]);
+    }
+
+    #[test]
+    fn static_table_records_only_nonnegative_output_bounds() {
+        let nonnegative =
+            LweLookupTable::new([(0, BigInt::from(0)), (1, BigInt::from(9))]).unwrap();
+        assert_eq!(nonnegative.canonical_output_exclusive_upper, Some(BigUint::from(10u8)));
+        assert_eq!(
+            nonnegative.canonical_output_exclusive_upper_for_modulus(&IntExpr::constant(9)),
+            None,
+            "a canonical output range must fit the matrix modulus"
+        );
+        assert_eq!(
+            LweLookupTable::new([(0, BigInt::from(-1)), (1, BigInt::from(9))])
+                .unwrap()
+                .canonical_output_exclusive_upper,
+            None
+        );
+    }
+
+    #[test]
+    fn tall_lookup_shares_one_helper_family_and_matches_every_runtime_row() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let digits = parameters.modulus_digits();
+        let slots = 4;
+        let table = LweLookupTable::new([
+            (0, BigInt::from(1)),
+            (1, BigInt::from(1)),
+            (2, BigInt::from(1)),
+            (3, BigInt::from(0)),
+        ])
+        .unwrap();
+        let lookup = compiler(
+            &parameters,
+            LweLookupIdentity {
+                call_path: Vec::new(),
+                gate: 1,
+                occurrence: 0,
+                lookup: 0,
+                slot: None,
+            },
+            table,
+        );
+        let ring = lookup.ring();
+        let input = BggTallEncodingWire {
+            rows: Family::pack(
+                (0..slots)
+                    .map(|slot| ring.input(format!("input-row-{slot}"), (1, digits)))
+                    .collect(),
+            )
+            .unwrap(),
+            pubkey: BggPublicKeyWire {
+                matrix: ring.input("input-public", (1, digits)),
+                reveal_plaintext: true,
+            },
+            plaintext: BggTallPlaintext::Diagonal(
+                Family::pack(
+                    (0..slots)
+                        .map(|slot| ring.input(format!("input-plain-{slot}"), (1, 1)))
+                        .collect(),
+                )
+                .unwrap(),
+            ),
+            canonical_input_exclusive_upper: Some(BigUint::from(4u8)),
+        };
+        let c_b_rows = Family::pack(
+            (0..slots).map(|slot| ring.input(format!("c-b-{slot}"), (1, digits + 2))).collect(),
+        )
+        .unwrap();
+        let make_matrix = |rows: usize, columns: usize, offset: usize| {
+            DCRTPolyMatrix::from_poly_vec(
+                &parameters,
+                (0..rows)
+                    .map(|row_index| row(&parameters, columns, offset + row_index).get_row(0))
+                    .collect(),
+            )
+        };
+        let low_values = (0..4)
+            .map(|index| make_matrix(digits, digits, 12 + index * digits))
+            .collect::<Vec<_>>();
+        let high_values = (0..4)
+            .map(|index| make_matrix(digits + 2, digits, 30 + index * (digits + 2)))
+            .collect::<Vec<_>>();
+        let names = LweLookupArtifactNames::for_compiler(&lookup);
+        let low_inputs = (0..4)
+            .map(|index| ring.input(format!("low-{index}"), (digits, digits)))
+            .collect::<Vec<_>>();
+        let high_inputs = (0..4)
+            .map(|index| ring.input(format!("high-{index}"), (digits + 2, digits)))
+            .collect::<Vec<_>>();
+        let output_plaintext_inputs = (0..4)
+            .map(|index| ring.input(format!("output-plaintext-{index}"), (1, 1)))
+            .collect::<Vec<_>>();
+        let producer_wires = LweLookupPreprocessingWires {
+            output_public_key: ring.input("output-public", (1, digits)),
+            low_matrices: Family::pack(low_inputs).unwrap(),
+            high_matrices: Family::pack(high_inputs).unwrap(),
+            output_plaintexts: Family::pack(output_plaintext_inputs).unwrap(),
+        };
+        let producer = lookup
+            .export_preprocessing(DslContext::new("tall-lookup-helpers"), producer_wires, &names)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut producer_inputs = BTreeMap::from([(
+            "output-public".to_owned(),
+            RuntimeValue::matrix(DCRTPolyMatrix::zero(&parameters, 1, digits)),
+        )]);
+        let output_values = [1usize, 1, 1, 0];
+        for index in 0..4 {
+            producer_inputs
+                .insert(format!("low-{index}"), RuntimeValue::matrix(low_values[index].clone()));
+            producer_inputs
+                .insert(format!("high-{index}"), RuntimeValue::matrix(high_values[index].clone()));
+            producer_inputs.insert(
+                format!("output-plaintext-{index}"),
+                RuntimeValue::matrix(DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    vec![DCRTPoly::from_usize_to_constant(&parameters, output_values[index])],
+                )),
+            );
+        }
+        let mut store = MemoryArtifactStore::default();
+        let mut backend = cpu_backend([parameters.clone()]);
+        let produced =
+            execute(&producer, &mut backend, producer_inputs, &mut store, SamplingMode::Fresh)
+                .unwrap();
+        let production_id = produced.production_id.expect("helper artifact production");
+        let manifest = store.manifest(&production_id).unwrap().clone();
+        let mut v1_manifest = manifest.clone();
+        for v2_name in [
+            &names.output_public_key,
+            &names.low_matrices,
+            &names.high_matrices,
+            &names.output_plaintexts,
+        ] {
+            let artifact = v1_manifest.artifacts.remove(v2_name).expect("v2 manifest artifact");
+            let v1_name = v2_name.replacen("lwe_lookup_v2_", "lwe_lookup_", 1);
+            v1_manifest.artifacts.insert(v1_name, artifact);
+        }
+        assert_eq!(manifest.artifacts[&names.low_matrices].family_count, Some(4));
+        assert_eq!(manifest.artifacts[&names.high_matrices].family_count, Some(4));
+        assert_eq!(manifest.artifacts[&names.output_plaintexts].family_count, Some(4));
+        let artifacts = lookup
+            .import_artifacts(&LweLookupArtifacts::for_compiler(production_id.clone(), &lookup))
+            .unwrap();
+        let output = lookup.tall_encoding(&input, &c_b_rows, &artifacts).unwrap();
+        assert_eq!(output.canonical_input_exclusive_upper, Some(BigUint::from(2u8)));
+        let tall_compiler = BggTallEncodingCompiler {
+            public_key: BggPublicKeyCompiler {
+                ring: ring.clone(),
+                base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
+                digit_count: IntExpr::constant(digits),
+            },
+        };
+        let accumulated = tall_compiler.add(&output, &output).unwrap();
+        assert_eq!(accumulated.canonical_input_exclusive_upper, Some(BigUint::from(3u8)));
+        let final_output = lookup.tall_encoding(&accumulated, &c_b_rows, &artifacts).unwrap();
+        let BggTallPlaintext::Diagonal(output_plaintexts) = output.plaintext else {
+            panic!("public lookup must reveal its output")
+        };
+        let BggTallPlaintext::Diagonal(final_plaintexts) = final_output.plaintext else {
+            panic!("the accumulated public lookup must reveal its output")
+        };
+        let mut context = DslContext::new("tall-lookup-runtime");
+        for slot in 0..slots {
+            context = context
+                .output(format!("row-{slot}"), output.rows.get_static(slot))
+                .unwrap()
+                .output(format!("plain-{slot}"), output_plaintexts.get_static(slot))
+                .unwrap()
+                .output(format!("final-plain-{slot}"), final_plaintexts.get_static(slot))
+                .unwrap();
+        }
+        let graph = context.build().unwrap();
+        assert!(graph.graph.scopes().values().flat_map(|scope| scope.nodes()).any(|node| {
+            matches!(
+                node.kind(),
+                NodeKind::ExtractCoefficient {
+                    canonical_input_exclusive_upper: Some(upper),
+                    ..
+                } if upper == &BigUint::from(4u8)
+            )
+        }));
+        assert!(graph.graph.scopes().values().flat_map(|scope| scope.nodes()).any(|node| {
+            matches!(
+                node.kind(),
+                NodeKind::ExtractCoefficient {
+                    canonical_input_exclusive_upper: Some(upper),
+                    ..
+                } if upper == &BigUint::from(3u8)
+            )
+        }));
+        assert_eq!(
+            graph
+                .graph
+                .scopes()
+                .values()
+                .flat_map(|scope| scope.nodes())
+                .filter(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
+                .count(),
+            6,
+            "each of the two lookup stages uses one shared low/high/output helper selection"
+        );
+        assert_eq!(
+            graph
+                .graph
+                .scopes()
+                .values()
+                .flat_map(|scope| scope.nodes())
+                .filter(|node| {
+                    matches!(node.kind(), NodeKind::Select { .. }) &&
+                        matches!(
+                            node.output_types().first(),
+                            Some(WireType::IndexedFamily { .. })
+                        )
+                })
+                .count(),
+            0,
+            "Tall lookup must not expose a chunk selector or switch"
+        );
+        assert_eq!(
+            graph
+                .graph
+                .scopes()
+                .values()
+                .flat_map(|scope| scope.nodes())
+                .filter(|node| {
+                    matches!(
+                        node.kind(),
+                        NodeKind::IntBinary(IntBinaryOp::Divide | IntBinaryOp::Remainder)
+                    )
+                })
+                .count(),
+            0,
+            "Tall lookup must not derive a chunk or offset from x"
+        );
+
+        let indices = [0usize, 1, 1, 3];
+        let input_rows =
+            (0..slots).map(|slot| row(&parameters, digits, 2 + slot)).collect::<Vec<_>>();
+        let c_b_values =
+            (0..slots).map(|slot| row(&parameters, digits + 2, 7 + slot)).collect::<Vec<_>>();
+        let mut inputs = BTreeMap::new();
+        for slot in 0..slots {
+            inputs.insert(
+                format!("input-row-{slot}"),
+                RuntimeValue::matrix(input_rows[slot].clone()),
+            );
+            inputs.insert(
+                format!("input-plain-{slot}"),
+                RuntimeValue::matrix(DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    vec![DCRTPoly::from_usize_to_constant(&parameters, indices[slot])],
+                )),
+            );
+            inputs.insert(format!("c-b-{slot}"), RuntimeValue::matrix(c_b_values[slot].clone()));
+        }
+        assert!(
+            graph
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(production_id.clone(), v1_manifest)]),
+                )
+                .is_err(),
+            "a v1 artifact namespace must not satisfy the v2 evaluator graph"
+        );
+        let graph = graph
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production_id, manifest)]),
+            )
+            .unwrap();
+        let result =
+            execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
+        let outputs = [1usize, 1, 1, 0];
+        for slot in 0..slots {
+            let index = indices[slot];
+            let expected = c_b_values[slot].clone() * high_values[index].clone() +
+                input_rows[slot].clone() * low_values[index].clone();
+            assert_eq!(matrix_output(&result, &format!("row-{slot}")), &expected);
+            assert_eq!(
+                matrix_output(&result, &format!("plain-{slot}")),
+                &DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    vec![DCRTPoly::from_usize_to_constant(&parameters, outputs[index])],
+                )
+            );
+            assert_eq!(
+                matrix_output(&result, &format!("final-plain-{slot}")),
+                &DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    vec![DCRTPoly::from_usize_to_constant(&parameters, 1)],
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn tall_lookup_rejects_hidden_mismatched_and_wrong_width_inputs() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let digits = parameters.modulus_digits();
+        let lookup = compiler(
+            &parameters,
+            LweLookupIdentity {
+                call_path: Vec::new(),
+                gate: 1,
+                occurrence: 0,
+                lookup: 0,
+                slot: None,
+            },
+            LweLookupTable::new([(0, BigInt::from(1)), (1, BigInt::from(0))]).unwrap(),
+        );
+        let ring = lookup.ring();
+        let rows = Family::pack(vec![ring.zero((1, digits)), ring.zero((1, digits))]).unwrap();
+        let diagonal = Family::pack(vec![ring.zero((1, 1)), ring.zero((1, 1))]).unwrap();
+        let artifacts = LweLookupArtifactWires {
+            output_public_key: ring.zero((1, digits)),
+            low_matrices: Family::pack((0..2).map(|_| ring.zero((digits, digits))).collect())
+                .unwrap(),
+            high_matrices: Family::pack((0..2).map(|_| ring.zero((digits + 2, digits))).collect())
+                .unwrap(),
+            output_plaintexts: Family::pack((0..2).map(|_| ring.zero((1, 1))).collect()).unwrap(),
+        };
+        let wire = |plaintext| BggTallEncodingWire {
+            rows: rows.clone(),
+            pubkey: BggPublicKeyWire { matrix: ring.zero((1, digits)), reveal_plaintext: true },
+            plaintext,
+            canonical_input_exclusive_upper: None,
+        };
+        assert!(matches!(
+            lookup.tall_encoding(
+                &wire(BggTallPlaintext::Hidden),
+                &Family::pack(vec![ring.zero((1, digits + 2)), ring.zero((1, digits + 2)),])
+                    .unwrap(),
+                &artifacts,
+            ),
+            Err(LweLookupCompileError::MissingPlaintext)
+        ));
+        assert!(matches!(
+            lookup.tall_encoding(
+                &wire(BggTallPlaintext::Diagonal(diagonal.clone())),
+                &Family::pack(vec![ring.zero((1, digits + 2))]).unwrap(),
+                &artifacts,
+            ),
+            Err(LweLookupCompileError::SlotCountMismatch)
+        ));
+        assert!(matches!(
+            lookup.tall_encoding(
+                &wire(BggTallPlaintext::Diagonal(diagonal)),
+                &Family::pack(vec![ring.zero((1, digits + 1)), ring.zero((1, digits + 1)),])
+                    .unwrap(),
+                &artifacts,
+            ),
+            Err(LweLookupCompileError::MatrixTypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn lookup_identity_collection_matches_the_lowering_identity() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(PublicLut::new(
-            &parameters,
-            2,
-            |parameters: &DCRTPolyParams, input| {
-                Some((
-                    input,
-                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
-                ))
-            },
-            None,
-        ));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output = circuit.public_lookup_gate(input, lookup_id).as_single_wire();
         circuit.output([output]);
         assert_eq!(
@@ -1352,25 +2150,20 @@ mod tests {
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(PublicLut::new(
-            &parameters,
-            2,
-            |parameters: &DCRTPolyParams, input| {
-                Some((
-                    input,
-                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
-                ))
-            },
-            None,
-        ));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output = circuit.public_lookup_gate(input, lookup_id);
         circuit.output([output]);
         let public_key = |name: &str| NaiveBggPublicKeyVecWire {
             matrices: ring.input_family(name, 2, (1, digit_count)),
             reveal_plaintext: true,
         };
-        let trapdoor =
-            ring.sample_trapdoor(1, 5, BigInt::from(1u64 << parameters.base_bits()), digit_count);
+        let trapdoor = ring.sample_trapdoor(
+            1,
+            5,
+            BigInt::from(1u64 << parameters.base_bits()),
+            digit_count,
+            1_000_000,
+        );
         let mut lookup = NaiveLweLookupPreprocessingLowering::new(
             parameters.clone(),
             ring.bytes_input("hash-key", 32),
@@ -1412,23 +2205,12 @@ mod tests {
     }
 
     #[test]
-    fn preprocessing_artifacts_drive_the_online_lwe_equation() {
+    fn circuit_public_lookup_lowers_to_logical_artifact_family_access() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(PublicLut::new(
-            &parameters,
-            2,
-            |parameters: &DCRTPolyParams, input| {
-                let (row, output) = if input == 0 { (1, 11) } else { (0, 13) };
-                Some((
-                    row,
-                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), output),
-                ))
-            },
-            None,
-        ));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
         circuit.output([output_gate]);
         let lookup = compiler(
@@ -1440,290 +2222,7 @@ mod tests {
                 lookup: lookup_id,
                 slot: None,
             },
-            LweLookupTable::from_public_lut(&parameters, circuit.lookup_table(lookup_id).as_ref())
-                .expect("permutation table"),
-        );
-        let names = LweLookupArtifactNames::for_compiler(&lookup);
-        let ring = lookup.ring();
-        let trapdoor =
-            ring.sample_trapdoor(1, 5, lookup.gadget_base.clone(), lookup.digit_count.clone());
-        let wires = lookup
-            .preprocess(
-                ring.bytes_input("hash-key", 32),
-                &BggPublicKeyWire {
-                    matrix: ring.input("input-public-key", (1, digit_count)),
-                    reveal_plaintext: true,
-                },
-                &trapdoor,
-            )
-            .expect("preprocessing graph");
-        let producer = lookup
-            .export_preprocessing(DslContext::new("lwe-lookup-producer"), wires, &names)
-            .expect("preprocessing outputs")
-            .build()
-            .expect("producer graph");
-        assert_eq!(
-            producer
-                .graph
-                .root_scope()
-                .nodes()
-                .iter()
-                .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
-                .count(),
-            1
-        );
-        let producer_symbolic = producer.elaborate(&ParamEnv::default()).expect("producer IR");
-        let producer_noise =
-            mxx_noise_simulator::simulate(&producer_symbolic).expect("producer noise simulation");
-        assert!(producer_noise.outputs.contains_key(&names.low_matrices));
-        assert!(producer_noise.outputs.contains_key(&names.high_matrices));
-        let producer = producer.validate(&ParamEnv::default()).expect("validated producer");
-        let mut store = MemoryArtifactStore::default();
-        let mut producer_backend = cpu_backend([parameters.clone()]);
-        let produced = execute(
-            &producer,
-            &mut producer_backend,
-            BTreeMap::from([
-                ("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x42; 32])),
-                (
-                    "input-public-key".to_owned(),
-                    RuntimeValue::matrix(DCRTPolyMatrix::zero(&parameters, 1, digit_count)),
-                ),
-            ]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .expect("preprocessing execution");
-        assert_eq!(producer_backend.preimage_batch_calls(), 1);
-        let production_id = produced.production_id.clone().expect("artifact production");
-        let manifest = store.manifest(&production_id).expect("manifest").clone();
-        let symbolic_exports = producer_symbolic
-            .outputs
-            .iter()
-            .map(|(name, reference)| {
-                let wire = producer_symbolic.wire(reference).expect("symbolic artifact output");
-                (
-                    name.clone(),
-                    mxx_ir_symbolic::manifest::ExportArtifact {
-                        wire_type: wire.wire_type.clone(),
-                        expression: wire.expression,
-                        family: wire.family.clone(),
-                        content_hash: None,
-                        layout: None,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let symbolic_manifest = mxx_ir_symbolic::manifest::export_manifest(
-            production_id.clone(),
-            &symbolic_exports,
-            &producer_symbolic.atoms,
-            &producer_symbolic.expressions,
-            &producer_symbolic.preimage_relations,
-            producer_symbolic.assumption_digest,
-        )
-        .expect("symbolic manifest");
-        assert_eq!(manifest.artifacts[&names.low_matrices].family_count, Some(lookup.table.len()));
-        let selected_low_handle = &produced.artifact_handles[&names.low_matrices][1];
-        let selected_low_descriptor = &manifest.artifacts[&names.low_matrices];
-        let ArtifactPayload::Matrix(selected_low_bytes) = store
-            .load(&selected_low_handle.key, selected_low_descriptor)
-            .expect("selected low matrix")
-        else {
-            panic!("matrix artifact")
-        };
-        let ArtifactType::Matrix(selected_low_type) = &selected_low_handle.artifact_type else {
-            panic!("matrix artifact type")
-        };
-        let selected_low = producer_backend
-            .matrix_from_bytes(selected_low_type, &selected_low_bytes)
-            .expect("decode selected low matrix");
-        let selected_high_handle = &produced.artifact_handles[&names.high_matrices][1];
-        let selected_high_descriptor = &manifest.artifacts[&names.high_matrices];
-        let ArtifactPayload::Matrix(selected_high_bytes) = store
-            .load(&selected_high_handle.key, selected_high_descriptor)
-            .expect("selected high matrix")
-        else {
-            panic!("matrix artifact")
-        };
-        let ArtifactType::Matrix(selected_high_type) = &selected_high_handle.artifact_type else {
-            panic!("matrix artifact type")
-        };
-        let selected_high = producer_backend
-            .matrix_from_bytes(selected_high_type, &selected_high_bytes)
-            .expect("decode selected high matrix");
-
-        let artifacts = LweLookupArtifacts::for_compiler(production_id.clone(), &lookup);
-        let invocation =
-            LweLookupInvocation::bind(lookup.clone(), artifacts, &parameters, &circuit)
-                .expect("circuit lookup invocation");
-        let input_vector = ring.input("input-vector", (1, digit_count));
-        let input = BggEncodingWire {
-            vector: input_vector.clone(),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input("consumer-public-key", (1, digit_count)),
-                reveal_plaintext: true,
-            },
-            plaintext: Some(ring.input("input-plaintext", (1, 1))),
-        };
-        let one = BggEncodingWire {
-            vector: ring.zero((1, digit_count)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.zero((1, digit_count)),
-                reveal_plaintext: true,
-            },
-            plaintext: Some(ring.polynomial([IntExpr::constant(1)])),
-        };
-        let standard = BggPublicKeyCompiler {
-            ring: ring.clone(),
-            base: lookup.gadget_base.clone(),
-            digit_count: lookup.digit_count.clone(),
-        };
-        let mut lookup_lowering =
-            LweLookupEncodingLowering::new([invocation], ring.input("c-b", (1, digit_count + 2)))
-                .expect("lookup lowering");
-        let mut slots = crate::NoSlotOperations::default();
-        let output = crate::PolyCircuitCompiler { public_key: standard }
-            .compile_encodings_with_lowerings(
-                &circuit,
-                one,
-                [input],
-                &mut lookup_lowering,
-                &mut slots,
-            )
-            .expect("circuit online graph")
-            .remove(0);
-        let consumer = DslContext::new("lwe-lookup-consumer")
-            .output("vector", output.vector)
-            .expect("vector")
-            .output("plaintext", output.plaintext.expect("revealed output"))
-            .expect("plaintext")
-            .build()
-            .expect("consumer graph");
-        let consumer_symbolic = consumer
-            .elaborate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production_id.clone(), manifest.clone())]),
-                &[symbolic_manifest],
-            )
-            .expect("consumer symbolic IR");
-        let consumer_noise =
-            mxx_noise_simulator::simulate(&consumer_symbolic).expect("consumer noise simulation");
-        assert!(consumer_noise.outputs.contains_key("vector"));
-        let output_expression = consumer_symbolic
-            .wire(&consumer_symbolic.outputs["vector"])
-            .and_then(|wire| wire.expression)
-            .expect("lookup output expression");
-        let mxx_ir_symbolic::SymbolicExprNode::Select { branches, .. } = &consumer_symbolic
-            .expressions
-            .get(output_expression)
-            .expect("lookup output expression")
-            .node
-        else {
-            panic!("lookup output must preserve its runtime selection")
-        };
-        assert_eq!(branches.len(), lookup.table.len());
-        assert!(branches.iter().all(|branch| matches!(
-            consumer_symbolic.expressions.get(*branch).expect("lookup branch expression").node,
-            mxx_ir_symbolic::SymbolicExprNode::Add(_)
-        )));
-        let consumer = consumer
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production_id, manifest)]),
-            )
-            .expect("validated consumer");
-        let input_vector_value = DCRTPolyMatrix::from_poly_vec_row(
-            &parameters,
-            (0..digit_count)
-                .map(|index| {
-                    DCRTPoly::const_rotate_poly(
-                        &parameters,
-                        index % parameters.ring_dimension() as usize,
-                    )
-                })
-                .collect(),
-        );
-        let c_b_value = DCRTPolyMatrix::from_poly_vec_row(
-            &parameters,
-            (0..digit_count + 2)
-                .map(|index| {
-                    DCRTPoly::const_rotate_poly(
-                        &parameters,
-                        index % parameters.ring_dimension() as usize,
-                    )
-                })
-                .collect(),
-        );
-        let expected_vector =
-            c_b_value.clone() * &selected_high + input_vector_value.clone() * &selected_low;
-        let consumed = execute(
-            &consumer,
-            &mut cpu_backend([parameters.clone()]),
-            BTreeMap::from([
-                ("input-vector".to_owned(), RuntimeValue::matrix(input_vector_value)),
-                (
-                    "consumer-public-key".to_owned(),
-                    RuntimeValue::matrix(DCRTPolyMatrix::zero(&parameters, 1, digit_count)),
-                ),
-                (
-                    "input-plaintext".to_owned(),
-                    RuntimeValue::matrix(DCRTPolyMatrix::from_poly_vec_row(
-                        &parameters,
-                        vec![DCRTPoly::from_usize_to_constant(&parameters, 1)],
-                    )),
-                ),
-                ("c-b".to_owned(), RuntimeValue::matrix(c_b_value)),
-            ]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .expect("online execution");
-        let RuntimeValue::Matrix(actual_vector) = &consumed.outputs["vector"] else {
-            panic!("vector output")
-        };
-        assert_eq!(actual_vector.as_ref(), &expected_vector);
-        let RuntimeValue::Matrix(actual_plaintext) = &consumed.outputs["plaintext"] else {
-            panic!("plaintext output")
-        };
-        assert_eq!(
-            actual_plaintext.as_ref(),
-            &DCRTPolyMatrix::from_poly_vec_row(
-                &parameters,
-                vec![DCRTPoly::from_usize_to_constant(&parameters, 13)],
-            )
-        );
-    }
-
-    #[test]
-    fn circuit_public_lookup_lowers_to_lazy_artifact_selection() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let digit_count = parameters.modulus_digits();
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let input_gate = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(PublicLut::new(
-            &parameters,
-            2,
-            |parameters: &DCRTPolyParams, input| {
-                Some((
-                    input,
-                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
-                ))
-            },
-            None,
-        ));
-        let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
-        circuit.output([output_gate]);
-        let lookup = compiler(
-            &parameters,
-            LweLookupIdentity {
-                call_path: Vec::new(),
-                gate: output_gate.as_single_wire().index(),
-                occurrence: 0,
-                lookup: lookup_id,
-                slot: None,
-            },
-            LweLookupTable::from_public_lut(&parameters, circuit.lookup_table(lookup_id).as_ref())
+            LweLookupTable::from_public_lut(circuit.lookup_table(lookup_id).as_ref())
                 .expect("table"),
         );
         let invocation = LweLookupInvocation::bind(
@@ -1813,35 +2312,215 @@ mod tests {
                 .iter()
                 .filter(|node| matches!(node.kind(), NodeKind::Input { artifact: Some(_), .. }))
                 .count(),
-            3
+            4
+        );
+        for suffix in ["_low_matrices", "_high_matrices", "_output_plaintexts"] {
+            assert!(
+                nodes.iter().any(|node| {
+                    let NodeKind::Input { artifact: Some(artifact), wire_type, .. } = node.kind()
+                    else {
+                        return false;
+                    };
+                    artifact.artifact_name.ends_with(suffix) &&
+                        matches!(
+                            wire_type,
+                            WireType::IndexedFamily { count, .. }
+                                if count == &IntExpr::constant(2)
+                        )
+                }),
+                "logical lookup artifact {suffix} must have table-length domain"
+            );
+        }
+        let dynamic_gets = nodes
+            .iter()
+            .filter(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
+            .collect::<Vec<_>>();
+        assert_eq!(dynamic_gets.len(), 3);
+        assert!(dynamic_gets.iter().all(|node| {
+            matches!(
+                node.arguments()[1].node().kind(),
+                NodeKind::ExtractCoefficient { position, .. }
+                    if position == &IntExpr::constant(0)
+            )
+        }));
+        assert!(
+            dynamic_gets
+                .iter()
+                .skip(1)
+                .all(|node| node.arguments()[1] == dynamic_gets[0].arguments()[1])
         );
         assert_eq!(
-            nodes.iter().filter(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic)).count(),
-            2
+            nodes
+                .iter()
+                .filter(|node| {
+                    matches!(node.kind(), NodeKind::Select { .. }) &&
+                        matches!(
+                            node.output_types().first(),
+                            Some(WireType::IndexedFamily { .. })
+                        )
+                })
+                .count(),
+            0,
+            "lookup artifacts are one logical family; chunk selection is not checker-visible"
         );
         assert_eq!(
-            nodes.iter().filter(|node| matches!(node.kind(), NodeKind::Select { .. })).count(),
-            1
+            nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind(),
+                        NodeKind::IntBinary(IntBinaryOp::Divide | IntBinaryOp::Remainder)
+                    )
+                })
+                .count(),
+            0,
+            "lookup access must use x directly, without chunk arithmetic"
         );
     }
 
     #[test]
-    fn poly_and_naive_lookup_lowerings_build_structural_family_graphs() {
+    fn single_public_lookup_keeps_the_output_signal_in_secret_public_key_gadget_order() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(PublicLut::new(
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
+        let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
+        circuit.output([output_gate]);
+        let lookup = compiler(
             &parameters,
-            2,
-            |parameters: &DCRTPolyParams, input| {
-                Some((
-                    input,
-                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
-                ))
+            LweLookupIdentity {
+                call_path: Vec::new(),
+                gate: output_gate.as_single_wire().index(),
+                occurrence: 0,
+                lookup: lookup_id,
+                slot: None,
             },
-            None,
-        ));
+            LweLookupTable::from_public_lut(circuit.lookup_table(lookup_id).as_ref())
+                .expect("table"),
+        );
+        let production_id = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [8; 32] };
+        let output_public_key_artifact =
+            LweLookupArtifactNames::for_compiler(&lookup).output_public_key;
+        let invocation = LweLookupInvocation::bind(
+            lookup.clone(),
+            LweLookupArtifacts::for_compiler(production_id.clone(), &lookup),
+            &parameters,
+            &circuit,
+        )
+        .expect("invocation");
+        let ring = lookup.ring();
+        let circuit_compiler = crate::PolyCircuitCompiler {
+            public_key: BggPublicKeyCompiler {
+                ring: ring.clone(),
+                base: lookup.gadget_base.clone(),
+                digit_count: lookup.digit_count.clone(),
+            },
+        };
+        let encoding = |prefix: &str| BggEncodingWire {
+            vector: ring.input(format!("{prefix}-vector"), (1, digit_count)),
+            pubkey: BggPublicKeyWire {
+                matrix: ring.input(format!("{prefix}-public"), (1, digit_count)),
+                reveal_plaintext: true,
+            },
+            plaintext: Some(ring.input(format!("{prefix}-plaintext"), (1, 1))),
+        };
+        let input_encoding = encoding("input");
+        let mut lowering =
+            LweLookupEncodingLowering::new([invocation], ring.input("c-b", (1, digit_count + 2)))
+                .expect("lowering");
+        let mut slots = crate::NoSlotOperations::default();
+        let output = circuit_compiler
+            .compile_encodings_with_lowerings(
+                &circuit,
+                encoding("one"),
+                [input_encoding],
+                &mut lowering,
+                &mut slots,
+            )
+            .expect("lookup lowering")
+            .into_iter()
+            .next()
+            .expect("one LUT output");
+        let output_plaintext = output.plaintext.clone().expect("lookup output plaintext");
+        let secret = ring.input("lookup-secret", (1, 1));
+        let gadget = ring.gadget(1, lookup.gadget_base.clone(), lookup.digit_count.clone());
+        let signal = secret.clone() * output.pubkey.matrix.clone() -
+            output_plaintext.clone() * secret.clone() * gadget.clone();
+
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) = signal.value_handle().node().kind()
+        else {
+            panic!("lookup signal must be a subtraction")
+        };
+        let [left, right] = signal.value_handle().node().arguments() else {
+            panic!("lookup signal subtraction must have two operands")
+        };
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = left.node().kind() else {
+            panic!("lookup signal left side must be secret times output public key")
+        };
+        assert_eq!(
+            left.node().arguments(),
+            [secret.value_handle().clone(), output.pubkey.matrix.value_handle().clone()]
+        );
+        let NodeKind::Input { artifact: Some(artifact), .. } =
+            output.pubkey.matrix.value_handle().node().kind()
+        else {
+            panic!("lookup output public key must be imported from its exact artifact")
+        };
+        assert_eq!(artifact.production_id, production_id);
+        assert_eq!(artifact.artifact_name, output_public_key_artifact);
+        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
+
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = right.node().kind() else {
+            panic!("lookup signal right side must end with a gadget multiplication")
+        };
+        let [plaintext_times_secret, right_gadget] = right.node().arguments() else {
+            panic!("lookup signal gadget product must have two operands")
+        };
+        assert_eq!(right_gadget, gadget.value_handle());
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = plaintext_times_secret.node().kind()
+        else {
+            panic!("lookup signal must multiply its plaintext by the secret before the gadget")
+        };
+        assert_eq!(
+            plaintext_times_secret.node().arguments(),
+            [output_plaintext.value_handle().clone(), secret.value_handle().clone()]
+        );
+        let NodeKind::FamilyGetDynamic = output_plaintext.value_handle().node().kind() else {
+            panic!("lookup output plaintext must use dynamic access to the artifact family")
+        };
+        let [output_family, output_selector] = output_plaintext.value_handle().node().arguments()
+        else {
+            panic!("lookup output plaintext family access has the wrong arity")
+        };
+        let NodeKind::Input { artifact: Some(artifact), .. } = output_family.node().kind() else {
+            panic!("lookup output plaintext must come from the authoritative artifact family")
+        };
+        assert_eq!(artifact.production_id, production_id);
+        assert_eq!(
+            artifact.artifact_name,
+            LweLookupArtifactNames::for_compiler(&lookup).output_plaintexts
+        );
+        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
+        let NodeKind::ExtractCoefficient { position, .. } = output_selector.node().kind() else {
+            panic!("lookup output plaintext selector must be the input coefficient")
+        };
+        assert_eq!(position, &IntExpr::constant(0));
+
+        DslContext::new("single-lwe-public-lookup-signal")
+            .output("signal", signal)
+            .expect("signal output")
+            .build()
+            .expect("signal graph");
+    }
+
+    #[test]
+    fn naive_lookup_lowerings_build_structural_family_graphs() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let digit_count = parameters.modulus_digits();
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input_gate = circuit.input(1).as_single_wire();
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
         circuit.output([output_gate]);
         let identity = LweLookupIdentity {
@@ -1851,63 +2530,17 @@ mod tests {
             lookup: lookup_id,
             slot: None,
         };
-        let table =
-            LweLookupTable::from_public_lut(&parameters, circuit.lookup_table(lookup_id).as_ref())
-                .expect("table");
+        let table = LweLookupTable::from_public_lut(circuit.lookup_table(lookup_id).as_ref())
+            .expect("table");
         let lookup = compiler(&parameters, identity.clone(), table.clone());
-        let invocation = LweLookupInvocation::bind(
-            lookup.clone(),
-            LweLookupArtifacts::for_compiler(
-                ProductionId { spec_hash: SpecHash([30; 32]), execution_nonce: [31; 32] },
-                &lookup,
-            ),
-            &parameters,
-            &circuit,
-        )
-        .expect("poly invocation");
         let ring = lookup.ring();
         let public_key_compiler = BggPublicKeyCompiler {
             ring: ring.clone(),
             base: lookup.gadget_base.clone(),
             digit_count: lookup.digit_count.clone(),
         };
-        let poly_encoding = |prefix: &str| BggPolyEncodingWire {
-            vectors: ring.input_family(format!("{prefix}-vectors"), 2, (1, digit_count)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input(format!("{prefix}-public"), (1, digit_count)),
-                reveal_plaintext: true,
-            },
-            plaintexts: Some(ring.input_family(format!("{prefix}-plaintexts"), 2, (1, 1))),
-        };
-        let mut poly_lowering = LweLookupPolyEncodingLowering::new(
-            [invocation],
-            ring.input_family("poly-c-b", 2, (1, digit_count + 2)),
-        )
-        .expect("poly lowering");
-        let mut poly_slots = crate::NoSlotOperations::default();
         let circuit_compiler =
             crate::PolyCircuitCompiler { public_key: public_key_compiler.clone() };
-        let poly_outputs = circuit_compiler
-            .compile_poly_encodings_with_lowerings(
-                &circuit,
-                poly_encoding("poly-one"),
-                [poly_encoding("poly-input")],
-                &mut poly_lowering,
-                &mut poly_slots,
-            )
-            .expect("poly lookup lowering");
-        let poly_graph = DslContext::new("poly-lwe-lookup")
-            .family_output("vectors", poly_outputs[0].vectors.clone())
-            .expect("vectors")
-            .family_output("plaintexts", poly_outputs[0].plaintexts.clone().expect("plaintexts"))
-            .expect("plaintexts")
-            .output("public", poly_outputs[0].pubkey.matrix.clone())
-            .expect("public")
-            .build()
-            .expect("poly graph");
-        assert!(poly_graph.graph.scopes().values().any(|scope| {
-            scope.nodes().iter().any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
-        }));
 
         let slots = (0..2)
             .map(|slot| {
@@ -2003,7 +2636,7 @@ mod tests {
                 .iter()
                 .filter(|node| matches!(node.kind(), NodeKind::Input { artifact: Some(_), .. }))
                 .count(),
-            6
+            8
         );
     }
 }

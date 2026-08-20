@@ -322,7 +322,7 @@ impl SerializablePolyCircuit {
 
     fn to_circuit_with_registries<P: Poly>(
         self,
-        lookup_registry: Arc<crate::circuit::poly_circuit::LookupRegistry<P>>,
+        lookup_registry: Arc<crate::circuit::poly_circuit::LookupRegistry>,
         binding_registry: Arc<crate::circuit::poly_circuit::BindingRegistry>,
         input_set_registry: Arc<crate::circuit::poly_circuit::InputSetRegistry>,
         sub_circuit_registry: Arc<crate::circuit::poly_circuit::SubCircuitRegistry<P>>,
@@ -553,8 +553,57 @@ mod tests {
         let inputs = circuit.input(2).to_vec();
         let transferred =
             circuit.slot_transfer_gate(inputs[0], &[(1, None), (0, Some(3)), (1, None)]);
-        let reduced = circuit.slot_reduce_gate(&[transferred, inputs[1].into()], 3);
+        let rotated = circuit.slot_rotation_gate(transferred, 5, 4);
+        let reduced = circuit.slot_reduce_gate(&[rotated, inputs[1].into()], 3);
         circuit.output([reduced]);
+        assert_json_roundtrip(circuit);
+    }
+
+    #[test]
+    fn serialization_roundtrip_preserves_parameterized_slot_rotation() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let rotation =
+            child.register_sub_circuit_param(SubCircuitParamSpec::SlotTransfer { max_scalar: 1 });
+        let input = child.input(1).as_single_wire();
+        let output = child.slot_transfer_gate_param(input, rotation);
+        child.output([output]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let child_id = circuit.register_sub_circuit(child);
+        let output = circuit.call_sub_circuit_with_bindings(
+            child_id,
+            [input],
+            &[SubCircuitParamValue::SlotTransfer(SlotTransferSpec::rotation(9, 8))],
+        );
+        circuit.output(output);
+        assert_json_roundtrip(circuit);
+    }
+
+    #[test]
+    fn serialization_roundtrip_preserves_repeated_lanes() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let transfer =
+            child.register_sub_circuit_param(SubCircuitParamSpec::SlotTransfer { max_scalar: 5 });
+        let input = child.input(1).as_single_wire();
+        let output = child.slot_transfer_gate_param(input, transfer);
+        child.output([output]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let child_id = circuit.register_sub_circuit(child);
+        let output = circuit.call_sub_circuit_with_bindings(
+            child_id,
+            [input],
+            &[SubCircuitParamValue::SlotTransfer(SlotTransferSpec::repeated_lanes(
+                1,
+                4,
+                3,
+                2,
+                Some(5),
+            ))],
+        );
+        circuit.output(output);
         assert_json_roundtrip(circuit);
     }
 

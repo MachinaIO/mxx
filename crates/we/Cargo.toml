@@ -13,19 +13,22 @@ gpu = ["mxx-primitives/gpu", "mxx-gadgets/gpu", "mxx-runtime/gpu"]
 mxx-primitives.workspace = true
 mxx-gadgets.workspace = true
 mxx-bgg.workspace = true
-mxx-bench-estimator.workspace = true
 mxx-dsl.workspace = true
 mxx-ir-core.workspace = true
-mxx-ir-symbolic.workspace = true
-mxx-noise-simulator.workspace = true
 mxx-runtime.workspace = true
-bigdecimal.workspace = true
+mxx-correctness.workspace = true
+mxx-bench-estimator.workspace = true
 num-bigint.workspace = true
+num-integer.workspace = true
+num-traits.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+keccak-asm.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
-keccak-asm.workspace = true
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
-mxx-gadgets.workspace = true
+serial_test.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true

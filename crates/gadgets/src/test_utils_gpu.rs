@@ -1,7 +1,9 @@
 use crate::{
     circuit::PolyCircuit,
     circuit_gadgets::{
-        arith::nested_rns::NestedRnsPolyContext,
+        arith::nested_rns::{
+            NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_with_offset,
+        },
         fhe::{
             ring_gsw::RingGswCiphertext,
             ring_gsw_nested_rns::{
@@ -11,7 +13,7 @@ use crate::{
             },
         },
     },
-    test_utils::build_circuit_graph,
+    test_utils::{build_circuit_graph, diagonal_matrix},
 };
 use mxx_dsl::{DslContext, Family, Ring};
 use mxx_ir_core::{ParamEnv, node::NodeKind};
@@ -26,7 +28,7 @@ use mxx_runtime::{
     RuntimeValue, artifact::MemoryArtifactStore, backend::poly::gpu::gpu_backend, execute,
     transcript::SamplingMode,
 };
-use num_bigint::{BigInt, Sign};
+use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use std::{collections::BTreeMap, sync::Arc};
@@ -119,6 +121,85 @@ fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
     );
     assert_eq!(first.to_cpu_matrix(), four);
     assert_eq!(second.to_cpu_matrix(), DCRTPolyMatrix::zero(&parameters, 1, 1));
+}
+
+#[test]
+#[serial_test::serial]
+fn test_gpu_packed_nested_rns_addition_matches_cpu_matrices() {
+    let parameters = DCRTPolyParams::new(2, 2, 12, 6);
+    let (moduli, _, _) = parameters.to_crt();
+    let gpu_parameters =
+        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits());
+    let mut circuit = PolyCircuit::<DCRTPoly>::new();
+    let context =
+        Arc::new(NestedRnsPolyContext::setup(&mut circuit, &parameters, 6, 2, 16, false, None));
+    let coefficient_slots = 2;
+    let left =
+        NestedRnsPoly::input(context.clone(), coefficient_slots, Some(2), None, &mut circuit);
+    let right =
+        NestedRnsPoly::input(context.clone(), coefficient_slots, Some(2), None, &mut circuit);
+    let sum = left.add(&right, &mut circuit);
+    circuit.output([sum.inner]);
+
+    let encode = |values: &[BigUint]| {
+        encode_nested_rns_poly_with_offset::<DCRTPoly>(
+            context.p_moduli_bits,
+            context.max_unreduced_muls,
+            &parameters,
+            values,
+            0,
+            Some(2),
+        )
+        .into_iter()
+        .map(|lanes| {
+            diagonal_matrix(
+                &parameters,
+                lanes.into_iter().map(|lane| DCRTPoly::from_biguint_to_constant(&parameters, lane)),
+            )
+        })
+        .collect::<Vec<_>>()
+    };
+    let left_inputs = encode(&[BigUint::from(1u8), BigUint::from(2u8)]);
+    let right_inputs = encode(&[BigUint::from(3u8), BigUint::from(4u8)]);
+    let expected = left_inputs
+        .iter()
+        .zip(&right_inputs)
+        .map(|(left, right)| left.clone() + right.clone())
+        .collect::<Vec<_>>();
+    let cpu_inputs = left_inputs.into_iter().chain(right_inputs).collect::<Vec<_>>();
+    let wire_size = coefficient_slots * context.q_moduli_depth;
+    assert!(wire_size > 1);
+    let graph = build_circuit_graph(
+        "gpu-packed-nested-rns-addition",
+        &parameters,
+        &circuit,
+        circuit.num_input(),
+        (wire_size, wire_size),
+    );
+    let runtime_inputs = cpu_inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            (
+                format!("input-{index}"),
+                RuntimeValue::matrix(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, input)),
+            )
+        })
+        .collect();
+    let execution = execute(
+        &graph,
+        &mut gpu_backend([gpu_parameters]),
+        runtime_inputs,
+        &mut MemoryArtifactStore::default(),
+        SamplingMode::Fresh,
+    )
+    .expect("execute packed nested-RNS addition on the GPU runtime backend");
+    for (index, expected) in expected.into_iter().enumerate() {
+        let RuntimeValue::Matrix(actual) = &execution.outputs[&format!("output-{index}")] else {
+            panic!("packed nested-RNS output must be a matrix")
+        };
+        assert_eq!(actual.to_cpu_matrix(), expected);
+    }
 }
 
 #[test]

@@ -174,6 +174,30 @@ __device__ __forceinline__ uint64_t signed_mod_i64(int64_t value, uint64_t modul
     return rem == 0 ? 0 : (modulus - rem);
 }
 
+__device__ __forceinline__ uint64_t abs_i64(int64_t value)
+{
+    if (value >= 0)
+    {
+        return static_cast<uint64_t>(value);
+    }
+    return static_cast<uint64_t>(-(value + 1)) + 1;
+}
+
+__device__ __forceinline__ uint64_t centered_sample_abs_i64(
+    int64_t value,
+    uint64_t coefficient_modulus)
+{
+    if (coefficient_modulus == 0)
+    {
+        // A zero sentinel means the full CRT modulus does not fit in u64. Since the sampler
+        // produces an i64, reduction cannot change its centered representative in that case.
+        return abs_i64(value);
+    }
+    const uint64_t residue = signed_mod_i64(value, coefficient_modulus);
+    const uint64_t negative_magnitude = coefficient_modulus - residue;
+    return residue < negative_magnitude ? residue : negative_magnitude;
+}
+
 __device__ __forceinline__ uint64_t sample_uniform_mod(DeviceChaChaRng &rng, uint64_t modulus)
 {
     if (modulus == 0)
@@ -221,6 +245,8 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
     uint32_t limb_idx,
     int dist_type,
     double sigma,
+    uint64_t max_coefficient_bound,
+    uint64_t coefficient_modulus,
     GpuRngSeed seed)
 {
     size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -258,7 +284,11 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
             static_cast<uint64_t>(coeff_idx + 1),
             0,
             0x6f70656e66686532ULL);
-        int64_t z = sample_integer_karney(rng, 0.0, sigma);
+        int64_t z;
+        do
+        {
+            z = sample_integer_karney(rng, 0.0, sigma);
+        } while (centered_sample_abs_i64(z, coefficient_modulus) > max_coefficient_bound);
         sample = signed_mod_i64(z, modulus);
     }
     else if (dist_type == GPU_MATRIX_DIST_BIT)
@@ -310,6 +340,8 @@ int launch_sample_distribution_multi_limb_kernel(
     uint32_t limb_idx,
     int dist_type,
     double sigma,
+    uint64_t max_coefficient_bound,
+    uint64_t coefficient_modulus,
     GpuRngSeed seed,
     cudaStream_t stream,
     const GpuMatrix *,
@@ -340,6 +372,8 @@ int launch_sample_distribution_multi_limb_kernel(
         limb_idx,
         dist_type,
         sigma,
+        max_coefficient_bound,
+        coefficient_modulus,
         seed);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
@@ -353,6 +387,8 @@ static int gpu_matrix_sample_distribution_impl(
     GpuMatrix *out,
     int dist_type,
     double sigma,
+    uint64_t max_coefficient_bound,
+    uint64_t coefficient_modulus,
     GpuRngSeed seed,
     size_t full_ncol,
     size_t col_offset)
@@ -445,6 +481,8 @@ static int gpu_matrix_sample_distribution_impl(
             static_cast<uint32_t>(limb),
             dist_type,
             sigma,
+            max_coefficient_bound,
+            coefficient_modulus,
             seed,
             limb_stream,
             out,
@@ -475,18 +513,38 @@ extern "C" int gpu_matrix_sample_distribution(
     GpuMatrix *out,
     int dist_type,
     double sigma,
+    uint64_t max_coefficient_bound,
+    uint64_t coefficient_modulus,
     GpuRngSeed seed)
 {
-    return gpu_matrix_sample_distribution_impl(out, dist_type, sigma, seed, out ? out->cols : 0, 0);
+    return gpu_matrix_sample_distribution_impl(
+        out,
+        dist_type,
+        sigma,
+        max_coefficient_bound,
+        coefficient_modulus,
+        seed,
+        out ? out->cols : 0,
+        0);
 }
 
 extern "C" int gpu_matrix_sample_distribution_columns(
     GpuMatrix *out,
     int dist_type,
     double sigma,
+    uint64_t max_coefficient_bound,
+    uint64_t coefficient_modulus,
     GpuRngSeed seed,
     size_t full_ncol,
     size_t col_offset)
 {
-    return gpu_matrix_sample_distribution_impl(out, dist_type, sigma, seed, full_ncol, col_offset);
+    return gpu_matrix_sample_distribution_impl(
+        out,
+        dist_type,
+        sigma,
+        max_coefficient_bound,
+        coefficient_modulus,
+        seed,
+        full_ncol,
+        col_offset);
 }

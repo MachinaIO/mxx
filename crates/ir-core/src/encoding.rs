@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-pub const IR_VERSION: u32 = 5;
+pub const IR_VERSION: u32 = 6;
 
 #[derive(Debug, Error)]
 pub enum EncodingError {
@@ -30,6 +30,12 @@ pub fn hash_canonical<T: Serialize>(value: &T) -> Result<[u8; 32], EncodingError
     Ok(Sha256::digest(bytes).into())
 }
 
+/// Hashes one concrete executable graph instantiation.
+///
+/// Unlike a parameter-independent protocol-declaration hash, this identity
+/// deliberately commits to every compile-parameter binding. Artifact
+/// `ProductionId`s use this hash so artifacts produced with different
+/// concrete dimensions or moduli cannot be interchanged.
 pub fn spec_hash(graph: &Graph, bindings: &ParamEnv) -> Result<SpecHash, EncodingError> {
     #[derive(Serialize)]
     struct Payload<'a> {
@@ -68,6 +74,8 @@ fn canonicalize_value(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{GraphOutput, NodeHandle, WireType, node::NodeKind};
+    use num_bigint::BigInt;
     use serde::Serialize;
 
     #[test]
@@ -97,5 +105,36 @@ mod tests {
             canonical_json(&lhs).expect("serializable"),
             canonical_json(&rhs).expect("serializable")
         );
+    }
+
+    #[test]
+    fn concrete_spec_hash_commits_to_parameter_bindings() {
+        let value = NodeHandle::new(
+            NodeKind::ConstantInt(BigInt::from(0)),
+            Vec::new(),
+            vec![WireType::ConstantInt],
+        )
+        .output(0)
+        .expect("constant output");
+        let graph = Graph::freeze(
+            "parameterized",
+            Vec::new(),
+            BTreeMap::from([("result".to_owned(), GraphOutput { value, confidentiality: None })]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("graph freezes")
+        .0;
+        let first = ParamEnv {
+            integers: BTreeMap::from([("modulus".to_owned(), BigInt::from(17))]),
+            ..ParamEnv::default()
+        };
+        let second = ParamEnv {
+            integers: BTreeMap::from([("modulus".to_owned(), BigInt::from(19))]),
+            ..ParamEnv::default()
+        };
+
+        assert_ne!(spec_hash(&graph, &first).unwrap(), spec_hash(&graph, &second).unwrap());
     }
 }

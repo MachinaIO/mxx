@@ -549,7 +549,7 @@ fn bit_mat(ring: &Ring, bit: bool) -> Mat {
 fn sample_scalar_bits(ring: &Ring, count: usize) -> Result<Vec<Mat>, Aky24CascadeGraphError> {
     (0..count)
         .map(|_| {
-            let sample = ring.uniform_in((1, 1), 0, 1);
+            let sample = ring.uniform_interval((1, 1), 0, 1);
             Ok(sample
                 .extract_coefficient(0)
                 .bit(0)

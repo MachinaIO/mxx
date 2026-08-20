@@ -846,7 +846,8 @@ mod tests {
         );
 
         // Test with GaussDist (Gaussian distribution)
-        let original_poly = sampler.sample_poly(&params, &DistType::GaussDist { sigma: 3.2 });
+        let original_poly = sampler
+            .sample_poly(&params, &DistType::GaussDist { sigma: 3.2, max_coefficient_bound: None });
         let bytes = original_poly.to_compact_bytes();
         let reconstructed_poly = DCRTPoly::from_compact_bytes(&params, &bytes);
 

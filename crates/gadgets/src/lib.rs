@@ -13,8 +13,9 @@ pub mod input_injector;
 pub mod noise_refresh;
 pub mod utils;
 
-#[cfg(test)]
-mod test_utils;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_utils;
 #[cfg(all(test, feature = "gpu"))]
 mod test_utils_gpu;
 
@@ -24,5 +25,5 @@ mod test_utils_gpu;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use mxx_primitives::rlwe_enc;
-pub(crate) use mxx_primitives::{element, matrix, poly, sampler};
 pub use mxx_primitives::{element::PolyElem, impl_binop_with_refs, parallel_iter, poly::Poly};
+pub(crate) use mxx_primitives::{matrix, poly, sampler};

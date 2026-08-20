@@ -1,5 +1,7 @@
 //! Cost estimation over validated scoped execution plans.
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod harness;
 
 use mxx_ir_core::{
@@ -24,7 +26,15 @@ pub struct MeasurementNode<'a> {
     pub id: NodeId,
     pub kind: &'a NodeKind,
     pub arguments: &'a [WireRef],
+    /// Kinds of the direct producers of `arguments`, in the same order.
+    pub argument_kinds: &'a [&'a NodeKind],
+    /// Concrete types of `arguments`, exposed by reference for measurement backends.
+    pub argument_types: &'a [ConcreteWireType],
     pub output_types: &'a [WireType],
+    /// Concrete types resolved by graph validation for every input wire.
+    pub concrete_argument_types: Vec<ConcreteWireType>,
+    /// Concrete types resolved by graph validation for every output port.
+    pub concrete_output_types: Vec<ConcreteWireType>,
 }
 
 pub trait MeasurementBackend {
@@ -59,6 +69,8 @@ impl Default for EstimateConfig {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostReport {
     pub total_work_seconds: f64,
+    /// Total measured work attributable to preimage sampling nodes, including loop multiplicity.
+    pub preimage_sampling_work_seconds: f64,
     pub critical_path_seconds: f64,
     pub maximum_parallelism: usize,
     pub persistent_bytes_over_time: Vec<u64>,
@@ -73,6 +85,7 @@ pub struct SubgraphCost {
     pub invocations: usize,
     pub measured_once: bool,
     pub work_seconds_per_invocation: f64,
+    pub preimage_sampling_work_seconds_per_invocation: f64,
     pub latency_seconds_per_invocation: f64,
     pub workspace_high_water_bytes: u64,
     pub peak_memory_bytes: u64,
@@ -116,6 +129,7 @@ pub fn estimate<B: MeasurementBackend>(
         invocations: BTreeMap::new(),
     };
     let mut report = estimator.estimate_scope(&FrozenGraphScopeId::Root, &validated.bindings)?;
+    estimator.record_child_invocations(&FrozenGraphScopeId::Root, &validated.bindings, 1)?;
     for (key, count) in estimator.invocations {
         if let Some(cached) = estimator.cache.get(&key) {
             report.per_subgraph.insert(
@@ -124,6 +138,8 @@ pub fn estimate<B: MeasurementBackend>(
                     invocations: count,
                     measured_once: true,
                     work_seconds_per_invocation: cached.total_work_seconds,
+                    preimage_sampling_work_seconds_per_invocation: cached
+                        .preimage_sampling_work_seconds,
                     latency_seconds_per_invocation: cached.critical_path_seconds,
                     workspace_high_water_bytes: cached.workspace_high_water_bytes,
                     peak_memory_bytes: cached.peak_memory_bytes,
@@ -208,20 +224,50 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         for (position, handle) in plan.execution_order.iter().enumerate() {
             let id = NodeId(position as u64);
             let arguments = scope.arguments(handle).expect("plan node belongs to scope");
+            let concrete_argument_types = arguments
+                .iter()
+                .map(|wire| {
+                    plan.wire_types
+                        .get(wire)
+                        .cloned()
+                        .expect("validated argument has a concrete type")
+                })
+                .collect::<Vec<_>>();
+            let argument_types = concrete_argument_types.clone();
+            let argument_kinds = arguments
+                .iter()
+                .map(|wire| {
+                    scope.node(wire.node).expect("validated argument has a source node").kind()
+                })
+                .collect::<Vec<_>>();
+            let concrete_output_types = (0..handle.output_types().len())
+                .map(|port| {
+                    plan.wire_types
+                        .get(&WireRef { node: id, port: mxx_ir_core::Port(port as u32) })
+                        .cloned()
+                        .expect("validated output has a concrete type")
+                })
+                .collect();
             let node = MeasurementNode {
                 scope: scope_id,
                 id,
                 kind: handle.kind(),
                 arguments: &arguments,
+                argument_kinds: &argument_kinds,
+                argument_types: &argument_types,
                 output_types: handle.output_types(),
+                concrete_argument_types,
+                concrete_output_types,
             };
             let predecessor = arguments
                 .iter()
                 .filter_map(|wire| completion.get(wire))
                 .copied()
                 .fold(0.0, f64::max);
-            let (measurement, nested_peak, nested_parallelism) = self.node_cost(&node, bindings)?;
+            let (measurement, preimage_sampling_work, nested_peak, nested_parallelism) =
+                self.node_cost(&node, bindings)?;
             report.total_work_seconds += measurement.work_seconds;
+            report.preimage_sampling_work_seconds += preimage_sampling_work;
             let finish = predecessor + measurement.latency_seconds;
             report.critical_path_seconds = report.critical_path_seconds.max(finish);
             report.workspace_high_water_bytes =
@@ -262,7 +308,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         &mut self,
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
-    ) -> Result<(NodeMeasurement, u64, usize), EstimateError> {
+    ) -> Result<(NodeMeasurement, f64, u64, usize), EstimateError> {
         match node.kind {
             NodeKind::SubgraphCall(call) => {
                 let child = self
@@ -271,7 +317,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .child_scope_id(node.scope, node.id)
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
                 let child_bindings = child_bindings(bindings, &call.bindings, None)?;
-                self.cached_child(child, child_bindings, 1)
+                self.cached_child(child, child_bindings)
             }
             NodeKind::ParallelLoop(loop_node) => {
                 if !self.backend.loop_index_invariant(self.validated.source.name(), node) {
@@ -289,7 +335,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         EstimateError::Expression("loop count is not usize".to_owned())
                     })?;
                 if count == 0 {
-                    return Ok((NodeMeasurement::default(), 0, 1));
+                    return Ok((NodeMeasurement::default(), 0.0, 0, 1));
                 }
                 let child = self
                     .validated
@@ -298,7 +344,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
                 let child_bindings =
                     child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
-                let (one, peak, parallelism) = self.cached_child(child, child_bindings, count)?;
+                let (one, preimage_work, peak, parallelism) =
+                    self.cached_child(child, child_bindings)?;
                 let concurrent = (self.config.device_pool_size.max(1) /
                     self.config.per_instance_occupancy.max(1))
                 .max(1);
@@ -309,14 +356,60 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         latency_seconds: one.latency_seconds * count.div_ceil(concurrent) as f64,
                         workspace_bytes: one.workspace_bytes,
                     },
+                    preimage_work * count as f64,
                     peak.saturating_mul(active as u64),
                     parallelism.saturating_mul(active),
+                ))
+            }
+            NodeKind::SequentialLoop(loop_node) => {
+                if !self.backend.loop_index_invariant(self.validated.source.name(), node) {
+                    return Err(EstimateError::LoopIndexDependentCost {
+                        scope: node.scope.clone(),
+                        node: node.id,
+                    });
+                }
+                let count = loop_node
+                    .count
+                    .evaluate(bindings)
+                    .map_err(|error| EstimateError::Expression(error.to_string()))?
+                    .to_usize()
+                    .ok_or_else(|| {
+                        EstimateError::Expression("sequential loop count is not usize".to_owned())
+                    })?;
+                if count == 0 {
+                    return Ok((NodeMeasurement::default(), 0.0, 0, 1));
+                }
+                let child = self
+                    .validated
+                    .source
+                    .child_scope_id(node.scope, node.id)
+                    .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
+                let child_bindings =
+                    child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
+                let (one, preimage_work, peak, parallelism) =
+                    self.cached_child(child, child_bindings)?;
+                Ok((
+                    NodeMeasurement {
+                        work_seconds: one.work_seconds * count as f64,
+                        latency_seconds: one.latency_seconds * count as f64,
+                        workspace_bytes: one.workspace_bytes,
+                    },
+                    preimage_work * count as f64,
+                    peak,
+                    parallelism,
                 ))
             }
             _ => self
                 .backend
                 .measure(self.validated.source.name(), node, bindings)
-                .map(|measurement| (measurement, 0, 1))
+                .map(|measurement| {
+                    let preimage_work = if matches!(node.kind, NodeKind::PreimageSample { .. }) {
+                        measurement.work_seconds
+                    } else {
+                        0.0
+                    };
+                    (measurement, preimage_work, 0, 1)
+                })
                 .map_err(|error| EstimateError::Backend(error.to_string())),
         }
     }
@@ -325,10 +418,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         &mut self,
         child: FrozenGraphScopeId,
         bindings: ParamEnv,
-        invocations: usize,
-    ) -> Result<(NodeMeasurement, u64, usize), EstimateError> {
+    ) -> Result<(NodeMeasurement, f64, u64, usize), EstimateError> {
         let key = CacheKey::new(child.clone(), &bindings)?;
-        *self.invocations.entry(key.clone()).or_default() += invocations;
         let report = if let Some(report) = self.cache.get(&key) {
             report.clone()
         } else {
@@ -342,9 +433,86 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 latency_seconds: report.critical_path_seconds,
                 workspace_bytes: report.workspace_high_water_bytes,
             },
+            report.preimage_sampling_work_seconds,
             report.peak_memory_bytes,
             report.maximum_parallelism,
         ))
+    }
+
+    fn record_child_invocations(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        bindings: &ParamEnv,
+        parent_invocations: usize,
+    ) -> Result<(), EstimateError> {
+        let nodes = self
+            .validated
+            .source
+            .scope(scope_id)
+            .ok_or_else(|| EstimateError::MissingScope(scope_id.clone()))?
+            .nodes()
+            .to_vec();
+        for (position, node) in nodes.iter().enumerate() {
+            let node_id = NodeId(position as u64);
+            let Some(child) = self.validated.source.child_scope_id(scope_id, node_id) else {
+                continue;
+            };
+            let (child_bindings, local_invocations) = match node.kind() {
+                NodeKind::SubgraphCall(call) => {
+                    (child_bindings(bindings, &call.bindings, None)?, 1)
+                }
+                NodeKind::ParallelLoop(loop_node) => {
+                    let count = loop_node
+                        .count
+                        .evaluate(bindings)
+                        .map_err(|error| EstimateError::Expression(error.to_string()))?
+                        .to_usize()
+                        .ok_or_else(|| {
+                            EstimateError::Expression("loop count is not usize".to_owned())
+                        })?;
+                    if count == 0 {
+                        continue;
+                    }
+                    (
+                        child_bindings(
+                            bindings,
+                            &loop_node.bindings,
+                            Some((loop_node.index_slot, 0)),
+                        )?,
+                        count,
+                    )
+                }
+                NodeKind::SequentialLoop(loop_node) => {
+                    let count = loop_node
+                        .count
+                        .evaluate(bindings)
+                        .map_err(|error| EstimateError::Expression(error.to_string()))?
+                        .to_usize()
+                        .ok_or_else(|| {
+                            EstimateError::Expression(
+                                "sequential loop count is not usize".to_owned(),
+                            )
+                        })?;
+                    if count == 0 {
+                        continue;
+                    }
+                    (
+                        child_bindings(
+                            bindings,
+                            &loop_node.bindings,
+                            Some((loop_node.index_slot, 0)),
+                        )?,
+                        count,
+                    )
+                }
+                _ => continue,
+            };
+            let invocations = parent_invocations.saturating_mul(local_invocations);
+            let key = CacheKey::new(child.clone(), &child_bindings)?;
+            *self.invocations.entry(key).or_default() += invocations;
+            self.record_child_invocations(&child, &child_bindings, invocations)?;
+        }
+        Ok(())
     }
 }
 
@@ -370,7 +538,7 @@ fn child_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, Ring};
+    use mxx_dsl::{DslContext, Int, IntType, Parallel, Ring, Sequential, Subgraph};
     use std::convert::Infallible;
 
     struct UnitBackend;
@@ -406,5 +574,61 @@ mod tests {
             estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
         assert_eq!(report.total_work_seconds, 3.0);
         assert_eq!(report.critical_path_seconds, 2.0);
+    }
+
+    #[test]
+    fn sequential_loop_iterations_extend_latency_without_parallel_memory_multiplication() {
+        let total =
+            Sequential::range(3)
+                .scan(Int::constant(0), Int::constant(1), |_, total, increment| {
+                    Ok(total.add(increment))
+                })
+                .expect("sequential scan");
+        let built = DslContext::new("estimate-sequential")
+            .int_output("total", total)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        let report =
+            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+        assert!(report.critical_path_seconds >= 3.0);
+        assert_eq!(report.maximum_parallelism, 1);
+    }
+
+    #[test]
+    fn sequential_loop_multiplies_all_nested_invocation_counts() {
+        let increment =
+            Subgraph::<Int, Int>::define("increment", IntType, |value| value.add(Int::constant(1)))
+                .expect("increment subgraph");
+        let total = Sequential::range(3)
+            .scan(Int::constant(0), Int::constant(0), |_, total, _| {
+                let direct = increment.call(total)?;
+                let parallel = Parallel::range(2).map_values(|_| {
+                    increment.call(direct.clone()).expect("nested subgraph call")
+                })?;
+                Ok(parallel.get_static(0))
+            })
+            .expect("nested sequential scan");
+        let built = DslContext::new("estimate-nested-sequential")
+            .int_output("total", total)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        let report =
+            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+
+        let invocation_count = |needle: &str| {
+            report
+                .per_subgraph
+                .iter()
+                .filter(|(name, _)| name.starts_with(needle))
+                .map(|(_, cost)| cost.invocations)
+                .sum::<usize>()
+        };
+        assert_eq!(invocation_count("SequentialBody"), 3);
+        assert_eq!(invocation_count("ParallelBody"), 6);
+        assert_eq!(invocation_count("Subgraph { canonical_name: \"increment\""), 9);
     }
 }

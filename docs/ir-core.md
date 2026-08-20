@@ -16,12 +16,12 @@ consumed by `mxx-runtime`. The graph specification hash depends on semantics,
 not allocation addresses, construction scheduling, source locations, or
 unreachable expressions.
 
-Symbolic reinterpretation and magnitude analysis are separate layers. The core
-stores only executable semantics and artifact metadata.
+Correctness declarations and deterministic hard-bound proofs are separate from
+execution. The core stores executable semantics, artifact metadata, and the
+authoritative integer cutoffs on sampler nodes.
 
 Tensor product, concatenation, selection, transpose, slice, reshape,
 constant-coefficient extraction, and CRT recomposition are ordinary executable
-core nodes. A symbolic layer may mirror these nodes, but it cannot change their
-runtime dataflow. Generic modulus-down and modulus-up operations are not exposed
+core nodes. Generic modulus-down and modulus-up operations are not exposed
 by the current core IR. Nested-RNS level switching remains a circuit gadget and
 is not represented as a generic core conversion.

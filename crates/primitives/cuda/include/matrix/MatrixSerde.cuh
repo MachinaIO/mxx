@@ -27,6 +27,13 @@ extern "C"
         size_t words_per_poly,
         GpuEventSet **out_events);
 
+    int gpu_matrix_batch_within_coefficient_bound(
+        const GpuMatrix *const *matrices,
+        size_t matrix_count,
+        const uint64_t *bound_words,
+        size_t bound_word_count,
+        uint8_t *accepted_out);
+
     int gpu_matrix_store_compact_bytes(
         GpuMatrix *mat,
         uint8_t *payload_out,
@@ -34,6 +41,15 @@ extern "C"
         uint16_t *out_max_coeff_bits,
         uint16_t *out_bytes_per_coeff,
         size_t *out_payload_len);
+
+    int gpu_matrix_store_compact_bytes_batch(
+        GpuMatrix *const *matrices,
+        size_t matrix_count,
+        uint8_t *const *payload_outputs,
+        const size_t *payload_capacities,
+        uint16_t *out_max_coeff_bits,
+        uint16_t *out_bytes_per_coeff,
+        size_t *out_payload_lengths);
 
     int gpu_matrix_load_compact_bytes(
         GpuMatrix *mat,

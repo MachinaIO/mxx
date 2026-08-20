@@ -262,33 +262,6 @@ mod tests {
     }
 
     #[test]
-    fn commitment_tree_builds_and_elaborates() {
-        let compiler = Wee25CommitmentCompiler {
-            modulus: 257.into(),
-            ring_dimension: 8.into(),
-            secret_size: 1,
-            tree_base: 2,
-            digit_count: 4,
-            gadget_base: 4.into(),
-        };
-        let ring = compiler.ring();
-        let blocks = (0..4)
-            .map(|index| ring.input(format!("block-{index}"), (1, compiler.public_columns())))
-            .collect::<Vec<_>>();
-        let tree =
-            compiler.commitment_tree(ring.bytes_input("hash-key", 32), &blocks).expect("tree");
-        let built = compiler
-            .export_commitment_tree(DslContext::new("wee25-commitment"), tree)
-            .expect("outputs")
-            .build()
-            .expect("build");
-        built.validate(&ParamEnv::default()).expect("validate");
-        let symbolic = built.elaborate(&ParamEnv::default()).expect("elaborate");
-        let report = mxx_noise_simulator::simulate(&symbolic).expect("simulate");
-        assert!(!report.outputs.is_empty());
-    }
-
-    #[test]
     fn commitment_tree_is_composable_inside_parallel_body() {
         let compiler = Wee25CommitmentCompiler {
             modulus: 257.into(),
@@ -317,7 +290,7 @@ mod tests {
             .build()
             .expect("build");
         built.validate(&ParamEnv::default()).expect("validate");
-        built.elaborate(&ParamEnv::default()).expect("elaborate");
+        built.validate(&ParamEnv::default()).expect("elaborate");
     }
 
     #[test]

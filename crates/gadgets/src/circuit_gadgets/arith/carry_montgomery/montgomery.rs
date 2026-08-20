@@ -60,7 +60,7 @@ impl<P: Poly + 'static> MontgomeryPolyContext<P> {
             .expect("q_moduli_big must be non-empty")
             .div_ceil(limb_bit_size);
         let carry_arith_ctx =
-            Arc::new(CarryArithPolyContext::setup(circuit, params, limb_bit_size, dummy_scalar));
+            Arc::new(CarryArithPolyContext::setup(circuit, limb_bit_size, dummy_scalar));
 
         let r_bits = limb_bit_size * num_limbs;
         let r = BigUint::one() << r_bits;
@@ -637,6 +637,7 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
 
     fn input(
         ctx: Arc<Self::Context>,
+        _num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         circuit: &mut PolyCircuit<P>,
@@ -663,6 +664,7 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
 
     fn input_with_metadata(
         ctx: Arc<Self::Context>,
+        _num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         max_plaintexts: Vec<BigUint>,
@@ -729,6 +731,7 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
 
     fn sparse_level_poly_with_metadata(
         ctx: Arc<Self::Context>,
+        _num_coefficient_slots: usize,
         active_levels: usize,
         enable_levels: Option<usize>,
         level_offset: usize,
@@ -875,6 +878,7 @@ impl<P: Poly + 'static> ModularArithmeticPlanner<P> for MontgomeryPoly<P> {
 
     fn input_with_planner_metadata(
         ctx: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         metadata: &Self::Metadata,
@@ -882,6 +886,7 @@ impl<P: Poly + 'static> ModularArithmeticPlanner<P> for MontgomeryPoly<P> {
     ) -> Self {
         Self::input_with_metadata(
             ctx,
+            num_coefficient_slots,
             enable_levels,
             level_offset,
             metadata.max_plaintexts.clone(),
@@ -1034,6 +1039,7 @@ impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for MontgomeryPoly<P> {
 
     fn gadget_vector(
         ctx: Arc<Self::Context>,
+        _num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         circuit: &mut PolyCircuit<P>,
@@ -1239,6 +1245,7 @@ mod tests {
     ) -> MontgomeryPoly<DCRTPoly> {
         <MontgomeryPoly<DCRTPoly> as ModularArithmeticGadget<DCRTPoly>>::input(
             context,
+            1,
             enable_levels,
             Some(level_offset),
             circuit,
@@ -1387,6 +1394,7 @@ mod tests {
         let input = build_input(context.clone(), enable_levels, level_offset, &mut circuit);
         let gadget = MontgomeryPoly::gadget_vector(
             context.clone(),
+            1,
             enable_levels,
             Some(level_offset),
             &mut circuit,

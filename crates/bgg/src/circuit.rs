@@ -1,10 +1,13 @@
 //! PolyCircuit evaluation into declarative BGG+ DAG values.
 
 use crate::{
-    BggEncodingCompiler, BggEncodingWire, BggPolyEncodingCompiler, BggPolyEncodingWire,
-    BggPublicKeyCompiler, BggPublicKeyWire, EncodingCompileError, NaiveBggEncodingVecWire,
-    NaiveBggPublicKeyVecWire, NaiveBggSlotTransferCompiler, NaiveBggVecCompiler,
-    NaiveVecCompileError, PolyEncodingCompileError, SlotFamilyCompileError,
+    BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire,
+    EncodingCompileError, NaiveBggEncodingVecWire, NaiveBggPublicKeyVecWire,
+    NaiveBggSlotTransferCompiler, NaiveBggVecCompiler, NaiveVecCompileError,
+    SlotFamilyCompileError,
+    tall_encoding::{
+        BggTallEncodingCompiler, BggTallEncodingWire, BggTallPlaintext, TallCompileError,
+    },
 };
 use mxx_dsl::{GraphValue, Subgraph};
 use mxx_gadgets::{
@@ -12,7 +15,7 @@ use mxx_gadgets::{
     circuit::{
         ArithmeticCircuitLowering, CircuitLowerError, CircuitLoweringTypes, GateInstance,
         PolyCircuit, PolyGateKind, PublicLookupLowering, SlotOperationLowering,
-        StructuredCircuitLowering, lower_circuit, lower_circuit_structured,
+        StructuredCircuitLowering, lower_circuit,
     },
 };
 use num_bigint::BigUint;
@@ -36,6 +39,16 @@ where
 {
     type Wire = A::Wire;
     type Error = A::Error;
+
+    fn enter_subcircuit_inputs(
+        &mut self,
+        inputs: Vec<Self::Wire>,
+        input_max_plaintext_norm_ranges: Option<
+            &[mxx_gadgets::circuit::SubCircuitInputMaxPlaintextNormRange],
+        >,
+    ) -> Result<Vec<Self::Wire>, Self::Error> {
+        self.arithmetic.enter_subcircuit_inputs(inputs, input_max_plaintext_norm_ranges)
+    }
 }
 
 impl<P, A, L, S> ArithmeticCircuitLowering<P> for ConfiguredCircuitLowering<'_, A, L, S>
@@ -97,6 +110,16 @@ where
         gate: GateInstance<'_>,
     ) -> Result<Self::Wire, Self::Error> {
         self.slots.slot_reduce(inputs, slot_count, gate)
+    }
+
+    fn slot_rotation(
+        &mut self,
+        input: &Self::Wire,
+        offset: u32,
+        num_slots: u32,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        self.slots.slot_rotation(input, offset, num_slots, gate)
     }
 }
 
@@ -163,6 +186,36 @@ where
             .call(inputs)
             .map_err(|error| CircuitLowerError::GraphStructure(error.to_string()))
     }
+
+    fn call_audited_constant_lut_subgraph(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<A::Wire>,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<Vec<A::Wire>, CircuitLowerError<A::Error>> {
+        definition
+            .call_with_canonical_input_exclusive_uppers(inputs, canonical_input_exclusive_uppers)
+            .map_err(|error| CircuitLowerError::GraphStructure(error.to_string()))
+    }
+
+    fn call_audited_constant_lut_subgraph_parallel(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<Vec<A::Wire>>,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<Vec<Vec<A::Wire>>, CircuitLowerError<A::Error>> {
+        inputs
+            .into_iter()
+            .map(|inputs| {
+                definition
+                    .call_with_canonical_input_exclusive_uppers(
+                        inputs,
+                        canonical_input_exclusive_uppers.clone(),
+                    )
+                    .map_err(|error| CircuitLowerError::GraphStructure(error.to_string()))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -172,7 +225,7 @@ pub enum CircuitCompileError {
     #[error(transparent)]
     NaiveVector(#[from] NaiveVecCompileError),
     #[error(transparent)]
-    PolyEncoding(#[from] PolyEncodingCompileError),
+    TallEncoding(#[from] TallCompileError),
     #[error(transparent)]
     SlotFamily(#[from] SlotFamilyCompileError),
     #[error(transparent)]
@@ -187,6 +240,8 @@ pub enum CircuitCompileError {
     InvalidSlotTransfer { gate: usize },
     #[error("slot-transfer artifact is missing: {name}")]
     MissingSlotTransferArtifact { name: String },
+    #[error("tall rotation encoding ({num_slots}, {offset}) is unavailable")]
+    MissingTallRotationEncoding { num_slots: u32, offset: u32 },
     #[error("gate {gate}: {source}")]
     LweLookup {
         gate: usize,
@@ -271,24 +326,24 @@ impl PolyCircuitCompiler {
     {
         let arithmetic = PublicKeyLowering::<P> { compiler: &self.public_key, marker: PhantomData };
         let mut lowering = ConfiguredCircuitLowering { arithmetic, lookup, slots };
-        lower_circuit_structured(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
+        lower_circuit(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
     }
 
-    pub fn compile_poly_encodings_with_lowerings<P, L, S>(
+    pub fn compile_tall_encodings_with_lowerings<P, L, S>(
         &self,
         circuit: &PolyCircuit<P>,
-        one: BggPolyEncodingWire,
-        inputs: impl IntoIterator<Item = BggPolyEncodingWire>,
+        one: BggTallEncodingWire,
+        inputs: impl IntoIterator<Item = BggTallEncodingWire>,
         lookup: &mut L,
         slots: &mut S,
-    ) -> Result<Vec<BggPolyEncodingWire>, CircuitCompileError>
+    ) -> Result<Vec<BggTallEncodingWire>, CircuitCompileError>
     where
         P: Poly,
-        L: PublicLookupLowering<P, Wire = BggPolyEncodingWire, Error = CircuitCompileError>,
-        S: SlotOperationLowering<P, Wire = BggPolyEncodingWire, Error = CircuitCompileError>,
+        L: PublicLookupLowering<P, Wire = BggTallEncodingWire, Error = CircuitCompileError>,
+        S: SlotOperationLowering<P, Wire = BggTallEncodingWire, Error = CircuitCompileError>,
     {
-        let compiler = BggPolyEncodingCompiler { public_key: self.public_key.clone() };
-        let arithmetic = PolyEncodingLowering::<P> { compiler: &compiler, marker: PhantomData };
+        let compiler = BggTallEncodingCompiler { public_key: self.public_key.clone() };
+        let arithmetic = TallEncodingLowering::<P> { compiler: &compiler, marker: PhantomData };
         let mut lowering = ConfiguredCircuitLowering { arithmetic, lookup, slots };
         lower_circuit(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
     }
@@ -309,7 +364,7 @@ impl PolyCircuitCompiler {
         let compiler = BggEncodingCompiler { public_key: self.public_key.clone() };
         let arithmetic = EncodingLowering::<P> { compiler: &compiler, marker: PhantomData };
         let mut lowering = ConfiguredCircuitLowering { arithmetic, lookup, slots };
-        lower_circuit_structured(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
+        lower_circuit(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
     }
 
     pub fn compile_naive_public_keys_with_lowerings<P, L, S>(
@@ -387,15 +442,15 @@ impl PolyCircuitCompiler {
         self.compile_naive_public_keys_with_lowerings(circuit, one, inputs, &mut lookup, &mut slots)
     }
 
-    pub fn compile_poly_encodings<P: Poly>(
+    pub fn compile_tall_encodings<P: Poly>(
         &self,
         circuit: &PolyCircuit<P>,
-        one: BggPolyEncodingWire,
-        inputs: impl IntoIterator<Item = BggPolyEncodingWire>,
-    ) -> Result<Vec<BggPolyEncodingWire>, CircuitCompileError> {
+        one: BggTallEncodingWire,
+        inputs: impl IntoIterator<Item = BggTallEncodingWire>,
+    ) -> Result<Vec<BggTallEncodingWire>, CircuitCompileError> {
         let mut lookup = NoPublicLookup::default();
         let mut slots = NoSlotOperations::default();
-        self.compile_poly_encodings_with_lowerings(circuit, one, inputs, &mut lookup, &mut slots)
+        self.compile_tall_encodings_with_lowerings(circuit, one, inputs, &mut lookup, &mut slots)
     }
 
     pub fn compile_naive_encodings<P: Poly>(
@@ -415,17 +470,42 @@ struct NaivePublicKeyLowering<P> {
     marker: PhantomData<P>,
 }
 
-struct PolyEncodingLowering<'a, P> {
-    compiler: &'a BggPolyEncodingCompiler,
+struct TallEncodingLowering<'a, P> {
+    compiler: &'a BggTallEncodingCompiler,
     marker: PhantomData<P>,
 }
 
-impl<P> CircuitLoweringTypes for PolyEncodingLowering<'_, P> {
-    type Wire = BggPolyEncodingWire;
+impl<P> CircuitLoweringTypes for TallEncodingLowering<'_, P> {
+    type Wire = BggTallEncodingWire;
     type Error = CircuitCompileError;
+
+    fn enter_subcircuit_inputs(
+        &mut self,
+        mut inputs: Vec<Self::Wire>,
+        input_max_plaintext_norm_ranges: Option<
+            &[mxx_gadgets::circuit::SubCircuitInputMaxPlaintextNormRange],
+        >,
+    ) -> Result<Vec<Self::Wire>, Self::Error> {
+        let Some(ranges) = input_max_plaintext_norm_ranges else {
+            return Ok(inputs);
+        };
+        for range in ranges {
+            let exclusive_upper = &range.norm + BigUint::from(1u8);
+            for input in &mut inputs[range.start..range.end] {
+                if !matches!(input.plaintext, BggTallPlaintext::Diagonal(_)) {
+                    return Err(CircuitCompileError::Structure(
+                        "sub-circuit plaintext norm metadata requires revealed tall plaintexts"
+                            .to_owned(),
+                    ));
+                }
+                input.canonical_input_exclusive_upper = Some(exclusive_upper.clone());
+            }
+        }
+        Ok(inputs)
+    }
 }
 
-impl<P: Poly> ArithmeticCircuitLowering<P> for PolyEncodingLowering<'_, P> {
+impl<P: Poly> ArithmeticCircuitLowering<P> for TallEncodingLowering<'_, P> {
     fn binary(
         &mut self,
         operation: PolyGateKind,
@@ -436,7 +516,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for PolyEncodingLowering<'_, P> {
         match operation {
             PolyGateKind::Add => Ok(self.compiler.add(lhs, rhs)?),
             PolyGateKind::Sub => Ok(self.compiler.sub(lhs, rhs)?),
-            PolyGateKind::Mul => Ok(self.compiler.mul(lhs, rhs)?),
+            PolyGateKind::Mul => Ok(self.compiler.simd_mul(lhs, rhs)?),
             _ => unsupported(gate, "non-binary operation"),
         }
     }
@@ -795,7 +875,7 @@ mod tests {
         LweLookupInvocation, LweLookupPublicKeyLowering, LweLookupTable,
     };
     use mxx_dsl::{DslContext, Ring};
-    use mxx_gadgets::{PolyElem, circuit::PublicLut};
+    use mxx_gadgets::circuit::{LutExpr, PublicLutProgram};
     use mxx_ir_core::{
         IntExpr, ParamEnv,
         artifact::{ProductionId, SpecHash},
@@ -803,10 +883,33 @@ mod tests {
         types::MatrixType,
     };
     use mxx_primitives::poly::{
-        Poly as ConcretePoly, PolyParams,
+        PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
-    use num_bigint::BigInt;
+    use num_bigint::{BigInt, BigUint};
+
+    #[derive(Default)]
+    struct RecordingTallLookup {
+        canonical_input_exclusive_upper: Option<BigUint>,
+    }
+
+    impl CircuitLoweringTypes for RecordingTallLookup {
+        type Wire = BggTallEncodingWire;
+        type Error = CircuitCompileError;
+    }
+
+    impl PublicLookupLowering<DCRTPoly> for RecordingTallLookup {
+        fn public_lookup(
+            &mut self,
+            _circuit: &PolyCircuit<DCRTPoly>,
+            _lookup_id: usize,
+            input: &Self::Wire,
+            _gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            self.canonical_input_exclusive_upper = input.canonical_input_exclusive_upper.clone();
+            Ok(input.clone())
+        }
+    }
 
     fn matrix_type(parameters: &DCRTPolyParams, rows: usize, columns: usize) -> MatrixType {
         MatrixType {
@@ -852,23 +955,127 @@ mod tests {
     }
 
     #[test]
+    fn configured_lowering_forwards_audited_lut_ranges_for_normal_and_parallel_calls() {
+        let context = DslContext::new("audited-lut-range-forwarding");
+        let ring = Ring::new(17, 8);
+        let public_key =
+            BggPublicKeyCompiler { ring: ring.clone(), base: 2.into(), digit_count: 2.into() };
+        let arithmetic =
+            PublicKeyLowering::<DCRTPoly> { compiler: &public_key, marker: PhantomData };
+        let mut lookup = NoPublicLookup::<BggPublicKeyWire>::default();
+        let mut slots = NoSlotOperations::<BggPublicKeyWire>::default();
+        let mut lowering =
+            ConfiguredCircuitLowering { arithmetic, lookup: &mut lookup, slots: &mut slots };
+        let input =
+            |name| BggPublicKeyWire { matrix: ring.input(name, (1, 1)), reveal_plaintext: true };
+        let definition = Subgraph::define(
+            "audited-lut-child",
+            vec![input("definition-input").schema()],
+            |values| values,
+        )
+        .expect("subgraph definition");
+        let bounds = vec![Some(BigUint::from(4u8))];
+        let normal = lowering
+            .call_audited_constant_lut_subgraph(
+                &definition,
+                vec![input("normal-input")],
+                bounds.clone(),
+            )
+            .expect("normal call");
+        let parallel = lowering
+            .call_audited_constant_lut_subgraph_parallel(
+                &definition,
+                vec![vec![input("parallel-left")], vec![input("parallel-right")]],
+                bounds.clone(),
+            )
+            .expect("parallel calls");
+        let graph = context
+            .output("normal", normal[0].matrix.clone())
+            .expect("normal output")
+            .output("parallel-left", parallel[0][0].matrix.clone())
+            .expect("parallel left output")
+            .output("parallel-right", parallel[1][0].matrix.clone())
+            .expect("parallel right output")
+            .build()
+            .expect("graph");
+        let calls = graph
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                NodeKind::SubgraphCall(call) => Some(&call.canonical_input_exclusive_uppers),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec![&bounds, &bounds, &bounds]);
+        graph.validate(&ParamEnv::default()).expect("validation");
+    }
+
+    #[test]
+    fn unstructured_tall_nested_call_attaches_the_exclusive_plaintext_upper() {
+        let mut parent = PolyCircuit::<DCRTPoly>::new();
+        let lookup = parent.register_public_lookup(
+            PublicLutProgram::new(8, LutExpr::input()).expect("identity lookup"),
+        );
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let child_input = child.input(1).as_single_wire();
+        let child_output = child.public_lookup_gate(child_input, lookup);
+        child.output([child_output]);
+
+        let parent_input = parent.input(1).as_single_wire();
+        let child_id = parent.register_sub_circuit(child);
+        let output = parent.call_sub_circuit_with_max_plaintext_norms(
+            child_id,
+            [parent_input],
+            [mxx_gadgets::circuit::SubCircuitInputMaxPlaintextNormRange::new(
+                0,
+                1,
+                BigUint::from(6u8),
+            )],
+        );
+        parent.output(output);
+
+        let ring = Ring::new(17, 8);
+        let public_key =
+            BggPublicKeyCompiler { ring: ring.clone(), base: 2.into(), digit_count: 2.into() };
+        let tall = |name: &str| BggTallEncodingWire {
+            rows: ring.input_family(format!("{name}-rows"), 1, (1, 2)),
+            pubkey: BggPublicKeyWire {
+                matrix: ring.input(format!("{name}-public"), (1, 2)),
+                reveal_plaintext: true,
+            },
+            plaintext: BggTallPlaintext::Diagonal(ring.input_family(
+                format!("{name}-plaintext"),
+                1,
+                (1, 1),
+            )),
+            canonical_input_exclusive_upper: None,
+        };
+        let mut lookup = RecordingTallLookup::default();
+        let mut slots = NoSlotOperations::<BggTallEncodingWire>::default();
+        PolyCircuitCompiler { public_key }
+            .compile_tall_encodings_with_lowerings(
+                &parent,
+                tall("one"),
+                [tall("input")],
+                &mut lookup,
+                &mut slots,
+            )
+            .expect("unstructured tall lowering");
+        assert_eq!(lookup.canonical_input_exclusive_upper, Some(BigUint::from(7u8)));
+    }
+
+    #[test]
     fn lookup_and_slot_providers_compose_in_one_circuit() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
         let transferred = circuit.slot_transfer_gate(input_gate, &[(0, None)]);
-        let lookup_id = circuit.register_public_lookup(PublicLut::new(
-            &parameters,
-            2,
-            |parameters: &DCRTPolyParams, input| {
-                Some((
-                    input,
-                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
-                ))
-            },
-            None,
-        ));
+        let lookup_id = circuit.register_public_lookup(
+            PublicLutProgram::new(2, LutExpr::input()).expect("identity LUT"),
+        );
         let looked_up = circuit.public_lookup_gate(transferred, lookup_id);
         circuit.output([looked_up]);
 
@@ -879,9 +1086,8 @@ mod tests {
             lookup: lookup_id,
             slot: None,
         };
-        let table =
-            LweLookupTable::from_public_lut(&parameters, circuit.lookup_table(lookup_id).as_ref())
-                .expect("lookup table");
+        let table = LweLookupTable::from_public_lut(circuit.lookup_table(lookup_id).as_ref())
+            .expect("lookup table");
         let lookup = LweLookupCompiler {
             identity,
             table,
@@ -917,6 +1123,7 @@ mod tests {
             hash_key: ring.bytes_input("slot-hash-key", 32),
             public_key_type: lookup.public_key_type.clone(),
             configured_slot_count: 1,
+            output_public_key_production: None,
             requests: Vec::new(),
         };
         let public_key = |name: &str| BggPublicKeyWire {

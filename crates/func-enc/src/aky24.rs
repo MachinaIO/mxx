@@ -45,7 +45,6 @@ use crate::{
 };
 
 pub mod dec_bench;
-pub mod error_simulation;
 pub mod keygen_bench;
 
 #[cfg(test)]
@@ -863,7 +862,7 @@ where
                 &params.poly_params,
                 1,
                 enc_key.b_matrix.col_size(),
-                DistType::GaussDist { sigma },
+                DistType::GaussDist { sigma, max_coefficient_bound: None },
             ),
             None => M::zero(&params.poly_params, 1, enc_key.b_matrix.col_size()),
         };

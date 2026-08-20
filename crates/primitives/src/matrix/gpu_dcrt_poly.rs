@@ -9,19 +9,24 @@ use crate::{
                 GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
                 GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, GpuDCRTPoly,
                 GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, GpuP1CovarianceCacheOpaque,
-                GpuRngSeed, check_status, gpu_event_set_destroy, gpu_event_set_wait,
-                gpu_matrix_add, gpu_matrix_add_block, gpu_matrix_copy, gpu_matrix_copy_block,
-                gpu_matrix_create, gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
+                GpuRngSeed, PinnedHostBuffer, check_status, gpu_event_set_destroy,
+                gpu_event_set_wait, gpu_matrix_add, gpu_matrix_add_block,
+                gpu_matrix_batch_within_coefficient_bound, gpu_matrix_binary_batch,
+                gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_copy_peer, gpu_matrix_create,
+                gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
                 gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal, gpu_matrix_fill_gadget,
                 gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_small_gadget,
-                gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
-                gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch, gpu_matrix_mul,
-                gpu_matrix_mul_scalar, gpu_matrix_mul_vertical_pair, gpu_matrix_ntt_all,
+                gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all, gpu_matrix_intt_batch,
+                gpu_matrix_intt_out_of_place_batch, gpu_matrix_load_compact_bytes,
+                gpu_matrix_load_rns_batch, gpu_matrix_mul, gpu_matrix_mul_batch,
+                gpu_matrix_mul_scalar, gpu_matrix_mul_scalar_batch, gpu_matrix_mul_vertical_pair,
+                gpu_matrix_negate_batch, gpu_matrix_ntt_all, gpu_matrix_ntt_batch,
                 gpu_matrix_preimage_add_correction, gpu_matrix_preimage_residual,
                 gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_columns,
                 gpu_matrix_sample_p1_full_cached, gpu_matrix_store_compact_bytes,
-                gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
+                gpu_matrix_store_compact_bytes_batch, gpu_matrix_store_const_coeff_batch,
+                gpu_matrix_store_rns_batch, gpu_matrix_sub, gpu_matrix_wait,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -35,6 +40,7 @@ use rayon::prelude::*;
 #[cfg(test)]
 use serial_test::serial as sequential;
 use std::{
+    collections::BTreeMap,
     fmt::Debug,
     ops::{Add, Mul, Neg, Range, Sub},
     path::Path,
@@ -77,7 +83,7 @@ pub struct GpuDCRTMatrixRnsSnapshot {
     level: usize,
     is_ntt: bool,
     bytes_per_poly: usize,
-    bytes: Vec<u8>,
+    bytes: PinnedHostBuffer<u8>,
 }
 
 impl GpuDCRTMatrixRnsSnapshot {
@@ -102,7 +108,7 @@ impl GpuDCRTMatrixRnsSnapshot {
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
     }
 
     fn validate_for_params(&self, params: &GpuDCRTPolyParams) {
@@ -115,7 +121,7 @@ impl GpuDCRTMatrixRnsSnapshot {
         let poly_count = self.nrow.checked_mul(self.ncol).expect("RNS snapshot shape overflow");
         let expected_len =
             poly_count.checked_mul(self.bytes_per_poly).expect("RNS snapshot byte length overflow");
-        assert_eq!(self.bytes.len(), expected_len, "RNS snapshot byte length mismatch");
+        assert_eq!(self.bytes.as_slice().len(), expected_len, "RNS snapshot byte length mismatch");
     }
 }
 
@@ -220,6 +226,12 @@ impl PartialEq for GpuDCRTPolyMatrix {
 impl Eq for GpuDCRTPolyMatrix {}
 
 impl GpuDCRTPolyMatrix {
+    /// Waits for writes to this matrix without synchronizing unrelated device work.
+    pub fn wait_until_ready(&self) {
+        let status = unsafe { gpu_matrix_wait(self.raw) };
+        check_status(status, "gpu_matrix_wait");
+    }
+
     pub(crate) fn new_empty_with_state(
         params: &GpuDCRTPolyParams,
         nrow: usize,
@@ -305,6 +317,280 @@ impl GpuDCRTPolyMatrix {
     pub(crate) fn into_coeff_domain(mut self) -> Self {
         self.intt_all_in_place();
         self
+    }
+
+    pub(crate) fn intt_batch_in_place(matrices: &mut [Self]) {
+        let pointers = matrices.iter_mut().map(|matrix| matrix.raw).collect::<Vec<_>>();
+        if pointers.is_empty() {
+            return;
+        }
+        let status = unsafe { gpu_matrix_intt_batch(pointers.as_ptr(), pointers.len()) };
+        check_status(status, "gpu_matrix_intt_batch");
+        for matrix in matrices {
+            matrix.is_ntt = false;
+        }
+    }
+
+    pub(crate) fn ntt_batch_in_place(matrices: &mut [Self]) {
+        let pointers = matrices.iter_mut().map(|matrix| matrix.raw).collect::<Vec<_>>();
+        if pointers.is_empty() {
+            return;
+        }
+        let status = unsafe { gpu_matrix_ntt_batch(pointers.as_ptr(), pointers.len()) };
+        check_status(status, "gpu_matrix_ntt_batch");
+        for matrix in matrices {
+            matrix.is_ntt = true;
+        }
+    }
+
+    pub(crate) fn batch_within_coefficient_bound(
+        matrices: &mut [Self],
+        bound: &BigUint,
+    ) -> Vec<bool> {
+        if matrices.is_empty() {
+            return Vec::new();
+        }
+        Self::intt_batch_in_place(matrices);
+        let matrix_ptrs = matrices.iter().map(|matrix| matrix.raw.cast_const()).collect::<Vec<_>>();
+        let mut bound_words = bound.to_u64_digits();
+        if bound_words.is_empty() {
+            bound_words.push(0);
+        }
+        let mut accepted = vec![0u8; matrices.len()];
+        let status = unsafe {
+            gpu_matrix_batch_within_coefficient_bound(
+                matrix_ptrs.as_ptr(),
+                matrix_ptrs.len(),
+                bound_words.as_ptr(),
+                bound_words.len(),
+                accepted.as_mut_ptr(),
+            )
+        };
+        check_status(status, "gpu_matrix_batch_within_coefficient_bound");
+        accepted.into_iter().map(|value| value != 0).collect()
+    }
+
+    fn compact_bytes_batch_homogeneous(matrices: &[&Self]) -> Vec<Vec<u8>> {
+        if matrices.is_empty() {
+            return Vec::new();
+        }
+        let formats = matrices
+            .iter()
+            .map(|matrix| {
+                if matrix.is_ntt { GPU_POLY_FORMAT_EVAL as u8 } else { GPU_POLY_FORMAT_COEFF as u8 }
+            })
+            .collect::<Vec<_>>();
+        let metadata = matrices
+            .iter()
+            .map(|matrix| (matrix.level, matrix.nrow, matrix.ncol))
+            .collect::<Vec<_>>();
+        let mut scratch = Vec::new();
+        if matrices[0].is_ntt {
+            scratch = matrices
+                .iter()
+                .map(|matrix| {
+                    Self::new_empty_with_state(
+                        &matrix.params,
+                        matrix.nrow,
+                        matrix.ncol,
+                        matrix.level,
+                        matrix.is_ntt,
+                    )
+                })
+                .collect();
+            let output_pointers = scratch.iter_mut().map(|matrix| matrix.raw).collect::<Vec<_>>();
+            let input_pointers =
+                matrices.iter().map(|matrix| matrix.raw.cast_const()).collect::<Vec<_>>();
+            let status = unsafe {
+                gpu_matrix_intt_out_of_place_batch(
+                    output_pointers.as_ptr(),
+                    input_pointers.as_ptr(),
+                    scratch.len(),
+                )
+            };
+            check_status(status, "gpu_matrix_intt_out_of_place_batch");
+        }
+        for matrix in &mut scratch {
+            matrix.is_ntt = false;
+        }
+        let capacities = matrices
+            .iter()
+            .map(|matrix| {
+                let coefficient_count = matrix
+                    .nrow
+                    .saturating_mul(matrix.ncol)
+                    .saturating_mul(matrix.params.ring_dimension() as usize);
+                let coefficient_bits = matrix
+                    .params
+                    .moduli()
+                    .iter()
+                    .take(matrix.level + 1)
+                    .map(|modulus| (u64::BITS - modulus.leading_zeros()) as usize)
+                    .sum::<usize>();
+                coefficient_count.saturating_mul(coefficient_bits).div_ceil(8)
+            })
+            .collect::<Vec<_>>();
+        let mut payloads =
+            capacities.iter().map(|capacity| vec![0u8; *capacity]).collect::<Vec<_>>();
+        let matrix_ptrs = if matrices[0].is_ntt {
+            scratch.iter_mut().map(|matrix| matrix.raw).collect::<Vec<_>>()
+        } else {
+            matrices.iter().map(|matrix| matrix.raw).collect::<Vec<_>>()
+        };
+        let payload_ptrs = payloads.iter_mut().map(Vec::as_mut_ptr).collect::<Vec<_>>();
+        let mut max_coefficient_bits = vec![0u16; matrices.len()];
+        let mut bytes_per_coefficient = vec![0u16; matrices.len()];
+        let mut payload_lengths = vec![0usize; matrices.len()];
+        let status = unsafe {
+            gpu_matrix_store_compact_bytes_batch(
+                matrix_ptrs.as_ptr(),
+                matrix_ptrs.len(),
+                payload_ptrs.as_ptr(),
+                capacities.as_ptr(),
+                max_coefficient_bits.as_mut_ptr(),
+                bytes_per_coefficient.as_mut_ptr(),
+                payload_lengths.as_mut_ptr(),
+            )
+        };
+        check_status(status, "gpu_matrix_store_compact_bytes_batch");
+        payloads
+            .into_iter()
+            .zip(payload_lengths)
+            .zip(formats)
+            .zip(metadata)
+            .zip(max_coefficient_bits.into_iter().zip(bytes_per_coefficient))
+            .map(
+                |(
+                    (((mut payload, payload_length), format), (level, nrow, ncol)),
+                    (max_coefficient_bits, bytes_per_coefficient),
+                )| {
+                    payload.truncate(payload_length);
+                    bincode::encode_to_vec(
+                        (
+                            1u8,
+                            format,
+                            level as u32,
+                            nrow,
+                            ncol,
+                            max_coefficient_bits,
+                            bytes_per_coefficient,
+                            payload,
+                        ),
+                        bincode::config::standard(),
+                    )
+                    .expect("Failed to serialize matrix to compact bytes")
+                },
+            )
+            .collect()
+    }
+
+    pub(crate) fn compact_bytes_batch_borrowed(matrices: &[&Self]) -> Vec<Vec<u8>> {
+        let mut groups = BTreeMap::new();
+        for (index, matrix) in matrices.iter().enumerate() {
+            let key = (
+                matrix.params.ctx_raw() as usize,
+                matrix.nrow,
+                matrix.ncol,
+                matrix.level,
+                matrix.is_ntt,
+            );
+            groups.entry(key).or_insert_with(Vec::new).push((index, *matrix));
+        }
+        let output_count = groups.values().map(Vec::len).sum();
+        let mut ordered = (0..output_count).map(|_| None).collect::<Vec<_>>();
+        for group in groups.into_values() {
+            if group[0].1.nrow == 0 || group[0].1.ncol == 0 {
+                for (index, matrix) in group {
+                    ordered[index] = Some(matrix.to_compact_bytes());
+                }
+                continue;
+            }
+            let indices = group.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+            let matrices = group.iter().map(|(_, matrix)| *matrix).collect::<Vec<_>>();
+            let serialized = Self::compact_bytes_batch_homogeneous(&matrices);
+            for (index, bytes) in indices.into_iter().zip(serialized) {
+                ordered[index] = Some(bytes);
+            }
+        }
+        ordered.into_iter().map(Option::unwrap).collect()
+    }
+
+    fn binary_batch_homogeneous(inputs: &[(Arc<Self>, Arc<Self>)], operation: i32) -> Vec<Self> {
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+        let outputs = inputs
+            .iter()
+            .map(|(left, _)| {
+                Self::new_empty_with_state(
+                    &left.params,
+                    left.nrow,
+                    left.ncol,
+                    left.level,
+                    left.is_ntt,
+                )
+            })
+            .collect::<Vec<_>>();
+        if outputs.iter().all(|output| output.nrow == 0 || output.ncol == 0) {
+            return outputs;
+        }
+        let output_pointers = outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
+        let left_pointers =
+            inputs.iter().map(|(left, _)| left.raw.cast_const()).collect::<Vec<_>>();
+        let right_pointers =
+            inputs.iter().map(|(_, right)| right.raw.cast_const()).collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_binary_batch(
+                output_pointers.as_ptr(),
+                left_pointers.as_ptr(),
+                right_pointers.as_ptr(),
+                outputs.len(),
+                operation,
+            )
+        };
+        check_status(status, "gpu_matrix_binary_batch");
+        outputs
+    }
+
+    fn binary_batch(inputs: Vec<(Arc<Self>, Arc<Self>)>, operation: i32) -> Vec<Self> {
+        let mut groups = BTreeMap::new();
+        for (index, (left, right)) in inputs.into_iter().enumerate() {
+            let key = (
+                left.params.ctx_raw() as usize,
+                right.params.ctx_raw() as usize,
+                left.nrow,
+                left.ncol,
+                right.nrow,
+                right.ncol,
+                left.level,
+                right.level,
+                left.is_ntt,
+                right.is_ntt,
+            );
+            groups.entry(key).or_insert_with(Vec::new).push((index, left, right));
+        }
+        let output_count = groups.values().map(Vec::len).sum();
+        let mut outputs = (0..output_count).map(|_| None).collect::<Vec<_>>();
+        for group in groups.into_values() {
+            let homogeneous = group
+                .iter()
+                .map(|(_, left, right)| (left.clone(), right.clone()))
+                .collect::<Vec<_>>();
+            let computed = if homogeneous.len() == 1 {
+                let (left, right) = &homogeneous[0];
+                vec![if operation == 0 {
+                    left.add_out_of_place(right)
+                } else {
+                    left.sub_out_of_place(right)
+                }]
+            } else {
+                Self::binary_batch_homogeneous(&homogeneous, operation)
+            };
+            for ((index, _, _), output) in group.into_iter().zip(computed) {
+                outputs[index] = Some(output);
+            }
+        }
+        outputs.into_iter().map(Option::unwrap).collect()
     }
 
     /// Reconstructs plaintext CRT levels entirely on one active GPU and
@@ -513,13 +799,23 @@ impl GpuDCRTPolyMatrix {
         ncol: usize,
         dist: GpuMatrixSampleDist,
         sigma: f64,
+        max_coefficient_bound: u64,
         seed: GpuRngSeed,
     ) -> Self {
         let out = Self::new_empty(params, nrow, ncol);
         if nrow == 0 || ncol == 0 {
             return out;
         }
-        let status = unsafe { gpu_matrix_sample_distribution(out.raw, dist.as_ffi(), sigma, seed) };
+        let status = unsafe {
+            gpu_matrix_sample_distribution(
+                out.raw,
+                dist.as_ffi(),
+                sigma,
+                max_coefficient_bound,
+                params.modulus().to_u64().unwrap_or(0),
+                seed,
+            )
+        };
         check_status(status, "gpu_matrix_sample_distribution");
         out
     }
@@ -532,6 +828,7 @@ impl GpuDCRTPolyMatrix {
         col_len: usize,
         dist: GpuMatrixSampleDist,
         sigma: f64,
+        max_coefficient_bound: u64,
         seed: GpuRngSeed,
     ) -> Self {
         let col_end = col_start
@@ -553,6 +850,8 @@ impl GpuDCRTPolyMatrix {
                 out.raw,
                 dist.as_ffi(),
                 sigma,
+                max_coefficient_bound,
+                params.modulus().to_u64().unwrap_or(0),
                 seed,
                 total_ncol,
                 col_start,
@@ -833,9 +1132,9 @@ impl GpuDCRTPolyMatrix {
     pub fn to_rns_snapshot(&self) -> GpuDCRTMatrixRnsSnapshot {
         let bytes_per_poly = rns_bytes_len_for_level(&self.params, self.level);
         let poly_count = self.nrow.checked_mul(self.ncol).expect("matrix shape overflow");
-        let mut bytes = vec![0u8; poly_count.saturating_mul(bytes_per_poly)];
+        let mut bytes = PinnedHostBuffer::zeroed(poly_count.saturating_mul(bytes_per_poly));
         let format = if self.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
-        self.store_rns_bytes(&mut bytes, bytes_per_poly, format);
+        self.store_rns_bytes(bytes.as_mut_slice(), bytes_per_poly, format);
         GpuDCRTMatrixRnsSnapshot {
             nrow: self.nrow,
             ncol: self.ncol,
@@ -858,9 +1157,9 @@ impl GpuDCRTPolyMatrix {
             snapshot.level,
             snapshot.is_ntt,
         );
-        if !snapshot.bytes.is_empty() {
+        if !snapshot.bytes.as_slice().is_empty() {
             let format = if snapshot.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
-            out.load_rns_bytes(&snapshot.bytes, snapshot.bytes_per_poly, format);
+            out.load_rns_bytes(snapshot.bytes.as_slice(), snapshot.bytes_per_poly, format);
         }
         out
     }
@@ -871,11 +1170,11 @@ impl GpuDCRTPolyMatrix {
         assert_eq!(self.ncol, snapshot.ncol, "RNS snapshot column count mismatch");
         assert_eq!(self.level, snapshot.level, "RNS snapshot level mismatch");
         assert_eq!(self.is_ntt, snapshot.is_ntt, "RNS snapshot format mismatch");
-        if snapshot.bytes.is_empty() {
+        if snapshot.bytes.as_slice().is_empty() {
             return;
         }
         let format = if snapshot.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
-        self.load_rns_bytes(&snapshot.bytes, snapshot.bytes_per_poly, format);
+        self.load_rns_bytes(snapshot.bytes.as_slice(), snapshot.bytes_per_poly, format);
     }
 
     fn cpu_params(&self) -> DCRTPolyParams {
@@ -1103,8 +1402,263 @@ impl GpuDCRTPolyMatrix {
 impl PolyMatrix for GpuDCRTPolyMatrix {
     type P = GpuDCRTPoly;
 
+    fn compact_bytes_batch(values: &[&Self]) -> Vec<Vec<u8>> {
+        Self::compact_bytes_batch_borrowed(values)
+    }
+
     fn params(&self) -> &GpuDCRTPolyParams {
         &self.params
+    }
+
+    fn wait_until_ready(&self) {
+        GpuDCRTPolyMatrix::wait_until_ready(self);
+    }
+
+    fn add_out_of_place(&self, rhs: &Self) -> Self {
+        debug_assert_eq!(self.params, rhs.params, "addition requires same params");
+        debug_assert_eq!(self.level, rhs.level, "addition requires same level");
+        debug_assert_eq!(self.is_ntt, rhs.is_ntt, "addition requires same domain");
+        let out =
+            Self::new_empty_with_state(&self.params, self.nrow, self.ncol, self.level, self.is_ntt);
+        if self.nrow != 0 && self.ncol != 0 {
+            let status = unsafe { gpu_matrix_add(out.raw, self.raw, rhs.raw) };
+            check_status(status, "gpu_matrix_add");
+        }
+        out
+    }
+
+    fn add_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
+        Self::binary_batch(inputs, 0)
+    }
+
+    fn sub_out_of_place(&self, rhs: &Self) -> Self {
+        debug_assert_eq!(self.params, rhs.params, "subtraction requires same params");
+        debug_assert_eq!(self.level, rhs.level, "subtraction requires same level");
+        debug_assert_eq!(self.is_ntt, rhs.is_ntt, "subtraction requires same domain");
+        let out =
+            Self::new_empty_with_state(&self.params, self.nrow, self.ncol, self.level, self.is_ntt);
+        if self.nrow != 0 && self.ncol != 0 {
+            let status = unsafe { gpu_matrix_sub(out.raw, self.raw, rhs.raw) };
+            check_status(status, "gpu_matrix_sub");
+        }
+        out
+    }
+
+    fn sub_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
+        Self::binary_batch(inputs, 1)
+    }
+
+    fn multiply_out_of_place(&self, rhs: &Self) -> Self {
+        self.mul_internal(rhs)
+    }
+
+    fn multiply_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
+        let mut groups = BTreeMap::new();
+        for (index, (left, right)) in inputs.into_iter().enumerate() {
+            let key = (
+                left.params.ctx_raw() as usize,
+                right.params.ctx_raw() as usize,
+                left.nrow,
+                left.ncol,
+                right.nrow,
+                right.ncol,
+                left.level,
+                right.level,
+                left.is_ntt,
+                right.is_ntt,
+            );
+            groups.entry(key).or_insert_with(Vec::new).push((index, left, right));
+        }
+        let output_count = groups.values().map(Vec::len).sum();
+        let mut ordered = (0..output_count).map(|_| None).collect::<Vec<_>>();
+        for group in groups.into_values() {
+            let homogeneous = group
+                .iter()
+                .map(|(_, left, right)| (left.clone(), right.clone()))
+                .collect::<Vec<_>>();
+            let (left_shape, right_shape) = (homogeneous[0].0.size(), homogeneous[0].1.size());
+            let computed =
+                if homogeneous.len() == 1 || left_shape == (1, 1) || right_shape == (1, 1) {
+                    homogeneous
+                        .into_par_iter()
+                        .map(|(left, right)| {
+                            if left.size() == (1, 1) {
+                                right.multiply_poly_out_of_place(&left.entry(0, 0))
+                            } else if right.size() == (1, 1) {
+                                left.multiply_poly_out_of_place(&right.entry(0, 0))
+                            } else {
+                                left.multiply_out_of_place(&right)
+                            }
+                        })
+                        .collect()
+                } else {
+                    let outputs = homogeneous
+                        .iter()
+                        .map(|(left, right)| {
+                            Self::new_empty_with_state(
+                                &left.params,
+                                left.nrow,
+                                right.ncol,
+                                left.level,
+                                true,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if outputs.iter().any(|output| output.nrow != 0 && output.ncol != 0) {
+                        let output_pointers =
+                            outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
+                        let left_pointers = homogeneous
+                            .iter()
+                            .map(|(left, _)| left.raw.cast_const())
+                            .collect::<Vec<_>>();
+                        let right_pointers = homogeneous
+                            .iter()
+                            .map(|(_, right)| right.raw.cast_const())
+                            .collect::<Vec<_>>();
+                        let status = unsafe {
+                            gpu_matrix_mul_batch(
+                                output_pointers.as_ptr(),
+                                left_pointers.as_ptr(),
+                                right_pointers.as_ptr(),
+                                outputs.len(),
+                            )
+                        };
+                        check_status(status, "gpu_matrix_mul_batch");
+                    }
+                    outputs
+                };
+            for ((index, _, _), output) in group.into_iter().zip(computed) {
+                ordered[index] = Some(output);
+            }
+        }
+        ordered.into_iter().map(Option::unwrap).collect()
+    }
+
+    fn negate_out_of_place(&self) -> Self {
+        -self
+    }
+
+    fn negate_batch_out_of_place(inputs: Vec<Arc<Self>>) -> Vec<Self> {
+        let mut groups = BTreeMap::new();
+        for (index, input) in inputs.into_iter().enumerate() {
+            let key = (
+                input.params.ctx_raw() as usize,
+                input.nrow,
+                input.ncol,
+                input.level,
+                input.is_ntt,
+            );
+            groups.entry(key).or_insert_with(Vec::new).push((index, input));
+        }
+        let output_count = groups.values().map(Vec::len).sum();
+        let mut ordered = (0..output_count).map(|_| None).collect::<Vec<_>>();
+        for group in groups.into_values() {
+            let homogeneous = group.iter().map(|(_, input)| input.clone()).collect::<Vec<_>>();
+            let computed = if homogeneous.len() == 1 {
+                vec![homogeneous[0].negate_out_of_place()]
+            } else {
+                let outputs = homogeneous
+                    .iter()
+                    .map(|input| {
+                        Self::new_empty_with_state(
+                            &input.params,
+                            input.nrow,
+                            input.ncol,
+                            input.level,
+                            input.is_ntt,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if outputs.iter().any(|output| output.nrow != 0 && output.ncol != 0) {
+                    let output_pointers =
+                        outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
+                    let input_pointers =
+                        homogeneous.iter().map(|input| input.raw.cast_const()).collect::<Vec<_>>();
+                    let status = unsafe {
+                        gpu_matrix_negate_batch(
+                            output_pointers.as_ptr(),
+                            input_pointers.as_ptr(),
+                            outputs.len(),
+                        )
+                    };
+                    check_status(status, "gpu_matrix_negate_batch");
+                }
+                outputs
+            };
+            for ((index, _), output) in group.into_iter().zip(computed) {
+                ordered[index] = Some(output);
+            }
+        }
+        ordered.into_iter().map(Option::unwrap).collect()
+    }
+
+    fn multiply_poly_out_of_place(&self, scalar: &Self::P) -> Self {
+        self.mul_scalar(scalar)
+    }
+
+    fn multiply_polys_batch_out_of_place(inputs: Vec<(Arc<Self>, Self::P)>) -> Vec<Self> {
+        let mut groups = BTreeMap::new();
+        for (index, (matrix, mut scalar)) in inputs.into_iter().enumerate() {
+            if !scalar.is_ntt() {
+                scalar.ntt_in_place();
+            }
+            let key = (
+                matrix.params.ctx_raw() as usize,
+                matrix.nrow,
+                matrix.ncol,
+                matrix.level,
+                matrix.is_ntt,
+                scalar.level(),
+                scalar.is_ntt(),
+            );
+            groups.entry(key).or_insert_with(Vec::new).push((index, matrix, scalar));
+        }
+        let output_count = groups.values().map(Vec::len).sum();
+        let mut ordered = (0..output_count).map(|_| None).collect::<Vec<_>>();
+        for group in groups.into_values() {
+            let computed = if group.len() == 1 {
+                vec![group[0].1.multiply_poly_out_of_place(&group[0].2)]
+            } else {
+                let outputs = group
+                    .iter()
+                    .map(|(_, matrix, _)| {
+                        Self::new_empty_with_state(
+                            &matrix.params,
+                            matrix.nrow,
+                            matrix.ncol,
+                            matrix.level,
+                            matrix.is_ntt,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if outputs.iter().any(|output| output.nrow != 0 && output.ncol != 0) {
+                    let output_pointers =
+                        outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
+                    let matrix_pointers = group
+                        .iter()
+                        .map(|(_, matrix, _)| matrix.raw.cast_const())
+                        .collect::<Vec<_>>();
+                    let scalar_pointers = group
+                        .iter()
+                        .map(|(_, _, scalar)| scalar.inner().raw.cast_const())
+                        .collect::<Vec<_>>();
+                    let status = unsafe {
+                        gpu_matrix_mul_scalar_batch(
+                            output_pointers.as_ptr(),
+                            matrix_pointers.as_ptr(),
+                            scalar_pointers.as_ptr(),
+                            outputs.len(),
+                        )
+                    };
+                    check_status(status, "gpu_matrix_mul_scalar_batch");
+                }
+                outputs
+            };
+            for ((index, _, _), output) in group.into_iter().zip(computed) {
+                ordered[index] = Some(output);
+            }
+        }
+        ordered.into_iter().map(Option::unwrap).collect()
     }
 
     fn add_in_place(&mut self, rhs: &Self) {
@@ -1230,7 +1784,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                 snapshot.level,
                 snapshot.is_ntt,
                 snapshot.bytes_per_poly,
-                snapshot.bytes,
+                snapshot.bytes.as_slice(),
             ),
             bincode::config::standard(),
         )
@@ -1250,9 +1804,32 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             .expect("Failed to deserialize GPU matrix RNS staging bytes")
             .0;
         assert_eq!(version, 1, "Unsupported GPU matrix RNS staging version: {version}");
-        let snapshot =
-            GpuDCRTMatrixRnsSnapshot { nrow, ncol, level, is_ntt, bytes_per_poly, bytes: payload };
+        let snapshot = GpuDCRTMatrixRnsSnapshot {
+            nrow,
+            ncol,
+            level,
+            is_ntt,
+            bytes_per_poly,
+            bytes: PinnedHostBuffer::from_slice(&payload),
+        };
         Self::from_rns_snapshot(params, &snapshot)
+    }
+
+    fn copy_to_params_direct(&self, params: &<Self::P as Poly>::Params) -> Option<Self> {
+        if self.params.ctx_raw() == params.ctx_raw() {
+            return Some(self.clone());
+        }
+        let output =
+            Self::new_empty_with_state(params, self.nrow, self.ncol, self.level, self.is_ntt);
+        let mut copied = 0i32;
+        let status = unsafe { gpu_matrix_copy_peer(output.raw, self.raw, &mut copied) };
+        check_status(status, "gpu_matrix_copy_peer");
+        (copied != 0).then_some(output)
+    }
+
+    fn copy_to_params_fanout(&self, params: &[&<Self::P as Poly>::Params]) -> Vec<Self> {
+        let snapshot = self.to_rns_snapshot();
+        params.par_iter().map(|parameters| Self::from_rns_snapshot(parameters, &snapshot)).collect()
     }
 
     fn zero_compact_bytes(
@@ -2115,6 +2692,7 @@ mod tests {
         element::{PolyElem, finite_ring::FinRingElem},
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::gpu::{detected_gpu_device_ids, gpu_device_sync},
+        sampler::bounds::matrix_within_coefficient_bound,
     };
     use num_bigint::BigUint;
     use rand::{Rng, rng};
@@ -2128,6 +2706,302 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let (moduli, _crt_bits, _crt_depth) = params.to_crt();
         GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_batch_coefficient_bound_matches_full_crt_cpu_check() {
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(32, 5, 17, 8);
+        let gpu_params = gpu_params_from_cpu(&cpu_params);
+        let modulus = gpu_params.modulus();
+        let values = [BigUint::ZERO, BigUint::from(5u8), modulus.as_ref() - BigUint::from(1u8)];
+        let mut candidates = values
+            .into_iter()
+            .map(|value| {
+                GpuDCRTPolyMatrix::from_poly_vec_row(
+                    &gpu_params,
+                    vec![GpuDCRTPoly::from_biguint_to_constant(&gpu_params, value)],
+                )
+                .into_coeff_domain()
+            })
+            .collect::<Vec<_>>();
+        let cutoff = BigUint::from(1u8);
+        let gpu = GpuDCRTPolyMatrix::batch_within_coefficient_bound(&mut candidates, &cutoff);
+        let cpu = candidates
+            .iter()
+            .map(|candidate| {
+                let mut evaluation = candidate.clone();
+                evaluation.singleton_ntt_in_place();
+                matrix_within_coefficient_bound(&evaluation.to_cpu_matrix(), &cutoff)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(gpu, cpu);
+        assert_eq!(gpu, vec![true, false, true]);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_compact_batch_is_byte_identical_to_scalar_serialization() {
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(32, 5, 17, 8);
+        let gpu_params = gpu_params_from_cpu(&cpu_params);
+        let modulus = gpu_params.modulus();
+        let mut matrices =
+            [BigUint::ZERO, BigUint::from(37u8), modulus.as_ref() - BigUint::from(7u8)]
+                .into_iter()
+                .map(|value| {
+                    GpuDCRTPolyMatrix::from_poly_vec_row(
+                        &gpu_params,
+                        vec![GpuDCRTPoly::from_biguint_to_constant(&gpu_params, value)],
+                    )
+                })
+                .collect::<Vec<_>>();
+        let mut random = rng();
+        matrices.push(GpuDCRTPolyMatrix::from_poly_vec(
+            &gpu_params,
+            (0..2)
+                .map(|_| {
+                    (0..2)
+                        .map(|_| {
+                            let coefficients = (0..gpu_params.ring_dimension())
+                                .map(|_| {
+                                    FinRingElem::new(
+                                        BigUint::from(random.random_range(0u64..10_000)),
+                                        modulus.clone(),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            GpuDCRTPoly::from_coeffs(&gpu_params, &coefficients)
+                        })
+                        .collect()
+                })
+                .collect(),
+        ));
+        let scalar = matrices.iter().map(PolyMatrix::to_compact_bytes).collect::<Vec<_>>();
+        let references = matrices.iter().collect::<Vec<_>>();
+        let batched = GpuDCRTPolyMatrix::compact_bytes_batch_borrowed(&references);
+        assert_eq!(batched, scalar);
+        for bytes in batched {
+            let decoded = GpuDCRTPolyMatrix::from_compact_bytes(&gpu_params, &bytes);
+            assert_eq!(decoded.to_compact_bytes(), bytes);
+        }
+        let coefficient_matrices =
+            matrices.iter().map(|matrix| matrix.clone().into_coeff_domain()).collect::<Vec<_>>();
+        let coefficient_references = coefficient_matrices.iter().collect::<Vec<_>>();
+        assert_eq!(
+            GpuDCRTPolyMatrix::compact_bytes_batch_borrowed(&coefficient_references),
+            coefficient_matrices.iter().map(PolyMatrix::to_compact_bytes).collect::<Vec<_>>()
+        );
+        let empty_rows = GpuDCRTPolyMatrix::new_empty(&gpu_params, 0, 3);
+        let empty_columns = GpuDCRTPolyMatrix::new_empty(&gpu_params, 2, 0);
+        let empty = vec![&empty_rows, &empty_columns];
+        assert_eq!(
+            GpuDCRTPolyMatrix::compact_bytes_batch_borrowed(&empty),
+            empty.iter().map(|matrix| matrix.to_compact_bytes()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_operation_batches_match_scalar_operations() {
+        gpu_device_sync();
+        let gpu_params = gpu_params_from_cpu(&DCRTPolyParams::new(32, 3, 17, 8));
+        let constant_matrix = |rows: usize, columns: usize, value: usize| {
+            GpuDCRTPolyMatrix::from_poly_vec(
+                &gpu_params,
+                (0..rows)
+                    .map(|row| {
+                        (0..columns)
+                            .map(|column| {
+                                GpuDCRTPoly::from_usize_to_constant(
+                                    &gpu_params,
+                                    value + row * columns + column,
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            )
+        };
+        let additions = (0..3)
+            .map(|index| {
+                (
+                    Arc::new(constant_matrix(2, 2, 3 + index)),
+                    Arc::new(constant_matrix(2, 2, 11 + index)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_additions =
+            additions.iter().map(|(left, right)| left.add_out_of_place(right)).collect::<Vec<_>>();
+        assert_eq!(
+            GpuDCRTPolyMatrix::add_batch_out_of_place(additions.clone()),
+            expected_additions
+        );
+        let expected_subtractions =
+            additions.iter().map(|(left, right)| left.sub_out_of_place(right)).collect::<Vec<_>>();
+        assert_eq!(
+            GpuDCRTPolyMatrix::sub_batch_out_of_place(additions.clone()),
+            expected_subtractions
+        );
+        let negated_inputs = additions.iter().map(|(left, _)| left.clone()).collect::<Vec<_>>();
+        let expected_negations =
+            negated_inputs.iter().map(|value| value.negate_out_of_place()).collect::<Vec<_>>();
+        assert_eq!(
+            GpuDCRTPolyMatrix::negate_batch_out_of_place(negated_inputs),
+            expected_negations
+        );
+
+        let multiplications = (0..3)
+            .map(|index| {
+                (
+                    Arc::new(constant_matrix(2, 3, 5 + index)),
+                    Arc::new(constant_matrix(3, 2, 17 + index)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_multiplications = multiplications
+            .iter()
+            .map(|(left, right)| left.multiply_out_of_place(right))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            GpuDCRTPolyMatrix::multiply_batch_out_of_place(multiplications),
+            expected_multiplications
+        );
+
+        let heterogeneous = vec![
+            (Arc::new(constant_matrix(1, 3, 23)), Arc::new(constant_matrix(1, 3, 29))),
+            (Arc::new(constant_matrix(2, 2, 31)), Arc::new(constant_matrix(2, 2, 37))),
+        ];
+        let expected = heterogeneous
+            .iter()
+            .map(|(left, right)| left.add_out_of_place(right))
+            .collect::<Vec<_>>();
+        assert_eq!(GpuDCRTPolyMatrix::add_batch_out_of_place(heterogeneous), expected);
+
+        let scaled_inputs = (0..3)
+            .map(|index| {
+                (
+                    Arc::new(constant_matrix(2, 2, 53 + index)),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 3 + index),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_scaled = scaled_inputs
+            .iter()
+            .map(|(matrix, scalar)| matrix.multiply_poly_out_of_place(scalar))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            GpuDCRTPolyMatrix::multiply_polys_batch_out_of_place(scaled_inputs),
+            expected_scaled
+        );
+
+        let second_params = gpu_params_from_cpu(&DCRTPolyParams::new(32, 3, 17, 8));
+        let mixed_contexts = vec![
+            constant_matrix(1, 2, 41),
+            GpuDCRTPolyMatrix::from_poly_vec_row(
+                &second_params,
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&second_params, 43),
+                    GpuDCRTPoly::from_usize_to_constant(&second_params, 47),
+                ],
+            ),
+        ];
+        let scalar = mixed_contexts.iter().map(PolyMatrix::to_compact_bytes).collect::<Vec<_>>();
+        let references = mixed_contexts.iter().collect::<Vec<_>>();
+        assert_eq!(GpuDCRTPolyMatrix::compact_bytes_batch_borrowed(&references), scalar);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_direct_context_copy_preserves_source_lifetime_dependency() {
+        gpu_device_sync();
+        let devices = detected_gpu_device_ids();
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 8);
+        let (moduli, _, _) = cpu_params.to_crt();
+        let staging_source_params = GpuDCRTPolyParams::new_with_gpu(
+            cpu_params.ring_dimension(),
+            moduli.clone(),
+            cpu_params.base_bits(),
+            vec![devices[0]],
+            Some(1),
+        );
+        let staging_destination_params = GpuDCRTPolyParams::new_with_gpu(
+            cpu_params.ring_dimension(),
+            moduli.clone(),
+            cpu_params.base_bits(),
+            vec![devices[0]],
+            Some(1),
+        );
+        let second_staging_destination_params = GpuDCRTPolyParams::new_with_gpu(
+            cpu_params.ring_dimension(),
+            moduli.clone(),
+            cpu_params.base_bits(),
+            vec![devices[0]],
+            Some(1),
+        );
+        let staging_source = GpuDCRTPolyMatrix::from_poly_vec_row(
+            &staging_source_params,
+            vec![
+                GpuDCRTPoly::from_usize_to_constant(&staging_source_params, 5),
+                GpuDCRTPoly::from_usize_to_constant(&staging_source_params, 13),
+            ],
+        );
+        let staged = staging_source.copy_to_params_fanout(&[
+            &staging_destination_params,
+            &second_staging_destination_params,
+        ]);
+        let expected_staging = staging_source.to_compact_bytes();
+        assert_eq!(staged.len(), 2);
+        for copy in staged {
+            assert_eq!(copy.to_compact_bytes(), expected_staging);
+        }
+        if devices.len() < 2 {
+            return;
+        }
+        let source_params = GpuDCRTPolyParams::new_with_gpu(
+            cpu_params.ring_dimension(),
+            moduli.clone(),
+            cpu_params.base_bits(),
+            vec![devices[0]],
+            Some(1),
+        );
+        let destination_params = GpuDCRTPolyParams::new_with_gpu(
+            cpu_params.ring_dimension(),
+            moduli,
+            cpu_params.base_bits(),
+            vec![devices[1]],
+            Some(1),
+        );
+        let values = vec![
+            vec![
+                GpuDCRTPoly::from_usize_to_constant(&source_params, 7),
+                GpuDCRTPoly::from_usize_to_constant(&source_params, 19),
+            ],
+            vec![
+                GpuDCRTPoly::from_usize_to_constant(&source_params, 31),
+                GpuDCRTPoly::from_usize_to_constant(&source_params, 43),
+            ],
+        ];
+        let source = GpuDCRTPolyMatrix::from_poly_vec(&source_params, values);
+        let Some(copied) = source.copy_to_params_direct(&destination_params) else {
+            return;
+        };
+        drop(source);
+        let expected = GpuDCRTPolyMatrix::from_poly_vec(
+            &destination_params,
+            vec![
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&destination_params, 7),
+                    GpuDCRTPoly::from_usize_to_constant(&destination_params, 19),
+                ],
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&destination_params, 31),
+                    GpuDCRTPoly::from_usize_to_constant(&destination_params, 43),
+                ],
+            ],
+        );
+        assert_eq!(copied, expected);
     }
 
     #[test]
@@ -2184,6 +3058,22 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_wait_until_ready_fences_the_result_event() {
+        let cpu_params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&cpu_params);
+        let left = gpu_constant_matrix(&gpu_params, 4, 7, 3);
+        let right = gpu_constant_matrix(&gpu_params, 7, 5, 101);
+        let addend = gpu_constant_matrix(&gpu_params, 4, 5, 211);
+        let expected = left.to_cpu_matrix() * right.to_cpu_matrix() + addend.to_cpu_matrix();
+
+        let actual = &left * &right + &addend;
+        actual.wait_until_ready();
+
+        assert_eq!(actual.to_cpu_matrix(), expected);
     }
 
     #[test]

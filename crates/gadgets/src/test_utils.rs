@@ -16,7 +16,6 @@ use crate::{
 use mxx_dsl::{ConcatAxis, DslContext, Family, GraphValue, Mat, Ring, Subgraph};
 use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange, validate::ValidatedGraph};
 use mxx_primitives::{
-    element::PolyElem,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -144,10 +143,8 @@ impl PublicLookupLowering<DCRTPoly> for RuntimeLowering {
     ) -> Result<Mat, Infallible> {
         let branches = circuit
             .lookup_table(lookup_id)
-            .entries(&self.parameters)
-            .map(|(_input, (_row, output))| {
-                self.ring.polynomial([IntExpr::constant(output.value().clone())])
-            })
+            .entries()
+            .map(|(_input, (_row, output))| self.ring.polynomial([IntExpr::constant(output)]))
             .collect::<Vec<_>>();
         if self.wire_size == 1 {
             return Ok(input
@@ -218,6 +215,18 @@ impl StructuredCircuitLowering<DCRTPoly> for RuntimeLowering {
             .map_err(|error| crate::circuit::CircuitLowerError::GraphStructure(error.to_string()))
     }
 
+    fn call_audited_constant_lut_subgraph(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<Mat>,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<Vec<Mat>, crate::circuit::CircuitLowerError<Self::Error>> {
+        // This unit-test lowerer executes DSL values only; it emits no checker evidence, so the
+        // producer contract has no runtime effect here. The subgraph call itself is preserved.
+        drop(canonical_input_exclusive_uppers);
+        self.call_subgraph(definition, inputs)
+    }
+
     fn call_subgraph_parallel(
         &mut self,
         definition: &Self::Subgraph,
@@ -263,6 +272,18 @@ impl StructuredCircuitLowering<DCRTPoly> for RuntimeLowering {
         }
         Ok(outputs)
     }
+
+    fn call_audited_constant_lut_subgraph_parallel(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<Vec<Mat>>,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<Vec<Vec<Mat>>, crate::circuit::CircuitLowerError<Self::Error>> {
+        // This unit-test lowerer executes DSL values only; it emits no checker evidence, so the
+        // producer contract has no runtime effect here. The subgraph calls themselves are kept.
+        drop(canonical_input_exclusive_uppers);
+        self.call_subgraph_parallel(definition, inputs)
+    }
 }
 
 pub fn constant_matrix(parameters: &DCRTPolyParams, value: usize) -> DCRTPolyMatrix {
@@ -270,10 +291,6 @@ pub fn constant_matrix(parameters: &DCRTPolyParams, value: usize) -> DCRTPolyMat
         parameters,
         vec![DCRTPoly::from_usize_to_constant(parameters, value)],
     )
-}
-
-pub fn polynomial_matrix(parameters: &DCRTPolyParams, value: DCRTPoly) -> DCRTPolyMatrix {
-    DCRTPolyMatrix::from_poly_vec_row(parameters, vec![value])
 }
 
 pub fn diagonal_matrix(
@@ -294,17 +311,34 @@ pub fn diagonal_matrix(
     )
 }
 
-pub fn execute_polynomial_circuit(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolyVec(pub Vec<DCRTPoly>);
+
+impl PolyVec {
+    pub fn to_diagonal_matrix(&self, parameters: &DCRTPolyParams) -> DCRTPolyMatrix {
+        diagonal_matrix(parameters, self.0.iter().cloned())
+    }
+
+    pub fn from_diagonal_matrix(matrix: &DCRTPolyMatrix) -> Self {
+        let (rows, columns) = matrix.size();
+        assert_eq!(rows, columns, "PolyVec requires a square diagonal matrix");
+        Self((0..rows).map(|slot| matrix.entry(slot, slot).clone()).collect())
+    }
+}
+
+pub fn execute_polyvec_circuit(
     name: &str,
     parameters: &DCRTPolyParams,
     circuit: &PolyCircuit<DCRTPoly>,
-    inputs: impl IntoIterator<Item = DCRTPoly>,
-) -> Vec<DCRTPoly> {
-    let inputs =
-        inputs.into_iter().map(|poly| polynomial_matrix(parameters, poly)).collect::<Vec<_>>();
-    execute_circuit(name, parameters, circuit, &inputs)
-        .into_iter()
-        .map(|matrix| matrix.entry(0, 0).clone())
+    inputs: Vec<PolyVec>,
+    wire_size: usize,
+) -> Vec<PolyVec> {
+    assert!(inputs.iter().all(|input| input.0.len() == wire_size));
+    let matrices =
+        inputs.iter().map(|input| input.to_diagonal_matrix(parameters)).collect::<Vec<_>>();
+    execute_circuit_with_shape(name, parameters, circuit, &matrices, (wire_size, wire_size))
+        .iter()
+        .map(PolyVec::from_diagonal_matrix)
         .collect()
 }
 
@@ -449,15 +483,18 @@ impl NegacyclicConvolutionContext<DCRTPoly> for ScalarArithmeticContext {
     fn reduce_q_level_row(
         &self,
         row: &[GateId],
+        input_norms: &[BigUint],
         _circuit: &mut PolyCircuit<DCRTPoly>,
-    ) -> Vec<GateId> {
-        row.to_vec()
+    ) -> (Vec<GateId>, Vec<BigUint>) {
+        (row.to_vec(), input_norms.to_vec())
     }
 
     fn mul_q_level_rows(
         &self,
         left: &[GateId],
         right: &[GateId],
+        _left_norms: &[BigUint],
+        _right_norms: &[BigUint],
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Vec<GateId> {
         assert_eq!(left.len(), 1);
@@ -505,12 +542,14 @@ impl ModularArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
 
     fn input(
         context: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Self {
         Self::input_with_metadata(
             context,
+            num_coefficient_slots,
             enable_levels,
             level_offset,
             vec![BigUint::from(1u8)],
@@ -521,6 +560,7 @@ impl ModularArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
 
     fn input_with_metadata(
         context: Arc<Self::Context>,
+        _num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         max_plaintexts: Vec<BigUint>,
@@ -557,6 +597,7 @@ impl ModularArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
 
     fn sparse_level_poly_with_metadata(
         context: Arc<Self::Context>,
+        _num_coefficient_slots: usize,
         active_levels: usize,
         enable_levels: Option<usize>,
         level_offset: usize,
@@ -661,6 +702,7 @@ impl ModularArithmeticPlanner<DCRTPoly> for ScalarArithmeticEntry {
 
     fn input_with_planner_metadata(
         context: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         metadata: &Self::Metadata,
@@ -668,6 +710,7 @@ impl ModularArithmeticPlanner<DCRTPoly> for ScalarArithmeticEntry {
     ) -> Self {
         Self::input_with_metadata(
             context,
+            num_coefficient_slots,
             enable_levels,
             level_offset,
             metadata.0.clone(),
@@ -739,11 +782,12 @@ impl DecomposeArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
 
     fn gadget_vector(
         context: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Vec<Self> {
-        vec![Self::input(context, enable_levels, level_offset, circuit)]
+        vec![Self::input(context, num_coefficient_slots, enable_levels, level_offset, circuit)]
     }
 
     fn gadget_decompose(&self, _circuit: &mut PolyCircuit<DCRTPoly>) -> Vec<Self> {
@@ -778,6 +822,10 @@ impl DecomposeArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
 }
 
 impl RingGswConvolution<DCRTPoly> for ScalarArithmeticEntry {
+    fn q_level_row_max_plaintext_norms(&self, physical_q_row: usize) -> Vec<BigUint> {
+        vec![self.p_max_traces[physical_q_row].clone()]
+    }
+
     fn from_diagonal_q_level_outputs(
         template: &Self,
         q_level_outputs: Vec<Vec<BatchedWire>>,

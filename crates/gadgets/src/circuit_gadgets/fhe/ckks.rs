@@ -13,9 +13,9 @@ use crate::{
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
-    simulator::poly_norm::maximum_coefficient_bound_from_sigma,
+    sampler::bounds::hard_cutoff_from_sigma_bound,
 };
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use bigdecimal::{BigDecimal, FromPrimitive};
 use num_bigint::BigUint;
 use std::sync::Arc;
 
@@ -64,7 +64,10 @@ pub fn sample_relinearization_eval_key_slots(
     let error = if error_sigma == 0.0 {
         DCRTPoly::const_zero(params)
     } else {
-        uniform_sampler.sample_poly(params, &DistType::GaussDist { sigma: error_sigma })
+        uniform_sampler.sample_poly(
+            params,
+            &DistType::GaussDist { sigma: error_sigma, max_coefficient_bound: None },
+        )
     };
     let a0_eval = DCRTPoly::from_biguints_eval(params, &a0.eval_slots());
     let error_eval = DCRTPoly::from_biguints_eval(params, &error.eval_slots());
@@ -177,8 +180,7 @@ impl<P: Poly + 'static> CKKSContext<P> {
     fn initial_ciphertext_error_bound(&self) -> BigUint {
         let sigma = BigDecimal::from_f64(self.error_sigma)
             .expect("CKKS error sigma must be finite");
-        let bound = maximum_coefficient_bound_from_sigma(&sigma);
-        BigUint::from(bound.ceil().to_u64().expect("CKKS error bound must fit in u64"))
+        hard_cutoff_from_sigma_bound(&sigma)
     }
 
     fn q_window_modulus(&self, level_offset: usize, active_levels: usize) -> BigUint {
@@ -669,7 +671,6 @@ mod tests {
 
     const BASE_BITS: u32 = 6;
     const CRT_DEPTH: usize = 12;
-    const P_MODULI_BITS: usize = 7;
     const SCALE: u64 = 1 << 8;
     const NUM_SLOTS: usize = 2;
     const RELIN_EXTRA_LEVELS: usize = 6;
@@ -677,6 +678,16 @@ mod tests {
     const CKKS_MUL_DEPTH: usize = 1;
     const CKKS_MUL_TEST_CRT_DEPTH: usize = NUM_LEFT_MODULI + CKKS_MUL_DEPTH + RELIN_EXTRA_LEVELS;
     const INPUT_ERROR_SIGMA: f64 = 4.0;
+
+    /// Smallest p-basis width for the given parameters and unreduced-multiplication budget,
+    /// so budget changes never silently starve these tests.
+    fn test_p_moduli_bits(params: &DCRTPolyParams, max_unreduced_muls: usize) -> usize {
+        crate::circuit_gadgets::arith::minimum_p_moduli_bits(
+            *params.to_crt().0.iter().max().expect("nonempty CRT basis"),
+            max_unreduced_muls,
+        )
+        .expect("test parameters support a p basis")
+    }
 
     fn create_test_context_with_params(
         circuit: &mut PolyCircuit<DCRTPoly>,
@@ -696,7 +707,7 @@ mod tests {
             circuit,
             params,
             NUM_SLOTS,
-            P_MODULI_BITS,
+            test_p_moduli_bits(params, DEFAULT_MAX_UNREDUCED_MULS),
             DEFAULT_MAX_UNREDUCED_MULS,
             scale,
             false,
@@ -881,7 +892,10 @@ mod tests {
             encrypt_zero_error_ciphertext(ctx, plaintext_slots, secret_key, active_levels);
         let sampler = DCRTPolyUniformSampler::new();
         let error_poly =
-            sampler.sample_poly(&ctx.params, &DistType::GaussDist { sigma: error_sigma });
+            sampler.sample_poly(
+                &ctx.params,
+                &DistType::GaussDist { sigma: error_sigma, max_coefficient_bound: None },
+            );
         let error_eval = DCRTPoly::from_biguints_eval(&ctx.params, &error_poly.eval_slots());
         c0 += &error_eval;
         (c0, c1)
@@ -2214,7 +2228,7 @@ mod tests {
             &mut circuit,
             &params,
             num_slots,
-            P_MODULI_BITS,
+            test_p_moduli_bits(&params, 4),
             4,
             SCALE,
             false,

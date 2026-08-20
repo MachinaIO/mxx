@@ -12,7 +12,10 @@ use mxx_ir_core::{
     artifact::{ArtifactConfidentiality, ArtifactType, ManifestArtifact, ProductionId},
     expr::euclidean_div_rem,
     graph::{FrozenGraphScopeId, GraphScope},
-    node::{IntBinaryOp, IntCompareOp, LoopInputMode, MatrixBinaryOp, NodeKind, RealBinaryOp},
+    node::{
+        HashVariant, IntBinaryOp, IntCompareOp, LoopInputMode, MatrixBinaryOp, NodeKind,
+        RealBinaryOp,
+    },
     types::{
         ConcreteMatrixType, ConcreteWireType, InstantiationFrame, NodeId, Port, WireId, WireRef,
     },
@@ -20,8 +23,14 @@ use mxx_ir_core::{
 use num_bigint::{BigInt, Sign};
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    num::NonZeroUsize,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
+use tracing::info;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionConfig {
@@ -31,12 +40,31 @@ pub struct ExecutionConfig {
     /// size. Artifact-compatible family outputs are streamed through the
     /// artifact store; scalar-only families are accumulated in memory.
     pub max_parallel_instances: NonZeroUsize,
+    /// Optional progress reporting for actual preimage sampler invocations.
+    pub preimage_progress: Option<PreimageProgressConfig>,
+    /// Optionally fence backend release streams after this many executed nodes.
+    /// This bounds queued releases without waiting unrelated live matrices.
+    pub release_fence_interval: Option<NonZeroUsize>,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> Self {
-        Self { max_parallel_instances: NonZeroUsize::new(64).expect("64 is nonzero") }
+        Self {
+            max_parallel_instances: NonZeroUsize::new(64).expect("64 is nonzero"),
+            preimage_progress: None,
+            release_fence_interval: None,
+        }
     }
+}
+
+/// Reporting contract for a known number of preimage sampler invocations.
+///
+/// The executor increments this count only after its backend has returned the
+/// sampled preimages. Replayed transcript values are deliberately excluded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreimageProgressConfig {
+    pub total: usize,
+    pub report_interval: NonZeroUsize,
 }
 
 pub struct ExecutionResult<B: Backend> {
@@ -54,6 +82,28 @@ pub struct StagedFamilyLease {
 }
 
 impl<B: Backend> ExecutionResult<B> {
+    /// Materializes a named output that the executor returned as a lazy or streamed artifact.
+    ///
+    /// Parallel-loop families may be streamed through the artifact store so their live backend
+    /// memory stays bounded by the configured wave size. Callers that need the complete output
+    /// value can explicitly load it after execution. The staged payloads remain owned by this
+    /// result and are deleted by [`Self::cleanup_staged`].
+    pub fn materialize_output<S: ArtifactStore>(
+        &mut self,
+        name: &str,
+        backend: &B,
+        store: &mut S,
+    ) -> Result<&RuntimeValue<B>, ExecutionError> {
+        let value = self
+            .outputs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ExecutionError::MissingOutput(name.to_owned()))?;
+        let value = materialize_runtime_value(value, backend, store)?;
+        self.outputs.insert(name.to_owned(), value);
+        Ok(&self.outputs[name])
+    }
+
     /// Deletes ephemeral streamed families returned by this execution.
     ///
     /// A returned staged family remains readable until this method is called.
@@ -108,12 +158,16 @@ struct ExecutableNode<'a> {
 pub enum ExecutionError {
     #[error("backend operation failed: {0}")]
     Backend(String),
+    #[error("preimage progress expected {expected} generated preimages but observed {actual}")]
+    PreimageProgressMismatch { expected: usize, actual: usize },
     #[error("artifact operation failed: {0}")]
     Artifact(String),
     #[error(transparent)]
     Transcript(#[from] TranscriptError),
     #[error("input {0} was not provided")]
     MissingInput(String),
+    #[error("output {0} does not exist")]
+    MissingOutput(String),
     #[error("wire {0:?} is unavailable")]
     MissingWire(WireRef),
     #[error("wire {0:?} has the wrong runtime value kind")]
@@ -134,6 +188,8 @@ pub enum ExecutionError {
     BackendPlacement { placement: usize, count: usize },
     #[error("backend returned an invalid parallel batch length at node {0:?}")]
     InvalidBatch(NodeId),
+    #[error("preimage public matrix does not match the trapdoor public matrix at node {0:?}")]
+    PreimagePublicMismatch(NodeId),
     #[error("manifest operation failed: {0}")]
     Manifest(String),
     #[error("scratch cleanup failed: {message}")]
@@ -325,6 +381,10 @@ where
         production,
         scratch_production,
         staged_families: BTreeMap::new(),
+        preimage_progress: config.preimage_progress.map(PreimageProgress::new),
+        executed_node_count: 0,
+        last_release_fence_node_count: 0,
+        has_pending_releases: false,
     };
     let inputs = inputs
         .into_iter()
@@ -345,6 +405,12 @@ where
             };
         }
     };
+    if let Err(error) = executor.finish_preimage_progress() {
+        return match executor.cleanup_all_staged_families() {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(cleanup_error),
+        };
+    }
     let mut named_outputs = validated
         .source
         .outputs()
@@ -370,6 +436,7 @@ where
             });
         }
     }
+    executor.fence_pending_releases()?;
     let result = ExecutionResult {
         outputs: named_outputs,
         production_id,
@@ -390,6 +457,69 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     production: ProductionId,
     scratch_production: ProductionId,
     staged_families: BTreeMap<(ProductionId, String), ManifestArtifact>,
+    preimage_progress: Option<PreimageProgress>,
+    executed_node_count: usize,
+    last_release_fence_node_count: usize,
+    has_pending_releases: bool,
+}
+
+struct PreimageProgress {
+    config: PreimageProgressConfig,
+    completed: usize,
+    last_reported: usize,
+    started: Instant,
+}
+
+impl PreimageProgress {
+    fn new(config: PreimageProgressConfig) -> Self {
+        info!(
+            total = config.total,
+            report_interval = config.report_interval.get(),
+            "preimage generation progress started"
+        );
+        Self { config, completed: 0, last_reported: 0, started: Instant::now() }
+    }
+
+    fn record(&mut self, count: usize) {
+        self.completed = self.completed.saturating_add(count);
+        let final_report = self.completed >= self.config.total;
+        if !final_report &&
+            self.completed.saturating_sub(self.last_reported) < self.config.report_interval.get()
+        {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        let elapsed_seconds = elapsed.as_secs_f64();
+        let rate_per_second = (self.completed as f64) / elapsed_seconds.max(f64::MIN_POSITIVE);
+        let remaining = self.config.total.saturating_sub(self.completed);
+        let eta = Duration::from_secs_f64((remaining as f64) / rate_per_second);
+        info!(
+            completed = self.completed,
+            total = self.config.total,
+            percent = (self.completed as f64) * 100.0 / (self.config.total.max(1) as f64),
+            rate_per_second,
+            elapsed = ?elapsed,
+            eta = ?eta,
+            "preimage generation progress"
+        );
+        self.last_reported = self.completed;
+    }
+
+    fn finish(&self) -> Result<(), ExecutionError> {
+        if self.completed != self.config.total {
+            return Err(ExecutionError::PreimageProgressMismatch {
+                expected: self.config.total,
+                actual: self.completed,
+            });
+        }
+        info!(
+            completed = self.completed,
+            total = self.config.total,
+            elapsed = ?self.started.elapsed(),
+            "preimage generation completed"
+        );
+        Ok(())
+    }
 }
 
 impl<B, S> Executor<'_, B, S>
@@ -446,10 +576,21 @@ where
                 args: scope.arguments(handle).expect("validated node belongs to its scope"),
             };
             if matches!(node.kind, NodeKind::PreimageSample { .. }) && envs.len() > 1 {
-                self.execute_preimage_batch(scope_id, &paths, &placements, &node, &mut values)?;
+                self.execute_preimage_batch(
+                    scope_id,
+                    &envs,
+                    &paths,
+                    &placements,
+                    &node,
+                    &mut values,
+                )?;
             } else if envs.len() > 1 &&
-                placements.iter().all(|placement| *placement == placements[0]) &&
-                self.execute_parallel_matrix_node(placements[0], &envs, &node, &mut values)?
+                self.execute_parallel_matrix_node_by_placement(
+                    &placements,
+                    &envs,
+                    &node,
+                    &mut values,
+                )?
             {
             } else if matches!(node.kind, NodeKind::Select { .. }) {
                 for index in 0..envs.len() {
@@ -490,9 +631,28 @@ where
                     if schedule.last_use.get(argument) == Some(&position) &&
                         !schedule.retained.contains(argument)
                     {
-                        values[index].remove(argument);
+                        if let Some(value) = values[index].remove(argument) {
+                            self.has_pending_releases |= value.releases_backend_resources_on_drop();
+                        }
                     }
                 }
+            }
+            self.executed_node_count = self.executed_node_count.saturating_add(envs.len());
+            if self.has_pending_releases &&
+                self.config.release_fence_interval.is_some_and(|interval| {
+                    self.executed_node_count.saturating_sub(self.last_release_fence_node_count) >=
+                        interval.get()
+                })
+            {
+                self.fence_pending_releases()?;
+                info!(
+                    scope = ?scope_id,
+                    scope_completed_nodes = position + 1,
+                    scope_total_nodes = validated_scope.execution_order.len(),
+                    total_executed_nodes = self.executed_node_count,
+                    instances = values.len(),
+                    "execution progress checkpoint"
+                );
             }
         }
         let mut instances = Vec::with_capacity(values.len());
@@ -508,21 +668,49 @@ where
         Ok(instances)
     }
 
+    fn execute_parallel_matrix_node_by_placement(
+        &mut self,
+        placements: &[usize],
+        envs: &[ParamEnv],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+    ) -> Result<bool, ExecutionError> {
+        if !matches!(
+            node.kind,
+            NodeKind::MatrixBinary(_) | NodeKind::MatrixNegate | NodeKind::MatrixScale { .. }
+        ) {
+            return Ok(false);
+        }
+        for placement in 0..self.backend.placement_count() {
+            let indices = placements
+                .iter()
+                .enumerate()
+                .filter_map(|(index, assigned)| (*assigned == placement).then_some(index))
+                .collect::<Vec<_>>();
+            if !indices.is_empty() {
+                self.execute_parallel_matrix_node(placement, envs, node, values, &indices)?;
+            }
+        }
+        Ok(true)
+    }
+
     fn execute_parallel_matrix_node(
         &mut self,
         placement: usize,
         envs: &[ParamEnv],
         node: &ExecutableNode<'_>,
         values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
-    ) -> Result<bool, ExecutionError> {
+        indices: &[usize],
+    ) -> Result<(), ExecutionError> {
         self.set_placement(placement)?;
         let outputs = match node.kind {
             NodeKind::MatrixBinary(operation) => {
-                let mut inputs = Vec::with_capacity(values.len());
-                for instance in values.iter_mut() {
+                let mut inputs = Vec::with_capacity(indices.len());
+                for index in indices {
+                    let instance = &mut values[*index];
                     let left = self.matrix(instance, node.args[0])?;
                     let right = self.matrix(instance, node.args[1])?;
-                    inputs.push((left.as_ref().clone(), right.as_ref().clone()));
+                    inputs.push((left, right));
                 }
                 match operation {
                     MatrixBinaryOp::Add => self.backend.add_batch(inputs),
@@ -532,32 +720,35 @@ where
                 .map_err(Self::backend_error)?
             }
             NodeKind::MatrixNegate => {
-                let mut inputs = Vec::with_capacity(values.len());
-                for instance in values.iter_mut() {
-                    inputs.push(self.matrix(instance, node.args[0])?.as_ref().clone());
+                let mut inputs = Vec::with_capacity(indices.len());
+                for index in indices {
+                    let instance = &mut values[*index];
+                    inputs.push(self.matrix(instance, node.args[0])?);
                 }
                 self.backend.negate_batch(inputs).map_err(Self::backend_error)?
             }
             NodeKind::MatrixScale { scalar } => {
-                let mut inputs = Vec::with_capacity(values.len());
-                for (env, instance) in envs.iter().zip(values.iter_mut()) {
+                let mut inputs = Vec::with_capacity(indices.len());
+                for index in indices {
+                    let env = &envs[*index];
+                    let instance = &mut values[*index];
                     let value = self.matrix(instance, node.args[0])?;
                     let scalar = scalar
                         .evaluate(env)
                         .map_err(|error| self.expression_error(node.id, error))?;
-                    inputs.push((value.as_ref().clone(), scalar));
+                    inputs.push((value, scalar));
                 }
                 self.backend.scale_integer_batch(inputs).map_err(Self::backend_error)?
             }
-            _ => return Ok(false),
+            _ => unreachable!("matrix batch kind checked by caller"),
         };
-        if outputs.len() != values.len() {
+        if outputs.len() != indices.len() {
             return Err(ExecutionError::InvalidBatch(node.id));
         }
-        for (instance, output) in values.iter_mut().zip(outputs) {
-            self.put(instance, node.id, 0, RuntimeValue::matrix(output));
+        for (index, output) in indices.iter().zip(outputs) {
+            self.put(&mut values[*index], node.id, 0, RuntimeValue::matrix(output));
         }
-        Ok(true)
+        Ok(())
     }
 
     fn persist_outputs(
@@ -1235,15 +1426,19 @@ where
                 let output = self.backend.concat(&inputs, *axis).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
-            NodeKind::Reshape { rows, columns } => {
-                let input = self.matrix(values, node.args[0])?;
-                let rows = self.eval_usize(node.id, rows, env)?;
-                let columns = self.eval_usize(node.id, columns, env)?;
-                let output =
-                    self.backend.reshape(&input, rows, columns).map_err(Self::backend_error)?;
-                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            NodeKind::UniformResidueSample { .. } => {
+                let wire = WireRef { node: node.id, port: Port(0) };
+                let ty = self.matrix_type(scope_id, path, wire)?;
+                let range = RuntimeSampleRange {
+                    minimum: BigInt::from(0),
+                    maximum: &ty.modulus - BigInt::from(1),
+                };
+                let value = self.sample_matrix(path, wire, &ty, |backend| {
+                    backend.sample_uniform(&ty, &range)
+                })?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
-            NodeKind::UniformSample { range, .. } => {
+            NodeKind::UniformIntervalSample { range, .. } => {
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
                 let range = RuntimeSampleRange {
@@ -1261,14 +1456,17 @@ where
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
-            NodeKind::GaussianSample { sigma, .. } => {
+            NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
                 let sigma = sigma
                     .evaluate_f64(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
+                let max_coefficient_bound = max_coefficient_bound
+                    .evaluate(env)
+                    .map_err(|error| self.expression_error(node.id, error))?;
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
-                    backend.sample_gaussian(&ty, sigma)
+                    backend.sample_gaussian(&ty, sigma, &max_coefficient_bound)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
@@ -1278,6 +1476,8 @@ where
                 tag_expressions,
                 tag_decimal_expressions,
                 tag_u64_le_expressions,
+                base,
+                digit_count,
                 ..
             } => {
                 let key = self.bytes(values, node.args[0])?;
@@ -1312,8 +1512,41 @@ where
                 }
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
+                let gadget_base = base
+                    .as_ref()
+                    .map(|base| {
+                        base.evaluate(env).map_err(|error| self.expression_error(node.id, error))
+                    })
+                    .transpose()?;
+                let digit_count = digit_count
+                    .as_ref()
+                    .map(|count| self.eval_usize(node.id, count, env))
+                    .transpose()?;
+                let gadget_layout = match (variant, gadget_base.as_ref(), digit_count) {
+                    (HashVariant::Plain, None, None) => None,
+                    (
+                        HashVariant::Decomposed | HashVariant::SmallDecomposed,
+                        Some(base),
+                        Some(count),
+                    ) => {
+                        if count == 0 || ty.rows % count != 0 {
+                            return Err(ExecutionError::Expression {
+                                node: node.id,
+                                message: "decomposed hash rows must be divisible by digit count"
+                                    .to_owned(),
+                            });
+                        }
+                        Some((base, count))
+                    }
+                    _ => {
+                        return Err(ExecutionError::Expression {
+                            node: node.id,
+                            message: "hash variant and gadget layout do not match".to_owned(),
+                        });
+                    }
+                };
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
-                    backend.sample_hash(&ty, key, &tag, *variant)
+                    backend.sample_hash(&ty, key, &tag, *variant, gadget_layout)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
@@ -1355,30 +1588,51 @@ where
                     },
                 );
             }
-            NodeKind::PreimageSample { .. } => {
+            NodeKind::PreimageSample { max_coefficient_bound, .. } => {
                 let public = self.matrix(values, node.args[0])?;
-                let (secret, _, _, sigma, gadget_base, digit_count, gadget_small) =
+                let (secret, trapdoor_public, _, sigma, gadget_base, digit_count, gadget_small) =
                     self.trapdoor(values, node.args[1])?;
+                if !Arc::ptr_eq(&public, &trapdoor_public) &&
+                    public.as_ref() != trapdoor_public.as_ref()
+                {
+                    return Err(ExecutionError::PreimagePublicMismatch(node.id));
+                }
                 let target = self.matrix(values, node.args[2])?;
+                let target_type = self.matrix_type(scope_id, path, node.args[2])?;
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
-                let value = if let Some(small) = gadget_small {
-                    self.backend.gadget_decompose(&target, small).map_err(Self::backend_error)?
+                let max_coefficient_bound = max_coefficient_bound
+                    .evaluate(env)
+                    .map_err(|error| self.expression_error(node.id, error))?;
+                let (value, sampled) = if let Some(small) = gadget_small {
+                    self.backend
+                        .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
+                        .map_err(Self::backend_error)?;
+                    (
+                        self.backend
+                            .gadget_decompose(&target, small)
+                            .map_err(Self::backend_error)?,
+                        false,
+                    )
                 } else {
                     let secret =
                         secret.as_ref().expect("sampled trapdoor must carry secret material");
-                    self.sample_matrix(path, wire, &ty, |backend| {
+                    self.sample_matrix_with_status(path, wire, &ty, |backend| {
                         backend.sample_preimage(
                             &ty,
                             sigma,
                             &gadget_base,
                             digit_count,
+                            &max_coefficient_bound,
                             secret,
                             &public,
                             &target,
                         )
                     })?
                 };
+                if sampled {
+                    self.record_preimages(1);
+                }
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
             NodeKind::GadgetDecompose { base, small, digit_count } => {
@@ -1388,28 +1642,28 @@ where
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
                 let base =
                     base.evaluate(env).map_err(|error| self.expression_error(node.id, error))?;
-                let digit_count = match digit_count {
-                    Some(count) => self.eval_usize(node.id, count, env)?,
-                    None if output_type.rows.is_multiple_of(input_type.rows) => {
-                        output_type.rows / input_type.rows
-                    }
-                    None => {
-                        return Err(ExecutionError::Expression {
-                            node: node.id,
-                            message:
-                                "gadget decomposition row count is not divisible by input rows"
-                                    .to_owned(),
-                        });
-                    }
-                };
+                let digit_count = self.eval_usize(node.id, digit_count, env)?;
                 self.backend
                     .validate_gadget_layout(&input_type, &base, digit_count, *small)
                     .map_err(Self::backend_error)?;
+                let expected_rows = input_type.rows.checked_mul(digit_count).ok_or_else(|| {
+                    ExecutionError::Expression {
+                        node: node.id,
+                        message: "gadget decomposition output row count overflow".to_owned(),
+                    }
+                })?;
+                if output_type.rows != expected_rows {
+                    return Err(ExecutionError::Expression {
+                        node: node.id,
+                        message: "gadget decomposition output type disagrees with digit count"
+                            .to_owned(),
+                    });
+                }
                 let output =
                     self.backend.gadget_decompose(&input, *small).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
-            NodeKind::ExtractCoefficient { position } => {
+            NodeKind::ExtractCoefficient { position, .. } => {
                 let input = self.matrix(values, node.args[0])?;
                 let position = self.eval_usize(node.id, position, env)?;
                 let output = self
@@ -1418,13 +1672,8 @@ where
                     .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::Int(output));
             }
-            NodeKind::ConstantCoefficient { position } => {
-                let input = self.matrix(values, node.args[0])?;
-                let position = self.eval_usize(node.id, position, env)?;
-                let coefficient = self
-                    .backend
-                    .extract_coefficient(&input, position)
-                    .map_err(Self::backend_error)?;
+            NodeKind::LiftIntegerToConstantPolynomial { .. } => {
+                let coefficient = self.int(values, node.args[0])?;
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
                 let identity = self
@@ -1657,6 +1906,72 @@ where
                     self.put(values, node.id, port as u32, value);
                 }
             }
+            NodeKind::SequentialLoop(loop_node) => {
+                let child_id =
+                    self.validated.source.child_scope_id(scope_id, node.id).ok_or_else(|| {
+                        ExecutionError::MissingSubgraph {
+                            node: node.id,
+                            name: format!("sequential body at {:?}", node.id),
+                        }
+                    })?;
+                let child = self.validated.source.scope(&child_id).ok_or_else(|| {
+                    ExecutionError::MissingSubgraph {
+                        node: node.id,
+                        name: format!("sequential body at {:?}", node.id),
+                    }
+                })?;
+                let count = self.eval_usize(node.id, &loop_node.count, env)?;
+                let parent_placement = self.backend.active_placement();
+                let mut carried = node.args[..loop_node.carried_count]
+                    .iter()
+                    .map(|wire| self.value(values, *wire))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let invariants = node.args[loop_node.carried_count..]
+                    .iter()
+                    .map(|wire| self.value(values, *wire))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let input_names = child
+                    .inputs()
+                    .iter()
+                    .map(|wire| {
+                        let input = child.node(wire.node).expect("validated sequential input node");
+                        let NodeKind::Input { name, .. } = input.kind() else {
+                            unreachable!("validated sequential input must reference an input node")
+                        };
+                        name.clone()
+                    })
+                    .collect::<Vec<_>>();
+                for index in 0..count {
+                    self.set_placement(parent_placement)?;
+                    let child_env = self.child_env(
+                        env,
+                        &loop_node.bindings,
+                        Some((loop_node.index_slot, index)),
+                        node.id,
+                    )?;
+                    let child_inputs = input_names
+                        .iter()
+                        .cloned()
+                        .zip(carried.iter().chain(&invariants).cloned())
+                        .collect::<BTreeMap<_, _>>();
+                    let mut child_path = path.to_vec();
+                    child_path
+                        .push(InstantiationFrame { call: node.id, loop_index: Some(index as u64) });
+                    carried = self
+                        .execute_instance(
+                            &child_id,
+                            &child_env,
+                            child_path,
+                            child_inputs,
+                            parent_placement,
+                        )?
+                        .outputs;
+                }
+                self.set_placement(parent_placement)?;
+                for (port, value) in carried.into_iter().enumerate() {
+                    self.put(values, node.id, port as u32, value);
+                }
+            }
             NodeKind::FamilyPack { count } => {
                 let count = self.eval_usize(node.id, count, env)?;
                 if count == 0 || node.args.len() != count {
@@ -1779,6 +2094,7 @@ where
     fn execute_preimage_batch(
         &mut self,
         scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
         paths: &[Vec<InstantiationFrame>],
         placements: &[usize],
         node: &ExecutableNode<'_>,
@@ -1796,8 +2112,13 @@ where
         for instance in 0..values.len() {
             self.set_placement(placements[instance])?;
             let public = self.matrix(&mut values[instance], node.args[0])?;
-            let (secret, _, _, sigma, gadget_base, digit_count, gadget_small) =
+            let (secret, trapdoor_public, _, sigma, gadget_base, digit_count, gadget_small) =
                 self.trapdoor(&mut values[instance], node.args[1])?;
+            if !Arc::ptr_eq(&public, &trapdoor_public) &&
+                public.as_ref() != trapdoor_public.as_ref()
+            {
+                return Err(ExecutionError::PreimagePublicMismatch(node.id));
+            }
             let target = self.matrix(&mut values[instance], node.args[2])?;
             let wire = WireRef { node: node.id, port: Port(0) };
             if let Some(small) = gadget_small {
@@ -1807,6 +2128,12 @@ where
                 continue;
             }
             let matrix_type = self.matrix_type(scope_id, &paths[instance], wire)?;
+            let NodeKind::PreimageSample { max_coefficient_bound, .. } = node.kind else {
+                unreachable!("preimage batch only handles preimage nodes")
+            };
+            let max_coefficient_bound = max_coefficient_bound
+                .evaluate(&envs[instance])
+                .map_err(|error| self.expression_error(node.id, error))?;
             pending.push(Pending {
                 instance,
                 placement: placements[instance],
@@ -1817,6 +2144,7 @@ where
                     sigma,
                     gadget_base,
                     digit_count,
+                    max_coefficient_bound,
                     trapdoor: secret.expect("sampled trapdoor must carry secret material"),
                     public,
                     target,
@@ -1860,32 +2188,53 @@ where
             if !missing.is_empty() {
                 let mut sampled_by_index =
                     (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
-                for placement in 0..self.backend.placement_count() {
-                    let indices = missing
-                        .iter()
-                        .copied()
-                        .filter(|index| pending[*index].placement == placement)
-                        .collect::<Vec<_>>();
-                    if indices.is_empty() {
-                        continue;
-                    }
-                    self.set_placement(placement)?;
-                    let sampled = self
-                        .backend
-                        .sample_preimage_batch(
-                            indices.iter().map(|index| pending[*index].request.clone()).collect(),
-                        )
-                        .map_err(Self::backend_error)?;
+                let groups = (0..self.backend.placement_count())
+                    .filter_map(|placement| {
+                        let indices = missing
+                            .iter()
+                            .copied()
+                            .filter(|index| pending[*index].placement == placement)
+                            .collect::<Vec<_>>();
+                        (!indices.is_empty()).then(|| {
+                            let requests: Vec<PreimageRequest<B::Matrix, B::Trapdoor>> = indices
+                                .iter()
+                                .map(|index| pending[*index].request.clone())
+                                .collect();
+                            (placement, indices, requests)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let batches = groups
+                    .iter()
+                    .map(|(placement, _, requests)| (*placement, requests.clone()))
+                    .collect();
+                let sampled_groups = self
+                    .backend
+                    .sample_preimage_batches_by_placement(batches)
+                    .map_err(Self::backend_error)?;
+                for ((expected_placement, indices, _), (placement, sampled)) in
+                    groups.into_iter().zip(sampled_groups)
+                {
+                    debug_assert_eq!(placement, expected_placement);
+                    self.record_preimages(sampled.len());
                     for (index, output) in indices.into_iter().zip(sampled) {
                         sampled_by_index[index] = Some(output);
                     }
                 }
+                let serialized = self.backend.matrices_to_bytes(
+                    &missing
+                        .iter()
+                        .map(|index| {
+                            sampled_by_index[*index]
+                                .as_ref()
+                                .expect("every missing preimage was sampled")
+                        })
+                        .collect::<Vec<_>>(),
+                );
                 let entries = missing
                     .iter()
-                    .map(|index| {
-                        let output = sampled_by_index[*index]
-                            .as_ref()
-                            .expect("every missing preimage was sampled");
+                    .zip(serialized)
+                    .map(|(index, bytes)| {
                         let request = &pending[*index];
                         (
                             DrawSite {
@@ -1895,7 +2244,7 @@ where
                             },
                             RecordedValue::Matrix {
                                 matrix_type: request.request.matrix_type.clone(),
-                                bytes: self.backend.matrix_to_bytes(output),
+                                bytes,
                             },
                         )
                     })
@@ -1960,24 +2309,35 @@ where
             outputs
         } else {
             let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
-            for placement in 0..self.backend.placement_count() {
-                let indices = pending
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, request)| {
-                        (request.placement == placement).then_some(index)
+            let groups = (0..self.backend.placement_count())
+                .filter_map(|placement| {
+                    let indices = pending
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, request)| {
+                            (request.placement == placement).then_some(index)
+                        })
+                        .collect::<Vec<_>>();
+                    (!indices.is_empty()).then(|| {
+                        let requests: Vec<PreimageRequest<B::Matrix, B::Trapdoor>> =
+                            indices.iter().map(|index| pending[*index].request.clone()).collect();
+                        (placement, indices, requests)
                     })
-                    .collect::<Vec<_>>();
-                if indices.is_empty() {
-                    continue;
-                }
-                self.set_placement(placement)?;
-                let sampled = self
-                    .backend
-                    .sample_preimage_batch(
-                        indices.iter().map(|index| pending[*index].request.clone()).collect(),
-                    )
-                    .map_err(Self::backend_error)?;
+                })
+                .collect::<Vec<_>>();
+            let batches = groups
+                .iter()
+                .map(|(placement, _, requests)| (*placement, requests.clone()))
+                .collect();
+            let sampled_groups = self
+                .backend
+                .sample_preimage_batches_by_placement(batches)
+                .map_err(Self::backend_error)?;
+            for ((expected_placement, indices, _), (placement, sampled)) in
+                groups.into_iter().zip(sampled_groups)
+            {
+                debug_assert_eq!(placement, expected_placement);
+                self.record_preimages(sampled.len());
                 for (index, output) in indices.into_iter().zip(sampled) {
                     outputs[index] = Some(output);
                 }
@@ -1990,7 +2350,8 @@ where
         debug_assert_eq!(outputs.len(), pending.len());
 
         if let SamplingMode::Record(recorder) = &mut self.sampling_mode {
-            for (request, output) in pending.iter().zip(&outputs) {
+            let serialized = self.backend.matrices_to_bytes(&outputs.iter().collect::<Vec<_>>());
+            for ((request, _), bytes) in pending.iter().zip(&outputs).zip(serialized) {
                 recorder.record(
                     DrawSite {
                         instantiation_path: request.path.clone(),
@@ -1999,7 +2360,7 @@ where
                     },
                     RecordedValue::Matrix {
                         matrix_type: request.request.matrix_type.clone(),
-                        bytes: self.backend.matrix_to_bytes(output),
+                        bytes,
                     },
                 )?;
             }
@@ -2050,6 +2411,19 @@ where
     where
         F: FnOnce(&mut B) -> Result<B::Matrix, B::Error>,
     {
+        self.sample_matrix_with_status(path, wire, ty, fresh).map(|(value, _)| value)
+    }
+
+    fn sample_matrix_with_status<F>(
+        &mut self,
+        path: &[InstantiationFrame],
+        wire: WireRef,
+        ty: &ConcreteMatrixType,
+        fresh: F,
+    ) -> Result<(B::Matrix, bool), ExecutionError>
+    where
+        F: FnOnce(&mut B) -> Result<B::Matrix, B::Error>,
+    {
         let site = DrawSite { instantiation_path: path.to_vec(), node: wire.node, port: wire.port };
         if let Some(production) = self.session.clone() {
             if let Some(recorded) = self
@@ -2058,9 +2432,11 @@ where
                 .map_err(Self::artifact_error)?
             {
                 return match recorded {
-                    RecordedValue::Matrix { matrix_type, bytes } if matrix_type == *ty => {
-                        self.backend.matrix_from_bytes(ty, &bytes).map_err(Self::backend_error)
-                    }
+                    RecordedValue::Matrix { matrix_type, bytes } if matrix_type == *ty => self
+                        .backend
+                        .matrix_from_bytes(ty, &bytes)
+                        .map(|value| (value, false))
+                        .map_err(Self::backend_error),
                     RecordedValue::Matrix { .. } | RecordedValue::Trapdoor { .. } => {
                         Err(TranscriptError::KindMismatch(site).into())
                     }
@@ -2079,10 +2455,12 @@ where
                     )],
                 )
                 .map_err(Self::artifact_error)?;
-            return Ok(value);
+            return Ok((value, true));
         }
         match &mut self.sampling_mode {
-            SamplingMode::Fresh => fresh(self.backend).map_err(Self::backend_error),
+            SamplingMode::Fresh => {
+                fresh(self.backend).map(|value| (value, true)).map_err(Self::backend_error)
+            }
             SamplingMode::Record(recorder) => {
                 let value = fresh(self.backend).map_err(Self::backend_error)?;
                 recorder.record(
@@ -2092,15 +2470,27 @@ where
                         bytes: self.backend.matrix_to_bytes(&value),
                     },
                 )?;
-                Ok(value)
+                Ok((value, true))
             }
             SamplingMode::Replay(replayer) => match replayer.get(&site)? {
-                RecordedValue::Matrix { bytes, .. } => {
-                    self.backend.matrix_from_bytes(ty, bytes).map_err(Self::backend_error)
-                }
+                RecordedValue::Matrix { bytes, .. } => self
+                    .backend
+                    .matrix_from_bytes(ty, bytes)
+                    .map(|value| (value, false))
+                    .map_err(Self::backend_error),
                 RecordedValue::Trapdoor { .. } => Err(TranscriptError::KindMismatch(site).into()),
             },
         }
+    }
+
+    fn record_preimages(&mut self, count: usize) {
+        if let Some(progress) = &mut self.preimage_progress {
+            progress.record(count);
+        }
+    }
+
+    fn finish_preimage_progress(&self) -> Result<(), ExecutionError> {
+        self.preimage_progress.as_ref().map_or(Ok(()), PreimageProgress::finish)
     }
 
     fn sample_trapdoor(
@@ -2275,51 +2665,7 @@ where
         artifact_type: ArtifactType,
         payload: ArtifactPayload,
     ) -> Result<RuntimeValue<B>, ExecutionError> {
-        match (artifact_type, payload) {
-            (ArtifactType::Matrix(matrix_type), ArtifactPayload::Matrix(bytes)) => {
-                let matrix = self
-                    .backend
-                    .matrix_from_bytes(&matrix_type, &bytes)
-                    .map_err(Self::backend_error)?;
-                Ok(RuntimeValue::matrix(matrix))
-            }
-            (ArtifactType::Bytes { length }, ArtifactPayload::Bytes(bytes))
-                if bytes.len() == length =>
-            {
-                Ok(RuntimeValue::Bytes(bytes))
-            }
-            (ArtifactType::TypedBlob { .. }, ArtifactPayload::TypedBlob(bytes)) => {
-                Ok(RuntimeValue::TypedBlob(bytes))
-            }
-            (
-                ArtifactType::Trapdoor { matrix, sigma, gadget_base, digit_count },
-                ArtifactPayload::Trapdoor { public_bytes, secret_bytes },
-            ) => {
-                let public = self
-                    .backend
-                    .matrix_from_bytes(&matrix, &public_bytes)
-                    .map_err(Self::backend_error)?;
-                let secret = self
-                    .backend
-                    .trapdoor_from_bytes(&matrix, &secret_bytes)
-                    .map_err(Self::backend_error)?;
-                let sigma = sigma
-                    .evaluate_f64(&ParamEnv::default())
-                    .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
-                Ok(RuntimeValue::Trapdoor {
-                    secret: Some(Arc::new(secret)),
-                    public: Arc::new(public),
-                    matrix_type: matrix,
-                    sigma,
-                    gadget_base,
-                    digit_count,
-                    gadget_small: None,
-                })
-            }
-            _ => Err(ExecutionError::Artifact(
-                "stored payload kind does not match artifact descriptor".to_owned(),
-            )),
-        }
+        decode_artifact(self.backend, artifact_type, payload)
     }
 
     fn matrix(
@@ -2331,6 +2677,15 @@ where
             RuntimeValue::Matrix(value) => Ok(value),
             _ => Err(ExecutionError::ValueKind(wire)),
         }
+    }
+
+    fn fence_pending_releases(&mut self) -> Result<(), ExecutionError> {
+        if self.has_pending_releases {
+            self.backend.fence_released_memory().map_err(Self::backend_error)?;
+            self.has_pending_releases = false;
+            self.last_release_fence_node_count = self.executed_node_count;
+        }
+        Ok(())
     }
 
     fn value(
@@ -2951,6 +3306,117 @@ fn collect_staged_families<B: Backend>(
     }
 }
 
+fn materialize_runtime_value<B: Backend, S: ArtifactStore>(
+    value: RuntimeValue<B>,
+    backend: &B,
+    store: &mut S,
+) -> Result<RuntimeValue<B>, ExecutionError> {
+    match value {
+        RuntimeValue::LazyArtifact { production, name, index, descriptor } => {
+            let artifact_type = descriptor.artifact_type.clone();
+            let payload = store
+                .load(&ArtifactKey { production, name, index }, &descriptor)
+                .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+            decode_artifact(backend, artifact_type, payload)
+        }
+        RuntimeValue::StagedArtifact { production, name, index, descriptor } => {
+            let artifact_type = descriptor.artifact_type.clone();
+            let payload = store
+                .load_staged(&ArtifactKey { production, name, index: Some(index) }, &descriptor)
+                .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+            decode_artifact(backend, artifact_type, payload)
+        }
+        RuntimeValue::LazyArtifactFamily { production, name, descriptor } => {
+            materialize_artifact_family(production, name, descriptor, false, backend, store)
+        }
+        RuntimeValue::StagedArtifactFamily { production, name, descriptor } => {
+            materialize_artifact_family(production, name, descriptor, true, backend, store)
+        }
+        RuntimeValue::IndexedFamily(values) => values
+            .into_iter()
+            .map(|value| materialize_runtime_value(value, backend, store))
+            .collect::<Result<Vec<_>, _>>()
+            .map(RuntimeValue::IndexedFamily),
+        value => Ok(value),
+    }
+}
+
+fn materialize_artifact_family<B: Backend, S: ArtifactStore>(
+    production: ProductionId,
+    name: String,
+    descriptor: ManifestArtifact,
+    staged: bool,
+    backend: &B,
+    store: &mut S,
+) -> Result<RuntimeValue<B>, ExecutionError> {
+    let count = descriptor
+        .family_count
+        .ok_or_else(|| ExecutionError::Manifest("artifact family has no cardinality".to_owned()))?;
+    let artifact_type = descriptor.artifact_type.clone();
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let key =
+            ArtifactKey { production: production.clone(), name: name.clone(), index: Some(index) };
+        let payload = if staged {
+            store.load_staged(&key, &descriptor)
+        } else {
+            store.load(&key, &descriptor)
+        }
+        .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+        values.push(decode_artifact(backend, artifact_type.clone(), payload)?);
+    }
+    Ok(RuntimeValue::IndexedFamily(values))
+}
+
+fn decode_artifact<B: Backend>(
+    backend: &B,
+    artifact_type: ArtifactType,
+    payload: ArtifactPayload,
+) -> Result<RuntimeValue<B>, ExecutionError> {
+    match (artifact_type, payload) {
+        (ArtifactType::Matrix(matrix_type), ArtifactPayload::Matrix(bytes)) => {
+            let matrix = backend
+                .matrix_from_bytes(&matrix_type, &bytes)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            Ok(RuntimeValue::matrix(matrix))
+        }
+        (ArtifactType::Bytes { length }, ArtifactPayload::Bytes(bytes))
+            if bytes.len() == length =>
+        {
+            Ok(RuntimeValue::Bytes(bytes))
+        }
+        (ArtifactType::TypedBlob { .. }, ArtifactPayload::TypedBlob(bytes)) => {
+            Ok(RuntimeValue::TypedBlob(bytes))
+        }
+        (
+            ArtifactType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. },
+            ArtifactPayload::Trapdoor { public_bytes, secret_bytes },
+        ) => {
+            let public = backend
+                .matrix_from_bytes(&matrix, &public_bytes)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            let secret = backend
+                .trapdoor_from_bytes(&matrix, &secret_bytes)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            let sigma = sigma
+                .evaluate_f64(&ParamEnv::default())
+                .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
+            Ok(RuntimeValue::Trapdoor {
+                secret: Some(Arc::new(secret)),
+                public: Arc::new(public),
+                matrix_type: matrix,
+                sigma,
+                gadget_base,
+                digit_count,
+                gadget_small: None,
+            })
+        }
+        _ => Err(ExecutionError::Artifact(
+            "stored payload kind does not match artifact descriptor".to_owned(),
+        )),
+    }
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -2964,10 +3430,17 @@ fn hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{artifact::MemoryArtifactStore, backend::poly::cpu_backend};
-    use mxx_dsl::{DslContext, Family, MatType, Parallel, Ring, Subgraph};
+    use crate::{
+        artifact::MemoryArtifactStore,
+        backend::poly::{CpuDcrtBackend, cpu_backend},
+    };
+    use mxx_dsl::{
+        DslContext, Family, HashTag, Int, MatType, Parallel, Ring, Sequential, Subgraph,
+        parallel_zip,
+    };
     use mxx_ir_core::{
-        Graph, GraphOutput, NodeHandle, RealExpr, ValueHandle, WireType,
+        Graph, GraphOutput, IntExpr, NodeHandle, RealExpr, ValueHandle, WireType,
+        artifact::ArtifactConfidentiality,
         node::{IntBinaryOp, IntCompareOp, NodeKind, RealBinaryOp},
     };
     use mxx_primitives::{
@@ -2980,6 +3453,26 @@ mod tests {
     use num_bigint::{BigInt, Sign};
     use num_traits::ToPrimitive;
     use rand::Rng;
+
+    #[test]
+    fn preimage_progress_requires_the_configured_exact_total() {
+        let mut progress = PreimageProgress {
+            config: PreimageProgressConfig {
+                total: 3,
+                report_interval: NonZeroUsize::new(2).expect("nonzero interval"),
+            },
+            completed: 0,
+            last_reported: 0,
+            started: Instant::now(),
+        };
+        progress.record(2);
+        assert!(matches!(
+            progress.finish(),
+            Err(ExecutionError::PreimageProgressMismatch { expected: 3, actual: 2 })
+        ));
+        progress.record(1);
+        assert!(progress.finish().is_ok());
+    }
 
     #[test]
     fn canonical_polynomial_coefficient_bits_roundtrip_on_cpu() {
@@ -3024,6 +3517,38 @@ mod tests {
     }
 
     #[test]
+    fn integer_lift_writes_only_the_constant_polynomial_coefficient() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let context = DslContext::new("integer-lift-constant-polynomial");
+        let coefficient = context.int_family_input("coefficient", 1).get_static(0);
+        let lifted = coefficient.lift_to_constant_polynomial(ring.matrix_type((1, 1)));
+        let expected = ring.polynomial([IntExpr::constant(-3)]);
+        let graph = context
+            .output("lifted", lifted)
+            .expect("lifted output")
+            .output("expected", expected)
+            .expect("expected output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let result = execute(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::from([(
+                "coefficient".to_owned(),
+                RuntimeValue::IndexedFamily(vec![RuntimeValue::Int(BigInt::from(-3))]),
+            )]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        assert_eq!(matrix_output(&result, "lifted"), matrix_output(&result, "expected"));
+    }
+
+    #[test]
     fn range_loop_executes_in_bounded_waves_with_concrete_loop_indices() {
         let parameters = DCRTPolyParams::default();
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
@@ -3045,17 +3570,481 @@ mod tests {
             BTreeMap::new(),
             &mut store,
             SamplingMode::Fresh,
-            ExecutionConfig { max_parallel_instances: NonZeroUsize::new(2).expect("nonzero") },
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(2).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
         )
         .expect("execution");
-        match &result.outputs["values"] {
-            RuntimeValue::IndexedFamily(values) => assert_eq!(values.len(), 3),
-            RuntimeValue::StagedArtifactFamily { descriptor, .. } => {
-                assert_eq!(descriptor.family_count, Some(3));
-            }
-            _ => panic!("range output is not a family"),
-        }
+        let RuntimeValue::StagedArtifactFamily { descriptor, .. } = &result.outputs["values"]
+        else {
+            panic!("matrix range output should be streamed");
+        };
+        assert_eq!(descriptor.family_count, Some(3));
+        let RuntimeValue::IndexedFamily(values) = result
+            .materialize_output("values", &backend, &mut store)
+            .expect("materialize range output")
+        else {
+            panic!("materialized range output is not an indexed family");
+        };
+        assert_eq!(values.len(), 3);
         result.cleanup_staged(&mut store).expect("staged cleanup");
+    }
+
+    #[test]
+    fn dynamic_integer_hash_tags_are_deterministic_and_row_distinct() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let key = ring.bytes_input("key", 32);
+        let rows = Family::pack(
+            [2usize, 0, 1]
+                .into_iter()
+                .map(|row| Int::constant(row).add(Int::constant(0)))
+                .collect(),
+        )
+        .expect("row family");
+        let dummy = Family::pack(vec![Int::constant(0); 3]).expect("dummy family");
+        let samples = parallel_zip((rows, dummy), move |_, (row, _)| {
+            let mut tag = HashTag::from(b"mxx-bgg/lwe-lookup-low/v2:test:row:".as_slice());
+            tag.push(row);
+            ring.hash_matrix(key.clone(), tag, (1, 1))
+        })
+        .expect("dynamic hash family");
+        let validated = DslContext::new("runtime-dynamic-hash-tags")
+            .family_output("samples", samples)
+            .expect("sample output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+
+        let execute_samples = |backend: &mut CpuDcrtBackend, store: &mut MemoryArtifactStore| {
+            let mut result = execute(
+                &validated,
+                backend,
+                BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(vec![0x5a; 32]))]),
+                store,
+                SamplingMode::Fresh,
+            )
+            .expect("dynamic hash execution");
+            let RuntimeValue::IndexedFamily(values) =
+                result.materialize_output("samples", backend, store).expect("materialized hashes")
+            else {
+                panic!("dynamic hashes must materialize as a family")
+            };
+            values
+                .iter()
+                .map(|value| {
+                    let RuntimeValue::Matrix(matrix) = value else {
+                        panic!("dynamic hash member must be a matrix")
+                    };
+                    matrix.as_ref().clone()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut first_backend = cpu_backend([parameters.clone()]);
+        let mut first_store = MemoryArtifactStore::default();
+        let first = execute_samples(&mut first_backend, &mut first_store);
+        let mut second_backend = cpu_backend([parameters]);
+        let mut second_store = MemoryArtifactStore::default();
+        let second = execute_samples(&mut second_backend, &mut second_store);
+        assert_eq!(first, second);
+        assert_ne!(first[0], first[1]);
+        assert_ne!(first[0], first[2]);
+        assert_ne!(first[1], first[2]);
+    }
+
+    #[test]
+    fn trapdoor_families_sample_preimages_and_persist_each_member() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let digit_count = parameters.modulus_digits();
+        let gadget_base = BigInt::from(1u64 << parameters.base_bits());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let trapdoors = Parallel::range(2)
+            .map_values(|_| ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1_000_000))
+            .expect("trapdoor family");
+        let public = trapdoors.public_matrices();
+        let swapped_public = Family::pack(vec![public.get_static(1), public.get_static(0)])
+            .expect("swapped public family");
+        let targets = Parallel::range(2)
+            .map(|index| {
+                ring.polynomial([IntExpr::Add(
+                    Box::new(index.expression()),
+                    Box::new(IntExpr::constant(1)),
+                )
+                .canonicalize()])
+            })
+            .expect("targets");
+        let expected_targets = targets.clone();
+        let preimages = trapdoors
+            .clone()
+            .parallel_zip_mat_values(targets, |_, trapdoor, target| {
+                trapdoor.sample_preimage(target, (digit_count + 2, 1)).as_mat()
+            })
+            .expect("preimages");
+        let products = trapdoors
+            .public_matrices()
+            .parallel_zip(preimages, |_, public, preimage| public * preimage)
+            .expect("products");
+        let static_target = ring.polynomial([3.into()]);
+        let static_trapdoor = trapdoors.get_static(0);
+        let static_public = static_trapdoor.public_matrix();
+        let static_product = static_public.clone() *
+            static_trapdoor.sample_preimage(static_target.clone(), (digit_count + 2, 1)).as_mat();
+        let indices = DslContext::new("trapdoor-family-indices").int_family_input("indices", 1);
+        let dynamic_target = ring.polynomial([4.into()]);
+        let dynamic_trapdoor = trapdoors.get(indices.get_static(0));
+        let dynamic_public = dynamic_trapdoor.public_matrix();
+        let dynamic_product = dynamic_public.clone() *
+            dynamic_trapdoor
+                .sample_preimage(dynamic_target.clone(), (digit_count + 2, 1))
+                .as_mat();
+        let validated = DslContext::new("runtime-trapdoor-family")
+            .public_family_output("public", trapdoors.public_matrices())
+            .expect("public family output")
+            .public_family_output("public-swapped", swapped_public)
+            .expect("swapped public family output")
+            .private_trapdoor_family_output("trapdoors", trapdoors)
+            .expect("private trapdoor family output")
+            .output("product-0", products.get_static(0))
+            .expect("first product")
+            .output("product-1", products.get_static(1))
+            .expect("second product")
+            .output("target-0", expected_targets.get_static(0))
+            .expect("first target")
+            .output("target-1", expected_targets.get_static(1))
+            .expect("second target")
+            .output("static-product", static_product)
+            .expect("static product")
+            .output("static-target", static_target)
+            .expect("static target")
+            .output("dynamic-product", dynamic_product)
+            .expect("dynamic product")
+            .output("dynamic-target", dynamic_target)
+            .expect("dynamic target")
+            .output("static-public", static_public)
+            .expect("static public")
+            .output("dynamic-public", dynamic_public)
+            .expect("dynamic public")
+            .output("expected-public-0", public.get_static(0))
+            .expect("expected first public")
+            .output("expected-public-1", public.get_static(1))
+            .expect("expected second public")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut backend = cpu_backend([parameters.clone()]);
+        let mut store = MemoryArtifactStore::default();
+        let result = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::from([(
+                "indices".to_owned(),
+                RuntimeValue::IndexedFamily(vec![RuntimeValue::Int(1.into())]),
+            )]),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(2).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("execution");
+
+        assert_eq!(result.artifact_handles["public"].len(), 2);
+        assert_eq!(result.artifact_handles["public-swapped"].len(), 2);
+        assert_eq!(result.artifact_handles["trapdoors"].len(), 2);
+        assert_eq!(matrix_output(&result, "product-0"), matrix_output(&result, "target-0"));
+        assert_eq!(matrix_output(&result, "product-1"), matrix_output(&result, "target-1"));
+        assert_eq!(
+            matrix_output(&result, "static-product"),
+            matrix_output(&result, "static-target")
+        );
+        assert_eq!(
+            matrix_output(&result, "dynamic-product"),
+            matrix_output(&result, "dynamic-target")
+        );
+        assert_eq!(
+            matrix_output(&result, "static-public"),
+            matrix_output(&result, "expected-public-0")
+        );
+        assert_eq!(
+            matrix_output(&result, "dynamic-public"),
+            matrix_output(&result, "expected-public-1")
+        );
+        assert_ne!(
+            matrix_output(&result, "expected-public-0"),
+            matrix_output(&result, "expected-public-1")
+        );
+        assert_ne!(matrix_output(&result, "target-0"), matrix_output(&result, "target-1"));
+
+        let production = result.production_id.expect("artifact production");
+        let manifest = store.manifest(&production).expect("artifact manifest").clone();
+        assert_eq!(manifest.artifacts["public"].confidentiality, ArtifactConfidentiality::Public);
+        assert!(manifest.artifacts["public"].content_hash.is_some());
+        assert_eq!(
+            manifest.artifacts["trapdoors"].confidentiality,
+            ArtifactConfidentiality::Private
+        );
+        assert!(manifest.artifacts["trapdoors"].content_hash.is_none());
+        let imported = ring.trapdoor_family_artifact_input(
+            production.clone(),
+            "public",
+            "trapdoors",
+            2,
+            1,
+            5,
+            gadget_base.clone(),
+            digit_count,
+            1_000_000,
+        );
+        let imported_targets = Parallel::range(2)
+            .map(|index| {
+                ring.polynomial([IntExpr::Add(
+                    Box::new(index.expression()),
+                    Box::new(IntExpr::constant(1)),
+                )
+                .canonicalize()])
+            })
+            .expect("import targets");
+        let expected_imported_targets = imported_targets.clone();
+        let imported_preimages = imported
+            .clone()
+            .parallel_zip_mat_values(imported_targets, |_, trapdoor, target| {
+                trapdoor.sample_preimage(target, (digit_count + 2, 1)).as_mat()
+            })
+            .expect("imported preimages");
+        let imported_products = imported
+            .public_matrices()
+            .parallel_zip(imported_preimages, |_, public, preimage| public * preimage)
+            .expect("imported products");
+        let imported_graph = DslContext::new("runtime-imported-trapdoor-family")
+            .output("product-0", imported_products.get_static(0))
+            .expect("first imported product")
+            .output("product-1", imported_products.get_static(1))
+            .expect("second imported product")
+            .output("target-0", expected_imported_targets.get_static(0))
+            .expect("first imported target")
+            .output("target-1", expected_imported_targets.get_static(1))
+            .expect("second imported target")
+            .build()
+            .expect("import build")
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest.clone())]),
+            )
+            .expect("import validation");
+        let imported_result = execute(
+            &imported_graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+        )
+        .expect("import execution");
+        assert_eq!(
+            matrix_output(&imported_result, "product-0"),
+            matrix_output(&imported_result, "target-0")
+        );
+        assert_eq!(
+            matrix_output(&imported_result, "product-1"),
+            matrix_output(&imported_result, "target-1")
+        );
+
+        let mismatched = ring.trapdoor_family_artifact_input(
+            production.clone(),
+            "public-swapped",
+            "trapdoors",
+            2,
+            1,
+            5,
+            gadget_base.clone(),
+            digit_count,
+            1_000_000,
+        );
+        let scalar_trapdoor = mismatched.get_static(0);
+        let scalar_mismatch_graph = DslContext::new("runtime-mismatched-scalar-trapdoor")
+            .output(
+                "preimage",
+                scalar_trapdoor
+                    .sample_preimage(ring.polynomial([1.into()]), (digit_count + 2, 1))
+                    .as_mat(),
+            )
+            .expect("mismatched scalar output")
+            .build()
+            .expect("mismatched scalar build")
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest.clone())]),
+            )
+            .expect("mismatched scalar validation");
+        assert!(matches!(
+            execute(
+                &scalar_mismatch_graph,
+                &mut backend,
+                BTreeMap::new(),
+                &mut store,
+                SamplingMode::Fresh,
+            ),
+            Err(ExecutionError::PreimagePublicMismatch(_))
+        ));
+
+        let batch_targets = Parallel::range(2)
+            .map(|index| ring.polynomial([index.expression()]))
+            .expect("mismatched batch targets");
+        let batch_preimages = mismatched
+            .parallel_zip_mat_values(batch_targets, |_, trapdoor, target| {
+                trapdoor.sample_preimage(target, (digit_count + 2, 1)).as_mat()
+            })
+            .expect("mismatched batch preimages");
+        let batch_mismatch_graph = DslContext::new("runtime-mismatched-batch-trapdoor")
+            .output("preimage", batch_preimages.get_static(0))
+            .expect("mismatched batch output")
+            .build()
+            .expect("mismatched batch build")
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .expect("mismatched batch validation");
+        assert!(matches!(
+            execute(
+                &batch_mismatch_graph,
+                &mut backend,
+                BTreeMap::new(),
+                &mut store,
+                SamplingMode::Fresh,
+            ),
+            Err(ExecutionError::PreimagePublicMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn sequential_scan_carries_each_iteration_output_into_the_next_iteration() {
+        let context = DslContext::new("runtime-sequential-scan");
+        let increments = context.int_family_input("increments", 3);
+        let total = Sequential::range(3)
+            .scan(Int::constant(0), increments, |index, total, increments| {
+                Ok(total.add(increments.get(index.as_int())))
+            })
+            .expect("sequential scan");
+        let validated = context
+            .int_output("total", total)
+            .expect("output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let result = execute(
+            &validated,
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            BTreeMap::from([(
+                "increments".to_owned(),
+                RuntimeValue::IndexedFamily(vec![
+                    RuntimeValue::Int(1.into()),
+                    RuntimeValue::Int(2.into()),
+                    RuntimeValue::Int(3.into()),
+                ]),
+            )]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        assert!(
+            matches!(&result.outputs["total"], RuntimeValue::Int(value) if value == &BigInt::from(6))
+        );
+
+        let untouched = Sequential::range(0)
+            .scan(Int::constant(7), Int::constant(99), |_, state, _| Ok(state))
+            .expect("empty sequential scan");
+        let validated = DslContext::new("runtime-empty-sequential-scan")
+            .int_output("value", untouched)
+            .expect("output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let result = execute(
+            &validated,
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        assert!(
+            matches!(&result.outputs["value"], RuntimeValue::Int(value) if value == &BigInt::from(7))
+        );
+
+        let initial =
+            Family::<Int>::pack(vec![Int::constant(0), Int::constant(0)]).expect("initial family");
+        let state = Sequential::range(3)
+            .scan(initial, Int::constant(0), |layer, state, _| {
+                state.parallel_map(|_, value| value.add(layer.as_int()))
+            })
+            .expect("nested sequential and parallel loop");
+        let validated = DslContext::new("runtime-nested-sequential-parallel")
+            .int_family_output("state", state)
+            .expect("output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let result = execute(
+            &validated,
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        let RuntimeValue::IndexedFamily(state) = &result.outputs["state"] else {
+            panic!("state output is not a family")
+        };
+        assert!(
+            state.iter().all(
+                |value| matches!(value, RuntimeValue::Int(value) if value == &BigInt::from(3))
+            )
+        );
+    }
+
+    #[test]
+    fn nested_parallel_segment_pack_executes_little_endian_bits() {
+        let context = DslContext::new("runtime-segmented-bit-pack");
+        let bits = context.int_family_input("bits", 6);
+        let packed = bits.parallel_pack_little_endian_bits(2, 3).expect("segmented bit packing");
+        let validated = context
+            .int_family_output("packed", packed)
+            .expect("output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let result = execute(
+            &validated,
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            BTreeMap::from([(
+                "bits".to_owned(),
+                RuntimeValue::IndexedFamily(
+                    [1, 0, 1, 0, 1, 1]
+                        .into_iter()
+                        .map(|bit| RuntimeValue::Int(BigInt::from(bit)))
+                        .collect(),
+                ),
+            )]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        let RuntimeValue::IndexedFamily(packed) = &result.outputs["packed"] else {
+            panic!("packed output is not a family")
+        };
+        assert!(matches!(&packed[0], RuntimeValue::Int(value) if value == &BigInt::from(5)));
+        assert!(matches!(&packed[1], RuntimeValue::Int(value) if value == &BigInt::from(6)));
     }
 
     #[test]
@@ -3088,7 +4077,10 @@ mod tests {
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
-            ExecutionConfig { max_parallel_instances: NonZeroUsize::new(2).expect("nonzero") },
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(2).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
         )
         .expect("execution");
         let four = DCRTPolyMatrix::from_poly_vec_row(
@@ -3118,9 +4110,6 @@ mod tests {
             .expect("output")
             .build()
             .expect("build");
-        let symbolic = built.elaborate(&ParamEnv::default()).expect("elaboration");
-        let output = symbolic.wire(&symbolic.outputs["values"]).expect("symbolic output");
-        assert!(output.family.is_some());
         let validated = built.validate(&ParamEnv::default()).expect("validation");
         let result = execute(
             &validated,
@@ -3224,7 +4213,7 @@ mod tests {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
-        let sample = ring.gaussian((1, 1), 3);
+        let sample = ring.gaussian((1, 1), 3, 19);
         let built = DslContext::new("runtime-transcript-and-trace")
             .output("sample", sample.clone())
             .expect("sample output")
@@ -3267,7 +4256,7 @@ mod tests {
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let sampled = DslContext::new("runtime-resumable-sample")
-            .private_output("sample", ring.gaussian((1, 1), 3))
+            .private_output("sample", ring.gaussian((1, 1), 3, 19))
             .expect("private sample")
             .build()
             .expect("build")

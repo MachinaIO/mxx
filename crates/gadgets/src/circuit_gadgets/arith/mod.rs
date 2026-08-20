@@ -56,8 +56,13 @@ pub trait ModularArithmeticGadget<P: Poly>: Clone + Debug + Send + Sync + 'stati
 
     fn p_max_traces(&self) -> &[BigUint];
 
+    fn num_coefficient_slots(&self) -> usize {
+        1
+    }
+
     fn input(
         ctx: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         circuit: &mut PolyCircuit<P>,
@@ -65,6 +70,7 @@ pub trait ModularArithmeticGadget<P: Poly>: Clone + Debug + Send + Sync + 'stati
 
     fn input_with_metadata(
         ctx: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         max_plaintexts: Vec<BigUint>,
@@ -87,6 +93,7 @@ pub trait ModularArithmeticGadget<P: Poly>: Clone + Debug + Send + Sync + 'stati
 
     fn sparse_level_poly_with_metadata(
         ctx: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         active_levels: usize,
         enable_levels: Option<usize>,
         level_offset: usize,
@@ -152,6 +159,7 @@ pub trait ModularArithmeticPlanner<P: Poly>: ModularArithmeticGadget<P> {
 
     fn input_with_planner_metadata(
         ctx: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         metadata: &Self::Metadata,
@@ -271,6 +279,7 @@ pub trait DecomposeArithmeticGadget<P: Poly>: ModularArithmeticGadget<P> {
 
     fn gadget_vector(
         ctx: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         circuit: &mut PolyCircuit<P>,

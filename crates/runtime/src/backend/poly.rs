@@ -9,14 +9,13 @@ use mxx_primitives::{
     poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{
         DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
-        hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
-        uniform::DCRTPolyUniformSampler,
+        bounds::matrix_within_coefficient_bound, hash::DCRTPolyHashSampler,
+        trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
 };
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, ToPrimitive, Zero};
-use rayon::prelude::*;
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use thiserror::Error;
 
@@ -59,6 +58,27 @@ where
     active_placement: usize,
     preimage_batch_calls: usize,
     _marker: PhantomData<(M, U, H, T)>,
+}
+
+fn rejection_resample_candidate<T>(
+    mut sample: impl FnMut() -> T,
+    mut accepts: impl FnMut(&T) -> bool,
+) -> T {
+    loop {
+        let candidate = sample();
+        if accepts(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+fn sample_bounded_candidate<M: PolyMatrix>(
+    max_coefficient_bound: &BigUint,
+    sample: impl FnMut() -> M,
+) -> M {
+    rejection_resample_candidate(sample, |candidate| {
+        matrix_within_coefficient_bound(candidate, max_coefficient_bound)
+    })
 }
 
 pub(crate) trait CrtRecomposeMatrix: PolyMatrix {
@@ -231,6 +251,22 @@ where
             .ok_or(PolyBackendError::MissingParameters(key))
     }
 
+    #[cfg(feature = "gpu")]
+    pub(super) fn parameters_at(
+        &self,
+        placement: usize,
+        matrix_type: &ConcreteMatrixType,
+    ) -> Result<&<M::P as Poly>::Params, PolyBackendError> {
+        let key = RingKey {
+            modulus: matrix_type.modulus.clone(),
+            ring_dimension: matrix_type.ring_dimension,
+        };
+        self.parameters
+            .get(placement)
+            .and_then(|parameters| parameters.get(&key))
+            .ok_or(PolyBackendError::MissingParameters(key))
+    }
+
     pub(super) fn validate_regular_gadget_layout(
         parameters: &<M::P as Poly>::Params,
         gadget_base: &BigInt,
@@ -320,12 +356,24 @@ where
         if value.params() == target {
             return Ok(value.clone());
         }
+        if let Some(copied) = value.copy_to_params_direct(target) {
+            return Ok(copied);
+        }
         let bytes = value.to_cpu_staging_bytes();
         Ok(M::from_cpu_staging_bytes(target, &bytes))
     }
 
     fn matrix_is_on_active_placement(&self, value: &M) -> bool {
         self.parameters_for_matrix(value).is_ok_and(|target| value.params() == target)
+    }
+
+    fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
+        for placement in &self.parameters {
+            for parameters in placement.values() {
+                parameters.fence_released_memory();
+            }
+        }
+        Ok(())
     }
 
     fn matrix_to_placements(&mut self, value: &M) -> Result<Vec<Option<M>>, Self::Error> {
@@ -342,21 +390,25 @@ where
                 parameters.get(&key).ok_or_else(|| PolyBackendError::MissingParameters(key.clone()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let staging =
-            targets.iter().any(|target| source != *target).then(|| value.to_cpu_staging_bytes());
-        Ok(targets
-            .into_iter()
-            .map(|target| {
-                if source == target {
-                    None
-                } else {
-                    Some(M::from_cpu_staging_bytes(
-                        target,
-                        staging.as_deref().expect("cross-placement staging was prepared"),
-                    ))
-                }
-            })
-            .collect())
+        let mut outputs = (0..targets.len()).map(|_| None).collect::<Vec<_>>();
+        let mut staged_indices = Vec::new();
+        for (index, target) in targets.iter().enumerate() {
+            if source == *target {
+                continue;
+            }
+            if let Some(copied) = value.copy_to_params_direct(target) {
+                outputs[index] = Some(copied);
+            } else {
+                staged_indices.push(index);
+            }
+        }
+        let staged_targets = staged_indices.iter().map(|index| targets[*index]).collect::<Vec<_>>();
+        for (index, copied) in
+            staged_indices.into_iter().zip(value.copy_to_params_fanout(&staged_targets))
+        {
+            outputs[index] = Some(copied);
+        }
+        Ok(outputs)
     }
 
     fn trapdoor_to_active_placement(
@@ -486,64 +538,54 @@ where
     }
 
     fn add(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
-        Ok(left.clone() + right)
+        Ok(left.add_out_of_place(right))
     }
 
-    fn add_batch(&mut self, inputs: Vec<(M, M)>) -> Result<Vec<M>, Self::Error> {
-        Ok(inputs.into_par_iter().map(|(left, right)| left + &right).collect())
+    fn add_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
+        Ok(M::add_batch_out_of_place(inputs))
     }
 
     fn sub(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
-        Ok(left.clone() - right)
+        Ok(left.sub_out_of_place(right))
     }
 
-    fn sub_batch(&mut self, inputs: Vec<(M, M)>) -> Result<Vec<M>, Self::Error> {
-        Ok(inputs.into_par_iter().map(|(left, right)| left - &right).collect())
+    fn sub_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
+        Ok(M::sub_batch_out_of_place(inputs))
     }
 
     fn multiply(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
         let left_size = left.size();
         let right_size = right.size();
         Ok(if left_size == (1, 1) {
-            right.clone() * left.entry(0, 0)
+            right.multiply_poly_out_of_place(&left.entry(0, 0))
         } else if right_size == (1, 1) {
-            left.clone() * right.entry(0, 0)
+            left.multiply_poly_out_of_place(&right.entry(0, 0))
         } else {
-            left.clone() * right
+            left.multiply_out_of_place(right)
         })
     }
 
-    fn multiply_batch(&mut self, inputs: Vec<(M, M)>) -> Result<Vec<M>, Self::Error> {
-        Ok(inputs
-            .into_par_iter()
-            .map(|(left, right)| {
-                let left_size = left.size();
-                let right_size = right.size();
-                if left_size == (1, 1) {
-                    right * left.entry(0, 0)
-                } else if right_size == (1, 1) {
-                    left * right.entry(0, 0)
-                } else {
-                    left * &right
-                }
-            })
-            .collect())
+    fn multiply_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
+        Ok(M::multiply_batch_out_of_place(inputs))
     }
 
     fn negate(&mut self, value: &M) -> Result<M, Self::Error> {
-        Ok(-value.clone())
+        Ok(value.negate_out_of_place())
     }
 
-    fn negate_batch(&mut self, inputs: Vec<M>) -> Result<Vec<M>, Self::Error> {
-        Ok(inputs.into_par_iter().map(|value| -value).collect())
+    fn negate_batch(&mut self, inputs: Vec<Arc<M>>) -> Result<Vec<M>, Self::Error> {
+        Ok(M::negate_batch_out_of_place(inputs))
     }
 
     fn scale_integer(&mut self, value: &M, scalar: &BigInt) -> Result<M, Self::Error> {
         let parameters = self.parameters_for_matrix(value)?;
-        Ok(value.clone() * Self::ring_integer(parameters, scalar)?)
+        Ok(value.multiply_poly_out_of_place(&Self::ring_integer(parameters, scalar)?))
     }
 
-    fn scale_integer_batch(&mut self, inputs: Vec<(M, BigInt)>) -> Result<Vec<M>, Self::Error> {
+    fn scale_integer_batch(
+        &mut self,
+        inputs: Vec<(Arc<M>, BigInt)>,
+    ) -> Result<Vec<M>, Self::Error> {
         let prepared = inputs
             .into_iter()
             .map(|(value, scalar)| {
@@ -551,7 +593,7 @@ where
                 Ok((value, Self::ring_integer(parameters, &scalar)?))
             })
             .collect::<Result<Vec<_>, PolyBackendError>>()?;
-        Ok(prepared.into_par_iter().map(|(value, scalar)| value * scalar).collect())
+        Ok(M::multiply_polys_batch_out_of_place(prepared))
     }
 
     fn transpose(&mut self, value: &M) -> Result<M, Self::Error> {
@@ -583,19 +625,6 @@ where
         })
     }
 
-    fn reshape(&mut self, value: &M, rows: usize, columns: usize) -> Result<M, Self::Error> {
-        let parameters = self.parameters_for_matrix(value)?;
-        let (old_rows, old_columns) = value.size();
-        if old_rows.saturating_mul(old_columns) != rows.saturating_mul(columns) {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        let entries = (0..old_rows)
-            .flat_map(|row| (0..old_columns).map(move |column| value.entry(row, column)))
-            .collect::<Vec<_>>();
-        let entries = entries.chunks(columns).map(|row| row.to_vec()).collect::<Vec<_>>();
-        Ok(M::from_poly_vec(parameters, entries))
-    }
-
     fn sample_uniform(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -620,12 +649,24 @@ where
         Ok(U::new().sample_uniform(parameters, ty.rows, ty.columns, distribution))
     }
 
-    fn sample_gaussian(&mut self, ty: &ConcreteMatrixType, sigma: f64) -> Result<M, Self::Error> {
+    fn sample_gaussian(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        sigma: f64,
+        max_coefficient_bound: &BigInt,
+    ) -> Result<M, Self::Error> {
         let parameters = self.parameters(ty)?;
+        let max_coefficient_bound =
+            max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
         Ok(if sigma == 0.0 {
             M::zero(parameters, ty.rows, ty.columns)
         } else {
-            U::new().sample_uniform(parameters, ty.rows, ty.columns, DistType::GaussDist { sigma })
+            U::new().sample_uniform(
+                parameters,
+                ty.rows,
+                ty.columns,
+                DistType::GaussDist { sigma, max_coefficient_bound: Some(max_coefficient_bound) },
+            )
         })
     }
 
@@ -635,20 +676,30 @@ where
         key: [u8; 32],
         tag: &[u8],
         variant: HashVariant,
+        gadget_layout: Option<(&BigInt, usize)>,
     ) -> Result<M, Self::Error> {
         let parameters = self.parameters(ty)?;
         let sampler = H::new();
         Ok(match variant {
-            HashVariant::Plain => sampler.sample_hash(
-                parameters,
-                key,
-                tag,
-                ty.rows,
-                ty.columns,
-                DistType::FinRingDist,
-            ),
+            HashVariant::Plain => {
+                if gadget_layout.is_some() {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
+                sampler.sample_hash(
+                    parameters,
+                    key,
+                    tag,
+                    ty.rows,
+                    ty.columns,
+                    DistType::FinRingDist,
+                )
+            }
             HashVariant::Decomposed => {
-                let digits = parameters.modulus_digits();
+                let (base, digits) = gadget_layout.ok_or(PolyBackendError::InvalidInteger)?;
+                self.validate_gadget_layout(ty, base, digits, false)?;
+                if ty.rows % digits != 0 {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
                 sampler.sample_hash_decomposed(
                     parameters,
                     key,
@@ -659,8 +710,11 @@ where
                 )
             }
             HashVariant::SmallDecomposed => {
-                let (_, crt_bits, _) = parameters.to_crt();
-                let digits = crt_bits.div_ceil(parameters.base_bits() as usize);
+                let (base, digits) = gadget_layout.ok_or(PolyBackendError::InvalidInteger)?;
+                self.validate_gadget_layout(ty, base, digits, true)?;
+                if ty.rows % digits != 0 {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
                 sampler.sample_hash_small_decomposed(
                     parameters,
                     key,
@@ -713,14 +767,19 @@ where
         sigma: f64,
         gadget_base: &BigInt,
         digit_count: usize,
+        max_coefficient_bound: &BigInt,
         trapdoor: &T::Trapdoor,
         public: &M,
         target: &M,
     ) -> Result<M, Self::Error> {
         let parameters = self.parameters(ty)?;
         Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
+        let max_coefficient_bound =
+            max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
         let sampler = T::new(parameters, sigma);
-        Ok(sampler.preimage(parameters, trapdoor, public, target))
+        Ok(sample_bounded_candidate(&max_coefficient_bound, || {
+            sampler.preimage(parameters, trapdoor, public, target)
+        }))
     }
 
     fn sample_preimage_batch(
@@ -738,6 +797,7 @@ where
                         request.sigma,
                         &request.gadget_base,
                         request.digit_count,
+                        &request.max_coefficient_bound,
                         &request.trapdoor,
                         &request.public,
                         &request.target,
@@ -748,6 +808,45 @@ where
         #[cfg(feature = "gpu")]
         {
             super::poly_gpu::sample_preimage_batch(self, requests)
+        }
+    }
+
+    fn sample_preimage_batches_by_placement(
+        &mut self,
+        batches: Vec<(usize, Vec<PreimageRequest<M, T::Trapdoor>>)>,
+    ) -> Result<Vec<(usize, Vec<M>)>, Self::Error> {
+        self.preimage_batch_calls += batches.len();
+        #[cfg(feature = "gpu")]
+        {
+            super::poly_gpu::sample_preimage_batches_by_placement(self, batches)
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let original = self.active_placement;
+            let result = batches
+                .into_iter()
+                .map(|(placement, requests)| {
+                    self.active_placement = placement;
+                    requests
+                        .into_iter()
+                        .map(|request| {
+                            self.sample_preimage(
+                                &request.matrix_type,
+                                request.sigma,
+                                &request.gadget_base,
+                                request.digit_count,
+                                &request.max_coefficient_bound,
+                                request.trapdoor.as_ref(),
+                                request.public.as_ref(),
+                                request.target.as_ref(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|outputs| (placement, outputs))
+                })
+                .collect();
+            self.active_placement = original;
+            result
         }
     }
 
@@ -833,6 +932,17 @@ where
         value.to_compact_bytes()
     }
 
+    fn matrices_to_bytes(&self, values: &[&M]) -> Vec<Vec<u8>> {
+        #[cfg(feature = "gpu")]
+        {
+            M::compact_bytes_batch(values)
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            values.iter().map(|value| value.to_compact_bytes()).collect()
+        }
+    }
+
     fn matrix_from_bytes(&self, ty: &ConcreteMatrixType, bytes: &[u8]) -> Result<M, Self::Error> {
         Ok(M::from_compact_bytes(self.parameters(ty)?, bytes))
     }
@@ -865,7 +975,7 @@ pub fn cpu_backend(parameters: impl IntoIterator<Item = DCRTPolyParams>) -> CpuD
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_primitives::poly::dcrt::poly::DCRTPoly;
+    use mxx_primitives::poly::{PolyParams, dcrt::poly::DCRTPoly};
 
     #[test]
     fn coefficient_extraction_returns_a_canonical_index_above_half_modulus() {
@@ -883,9 +993,63 @@ mod tests {
             BigInt::from_biguint(Sign::Plus, residue)
         );
     }
+
+    #[test]
+    fn bounded_candidate_sampling_retries_without_clipping() {
+        let parameters = DCRTPolyParams::new(2, 1, 10, 5);
+        let candidate = |value: u8| {
+            DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguint_to_constant(&parameters, BigUint::from(value))],
+            )
+        };
+        let rejected = candidate(7);
+        let accepted = candidate(2);
+        let mut draws = 0;
+        let sampled = sample_bounded_candidate(&BigUint::from(2u8), || {
+            draws += 1;
+            if draws == 1 { rejected.clone() } else { accepted.clone() }
+        });
+        assert_eq!(draws, 2);
+        assert_eq!(sampled, accepted);
+    }
+
+    #[test]
+    fn decomposed_hash_uses_the_explicit_backend_layout() {
+        let parameters = DCRTPolyParams::new(4, 1, 10, 5);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let digits = parameters.modulus_digits();
+        let base = BigInt::from(1u8) << parameters.base_bits();
+        let plain_type =
+            ConcreteMatrixType { modulus: modulus.clone(), ring_dimension: 4, rows: 2, columns: 3 };
+        let decomposed_type =
+            ConcreteMatrixType { rows: plain_type.rows * digits, ..plain_type.clone() };
+        let key = [7u8; 32];
+        let tag = b"runtime-explicit-layout";
+        let mut backend = cpu_backend([parameters]);
+
+        let plain = backend
+            .sample_hash(&plain_type, key, tag, HashVariant::Plain, None)
+            .expect("plain hash");
+        let decomposed = backend
+            .sample_hash(&decomposed_type, key, tag, HashVariant::Decomposed, Some((&base, digits)))
+            .expect("decomposed hash");
+        let small_decomposed = backend
+            .sample_hash(
+                &decomposed_type,
+                key,
+                tag,
+                HashVariant::SmallDecomposed,
+                Some((&base, digits)),
+            )
+            .expect("small decomposed hash");
+
+        assert_eq!(decomposed, plain.decompose());
+        assert_eq!(small_decomposed, plain.small_decompose());
+    }
 }
 
 #[cfg(feature = "gpu")]
 pub mod gpu {
-    pub use crate::backend::poly_gpu::{GpuDcrtBackend, gpu_backend};
+    pub use crate::backend::poly_gpu::{GpuDcrtBackend, gpu_backend, gpu_backend_on};
 }

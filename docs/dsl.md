@@ -1,41 +1,45 @@
 # Declarative graph DSL
 
-`mxx-dsl` is the typed construction API for executable graphs. Arithmetic on
-`Mat` creates immutable `mxx-ir-core` nodes immediately; there is no separate
-executable expression tree and no mutable graph builder.
+`mxx-dsl` is the typed construction API for the one executable `mxx-ir-core` DAG. Arithmetic on
+`Mat` creates immutable shared nodes immediately.
 
 ```rust
 let ring = Ring::new(q, n);
 let input = ring.input("input", (1, 1));
-let error = ring.gaussian((1, 1), sigma);
+let error = ring.gaussian((1, 1), sigma, max_coefficient_bound);
 let output = input * ring.identity(1) + error;
 let built = DslContext::new("example").public_output("output", output)?.build()?;
 ```
 
-`Subgraph::define` creates one reusable graph body. Its runtime values must be
-explicit arguments; implicit runtime captures are rejected. Matrices, integer
-values, bytes, indexed matrix families, trapdoors, preimages, tuples, and typed
-structs implementing `GraphValue` may cross a subgraph boundary.
+Every Gaussian and preimage sampler carries a required integer coefficient cutoff. Parameterized
+cutoffs reference declared integer parameters and are resolved by `ParamEnv`; the DSL never
+converts an unresolved `RealExpr` sigma itself.
 
-`Family::parallel_map`, the `parallel_zip` variants, and `Parallel::range`
-create structural `ParallelLoop` nodes. Their closures describe one body and
-are not executed once per element during construction. A primary family is a
-`Zip` input, explicitly captured scalar values are `Broadcast` inputs, and
-offset family relationships use `ZipOffset`.
-Symbolic instantiation records the offset as part of the source iteration
-identity: static member `i` of a `ZipOffset { offset }` input refers to source
-member `i + offset`, while dynamic identities retain the offset alongside the
-index wire.
+`Subgraph::define` stores one reusable body. Runtime values crossing its boundary are explicit.
+`Family::parallel_map`, `parallel_zip`, and `Parallel::range` create structural
+`ParallelLoop` nodes rather than expanding one body per member.
 
-See [ir-symbolic.md](ir-symbolic.md) for `assume` and symbolic expressions and
-[runtime.md](runtime.md) for bounded execution waves.
+Protocol builders may use crate-internal traced variants of these loop combinators to retain the
+handles of operations they just created for correctness certificates. Sealing remaps body-local
+handles and captured values to the exact sealed scope before freezing. Ordinary DSL users still
+receive only `BuiltGraph`; construction traces and the temporary freeze map are not runtime graph
+state or a second expression language.
 
-An operation involving a `VirtualMat` produces a typed symbolic expression
-instead of an executable node. The expression uses the same ordinary `+`, `-`,
-unary `-`, and `*` syntax, preserves ordered multiplication and nested sums,
-and is accepted only by `Mat::assume`. No factor-list macro or aggregate-label
-operation is part of the public API.
+Fixed public circuit descriptions use `DslContext::int_family_input`. `parallel_gather` broadcasts
+one read-only source family and dynamically gathers one member for every zipped index. Heterogeneous
+zip bundles keep composite values such as a BGG encoding's vector, public key, and plaintext in one
+parallel iteration while still lowering every component to ordinary core wires.
 
-Concrete values referenced only by an assumption are retained as existing core
-values during graph freezing, so callers do not need to publish them as extra
-outputs. The assumption itself still creates no executable core node.
+`Parallel::range(count).map_values` can also return `Trapdoor`. Because one trapdoor consists of a
+public matrix wire and a private trapdoor wire, the result is a `TrapdoorFamily` that keeps those
+two indexed families aligned. `public_matrices` exposes the public half, while `get`,
+`parallel_map_values`, and `parallel_zip_mat_values` feed matching trapdoors into preimage
+preprocessing without expanding a parameterized count. Persist the public half with
+`public_family_output` and the private half with `private_trapdoor_family_output`; import the pair
+with `trapdoor_family_artifact_input`.
+
+Correctness declarations use `IdealSpec::new` and `PurePredicateSpec::new`. These wrappers reject
+sampling nodes and retain a deterministic graph consumed by `mxx-correctness::ProtocolDecl`.
+There is no virtual matrix, assumption, symbolic overlay, or second expression DAG.
+
+See `docs/runtime.md` for execution and `docs/correctness/operational-protocol-inventory.md` for checking semantics.

@@ -34,7 +34,7 @@ preserving both the preimage equation and the authoritative cutoff.
 
 Owns the canonical executable graph, compile expressions, artifact metadata, parameter/type/shape
 validation, execution ordering, and liveness. `derive_param_constraints` is the shared source of
-decidable compile-parameter conditions consumed by concrete validation and Lean emission. Sampler
+decidable compile-parameter conditions consumed by concrete validation and operational checking. Sampler
 nodes serialize required integer coefficient cutoffs. Subgraph and parallel-loop bodies are
 structural and stored once.
 
@@ -51,12 +51,9 @@ transcripts, sessions, artifacts, and bounded parallel waves.
 
 ### `mxx-correctness`
 
-The library validates linked workflow declarations, emits checked-in Lean closed-protocol terms,
-and verifies source, workflow, and toolkit hashes together with theorem axiom dependencies. Emission is mechanical from `ProtocolDecl`;
-generated IR contains a Lean constructor tree, not an embedded JSON string. Each crate owns its
-protocol declarations, generated Lean modules, proofs, and small generation and verification
-examples. There is no central protocol registry or parameter-check executable. The shared Lean
-semantics remain in `lean/Mxx`; the ownership and build flow are documented in `docs/lean.md`.
+The library validates linked workflow declarations and evaluates their operational noise bounds
+with the Rust checker. Protocol declarations remain crate-owned; there is no central protocol
+registry or parameter-check executable.
 
 ### `mxx-gadgets` and `mxx-bgg`
 
@@ -70,7 +67,8 @@ slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
 Diamond protocol. A Diamond protocol fixes a layered Boolean shape but accepts gate opcodes and
 previous-layer indices as public runtime families. Encryption and decryption consume the same
 circuit assignment; witness bits are decryption-only inputs. Parameter search uses deterministic
-worst-case bounds and accepts a candidate only after the Lean hard-bound checker returns true.
+worst-case bounds and accepts a candidate only after the generic Rust operational checker accepts
+the frozen workflow and concrete parameter environment.
 
 `mxx-func-enc` and `mxx-io` currently expose compiling interface shells. Their protocol modules
-remain disabled.
+remain disabled. Diamond iO must migrate to the Rust operational checker before it is enabled.

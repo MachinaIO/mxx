@@ -18,8 +18,8 @@ pub use estimate::{DiamondCostEstimate, DiamondEstimateError, estimate_diamond_c
 #[cfg(feature = "gpu")]
 pub use estimate_gpu::{DiamondGpuMeasurementBackend, DiamondGpuMeasurementError};
 pub use graph::{
-    DIAMOND_PROTOCOL_SOURCE_PATHS, DiamondCompileError, DiamondDecryptionGraph,
-    DiamondEncryptionGraph, DiamondWeCompiler, DiamondWeProtocolFamily,
+    DiamondCompileError, DiamondDecryptionGraph, DiamondEncryptionGraph, DiamondWeCompiler,
+    DiamondWeProtocolFamily,
 };
 pub use parameter_search::{
     DiamondParameterSearch, DiamondParameterSearchError, DiamondSelectedParameters,

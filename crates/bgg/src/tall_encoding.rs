@@ -2,9 +2,9 @@
 //!
 //! A wire with diagonal message `X` represents
 //! `C_X = S A_X - X S G + E_X`, with one BGG+ row per slot and one public
-//! matrix shared by every row.  Rotation artifacts encode cyclic permutation
-//! matrices only inside preprocessing; they never enter the ordinary circuit
-//! wire type.  For a provisioned permutation `P`, rotation evaluates
+//! matrix shared by every row. Rotation preprocessing exports only public
+//! matrices; the online graph derives the matching permutation encodings from
+//! its one shared secret-row family. For a provisioned permutation `P`, rotation evaluates
 //! `C_P G^-1(A_X) + P C_X` followed by multiplication with the inverse
 //! permutation encoding.
 
@@ -12,12 +12,14 @@ use crate::{
     BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout,
     tall_rotation_encoding::{TallRotationDirection, TallRotationEncodingWires},
 };
-use mxx_dsl::{DslError, Family, Mat, Parallel, parallel_zip};
+use mxx_dsl::{DslError, Family, Int, Mat, Parallel};
 use mxx_ir_core::{
     IntExpr, RealExpr,
     node::{ConcatAxis, IndexRange},
     types::MatrixType,
 };
+use num_bigint::BigUint;
+use num_traits::{One, Zero};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -30,6 +32,9 @@ pub struct BggTallEncodingWire {
     pub pubkey: BggPublicKeyWire,
     /// Known or hidden diagonal plaintext metadata.
     pub plaintext: BggTallPlaintext,
+    /// Compile-time-only exclusive upper bound for the revealed canonical
+    /// plaintext. This is meaningful only when `plaintext` is diagonal.
+    pub canonical_input_exclusive_upper: Option<BigUint>,
 }
 
 /// Plaintext metadata for a tall BGG+ wire.
@@ -48,13 +53,11 @@ pub struct BggTallEncodingCompiler {
     pub public_key: BggPublicKeyCompiler,
 }
 
-/// Sampling result containing all requested tall encodings and slot transforms.
+/// Sampling result containing all requested tall encodings.
 #[derive(Clone)]
 pub struct BggTallEncodingSample {
     /// Sampled encodings, in the same order as the supplied public keys.
     pub encodings: Vec<BggTallEncodingWire>,
-    /// Matrices `R_i` defining slot secrets `s_i = s R_i`.
-    pub slot_secret_matrices: Family<Mat>,
 }
 
 /// Sampler for tall BGG+ encodings.
@@ -107,12 +110,18 @@ impl BggTallEncodingCompiler {
         lhs: &BggTallEncodingWire,
         rhs: &BggTallEncodingWire,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
-        self.binary(
+        let mut output = self.binary(
             lhs,
             rhs,
             |left, right| left + right,
             |compiler, left, right| compiler.add(left, right),
-        )
+        )?;
+        output.canonical_input_exclusive_upper = canonical_sum_upper(
+            lhs.canonical_input_exclusive_upper.as_ref(),
+            rhs.canonical_input_exclusive_upper.as_ref(),
+            &output.rows.element_type().modulus,
+        );
+        Ok(output)
     }
 
     /// Subtracts two tall encodings row by row.
@@ -162,6 +171,7 @@ impl BggTallEncodingCompiler {
             rows,
             pubkey: self.public_key.mul(&lhs.pubkey, &rhs.pubkey),
             plaintext,
+            canonical_input_exclusive_upper: None,
         })
     }
 
@@ -262,6 +272,7 @@ impl BggTallEncodingCompiler {
                 reveal_plaintext: input.pubkey.reveal_plaintext,
             },
             plaintext: BggTallPlaintext::Diagonal(rotated_plaintexts),
+            canonical_input_exclusive_upper: None,
         })
     }
 
@@ -295,6 +306,7 @@ impl BggTallEncodingCompiler {
             rows,
             pubkey: public_operation(&self.public_key, &lhs.pubkey, &rhs.pubkey),
             plaintext,
+            canonical_input_exclusive_upper: None,
         })
     }
 
@@ -320,7 +332,7 @@ impl BggTallEncodingCompiler {
         } else {
             self.public_key.small_scalar_mul(&input.pubkey, scalar)
         };
-        Ok(BggTallEncodingWire { rows, pubkey, plaintext })
+        Ok(BggTallEncodingWire { rows, pubkey, plaintext, canonical_input_exclusive_upper: None })
     }
 }
 
@@ -342,14 +354,71 @@ impl BggTallEncodingWire {
 }
 
 impl BggTallEncodingSampler {
-    /// Samples slot transforms and packed tall BGG+ rows.
+    /// Samples one revealed diagonal encoding under caller-supplied slot secrets.
+    ///
+    /// This is the primitive used for public per-row masks.  It deliberately
+    /// receives the already-sampled online secret family so a mask cannot
+    /// introduce a second Tall secret source or recover the old slot-transfer
+    /// construction.
+    pub fn sample_diagonal(
+        &self,
+        secret_rows: Family<Mat>,
+        public_key: BggPublicKeyWire,
+        plaintexts: Family<Mat>,
+    ) -> Result<BggTallEncodingWire, TallCompileError> {
+        if self.gaussian_sigma.is_some() != self.gaussian_max_coefficient_bound.is_some() {
+            return Err(TallCompileError::MissingGaussianBound);
+        }
+        let ring = self.layout.ring();
+        let secret_size = self.layout.secret_dimension;
+        let columns = self.layout.public_key_columns();
+        if !public_key.reveal_plaintext ||
+            secret_rows.count() != plaintexts.count() ||
+            !same_matrix_type(secret_rows.element_type(), &ring.matrix_type((1, secret_size))) ||
+            !same_matrix_type(plaintexts.element_type(), &ring.matrix_type((1, 1))) ||
+            !same_matrix_type(
+                public_key.matrix.matrix_type(),
+                &ring.matrix_type((secret_size, columns)),
+            )
+        {
+            return Err(TallCompileError::InvalidLayout);
+        }
+        let gadget =
+            ring.gadget(secret_size, self.layout.gadget_base.clone(), self.layout.digit_count);
+        let sigma = self.gaussian_sigma.clone();
+        let bound = self.gaussian_max_coefficient_bound.clone();
+        let public_matrix = public_key.matrix.clone();
+        let rows =
+            secret_rows.clone().parallel_zip(plaintexts.clone(), move |_, secret, plaintext| {
+                secret.clone() * public_matrix.clone() - plaintext * (secret * gadget.clone()) +
+                    match (&sigma, &bound) {
+                        (Some(sigma), Some(bound)) => {
+                            ring.gaussian((1, columns), sigma.clone(), bound.clone())
+                        }
+                        (None, None) => ring.zero((1, columns)),
+                        _ => unreachable!("validated Gaussian sampler configuration"),
+                    }
+            })?;
+        Ok(BggTallEncodingWire {
+            rows,
+            pubkey: public_key,
+            plaintext: BggTallPlaintext::Diagonal(plaintexts),
+            canonical_input_exclusive_upper: None,
+        })
+    }
+
+    /// Packs tall BGG+ rows under caller-supplied per-slot secrets.
+    ///
+    /// The caller owns sampling the fresh `S_i` family.  In particular, this
+    /// sampler never derives a slot secret from a long-lived secret or a slot
+    /// transform, which keeps the online encoding protocol free of hidden
+    /// preprocessing state.
     pub fn sample(
         &self,
-        secret: Mat,
+        secret_rows: Family<Mat>,
         public_keys: &[BggPublicKeyWire],
         plaintexts: &[Family<Mat>],
         slot_count: IntExpr,
-        supplied_slot_secrets: Option<Family<Mat>>,
     ) -> Result<BggTallEncodingSample, TallCompileError> {
         if public_keys.len() != plaintexts.len() + 1 {
             return Err(TallCompileError::InvalidLayout);
@@ -360,7 +429,8 @@ impl BggTallEncodingSampler {
         let ring = self.layout.ring();
         let secret_size = self.layout.secret_dimension;
         let columns = self.layout.public_key_columns();
-        if !same_matrix_type(secret.matrix_type(), &ring.matrix_type((1, secret_size))) ||
+        if secret_rows.count() != &slot_count ||
+            !same_matrix_type(secret_rows.element_type(), &ring.matrix_type((1, secret_size))) ||
             public_keys.par_iter().any(|key| {
                 !same_matrix_type(
                     key.matrix.matrix_type(),
@@ -374,81 +444,47 @@ impl BggTallEncodingSampler {
         {
             return Err(TallCompileError::InvalidLayout);
         }
-        let (slot_secret_matrices, transformed_secrets) =
-            if let Some(slot_secrets) = supplied_slot_secrets {
-                if slot_secrets.count() != &slot_count ||
-                    !same_matrix_type(
-                        slot_secrets.element_type(),
-                        &ring.matrix_type((secret_size, secret_size)),
-                    )
-                {
-                    return Err(TallCompileError::InvalidLayout);
-                }
-                let transformed = slot_secrets.clone().parallel_map({
-                    let secret = secret.clone();
-                    move |_, transform| secret.clone() * transform
-                })?;
-                (slot_secrets, transformed)
-            } else {
-                let (transformed, sampled) = Parallel::range(slot_count.clone()).map_values({
-                    let ring = ring.clone();
-                    let secret = secret.clone();
-                    move |_| {
-                        let transform = ring.uniform_interval((secret_size, secret_size), -1, 1);
-                        (secret.clone() * transform.clone(), transform)
-                    }
-                })?;
-                (sampled, transformed)
-            };
-        let ones = transformed_secrets.clone().parallel_map({
+        let ones = secret_rows.clone().parallel_map({
             let ring = ring.clone();
             move |_, _| ring.identity(1)
         })?;
-        let plaintext_rows = plaintexts.iter().cloned().reduce(|left, right| {
-            left.parallel_zip(right, |_, left, right| {
-                Mat::concat(ConcatAxis::Columns, vec![left, right])
-            })
-            .expect("validated tall plaintext counts")
-        });
-        let encoded_plaintexts = match plaintext_rows {
-            Some(rows) => ones.clone().parallel_zip(rows, |_, one, row| {
-                Mat::concat(ConcatAxis::Columns, vec![one, row])
-            })?,
-            None => ones.clone(),
-        };
-        let packed_public = Mat::concat(
-            ConcatAxis::Columns,
-            public_keys.iter().map(|key| key.matrix.clone()).collect(),
-        );
         let count = public_keys.len();
         let gadget =
             ring.gadget(secret_size, self.layout.gadget_base.clone(), self.layout.digit_count);
         let sigma = self.gaussian_sigma.clone();
-        let row_families = parallel_zip(
-            (transformed_secrets, encoded_plaintexts),
-            move |_, (slot_secret, encoded)| {
-                let packed = slot_secret.clone() * packed_public.clone() -
-                    encoded.tensor(slot_secret * gadget.clone()) +
-                    match (&sigma, &self.gaussian_max_coefficient_bound) {
-                        (Some(sigma), Some(bound)) => {
-                            ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
-                        }
-                        (None, None) => ring.zero((1, columns * count)),
-                        _ => unreachable!("validated Gaussian sampler configuration"),
-                    };
+        let bound = self.gaussian_max_coefficient_bound.clone();
+        let public_matrices = public_keys.iter().map(|key| key.matrix.clone()).collect::<Vec<_>>();
+        let mut input_families = Vec::with_capacity(count + 1);
+        input_families.push(secret_rows);
+        input_families.push(ones.clone());
+        input_families.extend(plaintexts.iter().cloned());
+        let row_families =
+            Family::<Mat>::parallel_zip_many_values(input_families, move |_, values| {
+                let secret_row = &values[0];
+                let secret_gadget = secret_row.clone() * gadget.clone();
+                let packed_error = match (&sigma, &bound) {
+                    (Some(sigma), Some(bound)) => {
+                        ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
+                    }
+                    (None, None) => ring.zero((1, columns * count)),
+                    _ => unreachable!("validated Gaussian sampler configuration"),
+                };
                 (0..count)
                     .map(|index| {
-                        packed.clone().slice(
+                        let plaintext = if index == 0 { &values[1] } else { &values[index + 1] };
+                        let error = packed_error.clone().slice(
                             None,
                             Some(IndexRange {
                                 start: (columns * index).into(),
                                 end: (columns * (index + 1)).into(),
                             }),
-                        )
+                        );
+                        secret_row.clone() * public_matrices[index].clone() -
+                            plaintext.clone().tensor(secret_gadget.clone()) +
+                            error
                     })
                     .collect::<Vec<_>>()
-            },
-        )?;
+            })?;
         let encodings = row_families
             .into_iter()
             .enumerate()
@@ -464,9 +500,10 @@ impl BggTallEncodingSampler {
                 } else {
                     BggTallPlaintext::Hidden
                 },
+                canonical_input_exclusive_upper: None,
             })
             .collect();
-        Ok(BggTallEncodingSample { encodings, slot_secret_matrices })
+        Ok(BggTallEncodingSample { encodings })
     }
 }
 
@@ -501,6 +538,22 @@ fn plaintext_count_mismatch(wire: &BggTallEncodingWire) -> bool {
     }
 }
 
+fn canonical_sum_upper(
+    lhs: Option<&BigUint>,
+    rhs: Option<&BigUint>,
+    modulus: &IntExpr,
+) -> Option<BigUint> {
+    let (lhs, rhs) = (lhs?, rhs?);
+    if lhs.is_zero() || rhs.is_zero() {
+        return None;
+    }
+    let IntExpr::Const(modulus) = modulus else {
+        return None;
+    };
+    let upper = lhs + rhs - BigUint::one();
+    (upper <= modulus.to_biguint()?).then_some(upper)
+}
+
 pub(crate) fn rotate_family(
     rows: &Family<Mat>,
     offset: usize,
@@ -510,11 +563,12 @@ pub(crate) fn rotate_family(
         return Err(TallCompileError::InvalidRotationLayout);
     }
     let offset = offset % num_slots;
-    Ok(Family::pack(
-        (0..num_slots)
-            .map(|destination| rows.get_static((destination + num_slots - offset) % num_slots))
-            .collect(),
-    )?)
+    // Keep the permutation as one generated gather. Packing static gets would lower to an
+    // explicit family and erase the source expression from checker-visible program bodies.
+    let indices = Parallel::range(num_slots).map_values(|destination| {
+        destination.as_int().add(Int::constant(num_slots - offset)).rem(Int::constant(num_slots))
+    })?;
+    Ok(rows.clone().parallel_gather(indices)?)
 }
 
 pub(crate) fn same_matrix_type(lhs: &MatrixType, rhs: &MatrixType) -> bool {
@@ -528,33 +582,23 @@ pub(crate) fn same_matrix_type(lhs: &MatrixType, rhs: &MatrixType) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        BggSlotTransferArtifactCompiler, BggSlotTransferPublicKeyLowering,
-        BggSlotTransferPublicSlotWires, BggTallSlotLowering, BggTallSlotPublicKeyLowering,
-        CircuitCompileError, LweLookupArtifactNames, LweLookupArtifacts, LweLookupCompiler,
-        LweLookupIdentity, LweLookupInvocation, LweLookupPreprocessingWires,
-        LweLookupPublicKeyLowering, LweLookupTable, LweLookupTallEncodingLowering,
-        PolyCircuitCompiler, TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts,
-        TallRotationEncodingCompiler, TallRotationEncodingKey, required_tall_rotation_encodings,
+        BggTallSlotLowering, BggTallSlotPublicKeyLowering, CircuitCompileError,
+        TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts,
+        TallRotationEncodingCompiler, TallRotationEncodingKey, TallRotationPublicWires,
+        required_tall_rotation_encodings,
         tall_rotation_encoding::tall_rotation_public_key_tag,
         test_utils::{execute_graph, matrix_output, row},
     };
     use mxx_dsl::{DslContext, Ring};
-    use mxx_gadgets::{
-        circuit::{
-            CircuitLoweringTypes, GateInstance, PolyCircuit, PublicLookupLowering,
-            SlotOperationLowering, SlotTransferSpec, SubCircuitParamSpec, SubCircuitParamValue,
-        },
-        circuit_gadgets::{
-            arith::{CrtWindow, NestedRnsPoly, NestedRnsPolyContext},
-            conv_mul::negacyclic_conv_mul,
-        },
-        test_utils::{PolyVec, execute_polyvec_circuit},
+    use mxx_gadgets::circuit::{
+        CircuitLoweringTypes, GateInstance, PolyCircuit, SlotOperationLowering, SlotTransferSpec,
+        SubCircuitParamSpec, SubCircuitParamValue,
     };
-    use mxx_ir_core::ParamEnv;
+    use mxx_ir_core::{ParamEnv, node::NodeKind};
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
-            Poly, PolyParams,
+            PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
@@ -564,10 +608,7 @@ mod tests {
         transcript::SamplingMode,
     };
     use num_bigint::BigInt;
-    use std::{
-        collections::{BTreeMap, BTreeSet},
-        sync::Arc,
-    };
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn concrete_ring(parameters: &DCRTPolyParams) -> Ring {
         Ring::new(
@@ -665,11 +706,43 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            canonical_input_exclusive_upper: None,
         };
         let left = wire("left");
         let right = wire("right");
         let sum = compiler.add(&left, &right).unwrap();
         let product = compiler.simd_mul(&left, &right).unwrap();
+        let mut bounded = left.clone();
+        bounded.canonical_input_exclusive_upper = Some(BigUint::from(7u8));
+        assert!(
+            compiler
+                .small_scalar_mul(&bounded, &ring.identity(1))
+                .unwrap()
+                .canonical_input_exclusive_upper
+                .is_none()
+        );
+        let mut bounded_right = right.clone();
+        bounded_right.canonical_input_exclusive_upper = Some(BigUint::from(4u8));
+        assert_eq!(
+            compiler.add(&bounded, &bounded_right).unwrap().canonical_input_exclusive_upper,
+            Some(BigUint::from(10u8)),
+            "[0, 7) + [0, 4) has exclusive upper bound 10"
+        );
+        let IntExpr::Const(modulus) = &left.rows.element_type().modulus else {
+            panic!("test ring has a concrete modulus")
+        };
+        let mut wrapping_left = left.clone();
+        wrapping_left.canonical_input_exclusive_upper = modulus.to_biguint();
+        let mut wrapping_right = right.clone();
+        wrapping_right.canonical_input_exclusive_upper = Some(BigUint::from(2u8));
+        assert!(
+            compiler
+                .add(&wrapping_left, &wrapping_right)
+                .unwrap()
+                .canonical_input_exclusive_upper
+                .is_none(),
+            "a sum that reaches the modulus is not a canonical nonwrapping range"
+        );
         let mut context = DslContext::new("tall-arithmetic-runtime")
             .output("sum-public", sum.pubkey.matrix)
             .unwrap()
@@ -779,6 +852,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            canonical_input_exclusive_upper: None,
         };
         let rotation = TallRotationEncodingWires {
             key: TallRotationEncodingKey { num_slots: slots as u32, offset: 1 },
@@ -863,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn tall_sampler_uses_supplied_slot_transforms_in_the_bgg_formula() {
+    fn tall_sampler_uses_master_secret_rows_in_the_bgg_formula() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let secret_size = 2;
         let slots = 3;
@@ -890,9 +964,9 @@ mod tests {
             (0..slots).map(|slot| ring.input(format!("plaintext-{slot}"), (1, 1))).collect(),
         )
         .unwrap();
-        let transforms = Family::pack(
+        let master_secret_rows = Family::pack(
             (0..slots)
-                .map(|slot| ring.input(format!("transform-{slot}"), (secret_size, secret_size)))
+                .map(|slot| ring.input(format!("master-secret-row-{slot}"), (1, secret_size)))
                 .collect(),
         )
         .unwrap();
@@ -901,36 +975,22 @@ mod tests {
             gaussian_sigma: None,
             gaussian_max_coefficient_bound: None,
         }
-        .sample(
-            ring.input("secret", (1, secret_size)),
-            &public_keys,
-            &[plaintexts],
-            slots.into(),
-            Some(transforms),
-        )
+        .sample(master_secret_rows, &public_keys, &[plaintexts], slots.into())
         .unwrap();
         let mut context = DslContext::new("tall-sampler-runtime");
         for slot in 0..slots {
             context = context
                 .output(format!("row-{slot}"), sample.encodings[1].rows.get_static(slot))
-                .unwrap()
-                .private_output(
-                    format!("transform-out-{slot}"),
-                    sample.slot_secret_matrices.get_static(slot),
-                )
                 .unwrap();
         }
 
-        let secret = row(&parameters, secret_size, 1);
         let public_one = public_matrix(&parameters, secret_size, columns, 4);
         let public_message = public_matrix(&parameters, secret_size, columns, 7);
         let plaintext_values =
             (0..slots).map(|slot| row(&parameters, 1, 10 + slot)).collect::<Vec<_>>();
-        let transform_values = (0..slots)
-            .map(|slot| public_matrix(&parameters, secret_size, secret_size, 14 + slot * 2))
-            .collect::<Vec<_>>();
+        let secret_row_values =
+            (0..slots).map(|slot| row(&parameters, secret_size, 14 + slot * 2)).collect::<Vec<_>>();
         let mut inputs = BTreeMap::from([
-            ("secret".to_owned(), RuntimeValue::matrix(secret.clone())),
             ("public-one".to_owned(), RuntimeValue::matrix(public_one)),
             ("public-message".to_owned(), RuntimeValue::matrix(public_message.clone())),
         ]);
@@ -940,22 +1000,249 @@ mod tests {
                 RuntimeValue::matrix(plaintext_values[slot].clone()),
             );
             inputs.insert(
-                format!("transform-{slot}"),
-                RuntimeValue::matrix(transform_values[slot].clone()),
+                format!("master-secret-row-{slot}"),
+                RuntimeValue::matrix(secret_row_values[slot].clone()),
             );
         }
         let result = execute_graph(context.build().unwrap(), parameters.clone(), inputs);
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, secret_size);
         for slot in 0..slots {
-            assert_eq!(
-                matrix_output(&result, &format!("transform-out-{slot}")),
-                &transform_values[slot]
-            );
-            let slot_secret = secret.clone() * transform_values[slot].clone();
-            let expected = slot_secret.clone() * public_message.clone() -
-                plaintext_values[slot].clone().tensor(&(slot_secret * gadget.clone()));
+            let secret_row = secret_row_values[slot].clone();
+            let expected = secret_row.clone() * public_message.clone() -
+                plaintext_values[slot].clone().tensor(&(secret_row * gadget.clone()));
             assert_eq!(matrix_output(&result, &format!("row-{slot}")), &expected);
         }
+    }
+
+    #[test]
+    fn tall_sampler_is_blockwise_for_three_keys_and_uses_one_packed_error() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let secret_size = 2;
+        let slots = 3;
+        let layout = BggSamplerLayout {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()).into(),
+            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            secret_dimension: secret_size,
+            digit_count: parameters.modulus_digits(),
+            gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
+        };
+        let ring = layout.ring();
+        let columns = layout.public_key_columns();
+        let public_keys = (0..3)
+            .map(|index| BggPublicKeyWire {
+                matrix: ring.input(format!("block-public-{index}"), (secret_size, columns)),
+                reveal_plaintext: true,
+            })
+            .collect::<Vec<_>>();
+        let plaintexts = (0..2)
+            .map(|index| ring.input_family(format!("block-plaintext-{index}"), slots, (1, 1)))
+            .collect::<Vec<_>>();
+        let secret_rows = ring.input_family("block-secret", slots, (1, secret_size));
+        let sample = BggTallEncodingSampler {
+            layout: layout.clone(),
+            gaussian_sigma: Some(3.into()),
+            gaussian_max_coefficient_bound: Some(19.into()),
+        }
+        .sample(secret_rows, &public_keys, &plaintexts, slots.into())
+        .expect("compatible blockwise sampler inputs");
+
+        let mut context = DslContext::new("tall-blockwise-sampler");
+        for (index, encoding) in sample.encodings.iter().enumerate() {
+            context = context
+                .family_output(format!("block-row-{index}"), encoding.rows.clone())
+                .expect("family output");
+        }
+        let built = context.build().expect("build blockwise sampler graph");
+        built.validate(&ParamEnv::default()).expect("valid blockwise sampler graph");
+        let nodes =
+            built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
+        assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::Concat { .. })));
+
+        let gaussian_nodes = nodes
+            .iter()
+            .filter(|node| matches!(node.kind(), NodeKind::GaussianSample { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(gaussian_nodes.len(), 1, "all blocks share one packed Gaussian");
+        let NodeKind::GaussianSample { matrix_type, .. } = gaussian_nodes[0].kind() else {
+            unreachable!("filtered Gaussian node")
+        };
+        assert_eq!(matrix_type.rows.canonicalize(), IntExpr::constant(1));
+        assert_eq!(
+            matrix_type.columns.canonicalize(),
+            IntExpr::constant(columns * public_keys.len())
+        );
+        let packed_error = gaussian_nodes[0].output(0).expect("Gaussian output");
+        let error_slices = nodes
+            .iter()
+            .filter_map(|node| {
+                let NodeKind::Slice { columns: Some(range), rows: None } = node.kind() else {
+                    return None;
+                };
+                (node.arguments().first().map(|argument| argument.node()) ==
+                    Some(packed_error.node()))
+                .then_some(range)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(error_slices.len(), public_keys.len(), "each block slices the shared error");
+        for (index, range) in error_slices.iter().enumerate() {
+            assert_eq!(range.start.canonicalize(), IntExpr::constant(columns * index));
+            assert_eq!(range.end.canonicalize(), IntExpr::constant(columns * (index + 1)));
+        }
+    }
+
+    #[test]
+    fn tall_sampler_blockwise_runtime_matches_identity_and_plaintext_formulas() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let secret_size = 2;
+        let slots = 3;
+        let layout = BggSamplerLayout {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()).into(),
+            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            secret_dimension: secret_size,
+            digit_count: parameters.modulus_digits(),
+            gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
+        };
+        let ring = layout.ring();
+        let columns = layout.public_key_columns();
+        let public_keys = (0..3)
+            .map(|index| BggPublicKeyWire {
+                matrix: ring.input(format!("formula-public-{index}"), (secret_size, columns)),
+                reveal_plaintext: true,
+            })
+            .collect::<Vec<_>>();
+        let plaintexts = (0..2)
+            .map(|index| {
+                Family::pack(
+                    (0..slots)
+                        .map(|slot| ring.input(format!("formula-plaintext-{index}-{slot}"), (1, 1)))
+                        .collect(),
+                )
+                .expect("plaintext family")
+            })
+            .collect::<Vec<_>>();
+        let secret_rows = Family::pack(
+            (0..slots)
+                .map(|slot| ring.input(format!("formula-secret-{slot}"), (1, secret_size)))
+                .collect(),
+        )
+        .expect("secret family");
+        let sample = BggTallEncodingSampler {
+            layout: layout.clone(),
+            gaussian_sigma: None,
+            gaussian_max_coefficient_bound: None,
+        }
+        .sample(secret_rows, &public_keys, &plaintexts, slots.into())
+        .expect("compatible formula sampler inputs");
+
+        let mut context = DslContext::new("tall-blockwise-formula");
+        for (block, encoding) in sample.encodings.iter().enumerate() {
+            for slot in 0..slots {
+                context = context
+                    .output(format!("formula-row-{block}-{slot}"), encoding.rows.get_static(slot))
+                    .expect("row output");
+            }
+        }
+        let built = context.build().expect("build formula graph");
+        built.validate(&ParamEnv::default()).expect("valid formula graph");
+
+        let public_values = (0..3)
+            .map(|block| public_matrix(&parameters, secret_size, columns, 3 + block * 7))
+            .collect::<Vec<_>>();
+        let plaintext_values = (0..2)
+            .map(|block| {
+                (0..slots)
+                    .map(|slot| row(&parameters, 1, 30 + block * 7 + slot))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let secret_values =
+            (0..slots).map(|slot| row(&parameters, secret_size, 50 + slot * 2)).collect::<Vec<_>>();
+        let mut inputs = BTreeMap::new();
+        for (block, value) in public_values.iter().enumerate() {
+            inputs.insert(format!("formula-public-{block}"), RuntimeValue::matrix(value.clone()));
+        }
+        for (block, values) in plaintext_values.iter().enumerate() {
+            for (slot, value) in values.iter().enumerate() {
+                inputs.insert(
+                    format!("formula-plaintext-{block}-{slot}"),
+                    RuntimeValue::matrix(value.clone()),
+                );
+            }
+        }
+        for (slot, value) in secret_values.iter().enumerate() {
+            inputs.insert(format!("formula-secret-{slot}"), RuntimeValue::matrix(value.clone()));
+        }
+        let result = execute_graph(built, parameters.clone(), inputs);
+        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, secret_size);
+        let identity = DCRTPolyMatrix::identity(&parameters, 1, None);
+        for block in 0..3 {
+            for slot in 0..slots {
+                let plaintext = if block == 0 {
+                    identity.clone()
+                } else {
+                    plaintext_values[block - 1][slot].clone()
+                };
+                let expected = secret_values[slot].clone() * public_values[block].clone() -
+                    plaintext.tensor(&(secret_values[slot].clone() * gadget.clone()));
+                assert_eq!(
+                    matrix_output(&result, &format!("formula-row-{block}-{slot}")),
+                    &expected,
+                    "block {block}, slot {slot} follows the Tall BGG formula",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tall_sampler_supports_one_key_without_plaintext_blocks() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let secret_size = 2;
+        let slots = 1;
+        let layout = BggSamplerLayout {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()).into(),
+            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            secret_dimension: secret_size,
+            digit_count: parameters.modulus_digits(),
+            gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
+        };
+        let ring = layout.ring();
+        let columns = layout.public_key_columns();
+        let public_key = BggPublicKeyWire {
+            matrix: ring.input("single-public", (secret_size, columns)),
+            reveal_plaintext: true,
+        };
+        let sample = BggTallEncodingSampler {
+            layout,
+            gaussian_sigma: None,
+            gaussian_max_coefficient_bound: None,
+        }
+        .sample(
+            ring.input_family("single-secret", slots, (1, secret_size)),
+            &[public_key],
+            &[],
+            slots.into(),
+        )
+        .expect("one-key sampler input");
+        assert_eq!(sample.encodings.len(), 1);
+        assert_eq!(sample.encodings[0].rows.count(), &IntExpr::constant(slots));
+        let built = DslContext::new("tall-single-block-sampler")
+            .family_output("row", sample.encodings[0].rows.clone())
+            .expect("family output")
+            .build()
+            .expect("build single-block sampler graph");
+        built.validate(&ParamEnv::default()).expect("valid single-block sampler graph");
+        assert!(
+            !built
+                .graph
+                .scopes()
+                .values()
+                .flat_map(|scope| scope.nodes())
+                .any(|node| matches!(node.kind(), NodeKind::Concat { .. }))
+        );
+        assert_eq!(
+            sample.encodings[0].rows.element_type().columns.canonicalize(),
+            IntExpr::constant(columns)
+        );
     }
 
     #[test]
@@ -995,20 +1282,7 @@ mod tests {
             error_max_coefficient_bound: 0.into(),
         };
         let ring = compiler.ring();
-        let transforms = Family::pack(
-            (0..slots)
-                .map(|slot| ring.input(format!("transform-{slot}"), (secret_size, secret_size)))
-                .collect(),
-        )
-        .unwrap();
-        let preprocessing = compiler
-            .preprocess(
-                ring.bytes_input("hash-key", 32),
-                ring.input("secret", (1, secret_size)),
-                transforms,
-                &[1, 3],
-            )
-            .unwrap();
+        let preprocessing = compiler.preprocess(ring.bytes_input("hash-key", 32), &[1, 3]).unwrap();
         let producer = compiler
             .export_preprocessing(DslContext::new("rotation-producer"), preprocessing)
             .unwrap()
@@ -1017,19 +1291,9 @@ mod tests {
             .validate(&ParamEnv::default())
             .unwrap();
 
-        let secret = row(&parameters, secret_size, 2);
-        let transform_values = (0..slots)
-            .map(|slot| public_matrix(&parameters, secret_size, secret_size, 5 + slot * 2))
-            .collect::<Vec<_>>();
         let hash_key = [0x42; 32];
-        let mut producer_inputs = BTreeMap::from([
-            ("hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec())),
-            ("secret".to_owned(), RuntimeValue::matrix(secret.clone())),
-        ]);
-        for (slot, transform) in transform_values.iter().enumerate() {
-            producer_inputs
-                .insert(format!("transform-{slot}"), RuntimeValue::matrix(transform.clone()));
-        }
+        let producer_inputs =
+            BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec()))]);
         let mut store = MemoryArtifactStore::default();
         let mut backend = cpu_backend([parameters.clone()]);
         let produced =
@@ -1037,15 +1301,20 @@ mod tests {
                 .unwrap();
         let production_id = produced.production_id.expect("artifact production");
         let manifest = store.manifest(&production_id).unwrap().clone();
-        assert_eq!(manifest.artifacts.len(), 8);
+        assert_eq!(manifest.artifacts.len(), 4);
 
         let artifacts = TallRotationEncodingArtifacts {
             production_id: production_id.clone(),
             slot_count: slots as u32,
         };
         let mut context = DslContext::new("rotation-consumer");
+        let secret_rows = Family::pack(
+            (0..slots).map(|slot| ring.input(format!("secret-{slot}"), (1, secret_size))).collect(),
+        )
+        .unwrap();
         for offset in [1, 3] {
-            let rotation = compiler.import_artifacts(&artifacts, offset).unwrap().unwrap();
+            let public = compiler.import_artifacts(&artifacts, offset).unwrap().unwrap();
+            let rotation = compiler.encode(&public, secret_rows.clone()).unwrap();
             context = context
                 .output(format!("a-forward-{offset}"), rotation.a_forward)
                 .unwrap()
@@ -1073,16 +1342,25 @@ mod tests {
                 &BTreeMap::from([(production_id, manifest)]),
             )
             .unwrap();
-        let consumed =
-            execute(&consumer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let secret_rows_values =
+            (0..slots).map(|slot| row(&parameters, secret_size, 2 + slot * 2)).collect::<Vec<_>>();
+        let consumed = execute(
+            &consumer,
+            &mut backend,
+            secret_rows_values
+                .iter()
+                .enumerate()
+                .map(|(slot, value)| {
+                    (format!("secret-{slot}"), RuntimeValue::matrix(value.clone()))
+                })
+                .collect(),
+            &mut store,
+            SamplingMode::Fresh,
+        )
+        .unwrap();
 
         let hash = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new();
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, secret_size);
-        let transformed = transform_values
-            .iter()
-            .map(|transform| secret.clone() * transform.clone())
-            .collect::<Vec<_>>();
         for offset in [1usize, 3] {
             let key = TallRotationEncodingKey { num_slots: slots as u32, offset: offset as u32 };
             let forward_tag = format!("bgg_tall_rotation_n{slots}_r{offset}_forward");
@@ -1114,13 +1392,13 @@ mod tests {
                 let backward_source = (slot + offset) % slots;
                 assert_eq!(
                     matrix_output(&consumed, &format!("c-forward-{offset}-{slot}")),
-                    &(transformed[slot].clone() * expected_forward.clone() -
-                        transformed[forward_source].clone() * gadget.clone())
+                    &(secret_rows_values[slot].clone() * expected_forward.clone() -
+                        secret_rows_values[forward_source].clone() * gadget.clone())
                 );
                 assert_eq!(
                     matrix_output(&consumed, &format!("c-backward-{offset}-{slot}")),
-                    &(transformed[slot].clone() * expected_backward.clone() -
-                        transformed[backward_source].clone() * gadget.clone())
+                    &(secret_rows_values[slot].clone() * expected_backward.clone() -
+                        secret_rows_values[backward_source].clone() * gadget.clone())
                 );
             }
         }
@@ -1167,17 +1445,20 @@ mod tests {
             plaintext: BggTallPlaintext::Diagonal(
                 Family::pack((0..slots).map(|_| ring.zero((1, 1))).collect()).unwrap(),
             ),
+            canonical_input_exclusive_upper: None,
         };
-        let public_key_type = input_public.matrix.matrix_type().clone();
         let mut public_lowering = BggTallSlotPublicKeyLowering {
-            inner: BggSlotTransferPublicKeyLowering {
-                compiler: public_compiler.clone(),
-                hash_key,
-                public_key_type,
-                configured_slot_count: slots,
-                output_public_key_production: None,
-                requests: Vec::new(),
-            },
+            compiler: public_compiler.clone(),
+            diagonal_mask_public_key: input_public.clone(),
+            configured_slot_count: slots,
+            rotations: BTreeMap::from([(
+                key,
+                TallRotationPublicWires {
+                    key,
+                    a_forward: rotation.a_forward.clone(),
+                    a_backward: rotation.a_backward.clone(),
+                },
+            )]),
         };
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1);
@@ -1198,7 +1479,6 @@ mod tests {
             )
             .unwrap()
             .remove(0);
-        assert!(public_lowering.inner.requests.is_empty());
         let mut tall_slots = TestTallRotationLowering {
             compiler: BggTallEncodingCompiler { public_key: public_compiler },
             rotation,
@@ -1236,33 +1516,30 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_slot_transfer_compiles_tall_rows() {
-        let artifact = BggSlotTransferArtifactCompiler {
-            modulus: 257.into(),
-            ring_dimension: 8.into(),
-            secret_size: 1,
-            slot_count: 2,
-            digit_count: 2,
-            chunk_columns: 2,
-            gadget_base: 4.into(),
-            trapdoor_sigma: RealExpr::from_integer(5),
-            error_sigma: RealExpr::from_integer(3),
-            preimage_max_coefficient_bound: 32.into(),
-            error_max_coefficient_bound: 19.into(),
-        };
+    fn tall_rotation_reindex_uses_generated_gather_without_family_pack() {
         let ring = Ring::new(257, 8);
-        let hash_key = ring.bytes_input("hash-key", 32);
-        let base = artifact.build_base().unwrap();
-        let slot_wires = artifact.build_slots(hash_key.clone(), &base).unwrap();
-        let public_slots = BggSlotTransferPublicSlotWires {
-            public_keys: slot_wires.public_keys.clone(),
-            b0_preimage_chunks: slot_wires.b0_preimage_chunks.clone(),
-            b1_preimage_chunks: slot_wires.b1_preimage_chunks.clone(),
-        };
+        let rows = ring.input_family("rotation-rows", 4, (1, 2));
+        let rotated = rotate_family(&rows, 1, 4).expect("generated rotation family");
+        let built = DslContext::new("tall-rotation-generated-reindex")
+            .family_output("rotated", rotated)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default()).expect("valid generated rotation graph");
 
+        let nodes =
+            built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
+        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))));
+        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic)));
+        assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyPack { .. })));
+    }
+
+    #[test]
+    fn identity_slot_transfer_uses_the_online_diagonal_mask() {
+        let ring = Ring::new(257, 8);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
-        let transferred = circuit.slot_transfer_gate(input_gate, &[(1, None), (0, Some(2))]);
+        let transferred = circuit.slot_transfer_gate(input_gate, &[(0, None), (1, Some(2))]);
         circuit.output([transferred]);
         let public_compiler =
             BggPublicKeyCompiler { ring: ring.clone(), base: 4.into(), digit_count: 2.into() };
@@ -1270,17 +1547,17 @@ mod tests {
             BggPublicKeyWire { matrix: ring.input("one-public", (1, 2)), reveal_plaintext: true };
         let input_public =
             BggPublicKeyWire { matrix: ring.input("input-public", (1, 2)), reveal_plaintext: true };
-        let mut public_lowering = BggSlotTransferPublicKeyLowering {
+        let diagonal_mask_public_key =
+            BggPublicKeyWire { matrix: ring.input("mask-public", (1, 2)), reveal_plaintext: true };
+        let mut public_lowering = BggTallSlotPublicKeyLowering {
             compiler: public_compiler.clone(),
-            hash_key: hash_key.clone(),
-            public_key_type: ring.matrix_type((1, 2)),
+            diagonal_mask_public_key: diagonal_mask_public_key.clone(),
             configured_slot_count: 2,
-            output_public_key_production: None,
-            requests: Vec::new(),
+            rotations: BTreeMap::new(),
         };
         let circuit_compiler = crate::PolyCircuitCompiler { public_key: public_compiler.clone() };
         let mut no_lookup = crate::NoPublicLookup::default();
-        circuit_compiler
+        let public_output = circuit_compiler
             .compile_public_keys_with_lowerings(
                 &circuit,
                 one_public.clone(),
@@ -1288,27 +1565,35 @@ mod tests {
                 &mut no_lookup,
                 &mut public_lowering,
             )
-            .unwrap();
-        let gate_wires =
-            artifact.build_gate_preimages(&base, &slot_wires, &public_lowering.requests).unwrap();
+            .unwrap()
+            .remove(0);
         let input = BggTallEncodingWire {
             rows: ring.input_family("rows", 2, (1, 2)),
             pubkey: input_public,
             plaintext: BggTallPlaintext::Diagonal(ring.input_family("plaintexts", 2, (1, 1))),
+            canonical_input_exclusive_upper: Some(BigUint::from(7u8)),
         };
         let one = BggTallEncodingWire {
             rows: ring.input_family("one-rows", 2, (1, 2)),
             pubkey: one_public,
             plaintext: BggTallPlaintext::Diagonal(ring.input_family("one-plaintexts", 2, (1, 1))),
+            canonical_input_exclusive_upper: None,
         };
         let mut lowering = BggTallSlotLowering {
-            compiler: BggTallEncodingCompiler { public_key: public_compiler },
-            artifact,
-            hash_key,
-            output_public_key_production: None,
-            c_b0: ring.input("c-b0", (1, 4)),
-            slots: public_slots,
-            gates: gate_wires,
+            compiler: BggTallEncodingCompiler { public_key: public_compiler.clone() },
+            diagonal_mask_public_key,
+            secret_rows: ring.input_family("secret-rows", 2, (1, 1)),
+            sampler: BggTallEncodingSampler {
+                layout: BggSamplerLayout {
+                    modulus: 257.into(),
+                    ring_dimension: 8.into(),
+                    secret_dimension: 1,
+                    digit_count: 2,
+                    gadget_base: 4.into(),
+                },
+                gaussian_sigma: None,
+                gaussian_max_coefficient_bound: None,
+            },
             rotations: BTreeMap::new(),
         };
         let mut no_lookup = crate::NoPublicLookup::default();
@@ -1325,11 +1610,52 @@ mod tests {
         let built = DslContext::new("tall-slot-transfer")
             .family_output("rows", output.rows)
             .unwrap()
-            .output("public", output.pubkey.matrix)
+            .output("public", output.pubkey.matrix.clone())
+            .unwrap()
+            .output("public-key-pass", public_output.matrix.clone())
             .unwrap()
             .build()
             .unwrap();
         built.validate(&ParamEnv::default()).expect("valid executable graph");
+        assert_eq!(
+            output.pubkey.matrix.matrix_type(),
+            public_output.matrix.matrix_type(),
+            "online mask multiplication and public-key lowering must agree on the output layout",
+        );
+    }
+
+    #[test]
+    fn nonidentity_tall_slot_transfer_fails_closed() {
+        let ring = Ring::new(257, 8);
+        let compiler =
+            BggPublicKeyCompiler { ring: ring.clone(), base: 4.into(), digit_count: 2.into() };
+        let key =
+            BggPublicKeyWire { matrix: ring.input("input-public", (1, 2)), reveal_plaintext: true };
+        let mut slots = BggTallSlotPublicKeyLowering {
+            compiler: compiler.clone(),
+            diagonal_mask_public_key: BggPublicKeyWire {
+                matrix: ring.input("mask-public", (1, 2)),
+                reveal_plaintext: true,
+            },
+            configured_slot_count: 2,
+            rotations: BTreeMap::new(),
+        };
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let transferred = circuit.slot_transfer_gate(input, &[(1, None), (0, None)]);
+        circuit.output([transferred]);
+        let result = crate::PolyCircuitCompiler { public_key: compiler }
+            .compile_public_keys_with_lowerings(
+                &circuit,
+                key.clone(),
+                [key],
+                &mut crate::NoPublicLookup::default(),
+                &mut slots,
+            );
+        assert!(matches!(
+            result,
+            Err(CircuitCompileError::Unsupported { feature: "nonidentity Tall slot transfer", .. })
+        ));
     }
 
     #[test]
@@ -1364,394 +1690,5 @@ mod tests {
                 TallRotationEncodingKey { num_slots: 8, offset: 3 },
             ])
         );
-    }
-
-    #[derive(Default)]
-    struct RecordingPublicLookups {
-        identities: Vec<(LweLookupIdentity, usize)>,
-    }
-
-    impl CircuitLoweringTypes for RecordingPublicLookups {
-        type Wire = BggPublicKeyWire;
-        type Error = CircuitCompileError;
-    }
-
-    impl<P: mxx_gadgets::Poly> PublicLookupLowering<P> for RecordingPublicLookups {
-        fn public_lookup(
-            &mut self,
-            _circuit: &PolyCircuit<P>,
-            lookup_id: usize,
-            input: &Self::Wire,
-            gate: GateInstance<'_>,
-        ) -> Result<Self::Wire, Self::Error> {
-            self.identities.push((
-                LweLookupIdentity {
-                    call_path: gate.call_path().to_vec(),
-                    gate: gate.local_gate().index(),
-                    occurrence: gate.operation_occurrence(),
-                    lookup: lookup_id,
-                    slot: None,
-                },
-                lookup_id,
-            ));
-            Ok(input.clone())
-        }
-    }
-
-    #[derive(Default)]
-    struct PassthroughPublicSlots;
-
-    impl CircuitLoweringTypes for PassthroughPublicSlots {
-        type Wire = BggPublicKeyWire;
-        type Error = CircuitCompileError;
-    }
-
-    impl<P: mxx_gadgets::Poly> SlotOperationLowering<P> for PassthroughPublicSlots {
-        fn slot_transfer(
-            &mut self,
-            input: &Self::Wire,
-            _source_slots: &[(u32, Option<u32>)],
-            _gate: GateInstance<'_>,
-        ) -> Result<Self::Wire, Self::Error> {
-            Ok(input.clone())
-        }
-
-        fn slot_reduce(
-            &mut self,
-            inputs: &[Self::Wire],
-            _slot_count: usize,
-            _gate: GateInstance<'_>,
-        ) -> Result<Self::Wire, Self::Error> {
-            Ok(inputs.first().expect("slot reduction input").clone())
-        }
-
-        fn slot_rotation(
-            &mut self,
-            input: &Self::Wire,
-            _offset: u32,
-            _num_slots: u32,
-            _gate: GateInstance<'_>,
-        ) -> Result<Self::Wire, Self::Error> {
-            Ok(input.clone())
-        }
-    }
-
-    fn assert_production_tall_artifacts_cover_circuit(
-        circuit: &PolyCircuit<DCRTPoly>,
-        parameters: &DCRTPolyParams,
-        physical_slots: usize,
-    ) -> Vec<Vec<DCRTPolyMatrix>> {
-        let ring = concrete_ring(parameters);
-        let digits = parameters.modulus_digits();
-        let public_key_compiler = BggPublicKeyCompiler {
-            ring: ring.clone(),
-            base: BigInt::from(1u64 << parameters.base_bits()).into(),
-            digit_count: digits.into(),
-        };
-        let circuit_compiler = PolyCircuitCompiler { public_key: public_key_compiler.clone() };
-        let public_key =
-            || BggPublicKeyWire { matrix: ring.zero((1, digits)), reveal_plaintext: true };
-
-        let mut recording_lookups = RecordingPublicLookups::default();
-        let mut passthrough_slots = PassthroughPublicSlots;
-        circuit_compiler
-            .compile_public_keys_with_lowerings(
-                circuit,
-                public_key(),
-                (0..circuit.num_input()).map(|_| public_key()),
-                &mut recording_lookups,
-                &mut passthrough_slots,
-            )
-            .expect("lookup identity discovery");
-        assert!(!recording_lookups.identities.is_empty());
-
-        let lookup_compilers = recording_lookups
-            .identities
-            .into_iter()
-            .map(|(identity, lookup_id)| {
-                let table =
-                    LweLookupTable::from_public_lut(circuit.lookup_table(lookup_id).as_ref())
-                        .expect("nested-RNS lookup table");
-                LweLookupCompiler {
-                    identity,
-                    table,
-                    public_key_type: ring.matrix_type((1, digits)),
-                    low_matrix_type: ring.matrix_type((digits, digits)),
-                    high_matrix_type: ring.matrix_type((digits + 2, digits)),
-                    gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
-                    digit_count: digits.into(),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut artifact_context = DslContext::new("packed-nested-rns-lookup-artifacts");
-        for lookup in &lookup_compilers {
-            let wires = LweLookupPreprocessingWires {
-                output_public_key: ring.zero((1, digits)),
-                low_chunks: (0..lookup.table.len().div_ceil(512))
-                    .map(|_| Family::pack((0..512).map(|_| ring.zero((digits, digits))).collect()))
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("lookup low artifact chunks"),
-                high_chunks: (0..lookup.table.len().div_ceil(512))
-                    .map(|_| {
-                        Family::pack((0..512).map(|_| ring.zero((digits + 2, digits))).collect())
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("lookup high artifact chunks"),
-            };
-            artifact_context = lookup
-                .export_preprocessing(
-                    artifact_context,
-                    wires,
-                    &LweLookupArtifactNames::for_compiler(lookup),
-                )
-                .expect("lookup artifact outputs");
-        }
-        let artifact_graph = artifact_context
-            .build()
-            .expect("lookup artifact graph")
-            .validate(&ParamEnv::default())
-            .expect("lookup artifact validation");
-        let mut store = MemoryArtifactStore::default();
-        let mut backend = cpu_backend([parameters.clone()]);
-        let artifact_result = execute(
-            &artifact_graph,
-            &mut backend,
-            BTreeMap::new(),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .expect("lookup artifact production");
-        let production_id = artifact_result.production_id.expect("lookup production id");
-        let manifest = store.manifest(&production_id).expect("lookup manifest").clone();
-        let invocations = lookup_compilers
-            .into_iter()
-            .map(|lookup| {
-                LweLookupInvocation::bind(
-                    lookup.clone(),
-                    LweLookupArtifacts::for_compiler(production_id.clone(), &lookup),
-                    parameters,
-                    circuit,
-                )
-                .expect("nested-RNS lookup invocation")
-            })
-            .collect::<Vec<_>>();
-
-        let hash_key = ring.bytes_input("packed-artifact-hash-key", 32);
-        let mut public_lookup =
-            LweLookupPublicKeyLowering::new(invocations.clone()).expect("public lookup lowering");
-        let mut public_slots = BggTallSlotPublicKeyLowering {
-            inner: BggSlotTransferPublicKeyLowering {
-                compiler: public_key_compiler.clone(),
-                hash_key: hash_key.clone(),
-                public_key_type: ring.matrix_type((1, digits)),
-                configured_slot_count: physical_slots,
-                output_public_key_production: None,
-                requests: Vec::new(),
-            },
-        };
-        circuit_compiler
-            .compile_public_keys_with_lowerings(
-                circuit,
-                public_key(),
-                (0..circuit.num_input()).map(|_| public_key()),
-                &mut public_lookup,
-                &mut public_slots,
-            )
-            .expect("production public-key lowering");
-        assert!(!public_slots.inner.requests.is_empty());
-
-        let artifact = BggSlotTransferArtifactCompiler {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()).into(),
-            ring_dimension: (parameters.ring_dimension() as usize).into(),
-            secret_size: 1,
-            slot_count: physical_slots,
-            digit_count: digits,
-            chunk_columns: digits.max(1),
-            gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
-            trapdoor_sigma: RealExpr::from_integer(5),
-            error_sigma: RealExpr::from_integer(0),
-            preimage_max_coefficient_bound: 32.into(),
-            error_max_coefficient_bound: 0.into(),
-        };
-        let base = artifact.build_base().expect("slot base artifacts");
-        let slot_wires =
-            artifact.build_slots(hash_key.clone(), &base).expect("slot preprocessing artifacts");
-        let gate_wires = artifact
-            .build_gate_preimages(&base, &slot_wires, &public_slots.inner.requests)
-            .expect("per-gate slot artifacts");
-        let slots = BggSlotTransferPublicSlotWires {
-            public_keys: slot_wires.public_keys,
-            b0_preimage_chunks: slot_wires.b0_preimage_chunks,
-            b1_preimage_chunks: slot_wires.b1_preimage_chunks,
-        };
-        let rotations = required_tall_rotation_encodings(circuit)
-            .expect("required tall rotations")
-            .into_iter()
-            .map(|key| {
-                let wire = TallRotationEncodingWires {
-                    key,
-                    a_forward: ring.hash_matrix(
-                        hash_key.clone(),
-                        tall_rotation_public_key_tag(key, false),
-                        (1, digits),
-                    ),
-                    a_backward: ring.hash_matrix(
-                        hash_key.clone(),
-                        tall_rotation_public_key_tag(key, true),
-                        (1, digits),
-                    ),
-                    c_forward: Family::pack(
-                        (0..physical_slots).map(|_| ring.zero((1, digits))).collect(),
-                    )
-                    .expect("forward rotation rows"),
-                    c_backward: Family::pack(
-                        (0..physical_slots).map(|_| ring.zero((1, digits))).collect(),
-                    )
-                    .expect("backward rotation rows"),
-                };
-                (key, wire)
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        let zero_tall = || BggTallEncodingWire {
-            rows: Family::pack((0..physical_slots).map(|_| ring.zero((1, digits))).collect())
-                .expect("packed rows"),
-            pubkey: public_key(),
-            plaintext: BggTallPlaintext::Diagonal(
-                Family::pack((0..physical_slots).map(|_| ring.zero((1, 1))).collect())
-                    .expect("packed plaintexts"),
-            ),
-        };
-        let one = BggTallEncodingWire {
-            plaintext: BggTallPlaintext::Diagonal(
-                Family::pack((0..physical_slots).map(|_| ring.identity(1)).collect())
-                    .expect("packed ones"),
-            ),
-            ..zero_tall()
-        };
-        let mut lookup = LweLookupTallEncodingLowering::new(
-            invocations,
-            Family::pack((0..physical_slots).map(|_| ring.zero((1, digits + 2))).collect())
-                .expect("lookup helper rows"),
-        )
-        .expect("tall lookup lowering");
-        let mut slots = BggTallSlotLowering {
-            compiler: BggTallEncodingCompiler { public_key: public_key_compiler },
-            artifact: artifact.clone(),
-            hash_key,
-            output_public_key_production: None,
-            c_b0: ring.zero((1, artifact.b0_public_columns())),
-            slots,
-            gates: gate_wires,
-            rotations,
-        };
-        let outputs = circuit_compiler
-            .compile_tall_encodings_with_lowerings(
-                circuit,
-                one,
-                (0..circuit.num_input()).map(|_| zero_tall()),
-                &mut lookup,
-                &mut slots,
-            )
-            .expect("generated production artifacts must cover every packed gate");
-        assert_eq!(outputs.len(), circuit.output_gate_ids().len());
-
-        let mut output_context = DslContext::new("packed-nested-rns-production-tall-runtime");
-        for (output_index, output) in outputs.into_iter().enumerate() {
-            let BggTallPlaintext::Diagonal(plaintexts) = output.plaintext else {
-                panic!("zero nested-RNS inputs keep revealed tall plaintexts")
-            };
-            for slot in 0..physical_slots {
-                output_context = output_context
-                    .output(
-                        format!("output-{output_index}-slot-{slot}"),
-                        plaintexts.get_static(slot),
-                    )
-                    .expect("unique production tall plaintext output");
-            }
-        }
-        let graph = output_context
-            .build()
-            .expect("production tall graph")
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production_id, manifest)]),
-            )
-            .expect("production tall manifest validation");
-        let result = execute(
-            &graph,
-            &mut backend,
-            BTreeMap::from([(
-                "packed-artifact-hash-key".to_owned(),
-                RuntimeValue::Bytes(vec![0x93; 32]),
-            )]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .expect("production tall runtime");
-        (0..circuit.output_gate_ids().len())
-            .map(|output_index| {
-                (0..physical_slots)
-                    .map(|slot| {
-                        matrix_output(&result, &format!("output-{output_index}-slot-{slot}"))
-                            .clone()
-                    })
-                    .collect()
-            })
-            .collect()
-    }
-
-    #[test]
-    #[serial_test::serial]
-    #[ignore = "CPU end-to-end Tall nested-RNS integration test"]
-    fn packed_nested_rns_compiles_through_tall_arithmetic_lookup_and_slot_lowerings() {
-        let parameters = DCRTPolyParams::new(2, 2, 12, 6);
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let nested =
-            Arc::new(NestedRnsPolyContext::setup(&mut circuit, &parameters, 6, 2, 16, false, None));
-        let coefficient_slots = 2;
-        let window = CrtWindow::full(nested.q_moduli_depth);
-        let left = NestedRnsPoly::input(nested.clone(), coefficient_slots, window, &mut circuit);
-        let right = NestedRnsPoly::input(nested.clone(), coefficient_slots, window, &mut circuit);
-        let ordinary = left.mul(&right, &mut circuit).full_reduce(&mut circuit);
-        let convolution =
-            negacyclic_conv_mul(&parameters, &mut circuit, &left, &right, coefficient_slots)
-                .full_reduce(&mut circuit);
-        let ordinary = ordinary.reconstruct(&mut circuit);
-        let convolution = convolution.reconstruct(&mut circuit);
-        circuit.output([ordinary, convolution]);
-
-        let physical_slots = coefficient_slots * nested.q_moduli_depth;
-        let rotations = required_tall_rotation_encodings(&circuit).expect("rotation discovery");
-        assert!(rotations.contains(&TallRotationEncodingKey {
-            num_slots: physical_slots as u32,
-            offset: nested.q_moduli_depth as u32,
-        }));
-        let outputs =
-            assert_production_tall_artifacts_cover_circuit(&circuit, &parameters, physical_slots);
-
-        let zero_polyvec =
-            PolyVec((0..physical_slots).map(|_| DCRTPoly::const_zero(&parameters)).collect());
-        let plaintext_outputs = execute_polyvec_circuit(
-            "packed-nested-rns-plaintext-oracle",
-            &parameters,
-            &circuit,
-            (0..circuit.num_input()).map(|_| zero_polyvec.clone()).collect(),
-            physical_slots,
-        );
-        assert_eq!(plaintext_outputs.len(), outputs.len());
-        for (output_index, plaintext_output) in plaintext_outputs.iter().enumerate() {
-            for slot in 0..physical_slots {
-                assert_eq!(
-                    outputs[output_index][slot],
-                    DCRTPolyMatrix::from_poly_vec(
-                        &parameters,
-                        vec![vec![plaintext_output.0[slot].clone()]],
-                    ),
-                    "tall decoded lane must match the PolyVec plaintext execution"
-                );
-            }
-        }
     }
 }

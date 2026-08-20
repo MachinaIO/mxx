@@ -9,6 +9,7 @@ pub mod constraints;
 pub mod encoding;
 pub mod expr;
 pub mod graph;
+pub mod inventory;
 pub mod node;
 mod serde_support;
 pub mod types;

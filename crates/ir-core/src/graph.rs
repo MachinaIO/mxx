@@ -127,6 +127,7 @@ impl NodeHandle {
         definition: SubgraphHandle,
         arguments: Vec<ValueHandle>,
         bindings: Vec<(String, crate::IntExpr)>,
+        canonical_input_exclusive_uppers: Vec<Option<num_bigint::BigUint>>,
     ) -> Self {
         let output_types = definition.output_types();
         Self::new_in_scope(
@@ -134,6 +135,7 @@ impl NodeHandle {
             NodeKind::SubgraphCall(SubgraphCall {
                 definition: definition.name().to_owned(),
                 bindings,
+                canonical_input_exclusive_uppers,
             }),
             arguments,
             output_types,

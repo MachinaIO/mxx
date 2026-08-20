@@ -185,13 +185,6 @@ pub trait Backend {
         inputs: &[&Self::Matrix],
         axis: ConcatAxis,
     ) -> Result<Self::Matrix, Self::Error>;
-    fn reshape(
-        &mut self,
-        value: &Self::Matrix,
-        rows: usize,
-        columns: usize,
-    ) -> Result<Self::Matrix, Self::Error>;
-
     fn sample_uniform(
         &mut self,
         ty: &ConcreteMatrixType,

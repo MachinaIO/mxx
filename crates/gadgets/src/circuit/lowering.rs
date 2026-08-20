@@ -1,6 +1,6 @@
 use super::{
     BatchedWire, GateParamSource, PolyCircuit, PolyGate, PolyGateKind, PolyGateType,
-    SlotTransferSpec, SubCircuitParamValue, gate::GateId,
+    SlotTransferSpec, SubCircuitInputMaxPlaintextNormRange, SubCircuitParamValue, gate::GateId,
 };
 use crate::Poly;
 use num_bigint::BigUint;
@@ -58,6 +58,16 @@ impl<'a> GateInstance<'a> {
 pub trait CircuitLoweringTypes {
     type Wire: Clone;
     type Error: Error + Send + Sync + 'static;
+
+    /// Attaches call-specific compile-time metadata to child inputs before the
+    /// child circuit is expanded. Ordinary lowerers leave inputs unchanged.
+    fn enter_subcircuit_inputs(
+        &mut self,
+        inputs: Vec<Self::Wire>,
+        _input_max_plaintext_norm_ranges: Option<&[SubCircuitInputMaxPlaintextNormRange]>,
+    ) -> Result<Vec<Self::Wire>, Self::Error> {
+        Ok(inputs)
+    }
 }
 
 /// Scheme-specific lowering for public lookup gates.
@@ -177,12 +187,58 @@ pub trait StructuredCircuitLowering<P: Poly>: GraphCircuitLowering<P> {
         inputs: Vec<Self::Wire>,
     ) -> Result<Vec<Self::Wire>, CircuitLowerError<Self::Error>>;
 
+    /// Calls an audited constant-polynomial canonical-nonnegative LUT subgraph.
+    ///
+    /// `canonical_input_exclusive_uppers` is aligned with `inputs`; its synthetic constant-one
+    /// entry is `None`. A present upper is derived only from a
+    /// [`SubCircuitInputMaxPlaintextNormRange`] attached to an audited LUT-bearing call. The LUT
+    /// may be in a descendant subgraph; no recursive structural scan is performed. Setting this
+    /// existing metadata is the producer's explicit assertion that the covered values are
+    /// canonical-nonnegative constant polynomials used by the LUT path. A range registered on the
+    /// definition takes precedence over a call-site range. Under that contract, an inclusive norm
+    /// `B` means the canonical integer is in `[0, B]`, so the transmitted exclusive upper is
+    /// `B + 1`.
+    ///
+    /// General polynomial calls must not reinterpret `PolyNorm` this way. Lowerers that do not
+    /// implement this audited contract reject a nonempty contract rather than silently dropping
+    /// it.
+    fn call_audited_constant_lut_subgraph(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<Self::Wire>,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<Vec<Self::Wire>, CircuitLowerError<Self::Error>> {
+        if canonical_input_exclusive_uppers.iter().any(Option::is_some) {
+            return Err(CircuitLowerError::GraphStructure(
+                "structured lowerer does not implement audited constant-LUT range contracts"
+                    .to_owned(),
+            ));
+        }
+        self.call_subgraph(definition, inputs)
+    }
+
     fn call_subgraph_parallel(
         &mut self,
         definition: &Self::Subgraph,
         inputs: Vec<Vec<Self::Wire>>,
     ) -> Result<Vec<Vec<Self::Wire>>, CircuitLowerError<Self::Error>> {
         inputs.into_iter().map(|inputs| self.call_subgraph(definition, inputs)).collect()
+    }
+
+    /// Parallel counterpart of [`Self::call_audited_constant_lut_subgraph`].
+    fn call_audited_constant_lut_subgraph_parallel(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<Vec<Self::Wire>>,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<Vec<Vec<Self::Wire>>, CircuitLowerError<Self::Error>> {
+        if canonical_input_exclusive_uppers.iter().any(Option::is_some) {
+            return Err(CircuitLowerError::GraphStructure(
+                "structured lowerer does not implement audited constant-LUT range contracts"
+                    .to_owned(),
+            ));
+        }
+        self.call_subgraph_parallel(definition, inputs)
     }
 }
 
@@ -358,6 +414,7 @@ fn call_structured_child<P, L>(
     child: Arc<PolyCircuit<P>>,
     one: &L::Wire,
     child_inputs: Vec<L::Wire>,
+    input_max_plaintext_norm_ranges: Option<&[SubCircuitInputMaxPlaintextNormRange]>,
     bindings: &[SubCircuitParamValue],
     call_path: &[usize],
     lowering: &mut L,
@@ -367,15 +424,35 @@ where
     P: Poly,
     L: StructuredCircuitLowering<P>,
 {
-    let definition =
-        structured_definition(child, one, &child_inputs, bindings, call_path, lowering, state)?;
-    lowering.call_subgraph(&definition, std::iter::once(one.clone()).chain(child_inputs).collect())
+    let definition = structured_definition(
+        child.clone(),
+        one,
+        &child_inputs,
+        bindings,
+        call_path,
+        lowering,
+        state,
+    )?;
+    let inputs = std::iter::once(one.clone()).chain(child_inputs).collect::<Vec<_>>();
+    let canonical_input_exclusive_uppers = audited_constant_lut_input_exclusive_uppers(
+        child
+            .sub_circuit_input_max_plaintext_norm_ranges
+            .as_deref()
+            .or(input_max_plaintext_norm_ranges),
+        inputs.len() - 1,
+    );
+    lowering.call_audited_constant_lut_subgraph(
+        &definition,
+        inputs,
+        canonical_input_exclusive_uppers,
+    )
 }
 
 fn call_structured_children_parallel<P, L>(
     child: Arc<PolyCircuit<P>>,
     one: &L::Wire,
     child_inputs: Vec<Vec<L::Wire>>,
+    input_max_plaintext_norm_ranges: Option<&[SubCircuitInputMaxPlaintextNormRange]>,
     bindings: &[SubCircuitParamValue],
     call_path: &[usize],
     lowering: &mut L,
@@ -386,13 +463,42 @@ where
     L: StructuredCircuitLowering<P>,
 {
     let first = child_inputs.first().ok_or(CircuitLowerError::InvalidArity { gate: 0 })?;
+    let input_count = first.len();
     let definition =
-        structured_definition(child, one, first, bindings, call_path, lowering, state)?;
+        structured_definition(child.clone(), one, first, bindings, call_path, lowering, state)?;
     let inputs = child_inputs
         .into_iter()
         .map(|inputs| std::iter::once(one.clone()).chain(inputs).collect())
         .collect();
-    lowering.call_subgraph_parallel(&definition, inputs)
+    let canonical_input_exclusive_uppers = audited_constant_lut_input_exclusive_uppers(
+        child
+            .sub_circuit_input_max_plaintext_norm_ranges
+            .as_deref()
+            .or(input_max_plaintext_norm_ranges),
+        input_count,
+    );
+    lowering.call_audited_constant_lut_subgraph_parallel(
+        &definition,
+        inputs,
+        canonical_input_exclusive_uppers,
+    )
+}
+
+fn audited_constant_lut_input_exclusive_uppers(
+    input_max_plaintext_norm_ranges: Option<&[SubCircuitInputMaxPlaintextNormRange]>,
+    input_count: usize,
+) -> Vec<Option<BigUint>> {
+    let mut uppers = vec![None; input_count + 1];
+    let Some(ranges) = input_max_plaintext_norm_ranges else {
+        return uppers;
+    };
+    for range in ranges {
+        let upper = &range.norm + BigUint::from(1u8);
+        for slot in &mut uppers[range.start + 1..range.end + 1] {
+            *slot = Some(upper.clone());
+        }
+    }
+    uppers
 }
 
 fn lower_scoped_structured<P, L>(
@@ -523,6 +629,7 @@ where
                                 child,
                                 &one,
                                 child_inputs,
+                                first_call.input_max_plaintext_norm_ranges.as_deref(),
                                 bindings.as_ref(),
                                 call_path,
                                 lowering,
@@ -553,6 +660,7 @@ where
                     child,
                     &one,
                     child_inputs,
+                    info.input_max_plaintext_norm_ranges.as_deref(),
                     info.param_bindings.as_ref(),
                     call_path,
                     lowering,
@@ -585,6 +693,7 @@ where
                         child.clone(),
                         &one,
                         child_inputs,
+                        info.input_max_plaintext_norm_ranges.as_deref(),
                         call_bindings.as_ref(),
                         call_path,
                         lowering,
@@ -713,6 +822,15 @@ where
                 let info = circuit.sub_circuit_call_info(*call_id);
                 let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
                 let child_inputs = flatten_inputs(&values, &info.inputs, gate_id)?;
+                let child_inputs = lowering
+                    .enter_subcircuit_inputs(
+                        child_inputs,
+                        child
+                            .sub_circuit_input_max_plaintext_norm_ranges
+                            .as_deref()
+                            .or(info.input_max_plaintext_norm_ranges.as_deref()),
+                    )
+                    .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?;
                 call_path.push(info.scoped_call_id);
                 let outputs = lower_scoped(
                     child.as_ref(),
@@ -744,6 +862,15 @@ where
                     .enumerate()
                 {
                     let child_inputs = flatten_inputs(&values, call_inputs, gate_id)?;
+                    let child_inputs = lowering
+                        .enter_subcircuit_inputs(
+                            child_inputs,
+                            child
+                                .sub_circuit_input_max_plaintext_norm_ranges
+                                .as_deref()
+                                .or(info.input_max_plaintext_norm_ranges.as_deref()),
+                        )
+                        .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?;
                     call_path.push(*scoped_call_id);
                     let outputs = lower_scoped(
                         child.as_ref(),
@@ -1006,6 +1133,7 @@ mod tests {
         call_site_identity_is_semantic: bool,
         sequential_subgraph_calls: usize,
         parallel_subgraph_batch_sizes: Vec<usize>,
+        audited_constant_lut_contracts: Vec<Vec<Option<BigUint>>>,
     }
 
     impl Default for RecordingLowering {
@@ -1019,6 +1147,7 @@ mod tests {
                 call_site_identity_is_semantic: true,
                 sequential_subgraph_calls: 0,
                 parallel_subgraph_batch_sizes: Vec::new(),
+                audited_constant_lut_contracts: Vec::new(),
             }
         }
     }
@@ -1184,12 +1313,38 @@ mod tests {
             Ok(definition.clone())
         }
 
+        fn call_audited_constant_lut_subgraph(
+            &mut self,
+            definition: &Self::Subgraph,
+            inputs: Vec<Self::Wire>,
+            canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+        ) -> Result<Vec<Self::Wire>, CircuitLowerError<Self::Error>> {
+            assert_eq!(inputs.len(), canonical_input_exclusive_uppers.len());
+            self.sequential_subgraph_calls += 1;
+            self.audited_constant_lut_contracts.push(canonical_input_exclusive_uppers);
+            Ok(definition.clone())
+        }
+
         fn call_subgraph_parallel(
             &mut self,
             definition: &Self::Subgraph,
             inputs: Vec<Vec<Self::Wire>>,
         ) -> Result<Vec<Vec<Self::Wire>>, CircuitLowerError<Self::Error>> {
             self.parallel_subgraph_batch_sizes.push(inputs.len());
+            Ok(inputs.into_iter().map(|_| definition.clone()).collect())
+        }
+
+        fn call_audited_constant_lut_subgraph_parallel(
+            &mut self,
+            definition: &Self::Subgraph,
+            inputs: Vec<Vec<Self::Wire>>,
+            canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+        ) -> Result<Vec<Vec<Self::Wire>>, CircuitLowerError<Self::Error>> {
+            assert!(
+                inputs.iter().all(|inputs| inputs.len() == canonical_input_exclusive_uppers.len())
+            );
+            self.parallel_subgraph_batch_sizes.push(inputs.len());
+            self.audited_constant_lut_contracts.push(canonical_input_exclusive_uppers);
             Ok(inputs.into_iter().map(|_| definition.clone()).collect())
         }
     }
@@ -1431,6 +1586,70 @@ mod tests {
             .expect("independent sub-circuit calls must lower as one parallel batch");
         assert_eq!(lowering.sequential_subgraph_calls, 0);
         assert_eq!(lowering.parallel_subgraph_batch_sizes, vec![2]);
+    }
+
+    #[test]
+    fn audited_constant_lut_calls_transport_inclusive_norms_as_exclusive_uppers() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let input = child.input(2);
+        let lookup = child.slot_transfer_gate(input.at(0), &[(0, None)]).as_single_wire();
+        child.gates.get_mut(&lookup).expect("lookup placeholder gate").gate_type =
+            PolyGateType::PubLut { lut_id: GateParamSource::Const(0) };
+        child.output([BatchedWire::single(lookup), input.at(1)]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(2);
+        let child_id = circuit.register_sub_circuit(child);
+        let outputs = circuit.call_sub_circuit_with_max_plaintext_norms(
+            child_id,
+            [inputs.at(0), inputs.at(1)],
+            [
+                SubCircuitInputMaxPlaintextNormRange::new(0, 1, BigUint::from(6u8)),
+                SubCircuitInputMaxPlaintextNormRange::new(1, 2, BigUint::from(10u8)),
+            ],
+        );
+        circuit.output(outputs);
+
+        let mut lowering = RecordingLowering::default();
+        lower_circuit_structured(&circuit, 1usize, [3, 5], &mut lowering)
+            .expect("audited constant-LUT lowering must succeed");
+        assert_eq!(
+            lowering.audited_constant_lut_contracts,
+            vec![vec![None, Some(BigUint::from(7u8)), Some(BigUint::from(11u8))]],
+        );
+    }
+
+    #[test]
+    fn audited_wrapper_contract_reaches_a_descendant_lut_without_recursive_scanning() {
+        let mut leaf = PolyCircuit::<DCRTPoly>::new();
+        let leaf_input = leaf.input(1);
+        let lookup = leaf.slot_transfer_gate(leaf_input, &[(0, None)]).as_single_wire();
+        leaf.gates.get_mut(&lookup).expect("lookup placeholder gate").gate_type =
+            PolyGateType::PubLut { lut_id: GateParamSource::Const(0) };
+        leaf.output([lookup]);
+
+        let mut wrapper = PolyCircuit::<DCRTPoly>::new();
+        let wrapper_input = wrapper.input(1);
+        let leaf_id = wrapper.register_sub_circuit(leaf);
+        let wrapper_output = wrapper.call_sub_circuit(leaf_id, [wrapper_input]);
+        wrapper.output(wrapper_output);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1);
+        let child_id = circuit.register_sub_circuit(wrapper);
+        let outputs = circuit.call_sub_circuit_with_max_plaintext_norms(
+            child_id,
+            [input],
+            [SubCircuitInputMaxPlaintextNormRange::new(0, 1, BigUint::from(6u8))],
+        );
+        circuit.output(outputs);
+
+        let mut lowering = RecordingLowering::default();
+        lower_circuit_structured(&circuit, 1usize, [3], &mut lowering)
+            .expect("audited wrapper-to-leaf LUT lowering must succeed");
+        assert!(
+            lowering.audited_constant_lut_contracts.contains(&vec![None, Some(BigUint::from(7u8))])
+        );
     }
 
     #[test]

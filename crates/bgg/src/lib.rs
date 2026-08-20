@@ -75,7 +75,7 @@ pub use tall_encoding::{
 pub use tall_rotation_encoding::{
     TallRotationDirection, TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts,
     TallRotationEncodingCompiler, TallRotationEncodingKey, TallRotationEncodingPreprocessingWires,
-    TallRotationEncodingWires, required_tall_rotation_encodings,
+    TallRotationEncodingWires, TallRotationPublicWires, required_tall_rotation_encodings,
 };
 pub use wee25_commitment::{
     Wee25CommitmentCompiler, Wee25CommitmentError, Wee25CommitmentTreeWire,

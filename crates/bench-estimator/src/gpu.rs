@@ -22,7 +22,7 @@ use mxx_runtime::{
     backend::{IndexRange, PreimageRequest, SampleRange, poly::gpu::GpuDcrtBackend},
 };
 use num_bigint::BigInt;
-use num_traits::ToPrimitive;
+use num_traits::{One, ToPrimitive};
 use std::{fmt, sync::Arc};
 use tracing::{debug, info};
 
@@ -262,13 +262,6 @@ impl GpuNodeMeasurementBackend {
                     .map(|_| backend.concat(&inputs, *axis).map_err(backend_error))
                     .collect()
             }
-            NodeKind::Reshape { rows, columns } => {
-                let rows = evaluate_usize(rows)?;
-                let columns = evaluate_usize(columns)?;
-                (0..batch_size)
-                    .map(|_| backend.reshape(matrix(0)?, rows, columns).map_err(backend_error))
-                    .collect()
-            }
             NodeKind::UniformResidueSample { .. } => {
                 let ty = output_matrix_type()?;
                 let range = SampleRange {
@@ -391,25 +384,54 @@ impl GpuNodeMeasurementBackend {
             NodeKind::GadgetDecompose { small, .. } => (0..batch_size)
                 .map(|_| backend.gadget_decompose(matrix(0)?, *small).map_err(backend_error))
                 .collect(),
-            NodeKind::ExtractCoefficient { position } => {
+            NodeKind::ExtractCoefficient { position, .. } => {
                 let position = evaluate_usize(position)?;
                 for _ in 0..batch_size {
                     backend.extract_coefficient(matrix(0)?, position).map_err(backend_error)?;
                 }
                 Ok(Vec::new())
             }
-            NodeKind::ConstantCoefficient { position } => {
-                let ty = output_matrix_type()?;
-                let position = evaluate_usize(position)?;
+            NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
+                let modulus = matrix_type
+                    .modulus
+                    .evaluate(bindings)
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                if modulus <= BigInt::one() {
+                    return Err(GpuMeasurementError(
+                        "constant-polynomial lift matrix modulus must exceed one".to_owned(),
+                    ));
+                }
+                let positive_dimension = |expression: &mxx_ir_core::IntExpr, label: &str| {
+                    expression
+                        .evaluate(bindings)
+                        .map_err(|error| GpuMeasurementError(error.to_string()))?
+                        .to_usize()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            GpuMeasurementError(format!(
+                                "constant-polynomial lift matrix {label} must be a positive usize"
+                            ))
+                        })
+                };
+                let ty = ConcreteMatrixType {
+                    modulus,
+                    ring_dimension: positive_dimension(
+                        &matrix_type.ring_dimension,
+                        "ring dimension",
+                    )?,
+                    rows: positive_dimension(&matrix_type.rows, "rows")?,
+                    columns: positive_dimension(&matrix_type.columns, "columns")?,
+                };
                 (0..batch_size)
                     .map(|_| {
-                        let coefficient = backend
-                            .extract_coefficient(matrix(0)?, position)
-                            .map_err(backend_error)?;
                         let identity = backend
-                            .constant_matrix(&ty, &ConstantMatrix::Identity, bindings)
+                            .constant_matrix(
+                                &ty,
+                                &mxx_ir_core::node::ConstantMatrix::Identity,
+                                bindings,
+                            )
                             .map_err(backend_error)?;
-                        backend.scale_integer(&identity, &coefficient).map_err(backend_error)
+                        backend.scale_integer(&identity, &BigInt::from(0)).map_err(backend_error)
                     })
                     .collect()
             }

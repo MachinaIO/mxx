@@ -70,23 +70,38 @@ impl<P: Poly + 'static> NegacyclicConvolutionContext<P> for NestedRnsPolyContext
         bindings
     }
 
-    fn reduce_q_level_row(&self, row: &[GateId], circuit: &mut PolyCircuit<P>) -> Vec<GateId> {
-        Self::reduce_q_level_row(self, row, circuit)
+    fn reduce_q_level_row(
+        &self,
+        row: &[GateId],
+        input_norms: &[BigUint],
+        circuit: &mut PolyCircuit<P>,
+    ) -> (Vec<GateId>, Vec<BigUint>) {
+        Self::reduce_q_level_row(self, row, input_norms, circuit)
     }
 
     fn mul_q_level_rows(
         &self,
         left: &[GateId],
         right: &[GateId],
+        left_norms: &[BigUint],
+        right_norms: &[BigUint],
         circuit: &mut PolyCircuit<P>,
     ) -> Vec<GateId> {
-        Self::mul_q_level_rows(self, left, right, circuit)
+        Self::mul_q_level_rows(self, left, right, left_norms, right_norms, circuit)
     }
 }
 
 impl<P: Poly + 'static> RingGswConvolution<P> for NestedRnsPoly<P> {
     fn physical_q_row_count(&self) -> usize {
         1
+    }
+
+    fn q_level_row_max_plaintext_norms(&self, physical_q_row: usize) -> Vec<BigUint> {
+        assert_eq!(physical_q_row, 0, "packed nested-RNS has one physical q row");
+        let active_levels = self.window.depth;
+        let trace = self.p_max_traces[..active_levels].iter().max().cloned().unwrap_or_default();
+        self.ctx.lookup_input_ranges_for_trace(&trace);
+        vec![trace; self.ctx.p_moduli.len()]
     }
 
     fn from_diagonal_q_level_outputs(

@@ -1426,14 +1426,6 @@ where
                 let output = self.backend.concat(&inputs, *axis).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
-            NodeKind::Reshape { rows, columns } => {
-                let input = self.matrix(values, node.args[0])?;
-                let rows = self.eval_usize(node.id, rows, env)?;
-                let columns = self.eval_usize(node.id, columns, env)?;
-                let output =
-                    self.backend.reshape(&input, rows, columns).map_err(Self::backend_error)?;
-                self.put(values, node.id, 0, RuntimeValue::matrix(output));
-            }
             NodeKind::UniformResidueSample { .. } => {
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
@@ -1671,7 +1663,7 @@ where
                     self.backend.gadget_decompose(&input, *small).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
-            NodeKind::ExtractCoefficient { position } => {
+            NodeKind::ExtractCoefficient { position, .. } => {
                 let input = self.matrix(values, node.args[0])?;
                 let position = self.eval_usize(node.id, position, env)?;
                 let output = self
@@ -1680,13 +1672,8 @@ where
                     .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::Int(output));
             }
-            NodeKind::ConstantCoefficient { position } => {
-                let input = self.matrix(values, node.args[0])?;
-                let position = self.eval_usize(node.id, position, env)?;
-                let coefficient = self
-                    .backend
-                    .extract_coefficient(&input, position)
-                    .map_err(Self::backend_error)?;
+            NodeKind::LiftIntegerToConstantPolynomial { .. } => {
+                let coefficient = self.int(values, node.args[0])?;
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
                 let identity = self
@@ -3443,8 +3430,14 @@ fn hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{artifact::MemoryArtifactStore, backend::poly::cpu_backend};
-    use mxx_dsl::{DslContext, Family, Int, MatType, Parallel, Ring, Sequential, Subgraph};
+    use crate::{
+        artifact::MemoryArtifactStore,
+        backend::poly::{CpuDcrtBackend, cpu_backend},
+    };
+    use mxx_dsl::{
+        DslContext, Family, HashTag, Int, MatType, Parallel, Ring, Sequential, Subgraph,
+        parallel_zip,
+    };
     use mxx_ir_core::{
         Graph, GraphOutput, IntExpr, NodeHandle, RealExpr, ValueHandle, WireType,
         artifact::ArtifactConfidentiality,
@@ -3524,6 +3517,38 @@ mod tests {
     }
 
     #[test]
+    fn integer_lift_writes_only_the_constant_polynomial_coefficient() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let context = DslContext::new("integer-lift-constant-polynomial");
+        let coefficient = context.int_family_input("coefficient", 1).get_static(0);
+        let lifted = coefficient.lift_to_constant_polynomial(ring.matrix_type((1, 1)));
+        let expected = ring.polynomial([IntExpr::constant(-3)]);
+        let graph = context
+            .output("lifted", lifted)
+            .expect("lifted output")
+            .output("expected", expected)
+            .expect("expected output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let result = execute(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::from([(
+                "coefficient".to_owned(),
+                RuntimeValue::IndexedFamily(vec![RuntimeValue::Int(BigInt::from(-3))]),
+            )]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        assert_eq!(matrix_output(&result, "lifted"), matrix_output(&result, "expected"));
+    }
+
+    #[test]
     fn range_loop_executes_in_bounded_waves_with_concrete_loop_indices() {
         let parameters = DCRTPolyParams::default();
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
@@ -3564,6 +3589,71 @@ mod tests {
         };
         assert_eq!(values.len(), 3);
         result.cleanup_staged(&mut store).expect("staged cleanup");
+    }
+
+    #[test]
+    fn dynamic_integer_hash_tags_are_deterministic_and_row_distinct() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let key = ring.bytes_input("key", 32);
+        let rows = Family::pack(
+            [2usize, 0, 1]
+                .into_iter()
+                .map(|row| Int::constant(row).add(Int::constant(0)))
+                .collect(),
+        )
+        .expect("row family");
+        let dummy = Family::pack(vec![Int::constant(0); 3]).expect("dummy family");
+        let samples = parallel_zip((rows, dummy), move |_, (row, _)| {
+            let mut tag = HashTag::from(b"mxx-bgg/lwe-lookup-low/v2:test:row:".as_slice());
+            tag.push(row);
+            ring.hash_matrix(key.clone(), tag, (1, 1))
+        })
+        .expect("dynamic hash family");
+        let validated = DslContext::new("runtime-dynamic-hash-tags")
+            .family_output("samples", samples)
+            .expect("sample output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+
+        let execute_samples = |backend: &mut CpuDcrtBackend, store: &mut MemoryArtifactStore| {
+            let mut result = execute(
+                &validated,
+                backend,
+                BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(vec![0x5a; 32]))]),
+                store,
+                SamplingMode::Fresh,
+            )
+            .expect("dynamic hash execution");
+            let RuntimeValue::IndexedFamily(values) =
+                result.materialize_output("samples", backend, store).expect("materialized hashes")
+            else {
+                panic!("dynamic hashes must materialize as a family")
+            };
+            values
+                .iter()
+                .map(|value| {
+                    let RuntimeValue::Matrix(matrix) = value else {
+                        panic!("dynamic hash member must be a matrix")
+                    };
+                    matrix.as_ref().clone()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut first_backend = cpu_backend([parameters.clone()]);
+        let mut first_store = MemoryArtifactStore::default();
+        let first = execute_samples(&mut first_backend, &mut first_store);
+        let mut second_backend = cpu_backend([parameters]);
+        let mut second_store = MemoryArtifactStore::default();
+        let second = execute_samples(&mut second_backend, &mut second_store);
+        assert_eq!(first, second);
+        assert_ne!(first[0], first[1]);
+        assert_ne!(first[0], first[2]);
+        assert_ne!(first[1], first[2]);
     }
 
     #[test]

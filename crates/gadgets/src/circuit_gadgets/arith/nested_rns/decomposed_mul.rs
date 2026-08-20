@@ -329,12 +329,18 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
         let mut helper_circuit = circuit.fresh_sub_circuit();
         let helper_ctx = Arc::new(nested_rns.as_ref().clone());
         let helper_metadata = NestedRnsPoly::<P>::normalized_metadata(helper_ctx.as_ref(), window);
+        let helper_trace_bound =
+            helper_metadata.p_max_traces.iter().max().cloned().unwrap_or(BigUint::ZERO);
+        helper_ctx.lookup_input_ranges_for_trace(&helper_trace_bound);
+        let helper_input_norms = vec![helper_trace_bound; helper_ctx.p_moduli.len()];
         let term_helper =
             Arc::new(negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit::<P>(
                 circuit,
                 nested_rns.as_ref(),
                 1,
                 num_slots,
+                &helper_input_norms,
+                &helper_input_norms,
             ));
         let term_batch_capacity = DIRECT_TERM_HELPER_BATCH;
         let term_batch_subcircuit_id =

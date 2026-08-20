@@ -215,6 +215,18 @@ impl StructuredCircuitLowering<DCRTPoly> for RuntimeLowering {
             .map_err(|error| crate::circuit::CircuitLowerError::GraphStructure(error.to_string()))
     }
 
+    fn call_audited_constant_lut_subgraph(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<Mat>,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<Vec<Mat>, crate::circuit::CircuitLowerError<Self::Error>> {
+        // This unit-test lowerer executes DSL values only; it emits no checker evidence, so the
+        // producer contract has no runtime effect here. The subgraph call itself is preserved.
+        drop(canonical_input_exclusive_uppers);
+        self.call_subgraph(definition, inputs)
+    }
+
     fn call_subgraph_parallel(
         &mut self,
         definition: &Self::Subgraph,
@@ -259,6 +271,18 @@ impl StructuredCircuitLowering<DCRTPoly> for RuntimeLowering {
             }
         }
         Ok(outputs)
+    }
+
+    fn call_audited_constant_lut_subgraph_parallel(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<Vec<Mat>>,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<Vec<Vec<Mat>>, crate::circuit::CircuitLowerError<Self::Error>> {
+        // This unit-test lowerer executes DSL values only; it emits no checker evidence, so the
+        // producer contract has no runtime effect here. The subgraph calls themselves are kept.
+        drop(canonical_input_exclusive_uppers);
+        self.call_subgraph_parallel(definition, inputs)
     }
 }
 
@@ -459,15 +483,18 @@ impl NegacyclicConvolutionContext<DCRTPoly> for ScalarArithmeticContext {
     fn reduce_q_level_row(
         &self,
         row: &[GateId],
+        input_norms: &[BigUint],
         _circuit: &mut PolyCircuit<DCRTPoly>,
-    ) -> Vec<GateId> {
-        row.to_vec()
+    ) -> (Vec<GateId>, Vec<BigUint>) {
+        (row.to_vec(), input_norms.to_vec())
     }
 
     fn mul_q_level_rows(
         &self,
         left: &[GateId],
         right: &[GateId],
+        _left_norms: &[BigUint],
+        _right_norms: &[BigUint],
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Vec<GateId> {
         assert_eq!(left.len(), 1);
@@ -770,6 +797,10 @@ impl DecomposeArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
 }
 
 impl RingGswConvolution<DCRTPoly> for ScalarArithmeticEntry {
+    fn q_level_row_max_plaintext_norms(&self, physical_q_row: usize) -> Vec<BigUint> {
+        vec![self.p_max_traces[physical_q_row].clone()]
+    }
+
     fn from_diagonal_q_level_outputs(
         template: &Self,
         q_level_outputs: Vec<Vec<BatchedWire>>,

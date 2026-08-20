@@ -18,7 +18,10 @@ mod montgomery;
 mod nested_rns;
 
 use crate::{
-    circuit::{BatchedWire, PolyCircuit, SubCircuitParamSpec, SubCircuitParamValue, gate::GateId},
+    circuit::{
+        BatchedWire, PolyCircuit, SubCircuitInputMaxPlaintextNormRange, SubCircuitParamSpec,
+        SubCircuitParamValue, gate::GateId,
+    },
     circuit_gadgets::arith::{ModularArithmeticContext, ModularArithmeticGadget},
     poly::{Poly, PolyParams},
 };
@@ -45,12 +48,19 @@ pub trait NegacyclicConvolutionContext<P: Poly>: ModularArithmeticContext<P> {
         self.q_level_diagonal_product_param_bindings(diagonal, num_slots)
     }
 
-    fn reduce_q_level_row(&self, row: &[GateId], circuit: &mut PolyCircuit<P>) -> Vec<GateId>;
+    fn reduce_q_level_row(
+        &self,
+        row: &[GateId],
+        input_norms: &[BigUint],
+        circuit: &mut PolyCircuit<P>,
+    ) -> (Vec<GateId>, Vec<BigUint>);
 
     fn mul_q_level_rows(
         &self,
         left: &[GateId],
         right: &[GateId],
+        left_norms: &[BigUint],
+        right_norms: &[BigUint],
         circuit: &mut PolyCircuit<P>,
     ) -> Vec<GateId>;
 }
@@ -62,6 +72,8 @@ where
     fn physical_q_row_count(&self) -> usize {
         self.active_q_moduli().len()
     }
+
+    fn q_level_row_max_plaintext_norms(&self, physical_q_row: usize) -> Vec<BigUint>;
 
     fn from_diagonal_q_level_outputs(
         template: &Self,
@@ -78,6 +90,35 @@ where
         p_max_trace: BigUint,
         circuit: &mut PolyCircuit<P>,
     ) -> Self;
+}
+
+fn diagonal_product_input_ranges<P: Poly, A: RingGswConvolution<P>>(
+    lhs: &A,
+    rhs: &A,
+    physical_q_row: usize,
+) -> Vec<SubCircuitInputMaxPlaintextNormRange>
+where
+    A::Context: NegacyclicConvolutionContext<P>,
+{
+    let mut norms = lhs.q_level_row_max_plaintext_norms(physical_q_row);
+    norms.extend(rhs.q_level_row_max_plaintext_norms(physical_q_row));
+    SubCircuitInputMaxPlaintextNormRange::compress(&norms)
+}
+
+fn maximum_physical_row_norms<P: Poly, A: RingGswConvolution<P>>(value: &A) -> Vec<BigUint>
+where
+    A::Context: NegacyclicConvolutionContext<P>,
+{
+    let mut rows =
+        (0..value.physical_q_row_count()).map(|row| value.q_level_row_max_plaintext_norms(row));
+    let mut maxima = rows.next().expect("convolution requires a physical q row");
+    for row in rows {
+        assert_eq!(row.len(), maxima.len());
+        for (maximum, bound) in maxima.iter_mut().zip(row) {
+            *maximum = std::cmp::max(std::mem::take(maximum), bound);
+        }
+    }
+    maxima
 }
 
 fn validate_inputs<P: Poly, A: RingGswConvolution<P>>(
@@ -141,12 +182,16 @@ fn q_level_diagonal_product_param_bindings<P: Poly, C: NegacyclicConvolutionCont
 fn q_level_diagonal_product_subcircuit<P: Poly + 'static, C: NegacyclicConvolutionContext<P>>(
     source_circuit: &PolyCircuit<P>,
     template_ctx: &C,
+    lhs_input_norms: &[BigUint],
+    rhs_input_norms: &[BigUint],
 ) -> PolyCircuit<P> {
     let mut circuit = source_circuit.fresh_sub_circuit();
     let ctx = Arc::new(template_ctx.clone());
     let p_moduli_depth = ctx.q_level_row_width();
     let param_specs = ctx.q_level_diagonal_product_param_specs();
     assert_eq!(param_specs.len(), p_moduli_depth + 1);
+    assert_eq!(lhs_input_norms.len(), p_moduli_depth);
+    assert_eq!(rhs_input_norms.len(), p_moduli_depth);
     let lhs_slot_transfer_param_ids = param_specs[..p_moduli_depth]
         .iter()
         .cloned()
@@ -165,14 +210,29 @@ fn q_level_diagonal_product_subcircuit<P: Poly + 'static, C: NegacyclicConvoluti
                 .as_single_wire()
         })
         .collect::<Vec<_>>();
-    let lhs_diagonal = ctx.reduce_q_level_row(&lhs_transferred, &mut circuit);
+    let lhs_transferred_norms = lhs_input_norms
+        .iter()
+        .zip(&param_specs[..p_moduli_depth])
+        .map(|(bound, spec)| match spec {
+            SubCircuitParamSpec::SlotTransfer { max_scalar } => bound * BigUint::from(*max_scalar),
+            _ => panic!("diagonal lhs parameter must be a slot transfer"),
+        })
+        .collect::<Vec<_>>();
+    let (lhs_diagonal, lhs_diagonal_norms) =
+        ctx.reduce_q_level_row(&lhs_transferred, &lhs_transferred_norms, &mut circuit);
     let rhs_rotated = rhs_row
         .iter()
         .map(|&gate_id| {
             circuit.slot_transfer_gate_param(gate_id, rhs_slot_transfer_param_id).as_single_wire()
         })
         .collect::<Vec<_>>();
-    let product_row = ctx.mul_q_level_rows(&lhs_diagonal, &rhs_rotated, &mut circuit);
+    let product_row = ctx.mul_q_level_rows(
+        &lhs_diagonal,
+        &rhs_rotated,
+        &lhs_diagonal_norms,
+        rhs_input_norms,
+        &mut circuit,
+    );
     circuit.output(product_row);
     circuit
 }
@@ -269,6 +329,8 @@ pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_subcircuit<P: Poly 
     template_ctx: &impl NegacyclicConvolutionContext<P>,
     row_count: usize,
     num_slots: usize,
+    lhs_input_norms: &[BigUint],
+    rhs_input_norms: &[BigUint],
 ) -> PolyCircuit<P> {
     assert!(
         row_count > 0,
@@ -278,10 +340,13 @@ pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_subcircuit<P: Poly 
     let mut circuit = source_circuit.fresh_sub_circuit();
     let ctx = Arc::new(template_ctx.clone());
     let p_moduli_depth = ctx.q_level_row_width();
-    let diagonal_product_id = circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<
-        P,
-        _,
-    >(source_circuit, ctx.as_ref()));
+    let diagonal_product_id =
+        circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<P, _>(
+            source_circuit,
+            ctx.as_ref(),
+            lhs_input_norms,
+            rhs_input_norms,
+        ));
     let left_rows =
         (0..row_count).map(|_| circuit.input(p_moduli_depth).to_vec()).collect::<Vec<_>>();
     let term_row = circuit.input(p_moduli_depth).to_vec();
@@ -326,6 +391,8 @@ pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit<
     template_ctx: &impl NegacyclicConvolutionContext<P>,
     row_count: usize,
     num_slots: usize,
+    lhs_input_norms: &[BigUint],
+    rhs_input_norms: &[BigUint],
 ) -> PolyCircuit<P> {
     assert!(
         row_count > 0,
@@ -335,10 +402,13 @@ pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit<
     let mut circuit = source_circuit.fresh_sub_circuit();
     let ctx = Arc::new(template_ctx.clone());
     let p_moduli_depth = ctx.q_level_row_width();
-    let diagonal_product_id = circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<
-        P,
-        _,
-    >(source_circuit, ctx.as_ref()));
+    let diagonal_product_id =
+        circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<P, _>(
+            source_circuit,
+            ctx.as_ref(),
+            lhs_input_norms,
+            rhs_input_norms,
+        ));
     let left_rows =
         (0..row_count).map(|_| circuit.input(p_moduli_depth).to_vec()).collect::<Vec<_>>();
     let term_row = circuit.input(p_moduli_depth).to_vec();
@@ -404,9 +474,18 @@ where
             )
         })
         .collect::<Vec<_>>();
-    let diagonal_product_subcircuit =
-        q_level_diagonal_product_subcircuit::<P, _>(circuit, lhs.context().as_ref());
+    let lhs_template_norms = maximum_physical_row_norms(lhs);
+    let rhs_template_norms = maximum_physical_row_norms(rhs);
+    let diagonal_product_subcircuit = q_level_diagonal_product_subcircuit::<P, _>(
+        circuit,
+        lhs.context().as_ref(),
+        &lhs_template_norms,
+        &rhs_template_norms,
+    );
     let diagonal_product_id = circuit.register_sub_circuit(diagonal_product_subcircuit);
+    let diagonal_input_ranges = (0..lhs.physical_q_row_count())
+        .map(|q_idx| diagonal_product_input_ranges(lhs, rhs, q_idx))
+        .collect::<Vec<_>>();
     debug!(
         "negacyclic_conv_mul prepared {} diagonal templates in parallel: num_slots={}, active_levels={}, elapsed_ms={}",
         diagonal_output_templates.len(),
@@ -425,8 +504,12 @@ where
         let mut q_level_outputs = Vec::with_capacity(lhs.physical_q_row_count());
         for q_idx in 0..lhs.physical_q_row_count() {
             let inputs = vec![lhs.q_level_row_batch(q_idx), rhs.q_level_row_batch(q_idx)];
-            let outputs =
-                circuit.call_sub_circuit_with_bindings(diagonal_product_id, &inputs, &bindings);
+            let outputs = circuit.call_sub_circuit_with_bindings_and_max_plaintext_norms(
+                diagonal_product_id,
+                &inputs,
+                &bindings,
+                diagonal_input_ranges[q_idx].clone(),
+            );
             q_level_outputs.push(outputs);
         }
         diagonal_terms.push(A::from_diagonal_q_level_outputs(
@@ -473,10 +556,17 @@ where
         rhs_q_idx,
         active_levels
     );
-    let diagonal_product_subcircuit =
-        q_level_diagonal_product_subcircuit::<P, _>(circuit, lhs.context().as_ref());
+    let lhs_template_norms = lhs.q_level_row_max_plaintext_norms(0);
+    let rhs_template_norms = rhs.q_level_row_max_plaintext_norms(0);
+    let diagonal_product_subcircuit = q_level_diagonal_product_subcircuit::<P, _>(
+        circuit,
+        lhs.context().as_ref(),
+        &lhs_template_norms,
+        &rhs_template_norms,
+    );
     let diagonal_product_id = circuit.register_sub_circuit(diagonal_product_subcircuit);
     let shared_inputs = vec![lhs.q_level_row_batch(rhs_q_idx), rhs.q_level_row_batch(rhs_q_idx)];
+    let diagonal_input_ranges = diagonal_product_input_ranges(lhs, rhs, 0);
     let diagonal_output_templates = (0..num_slots)
         .into_par_iter()
         .map(|diagonal| {
@@ -500,8 +590,12 @@ where
             num_slots,
             lhs.crt_window().depth,
         );
-        let outputs =
-            circuit.call_sub_circuit_with_bindings(diagonal_product_id, &shared_inputs, &bindings);
+        let outputs = circuit.call_sub_circuit_with_bindings_and_max_plaintext_norms(
+            diagonal_product_id,
+            &shared_inputs,
+            &bindings,
+            diagonal_input_ranges.clone(),
+        );
         diagonal_terms.push(A::from_sparse_diagonal_q_level_output(
             lhs,
             rhs_q_idx,

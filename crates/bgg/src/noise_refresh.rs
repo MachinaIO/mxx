@@ -434,15 +434,13 @@ impl NaiveBggNoiseRefreshCompiler {
         Ok(Family::pack(
             (0..self.slot_count)
                 .map(|slot| {
-                    wide.clone()
-                        .slice(
-                            None,
-                            Some(IndexRange {
-                                start: IntExpr::constant(slot * self.public_key_columns()),
-                                end: IntExpr::constant((slot + 1) * self.public_key_columns()),
-                            }),
-                        )
-                        .reshape(1, self.public_key_columns())
+                    wide.clone().slice(
+                        None,
+                        Some(IndexRange {
+                            start: IntExpr::constant(slot * self.public_key_columns()),
+                            end: IntExpr::constant((slot + 1) * self.public_key_columns()),
+                        }),
+                    )
                 })
                 .collect(),
         )?)

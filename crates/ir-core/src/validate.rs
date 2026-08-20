@@ -97,7 +97,42 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
         for (scope_id, scope) in graph.scopes() {
             let parent_declared = declared_by_scope.get(scope_id).cloned().unwrap_or_default();
             for (position, node) in scope.nodes().iter().enumerate() {
-                let Some(child) = graph.child_scope_id(scope_id, NodeId(position as u64)) else {
+                let node_id = NodeId(position as u64);
+                if let NodeKind::SubgraphCall(call) = node.kind() {
+                    if call.canonical_input_exclusive_uppers.len() != node.arguments().len() {
+                        return Err(ValidationError::Node {
+                            scope: scope_id.clone(),
+                            node: node_id,
+                            message: "canonical input exclusive upper bound count does not match call arguments"
+                                .to_owned(),
+                        });
+                    }
+                    if call
+                        .canonical_input_exclusive_uppers
+                        .iter()
+                        .any(|upper| upper.as_ref().is_some_and(|upper| upper.is_zero()))
+                    {
+                        return Err(ValidationError::Node {
+                            scope: scope_id.clone(),
+                            node: node_id,
+                            message: "canonical input exclusive upper bounds must be positive"
+                                .to_owned(),
+                        });
+                    }
+                    if call.canonical_input_exclusive_uppers.iter().zip(node.arguments()).any(
+                        |(upper, argument)| {
+                            upper.is_some() && !matches!(argument.wire_type(), WireType::Matrix(_))
+                        },
+                    ) {
+                        return Err(ValidationError::Node {
+                            scope: scope_id.clone(),
+                            node: node_id,
+                            message: "canonical input exclusive upper bounds require matrix call arguments"
+                                .to_owned(),
+                        });
+                    }
+                }
+                let Some(child) = graph.child_scope_id(scope_id, node_id) else {
                     continue;
                 };
                 let binding_names = match node.kind() {
@@ -318,8 +353,8 @@ pub fn validate_with_manifests(
     check_manifests(manifests)?;
     check_bindings(graph, bindings)?;
     check_topological(graph)?;
-    // This is the single source for parameter-only validity and is also emitted as Lean
-    // `ParamsValid`. The remaining validation derives concrete types, checks wire flow and
+    // This is the single source for parameter-only validity used by operational checking.
+    // The remaining validation derives concrete types, checks wire flow and
     // shapes, and constructs execution/liveness data.
     crate::constraints::evaluate_param_constraints(graph, bindings)?;
 
@@ -637,17 +672,6 @@ fn validate_node(
                 .collect::<Result<Vec<_>, _>>()?;
             vec![ConcreteWireType::Matrix(concat_type(&inputs, *axis, scope, node.id)?)]
         }
-        NodeKind::Reshape { rows, columns } => {
-            require_arity(scope, node, 1)?;
-            let input = matrix_argument(scope, values, node, 0)?;
-            let rows = positive_usize(rows.evaluate(env)?, "reshape rows", scope, node.id)?;
-            let columns =
-                positive_usize(columns.evaluate(env)?, "reshape columns", scope, node.id)?;
-            if rows.saturating_mul(columns) != input.rows.saturating_mul(input.columns) {
-                return node_error(scope, node.id, "reshape changes the element count");
-            }
-            vec![ConcreteWireType::Matrix(ConcreteMatrixType { rows, columns, ..input })]
-        }
         NodeKind::UniformResidueSample { matrix_type } => {
             require_arity(scope, node, 0)?;
             vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
@@ -805,7 +829,7 @@ fn validate_node(
             })?;
             vec![ConcreteWireType::Preimage(ConcreteMatrixType { rows, ..input })]
         }
-        NodeKind::ExtractCoefficient { position } | NodeKind::ConstantCoefficient { position } => {
+        NodeKind::ExtractCoefficient { position, .. } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
             let position =
@@ -813,11 +837,23 @@ fn validate_node(
             if !input.is_scalar() || position >= input.ring_dimension {
                 return node_error(scope, node.id, "coefficient extraction position is invalid");
             }
-            if matches!(node.kind, NodeKind::ExtractCoefficient { .. }) {
-                vec![ConcreteWireType::Int]
-            } else {
-                vec![ConcreteWireType::Matrix(input)]
+            vec![ConcreteWireType::Int]
+        }
+        NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
+            require_arity(scope, node, 1)?;
+            if !matches!(values.get(&node.args[0]), Some(ConcreteWireType::Int)) {
+                return node_error(scope, node.id, "constant-polynomial lift requires an integer");
             }
+            let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
+            if !matrix.is_scalar() || matrix.modulus <= BigInt::zero() || matrix.ring_dimension == 0
+            {
+                return node_error(
+                    scope,
+                    node.id,
+                    "constant-polynomial lift requires a positive scalar matrix type",
+                );
+            }
+            vec![ConcreteWireType::Matrix(matrix)]
         }
         NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
             require_arity(scope, node, 1)?;
@@ -1680,19 +1716,6 @@ mod tests {
             vec![WireType::Matrix(residue_type)],
         );
         assert!(validate(&graph("uniform-residue", residue), &ParamEnv::default()).is_ok());
-
-        let source = input("source", matrix_type(17, 2, 2));
-        let reshape = value(
-            NodeKind::Reshape { rows: IntExpr::constant(3), columns: IntExpr::constant(1) },
-            vec![source],
-            vec![WireType::Matrix(matrix_type(17, 3, 1))],
-        );
-        assert_eq!(
-            node_message(
-                validate(&graph("invalid-reshape", reshape), &ParamEnv::default()).unwrap_err()
-            ),
-            "reshape changes the element count"
-        );
     }
 
     #[test]
@@ -2004,6 +2027,38 @@ mod tests {
         assert_eq!(
             child_loop_dependencies(&parent, &[("i".to_owned(), IntExpr::Var("i".to_owned()))]),
             BTreeSet::from(["i".to_owned()])
+        );
+    }
+
+    #[test]
+    fn subgraph_call_requires_one_positive_canonical_upper_per_argument() {
+        let body = crate::with_new_construction_scope(|scope| {
+            let value = input("body-value", matrix_type(17, 1, 1));
+            crate::SubgraphHandle::new("bounded-subgraph", scope, vec![value.clone()], vec![value])
+                .expect("subgraph")
+        });
+        let outer = input("outer-value", matrix_type(17, 1, 1));
+        let missing =
+            NodeHandle::subgraph_call(body.clone(), vec![outer.clone()], Vec::new(), Vec::new())
+                .output(0)
+                .expect("output");
+        assert_eq!(
+            node_message(
+                validate(&graph("missing-upper", missing), &ParamEnv::default()).unwrap_err()
+            ),
+            "canonical input exclusive upper bound count does not match call arguments"
+        );
+        let zero = NodeHandle::subgraph_call(
+            body,
+            vec![outer],
+            Vec::new(),
+            vec![Some(num_bigint::BigUint::zero())],
+        )
+        .output(0)
+        .expect("output");
+        assert_eq!(
+            node_message(validate(&graph("zero-upper", zero), &ParamEnv::default()).unwrap_err()),
+            "canonical input exclusive upper bounds must be positive"
         );
     }
 

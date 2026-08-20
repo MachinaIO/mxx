@@ -14,6 +14,7 @@ use mxx_ir_core::{
     },
     types::{MatrixType, WireType},
 };
+use num_bigint::BigUint;
 use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
@@ -57,6 +58,12 @@ pub enum DslError {
     SubgraphCapture,
     #[error("graph value schema does not match its flattened values")]
     Schema,
+    #[error("canonical input exclusive upper bound count does not match flattened subgraph inputs")]
+    CanonicalInputUpperCount,
+    #[error("canonical input exclusive upper bounds must be positive")]
+    CanonicalInputUpperZero,
+    #[error("canonical input exclusive upper bounds require matrix subgraph inputs")]
+    CanonicalInputUpperNonMatrix,
     #[error("parallel families have different counts")]
     FamilyCountMismatch,
     #[error(transparent)]
@@ -532,7 +539,9 @@ impl Ring {
     ) -> Mat {
         let ty = self.matrix_type(shape);
         let tag = tag.into();
-        let pending = key.pending.clone();
+        let pending = Pending::merge([key.pending.clone(), tag.pending]);
+        let mut arguments = vec![key.value];
+        arguments.extend(tag.dynamic);
         let node = NodeHandle::new(
             NodeKind::HashSample {
                 matrix_type: ty.clone(),
@@ -544,7 +553,7 @@ impl Ring {
                 base,
                 digit_count,
             },
-            vec![key.value],
+            arguments,
             vec![WireType::Matrix(ty.clone())],
         );
         Mat { value: node.output(0).expect("hash output"), matrix_type: ty, pending }
@@ -642,12 +651,14 @@ impl Ring {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default)]
 pub struct HashTag {
     prefix: Vec<u8>,
     binary: Vec<IntExpr>,
     decimal: Vec<IntExpr>,
     u64_le: Vec<IntExpr>,
+    dynamic: Vec<ValueHandle>,
+    pending: Pending,
 }
 
 impl HashTag {
@@ -702,6 +713,13 @@ impl HashTagPart for LoopIndex {
 impl HashTagPart for IntExpr {
     fn append_to(self, tag: &mut HashTag) {
         tag.u64_le.push(self);
+    }
+}
+
+impl HashTagPart for Int {
+    fn append_to(self, tag: &mut HashTag) {
+        tag.dynamic.push(self.value);
+        tag.pending = Pending::merge([std::mem::take(&mut tag.pending), self.pending]);
     }
 }
 
@@ -783,15 +801,6 @@ impl Mat {
     }
 
     #[track_caller]
-    pub fn reshape(self, rows: impl Into<IntExpr>, columns: impl Into<IntExpr>) -> Self {
-        let rows = rows.into();
-        let columns = columns.into();
-        let ty =
-            MatrixType { rows: rows.clone(), columns: columns.clone(), ..self.matrix_type.clone() };
-        Self::from_node(NodeKind::Reshape { rows, columns }, vec![self], ty)
-    }
-
-    #[track_caller]
     pub fn tensor(self, rhs: Mat) -> Self {
         let ty = MatrixType {
             rows: IntExpr::Mul(
@@ -826,7 +835,8 @@ impl Mat {
             rows: IntExpr::Mul(
                 Box::new(self.matrix_type.rows.clone()),
                 Box::new(digit_count.clone()),
-            ),
+            )
+            .canonicalize(),
             ..self.matrix_type.clone()
         };
         let pending = self.pending;
@@ -840,9 +850,23 @@ impl Mat {
 
     #[track_caller]
     pub fn extract_coefficient(self, position: impl Into<IntExpr>) -> Int {
+        self.extract_coefficient_with_canonical_input_exclusive_upper(position, None)
+    }
+
+    /// Extracts a coefficient and optionally records a compile-time-only
+    /// exclusive upper bound for a canonical input integer.
+    #[track_caller]
+    pub fn extract_coefficient_with_canonical_input_exclusive_upper(
+        self,
+        position: impl Into<IntExpr>,
+        canonical_input_exclusive_upper: Option<num_bigint::BigUint>,
+    ) -> Int {
         let pending = self.pending;
         let node = NodeHandle::new(
-            NodeKind::ExtractCoefficient { position: position.into() },
+            NodeKind::ExtractCoefficient {
+                position: position.into(),
+                canonical_input_exclusive_upper,
+            },
             vec![self.value],
             vec![WireType::Int],
         );
@@ -866,12 +890,6 @@ impl Mat {
             bits.extend((0..coefficient_bits).map(|bit| value.clone().bit(bit)));
         }
         Family::<Bool>::pack_bools(bits)
-    }
-
-    #[track_caller]
-    pub fn constant_coefficient(self, position: impl Into<IntExpr>) -> Mat {
-        let ty = self.matrix_type.clone();
-        Self::from_node(NodeKind::ConstantCoefficient { position: position.into() }, vec![self], ty)
     }
 
     #[track_caller]
@@ -1388,6 +1406,19 @@ impl Int {
             vec![WireType::Bool],
         );
         Bool { value: node.output(0).expect("integer bit"), pending: self.pending }
+    }
+
+    #[track_caller]
+    pub fn lift_to_constant_polynomial(self, matrix_type: MatrixType) -> Mat {
+        assert_eq!(matrix_type.rows, IntExpr::constant(1), "constant-polynomial lift is scalar");
+        assert_eq!(matrix_type.columns, IntExpr::constant(1), "constant-polynomial lift is scalar");
+        let pending = self.pending;
+        let node = NodeHandle::new(
+            NodeKind::LiftIntegerToConstantPolynomial { matrix_type: matrix_type.clone() },
+            vec![self.value],
+            vec![WireType::Matrix(matrix_type.clone())],
+        );
+        Mat { value: node.output(0).expect("constant-polynomial lift"), matrix_type, pending }
     }
 
     fn compare(self, rhs: Self, operation: mxx_ir_core::node::IntCompareOp) -> Bool {
@@ -4412,14 +4443,58 @@ impl<I: GraphValue, O: GraphValue> Subgraph<I, O> {
     }
 
     pub fn call(&self, input: I) -> Result<O, DslError> {
-        let node = NodeHandle::subgraph_call(self.handle.clone(), input.flatten(), Vec::new());
+        let flattened = input.flatten();
+        let input_count = flattened.len();
+        self.call_flattened(flattened, input.pending(), vec![None; input_count])
+    }
+
+    /// Calls this subgraph with authoritative canonical coefficient bounds for
+    /// its flattened arguments.  `Some(U)` means a constant-polynomial
+    /// argument has canonical coefficients in `0..U`; `None` supplies no
+    /// such contract.  The vector includes every argument, including a
+    /// synthetic constant-one argument when the caller supplies one.
+    pub fn call_with_canonical_input_exclusive_uppers(
+        &self,
+        input: I,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<O, DslError> {
+        let flattened = input.flatten();
+        self.call_flattened(flattened, input.pending(), canonical_input_exclusive_uppers)
+    }
+
+    fn call_flattened(
+        &self,
+        flattened: Vec<ValueHandle>,
+        input_pending: Pending,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<O, DslError> {
+        if canonical_input_exclusive_uppers.len() != flattened.len() {
+            return Err(DslError::CanonicalInputUpperCount);
+        }
+        if canonical_input_exclusive_uppers
+            .iter()
+            .any(|upper| upper.as_ref().is_some_and(|upper| upper == &BigUint::from(0u8)))
+        {
+            return Err(DslError::CanonicalInputUpperZero);
+        }
+        if canonical_input_exclusive_uppers.iter().zip(&flattened).any(|(upper, input)| {
+            upper.is_some() && !matches!(input.wire_type(), WireType::Matrix(_))
+        }) {
+            return Err(DslError::CanonicalInputUpperNonMatrix);
+        }
+        let node = NodeHandle::subgraph_call(
+            self.handle.clone(),
+            flattened,
+            Vec::new(),
+            canonical_input_exclusive_uppers,
+        );
         let values = (0..self.output_schema.wire_types().len())
             .map(|port| node.output(port as u32).expect("subgraph output"))
             .collect::<Vec<_>>();
         O::from_values(
             &self.output_schema,
             &values,
-            Pending::merge([input.pending(), self.pending.clone()]),
+            Pending::merge([input_pending, self.pending.clone()]),
         )
     }
 }
@@ -4483,6 +4558,29 @@ mod tests {
         let input = ring.input("input", (2, 2));
         let output = input.clone() + input;
         let built = DslContext::new("sum").output("sum", output).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn dynamic_integer_hash_tag_is_an_explicit_argument_and_preserves_pending_metadata() {
+        let ring = Ring::new(17, 8);
+        let row = Int::constant(7).add(Int::constant(0)).semantic_anchor("hash-row").unwrap();
+        let mut tag = HashTag::from(b"dynamic-hash/v1:".as_slice());
+        tag.push(row);
+        let sample = ring.hash_matrix(ring.bytes_input("key", 32), tag, (1, 1));
+        let built =
+            DslContext::new("dynamic-hash-tag").output("sample", sample).unwrap().build().unwrap();
+
+        let hash = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+            .expect("hash sample");
+        assert_eq!(hash.arguments().len(), 2);
+        assert!(matches!(hash.arguments()[1].wire_type(), WireType::Int));
+        assert_eq!(built.anchors.get("hash-row").expect("dynamic tag anchor").len(), 1);
         built.validate(&ParamEnv::default()).unwrap();
     }
 
@@ -4611,6 +4709,23 @@ mod tests {
                 .flat_map(|scope| scope.nodes())
                 .any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
         );
+    }
+
+    #[test]
+    fn generated_index_family_gather_has_no_explicit_family_pack() {
+        let context = DslContext::new("generated-index-family-gather");
+        let values = context.int_family_input("values", 8);
+        let indices =
+            Parallel::range(2).map_values(|index| index.as_int().mul(Int::constant(3))).unwrap();
+        let gathered = values.parallel_gather(indices).unwrap();
+        let built = context.int_family_output("gathered", gathered).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+
+        let all_nodes =
+            built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
+        assert!(all_nodes.iter().any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))));
+        assert!(all_nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic)));
+        assert!(!all_nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyPack { .. })));
     }
 
     #[test]
@@ -4894,5 +5009,60 @@ mod tests {
         let selected = Family::select(selector, vec![left, right]).unwrap();
         let built = context.public_family_output("selected", selected).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn subgraph_call_carries_canonical_input_exclusive_uppers() {
+        let ring = Ring::new(17, 8);
+        let matrix = MatType(ring.matrix_type((1, 1)));
+        let subgraph = Subgraph::<Mat, Mat>::define("bounded-matrix", matrix, |value| value)
+            .expect("subgraph definition");
+        let context = DslContext::new("bounded-subgraph");
+        let output = subgraph
+            .call_with_canonical_input_exclusive_uppers(
+                ring.input("input", (1, 1)),
+                vec![Some(BigUint::from(4u8))],
+            )
+            .expect("bounded subgraph call");
+        let built = context.output("output", output).expect("output").build().expect("graph");
+        let call = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find_map(|node| match node.kind() {
+                NodeKind::SubgraphCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("subgraph call node");
+        assert_eq!(call.canonical_input_exclusive_uppers, vec![Some(BigUint::from(4u8))]);
+        let encoded = serde_json::to_vec(&built.graph).expect("serialize graph");
+        let decoded: Graph = serde_json::from_slice(&encoded).expect("deserialize graph");
+        assert_eq!(built.graph, decoded);
+        mxx_ir_core::validate(&decoded, &ParamEnv::default()).expect("valid graph");
+    }
+
+    #[test]
+    fn subgraph_call_rejects_invalid_canonical_input_exclusive_uppers() {
+        let subgraph = Subgraph::<Int, Int>::define("bounded-int-errors", IntType, |value| value)
+            .expect("subgraph definition");
+        assert!(matches!(
+            subgraph.call_with_canonical_input_exclusive_uppers(Int::constant(0), Vec::new()),
+            Err(DslError::CanonicalInputUpperCount)
+        ));
+        assert!(matches!(
+            subgraph.call_with_canonical_input_exclusive_uppers(
+                Int::constant(0),
+                vec![Some(BigUint::from(0u8))]
+            ),
+            Err(DslError::CanonicalInputUpperZero)
+        ));
+        assert!(matches!(
+            subgraph.call_with_canonical_input_exclusive_uppers(
+                Int::constant(0),
+                vec![Some(BigUint::from(1u8))]
+            ),
+            Err(DslError::CanonicalInputUpperNonMatrix)
+        ));
     }
 }

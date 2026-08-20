@@ -3,9 +3,10 @@
 use crate::{
     ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec,
     EndpointAnchor, EndpointAnchors, EndpointSemanticBinding, EndpointSpecId, InputContract,
-    InputContractEntry, InputValueContract, OutputRef, ParameterDecl, ParameterKind, ProtocolDecl,
-    ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
-    ProtocolStage, StageId, StageInputName, Workflow,
+    InputContractEntry, InputValueContract, OperationalDecoderKind, OperationalDecoderTarget,
+    OutputRef, ParameterDecl, ParameterKind, ProtocolDecl, ProtocolInputBinding,
+    ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage, StageId,
+    StageInputName, Workflow,
 };
 use mxx_dsl::{DerivationAttachmentValue, DslContext, GraphValue, IdealSpec, Ring, SemanticAnchor};
 use mxx_ir_core::{
@@ -16,16 +17,6 @@ use mxx_ir_core::{
 pub const PROTOCOL_NAME: &str = "toy-example";
 pub const DECODED_ENDPOINT: &str = "decoded-endpoint";
 pub const RESIDUAL_ANCHOR: &str = "toy.decoder.residual";
-pub const PROTOCOL_SOURCE_PATHS: &[&str] = &[
-    "crates/correctness/Cargo.toml",
-    "crates/correctness/examples/emit_correctness.rs",
-    "crates/correctness/src",
-    "crates/dsl/Cargo.toml",
-    "crates/dsl/src",
-    "crates/ir-core/Cargo.toml",
-    "crates/ir-core/src",
-];
-
 pub fn protocol() -> ProtocolDecl {
     let ring = Ring::new(256, 1);
     let message = ring.bool_input("message");
@@ -81,6 +72,7 @@ pub fn protocol() -> ProtocolDecl {
         .expect("unique output")
         .build()
         .expect("toy decryption graph");
+    let decoder_node = decrypt.graph.outputs()["decoded"].value.node;
 
     let ideal = IdealSpec::new(
         DslContext::new("toy-example-ideal")
@@ -144,6 +136,16 @@ pub fn protocol() -> ProtocolDecl {
                     ideal_output: "result".to_owned(),
                 }],
             },
+            operational_decoder_targets: vec![OperationalDecoderTarget {
+                target_id: "toy-threshold".to_owned(),
+                residual_stage: StageId("encrypt".to_owned()),
+                residual_output: "operational-residual".to_owned(),
+                decoder_stage: StageId("decrypt".to_owned()),
+                decoder_node,
+                kind: OperationalDecoderKind::ThresholdDecode {
+                    plaintext_modulus: IntExpr::constant(2),
+                },
+            }],
             endpoint_specs: vec![endpoint],
             input_contract: InputContract {
                 inputs: vec![InputContractEntry {
@@ -194,6 +196,21 @@ mod tests {
         assert_eq!(
             protocol.bundle.validate(),
             Err(crate::BundleValidationError::MissingComparatorConnection)
+        );
+    }
+
+    #[test]
+    fn operational_target_plaintext_modulus_must_match_the_executable_decoder() {
+        let mut protocol = protocol();
+        let OperationalDecoderKind::ThresholdDecode { plaintext_modulus } =
+            &mut protocol.bundle.operational_decoder_targets[0].kind
+        else {
+            unreachable!("toy target is threshold decoding")
+        };
+        *plaintext_modulus = IntExpr::constant(3);
+        assert_eq!(
+            protocol.bundle.validate(),
+            Err(crate::BundleValidationError::InvalidOperationalDecoderTarget)
         );
     }
 }

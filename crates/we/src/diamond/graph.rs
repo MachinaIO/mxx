@@ -8,9 +8,10 @@ use mxx_bgg::{
 use mxx_correctness::{
     ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec,
     EndpointAnchor, EndpointAnchors, EndpointSemanticBinding, EndpointSpecId, InputContract,
-    InputContractEntry, InputValueContract, OutputRef, ParameterDecl, ParameterKind, ProtocolDecl,
-    ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
-    ProtocolStage, StageId, StageInputName, Workflow,
+    InputContractEntry, InputValueContract, OperationalDecoderKind, OperationalDecoderTarget,
+    OutputRef, ParameterDecl, ParameterKind, ProtocolDecl, ProtocolInputBinding,
+    ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage, StageId,
+    StageInputName, Workflow,
 };
 use mxx_dsl::{
     Bool, BuiltGraph, DslContext, DslError, Int, Mat, Parallel, PurePredicateSpec, SemanticAnchor,
@@ -35,21 +36,6 @@ pub const HASH_KEY_INPUT: &str = "diamond-hash-key";
 pub const MESSAGE_INPUT: &str = "diamond-message";
 pub const DECODED_OUTPUT: &str = "diamond-decoded";
 pub const NOISY_PLAINTEXT_OUTPUT: &str = "diamond-noisy-plaintext";
-pub const DIAMOND_PROTOCOL_SOURCE_PATHS: &[&str] = &[
-    "crates/bgg/Cargo.toml",
-    "crates/bgg/src",
-    "crates/correctness/Cargo.toml",
-    "crates/correctness/src",
-    "crates/dsl/Cargo.toml",
-    "crates/dsl/src",
-    "crates/gadgets/Cargo.toml",
-    "crates/gadgets/src",
-    "crates/ir-core/Cargo.toml",
-    "crates/ir-core/src",
-    "crates/we/Cargo.toml",
-    "crates/we/examples/emit_correctness.rs",
-    "crates/we/src",
-];
 const IDEAL_MESSAGE_OUTPUT: &str = "message";
 
 #[derive(Clone)]
@@ -472,7 +458,7 @@ impl DiamondWeProtocolFamily {
             graph_params.input.digit_count.clone(),
         );
         let r_materialized = r_decomposition.as_mat();
-        let r_decomposed = r_materialized.reshape(public_columns, 1);
+        let r_decomposed = r_materialized;
         let difference = public_key_compiler.sub(&one_public_key, &circuit_output);
         let projected_difference = difference.matrix * r_decomposed.clone();
         let decoder_public_key = k_public_key_first + projected_difference;
@@ -964,6 +950,7 @@ impl DiamondWeProtocolFamily {
             },
         ]);
         let endpoint = EndpointSpecId::DiamondBooleanInterval;
+        let decoder_node = decryption.graph.outputs()[DECODED_OUTPUT].value.node;
         let declaration = ProtocolDecl {
             params: [
                 (
@@ -1051,6 +1038,14 @@ impl DiamondWeProtocolFamily {
                         ideal_output: IDEAL_MESSAGE_OUTPUT.to_owned(),
                     }],
                 },
+                operational_decoder_targets: vec![OperationalDecoderTarget {
+                    target_id: "diamond-boolean-interval".to_owned(),
+                    residual_stage: decrypt_id.clone(),
+                    residual_output: NOISY_PLAINTEXT_OUTPUT.to_owned(),
+                    decoder_stage: decrypt_id.clone(),
+                    decoder_node,
+                    kind: OperationalDecoderKind::BooleanInterval,
+                }],
                 endpoint_specs: vec![endpoint],
                 input_contract: InputContract { inputs: input_contracts },
                 input_bindings,
@@ -1338,106 +1333,5 @@ mod tests {
             ComparatorSpec::Equality { endpoints }
                 if endpoints.len() == 1 && endpoints[0].failure_value
         ));
-        let emitted = mxx_correctness::emit_protocol_for(
-            "diamond-we-family",
-            declaration.protocol(),
-            "MxxWe",
-            DIAMOND_PROTOCOL_SOURCE_PATHS,
-        )
-        .unwrap();
-        assert!(
-            emitted
-                .proof_ir
-                .contains("def DiamondWeFamily_protocol : Mxx.Certificate.ClosedProtocolDecl")
-        );
-        assert!(!emitted.proof_ir.contains("SparseCertificate"));
-        assert!(
-            emitted
-                .proof_ir
-                .contains(".roundDivide (.parameter \"diamond_modulus\") (.constant (2 : Int))")
-        );
-        assert!(!emitted.proof_ir.contains(
-            ".roundDivide (.subtract (.parameter \"diamond_modulus\") (.constant (1 : Int))) \
-             (.constant (2 : Int))"
-        ));
-    }
-
-    #[test]
-    fn protocol_hash_is_independent_of_runtime_parameter_bindings() {
-        let first = compiler();
-        let mut second_config = first.config.clone();
-        second_config.modulus = 769.into();
-        second_config.ring_dimension = 16;
-        second_config.digit_count = 3;
-        let second = DiamondWeCompiler::new(
-            second_config,
-            BooleanCircuitShape {
-                instance_width: 1,
-                witness_width: 1,
-                depth: 3,
-                max_layer_width: 4,
-            },
-        )
-        .unwrap();
-        let direct =
-            DiamondWeProtocolFamily::new(first.config.bgg_tag.clone()).protocol_decl().unwrap();
-        let first = mxx_correctness::emit_protocol_for(
-            "diamond-we-family",
-            first.protocol_decl().unwrap().protocol(),
-            "MxxWe",
-            DIAMOND_PROTOCOL_SOURCE_PATHS,
-        )
-        .unwrap();
-        let second = mxx_correctness::emit_protocol_for(
-            "diamond-we-family",
-            second.protocol_decl().unwrap().protocol(),
-            "MxxWe",
-            DIAMOND_PROTOCOL_SOURCE_PATHS,
-        )
-        .unwrap();
-        let direct = mxx_correctness::emit_protocol_for(
-            "diamond-we-family",
-            direct.protocol(),
-            "MxxWe",
-            DIAMOND_PROTOCOL_SOURCE_PATHS,
-        )
-        .unwrap();
-        assert_eq!(first.freshness.workflow_hash, second.freshness.workflow_hash);
-        assert_eq!(first.freshness.workflow_hash, direct.freshness.workflow_hash);
-    }
-
-    #[test]
-    #[ignore = "measures Lean compilation of the midsize binary transport"]
-    fn binary_transport_midsize_timing_gate() {
-        use std::{path::Path, time::Instant};
-
-        let declaration = DiamondWeProtocolFamily::new(b"mxx:diamond-we").protocol_decl().unwrap();
-        let emit_started = Instant::now();
-        let emitted = mxx_correctness::emit_protocol_for(
-            "diamond-we-family-midsize",
-            declaration.protocol(),
-            "MxxWe",
-            DIAMOND_PROTOCOL_SOURCE_PATHS,
-        )
-        .unwrap();
-        let emit_elapsed = emit_started.elapsed();
-        let lean_workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
-        let cold_started = Instant::now();
-        let prepared =
-            mxx_correctness::prepare_emitted_operational_checker(&lean_workspace, &emitted)
-                .unwrap();
-        let cold_elapsed = cold_started.elapsed();
-        let warm_started = Instant::now();
-        let warm = mxx_correctness::prepare_emitted_operational_checker(&lean_workspace, &emitted)
-            .unwrap();
-        let warm_elapsed = warm_started.elapsed();
-        assert_eq!(prepared.olean_path(), warm.olean_path());
-        eprintln!(
-            "midsize binary transport: generated_bytes={} emit_seconds={:.3} cold_prepare_seconds={:.3} warm_prepare_seconds={:.3}",
-            emitted.ir.len(),
-            emit_elapsed.as_secs_f64(),
-            cold_elapsed.as_secs_f64(),
-            warm_elapsed.as_secs_f64(),
-        );
     }
 }

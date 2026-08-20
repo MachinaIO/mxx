@@ -8,7 +8,7 @@ use num_bigint::BigInt;
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 
-/// A decidable parameter condition shared by concrete validation and Lean emission.
+/// A decidable parameter condition shared by concrete validation and operational checking.
 ///
 /// These constraints intentionally contain only compile-time expressions. Scheduling,
 /// liveness, concrete wire flow, and manifest checks remain validation-only concerns.
@@ -141,10 +141,6 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                         }
                     }
                 }
-                NodeKind::Reshape { rows, columns } => {
-                    positive(&mut constraints, rows, format!("{prefix}: reshape rows"));
-                    positive(&mut constraints, columns, format!("{prefix}: reshape columns"));
-                }
                 NodeKind::ThresholdDecode { plaintext_modulus, length, .. } => {
                     constraints.push(ParamConstraint::IntGreaterThan {
                         left: plaintext_modulus.clone(),
@@ -157,8 +153,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                     positive(&mut constraints, count, format!("{prefix}: family count"));
                 }
                 NodeKind::FamilyGetStatic { index } |
-                NodeKind::ExtractCoefficient { position: index } |
-                NodeKind::ConstantCoefficient { position: index } |
+                NodeKind::ExtractCoefficient { position: index, .. } |
                 NodeKind::BitExtract { bit: index } => {
                     nonnegative(&mut constraints, index, format!("{prefix}: index"));
                 }
@@ -179,6 +174,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::Concat {
                     axis: ConcatAxis::Rows | ConcatAxis::Columns | ConcatAxis::Diagonal,
                 } |
+                NodeKind::LiftIntegerToConstantPolynomial { .. } |
                 NodeKind::Input { .. } |
                 NodeKind::ConstantInt(_) |
                 NodeKind::EvaluateInt(_) |

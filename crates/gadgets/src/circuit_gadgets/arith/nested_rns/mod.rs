@@ -22,8 +22,8 @@ use super::CrtWindow;
 
 use crate::{
     circuit::{
-        BatchedWire, LutExpr, PolyCircuit, PublicLutProgram, SubCircuitParamSpec,
-        SubCircuitParamValue, gate::GateId,
+        BatchedWire, LutExpr, PolyCircuit, PublicLutProgram, SubCircuitInputMaxPlaintextNormRange,
+        SubCircuitParamSpec, SubCircuitParamValue, gate::GateId,
     },
     circuit_gadgets::conv_mul::{
         negacyclic_conv_mul_right_decomposed_term_many_subcircuit, negacyclic_conv_mul_right_sparse,
@@ -69,8 +69,6 @@ pub struct NestedRnsPolyContext {
     lazy_reduce_id: usize,
     decomposition_terms_id: usize,
     gadget_decompose_id: usize,
-    mul_lazy_reduce_id: usize,
-    mul_right_sparse_id: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,8 +82,6 @@ struct NestedRnsRegisteredSubcircuitIds {
     lazy_reduce_id: usize,
     decomposition_terms_id: usize,
     gadget_decompose_id: usize,
-    mul_lazy_reduce_id: usize,
-    mul_right_sparse_id: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -102,4 +98,35 @@ pub struct NestedRnsPoly<P: Poly> {
     pub max_plaintexts: Vec<BigUint>,
     pub(crate) p_max_traces: Vec<BigUint>,
     _p: PhantomData<P>,
+}
+
+/// Reconstruction output whose authoritative values live only at q1 anchors.
+///
+/// For a coefficient-major packed value with `D` q-level lanes, coefficient `c`
+/// is available exclusively at physical slot `c * D`.  The other lanes are an
+/// implementation byproduct of the cyclic rotations and must not be consumed as
+/// reconstructed coefficients.  This deliberately differs from
+/// [`NestedRnsPoly::reconstruct`], which produces a value valid in every lane.
+#[derive(Debug, Clone, Copy)]
+pub struct Q1AnchorReconstruction {
+    anchor_wire: GateId,
+    coefficient_slots: usize,
+    q_moduli_depth: usize,
+}
+
+impl Q1AnchorReconstruction {
+    /// Returns the circuit wire carrying the anchor-only reconstruction.
+    pub fn anchor_wire(self) -> GateId {
+        self.anchor_wire
+    }
+
+    /// Returns the sole authoritative physical slot for coefficient `coefficient`.
+    pub fn anchor_slot(self, coefficient: usize) -> usize {
+        assert!(
+            coefficient < self.coefficient_slots,
+            "q1 anchor coefficient index {coefficient} exceeds {} slots",
+            self.coefficient_slots
+        );
+        coefficient * self.q_moduli_depth
+    }
 }

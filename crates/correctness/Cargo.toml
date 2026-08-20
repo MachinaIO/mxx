@@ -3,7 +3,7 @@ name = "mxx-correctness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Perfect-correctness declarations, Lean emission, and verification for mxx"
+description = "Perfect-correctness declarations and Rust operational checking for mxx"
 
 [dependencies]
 mxx-ir-core.workspace = true
@@ -12,9 +12,10 @@ num-bigint.workspace = true
 num-traits.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
+tracing.workspace = true
 
-[build-dependencies]
-sha2.workspace = true
+[dev-dependencies]
+tracing-subscriber.workspace = true

@@ -6705,6 +6705,10 @@ impl<'a> Normalizer<'a> {
                 .program_call_matrix_facts(expression)
                 .map(|facts| facts.coefficient_bound.clone())
                 .unwrap_or(NumericContract::Missing),
+            // Input zero is the selector. Arena validation proves the remaining nonempty inputs
+            // are the complete, same-typed branch set, so their maximum is the exact compact
+            // transfer and a missing branch remains fail-closed.
+            ValueOperator::ExplicitElement { .. } => max_bounds(&child_bounds[1..])?,
             ValueOperator::Transform(_) => NumericContract::Missing,
             _ => child_bounds.into_iter().next().unwrap_or(NumericContract::Missing),
         };
@@ -9501,6 +9505,167 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(descriptor.central_factors.as_ref(), expected.as_slice());
         assert!(descriptor.ordered_factors.is_empty());
+    }
+
+    #[test]
+    fn nested_explicit_element_uses_branch_max_and_folds_without_changing_exact_identity() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let left = source_with(&mut expressions, matrix.clone(), 242);
+        let right = source_with(&mut expressions, matrix, 243);
+        let mut facts = FactStore::new(&expressions);
+        insert_matrix_bound(&mut facts, &expressions, left, 3);
+        insert_matrix_bound(&mut facts, &expressions, right, 7);
+        let domain = super::super::arena::FamilyDomain::new(0, 2).unwrap();
+        let selector = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let explicit = expressions
+            .intern(
+                ValueOperator::ExplicitElement {
+                    domain,
+                    element_type: ResolvedValueType::Matrix(matrix_type()),
+                },
+                Box::new([selector, left, right]),
+            )
+            .unwrap();
+        let explicit_node = expressions.node(explicit).unwrap();
+        assert_eq!(explicit_node.inputs.as_ref(), &[selector, left, right]);
+        assert!(matches!(
+            explicit_node.operator,
+            ValueOperator::ExplicitElement { domain: actual, .. } if actual == domain
+        ));
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Negate, &[explicit]).unwrap();
+        let family = programs.generated_family_from_body(&mut expressions, domain, root).unwrap();
+        assert_ne!(programs.family_body(family).unwrap(), explicit);
+        let semantic = programs.scoped(&expressions, family.program(), root).unwrap();
+        let explicit_semantic = programs.scoped(&expressions, family.program(), explicit).unwrap();
+        facts.finalize_ranges();
+        let mut monomials = MonomialArena::new(&expressions, &programs, family.program()).unwrap();
+
+        let baseline = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            normalizer.normalize(semantic).unwrap()
+        };
+        assert_eq!(
+            baseline.coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(7_u8))
+        );
+        let baseline_nf = baseline.exact_nf.unwrap();
+        assert_eq!(baseline_nf.exact_terms.len(), 1);
+        let baseline_monomial = *baseline_nf.exact_terms.keys().next().unwrap();
+        assert_eq!(baseline_nf.exact_terms[&baseline_monomial], BigInt::from(-1));
+        let descriptor = monomials.descriptor(baseline_monomial).unwrap();
+        assert!(descriptor.central_factors.is_empty());
+        assert_eq!(descriptor.ordered_factors.as_ref(), &[explicit_semantic]);
+
+        let mut relations = RelationRegistry::new();
+        relations.freeze();
+        let mut cache = NormalizationCache::new();
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&relations, &mut cache);
+        let folded = normalizer.normalize(semantic).unwrap();
+        assert_eq!(
+            folded.coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(7_u8))
+        );
+        assert!(folded.exact_nf.unwrap().exact_terms.is_empty());
+        assert_eq!(normalizer.counters().bounded_fold_count, 1);
+        assert_eq!(normalizer.counters().final_exact_term_count, 0);
+        assert_eq!(normalizer.counters().relation_remaining, 0);
+    }
+
+    #[test]
+    fn explicit_element_branch_bound_transfer_is_fail_closed_and_respects_fact_precedence() {
+        let run = |left_bound: Option<CoefficientBound>,
+                   right_bound: Option<CoefficientBound>,
+                   explicit_fact: Option<CoefficientBound>| {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let matrix = matrix_type();
+            let left = matrix_source(&mut expressions, "explicit-left", matrix.clone(), None);
+            let right = matrix_source(&mut expressions, "explicit-right", matrix, None);
+            let mut facts = FactStore::new(&expressions);
+            for (expression, bound) in [(left, left_bound), (right, right_bound)] {
+                if let Some(bound) = bound {
+                    let ResolvedValueType::Matrix(matrix) =
+                        expressions.value_type(expression).unwrap()
+                    else {
+                        panic!("explicit branch must be a matrix")
+                    };
+                    let mut matrix_facts = MatrixFacts::new(
+                        matrix.clone(),
+                        MatrixMetadata::new(MatrixLayout::row_major(matrix.rows, matrix.columns)),
+                    );
+                    matrix_facts.coefficient_bound = NumericContract::Known(bound);
+                    facts
+                        .insert(&expressions, expression, ValueFacts::Matrix(matrix_facts))
+                        .unwrap();
+                }
+            }
+            let domain = super::super::arena::FamilyDomain::new(0, 2).unwrap();
+            let selector = if explicit_fact.is_some() {
+                expressions
+                    .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+                    .unwrap()
+            } else {
+                expressions.intern_argument(0, ResolvedValueType::Int).unwrap()
+            };
+            let explicit = expressions
+                .intern(
+                    ValueOperator::ExplicitElement {
+                        domain,
+                        element_type: ResolvedValueType::Matrix(matrix_type()),
+                    },
+                    Box::new([selector, left, right]),
+                )
+                .unwrap();
+            if let Some(bound) = explicit_fact {
+                let ResolvedValueType::Matrix(matrix) = expressions.value_type(explicit).unwrap()
+                else {
+                    panic!("explicit value must be a matrix")
+                };
+                let mut matrix_facts = MatrixFacts::new(
+                    matrix.clone(),
+                    MatrixMetadata::new(MatrixLayout::row_major(matrix.rows, matrix.columns)),
+                );
+                matrix_facts.coefficient_bound = NumericContract::Known(bound);
+                facts.insert(&expressions, explicit, ValueFacts::Matrix(matrix_facts)).unwrap();
+            }
+            let family =
+                programs.generated_family_from_body(&mut expressions, domain, explicit).unwrap();
+            let semantic = programs.scoped(&expressions, family.program(), explicit).unwrap();
+            facts.finalize_ranges();
+            let mut monomials =
+                MonomialArena::new(&expressions, &programs, family.program()).unwrap();
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            normalizer.normalize(semantic).unwrap().coefficient_bound
+        };
+
+        assert_eq!(
+            run(Some(CoefficientBound::finite(3_u8)), Some(CoefficientBound::finite(7_u8)), None,),
+            NumericContract::Known(CoefficientBound::finite(7_u8))
+        );
+        assert_eq!(run(Some(CoefficientBound::finite(3_u8)), None, None), NumericContract::Missing);
+        assert_eq!(
+            run(Some(CoefficientBound::finite(3_u8)), Some(CoefficientBound::Large), None,),
+            NumericContract::Known(CoefficientBound::Large)
+        );
+        assert_eq!(
+            run(Some(CoefficientBound::ExactZero), Some(CoefficientBound::ExactZero), None,),
+            NumericContract::Known(CoefficientBound::ExactZero)
+        );
+        assert_eq!(
+            run(
+                Some(CoefficientBound::finite(3_u8)),
+                Some(CoefficientBound::finite(7_u8)),
+                Some(CoefficientBound::finite(11_u8)),
+            ),
+            NumericContract::Known(CoefficientBound::finite(11_u8))
+        );
     }
 
     fn insert_matrix_layout_fact(

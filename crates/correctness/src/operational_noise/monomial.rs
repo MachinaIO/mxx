@@ -130,6 +130,7 @@ pub(crate) struct MonomialSweepReport {
     pub occupied_factor_payload_lower_bound_bytes: u64,
     pub protected_prefix: MonomialSweepOwnerReport,
     pub value_cache: MonomialSweepOwnerReport,
+    pub exact_plan: MonomialSweepOwnerReport,
     pub gadget: MonomialSweepOwnerReport,
     pub canonical_runtime: MonomialSweepOwnerReport,
     pub closed: MonomialSweepOwnerReport,
@@ -494,6 +495,7 @@ impl MonomialArena {
             std::iter::empty(),
             std::iter::empty(),
             std::iter::empty(),
+            std::iter::empty(),
         )
     }
 
@@ -501,6 +503,7 @@ impl MonomialArena {
         &mut self,
         protected_prefix: usize,
         value_cache_roots: impl IntoIterator<Item = MonomialId>,
+        exact_plan_roots: impl IntoIterator<Item = MonomialId>,
         gadget_roots: impl IntoIterator<Item = MonomialId>,
         canonical_runtime_roots: impl IntoIterator<Item = MonomialId>,
         closed_roots: impl IntoIterator<Item = MonomialId>,
@@ -522,6 +525,7 @@ impl MonomialArena {
                 ));
         }
         let value_cache = self.mark_sweep_owner(&mut marked, value_cache_roots.into_iter())?;
+        let exact_plan = self.mark_sweep_owner(&mut marked, exact_plan_roots.into_iter())?;
         let gadget = self.mark_sweep_owner(&mut marked, gadget_roots.into_iter())?;
         let canonical_runtime =
             self.mark_sweep_owner(&mut marked, canonical_runtime_roots.into_iter())?;
@@ -569,6 +573,7 @@ impl MonomialArena {
                 ),
             protected_prefix: protected_report,
             value_cache,
+            exact_plan,
             gadget,
             canonical_runtime,
             closed,
@@ -901,11 +906,14 @@ mod tests {
         let root = programs.root(&expressions, scope).unwrap();
         let protected = arena.intern(&expressions, &programs, &[one], &[]).unwrap();
         let value = arena.intern(&expressions, &programs, &[], &[root]).unwrap();
-        let gadget = arena.intern(&expressions, &programs, &[], &[root, one]).unwrap();
-        let canonical = arena.intern(&expressions, &programs, &[], &[root, one, root]).unwrap();
-        let closed = arena.intern(&expressions, &programs, &[], &[root, one, root, one]).unwrap();
-        let suspended =
+        let exact = arena.intern(&expressions, &programs, &[], &[root, one]).unwrap();
+        let gadget = arena.intern(&expressions, &programs, &[], &[root, one, root]).unwrap();
+        let canonical =
+            arena.intern(&expressions, &programs, &[], &[root, one, root, one]).unwrap();
+        let closed =
             arena.intern(&expressions, &programs, &[], &[root, one, root, one, root]).unwrap();
+        let suspended =
+            arena.intern(&expressions, &programs, &[], &[root, one, root, one, root, one]).unwrap();
         let dead = arena
             .intern(&expressions, &programs, &[], &[root, root, one, one, root, root])
             .unwrap();
@@ -914,7 +922,8 @@ mod tests {
             .sweep_with_owners(
                 1,
                 [protected, value],
-                [value, gadget],
+                [value, exact],
+                [exact, gadget],
                 [gadget, canonical],
                 [canonical, closed],
                 [closed, suspended, protected],
@@ -922,6 +931,7 @@ mod tests {
             .unwrap();
         assert_eq!(report.protected_prefix.descriptor_slots, 1);
         assert_eq!(report.value_cache.descriptor_slots, 1);
+        assert_eq!(report.exact_plan.descriptor_slots, 1);
         assert_eq!(report.gadget.descriptor_slots, 1);
         assert_eq!(report.canonical_runtime.descriptor_slots, 1);
         assert_eq!(report.closed.descriptor_slots, 1);
@@ -929,6 +939,7 @@ mod tests {
         for owner in [
             report.protected_prefix,
             report.value_cache,
+            report.exact_plan,
             report.gadget,
             report.canonical_runtime,
             report.closed,
@@ -937,15 +948,15 @@ mod tests {
             assert!(owner.payload_lower_bound_bytes > 0);
         }
         assert_eq!(report.protected_prefix_occupied_slots, 1);
-        assert_eq!(report.high_water_slots, 7);
-        assert_eq!(report.occupied_slots, 6);
+        assert_eq!(report.high_water_slots, 8);
+        assert_eq!(report.occupied_slots, 7);
         assert_eq!(report.reclaimed_slots, 1);
-        assert_eq!(report.bucket_entries, 6);
+        assert_eq!(report.bucket_entries, 7);
         assert_eq!(report.occupied_central_factor_entries, 1);
-        assert_eq!(report.occupied_ordered_factor_entries, 15);
+        assert_eq!(report.occupied_ordered_factor_entries, 21);
         assert_eq!(
             report.occupied_factor_payload_lower_bound_bytes,
-            16 * u64::try_from(std::mem::size_of::<ScopedExprId>()).unwrap()
+            22 * u64::try_from(std::mem::size_of::<ScopedExprId>()).unwrap()
         );
         assert!(matches!(arena.descriptor(dead), Err(MonomialError::CollectedMonomialId { .. })));
     }

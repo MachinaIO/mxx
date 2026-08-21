@@ -612,6 +612,12 @@ struct DiagnosticOwnerCensus {
     ordinary_product_standalone_materializations: u64,
     ordinary_product_planned_pairs: u64,
     ordinary_product_max_streamed_output_terms: u64,
+    scalar_action_plans_created: u64,
+    scalar_action_streamed_executions: u64,
+    scalar_action_zero_weight_skips: u64,
+    scalar_action_standalone_materializations: u64,
+    scalar_action_reclassified_terms: u64,
+    scalar_action_reclassified_factors_max: u64,
     additive_materializations: u64,
     additive_materialization_output_terms_total: u64,
     additive_materialization_output_terms_max: u64,
@@ -959,6 +965,16 @@ fn diagnostic_watchdog_emit_snapshot(
         ordinary_product_max_streamed_output_terms = progress
             .owners
             .ordinary_product_max_streamed_output_terms,
+        scalar_action_plans_created = progress.owners.scalar_action_plans_created,
+        scalar_action_streamed_executions = progress.owners.scalar_action_streamed_executions,
+        scalar_action_zero_weight_skips = progress.owners.scalar_action_zero_weight_skips,
+        scalar_action_standalone_materializations = progress
+            .owners
+            .scalar_action_standalone_materializations,
+        scalar_action_reclassified_terms = progress.owners.scalar_action_reclassified_terms,
+        scalar_action_reclassified_factors_max = progress
+            .owners
+            .scalar_action_reclassified_factors_max,
         additive_materializations = progress.owners.additive_materializations,
         additive_materialization_output_terms_total = progress
             .owners
@@ -1659,6 +1675,16 @@ impl NormalizationTrace {
             ordinary_product_max_streamed_output_terms = self
                 .owners
                 .ordinary_product_max_streamed_output_terms,
+            scalar_action_plans_created = self.owners.scalar_action_plans_created,
+            scalar_action_streamed_executions = self.owners.scalar_action_streamed_executions,
+            scalar_action_zero_weight_skips = self.owners.scalar_action_zero_weight_skips,
+            scalar_action_standalone_materializations = self
+                .owners
+                .scalar_action_standalone_materializations,
+            scalar_action_reclassified_terms = self.owners.scalar_action_reclassified_terms,
+            scalar_action_reclassified_factors_max = self
+                .owners
+                .scalar_action_reclassified_factors_max,
             additive_materializations = self.owners.additive_materializations,
             additive_materialization_output_terms_total = self
                 .owners
@@ -1890,10 +1916,21 @@ struct ProductExactPlan {
     right: NodeExactState,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum ProductMode {
     Ordinary,
     TypedGadgetCandidate,
+    ScalarAction(ScalarActionExactPlan),
+}
+
+#[derive(Clone, Debug)]
+struct ScalarActionExactPlan {
+    scalar_on_left: bool,
+    scalar_expression: ExprId,
+    matrix_expression: ExprId,
+    scalar_type: ResolvedMatrixType,
+    matrix_type: ResolvedMatrixType,
+    centralized_scalar: Arc<PolynomialNF>,
 }
 
 #[derive(Debug)]
@@ -1958,6 +1995,12 @@ struct ProductPlanCounters {
     standalone_materializations: u64,
     planned_pairs: u64,
     max_streamed_output_terms: u64,
+    scalar_action_plans_created: u64,
+    scalar_action_streamed_executions: u64,
+    scalar_action_zero_weight_skips: u64,
+    scalar_action_standalone_materializations: u64,
+    scalar_action_reclassified_terms: u64,
+    scalar_action_reclassified_factors_max: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2058,6 +2101,7 @@ pub struct Normalizer<'a> {
     /// non-scalar Multiply whose complete real consumer set is Add/Sub or another member and
     /// which has no structural hold.
     deferred_products: BTreeSet<ExprId>,
+    deferred_scalar_actions: BTreeSet<ExprId>,
     /// Watchdog-only reverse-edge summary used to explain why a materialized Multiply would not
     /// qualify for the experimental ordinary-product deferral policy. It is never consulted by
     /// normalization semantics.
@@ -2458,7 +2502,7 @@ impl<'a> Normalizer<'a> {
         {
             return Err(NormalizeError::InvalidExactPlan { reason: "product operand type drift" });
         }
-        if plan.mode == ProductMode::TypedGadgetCandidate &&
+        if matches!(plan.mode, ProductMode::TypedGadgetCandidate) &&
             !self.gadget_recompositions.is_some_and(GadgetRecompositionRegistry::is_frozen)
         {
             return Err(NormalizeError::InvalidExactPlan {
@@ -2469,6 +2513,53 @@ impl<'a> Normalizer<'a> {
             self.validate_exact_plan_authority(Self::node_exact_authority(child))?;
             if Self::node_exact_plan_id(child).is_some_and(|id| id >= plan.id) {
                 return Err(NormalizeError::InvalidExactPlan { reason: "noncausal product edge" });
+            }
+        }
+        if let ProductMode::ScalarAction(scalar) = &plan.mode {
+            let (scalar_expression, matrix_expression, scalar_type, matrix_type, scalar_state) =
+                if scalar.scalar_on_left {
+                    (
+                        plan.left_expression,
+                        plan.right_expression,
+                        &plan.left_type,
+                        &plan.right_type,
+                        &plan.left,
+                    )
+                } else {
+                    (
+                        plan.right_expression,
+                        plan.left_expression,
+                        &plan.right_type,
+                        &plan.left_type,
+                        &plan.right,
+                    )
+                };
+            if scalar.scalar_expression != scalar_expression ||
+                scalar.matrix_expression != matrix_expression ||
+                scalar.scalar_type != *scalar_type ||
+                scalar.matrix_type != *matrix_type ||
+                scalar.scalar_type.rows != 1 ||
+                scalar.scalar_type.columns != 1 ||
+                scalar.matrix_type.rows == 1 && scalar.matrix_type.columns == 1
+            {
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "scalar action authority drift",
+                });
+            }
+            let NodeExactState::Materialized { normal_form, .. } = scalar_state else {
+                return Err(NormalizeError::InvalidExactPlan { reason: "deferred scalar operand" });
+            };
+            if !Arc::ptr_eq(normal_form, &scalar.centralized_scalar) {
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "scalar action normal form drift",
+                });
+            }
+            for monomial in scalar.centralized_scalar.exact_terms.keys() {
+                if !self.monomials.descriptor(*monomial)?.ordered_factors.is_empty() {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "scalar action was not centralized",
+                    });
+                }
             }
         }
         Ok(())
@@ -2545,20 +2636,19 @@ impl<'a> Normalizer<'a> {
 
     fn new_product_plan(
         &mut self,
+        scope_proof: &ScopeProof,
         expression: ExprId,
         node: &ExprNode,
-        left: NodeExactState,
-        right: NodeExactState,
+        mut left: NodeExactState,
+        mut right: NodeExactState,
     ) -> Result<Option<Arc<ProductExactPlan>>, NormalizeError> {
-        let mode = if self.deferred_gadget_products.contains(&expression) &&
-            self.gadget_recompositions.is_some_and(GadgetRecompositionRegistry::is_frozen)
-        {
-            ProductMode::TypedGadgetCandidate
-        } else if self.deferred_products.contains(&expression) {
-            ProductMode::Ordinary
-        } else {
+        let scalar_action_requested = self.deferred_scalar_actions.contains(&expression);
+        let typed_gadget_requested = self.deferred_gadget_products.contains(&expression) &&
+            self.gadget_recompositions.is_some_and(GadgetRecompositionRegistry::is_frozen);
+        let ordinary_requested = self.deferred_products.contains(&expression);
+        if !scalar_action_requested && !typed_gadget_requested && !ordinary_requested {
             return Ok(None);
-        };
+        }
         if self.relation_rewriting_enabled ||
             !matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Multiply)) ||
             node.inputs.len() != 2
@@ -2573,12 +2663,81 @@ impl<'a> Normalizer<'a> {
         };
         let left_type = matrix_type(node.inputs[0])?;
         let right_type = matrix_type(node.inputs[1])?;
-        if (left_type.rows == 1 && left_type.columns == 1) ||
-            (right_type.rows == 1 && right_type.columns == 1)
-        {
-            return Ok(None);
-        }
         let authority = self.exact_plan_authority(expression)?;
+        let left_scalar = left_type.rows == 1 && left_type.columns == 1;
+        let right_scalar = right_type.rows == 1 && right_type.columns == 1;
+        for (child, expected) in [(&left, &left_type), (&right, &right_type)] {
+            self.validate_exact_plan_authority(Self::node_exact_authority(child))?;
+            if &Self::node_exact_authority(child).matrix_type != expected {
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "product operand type mismatch",
+                });
+            }
+        }
+        let mode = if scalar_action_requested {
+            if left_scalar == right_scalar {
+                return Ok(None);
+            }
+            let (scalar_expression, matrix_expression, scalar_type, matrix_type, scalar_state) =
+                if left_scalar {
+                    (node.inputs[0], node.inputs[1], &left_type, &right_type, &left)
+                } else {
+                    (node.inputs[1], node.inputs[0], &right_type, &left_type, &right)
+                };
+            if scalar_type.modulus != matrix_type.modulus ||
+                scalar_type.ring_dimension != matrix_type.ring_dimension ||
+                authority.matrix_type != *matrix_type
+            {
+                return Ok(None);
+            }
+            let NodeExactState::Materialized { normal_form, .. } = scalar_state else {
+                return Ok(None);
+            };
+            if !self.scalar_nf_ordered_factors_match_type(normal_form, scalar_type)? {
+                return Ok(None);
+            }
+            let (centralized_scalar, terms, factors_max) =
+                self.centralize_scalar_nf(scope_proof, normal_form)?;
+            let centralized_scalar = Arc::new(centralized_scalar);
+            let centralized_state =
+                self.materialized_exact_state(scalar_expression, Arc::clone(&centralized_scalar))?;
+            if left_scalar {
+                left = centralized_state;
+            } else {
+                right = centralized_state;
+            }
+            self.product_plan_counters.scalar_action_reclassified_terms = self
+                .product_plan_counters
+                .scalar_action_reclassified_terms
+                .saturating_add(u64::try_from(terms).unwrap_or(u64::MAX));
+            self.product_plan_counters.scalar_action_reclassified_factors_max = self
+                .product_plan_counters
+                .scalar_action_reclassified_factors_max
+                .max(u64::try_from(factors_max).unwrap_or(u64::MAX));
+            self.trace.record_scalar_call();
+            if left_scalar {
+                self.trace.record_scalar_left();
+            } else {
+                self.trace.record_scalar_right();
+            }
+            ProductMode::ScalarAction(ScalarActionExactPlan {
+                scalar_on_left: left_scalar,
+                scalar_expression,
+                matrix_expression,
+                scalar_type: scalar_type.clone(),
+                matrix_type: matrix_type.clone(),
+                centralized_scalar,
+            })
+        } else {
+            if left_scalar || right_scalar {
+                return Ok(None);
+            }
+            if typed_gadget_requested {
+                ProductMode::TypedGadgetCandidate
+            } else {
+                ProductMode::Ordinary
+            }
+        };
         for (child, expected) in [(&left, &left_type), (&right, &right_type)] {
             self.validate_exact_plan_authority(Self::node_exact_authority(child))?;
             if &Self::node_exact_authority(child).matrix_type != expected {
@@ -2589,6 +2748,8 @@ impl<'a> Normalizer<'a> {
         }
         self.next_exact_plan_id =
             self.next_exact_plan_id.checked_add(1).ok_or(NormalizeError::ArithmeticOverflow)?;
+        let typed_candidate = matches!(mode, ProductMode::TypedGadgetCandidate);
+        let scalar_action = matches!(mode, ProductMode::ScalarAction(_));
         let plan = Arc::new(ProductExactPlan {
             id: self.next_exact_plan_id,
             authority,
@@ -2603,9 +2764,13 @@ impl<'a> Normalizer<'a> {
         });
         self.product_plan_counters.plans_created =
             self.product_plan_counters.plans_created.saturating_add(1);
-        if mode == ProductMode::TypedGadgetCandidate {
+        if typed_candidate {
             self.product_plan_counters.typed_candidate_plans =
                 self.product_plan_counters.typed_candidate_plans.saturating_add(1);
+        }
+        if scalar_action {
+            self.product_plan_counters.scalar_action_plans_created =
+                self.product_plan_counters.scalar_action_plans_created.saturating_add(1);
         }
         Ok(Some(plan))
     }
@@ -2617,7 +2782,7 @@ impl<'a> Normalizer<'a> {
         right: &PolynomialNF,
     ) -> Result<bool, NormalizeError> {
         self.validate_product_plan(plan)?;
-        if plan.mode != ProductMode::TypedGadgetCandidate {
+        if !matches!(plan.mode, ProductMode::TypedGadgetCandidate) {
             return Ok(false);
         }
         let Some(registry) = self.gadget_recompositions else { return Ok(false) };
@@ -2731,8 +2896,8 @@ impl<'a> Normalizer<'a> {
         state: &NodeExactState,
     ) -> Result<Arc<PolynomialNF>, NormalizeError> {
         self.validate_exact_state_dag(state)?;
-        let mut product_uses = Self::product_plan_use_counts(state)?;
         let product_operand_additives = Self::product_operand_additives(state);
+        let mut product_uses = self.product_plan_use_counts(state, &product_operand_additives)?;
         let mut outputs = BTreeMap::<(u8, u64), Arc<PolynomialNF>>::new();
         let mut scheduled = BTreeSet::<(u8, u64)>::new();
         let mut consumed_additives = BTreeSet::<u64>::new();
@@ -2835,14 +3000,20 @@ impl<'a> Normalizer<'a> {
                         &BigInt::from(1_u8),
                         &mut terms,
                         direct,
-                        plan.mode == ProductMode::TypedGadgetCandidate,
+                        matches!(plan.mode, ProductMode::TypedGadgetCandidate),
                     )?;
                     let planned = u64::try_from(left.exact_terms.len())
                         .unwrap_or(u64::MAX)
                         .saturating_mul(u64::try_from(right.exact_terms.len()).unwrap_or(u64::MAX));
                     self.product_plan_counters.standalone_materializations =
                         self.product_plan_counters.standalone_materializations.saturating_add(1);
-                    if plan.mode == ProductMode::TypedGadgetCandidate {
+                    if matches!(plan.mode, ProductMode::ScalarAction(_)) {
+                        self.product_plan_counters.scalar_action_standalone_materializations = self
+                            .product_plan_counters
+                            .scalar_action_standalone_materializations
+                            .saturating_add(1);
+                    }
+                    if matches!(plan.mode, ProductMode::TypedGadgetCandidate) {
                         self.product_plan_counters.typed_standalone_materializations = self
                             .product_plan_counters
                             .typed_standalone_materializations
@@ -2900,11 +3071,19 @@ impl<'a> Normalizer<'a> {
     }
 
     fn product_plan_use_counts(
+        &self,
         root: &NodeExactState,
+        product_operand_additives: &BTreeSet<u64>,
     ) -> Result<BTreeMap<u64, usize>, NormalizeError> {
+        // Count product-to-product definition edges once, then mirror the additive flattening
+        // work once per materialized additive output. A shared additive definition can feed more
+        // than one product destination, so counting only its definition edges would release a
+        // shared product output too early. This prepass is bounded by the same plan memberships
+        // that the materializer subsequently visits; it does not expand polynomial terms.
         let mut result = BTreeMap::<u64, usize>::new();
         let mut pending = vec![root.clone()];
         let mut seen = BTreeSet::new();
+        let mut additives = BTreeMap::<u64, Arc<AdditiveExactPlan>>::new();
         while let Some(state) = pending.pop() {
             let (kind, id) = match &state {
                 NodeExactState::Materialized { .. } | NodeExactState::GadgetProduct(_) => continue,
@@ -2914,17 +3093,38 @@ impl<'a> Normalizer<'a> {
             if !seen.insert((kind, id)) {
                 continue;
             }
+            let is_product = matches!(state, NodeExactState::Product(_));
             let children = match &state {
-                NodeExactState::Additive(plan) => [&plan.left, &plan.right],
+                NodeExactState::Additive(plan) => {
+                    additives.insert(plan.id, Arc::clone(plan));
+                    [&plan.left, &plan.right]
+                }
                 NodeExactState::Product(plan) => [&plan.left, &plan.right],
                 NodeExactState::Materialized { .. } | NodeExactState::GadgetProduct(_) => continue,
             };
             for child in children {
-                if let NodeExactState::Product(product) = child {
+                if is_product && let NodeExactState::Product(product) = child {
                     let count = result.entry(product.id).or_default();
                     *count = count.checked_add(1).ok_or(NormalizeError::ArithmeticOverflow)?;
                 }
                 pending.push(child.clone());
+            }
+        }
+        let mut additive_outputs = product_operand_additives.clone();
+        if let NodeExactState::Additive(plan) = root {
+            additive_outputs.insert(plan.id);
+        }
+        let no_outputs = BTreeMap::new();
+        for additive in additive_outputs {
+            let plan = additives.get(&additive).ok_or(NormalizeError::InvalidExactPlan {
+                reason: "missing additive output definition",
+            })?;
+            let flattened =
+                self.flatten_additive_plan(plan, &no_outputs, product_operand_additives)?;
+            for (product, _, occurrences, _) in flattened.products.into_values() {
+                let count = result.entry(product.id).or_default();
+                *count =
+                    count.checked_add(occurrences).ok_or(NormalizeError::ArithmeticOverflow)?;
             }
         }
         Ok(result)
@@ -3186,13 +3386,19 @@ impl<'a> Normalizer<'a> {
                         &weight,
                         &mut terms,
                         direct,
-                        plan.mode == ProductMode::TypedGadgetCandidate,
+                        matches!(plan.mode, ProductMode::TypedGadgetCandidate),
                     )?;
                     let planned = u64::try_from(left.exact_terms.len())
                         .unwrap_or(u64::MAX)
                         .saturating_mul(u64::try_from(right.exact_terms.len()).unwrap_or(u64::MAX));
                     self.product_plan_counters.streamed_executions =
                         self.product_plan_counters.streamed_executions.saturating_add(1);
+                    if matches!(plan.mode, ProductMode::ScalarAction(_)) {
+                        self.product_plan_counters.scalar_action_streamed_executions = self
+                            .product_plan_counters
+                            .scalar_action_streamed_executions
+                            .saturating_add(1);
+                    }
                     self.product_plan_counters.planned_pairs =
                         self.product_plan_counters.planned_pairs.saturating_add(planned);
                     self.product_plan_counters.max_streamed_output_terms = self
@@ -3206,6 +3412,12 @@ impl<'a> Normalizer<'a> {
             } else {
                 self.product_plan_counters.zero_weight_skips =
                     self.product_plan_counters.zero_weight_skips.saturating_add(1);
+                if matches!(plan.mode, ProductMode::ScalarAction(_)) {
+                    self.product_plan_counters.scalar_action_zero_weight_skips = self
+                        .product_plan_counters
+                        .scalar_action_zero_weight_skips
+                        .saturating_add(1);
+                }
             }
             for _ in 0..occurrences {
                 let had_output = outputs.contains_key(&(1, plan.id));
@@ -4212,6 +4424,22 @@ impl<'a> Normalizer<'a> {
             ordinary_product_max_streamed_output_terms: self
                 .product_plan_counters
                 .max_streamed_output_terms,
+            scalar_action_plans_created: self.product_plan_counters.scalar_action_plans_created,
+            scalar_action_streamed_executions: self
+                .product_plan_counters
+                .scalar_action_streamed_executions,
+            scalar_action_zero_weight_skips: self
+                .product_plan_counters
+                .scalar_action_zero_weight_skips,
+            scalar_action_standalone_materializations: self
+                .product_plan_counters
+                .scalar_action_standalone_materializations,
+            scalar_action_reclassified_terms: self
+                .product_plan_counters
+                .scalar_action_reclassified_terms,
+            scalar_action_reclassified_factors_max: self
+                .product_plan_counters
+                .scalar_action_reclassified_factors_max,
             additive_materializations: self.exact_plan_materializations,
             additive_materialization_output_terms_total: self
                 .exact_plan_materialization_output_terms_total,
@@ -4446,6 +4674,7 @@ impl<'a> Normalizer<'a> {
             gadget_product_counters: GadgetProductPlanCounters::default(),
             deferred_gadget_products: BTreeSet::new(),
             deferred_products: BTreeSet::new(),
+            deferred_scalar_actions: BTreeSet::new(),
             diagnostic_product_consumers: BTreeMap::new(),
             diagnostic_product_evaluations: BTreeMap::new(),
             diagnostic_product_root: None,
@@ -5043,6 +5272,7 @@ impl<'a> Normalizer<'a> {
         self.clear_value_cache();
         self.deferred_gadget_products.clear();
         self.deferred_products.clear();
+        self.deferred_scalar_actions.clear();
         self.diagnostic_product_consumers.clear();
         self.diagnostic_product_evaluations.clear();
         self.diagnostic_product_root = None;
@@ -5671,6 +5901,7 @@ impl<'a> Normalizer<'a> {
         let saved_gadget_product_plans = std::mem::take(&mut self.gadget_product_plans);
         let saved_deferred_gadget_products = std::mem::take(&mut self.deferred_gadget_products);
         let saved_deferred_products = std::mem::take(&mut self.deferred_products);
+        let saved_deferred_scalar_actions = std::mem::take(&mut self.deferred_scalar_actions);
         let saved_diagnostic_product_consumers =
             std::mem::take(&mut self.diagnostic_product_consumers);
         let saved_diagnostic_product_evaluations =
@@ -5722,6 +5953,7 @@ impl<'a> Normalizer<'a> {
         self.gadget_product_plans = saved_gadget_product_plans;
         self.deferred_gadget_products = saved_deferred_gadget_products;
         self.deferred_products = saved_deferred_products;
+        self.deferred_scalar_actions = saved_deferred_scalar_actions;
         self.diagnostic_product_consumers = saved_diagnostic_product_consumers;
         self.diagnostic_product_evaluations = saved_diagnostic_product_evaluations;
         self.diagnostic_product_root = saved_diagnostic_product_root;
@@ -5918,6 +6150,7 @@ impl<'a> Normalizer<'a> {
 
         let mut candidates = BTreeSet::new();
         let mut gadget_candidates = BTreeSet::new();
+        let mut scalar_action_candidates = BTreeSet::new();
         for expression in &reachable {
             if *expression == root ||
                 product_consumers.get(expression).is_some_and(|counts| counts.structural != 0)
@@ -5930,13 +6163,15 @@ impl<'a> Normalizer<'a> {
             {
                 continue;
             }
-            let non_scalar = node.inputs.iter().try_fold(true, |ordinary, input| {
+            let scalar_sides = node.inputs.iter().try_fold(0_u8, |count, input| {
                 let ResolvedValueType::Matrix(matrix) = self.expressions.value_type(*input)? else {
-                    return Ok::<_, NormalizeError>(false);
+                    return Ok::<_, NormalizeError>(u8::MAX);
                 };
-                Ok(ordinary && !(matrix.rows == 1 && matrix.columns == 1))
+                Ok(count.saturating_add(u8::from(matrix.rows == 1 && matrix.columns == 1)))
             })?;
-            if non_scalar {
+            if scalar_sides == 1 {
+                scalar_action_candidates.insert(*expression);
+            } else if scalar_sides == 0 {
                 gadget_candidates.insert(*expression);
                 // A direct decomposition operand is the existing typed gadget boundary. Keep
                 // it out of the ordinary policy so the specialized plan remains authoritative.
@@ -5956,6 +6191,24 @@ impl<'a> Normalizer<'a> {
         }
         let (eligible, _) = self.propagate_product_eligibility(&candidates, &real_consumers)?;
         self.deferred_products = eligible;
+        self.deferred_scalar_actions = scalar_action_candidates
+            .into_iter()
+            .filter(|expression| {
+                real_consumers.get(expression).is_some_and(|consumers| {
+                    !consumers.is_empty() &&
+                        consumers.iter().all(|consumer| {
+                            self.expressions.node(*consumer).is_ok_and(|node| {
+                                matches!(
+                                    node.operator,
+                                    ValueOperator::Matrix(
+                                        MatrixOperation::Add | MatrixOperation::Subtract
+                                    )
+                                )
+                            })
+                        })
+                })
+            })
+            .collect();
         if self.gadget_recompositions.is_some() {
             self.deferred_gadget_products = gadget_candidates
                 .iter()
@@ -6132,7 +6385,8 @@ impl<'a> Normalizer<'a> {
         let compositional_product =
             matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Multiply)) &&
                 (self.deferred_products.contains(&expression) ||
-                    self.deferred_gadget_products.contains(&expression));
+                    self.deferred_gadget_products.contains(&expression) ||
+                    self.deferred_scalar_actions.contains(&expression));
         let mut children = Vec::with_capacity(node.inputs.len());
         let mut child_exact = Vec::with_capacity(node.inputs.len());
         for child in &node.inputs {
@@ -6203,7 +6457,8 @@ impl<'a> Normalizer<'a> {
                 if deferred_gadget.is_none() &&
                     let (Some(left), Some(right)) = (left, right)
                 {
-                    deferred_product = self.new_product_plan(expression, node, left, right)?;
+                    deferred_product =
+                        self.new_product_plan(scope_proof, expression, node, left, right)?;
                 }
             }
             if let Some(plan) = deferred_gadget {
@@ -7099,46 +7354,67 @@ impl<'a> Normalizer<'a> {
             None
         };
 
-        let mut reclassify = |normal_form: &PolynomialNF| -> Result<PolynomialNF, NormalizeError> {
-            let mut reclassified_terms = BTreeMap::new();
-            let mut max_reclassified_factors = 0usize;
-            for (monomial, coefficient) in &normal_form.exact_terms {
-                if coefficient.is_zero() {
-                    continue;
-                }
-                let (mut central, ordered) = {
-                    let descriptor = self.monomials.descriptor(*monomial)?;
-                    (descriptor.central_factors.to_vec(), descriptor.ordered_factors.to_vec())
-                };
-                central.extend_from_slice(&ordered);
-                max_reclassified_factors = max_reclassified_factors.max(central.len());
-                let reclassified = self.monomials.intern_with_proof(
-                    self.expressions,
-                    self.programs,
-                    scope_proof,
-                    &central,
-                    &[],
-                )?;
-                merge_term(&mut reclassified_terms, reclassified, coefficient.clone());
-            }
-            self.trace
-                .record_scalar_reclassification(reclassified_terms.len(), max_reclassified_factors);
-            Ok(PolynomialNF {
-                exact_terms: reclassified_terms,
-                bounded_summary: BoundedSummary::missing(),
-            })
-        };
         if let Some(ordered_product) = ordered_scalar_product {
-            return Ok(ScalarActionNormalization::Exact(reclassify(&ordered_product)?));
+            let (reclassified, _, _) = self.centralize_scalar_nf(scope_proof, &ordered_product)?;
+            return Ok(ScalarActionNormalization::Exact(reclassified));
         }
 
-        let reclassified_left = if left_scalar { reclassify(left)? } else { left.clone() };
-        let reclassified_right = if right_scalar { reclassify(right)? } else { right.clone() };
+        let reclassified_left = if left_scalar {
+            self.centralize_scalar_nf(scope_proof, left)?.0
+        } else {
+            left.clone()
+        };
+        let reclassified_right = if right_scalar {
+            self.centralize_scalar_nf(scope_proof, right)?.0
+        } else {
+            right.clone()
+        };
         Ok(ScalarActionNormalization::Exact(self.product_nf(
             scope_proof,
             &reclassified_left,
             &reclassified_right,
         )?))
+    }
+
+    /// Move every typed scalar factor into the commutative part of its monomial. Callers must
+    /// first prove that all ordered factors have the declared 1x1 matrix type.
+    fn centralize_scalar_nf(
+        &mut self,
+        scope_proof: &ScopeProof,
+        normal_form: &PolynomialNF,
+    ) -> Result<(PolynomialNF, usize, usize), NormalizeError> {
+        let mut reclassified_terms = BTreeMap::new();
+        let mut max_reclassified_factors = 0usize;
+        for (monomial, coefficient) in &normal_form.exact_terms {
+            if coefficient.is_zero() {
+                continue;
+            }
+            let (mut central, ordered) = {
+                let descriptor = self.monomials.descriptor(*monomial)?;
+                (descriptor.central_factors.to_vec(), descriptor.ordered_factors.to_vec())
+            };
+            central.extend_from_slice(&ordered);
+            max_reclassified_factors = max_reclassified_factors.max(central.len());
+            let reclassified = self.monomials.intern_with_proof(
+                self.expressions,
+                self.programs,
+                scope_proof,
+                &central,
+                &[],
+            )?;
+            merge_term(&mut reclassified_terms, reclassified, coefficient.clone());
+        }
+        self.trace
+            .record_scalar_reclassification(reclassified_terms.len(), max_reclassified_factors);
+        let term_count = reclassified_terms.len();
+        Ok((
+            PolynomialNF {
+                exact_terms: reclassified_terms,
+                bounded_summary: BoundedSummary::missing(),
+            },
+            term_count,
+            max_reclassified_factors,
+        ))
     }
 
     fn scalar_nf_ordered_factors_match_type(
@@ -14430,6 +14706,7 @@ mod tests {
         let a_nf = nf(a_id);
         let old_add_leaf = Arc::downgrade(&a_nf);
         let node = expressions.node_arc(product).unwrap();
+        let proof = expressions.scope_proof(semantic.program(), root).unwrap();
         let mut normalizer =
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
         let a_state = normalizer.materialized_exact_state(a, Arc::clone(&a_nf)).unwrap();
@@ -14439,7 +14716,13 @@ mod tests {
         normalizer.relation_rewriting_enabled = false;
         normalizer.deferred_products.insert(product);
         let product_plan = normalizer
-            .new_product_plan(product, node.as_ref(), NodeExactState::Additive(sum_plan), c_state)
+            .new_product_plan(
+                &proof,
+                product,
+                node.as_ref(),
+                NodeExactState::Additive(sum_plan),
+                c_state,
+            )
             .unwrap()
             .unwrap();
         normalizer.product_plans.insert(product, Arc::clone(&product_plan));
@@ -15092,6 +15375,556 @@ mod tests {
             expressions.node(descriptor.ordered_factors[0].expression()).unwrap().operator,
             ValueOperator::Matrix(MatrixOperation::Tensor { .. })
         ));
+    }
+
+    #[test]
+    fn deferred_scalar_action_matches_eager_on_both_sides_and_streams() {
+        for scalar_on_left in [false, true] {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+            let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+            let matrix = matrix_source(
+                &mut expressions,
+                "deferred-scalar-action-matrix",
+                matrix_type.clone(),
+                None,
+            );
+            let scalar =
+                matrix_source(&mut expressions, "deferred-scalar-action-scalar", scalar_type, None);
+            let inputs = if scalar_on_left { [scalar, matrix] } else { [matrix, scalar] };
+            let action =
+                expressions.intern_matrix_transform(MatrixOperation::Multiply, &inputs).unwrap();
+            let zero =
+                matrix_source(&mut expressions, "deferred-scalar-action-zero", matrix_type, None);
+            let zero = expressions
+                .intern_matrix_transform(MatrixOperation::Subtract, &[zero, zero])
+                .unwrap();
+            let root =
+                expressions.intern_matrix_transform(MatrixOperation::Add, &[action, zero]).unwrap();
+            let (facts, mut monomials, root_semantic) =
+                setup(&mut expressions, &mut programs, root);
+            let action_semantic = programs.scoped(&expressions, monomials.scope(), action).unwrap();
+            let eager = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                .unwrap()
+                .normalize(action_semantic)
+                .unwrap();
+            let (deferred, counters) = {
+                let mut normalizer =
+                    Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+                let value = normalizer.normalize(root_semantic).unwrap();
+                (value, normalizer.product_plan_counters)
+            };
+            assert_eq!(eager.coefficient_bound, deferred.coefficient_bound);
+            assert_eq!(
+                descriptor_coefficient_multiset(eager.exact_nf.as_ref().unwrap(), &monomials),
+                descriptor_coefficient_multiset(deferred.exact_nf.as_ref().unwrap(), &monomials)
+            );
+            let exact = deferred.exact_nf.unwrap();
+            let descriptor =
+                monomials.descriptor(*exact.exact_terms.keys().next().unwrap()).unwrap();
+            assert_eq!(descriptor.central_factors.len(), 1);
+            assert_eq!(descriptor.ordered_factors.len(), 1);
+            assert_eq!(counters.scalar_action_plans_created, 1);
+            assert_eq!(counters.scalar_action_streamed_executions, 1);
+            assert_eq!(counters.scalar_action_standalone_materializations, 0);
+            assert_eq!(counters.scalar_action_zero_weight_skips, 0);
+        }
+    }
+
+    #[test]
+    fn deferred_scalar_actions_share_one_additive_matrix_output_and_cancel() {
+        for subtract_last in [false, true] {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+            let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+            let a = matrix_source(
+                &mut expressions,
+                "shared-scalar-action-a",
+                matrix_type.clone(),
+                None,
+            );
+            let b = matrix_source(&mut expressions, "shared-scalar-action-b", matrix_type, None);
+            let shared =
+                expressions.intern_matrix_transform(MatrixOperation::Add, &[a, b]).unwrap();
+            let actions = (0..4)
+                .map(|index| {
+                    let scalar = matrix_source(
+                        &mut expressions,
+                        &format!("shared-scalar-action-scalar-{index}"),
+                        scalar_type.clone(),
+                        None,
+                    );
+                    expressions
+                        .intern_matrix_transform(MatrixOperation::Multiply, &[shared, scalar])
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let left = expressions
+                .intern_matrix_transform(MatrixOperation::Add, &[actions[0], actions[1]])
+                .unwrap();
+            let right = expressions
+                .intern_matrix_transform(MatrixOperation::Add, &[actions[2], actions[3]])
+                .unwrap();
+            let root = if subtract_last {
+                expressions
+                    .intern_matrix_transform(MatrixOperation::Subtract, &[actions[0], actions[0]])
+                    .unwrap()
+            } else {
+                expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap()
+            };
+            let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            assert_eq!(
+                normalizer.product_plan_counters.scalar_action_plans_created,
+                if subtract_last { 1 } else { 4 }
+            );
+            assert_eq!(
+                normalizer.product_plan_counters.scalar_action_streamed_executions,
+                if subtract_last { 0 } else { 4 }
+            );
+            assert_eq!(
+                normalizer.product_plan_counters.scalar_action_standalone_materializations,
+                0
+            );
+            assert_eq!(
+                normalizer.product_plan_counters.scalar_action_zero_weight_skips,
+                u64::from(subtract_last)
+            );
+            assert!(normalizer.exact_plan_materializations <= 2);
+            let exact = value.exact_nf.unwrap();
+            if subtract_last {
+                assert!(exact.is_zero());
+            } else {
+                assert_eq!(exact.term_count(), 8);
+                assert!(
+                    exact
+                        .exact_terms
+                        .values()
+                        .all(|coefficient| coefficient == &BigInt::from(1_u8))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_multi_term_scalar_actions_match_eager_on_both_sides() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+        let a = matrix_source(&mut expressions, "multi-scalar-a", matrix_type.clone(), None);
+        let b = matrix_source(&mut expressions, "multi-scalar-b", matrix_type, None);
+        let shared = expressions.intern_matrix_transform(MatrixOperation::Add, &[a, b]).unwrap();
+        let s1 = matrix_source(&mut expressions, "multi-scalar-s1", scalar_type.clone(), None);
+        let s2 = matrix_source(&mut expressions, "multi-scalar-s2", scalar_type.clone(), None);
+        let s3 = matrix_source(&mut expressions, "multi-scalar-s3", scalar_type, None);
+        let difference =
+            expressions.intern_matrix_transform(MatrixOperation::Subtract, &[s1, s2]).unwrap();
+        let sum = expressions.intern_matrix_transform(MatrixOperation::Add, &[s2, s3]).unwrap();
+        let cancelled =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[difference, sum]).unwrap();
+        let scalar =
+            expressions.intern_matrix_transform(MatrixOperation::Negate, &[cancelled]).unwrap();
+        let left = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[scalar, shared])
+            .unwrap();
+        let right = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[shared, scalar])
+            .unwrap();
+        let action_sum =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        let action_difference =
+            expressions.intern_matrix_transform(MatrixOperation::Subtract, &[left, right]).unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[action_sum, action_difference])
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let scope = semantic.program();
+        let scoped = |expression| programs.scoped(&expressions, scope, expression).unwrap();
+        let left_semantic = scoped(left);
+        let right_semantic = scoped(right);
+        let sum_semantic = scoped(action_sum);
+        let difference_semantic = scoped(action_difference);
+
+        let eager_left = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(left_semantic)
+            .unwrap();
+        let eager_right = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(right_semantic)
+            .unwrap();
+        assert_eq!(
+            descriptor_coefficient_multiset(eager_left.exact_nf.as_ref().unwrap(), &monomials),
+            descriptor_coefficient_multiset(eager_right.exact_nf.as_ref().unwrap(), &monomials)
+        );
+        let eager_sum = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            normalizer
+                .add_nf(
+                    eager_left.exact_nf.as_ref().unwrap(),
+                    eager_right.exact_nf.as_ref().unwrap(),
+                    false,
+                )
+                .unwrap()
+        };
+        assert_eq!(eager_left.exact_nf.as_ref().unwrap().term_count(), 4);
+        assert_eq!(eager_sum.term_count(), 4);
+        assert!(eager_sum.exact_terms.values().all(|coefficient| coefficient == &BigInt::from(-2)));
+
+        let (deferred_sum, sum_counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let value = normalizer.normalize(sum_semantic).unwrap();
+            (value, normalizer.product_plan_counters)
+        };
+        assert_eq!(eager_left.coefficient_bound, eager_right.coefficient_bound);
+        assert_eq!(
+            eager_sum.bounded_summary,
+            deferred_sum.exact_nf.as_ref().unwrap().bounded_summary
+        );
+        assert_eq!(
+            descriptor_coefficient_multiset(&eager_sum, &monomials),
+            descriptor_coefficient_multiset(deferred_sum.exact_nf.as_ref().unwrap(), &monomials)
+        );
+        assert_eq!(sum_counters.scalar_action_plans_created, 2);
+        assert_eq!(sum_counters.scalar_action_streamed_executions, 2);
+
+        let (deferred_difference, difference_counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let value = normalizer.normalize(difference_semantic).unwrap();
+            (value, normalizer.product_plan_counters)
+        };
+        assert!(deferred_difference.exact_nf.unwrap().is_zero());
+        assert_eq!(difference_counters.scalar_action_plans_created, 2);
+        assert_eq!(difference_counters.scalar_action_streamed_executions, 2);
+    }
+
+    #[test]
+    fn product_use_counts_include_each_real_additive_output_destination() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+        let a = matrix_source(&mut expressions, "use-count-a", matrix_type.clone(), None);
+        let b = matrix_source(&mut expressions, "use-count-b", matrix_type.clone(), None);
+        let x = matrix_source(&mut expressions, "use-count-x", matrix_type, None);
+        let scalar = matrix_source(&mut expressions, "use-count-scalar", scalar_type, None);
+        let product =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[a, b]).unwrap();
+        let shared =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[product, x]).unwrap();
+        let scalar_action = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[shared, scalar])
+            .unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[product, scalar_action])
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let proof = expressions.scope_proof(semantic.program(), root).unwrap();
+        let scoped =
+            |expression| programs.scoped(&expressions, semantic.program(), expression).unwrap();
+        let a_id = monomials.intern(&expressions, &programs, &[], &[scoped(a)]).unwrap();
+        let b_id = monomials.intern(&expressions, &programs, &[], &[scoped(b)]).unwrap();
+        let x_id = monomials.intern(&expressions, &programs, &[], &[scoped(x)]).unwrap();
+        let scalar_semantic = scoped(scalar);
+        let scalar_id = monomials
+            .intern_with_proof(&expressions, &programs, &proof, &[scalar_semantic], &[])
+            .unwrap();
+        let dead = monomials
+            .intern(&expressions, &programs, &[], &[scoped(a), scoped(x), scoped(b)])
+            .unwrap();
+        let scalar_action_semantic = scoped(scalar_action);
+        let nf = |id| {
+            Arc::new(PolynomialNF {
+                exact_terms: BTreeMap::from([(id, BigInt::from(1_u8))]),
+                bounded_summary: BoundedSummary::missing(),
+            })
+        };
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let a_state = normalizer.materialized_exact_state(a, nf(a_id)).unwrap();
+        let b_state = normalizer.materialized_exact_state(b, nf(b_id)).unwrap();
+        let product_plan = Arc::new(ProductExactPlan {
+            id: 1,
+            authority: normalizer.exact_plan_authority(product).unwrap(),
+            expression: product,
+            left_expression: a,
+            right_expression: b,
+            left_type: Normalizer::node_exact_authority(&a_state).matrix_type.clone(),
+            right_type: Normalizer::node_exact_authority(&b_state).matrix_type.clone(),
+            mode: ProductMode::Ordinary,
+            left: a_state,
+            right: b_state,
+        });
+        let x_state = normalizer.materialized_exact_state(x, nf(x_id)).unwrap();
+        let shared_plan = Arc::new(AdditiveExactPlan {
+            id: 2,
+            authority: normalizer.exact_plan_authority(shared).unwrap(),
+            left: NodeExactState::Product(Arc::clone(&product_plan)),
+            right: x_state,
+            subtract_right: false,
+        });
+        let scalar_nf = nf(scalar_id);
+        let scalar_state =
+            normalizer.materialized_exact_state(scalar, Arc::clone(&scalar_nf)).unwrap();
+        let scalar_plan = Arc::new(ProductExactPlan {
+            id: 3,
+            authority: normalizer.exact_plan_authority(scalar_action).unwrap(),
+            expression: scalar_action,
+            left_expression: shared,
+            right_expression: scalar,
+            left_type: normalizer.exact_plan_authority(shared).unwrap().matrix_type.clone(),
+            right_type: normalizer.exact_plan_authority(scalar).unwrap().matrix_type.clone(),
+            mode: ProductMode::ScalarAction(ScalarActionExactPlan {
+                scalar_on_left: false,
+                scalar_expression: scalar,
+                matrix_expression: shared,
+                scalar_type: normalizer.exact_plan_authority(scalar).unwrap().matrix_type.clone(),
+                matrix_type: normalizer.exact_plan_authority(shared).unwrap().matrix_type.clone(),
+                centralized_scalar: scalar_nf,
+            }),
+            left: NodeExactState::Additive(shared_plan),
+            right: scalar_state,
+        });
+        normalizer.product_plans.insert(scalar_action, Arc::clone(&scalar_plan));
+        normalizer.insert_value_cache(
+            scalar_action,
+            Arc::new(AnalyzedValue {
+                semantic: scalar_action_semantic,
+                exact_nf: None,
+                coefficient_bound: NumericContract::Missing,
+            }),
+        );
+        normalizer.protected_monomial_prefix = 0;
+        normalizer.normalization_depth = 1;
+        normalizer.monomial_gc_allocation_threshold_bytes = 0;
+        normalizer.sweep_monomials_at_node_commit().unwrap();
+        normalizer.normalization_depth = 0;
+        for live in [a_id, b_id, x_id, scalar_id] {
+            normalizer.monomials.descriptor(live).unwrap();
+        }
+        let centralized_scalar = normalizer.monomials.descriptor(scalar_id).unwrap();
+        assert_eq!(centralized_scalar.central_factors.as_ref(), &[scalar_semantic]);
+        assert!(centralized_scalar.ordered_factors.is_empty());
+        assert!(matches!(
+            normalizer.monomials.descriptor(dead),
+            Err(MonomialError::CollectedMonomialId { .. })
+        ));
+        normalizer.clear_value_cache();
+        let root_state = NodeExactState::Additive(Arc::new(AdditiveExactPlan {
+            id: 4,
+            authority: normalizer.exact_plan_authority(root).unwrap(),
+            left: NodeExactState::Product(product_plan),
+            right: NodeExactState::Product(scalar_plan),
+            subtract_right: false,
+        }));
+        let boundaries = Normalizer::product_operand_additives(&root_state);
+        let counts = normalizer.product_plan_use_counts(&root_state, &boundaries).unwrap();
+        assert_eq!(counts.get(&1), Some(&2));
+        assert_eq!(counts.get(&3), Some(&1));
+        assert_eq!(normalizer.materialize_exact_state(&root_state).unwrap().term_count(), 3);
+    }
+
+    #[test]
+    fn scalar_action_plan_rejects_invalid_leaves_and_authority_before_mutation() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+        let matrix = matrix_source(
+            &mut expressions,
+            "invalid-scalar-action-matrix",
+            matrix_type.clone(),
+            None,
+        );
+        let scalar = matrix_source(
+            &mut expressions,
+            "invalid-scalar-action-scalar",
+            scalar_type.clone(),
+            None,
+        );
+        let action = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[matrix, scalar])
+            .unwrap();
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[action, matrix]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let matrix_semantic = programs.scoped(&expressions, semantic.program(), matrix).unwrap();
+        let scalar_semantic = programs.scoped(&expressions, semantic.program(), scalar).unwrap();
+        let matrix_id = monomials.intern(&expressions, &programs, &[], &[matrix_semantic]).unwrap();
+        let scalar_id = monomials.intern(&expressions, &programs, &[scalar_semantic], &[]).unwrap();
+        let tombstone = monomials
+            .intern(&expressions, &programs, &[], &[matrix_semantic, matrix_semantic])
+            .unwrap();
+        monomials.sweep(0, [matrix_id, scalar_id]).unwrap();
+        let mut foreign_arena =
+            MonomialArena::new(&expressions, &programs, semantic.program()).unwrap();
+        let foreign =
+            foreign_arena.intern(&expressions, &programs, &[], &[matrix_semantic]).unwrap();
+        let nf = |monomial| {
+            Arc::new(PolynomialNF {
+                exact_terms: BTreeMap::from([(monomial, BigInt::from(1_u8))]),
+                bounded_summary: BoundedSummary::missing(),
+            })
+        };
+        let matrix_nf = nf(matrix_id);
+        let scalar_nf = nf(scalar_id);
+        let scalar_nf_equal_but_distinct = nf(scalar_id);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let action_authority = normalizer.exact_plan_authority(action).unwrap();
+        let matrix_authority = normalizer.exact_plan_authority(matrix).unwrap();
+        let scalar_authority = normalizer.exact_plan_authority(scalar).unwrap();
+        let materialized = |authority: ExactPlanAuthority, normal_form: Arc<PolynomialNF>| {
+            NodeExactState::Materialized { authority, normal_form }
+        };
+        let plan = |matrix_normal_form: Arc<PolynomialNF>,
+                    scalar_state_normal_form: Arc<PolynomialNF>,
+                    centralized_scalar: Arc<PolynomialNF>,
+                    scalar_on_left: bool,
+                    mode_scalar_type: ResolvedMatrixType,
+                    mode_matrix_type: ResolvedMatrixType| {
+            NodeExactState::Product(Arc::new(ProductExactPlan {
+                id: 1,
+                authority: action_authority.clone(),
+                expression: action,
+                left_expression: matrix,
+                right_expression: scalar,
+                left_type: matrix_type.clone(),
+                right_type: scalar_type.clone(),
+                mode: ProductMode::ScalarAction(ScalarActionExactPlan {
+                    scalar_on_left,
+                    scalar_expression: scalar,
+                    matrix_expression: matrix,
+                    scalar_type: mode_scalar_type,
+                    matrix_type: mode_matrix_type,
+                    centralized_scalar,
+                }),
+                left: materialized(matrix_authority.clone(), matrix_normal_form),
+                right: materialized(scalar_authority.clone(), scalar_state_normal_form),
+            }))
+        };
+        let invalid_states = [
+            plan(
+                nf(foreign),
+                Arc::clone(&scalar_nf),
+                Arc::clone(&scalar_nf),
+                false,
+                scalar_type.clone(),
+                matrix_type.clone(),
+            ),
+            plan(
+                nf(tombstone),
+                Arc::clone(&scalar_nf),
+                Arc::clone(&scalar_nf),
+                false,
+                scalar_type.clone(),
+                matrix_type.clone(),
+            ),
+            plan(
+                Arc::clone(&matrix_nf),
+                Arc::clone(&scalar_nf),
+                scalar_nf_equal_but_distinct,
+                false,
+                scalar_type.clone(),
+                matrix_type.clone(),
+            ),
+            plan(
+                Arc::clone(&matrix_nf),
+                Arc::clone(&scalar_nf),
+                Arc::clone(&scalar_nf),
+                true,
+                scalar_type.clone(),
+                matrix_type.clone(),
+            ),
+            plan(
+                matrix_nf,
+                Arc::clone(&scalar_nf),
+                scalar_nf,
+                false,
+                matrix_type.clone(),
+                scalar_type.clone(),
+            ),
+        ];
+        for state in invalid_states {
+            let high_water = normalizer.monomials.len();
+            let occupied = normalizer.monomials.occupied_len();
+            let counters = normalizer.product_plan_counters;
+            assert!(normalizer.materialize_exact_state(&state).is_err());
+            assert_eq!(normalizer.monomials.len(), high_water);
+            assert_eq!(normalizer.monomials.occupied_len(), occupied);
+            assert_eq!(normalizer.product_plan_counters, counters);
+        }
+    }
+
+    #[test]
+    fn deferred_scalar_action_keeps_both_scalar_and_composite_scalar_eager() {
+        let run = |composite_scalar: bool| {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+            let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+            let scalar = if composite_scalar {
+                let row = matrix_source(
+                    &mut expressions,
+                    "deferred-composite-scalar-row",
+                    ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 2).unwrap(),
+                    None,
+                );
+                let column = matrix_source(
+                    &mut expressions,
+                    "deferred-composite-scalar-column",
+                    ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 1).unwrap(),
+                    None,
+                );
+                expressions
+                    .intern_matrix_transform(MatrixOperation::Multiply, &[row, column])
+                    .unwrap()
+            } else {
+                matrix_source(
+                    &mut expressions,
+                    "deferred-both-scalar-left",
+                    scalar_type.clone(),
+                    None,
+                )
+            };
+            let other = matrix_source(
+                &mut expressions,
+                "deferred-scalar-action-other",
+                if composite_scalar { matrix_type.clone() } else { scalar_type.clone() },
+                None,
+            );
+            let action = expressions
+                .intern_matrix_transform(MatrixOperation::Multiply, &[other, scalar])
+                .unwrap();
+            let zero_source = matrix_source(
+                &mut expressions,
+                "deferred-scalar-action-fallback-zero",
+                if composite_scalar { matrix_type } else { scalar_type },
+                None,
+            );
+            let zero = expressions
+                .intern_matrix_transform(MatrixOperation::Subtract, &[zero_source, zero_source])
+                .unwrap();
+            let root =
+                expressions.intern_matrix_transform(MatrixOperation::Add, &[action, zero]).unwrap();
+            let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            assert_eq!(normalizer.product_plan_counters.scalar_action_plans_created, 0);
+            assert_eq!(normalizer.product_plan_counters.scalar_action_streamed_executions, 0);
+            assert_eq!(value.exact_nf.unwrap().term_count(), 1);
+        };
+        run(false);
+        run(true);
     }
 
     #[test]
@@ -15793,7 +16626,8 @@ mod tests {
     }
 
     #[test]
-    fn compositional_product_keeps_scalar_root_nonadd_eager_and_materializes_relations() {
+    fn compositional_product_keeps_nonadd_eager_defers_scalar_add_child_and_materializes_relations()
+    {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let matrix = matrix_type();
@@ -15834,7 +16668,9 @@ mod tests {
         let mut normalizer =
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
         normalizer.normalize(scalar_semantic).unwrap();
-        assert_eq!(normalizer.product_plan_counters.plans_created, 0);
+        assert_eq!(normalizer.product_plan_counters.plans_created, 1);
+        assert_eq!(normalizer.product_plan_counters.scalar_action_plans_created, 1);
+        assert_eq!(normalizer.product_plan_counters.scalar_action_streamed_executions, 1);
         let relation_semantic =
             programs.scoped(&expressions, semantic.program(), relation_root).unwrap();
         let (relations, mut normalization_cache, _) = register_test_closed_relation(

@@ -4,9 +4,12 @@ use crate::{
     graph::Graph,
 };
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    io::{self, Write},
+};
 use thiserror::Error;
 
 pub const IR_VERSION: u32 = 6;
@@ -20,14 +23,17 @@ pub enum EncodingError {
 }
 
 pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, EncodingError> {
-    let value = serde_json::to_value(value)?;
-    let canonical = canonicalize_value(value);
-    Ok(serde_json::to_vec(&canonical)?)
+    let mut value = serde_json::to_value(value)?;
+    canonicalize_value(&mut value);
+    Ok(serde_json::to_vec(&value)?)
 }
 
 pub fn hash_canonical<T: Serialize>(value: &T) -> Result<[u8; 32], EncodingError> {
-    let bytes = canonical_json(value)?;
-    Ok(Sha256::digest(bytes).into())
+    let mut value = serde_json::to_value(value)?;
+    canonicalize_value(&mut value);
+    let mut hasher = Sha256::new();
+    serde_json::to_writer(DigestWriter(&mut hasher), &value)?;
+    Ok(hasher.finalize().into())
 }
 
 /// Hashes one concrete executable graph instantiation.
@@ -57,17 +63,33 @@ pub fn spec_hash(graph: &Graph, bindings: &ParamEnv) -> Result<SpecHash, Encodin
     Ok(SpecHash(hash_canonical(&payload)?))
 }
 
-fn canonicalize_value(value: Value) -> Value {
+fn canonicalize_value(value: &mut Value) {
     match value {
-        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_value).collect()),
-        Value::Object(values) => {
-            let sorted = values
-                .into_iter()
-                .map(|(key, value)| (key, canonicalize_value(value)))
-                .collect::<BTreeMap<_, _>>();
-            Value::Object(sorted.into_iter().collect::<Map<_, _>>())
+        Value::Array(values) => {
+            for value in values {
+                canonicalize_value(value);
+            }
         }
-        scalar => scalar,
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                canonicalize_value(value);
+            }
+            values.sort_keys();
+        }
+        _ => {}
+    }
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl Write for DigestWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -77,6 +99,43 @@ mod tests {
     use crate::{GraphOutput, NodeHandle, WireType, node::NodeKind};
     use num_bigint::BigInt;
     use serde::Serialize;
+    use serde_json::{Map, json};
+
+    fn tiny_graph() -> Graph {
+        let value = NodeHandle::new(
+            NodeKind::ConstantInt(BigInt::from(7)),
+            Vec::new(),
+            vec![WireType::ConstantInt],
+        )
+        .output(0)
+        .expect("constant output");
+        Graph::freeze(
+            "tiny-golden",
+            Vec::new(),
+            BTreeMap::from([("result".to_owned(), GraphOutput { value, confidentiality: None })]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("graph freezes")
+        .0
+    }
+
+    fn reference_canonicalize(value: Value) -> Value {
+        match value {
+            Value::Array(values) => {
+                Value::Array(values.into_iter().map(reference_canonicalize).collect())
+            }
+            Value::Object(values) => {
+                let sorted = values
+                    .into_iter()
+                    .map(|(key, value)| (key, reference_canonicalize(value)))
+                    .collect::<BTreeMap<_, _>>();
+                Value::Object(sorted.into_iter().collect::<Map<_, _>>())
+            }
+            scalar => scalar,
+        }
+    }
 
     #[test]
     fn object_keys_are_sorted_without_whitespace() {
@@ -87,6 +146,25 @@ mod tests {
         }
         let encoded = canonical_json(&Unsorted { z: 1, a: 2 }).expect("serializable");
         assert_eq!(encoded, br#"{"a":2,"z":1}"#);
+    }
+
+    #[test]
+    fn in_place_canonicalization_matches_the_previous_nested_contract() {
+        let input = json!({
+            "z": [{"omega": 0, "alpha": 1}, {"d": [3, {"y": 2, "x": 1}]}],
+            "a": {"right": [{"b": false, "a": true}], "left": null}
+        });
+        let expected = serde_json::to_vec(&reference_canonicalize(input.clone())).unwrap();
+        assert_eq!(canonical_json(&input).unwrap(), expected);
+    }
+
+    #[test]
+    fn streamed_hash_matches_hashing_the_canonical_json_bytes() {
+        let input = json!({"z": [3, {"b": 2, "a": 1}], "a": "value"});
+        assert_eq!(
+            hash_canonical(&input).unwrap(),
+            <[u8; 32]>::from(Sha256::digest(canonical_json(&input).unwrap()))
+        );
     }
 
     #[test]
@@ -136,5 +214,30 @@ mod tests {
         };
 
         assert_ne!(spec_hash(&graph, &first).unwrap(), spec_hash(&graph, &second).unwrap());
+    }
+
+    #[test]
+    fn tiny_graph_canonical_json_and_spec_hash_match_the_pre_streaming_golden() {
+        const CANONICAL_JSON: &[u8] = br#"{"effect_roots":[],"name":"tiny-golden","outputs":{"result":{"confidentiality":null,"value":{"node":0,"port":0}}},"parameters":[],"real_constants":{},"scopes":[{"id":{"tag":"Root"},"scope":{"inputs":[],"nodes":[{"arguments":[],"id":0,"kind":{"tag":"ConstantInt","value":"7"},"output_types":[{"tag":"ConstantInt"}]}],"outputs":[{"node":0,"port":0}]}}]}"#;
+        const SPEC_HASH: [u8; 32] = [
+            24, 72, 37, 192, 104, 64, 194, 126, 166, 191, 26, 87, 198, 189, 210, 255, 215, 166, 10,
+            219, 206, 151, 214, 116, 206, 162, 61, 64, 205, 21, 162, 229,
+        ];
+        let graph = tiny_graph();
+
+        assert_eq!(canonical_json(&graph).unwrap(), CANONICAL_JSON);
+        assert_eq!(spec_hash(&graph, &ParamEnv::default()).unwrap(), SpecHash(SPEC_HASH));
+
+        let clone = graph.clone();
+        let roundtrip: Graph =
+            serde_json::from_slice(&serde_json::to_vec(&graph).unwrap()).unwrap();
+        assert_eq!(
+            spec_hash(&graph, &ParamEnv::default()).unwrap(),
+            spec_hash(&clone, &ParamEnv::default()).unwrap()
+        );
+        assert_eq!(
+            spec_hash(&graph, &ParamEnv::default()).unwrap(),
+            spec_hash(&roundtrip, &ParamEnv::default()).unwrap()
+        );
     }
 }

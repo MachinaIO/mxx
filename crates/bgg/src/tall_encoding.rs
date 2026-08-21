@@ -589,7 +589,7 @@ mod tests {
         tall_rotation_encoding::tall_rotation_public_key_tag,
         test_utils::{execute_graph, matrix_output, row},
     };
-    use mxx_dsl::{DslContext, Ring};
+    use mxx_dsl::{BuiltGraph, DslContext, Ring};
     use mxx_gadgets::circuit::{
         CircuitLoweringTypes, GateInstance, PolyCircuit, SlotOperationLowering, SlotTransferSpec,
         SubCircuitParamSpec, SubCircuitParamValue,
@@ -1622,6 +1622,132 @@ mod tests {
             public_output.matrix.matrix_type(),
             "online mask multiplication and public-key lowering must agree on the output layout",
         );
+    }
+
+    #[test]
+    fn compact_identity_lane_mask_graph_scales_with_lanes_not_slots() {
+        fn build(slot_count: usize, lanes: usize) -> BuiltGraph {
+            assert_eq!(slot_count % lanes, 0);
+            let ring = Ring::new(257, 8);
+            let mut circuit = PolyCircuit::<DCRTPoly>::new();
+            let input_gate = circuit.input(1).as_single_wire();
+            let transferred = circuit.slot_identity_repeated_lanes_gate(
+                input_gate,
+                slot_count / lanes,
+                (0..lanes).map(|lane| Some((lane % 3) as u32)).collect(),
+            );
+            circuit.output([transferred]);
+            let public_compiler =
+                BggPublicKeyCompiler { ring: ring.clone(), base: 4.into(), digit_count: 2.into() };
+            let one_public = BggPublicKeyWire {
+                matrix: ring.input("compact-one-public", (1, 2)),
+                reveal_plaintext: true,
+            };
+            let input_public = BggPublicKeyWire {
+                matrix: ring.input("compact-input-public", (1, 2)),
+                reveal_plaintext: true,
+            };
+            let diagonal_mask_public_key = BggPublicKeyWire {
+                matrix: ring.input("compact-mask-public", (1, 2)),
+                reveal_plaintext: true,
+            };
+            let circuit_compiler =
+                crate::PolyCircuitCompiler { public_key: public_compiler.clone() };
+            let mut public_lowering = BggTallSlotPublicKeyLowering {
+                compiler: public_compiler.clone(),
+                diagonal_mask_public_key: diagonal_mask_public_key.clone(),
+                configured_slot_count: slot_count,
+                rotations: BTreeMap::new(),
+            };
+            let public_output = circuit_compiler
+                .compile_public_keys_with_lowerings(
+                    &circuit,
+                    one_public.clone(),
+                    [input_public.clone()],
+                    &mut crate::NoPublicLookup::default(),
+                    &mut public_lowering,
+                )
+                .expect("compact Tall public-key transfer")
+                .remove(0);
+            let input = BggTallEncodingWire {
+                rows: ring.input_family("compact-rows", slot_count, (1, 2)),
+                pubkey: input_public,
+                plaintext: BggTallPlaintext::Diagonal(ring.input_family(
+                    "compact-plaintexts",
+                    slot_count,
+                    (1, 1),
+                )),
+                canonical_input_exclusive_upper: None,
+            };
+            let one = BggTallEncodingWire {
+                rows: ring.input_family("compact-one-rows", slot_count, (1, 2)),
+                pubkey: one_public,
+                plaintext: BggTallPlaintext::Diagonal(ring.input_family(
+                    "compact-one-plaintexts",
+                    slot_count,
+                    (1, 1),
+                )),
+                canonical_input_exclusive_upper: None,
+            };
+            let mut lowering = BggTallSlotLowering {
+                compiler: BggTallEncodingCompiler { public_key: public_compiler.clone() },
+                diagonal_mask_public_key,
+                secret_rows: ring.input_family("compact-secret-rows", slot_count, (1, 1)),
+                sampler: BggTallEncodingSampler {
+                    layout: BggSamplerLayout {
+                        modulus: 257.into(),
+                        ring_dimension: 8.into(),
+                        secret_dimension: 1,
+                        digit_count: 2,
+                        gadget_base: 4.into(),
+                    },
+                    gaussian_sigma: None,
+                    gaussian_max_coefficient_bound: None,
+                },
+                rotations: BTreeMap::new(),
+            };
+            let output = circuit_compiler
+                .compile_tall_encodings_with_lowerings(
+                    &circuit,
+                    one,
+                    [input],
+                    &mut crate::NoPublicLookup::default(),
+                    &mut lowering,
+                )
+                .expect("compact Tall transfer")
+                .remove(0);
+            DslContext::new("compact-tall-slot-transfer")
+                .family_output("rows", output.rows)
+                .unwrap()
+                .output("public", public_output.matrix)
+                .unwrap()
+                .build()
+                .unwrap()
+        }
+
+        let small = build(8, 4);
+        let large = build(1 << 16, 4);
+        for graph in [&small, &large] {
+            graph.validate(&ParamEnv::default()).expect("valid compact Tall graph");
+            let nodes =
+                graph.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
+            assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyPack { .. })));
+            assert_eq!(
+                nodes
+                    .iter()
+                    .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+                    .count(),
+                3,
+                "mask generation, Tall sampling, and SIMD multiplication each retain one loop"
+            );
+        }
+        let graph_size = |graph: &BuiltGraph| {
+            (
+                graph.graph.scopes().len(),
+                graph.graph.scopes().values().map(|scope| scope.nodes().len()).sum::<usize>(),
+            )
+        };
+        assert_eq!(graph_size(&small), graph_size(&large));
     }
 
     #[test]

@@ -2231,6 +2231,93 @@ impl Family<Mat> {
         body_value.parallel_families(&node, &mut next_port, &count, pending)
     }
 
+    pub fn parallel_zip_many_with_broadcast_values<R: ParallelOutput>(
+        zipped: Vec<Self>,
+        broadcast: Vec<Self>,
+        body: impl FnOnce(LoopIndex, Vec<Mat>, Vec<Self>) -> Result<R, DslError>,
+    ) -> Result<R::Families, DslError> {
+        let Some(first) = zipped.first() else {
+            return Err(DslError::Schema);
+        };
+        let count = first.count.clone();
+        if zipped.iter().any(|family| family.count != count) {
+            return Err(DslError::FamilyCountMismatch);
+        }
+        let zipped_types = zipped
+            .iter()
+            .map(|family| family.element_schema.matrix_type.clone())
+            .collect::<Vec<_>>();
+        let broadcast_types = broadcast
+            .iter()
+            .map(|family| (family.element_schema.matrix_type.clone(), family.count.clone()))
+            .collect::<Vec<_>>();
+        let (index_slot, body_result) = with_loop_index(|index| -> Result<_, DslError> {
+            with_new_construction_scope(|scope| -> Result<_, DslError> {
+                let zipped_inputs = zipped_types
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, matrix_type)| {
+                        Mat::source_input(format!("zip-item-{index}"), matrix_type, None)
+                    })
+                    .collect::<Vec<_>>();
+                let broadcast_inputs = broadcast_types
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (matrix_type, count))| {
+                        Family::<Mat>::source_input(
+                            format!("broadcast-family-{index}"),
+                            matrix_type,
+                            count,
+                            None,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let explicit_inputs = zipped_inputs
+                    .iter()
+                    .map(|input| input.value.clone())
+                    .chain(broadcast_inputs.iter().map(|input| input.value.clone()))
+                    .collect();
+                let output = body(index, zipped_inputs, broadcast_inputs)?;
+                Ok((output, explicit_inputs, scope))
+            })
+        });
+        let (body_value, explicit_inputs, scope) = body_result?;
+        let body_outputs = body_value.flatten();
+        let sealed = SubgraphHandle::seal(
+            "parallel-zip-many-with-broadcast-body",
+            scope,
+            explicit_inputs,
+            body_outputs,
+            CapturePolicy::Reject,
+        )?;
+        let mut arguments = zipped.iter().map(|family| family.value.clone()).collect::<Vec<_>>();
+        let mut modes = vec![LoopInputMode::Zip; zipped.len()];
+        arguments.extend(broadcast.iter().map(|family| family.value.clone()));
+        modes.extend((0..broadcast.len()).map(|_| LoopInputMode::Broadcast));
+        let family_outputs = body_value.parallel_family_types(&count)?;
+        let node = NodeHandle::parallel_loop(
+            sealed.handle,
+            arguments,
+            family_outputs,
+            ParallelLoop {
+                count: count.clone(),
+                minimum_count: 0,
+                index_slot,
+                bindings: Vec::new(),
+                input_modes: modes,
+            },
+        );
+        let pending = Pending::merge(
+            zipped
+                .into_iter()
+                .map(|family| family.pending)
+                .chain(broadcast.into_iter().map(|family| family.pending))
+                .chain(std::iter::once(body_value.pending().remap(&sealed.remap))),
+        );
+        let mut next_port = 0;
+        body_value.parallel_families(&node, &mut next_port, &count, pending)
+    }
+
     pub fn parallel_map_values<R: ParallelOutput>(
         self,
         body: impl FnOnce(LoopIndex, Mat) -> R,
@@ -2711,6 +2798,13 @@ impl ParallelRange {
         self.map_values(body)
     }
 
+    pub fn try_map(
+        self,
+        body: impl FnOnce(LoopIndex) -> Result<Mat, DslError>,
+    ) -> Result<Family<Mat>, DslError> {
+        self.try_map_values(body)
+    }
+
     pub fn map_values<R: ParallelOutput>(
         self,
         body: impl FnOnce(LoopIndex) -> R,
@@ -2718,6 +2812,42 @@ impl ParallelRange {
         let count = self.count;
         let (index_slot, (body_value, scope)) =
             with_loop_index(|index| with_new_construction_scope(|scope| (body(index), scope)));
+        let body_outputs = body_value.flatten();
+        let sealed = SubgraphHandle::seal(
+            "parallel-range-body",
+            scope,
+            Vec::new(),
+            body_outputs,
+            CapturePolicy::BroadcastScalarsAndArtifactFamilies,
+        )?;
+        let arguments = sealed.captures.iter().map(|capture| capture.outer.clone()).collect();
+        let modes = (0..sealed.captures.len()).map(|_| LoopInputMode::Broadcast).collect();
+        let family_outputs = body_value.parallel_family_types(&count)?;
+        let node = NodeHandle::parallel_loop(
+            sealed.handle.clone(),
+            arguments,
+            family_outputs,
+            ParallelLoop {
+                count: count.clone(),
+                minimum_count: 0,
+                index_slot,
+                bindings: Vec::new(),
+                input_modes: modes,
+            },
+        );
+        let pending = body_value.pending().remap(&sealed.remap);
+        body_value.parallel_families(&node, &mut 0, &count, pending)
+    }
+
+    pub fn try_map_values<R: ParallelOutput>(
+        self,
+        body: impl FnOnce(LoopIndex) -> Result<R, DslError>,
+    ) -> Result<R::Families, DslError> {
+        let count = self.count;
+        let (index_slot, body_result) = with_loop_index(|index| {
+            with_new_construction_scope(|scope| body(index).map(|body_value| (body_value, scope)))
+        });
+        let (body_value, scope) = body_result?;
         let body_outputs = body_value.flatten();
         let sealed = SubgraphHandle::seal(
             "parallel-range-body",
@@ -4417,12 +4547,21 @@ impl<I: GraphValue, O: GraphValue> Subgraph<I, O> {
         input_schema: I::Schema,
         body: impl FnOnce(I) -> O,
     ) -> Result<Self, DslError> {
+        Self::try_define(name, input_schema, |inputs| Ok(body(inputs)))
+    }
+
+    pub fn try_define(
+        name: impl Into<String>,
+        input_schema: I::Schema,
+        body: impl FnOnce(I) -> Result<O, DslError>,
+    ) -> Result<Self, DslError> {
         let name = name.into();
-        let (inputs, output, scope) = with_new_construction_scope(|scope| {
-            let inputs = input_schema.placeholders();
-            let output = body(inputs.clone());
-            (inputs, output, scope)
-        });
+        let (inputs, output, scope) =
+            with_new_construction_scope(|scope| -> Result<_, DslError> {
+                let inputs = input_schema.placeholders();
+                let output = body(inputs.clone())?;
+                Ok((inputs, output, scope))
+            })?;
         let sealed = SubgraphHandle::seal(
             name,
             scope,
@@ -4876,6 +5015,87 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn parallel_zip_many_with_broadcast_keeps_formal_family_inputs() {
+        let ring = Ring::new(17, 8);
+        let zipped =
+            Family::pack(vec![ring.input("zipped-0", (1, 1)), ring.input("zipped-1", (1, 1))])
+                .unwrap();
+        let broadcast = Family::pack(vec![
+            ring.input("broadcast-0", (1, 1)),
+            ring.input("broadcast-1", (1, 1)),
+            ring.input("broadcast-2", (1, 1)),
+        ])
+        .unwrap();
+        let output = Family::<Mat>::parallel_zip_many_with_broadcast_values(
+            vec![zipped],
+            vec![broadcast],
+            |index, zipped, broadcast| {
+                Ok(zipped.into_iter().next().unwrap() + broadcast[0].get(index.as_int()))
+            },
+        )
+        .unwrap();
+        let context = DslContext::new("parallel-zip-many-with-broadcast");
+        let built = context.public_family_output("output", output).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        let loop_spec = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find_map(|node| match node.kind() {
+                NodeKind::ParallelLoop(spec) => Some(spec),
+                _ => None,
+            })
+            .expect("parallel loop");
+        assert_eq!(loop_spec.input_modes, vec![LoopInputMode::Zip, LoopInputMode::Broadcast]);
+        let encoded = serde_json::to_vec(&built.graph).unwrap();
+        let decoded: Graph = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, built.graph);
+        mxx_ir_core::validate(&decoded, &ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn parallel_zip_many_with_broadcast_rejects_zipped_count_mismatch() {
+        let ring = Ring::new(17, 8);
+        let left =
+            Family::pack(vec![ring.input("left-0", (1, 1)), ring.input("left-1", (1, 1))]).unwrap();
+        let right = Family::pack(vec![
+            ring.input("right-0", (1, 1)),
+            ring.input("right-1", (1, 1)),
+            ring.input("right-2", (1, 1)),
+        ])
+        .unwrap();
+        assert!(matches!(
+            Family::<Mat>::parallel_zip_many_with_broadcast_values(
+                vec![left, right],
+                Vec::new(),
+                |_, zipped, _| Ok(zipped.into_iter().next().unwrap()),
+            ),
+            Err(DslError::FamilyCountMismatch)
+        ));
+    }
+
+    #[test]
+    fn try_define_accepts_a_formal_nonartifact_family() {
+        let ring = Ring::new(17, 8);
+        let matrix_type = MatType(ring.matrix_type((1, 1)));
+        let family_type = MatFamilyType { element: ring.matrix_type((1, 1)), count: 2.into() };
+        let subgraph = Subgraph::<(Mat, Family<Mat>), Mat>::try_define(
+            "formal-matrix-family",
+            (matrix_type.clone(), family_type.clone()),
+            |(matrix, family)| Ok(matrix + family.get_static(0)),
+        )
+        .unwrap();
+        let context = DslContext::new("formal-matrix-family-call");
+        let input_family =
+            Family::pack(vec![ring.input("family-0", (1, 1)), ring.input("family-1", (1, 1))])
+                .unwrap();
+        let output = subgraph.call((ring.input("matrix", (1, 1)), input_family)).unwrap();
+        let built = context.output("output", output).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]

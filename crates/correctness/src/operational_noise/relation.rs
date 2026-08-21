@@ -391,19 +391,30 @@ impl NormalizationCache {
         }
     }
     pub fn intern(&mut self, rhs: PolynomialNF) -> Result<CanonicalRhsId, RelationRegistryError> {
+        self.intern_arc(Arc::new(rhs))
+    }
+    pub fn intern_arc(
+        &mut self,
+        rhs: Arc<PolynomialNF>,
+    ) -> Result<CanonicalRhsId, RelationRegistryError> {
         let mut hasher = DefaultHasher::new();
-        rhs.hash(&mut hasher);
+        rhs.as_ref().hash(&mut hasher);
         let hash = hasher.finish();
         if let Some(slots) = self.rhs_interner.get(&hash) {
             for slot in slots {
-                if self.rhs.get(*slot as usize).is_some_and(|stored| stored.as_ref() == &rhs) {
+                if self.rhs.get(*slot as usize).is_some_and(|stored| {
+                    Arc::ptr_eq(stored, &rhs) || stored.as_ref() == rhs.as_ref()
+                }) {
                     return Ok(CanonicalRhsId { arena: self.token, slot: *slot });
                 }
             }
         }
         let slot =
             u32::try_from(self.rhs.len()).map_err(|_| RelationRegistryError::CacheExhausted)?;
-        self.rhs.push(Arc::new(rhs));
+        // Misses retain the caller's immutable allocation. Lookup remains expected O(1) by
+        // content hash plus full equality within one collision bucket; pointer identity is only
+        // a comparison fast path and never contributes to hashing, ordering, or canonical IDs.
+        self.rhs.push(rhs);
         self.rhs_interner.entry(hash).or_default().push(slot);
         Ok(CanonicalRhsId { arena: self.token, slot })
     }
@@ -587,6 +598,16 @@ impl RelationRegistry {
         } else {
             Err(RelationRegistryError::NotFrozen)
         }
+    }
+    /// Report whether the frozen authority contains any concrete closed relations.
+    ///
+    /// This capability is derived directly from the authoritative closed map. It carries no
+    /// factor summary or matching heuristic and is unavailable while registration is mutable.
+    pub fn has_closed_relations(&self) -> Result<bool, RelationRegistryError> {
+        if !self.frozen {
+            return Err(RelationRegistryError::NotFrozen);
+        }
+        Ok(!self.closed.is_empty())
     }
     pub fn resolve_closed(
         &self,
@@ -908,6 +929,54 @@ mod tests {
     }
 
     #[test]
+    fn canonical_rhs_arc_interning_retains_misses_and_deduplicates_by_content() {
+        let mut cache = NormalizationCache::new();
+        let first = Arc::new(empty_nf());
+        let first_id = cache.intern_arc(Arc::clone(&first)).unwrap();
+        let stored = cache.get_arc(first_id).unwrap();
+        assert!(Arc::ptr_eq(&first, &stored));
+
+        let equal_distinct = Arc::new(empty_nf());
+        assert!(!Arc::ptr_eq(&first, &equal_distinct));
+        assert_eq!(cache.intern_arc(equal_distinct).unwrap(), first_id);
+        let mut unequal = empty_nf();
+        unequal.exact_terms.insert(MonomialId::new(ArenaToken::fresh(), 0), BigInt::from(1));
+        let unequal_id = cache.intern_arc(Arc::new(unequal)).unwrap();
+        assert_ne!(unequal_id, first_id);
+        assert_eq!(cache.canonical_rhs_count(), 2);
+    }
+
+    #[test]
+    fn owned_and_arc_interning_have_identical_structure_and_fingerprint() {
+        let mut value = empty_nf();
+        value.exact_terms.insert(MonomialId::new(ArenaToken::fresh(), 0), BigInt::from(3));
+        let mut owned = NormalizationCache::new();
+        let owned_first = owned.intern(empty_nf()).unwrap();
+        let owned_second = owned.intern(value.clone()).unwrap();
+        let mut shared = NormalizationCache::new();
+        let shared_first = shared.intern_arc(Arc::new(empty_nf())).unwrap();
+        let shared_second = shared.intern_arc(Arc::new(value)).unwrap();
+        assert_eq!((owned_first.slot, owned_second.slot), (shared_first.slot, shared_second.slot));
+        assert_eq!(owned.canonical_state_fingerprint(), shared.canonical_state_fingerprint());
+    }
+
+    #[test]
+    fn arc_checkpoint_rollback_invalidates_id_without_shortening_external_lifetime() {
+        let mut cache = NormalizationCache::new();
+        let checkpoint = cache.checkpoint();
+        let source = Arc::new(empty_nf());
+        let weak = Arc::downgrade(&source);
+        let id = cache.intern_arc(Arc::clone(&source)).unwrap();
+        let retained = cache.get_arc(id).unwrap();
+        drop(source);
+        cache.rollback(checkpoint);
+        assert_eq!(cache.get(id), Err(RelationRegistryError::InvalidCanonicalRhs));
+        assert!(weak.upgrade().is_some());
+        drop(retained);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
     fn closed_registry_is_authority_only_and_reports_deterministic_ambiguity() {
         let mut cache = NormalizationCache::new();
         let mut rhs = empty_nf();
@@ -1030,6 +1099,30 @@ mod tests {
         let generation = registry.freeze();
         assert_eq!(generation, registry.frozen_generation().unwrap());
         assert_eq!(registry.resolve_closed(&lhs), Ok(RelationResolution::NoMatch));
+    }
+
+    #[test]
+    fn frozen_closed_relation_capability_is_authoritative_and_fail_closed() {
+        let mut empty = RelationRegistry::new();
+        assert_eq!(empty.has_closed_relations(), Err(RelationRegistryError::NotFrozen));
+        empty.freeze();
+        assert_eq!(empty.has_closed_relations(), Ok(false));
+
+        let source = expression(0);
+        let trapdoor = expression(1);
+        let lhs =
+            CanonicalLhsKey { layout: None, monomial: MonomialId::new(ArenaToken::fresh(), 0) };
+        let rhs = CanonicalRhsId { arena: ArenaToken::fresh(), slot: 0 };
+        let mut populated = RelationRegistry::new();
+        populated.register_closed(lhs.clone(), rhs, &authority(source, trapdoor)).unwrap();
+        assert_eq!(populated.has_closed_relations(), Err(RelationRegistryError::NotFrozen));
+        populated.freeze();
+        assert_eq!(populated.has_closed_relations(), Ok(true));
+        assert_eq!(
+            populated.register_closed(lhs, rhs, &authority(source, trapdoor)),
+            Err(RelationRegistryError::Frozen)
+        );
+        assert_eq!(populated.has_closed_relations(), Ok(true));
     }
 
     #[test]

@@ -719,6 +719,8 @@ pub struct ExprArena {
     index_evaluators: BTreeMap<IndexFunctionDefinitionId, Arc<IndexEvaluator>>,
     program_signatures: BTreeMap<ValueProgramId, ProgramSignature>,
     scoped_derivations: BTreeMap<ValueProgramId, HashSet<u32>>,
+    #[cfg(test)]
+    scope_proof_builds: std::cell::Cell<u64>,
 }
 
 impl Default for ExprArena {
@@ -738,6 +740,8 @@ impl ExprArena {
             index_evaluators: BTreeMap::new(),
             program_signatures: BTreeMap::new(),
             scoped_derivations: BTreeMap::new(),
+            #[cfg(test)]
+            scope_proof_builds: std::cell::Cell::new(0),
         }
     }
 
@@ -1051,7 +1055,20 @@ impl ExprArena {
         if let Some(derived) = self.scoped_derivations.get(&program) {
             reachable.extend(derived.iter().copied());
         }
-        Ok(ScopeProof { arena: self.token, program, signature, root, reachable })
+        let proof = ScopeProof { arena: self.token, program, signature, root, reachable };
+        #[cfg(test)]
+        self.scope_proof_builds.set(self.scope_proof_builds.get().saturating_add(1));
+        Ok(proof)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_scope_proof_build_count(&self) {
+        self.scope_proof_builds.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scope_proof_build_count(&self) -> u64 {
+        self.scope_proof_builds.get()
     }
 
     /// Convert an expression produced under an already validated capability to
@@ -1070,6 +1087,31 @@ impl ExprArena {
         Ok(ScopedExprId { program: proof.program, expression })
     }
 
+    /// Project the sole immutable input edge of an already-scoped parent into the same program.
+    ///
+    /// The caller supplies no child ID or signature. Authority comes only from the arena-owned
+    /// parent edge and its registered program, so a node created after an older whole-root proof
+    /// can expose its direct child without rebuilding or extending that proof.
+    pub(crate) fn scoped_only_input(
+        &self,
+        parent: ScopedExprId,
+    ) -> Result<ScopedExprId, ArenaError> {
+        self.check_id(parent.expression)?;
+        if !self.program_signatures.contains_key(&parent.program) {
+            return Err(ArenaError::UnknownProgram(parent.program));
+        }
+        let node = self.node(parent.expression)?;
+        let [child] = node.inputs.as_ref() else {
+            return Err(ArenaError::InvalidArity {
+                operator: "ScopedOnlyInput".to_owned(),
+                expected: 1,
+                actual: node.inputs.len(),
+            });
+        };
+        self.check_id(*child)?;
+        Ok(ScopedExprId { program: parent.program, expression: *child })
+    }
+
     pub(crate) fn validate_scoped_from_proof(
         &self,
         proof: &ScopeProof,
@@ -1084,6 +1126,27 @@ impl ExprArena {
         }
         self.check_id(scoped.expression)?;
         if !proof.reachable.contains(&scoped.expression.slot) {
+            return Err(ArenaError::InvalidScopeProof);
+        }
+        Ok(())
+    }
+
+    /// Validate that an owned capability is authority for this exact normalization root before
+    /// it is moved into the normalizer. This deliberately rechecks every stable component rather
+    /// than accepting program equality alone: foreign arenas, replaced signatures, a proof for a
+    /// different root, and a root absent from the proven reachable set all fail closed.
+    pub(crate) fn validate_scope_proof_for_root(
+        &self,
+        proof: &ScopeProof,
+        program: ValueProgramId,
+        root: ExprId,
+    ) -> Result<(), ArenaError> {
+        self.validate_scope_proof(proof)?;
+        self.check_id(root)?;
+        if proof.program != program {
+            return Err(ArenaError::ScopeMismatch { expected: proof.program, actual: program });
+        }
+        if proof.root != root || !proof.reachable.contains(&root.slot) {
             return Err(ArenaError::InvalidScopeProof);
         }
         Ok(())
@@ -2720,6 +2783,156 @@ mod tests {
             ),
             Err(ArenaError::InvalidScopeProof)
         );
+    }
+
+    #[test]
+    fn scoped_only_input_uses_the_parent_edge_without_rebuilding_scope_authority() {
+        let mut arena = ExprArena::new();
+        let argument = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let signature = ProgramSignature {
+            inputs: [ProgramInput {
+                value_type: ResolvedValueType::Int,
+                trusted_index_range: None,
+            }]
+            .into(),
+            output: ResolvedValueType::Int,
+        };
+        let mut programs = ProgramArena::new();
+        let program = programs.finalize(&mut arena, signature, argument).unwrap();
+
+        let outer_proof = arena.scope_proof(program, argument).unwrap();
+        let mut construction_proof = arena.scope_proof(program, argument).unwrap();
+        let root = arena.scoped_from_proof(&construction_proof, argument).unwrap();
+        let detached_child = arena
+            .intern_scoped_transform(
+                &mut construction_proof,
+                ValueOperator::Scalar(ScalarOperation::Negate),
+                &[root],
+            )
+            .unwrap();
+        let detached_parent = arena
+            .intern_scoped_transform(
+                &mut construction_proof,
+                ValueOperator::Scalar(ScalarOperation::Negate),
+                &[detached_child],
+            )
+            .unwrap();
+        assert_eq!(
+            arena.scoped_from_proof(&outer_proof, detached_child.expression()),
+            Err(ArenaError::InvalidScopeProof),
+            "an older whole-root proof does not retroactively gain detached derivations"
+        );
+        arena.reset_scope_proof_build_count();
+        assert_eq!(arena.scoped_only_input(detached_parent), Ok(detached_child));
+        assert_eq!(arena.scope_proof_build_count(), 0);
+        let old_child =
+            arena.scoped_from_proof(&construction_proof, detached_child.expression()).unwrap();
+        assert_eq!(arena.scoped_only_input(detached_parent).unwrap(), old_child);
+        assert_eq!(arena.scope_proof_build_count(), 0);
+
+        let binary_parent = arena
+            .intern_scoped_transform(
+                &mut construction_proof,
+                ValueOperator::Scalar(ScalarOperation::Add),
+                &[root, root],
+            )
+            .unwrap();
+        assert!(matches!(
+            arena.scoped_only_input(root),
+            Err(ArenaError::InvalidArity { expected: 1, actual: 0, .. })
+        ));
+        assert!(matches!(
+            arena.scoped_only_input(binary_parent),
+            Err(ArenaError::InvalidArity { expected: 1, actual: 2, .. })
+        ));
+
+        let unknown = ScopedExprId {
+            program: ValueProgramId::new(programs.token(), u32::MAX),
+            expression: detached_parent.expression(),
+        };
+        assert!(matches!(arena.scoped_only_input(unknown), Err(ArenaError::UnknownProgram(_))));
+
+        let mut foreign_arena = ExprArena::new();
+        let foreign_argument = foreign_arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let mut foreign_programs = ProgramArena::new();
+        let foreign_program = foreign_programs
+            .finalize(
+                &mut foreign_arena,
+                ProgramSignature {
+                    inputs: [ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: None,
+                    }]
+                    .into(),
+                    output: ResolvedValueType::Int,
+                },
+                foreign_argument,
+            )
+            .unwrap();
+        let foreign_parent = foreign_programs.root(&foreign_arena, foreign_program).unwrap();
+        assert!(matches!(
+            arena.scoped_only_input(foreign_parent),
+            Err(ArenaError::ForeignExpression { .. })
+        ));
+
+        arena.program_signatures.remove(&program);
+        assert_eq!(
+            arena.scoped_only_input(detached_parent),
+            Err(ArenaError::UnknownProgram(program))
+        );
+    }
+
+    #[test]
+    fn exact_root_scope_proof_validation_rejects_every_mismatched_authority() {
+        let mut arena = ExprArena::new();
+        let argument = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let signature = ProgramSignature {
+            inputs: [ProgramInput {
+                value_type: ResolvedValueType::Int,
+                trusted_index_range: None,
+            }]
+            .into(),
+            output: ResolvedValueType::Int,
+        };
+        let mut first_programs = ProgramArena::new();
+        let first = first_programs.finalize(&mut arena, signature.clone(), argument).unwrap();
+        let mut second_programs = ProgramArena::new();
+        let second = second_programs.finalize(&mut arena, signature, argument).unwrap();
+
+        let proof = arena.scope_proof(first, argument).unwrap();
+        assert_eq!(arena.validate_scope_proof_for_root(&proof, first, argument), Ok(()));
+        assert!(matches!(
+            arena.validate_scope_proof_for_root(&proof, second, argument),
+            Err(ArenaError::ScopeMismatch { .. })
+        ));
+
+        let other =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(7)), Box::new([])).unwrap();
+        assert_eq!(
+            arena.validate_scope_proof_for_root(&proof, first, other),
+            Err(ArenaError::InvalidScopeProof)
+        );
+
+        let mut wrong_signature = arena.scope_proof(first, argument).unwrap();
+        wrong_signature.signature.output = ResolvedValueType::Bool;
+        assert_eq!(
+            arena.validate_scope_proof_for_root(&wrong_signature, first, argument),
+            Err(ArenaError::InvalidScopeProof)
+        );
+
+        let mut unreachable = arena.scope_proof(first, argument).unwrap();
+        unreachable.reachable.remove(&argument.slot);
+        assert_eq!(
+            arena.validate_scope_proof_for_root(&unreachable, first, argument),
+            Err(ArenaError::InvalidScopeProof)
+        );
+
+        let mut foreign = ExprArena::new();
+        let foreign_argument = foreign.intern_argument(0, ResolvedValueType::Int).unwrap();
+        assert!(matches!(
+            foreign.validate_scope_proof_for_root(&proof, first, foreign_argument),
+            Err(ArenaError::ForeignExpression { .. })
+        ));
     }
 
     #[test]

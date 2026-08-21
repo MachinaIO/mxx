@@ -2308,17 +2308,31 @@ impl<'a> ProductionAdapter<'a> {
                         }
                         _ => None,
                     };
+                    let protocol_input = self
+                        .protocol_inputs
+                        .get(&(wire.stage.clone(), StageInputName(name.to_owned())));
                     let source = SemanticFamilySourceIdentity {
-                        stable_definition: format!(
-                            "{}::{name}",
-                            self.graphs.get(&wire.stage).map(|g| g.name()).unwrap_or("graph")
-                        ),
-                        invocation: format!(
-                            "{}:{}:{:?}:{}",
-                            wire.stage.0,
-                            wire.occurrence.path,
-                            wire.occurrence.definition,
-                            wire.wire.node.0
+                        stable_definition: protocol_input
+                            .map(|_| "protocol-input".to_owned())
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "{}::{name}",
+                                    self.graphs
+                                        .get(&wire.stage)
+                                        .map(|graph| graph.name())
+                                        .unwrap_or("graph")
+                                )
+                            }),
+                        invocation: protocol_input.map(|input| input.0.clone()).unwrap_or_else(
+                            || {
+                                format!(
+                                    "{}:{}:{:?}:{}",
+                                    wire.stage.0,
+                                    wire.occurrence.path,
+                                    wire.occurrence.definition,
+                                    wire.wire.node.0
+                                )
+                            },
                         ),
                         element_type,
                         domain: FamilyDomain::new(0, self.eval_u64(count)?)?,
@@ -4082,6 +4096,809 @@ fn real_descriptor(value: &RealExpr) -> Result<String, ProductionAdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repeated_named_parallel_artifact_protocol() -> crate::ProtocolDecl {
+        use crate::{
+            ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
+            EndpointSemanticBinding, EndpointSpecId, OperationalDecoderKind,
+            OperationalDecoderTarget, OutputRef, StageId, operational_protocol_from_graphs,
+        };
+        use mxx_dsl::{
+            Bool, DslContext, Family, IdealSpec, Mat, MatFamilyType, Ring, SemanticAnchor, Subgraph,
+        };
+        use mxx_ir_core::{
+            IntExpr,
+            artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
+        };
+
+        let ring = Ring::new(257, 1);
+        let count = IntExpr::constant(2);
+        let artifact_a_source = ring.input_family("artifact-a-source", count.clone(), (1, 1));
+        let artifact_b_source = ring.input_family("artifact-b-source", count.clone(), (1, 1));
+        let producer = DslContext::new("named-parallel-artifact-producer")
+            .public_family_output("artifact-a", artifact_a_source)
+            .expect("artifact A output")
+            .public_family_output("artifact-b", artifact_b_source)
+            .expect("artifact B output")
+            .build()
+            .expect("producer graph");
+
+        let schema = MatFamilyType { element: ring.matrix_type((1, 1)), count: count.clone() };
+        let kernel = Subgraph::<Vec<Family<Mat>>, Family<Mat>>::try_define(
+            "named-parallel-artifact-kernel",
+            vec![schema.clone(), schema.clone(), schema],
+            |families| {
+                let [left, right, artifact] = families.as_slice() else {
+                    return Err(mxx_dsl::DslError::Schema);
+                };
+                Family::<Mat>::parallel_zip_many_with_broadcast_values(
+                    vec![left.clone(), right.clone()],
+                    vec![artifact.clone()],
+                    |index, zipped, broadcast| {
+                        let [left, right] = zipped.as_slice() else {
+                            return Err(mxx_dsl::DslError::Schema);
+                        };
+                        let [artifact] = broadcast.as_slice() else {
+                            return Err(mxx_dsl::DslError::Schema);
+                        };
+                        Ok(left.clone() - right.clone() + artifact.get(index.as_int()))
+                    },
+                )
+            },
+        )
+        .expect("named kernel");
+
+        let x = ring.input_family("x", count.clone(), (1, 1));
+        let y = ring.input_family("y", count.clone(), (1, 1));
+        let production = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [9; 32] };
+        let artifact_a = ring.family_artifact_input(
+            production.clone(),
+            "artifact-a",
+            count.clone(),
+            (1, 1),
+            ArtifactConfidentiality::Public,
+        );
+        let artifact_b = ring.family_artifact_input(
+            production,
+            "artifact-b",
+            count,
+            (1, 1),
+            ArtifactConfidentiality::Public,
+        );
+        let first = kernel.call(vec![x.clone(), x.clone(), artifact_a]).expect("first kernel call");
+        let second = kernel.call(vec![x, y, artifact_b]).expect("second kernel call");
+        let residual = first.get_static(0) - second.get_static(0);
+        let decoded = residual
+            .clone()
+            .threshold_decode_bools(2, 1)
+            .into_iter()
+            .next()
+            .expect("decoder output")
+            .semantic_anchor("named-parallel-artifact.decoder")
+            .expect("decoder anchor");
+        let consumer = DslContext::new("named-parallel-artifact-consumer")
+            .private_output("operational-residual", residual)
+            .expect("residual output")
+            .bool_output("decoded", decoded)
+            .expect("decoder output")
+            .build()
+            .expect("consumer graph");
+        let decoder_node = consumer.graph.outputs()["decoded"].value.node;
+        let endpoint = EndpointSpecId::ToyThresholdDecode;
+        let decoder_stage = StageId("consumer".to_owned());
+        operational_protocol_from_graphs(
+            vec![("producer".to_owned(), &producer), ("consumer".to_owned(), &consumer)],
+            "consumer",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            |bundle| {
+                bundle.ideal = IdealSpec::new(
+                    DslContext::new("named-parallel-artifact-ideal")
+                        .bool_output("decoded", Bool::constant(false))
+                        .expect("ideal decoder output")
+                        .build()
+                        .expect("ideal graph"),
+                )
+                .expect("ideal spec");
+                bundle.comparator = ComparatorSpec::Equality {
+                    endpoints: vec![ComparatorEndpointBinding {
+                        endpoint,
+                        actual_input: "decoded".to_owned(),
+                        ideal_input: "decoded".to_owned(),
+                        result_output: "failure".to_owned(),
+                        failure_value: true,
+                    }],
+                };
+                bundle.endpoints = EndpointAnchors {
+                    entries: vec![EndpointAnchor {
+                        spec: endpoint,
+                        stage: decoder_stage.clone(),
+                        semantic_anchor: "named-parallel-artifact.decoder".to_owned(),
+                        semantics: EndpointSemanticBinding::ThresholdDecode,
+                        workflow_output: OutputRef {
+                            stage: decoder_stage.clone(),
+                            output: "decoded".to_owned(),
+                        },
+                        ideal_output: "decoded".to_owned(),
+                    }],
+                };
+                bundle.operational_decoder_targets = vec![OperationalDecoderTarget {
+                    target_id: "named-parallel-artifact".to_owned(),
+                    residual_stage: decoder_stage.clone(),
+                    residual_output: "operational-residual".to_owned(),
+                    decoder_stage,
+                    decoder_node,
+                    kind: OperationalDecoderKind::ThresholdDecode {
+                        plaintext_modulus: IntExpr::constant(2),
+                    },
+                }];
+                bundle.endpoint_specs = vec![endpoint];
+            },
+        )
+        .expect("operational protocol")
+    }
+
+    #[test]
+    fn repeated_named_parallel_calls_preserve_zip_broadcast_and_source_identity() {
+        use crate::{ArtifactName, ProtocolInputId, StageInputName};
+        use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef, node::NodeKind};
+
+        let protocol = repeated_named_parallel_artifact_protocol();
+        let plan =
+            ProtocolPlan::build(&protocol, "named-parallel-artifact").expect("protocol plan");
+        let consumer_stage = protocol
+            .stages()
+            .iter()
+            .find(|stage| stage.id == StageId("consumer".to_owned()))
+            .expect("consumer stage");
+        let root_input = |name: &str| {
+            consumer_stage
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .enumerate()
+                .find_map(|(index, node)| {
+                    matches!(node.kind(), NodeKind::Input { name: actual, .. } if actual == name)
+                        .then_some(WireRef { node: NodeId(index as u64), port: Port(0) })
+                })
+                .expect("root input")
+        };
+        let x = root_input("x");
+        let y = root_input("y");
+        let artifact_a = root_input("artifact:artifact-a");
+        let artifact_b = root_input("artifact:artifact-b");
+
+        let named_definition = FrozenGraphScopeId::Subgraph {
+            canonical_name: "named-parallel-artifact-kernel".to_owned(),
+        };
+        let outer_occurrences = plan
+            .nodes()
+            .keys()
+            .filter(|wire| wire.occurrence.definition == named_definition)
+            .map(|wire| wire.occurrence.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(outer_occurrences.len(), 2);
+        let parallel_occurrences = plan
+            .nodes()
+            .keys()
+            .filter(|wire| {
+                matches!(
+                    &wire.occurrence.definition,
+                    FrozenGraphScopeId::ParallelBody { parent, .. }
+                        if parent.as_ref() == &named_definition
+                )
+            })
+            .map(|wire| wire.occurrence.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(parallel_occurrences.len(), 2);
+        assert!(outer_occurrences.is_disjoint(&parallel_occurrences));
+
+        let resolve_root = |mut wire: PlannedWire| {
+            while let Some(alias) = plan.aliases().iter().find(|alias| alias.child == wire) {
+                wire = alias.parent.clone();
+            }
+            wire
+        };
+        let mut actual_calls = Vec::new();
+        for parallel in &parallel_occurrences {
+            let FrozenGraphScopeId::ParallelBody { parent, owner } = &parallel.definition else {
+                panic!("parallel occurrence definition")
+            };
+            let owner_node = consumer_stage
+                .graph
+                .scope(parent)
+                .and_then(|scope| scope.node(*owner))
+                .expect("parallel owner node");
+            assert!(matches!(
+                owner_node.kind(),
+                NodeKind::ParallelLoop(spec)
+                    if spec.input_modes == vec![
+                        mxx_ir_core::node::LoopInputMode::Zip,
+                        mxx_ir_core::node::LoopInputMode::Zip,
+                        mxx_ir_core::node::LoopInputMode::Broadcast,
+                    ]
+            ));
+            let scope =
+                consumer_stage.graph.scope(&parallel.definition).expect("parallel body scope");
+            assert_eq!(scope.inputs().len(), 3);
+            let mut roots = Vec::new();
+            let mut outer = None;
+            for input in scope.inputs() {
+                let child = PlannedWire {
+                    stage: consumer_stage.id.clone(),
+                    occurrence: parallel.clone(),
+                    wire: *input,
+                };
+                let alias = plan
+                    .aliases()
+                    .iter()
+                    .find(|alias| alias.child == child)
+                    .expect("parallel formal alias");
+                assert!(outer_occurrences.contains(&alias.parent.occurrence));
+                match &outer {
+                    Some(existing) => assert_eq!(existing, &alias.parent.occurrence),
+                    None => outer = Some(alias.parent.occurrence.clone()),
+                }
+                roots.push(resolve_root(child).wire);
+            }
+            let [left, right, artifact] = roots.as_slice() else {
+                panic!("three resolved formal roots")
+            };
+            actual_calls.push((outer.expect("outer occurrence"), [*left, *right, *artifact]));
+        }
+        actual_calls.sort_by(|left, right| left.0.cmp(&right.0));
+        let actual_roots = actual_calls.iter().map(|(_, roots)| *roots).collect::<BTreeSet<_>>();
+        assert_eq!(actual_roots, BTreeSet::from([[x, x, artifact_a], [x, y, artifact_b]]));
+        assert_ne!(actual_calls[0].0, actual_calls[1].0);
+
+        let artifact_producers = plan.artifact_producers().iter().collect::<Vec<_>>();
+        assert_eq!(artifact_producers.len(), 2);
+        let artifact_bindings = artifact_producers
+            .iter()
+            .map(|producer| {
+                (
+                    producer.binding.consumer_input.clone(),
+                    producer.binding.producer_output.clone(),
+                    producer.consumer.clone(),
+                    producer.producer.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            artifact_bindings
+                .iter()
+                .map(|(_, output, _, _)| output.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ArtifactName("artifact-a".to_owned()),
+                ArtifactName("artifact-b".to_owned()),
+            ])
+        );
+        assert_eq!(
+            artifact_bindings.iter().map(|(input, _, _, _)| input.clone()).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                StageInputName("artifact:artifact-a".to_owned()),
+                StageInputName("artifact:artifact-b".to_owned()),
+            ])
+        );
+        assert_ne!(artifact_producers[0].consumer, artifact_producers[1].consumer);
+        assert_ne!(artifact_producers[0].producer, artifact_producers[1].producer);
+        assert_eq!(
+            artifact_producers
+                .iter()
+                .map(|producer| producer.consumer.wire)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([artifact_a, artifact_b])
+        );
+
+        let protocol_inputs = protocol
+            .bundle
+            .input_contract
+            .inputs
+            .iter()
+            .map(|input| input.id.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            BTreeSet::from([
+                ProtocolInputId::from("x"),
+                ProtocolInputId::from("y"),
+                ProtocolInputId::from("artifact-a-source"),
+                ProtocolInputId::from("artifact-b-source"),
+            ])
+            .is_subset(&protocol_inputs)
+        );
+
+        let adapter =
+            ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).expect("production adapter");
+        let (mut job, roots) = adapter.lower().expect("production lowering");
+        let ProductionRoot::Closed(residual) = roots.residual else { panic!("closed residual") };
+        let analysis = job.normalize_closed_root(residual).expect("residual normalization");
+        let exact = analysis.value.exact_nf.as_ref().expect("exact residual");
+        assert_eq!(exact.exact_terms.len(), 4, "diagnostics={:?}", analysis.exact_term_diagnostics);
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+        enum ExactSource {
+            Value(super::super::arena::SemanticSourceIdentity),
+            Family(super::super::arena::SemanticFamilySourceIdentity),
+        }
+        let monomials = job
+            .monomials()
+            .get(analysis.value.semantic.program())
+            .expect("closed-root monomial arena");
+        let mut exact_sources = BTreeMap::<ExactSource, BigInt>::new();
+        for (monomial, coefficient) in &exact.exact_terms {
+            let descriptor = monomials.descriptor(*monomial).expect("exact monomial");
+            let mut pending = descriptor
+                .central_factors
+                .iter()
+                .chain(descriptor.ordered_factors.iter())
+                .map(|factor| (factor.expression(), Vec::<Vec<ExprId>>::new()))
+                .collect::<Vec<_>>();
+            let mut sources = BTreeSet::new();
+            while let Some((expression, environments)) = pending.pop() {
+                let node = job.expressions().node(expression).expect("exact expression");
+                match &node.operator {
+                    ValueOperator::Source(source) => {
+                        sources.insert(ExactSource::Value(source.clone()));
+                    }
+                    ValueOperator::OpaqueFamilyElement { source } => {
+                        sources.insert(ExactSource::Family(source.clone()));
+                    }
+                    ValueOperator::Argument { position, .. } => {
+                        let (current, outer) = environments
+                            .split_first()
+                            .expect("program argument has a call environment");
+                        let actual = current
+                            .get(*position as usize)
+                            .copied()
+                            .expect("program argument position");
+                        pending.push((actual, outer.to_vec()));
+                    }
+                    ValueOperator::ProgramCall { program } => {
+                        let callee = job.programs().program(*program).expect("callee program");
+                        let mut nested = environments;
+                        nested.insert(0, node.inputs.to_vec());
+                        pending.push((callee.root, nested));
+                    }
+                    _ => pending.extend(
+                        node.inputs.iter().copied().map(|input| (input, environments.clone())),
+                    ),
+                }
+            }
+            assert_eq!(sources.len(), 1, "term sources={sources:?}");
+            let source = sources.into_iter().next().expect("one exact source");
+            assert!(exact_sources.insert(source, coefficient.clone()).is_none());
+        }
+        assert_eq!(exact_sources.len(), 4);
+        let mut coefficients_by_input = BTreeMap::new();
+        for (source, coefficient) in exact_sources {
+            let ExactSource::Family(source) = source else {
+                panic!("fixture exact source must be a family input")
+            };
+            assert_eq!(source.stable_definition, "protocol-input");
+            assert!(source.artifact.is_none(), "artifact imports must resolve to producer roots");
+            let input = ProtocolInputId(source.invocation);
+            assert!(protocol_inputs.contains(&input));
+            assert!(coefficients_by_input.insert(input, coefficient).is_none());
+        }
+        assert_eq!(
+            coefficients_by_input,
+            BTreeMap::from([
+                (ProtocolInputId::from("x"), BigInt::from(-1)),
+                (ProtocolInputId::from("y"), BigInt::from(1)),
+                (ProtocolInputId::from("artifact-a-source"), BigInt::from(1)),
+                (ProtocolInputId::from("artifact-b-source"), BigInt::from(-1)),
+            ])
+        );
+    }
+
+    fn compact_tall_gaussian_protocol() -> crate::ProtocolDecl {
+        use crate::{
+            ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
+            EndpointSemanticBinding, EndpointSpecId, OperationalDecoderKind,
+            OperationalDecoderTarget, OutputRef, StageId, operational_protocol_from_graphs,
+        };
+        use mxx_bgg::{
+            BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout, BggTallEncodingCompiler,
+            BggTallEncodingSampler, BggTallEncodingWire, BggTallPlaintext, BggTallSlotLowering,
+            NoPublicLookup, PolyCircuitCompiler,
+        };
+        use mxx_dsl::{
+            Bool, DslContext, Family, IdealSpec, Mat, MatFamilyType, MatType, Ring, SemanticAnchor,
+            Subgraph,
+        };
+        use mxx_gadgets::circuit::PolyCircuit;
+        use mxx_ir_core::{
+            IntExpr, RealExpr,
+            artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
+        };
+        use mxx_primitives::poly::dcrt::poly::DCRTPoly;
+
+        let ring = Ring::new(257, 1);
+        let count = IntExpr::constant(2);
+        let secret_size = 1;
+        let digit_count = 40;
+        let columns = secret_size * digit_count;
+        let mask_source = ring.input("diagonal-mask-source", (secret_size, columns));
+        let producer = DslContext::new("compact-tall-gaussian-producer")
+            .public_output("diagonal-mask", mask_source)
+            .expect("diagonal-mask output")
+            .build()
+            .expect("producer graph");
+
+        let family_schema =
+            MatFamilyType { element: ring.matrix_type((1, columns)), count: count.clone() };
+        let kernel = Subgraph::<(Vec<Family<Mat>>, Vec<Mat>), Family<Mat>>::try_define(
+            "compact-tall-gaussian-kernel",
+            (
+                vec![
+                    family_schema.clone(),
+                    family_schema,
+                    MatFamilyType {
+                        element: ring.matrix_type((1, secret_size)),
+                        count: count.clone(),
+                    },
+                ],
+                vec![
+                    MatType(ring.matrix_type((secret_size, columns))),
+                    MatType(ring.matrix_type((secret_size, columns))),
+                ],
+            ),
+            |(families, matrices)| {
+                let [left, right, secret_rows] = families.as_slice() else {
+                    return Err(mxx_dsl::DslError::Schema);
+                };
+                let [input_public_key, diagonal_mask_public_key] = matrices.as_slice() else {
+                    return Err(mxx_dsl::DslError::Schema);
+                };
+                let deterministic_rows =
+                    left.clone().parallel_zip(right.clone(), |_, left, right| left - right)?;
+                let public_compiler = BggPublicKeyCompiler {
+                    ring: Ring::new(257, 1),
+                    base: 4.into(),
+                    digit_count: digit_count.into(),
+                };
+                let input = BggTallEncodingWire {
+                    rows: deterministic_rows,
+                    pubkey: BggPublicKeyWire {
+                        matrix: input_public_key.clone(),
+                        reveal_plaintext: false,
+                    },
+                    plaintext: BggTallPlaintext::Hidden,
+                    canonical_input_exclusive_upper: None,
+                };
+                let mut circuit = PolyCircuit::<DCRTPoly>::new();
+                let circuit_input = circuit.input(1).as_single_wire();
+                let transferred = circuit.slot_identity_repeated_lanes_gate(
+                    circuit_input,
+                    1,
+                    vec![Some(1), Some(1)],
+                );
+                circuit.output([transferred]);
+                let circuit_compiler = PolyCircuitCompiler { public_key: public_compiler.clone() };
+                let mut lowering = BggTallSlotLowering {
+                    compiler: BggTallEncodingCompiler { public_key: public_compiler.clone() },
+                    diagonal_mask_public_key: BggPublicKeyWire {
+                        matrix: diagonal_mask_public_key.clone(),
+                        reveal_plaintext: true,
+                    },
+                    secret_rows: secret_rows.clone(),
+                    sampler: BggTallEncodingSampler {
+                        layout: BggSamplerLayout {
+                            modulus: 257.into(),
+                            ring_dimension: 1.into(),
+                            secret_dimension: secret_size,
+                            digit_count,
+                            gadget_base: 4.into(),
+                        },
+                        gaussian_sigma: Some(RealExpr::from(3)),
+                        gaussian_max_coefficient_bound: Some(5.into()),
+                    },
+                    rotations: BTreeMap::new(),
+                };
+                circuit_compiler
+                    .compile_tall_encodings_with_lowerings(
+                        &circuit,
+                        input.clone(),
+                        [input],
+                        &mut NoPublicLookup::default(),
+                        &mut lowering,
+                    )
+                    .map_err(|_| mxx_dsl::DslError::Schema)?
+                    .into_iter()
+                    .next()
+                    .map(|output| output.rows)
+                    .ok_or(mxx_dsl::DslError::Schema)
+            },
+        )
+        .expect("compact Tall Gaussian kernel");
+
+        let x = ring.input_family("x", count.clone(), (1, columns));
+        let y = ring.input_family("y", count.clone(), (1, columns));
+        let secret = ring.input_family("shared-secret", count, (1, secret_size));
+        let input_public_key = ring.input("input-public-key", (secret_size, columns));
+        let diagonal_mask = ring.artifact_input(
+            ProductionId { spec_hash: SpecHash([31; 32]), execution_nonce: [37; 32] },
+            "diagonal-mask",
+            (secret_size, columns),
+            ArtifactConfidentiality::Public,
+        );
+        let first = kernel
+            .call((
+                vec![x.clone(), x.clone(), secret.clone()],
+                vec![input_public_key.clone(), diagonal_mask.clone()],
+            ))
+            .expect("first compact Tall call");
+        let second = kernel
+            .call((vec![x, y, secret], vec![input_public_key, diagonal_mask]))
+            .expect("second compact Tall call");
+        let residual = first.get_static(0) - second.get_static(0);
+        let decoded = residual
+            .clone()
+            .threshold_decode_bools(2, 1)
+            .into_iter()
+            .next()
+            .expect("decoder output")
+            .semantic_anchor("compact-tall-gaussian.decoder")
+            .expect("decoder anchor");
+        let consumer = DslContext::new("compact-tall-gaussian-consumer")
+            .private_output("operational-residual", residual)
+            .expect("residual output")
+            .bool_output("decoded", decoded)
+            .expect("decoder output")
+            .build()
+            .expect("consumer graph");
+        let decoder_node = consumer.graph.outputs()["decoded"].value.node;
+        let endpoint = EndpointSpecId::ToyThresholdDecode;
+        let decoder_stage = StageId("consumer".to_owned());
+        operational_protocol_from_graphs(
+            vec![("producer".to_owned(), &producer), ("consumer".to_owned(), &consumer)],
+            "consumer",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            |bundle| {
+                bundle.ideal = IdealSpec::new(
+                    DslContext::new("compact-tall-gaussian-ideal")
+                        .bool_output("decoded", Bool::constant(false))
+                        .expect("ideal decoder output")
+                        .build()
+                        .expect("ideal graph"),
+                )
+                .expect("ideal spec");
+                bundle.comparator = ComparatorSpec::Equality {
+                    endpoints: vec![ComparatorEndpointBinding {
+                        endpoint,
+                        actual_input: "decoded".to_owned(),
+                        ideal_input: "decoded".to_owned(),
+                        result_output: "failure".to_owned(),
+                        failure_value: true,
+                    }],
+                };
+                bundle.endpoints = EndpointAnchors {
+                    entries: vec![EndpointAnchor {
+                        spec: endpoint,
+                        stage: decoder_stage.clone(),
+                        semantic_anchor: "compact-tall-gaussian.decoder".to_owned(),
+                        semantics: EndpointSemanticBinding::ThresholdDecode,
+                        workflow_output: OutputRef {
+                            stage: decoder_stage.clone(),
+                            output: "decoded".to_owned(),
+                        },
+                        ideal_output: "decoded".to_owned(),
+                    }],
+                };
+                bundle.operational_decoder_targets = vec![OperationalDecoderTarget {
+                    target_id: "compact-tall-gaussian".to_owned(),
+                    residual_stage: decoder_stage.clone(),
+                    residual_output: "operational-residual".to_owned(),
+                    decoder_stage,
+                    decoder_node,
+                    kind: OperationalDecoderKind::ThresholdDecode {
+                        plaintext_modulus: IntExpr::constant(2),
+                    },
+                }];
+                bundle.endpoint_specs = vec![endpoint];
+            },
+        )
+        .expect("compact Tall operational protocol")
+    }
+
+    #[test]
+    fn compact_tall_gaussian_calls_preserve_occurrence_and_shared_input_identity() {
+        use crate::{ArtifactName, ProtocolInputId};
+        use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef, node::NodeKind};
+
+        let protocol = compact_tall_gaussian_protocol();
+        let plan = ProtocolPlan::build(&protocol, "compact-tall-gaussian").expect("protocol plan");
+        let consumer_stage = protocol
+            .stages()
+            .iter()
+            .find(|stage| stage.id == StageId("consumer".to_owned()))
+            .expect("consumer stage");
+        let root_input = |name: &str| {
+            consumer_stage
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .enumerate()
+                .find_map(|(index, node)| {
+                    matches!(node.kind(), NodeKind::Input { name: actual, .. } if actual == name)
+                        .then_some(WireRef { node: NodeId(index as u64), port: Port(0) })
+                })
+                .expect("root input")
+        };
+        let shared_secret = root_input("shared-secret");
+        let shared_artifact = root_input("diagonal-mask");
+        let named_definition = FrozenGraphScopeId::Subgraph {
+            canonical_name: "compact-tall-gaussian-kernel".to_owned(),
+        };
+        let outer_occurrences = plan
+            .nodes()
+            .keys()
+            .filter(|wire| wire.occurrence.definition == named_definition)
+            .map(|wire| wire.occurrence.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(outer_occurrences.len(), 2);
+        let kernel_scope = consumer_stage.graph.scope(&named_definition).expect("kernel scope");
+        let secret_formal = kernel_scope.inputs()[2];
+        let artifact_formal = kernel_scope.inputs()[4];
+        for occurrence in &outer_occurrences {
+            let resolve_formal = |formal| {
+                let child = PlannedWire {
+                    stage: consumer_stage.id.clone(),
+                    occurrence: occurrence.clone(),
+                    wire: formal,
+                };
+                plan.aliases()
+                    .iter()
+                    .find(|alias| alias.child == child)
+                    .map(|alias| alias.parent.wire)
+                    .expect("outer formal alias")
+            };
+            assert_eq!(resolve_formal(secret_formal), shared_secret);
+            assert_eq!(resolve_formal(artifact_formal), shared_artifact);
+        }
+        let shared_secret_contracts = protocol
+            .bundle
+            .input_contract
+            .inputs
+            .iter()
+            .filter(|input| input.id == ProtocolInputId::from("shared-secret"))
+            .count();
+        assert_eq!(shared_secret_contracts, 1);
+        let artifact_producers = plan.artifact_producers().iter().collect::<Vec<_>>();
+        assert_eq!(artifact_producers.len(), 1);
+        assert_eq!(artifact_producers[0].consumer.wire, shared_artifact);
+        assert_eq!(
+            artifact_producers[0].binding.producer_output,
+            ArtifactName("diagonal-mask".into())
+        );
+
+        let gaussian_occurrences = plan
+            .nodes()
+            .keys()
+            .filter(|wire| {
+                consumer_stage
+                    .graph
+                    .scope(&wire.occurrence.definition)
+                    .and_then(|scope| scope.node(wire.wire.node))
+                    .is_some_and(|node| matches!(node.kind(), NodeKind::GaussianSample { .. }))
+            })
+            .map(|wire| wire.occurrence.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(gaussian_occurrences.len(), 2);
+        assert!(gaussian_occurrences.is_disjoint(&outer_occurrences));
+
+        let adapter =
+            ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).expect("production adapter");
+        let gaussian_events = adapter
+            .sample_events
+            .iter()
+            .filter_map(|(key, event)| {
+                matches!(key.operation, SamplerOperation::Gaussian { .. }).then_some(*event)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(gaussian_events.len(), 2);
+        let (mut job, roots) = adapter.lower().expect("production lowering");
+        let ProductionRoot::Closed(residual) = roots.residual else { panic!("closed residual") };
+        let mut pending = vec![(residual.expression(), Vec::<Vec<ExprId>>::new(), 1_i8)];
+        let mut lowered_gaussian_signs = BTreeMap::new();
+        while let Some((expression, environments, sign)) = pending.pop() {
+            let node = job.expressions().node(expression).expect("lowered expression");
+            match &node.operator {
+                ValueOperator::Sampler { event, operation: SamplerOperation::Gaussian { .. } } => {
+                    assert!(gaussian_events.contains(event));
+                    if let Some(existing) = lowered_gaussian_signs.insert(*event, sign) {
+                        assert_eq!(existing, sign);
+                    }
+                }
+                ValueOperator::Argument { position, .. } => {
+                    let (current, outer) =
+                        environments.split_first().expect("program argument call environment");
+                    pending.push((current[*position as usize], outer.to_vec(), sign));
+                }
+                ValueOperator::ProgramCall { program } => {
+                    let callee = job.programs().program(*program).expect("callee program");
+                    let mut nested = environments;
+                    nested.insert(0, node.inputs.to_vec());
+                    pending.push((callee.root, nested, sign));
+                }
+                ValueOperator::Matrix(MatrixOperation::Subtract) => {
+                    let [left, right] = node.inputs.as_ref() else {
+                        panic!("matrix subtraction arity")
+                    };
+                    pending.push((*left, environments.clone(), sign));
+                    pending.push((*right, environments, -sign));
+                }
+                ValueOperator::Matrix(MatrixOperation::Negate) => {
+                    let [input] = node.inputs.as_ref() else { panic!("matrix negation arity") };
+                    pending.push((*input, environments, -sign));
+                }
+                _ => pending.extend(
+                    node.inputs.iter().copied().map(|input| (input, environments.clone(), sign)),
+                ),
+            }
+        }
+        assert_eq!(lowered_gaussian_signs.len(), 2);
+        assert_eq!(
+            lowered_gaussian_signs.values().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([-1, 1])
+        );
+        let analysis = job.normalize_closed_root(residual).expect("residual normalization");
+        let exact = analysis.value.exact_nf.as_ref().expect("exact residual");
+        let monomials = job
+            .monomials()
+            .get(analysis.value.semantic.program())
+            .expect("closed-root monomial arena");
+        let mut deterministic_inputs = BTreeMap::new();
+        for (monomial, coefficient) in &exact.exact_terms {
+            let descriptor = monomials.descriptor(*monomial).expect("exact monomial");
+            let mut pending = descriptor
+                .central_factors
+                .iter()
+                .chain(descriptor.ordered_factors.iter())
+                .map(|factor| (factor.expression(), Vec::<Vec<ExprId>>::new()))
+                .collect::<Vec<_>>();
+            let mut inputs = BTreeSet::new();
+            while let Some((expression, environments)) = pending.pop() {
+                let node = job.expressions().node(expression).expect("exact expression");
+                match &node.operator {
+                    ValueOperator::OpaqueFamilyElement { source }
+                        if source.stable_definition == "protocol-input" =>
+                    {
+                        inputs.insert(ProtocolInputId(source.invocation.clone()));
+                    }
+                    ValueOperator::Argument { position, .. } => {
+                        let (current, outer) =
+                            environments.split_first().expect("program argument call environment");
+                        pending.push((current[*position as usize], outer.to_vec()));
+                    }
+                    ValueOperator::ProgramCall { program } => {
+                        let callee = job.programs().program(*program).expect("callee program");
+                        let mut nested = environments;
+                        nested.insert(0, node.inputs.to_vec());
+                        pending.push((callee.root, nested));
+                    }
+                    _ => pending.extend(
+                        node.inputs.iter().copied().map(|input| (input, environments.clone())),
+                    ),
+                }
+            }
+            for input in inputs {
+                if matches!(input.0.as_str(), "x" | "y") {
+                    assert!(deterministic_inputs.insert(input, coefficient.clone()).is_none());
+                }
+            }
+        }
+        assert_eq!(
+            deterministic_inputs,
+            BTreeMap::from([
+                (ProtocolInputId::from("x"), BigInt::from(-1)),
+                (ProtocolInputId::from("y"), BigInt::from(1)),
+            ])
+        );
+    }
 
     fn parallel_range_protocol() -> crate::ProtocolDecl {
         use crate::{

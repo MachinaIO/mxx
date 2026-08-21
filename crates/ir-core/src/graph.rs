@@ -587,6 +587,10 @@ impl fmt::Debug for GraphScope {
 
 #[derive(Clone)]
 pub struct Graph {
+    inner: Arc<GraphData>,
+}
+
+struct GraphData {
     name: String,
     parameters: Vec<CompileParameter>,
     outputs: BTreeMap<String, OutputRoot>,
@@ -667,39 +671,41 @@ impl Graph {
 
         Ok((
             Self {
-                name,
-                parameters,
-                outputs: frozen_outputs,
-                effect_roots: frozen_effects,
-                scopes,
-                real_constants,
+                inner: Arc::new(GraphData {
+                    name,
+                    parameters,
+                    outputs: frozen_outputs,
+                    effect_roots: frozen_effects,
+                    scopes,
+                    real_constants,
+                }),
             },
             freeze_map,
         ))
     }
 
     pub fn name(&self) -> &str {
-        &self.name
+        &self.inner.name
     }
 
     pub fn parameters(&self) -> &[CompileParameter] {
-        &self.parameters
+        &self.inner.parameters
     }
 
     pub fn outputs(&self) -> &BTreeMap<String, OutputRoot> {
-        &self.outputs
+        &self.inner.outputs
     }
 
     pub fn effect_roots(&self) -> &[WireRef] {
-        &self.effect_roots
+        &self.inner.effect_roots
     }
 
     pub fn scopes(&self) -> &BTreeMap<FrozenGraphScopeId, GraphScope> {
-        &self.scopes
+        &self.inner.scopes
     }
 
     pub fn scope(&self, id: &FrozenGraphScopeId) -> Option<&GraphScope> {
-        self.scopes.get(id)
+        self.inner.scopes.get(id)
     }
 
     pub fn root_scope(&self) -> &GraphScope {
@@ -707,7 +713,7 @@ impl Graph {
     }
 
     pub fn real_constants(&self) -> &BTreeMap<String, RealExpr> {
-        &self.real_constants
+        &self.inner.real_constants
     }
 
     pub fn child_scope_id(
@@ -734,11 +740,12 @@ impl Graph {
 
     fn serialized(&self) -> SerializedGraph {
         SerializedGraph {
-            name: self.name.clone(),
-            parameters: self.parameters.clone(),
-            outputs: self.outputs.clone(),
-            effect_roots: self.effect_roots.clone(),
+            name: self.inner.name.clone(),
+            parameters: self.inner.parameters.clone(),
+            outputs: self.inner.outputs.clone(),
+            effect_roots: self.inner.effect_roots.clone(),
             scopes: self
+                .inner
                 .scopes
                 .iter()
                 .map(|(id, scope)| SerializedScopeEntry {
@@ -746,8 +753,18 @@ impl Graph {
                     scope: SerializedScope::from_scope(scope),
                 })
                 .collect(),
-            real_constants: self.real_constants.clone(),
+            real_constants: self.inner.real_constants.clone(),
         }
+    }
+
+    #[cfg(test)]
+    fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    #[cfg(test)]
+    fn weak_storage(&self) -> std::sync::Weak<GraphData> {
+        Arc::downgrade(&self.inner)
     }
 }
 
@@ -759,7 +776,7 @@ impl fmt::Debug for Graph {
 
 impl PartialEq for Graph {
     fn eq(&self, other: &Self) -> bool {
-        self.serialized() == other.serialized()
+        Arc::ptr_eq(&self.inner, &other.inner) || self.serialized() == other.serialized()
     }
 }
 
@@ -1048,12 +1065,14 @@ impl SerializedGraph {
             return Err(FreezeError::InvalidSerialization("missing root scope".to_owned()));
         }
         Ok(Graph {
-            name: self.name,
-            parameters: self.parameters,
-            outputs: self.outputs,
-            effect_roots: self.effect_roots,
-            scopes,
-            real_constants: self.real_constants,
+            inner: Arc::new(GraphData {
+                name: self.name,
+                parameters: self.parameters,
+                outputs: self.outputs,
+                effect_roots: self.effect_roots,
+                scopes,
+                real_constants: self.real_constants,
+            }),
         })
     }
 }
@@ -1135,7 +1154,11 @@ struct SerializedNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IntExpr, node::MatrixBinaryOp, types::MatrixType};
+    use crate::{
+        IntExpr, encoding::spec_hash, expr::ParamEnv, node::MatrixBinaryOp, types::MatrixType,
+        validate::validate,
+    };
+    use num_bigint::BigInt;
 
     fn matrix_type() -> MatrixType {
         MatrixType {
@@ -1192,9 +1215,69 @@ mod tests {
             BTreeMap::new(),
         )
         .unwrap();
+        let clone = graph.clone();
+        assert!(graph.shares_storage_with(&clone));
+        assert_eq!(graph, clone);
+
         let encoded = serde_json::to_vec(&graph).unwrap();
         let decoded: Graph = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(graph, decoded);
+        assert!(!graph.shares_storage_with(&decoded));
+        assert_eq!(encoded, serde_json::to_vec(&decoded).unwrap());
+        assert_eq!(
+            spec_hash(&graph, &ParamEnv::default()).unwrap(),
+            spec_hash(&decoded, &ParamEnv::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn cloned_graph_outlives_original_without_storage_cycle() {
+        let value = input("x");
+        let (graph, _) = Graph::freeze(
+            "clone-lifetime",
+            Vec::new(),
+            BTreeMap::from([("out".to_owned(), GraphOutput { value, confidentiality: None })]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let weak = graph.weak_storage();
+        let clone = graph.clone();
+
+        drop(graph);
+        assert_eq!(clone.name(), "clone-lifetime");
+        assert_eq!(clone.root_scope().nodes().len(), 1);
+        assert!(weak.upgrade().is_some());
+
+        drop(clone);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn validation_shares_source_graph_but_owns_derived_state() {
+        let value = input("x");
+        let (graph, _) = Graph::freeze(
+            "validated-sharing",
+            Vec::new(),
+            BTreeMap::from([("out".to_owned(), GraphOutput { value, confidentiality: None })]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let mut validated = validate(&graph, &ParamEnv::default()).unwrap();
+
+        assert!(graph.shares_storage_with(&validated.source));
+        validated.bindings.integers.insert("independent".to_owned(), BigInt::from(1));
+        validated.scopes.clear();
+
+        assert!(graph.shares_storage_with(&validated.source));
+        assert_eq!(validated.bindings.integers["independent"], BigInt::from(1));
+        assert!(validated.scopes.is_empty());
+        assert!(graph.real_constants().is_empty());
+        assert_eq!(graph.root_scope().nodes().len(), 1);
+        assert_eq!(validated.source.root_scope().nodes().len(), 1);
     }
 
     #[test]

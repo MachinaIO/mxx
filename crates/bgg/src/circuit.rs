@@ -121,6 +121,16 @@ where
     ) -> Result<Self::Wire, Self::Error> {
         self.slots.slot_rotation(input, offset, num_slots, gate)
     }
+
+    fn slot_identity_repeated_lanes(
+        &mut self,
+        input: &Self::Wire,
+        num_blocks: u32,
+        lane_scalars: &[Option<u32>],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        self.slots.slot_identity_repeated_lanes(input, num_blocks, lane_scalars, gate)
+    }
 }
 
 impl<P, A, L, S> PublicLookupLowering<P> for ConfiguredCircuitLowering<'_, A, L, S>

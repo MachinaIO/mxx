@@ -407,6 +407,27 @@ impl<P: Poly> PolyCircuit<P> {
         ))
     }
 
+    /// Applies an identity-source lane mask repeated across coefficient blocks without expanding
+    /// the physical-slot mapping in the circuit representation.
+    pub fn slot_identity_repeated_lanes_gate<I: Into<BatchedWire>>(
+        &mut self,
+        input: I,
+        num_blocks: usize,
+        lane_scalars: Vec<Option<u32>>,
+    ) -> BatchedWire {
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
+            PolyGateType::SlotTransfer {
+                src_slots: GateParamSource::Const(SlotTransferSpec::identity_repeated_lanes(
+                    num_blocks,
+                    lane_scalars,
+                )),
+            },
+        ))
+    }
+
     pub fn slot_transfer_gate_param<I: Into<BatchedWire>>(
         &mut self,
         input: I,

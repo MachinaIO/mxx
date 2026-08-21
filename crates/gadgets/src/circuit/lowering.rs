@@ -110,6 +110,26 @@ pub trait SlotOperationLowering<P: Poly>: CircuitLoweringTypes {
         self.slot_transfer(input, &materialized, gate)
     }
 
+    /// Lowers an identity-source transfer whose lane scalars repeat across coefficient blocks.
+    ///
+    /// The default preserves compatibility for consumers that only understand explicit mappings.
+    /// Compact-aware consumers override this method and avoid allocating `num_blocks * lanes`
+    /// descriptors.
+    fn slot_identity_repeated_lanes(
+        &mut self,
+        input: &Self::Wire,
+        num_blocks: u32,
+        lane_scalars: &[Option<u32>],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let materialized = SlotTransferSpec::IdentityRepeatedLanes {
+            num_blocks,
+            lane_scalars: lane_scalars.to_vec(),
+        }
+        .materialize();
+        self.slot_transfer(input, &materialized, gate)
+    }
+
     fn slot_reduce(
         &mut self,
         inputs: &[Self::Wire],
@@ -553,6 +573,19 @@ where
                     SlotTransferSpec::Rotation { diagonal, num_slots } => lowering
                         .slot_rotation(input, *diagonal, *num_slots, gate_instance)
                         .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?,
+                    SlotTransferSpec::IdentityRepeatedLanes { num_blocks, lane_scalars } => {
+                        lowering
+                            .slot_identity_repeated_lanes(
+                                input,
+                                *num_blocks,
+                                lane_scalars,
+                                gate_instance,
+                            )
+                            .map_err(|source| CircuitLowerError::Operation {
+                                gate: gate_id,
+                                source,
+                            })?
+                    }
                     spec => {
                         let source_slots = materialize_slot_transfer(spec);
                         lowering.slot_transfer(input, &source_slots, gate_instance).map_err(
@@ -789,6 +822,19 @@ where
                     SlotTransferSpec::Rotation { diagonal, num_slots } => lowering
                         .slot_rotation(input, *diagonal, *num_slots, gate_instance)
                         .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?,
+                    SlotTransferSpec::IdentityRepeatedLanes { num_blocks, lane_scalars } => {
+                        lowering
+                            .slot_identity_repeated_lanes(
+                                input,
+                                *num_blocks,
+                                lane_scalars,
+                                gate_instance,
+                            )
+                            .map_err(|source| CircuitLowerError::Operation {
+                                gate: gate_id,
+                                source,
+                            })?
+                    }
                     spec => {
                         let source_slots = materialize_slot_transfer(spec);
                         lowering.slot_transfer(input, &source_slots, gate_instance).map_err(
@@ -1128,6 +1174,7 @@ mod tests {
         operations: Vec<(PolyGateKind, Vec<usize>, usize, usize)>,
         slot_mapping_pointers: Vec<usize>,
         slot_rotations: Vec<(u32, u32)>,
+        identity_repeated_lane_specs: Vec<(u32, Vec<Option<u32>>)>,
         small_scalars: Vec<Vec<u32>>,
         large_scalars: Vec<Vec<BigUint>>,
         call_site_identity_is_semantic: bool,
@@ -1142,6 +1189,7 @@ mod tests {
                 operations: Vec::new(),
                 slot_mapping_pointers: Vec::new(),
                 slot_rotations: Vec::new(),
+                identity_repeated_lane_specs: Vec::new(),
                 small_scalars: Vec::new(),
                 large_scalars: Vec::new(),
                 call_site_identity_is_semantic: true,
@@ -1224,6 +1272,18 @@ mod tests {
         ) -> Result<Self::Wire, Self::Error> {
             self.record(PolyGateKind::SlotTransfer, gate);
             self.slot_rotations.push((offset, num_slots));
+            Ok(*input)
+        }
+
+        fn slot_identity_repeated_lanes(
+            &mut self,
+            input: &Self::Wire,
+            num_blocks: u32,
+            lane_scalars: &[Option<u32>],
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            self.record(PolyGateKind::SlotTransfer, gate);
+            self.identity_repeated_lane_specs.push((num_blocks, lane_scalars.to_vec()));
             Ok(*input)
         }
 
@@ -1491,6 +1551,70 @@ mod tests {
             spec.materialize(),
             vec![(2, Some(7)), (3, Some(7)), (2, Some(7)), (3, Some(7)), (2, None), (3, None),]
         );
+    }
+
+    #[test]
+    fn identity_repeated_lanes_materializes_exact_identity_lane_mask() {
+        let spec = SlotTransferSpec::identity_repeated_lanes(3, vec![Some(2), None, Some(0)]);
+        assert_eq!(
+            spec.materialize(),
+            vec![
+                (0, Some(2)),
+                (1, None),
+                (2, Some(0)),
+                (3, Some(2)),
+                (4, None),
+                (5, Some(0)),
+                (6, Some(2)),
+                (7, None),
+                (8, Some(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_identity_repeated_lanes_dispatches_without_materialization() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let output = circuit.slot_identity_repeated_lanes_gate(
+            input,
+            1_000_000,
+            vec![Some(3), None, Some(0)],
+        );
+        circuit.output([output]);
+
+        for structured in [false, true] {
+            let mut lowering = RecordingLowering::default();
+            let outputs = if structured {
+                lower_circuit_structured(&circuit, 1usize, [11], &mut lowering)
+            } else {
+                lower_circuit(&circuit, 1usize, [11], &mut lowering)
+            }
+            .expect("compact transfer lowering must be infallible");
+            assert_eq!(outputs, vec![11]);
+            assert_eq!(
+                lowering.identity_repeated_lane_specs,
+                vec![(1_000_000, vec![Some(3), None, Some(0)])]
+            );
+            assert!(lowering.slot_mapping_pointers.is_empty());
+        }
+    }
+
+    #[test]
+    fn default_compact_lowering_matches_explicit_materialization() {
+        let spec = SlotTransferSpec::identity_repeated_lanes(2, vec![Some(4), None]);
+        let expected = spec.materialize();
+        let mut lowering = DefaultRotationLowering::default();
+        let input = 17usize;
+        lowering
+            .slot_identity_repeated_lanes(
+                &input,
+                2,
+                &[Some(4), None],
+                GateInstance::ordinary(&[], GateId(1)),
+            )
+            .expect("default compact lowering must be infallible");
+        assert_eq!(lowering.mappings, vec![expected]);
     }
 
     #[test]

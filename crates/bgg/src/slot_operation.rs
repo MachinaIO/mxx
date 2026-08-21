@@ -1878,7 +1878,7 @@ mod tall {
             TallRotationPublicWires,
         },
     };
-    use mxx_dsl::{Family, Mat};
+    use mxx_dsl::{Family, Int, Mat, Parallel};
     use mxx_gadgets::{
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
@@ -1976,6 +1976,27 @@ mod tall {
                 reveal_plaintext: input.reveal_plaintext,
             })
         }
+
+        fn slot_identity_repeated_lanes(
+            &mut self,
+            input: &Self::Wire,
+            num_blocks: u32,
+            lane_scalars: &[Option<u32>],
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            validate_identity_repeated_lanes(
+                num_blocks,
+                lane_scalars,
+                self.configured_slot_count,
+                gate,
+            )?;
+            if input.matrix.matrix_type() != self.diagonal_mask_public_key.matrix.matrix_type() {
+                return Err(CircuitCompileError::InvalidSlotTransfer {
+                    gate: gate.local_gate().index(),
+                });
+            }
+            Ok(self.compiler.mul(&self.diagonal_mask_public_key, input))
+        }
     }
 
     /// Encoding-side lowering for the secret-transfer-free Tall subset.
@@ -2029,6 +2050,32 @@ mod tall {
                 }
                 _ => unreachable!("Tall slot lowering requires a concrete secret-row family"),
             }
+        }
+
+        fn transfer_identity_repeated_lanes(
+            &self,
+            input: &BggTallEncodingWire,
+            num_blocks: u32,
+            lane_scalars: &[Option<u32>],
+            gate: GateInstance<'_>,
+        ) -> Result<BggTallEncodingWire, CircuitCompileError> {
+            let total_slots = validate_identity_repeated_lanes(
+                num_blocks,
+                lane_scalars,
+                self.configured_slot_count(),
+                gate,
+            )?;
+            let masks = identity_repeated_lane_masks(
+                &self.sampler.layout.ring(),
+                total_slots,
+                lane_scalars,
+            )?;
+            let mask = self.sampler.sample_diagonal(
+                self.secret_rows.clone(),
+                self.diagonal_mask_public_key.clone(),
+                masks,
+            )?;
+            Ok(self.compiler.simd_mul(&mask, input)?)
         }
     }
 
@@ -2093,6 +2140,16 @@ mod tall {
                 .rotate(input, rotation, TallRotationDirection::Forward)
                 .map_err(Into::into)
         }
+
+        fn slot_identity_repeated_lanes(
+            &mut self,
+            input: &Self::Wire,
+            num_blocks: u32,
+            lane_scalars: &[Option<u32>],
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            self.transfer_identity_repeated_lanes(input, num_blocks, lane_scalars, gate)
+        }
     }
 
     fn validate_identity_sources(
@@ -2116,6 +2173,87 @@ mod tall {
             });
         }
         Ok(())
+    }
+
+    fn validate_identity_repeated_lanes(
+        num_blocks: u32,
+        lane_scalars: &[Option<u32>],
+        slot_count: usize,
+        gate: GateInstance<'_>,
+    ) -> Result<usize, CircuitCompileError> {
+        let total_slots = usize::try_from(num_blocks)
+            .ok()
+            .and_then(|blocks| blocks.checked_mul(lane_scalars.len()))
+            .filter(|_| num_blocks > 0 && !lane_scalars.is_empty())
+            .ok_or(CircuitCompileError::InvalidSlotTransfer { gate: gate.local_gate().index() })?;
+        if total_slots != slot_count {
+            return Err(CircuitCompileError::InvalidSlotTransfer {
+                gate: gate.local_gate().index(),
+            });
+        }
+        Ok(total_slots)
+    }
+
+    fn identity_repeated_lane_masks(
+        ring: &mxx_dsl::Ring,
+        total_slots: usize,
+        lane_scalars: &[Option<u32>],
+    ) -> Result<Family<Mat>, mxx_dsl::DslError> {
+        let lanes = lane_scalars.len();
+        Parallel::range(total_slots).try_map(|index| {
+            index.as_int().rem(Int::constant(lanes)).select(
+                lane_scalars
+                    .iter()
+                    .map(|scalar| ring.polynomial([IntExpr::constant(scalar.unwrap_or(1))]))
+                    .collect(),
+            )
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::test_utils::{execute_graph, matrix_output};
+        use mxx_dsl::{DslContext, Ring};
+        use mxx_primitives::{
+            matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+            poly::{
+                PolyParams,
+                dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+            },
+        };
+        use std::collections::BTreeMap;
+
+        #[test]
+        fn compact_identity_lane_masks_match_explicit_runtime_sequence() {
+            let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+            let ring = Ring::new(
+                num_bigint::BigInt::from(parameters.modulus().as_ref().clone()),
+                parameters.ring_dimension() as usize,
+            );
+            let lane_scalars = [Some(0), None, Some(5)];
+            let masks = identity_repeated_lane_masks(&ring, 6, &lane_scalars)
+                .expect("compact identity lane masks");
+            let mut context = DslContext::new("compact-identity-lane-mask-runtime");
+            for slot in 0..6 {
+                context = context
+                    .output(format!("mask-{slot}"), masks.get_static(slot))
+                    .expect("mask output");
+            }
+            let result = execute_graph(
+                context.build().expect("compact mask graph"),
+                parameters.clone(),
+                BTreeMap::new(),
+            );
+            for slot in 0..6 {
+                let scalar = lane_scalars[slot % lane_scalars.len()].unwrap_or(1);
+                let expected = DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    vec![DCRTPoly::from_usize_to_constant(&parameters, scalar as usize)],
+                );
+                assert_eq!(matrix_output(&result, &format!("mask-{slot}")), &expected);
+            }
+        }
     }
 }
 pub use tall::*;

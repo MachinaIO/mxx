@@ -481,8 +481,11 @@ dependencies = [
 name = "mxx-correctness"
 version = "0.1.0"
 dependencies = [
+ "mxx-bgg",
  "mxx-dsl",
+ "mxx-gadgets",
  "mxx-ir-core",
+ "mxx-primitives",
  "num-bigint",
  "num-traits",
  "serde",

@@ -10,9 +10,10 @@ use mxx_bgg::{
     BggTallEncodingCompiler, BggTallEncodingSampler, BggTallPlaintext, BggTallSlotLowering,
     BggTallSlotPublicKeyLowering, LweLookupArtifactNames, LweLookupArtifacts, LweLookupCompiler,
     LweLookupIdentity, LweLookupPreprocessingLowering, LweLookupTable,
-    LweLookupTallEncodingLowering, PolyCircuitCompiler, TallRotationEncodingArtifactNames,
-    TallRotationEncodingArtifacts, TallRotationEncodingCompiler, TallRotationEncodingKey,
-    bind_lwe_lookup_invocations, required_tall_rotation_encodings,
+    LweLookupTallEncodingLowering, NoSlotOperations, PolyCircuitCompiler,
+    TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts, TallRotationEncodingCompiler,
+    TallRotationEncodingKey, bind_lwe_lookup_invocations, collect_lwe_lookup_identities,
+    required_tall_rotation_encodings,
 };
 use mxx_correctness::{
     ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
@@ -93,6 +94,37 @@ const TALL_OPERATIONAL_RESIDUAL: &str = "operational_residual";
 const TALL_OPERATIONAL_DECODED: &str = "operational_decoded";
 const TALL_DECODER_RESIDUAL_ANCHOR: &str = "tall.decoder.residual";
 const TALL_DECODER_RESULT_ANCHOR: &str = "tall.decoder.result";
+
+fn log_graph_phase(phase: &'static str, state: &'static str, started: Option<&Instant>) {
+    let (vm_rss_kib, vm_hwm_kib) = process_memory_kib();
+    info!(
+        phase,
+        state,
+        elapsed = ?started.map(Instant::elapsed),
+        vm_rss_kib = ?vm_rss_kib,
+        vm_hwm_kib = ?vm_hwm_kib,
+        "Tall graph preparation phase"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_kib() -> (Option<u64>, Option<u64>) {
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return (None, None);
+    };
+    let value = |name: &str| {
+        status.lines().find_map(|line| {
+            let remainder = line.strip_prefix(name)?.trim();
+            remainder.split_whitespace().next()?.parse().ok()
+        })
+    };
+    (value("VmRSS:"), value("VmHWM:"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_memory_kib() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
 
 #[derive(Clone, Debug)]
 struct TestConfig {
@@ -456,6 +488,51 @@ fn gate_kind_counts(circuit: &PolyCircuit<DCRTPoly>) -> HashMap<PolyGateKind, us
     counts
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LookupPlanningStats {
+    occurrences: usize,
+    preimages: usize,
+}
+
+/// Counts concrete lookup invocations without constructing lookup tables, DSL graphs, or samples.
+///
+/// The identity collector recursively expands registered sub-circuit calls in exactly the same way
+/// as the LWE preprocessing lowering. Table lengths are deliberately summed per occurrence: sharing
+/// a registered LUT does not remove any required preimage.
+fn lookup_planning_stats(circuit: &PolyCircuit<DCRTPoly>) -> Result<LookupPlanningStats, String> {
+    let identities = collect_lwe_lookup_identities(circuit).map_err(|error| error.to_string())?;
+    let preimages = identities.iter().try_fold(0usize, |total, identity| {
+        total
+            .checked_add(circuit.lookup_table(identity.lookup).len())
+            .ok_or_else(|| "lookup planning preimage count exceeds usize".to_owned())
+    })?;
+    Ok(LookupPlanningStats { occurrences: identities.len(), preimages })
+}
+
+fn selected_cpu_parameters(
+    config: &TestConfig,
+    test_name: &str,
+) -> Result<(usize, usize, DCRTPolyParams), String> {
+    let (crt_depth, log_ring_dimension) = config.selected_parameters.ok_or_else(|| {
+        format!(
+            "{test_name} requires both MXX_TALL_NESTED_RNS_SELECTED_CRT_DEPTH and \
+             MXX_TALL_NESTED_RNS_SELECTED_LOG_RING_DIMENSION"
+        )
+    })?;
+    let shift = u32::try_from(log_ring_dimension)
+        .map_err(|_| "selected log ring dimension exceeds u32".to_owned())?;
+    let ring_dimension = 1u32
+        .checked_shl(shift)
+        .ok_or_else(|| "selected ring dimension overflows u32".to_owned())?;
+    let base_bits = u32::try_from(config.gadget_base_bits)
+        .map_err(|_| "configured gadget base bits exceed u32".to_owned())?;
+    Ok((
+        crt_depth,
+        log_ring_dimension,
+        DCRTPolyParams::new(ring_dimension, crt_depth, config.crt_modulus_bits, base_bits),
+    ))
+}
+
 /// `log2` of an arbitrary-precision unsigned value for human-readable noise-margin logs.
 fn log2_biguint(value: &BigUint) -> f64 {
     if value.is_zero() {
@@ -705,6 +782,7 @@ fn prepare_candidate(
         return Err("nested-RNS gate counts depend on the coefficient slot count".to_owned());
     }
     let preprocessing_graph_started = Instant::now();
+    log_graph_phase("preprocessing_construction", "start", None);
     let physical_slots = ring_dimension * nested.q_moduli_depth;
     let modulus = BigInt::from(parameters.modulus().as_ref().clone());
     let gadget_base = BigInt::from(1u8) << config.gadget_base_bits;
@@ -845,21 +923,35 @@ fn prepare_candidate(
         .map_err(|error| error.to_string())?;
     let preprocessing = preprocessing_context.build().map_err(|error| error.to_string())?;
     let preprocessing_graph_construction = preprocessing_graph_started.elapsed();
+    log_graph_phase("preprocessing_construction", "end", Some(&preprocessing_graph_started));
     let bindings = ParamEnv::default();
+    let preprocessing_validate_started = Instant::now();
+    log_graph_phase("preprocessing_validate", "start", None);
     let validated_preprocessing =
         preprocessing.validate(&bindings).map_err(|error| error.to_string())?;
-    let production = production_id(
-        spec_hash(&preprocessing.graph, &bindings).map_err(|error| error.to_string())?,
-        [0x71; 32],
-    );
+    log_graph_phase("preprocessing_validate", "end", Some(&preprocessing_validate_started));
+
+    let spec_hash_started = Instant::now();
+    log_graph_phase("spec_hash", "start", None);
+    let preprocessing_spec_hash =
+        spec_hash(&preprocessing.graph, &bindings).map_err(|error| error.to_string())?;
+    log_graph_phase("spec_hash", "end", Some(&spec_hash_started));
+    let production = production_id(preprocessing_spec_hash, [0x71; 32]);
+
+    let manifest_export_started = Instant::now();
+    log_graph_phase("manifest_export", "start", None);
     let runtime_manifest = export_validated_manifest(production.clone(), &validated_preprocessing)
         .map_err(|error| error.to_string())?;
+    log_graph_phase("manifest_export", "end", Some(&manifest_export_started));
     validate_tall_preprocessing_manifest(
         &runtime_manifest,
         circuit.num_input(),
         &lookup_compilers,
         rotation_keys,
     )?;
+    drop(validated_preprocessing);
+    drop(lookup_entries);
+    log_graph_phase("validated_and_lookup_drop", "end", None);
     info!(
         ring_dimension,
         crt_depth = parameters.to_crt().2,
@@ -870,6 +962,8 @@ fn prepare_candidate(
         "constructed Tall nested-RNS candidate graphs"
     );
     debug!(q_moduli = ?parameters.to_crt().0, "candidate CRT moduli");
+    let encoding_construction_started = Instant::now();
+    log_graph_phase("encoding_construction", "start", None);
     let encoding_graph = build_encoding_graph(
         &parameters,
         &circuit,
@@ -881,40 +975,16 @@ fn prepare_candidate(
         config.error_sigma,
         true,
     )?;
+    log_graph_phase("encoding_construction", "end", Some(&encoding_construction_started));
     let manifests = BTreeMap::from([(production.clone(), runtime_manifest.clone())]);
+    let encoding_validate_started = Instant::now();
+    log_graph_phase("encoding_validate", "start", None);
     encoding_graph
         .validate_with_manifests(&bindings, &manifests)
         .map_err(|error| error.to_string())?;
+    log_graph_phase("encoding_validate", "end", Some(&encoding_validate_started));
     let operational_report = if preparation == CandidatePreparation::OperationalChecked {
-        let operational_encoding_graph = build_encoding_graph(
-            &parameters,
-            &circuit,
-            &layout,
-            production.clone(),
-            &lookup_compilers,
-            &rotation_offsets,
-            physical_slots,
-            config.error_sigma,
-            true,
-        )?;
-        for output in ["encoding_rows", "output_plaintexts", TALL_OPERATIONAL_RESIDUAL] {
-            if encoding_graph.graph.outputs().get(output) !=
-                operational_encoding_graph.graph.outputs().get(output)
-            {
-                return Err(format!(
-                    "operational residual suffix changed executable output identity {output}"
-                ));
-            }
-        }
-        operational_encoding_graph
-            .validate_with_manifests(&bindings, &manifests)
-            .map_err(|error| error.to_string())?;
-        Some(run_tall_operational_check(
-            &preprocessing,
-            &operational_encoding_graph,
-            &parameters,
-            &nested,
-        )?)
+        Some(run_tall_operational_check(&preprocessing, &encoding_graph, &parameters, &nested)?)
     } else {
         None
     };
@@ -1901,6 +1971,169 @@ fn runtime_verification(
 #[test]
 fn selected_parameters_produce_exactly_one_candidate() {
     assert_eq!(candidate_dimensions(1, 16, 3, 8, Some((7, 5))), vec![(7, 5)]);
+}
+
+#[test]
+fn lookup_planning_stats_match_preprocessing_for_repeated_subcircuit() {
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+    let digit_count = parameters.modulus_digits();
+    let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+    let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+
+    let mut circuit = PolyCircuit::<DCRTPoly>::new();
+    let lookup_id = circuit.register_public_lookup(
+        mxx_gadgets::circuit::PublicLutProgram::new(3, mxx_gadgets::circuit::LutExpr::input())
+            .expect("identity public LUT"),
+    );
+    let mut child = circuit.fresh_sub_circuit();
+    let child_input = child.input(1).as_single_wire();
+    let child_output = child.public_lookup_gate(child_input, lookup_id);
+    child.output([child_output]);
+    let child_id = circuit.register_sub_circuit(child);
+    let inputs = circuit.input(2).to_vec();
+    let first = circuit.call_sub_circuit(child_id, [inputs[0]]);
+    let second = circuit.call_sub_circuit(child_id, [inputs[1]]);
+    circuit.output([first[0], second[0]]);
+
+    let planning = lookup_planning_stats(&circuit).expect("lookup planning stats");
+    assert_eq!(planning, LookupPlanningStats { occurrences: 2, preimages: 6 });
+    assert_eq!(
+        planning.preimages,
+        circuit.lut_vector_len_with_subcircuits(),
+        "the recursive circuit helper must retain per-call LUT multiplicity"
+    );
+
+    let gadget_base = BigInt::from(1u64 << parameters.base_bits());
+    let trapdoor = ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1_000_000);
+    let mut lookup = LweLookupPreprocessingLowering::new(
+        parameters.clone(),
+        ring.bytes_input("planning-parity-hash-key", 32),
+        trapdoor,
+        gadget_base.clone().into(),
+        digit_count.into(),
+        Vec::new(),
+    );
+    let mut slots = NoSlotOperations::default();
+    let public_key = |name: &str| BggPublicKeyWire {
+        matrix: ring.input(name, (1, digit_count)),
+        reveal_plaintext: true,
+    };
+    PolyCircuitCompiler {
+        public_key: BggPublicKeyCompiler {
+            ring: ring.clone(),
+            base: gadget_base.into(),
+            digit_count: digit_count.into(),
+        },
+    }
+    .compile_public_keys_with_lowerings(
+        &circuit,
+        public_key("planning-parity-one"),
+        [public_key("planning-parity-input-0"), public_key("planning-parity-input-1")],
+        &mut lookup,
+        &mut slots,
+    )
+    .expect("public-key preprocessing lowering");
+    let lowered_occurrences = lookup.entries().len();
+    let lowered_preimages = lookup
+        .entries()
+        .iter()
+        .try_fold(0usize, |total, entry| total.checked_add(entry.compiler.table_length()));
+    assert_eq!(Some(planning.preimages), lowered_preimages);
+    assert_eq!(planning.occurrences, lowered_occurrences);
+    assert_eq!(lookup.entries()[0].compiler.identity.lookup, lookup_id);
+    assert_eq!(lookup.entries()[1].compiler.identity.lookup, lookup_id);
+    assert_ne!(
+        lookup.entries()[0].compiler.identity.call_path,
+        lookup.entries()[1].compiler.identity.call_path,
+        "the two sub-circuit calls must remain distinct lookup occurrences"
+    );
+    assert_eq!(lookup.entries()[0].compiler.table, lookup.entries()[1].compiler.table);
+}
+
+#[test]
+#[ignore = "CPU-only planning report; requires explicitly selected CRT depth and ring dimension"]
+fn test_tall_bgg_nested_rns_planning_stats() -> Result<(), String> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let config = TestConfig::from_env()?;
+    let (crt_depth, log_ring_dimension, parameters) =
+        selected_cpu_parameters(&config, "Tall nested-RNS planning")?;
+    let (q_moduli, _, actual_crt_depth) = parameters.to_crt();
+    if actual_crt_depth != crt_depth || q_moduli.len() != crt_depth {
+        return Err(format!(
+            "DCRT parameter schema mismatch: requested depth {crt_depth}, actual depth \
+             {actual_crt_depth}, q-modulus count {}",
+            q_moduli.len()
+        ));
+    }
+    let q_max = q_moduli
+        .iter()
+        .copied()
+        .max()
+        .ok_or_else(|| "planning requires a nonempty q-modulus basis".to_owned())?;
+    let p_modulus_bits = match config.p_moduli_bits {
+        Some(bits) => bits,
+        None => minimum_p_moduli_bits(q_max, config.max_unreduced_muls).ok_or_else(|| {
+            "no nested-RNS p-modulus basis supports the selected q basis".to_owned()
+        })?,
+    };
+    let CircuitBundle { circuit, nested } =
+        build_modq_multiplication_circuit(&parameters, &config, 1, p_modulus_bits);
+    let physical_slots = (parameters.ring_dimension() as usize)
+        .checked_mul(nested.q_moduli_depth)
+        .ok_or_else(|| "physical slot count exceeds usize".to_owned())?;
+    let lookup_stats = lookup_planning_stats(&circuit)?;
+    info!(
+        planning_only = true,
+        crt_depth,
+        log_ring_dimension,
+        ring_dimension = parameters.ring_dimension(),
+        q_moduli = ?q_moduli,
+        q_modulus_bits = parameters.modulus().bits(),
+        p_modulus_bits = nested.p_moduli_bits,
+        p_moduli = ?nested.p_moduli,
+        p_moduli_depth = nested.p_moduli.len(),
+        physical_slots,
+        gate_counts = ?circuit.count_gates_by_type_vec(),
+        lookup_occurrences = lookup_stats.occurrences,
+        lookup_preimages = lookup_stats.preimages,
+        "Tall nested-RNS planning-only statistics; this is not security, noise, graph, or runtime acceptance"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "CPU-only lattice estimator report; requires explicitly selected CRT depth and ring dimension"]
+fn test_tall_bgg_nested_rns_security_estimation() -> Result<(), String> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let config = TestConfig::from_env()?;
+    let (crt_depth, log_ring_dimension, parameters) =
+        selected_cpu_parameters(&config, "Tall nested-RNS security estimation")?;
+    let (q_moduli, _, actual_crt_depth) = parameters.to_crt();
+    if actual_crt_depth != crt_depth || q_moduli.len() != crt_depth {
+        return Err(format!(
+            "DCRT parameter schema mismatch: requested depth {crt_depth}, actual depth \
+             {actual_crt_depth}, q-modulus count {}",
+            q_moduli.len()
+        ));
+    }
+    let achieved_security_bits = lattice_security_bits(&parameters, config.error_sigma)?;
+    info!(
+        estimator_only = true,
+        crt_depth,
+        log_ring_dimension,
+        ring_dimension = parameters.ring_dimension(),
+        q_moduli = ?q_moduli,
+        q_modulus_bits = parameters.modulus().bits(),
+        achieved_security_bits,
+        required_security_bits = config.security_bits,
+        meets_requested_security = achieved_security_bits >= config.security_bits,
+        "Tall nested-RNS lattice-security estimate; no circuit, graph, noise, or runtime acceptance was evaluated"
+    );
+    Ok(())
 }
 
 #[test]

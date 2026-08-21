@@ -324,6 +324,38 @@ impl<P: Poly> NestedRnsPoly<P> {
             .collect()
     }
 
+    fn identity_repeated_lane_scalars(
+        &self,
+        src_slots: &[(u32, Option<Vec<u64>>)],
+        residue_modulus: u64,
+    ) -> Option<Vec<Option<u32>>> {
+        if src_slots.len() != self.num_coefficient_slots {
+            return None;
+        }
+        let lanes = self.window.depth;
+        let levels = self.resolve_enable_levels();
+        let mut repeated: Option<Vec<Option<u32>>> = None;
+        for (block, (source, scalars)) in src_slots.iter().enumerate() {
+            if usize::try_from(*source).ok() != Some(block) {
+                return None;
+            }
+            let lane_scalars = match scalars {
+                Some(values) if values.len() == levels && values.len() == lanes => values
+                    .iter()
+                    .map(|value| u32::try_from(value % residue_modulus).ok().map(Some))
+                    .collect::<Option<Vec<_>>>()?,
+                Some(_) => return None,
+                None => vec![None; lanes],
+            };
+            match &repeated {
+                Some(expected) if expected != &lane_scalars => return None,
+                Some(_) => {}
+                None => repeated = Some(lane_scalars),
+            }
+        }
+        repeated
+    }
+
     fn lane_scalar_mul_gate(
         &self,
         gate: GateId,
@@ -332,16 +364,15 @@ impl<P: Poly> NestedRnsPoly<P> {
         circuit: &mut PolyCircuit<P>,
     ) -> GateId {
         assert_eq!(active_scalars.len(), self.resolve_enable_levels());
-        let lanes = self.window.depth;
-        let plan = (0..self.num_coefficient_slots * lanes)
-            .map(|slot| {
-                let g = slot % lanes;
-                let scalar = u32::try_from(active_scalars[g] % residue_modulus)
-                    .expect("lane scalar must fit u32");
-                (u32::try_from(slot).expect("physical slot must fit u32"), Some(scalar))
+        let lane_scalars = active_scalars
+            .iter()
+            .map(|scalar| {
+                Some(u32::try_from(scalar % residue_modulus).expect("lane scalar must fit u32"))
             })
-            .collect::<Vec<_>>();
-        circuit.slot_transfer_gate(gate, &plan).as_single_wire()
+            .collect();
+        circuit
+            .slot_identity_repeated_lanes_gate(gate, self.num_coefficient_slots, lane_scalars)
+            .as_single_wire()
     }
 
     /// Apply one coefficient-block slot plan lane-wise, automatically reducing first when needed.
@@ -380,8 +411,18 @@ impl<P: Poly> NestedRnsPoly<P> {
                         operand.window.physical_slots(operand.num_coefficient_slots),
                     )
                 } else {
-                    let expanded = operand.expand_slot_transfer_for_residue(src_slots, p_j);
-                    circuit.slot_transfer_gate(gate_id, &expanded)
+                    if let Some(lane_scalars) =
+                        operand.identity_repeated_lane_scalars(src_slots, p_j)
+                    {
+                        circuit.slot_identity_repeated_lanes_gate(
+                            gate_id,
+                            operand.num_coefficient_slots,
+                            lane_scalars,
+                        )
+                    } else {
+                        let expanded = operand.expand_slot_transfer_for_residue(src_slots, p_j);
+                        circuit.slot_transfer_gate(gate_id, &expanded)
+                    }
                 }
             })
             .collect::<Vec<_>>();
@@ -404,25 +445,42 @@ impl<P: Poly> NestedRnsPoly<P> {
     pub(crate) fn repack_window(&self, target: CrtWindow, circuit: &mut PolyCircuit<P>) -> Self {
         let target = CrtWindow::new(target.offset, target.depth, self.ctx.q_moduli_depth);
         let operand = self.lazy_reduce_if_unreduced(circuit);
-        let plan = (0..operand.num_coefficient_slots)
-            .flat_map(|coefficient| {
-                (0..target.depth).map(move |target_local| {
-                    let global = target.offset + target_local;
-                    if global >= operand.window.offset && global < operand.window.end() {
-                        let source_local = global - operand.window.offset;
-                        let source = coefficient * operand.window.depth + source_local;
-                        (u32::try_from(source).expect("physical slot must fit u32"), None)
-                    } else {
-                        (0, Some(0))
-                    }
+        let identity_mapping = target == operand.window;
+        let inner = if identity_mapping {
+            operand
+                .inner
+                .gate_ids()
+                .map(|gate| {
+                    circuit
+                        .slot_identity_repeated_lanes_gate(
+                            gate,
+                            operand.num_coefficient_slots,
+                            vec![None; target.depth],
+                        )
+                        .as_single_wire()
                 })
-            })
-            .collect::<Vec<_>>();
-        let inner = operand
-            .inner
-            .gate_ids()
-            .map(|gate| circuit.slot_transfer_gate(gate, &plan).as_single_wire())
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        } else {
+            let plan = (0..operand.num_coefficient_slots)
+                .flat_map(|coefficient| {
+                    (0..target.depth).map(move |target_local| {
+                        let global = target.offset + target_local;
+                        if global >= operand.window.offset && global < operand.window.end() {
+                            let source_local = global - operand.window.offset;
+                            let source = coefficient * operand.window.depth + source_local;
+                            (u32::try_from(source).expect("physical slot must fit u32"), None)
+                        } else {
+                            (0, Some(0))
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            operand
+                .inner
+                .gate_ids()
+                .map(|gate| circuit.slot_transfer_gate(gate, &plan).as_single_wire())
+                .collect::<Vec<_>>()
+        };
         let mut max_plaintexts = vec![BigUint::ZERO; target.depth];
         let mut p_max_traces = vec![BigUint::ZERO; target.depth];
         for target_local in 0..target.depth {
@@ -1415,17 +1473,19 @@ impl<P: Poly> NestedRnsPoly<P> {
         max_plaintexts[target_q_idx] = max_plaintext;
         p_max_traces[target_q_idx] = p_max_trace;
         let lanes = window.depth;
-        let plan = (0..num_coefficient_slots * lanes)
-            .map(|slot| {
-                (
-                    u32::try_from(slot).expect("physical slot must fit u32"),
-                    Some(u32::from(slot % lanes == target_q_idx)),
-                )
-            })
-            .collect::<Vec<_>>();
+        let lane_scalars =
+            (0..lanes).map(|lane| Some(u32::from(lane == target_q_idx))).collect::<Vec<_>>();
         let inner = target_row
             .gate_ids()
-            .map(|gate| circuit.slot_transfer_gate(gate, &plan).as_single_wire())
+            .map(|gate| {
+                circuit
+                    .slot_identity_repeated_lanes_gate(
+                        gate,
+                        num_coefficient_slots,
+                        lane_scalars.clone(),
+                    )
+                    .as_single_wire()
+            })
             .collect::<Vec<_>>();
 
         Self::new(
@@ -2915,6 +2975,90 @@ mod tests {
         assert!(transfers.iter().all(|src_slots| {
             matches!(src_slots, GateParamSource::Const(SlotTransferSpec::Rotation { .. }))
         }));
+    }
+
+    #[test]
+    fn repeated_lane_masks_stay_compact_and_irregular_masks_fall_back_to_explicit() {
+        let mut compact_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, compact_context) = create_context(&mut compact_circuit, Some(2));
+        let compact_window = CrtWindow::new(0, 2, compact_context.q_moduli_depth);
+        let compact_input = NestedRnsPoly::input(
+            compact_context.clone(),
+            1 << 12,
+            compact_window,
+            &mut compact_circuit,
+        );
+        let _ = compact_input.const_mul(&[3, 5], &mut compact_circuit);
+        let compact_specs = compact_circuit
+            .gates_in_id_order()
+            .filter_map(|(_, gate)| match &gate.gate_type {
+                PolyGateType::SlotTransfer {
+                    src_slots:
+                        GateParamSource::Const(SlotTransferSpec::IdentityRepeatedLanes {
+                            num_blocks,
+                            lane_scalars,
+                        }),
+                } => Some((*num_blocks, lane_scalars)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(compact_specs.len(), compact_context.p_moduli.len());
+        assert!(compact_specs.iter().all(|(blocks, scalars)| {
+            *blocks == 1 << 12 && scalars.len() == compact_window.depth
+        }));
+
+        let mut repack_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, repack_context) = create_context(&mut repack_circuit, Some(2));
+        let repack_window = CrtWindow::new(0, 2, repack_context.q_moduli_depth);
+        let repack_input = NestedRnsPoly::input(
+            repack_context.clone(),
+            1 << 12,
+            repack_window,
+            &mut repack_circuit,
+        );
+        let _ = repack_input.repack_window(repack_window, &mut repack_circuit);
+        let repack_specs = repack_circuit
+            .gates_in_id_order()
+            .filter_map(|(_, gate)| match &gate.gate_type {
+                PolyGateType::SlotTransfer {
+                    src_slots:
+                        GateParamSource::Const(SlotTransferSpec::IdentityRepeatedLanes {
+                            num_blocks,
+                            lane_scalars,
+                        }),
+                } => Some((*num_blocks, lane_scalars)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(repack_specs.len(), repack_context.p_moduli.len());
+        assert!(repack_specs.iter().all(|(blocks, scalars)| {
+            *blocks == 1 << 12 &&
+                scalars.len() == repack_window.depth &&
+                scalars.iter().all(Option::is_none)
+        }));
+
+        let mut irregular_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, irregular_context) = create_context(&mut irregular_circuit, Some(2));
+        let irregular_window = CrtWindow::new(0, 2, irregular_context.q_moduli_depth);
+        let irregular_input = NestedRnsPoly::input(
+            irregular_context.clone(),
+            2,
+            irregular_window,
+            &mut irregular_circuit,
+        );
+        let _ = irregular_input
+            .slot_transfer(&[(0, Some(vec![1, 2])), (1, Some(vec![3, 4]))], &mut irregular_circuit);
+        let explicit_lengths = irregular_circuit
+            .gates_in_id_order()
+            .filter_map(|(_, gate)| match &gate.gate_type {
+                PolyGateType::SlotTransfer {
+                    src_slots: GateParamSource::Const(SlotTransferSpec::Explicit(mapping)),
+                } => Some(mapping.len()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(explicit_lengths.len(), irregular_context.p_moduli.len());
+        assert!(explicit_lengths.iter().all(|length| *length == 4));
     }
 
     #[test]

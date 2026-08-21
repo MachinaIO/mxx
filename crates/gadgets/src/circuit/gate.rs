@@ -69,6 +69,11 @@ pub enum SlotTransferSpec {
         prefix_blocks: u32,
         prefix_scalar: Option<u32>,
     },
+    /// Identity source mapping with one scalar mask repeated for every coefficient block.
+    IdentityRepeatedLanes {
+        num_blocks: u32,
+        lane_scalars: Vec<Option<u32>>,
+    },
 }
 
 impl SlotTransferSpec {
@@ -116,6 +121,23 @@ impl SlotTransferSpec {
             prefix_blocks: u32::try_from(prefix_blocks)
                 .expect("repeated-lanes prefix block count must fit in u32"),
             prefix_scalar,
+        }
+    }
+
+    pub fn identity_repeated_lanes(num_blocks: usize, lane_scalars: Vec<Option<u32>>) -> Self {
+        assert!(num_blocks > 0, "identity repeated-lanes block count must be positive");
+        assert!(!lane_scalars.is_empty(), "identity repeated-lanes mask must be nonempty");
+        let total_slots = num_blocks
+            .checked_mul(lane_scalars.len())
+            .expect("identity repeated-lanes slot count overflow");
+        assert!(
+            u32::try_from(total_slots).is_ok(),
+            "identity repeated-lanes slot count must fit in u32"
+        );
+        Self::IdentityRepeatedLanes {
+            num_blocks: u32::try_from(num_blocks)
+                .expect("identity repeated-lanes block count must fit in u32"),
+            lane_scalars,
         }
     }
 
@@ -206,6 +228,25 @@ impl SlotTransferSpec {
                     (0..num_slots).map(build).collect()
                 }
             }
+            Self::IdentityRepeatedLanes { num_blocks, lane_scalars } => {
+                let num_blocks = usize::try_from(*num_blocks)
+                    .expect("identity repeated-lanes block count must fit in usize");
+                let num_slots = num_blocks
+                    .checked_mul(lane_scalars.len())
+                    .expect("identity repeated-lanes slot count overflow");
+                let build = |slot: usize| {
+                    (
+                        u32::try_from(slot)
+                            .expect("identity repeated-lanes source slot must fit in u32"),
+                        lane_scalars[slot % lane_scalars.len()],
+                    )
+                };
+                if num_slots >= 1024 {
+                    (0..num_slots).into_par_iter().map(build).collect()
+                } else {
+                    (0..num_slots).map(build).collect()
+                }
+            }
         }
     }
 
@@ -224,6 +265,9 @@ impl SlotTransferSpec {
             Self::Rotation { .. } => 1,
             Self::Repeated { prefix_scalar, .. } | Self::RepeatedLanes { prefix_scalar, .. } => {
                 prefix_scalar.map_or(1, |scalar| scalar.max(1))
+            }
+            Self::IdentityRepeatedLanes { lane_scalars, .. } => {
+                lane_scalars.iter().map(|scalar| scalar.unwrap_or(1)).max().unwrap_or(1)
             }
         }
     }

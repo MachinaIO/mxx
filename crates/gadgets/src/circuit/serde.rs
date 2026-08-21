@@ -608,6 +608,16 @@ mod tests {
     }
 
     #[test]
+    fn serialization_roundtrip_preserves_identity_repeated_lanes() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let output =
+            circuit.slot_identity_repeated_lanes_gate(input, 4, vec![Some(3), None, Some(0)]);
+        circuit.output([output]);
+        assert_json_roundtrip(circuit);
+    }
+
+    #[test]
     fn serialization_roundtrip_preserves_parameterized_subcircuits() {
         let mut child = PolyCircuit::<DCRTPoly>::new();
         let scalar =

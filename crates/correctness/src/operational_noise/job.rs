@@ -1684,7 +1684,7 @@ impl CheckerJob {
         // concrete RHS, but must not mutate the frozen canonical registry or retain runtime IDs
         // whose backing slots are rolled back after this analysis.
         let checkpoint = self.normalization.checkpoint();
-        let normalized = self.normalize(root);
+        let normalized = self.normalize_with_trace(root);
         self.normalization.rollback(checkpoint);
         self.normalization.clear_runtime();
         let (analyzed, counters) = normalized?;
@@ -1874,6 +1874,21 @@ impl CheckerJob {
         &mut self,
         root: super::arena::ScopedExprId,
     ) -> Result<(AnalyzedValue, NormalizationCounters), JobError> {
+        self.normalize_with_trace_authority(root, false)
+    }
+
+    fn normalize_with_trace(
+        &mut self,
+        root: super::arena::ScopedExprId,
+    ) -> Result<(AnalyzedValue, NormalizationCounters), JobError> {
+        self.normalize_with_trace_authority(root, true)
+    }
+
+    fn normalize_with_trace_authority(
+        &mut self,
+        root: super::arena::ScopedExprId,
+        trace: bool,
+    ) -> Result<(AnalyzedValue, NormalizationCounters), JobError> {
         self.validate_frozen_resources()?;
         let scope = root.program();
         let (
@@ -1899,7 +1914,9 @@ impl CheckerJob {
             .map_err(JobError::Normalize)?
             .with_relations(relations, normalization)
             .with_gadget_recompositions(gadget_recompositions);
-        let value = normalizer.normalize(root).map_err(JobError::Normalize)?;
+        let value =
+            if trace { normalizer.normalize_with_trace(root) } else { normalizer.normalize(root) }
+                .map_err(JobError::Normalize)?;
         let counters = normalizer.counters();
         self.frozen_resources = Some(self.current_resource_counters());
         Ok((value, counters))

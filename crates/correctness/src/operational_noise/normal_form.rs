@@ -58,6 +58,7 @@ const MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 const PRODUCT_PROCESSED_HEARTBEAT: u64 = 1_000_000;
 const NORMALIZATION_WATCHDOG_ENV: &str = "MXX_OPERATIONAL_WATCHDOG_TRACE";
 const NORMALIZATION_WATCHDOG_INTERVAL_ENV: &str = "MXX_OPERATIONAL_WATCHDOG_INTERVAL_SECS";
+const NORMALIZATION_FOUR_CLASS_CENSUS_ENV: &str = "MXX_OPERATIONAL_FOUR_CLASS_CENSUS";
 const NORMALIZATION_WATCHDOG_INTERVAL: Duration = Duration::from_secs(4);
 const NORMALIZATION_WATCHDOG_MAX_INTERVAL_SECS: u64 = 3600;
 const NORMALIZATION_WATCHDOG_MAX_SNAPSHOTS: u8 = 18;
@@ -600,6 +601,12 @@ struct DiagnosticOwnerCensus {
     gadget_product_planned_pairs: u64,
     gadget_product_max_streamed_output_terms: u64,
     ordinary_product_plans_created: u64,
+    typed_product_candidate_plans: u64,
+    typed_product_direct_executions: u64,
+    typed_product_pair_attempts: u64,
+    typed_product_pair_matches: u64,
+    typed_product_pair_ordinary_fallbacks: u64,
+    typed_product_standalone_materializations: u64,
     ordinary_product_streamed_executions: u64,
     ordinary_product_zero_weight_skips: u64,
     ordinary_product_standalone_materializations: u64,
@@ -931,6 +938,16 @@ fn diagnostic_watchdog_emit_snapshot(
             .owners
             .gadget_product_max_streamed_output_terms,
         ordinary_product_plans_created = progress.owners.ordinary_product_plans_created,
+        typed_product_candidate_plans = progress.owners.typed_product_candidate_plans,
+        typed_product_direct_executions = progress.owners.typed_product_direct_executions,
+        typed_product_pair_attempts = progress.owners.typed_product_pair_attempts,
+        typed_product_pair_matches = progress.owners.typed_product_pair_matches,
+        typed_product_pair_ordinary_fallbacks = progress
+            .owners
+            .typed_product_pair_ordinary_fallbacks,
+        typed_product_standalone_materializations = progress
+            .owners
+            .typed_product_standalone_materializations,
         ordinary_product_streamed_executions = progress
             .owners
             .ordinary_product_streamed_executions,
@@ -1021,6 +1038,16 @@ fn normalization_watchdog_enabled() -> bool {
     std::env::var(NORMALIZATION_WATCHDOG_ENV)
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn normalization_four_class_census_enabled() -> bool {
+    normalization_four_class_census_enabled_from_value(
+        std::env::var(NORMALIZATION_FOUR_CLASS_CENSUS_ENV).ok().as_deref(),
+    )
+}
+
+fn normalization_four_class_census_enabled_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn normalization_watchdog_interval() -> Duration {
@@ -1611,6 +1638,16 @@ impl NormalizationTrace {
                 .owners
                 .gadget_product_max_streamed_output_terms,
             ordinary_product_plans_created = self.owners.ordinary_product_plans_created,
+            typed_product_candidate_plans = self.owners.typed_product_candidate_plans,
+            typed_product_direct_executions = self.owners.typed_product_direct_executions,
+            typed_product_pair_attempts = self.owners.typed_product_pair_attempts,
+            typed_product_pair_matches = self.owners.typed_product_pair_matches,
+            typed_product_pair_ordinary_fallbacks = self
+                .owners
+                .typed_product_pair_ordinary_fallbacks,
+            typed_product_standalone_materializations = self
+                .owners
+                .typed_product_standalone_materializations,
             ordinary_product_streamed_executions = self
                 .owners
                 .ordinary_product_streamed_executions,
@@ -1848,8 +1885,15 @@ struct ProductExactPlan {
     right_expression: ExprId,
     left_type: ResolvedMatrixType,
     right_type: ResolvedMatrixType,
+    mode: ProductMode,
     left: NodeExactState,
     right: NodeExactState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProductMode {
+    Ordinary,
+    TypedGadgetCandidate,
 }
 
 #[derive(Debug)]
@@ -1903,6 +1947,12 @@ struct GadgetProductPlanCounters {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ProductPlanCounters {
     plans_created: u64,
+    typed_candidate_plans: u64,
+    typed_direct_executions: u64,
+    typed_pair_attempts: u64,
+    typed_pair_matches: u64,
+    typed_pair_ordinary_fallbacks: u64,
+    typed_standalone_materializations: u64,
     streamed_executions: u64,
     zero_weight_skips: u64,
     standalone_materializations: u64,
@@ -2036,6 +2086,9 @@ pub struct Normalizer<'a> {
     counters: NormalizationCounters,
     trace: NormalizationTrace,
     watchdog: Option<DiagnosticWatchdog>,
+    /// Expensive exact-plan relation census. It is independent of the lightweight watchdog and
+    /// remains disabled unless explicitly requested for a bounded diagnostic run.
+    four_class_census_enabled: bool,
     watchdog_generation: u64,
     watchdog_product_processed: u64,
     watchdog_product_generated: u64,
@@ -2405,6 +2458,13 @@ impl<'a> Normalizer<'a> {
         {
             return Err(NormalizeError::InvalidExactPlan { reason: "product operand type drift" });
         }
+        if plan.mode == ProductMode::TypedGadgetCandidate &&
+            !self.gadget_recompositions.is_some_and(GadgetRecompositionRegistry::is_frozen)
+        {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "typed gadget product registry is not frozen",
+            });
+        }
         for child in [&plan.left, &plan.right] {
             self.validate_exact_plan_authority(Self::node_exact_authority(child))?;
             if Self::node_exact_plan_id(child).is_some_and(|id| id >= plan.id) {
@@ -2490,8 +2550,16 @@ impl<'a> Normalizer<'a> {
         left: NodeExactState,
         right: NodeExactState,
     ) -> Result<Option<Arc<ProductExactPlan>>, NormalizeError> {
+        let mode = if self.deferred_gadget_products.contains(&expression) &&
+            self.gadget_recompositions.is_some_and(GadgetRecompositionRegistry::is_frozen)
+        {
+            ProductMode::TypedGadgetCandidate
+        } else if self.deferred_products.contains(&expression) {
+            ProductMode::Ordinary
+        } else {
+            return Ok(None);
+        };
         if self.relation_rewriting_enabled ||
-            !self.deferred_products.contains(&expression) ||
             !matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Multiply)) ||
             node.inputs.len() != 2
         {
@@ -2529,12 +2597,57 @@ impl<'a> Normalizer<'a> {
             right_expression: node.inputs[1],
             left_type,
             right_type,
+            mode,
             left,
             right,
         });
         self.product_plan_counters.plans_created =
             self.product_plan_counters.plans_created.saturating_add(1);
+        if mode == ProductMode::TypedGadgetCandidate {
+            self.product_plan_counters.typed_candidate_plans =
+                self.product_plan_counters.typed_candidate_plans.saturating_add(1);
+        }
         Ok(Some(plan))
+    }
+
+    fn product_plan_uses_direct_gadget_rewrite(
+        &self,
+        plan: &ProductExactPlan,
+        left: &PolynomialNF,
+        right: &PolynomialNF,
+    ) -> Result<bool, NormalizeError> {
+        self.validate_product_plan(plan)?;
+        if plan.mode != ProductMode::TypedGadgetCandidate {
+            return Ok(false);
+        }
+        let Some(registry) = self.gadget_recompositions else { return Ok(false) };
+        if !registry.is_frozen() {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "typed gadget product registry is not frozen",
+            });
+        }
+        let mut left_endpoints = BTreeSet::new();
+        for monomial in left.exact_terms.keys() {
+            let descriptor = self.monomials.descriptor(*monomial)?;
+            if let Some(endpoint) = descriptor.ordered_factors.last() {
+                left_endpoints.insert(*endpoint);
+            }
+        }
+        let mut right_endpoints = BTreeSet::new();
+        for monomial in right.exact_terms.keys() {
+            let descriptor = self.monomials.descriptor(*monomial)?;
+            if let Some(endpoint) = descriptor.ordered_factors.first() {
+                right_endpoints.insert(*endpoint);
+            }
+        }
+        for gadget in left_endpoints {
+            for decomposition in &right_endpoints {
+                if self.authorized_gadget_pair_input(gadget, *decomposition)?.is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn new_gadget_product_plan(
@@ -2695,6 +2808,7 @@ impl<'a> Normalizer<'a> {
                         &BigInt::from(1_u8),
                         &mut terms,
                         true,
+                        false,
                     )?;
                     self.gadget_product_counters.standalone_materializations =
                         self.gadget_product_counters.standalone_materializations.saturating_add(1);
@@ -2710,18 +2824,30 @@ impl<'a> Normalizer<'a> {
                     let left = Self::exact_state_output(&plan.left, &outputs)?;
                     let right = Self::exact_state_output(&plan.right, &outputs)?;
                     let mut terms = BTreeMap::new();
+                    let direct = self.product_plan_uses_direct_gadget_rewrite(
+                        &plan,
+                        left.as_ref(),
+                        right.as_ref(),
+                    )?;
                     self.execute_product_into(
                         left.as_ref(),
                         right.as_ref(),
                         &BigInt::from(1_u8),
                         &mut terms,
-                        false,
+                        direct,
+                        plan.mode == ProductMode::TypedGadgetCandidate,
                     )?;
                     let planned = u64::try_from(left.exact_terms.len())
                         .unwrap_or(u64::MAX)
                         .saturating_mul(u64::try_from(right.exact_terms.len()).unwrap_or(u64::MAX));
                     self.product_plan_counters.standalone_materializations =
                         self.product_plan_counters.standalone_materializations.saturating_add(1);
+                    if plan.mode == ProductMode::TypedGadgetCandidate {
+                        self.product_plan_counters.typed_standalone_materializations = self
+                            .product_plan_counters
+                            .typed_standalone_materializations
+                            .saturating_add(1);
+                    }
                     self.product_plan_counters.planned_pairs =
                         self.product_plan_counters.planned_pairs.saturating_add(planned);
                     Self::release_product_output(&plan.left, &mut outputs, &mut product_uses)?;
@@ -3049,12 +3175,18 @@ impl<'a> Normalizer<'a> {
                 } else {
                     let left = Self::exact_state_output(&plan.left, outputs)?;
                     let right = Self::exact_state_output(&plan.right, outputs)?;
+                    let direct = self.product_plan_uses_direct_gadget_rewrite(
+                        &plan,
+                        left.as_ref(),
+                        right.as_ref(),
+                    )?;
                     self.execute_product_into(
                         left.as_ref(),
                         right.as_ref(),
                         &weight,
                         &mut terms,
-                        false,
+                        direct,
+                        plan.mode == ProductMode::TypedGadgetCandidate,
                     )?;
                     let planned = u64::try_from(left.exact_terms.len())
                         .unwrap_or(u64::MAX)
@@ -3104,6 +3236,7 @@ impl<'a> Normalizer<'a> {
                 &weight,
                 &mut terms,
                 true,
+                false,
             )?;
         }
         let output_terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
@@ -3222,6 +3355,7 @@ impl<'a> Normalizer<'a> {
         let mut roots = Vec::new();
         let mut top8 = DiagnosticMaterializedLeafTop8::default();
         let collect_origins = self.watchdog.is_some();
+        let collect_four_class = collect_origins && self.four_class_census_enabled;
         let mut diagnostic_nfs = Vec::<DiagnosticExactNf>::new();
         let observe_leaf =
             |normal_form: Arc<PolynomialNF>,
@@ -3232,7 +3366,7 @@ impl<'a> Normalizer<'a> {
              diagnostic_nfs: &mut Vec<DiagnosticExactNf>| {
                 let key = Arc::as_ptr(&normal_form) as usize;
                 if let Some(index) = seen_leaves.get(&key).copied() {
-                    if collect_origins {
+                    if collect_four_class {
                         diagnostic_nfs[index].under_product |= under_product;
                     }
                     return false;
@@ -3240,8 +3374,9 @@ impl<'a> Normalizer<'a> {
                 if collect_roots {
                     roots.extend(normal_form.exact_terms.keys().copied());
                 }
-                seen_leaves.insert(key, diagnostic_nfs.len());
-                if collect_origins {
+                let diagnostic_index = diagnostic_nfs.len();
+                seen_leaves.insert(key, diagnostic_index);
+                if collect_four_class {
                     diagnostic_nfs.push(DiagnosticExactNf {
                         normal_form,
                         ordinal: u64::try_from(diagnostic_nfs.len()).unwrap_or(u64::MAX),
@@ -3253,19 +3388,19 @@ impl<'a> Normalizer<'a> {
         while let Some((state, under_product)) = pending.pop() {
             match state {
                 NodeExactState::Additive(plan) => {
-                    if seen_plans.insert((0, plan.id, collect_origins && under_product)) {
+                    if seen_plans.insert((0, plan.id, collect_four_class && under_product)) {
                         pending.push((plan.left.clone(), under_product));
                         pending.push((plan.right.clone(), under_product));
                     }
                 }
                 NodeExactState::Product(plan) => {
-                    if seen_plans.insert((1, plan.id, collect_origins && under_product)) {
+                    if seen_plans.insert((1, plan.id, collect_four_class && under_product)) {
                         pending.push((plan.left.clone(), true));
                         pending.push((plan.right.clone(), true));
                     }
                 }
                 NodeExactState::GadgetProduct(plan) => {
-                    if seen_plans.insert((2, plan.id, collect_origins && under_product)) {
+                    if seen_plans.insert((2, plan.id, collect_four_class && under_product)) {
                         for normal_form in [&plan.left, &plan.right] {
                             observe_leaf(
                                 Arc::clone(normal_form),
@@ -4058,6 +4193,16 @@ impl<'a> Normalizer<'a> {
                 .gadget_product_counters
                 .max_streamed_output_terms,
             ordinary_product_plans_created: self.product_plan_counters.plans_created,
+            typed_product_candidate_plans: self.product_plan_counters.typed_candidate_plans,
+            typed_product_direct_executions: self.product_plan_counters.typed_direct_executions,
+            typed_product_pair_attempts: self.product_plan_counters.typed_pair_attempts,
+            typed_product_pair_matches: self.product_plan_counters.typed_pair_matches,
+            typed_product_pair_ordinary_fallbacks: self
+                .product_plan_counters
+                .typed_pair_ordinary_fallbacks,
+            typed_product_standalone_materializations: self
+                .product_plan_counters
+                .typed_standalone_materializations,
             ordinary_product_streamed_executions: self.product_plan_counters.streamed_executions,
             ordinary_product_zero_weight_skips: self.product_plan_counters.zero_weight_skips,
             ordinary_product_standalone_materializations: self
@@ -4092,13 +4237,14 @@ impl<'a> Normalizer<'a> {
         }
         let (plan_roots, materialized_leaf_top8, diagnostic_nfs) =
             self.exact_plan_leaf_roots_and_top8(true)?;
-        // Classification is watchdog-only. It is computed before mutation so an authority error
-        // aborts the sweep atomically, and committed only after the real sweep succeeds.
-        let four_class_started = self.watchdog.as_ref().map(|_| Instant::now());
-        let four_class = self
-            .watchdog
-            .as_ref()
-            .map(|_| self.diagnostic_four_class_census(&diagnostic_nfs))
+        // Classification is a separate expensive opt-in layered on the watchdog. It is computed
+        // before mutation so an authority error aborts the sweep atomically, and committed only
+        // after the real sweep succeeds. Ordinary watchdog owner telemetry remains enabled
+        // without paying for this factor walk.
+        let collect_four_class = self.watchdog.is_some() && self.four_class_census_enabled;
+        let four_class_started = collect_four_class.then(Instant::now);
+        let four_class = collect_four_class
+            .then(|| self.diagnostic_four_class_census(&diagnostic_nfs))
             .transpose()?;
         let four_class_elapsed_ns = four_class_started
             .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
@@ -4313,6 +4459,7 @@ impl<'a> Normalizer<'a> {
             counters: NormalizationCounters::default(),
             trace: NormalizationTrace::new(),
             watchdog: None,
+            four_class_census_enabled: normalization_four_class_census_enabled(),
             watchdog_generation: 0,
             watchdog_product_processed: 0,
             watchdog_product_generated: 0,
@@ -7695,7 +7842,7 @@ impl<'a> Normalizer<'a> {
         right: &PolynomialNF,
     ) -> Result<PolynomialNF, NormalizeError> {
         let mut terms = BTreeMap::new();
-        self.execute_product_into(left, right, &BigInt::from(1_u8), &mut terms, false)?;
+        self.execute_product_into(left, right, &BigInt::from(1_u8), &mut terms, false, false)?;
         Ok(PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() })
     }
 
@@ -7709,6 +7856,7 @@ impl<'a> Normalizer<'a> {
         weight: &BigInt,
         terms: &mut BTreeMap<MonomialId, BigInt>,
         direct_gadget_boundary: bool,
+        typed_product_plan: bool,
     ) -> Result<(), NormalizeError> {
         if self.watchdog.is_some() {
             self.watchdog_product_call_id = self.watchdog_product_call_id.saturating_add(1);
@@ -7764,13 +7912,23 @@ impl<'a> Normalizer<'a> {
                 false,
             );
         }
-        if direct_gadget_boundary {
+        if direct_gadget_boundary && typed_product_plan {
+            self.product_plan_counters.typed_direct_executions =
+                self.product_plan_counters.typed_direct_executions.saturating_add(1);
+        } else if direct_gadget_boundary {
             self.gadget_product_counters.streamed_executions =
                 self.gadget_product_counters.streamed_executions.saturating_add(1);
             self.gadget_product_counters.planned_pairs =
                 self.gadget_product_counters.planned_pairs.saturating_add(planned);
         }
-        let result = self.product_into_body(left, right, weight, terms, direct_gadget_boundary);
+        let result = self.product_into_body(
+            left,
+            right,
+            weight,
+            terms,
+            direct_gadget_boundary,
+            typed_product_plan,
+        );
         if self.trace.active {
             if result.is_ok() {
                 self.trace.product_max_output_terms = self
@@ -7779,7 +7937,7 @@ impl<'a> Normalizer<'a> {
                     .max(u64::try_from(terms.len()).unwrap_or(u64::MAX));
             }
         }
-        if direct_gadget_boundary && result.is_ok() {
+        if direct_gadget_boundary && !typed_product_plan && result.is_ok() {
             self.gadget_product_counters.max_streamed_output_terms = self
                 .gadget_product_counters
                 .max_streamed_output_terms
@@ -7803,6 +7961,7 @@ impl<'a> Normalizer<'a> {
         weight: &BigInt,
         terms: &mut BTreeMap<MonomialId, BigInt>,
         direct_gadget_boundary: bool,
+        typed_product_plan: bool,
     ) -> Result<(), NormalizeError> {
         let mut worklist = VecDeque::new();
         for (left_id, left_coefficient) in &left.exact_terms {
@@ -7822,7 +7981,23 @@ impl<'a> Normalizer<'a> {
                     continue;
                 }
                 let direct_rewrite = if direct_gadget_boundary {
-                    self.rewrite_gadget_product_pair(*left_id, *right_id)?
+                    if typed_product_plan {
+                        self.product_plan_counters.typed_pair_attempts =
+                            self.product_plan_counters.typed_pair_attempts.saturating_add(1);
+                    }
+                    let rewritten = self.rewrite_gadget_product_pair(*left_id, *right_id)?;
+                    if typed_product_plan {
+                        if rewritten.is_some() {
+                            self.product_plan_counters.typed_pair_matches =
+                                self.product_plan_counters.typed_pair_matches.saturating_add(1);
+                        } else {
+                            self.product_plan_counters.typed_pair_ordinary_fallbacks = self
+                                .product_plan_counters
+                                .typed_pair_ordinary_fallbacks
+                                .saturating_add(1);
+                        }
+                    }
+                    rewritten
                 } else {
                     None
                 };
@@ -10387,6 +10562,9 @@ mod tests {
         assert_eq!(gc.last_bucket_entries, 1);
         assert!(gc.sweep_total_ns >= gc.sweep_max_ns);
         assert!(gc.sweep_max_ns >= gc.sweep_last_ns);
+        assert!(gc.value_cache_top8_len > 0, "ordinary watchdog owner telemetry stays enabled");
+        assert_eq!(gc.exact_plan_four_class, DiagnosticFourClassCensus::default());
+        assert_eq!(gc.four_class_total_ns, 0);
         let terminal = normalizer.last_watchdog_snapshots.last().copied().unwrap();
         assert_eq!(terminal.gc, gc);
         let live = *value.exact_nf.as_ref().unwrap().exact_terms.keys().next().unwrap();
@@ -10426,6 +10604,7 @@ mod tests {
                     .unwrap()
                     .with_relations(&relations, &mut cache)
                     .with_watchdog_override(true, Duration::from_secs(60));
+            normalizer.four_class_census_enabled = true;
             normalizer.monomial_gc_allocation_threshold_bytes = 1;
             let value = normalizer.normalize(semantic).unwrap();
             (value, normalizer.counters(), normalizer.gc_counters)
@@ -11898,6 +12077,16 @@ mod tests {
             normalization_watchdog_interval_from_value(Some("18446744073709551615")),
             Duration::from_secs(NORMALIZATION_WATCHDOG_MAX_INTERVAL_SECS)
         );
+    }
+
+    #[test]
+    fn four_class_census_parser_is_explicit_opt_in() {
+        for disabled in [None, Some(""), Some("0"), Some("false"), Some("False"), Some("no")] {
+            assert!(!normalization_four_class_census_enabled_from_value(disabled));
+        }
+        for enabled in [Some("1"), Some("true"), Some("TRUE"), Some("yes"), Some("YES")] {
+            assert!(normalization_four_class_census_enabled_from_value(enabled));
+        }
     }
 
     #[test]
@@ -13516,13 +13705,13 @@ mod tests {
             .with_gadget_recompositions(&registry)
             .normalize(product_semantic)
             .unwrap();
-        let (deferred, counters) = {
+        let (deferred, product_counters, gadget_counters) = {
             let mut normalizer =
                 Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
                     .unwrap()
                     .with_gadget_recompositions(&registry);
             let value = normalizer.normalize(root_semantic).unwrap();
-            (value, normalizer.gadget_product_counters)
+            (value, normalizer.product_plan_counters, normalizer.gadget_product_counters)
         };
         let descriptor_multiset = |nf: &PolynomialNF, monomials: &MonomialArena| {
             nf.exact_terms
@@ -13543,9 +13732,15 @@ mod tests {
         );
         assert_eq!(eager.coefficient_bound, deferred.coefficient_bound);
         assert_eq!(deferred.exact_nf.as_ref().unwrap().term_count(), 2);
-        assert_eq!(counters.plans_created, 1);
-        assert_eq!(counters.streamed_executions, 1);
-        assert_eq!(counters.planned_pairs, 1);
+        assert_eq!(gadget_counters, GadgetProductPlanCounters::default());
+        assert_eq!(product_counters.plans_created, 2);
+        assert_eq!(product_counters.typed_candidate_plans, 2);
+        assert_eq!(product_counters.typed_direct_executions, 1);
+        assert_eq!(product_counters.typed_pair_attempts, 1);
+        assert_eq!(product_counters.typed_pair_matches, 1);
+        assert_eq!(product_counters.typed_pair_ordinary_fallbacks, 0);
+        assert_eq!(product_counters.streamed_executions, 1);
+        assert_eq!(product_counters.typed_standalone_materializations, 1);
     }
 
     #[test]
@@ -13680,12 +13875,48 @@ mod tests {
     }
 
     #[test]
+    fn typed_gadget_candidate_requires_a_frozen_registry_at_plan_construction() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 4).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 4, 4).unwrap();
+        let gadget_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 4).unwrap();
+        let (gadget, decomposition, _) = gadget_product(
+            &mut expressions,
+            false,
+            4,
+            gadget_type,
+            decomposition_type,
+            input_type.clone(),
+            Some((2, false)),
+        );
+        let product = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[gadget, decomposition])
+            .unwrap();
+        let zero_source = matrix_source(&mut expressions, "no-registry-zero", input_type, None);
+        let zero = expressions
+            .intern_matrix_transform(MatrixOperation::Subtract, &[zero_source, zero_source])
+            .unwrap();
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[product, zero]).unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        mark_scalar_sources_constant(&expressions, &mut facts, root);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let value = normalizer.normalize(semantic).unwrap();
+        assert!(value.exact_nf.is_some());
+        assert_eq!(normalizer.product_plan_counters, ProductPlanCounters::default());
+        assert_eq!(normalizer.gadget_product_counters, GadgetProductPlanCounters::default());
+    }
+
+    #[test]
     fn gadget_product_deferral_rejects_incomplete_or_mismatched_semantic_authority() {
         #[derive(Clone, Copy, Debug)]
         enum Rejection {
             WrongSource,
             WrongBase,
             WrongSmall,
+            WrongDigit,
             WrongType,
             WrongLayout,
             Unfrozen,
@@ -13695,6 +13926,7 @@ mod tests {
             Rejection::WrongSource,
             Rejection::WrongBase,
             Rejection::WrongSmall,
+            Rejection::WrongDigit,
             Rejection::WrongType,
             Rejection::WrongLayout,
             Rejection::Unfrozen,
@@ -13742,19 +13974,27 @@ mod tests {
                 BigUint::from(17_u8)
             };
             let rule_input = ResolvedMatrixType::new(rule_modulus.clone(), 1, 1, 4).unwrap();
-            let rule_decomposition =
-                ResolvedMatrixType::new(rule_modulus.clone(), 1, 4, 4).unwrap();
-            let rule_gadget = ResolvedMatrixType::new(rule_modulus, 1, 1, 4).unwrap();
+            let rule_digits = if matches!(rejection, Rejection::WrongDigit) { 3 } else { 4 };
+            let rule_decomposition = ResolvedMatrixType::new(
+                rule_modulus.clone(),
+                1,
+                usize::try_from(rule_digits).unwrap(),
+                4,
+            )
+            .unwrap();
+            let rule_gadget =
+                ResolvedMatrixType::new(rule_modulus, 1, 1, usize::try_from(rule_digits).unwrap())
+                    .unwrap();
             let mut registry = GadgetRecompositionRegistry::new();
             registry
                 .register(GadgetRecompositionRule {
                     base: 2,
                     small: false,
-                    digit_count: 4,
+                    digit_count: rule_digits,
                     gadget_layout: (!matches!(rejection, Rejection::WrongLayout))
-                        .then(|| MatrixLayout::row_major(1, 4)),
+                        .then(|| MatrixLayout::row_major(1, usize::try_from(rule_digits).unwrap())),
                     decomposition_layout: (!matches!(rejection, Rejection::WrongLayout))
-                        .then(|| MatrixLayout::row_major(4, 4)),
+                        .then(|| MatrixLayout::row_major(usize::try_from(rule_digits).unwrap(), 4)),
                     input_layout: (!matches!(rejection, Rejection::WrongLayout))
                         .then(|| MatrixLayout::row_major(1, 4)),
                     output_type: rule_input.clone(),
@@ -13779,6 +14019,19 @@ mod tests {
                 "{rejection:?} must not authorize a deferred product"
             );
             assert_eq!(normalizer.gadget_product_counters.streamed_executions, 0);
+            if matches!(rejection, Rejection::Unfrozen) {
+                assert_eq!(normalizer.product_plan_counters.plans_created, 0);
+            } else {
+                assert_eq!(normalizer.product_plan_counters.plans_created, 1, "{rejection:?}");
+                assert_eq!(
+                    normalizer.product_plan_counters.typed_candidate_plans, 1,
+                    "{rejection:?}"
+                );
+                assert_eq!(normalizer.product_plan_counters.typed_direct_executions, 0);
+                assert_eq!(normalizer.product_plan_counters.typed_pair_attempts, 0);
+                assert_eq!(normalizer.product_plan_counters.typed_pair_matches, 0);
+                assert_eq!(normalizer.product_plan_counters.typed_pair_ordinary_fallbacks, 0);
+            }
         }
 
         let valid = recomposition_registry(
@@ -14082,38 +14335,44 @@ mod tests {
                 bounded_summary: BoundedSummary::missing(),
             }),
         };
-        let mut normalizer =
-            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let registry =
+            recomposition_registry(matrix_type(), matrix_type(), matrix_type(), false, 1);
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_gadget_recompositions(&registry);
         let product_authority = normalizer.exact_plan_authority(product).unwrap();
         let left_authority = normalizer.exact_plan_authority(left_expression).unwrap();
         let right_authority = normalizer.exact_plan_authority(right_expression).unwrap();
         let left_type = left_authority.matrix_type.clone();
         let right_type = right_authority.matrix_type.clone();
         for invalid in [foreign, tombstone] {
-            let state = NodeExactState::Product(Arc::new(ProductExactPlan {
-                id: 1,
-                authority: product_authority.clone(),
-                expression: product,
-                left_expression,
-                right_expression,
-                left_type: left_type.clone(),
-                right_type: right_type.clone(),
-                left: leaf(left_authority.clone(), left),
-                right: leaf(right_authority.clone(), invalid),
-            }));
-            let high_water = normalizer.monomials.len();
-            let occupied = normalizer.monomials.occupied_len();
-            let counters = normalizer.product_plan_counters;
-            assert!(matches!(
-                normalizer.materialize_exact_state(&state),
-                Err(NormalizeError::Monomial(
-                    MonomialError::InvalidMonomialId { .. } |
-                        MonomialError::CollectedMonomialId { .. }
-                ))
-            ));
-            assert_eq!(normalizer.monomials.len(), high_water);
-            assert_eq!(normalizer.monomials.occupied_len(), occupied);
-            assert_eq!(normalizer.product_plan_counters, counters);
+            for mode in [ProductMode::Ordinary, ProductMode::TypedGadgetCandidate] {
+                let state = NodeExactState::Product(Arc::new(ProductExactPlan {
+                    id: 1,
+                    authority: product_authority.clone(),
+                    expression: product,
+                    left_expression,
+                    right_expression,
+                    left_type: left_type.clone(),
+                    right_type: right_type.clone(),
+                    mode,
+                    left: leaf(left_authority.clone(), left),
+                    right: leaf(right_authority.clone(), invalid),
+                }));
+                let high_water = normalizer.monomials.len();
+                let occupied = normalizer.monomials.occupied_len();
+                let counters = normalizer.product_plan_counters;
+                assert!(matches!(
+                    normalizer.materialize_exact_state(&state),
+                    Err(NormalizeError::Monomial(
+                        MonomialError::InvalidMonomialId { .. } |
+                            MonomialError::CollectedMonomialId { .. }
+                    ))
+                ));
+                assert_eq!(normalizer.monomials.len(), high_water);
+                assert_eq!(normalizer.monomials.occupied_len(), occupied);
+                assert_eq!(normalizer.product_plan_counters, counters);
+            }
         }
 
         let mut foreign_authority = product_authority.clone();
@@ -14126,6 +14385,7 @@ mod tests {
             right_expression,
             left_type,
             right_type,
+            mode: ProductMode::Ordinary,
             left: leaf(left_authority, left),
             right: leaf(right_authority, right),
         }));
@@ -15411,6 +15671,128 @@ mod tests {
     }
 
     #[test]
+    fn compositional_typed_gadget_candidate_reclassifies_materialized_endpoints_exactly() {
+        #[derive(Clone, Copy, Debug)]
+        enum Case {
+            Authorized,
+            Mixed,
+            Canceled,
+        }
+
+        for case in [Case::Authorized, Case::Mixed, Case::Canceled] {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let modulus = BigUint::from(17_u8);
+            let input_type = ResolvedMatrixType::new(modulus.clone(), 1, 1, 4).unwrap();
+            let decomposition_type = ResolvedMatrixType::new(modulus.clone(), 1, 4, 4).unwrap();
+            let gadget_type = ResolvedMatrixType::new(modulus, 1, 1, 4).unwrap();
+            let (gadget, decomposition, _) = gadget_product(
+                &mut expressions,
+                false,
+                4,
+                gadget_type.clone(),
+                decomposition_type.clone(),
+                input_type.clone(),
+                Some((2, false)),
+            );
+            let other = match case {
+                Case::Authorized => matrix_source(
+                    &mut expressions,
+                    "compositional-authorized-gadget",
+                    gadget_type.clone(),
+                    Some((2, false)),
+                ),
+                Case::Mixed => matrix_source(
+                    &mut expressions,
+                    "compositional-ordinary-prefix",
+                    gadget_type.clone(),
+                    None,
+                ),
+                Case::Canceled => gadget,
+            };
+            let additive_operation = if matches!(case, Case::Canceled) {
+                MatrixOperation::Subtract
+            } else {
+                MatrixOperation::Add
+            };
+            let left =
+                expressions.intern_matrix_transform(additive_operation, &[gadget, other]).unwrap();
+            let product = expressions
+                .intern_matrix_transform(MatrixOperation::Multiply, &[left, decomposition])
+                .unwrap();
+            let zero_source = matrix_source(
+                &mut expressions,
+                "compositional-gadget-zero",
+                input_type.clone(),
+                None,
+            );
+            let zero = expressions
+                .intern_matrix_transform(MatrixOperation::Subtract, &[zero_source, zero_source])
+                .unwrap();
+            let root = expressions
+                .intern_matrix_transform(MatrixOperation::Add, &[product, zero])
+                .unwrap();
+            let registry =
+                recomposition_registry(gadget_type, decomposition_type, input_type, false, 4);
+            let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+            mark_scalar_sources_constant(&expressions, &mut facts, root);
+            let product_semantic =
+                programs.scoped(&expressions, semantic.program(), product).unwrap();
+            let eager = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                .unwrap()
+                .with_gadget_recompositions(&registry)
+                .normalize(product_semantic)
+                .unwrap();
+            let (deferred, product_counters, gadget_counters, product_origin) = {
+                let mut normalizer =
+                    Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                        .unwrap()
+                        .with_gadget_recompositions(&registry)
+                        .with_watchdog_override(true, Duration::from_secs(60));
+                let value = normalizer.normalize(semantic).unwrap();
+                (
+                    value,
+                    normalizer.product_plan_counters,
+                    normalizer.gadget_product_counters,
+                    normalizer.diagnostic_materialization_origins.get(&product).copied(),
+                )
+            };
+            assert_eq!(
+                descriptor_coefficient_multiset(eager.exact_nf.as_ref().unwrap(), &monomials),
+                descriptor_coefficient_multiset(deferred.exact_nf.as_ref().unwrap(), &monomials),
+                "{case:?}"
+            );
+            assert_eq!(eager.coefficient_bound, deferred.coefficient_bound, "{case:?}");
+            assert_eq!(product_counters.plans_created, 1, "{case:?}");
+            assert_eq!(product_counters.typed_candidate_plans, 1, "{case:?}");
+            assert_eq!(product_counters.streamed_executions, 1, "{case:?}");
+            assert_eq!(product_counters.typed_standalone_materializations, 0, "{case:?}");
+            assert_eq!(gadget_counters, GadgetProductPlanCounters::default(), "{case:?}");
+            assert_eq!(product_origin, None, "{case:?} must not force a NonAdd child boundary");
+            match case {
+                Case::Authorized => {
+                    assert_eq!(product_counters.typed_direct_executions, 1);
+                    assert_eq!(product_counters.typed_pair_attempts, 2);
+                    assert_eq!(product_counters.typed_pair_matches, 2);
+                    assert_eq!(product_counters.typed_pair_ordinary_fallbacks, 0);
+                }
+                Case::Mixed => {
+                    assert_eq!(product_counters.typed_direct_executions, 1);
+                    assert_eq!(product_counters.typed_pair_attempts, 2);
+                    assert_eq!(product_counters.typed_pair_matches, 1);
+                    assert_eq!(product_counters.typed_pair_ordinary_fallbacks, 1);
+                }
+                Case::Canceled => {
+                    assert_eq!(product_counters.typed_direct_executions, 0);
+                    assert_eq!(product_counters.typed_pair_attempts, 0);
+                    assert_eq!(product_counters.typed_pair_matches, 0);
+                    assert_eq!(product_counters.typed_pair_ordinary_fallbacks, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn compositional_product_keeps_scalar_root_nonadd_eager_and_materializes_relations() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -15623,6 +16005,7 @@ mod tests {
         let mut normalizer =
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
         normalizer.watchdog = DiagnosticWatchdog::start(19, Duration::from_secs(60));
+        normalizer.four_class_census_enabled = true;
         let x_state = normalizer.materialized_exact_state(x, leaf(x_monomial)).unwrap();
         let y_state = normalizer.materialized_exact_state(y, leaf(y_monomial)).unwrap();
         let sum_plan = normalizer.new_additive_plan(sum, x_state, y_state, false).unwrap();

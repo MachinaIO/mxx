@@ -1951,6 +1951,16 @@ enum ExactMaterializationFrame {
     FinishGadgetProduct(Arc<GadgetProductExactPlan>),
 }
 
+/// Additional roots owned by one lexical product execution. An eager product has no owners
+/// beyond its operands and destination. A deferred product also borrows the complete plan root
+/// and every already-materialized session output, allowing a threshold-triggered sweep only at a
+/// quiescent pair boundary without making those local owners durable.
+#[derive(Clone, Copy)]
+enum ProductGcScope<'a> {
+    Eager,
+    Deferred { root: &'a NodeExactState, outputs: &'a BTreeMap<(u8, u64), Arc<PolynomialNF>> },
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ProductEligibilityStats {
     candidates: usize,
@@ -2183,6 +2193,9 @@ pub struct Normalizer<'a> {
     /// when no current normalization owner references them.
     protected_monomial_prefix: usize,
     monomial_gc_allocation_threshold_bytes: u64,
+    /// A product sweep pins lexical operands and destinations. The following node commit must run
+    /// one cleanup sweep even when that product sweep reset the allocation counter to zero.
+    in_product_sweep_since_node_commit: bool,
     gc_counters: DiagnosticGcCounters,
     exact_plan_materializations: u64,
     exact_plan_materialization_output_terms_total: u64,
@@ -2974,6 +2987,7 @@ impl<'a> Normalizer<'a> {
                         &mut terms,
                         true,
                         false,
+                        ProductGcScope::Deferred { root: state, outputs: &outputs },
                     )?;
                     self.gadget_product_counters.standalone_materializations =
                         self.gadget_product_counters.standalone_materializations.saturating_add(1);
@@ -3001,6 +3015,7 @@ impl<'a> Normalizer<'a> {
                         &mut terms,
                         direct,
                         matches!(plan.mode, ProductMode::TypedGadgetCandidate),
+                        ProductGcScope::Deferred { root: state, outputs: &outputs },
                     )?;
                     let planned = u64::try_from(left.exact_terms.len())
                         .unwrap_or(u64::MAX)
@@ -3037,6 +3052,7 @@ impl<'a> Normalizer<'a> {
                         &mut outputs,
                         &mut product_uses,
                         &mut consumed_additives,
+                        state,
                     )?;
                     outputs.insert((0, normal_form.0), normal_form.1);
                 }
@@ -3328,6 +3344,7 @@ impl<'a> Normalizer<'a> {
         outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
         product_uses: &mut BTreeMap<u64, usize>,
         consumed_additives: &mut BTreeSet<u64>,
+        materialization_root: &NodeExactState,
     ) -> Result<(u64, Arc<PolynomialNF>), NormalizeError> {
         // These additive definitions own the Product edges collected below. Mark them before a
         // canceled sibling can recursively discard a shared additive operand.
@@ -3387,6 +3404,7 @@ impl<'a> Normalizer<'a> {
                         &mut terms,
                         direct,
                         matches!(plan.mode, ProductMode::TypedGadgetCandidate),
+                        ProductGcScope::Deferred { root: materialization_root, outputs: &*outputs },
                     )?;
                     let planned = u64::try_from(left.exact_terms.len())
                         .unwrap_or(u64::MAX)
@@ -3449,6 +3467,7 @@ impl<'a> Normalizer<'a> {
                 &mut terms,
                 true,
                 false,
+                ProductGcScope::Deferred { root: materialization_root, outputs: &*outputs },
             )?;
         }
         let output_terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
@@ -3652,6 +3671,52 @@ impl<'a> Normalizer<'a> {
 
     fn exact_plan_leaf_roots(&self, validate: bool) -> Result<Vec<MonomialId>, NormalizeError> {
         self.exact_plan_leaf_roots_and_top8(validate).map(|(roots, _, _)| roots)
+    }
+
+    /// Collect every materialized leaf reachable from one local exact-plan root. This is used
+    /// only after the allocation threshold admits an in-product sweep. The plan is validated
+    /// before any arena mutation; descriptor validity is then checked again by the arena's
+    /// validate-before-sweep mark pass.
+    fn local_exact_state_leaf_roots(
+        &self,
+        root: &NodeExactState,
+    ) -> Result<Vec<MonomialId>, NormalizeError> {
+        self.validate_exact_state_dag(root)?;
+        let mut pending = vec![root.clone()];
+        let mut seen_plans = BTreeSet::<(u8, u64)>::new();
+        let mut seen_leaves = BTreeSet::<usize>::new();
+        let mut roots = Vec::new();
+        while let Some(state) = pending.pop() {
+            match state {
+                NodeExactState::Materialized { normal_form, .. } => {
+                    if seen_leaves.insert(Arc::as_ptr(&normal_form) as usize) {
+                        roots.extend(normal_form.exact_terms.keys().copied());
+                    }
+                }
+                NodeExactState::Additive(plan) => {
+                    if seen_plans.insert((0, plan.id)) {
+                        pending.push(plan.left.clone());
+                        pending.push(plan.right.clone());
+                    }
+                }
+                NodeExactState::Product(plan) => {
+                    if seen_plans.insert((1, plan.id)) {
+                        pending.push(plan.left.clone());
+                        pending.push(plan.right.clone());
+                    }
+                }
+                NodeExactState::GadgetProduct(plan) => {
+                    if seen_plans.insert((2, plan.id)) {
+                        for normal_form in [&plan.left, &plan.right] {
+                            if seen_leaves.insert(Arc::as_ptr(normal_form) as usize) {
+                                roots.extend(normal_form.exact_terms.keys().copied());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(roots)
     }
 
     fn diagnostic_frontier_reasons(
@@ -4457,14 +4522,93 @@ impl<'a> Normalizer<'a> {
     /// this boundary. Root collection is exact and fail-closed; the arena validates every ID
     /// before dropping any descriptor.
     fn sweep_monomials_at_node_commit(&mut self) -> Result<(), NormalizeError> {
+        let force_cleanup = self.in_product_sweep_since_node_commit;
+        self.sweep_monomials_at_quiescent_point(std::iter::empty(), force_cleanup)?;
+        if self.normalization_depth == 1 {
+            self.in_product_sweep_since_node_commit = false;
+        }
+        Ok(())
+    }
+
+    /// Complete the lexical cleanup armed by an in-product sweep. This is also used while an
+    /// outer normalization error is unwinding, after every product/relation local has gone out of
+    /// scope. The flag is cleared only after the arena validates all durable roots and commits the
+    /// sweep.
+    fn cleanup_in_product_sweep(&mut self) -> Result<(), NormalizeError> {
+        if !self.in_product_sweep_since_node_commit {
+            return Ok(());
+        }
+        self.sweep_monomials_at_quiescent_point(std::iter::empty(), true)?;
+        self.in_product_sweep_since_node_commit = false;
+        Ok(())
+    }
+
+    /// Drop owners that are durable only until one outer node walk finishes. After an outer error
+    /// they would be cleared at the start of the next call, so retaining them through error GC
+    /// would merely let the next protected-prefix refresh pin failed-call descriptors forever.
+    fn clear_failed_outer_gc_owners(&mut self) {
+        self.clear_value_cache();
+        self.exact_plans.clear();
+        self.product_plans.clear();
+        self.gadget_product_plans.clear();
+        self.clear_gadget_holds();
+        self.suspended_owner_roots.clear();
+    }
+
+    /// A cartesian pair is quiescent only after its rewrite worklist has drained completely. At
+    /// that point operands and the destination are explicit roots. Deferred materialization also
+    /// supplies its full pending plan DAG and all session outputs; without that scoped capability
+    /// an in-product sweep is not attempted.
+    fn sweep_monomials_at_product_pair(
+        &mut self,
+        left: &PolynomialNF,
+        right: &PolynomialNF,
+        destination: &TermMap<BigInt>,
+        scope: ProductGcScope<'_>,
+    ) -> Result<(), NormalizeError> {
         if self.normalization_depth != 1 ||
             self.monomials.allocated_payload_since_sweep() <
                 self.monomial_gc_allocation_threshold_bytes
         {
             return Ok(());
         }
-        let (plan_roots, materialized_leaf_top8, diagnostic_nfs) =
+        let mut roots = Vec::new();
+        roots.extend(left.exact_terms.keys().copied());
+        roots.extend(right.exact_terms.keys().copied());
+        roots.extend(destination.keys().copied());
+        if let ProductGcScope::Deferred { root, outputs } = scope {
+            roots.extend(self.local_exact_state_leaf_roots(root)?);
+            roots.extend(
+                outputs.values().flat_map(|normal_form| normal_form.exact_terms.keys().copied()),
+            );
+        }
+        let sweep_count = self.gc_counters.sweep_count;
+        self.sweep_monomials_at_quiescent_point(roots, false)?;
+        if self.gc_counters.sweep_count != sweep_count {
+            self.in_product_sweep_since_node_commit = true;
+        }
+        Ok(())
+    }
+
+    /// Sweep at a proven quiescent point, adding lexical exact-plan owners to the same fixed owner
+    /// class as durable exact plans. Callers must include every local owner that is not already in
+    /// the normalizer's durable maps. The O(1) depth/allocation gate intentionally precedes all
+    /// plan and output walks.
+    fn sweep_monomials_at_quiescent_point(
+        &mut self,
+        extra_exact_plan_roots: impl IntoIterator<Item = MonomialId>,
+        force: bool,
+    ) -> Result<(), NormalizeError> {
+        if self.normalization_depth != 1 ||
+            (!force &&
+                self.monomials.allocated_payload_since_sweep() <
+                    self.monomial_gc_allocation_threshold_bytes)
+        {
+            return Ok(());
+        }
+        let (mut plan_roots, materialized_leaf_top8, diagnostic_nfs) =
             self.exact_plan_leaf_roots_and_top8(true)?;
+        plan_roots.extend(extra_exact_plan_roots);
         // Classification is a separate expensive opt-in layered on the watchdog. It is computed
         // before mutation so an authority error aborts the sweep atomically, and committed only
         // after the real sweep succeeds. Ordinary watchdog owner telemetry remains enabled
@@ -4736,6 +4880,7 @@ impl<'a> Normalizer<'a> {
             fold_final_no_match: true,
             protected_monomial_prefix,
             monomial_gc_allocation_threshold_bytes: MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES,
+            in_product_sweep_since_node_commit: false,
             gc_counters: DiagnosticGcCounters::default(),
             exact_plan_materializations: 0,
             exact_plan_materialization_output_terms_total: 0,
@@ -5098,6 +5243,16 @@ impl<'a> Normalizer<'a> {
     ) -> Result<AnalyzedValue, NormalizeError> {
         let outermost = self.normalization_depth == 0;
         if outermost {
+            // A previous outer error keeps its primary error even if lexical GC cleanup fails.
+            // Before beginning a later call, however, that cleanup must succeed while the old
+            // protected prefix is still authoritative; otherwise failed-call descriptors could
+            // become externally pinned by the new prefix.
+            if self.in_product_sweep_since_node_commit {
+                self.normalization_depth = 1;
+                let cleanup = self.cleanup_in_product_sweep();
+                self.normalization_depth = 0;
+                cleanup?;
+            }
             self.protected_monomial_prefix = self.monomials.len();
             self.gc_counters = DiagnosticGcCounters::default();
             self.trace = NormalizationTrace::new();
@@ -5145,6 +5300,13 @@ impl<'a> Normalizer<'a> {
         let previous_subphase = self.trace.current_subphase;
         self.normalization_depth = self.normalization_depth.saturating_add(1);
         let result = self.normalize_traced(root, outermost, force_outer_trace, scope_proof);
+        if outermost && result.is_err() && self.in_product_sweep_since_node_commit {
+            // `normalize_traced` has returned, so all product and relation locals are gone. Keep
+            // the primary normalization error regardless of cleanup outcome; a failed cleanup
+            // leaves the flag armed and is retried before any later protected-prefix refresh.
+            self.clear_failed_outer_gc_owners();
+            let _ = self.cleanup_in_product_sweep();
+        }
         self.normalization_depth = self.normalization_depth.saturating_sub(1);
         if !outermost {
             self.trace.record_completed_invocation(self.trace.current_normalization_call);
@@ -8168,7 +8330,15 @@ impl<'a> Normalizer<'a> {
         right: &PolynomialNF,
     ) -> Result<PolynomialNF, NormalizeError> {
         let mut terms = BTreeMap::new();
-        self.execute_product_into(left, right, &BigInt::from(1_u8), &mut terms, false, false)?;
+        self.execute_product_into(
+            left,
+            right,
+            &BigInt::from(1_u8),
+            &mut terms,
+            false,
+            false,
+            ProductGcScope::Eager,
+        )?;
         Ok(PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() })
     }
 
@@ -8183,6 +8353,7 @@ impl<'a> Normalizer<'a> {
         terms: &mut BTreeMap<MonomialId, BigInt>,
         direct_gadget_boundary: bool,
         typed_product_plan: bool,
+        gc_scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
         if self.watchdog.is_some() {
             self.watchdog_product_call_id = self.watchdog_product_call_id.saturating_add(1);
@@ -8254,6 +8425,7 @@ impl<'a> Normalizer<'a> {
             terms,
             direct_gadget_boundary,
             typed_product_plan,
+            gc_scope,
         );
         if self.trace.active {
             if result.is_ok() {
@@ -8288,6 +8460,7 @@ impl<'a> Normalizer<'a> {
         terms: &mut BTreeMap<MonomialId, BigInt>,
         direct_gadget_boundary: bool,
         typed_product_plan: bool,
+        gc_scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
         let mut worklist = VecDeque::new();
         for (left_id, left_coefficient) in &left.exact_terms {
@@ -8383,6 +8556,7 @@ impl<'a> Normalizer<'a> {
                 // rewrite queue remains authoritative, but its live size now follows one pair's
                 // recursive splice instead of the full product cardinality.
                 self.drain_product_worklist(left, right, terms, &mut worklist)?;
+                self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
             }
         }
         if self.watchdog.is_some() {
@@ -10862,7 +11036,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_monomial_gc_reports_three_sweeps_and_exact_watchdog_terminal_totals() {
+    fn forced_monomial_gc_reports_product_cleanup_and_exact_watchdog_terminal_totals() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let left = gaussian_factor(&mut expressions, matrix_type(), 81_011, 3);
@@ -10876,7 +11050,9 @@ mod tests {
         normalizer.monomial_gc_allocation_threshold_bytes = 1;
         let value = normalizer.normalize(semantic).unwrap();
         let gc = normalizer.gc_counters;
-        assert_eq!(gc.sweep_count, 3);
+        // Two source commits, one quiescent product-pair sweep, and the mandatory post-product
+        // node cleanup keep lexical operands from becoming retained garbage.
+        assert_eq!(gc.sweep_count, 4);
         assert_eq!(gc.last_sweep_node, 3);
         assert_eq!(gc.last_high_water_slots, 3);
         assert_eq!(gc.last_occupied_slots, 1);
@@ -10884,7 +11060,10 @@ mod tests {
         assert_eq!(gc.cumulative_reclaimed_slots, 2);
         assert_eq!(gc.cumulative_reclaimed_payload_bytes, gc.last_reclaimed_payload_bytes);
         assert!(gc.last_reclaimed_payload_bytes > 0);
-        assert!(gc.last_allocated_payload_before_bytes > 0);
+        assert_eq!(
+            gc.last_allocated_payload_before_bytes, 0,
+            "the final forced cleanup follows a product sweep that reset allocation telemetry"
+        );
         assert_eq!(gc.last_bucket_entries, 1);
         assert!(gc.sweep_total_ns >= gc.sweep_max_ns);
         assert!(gc.sweep_max_ns >= gc.sweep_last_ns);
@@ -10966,6 +11145,229 @@ mod tests {
         assert_eq!(monomials.occupied_len(), 1);
         assert!(monomials.len() > 128, "slot high-water remains monotonic while payload is swept");
         assert_eq!(monomials.allocated_payload_since_sweep(), 0);
+    }
+
+    #[test]
+    fn in_product_gc_sweeps_between_pairs_and_preserves_eager_result() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let a = source_with(&mut expressions, matrix_type(), 82_201);
+        let b = source_with(&mut expressions, matrix_type(), 82_202);
+        let c = source_with(&mut expressions, matrix_type(), 82_203);
+        let d = source_with(&mut expressions, matrix_type(), 82_204);
+        let left = expressions.intern_matrix_transform(MatrixOperation::Add, &[a, b]).unwrap();
+        let right = expressions.intern_matrix_transform(MatrixOperation::Add, &[c, d]).unwrap();
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[left, right]).unwrap();
+        let (facts, _, semantic) = setup(&mut expressions, &mut programs, root);
+
+        let mut eager_arena =
+            MonomialArena::new(&expressions, &programs, semantic.program()).unwrap();
+        let eager = Normalizer::new(&mut expressions, &programs, &facts, &mut eager_arena)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        let eager_descriptors =
+            descriptor_coefficient_multiset(eager.exact_nf.as_ref().unwrap(), &eager_arena);
+
+        let mut swept_arena =
+            MonomialArena::new(&expressions, &programs, semantic.program()).unwrap();
+        let mut swept_normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut swept_arena).unwrap();
+        swept_normalizer.monomial_gc_allocation_threshold_bytes = 1;
+        let swept = swept_normalizer.normalize(semantic).unwrap();
+        assert_eq!(
+            descriptor_coefficient_multiset(
+                swept.exact_nf.as_ref().unwrap(),
+                swept_normalizer.monomials,
+            ),
+            eager_descriptors
+        );
+        assert_eq!(swept.coefficient_bound, eager.coefficient_bound);
+        assert_eq!(
+            swept.exact_nf.as_ref().unwrap().bounded_summary,
+            eager.exact_nf.as_ref().unwrap().bounded_summary
+        );
+        assert!(
+            swept_normalizer.gc_counters.sweep_count > swept_normalizer.counters.nodes_processed,
+            "four cartesian pairs must add quiescent sweeps beyond node commits"
+        );
+        for monomial in swept.exact_nf.as_ref().unwrap().exact_terms.keys() {
+            swept_normalizer.monomials.descriptor(*monomial).unwrap();
+        }
+    }
+
+    #[test]
+    fn product_gc_scope_pins_operands_destination_pending_leaves_and_session_outputs() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = source_with(&mut expressions, matrix_type(), 82_211);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let ids = (1_usize..=6)
+            .map(|length| {
+                monomials.intern(&expressions, &programs, &[], &vec![semantic; length]).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let nf = |monomial| {
+            Arc::new(PolynomialNF {
+                exact_terms: BTreeMap::from([(monomial, BigInt::from(1_u8))]),
+                bounded_summary: BoundedSummary::missing(),
+            })
+        };
+        let left = nf(ids[0]);
+        let right = nf(ids[1]);
+        let destination = BTreeMap::from([(ids[2], BigInt::from(1_u8))]);
+        let pending = nf(ids[3]);
+        let session_output = nf(ids[4]);
+        let mut foreign_arena =
+            MonomialArena::new(&expressions, &programs, semantic.program()).unwrap();
+        let foreign = foreign_arena.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let state = NodeExactState::Materialized {
+            authority: normalizer.exact_plan_authority(root).unwrap(),
+            normal_form: pending,
+        };
+        let outputs = BTreeMap::from([((0, 1), session_output)]);
+        normalizer.protected_monomial_prefix = 0;
+        normalizer.normalization_depth = 1;
+        normalizer.monomial_gc_allocation_threshold_bytes = 0;
+        normalizer
+            .sweep_monomials_at_product_pair(
+                left.as_ref(),
+                right.as_ref(),
+                &destination,
+                ProductGcScope::Deferred { root: &state, outputs: &outputs },
+            )
+            .unwrap();
+        for live in &ids[..5] {
+            normalizer.monomials.descriptor(*live).unwrap();
+        }
+        assert!(matches!(
+            normalizer.monomials.descriptor(ids[5]),
+            Err(MonomialError::CollectedMonomialId { .. })
+        ));
+
+        for invalid in [foreign, ids[5]] {
+            let invalid_outputs = BTreeMap::from([((0, 2), nf(invalid))]);
+            let occupied = normalizer.monomials.occupied_len();
+            let gc = normalizer.gc_counters;
+            assert!(matches!(
+                normalizer.sweep_monomials_at_product_pair(
+                    left.as_ref(),
+                    right.as_ref(),
+                    &destination,
+                    ProductGcScope::Deferred { root: &state, outputs: &invalid_outputs },
+                ),
+                Err(NormalizeError::Monomial(
+                    MonomialError::InvalidMonomialId { .. } |
+                        MonomialError::CollectedMonomialId { .. }
+                ))
+            ));
+            assert_eq!(normalizer.monomials.occupied_len(), occupied);
+            assert_eq!(normalizer.gc_counters, gc);
+        }
+
+        normalizer.monomial_gc_allocation_threshold_bytes = 1;
+        let sweep_count = normalizer.gc_counters.sweep_count;
+        normalizer
+            .sweep_monomials_at_product_pair(
+                left.as_ref(),
+                right.as_ref(),
+                &destination,
+                ProductGcScope::Deferred { root: &state, outputs: &outputs },
+            )
+            .unwrap();
+        assert_eq!(normalizer.gc_counters.sweep_count, sweep_count);
+
+        normalizer.normalization_depth = 2;
+        normalizer.monomial_gc_allocation_threshold_bytes = 0;
+        let sweep_count = normalizer.gc_counters.sweep_count;
+        normalizer
+            .sweep_monomials_at_product_pair(
+                left.as_ref(),
+                right.as_ref(),
+                &destination,
+                ProductGcScope::Deferred { root: &state, outputs: &outputs },
+            )
+            .unwrap();
+        assert_eq!(normalizer.gc_counters.sweep_count, sweep_count);
+    }
+
+    #[test]
+    fn outer_error_cleans_in_product_roots_before_the_next_prefix_refresh() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let prefix = source_with(&mut expressions, matrix_type(), 82_221);
+        let b = source_with(&mut expressions, matrix_type(), 82_222);
+        let k = source_with(&mut expressions, matrix_type(), 82_223);
+        let first_rhs = source_with(&mut expressions, matrix_type(), 82_224);
+        let second_rhs = source_with(&mut expressions, matrix_type(), 82_225);
+        let bk = product(&mut expressions, &[b, k]);
+        let root = product(&mut expressions, &[prefix, b, k]);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut relations = RelationRegistry::new();
+        let mut cache = NormalizationCache::new();
+        for rhs in [first_rhs, second_rhs] {
+            register_test_closed_relation_into(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut relations,
+                &mut cache,
+                bk,
+                rhs,
+                k,
+                b,
+            );
+        }
+        relations.freeze();
+        let protected_before_failure = monomials.len();
+        let arena = monomials.token();
+        let prefix_semantic = programs.scoped(&expressions, semantic.program(), prefix).unwrap();
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&relations, &mut cache);
+        normalizer.monomial_gc_allocation_threshold_bytes = 1;
+        let primary = normalizer.normalize(semantic).unwrap_err();
+        assert!(matches!(
+            primary,
+            NormalizeError::Relation(RelationRegistryError::Ambiguous { .. })
+        ));
+        assert!(!normalizer.in_product_sweep_since_node_commit);
+        assert_eq!(normalizer.protected_monomial_prefix, protected_before_failure);
+        assert!(normalizer.gc_counters.sweep_count >= 2, "pair sweep and error cleanup must run");
+        assert_eq!(
+            normalizer.gc_counters.last_occupied_slots,
+            u64::try_from(normalizer.monomials.occupied_len()).unwrap()
+        );
+
+        let high_water_after_failure = normalizer.monomials.len();
+        assert!(high_water_after_failure > protected_before_failure);
+        let collected = (protected_before_failure..high_water_after_failure)
+            .filter_map(|slot| u32::try_from(slot).ok())
+            .map(|slot| MonomialId::new(arena, slot))
+            .filter(|id| {
+                matches!(
+                    normalizer.monomials.descriptor(*id),
+                    Err(MonomialError::CollectedMonomialId { .. })
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!collected.is_empty(), "failed-call lexical descriptors must be reclaimed");
+
+        normalizer.relation_rewriting_enabled = false;
+        let recovered = normalizer.normalize(prefix_semantic).unwrap();
+        assert!(recovered.exact_nf.is_some());
+        assert!(!normalizer.in_product_sweep_since_node_commit);
+        assert_eq!(normalizer.protected_monomial_prefix, high_water_after_failure);
+        for id in collected {
+            assert!(matches!(
+                normalizer.monomials.descriptor(id),
+                Err(MonomialError::CollectedMonomialId { .. })
+            ));
+        }
     }
 
     #[test]

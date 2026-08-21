@@ -19,7 +19,7 @@ use super::{
         ValueFacts,
     },
     job::{ProofReachedUniversalLhs, ReachedUniversalLhs},
-    monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
+    monomial::{MonomialArena, MonomialError, MonomialId, MonomialSweepOwnerReport, TermMap},
     program::{ArenaError, ProgramArena, ValueProgramId},
     relation::{
         CanonicalLhsKey, GadgetRecompositionRegistry, NormalizationCache, RelationRegistry,
@@ -53,10 +53,13 @@ const NORMALIZATION_TRACE_FOCUS_EXPRESSION_SLOT_ENV: &str =
 const NORMALIZATION_TRACE_FOCUS_TAIL_NODES_ENV: &str = "MXX_OPERATIONAL_TRACE_FOCUS_TAIL_NODES";
 const NORMALIZATION_NODE_HEARTBEAT: u64 = 100_000;
 const LARGE_PRODUCT_PLANNED_PAIRS: u64 = 100_000;
+const MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 const PRODUCT_PROCESSED_HEARTBEAT: u64 = 1_000_000;
 const NORMALIZATION_WATCHDOG_ENV: &str = "MXX_OPERATIONAL_WATCHDOG_TRACE";
+const NORMALIZATION_WATCHDOG_INTERVAL_ENV: &str = "MXX_OPERATIONAL_WATCHDOG_INTERVAL_SECS";
 const NORMALIZATION_WATCHDOG_INTERVAL: Duration = Duration::from_secs(4);
-const NORMALIZATION_WATCHDOG_MAX_SNAPSHOTS: u8 = 30;
+const NORMALIZATION_WATCHDOG_MAX_INTERVAL_SECS: u64 = 3600;
+const NORMALIZATION_WATCHDOG_MAX_SNAPSHOTS: u8 = 18;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DiagnosticPhase {
@@ -77,7 +80,20 @@ enum DiagnosticPhase {
     ProofRollback,
     RelationClosure,
     RelationSearch,
+    ProductGeneration,
+    ProductGenerationEnd,
+    ProductDrain,
+    ProductEnd,
     Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerCensusReason {
+    RetainedArenaMilestone,
+    LargeProductGenerationEnd,
+    LargeProductEnd,
+    OuterTerminal,
+    OuterError,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -234,11 +250,138 @@ struct DiagnosticProgress {
     nodes_done: u64,
     nodes_total: u64,
     product_processed: u64,
+    product_generated: u64,
+    product_enqueued: u64,
+    product_generation_current: u64,
+    product_enqueued_current: u64,
+    product_queue_current: u64,
+    product_output_current: u64,
     relation_processed: u64,
     specialization: DiagnosticSpecializationCounters,
     relation_closure: DiagnosticRelationCounters,
     timings: DiagnosticTimings,
+    owners: DiagnosticOwnerCensus,
+    owner_census_seq: u64,
+    owner_census_depth: u32,
+    owner_census_call: u64,
+    owner_census_product_call_id: u64,
+    owner_census_phase: DiagnosticPhase,
+    owner_census_reason: Option<OwnerCensusReason>,
+    gc: DiagnosticGcCounters,
     last_change: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiagnosticGcCounters {
+    sweep_count: u64,
+    last_sweep_node: u64,
+    last_high_water_slots: u64,
+    last_occupied_slots: u64,
+    last_reclaimed_slots: u64,
+    last_reclaimed_payload_bytes: u64,
+    cumulative_reclaimed_slots: u64,
+    cumulative_reclaimed_payload_bytes: u64,
+    last_allocated_payload_before_bytes: u64,
+    last_bucket_entries: u64,
+    last_protected_prefix_occupied_slots: u64,
+    last_occupied_central_factor_entries: u64,
+    last_occupied_ordered_factor_entries: u64,
+    last_occupied_factor_payload_lower_bound_bytes: u64,
+    last_protected_prefix: MonomialSweepOwnerReport,
+    last_value_cache: MonomialSweepOwnerReport,
+    last_gadget: MonomialSweepOwnerReport,
+    last_canonical_runtime: MonomialSweepOwnerReport,
+    last_closed: MonomialSweepOwnerReport,
+    last_suspended: MonomialSweepOwnerReport,
+    value_cache_entries: u64,
+    value_cache_exact_term_refs: u64,
+    value_cache_top8_exact_term_refs: u64,
+    value_cache_top8_len: u8,
+    value_cache_top8: [DiagnosticValueCacheTopEntry; 8],
+    sweep_total_ns: u64,
+    sweep_max_ns: u64,
+    sweep_last_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiagnosticValueCacheTopEntry {
+    expression_slot: u64,
+    operator_category: &'static str,
+    term_count: u64,
+    remaining_uses: u64,
+    producer_input_count: u64,
+    cached_input_exact_term_refs_sum: u64,
+    cached_input_exact_term_refs_max: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiagnosticValueCacheTop8 {
+    entries: u64,
+    exact_term_refs: u64,
+    top_exact_term_refs: u64,
+    len: u8,
+    top: [DiagnosticValueCacheTopEntry; 8],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiagnosticOwnerCensus {
+    monomial_allocated_descriptor_slots: u64,
+    monomial_retained_descriptor_slots: u64,
+    monomial_reclaimed_descriptor_slots: u64,
+    monomial_reachable_descriptor_slots: u64,
+    monomial_reachable_central_factor_entries: u64,
+    monomial_reachable_ordered_factor_entries: u64,
+    monomial_reachable_max_factor_word: u64,
+    monomial_owned_payload_lower_bound_bytes: u64,
+    monomial_unreachable_descriptor_slots: u64,
+    monomial_unreachable_central_factor_entries: u64,
+    monomial_unreachable_ordered_factor_entries: u64,
+    monomial_unreachable_payload_lower_bound_bytes: u64,
+    monomial_invalid_root_count: u64,
+    // Owner-local term counts are reference counts and are deliberately non-additive: the unique
+    // reachable monomial fields above use a slot bitset to deduplicate IDs shared by owners.
+    cache_entries: u64,
+    cache_exact_terms: u64,
+    cache_exact_terms_peak: u64,
+    cache_largest_nf_terms_seen: u64,
+    gadget_entries: u64,
+    gadget_exact_terms: u64,
+    gadget_exact_terms_peak: u64,
+    gadget_largest_nf_terms_seen: u64,
+    canonical_rhs_entries: u64,
+    canonical_rhs_exact_terms: u64,
+    canonical_rhs_exact_terms_peak: u64,
+    canonical_rhs_largest_nf_terms: u64,
+    runtime_entries: u64,
+    runtime_lhs_keys: u64,
+}
+
+/// A bounded, immutable owner-census observation. The product fields are copied at the same
+/// instant as the owner roots are scanned, so a subsequent phase transition cannot relabel or
+/// overwrite a generation-end sample before the reporter thread wakes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DiagnosticOwnerSample {
+    owners: DiagnosticOwnerCensus,
+    seq: u64,
+    depth: u32,
+    call: u64,
+    product_call_id: u64,
+    reason: OwnerCensusReason,
+    phase: DiagnosticPhase,
+    product_generated: u64,
+    product_enqueued: u64,
+    product_queue_current: u64,
+    product_output_current: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NormalizerOwnerCounters {
+    cache_exact_terms: u64,
+    cache_exact_terms_peak: u64,
+    cache_largest_nf_terms_seen: u64,
+    gadget_exact_terms: u64,
+    gadget_exact_terms_peak: u64,
+    gadget_largest_nf_terms_seen: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -255,6 +398,8 @@ struct DiagnosticParentState {
 struct DiagnosticShared {
     progress: Mutex<DiagnosticProgress>,
     stop: AtomicBool,
+    emitted_lines: Mutex<u8>,
+    owner_samples: Mutex<Vec<DiagnosticOwnerSample>>,
     #[cfg(test)]
     events: Mutex<Vec<&'static str>>,
     #[cfg(test)]
@@ -281,13 +426,29 @@ impl DiagnosticWatchdog {
                 nodes_done: 0,
                 nodes_total: 0,
                 product_processed: 0,
+                product_generated: 0,
+                product_enqueued: 0,
+                product_generation_current: 0,
+                product_enqueued_current: 0,
+                product_queue_current: 0,
+                product_output_current: 0,
                 relation_processed: 0,
                 specialization: DiagnosticSpecializationCounters::default(),
                 relation_closure: DiagnosticRelationCounters::default(),
                 timings: DiagnosticTimings::default(),
+                owners: DiagnosticOwnerCensus::default(),
+                owner_census_seq: 0,
+                owner_census_depth: 0,
+                owner_census_call: 0,
+                owner_census_product_call_id: 0,
+                owner_census_phase: DiagnosticPhase::StateReset,
+                owner_census_reason: None,
+                gc: DiagnosticGcCounters::default(),
                 last_change: Instant::now(),
             }),
             stop: AtomicBool::new(false),
+            emitted_lines: Mutex::new(0),
+            owner_samples: Mutex::new(Vec::new()),
             #[cfg(test)]
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -297,8 +458,15 @@ impl DiagnosticWatchdog {
         let reporter = thread::Builder::new()
             .name("mxx-normalization-watchdog".to_owned())
             .spawn(move || {
-                diagnostic_watchdog_emit(&reporter_shared, "watchdog_initial");
+                // The starter emits the initial line synchronously before releasing this thread,
+                // so immediate owner samples cannot race ahead of the session header.
+                thread::park();
                 let mut emitted = 1_u8;
+                // The startup and finish unparks may coalesce before this thread first runs.
+                // Observe the released stop flag before entering a potentially long timeout.
+                if reporter_shared.stop.load(Ordering::Acquire) {
+                    return emitted;
+                }
                 while emitted <= NORMALIZATION_WATCHDOG_MAX_SNAPSHOTS {
                     thread::park_timeout(interval);
                     if reporter_shared.stop.load(Ordering::Acquire) {
@@ -310,6 +478,8 @@ impl DiagnosticWatchdog {
                 emitted
             })
             .ok()?;
+        diagnostic_watchdog_emit(&shared, "watchdog_initial");
+        reporter.thread().unpark();
         Some(Self { shared, reporter: Some(reporter), next_call: 0 })
     }
 
@@ -318,6 +488,16 @@ impl DiagnosticWatchdog {
             self.shared.progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         update(&mut progress);
         progress.last_change = Instant::now();
+    }
+
+    fn emit_owner_sample(&self, owner_sample: DiagnosticOwnerSample, progress: DiagnosticProgress) {
+        let mut samples =
+            self.shared.owner_samples.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if samples.len() < 12 {
+            samples.push(owner_sample);
+        }
+        drop(samples);
+        diagnostic_watchdog_emit_snapshot(&self.shared, "watchdog_owner_sample", Some(progress));
     }
 
     fn enter_call(&mut self, depth: u32) -> DiagnosticParentState {
@@ -383,7 +563,23 @@ impl Drop for DiagnosticWatchdog {
 }
 
 fn diagnostic_watchdog_emit(shared: &DiagnosticShared, event: &'static str) {
-    let progress = *shared.progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    diagnostic_watchdog_emit_snapshot(shared, event, None);
+}
+
+fn diagnostic_watchdog_emit_snapshot(
+    shared: &DiagnosticShared,
+    event: &'static str,
+    frozen: Option<DiagnosticProgress>,
+) {
+    let mut emitted = shared.emitted_lines.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *emitted >= 32 {
+        return;
+    }
+    *emitted = emitted.saturating_add(1);
+    drop(emitted);
+    let progress = frozen.unwrap_or_else(|| {
+        *shared.progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    });
     #[cfg(test)]
     shared.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(event);
     #[cfg(test)]
@@ -401,7 +597,53 @@ fn diagnostic_watchdog_emit(shared: &DiagnosticShared, event: &'static str) {
         nodes_done = progress.nodes_done,
         nodes_total = progress.nodes_total,
         product_processed = progress.product_processed,
+        product_generated = progress.product_generated,
+        product_enqueued = progress.product_enqueued,
+        product_generation_current = progress.product_generation_current,
+        product_enqueued_current = progress.product_enqueued_current,
+        product_queue_current = progress.product_queue_current,
+        product_output_current = progress.product_output_current,
         relation_processed = progress.relation_processed,
+        gc = ?progress.gc,
+        owner_census_seq = progress.owner_census_seq,
+        owner_census_depth = progress.owner_census_depth,
+        owner_census_call = progress.owner_census_call,
+        owner_census_product_call_id = progress.owner_census_product_call_id,
+        owner_census_phase = ?progress.owner_census_phase,
+        owner_census_reason = ?progress.owner_census_reason,
+        monomial_allocated_descriptor_slots = progress.owners.monomial_allocated_descriptor_slots,
+        monomial_retained_descriptor_slots = progress.owners.monomial_retained_descriptor_slots,
+        monomial_reclaimed_descriptor_slots = progress.owners.monomial_reclaimed_descriptor_slots,
+        monomial_reachable_descriptor_slots = progress.owners.monomial_reachable_descriptor_slots,
+            monomial_reachable_central_factor_entries = progress
+                .owners
+                .monomial_reachable_central_factor_entries,
+            monomial_reachable_ordered_factor_entries = progress
+                .owners
+                .monomial_reachable_ordered_factor_entries,
+            monomial_reachable_max_factor_word = progress
+                .owners
+                .monomial_reachable_max_factor_word,
+        monomial_owned_payload_lower_bound_bytes = progress.owners.monomial_owned_payload_lower_bound_bytes,
+        monomial_unreachable_descriptor_slots = progress.owners.monomial_unreachable_descriptor_slots,
+        monomial_unreachable_central_factor_entries = progress.owners.monomial_unreachable_central_factor_entries,
+        monomial_unreachable_ordered_factor_entries = progress.owners.monomial_unreachable_ordered_factor_entries,
+        monomial_unreachable_payload_lower_bound_bytes = progress.owners.monomial_unreachable_payload_lower_bound_bytes,
+        monomial_invalid_root_count = progress.owners.monomial_invalid_root_count,
+        cache_owner_entries = progress.owners.cache_entries,
+        cache_exact_terms = progress.owners.cache_exact_terms,
+        cache_exact_terms_peak = progress.owners.cache_exact_terms_peak,
+        cache_largest_nf_terms_seen = progress.owners.cache_largest_nf_terms_seen,
+        gadget_owner_entries = progress.owners.gadget_entries,
+        gadget_exact_terms = progress.owners.gadget_exact_terms,
+        gadget_exact_terms_peak = progress.owners.gadget_exact_terms_peak,
+        gadget_largest_nf_terms_seen = progress.owners.gadget_largest_nf_terms_seen,
+        canonical_rhs_entries = progress.owners.canonical_rhs_entries,
+        canonical_rhs_exact_terms = progress.owners.canonical_rhs_exact_terms,
+        canonical_rhs_exact_terms_peak = progress.owners.canonical_rhs_exact_terms_peak,
+        canonical_rhs_largest_nf_terms = progress.owners.canonical_rhs_largest_nf_terms,
+        runtime_entries = progress.owners.runtime_entries,
+        runtime_lhs_keys = progress.owners.runtime_lhs_keys,
         runtime_lookup_hits = progress.specialization.runtime_lookup_hits,
         runtime_lookup_misses = progress.specialization.runtime_lookup_misses,
         ordinary_specializations_started = progress.specialization.ordinary_specializations_started,
@@ -476,6 +718,20 @@ fn normalization_watchdog_enabled() -> bool {
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
+fn normalization_watchdog_interval() -> Duration {
+    let value = std::env::var(NORMALIZATION_WATCHDOG_INTERVAL_ENV).ok();
+    normalization_watchdog_interval_from_value(value.as_deref())
+}
+
+fn normalization_watchdog_interval_from_value(value: Option<&str>) -> Duration {
+    let seconds = value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| seconds.min(NORMALIZATION_WATCHDOG_MAX_INTERVAL_SECS))
+        .unwrap_or(NORMALIZATION_WATCHDOG_INTERVAL.as_secs());
+    Duration::from_secs(seconds)
+}
+
 #[derive(Debug)]
 struct NormalizationTrace {
     active: bool,
@@ -534,6 +790,7 @@ struct NormalizationTrace {
     cache_len: u64,
     cache_peak: u64,
     monomial_len: u64,
+    owners: DiagnosticOwnerCensus,
     next_node_heartbeat: u64,
     product_heartbeat_interval: u64,
     next_product_generated_heartbeat: u64,
@@ -545,6 +802,8 @@ struct NormalizationTrace {
     product_rewrites: u64,
     product_enqueued: u64,
     product_peak_queue: u64,
+    product_current_queue: u64,
+    product_current_output: u64,
     product_max_left_terms: u64,
     product_max_right_terms: u64,
     product_max_output_terms: u64,
@@ -619,6 +878,7 @@ impl NormalizationTrace {
             cache_len: 0,
             cache_peak: 0,
             monomial_len: 0,
+            owners: DiagnosticOwnerCensus::default(),
             next_node_heartbeat: NORMALIZATION_NODE_HEARTBEAT,
             product_heartbeat_interval: PRODUCT_PROCESSED_HEARTBEAT,
             next_product_generated_heartbeat: PRODUCT_PROCESSED_HEARTBEAT,
@@ -630,6 +890,8 @@ impl NormalizationTrace {
             product_rewrites: 0,
             product_enqueued: 0,
             product_peak_queue: 0,
+            product_current_queue: 0,
+            product_current_output: 0,
             product_max_left_terms: 0,
             product_max_right_terms: 0,
             product_max_output_terms: 0,
@@ -979,6 +1241,38 @@ impl NormalizationTrace {
             cache_len = self.cache_len,
             cache_peak = self.cache_peak,
             monomial_len = self.monomial_len,
+            monomial_allocated_descriptor_slots = self.owners.monomial_allocated_descriptor_slots,
+            monomial_retained_descriptor_slots = self.owners.monomial_retained_descriptor_slots,
+            monomial_reclaimed_descriptor_slots = self.owners.monomial_reclaimed_descriptor_slots,
+            monomial_reachable_descriptor_slots = self.owners.monomial_reachable_descriptor_slots,
+            monomial_reachable_central_factor_entries = self
+                .owners
+                .monomial_reachable_central_factor_entries,
+            monomial_reachable_ordered_factor_entries = self
+                .owners
+                .monomial_reachable_ordered_factor_entries,
+            monomial_reachable_max_factor_word = self
+                .owners
+                .monomial_reachable_max_factor_word,
+            monomial_owned_payload_lower_bound_bytes = self.owners.monomial_owned_payload_lower_bound_bytes,
+            monomial_unreachable_descriptor_slots = self.owners.monomial_unreachable_descriptor_slots,
+            monomial_unreachable_central_factor_entries = self.owners.monomial_unreachable_central_factor_entries,
+            monomial_unreachable_ordered_factor_entries = self.owners.monomial_unreachable_ordered_factor_entries,
+            monomial_unreachable_payload_lower_bound_bytes = self.owners.monomial_unreachable_payload_lower_bound_bytes,
+            cache_owner_entries = self.owners.cache_entries,
+            cache_exact_terms = self.owners.cache_exact_terms,
+            cache_exact_terms_peak = self.owners.cache_exact_terms_peak,
+            cache_largest_nf_terms_seen = self.owners.cache_largest_nf_terms_seen,
+            gadget_owner_entries = self.owners.gadget_entries,
+            gadget_exact_terms = self.owners.gadget_exact_terms,
+            gadget_exact_terms_peak = self.owners.gadget_exact_terms_peak,
+            gadget_largest_nf_terms_seen = self.owners.gadget_largest_nf_terms_seen,
+            canonical_rhs_entries = self.owners.canonical_rhs_entries,
+            canonical_rhs_exact_terms = self.owners.canonical_rhs_exact_terms,
+            canonical_rhs_exact_terms_peak = self.owners.canonical_rhs_exact_terms_peak,
+            canonical_rhs_largest_nf_terms = self.owners.canonical_rhs_largest_nf_terms,
+            runtime_entries = self.owners.runtime_entries,
+            runtime_lhs_keys = self.owners.runtime_lhs_keys,
             product_calls = self.product_calls,
             product_planned = self.product_planned,
             product_generated = self.product_generated,
@@ -986,6 +1280,8 @@ impl NormalizationTrace {
             product_rewrites = self.product_rewrites,
             product_enqueued = self.product_enqueued,
             product_peak_queue = self.product_peak_queue,
+            product_current_queue = self.product_current_queue,
+            product_current_output = self.product_current_output,
             product_max_left_terms = self.product_max_left_terms,
             product_max_right_terms = self.product_max_right_terms,
             product_max_output_terms = self.product_max_output_terms,
@@ -1007,9 +1303,22 @@ impl NormalizationTrace {
 
 fn normalization_operator_category(operator: &ValueOperator) -> &'static str {
     match operator {
-        ValueOperator::Matrix(MatrixOperation::Multiply) => "matrix_multiply",
-        ValueOperator::Matrix(MatrixOperation::Tensor { .. }) => "matrix_tensor",
-        ValueOperator::Matrix(_) => "matrix_other",
+        ValueOperator::Matrix(MatrixOperation::Add) => "add",
+        ValueOperator::Matrix(MatrixOperation::Subtract) => "subtract",
+        ValueOperator::Matrix(MatrixOperation::Multiply) => "multiply",
+        ValueOperator::Matrix(MatrixOperation::Negate) => "negate",
+        ValueOperator::Matrix(MatrixOperation::Scale) => "scale",
+        ValueOperator::Matrix(MatrixOperation::Transpose) => "transpose",
+        ValueOperator::Matrix(MatrixOperation::Slice { .. }) => "slice",
+        ValueOperator::Matrix(MatrixOperation::IndexedSlice { .. }) => "indexed_slice",
+        ValueOperator::Matrix(MatrixOperation::View { .. }) => "view",
+        ValueOperator::Matrix(MatrixOperation::Concat { .. }) => "concat",
+        ValueOperator::Matrix(MatrixOperation::Tensor { .. }) => "tensor",
+        ValueOperator::Matrix(MatrixOperation::CrtRecompose { .. }) => "crt_recompose",
+        ValueOperator::Matrix(MatrixOperation::ExtractCoefficient { .. }) => "extract_coefficient",
+        ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial { .. }) => {
+            "lift_constant_polynomial"
+        }
         ValueOperator::Scalar(_) => "scalar",
         ValueOperator::Transform(_) => "transform",
         ValueOperator::Source(_) => "source",
@@ -1238,15 +1547,31 @@ pub struct Normalizer<'a> {
     /// factor may be paired with several exact terms of the other operand, so the held NF must be
     /// reusable rather than consumed once per pair.
     gadget_input_nfs: BTreeMap<ExprId, Arc<PolynomialNF>>,
+    owner_counters: NormalizerOwnerCounters,
     counters: NormalizationCounters,
     trace: NormalizationTrace,
     watchdog: Option<DiagnosticWatchdog>,
     watchdog_generation: u64,
     watchdog_product_processed: u64,
+    watchdog_product_generated: u64,
+    watchdog_product_enqueued: u64,
+    watchdog_product_generation_current: u64,
+    watchdog_product_enqueued_current: u64,
+    watchdog_product_queue_current: u64,
+    watchdog_product_output_current: u64,
     watchdog_relation_processed: u64,
     watchdog_specialization: DiagnosticSpecializationCounters,
     watchdog_relation_closure: DiagnosticRelationCounters,
     watchdog_timings: DiagnosticTimings,
+    /// Monomial IDs retained solely by suspended nested-normalizer callers. Diagnostic only.
+    suspended_owner_roots: Vec<MonomialId>,
+    owner_census_samples: u8,
+    owner_census_seq: u64,
+    watchdog_product_call_id: u64,
+    largest_sampled_product_planned: u64,
+    large_product_pairs_sampled: u8,
+    current_large_product_sampled: bool,
+    next_retained_census_milestone: u64,
     #[cfg(test)]
     watchdog_hot_publish_count: u64,
     normalization_depth: u32,
@@ -1270,9 +1595,399 @@ pub struct Normalizer<'a> {
     relation_matcher_publish_observer: Option<Box<dyn FnMut(DiagnosticRelationCounters)>>,
     relation_rewriting_enabled: bool,
     fold_final_no_match: bool,
+    /// Slots below this outer-call high-water are externally observable and remain pinned even
+    /// when no current normalization owner references them.
+    protected_monomial_prefix: usize,
+    monomial_gc_allocation_threshold_bytes: u64,
+    gc_counters: DiagnosticGcCounters,
 }
 
 impl<'a> Normalizer<'a> {
+    fn restored_owner_counters(
+        saved: NormalizerOwnerCounters,
+        nested: NormalizerOwnerCounters,
+    ) -> NormalizerOwnerCounters {
+        NormalizerOwnerCounters {
+            cache_exact_terms: saved.cache_exact_terms,
+            cache_exact_terms_peak: saved.cache_exact_terms_peak.max(nested.cache_exact_terms_peak),
+            cache_largest_nf_terms_seen: saved
+                .cache_largest_nf_terms_seen
+                .max(nested.cache_largest_nf_terms_seen),
+            gadget_exact_terms: saved.gadget_exact_terms,
+            gadget_exact_terms_peak: saved
+                .gadget_exact_terms_peak
+                .max(nested.gadget_exact_terms_peak),
+            gadget_largest_nf_terms_seen: saved
+                .gadget_largest_nf_terms_seen
+                .max(nested.gadget_largest_nf_terms_seen),
+        }
+    }
+
+    fn exact_terms(value: &AnalyzedValue) -> u64 {
+        value.exact_nf.as_ref().map_or(0, |normal_form| {
+            u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX)
+        })
+    }
+
+    fn diagnostic_value_cache_top8(&self) -> DiagnosticValueCacheTop8 {
+        let mut result = DiagnosticValueCacheTop8 {
+            entries: u64::try_from(self.cache.len()).unwrap_or(u64::MAX),
+            ..DiagnosticValueCacheTop8::default()
+        };
+        for (&expression, value) in &self.cache {
+            let Some(normal_form) = value.exact_nf.as_ref() else { continue };
+            let term_count = u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX);
+            result.exact_term_refs = result.exact_term_refs.saturating_add(term_count);
+            let candidate = DiagnosticValueCacheTopEntry {
+                expression_slot: u64::from(expression.slot()),
+                operator_category: self
+                    .expressions
+                    .node(expression)
+                    .map(|node| normalization_operator_category(&node.operator))
+                    .unwrap_or("invalid"),
+                term_count,
+                remaining_uses: self
+                    .remaining_uses
+                    .get(&expression)
+                    .copied()
+                    .map(|uses| u64::try_from(uses).unwrap_or(u64::MAX))
+                    .unwrap_or(0),
+                producer_input_count: 0,
+                cached_input_exact_term_refs_sum: 0,
+                cached_input_exact_term_refs_max: 0,
+            };
+            let current_len = usize::from(result.len);
+            let insertion = (0..current_len).find(|&index| {
+                candidate.term_count > result.top[index].term_count ||
+                    (candidate.term_count == result.top[index].term_count &&
+                        candidate.expression_slot < result.top[index].expression_slot)
+            });
+            let insertion = insertion.unwrap_or(current_len);
+            if insertion >= result.top.len() {
+                continue;
+            }
+            let new_len = (current_len + 1).min(result.top.len());
+            for index in (insertion + 1..new_len).rev() {
+                result.top[index] = result.top[index - 1];
+            }
+            result.top[insertion] = candidate;
+            result.len = u8::try_from(new_len).unwrap_or(8);
+        }
+        result.top_exact_term_refs = result.top[..usize::from(result.len)]
+            .iter()
+            .fold(0_u64, |total, entry| total.saturating_add(entry.term_count));
+        // Input ownership is intentionally inspected only after the bounded top-eight selection.
+        // This keeps the diagnostic scan O(cache entries + 8 * producer arity * log(cache)) and
+        // records only aggregate sizes, never semantic input identities or values.
+        for entry in &mut result.top[..usize::from(result.len)] {
+            let Ok(slot) = u32::try_from(entry.expression_slot) else { continue };
+            let expression = ExprId::new(self.expressions.token(), slot);
+            let Ok(node) = self.expressions.node(expression) else { continue };
+            entry.producer_input_count = u64::try_from(node.inputs.len()).unwrap_or(u64::MAX);
+            for input in &node.inputs {
+                let term_count = self
+                    .cache
+                    .get(input)
+                    .and_then(|value| value.exact_nf.as_ref())
+                    .map(|normal_form| {
+                        u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX)
+                    })
+                    .unwrap_or(0);
+                entry.cached_input_exact_term_refs_sum =
+                    entry.cached_input_exact_term_refs_sum.saturating_add(term_count);
+                entry.cached_input_exact_term_refs_max =
+                    entry.cached_input_exact_term_refs_max.max(term_count);
+            }
+        }
+        result
+    }
+
+    fn clear_value_cache(&mut self) {
+        self.cache.clear();
+        self.owner_counters.cache_exact_terms = 0;
+    }
+
+    fn insert_value_cache(&mut self, expression: ExprId, value: Arc<AnalyzedValue>) {
+        let terms = Self::exact_terms(value.as_ref());
+        if let Some(previous) = self.cache.insert(expression, value) {
+            self.owner_counters.cache_exact_terms = self
+                .owner_counters
+                .cache_exact_terms
+                .saturating_sub(Self::exact_terms(previous.as_ref()));
+        }
+        self.owner_counters.cache_exact_terms =
+            self.owner_counters.cache_exact_terms.saturating_add(terms);
+        self.owner_counters.cache_exact_terms_peak =
+            self.owner_counters.cache_exact_terms_peak.max(self.owner_counters.cache_exact_terms);
+        self.owner_counters.cache_largest_nf_terms_seen =
+            self.owner_counters.cache_largest_nf_terms_seen.max(terms);
+    }
+
+    fn take_value_cache(&mut self, expression: ExprId) -> Option<Arc<AnalyzedValue>> {
+        let previous = self.cache.remove(&expression);
+        if let Some(previous) = previous.as_ref() {
+            self.owner_counters.cache_exact_terms = self
+                .owner_counters
+                .cache_exact_terms
+                .saturating_sub(Self::exact_terms(previous.as_ref()));
+        }
+        previous
+    }
+
+    fn remove_value_cache(&mut self, expression: ExprId) {
+        self.take_value_cache(expression);
+    }
+
+    fn clear_gadget_holds(&mut self) {
+        self.gadget_input_nfs.clear();
+        self.owner_counters.gadget_exact_terms = 0;
+    }
+
+    fn insert_gadget_hold(&mut self, expression: ExprId, normal_form: Arc<PolynomialNF>) {
+        let terms = u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX);
+        if let Some(previous) = self.gadget_input_nfs.insert(expression, normal_form) {
+            self.owner_counters.gadget_exact_terms = self
+                .owner_counters
+                .gadget_exact_terms
+                .saturating_sub(u64::try_from(previous.exact_terms.len()).unwrap_or(u64::MAX));
+        }
+        self.owner_counters.gadget_exact_terms =
+            self.owner_counters.gadget_exact_terms.saturating_add(terms);
+        self.owner_counters.gadget_exact_terms_peak =
+            self.owner_counters.gadget_exact_terms_peak.max(self.owner_counters.gadget_exact_terms);
+        self.owner_counters.gadget_largest_nf_terms_seen =
+            self.owner_counters.gadget_largest_nf_terms_seen.max(terms);
+    }
+
+    fn owner_census_with_active(
+        &self,
+        active: impl IntoIterator<Item = MonomialId>,
+    ) -> DiagnosticOwnerCensus {
+        let cache_roots = self.cache.values().flat_map(|value| {
+            value.exact_nf.iter().flat_map(|normal_form| normal_form.exact_terms.keys().copied())
+        });
+        let gadget_roots = self
+            .gadget_input_nfs
+            .values()
+            .flat_map(|normal_form| normal_form.exact_terms.keys().copied());
+        let canonical_roots =
+            self.normalization.as_deref().into_iter().flat_map(NormalizationCache::monomial_roots);
+        let closed_roots =
+            self.relations.into_iter().flat_map(RelationRegistry::closed_monomial_roots);
+        let suspended_roots = self.suspended_owner_roots.iter().copied();
+        let monomial = self.monomials.owner_census(
+            cache_roots
+                .chain(gadget_roots)
+                .chain(canonical_roots)
+                .chain(closed_roots)
+                .chain(suspended_roots)
+                .chain(active),
+        );
+        let canonical =
+            self.normalization.as_deref().map(|cache| cache.owner_census()).unwrap_or_default();
+        DiagnosticOwnerCensus {
+            monomial_allocated_descriptor_slots: monomial.allocated_descriptor_slots,
+            monomial_retained_descriptor_slots: monomial.retained_descriptor_slots,
+            monomial_reclaimed_descriptor_slots: monomial.reclaimed_descriptor_slots,
+            monomial_reachable_descriptor_slots: monomial.reachable_descriptor_slots,
+            monomial_reachable_central_factor_entries: monomial.reachable_central_factor_entries,
+            monomial_reachable_ordered_factor_entries: monomial.reachable_ordered_factor_entries,
+            monomial_reachable_max_factor_word: monomial.reachable_max_factor_word,
+            monomial_owned_payload_lower_bound_bytes: monomial.owned_payload_lower_bound_bytes,
+            monomial_unreachable_descriptor_slots: monomial.unreachable_descriptor_slots,
+            monomial_unreachable_central_factor_entries: monomial
+                .unreachable_central_factor_entries,
+            monomial_unreachable_ordered_factor_entries: monomial
+                .unreachable_ordered_factor_entries,
+            monomial_unreachable_payload_lower_bound_bytes: monomial
+                .unreachable_payload_lower_bound_bytes,
+            monomial_invalid_root_count: monomial.invalid_root_count,
+            cache_entries: u64::try_from(self.cache.len()).unwrap_or(u64::MAX),
+            cache_exact_terms: self.owner_counters.cache_exact_terms,
+            cache_exact_terms_peak: self.owner_counters.cache_exact_terms_peak,
+            cache_largest_nf_terms_seen: self.owner_counters.cache_largest_nf_terms_seen,
+            gadget_entries: u64::try_from(self.gadget_input_nfs.len()).unwrap_or(u64::MAX),
+            gadget_exact_terms: self.owner_counters.gadget_exact_terms,
+            gadget_exact_terms_peak: self.owner_counters.gadget_exact_terms_peak,
+            gadget_largest_nf_terms_seen: self.owner_counters.gadget_largest_nf_terms_seen,
+            canonical_rhs_entries: canonical.canonical_rhs_entries,
+            canonical_rhs_exact_terms: canonical.canonical_rhs_exact_terms,
+            canonical_rhs_exact_terms_peak: canonical.canonical_rhs_exact_terms_peak,
+            canonical_rhs_largest_nf_terms: canonical.canonical_rhs_largest_nf_terms,
+            runtime_entries: canonical.runtime_entries,
+            runtime_lhs_keys: canonical.runtime_lhs_keys,
+        }
+    }
+
+    fn owner_census(&self) -> DiagnosticOwnerCensus {
+        self.owner_census_with_active(std::iter::empty())
+    }
+
+    /// Run only after a depth-one node has been fully committed to every durable owner. Product
+    /// and relation worklists are lexical locals inside `evaluate_node` and are therefore gone at
+    /// this boundary. Root collection is exact and fail-closed; the arena validates every ID
+    /// before dropping any descriptor.
+    fn sweep_monomials_at_node_commit(&mut self) -> Result<(), NormalizeError> {
+        if self.normalization_depth != 1 ||
+            self.monomials.allocated_payload_since_sweep() <
+                self.monomial_gc_allocation_threshold_bytes
+        {
+            return Ok(());
+        }
+        let cache_roots = self.cache.values().flat_map(|value| {
+            value.exact_nf.iter().flat_map(|normal_form| normal_form.exact_terms.keys().copied())
+        });
+        let gadget_roots = self
+            .gadget_input_nfs
+            .values()
+            .flat_map(|normal_form| normal_form.exact_terms.keys().copied());
+        let canonical_roots =
+            self.normalization.as_deref().into_iter().flat_map(NormalizationCache::monomial_roots);
+        let closed_roots =
+            self.relations.into_iter().flat_map(RelationRegistry::closed_monomial_roots);
+        let suspended_roots = self.suspended_owner_roots.iter().copied();
+        let arena = self.monomials.token();
+        // Value-cache, gadget, and suspended owners are local by construction. Do not filter
+        // them: a foreign/tombstoned/out-of-range ID is an invariant violation and must reach the
+        // arena's validate-before-mutate boundary. Canonical/runtime and closed-relation owners
+        // are checker-global, so only their roots for this exact scoped arena participate.
+        let canonical_roots = canonical_roots.filter(move |root| root.arena() == arena);
+        let closed_roots = closed_roots.filter(move |root| root.arena() == arena);
+        let allocated_payload_before = self.monomials.allocated_payload_since_sweep();
+        // Timing starts only after the deterministic depth/allocation gate admits an actual
+        // sweep attempt. A validation error leaves both the arena and telemetry unchanged.
+        let started = Instant::now();
+        let report = self.monomials.sweep_with_owners(
+            self.protected_monomial_prefix,
+            cache_roots,
+            gadget_roots,
+            canonical_roots,
+            closed_roots,
+            suspended_roots,
+        )?;
+        let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // This scan is diagnostic-only and is skipped entirely unless a watchdog exists.
+        let value_cache_top8 = self.watchdog.as_ref().map(|_| self.diagnostic_value_cache_top8());
+        self.gc_counters.sweep_count = self.gc_counters.sweep_count.saturating_add(1);
+        self.gc_counters.last_sweep_node = self.counters.nodes_processed;
+        self.gc_counters.last_high_water_slots = report.high_water_slots;
+        self.gc_counters.last_occupied_slots = report.occupied_slots;
+        self.gc_counters.last_reclaimed_slots = report.reclaimed_slots;
+        self.gc_counters.last_reclaimed_payload_bytes = report.reclaimed_payload_lower_bound_bytes;
+        self.gc_counters.cumulative_reclaimed_slots =
+            self.gc_counters.cumulative_reclaimed_slots.saturating_add(report.reclaimed_slots);
+        self.gc_counters.cumulative_reclaimed_payload_bytes = self
+            .gc_counters
+            .cumulative_reclaimed_payload_bytes
+            .saturating_add(report.reclaimed_payload_lower_bound_bytes);
+        self.gc_counters.last_allocated_payload_before_bytes = allocated_payload_before;
+        self.gc_counters.last_bucket_entries = report.bucket_entries;
+        self.gc_counters.last_protected_prefix_occupied_slots =
+            report.protected_prefix_occupied_slots;
+        self.gc_counters.last_occupied_central_factor_entries =
+            report.occupied_central_factor_entries;
+        self.gc_counters.last_occupied_ordered_factor_entries =
+            report.occupied_ordered_factor_entries;
+        self.gc_counters.last_occupied_factor_payload_lower_bound_bytes =
+            report.occupied_factor_payload_lower_bound_bytes;
+        self.gc_counters.last_protected_prefix = report.protected_prefix;
+        self.gc_counters.last_value_cache = report.value_cache;
+        self.gc_counters.last_gadget = report.gadget;
+        self.gc_counters.last_canonical_runtime = report.canonical_runtime;
+        self.gc_counters.last_closed = report.closed;
+        self.gc_counters.last_suspended = report.suspended;
+        if let Some(top8) = value_cache_top8 {
+            self.gc_counters.value_cache_entries = top8.entries;
+            self.gc_counters.value_cache_exact_term_refs = top8.exact_term_refs;
+            self.gc_counters.value_cache_top8_exact_term_refs = top8.top_exact_term_refs;
+            self.gc_counters.value_cache_top8_len = top8.len;
+            self.gc_counters.value_cache_top8 = top8.top;
+        }
+        self.gc_counters.sweep_total_ns =
+            self.gc_counters.sweep_total_ns.saturating_add(elapsed_ns);
+        self.gc_counters.sweep_max_ns = self.gc_counters.sweep_max_ns.max(elapsed_ns);
+        self.gc_counters.sweep_last_ns = elapsed_ns;
+        let gc = self.gc_counters;
+        // `watchdog_update` exits before locking when diagnostics are disabled.
+        self.watchdog_update(|progress| progress.gc = gc);
+        Ok(())
+    }
+
+    fn refresh_owner_diagnostics(&mut self) {
+        // Cheap legacy trace boundary: fresh O(D) census is scheduled only by
+        // `sample_owner_census` with an explicit reason.
+    }
+
+    fn sample_owner_census(
+        &mut self,
+        reason: OwnerCensusReason,
+        active: impl IntoIterator<Item = MonomialId>,
+    ) {
+        if (self.watchdog.is_none() && !self.trace.active) || self.owner_census_samples >= 12 {
+            return;
+        }
+        let owners = self.owner_census_with_active(active);
+        self.owner_census_samples = self.owner_census_samples.saturating_add(1);
+        self.owner_census_seq = self.owner_census_seq.saturating_add(1);
+        let seq = self.owner_census_seq;
+        let product_call_id = self.watchdog_product_call_id;
+        if self.trace.active {
+            self.trace.owners = owners;
+        }
+        let mut frozen = None;
+        let mut owner_sample = None;
+        self.watchdog_update(|progress| {
+            progress.owners = owners;
+            progress.owner_census_seq = seq;
+            progress.owner_census_depth = progress.depth;
+            progress.owner_census_call = progress.current_call;
+            progress.owner_census_product_call_id = product_call_id;
+            progress.owner_census_phase = progress.phase;
+            progress.owner_census_reason = Some(reason);
+            owner_sample = Some(DiagnosticOwnerSample {
+                owners,
+                seq,
+                depth: progress.depth,
+                call: progress.current_call,
+                product_call_id,
+                reason,
+                phase: progress.phase,
+                product_generated: progress.product_generated,
+                product_enqueued: progress.product_enqueued,
+                product_queue_current: progress.product_queue_current,
+                product_output_current: progress.product_output_current,
+            });
+            frozen = Some(*progress);
+        });
+        if let (Some(watchdog), Some(owner_sample), Some(progress)) =
+            (&self.watchdog, owner_sample, frozen)
+        {
+            watchdog.emit_owner_sample(owner_sample, progress);
+        }
+    }
+
+    fn admits_large_product_census_pair(&self, planned: u64) -> bool {
+        planned >= 100_000 &&
+            self.large_product_pairs_sampled < 5 &&
+            (self.largest_sampled_product_planned == 0 ||
+                planned > self.largest_sampled_product_planned) &&
+            self.owner_census_samples <= 9
+    }
+
+    fn admits_retained_arena_census(&mut self, retained: u64) -> bool {
+        if self.owner_census_samples >= 8 || retained < self.next_retained_census_milestone {
+            return false;
+        }
+        while retained >= self.next_retained_census_milestone {
+            self.next_retained_census_milestone =
+                self.next_retained_census_milestone.saturating_mul(2);
+            if self.next_retained_census_milestone == u64::MAX {
+                break;
+            }
+        }
+        true
+    }
+
     pub fn new(
         expressions: &'a mut ExprArena,
         programs: &'a ProgramArena,
@@ -1287,6 +2002,7 @@ impl<'a> Normalizer<'a> {
                 actual: facts.arena(),
             }));
         }
+        let protected_monomial_prefix = monomials.len();
         Ok(Self {
             expressions,
             programs,
@@ -1300,15 +2016,30 @@ impl<'a> Normalizer<'a> {
             expression_bounds: BTreeMap::new(),
             remaining_uses: BTreeMap::new(),
             gadget_input_nfs: BTreeMap::new(),
+            owner_counters: NormalizerOwnerCounters::default(),
             counters: NormalizationCounters::default(),
             trace: NormalizationTrace::new(),
             watchdog: None,
             watchdog_generation: 0,
             watchdog_product_processed: 0,
+            watchdog_product_generated: 0,
+            watchdog_product_enqueued: 0,
+            watchdog_product_generation_current: 0,
+            watchdog_product_enqueued_current: 0,
+            watchdog_product_queue_current: 0,
+            watchdog_product_output_current: 0,
             watchdog_relation_processed: 0,
             watchdog_specialization: DiagnosticSpecializationCounters::default(),
             watchdog_relation_closure: DiagnosticRelationCounters::default(),
             watchdog_timings: DiagnosticTimings::default(),
+            suspended_owner_roots: Vec::new(),
+            owner_census_samples: 0,
+            owner_census_seq: 0,
+            watchdog_product_call_id: 0,
+            largest_sampled_product_planned: 0,
+            large_product_pairs_sampled: 0,
+            current_large_product_sampled: false,
+            next_retained_census_milestone: 1 << 20,
             #[cfg(test)]
             watchdog_hot_publish_count: 0,
             normalization_depth: 0,
@@ -1332,6 +2063,9 @@ impl<'a> Normalizer<'a> {
             relation_matcher_publish_observer: None,
             relation_rewriting_enabled: true,
             fold_final_no_match: true,
+            protected_monomial_prefix,
+            monomial_gc_allocation_threshold_bytes: MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES,
+            gc_counters: DiagnosticGcCounters::default(),
         })
     }
 
@@ -1408,14 +2142,27 @@ impl<'a> Normalizer<'a> {
         update(&mut self.watchdog_timings).record(elapsed_ns);
     }
 
-    fn watchdog_record_product_processed(&mut self) {
+    fn watchdog_record_product_processed(
+        &mut self,
+        queue_current: u64,
+        output_current: u64,
+        active: impl IntoIterator<Item = MonomialId>,
+    ) {
         if self.watchdog.is_none() {
             return;
         }
+        self.watchdog_product_queue_current = queue_current;
+        self.watchdog_product_output_current = output_current;
         self.watchdog_product_processed = self.watchdog_product_processed.saturating_add(1);
         let processed = self.watchdog_product_processed;
         if processed >= 1_024 && processed.is_power_of_two() {
-            self.watchdog_update(|progress| progress.product_processed = processed);
+            let _ = active;
+            self.watchdog_update(|progress| {
+                progress.phase = DiagnosticPhase::ProductDrain;
+                progress.product_processed = processed;
+                progress.product_queue_current = queue_current;
+                progress.product_output_current = output_current;
+            });
             #[cfg(test)]
             {
                 self.watchdog_hot_publish_count = self.watchdog_hot_publish_count.saturating_add(1);
@@ -1423,14 +2170,62 @@ impl<'a> Normalizer<'a> {
         }
     }
 
-    fn watchdog_record_relation_processed(&mut self) {
+    fn watchdog_record_product_generated(
+        &mut self,
+        enqueued: bool,
+        queue_current: u64,
+        active: impl IntoIterator<Item = MonomialId>,
+    ) {
+        if self.watchdog.is_none() {
+            return;
+        }
+        self.watchdog_product_generated = self.watchdog_product_generated.saturating_add(1);
+        self.watchdog_product_generation_current =
+            self.watchdog_product_generation_current.saturating_add(1);
+        if enqueued {
+            self.watchdog_product_enqueued = self.watchdog_product_enqueued.saturating_add(1);
+            self.watchdog_product_enqueued_current =
+                self.watchdog_product_enqueued_current.saturating_add(1);
+        }
+        self.watchdog_product_queue_current = queue_current;
+        self.watchdog_product_output_current = 0;
+        let generated = self.watchdog_product_generated;
+        let enqueued_count = self.watchdog_product_enqueued;
+        let generation_current = self.watchdog_product_generation_current;
+        let enqueued_current = self.watchdog_product_enqueued_current;
+        let generated_crossing = generation_current == 1 || generation_current.is_power_of_two();
+        let enqueued_crossing =
+            enqueued && (enqueued_current == 1 || enqueued_current.is_power_of_two());
+        if generated_crossing || enqueued_crossing {
+            let _ = active;
+            self.watchdog_update(|progress| {
+                progress.phase = DiagnosticPhase::ProductGeneration;
+                progress.product_generated = generated;
+                progress.product_enqueued = enqueued_count;
+                progress.product_generation_current = generation_current;
+                progress.product_enqueued_current = enqueued_current;
+                progress.product_queue_current = queue_current;
+                progress.product_output_current = 0;
+            });
+            #[cfg(test)]
+            {
+                self.watchdog_hot_publish_count = self.watchdog_hot_publish_count.saturating_add(1);
+            }
+        }
+    }
+
+    fn watchdog_record_relation_processed(&mut self, active: impl IntoIterator<Item = MonomialId>) {
         if self.watchdog.is_none() {
             return;
         }
         self.watchdog_relation_processed = self.watchdog_relation_processed.saturating_add(1);
         let processed = self.watchdog_relation_processed;
         if processed >= 1_024 && processed.is_power_of_two() {
-            self.watchdog_update(|progress| progress.relation_processed = processed);
+            let _ = active;
+            self.watchdog_update(|progress| {
+                progress.phase = DiagnosticPhase::RelationSearch;
+                progress.relation_processed = processed;
+            });
             #[cfg(test)]
             {
                 self.watchdog_hot_publish_count = self.watchdog_hot_publish_count.saturating_add(1);
@@ -1498,6 +2293,28 @@ impl<'a> Normalizer<'a> {
         if self.watchdog.is_none() {
             return;
         }
+        self.watchdog_relation_closure = counters;
+        self.watchdog_update(|progress| {
+            progress.phase = phase;
+            progress.relation_closure = counters;
+            progress.timings = self.watchdog_timings;
+        });
+        #[cfg(test)]
+        {
+            self.watchdog_hot_publish_count = self.watchdog_hot_publish_count.saturating_add(1);
+        }
+    }
+
+    fn watchdog_publish_relation_closure_with_active(
+        &mut self,
+        phase: DiagnosticPhase,
+        counters: DiagnosticRelationCounters,
+        active: impl IntoIterator<Item = MonomialId>,
+    ) {
+        if self.watchdog.is_none() {
+            return;
+        }
+        let _ = active;
         self.watchdog_relation_closure = counters;
         self.watchdog_update(|progress| {
             progress.phase = phase;
@@ -1603,6 +2420,8 @@ impl<'a> Normalizer<'a> {
     ) -> Result<AnalyzedValue, NormalizeError> {
         let outermost = self.normalization_depth == 0;
         if outermost {
+            self.protected_monomial_prefix = self.monomials.len();
+            self.gc_counters = DiagnosticGcCounters::default();
             self.trace = NormalizationTrace::new();
             let enabled = normalization_watchdog_enabled();
             #[cfg(test)]
@@ -1610,15 +2429,29 @@ impl<'a> Normalizer<'a> {
             if enabled {
                 self.watchdog_generation = self.watchdog_generation.saturating_add(1);
                 self.watchdog_product_processed = 0;
+                self.watchdog_product_generated = 0;
+                self.watchdog_product_enqueued = 0;
+                self.watchdog_product_generation_current = 0;
+                self.watchdog_product_enqueued_current = 0;
+                self.watchdog_product_queue_current = 0;
+                self.watchdog_product_output_current = 0;
                 self.watchdog_relation_processed = 0;
                 self.watchdog_specialization = DiagnosticSpecializationCounters::default();
                 self.watchdog_relation_closure = DiagnosticRelationCounters::default();
                 self.watchdog_timings = DiagnosticTimings::default();
+                self.suspended_owner_roots.clear();
+                self.owner_census_samples = 0;
+                self.owner_census_seq = 0;
+                self.watchdog_product_call_id = 0;
+                self.largest_sampled_product_planned = 0;
+                self.large_product_pairs_sampled = 0;
+                self.current_large_product_sampled = false;
+                self.next_retained_census_milestone = 1 << 20;
                 #[cfg(test)]
                 {
                     self.watchdog_hot_publish_count = 0;
                 }
-                let interval = NORMALIZATION_WATCHDOG_INTERVAL;
+                let interval = normalization_watchdog_interval();
                 #[cfg(test)]
                 let interval = self.watchdog_interval_override.unwrap_or(interval);
                 self.watchdog = DiagnosticWatchdog::start(self.watchdog_generation, interval);
@@ -1642,6 +2475,21 @@ impl<'a> Normalizer<'a> {
             watchdog.complete_call(parent, result.is_err());
         }
         if outermost {
+            self.sample_owner_census(
+                if result.is_ok() {
+                    OwnerCensusReason::OuterTerminal
+                } else {
+                    OwnerCensusReason::OuterError
+                },
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.exact_nf.as_ref())
+                    .into_iter()
+                    .flat_map(|normal_form| normal_form.exact_terms.keys().copied()),
+            );
+        }
+        if outermost {
             if self.trace.active {
                 self.trace.cache_len = u64::try_from(self.cache.len()).unwrap_or(u64::MAX);
                 self.trace.monomial_len = u64::try_from(self.monomials.len()).unwrap_or(u64::MAX);
@@ -1653,12 +2501,24 @@ impl<'a> Normalizer<'a> {
                 true,
             );
             let product_processed = self.watchdog_product_processed;
+            let product_generated = self.watchdog_product_generated;
+            let product_enqueued = self.watchdog_product_enqueued;
+            let product_generation_current = self.watchdog_product_generation_current;
+            let product_enqueued_current = self.watchdog_product_enqueued_current;
+            let product_queue_current = self.watchdog_product_queue_current;
+            let product_output_current = self.watchdog_product_output_current;
             let relation_processed = self.watchdog_relation_processed;
             let specialization = self.watchdog_specialization;
             let relation_closure = self.watchdog_relation_closure;
             let timings = self.watchdog_timings;
             self.watchdog_update(|progress| {
                 progress.product_processed = product_processed;
+                progress.product_generated = product_generated;
+                progress.product_enqueued = product_enqueued;
+                progress.product_generation_current = product_generation_current;
+                progress.product_enqueued_current = product_enqueued_current;
+                progress.product_queue_current = product_queue_current;
+                progress.product_output_current = product_output_current;
                 progress.relation_processed = relation_processed;
                 progress.specialization = specialization;
                 progress.relation_closure = relation_closure;
@@ -1725,10 +2585,11 @@ impl<'a> Normalizer<'a> {
         self.watchdog_update(|progress| progress.phase = DiagnosticPhase::ScopeProofDone);
         self.trace.enter_next_root_phase("next_root:normalize_proof_end", trace_next_root_proof);
         self.watchdog_update(|progress| progress.phase = DiagnosticPhase::StateReset);
-        self.cache.clear();
+        self.clear_value_cache();
         self.expression_bounds.clear();
         self.remaining_uses.clear();
-        self.gadget_input_nfs.clear();
+        self.clear_gadget_holds();
+        self.owner_counters = NormalizerOwnerCounters::default();
         self.counters = NormalizationCounters::default();
         self.watchdog_update(|progress| progress.phase = DiagnosticPhase::UseCounts);
         let use_counts_started = self.watchdog_timing_start();
@@ -1771,6 +2632,7 @@ impl<'a> Normalizer<'a> {
                     self.trace.next_product_processed_heartbeat =
                         self.trace_product_heartbeat_interval;
                 }
+                self.refresh_owner_diagnostics();
                 self.trace.emit(
                     "normalize_start",
                     self.trace.nodes_processed,
@@ -1824,8 +2686,9 @@ impl<'a> Normalizer<'a> {
                 progress.phase = DiagnosticPhase::NodeWalk;
                 progress.nodes_done = nodes_done;
             });
-            self.cache.insert(expression, Arc::new(value));
+            self.insert_value_cache(expression, Arc::new(value));
             completed.insert(expression);
+            self.sweep_monomials_at_node_commit()?;
             self.counters.peak_cached_values =
                 self.counters.peak_cached_values.max(self.cache.len() as u64);
             if self.trace.active {
@@ -1834,6 +2697,7 @@ impl<'a> Normalizer<'a> {
                 self.trace.cache_peak = self.trace.cache_peak.max(self.trace.cache_len);
                 self.trace.monomial_len = u64::try_from(self.monomials.len()).unwrap_or(u64::MAX);
                 if self.trace.nodes_processed >= self.trace.next_node_heartbeat {
+                    self.refresh_owner_diagnostics();
                     self.trace.emit(
                         "normalize_heartbeat",
                         self.trace.nodes_processed,
@@ -1850,8 +2714,7 @@ impl<'a> Normalizer<'a> {
         self.update_trace_root_shape(root_nf.as_deref());
         self.trace.enter_postphase("post:root_take");
         let value = self
-            .cache
-            .remove(&root.expression())
+            .take_value_cache(root.expression())
             .ok_or(NormalizeError::MissingCachedValue { expression: root.expression() })?;
         let mut value = Arc::try_unwrap(value)
             .map_err(|_| NormalizeError::SharedRootCacheValue { expression: root.expression() })?;
@@ -2054,6 +2917,11 @@ impl<'a> Normalizer<'a> {
                     }
                 }
             });
+        if self.watchdog.is_some() {
+            if let Ok(ProofResolutionOwned::Rewrite(rhs)) = &result {
+                self.suspended_owner_roots.extend(rhs.exact_terms.keys().copied());
+            }
+        }
         self.normalization
             .as_deref_mut()
             .expect("normalization cache checked above")
@@ -2073,6 +2941,7 @@ impl<'a> Normalizer<'a> {
         kind: SpecializationKind,
     ) -> Result<BTreeMap<CanonicalLhsKey, BTreeSet<super::relation::CanonicalRhsId>>, NormalizeError>
     {
+        let suspended_checkpoint = self.suspended_owner_roots.len();
         self.watchdog_record_specialization(DiagnosticPhase::UniversalSpecialization, |counters| {
             match kind {
                 SpecializationKind::Ordinary => {
@@ -2109,6 +2978,7 @@ impl<'a> Normalizer<'a> {
         let mut result = BTreeMap::<CanonicalLhsKey, BTreeSet<_>>::new();
         for (static_lhs, targets) in registrations {
             if !static_lhs.domain.contains(index_range) {
+                self.suspended_owner_roots.truncate(suspended_checkpoint);
                 return Err(NormalizeError::Relation(RelationRegistryError::IndexOutOfDomain));
             }
             for registration in targets.into_values() {
@@ -2117,12 +2987,23 @@ impl<'a> Normalizer<'a> {
                     counters.registrations_started =
                         counters.registrations_started.saturating_add(1);
                 });
-                let (lhs, rhs) = self.specialize_registration(index, index_range, &registration)?;
+                let (lhs, rhs) =
+                    match self.specialize_registration(index, index_range, &registration) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.suspended_owner_roots.truncate(suspended_checkpoint);
+                            return Err(error);
+                        }
+                    };
                 self.watchdog_record_specialization(DiagnosticPhase::Registration, |counters| {
                     counters.registrations_completed =
                         counters.registrations_completed.saturating_add(1);
                 });
+                let lhs_monomial = lhs.monomial;
                 result.entry(lhs).or_default().insert(rhs);
+                if self.watchdog.is_some() {
+                    self.suspended_owner_roots.push(lhs_monomial);
+                }
             }
         }
         self.watchdog_record_specialization(DiagnosticPhase::UniversalSpecialization, |counters| {
@@ -2137,6 +3018,7 @@ impl<'a> Normalizer<'a> {
                 }
             }
         });
+        self.suspended_owner_roots.truncate(suspended_checkpoint);
         Ok(result)
     }
 
@@ -2191,7 +3073,17 @@ impl<'a> Normalizer<'a> {
         // registration/specialization.
         let product = self.normalize_specialized_root_without_relations(product_root)?;
         let monomial = canonical_lhs_monomial(product.exact_nf.as_deref())?;
-        let (_, target) = self.normalize_plan(registration.target_plan, index)?;
+        let lhs_pin_checkpoint = self.suspended_owner_roots.len();
+        if self.watchdog.is_some() {
+            self.suspended_owner_roots.push(monomial);
+        }
+        let (_, target) = match self.normalize_plan(registration.target_plan, index) {
+            Ok(value) => value,
+            Err(error) => {
+                self.suspended_owner_roots.truncate(lhs_pin_checkpoint);
+                return Err(error);
+            }
+        };
         if self.watchdog.is_some() {
             let exact_terms = u64::try_from(target.exact_terms.len()).unwrap_or(u64::MAX);
             self.watchdog_record_specialization(DiagnosticPhase::RhsIntern, |counters| {
@@ -2208,7 +3100,13 @@ impl<'a> Normalizer<'a> {
                 .as_deref_mut()
                 .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
             let before = track_interner_outcome.then(|| normalization.canonical_rhs_count());
-            let rhs = normalization.intern_arc(target)?;
+            let rhs = match normalization.intern_arc(target) {
+                Ok(rhs) => rhs,
+                Err(error) => {
+                    self.suspended_owner_roots.truncate(lhs_pin_checkpoint);
+                    return Err(error.into());
+                }
+            };
             (rhs, before.map(|before| normalization.canonical_rhs_count() > before))
         };
         if let Some(inserted) = inserted {
@@ -2221,6 +3119,7 @@ impl<'a> Normalizer<'a> {
             });
         }
         self.trace.enter_caller_phase("registration:rhs_intern_end", false);
+        self.suspended_owner_roots.truncate(lhs_pin_checkpoint);
         Ok((CanonicalLhsKey { layout: registration.lhs.layout.clone(), monomial }, rhs))
     }
 
@@ -2255,6 +3154,20 @@ impl<'a> Normalizer<'a> {
         self.trace.enter_next_root_phase("next_root:preproof_end", trace_next_root);
         let scoped = self.expressions.scoped_from_proof(&proof, root)?;
         self.trace.next_root_normalize_proof_pending = trace_next_root;
+        let suspended_checkpoint = self.suspended_owner_roots.len();
+        if self.watchdog.is_some() {
+            self.suspended_owner_roots.extend(self.cache.values().flat_map(|value| {
+                value
+                    .exact_nf
+                    .iter()
+                    .flat_map(|normal_form| normal_form.exact_terms.keys().copied())
+            }));
+            self.suspended_owner_roots.extend(
+                self.gadget_input_nfs
+                    .values()
+                    .flat_map(|normal_form| normal_form.exact_terms.keys().copied()),
+            );
+        }
         let saved_cache = std::mem::take(&mut self.cache);
         // `normalize` owns a complete root-local bounds map and clears it at entry. Keep the
         // outer map out of that nested invocation, then merge newly-derived entries back after
@@ -2263,6 +3176,8 @@ impl<'a> Normalizer<'a> {
         let saved_expression_bounds = std::mem::take(&mut self.expression_bounds);
         let saved_uses = std::mem::take(&mut self.remaining_uses);
         let saved_gadget_input_nfs = std::mem::take(&mut self.gadget_input_nfs);
+        let saved_owner_counters = self.owner_counters;
+        self.owner_counters = NormalizerOwnerCounters::default();
         let saved_counters = self.counters;
         let saved_trace_expression_slot = self.trace.current_expression_slot;
         let saved_trace_operator = self.trace.current_operator;
@@ -2301,16 +3216,21 @@ impl<'a> Normalizer<'a> {
         self.trace.enter_caller_phase("caller:bounds_merge_end", true);
         self.trace.enter_caller_phase("caller:uses_restore_start", false);
         let state_restore_started = self.watchdog_timing_start();
+        let nested_owner_counters = self.owner_counters;
         self.remaining_uses = saved_uses;
         self.trace.enter_caller_phase("caller:uses_restore_end", false);
         self.gadget_input_nfs = saved_gadget_input_nfs;
+        self.owner_counters =
+            Self::restored_owner_counters(saved_owner_counters, nested_owner_counters);
         self.counters = saved_counters;
         self.trace.current_expression_slot = saved_trace_expression_slot;
         self.trace.current_operator = saved_trace_operator;
         self.fold_final_no_match = saved_fold_final_no_match;
+        self.suspended_owner_roots.truncate(suspended_checkpoint);
         self.watchdog_record_timing(state_restore_started, |timings| {
             &mut timings.specialized_state_restore
         });
+        self.refresh_owner_diagnostics();
         self.trace.enter_caller_phase("caller:state_restored", false);
         value
     }
@@ -2448,7 +3368,7 @@ impl<'a> Normalizer<'a> {
             .ok_or(NormalizeError::MissingCachedValue { expression })?;
         *remaining = remaining.saturating_sub(1);
         if *remaining == 0 {
-            self.cache.remove(&expression);
+            self.remove_value_cache(expression);
             self.counters.remaining_use_releases =
                 self.counters.remaining_use_releases.saturating_add(1);
         }
@@ -2470,7 +3390,7 @@ impl<'a> Normalizer<'a> {
         let Some(normal_form) = value.exact_nf.clone() else {
             return Ok(None);
         };
-        self.gadget_input_nfs.insert(expression, normal_form.clone());
+        self.insert_gadget_hold(expression, normal_form.clone());
         Ok(Some(normal_form))
     }
 
@@ -4099,9 +5019,24 @@ impl<'a> Normalizer<'a> {
         left: &PolynomialNF,
         right: &PolynomialNF,
     ) -> Result<PolynomialNF, NormalizeError> {
+        if self.watchdog.is_some() {
+            self.watchdog_product_call_id = self.watchdog_product_call_id.saturating_add(1);
+            self.watchdog_product_generation_current = 0;
+            self.watchdog_product_enqueued_current = 0;
+            self.watchdog_product_queue_current = 0;
+            self.watchdog_product_output_current = 0;
+        }
         let planned = u64::try_from(left.exact_terms.len())
             .unwrap_or(u64::MAX)
             .saturating_mul(u64::try_from(right.exact_terms.len()).unwrap_or(u64::MAX));
+        self.current_large_product_sampled = false;
+        let retained = u64::try_from(self.monomials.len()).unwrap_or(u64::MAX);
+        if self.admits_retained_arena_census(retained) {
+            self.sample_owner_census(
+                OwnerCensusReason::RetainedArenaMilestone,
+                left.exact_terms.keys().chain(right.exact_terms.keys()).copied(),
+            );
+        }
         if self.trace.active {
             self.trace.product_calls = self.trace.product_calls.saturating_add(1);
             self.trace.product_planned = self.trace.product_planned.saturating_add(planned);
@@ -4115,6 +5050,8 @@ impl<'a> Normalizer<'a> {
                 .max(u64::try_from(right.exact_terms.len()).unwrap_or(u64::MAX));
         }
         let trace_large_product = self.trace.active && planned >= LARGE_PRODUCT_PLANNED_PAIRS;
+        self.trace.product_current_queue = 0;
+        self.trace.product_current_output = 0;
         if trace_large_product {
             self.trace.emit(
                 "product_start",
@@ -4158,7 +5095,8 @@ impl<'a> Normalizer<'a> {
                     if self.trace.product_generated >= self.trace.next_product_generated_heartbeat {
                         self.trace.last_product_heartbeat_operator = self.trace.current_operator;
                         self.trace.product_heartbeat_saw_matrix_multiply |=
-                            self.trace.current_operator == "matrix_multiply";
+                            self.trace.current_operator == "multiply";
+                        self.refresh_owner_diagnostics();
                         self.trace.emit(
                             "product_generated_heartbeat",
                             self.trace.nodes_processed,
@@ -4173,10 +5111,29 @@ impl<'a> Normalizer<'a> {
                 }
                 let coefficient = left_coefficient * right_coefficient;
                 if coefficient.is_zero() {
+                    self.watchdog_record_product_generated(
+                        false,
+                        u64::try_from(worklist.len()).unwrap_or(u64::MAX),
+                        std::iter::once(product)
+                            .chain(left.exact_terms.keys().copied())
+                            .chain(right.exact_terms.keys().copied())
+                            .chain(worklist.iter().map(|(id, _)| *id)),
+                    );
                     continue;
                 }
                 worklist.push_back((product, coefficient));
+                self.watchdog_record_product_generated(
+                    true,
+                    u64::try_from(worklist.len()).unwrap_or(u64::MAX),
+                    left.exact_terms
+                        .keys()
+                        .chain(right.exact_terms.keys())
+                        .chain(worklist.iter().map(|(id, _)| id))
+                        .copied(),
+                );
                 if self.trace.active {
+                    self.trace.product_current_queue =
+                        u64::try_from(worklist.len()).unwrap_or(u64::MAX);
                     self.trace.product_enqueued = self.trace.product_enqueued.saturating_add(1);
                     self.trace.product_peak_queue = self
                         .trace
@@ -4185,15 +5142,59 @@ impl<'a> Normalizer<'a> {
                 }
             }
         }
+        if self.watchdog.is_some() {
+            let generated = self.watchdog_product_generated;
+            let enqueued = self.watchdog_product_enqueued;
+            let generation_current = self.watchdog_product_generation_current;
+            let enqueued_current = self.watchdog_product_enqueued_current;
+            let queue_current = u64::try_from(worklist.len()).unwrap_or(u64::MAX);
+            self.watchdog_update(|progress| {
+                progress.phase = DiagnosticPhase::ProductGenerationEnd;
+                progress.product_generated = generated;
+                progress.product_enqueued = enqueued;
+                progress.product_generation_current = generation_current;
+                progress.product_enqueued_current = enqueued_current;
+                progress.product_queue_current = queue_current;
+                progress.product_output_current = 0;
+            });
+            // Up to five record-breaking large products are sampled as complete GenEnd/End
+            // pairs. This keeps the latest OOM-dominant product useful while reserving one final
+            // terminal/error sample under the global cap of twelve.
+            if self.admits_large_product_census_pair(generation_current) {
+                self.current_large_product_sampled = true;
+                self.largest_sampled_product_planned = generation_current;
+                self.sample_owner_census(
+                    OwnerCensusReason::LargeProductGenerationEnd,
+                    left.exact_terms
+                        .keys()
+                        .chain(right.exact_terms.keys())
+                        .chain(worklist.iter().map(|(id, _)| id))
+                        .copied(),
+                );
+            }
+        }
         let mut terms = BTreeMap::new();
         while let Some((monomial, coefficient)) = worklist.pop_front() {
-            self.watchdog_record_product_processed();
+            let queue_current = u64::try_from(worklist.len()).unwrap_or(u64::MAX);
+            let output_current = u64::try_from(terms.len()).unwrap_or(u64::MAX);
+            self.watchdog_record_product_processed(
+                queue_current,
+                output_current,
+                std::iter::once(monomial)
+                    .chain(left.exact_terms.keys().copied())
+                    .chain(right.exact_terms.keys().copied())
+                    .chain(worklist.iter().map(|(id, _)| *id))
+                    .chain(terms.keys().copied()),
+            );
             if self.trace.active {
+                self.trace.product_current_queue = queue_current;
+                self.trace.product_current_output = output_current;
                 self.trace.product_processed = self.trace.product_processed.saturating_add(1);
                 if self.trace.product_processed >= self.trace.next_product_processed_heartbeat {
                     self.trace.last_product_heartbeat_operator = self.trace.current_operator;
                     self.trace.product_heartbeat_saw_matrix_multiply |=
-                        self.trace.current_operator == "matrix_multiply";
+                        self.trace.current_operator == "multiply";
+                    self.refresh_owner_diagnostics();
                     self.trace.emit(
                         "product_processed_heartbeat",
                         self.trace.nodes_processed,
@@ -4211,6 +5212,10 @@ impl<'a> Normalizer<'a> {
             }
             let Some(rewritten) = self.rewrite_gadget_decomposition(monomial)? else {
                 merge_term(&mut terms, monomial, coefficient);
+                if self.trace.active {
+                    self.trace.product_current_output =
+                        u64::try_from(terms.len()).unwrap_or(u64::MAX);
+                }
                 continue;
             };
             if self.trace.active {
@@ -4230,8 +5235,37 @@ impl<'a> Normalizer<'a> {
                         .trace
                         .product_peak_queue
                         .max(u64::try_from(worklist.len()).unwrap_or(u64::MAX));
+                    self.trace.product_current_queue =
+                        u64::try_from(worklist.len()).unwrap_or(u64::MAX);
                 }
             }
+        }
+        if self.watchdog.is_some() {
+            self.watchdog_product_queue_current = 0;
+            self.watchdog_product_output_current = u64::try_from(terms.len()).unwrap_or(u64::MAX);
+            let output_current = self.watchdog_product_output_current;
+            self.watchdog_update(|progress| {
+                progress.phase = DiagnosticPhase::ProductEnd;
+                progress.product_queue_current = 0;
+                progress.product_output_current = output_current;
+            });
+            if self.current_large_product_sampled {
+                self.sample_owner_census(
+                    OwnerCensusReason::LargeProductEnd,
+                    left.exact_terms
+                        .keys()
+                        .chain(right.exact_terms.keys())
+                        .chain(terms.keys())
+                        .copied(),
+                );
+                self.large_product_pairs_sampled =
+                    self.large_product_pairs_sampled.saturating_add(1);
+                self.current_large_product_sampled = false;
+            }
+        }
+        if self.trace.active {
+            self.trace.product_current_queue = 0;
+            self.trace.product_current_output = u64::try_from(terms.len()).unwrap_or(u64::MAX);
         }
         Ok(PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() })
     }
@@ -4392,9 +5426,10 @@ impl<'a> Normalizer<'a> {
         diagnostic.counters.closures_started =
             diagnostic.counters.closures_started.saturating_add(1);
         diagnostic.counters.active_depth = diagnostic.counters.active_depth.saturating_add(1);
-        self.watchdog_publish_relation_closure(
+        self.watchdog_publish_relation_closure_with_active(
             DiagnosticPhase::RelationClosure,
             diagnostic.counters,
+            normal_form.exact_terms.keys().copied(),
         );
         let result = self.rewrite_closed_relations_impl(
             normal_form,
@@ -4409,9 +5444,10 @@ impl<'a> Normalizer<'a> {
             diagnostic.counters.closures_errored =
                 diagnostic.counters.closures_errored.saturating_add(1);
         }
-        self.watchdog_publish_relation_closure(
+        self.watchdog_publish_relation_closure_with_active(
             if result.is_ok() { DiagnosticPhase::RelationClosure } else { DiagnosticPhase::Error },
             diagnostic.counters,
+            normal_form.exact_terms.keys().copied(),
         );
         result
     }
@@ -4441,7 +5477,11 @@ impl<'a> Normalizer<'a> {
         }
         while let Some((monomial, coefficient)) = worklist.pop_front() {
             let diagnostic_before = diagnostic.as_deref().map(|diagnostic| diagnostic.counters);
-            self.watchdog_record_relation_processed();
+            self.watchdog_record_relation_processed(
+                std::iter::once(monomial)
+                    .chain(worklist.iter().map(|(id, _)| *id))
+                    .chain(result.keys().copied()),
+            );
             self.trace.record_relation_processed(worklist.len(), result.len());
             if let Some(diagnostic) = diagnostic.as_deref_mut() {
                 diagnostic.counters.dequeued = diagnostic.counters.dequeued.saturating_add(1);
@@ -6316,6 +7356,818 @@ mod tests {
     }
 
     #[test]
+    fn forced_monomial_gc_preserves_exact_nf_bound_and_counters_at_node_commit() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = gaussian_factor(&mut expressions, matrix_type(), 81_001, 3);
+        let middle = gaussian_factor(&mut expressions, matrix_type(), 81_002, 5);
+        let right = gaussian_factor(&mut expressions, matrix_type(), 81_003, 7);
+        let root = product(&mut expressions, &[left, middle, right]);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+
+        let (forced, forced_counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            normalizer.monomial_gc_allocation_threshold_bytes = 1;
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        let high_water_after_gc = monomials.len();
+        assert!(monomials.occupied_len() < high_water_after_gc);
+        for monomial in forced.exact_nf.as_ref().unwrap().exact_terms.keys() {
+            assert!(monomials.descriptor(*monomial).is_ok(), "committed root NF must stay live");
+        }
+
+        let (second_forced, second_forced_counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            normalizer.monomial_gc_allocation_threshold_bytes = 1;
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        for monomial in forced.exact_nf.as_ref().unwrap().exact_terms.keys() {
+            assert!(
+                monomials.descriptor(*monomial).is_ok(),
+                "a prior-call external result is protected by the next outer prefix"
+            );
+        }
+        let (disabled, disabled_counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            normalizer.monomial_gc_allocation_threshold_bytes = u64::MAX;
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        assert_eq!(forced.exact_nf, second_forced.exact_nf);
+        assert_eq!(forced.coefficient_bound, second_forced.coefficient_bound);
+        assert_eq!(forced_counters, second_forced_counters);
+        assert_eq!(forced.semantic, disabled.semantic);
+        assert_eq!(forced.coefficient_bound, disabled.coefficient_bound);
+        assert_eq!(forced.exact_nf, disabled.exact_nf);
+        assert_eq!(forced_counters, disabled_counters);
+        assert!(monomials.len() >= high_water_after_gc, "collected slots are never reused");
+    }
+
+    #[test]
+    fn forced_monomial_gc_reports_three_sweeps_and_exact_watchdog_terminal_totals() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = gaussian_factor(&mut expressions, matrix_type(), 81_011, 3);
+        let right = gaussian_factor(&mut expressions, matrix_type(), 81_012, 5);
+        let root = product(&mut expressions, &[left, right]);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_watchdog_override(true, Duration::from_secs(60));
+        normalizer.monomial_gc_allocation_threshold_bytes = 1;
+        let value = normalizer.normalize(semantic).unwrap();
+        let gc = normalizer.gc_counters;
+        assert_eq!(gc.sweep_count, 3);
+        assert_eq!(gc.last_sweep_node, 3);
+        assert_eq!(gc.last_high_water_slots, 3);
+        assert_eq!(gc.last_occupied_slots, 1);
+        assert_eq!(gc.last_reclaimed_slots, 2);
+        assert_eq!(gc.cumulative_reclaimed_slots, 2);
+        assert_eq!(gc.cumulative_reclaimed_payload_bytes, gc.last_reclaimed_payload_bytes);
+        assert!(gc.last_reclaimed_payload_bytes > 0);
+        assert!(gc.last_allocated_payload_before_bytes > 0);
+        assert_eq!(gc.last_bucket_entries, 1);
+        assert!(gc.sweep_total_ns >= gc.sweep_max_ns);
+        assert!(gc.sweep_max_ns >= gc.sweep_last_ns);
+        let terminal = normalizer.last_watchdog_snapshots.last().copied().unwrap();
+        assert_eq!(terminal.gc, gc);
+        let live = *value.exact_nf.as_ref().unwrap().exact_terms.keys().next().unwrap();
+        assert!(normalizer.monomials.descriptor(live).is_ok());
+    }
+
+    #[test]
+    fn forced_monomial_gc_watchdog_on_off_preserves_nf_bound_and_cache_fingerprint() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = gaussian_factor(&mut expressions, matrix_type(), 81_021, 3);
+        let right = gaussian_factor(&mut expressions, matrix_type(), 81_022, 5);
+        let root = product(&mut expressions, &[left, right]);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut relations = RelationRegistry::new();
+        relations.freeze();
+        let mut cache = NormalizationCache::new();
+
+        let (off, off_counters, off_gc) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                    .unwrap()
+                    .with_relations(&relations, &mut cache)
+                    .with_watchdog_override(false, Duration::from_secs(60));
+            normalizer.monomial_gc_allocation_threshold_bytes = 1;
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters(), normalizer.gc_counters)
+        };
+        assert_eq!(off_gc.value_cache_top8_len, 0);
+        let fingerprint = cache.canonical_state_fingerprint();
+        let (on, on_counters, on_gc) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                    .unwrap()
+                    .with_relations(&relations, &mut cache)
+                    .with_watchdog_override(true, Duration::from_secs(60));
+            normalizer.monomial_gc_allocation_threshold_bytes = 1;
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters(), normalizer.gc_counters)
+        };
+        assert!(on_gc.sweep_count > 0);
+        assert!(on_gc.value_cache_top8_len > 0);
+        assert_eq!(off.semantic, on.semantic);
+        assert_eq!(off.exact_nf, on.exact_nf);
+        assert_eq!(off.coefficient_bound, on.coefficient_bound);
+        assert_eq!(off_counters, on_counters);
+        assert_eq!(cache.canonical_state_fingerprint(), fingerprint);
+    }
+
+    #[test]
+    fn forced_monomial_gc_keeps_left_deep_fresh_factor_chain_occupied_set_bounded() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let factors = (0_u64..128)
+            .map(|index| gaussian_factor(&mut expressions, matrix_type(), 82_000 + index, 3))
+            .collect::<Vec<_>>();
+        let root = product(&mut expressions, &factors);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let value = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            normalizer.monomial_gc_allocation_threshold_bytes = 1;
+            normalizer.normalize(semantic).unwrap()
+        };
+        let final_id = *value.exact_nf.as_ref().unwrap().exact_terms.keys().next().unwrap();
+        assert_eq!(monomials.descriptor(final_id).unwrap().ordered_factors.len(), 128);
+        assert_eq!(monomials.occupied_len(), 1);
+        assert!(monomials.len() > 128, "slot high-water remains monotonic while payload is swept");
+        assert_eq!(monomials.allocated_payload_since_sweep(), 0);
+    }
+
+    #[test]
+    fn owner_census_tracks_cache_last_use_and_gadget_hold_lifecycles() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = source(&mut expressions);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let monomial = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let normal_form = Arc::new(PolynomialNF {
+            exact_terms: BTreeMap::from([(monomial, BigInt::from(1))]),
+            bounded_summary: BoundedSummary::missing(),
+        });
+        let analyzed = Arc::new(AnalyzedValue {
+            semantic,
+            exact_nf: Some(Arc::clone(&normal_form)),
+            coefficient_bound: NumericContract::Missing,
+        });
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+
+        normalizer.insert_value_cache(semantic.expression(), Arc::clone(&analyzed));
+        normalizer.remaining_uses.insert(semantic.expression(), 1);
+        let held = normalizer.owner_census();
+        assert_eq!(held.cache_entries, 1);
+        assert_eq!(held.cache_exact_terms, 1);
+        assert_eq!(held.cache_exact_terms_peak, 1);
+        assert_eq!(held.cache_largest_nf_terms_seen, 1);
+        assert_eq!(held.monomial_retained_descriptor_slots, 1);
+        assert_eq!(held.monomial_reachable_descriptor_slots, 1);
+
+        normalizer.child_value(semantic.expression()).unwrap();
+        let released = normalizer.owner_census();
+        assert_eq!(released.cache_entries, 0);
+        assert_eq!(released.cache_exact_terms, 0);
+        assert_eq!(released.cache_exact_terms_peak, 1);
+        assert_eq!(released.monomial_reachable_descriptor_slots, 0);
+        assert_eq!(released.monomial_unreachable_descriptor_slots, 1);
+
+        normalizer.insert_gadget_hold(semantic.expression(), Arc::clone(&normal_form));
+        normalizer.insert_gadget_hold(semantic.expression(), Arc::clone(&normal_form));
+        let gadget = normalizer.owner_census();
+        assert_eq!(gadget.gadget_entries, 1);
+        assert_eq!(gadget.gadget_exact_terms, 1);
+        assert_eq!(gadget.gadget_exact_terms_peak, 1);
+        assert_eq!(gadget.gadget_largest_nf_terms_seen, 1);
+        normalizer.insert_value_cache(semantic.expression(), analyzed);
+        let shared = normalizer.owner_census();
+        assert_eq!(shared.cache_exact_terms, 1);
+        assert_eq!(shared.gadget_exact_terms, 1);
+        assert_eq!(shared.monomial_reachable_descriptor_slots, 1);
+        normalizer.clear_gadget_holds();
+        let cleared = normalizer.owner_census();
+        assert_eq!(cleared.gadget_exact_terms, 0);
+        assert_eq!(cleared.cache_exact_terms, 1);
+    }
+
+    #[test]
+    fn monomial_gc_preserves_cache_gadget_and_canonical_rhs_owners() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = source(&mut expressions);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let cache_id = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let gadget_id =
+            monomials.intern(&expressions, &programs, &[], &[semantic, semantic]).unwrap();
+        let canonical_id = monomials
+            .intern(&expressions, &programs, &[], &[semantic, semantic, semantic])
+            .unwrap();
+        let runtime_id = monomials
+            .intern(&expressions, &programs, &[], &[semantic, semantic, semantic, semantic])
+            .unwrap();
+        let closed_id = monomials
+            .intern(
+                &expressions,
+                &programs,
+                &[],
+                &[semantic, semantic, semantic, semantic, semantic],
+            )
+            .unwrap();
+        let suspended_id = monomials
+            .intern(
+                &expressions,
+                &programs,
+                &[],
+                &[semantic, semantic, semantic, semantic, semantic, semantic],
+            )
+            .unwrap();
+        let unowned_id = monomials
+            .intern(
+                &expressions,
+                &programs,
+                &[],
+                &[semantic, semantic, semantic, semantic, semantic, semantic, semantic],
+            )
+            .unwrap();
+        let nf = |id| {
+            Arc::new(PolynomialNF {
+                exact_terms: BTreeMap::from([(id, BigInt::from(1))]),
+                bounded_summary: BoundedSummary::missing(),
+            })
+        };
+        let mut canonical = NormalizationCache::new();
+        let rhs = canonical.intern_arc(nf(canonical_id)).unwrap();
+        let family = programs
+            .generated_family(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: Some(TrustedIndexRange {
+                            minimum: 0,
+                            maximum_exclusive: 1,
+                        }),
+                    }]),
+                    output: ResolvedValueType::Matrix(matrix_type()),
+                },
+                root,
+            )
+            .unwrap();
+        let dispatch = UniversalDispatchKey {
+            preimage_family: family,
+            preimage_source: SamplerSourceContract { expression: root },
+            matrix_type: matrix_type(),
+            trapdoor_source: TrapdoorSourceContract { expression: root },
+        };
+        let mut relations = RelationRegistry::new();
+        relations
+            .register_closed(
+                CanonicalLhsKey { layout: None, monomial: closed_id },
+                rhs,
+                &closed_relation_authority(&matrix_type(), root, root),
+            )
+            .unwrap();
+        let generation = relations.freeze();
+        canonical.runtime_insert(
+            RuntimeSpecializationKey { dispatch, index: semantic, generation },
+            BTreeMap::from([(
+                CanonicalLhsKey { layout: None, monomial: runtime_id },
+                BTreeSet::from([rhs]),
+            )]),
+        );
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&relations, &mut canonical);
+        normalizer.protected_monomial_prefix = 0;
+        normalizer.monomial_gc_allocation_threshold_bytes = 1;
+        normalizer.normalization_depth = 1;
+        normalizer.insert_value_cache(
+            semantic.expression(),
+            Arc::new(AnalyzedValue {
+                semantic,
+                exact_nf: Some(nf(cache_id)),
+                coefficient_bound: NumericContract::Missing,
+            }),
+        );
+        normalizer.insert_gadget_hold(semantic.expression(), nf(gadget_id));
+        normalizer.suspended_owner_roots.push(suspended_id);
+        normalizer.sweep_monomials_at_node_commit().unwrap();
+        assert_eq!(normalizer.gc_counters.last_protected_prefix.descriptor_slots, 0);
+        assert_eq!(normalizer.gc_counters.last_value_cache.descriptor_slots, 1);
+        assert_eq!(normalizer.gc_counters.last_gadget.descriptor_slots, 1);
+        assert_eq!(normalizer.gc_counters.last_canonical_runtime.descriptor_slots, 2);
+        assert_eq!(normalizer.gc_counters.last_closed.descriptor_slots, 1);
+        assert_eq!(normalizer.gc_counters.last_suspended.descriptor_slots, 1);
+        assert_eq!(normalizer.gc_counters.last_occupied_slots, 6);
+        assert_eq!(normalizer.gc_counters.last_reclaimed_slots, 1);
+        assert_eq!(normalizer.gc_counters.value_cache_top8_len, 0);
+        assert!(normalizer.monomials.descriptor(cache_id).is_ok());
+        assert!(normalizer.monomials.descriptor(gadget_id).is_ok());
+        assert!(normalizer.monomials.descriptor(canonical_id).is_ok());
+        assert!(normalizer.monomials.descriptor(runtime_id).is_ok());
+        assert!(normalizer.monomials.descriptor(closed_id).is_ok());
+        assert!(normalizer.monomials.descriptor(suspended_id).is_ok());
+        assert!(matches!(
+            normalizer.monomials.descriptor(unowned_id),
+            Err(MonomialError::CollectedMonomialId { .. })
+        ));
+        assert_eq!(normalizer.monomials.occupied_len(), 6);
+    }
+
+    #[test]
+    fn normalization_operator_category_names_every_matrix_operation() {
+        let output = matrix_type();
+        let layout = MatrixLayout::row_major(output.rows, output.columns);
+        let cases = [
+            (ValueOperator::Matrix(MatrixOperation::Add), "add"),
+            (ValueOperator::Matrix(MatrixOperation::Subtract), "subtract"),
+            (ValueOperator::Matrix(MatrixOperation::Multiply), "multiply"),
+            (ValueOperator::Matrix(MatrixOperation::Negate), "negate"),
+            (ValueOperator::Matrix(MatrixOperation::Scale), "scale"),
+            (ValueOperator::Matrix(MatrixOperation::Transpose), "transpose"),
+            (
+                ValueOperator::Matrix(MatrixOperation::Slice {
+                    row_start: 0,
+                    row_end_exclusive: output.rows,
+                    column_start: 0,
+                    column_end_exclusive: output.columns,
+                    layout: layout.clone(),
+                }),
+                "slice",
+            ),
+            (
+                ValueOperator::Matrix(MatrixOperation::IndexedSlice {
+                    output: output.clone(),
+                    layout: layout.clone(),
+                }),
+                "indexed_slice",
+            ),
+            (
+                ValueOperator::Matrix(MatrixOperation::View {
+                    output: output.clone(),
+                    layout: layout.clone(),
+                }),
+                "view",
+            ),
+            (
+                ValueOperator::Matrix(MatrixOperation::Concat {
+                    axis: 0,
+                    output: output.clone(),
+                    layout: layout.clone(),
+                }),
+                "concat",
+            ),
+            (
+                ValueOperator::Matrix(MatrixOperation::Tensor {
+                    output: output.clone(),
+                    left_layout: layout.clone(),
+                    right_layout: layout.clone(),
+                    output_layout: layout.clone(),
+                }),
+                "tensor",
+            ),
+            (
+                ValueOperator::Matrix(MatrixOperation::CrtRecompose {
+                    plaintext_moduli: vec![BigUint::from(17_u8)].into_boxed_slice(),
+                    reconstruction_coefficients: vec![BigInt::from(1_u8)].into_boxed_slice(),
+                    output: output.clone(),
+                }),
+                "crt_recompose",
+            ),
+            (
+                ValueOperator::Matrix(MatrixOperation::ExtractCoefficient { row: 0, column: 0 }),
+                "extract_coefficient",
+            ),
+            (
+                ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
+                    output,
+                    coefficient_bits: 1,
+                }),
+                "lift_constant_polynomial",
+            ),
+        ];
+        for (operator, expected) in cases {
+            assert_eq!(normalization_operator_category(&operator), expected);
+        }
+    }
+
+    #[test]
+    fn monomial_gc_watchdog_ranks_value_cache_top8_stably_without_semantic_payloads() {
+        let mut expressions = ExprArena::new();
+        let cache_expressions = (0_u64..10)
+            .map(|event| source_with(&mut expressions, matrix_type(), 83_100 + event))
+            .collect::<Vec<_>>();
+        let mut programs = ProgramArena::new();
+        let (facts, mut monomials, semantic) =
+            setup(&mut expressions, &mut programs, cache_expressions[0]);
+        let ids = (1..=9)
+            .map(|count| {
+                monomials.intern(&expressions, &programs, &[], &vec![semantic; count]).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let term_counts = [1_usize, 9, 3, 8, 8, 5, 4, 2, 7, 6];
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        normalizer.monomial_gc_allocation_threshold_bytes = 1;
+        normalizer.normalization_depth = 1;
+        normalizer.watchdog = DiagnosticWatchdog::start(1, Duration::from_secs(60));
+        for (index, (&expression, &term_count)) in
+            cache_expressions.iter().zip(term_counts.iter()).enumerate()
+        {
+            let exact_terms =
+                ids[..term_count].iter().copied().map(|id| (id, BigInt::from(1))).collect();
+            normalizer.insert_value_cache(
+                expression,
+                Arc::new(AnalyzedValue {
+                    semantic,
+                    exact_nf: Some(Arc::new(PolynomialNF {
+                        exact_terms,
+                        bounded_summary: BoundedSummary::missing(),
+                    })),
+                    coefficient_bound: NumericContract::Missing,
+                }),
+            );
+            normalizer.remaining_uses.insert(expression, index + 1);
+        }
+
+        normalizer.sweep_monomials_at_node_commit().unwrap();
+        let gc = normalizer.gc_counters;
+        assert_eq!(gc.value_cache_entries, 10);
+        assert_eq!(gc.value_cache_exact_term_refs, 53);
+        assert_eq!(gc.value_cache_top8_len, 8);
+        assert_eq!(gc.value_cache_top8_exact_term_refs, 50);
+        let ranked = &gc.value_cache_top8;
+        assert_eq!(ranked.map(|entry| entry.term_count), [9, 8, 8, 7, 6, 5, 4, 3]);
+        assert!(ranked[1].expression_slot < ranked[2].expression_slot);
+        for entry in ranked {
+            assert_eq!(entry.operator_category, "sample");
+            let position = cache_expressions
+                .iter()
+                .position(|expression| u64::from(expression.slot()) == entry.expression_slot)
+                .unwrap();
+            assert_eq!(entry.remaining_uses, u64::try_from(position + 1).unwrap());
+        }
+        let progress = *normalizer
+            .watchdog
+            .as_ref()
+            .unwrap()
+            .shared
+            .progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(progress.gc, gc);
+        normalizer.watchdog.as_mut().unwrap().finish(false);
+    }
+
+    #[test]
+    fn value_cache_top8_reports_selected_producer_input_nf_sizes() {
+        let mut expressions = ExprArena::new();
+        let left = source_with(&mut expressions, matrix_type(), 83_200);
+        let right = source_with(&mut expressions, matrix_type(), 83_201);
+        let sum =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        let mut programs = ProgramArena::new();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, sum);
+        let ids = (1..=9)
+            .map(|count| {
+                monomials.intern(&expressions, &programs, &[], &vec![semantic; count]).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        for (expression, term_count) in [(left, 2_usize), (right, 3), (sum, 9)] {
+            normalizer.insert_value_cache(
+                expression,
+                Arc::new(AnalyzedValue {
+                    semantic,
+                    exact_nf: Some(Arc::new(PolynomialNF {
+                        exact_terms: ids[..term_count]
+                            .iter()
+                            .copied()
+                            .map(|id| (id, BigInt::from(1_u8)))
+                            .collect(),
+                        bounded_summary: BoundedSummary::missing(),
+                    })),
+                    coefficient_bound: NumericContract::Missing,
+                }),
+            );
+        }
+
+        let top8 = normalizer.diagnostic_value_cache_top8();
+        assert_eq!(top8.len, 3);
+        let producer = top8.top[0];
+        assert_eq!(producer.expression_slot, u64::from(sum.slot()));
+        assert_eq!(producer.operator_category, "add");
+        assert_eq!(producer.producer_input_count, 2);
+        assert_eq!(producer.cached_input_exact_term_refs_sum, 5);
+        assert_eq!(producer.cached_input_exact_term_refs_max, 3);
+        for source in &top8.top[1..3] {
+            assert_eq!(source.producer_input_count, 0);
+            assert_eq!(source.cached_input_exact_term_refs_sum, 0);
+            assert_eq!(source.cached_input_exact_term_refs_max, 0);
+        }
+    }
+
+    #[test]
+    fn monomial_gc_projects_global_relation_roots_to_the_local_arena() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root_a = source_with(&mut expressions, matrix_type(), 83_001);
+        let (_, mut arena_a, semantic_a) = setup(&mut expressions, &mut programs, root_a);
+        let canonical_a =
+            arena_a.intern(&expressions, &programs, &[], &[semantic_a, semantic_a]).unwrap();
+        let runtime_a = arena_a
+            .intern(&expressions, &programs, &[], &[semantic_a, semantic_a, semantic_a])
+            .unwrap();
+        let closed_a = arena_a
+            .intern(&expressions, &programs, &[], &[semantic_a, semantic_a, semantic_a, semantic_a])
+            .unwrap();
+        let rhs_nf = Arc::new(PolynomialNF {
+            exact_terms: BTreeMap::from([(canonical_a, BigInt::from(1))]),
+            bounded_summary: BoundedSummary::missing(),
+        });
+        let mut cache = NormalizationCache::new();
+        let rhs = cache.intern_arc(rhs_nf).unwrap();
+        let family_a = programs
+            .generated_family(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: Some(TrustedIndexRange {
+                            minimum: 0,
+                            maximum_exclusive: 1,
+                        }),
+                    }]),
+                    output: ResolvedValueType::Matrix(matrix_type()),
+                },
+                root_a,
+            )
+            .unwrap();
+        let dispatch = UniversalDispatchKey {
+            preimage_family: family_a,
+            preimage_source: SamplerSourceContract { expression: root_a },
+            matrix_type: matrix_type(),
+            trapdoor_source: TrapdoorSourceContract { expression: root_a },
+        };
+        let mut relations = RelationRegistry::new();
+        relations
+            .register_closed(
+                CanonicalLhsKey { layout: None, monomial: closed_a },
+                rhs,
+                &closed_relation_authority(&matrix_type(), root_a, root_a),
+            )
+            .unwrap();
+        let generation = relations.freeze();
+        cache.runtime_insert(
+            RuntimeSpecializationKey { dispatch, index: semantic_a, generation },
+            BTreeMap::from([(
+                CanonicalLhsKey { layout: None, monomial: runtime_a },
+                BTreeSet::from([rhs]),
+            )]),
+        );
+
+        let root_b = source_with(&mut expressions, matrix_type(), 83_002);
+        let (facts_b, mut arena_b, semantic_b) = setup(&mut expressions, &mut programs, root_b);
+        let local_live = arena_b.intern(&expressions, &programs, &[], &[semantic_b]).unwrap();
+        let local_dead =
+            arena_b.intern(&expressions, &programs, &[], &[semantic_b, semantic_b]).unwrap();
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts_b, &mut arena_b)
+            .unwrap()
+            .with_relations(&relations, &mut cache);
+        normalizer.protected_monomial_prefix = 0;
+        normalizer.monomial_gc_allocation_threshold_bytes = 1;
+        normalizer.normalization_depth = 1;
+        normalizer.insert_value_cache(
+            semantic_b.expression(),
+            Arc::new(AnalyzedValue {
+                semantic: semantic_b,
+                exact_nf: Some(Arc::new(PolynomialNF {
+                    exact_terms: BTreeMap::from([(local_live, BigInt::from(1))]),
+                    bounded_summary: BoundedSummary::missing(),
+                })),
+                coefficient_bound: NumericContract::Missing,
+            }),
+        );
+        normalizer.sweep_monomials_at_node_commit().unwrap();
+        assert!(normalizer.monomials.descriptor(local_live).is_ok());
+        assert!(matches!(
+            normalizer.monomials.descriptor(local_dead),
+            Err(MonomialError::CollectedMonomialId { .. })
+        ));
+        assert!(arena_a.descriptor(canonical_a).is_ok());
+        assert!(arena_a.descriptor(runtime_a).is_ok());
+        assert!(arena_a.descriptor(closed_a).is_ok());
+    }
+
+    #[test]
+    fn monomial_gc_rejects_foreign_local_cache_root_before_mutation() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root_a = source_with(&mut expressions, matrix_type(), 83_011);
+        let (_, mut arena_a, semantic_a) = setup(&mut expressions, &mut programs, root_a);
+        let foreign = arena_a.intern(&expressions, &programs, &[], &[semantic_a]).unwrap();
+
+        let root_b = source_with(&mut expressions, matrix_type(), 83_012);
+        let (facts_b, mut arena_b, semantic_b) = setup(&mut expressions, &mut programs, root_b);
+        let local_live = arena_b.intern(&expressions, &programs, &[], &[semantic_b]).unwrap();
+        let local_dead =
+            arena_b.intern(&expressions, &programs, &[], &[semantic_b, semantic_b]).unwrap();
+        let occupied_before = arena_b.occupied_len();
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts_b, &mut arena_b).unwrap();
+        normalizer.protected_monomial_prefix = 0;
+        normalizer.monomial_gc_allocation_threshold_bytes = 1;
+        normalizer.normalization_depth = 1;
+        normalizer.insert_value_cache(
+            semantic_b.expression(),
+            Arc::new(AnalyzedValue {
+                semantic: semantic_b,
+                exact_nf: Some(Arc::new(PolynomialNF {
+                    exact_terms: BTreeMap::from([(foreign, BigInt::from(1))]),
+                    bounded_summary: BoundedSummary::missing(),
+                })),
+                coefficient_bound: NumericContract::Missing,
+            }),
+        );
+        assert!(matches!(
+            normalizer.sweep_monomials_at_node_commit(),
+            Err(NormalizeError::Monomial(MonomialError::InvalidMonomialId { .. }))
+        ));
+        assert_eq!(normalizer.gc_counters, DiagnosticGcCounters::default());
+        assert_eq!(normalizer.monomials.occupied_len(), occupied_before);
+        assert!(normalizer.monomials.descriptor(local_live).is_ok());
+        assert!(normalizer.monomials.descriptor(local_dead).is_ok());
+    }
+
+    #[test]
+    fn monomial_gc_rejects_tombstoned_local_cache_root_without_telemetry_update() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = source_with(&mut expressions, matrix_type(), 83_013);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let live = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let tombstone =
+            monomials.intern(&expressions, &programs, &[], &[semantic, semantic]).unwrap();
+        monomials.sweep(0, [live]).unwrap();
+        let later = monomials
+            .intern(&expressions, &programs, &[], &[semantic, semantic, semantic])
+            .unwrap();
+        let occupied_before = monomials.occupied_len();
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        normalizer.protected_monomial_prefix = 0;
+        normalizer.monomial_gc_allocation_threshold_bytes = 1;
+        normalizer.normalization_depth = 1;
+        normalizer.insert_value_cache(
+            semantic.expression(),
+            Arc::new(AnalyzedValue {
+                semantic,
+                exact_nf: Some(Arc::new(PolynomialNF {
+                    exact_terms: BTreeMap::from([(tombstone, BigInt::from(1))]),
+                    bounded_summary: BoundedSummary::missing(),
+                })),
+                coefficient_bound: NumericContract::Missing,
+            }),
+        );
+        assert!(matches!(
+            normalizer.sweep_monomials_at_node_commit(),
+            Err(NormalizeError::Monomial(MonomialError::CollectedMonomialId { .. }))
+        ));
+        assert_eq!(normalizer.gc_counters, DiagnosticGcCounters::default());
+        assert_eq!(normalizer.monomials.occupied_len(), occupied_before);
+        assert!(normalizer.monomials.descriptor(live).is_ok());
+        assert!(normalizer.monomials.descriptor(later).is_ok());
+    }
+
+    #[test]
+    fn monomial_gc_threshold_and_depth_gates_are_deterministic() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = source_with(&mut expressions, matrix_type(), 83_003);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let live = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let dead = monomials.intern(&expressions, &programs, &[], &[semantic, semantic]).unwrap();
+        let allocated = monomials.allocated_payload_since_sweep();
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        normalizer.protected_monomial_prefix = 0;
+        normalizer.insert_value_cache(
+            semantic.expression(),
+            Arc::new(AnalyzedValue {
+                semantic,
+                exact_nf: Some(Arc::new(PolynomialNF {
+                    exact_terms: BTreeMap::from([(live, BigInt::from(1))]),
+                    bounded_summary: BoundedSummary::missing(),
+                })),
+                coefficient_bound: NumericContract::Missing,
+            }),
+        );
+        normalizer.normalization_depth = 1;
+        normalizer.monomial_gc_allocation_threshold_bytes = allocated.saturating_add(1);
+        normalizer.sweep_monomials_at_node_commit().unwrap();
+        assert!(normalizer.monomials.descriptor(dead).is_ok(), "below threshold is a no-op");
+        normalizer.monomial_gc_allocation_threshold_bytes = 1;
+        normalizer.normalization_depth = 2;
+        normalizer.sweep_monomials_at_node_commit().unwrap();
+        assert!(normalizer.monomials.descriptor(dead).is_ok(), "nested depth is a no-op");
+        normalizer.normalization_depth = 1;
+        normalizer.sweep_monomials_at_node_commit().unwrap();
+        assert!(normalizer.monomials.descriptor(live).is_ok());
+        assert!(matches!(
+            normalizer.monomials.descriptor(dead),
+            Err(MonomialError::CollectedMonomialId { .. })
+        ));
+    }
+
+    #[test]
+    fn owner_census_restores_outer_live_counts_and_retains_nested_peaks() {
+        let saved = NormalizerOwnerCounters {
+            cache_exact_terms: 3,
+            cache_exact_terms_peak: 5,
+            cache_largest_nf_terms_seen: 4,
+            gadget_exact_terms: 2,
+            gadget_exact_terms_peak: 2,
+            gadget_largest_nf_terms_seen: 2,
+        };
+        let nested = NormalizerOwnerCounters {
+            cache_exact_terms: 7,
+            cache_exact_terms_peak: 11,
+            cache_largest_nf_terms_seen: 9,
+            gadget_exact_terms: 6,
+            gadget_exact_terms_peak: 8,
+            gadget_largest_nf_terms_seen: 7,
+        };
+        let restored = Normalizer::restored_owner_counters(saved, nested);
+        assert_eq!(restored.cache_exact_terms, 3);
+        assert_eq!(restored.cache_exact_terms_peak, 11);
+        assert_eq!(restored.cache_largest_nf_terms_seen, 9);
+        assert_eq!(restored.gadget_exact_terms, 2);
+        assert_eq!(restored.gadget_exact_terms_peak, 8);
+        assert_eq!(restored.gadget_largest_nf_terms_seen, 7);
+    }
+
+    #[test]
+    fn owner_census_marks_rolled_back_canonical_rhs_as_historical_unreachable() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = source_with(&mut expressions, matrix_type(), 7_081);
+        let (_, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let monomial = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let rhs = PolynomialNF {
+            exact_terms: BTreeMap::from([(monomial, BigInt::from(1))]),
+            bounded_summary: BoundedSummary::missing(),
+        };
+        let mut cache = NormalizationCache::new();
+        let checkpoint = cache.checkpoint();
+        cache.intern(rhs).unwrap();
+        let reachable = monomials.owner_census(cache.monomial_roots());
+        assert_eq!(reachable.reachable_descriptor_slots, 1);
+        assert_eq!(reachable.unreachable_descriptor_slots, 0);
+
+        cache.rollback(checkpoint);
+        let rolled_back = monomials.owner_census(cache.monomial_roots());
+        assert_eq!(rolled_back.retained_descriptor_slots, 1);
+        assert_eq!(rolled_back.reachable_descriptor_slots, 0);
+        assert_eq!(rolled_back.unreachable_descriptor_slots, 1);
+        assert_eq!(cache.owner_census().canonical_rhs_exact_terms_peak, 1);
+    }
+
+    #[test]
+    fn suspended_owner_roots_keep_outer_nested_and_shared_ids_in_one_unique_union() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = source_with(&mut expressions, matrix_type(), 7_082);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let outer = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let shared = monomials.combine_interned(semantic.program(), outer, outer).unwrap();
+        let nested = monomials.combine_interned(semantic.program(), shared, outer).unwrap();
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let checkpoint = normalizer.suspended_owner_roots.len();
+        normalizer.suspended_owner_roots.extend([outer, nested, shared, shared]);
+        let nested_census = normalizer.owner_census_with_active([outer, shared]);
+        assert_eq!(nested_census.monomial_reachable_descriptor_slots, 3);
+
+        normalizer.suspended_owner_roots.truncate(checkpoint);
+        let restored = normalizer.owner_census_with_active([outer, shared]);
+        assert_eq!(restored.monomial_reachable_descriptor_slots, 2);
+        assert_eq!(restored.monomial_unreachable_descriptor_slots, 1);
+        assert!(normalizer.suspended_owner_roots.is_empty());
+    }
+
+    #[test]
     fn one_scope_proof_serves_all_atoms_and_scoped_derivations_in_one_root() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -6422,8 +8274,12 @@ mod tests {
         expressions.reset_scope_proof_build_count();
         let specialized = {
             let mut normalizer =
-                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
-            normalizer.normalize_specialized_root(transformed.expression()).unwrap()
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                    .unwrap()
+                    .with_watchdog_override(true, Duration::from_secs(60));
+            let value = normalizer.normalize_specialized_root(transformed.expression()).unwrap();
+            assert!(normalizer.suspended_owner_roots.is_empty());
+            value
         };
         assert_eq!(expressions.scope_proof_build_count(), 1);
         assert_eq!(specialized.semantic, public.semantic);
@@ -6454,9 +8310,9 @@ mod tests {
         let focused_slot = u64::from(atom.slot());
         assert!(focused_slot > 0);
         let expected_tail = [
-            (u64::from(lifted.slot()), "matrix_other", 3),
+            (u64::from(lifted.slot()), "lift_constant_polynomial", 3),
             (focused_slot, "sample", 2),
-            (u64::from(root.slot()), "matrix_other", 1),
+            (u64::from(root.slot()), "add", 1),
         ];
         let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
 
@@ -6582,12 +8438,31 @@ mod tests {
     }
 
     #[test]
+    fn watchdog_interval_parser_defaults_rejects_zero_and_clamps_large_values() {
+        assert_eq!(
+            normalization_watchdog_interval_from_value(None),
+            NORMALIZATION_WATCHDOG_INTERVAL
+        );
+        for invalid in [Some(""), Some("0"), Some("-1"), Some("not-a-number")] {
+            assert_eq!(
+                normalization_watchdog_interval_from_value(invalid),
+                NORMALIZATION_WATCHDOG_INTERVAL
+            );
+        }
+        assert_eq!(normalization_watchdog_interval_from_value(Some("45")), Duration::from_secs(45));
+        assert_eq!(
+            normalization_watchdog_interval_from_value(Some("18446744073709551615")),
+            Duration::from_secs(NORMALIZATION_WATCHDOG_MAX_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
     fn watchdog_caps_lines_and_joins_after_progress_and_barrier_stall() {
         let mut watchdog = DiagnosticWatchdog::start(7, Duration::from_millis(1)).unwrap();
         watchdog.update(|progress| {
             progress.phase = DiagnosticPhase::NodeWalk;
             progress.expression_slot = 41;
-            progress.operator = "matrix_multiply";
+            progress.operator = "multiply";
             progress.nodes_done = 5;
             progress.nodes_total = 10;
         });
@@ -6601,7 +8476,7 @@ mod tests {
         helper.join().unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         while watchdog.shared.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len() <
-            31 &&
+            19 &&
             Instant::now() < deadline
         {
             thread::yield_now();
@@ -6609,10 +8484,10 @@ mod tests {
         let shared = Arc::clone(&watchdog.shared);
         watchdog.finish(false);
         let events = shared.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-        assert_eq!(events.len(), 32);
+        assert_eq!(events.len(), 20);
         assert_eq!(events.first(), Some(&"watchdog_initial"));
         assert_eq!(events.last(), Some(&"watchdog_terminal"));
-        assert_eq!(events.iter().filter(|event| **event == "watchdog_snapshot").count(), 30);
+        assert_eq!(events.iter().filter(|event| **event == "watchdog_snapshot").count(), 18);
         let snapshots =
             shared.snapshots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         assert!(snapshots.iter().any(|snapshot| snapshot.phase == DiagnosticPhase::NodeWalk));
@@ -6626,11 +8501,43 @@ mod tests {
                     snapshot.nodes_done,
                     snapshot.nodes_total
                 ),
-                (41, "matrix_multiply", 5, 10)
+                (41, "multiply", 5, 10)
             );
         }
         drop(watchdog);
         assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    #[test]
+    fn watchdog_quick_finish_never_enters_the_long_startup_timeout() {
+        for error in [false, true] {
+            let started = Instant::now();
+            let mut watchdog = DiagnosticWatchdog::start(8, Duration::from_secs(60)).unwrap();
+            watchdog.finish(error);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "quick finish must not wait for the reporter interval"
+            );
+            let events = watchdog
+                .shared
+                .events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            assert_eq!(events, ["watchdog_initial", "watchdog_terminal"]);
+            assert!(events.len() <= 32);
+            let snapshots = watchdog
+                .shared
+                .snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            assert_eq!(snapshots.len(), 2);
+            assert_eq!(
+                snapshots.last().map(|snapshot| snapshot.phase),
+                Some(if error { DiagnosticPhase::Error } else { DiagnosticPhase::CallReturn })
+            );
+        }
     }
 
     #[test]
@@ -6710,8 +8617,20 @@ mod tests {
             assert_eq!(normalizer.last_watchdog_events.last(), Some(&"watchdog_terminal"));
             assert!(normalizer.last_watchdog_events.len() <= 32);
             assert!(normalizer.last_watchdog_events.iter().all(|event| {
-                matches!(*event, "watchdog_initial" | "watchdog_snapshot" | "watchdog_terminal")
+                matches!(
+                    *event,
+                    "watchdog_initial" |
+                        "watchdog_snapshot" |
+                        "watchdog_owner_sample" |
+                        "watchdog_terminal"
+                )
             }));
+            let terminal = normalizer.last_watchdog_snapshots.last().copied().unwrap();
+            assert_eq!(terminal.owners.monomial_retained_descriptor_slots, 1);
+            assert_eq!(terminal.owners.monomial_reachable_descriptor_slots, 1);
+            assert_eq!(terminal.owners.cache_entries, 0);
+            assert_eq!(terminal.owners.cache_exact_terms, 0);
+            assert_eq!(terminal.owners.cache_exact_terms_peak, 1);
             (value, normalizer.counters(), normalizer.trace.lines_emitted)
         };
         assert!(off_trace_lines > 0);
@@ -6720,6 +8639,20 @@ mod tests {
         assert_eq!(off.coefficient_bound, on.coefficient_bound);
         assert_eq!(off.exact_nf, on.exact_nf);
         assert_eq!(off_counters, on_counters);
+    }
+
+    #[test]
+    fn ordinary_normalize_without_watchdog_or_trace_runs_zero_owner_censuses() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = source_with(&mut expressions, matrix_type(), 7_083);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_watchdog_override(false, Duration::from_millis(1));
+        normalizer.normalize(semantic).unwrap();
+        assert_eq!(normalizer.owner_census_samples, 0);
+        assert_eq!(normalizer.owner_census_seq, 0);
     }
 
     #[test]
@@ -6732,8 +8665,8 @@ mod tests {
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
         normalizer.watchdog = DiagnosticWatchdog::start(11, Duration::from_secs(60));
         for _ in 0..1_000_000 {
-            normalizer.watchdog_record_product_processed();
-            normalizer.watchdog_record_relation_processed();
+            normalizer.watchdog_record_product_processed(0, 0, std::iter::empty());
+            normalizer.watchdog_record_relation_processed(std::iter::empty());
         }
         assert_eq!(normalizer.watchdog_product_processed, 1_000_000);
         assert_eq!(normalizer.watchdog_relation_processed, 1_000_000);
@@ -6750,6 +8683,237 @@ mod tests {
         assert!(progress.relation_processed >= 524_288);
         normalizer.watchdog.as_mut().unwrap().finish(false);
         normalizer.watchdog = None;
+    }
+
+    #[test]
+    fn watchdog_cartesian_generation_publishes_before_drain_with_exact_active_owner_union() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = source_with(&mut expressions, matrix_type(), 7_080);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let monomial = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        normalizer.watchdog = DiagnosticWatchdog::start(12, Duration::from_secs(60));
+
+        for queue in 1_u64..=1_024 {
+            // This directly models the eager Cartesian producer before the drain loop starts.
+            normalizer.watchdog_record_product_generated(true, queue, [monomial, monomial]);
+        }
+        let progress = *normalizer
+            .watchdog
+            .as_ref()
+            .unwrap()
+            .shared
+            .progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(progress.phase, DiagnosticPhase::ProductGeneration);
+        assert_eq!(progress.product_generation_current, 1_024);
+        assert_eq!(progress.product_enqueued_current, 1_024);
+        assert_eq!(progress.product_queue_current, 1_024);
+        assert_eq!(progress.product_output_current, 0);
+        assert_eq!(progress.owner_census_seq, 0);
+        // Small-product counter heartbeats do not run the O(retained) census. A designated
+        // generation-end sample carries the active queue union and its coherence metadata.
+        normalizer
+            .watchdog_update(|progress| progress.phase = DiagnosticPhase::ProductGenerationEnd);
+        normalizer.sample_owner_census(
+            OwnerCensusReason::LargeProductGenerationEnd,
+            [monomial, monomial],
+        );
+        let progress = *normalizer
+            .watchdog
+            .as_ref()
+            .unwrap()
+            .shared
+            .progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(progress.owners.monomial_retained_descriptor_slots, 1);
+        assert_eq!(progress.owners.monomial_reachable_descriptor_slots, 1);
+        assert_eq!(progress.owners.monomial_unreachable_descriptor_slots, 0);
+        assert_eq!(progress.owner_census_seq, 1);
+        assert_eq!(progress.owner_census_phase, DiagnosticPhase::ProductGenerationEnd);
+        assert_eq!(
+            progress.owner_census_reason,
+            Some(OwnerCensusReason::LargeProductGenerationEnd)
+        );
+        assert_eq!(normalizer.owner_census_samples, 1);
+        normalizer.watchdog_update(|progress| {
+            progress.phase = DiagnosticPhase::ProductEnd;
+            progress.product_queue_current = 0;
+            progress.product_output_current = 7;
+        });
+        normalizer.sample_owner_census(OwnerCensusReason::LargeProductEnd, [monomial]);
+        normalizer.sample_owner_census(OwnerCensusReason::OuterTerminal, [monomial]);
+        let terminal = *normalizer
+            .watchdog
+            .as_ref()
+            .unwrap()
+            .shared
+            .progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(terminal.owner_census_seq, 3);
+        assert_eq!(terminal.owner_census_reason, Some(OwnerCensusReason::OuterTerminal));
+        assert_eq!(normalizer.owner_census_samples, 3);
+        let shared = Arc::clone(&normalizer.watchdog.as_ref().unwrap().shared);
+        normalizer.watchdog.as_mut().unwrap().finish(false);
+        normalizer.watchdog = None;
+        let owner_samples =
+            shared.owner_samples.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        assert_eq!(owner_samples.len(), 3);
+        assert_eq!(
+            (
+                owner_samples[0].seq,
+                owner_samples[0].product_queue_current,
+                owner_samples[0].product_output_current
+            ),
+            (1, 1_024, 0)
+        );
+        assert_eq!(
+            (
+                owner_samples[1].seq,
+                owner_samples[1].product_queue_current,
+                owner_samples[1].product_output_current
+            ),
+            (2, 0, 7)
+        );
+        assert_eq!(owner_samples[0].reason, OwnerCensusReason::LargeProductGenerationEnd);
+        assert_eq!(owner_samples[1].reason, OwnerCensusReason::LargeProductEnd);
+        assert_eq!(owner_samples[2].reason, OwnerCensusReason::OuterTerminal);
+        assert_eq!(owner_samples[0].phase, DiagnosticPhase::ProductGenerationEnd);
+        assert_eq!(owner_samples[1].phase, DiagnosticPhase::ProductEnd);
+        assert_eq!(
+            (owner_samples[0].product_generated, owner_samples[0].product_enqueued),
+            (1_024, 1_024)
+        );
+        assert_eq!(owner_samples[0].owners.monomial_reachable_descriptor_slots, 1);
+        let events = shared.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let snapshots =
+            shared.snapshots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let emitted_owner_samples = events
+            .iter()
+            .zip(&snapshots)
+            .filter_map(|(event, snapshot)| (*event == "watchdog_owner_sample").then_some(snapshot))
+            .collect::<Vec<_>>();
+        assert_eq!(emitted_owner_samples.len(), 3);
+        assert_eq!(
+            (
+                emitted_owner_samples[0].owner_census_seq,
+                emitted_owner_samples[0].product_queue_current,
+                emitted_owner_samples[0].product_output_current
+            ),
+            (1, 1_024, 0)
+        );
+        assert_eq!(
+            (
+                emitted_owner_samples[1].owner_census_seq,
+                emitted_owner_samples[1].product_queue_current,
+                emitted_owner_samples[1].product_output_current
+            ),
+            (2, 0, 7)
+        );
+        // One publication per shared first/power-of-two boundary, not per generated pair.
+        assert!(normalizer.watchdog_hot_publish_count <= 11);
+    }
+
+    #[test]
+    fn owner_census_scheduler_preserves_late_strictly_larger_product_pair() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = source_with(&mut expressions, matrix_type(), 7_081);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let monomial = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        normalizer.watchdog = DiagnosticWatchdog::start(14, Duration::from_secs(60));
+        normalizer.next_retained_census_milestone = 1 << 20;
+
+        // Only the first of five equal early products consumes a pair. Equal planned sizes do not
+        // displace a later, strictly larger OOM-dominant product.
+        for product_call_id in 1_u64..=5 {
+            normalizer.watchdog_product_call_id = product_call_id;
+            if normalizer.admits_large_product_census_pair(100_000) {
+                normalizer.largest_sampled_product_planned = 100_000;
+                normalizer.watchdog_update(|progress| {
+                    progress.phase = DiagnosticPhase::ProductGenerationEnd;
+                    progress.product_generation_current = 100_000;
+                    progress.product_enqueued_current = 100_000;
+                    progress.product_queue_current = 100_000;
+                    progress.product_output_current = 0;
+                });
+                normalizer
+                    .sample_owner_census(OwnerCensusReason::LargeProductGenerationEnd, [monomial]);
+                normalizer.watchdog_update(|progress| {
+                    progress.phase = DiagnosticPhase::ProductEnd;
+                    progress.product_queue_current = 0;
+                    progress.product_output_current = 1;
+                });
+                normalizer.sample_owner_census(OwnerCensusReason::LargeProductEnd, [monomial]);
+                normalizer.large_product_pairs_sampled =
+                    normalizer.large_product_pairs_sampled.saturating_add(1);
+            }
+        }
+        assert_eq!(normalizer.large_product_pairs_sampled, 1);
+
+        // Model the authoritative retained-arena geometric crossings without allocating millions
+        // of descriptors in this scheduler fixture.
+        for retained in [1_u64 << 20, 1_u64 << 21, 1_u64 << 22] {
+            assert!(normalizer.admits_retained_arena_census(retained));
+            normalizer.watchdog_update(|progress| {
+                progress.phase = DiagnosticPhase::ProductGeneration;
+            });
+            normalizer.sample_owner_census(OwnerCensusReason::RetainedArenaMilestone, [monomial]);
+        }
+
+        normalizer.watchdog_product_call_id = 6;
+        assert!(normalizer.admits_large_product_census_pair(200_000));
+        normalizer.largest_sampled_product_planned = 200_000;
+        normalizer.watchdog_update(|progress| {
+            progress.phase = DiagnosticPhase::ProductGenerationEnd;
+            progress.product_generation_current = 200_000;
+            progress.product_enqueued_current = 200_000;
+            progress.product_queue_current = 200_000;
+            progress.product_output_current = 0;
+        });
+        normalizer.sample_owner_census(OwnerCensusReason::LargeProductGenerationEnd, [monomial]);
+        normalizer.watchdog_update(|progress| {
+            progress.phase = DiagnosticPhase::ProductEnd;
+            progress.product_queue_current = 0;
+            progress.product_output_current = 2;
+        });
+        normalizer.sample_owner_census(OwnerCensusReason::LargeProductEnd, [monomial]);
+        normalizer.large_product_pairs_sampled =
+            normalizer.large_product_pairs_sampled.saturating_add(1);
+        normalizer.sample_owner_census(OwnerCensusReason::OuterTerminal, [monomial]);
+
+        let shared = Arc::clone(&normalizer.watchdog.as_ref().unwrap().shared);
+        normalizer.watchdog.as_mut().unwrap().finish(false);
+        normalizer.watchdog = None;
+        let samples =
+            shared.owner_samples.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        assert_eq!(samples.len(), 8);
+        assert_eq!(samples.iter().filter(|sample| sample.product_call_id <= 5).count(), 5);
+        assert_eq!(samples[5].reason, OwnerCensusReason::LargeProductGenerationEnd);
+        assert_eq!(samples[5].product_call_id, 6);
+        assert_eq!(
+            (samples[5].product_queue_current, samples[5].product_output_current),
+            (200_000, 0)
+        );
+        assert_eq!(samples[6].reason, OwnerCensusReason::LargeProductEnd);
+        assert_eq!((samples[6].product_queue_current, samples[6].product_output_current), (0, 2));
+        assert_eq!(samples[7].reason, OwnerCensusReason::OuterTerminal);
+        assert_eq!(
+            samples.iter().map(|sample| sample.seq).collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<_>>()
+        );
+        let events = shared.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        assert_eq!(events.iter().filter(|event| **event == "watchdog_owner_sample").count(), 8);
+        assert_eq!(events.iter().filter(|event| **event == "watchdog_terminal").count(), 1);
+        assert!(events.len() <= 32);
+        assert!(normalizer.owner_census_samples <= 11);
     }
 
     #[test]
@@ -7025,6 +9189,7 @@ mod tests {
         normalizer.trace.activate(1, 1, normalizer.monomials.len());
         normalizer.trace.record_completed_invocation(2);
         assert!(normalizer.normalize_specialized_root(invalid_root).is_err());
+        assert!(normalizer.suspended_owner_roots.is_empty());
         // `preproof_end` is lexically after the fallible proof and cannot be replayed on error.
         assert_eq!(normalizer.trace.caller_history, ["next_root:preproof_start"]);
         assert!(!normalizer.trace.next_specialized_root_armed);

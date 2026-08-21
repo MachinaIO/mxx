@@ -368,11 +368,27 @@ pub struct NormalizationCache {
     rhs_interner: BTreeMap<u64, Vec<u32>>,
     runtime:
         BTreeMap<RuntimeSpecializationKey, BTreeMap<CanonicalLhsKey, BTreeSet<CanonicalRhsId>>>,
+    rhs_exact_terms: u64,
+    rhs_exact_terms_max: u64,
+    rhs_exact_terms_peak: u64,
+    runtime_lhs_keys: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NormalizationCacheOwnerCensus {
+    pub canonical_rhs_entries: u64,
+    pub canonical_rhs_exact_terms: u64,
+    pub canonical_rhs_exact_terms_peak: u64,
+    pub canonical_rhs_largest_nf_terms: u64,
+    pub runtime_entries: u64,
+    pub runtime_lhs_keys: u64,
 }
 
 pub(crate) struct NormalizationCheckpoint {
     rhs_len: usize,
     rhs_interner: BTreeMap<u64, Vec<u32>>,
+    rhs_exact_terms: u64,
+    rhs_exact_terms_max: u64,
 }
 
 impl Default for NormalizationCache {
@@ -382,12 +398,22 @@ impl Default for NormalizationCache {
 }
 
 impl NormalizationCache {
+    pub(crate) fn monomial_roots(&self) -> impl Iterator<Item = MonomialId> + '_ {
+        self.rhs
+            .iter()
+            .flat_map(|normal_form| normal_form.exact_terms.keys().copied())
+            .chain(self.runtime.values().flat_map(|entries| entries.keys().map(|lhs| lhs.monomial)))
+    }
     pub fn new() -> Self {
         Self {
             token: ArenaToken::fresh(),
             rhs: Vec::new(),
             rhs_interner: BTreeMap::new(),
             runtime: BTreeMap::new(),
+            rhs_exact_terms: 0,
+            rhs_exact_terms_max: 0,
+            rhs_exact_terms_peak: 0,
+            runtime_lhs_keys: 0,
         }
     }
     pub fn intern(&mut self, rhs: PolynomialNF) -> Result<CanonicalRhsId, RelationRegistryError> {
@@ -414,6 +440,10 @@ impl NormalizationCache {
         // Misses retain the caller's immutable allocation. Lookup remains expected O(1) by
         // content hash plus full equality within one collision bucket; pointer identity is only
         // a comparison fast path and never contributes to hashing, ordering, or canonical IDs.
+        let exact_terms = u64::try_from(rhs.exact_terms.len()).unwrap_or(u64::MAX);
+        self.rhs_exact_terms = self.rhs_exact_terms.saturating_add(exact_terms);
+        self.rhs_exact_terms_max = self.rhs_exact_terms_max.max(exact_terms);
+        self.rhs_exact_terms_peak = self.rhs_exact_terms_peak.max(self.rhs_exact_terms);
         self.rhs.push(rhs);
         self.rhs_interner.entry(hash).or_default().push(slot);
         Ok(CanonicalRhsId { arena: self.token, slot })
@@ -447,7 +477,13 @@ impl NormalizationCache {
         key: RuntimeSpecializationKey,
         value: BTreeMap<CanonicalLhsKey, BTreeSet<CanonicalRhsId>>,
     ) {
-        self.runtime.insert(key, value);
+        let new_lhs_keys = u64::try_from(value.len()).unwrap_or(u64::MAX);
+        if let Some(previous) = self.runtime.insert(key, value) {
+            self.runtime_lhs_keys = self
+                .runtime_lhs_keys
+                .saturating_sub(u64::try_from(previous.len()).unwrap_or(u64::MAX));
+        }
+        self.runtime_lhs_keys = self.runtime_lhs_keys.saturating_add(new_lhs_keys);
     }
     pub fn runtime_entry_count(&self) -> usize {
         self.runtime.len()
@@ -462,14 +498,32 @@ impl NormalizationCache {
         hasher.finish()
     }
     pub(crate) fn checkpoint(&self) -> NormalizationCheckpoint {
-        NormalizationCheckpoint { rhs_len: self.rhs.len(), rhs_interner: self.rhs_interner.clone() }
+        NormalizationCheckpoint {
+            rhs_len: self.rhs.len(),
+            rhs_interner: self.rhs_interner.clone(),
+            rhs_exact_terms: self.rhs_exact_terms,
+            rhs_exact_terms_max: self.rhs_exact_terms_max,
+        }
     }
     pub(crate) fn rollback(&mut self, checkpoint: NormalizationCheckpoint) {
         self.rhs.truncate(checkpoint.rhs_len);
         self.rhs_interner = checkpoint.rhs_interner;
+        self.rhs_exact_terms = checkpoint.rhs_exact_terms;
+        self.rhs_exact_terms_max = checkpoint.rhs_exact_terms_max;
     }
     pub(crate) fn clear_runtime(&mut self) {
         self.runtime.clear();
+        self.runtime_lhs_keys = 0;
+    }
+    pub(crate) fn owner_census(&self) -> NormalizationCacheOwnerCensus {
+        NormalizationCacheOwnerCensus {
+            canonical_rhs_entries: u64::try_from(self.rhs.len()).unwrap_or(u64::MAX),
+            canonical_rhs_exact_terms: self.rhs_exact_terms,
+            canonical_rhs_exact_terms_peak: self.rhs_exact_terms_peak,
+            canonical_rhs_largest_nf_terms: self.rhs_exact_terms_max,
+            runtime_entries: u64::try_from(self.runtime.len()).unwrap_or(u64::MAX),
+            runtime_lhs_keys: self.runtime_lhs_keys,
+        }
     }
 }
 
@@ -546,6 +600,9 @@ impl RelationRegistry {
     }
     pub fn is_frozen(&self) -> bool {
         self.frozen
+    }
+    pub(crate) fn closed_monomial_roots(&self) -> impl Iterator<Item = MonomialId> + '_ {
+        self.closed.keys().filter(move |_| self.frozen).map(|lhs| lhs.monomial)
     }
     pub fn register_closed(
         &mut self,
@@ -947,6 +1004,33 @@ mod tests {
     }
 
     #[test]
+    fn owner_census_tracks_canonical_rhs_and_rollback_without_changing_fingerprint() {
+        let mut cache = NormalizationCache::new();
+        let first = cache.intern(empty_nf()).unwrap();
+        let checkpoint = cache.checkpoint();
+        let fingerprint = cache.canonical_state_fingerprint();
+        let mut two_terms = empty_nf();
+        let token = ArenaToken::fresh();
+        two_terms.exact_terms.insert(MonomialId::new(token, 0), BigInt::from(1));
+        two_terms.exact_terms.insert(MonomialId::new(token, 1), BigInt::from(1));
+        cache.intern(two_terms).unwrap();
+        let grown = cache.owner_census();
+        assert_eq!(grown.canonical_rhs_entries, 2);
+        assert_eq!(grown.canonical_rhs_exact_terms, 2);
+        assert_eq!(grown.canonical_rhs_exact_terms_peak, 2);
+        assert_eq!(grown.canonical_rhs_largest_nf_terms, 2);
+
+        cache.rollback(checkpoint);
+        let restored = cache.owner_census();
+        assert_eq!(restored.canonical_rhs_entries, 1);
+        assert_eq!(restored.canonical_rhs_exact_terms, 0);
+        assert_eq!(restored.canonical_rhs_exact_terms_peak, 2);
+        assert_eq!(restored.canonical_rhs_largest_nf_terms, 0);
+        assert_eq!(cache.get(first), Ok(&empty_nf()));
+        assert_eq!(cache.canonical_state_fingerprint(), fingerprint);
+    }
+
+    #[test]
     fn owned_and_arc_interning_have_identical_structure_and_fingerprint() {
         let mut value = empty_nf();
         value.exact_terms.insert(MonomialId::new(ArenaToken::fresh(), 0), BigInt::from(3));
@@ -1115,11 +1199,13 @@ mod tests {
         let rhs = CanonicalRhsId { arena: ArenaToken::fresh(), slot: 0 };
         let mut populated = RelationRegistry::new();
         populated.register_closed(lhs.clone(), rhs, &authority(source, trapdoor)).unwrap();
+        assert!(populated.closed_monomial_roots().next().is_none());
         assert_eq!(populated.has_closed_relations(), Err(RelationRegistryError::NotFrozen));
         populated.freeze();
         assert_eq!(populated.has_closed_relations(), Ok(true));
+        assert_eq!(populated.closed_monomial_roots().collect::<Vec<_>>(), vec![lhs.monomial]);
         assert_eq!(
-            populated.register_closed(lhs, rhs, &authority(source, trapdoor)),
+            populated.register_closed(lhs.clone(), rhs, &authority(source, trapdoor)),
             Err(RelationRegistryError::Frozen)
         );
         assert_eq!(populated.has_closed_relations(), Ok(true));
@@ -1178,6 +1264,16 @@ mod tests {
                 })
                 .is_some()
         );
+        let rhs = cache.intern(empty_nf()).unwrap();
+        let lhs =
+            CanonicalLhsKey { layout: None, monomial: MonomialId::new(ArenaToken::fresh(), 0) };
+        cache.runtime_insert(
+            RuntimeSpecializationKey { dispatch: dispatch.clone(), index: first, generation },
+            BTreeMap::from([(lhs, BTreeSet::from([rhs]))]),
+        );
+        let census = cache.owner_census();
+        assert_eq!(census.runtime_entries, 1);
+        assert_eq!(census.runtime_lhs_keys, 1);
         assert!(
             cache
                 .runtime_get(&RuntimeSpecializationKey { dispatch, index: second, generation })

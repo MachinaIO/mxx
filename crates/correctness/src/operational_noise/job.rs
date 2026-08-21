@@ -499,7 +499,7 @@ impl MonomialStores {
     }
 
     pub fn term_count(&self) -> usize {
-        self.arenas.values().map(MonomialArena::len).sum()
+        self.arenas.values().map(MonomialArena::occupied_len).sum()
     }
 
     pub fn get(&self, scope: super::arena::ValueProgramId) -> Option<&MonomialArena> {

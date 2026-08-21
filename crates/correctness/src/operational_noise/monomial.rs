@@ -479,6 +479,17 @@ impl MonomialArena {
             .ok_or(MonomialError::CollectedMonomialId { slot: id.slot })
     }
 
+    pub(crate) fn descriptor_payload_lower_bound_bytes(
+        &self,
+        id: MonomialId,
+    ) -> Result<u64, MonomialError> {
+        let descriptor = self.descriptor(id)?;
+        Ok(descriptor_payload_lower_bound_bytes(
+            u64::try_from(descriptor.central_factors.len()).unwrap_or(u64::MAX),
+            u64::try_from(descriptor.ordered_factors.len()).unwrap_or(u64::MAX),
+        ))
+    }
+
     /// Collect unrooted descriptors without changing any surviving or future slot identity.
     /// Every supplied root is authoritative: foreign, out-of-range, or already-collected roots
     /// fail closed before the arena is mutated.

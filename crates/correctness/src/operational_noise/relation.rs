@@ -157,6 +157,48 @@ impl GadgetRecompositionRegistry {
                     rule.input_layout.as_ref() == input_layout
             })
     }
+
+    pub(crate) fn allows_gadget_half(
+        &self,
+        base: u64,
+        small: bool,
+        gadget_type: &ResolvedMatrixType,
+        gadget_layout: Option<&MatrixLayout>,
+    ) -> Result<bool, RelationRegistryError> {
+        if !self.frozen {
+            return Err(RelationRegistryError::NotFrozen);
+        }
+        Ok(self.rules.iter().any(|rule| {
+            rule.base == base &&
+                rule.small == small &&
+                &rule.gadget_type == gadget_type &&
+                rule.gadget_layout.as_ref() == gadget_layout
+        }))
+    }
+
+    pub(crate) fn allows_decomposition_half(
+        &self,
+        base: u64,
+        small: bool,
+        digit_count: u32,
+        decomposition_type: &ResolvedMatrixType,
+        input_type: &ResolvedMatrixType,
+        decomposition_layout: Option<&MatrixLayout>,
+        input_layout: Option<&MatrixLayout>,
+    ) -> Result<bool, RelationRegistryError> {
+        if !self.frozen {
+            return Err(RelationRegistryError::NotFrozen);
+        }
+        Ok(self.rules.iter().any(|rule| {
+            rule.base == base &&
+                rule.small == small &&
+                rule.digit_count == digit_count &&
+                &rule.decomposition_type == decomposition_type &&
+                &rule.input_type == input_type &&
+                rule.decomposition_layout.as_ref() == decomposition_layout &&
+                rule.input_layout.as_ref() == input_layout
+        }))
+    }
 }
 
 impl FactorOrderContract {
@@ -665,6 +707,13 @@ impl RelationRegistry {
             return Err(RelationRegistryError::NotFrozen);
         }
         Ok(!self.closed.is_empty())
+    }
+
+    pub(crate) fn has_universal_relations(&self) -> Result<bool, RelationRegistryError> {
+        if !self.frozen {
+            return Err(RelationRegistryError::NotFrozen);
+        }
+        Ok(!self.universal.is_empty())
     }
     pub fn resolve_closed(
         &self,

@@ -303,10 +303,138 @@ struct DiagnosticGcCounters {
     value_cache_top8_len: u8,
     value_cache_top8: [DiagnosticValueCacheTopEntry; 8],
     materialized_leaf_top8: DiagnosticMaterializedLeafTop8,
+    exact_plan_four_class: DiagnosticFourClassCensus,
+    four_class_total_ns: u64,
+    four_class_max_ns: u64,
+    four_class_last_ns: u64,
     sweep_total_ns: u64,
     sweep_max_ns: u64,
     sweep_last_ns: u64,
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiagnosticClassStats {
+    unique_monomials: u64,
+    term_refs: u64,
+    payload_lower_bound_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiagnosticFourClassTopEntry {
+    nf_ordinal: u64,
+    under_product: bool,
+    finite_no_relation_refs: u64,
+    finite_relation_frontier_refs: u64,
+    missing_refs: u64,
+    large_refs: u64,
+    finite_no_relation_payload: u64,
+    finite_relation_frontier_payload: u64,
+    missing_payload: u64,
+    large_payload: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiagnosticFourClassCensus {
+    finite_no_relation: DiagnosticClassStats,
+    finite_relation_frontier: DiagnosticClassStats,
+    missing: DiagnosticClassStats,
+    large: DiagnosticClassStats,
+    // Reason statistics overlap by design; the union fields prove exact frontier coverage.
+    current_exact_preimage: DiagnosticClassStats,
+    // Ambiguous universal dispatch is relation-relevant but is not proven current authority.
+    ambiguous_universal_dispatch: DiagnosticClassStats,
+    current_authorized_gadget_pair: DiagnosticClassStats,
+    closed_blanket: DiagnosticClassStats,
+    future_typed_gadget: DiagnosticClassStats,
+    future_universal_blanket: DiagnosticClassStats,
+    frontier_unique_union: u64,
+    frontier_reason_unique_union: u64,
+    frontier_reason_term_ref_union: u64,
+    frontier_reason_payload_union: u64,
+    top_len: u8,
+    top: [DiagnosticFourClassTopEntry; 8],
+}
+
+impl DiagnosticFourClassCensus {
+    fn class_mut(&mut self, class: DiagnosticTermClass) -> &mut DiagnosticClassStats {
+        match class {
+            DiagnosticTermClass::FiniteNoRelation => &mut self.finite_no_relation,
+            DiagnosticTermClass::FiniteRelationFrontier => &mut self.finite_relation_frontier,
+            DiagnosticTermClass::Missing => &mut self.missing,
+            DiagnosticTermClass::Large => &mut self.large,
+        }
+    }
+
+    fn reason_mut(&mut self, index: usize) -> Option<&mut DiagnosticClassStats> {
+        Some(match index {
+            0 => &mut self.current_exact_preimage,
+            1 => &mut self.ambiguous_universal_dispatch,
+            2 => &mut self.current_authorized_gadget_pair,
+            3 => &mut self.closed_blanket,
+            4 => &mut self.future_typed_gadget,
+            5 => &mut self.future_universal_blanket,
+            _ => return None,
+        })
+    }
+}
+
+impl DiagnosticFourClassTopEntry {
+    fn observe(&mut self, class: DiagnosticTermClass, payload: u64) {
+        let (refs, bytes) = match class {
+            DiagnosticTermClass::FiniteNoRelation => {
+                (&mut self.finite_no_relation_refs, &mut self.finite_no_relation_payload)
+            }
+            DiagnosticTermClass::FiniteRelationFrontier => (
+                &mut self.finite_relation_frontier_refs,
+                &mut self.finite_relation_frontier_payload,
+            ),
+            DiagnosticTermClass::Missing => (&mut self.missing_refs, &mut self.missing_payload),
+            DiagnosticTermClass::Large => (&mut self.large_refs, &mut self.large_payload),
+        };
+        *refs = refs.saturating_add(1);
+        *bytes = bytes.saturating_add(payload);
+    }
+
+    fn total_refs(self) -> u64 {
+        self.finite_no_relation_refs
+            .saturating_add(self.finite_relation_frontier_refs)
+            .saturating_add(self.missing_refs)
+            .saturating_add(self.large_refs)
+    }
+}
+
+#[derive(Clone)]
+struct DiagnosticExactNf {
+    normal_form: Arc<PolynomialNF>,
+    ordinal: u64,
+    under_product: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DiagnosticTermClass {
+    FiniteNoRelation,
+    FiniteRelationFrontier,
+    Large,
+    Missing,
+}
+
+impl DiagnosticTermClass {
+    fn rank(self) -> u8 {
+        match self {
+            Self::FiniteNoRelation => 0,
+            Self::FiniteRelationFrontier => 1,
+            Self::Large => 2,
+            Self::Missing => 3,
+        }
+    }
+}
+
+const FRONTIER_CURRENT_EXACT_PREIMAGE: u8 = 1 << 0;
+const FRONTIER_AMBIGUOUS_UNIVERSAL_DISPATCH: u8 = 1 << 1;
+const FRONTIER_CURRENT_AUTHORIZED_GADGET: u8 = 1 << 2;
+const FRONTIER_CLOSED_BLANKET: u8 = 1 << 3;
+const FRONTIER_FUTURE_TYPED_GADGET: u8 = 1 << 4;
+const FRONTIER_FUTURE_UNIVERSAL_BLANKET: u8 = 1 << 5;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DiagnosticValueCacheTopEntry {
@@ -3062,53 +3190,103 @@ impl<'a> Normalizer<'a> {
     fn exact_plan_leaf_roots_and_top8(
         &self,
         validate: bool,
-    ) -> Result<(Vec<MonomialId>, DiagnosticMaterializedLeafTop8), NormalizeError> {
+    ) -> Result<
+        (Vec<MonomialId>, DiagnosticMaterializedLeafTop8, Vec<DiagnosticExactNf>),
+        NormalizeError,
+    > {
         let mut pending = self
             .exact_plans
             .values()
             .cloned()
-            .map(NodeExactState::Additive)
-            .chain(self.product_plans.values().cloned().map(NodeExactState::Product))
-            .chain(self.gadget_product_plans.values().cloned().map(NodeExactState::GadgetProduct))
+            .map(|plan| (NodeExactState::Additive(plan), false))
+            .chain(
+                self.product_plans
+                    .values()
+                    .cloned()
+                    .map(|plan| (NodeExactState::Product(plan), true)),
+            )
+            .chain(
+                self.gadget_product_plans
+                    .values()
+                    .cloned()
+                    .map(|plan| (NodeExactState::GadgetProduct(plan), true)),
+            )
             .collect::<Vec<_>>();
         if validate {
-            for state in &pending {
+            for (state, _) in &pending {
                 self.validate_exact_state_dag(state)?;
             }
         }
-        let mut seen_plans = BTreeSet::<(u8, u64)>::new();
-        let mut seen_leaves = BTreeSet::new();
+        let mut seen_plans = BTreeSet::<(u8, u64, bool)>::new();
+        let mut seen_leaves = HashMap::<usize, usize>::new();
         let mut roots = Vec::new();
         let mut top8 = DiagnosticMaterializedLeafTop8::default();
         let collect_origins = self.watchdog.is_some();
-        while let Some(state) = pending.pop() {
+        let mut diagnostic_nfs = Vec::<DiagnosticExactNf>::new();
+        let observe_leaf =
+            |normal_form: Arc<PolynomialNF>,
+             under_product: bool,
+             roots: &mut Vec<MonomialId>,
+             collect_roots: bool,
+             seen_leaves: &mut HashMap<usize, usize>,
+             diagnostic_nfs: &mut Vec<DiagnosticExactNf>| {
+                let key = Arc::as_ptr(&normal_form) as usize;
+                if let Some(index) = seen_leaves.get(&key).copied() {
+                    if collect_origins {
+                        diagnostic_nfs[index].under_product |= under_product;
+                    }
+                    return false;
+                }
+                if collect_roots {
+                    roots.extend(normal_form.exact_terms.keys().copied());
+                }
+                seen_leaves.insert(key, diagnostic_nfs.len());
+                if collect_origins {
+                    diagnostic_nfs.push(DiagnosticExactNf {
+                        normal_form,
+                        ordinal: u64::try_from(diagnostic_nfs.len()).unwrap_or(u64::MAX),
+                        under_product,
+                    });
+                }
+                true
+            };
+        while let Some((state, under_product)) = pending.pop() {
             match state {
                 NodeExactState::Additive(plan) => {
-                    if seen_plans.insert((0, plan.id)) {
-                        pending.push(plan.left.clone());
-                        pending.push(plan.right.clone());
+                    if seen_plans.insert((0, plan.id, collect_origins && under_product)) {
+                        pending.push((plan.left.clone(), under_product));
+                        pending.push((plan.right.clone(), under_product));
                     }
                 }
                 NodeExactState::Product(plan) => {
-                    if seen_plans.insert((1, plan.id)) {
-                        pending.push(plan.left.clone());
-                        pending.push(plan.right.clone());
+                    if seen_plans.insert((1, plan.id, collect_origins && under_product)) {
+                        pending.push((plan.left.clone(), true));
+                        pending.push((plan.right.clone(), true));
                     }
                 }
                 NodeExactState::GadgetProduct(plan) => {
-                    if seen_plans.insert((2, plan.id)) {
+                    if seen_plans.insert((2, plan.id, collect_origins && under_product)) {
                         for normal_form in [&plan.left, &plan.right] {
-                            let key = Arc::as_ptr(normal_form) as usize;
-                            if seen_leaves.insert(key) {
-                                roots.extend(normal_form.exact_terms.keys().copied());
-                            }
+                            observe_leaf(
+                                Arc::clone(normal_form),
+                                true,
+                                &mut roots,
+                                true,
+                                &mut seen_leaves,
+                                &mut diagnostic_nfs,
+                            );
                         }
                     }
                 }
                 NodeExactState::Materialized { normal_form, .. } => {
-                    let key = Arc::as_ptr(&normal_form) as usize;
-                    if seen_leaves.insert(key) {
-                        roots.extend(normal_form.exact_terms.keys().copied());
+                    if observe_leaf(
+                        Arc::clone(&normal_form),
+                        under_product,
+                        &mut roots,
+                        true,
+                        &mut seen_leaves,
+                        &mut diagnostic_nfs,
+                    ) {
                         if collect_origins &&
                             let Some(origin) =
                                 self.diagnostic_materialized_leaf_origin(&normal_form)
@@ -3122,11 +3300,243 @@ impl<'a> Normalizer<'a> {
                 }
             }
         }
-        Ok((roots, top8))
+        Ok((roots, top8, diagnostic_nfs))
     }
 
     fn exact_plan_leaf_roots(&self, validate: bool) -> Result<Vec<MonomialId>, NormalizeError> {
-        self.exact_plan_leaf_roots_and_top8(validate).map(|(roots, _)| roots)
+        self.exact_plan_leaf_roots_and_top8(validate).map(|(roots, _, _)| roots)
+    }
+
+    fn diagnostic_frontier_reasons(
+        &self,
+        monomial: MonomialId,
+        under_product: bool,
+        has_closed: bool,
+        has_universal: bool,
+    ) -> Result<u8, NormalizeError> {
+        let descriptor = self.monomials.descriptor(monomial)?;
+        let mut reasons = 0_u8;
+        if has_closed &&
+            (!descriptor.central_factors.is_empty() || !descriptor.ordered_factors.is_empty())
+        {
+            reasons |= FRONTIER_CLOSED_BLANKET;
+        }
+        if let Some(relations) = self.relations {
+            for factor in &descriptor.ordered_factors {
+                let node = self.expressions.node(factor.expression())?;
+                if let ValueOperator::ProgramCall { program } = node.operator {
+                    match relations.dispatch_for_preimage_program(program) {
+                        Ok(Some(_)) => {
+                            reasons |= FRONTIER_CURRENT_EXACT_PREIMAGE;
+                        }
+                        Err(RelationRegistryError::AmbiguousPreimageDispatch) => {
+                            reasons |= FRONTIER_AMBIGUOUS_UNIVERSAL_DISPATCH;
+                        }
+                        Ok(None) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+        for pair in descriptor.ordered_factors.windows(2) {
+            if self.authorized_gadget_pair_input(pair[0], pair[1])?.is_some() {
+                reasons |= FRONTIER_CURRENT_AUTHORIZED_GADGET;
+            }
+        }
+        if under_product && !descriptor.ordered_factors.is_empty() {
+            if has_universal {
+                // A future product can place the narrow public factor outside this retained
+                // word. Without that boundary, absence of a current preimage call is not proof
+                // that universal rewriting is impossible.
+                reasons |= FRONTIER_FUTURE_UNIVERSAL_BLANKET;
+            }
+            if self.diagnostic_future_typed_gadget_boundary(descriptor)? {
+                reasons |= FRONTIER_FUTURE_TYPED_GADGET;
+            }
+        }
+        Ok(reasons)
+    }
+
+    fn diagnostic_future_typed_gadget_boundary(
+        &self,
+        descriptor: &super::monomial::MonomialDescriptor,
+    ) -> Result<bool, NormalizeError> {
+        let Some(registry) = self.gadget_recompositions else { return Ok(false) };
+        let layout = |expression| match self.facts.facts(expression) {
+            Ok(ValueFacts::Matrix(facts)) => Some(facts.metadata.layout.clone()),
+            _ => None,
+        };
+        for factor in [descriptor.ordered_factors.first(), descriptor.ordered_factors.last()]
+            .into_iter()
+            .flatten()
+        {
+            let node = self.expressions.node(factor.expression())?;
+            let factor_type = match self.expressions.value_type(factor.expression())? {
+                ResolvedValueType::Matrix(matrix) => matrix,
+                _ => continue,
+            };
+            if let Some(super::arena::MatrixConstantKind::Gadget { base, small }) =
+                node.operator.source_matrix_constant() &&
+                registry.allows_gadget_half(
+                    *base,
+                    *small,
+                    factor_type,
+                    layout(factor.expression()).as_ref(),
+                )?
+            {
+                return Ok(true);
+            }
+            if let ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                base,
+                small,
+                digit_count,
+                ..
+            }) = &node.operator &&
+                let Some(input) = node.inputs.first().copied() &&
+                let ResolvedValueType::Matrix(input_type) = self.expressions.value_type(input)? &&
+                registry.allows_decomposition_half(
+                    *base,
+                    *small,
+                    *digit_count,
+                    factor_type,
+                    input_type,
+                    layout(factor.expression()).as_ref(),
+                    layout(input).as_ref(),
+                )?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn diagnostic_four_class_census(
+        &self,
+        normal_forms: &[DiagnosticExactNf],
+    ) -> Result<DiagnosticFourClassCensus, NormalizeError> {
+        #[derive(Clone, Copy)]
+        struct Record {
+            class: DiagnosticTermClass,
+            reasons: u8,
+            payload: u64,
+        }
+        let has_closed = self
+            .relations
+            .map(RelationRegistry::has_closed_relations)
+            .transpose()?
+            .unwrap_or(false);
+        let has_universal = self
+            .relations
+            .map(RelationRegistry::has_universal_relations)
+            .transpose()?
+            .unwrap_or(false);
+        if self.gadget_recompositions.is_some_and(|registry| !registry.is_frozen()) {
+            return Err(RelationRegistryError::NotFrozen.into());
+        }
+        let mut records = BTreeMap::<MonomialId, Record>::new();
+        let mut census = DiagnosticFourClassCensus::default();
+        for nf in normal_forms {
+            let mut entry = DiagnosticFourClassTopEntry {
+                nf_ordinal: nf.ordinal,
+                under_product: nf.under_product,
+                ..DiagnosticFourClassTopEntry::default()
+            };
+            for (monomial, coefficient) in &nf.normal_form.exact_terms {
+                let bound_class = match self.bound_monomial(*monomial, coefficient)? {
+                    NumericContract::Missing => DiagnosticTermClass::Missing,
+                    NumericContract::Known(CoefficientBound::Large) => DiagnosticTermClass::Large,
+                    NumericContract::Known(_) => DiagnosticTermClass::FiniteNoRelation,
+                };
+                let reasons = if bound_class == DiagnosticTermClass::FiniteNoRelation {
+                    self.diagnostic_frontier_reasons(
+                        *monomial,
+                        nf.under_product,
+                        has_closed,
+                        has_universal,
+                    )?
+                } else {
+                    0
+                };
+                let class = if reasons == 0 {
+                    bound_class
+                } else {
+                    DiagnosticTermClass::FiniteRelationFrontier
+                };
+                let payload = self.monomials.descriptor_payload_lower_bound_bytes(*monomial)?;
+                let stats = census.class_mut(class);
+                stats.term_refs = stats.term_refs.saturating_add(1);
+                entry.observe(class, payload);
+                if class == DiagnosticTermClass::FiniteRelationFrontier {
+                    census.frontier_reason_term_ref_union =
+                        census.frontier_reason_term_ref_union.saturating_add(1);
+                    for (index, bit) in [1_u8, 2, 4, 8, 16, 32].into_iter().enumerate() {
+                        if reasons & bit != 0 &&
+                            let Some(reason) = census.reason_mut(index)
+                        {
+                            reason.term_refs = reason.term_refs.saturating_add(1);
+                        }
+                    }
+                }
+                let record =
+                    records.entry(*monomial).or_insert(Record { class, reasons: 0, payload });
+                if class.rank() > record.class.rank() {
+                    record.class = class;
+                }
+                record.reasons |= reasons;
+            }
+            let score = entry.total_refs();
+            let len = usize::from(census.top_len);
+            let insert = (0..len)
+                .find(|index| {
+                    let existing = &census.top[*index];
+                    score > existing.total_refs() ||
+                        (score == existing.total_refs() &&
+                            entry.nf_ordinal < existing.nf_ordinal)
+                })
+                .unwrap_or(len);
+            if insert < census.top.len() {
+                let new_len = (len + 1).min(census.top.len());
+                for index in (insert + 1..new_len).rev() {
+                    census.top[index] = census.top[index - 1];
+                }
+                census.top[insert] = entry;
+                census.top_len = u8::try_from(new_len).unwrap_or(8);
+            }
+        }
+        for record in records.values() {
+            let stats = census.class_mut(record.class);
+            stats.unique_monomials = stats.unique_monomials.saturating_add(1);
+            stats.payload_lower_bound_bytes =
+                stats.payload_lower_bound_bytes.saturating_add(record.payload);
+            if record.class == DiagnosticTermClass::FiniteRelationFrontier {
+                census.frontier_unique_union = census.frontier_unique_union.saturating_add(1);
+                if record.reasons != 0 {
+                    census.frontier_reason_unique_union =
+                        census.frontier_reason_unique_union.saturating_add(1);
+                    census.frontier_reason_payload_union =
+                        census.frontier_reason_payload_union.saturating_add(record.payload);
+                }
+                for (index, bit) in [1_u8, 2, 4, 8, 16, 32].into_iter().enumerate() {
+                    if record.reasons & bit == 0 {
+                        continue;
+                    }
+                    let Some(reason) = census.reason_mut(index) else { continue };
+                    reason.unique_monomials = reason.unique_monomials.saturating_add(1);
+                    reason.payload_lower_bound_bytes =
+                        reason.payload_lower_bound_bytes.saturating_add(record.payload);
+                }
+            }
+        }
+        debug_assert_eq!(census.frontier_unique_union, census.frontier_reason_unique_union);
+        debug_assert_eq!(
+            census.finite_relation_frontier.term_refs,
+            census.frontier_reason_term_ref_union
+        );
+        debug_assert_eq!(
+            census.finite_relation_frontier.payload_lower_bound_bytes,
+            census.frontier_reason_payload_union
+        );
+        Ok(census)
     }
 
     fn exact_plan_diagnostic_shape(
@@ -3680,7 +4090,18 @@ impl<'a> Normalizer<'a> {
         {
             return Ok(());
         }
-        let (plan_roots, materialized_leaf_top8) = self.exact_plan_leaf_roots_and_top8(true)?;
+        let (plan_roots, materialized_leaf_top8, diagnostic_nfs) =
+            self.exact_plan_leaf_roots_and_top8(true)?;
+        // Classification is watchdog-only. It is computed before mutation so an authority error
+        // aborts the sweep atomically, and committed only after the real sweep succeeds.
+        let four_class_started = self.watchdog.as_ref().map(|_| Instant::now());
+        let four_class = self
+            .watchdog
+            .as_ref()
+            .map(|_| self.diagnostic_four_class_census(&diagnostic_nfs))
+            .transpose()?;
+        let four_class_elapsed_ns = four_class_started
+            .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         let cache_roots = self.cache.values().flat_map(|value| {
             value.exact_nf.iter().flat_map(|normal_form| normal_form.exact_terms.keys().copied())
         });
@@ -3752,6 +4173,14 @@ impl<'a> Normalizer<'a> {
             self.gc_counters.value_cache_top8_len = top8.len;
             self.gc_counters.value_cache_top8 = top8.top;
             self.gc_counters.materialized_leaf_top8 = materialized_leaf_top8;
+            self.gc_counters.exact_plan_four_class = four_class.unwrap_or_default();
+            if let Some(elapsed_ns) = four_class_elapsed_ns {
+                self.gc_counters.four_class_total_ns =
+                    self.gc_counters.four_class_total_ns.saturating_add(elapsed_ns);
+                self.gc_counters.four_class_max_ns =
+                    self.gc_counters.four_class_max_ns.max(elapsed_ns);
+                self.gc_counters.four_class_last_ns = elapsed_ns;
+            }
         }
         self.gc_counters.sweep_total_ns =
             self.gc_counters.sweep_total_ns.saturating_add(elapsed_ns);
@@ -9766,6 +10195,119 @@ mod tests {
     }
 
     #[test]
+    fn four_class_census_uses_bound_authority_and_deduplicates_global_payload() {
+        let mut expressions = ExprArena::new();
+        let finite = gaussian_factor(&mut expressions, matrix_type(), 80_001, 3);
+        let large = source_with(&mut expressions, matrix_type(), 80_002);
+        let missing =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[finite, finite]).unwrap();
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[missing, large]).unwrap();
+        let mut programs = ProgramArena::new();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let scope = semantic.program();
+        let mut ids = BTreeMap::new();
+        for expression in [finite, large, missing] {
+            let scoped = programs.scoped(&expressions, scope, expression).unwrap();
+            ids.insert(
+                expression,
+                monomials.intern(&expressions, &programs, &[], &[scoped]).unwrap(),
+            );
+        }
+        let shared = Arc::new(PolynomialNF {
+            exact_terms: BTreeMap::from([
+                (ids[&finite], BigInt::from(1_u8)),
+                (ids[&large], BigInt::from(1_u8)),
+                (ids[&missing], BigInt::from(1_u8)),
+            ]),
+            bounded_summary: BoundedSummary::missing(),
+        });
+        let normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let census = normalizer
+            .diagnostic_four_class_census(&[DiagnosticExactNf {
+                normal_form: Arc::clone(&shared),
+                ordinal: 0,
+                under_product: false,
+            }])
+            .unwrap();
+        assert_eq!(census.finite_no_relation.unique_monomials, 1);
+        assert_eq!(census.finite_no_relation.term_refs, 1);
+        assert_eq!(census.missing.unique_monomials, 1);
+        assert_eq!(census.missing.term_refs, 1);
+        assert_eq!(census.large.unique_monomials, 1);
+        assert_eq!(census.large.term_refs, 1);
+        assert_eq!(census.finite_relation_frontier, DiagnosticClassStats::default());
+        assert_eq!(census.frontier_unique_union, census.frontier_reason_unique_union);
+        assert_eq!(census.top_len, 1);
+        assert_eq!(census.top[0].finite_no_relation_refs, 1);
+        assert_eq!(census.top[0].missing_refs, 1);
+        assert_eq!(census.top[0].large_refs, 1);
+        assert_eq!(
+            census.finite_no_relation.payload_lower_bound_bytes,
+            normalizer.monomials.descriptor_payload_lower_bound_bytes(ids[&finite]).unwrap()
+        );
+    }
+
+    #[test]
+    fn four_class_census_closed_blanket_exactly_covers_finite_frontier_and_rejects_mutable_authority()
+     {
+        let mut expressions = ExprArena::new();
+        let b = gaussian_factor(&mut expressions, matrix_type(), 80_011, 3);
+        let k = gaussian_factor(&mut expressions, matrix_type(), 80_012, 5);
+        let p = gaussian_factor(&mut expressions, matrix_type(), 80_013, 7);
+        let bk = product(&mut expressions, &[b, k]);
+        let mut programs = ProgramArena::new();
+        let (facts, mut monomials, _) = setup(&mut expressions, &mut programs, bk);
+        let (relations, mut cache, lhs) = register_test_closed_relation(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            bk,
+            p,
+            k,
+            b,
+        );
+        let nf = Arc::new(PolynomialNF {
+            exact_terms: BTreeMap::from([(lhs, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::missing(),
+        });
+        let normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&relations, &mut cache);
+        let census = normalizer
+            .diagnostic_four_class_census(&[DiagnosticExactNf {
+                normal_form: nf,
+                ordinal: 0,
+                under_product: false,
+            }])
+            .unwrap();
+        assert_eq!(census.finite_relation_frontier.unique_monomials, 1);
+        assert_eq!(census.closed_blanket.unique_monomials, 1);
+        assert_eq!(census.frontier_unique_union, 1);
+        assert_eq!(census.frontier_reason_unique_union, 1);
+        assert_eq!(
+            census.finite_relation_frontier.term_refs,
+            census.frontier_reason_term_ref_union
+        );
+        assert_eq!(
+            census.finite_relation_frontier.payload_lower_bound_bytes,
+            census.frontier_reason_payload_union
+        );
+
+        let mutable = RelationRegistry::new();
+        let mut mutable_cache = NormalizationCache::new();
+        let normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&mutable, &mut mutable_cache);
+        assert_eq!(
+            normalizer.diagnostic_four_class_census(&[]),
+            Err(NormalizeError::Relation(RelationRegistryError::NotFrozen))
+        );
+    }
+
+    #[test]
     fn forced_monomial_gc_preserves_exact_nf_bound_and_counters_at_node_commit() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -9874,6 +10416,9 @@ mod tests {
             (value, normalizer.counters(), normalizer.gc_counters)
         };
         assert_eq!(off_gc.value_cache_top8_len, 0);
+        assert_eq!(off_gc.four_class_total_ns, 0);
+        assert_eq!(off_gc.four_class_max_ns, 0);
+        assert_eq!(off_gc.four_class_last_ns, 0);
         let fingerprint = cache.canonical_state_fingerprint();
         let (on, on_counters, on_gc) = {
             let mut normalizer =
@@ -9887,6 +10432,8 @@ mod tests {
         };
         assert!(on_gc.sweep_count > 0);
         assert!(on_gc.value_cache_top8_len > 0);
+        assert!(on_gc.four_class_total_ns >= on_gc.four_class_max_ns);
+        assert!(on_gc.four_class_max_ns >= on_gc.four_class_last_ns);
         assert_eq!(off.semantic, on.semantic);
         assert_eq!(off.exact_nf, on.exact_nf);
         assert_eq!(off.coefficient_bound, on.coefficient_bound);
@@ -12728,6 +13275,79 @@ mod tests {
     }
 
     #[test]
+    fn four_class_frontier_distinguishes_current_and_future_typed_gadget_authority() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 3, 1).unwrap();
+        let gadget_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 3).unwrap();
+        let (gadget, decomposition, input) = gadget_product(
+            &mut expressions,
+            false,
+            3,
+            gadget_type.clone(),
+            decomposition_type.clone(),
+            input_type.clone(),
+            Some((2, false)),
+        );
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[gadget, decomposition])
+            .unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        for expression in [gadget, decomposition, input] {
+            insert_matrix_bound(&mut facts, &expressions, expression, 3);
+        }
+        let scope = semantic.program();
+        let scoped = |expression| programs.scoped(&expressions, scope, expression).unwrap();
+        let gadget_only =
+            monomials.intern(&expressions, &programs, &[], &[scoped(gadget)]).unwrap();
+        let pair = monomials
+            .intern(&expressions, &programs, &[], &[scoped(gadget), scoped(decomposition)])
+            .unwrap();
+        let registry =
+            recomposition_registry(gadget_type, decomposition_type, input_type, false, 3);
+        let normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_gadget_recompositions(&registry);
+        let future =
+            normalizer.diagnostic_frontier_reasons(gadget_only, true, false, false).unwrap();
+        assert_eq!(future, FRONTIER_FUTURE_TYPED_GADGET);
+        let overlapping_future =
+            normalizer.diagnostic_frontier_reasons(gadget_only, true, false, true).unwrap();
+        assert_eq!(
+            overlapping_future,
+            FRONTIER_FUTURE_TYPED_GADGET | FRONTIER_FUTURE_UNIVERSAL_BLANKET
+        );
+        let current = normalizer.diagnostic_frontier_reasons(pair, false, false, false).unwrap();
+        assert_eq!(current, FRONTIER_CURRENT_AUTHORIZED_GADGET);
+        let no_future =
+            normalizer.diagnostic_frontier_reasons(gadget_only, false, false, false).unwrap();
+        assert_eq!(no_future, 0);
+        let leaf = || {
+            Arc::new(PolynomialNF {
+                exact_terms: BTreeMap::from([(gadget_only, BigInt::from(1_u8))]),
+                bounded_summary: BoundedSummary::missing(),
+            })
+        };
+        let joined = normalizer
+            .diagnostic_four_class_census(&[
+                DiagnosticExactNf { normal_form: leaf(), ordinal: 0, under_product: false },
+                DiagnosticExactNf { normal_form: leaf(), ordinal: 1, under_product: true },
+            ])
+            .unwrap();
+        assert_eq!(joined.finite_relation_frontier.unique_monomials, 1);
+        assert_eq!(joined.finite_relation_frontier.term_refs, 1);
+        assert_eq!(joined.finite_no_relation.unique_monomials, 0);
+        assert_eq!(joined.finite_no_relation.term_refs, 1);
+        assert_eq!(joined.future_typed_gadget.unique_monomials, 1);
+        assert_eq!(joined.future_typed_gadget.term_refs, 1);
+        assert_eq!(joined.frontier_reason_term_ref_union, 1);
+        assert_eq!(joined.top_len, 2);
+        assert_eq!(joined.top[0].finite_no_relation_refs, 1);
+        assert_eq!(joined.top[1].finite_relation_frontier_refs, 1);
+    }
+
+    #[test]
     fn gadget_recomposition_rewrites_regular_and_small_typed_constants() {
         for small in [false, true] {
             let mut expressions = ExprArena::new();
@@ -15027,6 +15647,17 @@ mod tests {
         assert_eq!(normalizer.gc_counters.materialized_leaf_top8.exact_term_refs, 2);
         assert_eq!(normalizer.gc_counters.materialized_leaf_top8.top[0].producer, Some(x));
         assert_eq!(normalizer.gc_counters.materialized_leaf_top8.top[1].producer, Some(y));
+        let classes = normalizer.gc_counters.exact_plan_four_class;
+        assert_eq!(classes.large.unique_monomials, 2);
+        assert_eq!(classes.large.term_refs, 2);
+        assert_eq!(classes.top_len, 2);
+        assert_eq!(classes.frontier_unique_union, classes.frontier_reason_unique_union);
+        assert!(
+            normalizer.gc_counters.four_class_total_ns >= normalizer.gc_counters.four_class_max_ns
+        );
+        assert!(
+            normalizer.gc_counters.four_class_max_ns >= normalizer.gc_counters.four_class_last_ns
+        );
         let owners = normalizer.owner_census();
         assert_eq!(owners.additive_plan_nodes, 2);
         assert_eq!(owners.additive_unique_leaf_refs, 2);
@@ -16911,11 +17542,57 @@ mod tests {
         ambiguous_relations.register_universal(ambiguous_registration).unwrap();
         ambiguous_relations.freeze();
         let mut ambiguous_cache = NormalizationCache::new();
+        let lhs_factor_expressions = {
+            let descriptor = monomials.descriptor(lhs).unwrap();
+            descriptor
+                .central_factors
+                .iter()
+                .chain(&descriptor.ordered_factors)
+                .map(|factor| factor.expression())
+                .collect::<Vec<_>>()
+        };
         let mut ambiguous_normalizer =
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
                 .unwrap()
                 .with_relations(&ambiguous_relations, &mut ambiguous_cache)
                 .with_watchdog_override(true, Duration::from_secs(60));
+        for expression in lhs_factor_expressions {
+            ambiguous_normalizer
+                .expression_bounds
+                .insert(expression, NumericContract::Known(CoefficientBound::finite(1_u8)));
+        }
+        let ambiguous_reasons =
+            ambiguous_normalizer.diagnostic_frontier_reasons(lhs, false, false, true).unwrap();
+        assert_eq!(ambiguous_reasons, FRONTIER_AMBIGUOUS_UNIVERSAL_DISPATCH);
+        let cache_entries_before =
+            ambiguous_normalizer.normalization.as_deref().unwrap().runtime_entry_count();
+        let cache_fingerprint_before =
+            ambiguous_normalizer.normalization.as_deref().unwrap().canonical_state_fingerprint();
+        let ambiguous_census = ambiguous_normalizer
+            .diagnostic_four_class_census(&[DiagnosticExactNf {
+                normal_form: Arc::new(PolynomialNF {
+                    exact_terms: BTreeMap::from([(lhs, BigInt::from(1_u8))]),
+                    bounded_summary: BoundedSummary::missing(),
+                }),
+                ordinal: 0,
+                under_product: false,
+            }])
+            .unwrap();
+        assert_eq!(ambiguous_census.finite_relation_frontier.unique_monomials, 1);
+        assert_eq!(ambiguous_census.finite_relation_frontier.term_refs, 1);
+        assert_eq!(ambiguous_census.current_exact_preimage, DiagnosticClassStats::default());
+        assert_eq!(ambiguous_census.ambiguous_universal_dispatch.unique_monomials, 1);
+        assert_eq!(ambiguous_census.ambiguous_universal_dispatch.term_refs, 1);
+        assert_eq!(ambiguous_census.top_len, 1);
+        assert_eq!(ambiguous_census.top[0].finite_relation_frontier_refs, 1);
+        assert_eq!(
+            ambiguous_normalizer.normalization.as_deref().unwrap().runtime_entry_count(),
+            cache_entries_before
+        );
+        assert_eq!(
+            ambiguous_normalizer.normalization.as_deref().unwrap().canonical_state_fingerprint(),
+            cache_fingerprint_before
+        );
         let error = ambiguous_normalizer.normalize(root).unwrap_err();
         assert_eq!(
             error,

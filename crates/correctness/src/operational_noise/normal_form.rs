@@ -6,7 +6,7 @@
 
 use super::{
     arena::{
-        ExprArena, ExprId, ExprNode, HashVariant, MatrixLayout, MatrixOperation,
+        ArenaToken, ExprArena, ExprId, ExprNode, HashVariant, MatrixLayout, MatrixOperation,
         ResolvedMatrixType, ResolvedValueType, SamplerOperation, ScalarOperation, ScopeProof,
         ScopedExprId, TypedConstant, ValueOperator, ValueTransformOperation,
     },
@@ -22,8 +22,8 @@ use super::{
     monomial::{MonomialArena, MonomialError, MonomialId, MonomialSweepOwnerReport, TermMap},
     program::{ArenaError, ProgramArena, ValueProgramId},
     relation::{
-        CanonicalLhsKey, GadgetRecompositionRegistry, NormalizationCache, RelationRegistry,
-        RelationRegistryError, RelationResolution, RuntimeSpecializationKey,
+        CanonicalLhsKey, FrozenGeneration, GadgetRecompositionRegistry, NormalizationCache,
+        RelationRegistry, RelationRegistryError, RelationResolution, RuntimeSpecializationKey,
         UniversalRelationRegistration,
     },
 };
@@ -354,6 +354,13 @@ struct DiagnosticOwnerCensus {
     canonical_rhs_largest_nf_terms: u64,
     runtime_entries: u64,
     runtime_lhs_keys: u64,
+    additive_plan_nodes: u64,
+    additive_unique_leaf_refs: u64,
+    additive_unique_leaf_exact_term_refs: u64,
+    additive_largest_leaf_exact_terms: u64,
+    additive_materializations: u64,
+    additive_materialization_output_terms_total: u64,
+    additive_materialization_output_terms_max: u64,
 }
 
 /// A bounded, immutable owner-census observation. The product fields are copied at the same
@@ -644,6 +651,21 @@ fn diagnostic_watchdog_emit_snapshot(
         canonical_rhs_largest_nf_terms = progress.owners.canonical_rhs_largest_nf_terms,
         runtime_entries = progress.owners.runtime_entries,
         runtime_lhs_keys = progress.owners.runtime_lhs_keys,
+        additive_plan_nodes = progress.owners.additive_plan_nodes,
+        additive_unique_leaf_refs = progress.owners.additive_unique_leaf_refs,
+        additive_unique_leaf_exact_term_refs = progress
+            .owners
+            .additive_unique_leaf_exact_term_refs,
+        additive_largest_leaf_exact_terms = progress
+            .owners
+            .additive_largest_leaf_exact_terms,
+        additive_materializations = progress.owners.additive_materializations,
+        additive_materialization_output_terms_total = progress
+            .owners
+            .additive_materialization_output_terms_total,
+        additive_materialization_output_terms_max = progress
+            .owners
+            .additive_materialization_output_terms_max,
         runtime_lookup_hits = progress.specialization.runtime_lookup_hits,
         runtime_lookup_misses = progress.specialization.runtime_lookup_misses,
         ordinary_specializations_started = progress.specialization.ordinary_specializations_started,
@@ -1273,6 +1295,21 @@ impl NormalizationTrace {
             canonical_rhs_largest_nf_terms = self.owners.canonical_rhs_largest_nf_terms,
             runtime_entries = self.owners.runtime_entries,
             runtime_lhs_keys = self.owners.runtime_lhs_keys,
+            additive_plan_nodes = self.owners.additive_plan_nodes,
+            additive_unique_leaf_refs = self.owners.additive_unique_leaf_refs,
+            additive_unique_leaf_exact_term_refs = self
+                .owners
+                .additive_unique_leaf_exact_term_refs,
+            additive_largest_leaf_exact_terms = self
+                .owners
+                .additive_largest_leaf_exact_terms,
+            additive_materializations = self.owners.additive_materializations,
+            additive_materialization_output_terms_total = self
+                .owners
+                .additive_materialization_output_terms_total,
+            additive_materialization_output_terms_max = self
+                .owners
+                .additive_materialization_output_terms_max,
             product_calls = self.product_calls,
             product_planned = self.product_planned,
             product_generated = self.product_generated,
@@ -1455,6 +1492,32 @@ pub struct AnalyzedValue {
     pub coefficient_bound: NumericContract<CoefficientBound>,
 }
 
+/// Exact state retained only while one root is being walked. Addition nodes are persistent and
+/// immutable; public results and every non-additive operator still receive a materialized NF.
+#[derive(Clone, Debug)]
+enum NodeExactState {
+    Materialized { authority: ExactPlanAuthority, normal_form: Arc<PolynomialNF> },
+    Additive(Arc<AdditiveExactPlan>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExactPlanAuthority {
+    expressions: ArenaToken,
+    monomials: ArenaToken,
+    scope: ValueProgramId,
+    relations: Option<FrozenGeneration>,
+    matrix_type: ResolvedMatrixType,
+}
+
+#[derive(Debug)]
+struct AdditiveExactPlan {
+    id: u64,
+    authority: ExactPlanAuthority,
+    left: NodeExactState,
+    right: NodeExactState,
+    subtract_right: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NormalizationCounters {
     pub nodes_processed: u64,
@@ -1482,6 +1545,7 @@ pub enum NormalizeError {
     MissingCachedValue { expression: ExprId },
     SharedRootCacheValue { expression: ExprId },
     UnsupportedOperator { operator: String },
+    InvalidExactPlan { reason: &'static str },
     ArithmeticOverflow,
     Relation(RelationRegistryError),
 }
@@ -1536,6 +1600,10 @@ pub struct Normalizer<'a> {
     gadget_recompositions: Option<&'a GadgetRecompositionRegistry>,
     normalization: Option<&'a mut NormalizationCache>,
     cache: BTreeMap<ExprId, Arc<AnalyzedValue>>,
+    /// Add/Sub exact plans corresponding to cache entries whose public `exact_nf` is temporarily
+    /// absent. Entries are removed at the same last-use boundary as the value cache.
+    exact_plans: BTreeMap<ExprId, Arc<AdditiveExactPlan>>,
+    next_exact_plan_id: u64,
     /// Durable value-level transfer results for expressions which may be released from `cache`
     /// before the root's exact monomials are folded.  This is deliberately keyed by expression
     /// identity rather than by a monomial: it does not become semantic identity or duplicate
@@ -1600,6 +1668,9 @@ pub struct Normalizer<'a> {
     protected_monomial_prefix: usize,
     monomial_gc_allocation_threshold_bytes: u64,
     gc_counters: DiagnosticGcCounters,
+    exact_plan_materializations: u64,
+    exact_plan_materialization_output_terms_total: u64,
+    exact_plan_materialization_output_terms_max: u64,
 }
 
 impl<'a> Normalizer<'a> {
@@ -1627,6 +1698,248 @@ impl<'a> Normalizer<'a> {
         value.exact_nf.as_ref().map_or(0, |normal_form| {
             u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX)
         })
+    }
+
+    fn exact_plan_authority(
+        &self,
+        expression: ExprId,
+    ) -> Result<ExactPlanAuthority, NormalizeError> {
+        let ResolvedValueType::Matrix(matrix_type) = self.expressions.value_type(expression)?
+        else {
+            return Err(NormalizeError::InvalidExactPlan { reason: "non-matrix exact state" });
+        };
+        let relations = self.relations.map(RelationRegistry::frozen_generation).transpose()?;
+        Ok(ExactPlanAuthority {
+            expressions: self.expressions.token(),
+            monomials: self.monomials.token(),
+            scope: self.scope,
+            relations,
+            matrix_type: matrix_type.clone(),
+        })
+    }
+
+    fn validate_exact_plan_authority(
+        &self,
+        authority: &ExactPlanAuthority,
+    ) -> Result<(), NormalizeError> {
+        if authority.expressions != self.expressions.token() ||
+            authority.monomials != self.monomials.token() ||
+            authority.scope != self.scope
+        {
+            return Err(NormalizeError::InvalidExactPlan { reason: "foreign exact authority" });
+        }
+        let relations = self.relations.map(RelationRegistry::frozen_generation).transpose()?;
+        if authority.relations != relations {
+            return Err(NormalizeError::InvalidExactPlan { reason: "stale relation context" });
+        }
+        Ok(())
+    }
+
+    fn materialized_exact_state(
+        &self,
+        expression: ExprId,
+        normal_form: Arc<PolynomialNF>,
+    ) -> Result<NodeExactState, NormalizeError> {
+        Ok(NodeExactState::Materialized {
+            authority: self.exact_plan_authority(expression)?,
+            normal_form,
+        })
+    }
+
+    fn cached_exact_state(
+        &self,
+        expression: ExprId,
+        value: &AnalyzedValue,
+    ) -> Result<Option<NodeExactState>, NormalizeError> {
+        if let Some(plan) = self.exact_plans.get(&expression) {
+            if value.exact_nf.is_some() {
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "cache entry has two exact representations",
+                });
+            }
+            return Ok(Some(NodeExactState::Additive(Arc::clone(plan))));
+        }
+        value
+            .exact_nf
+            .as_ref()
+            .cloned()
+            .map(|normal_form| self.materialized_exact_state(expression, normal_form))
+            .transpose()
+    }
+
+    fn new_additive_plan(
+        &mut self,
+        expression: ExprId,
+        left: NodeExactState,
+        right: NodeExactState,
+        subtract_right: bool,
+    ) -> Result<Arc<AdditiveExactPlan>, NormalizeError> {
+        let authority = self.exact_plan_authority(expression)?;
+        for child in [&left, &right] {
+            let child_authority = match child {
+                NodeExactState::Materialized { authority, .. } => authority,
+                NodeExactState::Additive(plan) => &plan.authority,
+            };
+            self.validate_exact_plan_authority(child_authority)?;
+            if child_authority.matrix_type != authority.matrix_type {
+                return Err(NormalizeError::InvalidExactPlan { reason: "additive type mismatch" });
+            }
+        }
+        self.next_exact_plan_id =
+            self.next_exact_plan_id.checked_add(1).ok_or(NormalizeError::ArithmeticOverflow)?;
+        Ok(Arc::new(AdditiveExactPlan {
+            id: self.next_exact_plan_id,
+            authority,
+            left,
+            right,
+            subtract_right,
+        }))
+    }
+
+    /// Materialize a persistent additive DAG by propagating signed weights from newer parents to
+    /// older children. Each additive node and each shared NF leaf is visited once; coefficients
+    /// are accumulated directly into the single result term map.
+    fn materialize_exact_state(
+        &mut self,
+        state: &NodeExactState,
+    ) -> Result<Arc<PolynomialNF>, NormalizeError> {
+        if let NodeExactState::Materialized { authority, normal_form } = state {
+            self.validate_exact_plan_authority(authority)?;
+            return Ok(Arc::clone(normal_form));
+        }
+        let mut pending = BTreeMap::<u64, (Arc<AdditiveExactPlan>, BigInt)>::new();
+        let NodeExactState::Additive(root) = state else {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "materialized state reached additive materializer",
+            });
+        };
+        pending.insert(root.id, (Arc::clone(root), BigInt::from(1_u8)));
+        let mut leaves = HashMap::<usize, (Arc<PolynomialNF>, BigInt)>::new();
+        while let Some((_, (plan, weight))) = pending.pop_last() {
+            self.validate_exact_plan_authority(&plan.authority)?;
+            for (child, sign) in
+                [(&plan.left, 1_i8), (&plan.right, if plan.subtract_right { -1 } else { 1 })]
+            {
+                let signed = if sign < 0 { -weight.clone() } else { weight.clone() };
+                match child {
+                    NodeExactState::Additive(child) => {
+                        self.validate_exact_plan_authority(&child.authority)?;
+                        if child.authority.matrix_type != plan.authority.matrix_type ||
+                            child.id >= plan.id
+                        {
+                            return Err(NormalizeError::InvalidExactPlan {
+                                reason: "invalid additive edge",
+                            });
+                        }
+                        pending
+                            .entry(child.id)
+                            .and_modify(|(_, total)| *total += &signed)
+                            .or_insert_with(|| (Arc::clone(child), signed));
+                    }
+                    NodeExactState::Materialized { authority, normal_form } => {
+                        self.validate_exact_plan_authority(authority)?;
+                        if authority.matrix_type != plan.authority.matrix_type {
+                            return Err(NormalizeError::InvalidExactPlan {
+                                reason: "invalid leaf type",
+                            });
+                        }
+                        let key = Arc::as_ptr(normal_form) as usize;
+                        leaves
+                            .entry(key)
+                            .and_modify(|(_, total)| *total += &signed)
+                            .or_insert_with(|| (Arc::clone(normal_form), signed));
+                    }
+                }
+            }
+        }
+        let mut terms = BTreeMap::new();
+        for (_, (normal_form, weight)) in leaves {
+            if weight.is_zero() {
+                continue;
+            }
+            for (monomial, coefficient) in &normal_form.exact_terms {
+                merge_term(&mut terms, *monomial, coefficient * &weight);
+            }
+        }
+        let output_terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
+        self.exact_plan_materializations = self.exact_plan_materializations.saturating_add(1);
+        self.exact_plan_materialization_output_terms_total =
+            self.exact_plan_materialization_output_terms_total.saturating_add(output_terms);
+        self.exact_plan_materialization_output_terms_max =
+            self.exact_plan_materialization_output_terms_max.max(output_terms);
+        Ok(Arc::new(PolynomialNF {
+            exact_terms: terms,
+            bounded_summary: BoundedSummary::missing(),
+        }))
+    }
+
+    fn exact_plan_leaf_roots(&self, validate: bool) -> Result<Vec<MonomialId>, NormalizeError> {
+        let mut plans = self.exact_plans.values().cloned().collect::<Vec<_>>();
+        let mut seen_plans = BTreeSet::new();
+        let mut seen_leaves = BTreeSet::new();
+        let mut roots = Vec::new();
+        while let Some(plan) = plans.pop() {
+            if !seen_plans.insert(plan.id) {
+                continue;
+            }
+            if validate {
+                self.validate_exact_plan_authority(&plan.authority)?;
+            }
+            for child in [&plan.left, &plan.right] {
+                match child {
+                    NodeExactState::Additive(child) => {
+                        if child.id >= plan.id {
+                            return Err(NormalizeError::InvalidExactPlan {
+                                reason: "non-causal additive plan",
+                            });
+                        }
+                        plans.push(Arc::clone(child));
+                    }
+                    NodeExactState::Materialized { authority, normal_form } => {
+                        if validate {
+                            self.validate_exact_plan_authority(authority)?;
+                        }
+                        let key = Arc::as_ptr(normal_form) as usize;
+                        if seen_leaves.insert(key) {
+                            roots.extend(normal_form.exact_terms.keys().copied());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(roots)
+    }
+
+    fn exact_plan_diagnostic_shape(&self) -> (u64, u64, u64, u64) {
+        let mut plans = self.exact_plans.values().cloned().collect::<Vec<_>>();
+        let mut seen_plans = BTreeSet::new();
+        let mut seen_leaves = BTreeSet::new();
+        let mut leaf_exact_term_refs = 0_u64;
+        let mut largest_leaf_exact_terms = 0_u64;
+        while let Some(plan) = plans.pop() {
+            if !seen_plans.insert(plan.id) {
+                continue;
+            }
+            for child in [&plan.left, &plan.right] {
+                match child {
+                    NodeExactState::Additive(child) => plans.push(Arc::clone(child)),
+                    NodeExactState::Materialized { normal_form, .. } => {
+                        if seen_leaves.insert(Arc::as_ptr(normal_form) as usize) {
+                            let terms =
+                                u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX);
+                            leaf_exact_term_refs = leaf_exact_term_refs.saturating_add(terms);
+                            largest_leaf_exact_terms = largest_leaf_exact_terms.max(terms);
+                        }
+                    }
+                }
+            }
+        }
+        (
+            u64::try_from(seen_plans.len()).unwrap_or(u64::MAX),
+            u64::try_from(seen_leaves.len()).unwrap_or(u64::MAX),
+            leaf_exact_term_refs,
+            largest_leaf_exact_terms,
+        )
     }
 
     fn diagnostic_value_cache_top8(&self) -> DiagnosticValueCacheTop8 {
@@ -1704,10 +2017,14 @@ impl<'a> Normalizer<'a> {
 
     fn clear_value_cache(&mut self) {
         self.cache.clear();
+        self.exact_plans.clear();
         self.owner_counters.cache_exact_terms = 0;
     }
 
     fn insert_value_cache(&mut self, expression: ExprId, value: Arc<AnalyzedValue>) {
+        if value.exact_nf.is_some() {
+            self.exact_plans.remove(&expression);
+        }
         let terms = Self::exact_terms(value.as_ref());
         if let Some(previous) = self.cache.insert(expression, value) {
             self.owner_counters.cache_exact_terms = self
@@ -1724,6 +2041,7 @@ impl<'a> Normalizer<'a> {
     }
 
     fn take_value_cache(&mut self, expression: ExprId) -> Option<Arc<AnalyzedValue>> {
+        self.exact_plans.remove(&expression);
         let previous = self.cache.remove(&expression);
         if let Some(previous) = previous.as_ref() {
             self.owner_counters.cache_exact_terms = self
@@ -1763,9 +2081,17 @@ impl<'a> Normalizer<'a> {
         &self,
         active: impl IntoIterator<Item = MonomialId>,
     ) -> DiagnosticOwnerCensus {
-        let cache_roots = self.cache.values().flat_map(|value| {
-            value.exact_nf.iter().flat_map(|normal_form| normal_form.exact_terms.keys().copied())
-        });
+        let plan_roots = self.exact_plan_leaf_roots(false).unwrap_or_default();
+        let cache_roots = self
+            .cache
+            .values()
+            .flat_map(|value| {
+                value
+                    .exact_nf
+                    .iter()
+                    .flat_map(|normal_form| normal_form.exact_terms.keys().copied())
+            })
+            .chain(plan_roots);
         let gadget_roots = self
             .gadget_input_nfs
             .values()
@@ -1785,6 +2111,12 @@ impl<'a> Normalizer<'a> {
         );
         let canonical =
             self.normalization.as_deref().map(|cache| cache.owner_census()).unwrap_or_default();
+        let (
+            additive_plan_nodes,
+            additive_unique_leaf_refs,
+            additive_unique_leaf_exact_term_refs,
+            additive_largest_leaf_exact_terms,
+        ) = self.exact_plan_diagnostic_shape();
         DiagnosticOwnerCensus {
             monomial_allocated_descriptor_slots: monomial.allocated_descriptor_slots,
             monomial_retained_descriptor_slots: monomial.retained_descriptor_slots,
@@ -1816,6 +2148,15 @@ impl<'a> Normalizer<'a> {
             canonical_rhs_largest_nf_terms: canonical.canonical_rhs_largest_nf_terms,
             runtime_entries: canonical.runtime_entries,
             runtime_lhs_keys: canonical.runtime_lhs_keys,
+            additive_plan_nodes,
+            additive_unique_leaf_refs,
+            additive_unique_leaf_exact_term_refs,
+            additive_largest_leaf_exact_terms,
+            additive_materializations: self.exact_plan_materializations,
+            additive_materialization_output_terms_total: self
+                .exact_plan_materialization_output_terms_total,
+            additive_materialization_output_terms_max: self
+                .exact_plan_materialization_output_terms_max,
         }
     }
 
@@ -1834,9 +2175,17 @@ impl<'a> Normalizer<'a> {
         {
             return Ok(());
         }
-        let cache_roots = self.cache.values().flat_map(|value| {
-            value.exact_nf.iter().flat_map(|normal_form| normal_form.exact_terms.keys().copied())
-        });
+        let plan_roots = self.exact_plan_leaf_roots(true)?;
+        let cache_roots = self
+            .cache
+            .values()
+            .flat_map(|value| {
+                value
+                    .exact_nf
+                    .iter()
+                    .flat_map(|normal_form| normal_form.exact_terms.keys().copied())
+            })
+            .chain(plan_roots);
         let gadget_roots = self
             .gadget_input_nfs
             .values()
@@ -2013,6 +2362,8 @@ impl<'a> Normalizer<'a> {
             gadget_recompositions: None,
             normalization: None,
             cache: BTreeMap::new(),
+            exact_plans: BTreeMap::new(),
+            next_exact_plan_id: 0,
             expression_bounds: BTreeMap::new(),
             remaining_uses: BTreeMap::new(),
             gadget_input_nfs: BTreeMap::new(),
@@ -2066,6 +2417,9 @@ impl<'a> Normalizer<'a> {
             protected_monomial_prefix,
             monomial_gc_allocation_threshold_bytes: MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES,
             gc_counters: DiagnosticGcCounters::default(),
+            exact_plan_materializations: 0,
+            exact_plan_materialization_output_terms_total: 0,
+            exact_plan_materialization_output_terms_max: 0,
         })
     }
 
@@ -2586,10 +2940,16 @@ impl<'a> Normalizer<'a> {
         self.trace.enter_next_root_phase("next_root:normalize_proof_end", trace_next_root_proof);
         self.watchdog_update(|progress| progress.phase = DiagnosticPhase::StateReset);
         self.clear_value_cache();
+        self.exact_plans.clear();
         self.expression_bounds.clear();
         self.remaining_uses.clear();
         self.clear_gadget_holds();
         self.owner_counters = NormalizerOwnerCounters::default();
+        if outermost {
+            self.exact_plan_materializations = 0;
+            self.exact_plan_materialization_output_terms_total = 0;
+            self.exact_plan_materialization_output_terms_max = 0;
+        }
         self.counters = NormalizationCounters::default();
         self.watchdog_update(|progress| progress.phase = DiagnosticPhase::UseCounts);
         let use_counts_started = self.watchdog_timing_start();
@@ -2710,6 +3070,17 @@ impl<'a> Normalizer<'a> {
             }
         }
         self.watchdog_update(|progress| progress.phase = DiagnosticPhase::Post);
+        if let Some(plan) = self.exact_plans.remove(&root.expression()) {
+            let materialized = self.materialize_exact_state(&NodeExactState::Additive(plan))?;
+            let cached = self
+                .cache
+                .get(&root.expression())
+                .cloned()
+                .ok_or(NormalizeError::MissingCachedValue { expression: root.expression() })?;
+            let materialized_value =
+                synchronize_materialized_value(cached.as_ref().clone(), materialized);
+            self.insert_value_cache(root.expression(), Arc::new(materialized_value));
+        }
         let root_nf = self.cache.get(&root.expression()).and_then(|value| value.exact_nf.clone());
         self.update_trace_root_shape(root_nf.as_deref());
         self.trace.enter_postphase("post:root_take");
@@ -3167,8 +3538,10 @@ impl<'a> Normalizer<'a> {
                     .values()
                     .flat_map(|normal_form| normal_form.exact_terms.keys().copied()),
             );
+            self.suspended_owner_roots.extend(self.exact_plan_leaf_roots(true)?);
         }
         let saved_cache = std::mem::take(&mut self.cache);
+        let saved_exact_plans = std::mem::take(&mut self.exact_plans);
         // `normalize` owns a complete root-local bounds map and clears it at entry. Keep the
         // outer map out of that nested invocation, then merge newly-derived entries back after
         // restoring it. This preserves the outer typed authority without retaining a stale
@@ -3197,6 +3570,7 @@ impl<'a> Normalizer<'a> {
         self.watchdog_update(|progress| progress.phase = DiagnosticPhase::CallerMerge);
         self.trace.enter_caller_phase("caller:nested_return", true);
         self.cache = saved_cache;
+        self.exact_plans = saved_exact_plans;
         self.trace.enter_caller_phase("caller:cache_restored", false);
         let nested_expression_bounds = std::mem::take(&mut self.expression_bounds);
         self.expression_bounds = saved_expression_bounds;
@@ -3207,7 +3581,9 @@ impl<'a> Normalizer<'a> {
             u64::try_from(self.expression_bounds.len()).unwrap_or(u64::MAX);
         self.trace.enter_caller_phase("caller:bounds_merge_start", true);
         let merge_bounds_started = self.watchdog_timing_start();
-        self.merge_expression_bounds(nested_expression_bounds);
+        if value.is_ok() {
+            self.merge_expression_bounds(nested_expression_bounds);
+        }
         self.watchdog_record_timing(merge_bounds_started, |timings| {
             &mut timings.specialized_merge_bounds
         });
@@ -3356,12 +3732,16 @@ impl<'a> Normalizer<'a> {
         Ok(reachable)
     }
 
-    fn child_value(&mut self, expression: ExprId) -> Result<Arc<AnalyzedValue>, NormalizeError> {
+    fn child_value_with_exact(
+        &mut self,
+        expression: ExprId,
+    ) -> Result<(Arc<AnalyzedValue>, Option<NodeExactState>), NormalizeError> {
         let value = self
             .cache
             .get(&expression)
             .cloned()
             .ok_or(NormalizeError::MissingCachedValue { expression })?;
+        let exact = self.cached_exact_state(expression, value.as_ref())?;
         let remaining = self
             .remaining_uses
             .get_mut(&expression)
@@ -3372,7 +3752,14 @@ impl<'a> Normalizer<'a> {
             self.counters.remaining_use_releases =
                 self.counters.remaining_use_releases.saturating_add(1);
         }
-        Ok(value)
+        Ok((value, exact))
+    }
+
+    fn child_value(&mut self, expression: ExprId) -> Result<Arc<AnalyzedValue>, NormalizeError> {
+        let (value, exact) = self.child_value_with_exact(expression)?;
+        let Some(exact @ NodeExactState::Additive(_)) = exact else { return Ok(value) };
+        let materialized = self.materialize_exact_state(&exact)?;
+        Ok(Arc::new(synchronize_materialized_value(value.as_ref().clone(), materialized)))
     }
 
     fn gadget_input_nf(
@@ -3405,12 +3792,50 @@ impl<'a> Normalizer<'a> {
         // projection. Calling `ProgramArena::scoped` here would walk the remaining sub-DAG once
         // per node and turn a linear chain into O(N^2).
         let semantic = self.expressions.scoped_from_proof(scope_proof, expression)?;
+        let additive = matches!(
+            node.operator,
+            ValueOperator::Matrix(MatrixOperation::Add | MatrixOperation::Subtract)
+        );
         let mut children = Vec::with_capacity(node.inputs.len());
+        let mut child_exact = Vec::with_capacity(node.inputs.len());
         for child in &node.inputs {
-            children.push(self.child_value(*child)?);
+            if additive {
+                let (value, exact) = self.child_value_with_exact(*child)?;
+                children.push(value);
+                child_exact.push(exact);
+            } else {
+                children.push(self.child_value(*child)?);
+            }
         }
         let output_type = self.expressions.value_type(expression)?.clone();
-        let mut value = if matches!(output_type, ResolvedValueType::Matrix(_)) {
+        let mut value = if additive && matches!(output_type, ResolvedValueType::Matrix(_)) {
+            let bound = self.matrix_bound(expression, node, &children)?;
+            match (
+                child_exact.first().and_then(Clone::clone),
+                child_exact.get(1).and_then(Clone::clone),
+            ) {
+                (Some(left), Some(right)) => {
+                    let plan = self.new_additive_plan(
+                        expression,
+                        left,
+                        right,
+                        matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Subtract)),
+                    )?;
+                    if self.relations.is_some() && self.relation_rewriting_enabled {
+                        let normal_form =
+                            self.materialize_exact_state(&NodeExactState::Additive(plan))?;
+                        synchronize_materialized_value(
+                            AnalyzedValue { semantic, exact_nf: None, coefficient_bound: bound },
+                            normal_form,
+                        )
+                    } else {
+                        self.exact_plans.insert(expression, plan);
+                        AnalyzedValue { semantic, exact_nf: None, coefficient_bound: bound }
+                    }
+                }
+                _ => self.evaluate_matrix(scope_proof, semantic, expression, node, &children)?,
+            }
+        } else if matches!(output_type, ResolvedValueType::Matrix(_)) {
             self.evaluate_matrix(scope_proof, semantic, expression, node, &children)?
         } else {
             self.evaluate_nonmatrix(semantic, expression, node, &children)?
@@ -6987,6 +7412,26 @@ fn with_summary(
         bound
     };
     normal_form
+}
+
+fn with_summary_arc(
+    normal_form: Arc<PolynomialNF>,
+    bound: NumericContract<CoefficientBound>,
+) -> Arc<PolynomialNF> {
+    match Arc::try_unwrap(normal_form) {
+        Ok(normal_form) => Arc::new(with_summary(normal_form, bound)),
+        Err(normal_form) => Arc::new(with_summary(normal_form.as_ref().clone(), bound)),
+    }
+}
+
+fn synchronize_materialized_value(
+    mut value: AnalyzedValue,
+    normal_form: Arc<PolynomialNF>,
+) -> AnalyzedValue {
+    let normal_form = with_summary_arc(normal_form, value.coefficient_bound.clone());
+    value.coefficient_bound = normal_form.bounded_summary.coefficient_bound.clone();
+    value.exact_nf = Some(normal_form);
+    value
 }
 
 /// Merge two sound value-level contracts without replacing a known result with a weaker one.
@@ -10621,6 +11066,367 @@ mod tests {
     }
 
     #[test]
+    fn persistent_additive_plan_materializes_shared_fanout_once() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = source_with(&mut expressions, matrix_type(), 10_901);
+        let right = source_with(&mut expressions, matrix_type(), 10_902);
+        let mut root =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        for _ in 0..16 {
+            root =
+                expressions.intern_matrix_transform(MatrixOperation::Add, &[root, root]).unwrap();
+        }
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let value = normalizer.normalize(semantic).unwrap();
+        let exact = value.exact_nf.unwrap();
+        assert_eq!(exact.exact_terms.len(), 2);
+        assert!(
+            exact.exact_terms.values().all(|coefficient| coefficient == &BigInt::from(1_u64 << 16))
+        );
+        assert_eq!(normalizer.exact_plan_materializations, 1);
+        assert_eq!(normalizer.exact_plan_materialization_output_terms_total, 2);
+        assert_eq!(normalizer.exact_plan_materialization_output_terms_max, 2);
+    }
+
+    #[test]
+    fn persistent_additive_plan_merges_distinct_sibling_fanouts() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let x = source_with(&mut expressions, matrix_type(), 10_912);
+        let y = source_with(&mut expressions, matrix_type(), 10_913);
+        let mut left = expressions.intern_matrix_transform(MatrixOperation::Add, &[x, y]).unwrap();
+        let mut right =
+            expressions.intern_matrix_transform(MatrixOperation::Subtract, &[x, y]).unwrap();
+        for _ in 0..16 {
+            left =
+                expressions.intern_matrix_transform(MatrixOperation::Add, &[left, left]).unwrap();
+            right =
+                expressions.intern_matrix_transform(MatrixOperation::Add, &[right, right]).unwrap();
+        }
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let value = normalizer.normalize(semantic).unwrap();
+        let exact = value.exact_nf.unwrap();
+        assert_eq!(exact.exact_terms.len(), 1);
+        assert_eq!(exact.exact_terms.values().next(), Some(&BigInt::from(1_u64 << 17)));
+        assert_eq!(normalizer.exact_plan_materializations, 1);
+    }
+
+    #[test]
+    fn persistent_additive_plan_cancels_and_materializes_before_multiply() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let x = source_with(&mut expressions, matrix_type(), 10_903);
+        let y = source_with(&mut expressions, matrix_type(), 10_904);
+        let sum = expressions.intern_matrix_transform(MatrixOperation::Add, &[x, y]).unwrap();
+        let cancelled =
+            expressions.intern_matrix_transform(MatrixOperation::Subtract, &[sum, sum]).unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[cancelled, x])
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let cancelled_semantic =
+            programs.scoped(&expressions, monomials.scope(), cancelled).unwrap();
+        let cancelled_value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(cancelled_semantic)
+            .unwrap();
+        assert_eq!(
+            cancelled_value.coefficient_bound,
+            NumericContract::Known(CoefficientBound::ExactZero)
+        );
+        assert_eq!(
+            cancelled_value.exact_nf.as_ref().unwrap().bounded_summary.coefficient_bound,
+            cancelled_value.coefficient_bound
+        );
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let value = normalizer.normalize(semantic).unwrap();
+        assert!(value.exact_nf.unwrap().is_zero());
+        assert_eq!(value.coefficient_bound, NumericContract::Known(CoefficientBound::ExactZero));
+        assert_eq!(normalizer.exact_plan_materializations, 1);
+    }
+
+    #[test]
+    fn persistent_additive_plan_rejects_type_mismatch_before_materialization() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let source = source(&mut expressions);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, source);
+        let foreign_expression_token = ExprArena::new().token();
+        let foreign_monomial_token =
+            MonomialArena::new(&expressions, &programs, monomials.scope()).unwrap().token();
+        let mut frozen_relations = RelationRegistry::new();
+        let foreign_relation_generation = frozen_relations.freeze();
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let normal_form = Arc::new(PolynomialNF::zero());
+        let left = normalizer
+            .materialized_exact_state(semantic.expression(), Arc::clone(&normal_form))
+            .unwrap();
+        let mut wrong = normalizer.exact_plan_authority(semantic.expression()).unwrap();
+        wrong.matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let right = NodeExactState::Materialized { authority: wrong, normal_form };
+        assert!(matches!(
+            normalizer.new_additive_plan(semantic.expression(), left, right, false),
+            Err(NormalizeError::InvalidExactPlan { reason: "additive type mismatch" })
+        ));
+        let next_id = normalizer.next_exact_plan_id;
+        let valid = normalizer.exact_plan_authority(semantic.expression()).unwrap();
+        let authorities = [
+            ExactPlanAuthority { expressions: foreign_expression_token, ..valid.clone() },
+            ExactPlanAuthority { monomials: foreign_monomial_token, ..valid.clone() },
+            ExactPlanAuthority {
+                scope: ValueProgramId::new(ArenaToken::fresh(), 0),
+                ..valid.clone()
+            },
+            ExactPlanAuthority { relations: Some(foreign_relation_generation), ..valid.clone() },
+        ];
+        for authority in authorities {
+            let left = NodeExactState::Materialized {
+                authority,
+                normal_form: Arc::new(PolynomialNF::zero()),
+            };
+            let right = normalizer
+                .materialized_exact_state(semantic.expression(), Arc::new(PolynomialNF::zero()))
+                .unwrap();
+            assert!(matches!(
+                normalizer.new_additive_plan(semantic.expression(), left, right, false),
+                Err(NormalizeError::InvalidExactPlan { .. })
+            ));
+            assert_eq!(normalizer.next_exact_plan_id, next_id);
+            assert!(normalizer.exact_plans.is_empty());
+        }
+    }
+
+    #[test]
+    fn forced_gc_marks_unique_additive_plan_leaves() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let x = source_with(&mut expressions, matrix_type(), 10_905);
+        let y = source_with(&mut expressions, matrix_type(), 10_906);
+        let sum = expressions.intern_matrix_transform(MatrixOperation::Add, &[x, y]).unwrap();
+        let root = expressions.intern_matrix_transform(MatrixOperation::Add, &[sum, sum]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        normalizer.monomial_gc_allocation_threshold_bytes = 0;
+        let value = normalizer.normalize(semantic).unwrap();
+        let exact = value.exact_nf.unwrap();
+        assert_eq!(exact.exact_terms.len(), 2);
+        assert!(exact.exact_terms.values().all(|coefficient| coefficient == &BigInt::from(2_u8)));
+        for monomial in exact.exact_terms.keys() {
+            normalizer.monomials.descriptor(*monomial).unwrap();
+        }
+    }
+
+    #[test]
+    fn additive_plan_gc_rejects_foreign_and_tombstoned_leaf_ids_before_mutation() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let foreign_root = source_with(&mut expressions, matrix_type(), 10_909);
+        let (_, mut foreign_arena, foreign_semantic) =
+            setup(&mut expressions, &mut programs, foreign_root);
+        let foreign =
+            foreign_arena.intern(&expressions, &programs, &[], &[foreign_semantic]).unwrap();
+
+        let x = source_with(&mut expressions, matrix_type(), 10_910);
+        let y = source_with(&mut expressions, matrix_type(), 10_911);
+        let root = expressions.intern_matrix_transform(MatrixOperation::Add, &[x, y]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let local = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let tombstone =
+            monomials.intern(&expressions, &programs, &[], &[semantic, semantic]).unwrap();
+        monomials.sweep(0, [local]).unwrap();
+        let occupied_before = monomials.occupied_len();
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        normalizer.protected_monomial_prefix = 0;
+        normalizer.monomial_gc_allocation_threshold_bytes = 0;
+        normalizer.normalization_depth = 1;
+        for (invalid, expected_collected) in [(foreign, false), (tombstone, true)] {
+            let invalid_nf = Arc::new(PolynomialNF {
+                exact_terms: BTreeMap::from([(invalid, BigInt::from(1_u8))]),
+                bounded_summary: BoundedSummary::missing(),
+            });
+            let left = normalizer.materialized_exact_state(x, invalid_nf).unwrap();
+            let right =
+                normalizer.materialized_exact_state(y, Arc::new(PolynomialNF::zero())).unwrap();
+            let plan = normalizer.new_additive_plan(root, left, right, false).unwrap();
+            normalizer.exact_plans.insert(root, plan);
+            normalizer.insert_value_cache(
+                root,
+                Arc::new(AnalyzedValue {
+                    semantic,
+                    exact_nf: None,
+                    coefficient_bound: NumericContract::Missing,
+                }),
+            );
+            let error = normalizer.sweep_monomials_at_node_commit().unwrap_err();
+            assert!(if expected_collected {
+                matches!(error, NormalizeError::Monomial(MonomialError::CollectedMonomialId { .. }))
+            } else {
+                matches!(error, NormalizeError::Monomial(MonomialError::InvalidMonomialId { .. }))
+            });
+            assert_eq!(normalizer.monomials.occupied_len(), occupied_before);
+            assert_eq!(normalizer.gc_counters, DiagnosticGcCounters::default());
+            normalizer.clear_value_cache();
+        }
+    }
+
+    #[test]
+    fn additive_owner_telemetry_counts_unique_plan_nodes_and_leaf_arcs() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let x = source_with(&mut expressions, matrix_type(), 10_907);
+        let y = source_with(&mut expressions, matrix_type(), 10_908);
+        let sum = expressions.intern_matrix_transform(MatrixOperation::Add, &[x, y]).unwrap();
+        let root = expressions.intern_matrix_transform(MatrixOperation::Add, &[sum, sum]).unwrap();
+        let (facts, mut monomials, _) = setup(&mut expressions, &mut programs, root);
+        let x_semantic = programs.scoped(&expressions, monomials.scope(), x).unwrap();
+        let y_semantic = programs.scoped(&expressions, monomials.scope(), y).unwrap();
+        let x_monomial = monomials.intern(&expressions, &programs, &[], &[x_semantic]).unwrap();
+        let y_monomial = monomials.intern(&expressions, &programs, &[], &[y_semantic]).unwrap();
+        let leaf = |monomial| {
+            Arc::new(PolynomialNF {
+                exact_terms: BTreeMap::from([(monomial, BigInt::from(1_u8))]),
+                bounded_summary: BoundedSummary::missing(),
+            })
+        };
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let x_state = normalizer.materialized_exact_state(x, leaf(x_monomial)).unwrap();
+        let y_state = normalizer.materialized_exact_state(y, leaf(y_monomial)).unwrap();
+        let sum_plan = normalizer.new_additive_plan(sum, x_state, y_state, false).unwrap();
+        let root_plan = normalizer
+            .new_additive_plan(
+                root,
+                NodeExactState::Additive(Arc::clone(&sum_plan)),
+                NodeExactState::Additive(sum_plan),
+                false,
+            )
+            .unwrap();
+        let materialized = normalizer
+            .materialize_exact_state(&NodeExactState::Additive(Arc::clone(&root_plan)))
+            .unwrap();
+        assert_eq!(materialized.term_count(), 2);
+        normalizer.exact_plans.insert(root, root_plan);
+        let owners = normalizer.owner_census();
+        assert_eq!(owners.additive_plan_nodes, 2);
+        assert_eq!(owners.additive_unique_leaf_refs, 2);
+        assert_eq!(owners.additive_unique_leaf_exact_term_refs, 2);
+        assert_eq!(owners.additive_largest_leaf_exact_terms, 1);
+        assert_eq!(owners.additive_materializations, 1);
+        assert_eq!(owners.additive_materialization_output_terms_total, 2);
+        assert_eq!(owners.additive_materialization_output_terms_max, 2);
+
+        normalizer.watchdog = DiagnosticWatchdog::start(19, Duration::from_secs(60));
+        normalizer.sample_owner_census(OwnerCensusReason::OuterTerminal, std::iter::empty());
+        let shared = Arc::clone(&normalizer.watchdog.as_ref().unwrap().shared);
+        normalizer.watchdog.as_mut().unwrap().finish(false);
+        normalizer.watchdog = None;
+        let events = shared.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let snapshots =
+            shared.snapshots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let captured = events
+            .iter()
+            .zip(&snapshots)
+            .find_map(|(event, snapshot)| (*event == "watchdog_owner_sample").then_some(snapshot))
+            .unwrap();
+        assert_eq!(captured.owners.additive_plan_nodes, 2);
+        assert_eq!(captured.owners.additive_unique_leaf_refs, 2);
+        assert_eq!(captured.owners.additive_unique_leaf_exact_term_refs, 2);
+        assert_eq!(captured.owners.additive_largest_leaf_exact_terms, 1);
+        assert_eq!(captured.owners.additive_materializations, 1);
+        assert_eq!(captured.owners.additive_materialization_output_terms_total, 2);
+        assert_eq!(captured.owners.additive_materialization_output_terms_max, 2);
+    }
+
+    #[test]
+    fn nested_specialized_additive_plan_restores_outer_state_on_success_and_error() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let x = source_with(&mut expressions, matrix_type(), 10_917);
+        let y = source_with(&mut expressions, matrix_type(), 10_918);
+        let nested = expressions.intern_matrix_transform(MatrixOperation::Add, &[x, y]).unwrap();
+        let b = source_with(&mut expressions, matrix_type(), 10_919);
+        let k = source_with(&mut expressions, matrix_type(), 10_920);
+        let first_rhs = source_with(&mut expressions, matrix_type(), 10_921);
+        let second_rhs = source_with(&mut expressions, matrix_type(), 10_922);
+        let ambiguous_root = product(&mut expressions, &[b, k]);
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[nested, ambiguous_root])
+            .unwrap();
+        let (facts, mut monomials, _) = setup(&mut expressions, &mut programs, root);
+        let mut relations = RelationRegistry::new();
+        let mut normalization_cache = NormalizationCache::new();
+        for rhs in [first_rhs, second_rhs] {
+            register_test_closed_relation_into(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut relations,
+                &mut normalization_cache,
+                ambiguous_root,
+                rhs,
+                k,
+                b,
+            );
+        }
+        relations.freeze();
+        let normalization_fingerprint = normalization_cache.canonical_state_fingerprint();
+        let nested_semantic = programs.scoped(&expressions, monomials.scope(), nested).unwrap();
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&relations, &mut normalization_cache);
+        let left = normalizer.materialized_exact_state(x, Arc::new(PolynomialNF::zero())).unwrap();
+        let right = normalizer.materialized_exact_state(y, Arc::new(PolynomialNF::zero())).unwrap();
+        let nested_plan = normalizer.new_additive_plan(nested, left, right, false).unwrap();
+        let nested_value = normalizer.normalize_specialized_root(nested).unwrap();
+        assert!(nested_value.exact_nf.is_some());
+
+        normalizer.clear_value_cache();
+        normalizer.exact_plans.clear();
+        normalizer.expression_bounds.clear();
+        normalizer.remaining_uses.clear();
+        normalizer.clear_gadget_holds();
+        normalizer.exact_plans.insert(nested, Arc::clone(&nested_plan));
+        let outer_cache_value = Arc::new(AnalyzedValue {
+            semantic: nested_semantic,
+            exact_nf: None,
+            coefficient_bound: NumericContract::Missing,
+        });
+        normalizer.insert_value_cache(nested, Arc::clone(&outer_cache_value));
+        normalizer.expression_bounds.insert(root, NumericContract::Missing);
+        normalizer.remaining_uses.insert(root, 7);
+        let gadget_nf = Arc::new(PolynomialNF::zero());
+        normalizer.insert_gadget_hold(root, Arc::clone(&gadget_nf));
+        let saved_bounds = normalizer.expression_bounds.clone();
+        let saved_uses = normalizer.remaining_uses.clone();
+
+        let error = normalizer.normalize_specialized_root(ambiguous_root).unwrap_err();
+        assert!(matches!(error, NormalizeError::Relation(RelationRegistryError::Ambiguous { .. })));
+        assert!(Arc::ptr_eq(normalizer.exact_plans.get(&nested).unwrap(), &nested_plan));
+        assert!(Arc::ptr_eq(normalizer.cache.get(&nested).unwrap(), &outer_cache_value));
+        assert_eq!(normalizer.expression_bounds, saved_bounds);
+        assert_eq!(normalizer.remaining_uses, saved_uses);
+        assert!(Arc::ptr_eq(normalizer.gadget_input_nfs.get(&root).unwrap(), &gadget_nf));
+        assert_eq!(normalizer.exact_plans.len(), 1);
+        assert_eq!(normalizer.cache.len(), 1);
+        assert_eq!(normalizer.gadget_input_nfs.len(), 1);
+        assert!(normalizer.suspended_owner_roots.is_empty());
+        drop(normalizer);
+        assert_eq!(normalization_cache.canonical_state_fingerprint(), normalization_fingerprint);
+    }
+
+    #[test]
     fn double_transpose_reuses_the_grandchild_nf_for_sum_and_product_cancellation() {
         for product in [false, true] {
             let mut expressions = ExprArena::new();
@@ -11170,6 +11976,49 @@ mod tests {
     }
 
     #[test]
+    fn additive_plan_materializes_before_closed_relation_boundary_without_cache_drift() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let b = source_with(&mut expressions, matrix_type(), 10_914);
+        let k = source_with(&mut expressions, matrix_type(), 10_915);
+        let p = source_with(&mut expressions, matrix_type(), 10_916);
+        let bk = product(&mut expressions, &[b, k]);
+        let root = expressions.intern_matrix_transform(MatrixOperation::Add, &[bk, bk]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let (relations, mut cache, _) = register_test_closed_relation(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            bk,
+            p,
+            k,
+            b,
+        );
+        let p_proof = expressions.scope_proof(monomials.scope(), p).unwrap();
+        let p_scoped = expressions.scoped_from_proof(&p_proof, p).unwrap();
+        let p_id = {
+            let value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                .unwrap()
+                .normalize(p_scoped)
+                .unwrap();
+            *value.exact_nf.unwrap().exact_terms.keys().next().unwrap()
+        };
+        let fingerprint = cache.canonical_state_fingerprint();
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&relations, &mut cache);
+        normalizer.fold_final_no_match = false;
+        let value = normalizer.normalize(semantic).unwrap();
+        assert_eq!(
+            value.exact_nf.unwrap().exact_terms,
+            BTreeMap::from([(p_id, BigInt::from(2_u8))])
+        );
+        drop(normalizer);
+        assert_eq!(cache.canonical_state_fingerprint(), fingerprint);
+    }
+
+    #[test]
     fn closed_relation_watchdog_distinguishes_whole_and_window_matches() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -11293,7 +12142,10 @@ mod tests {
         let first_rhs = source_with(&mut expressions, matrix_type(), 739);
         let second_rhs = source_with(&mut expressions, matrix_type(), 740);
         let bk = product(&mut expressions, &[b, k]);
-        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, bk);
+        // Force the ambiguous closed lookup to occur only after the persistent Add plan reaches
+        // the root relation boundary.
+        let root = expressions.intern_matrix_transform(MatrixOperation::Add, &[bk, bk]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
         let mut relations = RelationRegistry::new();
         let mut cache = NormalizationCache::new();
         register_test_closed_relation_into(

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Perfect-correctness declarations and the Rust operational checker.
 //!
 //! This crate deliberately contains no probabilistic tail estimates. Correctness consumes only

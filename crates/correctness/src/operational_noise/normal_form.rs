@@ -2898,6 +2898,8 @@ impl<'a> Normalizer<'a> {
         self.validate_exact_state_dag(state)?;
         let product_operand_additives = Self::product_operand_additives(state);
         let mut product_uses = self.product_plan_use_counts(state, &product_operand_additives)?;
+        let mut additive_output_uses =
+            self.additive_output_use_counts(state, &product_operand_additives)?;
         let mut outputs = BTreeMap::<(u8, u64), Arc<PolynomialNF>>::new();
         let mut scheduled = BTreeSet::<(u8, u64)>::new();
         let mut consumed_additives = BTreeSet::<u64>::new();
@@ -3023,6 +3025,16 @@ impl<'a> Normalizer<'a> {
                         self.product_plan_counters.planned_pairs.saturating_add(planned);
                     Self::release_product_output(&plan.left, &mut outputs, &mut product_uses)?;
                     Self::release_product_output(&plan.right, &mut outputs, &mut product_uses)?;
+                    Self::release_additive_output(
+                        &plan.left,
+                        &mut outputs,
+                        &mut additive_output_uses,
+                    )?;
+                    Self::release_additive_output(
+                        &plan.right,
+                        &mut outputs,
+                        &mut additive_output_uses,
+                    )?;
                     outputs.insert(
                         (1, plan.id),
                         Arc::new(PolynomialNF {
@@ -3036,6 +3048,7 @@ impl<'a> Normalizer<'a> {
                         flattened,
                         &mut outputs,
                         &mut product_uses,
+                        &mut additive_output_uses,
                         &mut consumed_additives,
                     )?;
                     outputs.insert((0, normal_form.0), normal_form.1);
@@ -3130,6 +3143,61 @@ impl<'a> Normalizer<'a> {
         Ok(result)
     }
 
+    fn additive_output_use_counts(
+        &self,
+        root: &NodeExactState,
+        product_operand_additives: &BTreeSet<u64>,
+    ) -> Result<BTreeMap<u64, usize>, NormalizeError> {
+        // Count reads from the same aggregate schedule that the materializer executes. Product
+        // definitions execute at most once, while a nonzero boundary Additive is read once by
+        // each materialized Additive destination. The root output is pinned separately until the
+        // final extraction and therefore has no releasable use here.
+        let mut result = BTreeMap::<u64, usize>::new();
+        let mut pending = vec![root.clone()];
+        let mut seen_products = BTreeSet::new();
+        let mut seen_additives = BTreeSet::new();
+        let no_outputs = BTreeMap::new();
+        while let Some(state) = pending.pop() {
+            match state {
+                NodeExactState::Materialized { .. } | NodeExactState::GadgetProduct(_) => {}
+                NodeExactState::Product(plan) => {
+                    if !seen_products.insert(plan.id) {
+                        continue;
+                    }
+                    for child in [&plan.left, &plan.right] {
+                        if let NodeExactState::Additive(additive) = child {
+                            let count = result.entry(additive.id).or_default();
+                            *count =
+                                count.checked_add(1).ok_or(NormalizeError::ArithmeticOverflow)?;
+                        }
+                        pending.push(child.clone());
+                    }
+                }
+                NodeExactState::Additive(plan) => {
+                    if !seen_additives.insert(plan.id) {
+                        continue;
+                    }
+                    let flattened =
+                        self.flatten_additive_plan(&plan, &no_outputs, product_operand_additives)?;
+                    for (_, (additive, weight)) in flattened.additive_outputs {
+                        if weight.is_zero() {
+                            continue;
+                        }
+                        let count = result.entry(additive.id).or_default();
+                        *count = count.checked_add(1).ok_or(NormalizeError::ArithmeticOverflow)?;
+                        pending.push(NodeExactState::Additive(additive));
+                    }
+                    // A zero-weight Product is still a definition whose reserved operand reads
+                    // must be abandoned exactly once when the aggregate scheduler skips it.
+                    for (_, (product, _, _, _)) in flattened.products {
+                        pending.push(NodeExactState::Product(product));
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     fn product_operand_additives(root: &NodeExactState) -> BTreeSet<u64> {
         let mut result = BTreeSet::new();
         let mut pending = vec![root.clone()];
@@ -3174,6 +3242,58 @@ impl<'a> Normalizer<'a> {
             outputs.remove(&(1, plan.id));
         }
         Ok(())
+    }
+
+    fn release_additive_output(
+        state: &NodeExactState,
+        outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
+        additive_output_uses: &mut BTreeMap<u64, usize>,
+    ) -> Result<(), NormalizeError> {
+        let NodeExactState::Additive(plan) = state else { return Ok(()) };
+        let remaining =
+            additive_output_uses.get_mut(&plan.id).ok_or(NormalizeError::InvalidExactPlan {
+                reason: "missing additive output use count",
+            })?;
+        if *remaining == 0 {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "additive output use count underflow",
+            });
+        }
+        if *remaining == 1 && !outputs.contains_key(&(0, plan.id)) {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "missing additive output at last use",
+            });
+        }
+        *remaining -= 1;
+        if *remaining == 0 {
+            outputs.remove(&(0, plan.id));
+        }
+        Ok(())
+    }
+
+    /// Abandon one reserved read of an Additive output because its owning Product will never
+    /// execute. Unlike a successful read, the last abandoned read may find no output: in that
+    /// case the caller must recursively discard the unmaterialized Additive definition.
+    fn abandon_additive_output(
+        state: &NodeExactState,
+        outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
+        additive_output_uses: &mut BTreeMap<u64, usize>,
+    ) -> Result<bool, NormalizeError> {
+        let NodeExactState::Additive(plan) = state else { return Ok(false) };
+        let remaining =
+            additive_output_uses.get_mut(&plan.id).ok_or(NormalizeError::InvalidExactPlan {
+                reason: "missing additive output use count",
+            })?;
+        if *remaining == 0 {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "additive output use count underflow",
+            });
+        }
+        *remaining -= 1;
+        if *remaining != 0 {
+            return Ok(false);
+        }
+        Ok(outputs.remove(&(0, plan.id)).is_none())
     }
 
     fn validate_exact_state_dag(&self, root: &NodeExactState) -> Result<(), NormalizeError> {
@@ -3327,6 +3447,7 @@ impl<'a> Normalizer<'a> {
         flattened: FlattenedAdditiveExactPlan,
         outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
         product_uses: &mut BTreeMap<u64, usize>,
+        additive_output_uses: &mut BTreeMap<u64, usize>,
         consumed_additives: &mut BTreeSet<u64>,
     ) -> Result<(u64, Arc<PolynomialNF>), NormalizeError> {
         // These additive definitions own the Product edges collected below. Mark them before a
@@ -3340,6 +3461,7 @@ impl<'a> Normalizer<'a> {
                         vec![NodeExactState::Additive(additive)],
                         outputs,
                         product_uses,
+                        additive_output_uses,
                         consumed_additives,
                     )?;
                 }
@@ -3352,6 +3474,11 @@ impl<'a> Normalizer<'a> {
             for (monomial, coefficient) in &normal_form.exact_terms {
                 merge_term(&mut terms, *monomial, coefficient * &weight);
             }
+            Self::release_additive_output(
+                &NodeExactState::Additive(additive),
+                outputs,
+                additive_output_uses,
+            )?;
         }
         for (_, (normal_form, weight)) in flattened.leaves {
             if weight.is_zero() {
@@ -3407,6 +3534,8 @@ impl<'a> Normalizer<'a> {
                         .max(u64::try_from(terms.len()).unwrap_or(u64::MAX));
                     Self::release_product_output(&plan.left, outputs, product_uses)?;
                     Self::release_product_output(&plan.right, outputs, product_uses)?;
+                    Self::release_additive_output(&plan.left, outputs, additive_output_uses)?;
+                    Self::release_additive_output(&plan.right, outputs, additive_output_uses)?;
                     executed = true;
                 }
             } else {
@@ -3431,6 +3560,7 @@ impl<'a> Normalizer<'a> {
                         &plan,
                         outputs,
                         product_uses,
+                        additive_output_uses,
                         consumed_additives,
                     )?;
                 }
@@ -3471,12 +3601,14 @@ impl<'a> Normalizer<'a> {
         product: &Arc<ProductExactPlan>,
         outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
         product_uses: &mut BTreeMap<u64, usize>,
+        additive_output_uses: &mut BTreeMap<u64, usize>,
         consumed_additives: &mut BTreeSet<u64>,
     ) -> Result<(), NormalizeError> {
         self.discard_unexecuted_exact_states(
             vec![product.left.clone(), product.right.clone()],
             outputs,
             product_uses,
+            additive_output_uses,
             consumed_additives,
         )
     }
@@ -3486,13 +3618,27 @@ impl<'a> Normalizer<'a> {
         mut pending: Vec<NodeExactState>,
         outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
         product_uses: &mut BTreeMap<u64, usize>,
+        additive_output_uses: &mut BTreeMap<u64, usize>,
         consumed_additives: &mut BTreeSet<u64>,
     ) -> Result<(), NormalizeError> {
         while let Some(state) = pending.pop() {
             match state {
                 NodeExactState::Materialized { .. } | NodeExactState::GadgetProduct(_) => {}
                 NodeExactState::Additive(plan) => {
-                    if outputs.contains_key(&(0, plan.id)) || !consumed_additives.insert(plan.id) {
+                    let should_discard_definition = if additive_output_uses.contains_key(&plan.id) {
+                        Self::abandon_additive_output(
+                            &NodeExactState::Additive(Arc::clone(&plan)),
+                            outputs,
+                            additive_output_uses,
+                        )?
+                    } else if outputs.contains_key(&(0, plan.id)) {
+                        return Err(NormalizeError::InvalidExactPlan {
+                            reason: "additive output exists without a use count",
+                        });
+                    } else {
+                        true
+                    };
+                    if !should_discard_definition || !consumed_additives.insert(plan.id) {
                         continue;
                     }
                     pending.push(plan.left.clone());
@@ -6189,9 +6335,7 @@ impl<'a> Normalizer<'a> {
                 }
             }
         }
-        let (eligible, _) = self.propagate_product_eligibility(&candidates, &real_consumers)?;
-        self.deferred_products = eligible;
-        self.deferred_scalar_actions = scalar_action_candidates
+        let scalar_action_candidates = scalar_action_candidates
             .into_iter()
             .filter(|expression| {
                 real_consumers.get(expression).is_some_and(|consumers| {
@@ -6208,7 +6352,59 @@ impl<'a> Normalizer<'a> {
                         })
                 })
             })
-            .collect();
+            .collect::<BTreeSet<_>>();
+        let mut scalar_actions_by_matrix = BTreeMap::<ExprId, BTreeSet<ExprId>>::new();
+        for expression in &scalar_action_candidates {
+            let node = self.expressions.node(*expression)?;
+            let mut matrix_input = None;
+            for input in &node.inputs {
+                let ResolvedValueType::Matrix(matrix) = self.expressions.value_type(*input)? else {
+                    continue;
+                };
+                if matrix.rows != 1 || matrix.columns != 1 {
+                    matrix_input = Some(*input);
+                }
+            }
+            let Some(matrix_input) = matrix_input else { continue };
+            scalar_actions_by_matrix.entry(matrix_input).or_default().insert(*expression);
+        }
+        let mut admitted_scalar_actions = BTreeSet::new();
+        let mut barrier_pending = Vec::new();
+        for (matrix, actions) in scalar_actions_by_matrix {
+            if actions.len() >= 2 {
+                admitted_scalar_actions.extend(actions);
+                barrier_pending.push(matrix);
+            }
+        }
+        // Stop product deferral at the first multiply below an admitted scalar action's matrix
+        // operand so the eager frontier commits at a node boundary where normal monomial GC
+        // remains available. Nonlinear operators other than multiply are already eager boundaries.
+        // The barrier is global: a shared expression never has two edge-dependent representations.
+        let mut barrier_visited = BTreeSet::new();
+        let mut product_frontier = BTreeSet::new();
+        while let Some(expression) = barrier_pending.pop() {
+            if !barrier_visited.insert(expression) {
+                continue;
+            }
+            let node = self.expressions.node(expression)?;
+            match node.operator {
+                ValueOperator::Matrix(MatrixOperation::Add | MatrixOperation::Subtract) => {
+                    barrier_pending.extend(node.inputs.iter().copied());
+                }
+                ValueOperator::Matrix(MatrixOperation::Multiply) => {
+                    product_frontier.insert(expression);
+                }
+                _ => {}
+            }
+        }
+        for expression in &product_frontier {
+            candidates.remove(expression);
+            gadget_candidates.remove(expression);
+            admitted_scalar_actions.remove(expression);
+        }
+        let (eligible, _) = self.propagate_product_eligibility(&candidates, &real_consumers)?;
+        self.deferred_products = eligible;
+        self.deferred_scalar_actions = admitted_scalar_actions;
         if self.gadget_recompositions.is_some() {
             self.deferred_gadget_products = gadget_candidates
                 .iter()
@@ -15378,7 +15574,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_scalar_action_matches_eager_on_both_sides_and_streams() {
+    fn single_scalar_action_matches_eager_on_both_sides_without_deferral() {
         for scalar_on_left in [false, true] {
             let mut expressions = ExprArena::new();
             let mut programs = ProgramArena::new();
@@ -15425,8 +15621,8 @@ mod tests {
                 monomials.descriptor(*exact.exact_terms.keys().next().unwrap()).unwrap();
             assert_eq!(descriptor.central_factors.len(), 1);
             assert_eq!(descriptor.ordered_factors.len(), 1);
-            assert_eq!(counters.scalar_action_plans_created, 1);
-            assert_eq!(counters.scalar_action_streamed_executions, 1);
+            assert_eq!(counters.scalar_action_plans_created, 0);
+            assert_eq!(counters.scalar_action_streamed_executions, 0);
             assert_eq!(counters.scalar_action_standalone_materializations, 0);
             assert_eq!(counters.scalar_action_zero_weight_skips, 0);
         }
@@ -15480,7 +15676,7 @@ mod tests {
             let value = normalizer.normalize(semantic).unwrap();
             assert_eq!(
                 normalizer.product_plan_counters.scalar_action_plans_created,
-                if subtract_last { 1 } else { 4 }
+                if subtract_last { 0 } else { 4 }
             );
             assert_eq!(
                 normalizer.product_plan_counters.scalar_action_streamed_executions,
@@ -15490,10 +15686,7 @@ mod tests {
                 normalizer.product_plan_counters.scalar_action_standalone_materializations,
                 0
             );
-            assert_eq!(
-                normalizer.product_plan_counters.scalar_action_zero_weight_skips,
-                u64::from(subtract_last)
-            );
+            assert_eq!(normalizer.product_plan_counters.scalar_action_zero_weight_skips, 0);
             assert!(normalizer.exact_plan_materializations <= 2);
             let exact = value.exact_nf.unwrap();
             if subtract_last {
@@ -15508,6 +15701,221 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn two_distinct_admitted_scalar_actions_cancel_without_output_underflow() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+        let a = matrix_source(&mut expressions, "cancel-action-a", matrix_type.clone(), None);
+        let b = matrix_source(&mut expressions, "cancel-action-b", matrix_type, None);
+        let shared = expressions.intern_matrix_transform(MatrixOperation::Add, &[a, b]).unwrap();
+        let scalar = matrix_source(&mut expressions, "cancel-action-scalar", scalar_type, None);
+        let negated =
+            expressions.intern_matrix_transform(MatrixOperation::Negate, &[scalar]).unwrap();
+        let equivalent =
+            expressions.intern_matrix_transform(MatrixOperation::Negate, &[negated]).unwrap();
+        let left = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[shared, scalar])
+            .unwrap();
+        let right = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[shared, equivalent])
+            .unwrap();
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Subtract, &[left, right]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let value = normalizer.normalize(semantic).unwrap();
+        assert!(value.exact_nf.unwrap().is_zero());
+        assert_eq!(normalizer.product_plan_counters.scalar_action_plans_created, 2);
+        assert_eq!(normalizer.product_plan_counters.scalar_action_streamed_executions, 2);
+    }
+
+    #[test]
+    fn scalar_action_admission_requires_distinct_shared_additive_consumers() {
+        let run = |case: u8| {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+            let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+            let a = matrix_source(&mut expressions, "fanout-a", matrix_type.clone(), None);
+            let b = matrix_source(&mut expressions, "fanout-b", matrix_type, None);
+            let shared =
+                expressions.intern_matrix_transform(MatrixOperation::Add, &[a, b]).unwrap();
+            let scalar_a =
+                matrix_source(&mut expressions, "fanout-scalar-a", scalar_type.clone(), None);
+            let scalar_b = matrix_source(&mut expressions, "fanout-scalar-b", scalar_type, None);
+            let action_a = expressions
+                .intern_matrix_transform(MatrixOperation::Multiply, &[shared, scalar_a])
+                .unwrap();
+            let action_b = expressions
+                .intern_matrix_transform(MatrixOperation::Multiply, &[shared, scalar_b])
+                .unwrap();
+            let root = match case {
+                0 => expressions
+                    .intern_matrix_transform(MatrixOperation::Add, &[action_a, action_b])
+                    .unwrap(),
+                1 => expressions
+                    .intern_matrix_transform(MatrixOperation::Add, &[action_a, action_a])
+                    .unwrap(),
+                _ => expressions
+                    .intern_matrix_transform(MatrixOperation::Add, &[action_a, shared])
+                    .unwrap(),
+            };
+            let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            normalizer.compute_use_counts(semantic.expression()).unwrap();
+            (
+                normalizer.deferred_scalar_actions.contains(&action_a),
+                normalizer.deferred_scalar_actions.contains(&action_b),
+            )
+        };
+        assert_eq!(run(0), (true, true));
+        assert_eq!(run(1), (false, false));
+        assert_eq!(run(2), (false, false));
+    }
+
+    #[test]
+    fn scalar_action_shared_direct_product_is_admitted_and_forced_eager() {
+        for matrix_is_product in [false, true] {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+            let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+            let a = matrix_source(&mut expressions, "direct-fanout-a", matrix_type.clone(), None);
+            let b = matrix_source(&mut expressions, "direct-fanout-b", matrix_type, None);
+            let matrix = if matrix_is_product {
+                expressions.intern_matrix_transform(MatrixOperation::Multiply, &[a, b]).unwrap()
+            } else {
+                a
+            };
+            let scalar_a = matrix_source(
+                &mut expressions,
+                "direct-fanout-scalar-a",
+                scalar_type.clone(),
+                None,
+            );
+            let scalar_b =
+                matrix_source(&mut expressions, "direct-fanout-scalar-b", scalar_type, None);
+            let action_a = expressions
+                .intern_matrix_transform(MatrixOperation::Multiply, &[matrix, scalar_a])
+                .unwrap();
+            let action_b = expressions
+                .intern_matrix_transform(MatrixOperation::Multiply, &[matrix, scalar_b])
+                .unwrap();
+            let root = expressions
+                .intern_matrix_transform(MatrixOperation::Add, &[action_a, action_b])
+                .unwrap();
+            let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            normalizer.compute_use_counts(semantic.expression()).unwrap();
+            assert!(normalizer.deferred_scalar_actions.contains(&action_a));
+            assert!(normalizer.deferred_scalar_actions.contains(&action_b));
+            if matrix_is_product {
+                assert!(!normalizer.deferred_products.contains(&matrix));
+                assert!(!normalizer.deferred_gadget_products.contains(&matrix));
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_action_backward_barrier_forces_only_first_product_frontiers_eager() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+        let a = matrix_source(&mut expressions, "barrier-a", matrix_type.clone(), None);
+        let b = matrix_source(&mut expressions, "barrier-b", matrix_type.clone(), None);
+        let c = matrix_source(&mut expressions, "barrier-c", matrix_type.clone(), None);
+        let d = matrix_source(&mut expressions, "barrier-d", matrix_type.clone(), None);
+        let e = matrix_source(&mut expressions, "barrier-e", matrix_type.clone(), None);
+        let frontier =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[a, b]).unwrap();
+        let shared =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[frontier, c]).unwrap();
+        let scalar_a =
+            matrix_source(&mut expressions, "barrier-scalar-a", scalar_type.clone(), None);
+        let scalar_b = matrix_source(&mut expressions, "barrier-scalar-b", scalar_type, None);
+        let action_a = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[shared, scalar_a])
+            .unwrap();
+        let action_b = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[shared, scalar_b])
+            .unwrap();
+        let actions = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[action_a, action_b])
+            .unwrap();
+        let unrelated =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[d, e]).unwrap();
+        let combined = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[actions, unrelated])
+            .unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[combined, frontier])
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        normalizer.compute_use_counts(semantic.expression()).unwrap();
+        assert!(normalizer.deferred_scalar_actions.contains(&action_a));
+        assert!(normalizer.deferred_scalar_actions.contains(&action_b));
+        assert!(!normalizer.deferred_products.contains(&frontier));
+        assert!(!normalizer.deferred_gadget_products.contains(&frontier));
+        assert!(normalizer.deferred_products.contains(&unrelated));
+    }
+
+    #[test]
+    fn scalar_action_backward_barrier_excludes_typed_gadget_frontier() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 4).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 4, 4).unwrap();
+        let gadget_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 4).unwrap();
+        let (gadget, decomposition, _) = gadget_product(
+            &mut expressions,
+            false,
+            4,
+            gadget_type.clone(),
+            decomposition_type.clone(),
+            input_type.clone(),
+            Some((2, false)),
+        );
+        let frontier = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[gadget, decomposition])
+            .unwrap();
+        let other =
+            matrix_source(&mut expressions, "typed-barrier-other", input_type.clone(), None);
+        let shared =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[frontier, other]).unwrap();
+        let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let scalar_a =
+            matrix_source(&mut expressions, "typed-barrier-scalar-a", scalar_type.clone(), None);
+        let scalar_b = matrix_source(&mut expressions, "typed-barrier-scalar-b", scalar_type, None);
+        let action_a = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[shared, scalar_a])
+            .unwrap();
+        let action_b = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[shared, scalar_b])
+            .unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[action_a, action_b])
+            .unwrap();
+        let registry =
+            recomposition_registry(gadget_type, decomposition_type, input_type, false, 4);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_gadget_recompositions(&registry);
+        normalizer.compute_use_counts(semantic.expression()).unwrap();
+        assert!(normalizer.deferred_scalar_actions.contains(&action_a));
+        assert!(normalizer.deferred_scalar_actions.contains(&action_b));
+        assert!(!normalizer.deferred_products.contains(&frontier));
+        assert!(!normalizer.deferred_gadget_products.contains(&frontier));
     }
 
     #[test]
@@ -15727,9 +16135,388 @@ mod tests {
         }));
         let boundaries = Normalizer::product_operand_additives(&root_state);
         let counts = normalizer.product_plan_use_counts(&root_state, &boundaries).unwrap();
+        let additive_counts =
+            normalizer.additive_output_use_counts(&root_state, &boundaries).unwrap();
         assert_eq!(counts.get(&1), Some(&2));
         assert_eq!(counts.get(&3), Some(&1));
+        assert_eq!(additive_counts.get(&2), Some(&1));
         assert_eq!(normalizer.materialize_exact_state(&root_state).unwrap().term_count(), 3);
+    }
+
+    #[test]
+    fn additive_output_use_counts_track_distinct_product_reads_and_release_last_use() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+        let a = matrix_source(&mut expressions, "add-use-a", matrix_type.clone(), None);
+        let b = matrix_source(&mut expressions, "add-use-b", matrix_type.clone(), None);
+        let shared = expressions.intern_matrix_transform(MatrixOperation::Add, &[a, b]).unwrap();
+        let rights = (0..4)
+            .map(|index| {
+                matrix_source(
+                    &mut expressions,
+                    &format!("add-use-right-{index}"),
+                    matrix_type.clone(),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let products = rights
+            .iter()
+            .map(|right| {
+                expressions
+                    .intern_matrix_transform(MatrixOperation::Multiply, &[shared, *right])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let left = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[products[0], products[1]])
+            .unwrap();
+        let right = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[products[2], products[3]])
+            .unwrap();
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        let (facts, mut monomials, _) = setup(&mut expressions, &mut programs, root);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let zero = Arc::new(PolynomialNF::zero());
+        let a_state = normalizer.materialized_exact_state(a, Arc::clone(&zero)).unwrap();
+        let b_state = normalizer.materialized_exact_state(b, Arc::clone(&zero)).unwrap();
+        let shared_plan = Arc::new(AdditiveExactPlan {
+            id: 1,
+            authority: normalizer.exact_plan_authority(shared).unwrap(),
+            left: a_state,
+            right: b_state,
+            subtract_right: false,
+        });
+        let mut product_states = Vec::new();
+        for (index, (product, right)) in products.iter().zip(&rights).enumerate() {
+            let right_state =
+                normalizer.materialized_exact_state(*right, Arc::clone(&zero)).unwrap();
+            product_states.push(NodeExactState::Product(Arc::new(ProductExactPlan {
+                id: u64::try_from(index).unwrap() + 2,
+                authority: normalizer.exact_plan_authority(*product).unwrap(),
+                expression: *product,
+                left_expression: shared,
+                right_expression: *right,
+                left_type: matrix_type.clone(),
+                right_type: matrix_type.clone(),
+                mode: ProductMode::Ordinary,
+                left: NodeExactState::Additive(Arc::clone(&shared_plan)),
+                right: right_state,
+            })));
+        }
+        let left_plan = Arc::new(AdditiveExactPlan {
+            id: 6,
+            authority: normalizer.exact_plan_authority(left).unwrap(),
+            left: product_states[0].clone(),
+            right: product_states[1].clone(),
+            subtract_right: false,
+        });
+        let right_plan = Arc::new(AdditiveExactPlan {
+            id: 7,
+            authority: normalizer.exact_plan_authority(right).unwrap(),
+            left: product_states[2].clone(),
+            right: product_states[3].clone(),
+            subtract_right: false,
+        });
+        let root_state = NodeExactState::Additive(Arc::new(AdditiveExactPlan {
+            id: 8,
+            authority: normalizer.exact_plan_authority(root).unwrap(),
+            left: NodeExactState::Additive(left_plan),
+            right: NodeExactState::Additive(right_plan),
+            subtract_right: false,
+        }));
+        let boundaries = Normalizer::product_operand_additives(&root_state);
+        let mut counts = normalizer.additive_output_use_counts(&root_state, &boundaries).unwrap();
+        assert_eq!(counts.get(&1), Some(&4));
+        assert!(!counts.contains_key(&8));
+        let mut outputs = BTreeMap::from([((0, 1), Arc::clone(&zero))]);
+        for (index, product) in product_states.iter().enumerate() {
+            let NodeExactState::Product(product) = product else { unreachable!() };
+            Normalizer::release_additive_output(&product.left, &mut outputs, &mut counts).unwrap();
+            assert_eq!(outputs.contains_key(&(0, 1)), index != 3);
+        }
+        assert!(matches!(
+            Normalizer::release_additive_output(
+                &NodeExactState::Additive(shared_plan),
+                &mut outputs,
+                &mut counts,
+            ),
+            Err(NormalizeError::InvalidExactPlan { reason: "additive output use count underflow" })
+        ));
+
+        let missing_plan = Arc::new(AdditiveExactPlan {
+            id: 9,
+            authority: normalizer.exact_plan_authority(shared).unwrap(),
+            left: normalizer.materialized_exact_state(a, Arc::clone(&zero)).unwrap(),
+            right: normalizer.materialized_exact_state(b, zero).unwrap(),
+            subtract_right: false,
+        });
+        let mut missing_counts = BTreeMap::from([(9, 1)]);
+        let mut missing_outputs = BTreeMap::new();
+        assert!(matches!(
+            Normalizer::release_additive_output(
+                &NodeExactState::Additive(missing_plan),
+                &mut missing_outputs,
+                &mut missing_counts,
+            ),
+            Err(NormalizeError::InvalidExactPlan { reason: "missing additive output at last use" })
+        ));
+        assert_eq!(missing_counts.get(&9), Some(&1));
+        assert!(missing_outputs.is_empty());
+    }
+
+    #[test]
+    fn additive_output_use_counts_count_same_additive_in_both_product_positions() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+        let a = matrix_source(&mut expressions, "add-double-a", matrix_type.clone(), None);
+        let b = matrix_source(&mut expressions, "add-double-b", matrix_type.clone(), None);
+        let shared = expressions.intern_matrix_transform(MatrixOperation::Add, &[a, b]).unwrap();
+        let product = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[shared, shared])
+            .unwrap();
+        let (facts, mut monomials, _) = setup(&mut expressions, &mut programs, product);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let zero = Arc::new(PolynomialNF::zero());
+        let shared_plan = Arc::new(AdditiveExactPlan {
+            id: 1,
+            authority: normalizer.exact_plan_authority(shared).unwrap(),
+            left: normalizer.materialized_exact_state(a, Arc::clone(&zero)).unwrap(),
+            right: normalizer.materialized_exact_state(b, zero).unwrap(),
+            subtract_right: false,
+        });
+        let root_state = NodeExactState::Product(Arc::new(ProductExactPlan {
+            id: 2,
+            authority: normalizer.exact_plan_authority(product).unwrap(),
+            expression: product,
+            left_expression: shared,
+            right_expression: shared,
+            left_type: matrix_type.clone(),
+            right_type: matrix_type.clone(),
+            mode: ProductMode::Ordinary,
+            left: NodeExactState::Additive(Arc::clone(&shared_plan)),
+            right: NodeExactState::Additive(shared_plan),
+        }));
+        let boundaries = Normalizer::product_operand_additives(&root_state);
+        let counts = normalizer.additive_output_use_counts(&root_state, &boundaries).unwrap();
+        assert_eq!(counts.get(&1), Some(&2));
+    }
+
+    #[test]
+    fn canceled_products_abandon_materialized_and_recursive_additive_reads() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+        let a = matrix_source(&mut expressions, "abandon-a", matrix_type.clone(), None);
+        let b = matrix_source(&mut expressions, "abandon-b", matrix_type.clone(), None);
+        let c = matrix_source(&mut expressions, "abandon-c", matrix_type.clone(), None);
+        let shared = expressions.intern_matrix_transform(MatrixOperation::Add, &[a, b]).unwrap();
+        let inner =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[a, b]).unwrap();
+        let dead =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[shared, c]).unwrap();
+        let both = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[shared, shared])
+            .unwrap();
+        let nested =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[shared, c]).unwrap();
+        let nested_dead =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[nested, c]).unwrap();
+        let live =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[shared, b]).unwrap();
+        let direct_root =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[dead, both]).unwrap();
+        let nested_root = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[nested_dead, live])
+            .unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[direct_root, nested_root])
+            .unwrap();
+        let (facts, mut monomials, _) = setup(&mut expressions, &mut programs, root);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let zero = Arc::new(PolynomialNF::zero());
+        let materialized_a = normalizer.materialized_exact_state(a, Arc::clone(&zero)).unwrap();
+        let materialized_b = normalizer.materialized_exact_state(b, Arc::clone(&zero)).unwrap();
+        let materialized_c = normalizer.materialized_exact_state(c, Arc::clone(&zero)).unwrap();
+        let shared_plan = Arc::new(AdditiveExactPlan {
+            id: 1,
+            authority: normalizer.exact_plan_authority(shared).unwrap(),
+            left: materialized_a.clone(),
+            right: materialized_b.clone(),
+            subtract_right: false,
+        });
+        let dead_plan = Arc::new(ProductExactPlan {
+            id: 2,
+            authority: normalizer.exact_plan_authority(dead).unwrap(),
+            expression: dead,
+            left_expression: shared,
+            right_expression: c,
+            left_type: matrix_type.clone(),
+            right_type: matrix_type.clone(),
+            mode: ProductMode::Ordinary,
+            left: NodeExactState::Additive(Arc::clone(&shared_plan)),
+            right: materialized_c.clone(),
+        });
+
+        let mut outputs = BTreeMap::from([((0, 1), Arc::clone(&zero))]);
+        let mut product_uses = BTreeMap::new();
+        let mut additive_uses = BTreeMap::from([(1, 2)]);
+        let mut consumed = BTreeSet::new();
+        normalizer
+            .discard_unexecuted_product_dependencies(
+                &dead_plan,
+                &mut outputs,
+                &mut product_uses,
+                &mut additive_uses,
+                &mut consumed,
+            )
+            .unwrap();
+        assert_eq!(additive_uses.get(&1), Some(&1));
+        assert!(outputs.contains_key(&(0, 1)));
+        Normalizer::release_additive_output(
+            &NodeExactState::Additive(Arc::clone(&shared_plan)),
+            &mut outputs,
+            &mut additive_uses,
+        )
+        .unwrap();
+        assert_eq!(additive_uses.get(&1), Some(&0));
+        assert!(!outputs.contains_key(&(0, 1)));
+
+        let inner_plan = Arc::new(ProductExactPlan {
+            id: 3,
+            authority: normalizer.exact_plan_authority(inner).unwrap(),
+            expression: inner,
+            left_expression: a,
+            right_expression: b,
+            left_type: matrix_type.clone(),
+            right_type: matrix_type.clone(),
+            mode: ProductMode::Ordinary,
+            left: materialized_a,
+            right: materialized_b,
+        });
+        let recursive_add = Arc::new(AdditiveExactPlan {
+            id: 4,
+            authority: normalizer.exact_plan_authority(shared).unwrap(),
+            left: NodeExactState::Product(inner_plan),
+            right: materialized_c,
+            subtract_right: false,
+        });
+        let both_plan = Arc::new(ProductExactPlan {
+            id: 5,
+            authority: normalizer.exact_plan_authority(both).unwrap(),
+            expression: both,
+            left_expression: shared,
+            right_expression: shared,
+            left_type: matrix_type.clone(),
+            right_type: matrix_type.clone(),
+            mode: ProductMode::Ordinary,
+            left: NodeExactState::Additive(Arc::clone(&recursive_add)),
+            right: NodeExactState::Additive(recursive_add),
+        });
+        let mut outputs = BTreeMap::new();
+        let mut product_uses = BTreeMap::from([(3, 1)]);
+        let mut additive_uses = BTreeMap::from([(4, 2)]);
+        let mut consumed = BTreeSet::new();
+        normalizer
+            .discard_unexecuted_product_dependencies(
+                &both_plan,
+                &mut outputs,
+                &mut product_uses,
+                &mut additive_uses,
+                &mut consumed,
+            )
+            .unwrap();
+        assert_eq!(additive_uses.get(&4), Some(&0));
+        assert_eq!(product_uses.get(&3), Some(&0));
+        assert!(outputs.is_empty());
+        assert!(consumed.contains(&4));
+
+        let boundary = Arc::new(AdditiveExactPlan {
+            id: 6,
+            authority: normalizer.exact_plan_authority(shared).unwrap(),
+            left: normalizer.materialized_exact_state(a, Arc::clone(&zero)).unwrap(),
+            right: normalizer.materialized_exact_state(b, Arc::clone(&zero)).unwrap(),
+            subtract_right: false,
+        });
+        let outer = Arc::new(AdditiveExactPlan {
+            id: 7,
+            authority: normalizer.exact_plan_authority(nested).unwrap(),
+            left: NodeExactState::Additive(Arc::clone(&boundary)),
+            right: normalizer.materialized_exact_state(c, Arc::clone(&zero)).unwrap(),
+            subtract_right: false,
+        });
+        let dead_nested = Arc::new(ProductExactPlan {
+            id: 8,
+            authority: normalizer.exact_plan_authority(nested_dead).unwrap(),
+            expression: nested_dead,
+            left_expression: nested,
+            right_expression: c,
+            left_type: matrix_type.clone(),
+            right_type: matrix_type.clone(),
+            mode: ProductMode::Ordinary,
+            left: NodeExactState::Additive(outer),
+            right: normalizer.materialized_exact_state(c, Arc::clone(&zero)).unwrap(),
+        });
+        let live_plan = Arc::new(ProductExactPlan {
+            id: 9,
+            authority: normalizer.exact_plan_authority(live).unwrap(),
+            expression: live,
+            left_expression: shared,
+            right_expression: b,
+            left_type: matrix_type.clone(),
+            right_type: matrix_type,
+            mode: ProductMode::Ordinary,
+            left: NodeExactState::Additive(Arc::clone(&boundary)),
+            right: normalizer.materialized_exact_state(b, zero).unwrap(),
+        });
+        for materialized_boundary in [true, false] {
+            let mut outputs = if materialized_boundary {
+                BTreeMap::from([((0, 6), Arc::new(PolynomialNF::zero()))])
+            } else {
+                BTreeMap::new()
+            };
+            let mut product_uses = BTreeMap::new();
+            let mut additive_uses = BTreeMap::from([(6, 2), (7, 1)]);
+            let mut consumed = BTreeSet::new();
+            normalizer
+                .discard_unexecuted_product_dependencies(
+                    &dead_nested,
+                    &mut outputs,
+                    &mut product_uses,
+                    &mut additive_uses,
+                    &mut consumed,
+                )
+                .unwrap();
+            assert_eq!(additive_uses.get(&7), Some(&0));
+            assert_eq!(additive_uses.get(&6), Some(&1));
+            assert_eq!(outputs.contains_key(&(0, 6)), materialized_boundary);
+            if materialized_boundary {
+                Normalizer::release_additive_output(
+                    &live_plan.left,
+                    &mut outputs,
+                    &mut additive_uses,
+                )
+                .unwrap();
+            } else {
+                normalizer
+                    .discard_unexecuted_product_dependencies(
+                        &live_plan,
+                        &mut outputs,
+                        &mut product_uses,
+                        &mut additive_uses,
+                        &mut consumed,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(additive_uses.get(&6), Some(&0));
+            assert!(!outputs.contains_key(&(0, 6)));
+        }
     }
 
     #[test]
@@ -16668,9 +17455,9 @@ mod tests {
         let mut normalizer =
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
         normalizer.normalize(scalar_semantic).unwrap();
-        assert_eq!(normalizer.product_plan_counters.plans_created, 1);
-        assert_eq!(normalizer.product_plan_counters.scalar_action_plans_created, 1);
-        assert_eq!(normalizer.product_plan_counters.scalar_action_streamed_executions, 1);
+        assert_eq!(normalizer.product_plan_counters.plans_created, 0);
+        assert_eq!(normalizer.product_plan_counters.scalar_action_plans_created, 0);
+        assert_eq!(normalizer.product_plan_counters.scalar_action_streamed_executions, 0);
         let relation_semantic =
             programs.scoped(&expressions, semantic.program(), relation_root).unwrap();
         let (relations, mut normalization_cache, _) = register_test_closed_relation(

@@ -35,7 +35,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -302,6 +302,7 @@ struct DiagnosticGcCounters {
     value_cache_top8_exact_term_refs: u64,
     value_cache_top8_len: u8,
     value_cache_top8: [DiagnosticValueCacheTopEntry; 8],
+    materialized_leaf_top8: DiagnosticMaterializedLeafTop8,
     sweep_total_ns: u64,
     sweep_max_ns: u64,
     sweep_last_ns: u64,
@@ -347,6 +348,71 @@ struct DiagnosticProductEvaluationSnapshot {
     left_columns: u64,
     right_rows: u64,
     right_columns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+enum DiagnosticMaterializationReason {
+    #[default]
+    OrdinaryProducer,
+    Root,
+    RelationBoundary,
+    SpecializedReturn,
+    NonAddConsumer,
+    NestedAdditiveReturn,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiagnosticMaterializedLeafOrigin {
+    producer: Option<ExprId>,
+    producer_operator: &'static str,
+    reason: DiagnosticMaterializationReason,
+    consumer: Option<ExprId>,
+    consumer_operator: &'static str,
+    consumer_category: &'static str,
+    remaining_uses: u64,
+    scalar_classification: &'static str,
+    forced_input_count: u64,
+    forced_terms_sum: u64,
+    forced_terms_max: u64,
+    retained_term_count: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DiagnosticMaterializedLeafAttachment {
+    normal_form: Weak<PolynomialNF>,
+    origin: DiagnosticMaterializedLeafOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiagnosticMaterializedLeafTop8 {
+    exact_term_refs: u64,
+    len: u8,
+    top: [DiagnosticMaterializedLeafOrigin; 8],
+}
+
+impl DiagnosticMaterializedLeafTop8 {
+    fn observe(&mut self, mut origin: DiagnosticMaterializedLeafOrigin, terms: u64) {
+        origin.retained_term_count = terms;
+        self.exact_term_refs = self.exact_term_refs.saturating_add(terms);
+        let len = usize::from(self.len);
+        let key = |entry: &DiagnosticMaterializedLeafOrigin| {
+            (
+                std::cmp::Reverse(entry.retained_term_count),
+                entry.producer.map(ExprId::slot).unwrap_or(u32::MAX),
+                entry.consumer.map(ExprId::slot).unwrap_or(u32::MAX),
+            )
+        };
+        let insert = (0..len).find(|index| key(&origin) < key(&self.top[*index])).unwrap_or(len);
+        if insert >= self.top.len() {
+            return;
+        }
+        let new_len = (len + 1).min(self.top.len());
+        for index in (insert + 1..new_len).rev() {
+            self.top[index] = self.top[index - 1];
+        }
+        self.top[insert] = origin;
+        self.len = u8::try_from(new_len).unwrap_or(8);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -397,6 +463,7 @@ struct DiagnosticOwnerCensus {
     gadget_product_unique_operand_refs: u64,
     gadget_product_operand_exact_term_refs: u64,
     gadget_product_largest_operand_exact_terms: u64,
+    materialized_leaf_top8: DiagnosticMaterializedLeafTop8,
     gadget_product_plans_created: u64,
     gadget_product_streamed_executions: u64,
     gadget_product_zero_weight_skips: u64,
@@ -716,6 +783,7 @@ fn diagnostic_watchdog_emit_snapshot(
         gadget_product_largest_operand_exact_terms = progress
             .owners
             .gadget_product_largest_operand_exact_terms,
+        materialized_leaf_top8 = ?progress.owners.materialized_leaf_top8,
         gadget_product_plans_created = progress.owners.gadget_product_plans_created,
         gadget_product_streamed_executions = progress.owners.gadget_product_streamed_executions,
         gadget_product_zero_weight_skips = progress.owners.gadget_product_zero_weight_skips,
@@ -1380,6 +1448,7 @@ impl NormalizationTrace {
             gadget_product_largest_operand_exact_terms = self
                 .owners
                 .gadget_product_largest_operand_exact_terms,
+            materialized_leaf_top8 = ?self.owners.materialized_leaf_top8,
             gadget_product_plans_created = self.owners.gadget_product_plans_created,
             gadget_product_streamed_executions = self
                 .owners
@@ -1729,6 +1798,13 @@ pub struct Normalizer<'a> {
     diagnostic_product_consumers: BTreeMap<ExprId, DiagnosticProductConsumerCounts>,
     diagnostic_product_evaluations: BTreeMap<ExprId, DiagnosticProductEvaluationSnapshot>,
     diagnostic_product_root: Option<ExprId>,
+    /// Watchdog-only provenance for exact NFs produced after forcing a deferred plan. Keying by
+    /// the resulting expression keeps this out of semantic identity and all normalization keys.
+    diagnostic_materialization_origins: BTreeMap<ExprId, DiagnosticMaterializedLeafOrigin>,
+    /// Watchdog-only attachment from immutable NF allocation identity to its origin. This keeps
+    /// diagnostic metadata out of every exact-plan node when the watchdog is disabled.
+    diagnostic_materialized_leaf_origins: HashMap<usize, DiagnosticMaterializedLeafAttachment>,
+    diagnostic_current_expression: Option<ExprId>,
     /// Durable value-level transfer results for expressions which may be released from `cache`
     /// before the root's exact monomials are folded.  This is deliberately keyed by expression
     /// identity rather than by a monomial: it does not become semantic identity or duplicate
@@ -1863,23 +1939,171 @@ impl<'a> Normalizer<'a> {
     }
 
     fn materialized_exact_state(
-        &self,
+        &mut self,
         expression: ExprId,
         normal_form: Arc<PolynomialNF>,
     ) -> Result<NodeExactState, NormalizeError> {
+        if self.watchdog.is_some() {
+            let consumer =
+                self.diagnostic_current_expression.filter(|current| *current != expression);
+            let mut origin = self
+                .diagnostic_materialization_origins
+                .get(&expression)
+                .copied()
+                .unwrap_or_else(|| DiagnosticMaterializedLeafOrigin {
+                    producer: Some(expression),
+                    producer_operator: self
+                        .expressions
+                        .node(expression)
+                        .map_or("invalid", |node| normalization_operator_category(&node.operator)),
+                    consumer,
+                    consumer_operator: consumer.map_or("root", |id| {
+                        self.expressions.node(id).map_or("invalid", |node| {
+                            normalization_operator_category(&node.operator)
+                        })
+                    }),
+                    consumer_category: consumer
+                        .map_or("root", |id| self.diagnostic_consumer_category(id)),
+                    remaining_uses: u64::try_from(
+                        *self.remaining_uses.get(&expression).unwrap_or(&0),
+                    )
+                    .unwrap_or(u64::MAX),
+                    scalar_classification: consumer
+                        .map_or("not_multiply", |id| self.diagnostic_scalar_classification(id)),
+                    retained_term_count: u64::try_from(normal_form.exact_terms.len())
+                        .unwrap_or(u64::MAX),
+                    ..DiagnosticMaterializedLeafOrigin::default()
+                });
+            origin.retained_term_count =
+                u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX);
+            let key = Arc::as_ptr(&normal_form) as usize;
+            let same_allocation = self
+                .diagnostic_materialized_leaf_origins
+                .get(&key)
+                .and_then(|attachment| attachment.normal_form.upgrade())
+                .is_some_and(|attached| Arc::ptr_eq(&attached, &normal_form));
+            if !same_allocation {
+                self.diagnostic_materialized_leaf_origins.insert(
+                    key,
+                    DiagnosticMaterializedLeafAttachment {
+                        normal_form: Arc::downgrade(&normal_form),
+                        origin,
+                    },
+                );
+            }
+        }
         Ok(NodeExactState::Materialized {
             authority: self.exact_plan_authority(expression)?,
             normal_form,
         })
     }
 
-    fn cached_exact_state(
+    fn diagnostic_materialized_leaf_origin(
         &self,
+        normal_form: &Arc<PolynomialNF>,
+    ) -> Option<DiagnosticMaterializedLeafOrigin> {
+        self.diagnostic_materialized_leaf_origins
+            .get(&(Arc::as_ptr(normal_form) as usize))
+            .and_then(|attachment| {
+                attachment
+                    .normal_form
+                    .upgrade()
+                    .filter(|attached| Arc::ptr_eq(attached, normal_form))
+                    .map(|_| attachment.origin)
+            })
+    }
+
+    fn diagnostic_scalar_classification(&self, expression: ExprId) -> &'static str {
+        let Ok(node) = self.expressions.node(expression) else { return "" };
+        if !matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Multiply)) ||
+            node.inputs.len() != 2
+        {
+            return "not_multiply";
+        }
+        let scalar = |input: ExprId| {
+            matches!(
+                self.expressions.value_type(input),
+                Ok(ResolvedValueType::Matrix(matrix)) if matrix.rows == 1 && matrix.columns == 1
+            )
+        };
+        match (scalar(node.inputs[0]), scalar(node.inputs[1])) {
+            (false, false) => "ordinary",
+            (true, false) => "scalar_left",
+            (false, true) => "scalar_right",
+            (true, true) => "scalar_both",
+        }
+    }
+
+    fn diagnostic_consumer_category(&self, expression: ExprId) -> &'static str {
+        let Ok(node) = self.expressions.node(expression) else { return "invalid" };
+        match node.operator {
+            ValueOperator::Matrix(MatrixOperation::Add | MatrixOperation::Subtract) => "add_sub",
+            ValueOperator::Matrix(MatrixOperation::Multiply) => "multiply",
+            ValueOperator::Matrix(_) | ValueOperator::Transform(_) => "structural",
+            _ => "root_other",
+        }
+    }
+
+    fn record_materialization_origin(
+        &mut self,
+        producer: ExprId,
+        reason: DiagnosticMaterializationReason,
+        consumer: Option<ExprId>,
+        retained_term_count: u64,
+    ) {
+        if self.watchdog.is_none() {
+            return;
+        }
+        let key = consumer.unwrap_or(producer);
+        let remaining_uses =
+            u64::try_from(*self.remaining_uses.get(&producer).unwrap_or(&0)).unwrap_or(u64::MAX);
+        let origin = DiagnosticMaterializedLeafOrigin {
+            producer: Some(producer),
+            producer_operator: self
+                .expressions
+                .node(producer)
+                .map_or("invalid", |node| normalization_operator_category(&node.operator)),
+            reason,
+            consumer,
+            consumer_operator: consumer.map_or("root", |id| {
+                self.expressions
+                    .node(id)
+                    .map_or("invalid", |node| normalization_operator_category(&node.operator))
+            }),
+            consumer_category: consumer.map_or("root", |id| self.diagnostic_consumer_category(id)),
+            remaining_uses,
+            scalar_classification: consumer
+                .map_or("not_multiply", |id| self.diagnostic_scalar_classification(id)),
+            forced_input_count: 1,
+            forced_terms_sum: retained_term_count,
+            forced_terms_max: retained_term_count,
+            retained_term_count,
+        };
+        self.diagnostic_materialization_origins
+            .entry(key)
+            .and_modify(|current| {
+                current.reason = current.reason.max(reason);
+                if current.producer != Some(producer) {
+                    current.producer = None;
+                    current.producer_operator = "multiple";
+                }
+                current.forced_input_count = current.forced_input_count.saturating_add(1);
+                current.forced_terms_sum =
+                    current.forced_terms_sum.saturating_add(retained_term_count);
+                current.forced_terms_max = current.forced_terms_max.max(retained_term_count);
+                current.remaining_uses = current.remaining_uses.max(remaining_uses);
+                current.retained_term_count = current.retained_term_count.max(retained_term_count);
+            })
+            .or_insert(origin);
+    }
+
+    fn cached_exact_state(
+        &mut self,
         expression: ExprId,
         value: &AnalyzedValue,
     ) -> Result<Option<NodeExactState>, NormalizeError> {
-        let additive = self.exact_plans.get(&expression);
-        let product = self.gadget_product_plans.get(&expression);
+        let additive = self.exact_plans.get(&expression).cloned();
+        let product = self.gadget_product_plans.get(&expression).cloned();
         if additive.is_some() && product.is_some() {
             return Err(NormalizeError::InvalidExactPlan {
                 reason: "cache entry has two deferred exact representations",
@@ -1891,7 +2115,7 @@ impl<'a> Normalizer<'a> {
                     reason: "cache entry has two exact representations",
                 });
             }
-            return Ok(Some(NodeExactState::Additive(Arc::clone(plan))));
+            return Ok(Some(NodeExactState::Additive(plan)));
         }
         if let Some(plan) = product {
             if value.exact_nf.is_some() {
@@ -1899,7 +2123,7 @@ impl<'a> Normalizer<'a> {
                     reason: "cache entry has two exact representations",
                 });
             }
-            return Ok(Some(NodeExactState::GadgetProduct(Arc::clone(plan))));
+            return Ok(Some(NodeExactState::GadgetProduct(plan)));
         }
         value
             .exact_nf
@@ -2060,7 +2284,7 @@ impl<'a> Normalizer<'a> {
         state: &NodeExactState,
     ) -> Result<Arc<PolynomialNF>, NormalizeError> {
         match state {
-            NodeExactState::Materialized { authority, normal_form } => {
+            NodeExactState::Materialized { authority, normal_form, .. } => {
                 self.validate_exact_plan_authority(authority)?;
                 return Ok(Arc::clone(normal_form));
             }
@@ -2127,7 +2351,7 @@ impl<'a> Normalizer<'a> {
                             .and_modify(|(_, total)| *total += &signed)
                             .or_insert_with(|| (Arc::clone(child), signed));
                     }
-                    NodeExactState::Materialized { authority, normal_form } => {
+                    NodeExactState::Materialized { authority, normal_form, .. } => {
                         self.validate_exact_plan_authority(authority)?;
                         if authority.matrix_type != plan.authority.matrix_type {
                             return Err(NormalizeError::InvalidExactPlan {
@@ -2178,13 +2402,35 @@ impl<'a> Normalizer<'a> {
         }))
     }
 
-    fn exact_plan_leaf_roots(&self, validate: bool) -> Result<Vec<MonomialId>, NormalizeError> {
+    fn materialize_exact_state_for(
+        &mut self,
+        state: &NodeExactState,
+        producer: ExprId,
+        reason: DiagnosticMaterializationReason,
+        consumer: Option<ExprId>,
+    ) -> Result<Arc<PolynomialNF>, NormalizeError> {
+        let normal_form = self.materialize_exact_state(state)?;
+        self.record_materialization_origin(
+            producer,
+            reason,
+            consumer,
+            u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX),
+        );
+        Ok(normal_form)
+    }
+
+    fn exact_plan_leaf_roots_and_top8(
+        &self,
+        validate: bool,
+    ) -> Result<(Vec<MonomialId>, DiagnosticMaterializedLeafTop8), NormalizeError> {
         let mut plans = self.exact_plans.values().cloned().collect::<Vec<_>>();
         let mut products = self.gadget_product_plans.values().cloned().collect::<Vec<_>>();
         let mut seen_plans = BTreeSet::new();
         let mut seen_products = BTreeSet::new();
         let mut seen_leaves = BTreeSet::new();
         let mut roots = Vec::new();
+        let mut top8 = DiagnosticMaterializedLeafTop8::default();
+        let collect_origins = self.watchdog.is_some();
         while let Some(plan) = plans.pop() {
             if !seen_plans.insert(plan.id) {
                 continue;
@@ -2217,6 +2463,16 @@ impl<'a> Normalizer<'a> {
                         let key = Arc::as_ptr(normal_form) as usize;
                         if seen_leaves.insert(key) {
                             roots.extend(normal_form.exact_terms.keys().copied());
+                            if collect_origins &&
+                                let Some(origin) =
+                                    self.diagnostic_materialized_leaf_origin(normal_form)
+                            {
+                                top8.observe(
+                                    origin,
+                                    u64::try_from(normal_form.exact_terms.len())
+                                        .unwrap_or(u64::MAX),
+                                );
+                            }
                         }
                     }
                 }
@@ -2236,10 +2492,16 @@ impl<'a> Normalizer<'a> {
                 }
             }
         }
-        Ok(roots)
+        Ok((roots, top8))
     }
 
-    fn exact_plan_diagnostic_shape(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    fn exact_plan_leaf_roots(&self, validate: bool) -> Result<Vec<MonomialId>, NormalizeError> {
+        self.exact_plan_leaf_roots_and_top8(validate).map(|(roots, _)| roots)
+    }
+
+    fn exact_plan_diagnostic_shape(
+        &self,
+    ) -> (u64, u64, u64, u64, u64, u64, u64, u64, DiagnosticMaterializedLeafTop8) {
         let mut plans = self.exact_plans.values().cloned().collect::<Vec<_>>();
         let mut products = self.gadget_product_plans.values().cloned().collect::<Vec<_>>();
         let mut seen_plans = BTreeSet::new();
@@ -2250,6 +2512,8 @@ impl<'a> Normalizer<'a> {
         let mut largest_leaf_exact_terms = 0_u64;
         let mut product_operand_exact_term_refs = 0_u64;
         let mut largest_product_operand_exact_terms = 0_u64;
+        let mut materialized_top8 = DiagnosticMaterializedLeafTop8::default();
+        let collect_origins = self.watchdog.is_some();
         while let Some(plan) = plans.pop() {
             if !seen_plans.insert(plan.id) {
                 continue;
@@ -2259,11 +2523,18 @@ impl<'a> Normalizer<'a> {
                     NodeExactState::Additive(child) => plans.push(Arc::clone(child)),
                     NodeExactState::GadgetProduct(child) => products.push(Arc::clone(child)),
                     NodeExactState::Materialized { normal_form, .. } => {
-                        if seen_leaves.insert(Arc::as_ptr(normal_form) as usize) {
+                        let key = Arc::as_ptr(normal_form) as usize;
+                        if seen_leaves.insert(key) {
                             let terms =
                                 u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX);
                             leaf_exact_term_refs = leaf_exact_term_refs.saturating_add(terms);
                             largest_leaf_exact_terms = largest_leaf_exact_terms.max(terms);
+                            if collect_origins &&
+                                let Some(origin) =
+                                    self.diagnostic_materialized_leaf_origin(normal_form)
+                            {
+                                materialized_top8.observe(origin, terms);
+                            }
                         }
                     }
                 }
@@ -2292,6 +2563,7 @@ impl<'a> Normalizer<'a> {
             u64::try_from(seen_product_operands.len()).unwrap_or(u64::MAX),
             product_operand_exact_term_refs,
             largest_product_operand_exact_terms,
+            materialized_top8,
         )
     }
 
@@ -2638,6 +2910,7 @@ impl<'a> Normalizer<'a> {
             gadget_product_unique_operand_refs,
             gadget_product_operand_exact_term_refs,
             gadget_product_largest_operand_exact_terms,
+            materialized_leaf_top8,
         ) = self.exact_plan_diagnostic_shape();
         DiagnosticOwnerCensus {
             monomial_allocated_descriptor_slots: monomial.allocated_descriptor_slots,
@@ -2678,6 +2951,7 @@ impl<'a> Normalizer<'a> {
             gadget_product_unique_operand_refs,
             gadget_product_operand_exact_term_refs,
             gadget_product_largest_operand_exact_terms,
+            materialized_leaf_top8,
             gadget_product_plans_created: self.gadget_product_counters.plans_created,
             gadget_product_streamed_executions: self.gadget_product_counters.streamed_executions,
             gadget_product_zero_weight_skips: self.gadget_product_counters.zero_weight_skips,
@@ -2711,7 +2985,7 @@ impl<'a> Normalizer<'a> {
         {
             return Ok(());
         }
-        let plan_roots = self.exact_plan_leaf_roots(true)?;
+        let (plan_roots, materialized_leaf_top8) = self.exact_plan_leaf_roots_and_top8(true)?;
         let cache_roots = self.cache.values().flat_map(|value| {
             value.exact_nf.iter().flat_map(|normal_form| normal_form.exact_terms.keys().copied())
         });
@@ -2782,6 +3056,7 @@ impl<'a> Normalizer<'a> {
             self.gc_counters.value_cache_top8_exact_term_refs = top8.top_exact_term_refs;
             self.gc_counters.value_cache_top8_len = top8.len;
             self.gc_counters.value_cache_top8 = top8.top;
+            self.gc_counters.materialized_leaf_top8 = materialized_leaf_top8;
         }
         self.gc_counters.sweep_total_ns =
             self.gc_counters.sweep_total_ns.saturating_add(elapsed_ns);
@@ -2901,6 +3176,9 @@ impl<'a> Normalizer<'a> {
             diagnostic_product_consumers: BTreeMap::new(),
             diagnostic_product_evaluations: BTreeMap::new(),
             diagnostic_product_root: None,
+            diagnostic_materialization_origins: BTreeMap::new(),
+            diagnostic_materialized_leaf_origins: HashMap::new(),
+            diagnostic_current_expression: None,
             expression_bounds: BTreeMap::new(),
             remaining_uses: BTreeMap::new(),
             gadget_input_nfs: BTreeMap::new(),
@@ -3493,6 +3771,9 @@ impl<'a> Normalizer<'a> {
         self.diagnostic_product_consumers.clear();
         self.diagnostic_product_evaluations.clear();
         self.diagnostic_product_root = None;
+        self.diagnostic_materialization_origins.clear();
+        self.diagnostic_materialized_leaf_origins.clear();
+        self.diagnostic_current_expression = None;
         self.expression_bounds.clear();
         self.remaining_uses.clear();
         self.clear_gadget_holds();
@@ -3632,7 +3913,13 @@ impl<'a> Normalizer<'a> {
                 },
             );
         if let Some(deferred_root) = deferred_root {
-            let materialized = self.materialize_exact_state(&deferred_root)?;
+            let reason = if self.normalization_depth > 1 {
+                DiagnosticMaterializationReason::NestedAdditiveReturn
+            } else {
+                DiagnosticMaterializationReason::Root
+            };
+            let materialized =
+                self.materialize_exact_state_for(&deferred_root, root.expression(), reason, None)?;
             let cached = self
                 .cache
                 .get(&root.expression())
@@ -4110,6 +4397,11 @@ impl<'a> Normalizer<'a> {
         let saved_diagnostic_product_evaluations =
             std::mem::take(&mut self.diagnostic_product_evaluations);
         let saved_diagnostic_product_root = self.diagnostic_product_root.take();
+        let saved_diagnostic_materialization_origins =
+            std::mem::take(&mut self.diagnostic_materialization_origins);
+        let saved_diagnostic_materialized_leaf_origins =
+            std::mem::take(&mut self.diagnostic_materialized_leaf_origins);
+        let saved_diagnostic_current_expression = self.diagnostic_current_expression.take();
         // `normalize` owns a complete root-local bounds map and clears it at entry. Keep the
         // outer map out of that nested invocation, then merge newly-derived entries back after
         // restoring it. This preserves the outer typed authority without retaining a stale
@@ -4126,6 +4418,14 @@ impl<'a> Normalizer<'a> {
         self.fold_final_no_match = false;
         let nested_normalize_started = self.watchdog_timing_start();
         let value = self.normalize_with_existing_scope_proof(scoped, proof);
+        let nested_return_origin = value
+            .as_ref()
+            .ok()
+            .and_then(|_| self.diagnostic_materialization_origins.get(&root).copied())
+            .map(|mut origin| {
+                origin.reason = DiagnosticMaterializationReason::SpecializedReturn;
+                origin
+            });
         self.watchdog_record_timing(nested_normalize_started, |timings| {
             &mut timings.specialized_nested_normalize
         });
@@ -4144,6 +4444,12 @@ impl<'a> Normalizer<'a> {
         self.diagnostic_product_consumers = saved_diagnostic_product_consumers;
         self.diagnostic_product_evaluations = saved_diagnostic_product_evaluations;
         self.diagnostic_product_root = saved_diagnostic_product_root;
+        self.diagnostic_materialization_origins = saved_diagnostic_materialization_origins;
+        self.diagnostic_materialized_leaf_origins = saved_diagnostic_materialized_leaf_origins;
+        self.diagnostic_current_expression = saved_diagnostic_current_expression;
+        if let Some(origin) = nested_return_origin {
+            self.diagnostic_materialization_origins.insert(root, origin);
+        }
         self.trace.enter_caller_phase("caller:cache_restored", false);
         let nested_expression_bounds = std::mem::take(&mut self.expression_bounds);
         self.expression_bounds = saved_expression_bounds;
@@ -4396,7 +4702,12 @@ impl<'a> Normalizer<'a> {
         else {
             return Ok(value);
         };
-        let materialized = self.materialize_exact_state(&exact)?;
+        let materialized = self.materialize_exact_state_for(
+            &exact,
+            expression,
+            DiagnosticMaterializationReason::NonAddConsumer,
+            self.diagnostic_current_expression,
+        )?;
         Ok(Arc::new(synchronize_materialized_value(value.as_ref().clone(), materialized)))
     }
 
@@ -4425,6 +4736,9 @@ impl<'a> Normalizer<'a> {
         expression: ExprId,
         node: &ExprNode,
     ) -> Result<AnalyzedValue, NormalizeError> {
+        if self.watchdog.is_some() {
+            self.diagnostic_current_expression = Some(expression);
+        }
         // `normalize` validates the complete root once. Every expression reaching this point was
         // discovered below that validated root, so rebuilding the scoped view is an O(1) checked
         // projection. Calling `ProgramArena::scoped` here would walk the remaining sub-DAG once
@@ -4466,8 +4780,12 @@ impl<'a> Normalizer<'a> {
                         matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Subtract)),
                     )?;
                     if self.relations.is_some() && self.relation_rewriting_enabled {
-                        let normal_form =
-                            self.materialize_exact_state(&NodeExactState::Additive(plan))?;
+                        let normal_form = self.materialize_exact_state_for(
+                            &NodeExactState::Additive(plan),
+                            expression,
+                            DiagnosticMaterializationReason::RelationBoundary,
+                            Some(expression),
+                        )?;
                         synchronize_materialized_value(
                             AnalyzedValue { semantic, exact_nf: None, coefficient_bound: bound },
                             normal_form,
@@ -10382,6 +10700,51 @@ mod tests {
     }
 
     #[test]
+    fn materialization_origin_is_watchdog_only_and_preserves_exact_result() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let x = source_with(&mut expressions, matrix_type(), 70_701);
+        let y = source_with(&mut expressions, matrix_type(), 70_702);
+        let sum = expressions.intern_matrix_transform(MatrixOperation::Add, &[x, y]).unwrap();
+        let root = expressions.intern_matrix_transform(MatrixOperation::Negate, &[sum]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let (off, off_counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                    .unwrap()
+                    .with_watchdog_override(false, Duration::from_secs(60));
+            let value = normalizer.normalize(semantic).unwrap();
+            assert!(normalizer.diagnostic_materialization_origins.is_empty());
+            (value, normalizer.counters())
+        };
+        let (on, on_counters, origin) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                    .unwrap()
+                    .with_watchdog_override(true, Duration::from_secs(60));
+            let value = normalizer.normalize(semantic).unwrap();
+            let origin = normalizer.diagnostic_materialization_origins.get(&root).copied().unwrap();
+            (value, normalizer.counters(), origin)
+        };
+        assert_eq!(origin.producer, Some(sum));
+        assert_eq!(origin.producer_operator, "add");
+        assert_eq!(origin.reason, DiagnosticMaterializationReason::NonAddConsumer);
+        assert_eq!(origin.consumer, Some(root));
+        assert_eq!(origin.consumer_operator, "negate");
+        assert_eq!(origin.consumer_category, "structural");
+        assert_eq!(origin.remaining_uses, 0);
+        assert_eq!(origin.scalar_classification, "not_multiply");
+        assert_eq!(origin.forced_input_count, 1);
+        assert_eq!(origin.forced_terms_sum, 2);
+        assert_eq!(origin.forced_terms_max, 2);
+        assert_eq!(origin.retained_term_count, 2);
+        assert_eq!(off.semantic, on.semantic);
+        assert_eq!(off.coefficient_bound, on.coefficient_bound);
+        assert_eq!(off.exact_nf, on.exact_nf);
+        assert_eq!(off_counters, on_counters);
+    }
+
+    #[test]
     fn ordinary_normalize_without_watchdog_or_trace_runs_zero_owner_censuses() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -13258,6 +13621,7 @@ mod tests {
         };
         let mut normalizer =
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        normalizer.watchdog = DiagnosticWatchdog::start(19, Duration::from_secs(60));
         let x_state = normalizer.materialized_exact_state(x, leaf(x_monomial)).unwrap();
         let y_state = normalizer.materialized_exact_state(y, leaf(y_monomial)).unwrap();
         let sum_plan = normalizer.new_additive_plan(sum, x_state, y_state, false).unwrap();
@@ -13274,6 +13638,14 @@ mod tests {
             .unwrap();
         assert_eq!(materialized.term_count(), 2);
         normalizer.exact_plans.insert(root, root_plan);
+        normalizer.normalization_depth = 1;
+        normalizer.monomial_gc_allocation_threshold_bytes = 0;
+        normalizer.sweep_monomials_at_node_commit().unwrap();
+        normalizer.normalization_depth = 0;
+        assert_eq!(normalizer.gc_counters.materialized_leaf_top8.len, 2);
+        assert_eq!(normalizer.gc_counters.materialized_leaf_top8.exact_term_refs, 2);
+        assert_eq!(normalizer.gc_counters.materialized_leaf_top8.top[0].producer, Some(x));
+        assert_eq!(normalizer.gc_counters.materialized_leaf_top8.top[1].producer, Some(y));
         let owners = normalizer.owner_census();
         assert_eq!(owners.additive_plan_nodes, 2);
         assert_eq!(owners.additive_unique_leaf_refs, 2);
@@ -13283,11 +13655,14 @@ mod tests {
         assert_eq!(owners.additive_materialization_output_terms_total, 2);
         assert_eq!(owners.additive_materialization_output_terms_max, 2);
 
-        normalizer.watchdog = DiagnosticWatchdog::start(19, Duration::from_secs(60));
         normalizer.sample_owner_census(OwnerCensusReason::OuterTerminal, std::iter::empty());
         let shared = Arc::clone(&normalizer.watchdog.as_ref().unwrap().shared);
         normalizer.watchdog.as_mut().unwrap().finish(false);
         normalizer.watchdog = None;
+        assert_eq!(
+            normalizer.exact_plan_diagnostic_shape().8,
+            DiagnosticMaterializedLeafTop8::default()
+        );
         let events = shared.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         let snapshots =
             shared.snapshots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
@@ -13303,6 +13678,177 @@ mod tests {
         assert_eq!(captured.owners.additive_materializations, 1);
         assert_eq!(captured.owners.additive_materialization_output_terms_total, 2);
         assert_eq!(captured.owners.additive_materialization_output_terms_max, 2);
+        assert_eq!(captured.owners.materialized_leaf_top8.len, 2);
+        assert_eq!(captured.owners.materialized_leaf_top8.exact_term_refs, 2);
+    }
+
+    #[test]
+    fn materialized_leaf_top8_keeps_the_dominant_eight_with_stable_ties() {
+        let arena = ArenaToken::fresh();
+        let mut top8 = DiagnosticMaterializedLeafTop8::default();
+        for slot in (0_u32..10).rev() {
+            let terms = if slot == 9 { 884_118 } else { u64::from(slot + 1) };
+            top8.observe(
+                DiagnosticMaterializedLeafOrigin {
+                    producer: Some(ExprId::new(arena, slot)),
+                    producer_operator: "add",
+                    reason: DiagnosticMaterializationReason::NonAddConsumer,
+                    consumer: Some(ExprId::new(arena, 100 + slot)),
+                    consumer_operator: "multiply",
+                    consumer_category: "multiply",
+                    remaining_uses: u64::from(slot),
+                    scalar_classification: "ordinary",
+                    forced_input_count: 1,
+                    forced_terms_sum: terms,
+                    forced_terms_max: terms,
+                    retained_term_count: 0,
+                },
+                terms,
+            );
+        }
+        assert_eq!(top8.len, 8);
+        assert_eq!(top8.exact_term_refs, 884_163);
+        assert_eq!(top8.top[0].producer.map(ExprId::slot), Some(9));
+        assert_eq!(top8.top[0].retained_term_count, 884_118);
+        assert_eq!(top8.top[7].producer.map(ExprId::slot), Some(2));
+
+        let tied = DiagnosticMaterializedLeafOrigin {
+            producer: Some(ExprId::new(arena, 1)),
+            retained_term_count: 0,
+            ..DiagnosticMaterializedLeafOrigin::default()
+        };
+        let mut ties = DiagnosticMaterializedLeafTop8::default();
+        ties.observe(tied, 7);
+        ties.observe(
+            DiagnosticMaterializedLeafOrigin { producer: Some(ExprId::new(arena, 0)), ..tied },
+            7,
+        );
+        assert_eq!(ties.top[0].producer.map(ExprId::slot), Some(0));
+        assert_eq!(ties.top[1].producer.map(ExprId::slot), Some(1));
+    }
+
+    #[test]
+    fn materialization_origin_aggregates_two_forced_children_for_one_consumer() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let x = source_with(&mut expressions, matrix_type(), 71_001);
+        let y = source_with(&mut expressions, matrix_type(), 71_002);
+        let u = source_with(&mut expressions, matrix_type(), 71_003);
+        let v = source_with(&mut expressions, matrix_type(), 71_004);
+        let left_add = expressions.intern_matrix_transform(MatrixOperation::Add, &[x, y]).unwrap();
+        let right_add = expressions.intern_matrix_transform(MatrixOperation::Add, &[u, v]).unwrap();
+        let consumer = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[left_add, right_add])
+            .unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[consumer, consumer])
+            .unwrap();
+        let (facts, mut monomials, _) = setup(&mut expressions, &mut programs, root);
+        let mut ids = BTreeMap::new();
+        for expression in [x, y, u, v] {
+            let scoped = programs.scoped(&expressions, monomials.scope(), expression).unwrap();
+            ids.insert(
+                expression,
+                monomials.intern(&expressions, &programs, &[], &[scoped]).unwrap(),
+            );
+        }
+        let leaf = |expression| {
+            Arc::new(PolynomialNF {
+                exact_terms: BTreeMap::from([(ids[&expression], BigInt::from(1_u8))]),
+                bounded_summary: BoundedSummary::missing(),
+            })
+        };
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        normalizer.watchdog = DiagnosticWatchdog::start(20, Duration::from_secs(60));
+        normalizer.remaining_uses.insert(left_add, 1);
+        normalizer.remaining_uses.insert(right_add, 3);
+        let x_state = normalizer.materialized_exact_state(x, leaf(x)).unwrap();
+        let y_state = normalizer.materialized_exact_state(y, leaf(y)).unwrap();
+        let left_plan = normalizer.new_additive_plan(left_add, x_state, y_state, false).unwrap();
+        let u_state = normalizer.materialized_exact_state(u, leaf(u)).unwrap();
+        let v_state = normalizer.materialized_exact_state(v, leaf(v)).unwrap();
+        let right_plan = normalizer.new_additive_plan(right_add, u_state, v_state, false).unwrap();
+        let left_nf = normalizer
+            .materialize_exact_state_for(
+                &NodeExactState::Additive(left_plan),
+                left_add,
+                DiagnosticMaterializationReason::NonAddConsumer,
+                Some(consumer),
+            )
+            .unwrap();
+        let right_nf = normalizer
+            .materialize_exact_state_for(
+                &NodeExactState::Additive(right_plan),
+                right_add,
+                DiagnosticMaterializationReason::NonAddConsumer,
+                Some(consumer),
+            )
+            .unwrap();
+        assert_eq!(left_nf.term_count(), 2);
+        assert_eq!(right_nf.term_count(), 2);
+        let aggregated = normalizer.diagnostic_materialization_origins[&consumer];
+        assert_eq!(aggregated.producer, None);
+        assert_eq!(aggregated.producer_operator, "multiple");
+        assert_eq!(aggregated.consumer, Some(consumer));
+        assert_eq!(aggregated.consumer_operator, "multiply");
+        assert_eq!(aggregated.consumer_category, "multiply");
+        assert_eq!(aggregated.scalar_classification, "ordinary");
+        assert_eq!(aggregated.remaining_uses, 3);
+        assert_eq!(aggregated.forced_input_count, 2);
+        assert_eq!(aggregated.forced_terms_sum, 4);
+        assert_eq!(aggregated.forced_terms_max, 2);
+
+        let consumer_nf = Arc::new(PolynomialNF {
+            exact_terms: BTreeMap::from([
+                (ids[&x], BigInt::from(1_u8)),
+                (ids[&y], BigInt::from(1_u8)),
+                (ids[&u], BigInt::from(1_u8)),
+            ]),
+            bounded_summary: BoundedSummary::missing(),
+        });
+        let consumer_state =
+            normalizer.materialized_exact_state(consumer, Arc::clone(&consumer_nf)).unwrap();
+        let root_plan = normalizer
+            .new_additive_plan(root, consumer_state.clone(), consumer_state, false)
+            .unwrap();
+        normalizer.exact_plans.insert(root, root_plan);
+        let shape = normalizer.exact_plan_diagnostic_shape();
+        let top8 = shape.8;
+        assert_eq!(top8.len, 1);
+        assert_eq!(top8.exact_term_refs, 3);
+        assert_eq!(top8.top[0].producer, None);
+        assert_eq!(top8.top[0].producer_operator, "multiple");
+        assert_eq!(top8.top[0].forced_input_count, 2);
+        assert_eq!(top8.top[0].forced_terms_sum, 4);
+        assert_eq!(top8.top[0].forced_terms_max, 2);
+        assert_eq!(top8.top[0].retained_term_count, 3);
+        normalizer.watchdog.as_mut().unwrap().finish(false);
+        normalizer.watchdog = None;
+    }
+
+    #[test]
+    fn materialized_leaf_origin_does_not_outlive_its_nf_allocation() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let source = source_with(&mut expressions, matrix_type(), 71_010);
+        let (facts, mut monomials, _) = setup(&mut expressions, &mut programs, source);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        normalizer.watchdog = DiagnosticWatchdog::start(21, Duration::from_secs(60));
+        let normal_form = Arc::new(PolynomialNF::zero());
+        let key = Arc::as_ptr(&normal_form) as usize;
+        let state = normalizer.materialized_exact_state(source, Arc::clone(&normal_form)).unwrap();
+        let weak = normalizer.diagnostic_materialized_leaf_origins[&key].normal_form.clone();
+        assert!(normalizer.diagnostic_materialized_leaf_origin(&normal_form).is_some());
+        drop(state);
+        drop(normal_form);
+        assert!(weak.upgrade().is_none());
+        assert!(
+            normalizer.diagnostic_materialized_leaf_origins[&key].normal_form.upgrade().is_none()
+        );
+        normalizer.watchdog.as_mut().unwrap().finish(false);
+        normalizer.watchdog = None;
     }
 
     #[test]
@@ -13346,7 +13892,8 @@ mod tests {
         };
         let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
             .unwrap()
-            .with_relations(&relations, &mut normalization_cache);
+            .with_relations(&relations, &mut normalization_cache)
+            .with_watchdog_override(true, Duration::from_secs(60));
         let outer_product_consumers = BTreeMap::from([(
             ambiguous_root,
             DiagnosticProductConsumerCounts { add_sub: 1, ..Default::default() },
@@ -13367,6 +13914,32 @@ mod tests {
         normalizer.diagnostic_product_consumers = outer_product_consumers.clone();
         normalizer.diagnostic_product_evaluations = outer_product_evaluations.clone();
         normalizer.diagnostic_product_root = Some(ambiguous_root);
+        let outer_materialization_origins = BTreeMap::from([(
+            root,
+            DiagnosticMaterializedLeafOrigin {
+                producer: Some(nested),
+                producer_operator: "add",
+                reason: DiagnosticMaterializationReason::NonAddConsumer,
+                consumer: Some(root),
+                consumer_operator: "add",
+                consumer_category: "add_sub",
+                remaining_uses: 7,
+                scalar_classification: "not_multiply",
+                forced_input_count: 1,
+                forced_terms_sum: 2,
+                forced_terms_max: 2,
+                retained_term_count: 2,
+            },
+        )]);
+        normalizer.diagnostic_materialization_origins = outer_materialization_origins.clone();
+        let outer_origin_nf = Arc::new(PolynomialNF::zero());
+        normalizer.diagnostic_materialized_leaf_origins.insert(
+            Arc::as_ptr(&outer_origin_nf) as usize,
+            DiagnosticMaterializedLeafAttachment {
+                normal_form: Arc::downgrade(&outer_origin_nf),
+                origin: outer_materialization_origins[&root],
+            },
+        );
         let outer_gadget_product_plan = Arc::new(GadgetProductExactPlan {
             id: 91_001,
             authority: normalizer.exact_plan_authority(ambiguous_root).unwrap(),
@@ -13393,6 +13966,17 @@ mod tests {
         assert_eq!(normalizer.diagnostic_product_consumers, outer_product_consumers);
         assert_eq!(normalizer.diagnostic_product_evaluations, outer_product_evaluations);
         assert_eq!(normalizer.diagnostic_product_root, Some(ambiguous_root));
+        let mut restored_materialization_origins = outer_materialization_origins.clone();
+        let specialized_origin =
+            normalizer.diagnostic_materialization_origins.get(&nested).copied().unwrap();
+        assert_eq!(specialized_origin.producer, Some(nested));
+        assert_eq!(specialized_origin.reason, DiagnosticMaterializationReason::SpecializedReturn);
+        restored_materialization_origins.insert(nested, specialized_origin);
+        assert_eq!(normalizer.diagnostic_materialization_origins, restored_materialization_origins);
+        assert_eq!(
+            normalizer.diagnostic_materialized_leaf_origin(&outer_origin_nf),
+            Some(outer_materialization_origins[&root])
+        );
 
         normalizer.clear_value_cache();
         normalizer.exact_plans.clear();
@@ -13436,6 +14020,11 @@ mod tests {
         assert_eq!(normalizer.diagnostic_product_consumers, outer_product_consumers);
         assert_eq!(normalizer.diagnostic_product_evaluations, outer_product_evaluations);
         assert_eq!(normalizer.diagnostic_product_root, Some(ambiguous_root));
+        assert_eq!(normalizer.diagnostic_materialization_origins, restored_materialization_origins);
+        assert_eq!(
+            normalizer.diagnostic_materialized_leaf_origin(&outer_origin_nf),
+            Some(outer_materialization_origins[&root])
+        );
         drop(normalizer);
         assert_eq!(normalization_cache.canonical_state_fingerprint(), normalization_fingerprint);
     }

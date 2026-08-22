@@ -62,7 +62,7 @@ const MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 const MONOMIAL_GC_ALLOCATION_THRESHOLD_ENV: &str = "MXX_OPERATIONAL_MONOMIAL_GC_THRESHOLD_BYTES";
 const MONOMIAL_GC_ALLOCATOR_TRIM_RECLAIMED_SLOTS: u64 = 1_000_000;
 const MONOMIAL_GC_ALLOCATOR_TRIM_RECLAIMED_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
-const LARGE_TERM_MERGE_ALLOCATOR_TRIM_INTERVAL: usize = 1_000_000;
+const LARGE_TERM_MERGE_ALLOCATOR_TRIM_INTERVAL: usize = 100_000;
 const MONOMIAL_GC_LOW_YIELD_BACKOFF_MIN_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 const MONOMIAL_GC_LOW_YIELD_BACKOFF_FACTOR: u64 = 4;
 const MONOMIAL_GC_LOW_YIELD_BACKOFF_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
@@ -11149,6 +11149,9 @@ fn merge_scaled_terms(
     if destination_last < source_first || source_last < destination_first {
         let mut source = scaled();
         terms.append(&mut source);
+        if terms.len() >= LARGE_TERM_MERGE_ALLOCATOR_TRIM_INTERVAL {
+            trim_allocator_during_large_term_merge();
+        }
         return Ok(());
     }
 

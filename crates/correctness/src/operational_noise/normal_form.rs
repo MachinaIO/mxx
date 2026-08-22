@@ -11112,54 +11112,18 @@ fn merge_scaled_terms(
         return Ok(());
     }
 
-    // Scanning the complete destination is linear in its size. Once a destination is much larger
-    // than the next source (the dominant Tall additive-materialization shape), ordered insertion
-    // touches only the source terms and avoids cloning a temporary source B-tree. Iterating the
-    // canonical source order keeps coefficient and cancellation semantics deterministic.
-    if source.len().saturating_mul(8) <= terms.len() {
-        let unit_weight = weight == &BigInt::from(1_u8);
-        for (&monomial, coefficient) in source {
-            let mut coefficient = coefficient.clone();
-            if !unit_weight {
-                coefficient *= weight;
-            }
-            merge_term(terms, monomial, coefficient);
+    // Overlapping ranges cannot use `BTreeMap::append`, whose replacement semantics would lose
+    // coefficient addition. Insert directly from the immutable source instead of cloning the
+    // complete source tree and allocating an overlap vector. This bounds peak memory by the final
+    // destination even when both maps contain tens of millions of interleaved keys.
+    let unit_weight = weight == &BigInt::from(1_u8);
+    for (&monomial, coefficient) in source {
+        let mut coefficient = coefficient.clone();
+        if !unit_weight {
+            coefficient *= weight;
         }
-        return Ok(());
+        merge_term(terms, monomial, coefficient);
     }
-
-    let mut source = scaled();
-    let mut overlaps = Vec::new();
-    let mut left = terms.keys().peekable();
-    let mut right = source.keys().peekable();
-    while let (Some(&left_key), Some(&right_key)) = (left.peek(), right.peek()) {
-        match left_key.cmp(right_key) {
-            std::cmp::Ordering::Less => {
-                left.next();
-            }
-            std::cmp::Ordering::Greater => {
-                right.next();
-            }
-            std::cmp::Ordering::Equal => {
-                overlaps.push(*left_key);
-                left.next();
-                right.next();
-            }
-        }
-    }
-    for monomial in overlaps {
-        let existing = terms.remove(&monomial).ok_or(NormalizeError::InvalidExactPlan {
-            reason: "missing destination overlap during bulk term merge",
-        })?;
-        let incoming = source.get_mut(&monomial).ok_or(NormalizeError::InvalidExactPlan {
-            reason: "missing source overlap during bulk term merge",
-        })?;
-        *incoming += existing;
-        if incoming.is_zero() {
-            source.remove(&monomial);
-        }
-    }
-    terms.append(&mut source);
     Ok(())
 }
 

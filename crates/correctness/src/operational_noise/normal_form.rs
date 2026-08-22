@@ -1955,7 +1955,7 @@ struct FlattenedAdditiveExactPlan {
     additive_ids: BTreeSet<u64>,
     leaves: HashMap<usize, (Arc<PolynomialNF>, BigInt)>,
     additive_outputs: BTreeMap<u64, (Arc<AdditiveExactPlan>, BigInt)>,
-    products: BTreeMap<u64, (Arc<ProductExactPlan>, BigInt, usize, bool)>,
+    products: BTreeMap<u64, (Arc<ProductExactPlan>, BigInt, usize, bool, bool)>,
     gadget_products: BTreeMap<u64, (Arc<GadgetProductExactPlan>, BigInt)>,
 }
 
@@ -3111,6 +3111,12 @@ impl<'a> Normalizer<'a> {
         let mut product_uses = self.product_plan_use_counts(state, &product_operand_additives)?;
         let mut outputs = BTreeMap::<(u8, u64), Arc<PolynomialNF>>::new();
         let mut scheduled = BTreeSet::<(u8, u64)>::new();
+        // Only direct Additive-output reads owned by pending FinishAdditive frames need to keep a
+        // materialized Additive NF across another product. Product operand reads are depth-first:
+        // after one product finishes, an unpinned Additive output can be dropped and later
+        // consumers can schedule the immutable plan again. This follows the actual execution
+        // schedule instead of predicting reads from graph shape.
+        let mut additive_output_pins = BTreeMap::<u64, usize>::new();
         let mut consumed_additives = BTreeSet::<u64>::new();
         let mut frames = vec![ExactMaterializationFrame::Enter(state.clone())];
 
@@ -3143,13 +3149,24 @@ impl<'a> Normalizer<'a> {
                             )?;
                             let mut dependencies = Vec::new();
                             for (additive, weight) in flattened.additive_outputs.values() {
-                                if !weight.is_zero() && !outputs.contains_key(&(0, additive.id)) {
-                                    dependencies
-                                        .push(NodeExactState::Additive(Arc::clone(additive)));
+                                if !weight.is_zero() {
+                                    let pins = additive_output_pins.entry(additive.id).or_default();
+                                    *pins = pins
+                                        .checked_add(1)
+                                        .ok_or(NormalizeError::ArithmeticOverflow)?;
+                                    if !outputs.contains_key(&(0, additive.id)) {
+                                        dependencies
+                                            .push(NodeExactState::Additive(Arc::clone(additive)));
+                                    }
                                 }
                             }
-                            for (product, weight, occurrences, standalone) in
-                                flattened.products.values_mut()
+                            for (
+                                product,
+                                weight,
+                                occurrences,
+                                standalone,
+                                additive_operands_pinned,
+                            ) in flattened.products.values_mut()
                             {
                                 if weight.is_zero() {
                                     continue;
@@ -3159,8 +3176,15 @@ impl<'a> Normalizer<'a> {
                                         reason: "missing product use count",
                                     },
                                 )?;
-                                *standalone = outputs.contains_key(&(1, product.id)) ||
-                                    remaining > *occurrences;
+                                let output_exists = outputs.contains_key(&(1, product.id));
+                                *standalone = output_exists || remaining > *occurrences;
+                                *additive_operands_pinned = !output_exists;
+                                if *additive_operands_pinned {
+                                    Self::pin_product_additive_operands(
+                                        product,
+                                        &mut additive_output_pins,
+                                    )?;
+                                }
                                 if *standalone {
                                     dependencies.push(NodeExactState::Product(Arc::clone(product)));
                                 } else {
@@ -3242,6 +3266,12 @@ impl<'a> Normalizer<'a> {
                         self.product_plan_counters.planned_pairs.saturating_add(planned);
                     Self::release_product_output(&plan.left, &mut outputs, &mut product_uses)?;
                     Self::release_product_output(&plan.right, &mut outputs, &mut product_uses)?;
+                    Self::drop_unpinned_product_additive_operands(
+                        &plan,
+                        &mut outputs,
+                        &mut scheduled,
+                        &additive_output_pins,
+                    )?;
                     outputs.insert(
                         (1, plan.id),
                         Arc::new(PolynomialNF {
@@ -3255,6 +3285,8 @@ impl<'a> Normalizer<'a> {
                         flattened,
                         &mut outputs,
                         &mut product_uses,
+                        &mut scheduled,
+                        &mut additive_output_pins,
                         &mut consumed_additives,
                         &materialization_root_leaf_roots,
                     )?;
@@ -3263,7 +3295,115 @@ impl<'a> Normalizer<'a> {
             }
         }
 
+        if !additive_output_pins.is_empty() {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "unconsumed additive output pins",
+            });
+        }
+        let root_additive_id = match state {
+            NodeExactState::Additive(plan) => Some(plan.id),
+            NodeExactState::Materialized { .. } |
+            NodeExactState::Product(_) |
+            NodeExactState::GadgetProduct(_) => None,
+        };
+        if outputs.keys().any(|(kind, id)| *kind == 0 && Some(*id) != root_additive_id) {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "orphaned additive materialization output",
+            });
+        }
         Self::exact_state_output(state, &outputs)
+    }
+
+    fn product_additive_operand_ids(plan: &ProductExactPlan) -> BTreeSet<u64> {
+        let mut additive_ids = BTreeSet::new();
+        for operand in [&plan.left, &plan.right] {
+            if let NodeExactState::Additive(additive) = operand {
+                additive_ids.insert(additive.id);
+            }
+        }
+        additive_ids
+    }
+
+    fn pin_product_additive_operands(
+        plan: &ProductExactPlan,
+        additive_output_pins: &mut BTreeMap<u64, usize>,
+    ) -> Result<(), NormalizeError> {
+        for id in Self::product_additive_operand_ids(plan) {
+            let pins = additive_output_pins.entry(id).or_default();
+            *pins = pins.checked_add(1).ok_or(NormalizeError::ArithmeticOverflow)?;
+        }
+        Ok(())
+    }
+
+    fn drop_unpinned_product_additive_operands(
+        plan: &ProductExactPlan,
+        outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
+        scheduled: &mut BTreeSet<(u8, u64)>,
+        additive_output_pins: &BTreeMap<u64, usize>,
+    ) -> Result<(), NormalizeError> {
+        for id in Self::product_additive_operand_ids(plan) {
+            if additive_output_pins.get(&id).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            if outputs.remove(&(0, id)).is_none() {
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "missing consumed additive product operand",
+                });
+            }
+            scheduled.remove(&(0, id));
+        }
+        Ok(())
+    }
+
+    fn release_reserved_product_additive_operands(
+        plan: &ProductExactPlan,
+        outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
+        scheduled: &mut BTreeSet<(u8, u64)>,
+        additive_output_pins: &mut BTreeMap<u64, usize>,
+    ) -> Result<(), NormalizeError> {
+        for id in Self::product_additive_operand_ids(plan) {
+            let remaining =
+                additive_output_pins.get_mut(&id).ok_or(NormalizeError::InvalidExactPlan {
+                    reason: "missing product additive operand pin",
+                })?;
+            *remaining = remaining.checked_sub(1).ok_or(NormalizeError::InvalidExactPlan {
+                reason: "product additive operand pin underflow",
+            })?;
+            if *remaining == 0 {
+                additive_output_pins.remove(&id);
+                if outputs.remove(&(0, id)).is_none() {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "missing consumed product additive operand",
+                    });
+                }
+                scheduled.remove(&(0, id));
+            }
+        }
+        Ok(())
+    }
+
+    fn release_additive_boundary_output(
+        id: u64,
+        outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
+        scheduled: &mut BTreeSet<(u8, u64)>,
+        additive_output_pins: &mut BTreeMap<u64, usize>,
+    ) -> Result<(), NormalizeError> {
+        let remaining = additive_output_pins
+            .get_mut(&id)
+            .ok_or(NormalizeError::InvalidExactPlan { reason: "missing additive boundary pin" })?;
+        *remaining = remaining.checked_sub(1).ok_or(NormalizeError::InvalidExactPlan {
+            reason: "additive boundary pin underflow",
+        })?;
+        if *remaining == 0 {
+            additive_output_pins.remove(&id);
+            if outputs.remove(&(0, id)).is_none() {
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "missing consumed additive boundary output",
+                });
+            }
+            scheduled.remove(&(0, id));
+        }
+        Ok(())
     }
 
     fn node_exact_output_key(state: &NodeExactState) -> Option<(u8, u64)> {
@@ -3341,7 +3481,7 @@ impl<'a> Normalizer<'a> {
             })?;
             let flattened =
                 self.flatten_additive_plan(plan, &no_outputs, product_operand_additives)?;
-            for (product, _, occurrences, _) in flattened.products.into_values() {
+            for (product, _, occurrences, _, _) in flattened.products.into_values() {
                 let count = result.entry(product.id).or_default();
                 *count =
                     count.checked_add(occurrences).ok_or(NormalizeError::ArithmeticOverflow)?;
@@ -3474,7 +3614,8 @@ impl<'a> Normalizer<'a> {
         let mut additive_ids = BTreeSet::new();
         let mut leaves = HashMap::<usize, (Arc<PolynomialNF>, BigInt)>::new();
         let mut additive_outputs = BTreeMap::<u64, (Arc<AdditiveExactPlan>, BigInt)>::new();
-        let mut products = BTreeMap::<u64, (Arc<ProductExactPlan>, BigInt, usize, bool)>::new();
+        let mut products =
+            BTreeMap::<u64, (Arc<ProductExactPlan>, BigInt, usize, bool, bool)>::new();
         let mut gadget_products = BTreeMap::<u64, (Arc<GadgetProductExactPlan>, BigInt)>::new();
         while let Some((_, (plan, weight))) = pending.pop_last() {
             if !additive_ids.insert(plan.id) {
@@ -3486,13 +3627,13 @@ impl<'a> Normalizer<'a> {
                 let signed = if sign < 0 { -weight.clone() } else { weight.clone() };
                 match child {
                     NodeExactState::Additive(child) => {
-                        if let Some(normal_form) = outputs.get(&(0, child.id)) {
-                            let key = Arc::as_ptr(normal_form) as usize;
-                            leaves
-                                .entry(key)
-                                .and_modify(|(_, total)| *total += &signed)
-                                .or_insert_with(|| (Arc::clone(normal_form), signed));
-                        } else if product_operand_additives.contains(&child.id) {
+                        // Preserve the Additive output identity even when its NF already exists.
+                        // FinishAdditive owns one explicit read of this boundary and can therefore
+                        // release it exactly after merging; treating it as an anonymous Arc leaf
+                        // would lose that liveness edge.
+                        if outputs.contains_key(&(0, child.id)) ||
+                            product_operand_additives.contains(&child.id)
+                        {
                             additive_outputs
                                 .entry(child.id)
                                 .and_modify(|(_, total)| *total += &signed)
@@ -3506,10 +3647,10 @@ impl<'a> Normalizer<'a> {
                     }
                     NodeExactState::Product(child) => match products.entry(child.id) {
                         std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert((Arc::clone(child), signed, 1, false));
+                            entry.insert((Arc::clone(child), signed, 1, false, false));
                         }
                         std::collections::btree_map::Entry::Occupied(mut entry) => {
-                            let (_, total, occurrences, _) = entry.get_mut();
+                            let (_, total, occurrences, _, _) = entry.get_mut();
                             *total += &signed;
                             *occurrences = occurrences
                                 .checked_add(1)
@@ -3547,6 +3688,8 @@ impl<'a> Normalizer<'a> {
         flattened: FlattenedAdditiveExactPlan,
         outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
         product_uses: &mut BTreeMap<u64, usize>,
+        scheduled: &mut BTreeSet<(u8, u64)>,
+        additive_output_pins: &mut BTreeMap<u64, usize>,
         consumed_additives: &mut BTreeSet<u64>,
         materialization_root_leaf_roots: &[MonomialId],
     ) -> Result<(u64, Arc<PolynomialNF>), NormalizeError> {
@@ -3556,7 +3699,12 @@ impl<'a> Normalizer<'a> {
         let mut terms = BTreeMap::new();
         for (_, (additive, weight)) in flattened.additive_outputs {
             if weight.is_zero() {
-                if !outputs.contains_key(&(0, additive.id)) {
+                if outputs.contains_key(&(0, additive.id)) {
+                    if additive_output_pins.get(&additive.id).copied().unwrap_or(0) == 0 {
+                        outputs.remove(&(0, additive.id));
+                        scheduled.remove(&(0, additive.id));
+                    }
+                } else {
                     self.discard_unexecuted_exact_states(
                         vec![NodeExactState::Additive(additive)],
                         outputs,
@@ -3573,6 +3721,12 @@ impl<'a> Normalizer<'a> {
             for (monomial, coefficient) in &normal_form.exact_terms {
                 merge_term(&mut terms, *monomial, coefficient * &weight);
             }
+            Self::release_additive_boundary_output(
+                additive.id,
+                outputs,
+                scheduled,
+                additive_output_pins,
+            )?;
         }
         for (_, (normal_form, weight)) in flattened.leaves {
             if weight.is_zero() {
@@ -3582,7 +3736,9 @@ impl<'a> Normalizer<'a> {
                 merge_term(&mut terms, *monomial, coefficient * &weight);
             }
         }
-        for (_, (plan, weight, occurrences, standalone)) in flattened.products.into_iter().rev() {
+        for (_, (plan, weight, occurrences, standalone, additive_operands_pinned)) in
+            flattened.products.into_iter().rev()
+        {
             let mut executed = false;
             if !weight.is_zero() {
                 if standalone || outputs.contains_key(&(1, plan.id)) {
@@ -3643,6 +3799,14 @@ impl<'a> Normalizer<'a> {
                         .scalar_action_zero_weight_skips
                         .saturating_add(1);
                 }
+            }
+            if !weight.is_zero() && additive_operands_pinned {
+                Self::release_reserved_product_additive_operands(
+                    &plan,
+                    outputs,
+                    scheduled,
+                    additive_output_pins,
+                )?;
             }
             for _ in 0..occurrences {
                 let had_output = outputs.contains_key(&(1, plan.id));

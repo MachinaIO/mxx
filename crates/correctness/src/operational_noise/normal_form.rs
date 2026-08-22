@@ -1974,7 +1974,10 @@ enum ExactMaterializationFrame {
 #[derive(Clone, Copy)]
 enum ProductGcScope<'a> {
     Eager,
-    Deferred { root: &'a NodeExactState, outputs: &'a BTreeMap<(u8, u64), Arc<PolynomialNF>> },
+    Deferred {
+        root_leaf_roots: &'a [MonomialId],
+        outputs: &'a BTreeMap<(u8, u64), Arc<PolynomialNF>>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -3100,6 +3103,10 @@ impl<'a> Normalizer<'a> {
         state: &NodeExactState,
     ) -> Result<Arc<PolynomialNF>, NormalizeError> {
         self.validate_exact_state_dag(state)?;
+        // The immutable plan root is identical at every in-product GC safe point. Cache its
+        // materialized leaf IDs once for this session instead of rewalking the full DAG and
+        // rebuilding a multi-million-entry root vector after every allocation threshold.
+        let materialization_root_leaf_roots = self.local_exact_state_leaf_roots(state)?;
         let product_operand_additives = Self::product_operand_additives(state);
         let mut product_uses = self.product_plan_use_counts(state, &product_operand_additives)?;
         let mut outputs = BTreeMap::<(u8, u64), Arc<PolynomialNF>>::new();
@@ -3178,7 +3185,10 @@ impl<'a> Normalizer<'a> {
                         &mut terms,
                         true,
                         false,
-                        ProductGcScope::Deferred { root: state, outputs: &outputs },
+                        ProductGcScope::Deferred {
+                            root_leaf_roots: &materialization_root_leaf_roots,
+                            outputs: &outputs,
+                        },
                     )?;
                     self.gadget_product_counters.standalone_materializations =
                         self.gadget_product_counters.standalone_materializations.saturating_add(1);
@@ -3206,7 +3216,10 @@ impl<'a> Normalizer<'a> {
                         &mut terms,
                         direct,
                         matches!(plan.mode, ProductMode::TypedGadgetCandidate),
-                        ProductGcScope::Deferred { root: state, outputs: &outputs },
+                        ProductGcScope::Deferred {
+                            root_leaf_roots: &materialization_root_leaf_roots,
+                            outputs: &outputs,
+                        },
                     )?;
                     let planned = u64::try_from(left.exact_terms.len())
                         .unwrap_or(u64::MAX)
@@ -3243,7 +3256,7 @@ impl<'a> Normalizer<'a> {
                         &mut outputs,
                         &mut product_uses,
                         &mut consumed_additives,
-                        state,
+                        &materialization_root_leaf_roots,
                     )?;
                     outputs.insert((0, normal_form.0), normal_form.1);
                 }
@@ -3535,7 +3548,7 @@ impl<'a> Normalizer<'a> {
         outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
         product_uses: &mut BTreeMap<u64, usize>,
         consumed_additives: &mut BTreeSet<u64>,
-        materialization_root: &NodeExactState,
+        materialization_root_leaf_roots: &[MonomialId],
     ) -> Result<(u64, Arc<PolynomialNF>), NormalizeError> {
         // These additive definitions own the Product edges collected below. Mark them before a
         // canceled sibling can recursively discard a shared additive operand.
@@ -3595,7 +3608,10 @@ impl<'a> Normalizer<'a> {
                         &mut terms,
                         direct,
                         matches!(plan.mode, ProductMode::TypedGadgetCandidate),
-                        ProductGcScope::Deferred { root: materialization_root, outputs: &*outputs },
+                        ProductGcScope::Deferred {
+                            root_leaf_roots: materialization_root_leaf_roots,
+                            outputs: &*outputs,
+                        },
                     )?;
                     let planned = u64::try_from(left.exact_terms.len())
                         .unwrap_or(u64::MAX)
@@ -3658,7 +3674,10 @@ impl<'a> Normalizer<'a> {
                 &mut terms,
                 true,
                 false,
-                ProductGcScope::Deferred { root: materialization_root, outputs: &*outputs },
+                ProductGcScope::Deferred {
+                    root_leaf_roots: materialization_root_leaf_roots,
+                    outputs: &*outputs,
+                },
             )?;
         }
         let output_terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
@@ -4792,17 +4811,26 @@ impl<'a> Normalizer<'a> {
         {
             return Ok(());
         }
-        let mut roots = Vec::new();
-        roots.extend(left.exact_terms.keys().copied());
-        roots.extend(right.exact_terms.keys().copied());
-        roots.extend(destination.keys().copied());
-        roots.extend(active_worklist_roots);
-        if let ProductGcScope::Deferred { root, outputs } = scope {
-            roots.extend(self.local_exact_state_leaf_roots(root)?);
-            roots.extend(
-                outputs.values().flat_map(|normal_form| normal_form.exact_terms.keys().copied()),
-            );
-        }
+        let (root_leaf_roots, outputs): (
+            &[MonomialId],
+            Option<&BTreeMap<(u8, u64), Arc<PolynomialNF>>>,
+        ) = match scope {
+            ProductGcScope::Eager => (&[], None),
+            ProductGcScope::Deferred { root_leaf_roots, outputs } => {
+                (root_leaf_roots, Some(outputs))
+            }
+        };
+        let roots = left
+            .exact_terms
+            .keys()
+            .copied()
+            .chain(right.exact_terms.keys().copied())
+            .chain(destination.keys().copied())
+            .chain(active_worklist_roots)
+            .chain(root_leaf_roots.iter().copied())
+            .chain(outputs.into_iter().flat_map(|outputs| {
+                outputs.values().flat_map(|normal_form| normal_form.exact_terms.keys().copied())
+            }));
         let sweep_count = self.gc_counters.sweep_count;
         self.sweep_monomials_at_quiescent_point(roots, false)?;
         if self.gc_counters.sweep_count != sweep_count {
@@ -4827,9 +4855,8 @@ impl<'a> Normalizer<'a> {
         {
             return Ok(());
         }
-        let (mut plan_roots, materialized_leaf_top8, diagnostic_nfs) =
+        let (plan_roots, materialized_leaf_top8, diagnostic_nfs) =
             self.exact_plan_leaf_roots_and_top8(true)?;
-        plan_roots.extend(extra_exact_plan_roots);
         // Classification is a separate expensive opt-in layered on the watchdog. It is computed
         // before mutation so an authority error aborts the sweep atomically, and committed only
         // after the real sweep succeeds. Ordinary watchdog owner telemetry remains enabled
@@ -4867,7 +4894,7 @@ impl<'a> Normalizer<'a> {
         let report = self.monomials.sweep_with_owners(
             self.protected_monomial_prefix,
             cache_roots,
-            plan_roots,
+            plan_roots.into_iter().chain(extra_exact_plan_roots),
             gadget_roots,
             canonical_roots,
             closed_roots,
@@ -11820,12 +11847,17 @@ mod tests {
         normalizer.protected_monomial_prefix = 0;
         normalizer.normalization_depth = 1;
         normalizer.monomial_gc_allocation_threshold_bytes = 0;
+        let cached_root_leaf_roots = normalizer.local_exact_state_leaf_roots(&state).unwrap();
+        assert_eq!(cached_root_leaf_roots, vec![ids[3]]);
         normalizer
             .sweep_monomials_at_product_pair(
                 left.as_ref(),
                 right.as_ref(),
                 &destination,
-                ProductGcScope::Deferred { root: &state, outputs: &outputs },
+                ProductGcScope::Deferred {
+                    root_leaf_roots: &cached_root_leaf_roots,
+                    outputs: &outputs,
+                },
             )
             .unwrap();
         for live in &ids[..5] {
@@ -11845,7 +11877,10 @@ mod tests {
                     left.as_ref(),
                     right.as_ref(),
                     &destination,
-                    ProductGcScope::Deferred { root: &state, outputs: &invalid_outputs },
+                    ProductGcScope::Deferred {
+                        root_leaf_roots: &cached_root_leaf_roots,
+                        outputs: &invalid_outputs,
+                    },
                 ),
                 Err(NormalizeError::Monomial(
                     MonomialError::InvalidMonomialId { .. } |
@@ -11863,7 +11898,10 @@ mod tests {
                 left.as_ref(),
                 right.as_ref(),
                 &destination,
-                ProductGcScope::Deferred { root: &state, outputs: &outputs },
+                ProductGcScope::Deferred {
+                    root_leaf_roots: &cached_root_leaf_roots,
+                    outputs: &outputs,
+                },
             )
             .unwrap();
         assert_eq!(normalizer.gc_counters.sweep_count, sweep_count);
@@ -11876,7 +11914,10 @@ mod tests {
                 left.as_ref(),
                 right.as_ref(),
                 &destination,
-                ProductGcScope::Deferred { root: &state, outputs: &outputs },
+                ProductGcScope::Deferred {
+                    root_leaf_roots: &cached_root_leaf_roots,
+                    outputs: &outputs,
+                },
             )
             .unwrap();
         assert_eq!(normalizer.gc_counters.sweep_count, sweep_count);

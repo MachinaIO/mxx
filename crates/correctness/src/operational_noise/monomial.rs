@@ -87,10 +87,6 @@ pub enum MonomialError {
     CollectedMonomialId {
         slot: u32,
     },
-    InconsistentIndex {
-        expected_occupied: u64,
-        indexed_slots: u64,
-    },
     NotMatrix {
         factor: ScopedExprId,
         actual: ResolvedValueType,
@@ -791,71 +787,9 @@ impl MonomialArena {
     ) -> Result<MonomialSweepReport, MonomialError> {
         let high_water = self.descriptors.len();
         let protected_prefix = protected_prefix.min(high_water);
-        // Dense arenas are faster as a contiguous descriptor scan. Once stable tombstones exceed
-        // half the directory, enumerate the hash index's live slots instead so sweep cost follows
-        // current occupancy rather than historical high-water.
-        let sparse = self.occupied_descriptor_slots.saturating_mul(2) < high_water as u64;
-        let occupied_slots = if sparse {
-            let collect_shard_slots = |shard: &HashMap<u64, MonomialBucket>| {
-                shard
-                    .iter()
-                    .flat_map(|(&hash, bucket)| {
-                        bucket.slots().iter().copied().map(move |slot| (hash, slot))
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let mut slots = if rayon::current_num_threads() > 1 {
-                self.buckets
-                    .par_iter()
-                    .map(collect_shard_slots)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-            } else {
-                self.buckets.iter().flat_map(|shard| collect_shard_slots(shard)).collect::<Vec<_>>()
-            };
-            // A hash collision bucket may mention the same slot as another synthetic/test bucket.
-            // De-duplicate without sorting so the walk remains linear in indexed live entries.
-            let mut indexed = vec![0_u64; high_water.div_ceil(64)];
-            slots.retain(|&(_, slot)| {
-                let slot = slot as usize;
-                let Some(word) = indexed.get_mut(slot / 64) else { return true };
-                let mask = 1_u64 << (slot % 64);
-                let first = *word & mask == 0;
-                *word |= mask;
-                first
-            });
-            if slots.len() != self.occupied_descriptor_slots as usize {
-                return Err(MonomialError::InconsistentIndex {
-                    expected_occupied: self.occupied_descriptor_slots,
-                    indexed_slots: u64::try_from(slots.len()).unwrap_or(u64::MAX),
-                });
-            }
-            for &(_, slot) in &slots {
-                let Some(entry) = self.descriptors.get(slot as usize) else {
-                    return Err(MonomialError::InvalidSlot { slot });
-                };
-                if entry.is_none() {
-                    return Err(MonomialError::CollectedMonomialId { slot });
-                }
-            }
-            Some(slots)
-        } else {
-            None
-        };
         let mut marked = vec![0_u64; high_water.div_ceil(64)];
         let mut protected_report = MonomialSweepOwnerReport::default();
-        let protected_slots: Box<dyn Iterator<Item = usize> + '_> = match &occupied_slots {
-            Some(slots) => Box::new(
-                slots
-                    .iter()
-                    .map(|&(_, slot)| slot as usize)
-                    .filter(move |&slot| slot < protected_prefix),
-            ),
-            None => Box::new(0..protected_prefix),
-        };
-        for slot in protected_slots {
+        for slot in 0..protected_prefix {
             let Some(descriptor) = self.descriptors[slot].as_ref() else { continue };
             marked[slot / 64] |= 1_u64 << (slot % 64);
             protected_report.descriptor_slots = protected_report.descriptor_slots.saturating_add(1);
@@ -876,11 +810,10 @@ impl MonomialArena {
 
         let mut reclaimed_slots = 0_u64;
         let mut reclaimed_payload = 0_u64;
-        let reclaim_slots: Box<dyn Iterator<Item = usize> + '_> = match &occupied_slots {
-            Some(slots) => Box::new(slots.iter().map(|&(_, slot)| slot as usize)),
-            None => Box::new(0..high_water),
-        };
-        for slot in reclaim_slots {
+        // Descriptor slots are monotonic and therefore naturally ordered. Even with many
+        // tombstones, this contiguous scan is substantially faster than following the hash
+        // index's random slot order and needs no proportional temporary slot vector.
+        for slot in 0..high_water {
             if marked.get(slot / 64).is_some_and(|word| word & (1_u64 << (slot % 64)) != 0) {
                 continue;
             }
@@ -1270,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_sweep_prunes_bucket_entries_in_place_and_collapses_collisions() {
+    fn sweep_prunes_bucket_entries_in_place_and_collapses_collisions() {
         let (expressions, programs, scope, one, _, _) = fixture();
         let mut arena = MonomialArena::new(&expressions, &programs, scope).unwrap();
         let root = programs.root(&expressions, scope).unwrap();

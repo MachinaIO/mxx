@@ -126,7 +126,7 @@ pub struct MonomialArena {
     descriptors: Vec<Option<MonomialDescriptor>>,
     // Hash buckets contain slots only.  Full descriptor equality below makes
     // this collision-safe without storing a second copy of either factor list.
-    buckets: HashMap<u64, MonomialBucket>,
+    buckets: Vec<HashMap<u64, MonomialBucket>>,
     central_factor_entries: u64,
     ordered_factor_entries: u64,
     occupied_descriptor_slots: u64,
@@ -134,6 +134,7 @@ pub struct MonomialArena {
 }
 
 const PARALLEL_DESCRIPTOR_BATCH_MIN: usize = 256;
+const MONOMIAL_BUCKET_SHARDS: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MonomialBucket {
@@ -159,13 +160,29 @@ impl MonomialBucket {
     }
 }
 
-fn insert_bucket_slot(buckets: &mut HashMap<u64, MonomialBucket>, hash: u64, slot: u32) {
-    match buckets.entry(hash) {
+fn bucket_shard(hash: u64) -> usize {
+    hash as usize & (MONOMIAL_BUCKET_SHARDS - 1)
+}
+
+fn new_bucket_shards() -> Vec<HashMap<u64, MonomialBucket>> {
+    (0..MONOMIAL_BUCKET_SHARDS).map(|_| HashMap::new()).collect()
+}
+
+fn insert_shard_slot(bucket: &mut HashMap<u64, MonomialBucket>, hash: u64, slot: u32) {
+    match bucket.entry(hash) {
         std::collections::hash_map::Entry::Vacant(entry) => {
             entry.insert(MonomialBucket::Single(slot));
         }
         std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().push(slot),
     }
+}
+
+fn insert_bucket_slot(buckets: &mut [HashMap<u64, MonomialBucket>], hash: u64, slot: u32) {
+    insert_shard_slot(&mut buckets[bucket_shard(hash)], hash, slot);
+}
+
+fn bucket_slots(buckets: &[HashMap<u64, MonomialBucket>], hash: u64) -> Option<&MonomialBucket> {
+    buckets[bucket_shard(hash)].get(&hash)
 }
 
 struct PreparedMonomialDescriptor {
@@ -241,7 +258,7 @@ impl MonomialArena {
             expression_arena: expressions.token(),
             scope,
             descriptors: Vec::new(),
-            buckets: HashMap::new(),
+            buckets: new_bucket_shards(),
             central_factor_entries: 0,
             ordered_factor_entries: 0,
             occupied_descriptor_slots: 0,
@@ -574,7 +591,7 @@ impl MonomialArena {
             ordered_factors: ordered.into_boxed_slice(),
         };
         let hash = structural_hash(&descriptor);
-        let Some(slots) = self.buckets.get(&hash) else {
+        let Some(slots) = bucket_slots(&self.buckets, hash) else {
             return Ok(None);
         };
         for &slot in slots.slots() {
@@ -598,7 +615,7 @@ impl MonomialArena {
         prepared: PreparedMonomialDescriptor,
     ) -> Result<MonomialId, MonomialError> {
         let PreparedMonomialDescriptor { descriptor, hash } = prepared;
-        if let Some(slots) = self.buckets.get(&hash) {
+        if let Some(slots) = bucket_slots(&self.buckets, hash) {
             for &slot in slots.slots() {
                 let Some(existing) = self.descriptors.get(slot as usize).and_then(Option::as_ref)
                 else {
@@ -810,12 +827,23 @@ impl MonomialArena {
         } else {
             self.descriptors.iter().enumerate().filter_map(prepare_bucket).collect::<Vec<_>>()
         };
-        let mut buckets: HashMap<u64, MonomialBucket> =
-            HashMap::with_capacity(prepared_buckets.len());
+        let mut prepared_shards =
+            (0..MONOMIAL_BUCKET_SHARDS).map(|_| Vec::new()).collect::<Vec<Vec<(u64, u32)>>>();
         for (hash, slot) in prepared_buckets {
-            insert_bucket_slot(&mut buckets, hash, slot);
+            prepared_shards[bucket_shard(hash)].push((hash, slot));
         }
-        self.buckets = buckets;
+        let build_shard = |entries: Vec<(u64, u32)>| {
+            let mut bucket = HashMap::with_capacity(entries.len());
+            for (hash, slot) in entries {
+                insert_shard_slot(&mut bucket, hash, slot);
+            }
+            bucket
+        };
+        self.buckets = if rayon::current_num_threads() > 1 {
+            prepared_shards.into_par_iter().map(build_shard).collect()
+        } else {
+            prepared_shards.into_iter().map(build_shard).collect()
+        };
         self.allocated_payload_since_sweep = 0;
         Ok(MonomialSweepReport {
             high_water_slots: u64::try_from(high_water).unwrap_or(u64::MAX),
@@ -1151,7 +1179,15 @@ mod tests {
             Err(MonomialError::CollectedMonomialId { slot }) if slot == dead.slot
         ));
         assert_eq!(arena.descriptor(live).unwrap().central_factors.as_ref(), &[one]);
-        assert_eq!(arena.buckets.values().map(|bucket| bucket.slots().len()).sum::<usize>(), 1);
+        assert_eq!(
+            arena
+                .buckets
+                .iter()
+                .flat_map(HashMap::values)
+                .map(|bucket| bucket.slots().len())
+                .sum::<usize>(),
+            1
+        );
 
         let reinterned = arena.intern(&expressions, &programs, &[], &[root, one]).unwrap();
         assert_ne!(reinterned, dead);

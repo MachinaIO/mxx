@@ -12,7 +12,7 @@ use super::{
 };
 use rayon::prelude::*;
 use std::{
-    collections::{BTreeMap, hash_map::DefaultHasher},
+    collections::{BTreeMap, HashMap, hash_map::DefaultHasher},
     error::Error,
     fmt,
     hash::{Hash, Hasher},
@@ -126,7 +126,7 @@ pub struct MonomialArena {
     descriptors: Vec<Option<MonomialDescriptor>>,
     // Hash buckets contain slots only.  Full descriptor equality below makes
     // this collision-safe without storing a second copy of either factor list.
-    buckets: BTreeMap<u64, Vec<u32>>,
+    buckets: HashMap<u64, Vec<u32>>,
     central_factor_entries: u64,
     ordered_factor_entries: u64,
     occupied_descriptor_slots: u64,
@@ -208,7 +208,7 @@ impl MonomialArena {
             expression_arena: expressions.token(),
             scope,
             descriptors: Vec::new(),
-            buckets: BTreeMap::new(),
+            buckets: HashMap::new(),
             central_factor_entries: 0,
             ordered_factor_entries: 0,
             occupied_descriptor_slots: 0,
@@ -758,12 +758,30 @@ impl MonomialArena {
                 .saturating_add(descriptor_payload_lower_bound_bytes(central, ordered));
         }
 
-        self.buckets.clear();
-        for (slot, descriptor) in self.descriptors.iter().enumerate() {
-            let Some(descriptor) = descriptor.as_ref() else { continue };
-            let slot = u32::try_from(slot).map_err(|_| MonomialError::ArenaExhausted)?;
-            self.buckets.entry(structural_hash(descriptor)).or_default().push(slot);
+        if self
+            .descriptors
+            .len()
+            .checked_sub(1)
+            .is_some_and(|last_slot| u32::try_from(last_slot).is_err())
+        {
+            return Err(MonomialError::ArenaExhausted);
         }
+        let prepare_bucket = |(slot, descriptor): (usize, &Option<MonomialDescriptor>)| {
+            descriptor.as_ref().map(|descriptor| (structural_hash(descriptor), slot as u32))
+        };
+        let prepared_buckets = if self.occupied_descriptor_slots as usize >=
+            PARALLEL_DESCRIPTOR_BATCH_MIN &&
+            rayon::current_num_threads() > 1
+        {
+            self.descriptors.par_iter().enumerate().filter_map(prepare_bucket).collect::<Vec<_>>()
+        } else {
+            self.descriptors.iter().enumerate().filter_map(prepare_bucket).collect::<Vec<_>>()
+        };
+        let mut buckets: HashMap<u64, Vec<u32>> = HashMap::with_capacity(prepared_buckets.len());
+        for (hash, slot) in prepared_buckets {
+            buckets.entry(hash).or_default().push(slot);
+        }
+        self.buckets = buckets;
         self.allocated_payload_since_sweep = 0;
         Ok(MonomialSweepReport {
             high_water_slots: u64::try_from(high_water).unwrap_or(u64::MAX),
@@ -1337,6 +1355,38 @@ mod tests {
             Err(MonomialError::InvalidMonomialId { .. })
         ));
         assert_eq!(parallel.len(), before_invalid, "validation must precede batch mutation");
+    }
+
+    #[test]
+    fn parallel_sweep_rebuild_matches_single_threaded_bucket_index() {
+        let (expressions, programs, scope, one, _, _) = fixture();
+        let root = programs.root(&expressions, scope).unwrap();
+        let build = || {
+            let mut arena = MonomialArena::new(&expressions, &programs, scope).unwrap();
+            let ids = (0..600_usize)
+                .map(|index| {
+                    let ordered = (0..index + 1)
+                        .map(|position| if (index + position) % 2 == 0 { root } else { one })
+                        .collect::<Vec<_>>();
+                    arena.intern(&expressions, &programs, &[], &ordered).unwrap()
+                })
+                .collect::<Vec<_>>();
+            (arena, ids)
+        };
+        let (mut sequential, sequential_ids) = build();
+        let (mut parallel, parallel_ids) = build();
+        let sequential_roots = sequential_ids.iter().step_by(3).copied().collect::<Vec<_>>();
+        let parallel_roots = parallel_ids.iter().step_by(3).copied().collect::<Vec<_>>();
+
+        let sequential_pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let sequential_report =
+            sequential_pool.install(|| sequential.sweep(0, sequential_roots)).unwrap();
+        let parallel_pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let parallel_report = parallel_pool.install(|| parallel.sweep(0, parallel_roots)).unwrap();
+
+        assert_eq!(sequential_report, parallel_report);
+        assert_eq!(sequential.descriptors, parallel.descriptors);
+        assert_eq!(sequential.buckets, parallel.buckets);
     }
 
     #[test]

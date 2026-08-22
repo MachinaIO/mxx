@@ -1898,6 +1898,136 @@ pub struct PolynomialNF {
     pub bounded_summary: BoundedSummary,
 }
 
+trait ExactTermAccumulator {
+    type Roots<'a>: Iterator<Item = MonomialId>
+    where
+        Self: 'a;
+
+    fn len(&self) -> usize;
+    fn roots(&self) -> Self::Roots<'_>;
+    fn merge(&mut self, monomial: MonomialId, coefficient: BigInt) -> Result<(), NormalizeError>;
+}
+
+impl ExactTermAccumulator for TermMap<BigInt> {
+    type Roots<'a> = std::iter::Copied<std::collections::btree_map::Keys<'a, MonomialId, BigInt>>;
+
+    fn len(&self) -> usize {
+        BTreeMap::len(self)
+    }
+
+    fn roots(&self) -> Self::Roots<'_> {
+        self.keys().copied()
+    }
+
+    fn merge(&mut self, monomial: MonomialId, coefficient: BigInt) -> Result<(), NormalizeError> {
+        merge_term(self, monomial, coefficient);
+        Ok(())
+    }
+}
+
+struct DenseTermAccumulator {
+    arena: ArenaToken,
+    coefficients: Vec<Option<BigInt>>,
+    registered_slots: Vec<bool>,
+    occupied_slots: Vec<u32>,
+    len: usize,
+}
+
+impl DenseTermAccumulator {
+    fn new(arena: ArenaToken) -> Self {
+        Self {
+            arena,
+            coefficients: Vec::new(),
+            registered_slots: Vec::new(),
+            occupied_slots: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn into_term_map(mut self) -> TermMap<BigInt> {
+        let mut result = BTreeMap::new();
+        for slot in self.occupied_slots {
+            let index = slot as usize;
+            let Some(coefficient) = self.coefficients[index].take() else { continue };
+            result.insert(MonomialId::new(self.arena, slot), coefficient);
+        }
+        result
+    }
+}
+
+struct DenseTermRoots<'a> {
+    arena: ArenaToken,
+    slots: std::slice::Iter<'a, u32>,
+    coefficients: &'a [Option<BigInt>],
+}
+
+impl Iterator for DenseTermRoots<'_> {
+    type Item = MonomialId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for &slot in self.slots.by_ref() {
+            if self.coefficients[slot as usize].is_some() {
+                return Some(MonomialId::new(self.arena, slot));
+            }
+        }
+        None
+    }
+}
+
+impl ExactTermAccumulator for DenseTermAccumulator {
+    type Roots<'a> = DenseTermRoots<'a>;
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn roots(&self) -> Self::Roots<'_> {
+        DenseTermRoots {
+            arena: self.arena,
+            slots: self.occupied_slots.iter(),
+            coefficients: &self.coefficients,
+        }
+    }
+
+    fn merge(&mut self, monomial: MonomialId, coefficient: BigInt) -> Result<(), NormalizeError> {
+        if coefficient.is_zero() {
+            return Ok(());
+        }
+        if monomial.arena() != self.arena {
+            return Err(NormalizeError::Monomial(MonomialError::InvalidMonomialId {
+                expected: self.arena,
+                actual: monomial.arena(),
+            }));
+        }
+        let index = monomial.slot() as usize;
+        if index >= self.coefficients.len() {
+            self.coefficients
+                .try_reserve(index + 1 - self.coefficients.len())
+                .map_err(|_| NormalizeError::ArithmeticOverflow)?;
+            self.coefficients.resize_with(index + 1, || None);
+            self.registered_slots
+                .try_reserve(index + 1 - self.registered_slots.len())
+                .map_err(|_| NormalizeError::ArithmeticOverflow)?;
+            self.registered_slots.resize(index + 1, false);
+        }
+        if let Some(existing) = self.coefficients[index].as_mut() {
+            *existing += coefficient;
+            if existing.is_zero() {
+                self.coefficients[index] = None;
+                self.len -= 1;
+            }
+        } else {
+            self.coefficients[index] = Some(coefficient);
+            if !self.registered_slots[index] {
+                self.registered_slots[index] = true;
+                self.occupied_slots.push(monomial.slot());
+            }
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProofResolutionOwned {
     NoMatch,
@@ -3610,7 +3740,7 @@ impl<'a> Normalizer<'a> {
         // These additive definitions own the Product edges collected below. Mark them before a
         // canceled sibling can recursively discard a shared additive operand.
         consumed_additives.extend(flattened.additive_ids.iter().copied());
-        let mut terms = BTreeMap::new();
+        let mut terms = DenseTermAccumulator::new(self.monomials.token());
         for (_, (additive, weight)) in flattened.additive_outputs {
             if weight.is_zero() {
                 if !outputs.contains_key(&(0, additive.id)) {
@@ -3627,13 +3757,13 @@ impl<'a> Normalizer<'a> {
                 outputs.get(&(0, additive.id)).ok_or(NormalizeError::InvalidExactPlan {
                     reason: "missing scheduled additive output",
                 })?;
-            merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight)?;
+            merge_scaled_terms_dense(&mut terms, &normal_form.exact_terms, &weight)?;
         }
         for (_, (normal_form, weight)) in flattened.leaves {
             if weight.is_zero() {
                 continue;
             }
-            merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight)?;
+            merge_scaled_terms_dense(&mut terms, &normal_form.exact_terms, &weight)?;
         }
         for (_, (plan, weight, occurrences, standalone)) in flattened.products.into_iter().rev() {
             let mut executed = false;
@@ -3643,7 +3773,7 @@ impl<'a> Normalizer<'a> {
                         outputs.get(&(1, plan.id)).ok_or(NormalizeError::InvalidExactPlan {
                             reason: "missing scheduled product output",
                         })?;
-                    merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight)?;
+                    merge_scaled_terms_dense(&mut terms, &normal_form.exact_terms, &weight)?;
                 } else {
                     let left = Self::exact_state_output(&plan.left, outputs)?;
                     let right = Self::exact_state_output(&plan.right, outputs)?;
@@ -3732,6 +3862,7 @@ impl<'a> Normalizer<'a> {
             )?;
         }
         let output_terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
+        let terms = terms.into_term_map();
         self.exact_plan_materializations = self.exact_plan_materializations.saturating_add(1);
         self.exact_plan_materialization_output_terms_total =
             self.exact_plan_materialization_output_terms_total.saturating_add(output_terms);
@@ -4821,21 +4952,21 @@ impl<'a> Normalizer<'a> {
     /// that point operands and the destination are explicit roots. Deferred materialization also
     /// supplies its full pending plan DAG and all session outputs; without that scoped capability
     /// an in-product sweep is not attempted.
-    fn sweep_monomials_at_product_pair(
+    fn sweep_monomials_at_product_pair<A: ExactTermAccumulator>(
         &mut self,
         left: &PolynomialNF,
         right: &PolynomialNF,
-        destination: &TermMap<BigInt>,
+        destination: &A,
         scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
         self.sweep_monomials_at_product_roots(left, right, destination, std::iter::empty(), scope)
     }
 
-    fn sweep_monomials_during_product_worklist(
+    fn sweep_monomials_during_product_worklist<A: ExactTermAccumulator>(
         &mut self,
         left: &PolynomialNF,
         right: &PolynomialNF,
-        destination: &TermMap<BigInt>,
+        destination: &A,
         worklist: &VecDeque<ProductWorkItem>,
         scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
@@ -4851,11 +4982,11 @@ impl<'a> Normalizer<'a> {
         self.sweep_monomials_at_product_roots(left, right, destination, roots, scope)
     }
 
-    fn sweep_monomials_at_product_roots(
+    fn sweep_monomials_at_product_roots<A: ExactTermAccumulator>(
         &mut self,
         left: &PolynomialNF,
         right: &PolynomialNF,
-        destination: &TermMap<BigInt>,
+        destination: &A,
         active_worklist_roots: impl IntoIterator<Item = MonomialId>,
         scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
@@ -4881,7 +5012,7 @@ impl<'a> Normalizer<'a> {
             .keys()
             .copied()
             .chain(right.exact_terms.keys().copied())
-            .chain(destination.keys().copied())
+            .chain(destination.roots())
             .chain(active_worklist_roots)
             .chain(root_leaf_roots.iter().copied())
             .chain(outputs.into_iter().flat_map(|outputs| {
@@ -8805,17 +8936,17 @@ impl<'a> Normalizer<'a> {
         Ok(Some(authorizations))
     }
 
-    fn commit_parallel_product_rewrite(
+    fn commit_parallel_product_rewrite<A: ExactTermAccumulator>(
         &mut self,
         result: ParallelProductRewriteResult,
-        terms: &mut BTreeMap<MonomialId, BigInt>,
+        terms: &mut A,
     ) -> Result<(), NormalizeError> {
         for (descriptor, coefficient) in result.terms {
             if coefficient.is_zero() {
                 continue;
             }
             let monomial = self.monomials.intern_derived(descriptor)?;
-            merge_term(terms, monomial, coefficient);
+            terms.merge(monomial, coefficient)?;
         }
         if self.watchdog.is_some() {
             self.watchdog_product_processed =
@@ -8876,12 +9007,12 @@ impl<'a> Normalizer<'a> {
     /// Execute one complete product lifecycle. Both eager products and deferred weighted gadget
     /// products pass through this wrapper, so per-call progress never inherits a preceding
     /// product's queue, generation, or large-product sampling state.
-    fn execute_product_into(
+    fn execute_product_into<A: ExactTermAccumulator>(
         &mut self,
         left: &PolynomialNF,
         right: &PolynomialNF,
         weight: &BigInt,
-        terms: &mut BTreeMap<MonomialId, BigInt>,
+        terms: &mut A,
         direct_gadget_boundary: bool,
         typed_product_plan: bool,
         gc_scope: ProductGcScope<'_>,
@@ -8983,12 +9114,12 @@ impl<'a> Normalizer<'a> {
         result
     }
 
-    fn product_into_body(
+    fn product_into_body<A: ExactTermAccumulator>(
         &mut self,
         left: &PolynomialNF,
         right: &PolynomialNF,
         weight: &BigInt,
-        terms: &mut BTreeMap<MonomialId, BigInt>,
+        terms: &mut A,
         direct_gadget_boundary: bool,
         typed_product_plan: bool,
         gc_scope: ProductGcScope<'_>,
@@ -9013,7 +9144,7 @@ impl<'a> Normalizer<'a> {
                                 .copied()
                                 .chain(right.exact_terms.keys().copied())
                                 .chain(worklist.iter().flat_map(ProductWorkItem::monomial_roots))
-                                .chain(terms.keys().copied()),
+                                .chain(terms.roots()),
                         );
                         continue;
                     }
@@ -9086,7 +9217,7 @@ impl<'a> Normalizer<'a> {
                             .copied()
                             .chain(right.exact_terms.keys().copied())
                             .chain(worklist.iter().flat_map(ProductWorkItem::monomial_roots))
-                            .chain(terms.keys().copied()),
+                            .chain(terms.roots()),
                     );
                     if self.trace.active {
                         self.trace.product_current_queue =
@@ -9134,7 +9265,7 @@ impl<'a> Normalizer<'a> {
                         .copied()
                         .chain(right.exact_terms.keys().copied())
                         .chain(worklist.iter().flat_map(ProductWorkItem::monomial_roots))
-                        .chain(terms.keys().copied()),
+                        .chain(terms.roots()),
                 );
             }
         }
@@ -9153,9 +9284,9 @@ impl<'a> Normalizer<'a> {
                     OwnerCensusReason::LargeProductEnd,
                     left.exact_terms
                         .keys()
-                        .chain(right.exact_terms.keys())
-                        .chain(terms.keys())
-                        .copied(),
+                        .copied()
+                        .chain(right.exact_terms.keys().copied())
+                        .chain(terms.roots()),
                 );
                 self.large_product_pairs_sampled =
                     self.large_product_pairs_sampled.saturating_add(1);
@@ -9173,12 +9304,12 @@ impl<'a> Normalizer<'a> {
     /// Gadget-bearing products retain the incremental authoritative rewrite worklist above: a
     /// recursively expanded branch is intentionally never buffered as a raw parallel result.
     /// Interning remains ordered and single-threaded, preserving deterministic IDs and merging.
-    fn parallel_product_pairs_into(
+    fn parallel_product_pairs_into<A: ExactTermAccumulator>(
         &mut self,
         left: &PolynomialNF,
         right: &PolynomialNF,
         weight: &BigInt,
-        terms: &mut BTreeMap<MonomialId, BigInt>,
+        terms: &mut A,
         gc_scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
         for (&left_id, left_coefficient) in &left.exact_terms {
@@ -9196,9 +9327,9 @@ impl<'a> Normalizer<'a> {
                         0,
                         left.exact_terms
                             .keys()
-                            .chain(right.exact_terms.keys())
-                            .chain(terms.keys())
-                            .copied(),
+                            .copied()
+                            .chain(right.exact_terms.keys().copied())
+                            .chain(terms.roots()),
                     );
                     if self.trace.active {
                         self.trace.product_generated =
@@ -9242,13 +9373,13 @@ impl<'a> Normalizer<'a> {
                         std::iter::once(product)
                             .chain(left.exact_terms.keys().copied())
                             .chain(right.exact_terms.keys().copied())
-                            .chain(terms.keys().copied()),
+                            .chain(terms.roots()),
                     );
                     if self.trace.active {
                         self.trace.product_processed =
                             self.trace.product_processed.saturating_add(1);
                     }
-                    merge_term(terms, product, coefficient);
+                    terms.merge(product, coefficient)?;
                 }
                 self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
             }
@@ -9256,11 +9387,11 @@ impl<'a> Normalizer<'a> {
         Ok(())
     }
 
-    fn drain_product_worklist(
+    fn drain_product_worklist<A: ExactTermAccumulator>(
         &mut self,
         left: &PolynomialNF,
         right: &PolynomialNF,
-        terms: &mut BTreeMap<MonomialId, BigInt>,
+        terms: &mut A,
         worklist: &mut VecDeque<ProductWorkItem>,
         gc_scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
@@ -9333,7 +9464,7 @@ impl<'a> Normalizer<'a> {
                     .chain(left.exact_terms.keys().copied())
                     .chain(right.exact_terms.keys().copied())
                     .chain(worklist.iter().flat_map(ProductWorkItem::monomial_roots))
-                    .chain(terms.keys().copied()),
+                    .chain(terms.roots()),
             );
             if self.trace.active {
                 self.trace.product_current_queue = queue_current;
@@ -9360,7 +9491,7 @@ impl<'a> Normalizer<'a> {
                 continue;
             }
             let Some(splice) = self.product_gadget_splice(monomial, coefficient.clone())? else {
-                merge_term(terms, monomial, coefficient);
+                terms.merge(monomial, coefficient)?;
                 if self.trace.active {
                     self.trace.product_current_output =
                         u64::try_from(terms.len()).unwrap_or(u64::MAX);
@@ -11174,6 +11305,25 @@ fn merge_scaled_terms(
         source.len() % LARGE_TERM_MERGE_ALLOCATOR_TRIM_INTERVAL != 0
     {
         trim_allocator_during_large_term_merge();
+    }
+    Ok(())
+}
+
+fn merge_scaled_terms_dense(
+    terms: &mut DenseTermAccumulator,
+    source: &TermMap<BigInt>,
+    weight: &BigInt,
+) -> Result<(), NormalizeError> {
+    if source.is_empty() || weight.is_zero() {
+        return Ok(());
+    }
+    let unit_weight = weight == &BigInt::from(1_u8);
+    for (&monomial, coefficient) in source {
+        let mut coefficient = coefficient.clone();
+        if !unit_weight {
+            coefficient *= weight;
+        }
+        terms.merge(monomial, coefficient)?;
     }
     Ok(())
 }
@@ -17783,6 +17933,35 @@ mod tests {
         assert!(!large_destination.contains_key(&many_ids[7]));
         assert_eq!(large_destination.get(&many_ids[16]), Some(&BigInt::from(3_u8)));
         assert_eq!(large_destination.len(), 16);
+    }
+
+    #[test]
+    fn dense_term_accumulator_preserves_cancellation_order_and_arena_authority() {
+        let token = ArenaToken::fresh();
+        let ids =
+            [MonomialId::new(token, 7), MonomialId::new(token, 2), MonomialId::new(token, 19)];
+        let mut dense = DenseTermAccumulator::new(token);
+        dense.merge(ids[0], BigInt::from(5_u8)).unwrap();
+        dense.merge(ids[1], BigInt::from(-3_i8)).unwrap();
+        dense.merge(ids[0], BigInt::from(-5_i8)).unwrap();
+        dense.merge(ids[0], BigInt::from(11_u8)).unwrap();
+        dense.merge(ids[2], BigInt::from(0_u8)).unwrap();
+
+        assert_eq!(dense.len(), 2);
+        assert_eq!(dense.roots().collect::<BTreeSet<_>>(), BTreeSet::from([ids[0], ids[1]]));
+        assert_eq!(
+            dense.into_term_map(),
+            BTreeMap::from([(ids[0], BigInt::from(11_u8)), (ids[1], BigInt::from(-3_i8))])
+        );
+
+        let mut dense = DenseTermAccumulator::new(token);
+        let foreign = MonomialId::new(ArenaToken::fresh(), 2);
+        assert!(matches!(
+            dense.merge(foreign, BigInt::from(1_u8)),
+            Err(NormalizeError::Monomial(MonomialError::InvalidMonomialId { .. }))
+        ));
+        assert_eq!(dense.len(), 0);
+        assert!(dense.roots().next().is_none());
     }
 
     #[test]

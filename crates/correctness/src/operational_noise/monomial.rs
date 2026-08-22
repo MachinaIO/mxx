@@ -33,6 +33,10 @@ impl MonomialId {
     pub(crate) const fn arena(self) -> ArenaToken {
         self.arena
     }
+
+    pub(crate) const fn slot(self) -> u32 {
+        self.slot
+    }
 }
 
 /// A canonical monomial descriptor.  Central factors commute and are sorted;

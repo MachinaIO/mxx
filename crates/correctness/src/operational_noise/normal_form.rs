@@ -59,6 +59,15 @@ const NORMALIZATION_TRACE_FOCUS_TAIL_NODES_ENV: &str = "MXX_OPERATIONAL_TRACE_FO
 const NORMALIZATION_NODE_HEARTBEAT: u64 = 100_000;
 const LARGE_PRODUCT_PLANNED_PAIRS: u64 = 100_000;
 const MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
+const MONOMIAL_GC_ALLOCATION_THRESHOLD_ENV: &str = "MXX_OPERATIONAL_MONOMIAL_GC_THRESHOLD_BYTES";
+
+fn monomial_gc_allocation_threshold_bytes() -> u64 {
+    std::env::var(MONOMIAL_GC_ALLOCATION_THRESHOLD_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|threshold| *threshold > 0)
+        .unwrap_or(MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES)
+}
 const PARALLEL_GADGET_SPLICE_BATCH_TERMS: usize = 8 * 1024;
 const PARALLEL_PRODUCT_REWRITE_MIN_BRANCHES: usize = 16;
 const PARALLEL_PRODUCT_PAIR_BATCH: usize = 1_024;
@@ -5037,7 +5046,7 @@ impl<'a> Normalizer<'a> {
             relation_rewriting_enabled: true,
             fold_final_no_match: true,
             protected_monomial_prefix,
-            monomial_gc_allocation_threshold_bytes: MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES,
+            monomial_gc_allocation_threshold_bytes: monomial_gc_allocation_threshold_bytes(),
             in_product_sweep_since_node_commit: false,
             gc_counters: DiagnosticGcCounters::default(),
             exact_plan_materializations: 0,

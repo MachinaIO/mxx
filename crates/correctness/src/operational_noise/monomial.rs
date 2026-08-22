@@ -10,6 +10,7 @@ use super::{
     },
     program::ProgramArena,
 };
+use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
     error::Error,
@@ -36,10 +37,25 @@ impl MonomialId {
 
 /// A canonical monomial descriptor.  Central factors commute and are sorted;
 /// ordered factors retain their non-commutative sequence.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MonomialDescriptor {
     pub central_factors: Box<[ScopedExprId]>,
     pub ordered_factors: Box<[ScopedExprId]>,
+}
+
+/// An owned descriptor derived exclusively from already validated monomials in one arena.
+/// Its private fields prevent callers from turning raw scoped factors into an interning
+/// capability without passing the arena's normal validation boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DerivedMonomialDescriptor {
+    descriptor: MonomialDescriptor,
+    hash: u64,
+}
+
+impl DerivedMonomialDescriptor {
+    pub(crate) fn ordered_factors(&self) -> &[ScopedExprId] {
+        &self.descriptor.ordered_factors
+    }
 }
 
 /// The exact-term map deliberately stores IDs, never factor trees.
@@ -115,6 +131,18 @@ pub struct MonomialArena {
     ordered_factor_entries: u64,
     occupied_descriptor_slots: u64,
     allocated_payload_since_sweep: u64,
+}
+
+const PARALLEL_DESCRIPTOR_BATCH_MIN: usize = 256;
+
+struct PreparedMonomialDescriptor {
+    descriptor: MonomialDescriptor,
+    hash: u64,
+}
+
+struct PreparedWrappedDescriptor {
+    intermediate: Option<PreparedMonomialDescriptor>,
+    output: PreparedMonomialDescriptor,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -307,6 +335,168 @@ impl MonomialArena {
         })
     }
 
+    pub(crate) fn derive_product(
+        &self,
+        scope: ValueProgramId,
+        left: MonomialId,
+        right: MonomialId,
+    ) -> Result<DerivedMonomialDescriptor, MonomialError> {
+        if scope != self.scope {
+            return Err(MonomialError::ForeignScope { expected: self.scope, actual: scope });
+        }
+        let left = self.descriptor(left)?;
+        let right = self.descriptor(right)?;
+        Self::derive_from_descriptors([left, right])
+    }
+
+    pub(crate) fn derive_gadget_splice(
+        &self,
+        source: &DerivedMonomialDescriptor,
+        index: usize,
+        input: MonomialId,
+    ) -> Result<DerivedMonomialDescriptor, MonomialError> {
+        let input = self.descriptor(input)?;
+        let ordered = source.descriptor.ordered_factors.as_ref();
+        if index.checked_add(1).is_none_or(|right| right >= ordered.len()) {
+            return Err(MonomialError::ArenaExhausted);
+        }
+        let central_len = source
+            .descriptor
+            .central_factors
+            .len()
+            .checked_add(input.central_factors.len())
+            .ok_or(MonomialError::ArenaExhausted)?;
+        let ordered_len = ordered
+            .len()
+            .checked_sub(2)
+            .and_then(|len| len.checked_add(input.ordered_factors.len()))
+            .ok_or(MonomialError::ArenaExhausted)?;
+        let mut central = Vec::new();
+        central.try_reserve_exact(central_len).map_err(|_| MonomialError::ArenaExhausted)?;
+        central.extend_from_slice(&source.descriptor.central_factors);
+        central.extend_from_slice(&input.central_factors);
+        central.sort_unstable();
+        let mut replacement = Vec::new();
+        replacement.try_reserve_exact(ordered_len).map_err(|_| MonomialError::ArenaExhausted)?;
+        replacement.extend_from_slice(&ordered[..index]);
+        replacement.extend_from_slice(&input.ordered_factors);
+        replacement.extend_from_slice(&ordered[index + 2..]);
+        let descriptor = MonomialDescriptor {
+            central_factors: central.into_boxed_slice(),
+            ordered_factors: replacement.into_boxed_slice(),
+        };
+        let hash = structural_hash(&descriptor);
+        Ok(DerivedMonomialDescriptor { descriptor, hash })
+    }
+
+    pub(crate) fn intern_derived(
+        &mut self,
+        derived: DerivedMonomialDescriptor,
+    ) -> Result<MonomialId, MonomialError> {
+        self.intern_prepared_descriptor(PreparedMonomialDescriptor {
+            descriptor: derived.descriptor,
+            hash: derived.hash,
+        })
+    }
+
+    fn derive_from_descriptors<'descriptor>(
+        descriptors: impl IntoIterator<Item = &'descriptor MonomialDescriptor>,
+    ) -> Result<DerivedMonomialDescriptor, MonomialError> {
+        let prepared = Self::prepare_descriptor(descriptors)?;
+        Ok(DerivedMonomialDescriptor { descriptor: prepared.descriptor, hash: prepared.hash })
+    }
+
+    /// Wrap many already-validated input monomials in the same optional prefix and suffix.
+    ///
+    /// Descriptor construction and structural hashing are read-only and therefore run in
+    /// parallel for large splice batches. Interning remains ordered and single-threaded: stable
+    /// monotonic IDs, collision checks, and the arena's mutation boundary are unchanged.
+    pub(crate) fn combine_interned_wrapped_batch(
+        &mut self,
+        scope: ValueProgramId,
+        prefix: Option<MonomialId>,
+        inputs: &[MonomialId],
+        suffix: Option<MonomialId>,
+    ) -> Result<Vec<MonomialId>, MonomialError> {
+        if scope != self.scope {
+            return Err(MonomialError::ForeignScope { expected: self.scope, actual: scope });
+        }
+        if let Some(prefix) = prefix {
+            self.descriptor(prefix)?;
+        }
+        for &input in inputs {
+            self.descriptor(input)?;
+        }
+        if let Some(suffix) = suffix {
+            self.descriptor(suffix)?;
+        }
+        if prefix.is_none() && suffix.is_none() {
+            return Ok(inputs.to_vec());
+        }
+
+        let prepare = |&input: &MonomialId| self.prepare_wrapped_descriptor(prefix, input, suffix);
+        let prepared =
+            if inputs.len() >= PARALLEL_DESCRIPTOR_BATCH_MIN && rayon::current_num_threads() > 1 {
+                inputs.par_iter().map(prepare).collect::<Result<Vec<_>, _>>()?
+            } else {
+                inputs.iter().map(prepare).collect::<Result<Vec<_>, _>>()?
+            };
+        prepared
+            .into_iter()
+            .map(|prepared| {
+                if let Some(intermediate) = prepared.intermediate {
+                    self.intern_prepared_descriptor(intermediate)?;
+                }
+                self.intern_prepared_descriptor(prepared.output)
+            })
+            .collect()
+    }
+
+    fn prepare_wrapped_descriptor(
+        &self,
+        prefix: Option<MonomialId>,
+        input: MonomialId,
+        suffix: Option<MonomialId>,
+    ) -> Result<PreparedWrappedDescriptor, MonomialError> {
+        let prefix = prefix.map(|id| self.descriptor(id)).transpose()?;
+        let input = self.descriptor(input)?;
+        let suffix = suffix.map(|id| self.descriptor(id)).transpose()?;
+        let intermediate =
+            prefix.zip(suffix).map(|(prefix, _)| Self::prepare_descriptor([prefix, input]));
+        let intermediate = intermediate.transpose()?;
+        let output = Self::prepare_descriptor(
+            prefix.into_iter().chain(std::iter::once(input)).chain(suffix),
+        )?;
+        Ok(PreparedWrappedDescriptor { intermediate, output })
+    }
+
+    fn prepare_descriptor<'descriptor>(
+        descriptors: impl IntoIterator<Item = &'descriptor MonomialDescriptor>,
+    ) -> Result<PreparedMonomialDescriptor, MonomialError> {
+        let descriptors = descriptors.into_iter().collect::<Vec<_>>();
+        let central_len = descriptors.iter().try_fold(0_usize, |len, descriptor| {
+            len.checked_add(descriptor.central_factors.len()).ok_or(MonomialError::ArenaExhausted)
+        })?;
+        let ordered_len = descriptors.iter().try_fold(0_usize, |len, descriptor| {
+            len.checked_add(descriptor.ordered_factors.len()).ok_or(MonomialError::ArenaExhausted)
+        })?;
+        let mut central = Vec::new();
+        central.try_reserve_exact(central_len).map_err(|_| MonomialError::ArenaExhausted)?;
+        let mut ordered = Vec::new();
+        ordered.try_reserve_exact(ordered_len).map_err(|_| MonomialError::ArenaExhausted)?;
+        for descriptor in descriptors {
+            central.extend_from_slice(&descriptor.central_factors);
+            ordered.extend_from_slice(&descriptor.ordered_factors);
+        }
+        central.sort_unstable();
+        let descriptor = MonomialDescriptor {
+            central_factors: central.into_boxed_slice(),
+            ordered_factors: ordered.into_boxed_slice(),
+        };
+        let hash = structural_hash(&descriptor);
+        Ok(PreparedMonomialDescriptor { descriptor, hash })
+    }
+
     /// Find an exact descriptor which has already been validated and interned in this arena.
     ///
     /// Relation fixed-point matching uses this for RHS-derived subwords which are not necessarily
@@ -367,6 +557,14 @@ impl MonomialArena {
         descriptor: MonomialDescriptor,
     ) -> Result<MonomialId, MonomialError> {
         let hash = structural_hash(&descriptor);
+        self.intern_prepared_descriptor(PreparedMonomialDescriptor { descriptor, hash })
+    }
+
+    fn intern_prepared_descriptor(
+        &mut self,
+        prepared: PreparedMonomialDescriptor,
+    ) -> Result<MonomialId, MonomialError> {
+        let PreparedMonomialDescriptor { descriptor, hash } = prepared;
         if let Some(slots) = self.buckets.get(&hash) {
             for &slot in slots {
                 let Some(existing) = self.descriptors.get(slot as usize).and_then(Option::as_ref)
@@ -1071,6 +1269,74 @@ mod tests {
         );
         assert_eq!(arena.find_interned(scope, &[one, one, root], &[one, root, one]).unwrap(), None);
         assert_eq!(arena.len(), before, "lookup must never intern a missing descriptor");
+    }
+
+    #[test]
+    fn parallel_wrapped_batch_matches_ordered_sequential_interning() {
+        let (expressions, programs, scope, one, _, _) = fixture();
+        let root = programs.root(&expressions, scope).unwrap();
+        let build_inputs = |arena: &mut MonomialArena| {
+            (0..300_usize)
+                .map(|index| {
+                    let ordered = (0..index + 1)
+                        .map(|position| if position % 2 == 0 { root } else { one })
+                        .collect::<Vec<_>>();
+                    arena.intern(&expressions, &programs, &[], &ordered).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut sequential = MonomialArena::new(&expressions, &programs, scope).unwrap();
+        let sequential_prefix =
+            sequential.intern(&expressions, &programs, &[one], &[root]).unwrap();
+        let sequential_suffix = sequential.intern(&expressions, &programs, &[], &[one]).unwrap();
+        let sequential_inputs = build_inputs(&mut sequential);
+        let sequential_outputs = sequential_inputs
+            .iter()
+            .map(|&input| {
+                let intermediate =
+                    sequential.combine_interned(scope, sequential_prefix, input).unwrap();
+                sequential.combine_interned(scope, intermediate, sequential_suffix).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let mut parallel = MonomialArena::new(&expressions, &programs, scope).unwrap();
+        let parallel_prefix = parallel.intern(&expressions, &programs, &[one], &[root]).unwrap();
+        let parallel_suffix = parallel.intern(&expressions, &programs, &[], &[one]).unwrap();
+        let parallel_inputs = build_inputs(&mut parallel);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let parallel_outputs = pool
+            .install(|| {
+                parallel.combine_interned_wrapped_batch(
+                    scope,
+                    Some(parallel_prefix),
+                    &parallel_inputs,
+                    Some(parallel_suffix),
+                )
+            })
+            .unwrap();
+
+        assert_eq!(sequential.len(), parallel.len());
+        for (sequential_id, parallel_id) in sequential_outputs.into_iter().zip(parallel_outputs) {
+            assert_eq!(sequential_id.slot, parallel_id.slot, "commit order must remain stable");
+            let sequential_descriptor = sequential.descriptor(sequential_id).unwrap();
+            let parallel_descriptor = parallel.descriptor(parallel_id).unwrap();
+            assert_eq!(sequential_descriptor, parallel_descriptor);
+        }
+
+        let before_invalid = parallel.len();
+        let mut invalid_inputs = parallel_inputs;
+        invalid_inputs.push(MonomialId::new(ArenaToken::fresh(), 0));
+        assert!(matches!(
+            parallel.combine_interned_wrapped_batch(
+                scope,
+                Some(parallel_prefix),
+                &invalid_inputs,
+                Some(parallel_suffix),
+            ),
+            Err(MonomialError::InvalidMonomialId { .. })
+        ));
+        assert_eq!(parallel.len(), before_invalid, "validation must precede batch mutation");
     }
 
     #[test]

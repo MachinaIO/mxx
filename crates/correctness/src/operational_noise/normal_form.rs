@@ -20,7 +20,10 @@ use super::{
         ValueFacts,
     },
     job::{ProofReachedUniversalLhs, ReachedUniversalLhs},
-    monomial::{MonomialArena, MonomialError, MonomialId, MonomialSweepOwnerReport, TermMap},
+    monomial::{
+        DerivedMonomialDescriptor, MonomialArena, MonomialError, MonomialId,
+        MonomialSweepOwnerReport, TermMap,
+    },
     program::{ArenaError, ProgramArena, ValueProgramId},
     relation::{
         CanonicalLhsKey, FrozenGeneration, GadgetRecompositionRegistry, NormalizationCache,
@@ -31,6 +34,7 @@ use super::{
 use mxx_ir_core::types::ConcreteMatrixType;
 use num_bigint::{BigInt, BigUint};
 use num_traits::{Signed, ToPrimitive, Zero};
+use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt,
@@ -55,6 +59,9 @@ const NORMALIZATION_TRACE_FOCUS_TAIL_NODES_ENV: &str = "MXX_OPERATIONAL_TRACE_FO
 const NORMALIZATION_NODE_HEARTBEAT: u64 = 100_000;
 const LARGE_PRODUCT_PLANNED_PAIRS: u64 = 100_000;
 const MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
+const PARALLEL_GADGET_SPLICE_BATCH_TERMS: usize = 8 * 1024;
+const PARALLEL_PRODUCT_REWRITE_MIN_BRANCHES: usize = 16;
+const PARALLEL_PRODUCT_PAIR_BATCH: usize = 1_024;
 const PRODUCT_PROCESSED_HEARTBEAT: u64 = 1_000_000;
 const NORMALIZATION_WATCHDOG_ENV: &str = "MXX_OPERATIONAL_WATCHDOG_TRACE";
 const NORMALIZATION_WATCHDOG_INTERVAL_ENV: &str = "MXX_OPERATIONAL_WATCHDOG_INTERVAL_SECS";
@@ -1959,6 +1966,157 @@ enum ExactMaterializationFrame {
 enum ProductGcScope<'a> {
     Eager,
     Deferred { root: &'a NodeExactState, outputs: &'a BTreeMap<(u8, u64), Arc<PolynomialNF>> },
+}
+
+#[derive(Clone, Copy)]
+struct ParallelGadgetRewriteContext<'a> {
+    monomials: &'a MonomialArena,
+    gadget_inputs: &'a BTreeMap<ExprId, Arc<PolynomialNF>>,
+    authorizations: &'a BTreeMap<(ScopedExprId, ScopedExprId), ExprId>,
+}
+
+enum DerivedGadgetRewrite {
+    NoMatch,
+    MissingInput,
+    Rewrite(Vec<(DerivedMonomialDescriptor, BigInt)>),
+}
+
+#[derive(Default)]
+struct ParallelProductRewriteStats {
+    processed: u64,
+    rewrites: u64,
+    enqueued: u64,
+}
+
+struct ParallelProductRewriteResult {
+    terms: Vec<(DerivedMonomialDescriptor, BigInt)>,
+    stats: ParallelProductRewriteStats,
+}
+
+fn authorized_gadget_pair_input_from(
+    expressions: &ExprArena,
+    facts: &FactStore,
+    registry: Option<&GadgetRecompositionRegistry>,
+    gadget: ScopedExprId,
+    decomposition: ScopedExprId,
+) -> Result<Option<ExprId>, NormalizeError> {
+    let decomposition_node = expressions.node(decomposition.expression())?;
+    let ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+        base,
+        small,
+        digit_count,
+        ..
+    }) = &decomposition_node.operator
+    else {
+        return Ok(None);
+    };
+    let gadget_node = expressions.node(gadget.expression())?;
+    let Some(super::arena::MatrixConstantKind::Gadget { base: gadget_base, small: gadget_small }) =
+        gadget_node.operator.source_matrix_constant()
+    else {
+        return Ok(None);
+    };
+    if gadget_base != base || gadget_small != small {
+        return Ok(None);
+    }
+    let Some(input) = decomposition_node.inputs.first().copied() else {
+        return Ok(None);
+    };
+    let matrix_type = |expression| -> Result<Option<&ResolvedMatrixType>, NormalizeError> {
+        Ok(match expressions.value_type(expression)? {
+            ResolvedValueType::Matrix(matrix) => Some(matrix),
+            _ => None,
+        })
+    };
+    let (Some(input_type), Some(gadget_type), Some(decomposition_type), Some(output_type)) = (
+        matrix_type(input)?,
+        matrix_type(gadget.expression())?,
+        matrix_type(decomposition.expression())?,
+        matrix_type(input)?,
+    ) else {
+        return Ok(None);
+    };
+    let layout = |expression| match facts.facts(expression) {
+        Ok(ValueFacts::Matrix(facts)) => Some(facts.metadata.layout.clone()),
+        _ => None,
+    };
+    let Some(registry) = registry else { return Ok(None) };
+    Ok(registry
+        .allows(
+            *base,
+            *small,
+            *digit_count,
+            gadget_type,
+            decomposition_type,
+            input_type,
+            output_type,
+            layout(gadget.expression()).as_ref(),
+            layout(decomposition.expression()).as_ref(),
+            layout(input).as_ref(),
+        )
+        .then_some(input))
+}
+
+impl ParallelGadgetRewriteContext<'_> {
+    fn rewrite_once(
+        &self,
+        monomial: &DerivedMonomialDescriptor,
+    ) -> Result<DerivedGadgetRewrite, NormalizeError> {
+        let ordered = monomial.ordered_factors();
+        for index in 0..ordered.len().saturating_sub(1) {
+            let Some(&input) = self.authorizations.get(&(ordered[index], ordered[index + 1]))
+            else {
+                continue;
+            };
+            let Some(input_nf) = self.gadget_inputs.get(&input) else {
+                return Ok(DerivedGadgetRewrite::MissingInput);
+            };
+            let rewritten = input_nf
+                .exact_terms
+                .iter()
+                .map(|(&input_monomial, coefficient)| {
+                    Ok((
+                        self.monomials.derive_gadget_splice(monomial, index, input_monomial)?,
+                        coefficient.clone(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, NormalizeError>>()?;
+            return Ok(DerivedGadgetRewrite::Rewrite(rewritten));
+        }
+        Ok(DerivedGadgetRewrite::NoMatch)
+    }
+
+    fn close_branch(
+        &self,
+        seed: (DerivedMonomialDescriptor, BigInt),
+    ) -> Result<Option<ParallelProductRewriteResult>, NormalizeError> {
+        let mut worklist = VecDeque::from([seed]);
+        let mut terms = Vec::new();
+        let mut stats = ParallelProductRewriteStats::default();
+        while let Some((monomial, coefficient)) = worklist.pop_front() {
+            stats.processed = stats.processed.saturating_add(1);
+            if coefficient.is_zero() {
+                continue;
+            }
+            match self.rewrite_once(&monomial)? {
+                DerivedGadgetRewrite::NoMatch => terms.push((monomial, coefficient)),
+                DerivedGadgetRewrite::MissingInput => return Ok(None),
+                DerivedGadgetRewrite::Rewrite(rewritten) => {
+                    stats.rewrites = stats.rewrites.saturating_add(1);
+                    stats.enqueued = stats
+                        .enqueued
+                        .saturating_add(u64::try_from(rewritten.len()).unwrap_or(u64::MAX));
+                    for (rewritten_monomial, rewritten_coefficient) in rewritten.into_iter().rev() {
+                        worklist.push_front((
+                            rewritten_monomial,
+                            coefficient.clone() * rewritten_coefficient,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(Some(ParallelProductRewriteResult { terms, stats }))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -8323,6 +8481,219 @@ impl<'a> Normalizer<'a> {
         PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() }
     }
 
+    fn parallel_rewrite_product_pair(
+        &self,
+        left: MonomialId,
+        right: MonomialId,
+        coefficient: BigInt,
+    ) -> Result<Option<ParallelProductRewriteResult>, NormalizeError> {
+        if self.gadget_input_nfs.is_empty() {
+            return Ok(None);
+        }
+        let seed = self.monomials.derive_product(self.scope, left, right)?;
+        let mut worklist = VecDeque::from([(seed, coefficient)]);
+        let mut prefix_terms = Vec::new();
+        let mut prefix_stats = ParallelProductRewriteStats::default();
+        while worklist.len() < PARALLEL_PRODUCT_REWRITE_MIN_BRANCHES {
+            let Some((monomial, coefficient)) = worklist.pop_front() else {
+                return Ok(None);
+            };
+            prefix_stats.processed = prefix_stats.processed.saturating_add(1);
+            if coefficient.is_zero() {
+                continue;
+            }
+            match self.rewrite_derived_gadget_once(&monomial)? {
+                DerivedGadgetRewrite::NoMatch => prefix_terms.push((monomial, coefficient)),
+                DerivedGadgetRewrite::MissingInput => return Ok(None),
+                DerivedGadgetRewrite::Rewrite(rewritten) => {
+                    prefix_stats.rewrites = prefix_stats.rewrites.saturating_add(1);
+                    prefix_stats.enqueued = prefix_stats
+                        .enqueued
+                        .saturating_add(u64::try_from(rewritten.len()).unwrap_or(u64::MAX));
+                    for (rewritten_monomial, rewritten_coefficient) in rewritten.into_iter().rev() {
+                        worklist.push_front((
+                            rewritten_monomial,
+                            coefficient.clone() * rewritten_coefficient,
+                        ));
+                    }
+                }
+            }
+        }
+
+        let branches = worklist.into_iter().collect::<Vec<_>>();
+        let Some(authorizations) = self.parallel_gadget_authorizations(&branches)? else {
+            return Ok(None);
+        };
+        let context = ParallelGadgetRewriteContext {
+            monomials: self.monomials,
+            gadget_inputs: &self.gadget_input_nfs,
+            authorizations: &authorizations,
+        };
+        let branch_results = branches
+            .into_par_iter()
+            .map(|branch| context.close_branch(branch))
+            .collect::<Result<Vec<_>, NormalizeError>>()?;
+        let mut terms = prefix_terms;
+        let mut stats = prefix_stats;
+        for result in branch_results {
+            let Some(result) = result else { return Ok(None) };
+            terms.extend(result.terms);
+            stats.processed = stats.processed.saturating_add(result.stats.processed);
+            stats.rewrites = stats.rewrites.saturating_add(result.stats.rewrites);
+            stats.enqueued = stats.enqueued.saturating_add(result.stats.enqueued);
+        }
+        Ok(Some(ParallelProductRewriteResult { terms, stats }))
+    }
+
+    fn rewrite_derived_gadget_once(
+        &self,
+        monomial: &DerivedMonomialDescriptor,
+    ) -> Result<DerivedGadgetRewrite, NormalizeError> {
+        let ordered = monomial.ordered_factors();
+        for index in 0..ordered.len().saturating_sub(1) {
+            let Some(input) =
+                self.authorized_gadget_pair_input(ordered[index], ordered[index + 1])?
+            else {
+                continue;
+            };
+            let Some(input_nf) = self.gadget_input_nfs.get(&input) else {
+                return Ok(DerivedGadgetRewrite::MissingInput);
+            };
+            let rewritten = input_nf
+                .exact_terms
+                .iter()
+                .map(|(&input_monomial, coefficient)| {
+                    Ok((
+                        self.monomials.derive_gadget_splice(monomial, index, input_monomial)?,
+                        coefficient.clone(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, NormalizeError>>()?;
+            return Ok(DerivedGadgetRewrite::Rewrite(rewritten));
+        }
+        Ok(DerivedGadgetRewrite::NoMatch)
+    }
+
+    /// Freeze every typed gadget/decomposition authorization reachable from the current branch
+    /// frontier. Derived words can introduce factors only from already-authorized gadget input
+    /// normal forms, so this fixed point is complete without sharing the non-`Sync` expression
+    /// arena with Rayon workers.
+    fn parallel_gadget_authorizations(
+        &self,
+        branches: &[(DerivedMonomialDescriptor, BigInt)],
+    ) -> Result<Option<BTreeMap<(ScopedExprId, ScopedExprId), ExprId>>, NormalizeError> {
+        let mut pending_factors = BTreeSet::new();
+        for (descriptor, _) in branches {
+            pending_factors.extend(descriptor.ordered_factors().iter().copied());
+        }
+        self.parallel_gadget_authorizations_from_factors(pending_factors)
+    }
+
+    fn parallel_gadget_authorizations_from_factors(
+        &self,
+        mut pending_factors: BTreeSet<ScopedExprId>,
+    ) -> Result<Option<BTreeMap<(ScopedExprId, ScopedExprId), ExprId>>, NormalizeError> {
+        let mut inspected_factors = BTreeSet::new();
+        let mut gadgets = BTreeSet::new();
+        let mut decompositions = BTreeSet::new();
+        let mut inspected_pairs = BTreeSet::new();
+        let mut authorizations = BTreeMap::new();
+
+        while !pending_factors.is_empty() {
+            let current = std::mem::take(&mut pending_factors);
+            for factor in current {
+                if !inspected_factors.insert(factor) {
+                    continue;
+                }
+                let node = self.expressions.node(factor.expression())?;
+                if matches!(
+                    node.operator.source_matrix_constant(),
+                    Some(super::arena::MatrixConstantKind::Gadget { .. })
+                ) {
+                    gadgets.insert(factor);
+                }
+                if matches!(
+                    node.operator,
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose { .. })
+                ) {
+                    decompositions.insert(factor);
+                }
+            }
+
+            for &gadget in &gadgets {
+                for &decomposition in &decompositions {
+                    if !inspected_pairs.insert((gadget, decomposition)) {
+                        continue;
+                    }
+                    let Some(input) = self.authorized_gadget_pair_input(gadget, decomposition)?
+                    else {
+                        continue;
+                    };
+                    let Some(input_nf) = self.gadget_input_nfs.get(&input) else {
+                        return Ok(None);
+                    };
+                    authorizations.insert((gadget, decomposition), input);
+                    for &monomial in input_nf.exact_terms.keys() {
+                        pending_factors.extend(
+                            self.monomials.descriptor(monomial)?.ordered_factors.iter().copied(),
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(Some(authorizations))
+    }
+
+    fn commit_parallel_product_rewrite(
+        &mut self,
+        result: ParallelProductRewriteResult,
+        terms: &mut BTreeMap<MonomialId, BigInt>,
+    ) -> Result<(), NormalizeError> {
+        for (descriptor, coefficient) in result.terms {
+            if coefficient.is_zero() {
+                continue;
+            }
+            let monomial = self.monomials.intern_derived(descriptor)?;
+            merge_term(terms, monomial, coefficient);
+        }
+        if self.watchdog.is_some() {
+            self.watchdog_product_processed =
+                self.watchdog_product_processed.saturating_add(result.stats.processed);
+            self.watchdog_product_processed_current =
+                self.watchdog_product_processed_current.saturating_add(result.stats.processed);
+            self.watchdog_product_enqueued =
+                self.watchdog_product_enqueued.saturating_add(result.stats.enqueued);
+            self.watchdog_product_enqueued_current =
+                self.watchdog_product_enqueued_current.saturating_add(result.stats.enqueued);
+            let processed = self.watchdog_product_processed;
+            let processed_current = self.watchdog_product_processed_current;
+            let enqueued = self.watchdog_product_enqueued;
+            let enqueued_current = self.watchdog_product_enqueued_current;
+            let output_current = u64::try_from(terms.len()).unwrap_or(u64::MAX);
+            self.watchdog_update(|progress| {
+                progress.phase = DiagnosticPhase::ProductDrain;
+                progress.product_processed = processed;
+                progress.product_processed_current = processed_current;
+                progress.product_enqueued = enqueued;
+                progress.product_enqueued_current = enqueued_current;
+                progress.product_queue_current = 0;
+                progress.product_output_current = output_current;
+            });
+        }
+        if self.trace.active {
+            self.trace.product_processed =
+                self.trace.product_processed.saturating_add(result.stats.processed);
+            self.trace.product_rewrites =
+                self.trace.product_rewrites.saturating_add(result.stats.rewrites);
+            self.trace.product_enqueued =
+                self.trace.product_enqueued.saturating_add(result.stats.enqueued);
+            self.trace.product_current_queue = 0;
+            self.trace.product_current_output = u64::try_from(terms.len()).unwrap_or(u64::MAX);
+        }
+        Ok(())
+    }
+
     fn product_nf(
         &mut self,
         _scope_proof: &ScopeProof,
@@ -8463,12 +8834,116 @@ impl<'a> Normalizer<'a> {
         gc_scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
         let mut worklist = VecDeque::new();
-        for (left_id, left_coefficient) in &left.exact_terms {
-            for (right_id, right_coefficient) in &right.exact_terms {
-                let coefficient = left_coefficient * right_coefficient * weight;
-                if coefficient.is_zero() {
+        let parallel_pairs = !direct_gadget_boundary &&
+            !self.gadget_input_nfs.is_empty() &&
+            left.exact_terms.len().saturating_mul(right.exact_terms.len()) >=
+                PARALLEL_PRODUCT_PAIR_BATCH;
+        if parallel_pairs {
+            self.parallel_product_pairs_into(left, right, weight, terms, gc_scope)?;
+        } else {
+            for (left_id, left_coefficient) in &left.exact_terms {
+                for (right_id, right_coefficient) in &right.exact_terms {
+                    let coefficient = left_coefficient * right_coefficient * weight;
+                    if coefficient.is_zero() {
+                        self.watchdog_record_product_generated(
+                            false,
+                            u64::try_from(worklist.len()).unwrap_or(u64::MAX),
+                            left.exact_terms
+                                .keys()
+                                .chain(right.exact_terms.keys())
+                                .chain(worklist.iter().map(|(id, _)| id))
+                                .chain(terms.keys())
+                                .copied(),
+                        );
+                        continue;
+                    }
+                    let direct_rewrite = if direct_gadget_boundary {
+                        if typed_product_plan {
+                            self.product_plan_counters.typed_pair_attempts =
+                                self.product_plan_counters.typed_pair_attempts.saturating_add(1);
+                        }
+                        let rewritten = self.rewrite_gadget_product_pair(*left_id, *right_id)?;
+                        if typed_product_plan {
+                            if rewritten.is_some() {
+                                self.product_plan_counters.typed_pair_matches =
+                                    self.product_plan_counters.typed_pair_matches.saturating_add(1);
+                            } else {
+                                self.product_plan_counters.typed_pair_ordinary_fallbacks = self
+                                    .product_plan_counters
+                                    .typed_pair_ordinary_fallbacks
+                                    .saturating_add(1);
+                            }
+                        }
+                        rewritten
+                    } else {
+                        None
+                    };
+                    if self.trace.active {
+                        self.trace.product_generated =
+                            self.trace.product_generated.saturating_add(1);
+                        if self.trace.product_generated >=
+                            self.trace.next_product_generated_heartbeat
+                        {
+                            self.trace.last_product_heartbeat_operator =
+                                self.trace.current_operator;
+                            self.trace.product_heartbeat_saw_matrix_multiply |=
+                                self.trace.current_operator == "multiply";
+                            self.refresh_owner_diagnostics();
+                            self.trace.emit(
+                                "product_generated_heartbeat",
+                                self.trace.nodes_processed,
+                                self.trace.nodes_total,
+                                false,
+                            );
+                            self.trace.next_product_generated_heartbeat = self
+                                .trace
+                                .next_product_generated_heartbeat
+                                .saturating_add(self.trace.product_heartbeat_interval);
+                        }
+                    }
+                    if direct_rewrite.is_none() && !direct_gadget_boundary {
+                        if let Some(parallel) = self.parallel_rewrite_product_pair(
+                            *left_id,
+                            *right_id,
+                            coefficient.clone(),
+                        )? {
+                            self.watchdog_record_product_generated(
+                                true,
+                                0,
+                                left.exact_terms
+                                    .keys()
+                                    .chain(right.exact_terms.keys())
+                                    .chain(terms.keys())
+                                    .copied(),
+                            );
+                            if self.trace.active {
+                                self.trace.product_enqueued =
+                                    self.trace.product_enqueued.saturating_add(1);
+                            }
+                            self.commit_parallel_product_rewrite(parallel, terms)?;
+                            self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
+                            continue;
+                        }
+                    }
+                    if let Some(rewritten) = direct_rewrite {
+                        if self.trace.active {
+                            self.trace.product_rewrites =
+                                self.trace.product_rewrites.saturating_add(1);
+                        }
+                        for (rewritten_monomial, rewritten_coefficient) in
+                            rewritten.into_iter().rev()
+                        {
+                            worklist.push_front((
+                                rewritten_monomial,
+                                coefficient.clone() * rewritten_coefficient,
+                            ));
+                        }
+                    } else {
+                        let product = self.product_monomials(*left_id, *right_id)?;
+                        worklist.push_back((product, coefficient));
+                    }
                     self.watchdog_record_product_generated(
-                        false,
+                        true,
                         u64::try_from(worklist.len()).unwrap_or(u64::MAX),
                         left.exact_terms
                             .keys()
@@ -8477,86 +8952,21 @@ impl<'a> Normalizer<'a> {
                             .chain(terms.keys())
                             .copied(),
                     );
-                    continue;
-                }
-                let direct_rewrite = if direct_gadget_boundary {
-                    if typed_product_plan {
-                        self.product_plan_counters.typed_pair_attempts =
-                            self.product_plan_counters.typed_pair_attempts.saturating_add(1);
-                    }
-                    let rewritten = self.rewrite_gadget_product_pair(*left_id, *right_id)?;
-                    if typed_product_plan {
-                        if rewritten.is_some() {
-                            self.product_plan_counters.typed_pair_matches =
-                                self.product_plan_counters.typed_pair_matches.saturating_add(1);
-                        } else {
-                            self.product_plan_counters.typed_pair_ordinary_fallbacks = self
-                                .product_plan_counters
-                                .typed_pair_ordinary_fallbacks
-                                .saturating_add(1);
-                        }
-                    }
-                    rewritten
-                } else {
-                    None
-                };
-                if self.trace.active {
-                    self.trace.product_generated = self.trace.product_generated.saturating_add(1);
-                    if self.trace.product_generated >= self.trace.next_product_generated_heartbeat {
-                        self.trace.last_product_heartbeat_operator = self.trace.current_operator;
-                        self.trace.product_heartbeat_saw_matrix_multiply |=
-                            self.trace.current_operator == "multiply";
-                        self.refresh_owner_diagnostics();
-                        self.trace.emit(
-                            "product_generated_heartbeat",
-                            self.trace.nodes_processed,
-                            self.trace.nodes_total,
-                            false,
-                        );
-                        self.trace.next_product_generated_heartbeat = self
-                            .trace
-                            .next_product_generated_heartbeat
-                            .saturating_add(self.trace.product_heartbeat_interval);
-                    }
-                }
-                if let Some(rewritten) = direct_rewrite {
                     if self.trace.active {
-                        self.trace.product_rewrites = self.trace.product_rewrites.saturating_add(1);
+                        self.trace.product_current_queue =
+                            u64::try_from(worklist.len()).unwrap_or(u64::MAX);
+                        self.trace.product_enqueued = self.trace.product_enqueued.saturating_add(1);
+                        self.trace.product_peak_queue = self
+                            .trace
+                            .product_peak_queue
+                            .max(u64::try_from(worklist.len()).unwrap_or(u64::MAX));
                     }
-                    for (rewritten_monomial, rewritten_coefficient) in rewritten.into_iter().rev() {
-                        worklist.push_front((
-                            rewritten_monomial,
-                            coefficient.clone() * rewritten_coefficient,
-                        ));
-                    }
-                } else {
-                    let product = self.product_monomials(*left_id, *right_id)?;
-                    worklist.push_back((product, coefficient));
+                    // Drain each completed cartesian pair before generating the next one. The same
+                    // rewrite queue remains authoritative, but its live size now follows one pair's
+                    // recursive splice instead of the full product cardinality.
+                    self.drain_product_worklist(left, right, terms, &mut worklist)?;
+                    self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
                 }
-                self.watchdog_record_product_generated(
-                    true,
-                    u64::try_from(worklist.len()).unwrap_or(u64::MAX),
-                    left.exact_terms
-                        .keys()
-                        .chain(right.exact_terms.keys())
-                        .chain(worklist.iter().map(|(id, _)| id))
-                        .chain(terms.keys())
-                        .copied(),
-                );
-                if self.trace.active {
-                    self.trace.product_current_queue =
-                        u64::try_from(worklist.len()).unwrap_or(u64::MAX);
-                    self.trace.product_enqueued = self.trace.product_enqueued.saturating_add(1);
-                    self.trace.product_peak_queue = self
-                        .trace
-                        .product_peak_queue
-                        .max(u64::try_from(worklist.len()).unwrap_or(u64::MAX));
-                }
-                // Drain each completed cartesian pair before generating the next one. The same
-                // rewrite queue remains authoritative, but its live size now follows one pair's
-                // recursive splice instead of the full product cardinality.
-                self.drain_product_worklist(left, right, terms, &mut worklist)?;
-                self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
             }
         }
         if self.watchdog.is_some() {
@@ -8619,6 +9029,105 @@ impl<'a> Normalizer<'a> {
         if self.trace.active {
             self.trace.product_current_queue = 0;
             self.trace.product_current_output = u64::try_from(terms.len()).unwrap_or(u64::MAX);
+        }
+        Ok(())
+    }
+
+    /// Close independent cartesian pairs on Rayon workers without sharing mutable arena state.
+    /// Workers derive immutable descriptors from already-validated monomials; the caller commits
+    /// results in the original BTree iteration order, preserving deterministic IDs and merging.
+    fn parallel_product_pairs_into(
+        &mut self,
+        left: &PolynomialNF,
+        right: &PolynomialNF,
+        weight: &BigInt,
+        terms: &mut BTreeMap<MonomialId, BigInt>,
+        gc_scope: ProductGcScope<'_>,
+    ) -> Result<(), NormalizeError> {
+        let mut product_factors = BTreeSet::new();
+        for &monomial in left.exact_terms.keys().chain(right.exact_terms.keys()) {
+            product_factors
+                .extend(self.monomials.descriptor(monomial)?.ordered_factors.iter().copied());
+        }
+        let Some(authorizations) =
+            self.parallel_gadget_authorizations_from_factors(product_factors)?
+        else {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "parallel gadget input missing after authorization",
+            });
+        };
+        let mut pairs = left.exact_terms.iter().flat_map(|(&left_id, left_coefficient)| {
+            right.exact_terms.iter().map(move |(&right_id, right_coefficient)| {
+                (left_id, left_coefficient, right_id, right_coefficient)
+            })
+        });
+        loop {
+            let mut seeds = Vec::with_capacity(PARALLEL_PRODUCT_PAIR_BATCH);
+            while seeds.len() < PARALLEL_PRODUCT_PAIR_BATCH {
+                let Some((left_id, left_coefficient, right_id, right_coefficient)) = pairs.next()
+                else {
+                    break;
+                };
+                let coefficient = left_coefficient * right_coefficient * weight;
+                self.watchdog_record_product_generated(
+                    !coefficient.is_zero(),
+                    0,
+                    left.exact_terms
+                        .keys()
+                        .chain(right.exact_terms.keys())
+                        .chain(terms.keys())
+                        .copied(),
+                );
+                if self.trace.active {
+                    self.trace.product_generated = self.trace.product_generated.saturating_add(1);
+                }
+                if coefficient.is_zero() {
+                    continue;
+                }
+                seeds.push((
+                    self.monomials.derive_product(self.scope, left_id, right_id)?,
+                    coefficient,
+                ));
+            }
+            if seeds.is_empty() {
+                if pairs.next().is_none() {
+                    break;
+                }
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "parallel product pair iterator drift",
+                });
+            }
+
+            let results = {
+                let context = ParallelGadgetRewriteContext {
+                    monomials: self.monomials,
+                    gadget_inputs: &self.gadget_input_nfs,
+                    authorizations: &authorizations,
+                };
+                seeds
+                    .into_par_iter()
+                    .map(|seed| context.close_branch(seed))
+                    .collect::<Result<Vec<_>, NormalizeError>>()?
+            };
+            if self.trace.active {
+                self.trace.product_enqueued = self
+                    .trace
+                    .product_enqueued
+                    .saturating_add(u64::try_from(results.len()).unwrap_or(u64::MAX));
+                self.trace.product_peak_queue = self
+                    .trace
+                    .product_peak_queue
+                    .max(u64::try_from(results.len()).unwrap_or(u64::MAX));
+            }
+            for result in results {
+                let Some(result) = result else {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "parallel gadget input disappeared",
+                    });
+                };
+                self.commit_parallel_product_rewrite(result, terms)?;
+            }
+            self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
         }
         Ok(())
     }
@@ -8806,15 +9315,23 @@ impl<'a> Normalizer<'a> {
             )?)
         };
         let mut terms = BTreeMap::new();
-        for (input_monomial, input_coefficient) in &input_nf.exact_terms {
-            let mut replacement = *input_monomial;
-            if let Some(left) = left {
-                replacement = self.monomials.combine_interned(self.scope, left, replacement)?;
+        let mut input_terms = input_nf.exact_terms.iter();
+        loop {
+            let batch =
+                input_terms.by_ref().take(PARALLEL_GADGET_SPLICE_BATCH_TERMS).collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
             }
-            if let Some(suffix) = suffix {
-                replacement = self.monomials.combine_interned(self.scope, replacement, suffix)?;
+            let input_monomials = batch.iter().map(|(id, _)| **id).collect::<Vec<_>>();
+            let replacements = self.monomials.combine_interned_wrapped_batch(
+                self.scope,
+                left,
+                &input_monomials,
+                suffix,
+            )?;
+            for ((_, input_coefficient), replacement) in batch.into_iter().zip(replacements) {
+                merge_term(&mut terms, replacement, input_coefficient.clone());
             }
-            merge_term(&mut terms, replacement, input_coefficient.clone());
         }
         Ok(Some(terms))
     }
@@ -8824,65 +9341,13 @@ impl<'a> Normalizer<'a> {
         gadget: ScopedExprId,
         decomposition: ScopedExprId,
     ) -> Result<Option<ExprId>, NormalizeError> {
-        let decomposition_node = self.expressions.node(decomposition.expression())?;
-        let ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
-            base,
-            small,
-            digit_count,
-            ..
-        }) = &decomposition_node.operator
-        else {
-            return Ok(None);
-        };
-        let gadget_node = self.expressions.node(gadget.expression())?;
-        let Some(super::arena::MatrixConstantKind::Gadget {
-            base: gadget_base,
-            small: gadget_small,
-        }) = gadget_node.operator.source_matrix_constant()
-        else {
-            return Ok(None);
-        };
-        if gadget_base != base || gadget_small != small {
-            return Ok(None);
-        }
-        let Some(input) = decomposition_node.inputs.first().copied() else {
-            return Ok(None);
-        };
-        let matrix_type = |expression| -> Result<Option<&ResolvedMatrixType>, NormalizeError> {
-            Ok(match self.expressions.value_type(expression)? {
-                ResolvedValueType::Matrix(matrix) => Some(matrix),
-                _ => None,
-            })
-        };
-        let (Some(input_type), Some(gadget_type), Some(decomposition_type), Some(output_type)) = (
-            matrix_type(input)?,
-            matrix_type(gadget.expression())?,
-            matrix_type(decomposition.expression())?,
-            matrix_type(input)?,
-        ) else {
-            return Ok(None);
-        };
-        let layout = |expression| match self.facts.facts(expression) {
-            Ok(ValueFacts::Matrix(facts)) => Some(facts.metadata.layout.clone()),
-            _ => None,
-        };
-        let Some(registry) = self.gadget_recompositions else {
-            return Ok(None);
-        };
-        Ok(registry
-            .allows(
-                *base,
-                *small,
-                *digit_count,
-                gadget_type,
-                decomposition_type,
-                input_type,
-                output_type,
-                layout(gadget.expression()).as_ref(),
-                layout(decomposition.expression()).as_ref(),
-                layout(input).as_ref(),
-            )
-            .then_some(input))
+        authorized_gadget_pair_input_from(
+            self.expressions,
+            self.facts,
+            self.gadget_recompositions,
+            gadget,
+            decomposition,
+        )
     }
 
     fn product_monomials(
@@ -15581,6 +16046,98 @@ mod tests {
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(factors, [first, second].into_iter().collect());
+    }
+
+    #[test]
+    fn parallel_product_rewrite_closes_independent_gadget_branches_deterministically() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 2, 1).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 6, 1).unwrap();
+        let gadget_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 2, 6).unwrap();
+        let sources = (0..PARALLEL_PRODUCT_REWRITE_MIN_BRANCHES)
+            .map(|index| {
+                matrix_source(
+                    &mut expressions,
+                    &format!("parallel-branch-{index}"),
+                    input_type.clone(),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let input = sources[1..].iter().fold(sources[0], |left, &right| {
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap()
+        });
+        let gadget = matrix_source(
+            &mut expressions,
+            "parallel-gadget",
+            gadget_type.clone(),
+            Some((2, false)),
+        );
+        let decomposition = expressions
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    output: decomposition_type.clone(),
+                    base: 2,
+                    small: false,
+                    digit_count: 3,
+                }),
+                Box::new([input]),
+            )
+            .unwrap();
+        let product = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[gadget, decomposition])
+            .unwrap();
+        let registry =
+            recomposition_registry(gadget_type, decomposition_type, input_type, false, 3);
+        let (mut facts, mut monomials, root) = setup(&mut expressions, &mut programs, product);
+        for expression in [gadget, decomposition, input] {
+            insert_matrix_layout_fact(&expressions, &mut facts, expression, false);
+        }
+        let scope = monomials.scope();
+        let scoped = |expression| programs.scoped(&expressions, scope, expression).unwrap();
+        let left = monomials.intern(&expressions, &programs, &[], &[scoped(gadget)]).unwrap();
+        let right =
+            monomials.intern(&expressions, &programs, &[], &[scoped(decomposition)]).unwrap();
+        let input_terms = sources
+            .iter()
+            .enumerate()
+            .map(|(index, &source)| {
+                let id = monomials.intern(&expressions, &programs, &[], &[scoped(source)]).unwrap();
+                (id, BigInt::from(index + 1))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let input_nf = Arc::new(PolynomialNF {
+            exact_terms: input_terms,
+            bounded_summary: BoundedSummary::missing(),
+        });
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_gadget_recompositions(&registry);
+        normalizer.gadget_input_nfs.insert(input, input_nf);
+        let parallel = normalizer
+            .parallel_rewrite_product_pair(left, right, BigInt::from(2_u8))
+            .unwrap()
+            .expect("sixteen independent branches must use the parallel closure path");
+        assert_eq!(parallel.stats.rewrites, 1);
+        assert_eq!(parallel.terms.len(), PARALLEL_PRODUCT_REWRITE_MIN_BRANCHES);
+        let mut terms = BTreeMap::new();
+        normalizer.commit_parallel_product_rewrite(parallel, &mut terms).unwrap();
+        assert_eq!(terms.len(), PARALLEL_PRODUCT_REWRITE_MIN_BRANCHES);
+        for (index, source) in sources.into_iter().enumerate() {
+            let expected = BigInt::from(2 * (index + 1));
+            let coefficient = terms
+                .iter()
+                .find_map(|(id, coefficient)| {
+                    let descriptor = normalizer.monomials.descriptor(*id).unwrap();
+                    (descriptor.ordered_factors.len() == 1 &&
+                        descriptor.ordered_factors[0].expression() == source)
+                        .then_some(coefficient)
+                })
+                .unwrap();
+            assert_eq!(coefficient, &expected);
+        }
+        let _ = root;
     }
 
     #[test]

@@ -3244,6 +3244,8 @@ impl<'a> Normalizer<'a> {
         let materialization_root_leaf_roots = self.local_exact_state_leaf_roots(state)?;
         let product_operand_additives = Self::product_operand_additives(state);
         let mut product_uses = self.product_plan_use_counts(state, &product_operand_additives)?;
+        let mut additive_output_uses =
+            self.additive_output_use_counts(state, &product_operand_additives)?;
         let mut outputs = BTreeMap::<(u8, u64), Arc<PolynomialNF>>::new();
         let mut scheduled = BTreeSet::<(u8, u64)>::new();
         let mut consumed_additives = BTreeSet::<u64>::new();
@@ -3377,6 +3379,16 @@ impl<'a> Normalizer<'a> {
                         self.product_plan_counters.planned_pairs.saturating_add(planned);
                     Self::release_product_output(&plan.left, &mut outputs, &mut product_uses)?;
                     Self::release_product_output(&plan.right, &mut outputs, &mut product_uses)?;
+                    Self::release_additive_output(
+                        &plan.left,
+                        &mut outputs,
+                        &mut additive_output_uses,
+                    )?;
+                    Self::release_additive_output(
+                        &plan.right,
+                        &mut outputs,
+                        &mut additive_output_uses,
+                    )?;
                     outputs.insert(
                         (1, plan.id),
                         Arc::new(PolynomialNF {
@@ -3390,6 +3402,7 @@ impl<'a> Normalizer<'a> {
                         flattened,
                         &mut outputs,
                         &mut product_uses,
+                        &mut additive_output_uses,
                         &mut consumed_additives,
                         &materialization_root_leaf_roots,
                     )?;
@@ -3485,6 +3498,62 @@ impl<'a> Normalizer<'a> {
         Ok(result)
     }
 
+    fn additive_output_use_counts(
+        &self,
+        root: &NodeExactState,
+        product_operand_additives: &BTreeSet<u64>,
+    ) -> Result<BTreeMap<u64, usize>, NormalizeError> {
+        let mut result = BTreeMap::<u64, usize>::new();
+        let mut additives = BTreeMap::<u64, Arc<AdditiveExactPlan>>::new();
+        let mut pending = vec![root.clone()];
+        let mut seen = BTreeSet::new();
+        while let Some(state) = pending.pop() {
+            let Some((kind, id)) = Self::node_exact_output_key(&state) else { continue };
+            if !seen.insert((kind, id)) {
+                continue;
+            }
+            match state {
+                NodeExactState::Product(plan) => {
+                    for child in [&plan.left, &plan.right] {
+                        if let NodeExactState::Additive(additive) = child {
+                            let count = result.entry(additive.id).or_default();
+                            *count =
+                                count.checked_add(1).ok_or(NormalizeError::ArithmeticOverflow)?;
+                        }
+                        pending.push(child.clone());
+                    }
+                }
+                NodeExactState::Additive(plan) => {
+                    additives.insert(plan.id, Arc::clone(&plan));
+                    pending.push(plan.left.clone());
+                    pending.push(plan.right.clone());
+                }
+                NodeExactState::Materialized { .. } | NodeExactState::GadgetProduct(_) => {}
+            }
+        }
+
+        let mut destinations = product_operand_additives.clone();
+        if let NodeExactState::Additive(root) = root {
+            destinations.insert(root.id);
+        }
+        let no_outputs = BTreeMap::new();
+        for destination in destinations {
+            let plan = additives.get(&destination).ok_or(NormalizeError::InvalidExactPlan {
+                reason: "missing additive output definition",
+            })?;
+            let flattened =
+                self.flatten_additive_plan(plan, &no_outputs, product_operand_additives)?;
+            for (additive, weight) in flattened.additive_outputs.into_values() {
+                if weight.is_zero() {
+                    continue;
+                }
+                let count = result.entry(additive.id).or_default();
+                *count = count.checked_add(1).ok_or(NormalizeError::ArithmeticOverflow)?;
+            }
+        }
+        Ok(result)
+    }
+
     fn product_operand_additives(root: &NodeExactState) -> BTreeSet<u64> {
         let mut result = BTreeSet::new();
         let mut pending = vec![root.clone()];
@@ -3527,6 +3596,30 @@ impl<'a> Normalizer<'a> {
             .ok_or(NormalizeError::InvalidExactPlan { reason: "product use count underflow" })?;
         if *remaining == 0 {
             outputs.remove(&(1, plan.id));
+        }
+        Ok(())
+    }
+
+    fn release_additive_output(
+        state: &NodeExactState,
+        outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
+        additive_output_uses: &mut BTreeMap<u64, usize>,
+    ) -> Result<(), NormalizeError> {
+        let NodeExactState::Additive(plan) = state else { return Ok(()) };
+        if !outputs.contains_key(&(0, plan.id)) {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "missing additive output on successful read",
+            });
+        }
+        let remaining =
+            additive_output_uses.get_mut(&plan.id).ok_or(NormalizeError::InvalidExactPlan {
+                reason: "missing additive output use count",
+            })?;
+        *remaining = remaining.checked_sub(1).ok_or(NormalizeError::InvalidExactPlan {
+            reason: "additive output use count underflow",
+        })?;
+        if *remaining == 0 {
+            outputs.remove(&(0, plan.id));
         }
         Ok(())
     }
@@ -3621,17 +3714,17 @@ impl<'a> Normalizer<'a> {
                 let signed = if sign < 0 { -weight.clone() } else { weight.clone() };
                 match child {
                     NodeExactState::Additive(child) => {
-                        if let Some(normal_form) = outputs.get(&(0, child.id)) {
+                        if product_operand_additives.contains(&child.id) {
+                            additive_outputs
+                                .entry(child.id)
+                                .and_modify(|(_, total)| *total += &signed)
+                                .or_insert_with(|| (Arc::clone(child), signed));
+                        } else if let Some(normal_form) = outputs.get(&(0, child.id)) {
                             let key = Arc::as_ptr(normal_form) as usize;
                             leaves
                                 .entry(key)
                                 .and_modify(|(_, total)| *total += &signed)
                                 .or_insert_with(|| (Arc::clone(normal_form), signed));
-                        } else if product_operand_additives.contains(&child.id) {
-                            additive_outputs
-                                .entry(child.id)
-                                .and_modify(|(_, total)| *total += &signed)
-                                .or_insert_with(|| (Arc::clone(child), signed));
                         } else {
                             pending
                                 .entry(child.id)
@@ -3682,6 +3775,7 @@ impl<'a> Normalizer<'a> {
         flattened: FlattenedAdditiveExactPlan,
         outputs: &mut BTreeMap<(u8, u64), Arc<PolynomialNF>>,
         product_uses: &mut BTreeMap<u64, usize>,
+        additive_output_uses: &mut BTreeMap<u64, usize>,
         consumed_additives: &mut BTreeSet<u64>,
         materialization_root_leaf_roots: &[MonomialId],
     ) -> Result<(u64, Arc<PolynomialNF>), NormalizeError> {
@@ -3701,11 +3795,15 @@ impl<'a> Normalizer<'a> {
                 }
                 continue;
             }
-            let normal_form =
-                outputs.get(&(0, additive.id)).ok_or(NormalizeError::InvalidExactPlan {
-                    reason: "missing scheduled additive output",
-                })?;
+            let normal_form = outputs.get(&(0, additive.id)).cloned().ok_or(
+                NormalizeError::InvalidExactPlan { reason: "missing scheduled additive output" },
+            )?;
             merge_scaled_terms_hash(&mut terms, &normal_form.exact_terms, &weight)?;
+            Self::release_additive_output(
+                &NodeExactState::Additive(additive),
+                outputs,
+                additive_output_uses,
+            )?;
         }
         for (_, (normal_form, weight)) in flattened.leaves {
             if weight.is_zero() {
@@ -3761,6 +3859,8 @@ impl<'a> Normalizer<'a> {
                         .max(u64::try_from(terms.len()).unwrap_or(u64::MAX));
                     Self::release_product_output(&plan.left, outputs, product_uses)?;
                     Self::release_product_output(&plan.right, outputs, product_uses)?;
+                    Self::release_additive_output(&plan.left, outputs, additive_output_uses)?;
+                    Self::release_additive_output(&plan.right, outputs, additive_output_uses)?;
                     executed = true;
                 }
             } else {

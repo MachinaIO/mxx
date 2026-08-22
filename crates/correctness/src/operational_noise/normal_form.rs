@@ -1935,8 +1935,12 @@ impl HashTermAccumulator {
         Self { arena, terms: HashMap::new() }
     }
 
-    fn into_term_map(self) -> TermMap<BigInt> {
-        self.terms.into_iter().collect()
+    fn into_term_map(self) -> Result<TermMap<BigInt>, NormalizeError> {
+        let mut entries = Vec::new();
+        entries.try_reserve(self.terms.len()).map_err(|_| NormalizeError::ArithmeticOverflow)?;
+        entries.extend(self.terms);
+        entries.sort_unstable_by_key(|(monomial, _)| *monomial);
+        Ok(entries.into_iter().collect())
     }
 }
 
@@ -3910,7 +3914,7 @@ impl<'a> Normalizer<'a> {
             )?;
         }
         let output_terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
-        let terms = terms.into_term_map();
+        let terms = terms.into_term_map()?;
         self.exact_plan_materializations = self.exact_plan_materializations.saturating_add(1);
         self.exact_plan_materialization_output_terms_total =
             self.exact_plan_materialization_output_terms_total.saturating_add(output_terms);
@@ -17998,7 +18002,7 @@ mod tests {
         assert_eq!(dense.len(), 2);
         assert_eq!(dense.roots().collect::<BTreeSet<_>>(), BTreeSet::from([ids[0], ids[1]]));
         assert_eq!(
-            dense.into_term_map(),
+            dense.into_term_map().unwrap(),
             BTreeMap::from([(ids[0], BigInt::from(11_u8)), (ids[1], BigInt::from(-3_i8))])
         );
 

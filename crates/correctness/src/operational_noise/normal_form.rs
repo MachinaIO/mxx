@@ -1936,11 +1936,11 @@ impl HashTermAccumulator {
     }
 
     fn into_term_map(self) -> Result<TermMap<BigInt>, NormalizeError> {
-        let mut entries = Vec::new();
-        entries.try_reserve(self.terms.len()).map_err(|_| NormalizeError::ArithmeticOverflow)?;
-        entries.extend(self.terms);
-        entries.sort_unstable_by_key(|(monomial, _)| *monomial);
-        Ok(entries.into_iter().collect())
+        // `BTreeMap::from_iter` collects once, sorts once, and bulk-builds the tree from that
+        // sorted buffer. Pre-sorting here would make `from_iter` allocate a second buffer and
+        // sort all exact terms again, which is prohibitive for the tens-of-millions-term Tall
+        // normalization roots.
+        Ok(self.terms.into_iter().collect())
     }
 }
 

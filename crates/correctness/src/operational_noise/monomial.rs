@@ -904,50 +904,18 @@ impl MonomialArena {
         {
             return Err(MonomialError::ArenaExhausted);
         }
-        if occupied_slots.is_some() {
-            // The sparse walk came from the authoritative hash index. Prune that index in place:
-            // rebuilding millions of surviving entries into fresh HashMaps doubled peak memory
-            // and dominated sweep time after a large tombstone-producing product. Descriptor
-            // equality and monotonic slot identity are unchanged, and collision buckets collapse
-            // back to their compact representation when only one live slot remains.
-            let descriptors = &self.descriptors;
-            for shard in &mut self.buckets {
-                shard.retain(|_, bucket| {
-                    bucket.retain_slots(|slot| {
-                        descriptors.get(slot as usize).is_some_and(Option::is_some)
-                    })
-                });
-            }
-        } else {
-            let prepared_buckets = {
-                let prepare = |(slot, descriptor): (usize, &Option<MonomialDescriptor>)| {
-                    descriptor.as_ref().map(|descriptor| (structural_hash(descriptor), slot as u32))
-                };
-                if self.occupied_descriptor_slots as usize >= PARALLEL_DESCRIPTOR_BATCH_MIN &&
-                    rayon::current_num_threads() > 1
-                {
-                    self.descriptors.par_iter().enumerate().filter_map(prepare).collect::<Vec<_>>()
-                } else {
-                    self.descriptors.iter().enumerate().filter_map(prepare).collect::<Vec<_>>()
-                }
-            };
-            let mut prepared_shards =
-                (0..MONOMIAL_BUCKET_SHARDS).map(|_| Vec::new()).collect::<Vec<Vec<(u64, u32)>>>();
-            for (hash, slot) in prepared_buckets {
-                prepared_shards[bucket_shard(hash)].push((hash, slot));
-            }
-            let build_shard = |entries: Vec<(u64, u32)>| {
-                let mut bucket = HashMap::with_capacity(entries.len());
-                for (hash, slot) in entries {
-                    insert_shard_slot(&mut bucket, hash, slot);
-                }
-                bucket
-            };
-            self.buckets = if rayon::current_num_threads() > 1 {
-                prepared_shards.into_par_iter().map(build_shard).collect()
-            } else {
-                prepared_shards.into_iter().map(build_shard).collect()
-            };
+        // Descriptors are immutable, so their structural hash never changes. Prune the existing
+        // authoritative index in place for both dense and sparse sweeps instead of rescanning
+        // every surviving factor word and rebuilding fresh HashMaps. This retains the dense
+        // descriptor walk's cache locality while eliminating the dominant high-live-set cost.
+        // Collision buckets collapse back to their compact representation at one live slot.
+        let descriptors = &self.descriptors;
+        for shard in &mut self.buckets {
+            shard.retain(|_, bucket| {
+                bucket.retain_slots(|slot| {
+                    descriptors.get(slot as usize).is_some_and(Option::is_some)
+                })
+            });
         }
         self.allocated_payload_since_sweep = 0;
         Ok(MonomialSweepReport {

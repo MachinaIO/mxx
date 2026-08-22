@@ -20,11 +20,12 @@ static NEXT_ARENA_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// and ordering relation, so a slot from a different arena can never alias a
 /// local slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct ArenaToken(pub(crate) u64);
+pub struct ArenaToken(pub(crate) u32);
 
 impl ArenaToken {
     pub(crate) fn fresh() -> Self {
-        Self(NEXT_ARENA_TOKEN.fetch_add(1, Ordering::Relaxed))
+        let token = NEXT_ARENA_TOKEN.fetch_add(1, Ordering::Relaxed);
+        Self(u32::try_from(token).expect("job-local arena token space exhausted"))
     }
 }
 
@@ -2157,6 +2158,14 @@ pub struct ValueProgram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_local_ids_remain_compact() {
+        assert_eq!(std::mem::size_of::<ArenaToken>(), 4);
+        assert_eq!(std::mem::size_of::<ExprId>(), 8);
+        assert_eq!(std::mem::size_of::<ValueProgramId>(), 8);
+        assert_eq!(std::mem::size_of::<ScopedExprId>(), 16);
+    }
     use crate::operational_noise::program::ProgramArena;
 
     fn matrix() -> ResolvedMatrixType {

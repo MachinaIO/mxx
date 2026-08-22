@@ -60,6 +60,9 @@ const NORMALIZATION_NODE_HEARTBEAT: u64 = 100_000;
 const LARGE_PRODUCT_PLANNED_PAIRS: u64 = 100_000;
 const MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 const MONOMIAL_GC_ALLOCATION_THRESHOLD_ENV: &str = "MXX_OPERATIONAL_MONOMIAL_GC_THRESHOLD_BYTES";
+const MONOMIAL_GC_LOW_YIELD_BACKOFF_MIN_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+const MONOMIAL_GC_LOW_YIELD_BACKOFF_FACTOR: u64 = 4;
+const MONOMIAL_GC_LOW_YIELD_BACKOFF_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 fn monomial_gc_allocation_threshold_bytes() -> u64 {
     std::env::var(MONOMIAL_GC_ALLOCATION_THRESHOLD_ENV)
@@ -67,6 +70,20 @@ fn monomial_gc_allocation_threshold_bytes() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|threshold| *threshold > 0)
         .unwrap_or(MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES)
+}
+
+fn next_product_gc_backoff_multiplier(
+    base_threshold: u64,
+    current_multiplier: u64,
+    allocated: u64,
+    reclaimed: u64,
+) -> u64 {
+    if base_threshold < MONOMIAL_GC_LOW_YIELD_BACKOFF_MIN_THRESHOLD_BYTES ||
+        reclaimed >= allocated / 100
+    {
+        return current_multiplier;
+    }
+    current_multiplier.saturating_mul(MONOMIAL_GC_LOW_YIELD_BACKOFF_FACTOR).max(1)
 }
 const PARALLEL_GADGET_SPLICE_BATCH_TERMS: usize = 8 * 1024;
 const PARALLEL_PRODUCT_REWRITE_MIN_BRANCHES: usize = 16;
@@ -2386,6 +2403,10 @@ pub struct Normalizer<'a> {
     /// when no current normalization owner references them.
     protected_monomial_prefix: usize,
     monomial_gc_allocation_threshold_bytes: u64,
+    /// Product-local sweeps back off when a completed sweep proves that almost every descriptor
+    /// is still live. Node commits reset this to the configured base threshold because releasing
+    /// a node's lexical owners can make the next collection productive again.
+    in_product_gc_backoff_multiplier: u64,
     gadget_splice_batch_terms: usize,
     /// A product sweep pins lexical operands and destinations. The following node commit must run
     /// one cleanup sweep even when that product sweep reset the allocation counter to zero.
@@ -4730,6 +4751,7 @@ impl<'a> Normalizer<'a> {
         self.sweep_monomials_at_quiescent_point(std::iter::empty(), force_cleanup)?;
         if self.normalization_depth == 1 {
             self.in_product_sweep_since_node_commit = false;
+            self.in_product_gc_backoff_multiplier = 1;
         }
         Ok(())
     }
@@ -4784,6 +4806,8 @@ impl<'a> Normalizer<'a> {
         if self.normalization_depth != 1 ||
             self.monomials.allocated_payload_since_sweep() <
                 self.monomial_gc_allocation_threshold_bytes
+                    .saturating_mul(self.in_product_gc_backoff_multiplier)
+                    .min(MONOMIAL_GC_LOW_YIELD_BACKOFF_MAX_BYTES)
         {
             return Ok(());
         }
@@ -4802,6 +4826,8 @@ impl<'a> Normalizer<'a> {
         if self.normalization_depth != 1 ||
             self.monomials.allocated_payload_since_sweep() <
                 self.monomial_gc_allocation_threshold_bytes
+                    .saturating_mul(self.in_product_gc_backoff_multiplier)
+                    .min(MONOMIAL_GC_LOW_YIELD_BACKOFF_MAX_BYTES)
         {
             return Ok(());
         }
@@ -4829,6 +4855,14 @@ impl<'a> Normalizer<'a> {
         self.sweep_monomials_at_quiescent_point(roots, false)?;
         if self.gc_counters.sweep_count != sweep_count {
             self.in_product_sweep_since_node_commit = true;
+            let allocated = self.gc_counters.last_allocated_payload_before_bytes;
+            let reclaimed = self.gc_counters.last_reclaimed_payload_bytes;
+            self.in_product_gc_backoff_multiplier = next_product_gc_backoff_multiplier(
+                self.monomial_gc_allocation_threshold_bytes,
+                self.in_product_gc_backoff_multiplier,
+                allocated,
+                reclaimed,
+            );
         }
         Ok(())
     }
@@ -5122,6 +5156,7 @@ impl<'a> Normalizer<'a> {
             fold_final_no_match: true,
             protected_monomial_prefix,
             monomial_gc_allocation_threshold_bytes: monomial_gc_allocation_threshold_bytes(),
+            in_product_gc_backoff_multiplier: 1,
             gadget_splice_batch_terms: PARALLEL_GADGET_SPLICE_BATCH_TERMS,
             in_product_sweep_since_node_commit: false,
             gc_counters: DiagnosticGcCounters::default(),
@@ -11433,6 +11468,15 @@ fn weighted_sum_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn product_gc_backoff_only_grows_after_large_low_yield_sweeps() {
+        let base = MONOMIAL_GC_LOW_YIELD_BACKOFF_MIN_THRESHOLD_BYTES;
+        assert_eq!(next_product_gc_backoff_multiplier(base, 1, base, 0), 4);
+        assert_eq!(next_product_gc_backoff_multiplier(base, 4, base, 0), 16);
+        assert_eq!(next_product_gc_backoff_multiplier(base, 4, base, base / 100), 4);
+        assert_eq!(next_product_gc_backoff_multiplier(base - 1, 1, base, 0), 1);
+    }
     use crate::operational_noise::{
         arena::{
             ArenaToken, HashVariant, MatrixLayout, MatrixOperation, ProgramInput, ProgramSignature,

@@ -567,10 +567,12 @@ impl MonomialArena {
         central.sort_unstable();
 
         let mut hasher = DefaultHasher::new();
+        central_len.hash(&mut hasher);
         central.as_slice().hash(&mut hasher);
-        // `Hash for [T]` writes its length prefix before the elements. The default prefix for
-        // `DefaultHasher` is the ordinary `usize` hash; spelling it directly keeps this code on
-        // stable Rust while matching `MonomialDescriptor`'s derived hash byte-for-byte.
+        // `structural_hash` deliberately hashes each factor-list length once explicitly and once
+        // through the slice's `Hash` implementation. Reproduce both prefixes without allocating
+        // the ordered factor buffer on the existing-descriptor path.
+        ordered_len.hash(&mut hasher);
         ordered_len.hash(&mut hasher);
         for factor in descriptors.iter().flat_map(|descriptor| &descriptor.ordered_factors) {
             factor.hash(&mut hasher);
@@ -600,13 +602,12 @@ impl MonomialArena {
         for descriptor in descriptors {
             ordered.extend_from_slice(&descriptor.ordered_factors);
         }
-        Ok(PreparedOrExistingMonomial::Prepared(PreparedMonomialDescriptor {
-            descriptor: MonomialDescriptor {
-                central_factors: central.into_boxed_slice(),
-                ordered_factors: ordered.into_boxed_slice(),
-            },
-            hash,
-        }))
+        let descriptor = MonomialDescriptor {
+            central_factors: central.into_boxed_slice(),
+            ordered_factors: ordered.into_boxed_slice(),
+        };
+        debug_assert_eq!(hash, structural_hash(&descriptor));
+        Ok(PreparedOrExistingMonomial::Prepared(PreparedMonomialDescriptor { descriptor, hash }))
     }
 
     fn prepare_descriptor<'descriptor>(
@@ -1557,6 +1558,18 @@ mod tests {
             let parallel_descriptor = parallel.descriptor(parallel_id).unwrap();
             assert_eq!(sequential_descriptor, parallel_descriptor);
         }
+
+        let before_cross_path = parallel.len();
+        let ordinary_intermediate =
+            parallel.combine_interned(scope, parallel_prefix, parallel_inputs[0]).unwrap();
+        let ordinary_output =
+            parallel.combine_interned(scope, ordinary_intermediate, parallel_suffix).unwrap();
+        assert_eq!(ordinary_output, parallel_outputs[0]);
+        assert_eq!(
+            parallel.len(),
+            before_cross_path,
+            "batch and ordinary interning must use the same structural hash buckets",
+        );
 
         for &input in &parallel_inputs {
             let prepared = parallel

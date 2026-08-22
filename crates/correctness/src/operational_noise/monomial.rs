@@ -126,7 +126,7 @@ pub struct MonomialArena {
     descriptors: Vec<Option<MonomialDescriptor>>,
     // Hash buckets contain slots only.  Full descriptor equality below makes
     // this collision-safe without storing a second copy of either factor list.
-    buckets: HashMap<u64, Vec<u32>>,
+    buckets: HashMap<u64, MonomialBucket>,
     central_factor_entries: u64,
     ordered_factor_entries: u64,
     occupied_descriptor_slots: u64,
@@ -134,6 +134,39 @@ pub struct MonomialArena {
 }
 
 const PARALLEL_DESCRIPTOR_BATCH_MIN: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MonomialBucket {
+    Single(u32),
+    Collision(Vec<u32>),
+}
+
+impl MonomialBucket {
+    fn slots(&self) -> &[u32] {
+        match self {
+            Self::Single(slot) => std::slice::from_ref(slot),
+            Self::Collision(slots) => slots,
+        }
+    }
+
+    fn push(&mut self, slot: u32) {
+        match self {
+            Self::Single(existing) => {
+                *self = Self::Collision(vec![*existing, slot]);
+            }
+            Self::Collision(slots) => slots.push(slot),
+        }
+    }
+}
+
+fn insert_bucket_slot(buckets: &mut HashMap<u64, MonomialBucket>, hash: u64, slot: u32) {
+    match buckets.entry(hash) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(MonomialBucket::Single(slot));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().push(slot),
+    }
+}
 
 struct PreparedMonomialDescriptor {
     descriptor: MonomialDescriptor,
@@ -544,7 +577,7 @@ impl MonomialArena {
         let Some(slots) = self.buckets.get(&hash) else {
             return Ok(None);
         };
-        for &slot in slots {
+        for &slot in slots.slots() {
             if self.descriptors.get(slot as usize).and_then(Option::as_ref) == Some(&descriptor) {
                 return Ok(Some(MonomialId::new(self.token, slot)));
             }
@@ -566,7 +599,7 @@ impl MonomialArena {
     ) -> Result<MonomialId, MonomialError> {
         let PreparedMonomialDescriptor { descriptor, hash } = prepared;
         if let Some(slots) = self.buckets.get(&hash) {
-            for &slot in slots {
+            for &slot in slots.slots() {
                 let Some(existing) = self.descriptors.get(slot as usize).and_then(Option::as_ref)
                 else {
                     continue;
@@ -588,7 +621,7 @@ impl MonomialArena {
             .allocated_payload_since_sweep
             .saturating_add(descriptor_payload_lower_bound_bytes(central_len, ordered_len));
         self.descriptors.push(Some(descriptor));
-        self.buckets.entry(hash).or_default().push(slot);
+        insert_bucket_slot(&mut self.buckets, hash, slot);
         Ok(MonomialId::new(self.token, slot))
     }
 
@@ -777,9 +810,10 @@ impl MonomialArena {
         } else {
             self.descriptors.iter().enumerate().filter_map(prepare_bucket).collect::<Vec<_>>()
         };
-        let mut buckets: HashMap<u64, Vec<u32>> = HashMap::with_capacity(prepared_buckets.len());
+        let mut buckets: HashMap<u64, MonomialBucket> =
+            HashMap::with_capacity(prepared_buckets.len());
         for (hash, slot) in prepared_buckets {
-            buckets.entry(hash).or_default().push(slot);
+            insert_bucket_slot(&mut buckets, hash, slot);
         }
         self.buckets = buckets;
         self.allocated_payload_since_sweep = 0;
@@ -1100,7 +1134,7 @@ mod tests {
         // A synthetic structural-hash collision exercises full descriptor equality and bucket
         // rebuilding without making pointer/hash identity semantic.
         let live_hash = structural_hash(arena.descriptor(live).unwrap());
-        arena.buckets.entry(live_hash).or_default().push(dead.slot);
+        insert_bucket_slot(&mut arena.buckets, live_hash, dead.slot);
         let report = arena.sweep(0, [live]).unwrap();
         assert_eq!(report.high_water_slots, 2);
         assert_eq!(report.occupied_slots, 1);
@@ -1117,7 +1151,7 @@ mod tests {
             Err(MonomialError::CollectedMonomialId { slot }) if slot == dead.slot
         ));
         assert_eq!(arena.descriptor(live).unwrap().central_factors.as_ref(), &[one]);
-        assert_eq!(arena.buckets.values().map(Vec::len).sum::<usize>(), 1);
+        assert_eq!(arena.buckets.values().map(|bucket| bucket.slots().len()).sum::<usize>(), 1);
 
         let reinterned = arena.intern(&expressions, &programs, &[], &[root, one]).unwrap();
         assert_ne!(reinterned, dead);

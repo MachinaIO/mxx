@@ -1925,90 +1925,30 @@ impl ExactTermAccumulator for TermMap<BigInt> {
     }
 }
 
-struct DenseTermAccumulator {
+struct HashTermAccumulator {
     arena: ArenaToken,
-    pages: HashMap<u32, DenseTermPage>,
-    occupied_slots: Vec<u32>,
-    len: usize,
+    terms: HashMap<MonomialId, BigInt>,
 }
 
-const DENSE_TERM_PAGE_SLOTS: usize = 1_024;
-
-struct DenseTermPage {
-    coefficients: Box<[Option<BigInt>]>,
-    registered: Box<[bool]>,
-}
-
-impl DenseTermPage {
-    fn try_new() -> Result<Self, NormalizeError> {
-        let mut coefficients = Vec::new();
-        coefficients
-            .try_reserve_exact(DENSE_TERM_PAGE_SLOTS)
-            .map_err(|_| NormalizeError::ArithmeticOverflow)?;
-        coefficients.resize_with(DENSE_TERM_PAGE_SLOTS, || None);
-        let mut registered = Vec::new();
-        registered
-            .try_reserve_exact(DENSE_TERM_PAGE_SLOTS)
-            .map_err(|_| NormalizeError::ArithmeticOverflow)?;
-        registered.resize(DENSE_TERM_PAGE_SLOTS, false);
-        Ok(Self {
-            coefficients: coefficients.into_boxed_slice(),
-            registered: registered.into_boxed_slice(),
-        })
-    }
-}
-
-impl DenseTermAccumulator {
+impl HashTermAccumulator {
     fn new(arena: ArenaToken) -> Self {
-        Self { arena, pages: HashMap::new(), occupied_slots: Vec::new(), len: 0 }
+        Self { arena, terms: HashMap::new() }
     }
 
-    fn into_term_map(mut self) -> TermMap<BigInt> {
-        let mut result = BTreeMap::new();
-        for slot in self.occupied_slots {
-            let page_index = slot / u32::try_from(DENSE_TERM_PAGE_SLOTS).unwrap();
-            let offset = slot as usize % DENSE_TERM_PAGE_SLOTS;
-            let Some(coefficient) =
-                self.pages.get_mut(&page_index).unwrap().coefficients[offset].take()
-            else {
-                continue;
-            };
-            result.insert(MonomialId::new(self.arena, slot), coefficient);
-        }
-        result
+    fn into_term_map(self) -> TermMap<BigInt> {
+        self.terms.into_iter().collect()
     }
 }
 
-struct DenseTermRoots<'a> {
-    arena: ArenaToken,
-    slots: std::slice::Iter<'a, u32>,
-    pages: &'a HashMap<u32, DenseTermPage>,
-}
-
-impl Iterator for DenseTermRoots<'_> {
-    type Item = MonomialId;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        for &slot in self.slots.by_ref() {
-            let page_index = slot / u32::try_from(DENSE_TERM_PAGE_SLOTS).unwrap();
-            let offset = slot as usize % DENSE_TERM_PAGE_SLOTS;
-            if self.pages[&page_index].coefficients[offset].is_some() {
-                return Some(MonomialId::new(self.arena, slot));
-            }
-        }
-        None
-    }
-}
-
-impl ExactTermAccumulator for DenseTermAccumulator {
-    type Roots<'a> = DenseTermRoots<'a>;
+impl ExactTermAccumulator for HashTermAccumulator {
+    type Roots<'a> = std::iter::Copied<std::collections::hash_map::Keys<'a, MonomialId, BigInt>>;
 
     fn len(&self) -> usize {
-        self.len
+        self.terms.len()
     }
 
     fn roots(&self) -> Self::Roots<'_> {
-        DenseTermRoots { arena: self.arena, slots: self.occupied_slots.iter(), pages: &self.pages }
+        self.terms.keys().copied()
     }
 
     fn merge(&mut self, monomial: MonomialId, coefficient: BigInt) -> Result<(), NormalizeError> {
@@ -2021,27 +1961,16 @@ impl ExactTermAccumulator for DenseTermAccumulator {
                 actual: monomial.arena(),
             }));
         }
-        let page_index = monomial.slot() / u32::try_from(DENSE_TERM_PAGE_SLOTS).unwrap();
-        let offset = monomial.slot() as usize % DENSE_TERM_PAGE_SLOTS;
-        if !self.pages.contains_key(&page_index) {
-            let page = DenseTermPage::try_new()?;
-            self.pages.try_reserve(1).map_err(|_| NormalizeError::ArithmeticOverflow)?;
-            self.pages.insert(page_index, page);
-        }
-        let page = self.pages.get_mut(&page_index).unwrap();
-        if let Some(existing) = page.coefficients[offset].as_mut() {
-            *existing += coefficient;
-            if existing.is_zero() {
-                page.coefficients[offset] = None;
-                self.len -= 1;
+        match self.terms.entry(monomial) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() += coefficient;
+                if entry.get().is_zero() {
+                    entry.remove();
+                }
             }
-        } else {
-            page.coefficients[offset] = Some(coefficient);
-            if !page.registered[offset] {
-                page.registered[offset] = true;
-                self.occupied_slots.push(monomial.slot());
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(coefficient);
             }
-            self.len += 1;
         }
         Ok(())
     }
@@ -3759,7 +3688,7 @@ impl<'a> Normalizer<'a> {
         // These additive definitions own the Product edges collected below. Mark them before a
         // canceled sibling can recursively discard a shared additive operand.
         consumed_additives.extend(flattened.additive_ids.iter().copied());
-        let mut terms = DenseTermAccumulator::new(self.monomials.token());
+        let mut terms = HashTermAccumulator::new(self.monomials.token());
         for (_, (additive, weight)) in flattened.additive_outputs {
             if weight.is_zero() {
                 if !outputs.contains_key(&(0, additive.id)) {
@@ -3776,13 +3705,13 @@ impl<'a> Normalizer<'a> {
                 outputs.get(&(0, additive.id)).ok_or(NormalizeError::InvalidExactPlan {
                     reason: "missing scheduled additive output",
                 })?;
-            merge_scaled_terms_dense(&mut terms, &normal_form.exact_terms, &weight)?;
+            merge_scaled_terms_hash(&mut terms, &normal_form.exact_terms, &weight)?;
         }
         for (_, (normal_form, weight)) in flattened.leaves {
             if weight.is_zero() {
                 continue;
             }
-            merge_scaled_terms_dense(&mut terms, &normal_form.exact_terms, &weight)?;
+            merge_scaled_terms_hash(&mut terms, &normal_form.exact_terms, &weight)?;
         }
         for (_, (plan, weight, occurrences, standalone)) in flattened.products.into_iter().rev() {
             let mut executed = false;
@@ -3792,7 +3721,7 @@ impl<'a> Normalizer<'a> {
                         outputs.get(&(1, plan.id)).ok_or(NormalizeError::InvalidExactPlan {
                             reason: "missing scheduled product output",
                         })?;
-                    merge_scaled_terms_dense(&mut terms, &normal_form.exact_terms, &weight)?;
+                    merge_scaled_terms_hash(&mut terms, &normal_form.exact_terms, &weight)?;
                 } else {
                     let left = Self::exact_state_output(&plan.left, outputs)?;
                     let right = Self::exact_state_output(&plan.right, outputs)?;
@@ -11328,8 +11257,8 @@ fn merge_scaled_terms(
     Ok(())
 }
 
-fn merge_scaled_terms_dense(
-    terms: &mut DenseTermAccumulator,
+fn merge_scaled_terms_hash(
+    terms: &mut HashTermAccumulator,
     source: &TermMap<BigInt>,
     weight: &BigInt,
 ) -> Result<(), NormalizeError> {
@@ -17955,11 +17884,11 @@ mod tests {
     }
 
     #[test]
-    fn dense_term_accumulator_preserves_cancellation_order_and_arena_authority() {
+    fn hash_term_accumulator_preserves_cancellation_order_and_arena_authority() {
         let token = ArenaToken::fresh();
         let ids =
             [MonomialId::new(token, 7), MonomialId::new(token, 2), MonomialId::new(token, 19)];
-        let mut dense = DenseTermAccumulator::new(token);
+        let mut dense = HashTermAccumulator::new(token);
         dense.merge(ids[0], BigInt::from(5_u8)).unwrap();
         dense.merge(ids[1], BigInt::from(-3_i8)).unwrap();
         dense.merge(ids[0], BigInt::from(-5_i8)).unwrap();
@@ -17973,7 +17902,7 @@ mod tests {
             BTreeMap::from([(ids[0], BigInt::from(11_u8)), (ids[1], BigInt::from(-3_i8))])
         );
 
-        let mut dense = DenseTermAccumulator::new(token);
+        let mut dense = HashTermAccumulator::new(token);
         let foreign = MonomialId::new(ArenaToken::fresh(), 2);
         assert!(matches!(
             dense.merge(foreign, BigInt::from(1_u8)),

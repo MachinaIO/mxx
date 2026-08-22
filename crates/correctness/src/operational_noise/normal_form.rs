@@ -1927,28 +1927,52 @@ impl ExactTermAccumulator for TermMap<BigInt> {
 
 struct DenseTermAccumulator {
     arena: ArenaToken,
-    coefficients: Vec<Option<BigInt>>,
-    registered_slots: Vec<bool>,
+    pages: HashMap<u32, DenseTermPage>,
     occupied_slots: Vec<u32>,
     len: usize,
 }
 
+const DENSE_TERM_PAGE_SLOTS: usize = 1_024;
+
+struct DenseTermPage {
+    coefficients: Box<[Option<BigInt>]>,
+    registered: Box<[bool]>,
+}
+
+impl DenseTermPage {
+    fn try_new() -> Result<Self, NormalizeError> {
+        let mut coefficients = Vec::new();
+        coefficients
+            .try_reserve_exact(DENSE_TERM_PAGE_SLOTS)
+            .map_err(|_| NormalizeError::ArithmeticOverflow)?;
+        coefficients.resize_with(DENSE_TERM_PAGE_SLOTS, || None);
+        let mut registered = Vec::new();
+        registered
+            .try_reserve_exact(DENSE_TERM_PAGE_SLOTS)
+            .map_err(|_| NormalizeError::ArithmeticOverflow)?;
+        registered.resize(DENSE_TERM_PAGE_SLOTS, false);
+        Ok(Self {
+            coefficients: coefficients.into_boxed_slice(),
+            registered: registered.into_boxed_slice(),
+        })
+    }
+}
+
 impl DenseTermAccumulator {
     fn new(arena: ArenaToken) -> Self {
-        Self {
-            arena,
-            coefficients: Vec::new(),
-            registered_slots: Vec::new(),
-            occupied_slots: Vec::new(),
-            len: 0,
-        }
+        Self { arena, pages: HashMap::new(), occupied_slots: Vec::new(), len: 0 }
     }
 
     fn into_term_map(mut self) -> TermMap<BigInt> {
         let mut result = BTreeMap::new();
         for slot in self.occupied_slots {
-            let index = slot as usize;
-            let Some(coefficient) = self.coefficients[index].take() else { continue };
+            let page_index = slot / u32::try_from(DENSE_TERM_PAGE_SLOTS).unwrap();
+            let offset = slot as usize % DENSE_TERM_PAGE_SLOTS;
+            let Some(coefficient) =
+                self.pages.get_mut(&page_index).unwrap().coefficients[offset].take()
+            else {
+                continue;
+            };
             result.insert(MonomialId::new(self.arena, slot), coefficient);
         }
         result
@@ -1958,7 +1982,7 @@ impl DenseTermAccumulator {
 struct DenseTermRoots<'a> {
     arena: ArenaToken,
     slots: std::slice::Iter<'a, u32>,
-    coefficients: &'a [Option<BigInt>],
+    pages: &'a HashMap<u32, DenseTermPage>,
 }
 
 impl Iterator for DenseTermRoots<'_> {
@@ -1966,7 +1990,9 @@ impl Iterator for DenseTermRoots<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         for &slot in self.slots.by_ref() {
-            if self.coefficients[slot as usize].is_some() {
+            let page_index = slot / u32::try_from(DENSE_TERM_PAGE_SLOTS).unwrap();
+            let offset = slot as usize % DENSE_TERM_PAGE_SLOTS;
+            if self.pages[&page_index].coefficients[offset].is_some() {
                 return Some(MonomialId::new(self.arena, slot));
             }
         }
@@ -1982,11 +2008,7 @@ impl ExactTermAccumulator for DenseTermAccumulator {
     }
 
     fn roots(&self) -> Self::Roots<'_> {
-        DenseTermRoots {
-            arena: self.arena,
-            slots: self.occupied_slots.iter(),
-            coefficients: &self.coefficients,
-        }
+        DenseTermRoots { arena: self.arena, slots: self.occupied_slots.iter(), pages: &self.pages }
     }
 
     fn merge(&mut self, monomial: MonomialId, coefficient: BigInt) -> Result<(), NormalizeError> {
@@ -1999,27 +2021,24 @@ impl ExactTermAccumulator for DenseTermAccumulator {
                 actual: monomial.arena(),
             }));
         }
-        let index = monomial.slot() as usize;
-        if index >= self.coefficients.len() {
-            self.coefficients
-                .try_reserve(index + 1 - self.coefficients.len())
-                .map_err(|_| NormalizeError::ArithmeticOverflow)?;
-            self.coefficients.resize_with(index + 1, || None);
-            self.registered_slots
-                .try_reserve(index + 1 - self.registered_slots.len())
-                .map_err(|_| NormalizeError::ArithmeticOverflow)?;
-            self.registered_slots.resize(index + 1, false);
+        let page_index = monomial.slot() / u32::try_from(DENSE_TERM_PAGE_SLOTS).unwrap();
+        let offset = monomial.slot() as usize % DENSE_TERM_PAGE_SLOTS;
+        if !self.pages.contains_key(&page_index) {
+            let page = DenseTermPage::try_new()?;
+            self.pages.try_reserve(1).map_err(|_| NormalizeError::ArithmeticOverflow)?;
+            self.pages.insert(page_index, page);
         }
-        if let Some(existing) = self.coefficients[index].as_mut() {
+        let page = self.pages.get_mut(&page_index).unwrap();
+        if let Some(existing) = page.coefficients[offset].as_mut() {
             *existing += coefficient;
             if existing.is_zero() {
-                self.coefficients[index] = None;
+                page.coefficients[offset] = None;
                 self.len -= 1;
             }
         } else {
-            self.coefficients[index] = Some(coefficient);
-            if !self.registered_slots[index] {
-                self.registered_slots[index] = true;
+            page.coefficients[offset] = Some(coefficient);
+            if !page.registered[offset] {
+                page.registered[offset] = true;
                 self.occupied_slots.push(monomial.slot());
             }
             self.len += 1;

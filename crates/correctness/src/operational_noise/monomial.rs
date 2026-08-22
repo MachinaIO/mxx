@@ -162,6 +162,23 @@ impl MonomialBucket {
             Self::Collision(slots) => slots.push(slot),
         }
     }
+
+    fn retain_slots(&mut self, mut retain: impl FnMut(u32) -> bool) -> bool {
+        match self {
+            Self::Single(slot) => retain(*slot),
+            Self::Collision(slots) => {
+                slots.retain(|&slot| retain(slot));
+                match slots.as_slice() {
+                    [] => false,
+                    [slot] => {
+                        *self = Self::Single(*slot);
+                        true
+                    }
+                    _ => true,
+                }
+            }
+        }
+    }
 }
 
 fn bucket_shard(hash: u64) -> usize {
@@ -887,22 +904,22 @@ impl MonomialArena {
         {
             return Err(MonomialError::ArenaExhausted);
         }
-        let prepared_buckets = match &occupied_slots {
-            Some(slots) => {
-                // Sparse traversal already came from the authoritative hash index. Preserve the
-                // existing hash instead of rescanning every surviving factor word.
-                let prepare = |&(hash, slot): &(u64, u32)| {
-                    self.descriptors[slot as usize].as_ref().map(|_| (hash, slot))
-                };
-                if self.occupied_descriptor_slots as usize >= PARALLEL_DESCRIPTOR_BATCH_MIN &&
-                    rayon::current_num_threads() > 1
-                {
-                    slots.par_iter().filter_map(prepare).collect::<Vec<_>>()
-                } else {
-                    slots.iter().filter_map(prepare).collect::<Vec<_>>()
-                }
+        if occupied_slots.is_some() {
+            // The sparse walk came from the authoritative hash index. Prune that index in place:
+            // rebuilding millions of surviving entries into fresh HashMaps doubled peak memory
+            // and dominated sweep time after a large tombstone-producing product. Descriptor
+            // equality and monotonic slot identity are unchanged, and collision buckets collapse
+            // back to their compact representation when only one live slot remains.
+            let descriptors = &self.descriptors;
+            for shard in &mut self.buckets {
+                shard.retain(|_, bucket| {
+                    bucket.retain_slots(|slot| {
+                        descriptors.get(slot as usize).is_some_and(Option::is_some)
+                    })
+                });
             }
-            None => {
+        } else {
+            let prepared_buckets = {
                 let prepare = |(slot, descriptor): (usize, &Option<MonomialDescriptor>)| {
                     descriptor.as_ref().map(|descriptor| (structural_hash(descriptor), slot as u32))
                 };
@@ -913,25 +930,25 @@ impl MonomialArena {
                 } else {
                     self.descriptors.iter().enumerate().filter_map(prepare).collect::<Vec<_>>()
                 }
+            };
+            let mut prepared_shards =
+                (0..MONOMIAL_BUCKET_SHARDS).map(|_| Vec::new()).collect::<Vec<Vec<(u64, u32)>>>();
+            for (hash, slot) in prepared_buckets {
+                prepared_shards[bucket_shard(hash)].push((hash, slot));
             }
-        };
-        let mut prepared_shards =
-            (0..MONOMIAL_BUCKET_SHARDS).map(|_| Vec::new()).collect::<Vec<Vec<(u64, u32)>>>();
-        for (hash, slot) in prepared_buckets {
-            prepared_shards[bucket_shard(hash)].push((hash, slot));
+            let build_shard = |entries: Vec<(u64, u32)>| {
+                let mut bucket = HashMap::with_capacity(entries.len());
+                for (hash, slot) in entries {
+                    insert_shard_slot(&mut bucket, hash, slot);
+                }
+                bucket
+            };
+            self.buckets = if rayon::current_num_threads() > 1 {
+                prepared_shards.into_par_iter().map(build_shard).collect()
+            } else {
+                prepared_shards.into_iter().map(build_shard).collect()
+            };
         }
-        let build_shard = |entries: Vec<(u64, u32)>| {
-            let mut bucket = HashMap::with_capacity(entries.len());
-            for (hash, slot) in entries {
-                insert_shard_slot(&mut bucket, hash, slot);
-            }
-            bucket
-        };
-        self.buckets = if rayon::current_num_threads() > 1 {
-            prepared_shards.into_par_iter().map(build_shard).collect()
-        } else {
-            prepared_shards.into_iter().map(build_shard).collect()
-        };
         self.allocated_payload_since_sweep = 0;
         Ok(MonomialSweepReport {
             high_water_slots: u64::try_from(high_water).unwrap_or(u64::MAX),
@@ -1282,6 +1299,44 @@ mod tests {
         assert!(reinterned.slot > dead.slot);
         assert_eq!(arena.len(), 3);
         assert_eq!(arena.occupied_len(), 2);
+    }
+
+    #[test]
+    fn sparse_sweep_prunes_bucket_entries_in_place_and_collapses_collisions() {
+        let (expressions, programs, scope, one, _, _) = fixture();
+        let mut arena = MonomialArena::new(&expressions, &programs, scope).unwrap();
+        let root = programs.root(&expressions, scope).unwrap();
+        let ids = (1..=8_usize)
+            .map(|width| arena.intern(&expressions, &programs, &[], &vec![root; width]).unwrap())
+            .collect::<Vec<_>>();
+        arena.sweep(0, [ids[0], ids[1]]).unwrap();
+        assert_eq!(arena.len(), 8);
+        assert_eq!(arena.occupied_len(), 2);
+
+        let dead = arena.intern(&expressions, &programs, &[one], &[root, one, root]).unwrap();
+        let live_hash = structural_hash(arena.descriptor(ids[0]).unwrap());
+        insert_bucket_slot(&mut arena.buckets, live_hash, dead.slot);
+        let report = arena.sweep(0, [ids[0], ids[1]]).unwrap();
+        assert_eq!(report.high_water_slots, 9);
+        assert_eq!(report.occupied_slots, 2);
+        assert_eq!(report.reclaimed_slots, 1);
+        assert!(matches!(
+            arena.buckets[bucket_shard(live_hash)].get(&live_hash),
+            Some(MonomialBucket::Single(slot)) if *slot == ids[0].slot
+        ));
+        assert_eq!(
+            arena
+                .buckets
+                .iter()
+                .flat_map(HashMap::values)
+                .map(|bucket| bucket.slots().len())
+                .sum::<usize>(),
+            2
+        );
+        assert!(matches!(
+            arena.descriptor(dead),
+            Err(MonomialError::CollectedMonomialId { slot }) if slot == dead.slot
+        ));
     }
 
     #[test]

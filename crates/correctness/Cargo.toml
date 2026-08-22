@@ -8,6 +8,7 @@ description = "Perfect-correctness declarations and Rust operational checking fo
 [dependencies]
 mxx-ir-core.workspace = true
 mxx-dsl.workspace = true
+libc.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
 rayon.workspace = true

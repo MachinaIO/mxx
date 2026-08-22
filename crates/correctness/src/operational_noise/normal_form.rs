@@ -3570,17 +3570,13 @@ impl<'a> Normalizer<'a> {
                 outputs.get(&(0, additive.id)).ok_or(NormalizeError::InvalidExactPlan {
                     reason: "missing scheduled additive output",
                 })?;
-            for (monomial, coefficient) in &normal_form.exact_terms {
-                merge_term(&mut terms, *monomial, coefficient * &weight);
-            }
+            merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight);
         }
         for (_, (normal_form, weight)) in flattened.leaves {
             if weight.is_zero() {
                 continue;
             }
-            for (monomial, coefficient) in &normal_form.exact_terms {
-                merge_term(&mut terms, *monomial, coefficient * &weight);
-            }
+            merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight);
         }
         for (_, (plan, weight, occurrences, standalone)) in flattened.products.into_iter().rev() {
             let mut executed = false;
@@ -3590,9 +3586,7 @@ impl<'a> Normalizer<'a> {
                         outputs.get(&(1, plan.id)).ok_or(NormalizeError::InvalidExactPlan {
                             reason: "missing scheduled product output",
                         })?;
-                    for (monomial, coefficient) in &normal_form.exact_terms {
-                        merge_term(&mut terms, *monomial, coefficient * &weight);
-                    }
+                    merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight);
                 } else {
                     let left = Self::exact_state_output(&plan.left, outputs)?;
                     let right = Self::exact_state_output(&plan.right, outputs)?;
@@ -11047,6 +11041,39 @@ fn merge_term(terms: &mut TermMap<BigInt>, monomial: MonomialId, coefficient: Bi
     }
 }
 
+/// Merge one already-canonical ordered term map with a common coefficient. Empty and disjoint
+/// destinations are the dominant exact-plan cases; cloning the B-tree shape and using
+/// `BTreeMap::append` avoids millions of independent logarithmic lookups while retaining the
+/// exact coefficient/cancellation semantics of [`merge_term`].
+fn merge_scaled_terms(terms: &mut TermMap<BigInt>, source: &TermMap<BigInt>, weight: &BigInt) {
+    if source.is_empty() || weight.is_zero() {
+        return;
+    }
+    let scaled = || {
+        let mut result = source.clone();
+        if weight != &BigInt::from(1_u8) {
+            for coefficient in result.values_mut() {
+                *coefficient *= weight;
+            }
+        }
+        result
+    };
+    if terms.is_empty() {
+        *terms = scaled();
+        return;
+    }
+    let disjoint = terms.last_key_value().unwrap().0 < source.first_key_value().unwrap().0 ||
+        source.last_key_value().unwrap().0 < terms.first_key_value().unwrap().0;
+    if disjoint {
+        let mut source = scaled();
+        terms.append(&mut source);
+        return;
+    }
+    for (monomial, coefficient) in source {
+        merge_term(terms, *monomial, coefficient * weight);
+    }
+}
+
 fn record_relation_outcome(
     diagnostic: Option<&mut RelationClosureDiagnostic>,
     monomial: MonomialId,
@@ -17594,6 +17621,39 @@ mod tests {
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
         let value = normalizer.normalize(root_semantic).unwrap();
         assert!(value.exact_nf.unwrap().is_zero());
+    }
+
+    #[test]
+    fn scaled_term_map_merge_preserves_disjoint_and_overlapping_semantics() {
+        let token = ArenaToken::fresh();
+        let ids = (0..5).map(|slot| MonomialId::new(token, slot)).collect::<Vec<_>>();
+        let mut actual =
+            BTreeMap::from([(ids[0], BigInt::from(2_u8)), (ids[1], BigInt::from(3_u8))]);
+        let disjoint =
+            BTreeMap::from([(ids[3], BigInt::from(5_u8)), (ids[4], BigInt::from(-7_i8))]);
+        merge_scaled_terms(&mut actual, &disjoint, &BigInt::from(-2_i8));
+        assert_eq!(
+            actual,
+            BTreeMap::from([
+                (ids[0], BigInt::from(2_u8)),
+                (ids[1], BigInt::from(3_u8)),
+                (ids[3], BigInt::from(-10_i8)),
+                (ids[4], BigInt::from(14_u8)),
+            ])
+        );
+
+        let overlapping =
+            BTreeMap::from([(ids[1], BigInt::from(-3_i8)), (ids[2], BigInt::from(11_u8))]);
+        merge_scaled_terms(&mut actual, &overlapping, &BigInt::from(1_u8));
+        assert_eq!(
+            actual,
+            BTreeMap::from([
+                (ids[0], BigInt::from(2_u8)),
+                (ids[2], BigInt::from(11_u8)),
+                (ids[3], BigInt::from(-10_i8)),
+                (ids[4], BigInt::from(14_u8)),
+            ])
+        );
     }
 
     #[test]

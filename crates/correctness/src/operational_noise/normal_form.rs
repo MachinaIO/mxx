@@ -11101,6 +11101,33 @@ fn merge_scaled_terms(
         *terms = scaled();
         return Ok(());
     }
+
+    let destination_first = *terms.first_key_value().expect("nonempty destination").0;
+    let destination_last = *terms.last_key_value().expect("nonempty destination").0;
+    let source_first = *source.first_key_value().expect("nonempty source").0;
+    let source_last = *source.last_key_value().expect("nonempty source").0;
+    if destination_last < source_first || source_last < destination_first {
+        let mut source = scaled();
+        terms.append(&mut source);
+        return Ok(());
+    }
+
+    // Scanning the complete destination is linear in its size. Once a destination is much larger
+    // than the next source (the dominant Tall additive-materialization shape), ordered insertion
+    // touches only the source terms and avoids cloning a temporary source B-tree. Iterating the
+    // canonical source order keeps coefficient and cancellation semantics deterministic.
+    if source.len().saturating_mul(8) <= terms.len() {
+        let unit_weight = weight == &BigInt::from(1_u8);
+        for (&monomial, coefficient) in source {
+            let mut coefficient = coefficient.clone();
+            if !unit_weight {
+                coefficient *= weight;
+            }
+            merge_term(terms, monomial, coefficient);
+        }
+        return Ok(());
+    }
+
     let mut source = scaled();
     let mut overlaps = Vec::new();
     let mut left = terms.keys().peekable();
@@ -17725,6 +17752,22 @@ mod tests {
                 (ids[4], BigInt::from(14_u8)),
             ])
         );
+
+        let many_ids = (0..18).map(|slot| MonomialId::new(token, 100 + slot)).collect::<Vec<_>>();
+        let mut large_destination = many_ids[..16]
+            .iter()
+            .copied()
+            .map(|monomial| (monomial, BigInt::from(1_u8)))
+            .collect::<BTreeMap<_, _>>();
+        let small_overlapping = BTreeMap::from([
+            (many_ids[7], BigInt::from(-1_i8)),
+            (many_ids[16], BigInt::from(3_u8)),
+        ]);
+        merge_scaled_terms(&mut large_destination, &small_overlapping, &BigInt::from(1_u8))
+            .unwrap();
+        assert!(!large_destination.contains_key(&many_ids[7]));
+        assert_eq!(large_destination.get(&many_ids[16]), Some(&BigInt::from(3_u8)));
+        assert_eq!(large_destination.len(), 16);
     }
 
     #[test]

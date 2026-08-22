@@ -62,6 +62,7 @@ const MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 const MONOMIAL_GC_ALLOCATION_THRESHOLD_ENV: &str = "MXX_OPERATIONAL_MONOMIAL_GC_THRESHOLD_BYTES";
 const MONOMIAL_GC_ALLOCATOR_TRIM_RECLAIMED_SLOTS: u64 = 1_000_000;
 const MONOMIAL_GC_ALLOCATOR_TRIM_RECLAIMED_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const LARGE_TERM_MERGE_ALLOCATOR_TRIM_INTERVAL: usize = 1_000_000;
 const MONOMIAL_GC_LOW_YIELD_BACKOFF_MIN_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 const MONOMIAL_GC_LOW_YIELD_BACKOFF_FACTOR: u64 = 4;
 const MONOMIAL_GC_LOW_YIELD_BACKOFF_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
@@ -90,9 +91,22 @@ fn trim_allocator_after_large_monomial_sweep(reclaimed_slots: u64, reclaimed_pay
     }
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_allocator_during_large_term_merge() {
+    // Large additive folds repeatedly allocate and then cancel B-tree nodes without reaching a
+    // monomial-GC safe point. Returning only completely free glibc pages is safe while the map is
+    // live and prevents a long merge from retaining all canceled-node pages as RSS.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn trim_allocator_after_large_monomial_sweep(_reclaimed_slots: u64, _reclaimed_payload_bytes: u64) {
 }
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_allocator_during_large_term_merge() {}
 
 fn next_product_gc_backoff_multiplier(
     base_threshold: u64,
@@ -11143,12 +11157,20 @@ fn merge_scaled_terms(
     // complete source tree and allocating an overlap vector. This bounds peak memory by the final
     // destination even when both maps contain tens of millions of interleaved keys.
     let unit_weight = weight == &BigInt::from(1_u8);
-    for (&monomial, coefficient) in source {
+    for (processed, (&monomial, coefficient)) in source.iter().enumerate() {
         let mut coefficient = coefficient.clone();
         if !unit_weight {
             coefficient *= weight;
         }
         merge_term(terms, monomial, coefficient);
+        if (processed + 1) % LARGE_TERM_MERGE_ALLOCATOR_TRIM_INTERVAL == 0 {
+            trim_allocator_during_large_term_merge();
+        }
+    }
+    if source.len() >= LARGE_TERM_MERGE_ALLOCATOR_TRIM_INTERVAL &&
+        source.len() % LARGE_TERM_MERGE_ALLOCATOR_TRIM_INTERVAL != 0
+    {
+        trim_allocator_during_large_term_merge();
     }
     Ok(())
 }

@@ -3570,13 +3570,13 @@ impl<'a> Normalizer<'a> {
                 outputs.get(&(0, additive.id)).ok_or(NormalizeError::InvalidExactPlan {
                     reason: "missing scheduled additive output",
                 })?;
-            merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight);
+            merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight)?;
         }
         for (_, (normal_form, weight)) in flattened.leaves {
             if weight.is_zero() {
                 continue;
             }
-            merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight);
+            merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight)?;
         }
         for (_, (plan, weight, occurrences, standalone)) in flattened.products.into_iter().rev() {
             let mut executed = false;
@@ -3586,7 +3586,7 @@ impl<'a> Normalizer<'a> {
                         outputs.get(&(1, plan.id)).ok_or(NormalizeError::InvalidExactPlan {
                             reason: "missing scheduled product output",
                         })?;
-                    merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight);
+                    merge_scaled_terms(&mut terms, &normal_form.exact_terms, &weight)?;
                 } else {
                     let left = Self::exact_state_output(&plan.left, outputs)?;
                     let right = Self::exact_state_output(&plan.right, outputs)?;
@@ -11045,9 +11045,13 @@ fn merge_term(terms: &mut TermMap<BigInt>, monomial: MonomialId, coefficient: Bi
 /// destinations are the dominant exact-plan cases; cloning the B-tree shape and using
 /// `BTreeMap::append` avoids millions of independent logarithmic lookups while retaining the
 /// exact coefficient/cancellation semantics of [`merge_term`].
-fn merge_scaled_terms(terms: &mut TermMap<BigInt>, source: &TermMap<BigInt>, weight: &BigInt) {
+fn merge_scaled_terms(
+    terms: &mut TermMap<BigInt>,
+    source: &TermMap<BigInt>,
+    weight: &BigInt,
+) -> Result<(), NormalizeError> {
     if source.is_empty() || weight.is_zero() {
-        return;
+        return Ok(());
     }
     let scaled = || {
         let mut result = source.clone();
@@ -11060,18 +11064,41 @@ fn merge_scaled_terms(terms: &mut TermMap<BigInt>, source: &TermMap<BigInt>, wei
     };
     if terms.is_empty() {
         *terms = scaled();
-        return;
+        return Ok(());
     }
-    let disjoint = terms.last_key_value().unwrap().0 < source.first_key_value().unwrap().0 ||
-        source.last_key_value().unwrap().0 < terms.first_key_value().unwrap().0;
-    if disjoint {
-        let mut source = scaled();
-        terms.append(&mut source);
-        return;
+    let mut source = scaled();
+    let mut overlaps = Vec::new();
+    let mut left = terms.keys().peekable();
+    let mut right = source.keys().peekable();
+    while let (Some(&left_key), Some(&right_key)) = (left.peek(), right.peek()) {
+        match left_key.cmp(right_key) {
+            std::cmp::Ordering::Less => {
+                left.next();
+            }
+            std::cmp::Ordering::Greater => {
+                right.next();
+            }
+            std::cmp::Ordering::Equal => {
+                overlaps.push(*left_key);
+                left.next();
+                right.next();
+            }
+        }
     }
-    for (monomial, coefficient) in source {
-        merge_term(terms, *monomial, coefficient * weight);
+    for monomial in overlaps {
+        let existing = terms.remove(&monomial).ok_or(NormalizeError::InvalidExactPlan {
+            reason: "missing destination overlap during bulk term merge",
+        })?;
+        let incoming = source.get_mut(&monomial).ok_or(NormalizeError::InvalidExactPlan {
+            reason: "missing source overlap during bulk term merge",
+        })?;
+        *incoming += existing;
+        if incoming.is_zero() {
+            source.remove(&monomial);
+        }
     }
+    terms.append(&mut source);
+    Ok(())
 }
 
 fn record_relation_outcome(
@@ -17631,7 +17658,7 @@ mod tests {
             BTreeMap::from([(ids[0], BigInt::from(2_u8)), (ids[1], BigInt::from(3_u8))]);
         let disjoint =
             BTreeMap::from([(ids[3], BigInt::from(5_u8)), (ids[4], BigInt::from(-7_i8))]);
-        merge_scaled_terms(&mut actual, &disjoint, &BigInt::from(-2_i8));
+        merge_scaled_terms(&mut actual, &disjoint, &BigInt::from(-2_i8)).unwrap();
         assert_eq!(
             actual,
             BTreeMap::from([
@@ -17644,7 +17671,7 @@ mod tests {
 
         let overlapping =
             BTreeMap::from([(ids[1], BigInt::from(-3_i8)), (ids[2], BigInt::from(11_u8))]);
-        merge_scaled_terms(&mut actual, &overlapping, &BigInt::from(1_u8));
+        merge_scaled_terms(&mut actual, &overlapping, &BigInt::from(1_u8)).unwrap();
         assert_eq!(
             actual,
             BTreeMap::from([

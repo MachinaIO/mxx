@@ -780,7 +780,12 @@ impl MonomialArena {
         let sparse = self.occupied_descriptor_slots.saturating_mul(2) < high_water as u64;
         let occupied_slots = if sparse {
             let collect_shard_slots = |shard: &HashMap<u64, MonomialBucket>| {
-                shard.values().flat_map(|bucket| bucket.slots().iter().copied()).collect::<Vec<_>>()
+                shard
+                    .iter()
+                    .flat_map(|(&hash, bucket)| {
+                        bucket.slots().iter().copied().map(move |slot| (hash, slot))
+                    })
+                    .collect::<Vec<_>>()
             };
             let mut slots = if rayon::current_num_threads() > 1 {
                 self.buckets
@@ -796,7 +801,7 @@ impl MonomialArena {
             // A hash collision bucket may mention the same slot as another synthetic/test bucket.
             // De-duplicate without sorting so the walk remains linear in indexed live entries.
             let mut indexed = vec![0_u64; high_water.div_ceil(64)];
-            slots.retain(|&slot| {
+            slots.retain(|&(_, slot)| {
                 let slot = slot as usize;
                 let Some(word) = indexed.get_mut(slot / 64) else { return true };
                 let mask = 1_u64 << (slot % 64);
@@ -810,7 +815,7 @@ impl MonomialArena {
                     indexed_slots: u64::try_from(slots.len()).unwrap_or(u64::MAX),
                 });
             }
-            for &slot in &slots {
+            for &(_, slot) in &slots {
                 let Some(entry) = self.descriptors.get(slot as usize) else {
                     return Err(MonomialError::InvalidSlot { slot });
                 };
@@ -828,7 +833,7 @@ impl MonomialArena {
             Some(slots) => Box::new(
                 slots
                     .iter()
-                    .map(|&slot| slot as usize)
+                    .map(|&(_, slot)| slot as usize)
                     .filter(move |&slot| slot < protected_prefix),
             ),
             None => Box::new(0..protected_prefix),
@@ -855,7 +860,7 @@ impl MonomialArena {
         let mut reclaimed_slots = 0_u64;
         let mut reclaimed_payload = 0_u64;
         let reclaim_slots: Box<dyn Iterator<Item = usize> + '_> = match &occupied_slots {
-            Some(slots) => Box::new(slots.iter().map(|&slot| slot as usize)),
+            Some(slots) => Box::new(slots.iter().map(|&(_, slot)| slot as usize)),
             None => Box::new(0..high_water),
         };
         for slot in reclaim_slots {
@@ -884,10 +889,10 @@ impl MonomialArena {
         }
         let prepared_buckets = match &occupied_slots {
             Some(slots) => {
-                let prepare = |&slot: &u32| {
-                    self.descriptors[slot as usize]
-                        .as_ref()
-                        .map(|descriptor| (structural_hash(descriptor), slot))
+                // Sparse traversal already came from the authoritative hash index. Preserve the
+                // existing hash instead of rescanning every surviving factor word.
+                let prepare = |&(hash, slot): &(u64, u32)| {
+                    self.descriptors[slot as usize].as_ref().map(|_| (hash, slot))
                 };
                 if self.occupied_descriptor_slots as usize >= PARALLEL_DESCRIPTOR_BATCH_MIN &&
                     rayon::current_num_threads() > 1

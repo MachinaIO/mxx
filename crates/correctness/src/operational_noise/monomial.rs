@@ -207,9 +207,14 @@ struct PreparedMonomialDescriptor {
     hash: u64,
 }
 
+enum PreparedOrExistingMonomial {
+    Existing(MonomialId),
+    Prepared(PreparedMonomialDescriptor),
+}
+
 struct PreparedWrappedDescriptor {
-    intermediate: Option<PreparedMonomialDescriptor>,
-    output: PreparedMonomialDescriptor,
+    intermediate: Option<PreparedOrExistingMonomial>,
+    output: PreparedOrExistingMonomial,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -512,9 +517,16 @@ impl MonomialArena {
             .into_iter()
             .map(|prepared| {
                 if let Some(intermediate) = prepared.intermediate {
-                    self.intern_prepared_descriptor(intermediate)?;
+                    if let PreparedOrExistingMonomial::Prepared(intermediate) = intermediate {
+                        self.intern_prepared_descriptor(intermediate)?;
+                    }
                 }
-                self.intern_prepared_descriptor(prepared.output)
+                match prepared.output {
+                    PreparedOrExistingMonomial::Existing(output) => Ok(output),
+                    PreparedOrExistingMonomial::Prepared(output) => {
+                        self.intern_prepared_descriptor(output)
+                    }
+                }
             })
             .collect()
     }
@@ -529,12 +541,72 @@ impl MonomialArena {
         let input = self.descriptor(input)?;
         let suffix = suffix.map(|id| self.descriptor(id)).transpose()?;
         let intermediate =
-            prefix.zip(suffix).map(|(prefix, _)| Self::prepare_descriptor([prefix, input]));
+            prefix.zip(suffix).map(|(prefix, _)| self.prepare_or_find_descriptor(&[prefix, input]));
         let intermediate = intermediate.transpose()?;
-        let output = Self::prepare_descriptor(
-            prefix.into_iter().chain(std::iter::once(input)).chain(suffix),
-        )?;
+        let descriptors =
+            prefix.into_iter().chain(std::iter::once(input)).chain(suffix).collect::<Vec<_>>();
+        let output = self.prepare_or_find_descriptor(&descriptors)?;
         Ok(PreparedWrappedDescriptor { intermediate, output })
+    }
+
+    fn prepare_or_find_descriptor(
+        &self,
+        descriptors: &[&MonomialDescriptor],
+    ) -> Result<PreparedOrExistingMonomial, MonomialError> {
+        let central_len = descriptors.iter().try_fold(0_usize, |len, descriptor| {
+            len.checked_add(descriptor.central_factors.len()).ok_or(MonomialError::ArenaExhausted)
+        })?;
+        let ordered_len = descriptors.iter().try_fold(0_usize, |len, descriptor| {
+            len.checked_add(descriptor.ordered_factors.len()).ok_or(MonomialError::ArenaExhausted)
+        })?;
+        let mut central = Vec::new();
+        central.try_reserve_exact(central_len).map_err(|_| MonomialError::ArenaExhausted)?;
+        for descriptor in descriptors {
+            central.extend_from_slice(&descriptor.central_factors);
+        }
+        central.sort_unstable();
+
+        let mut hasher = DefaultHasher::new();
+        central.as_slice().hash(&mut hasher);
+        // `Hash for [T]` writes its length prefix before the elements. The default prefix for
+        // `DefaultHasher` is the ordinary `usize` hash; spelling it directly keeps this code on
+        // stable Rust while matching `MonomialDescriptor`'s derived hash byte-for-byte.
+        ordered_len.hash(&mut hasher);
+        for factor in descriptors.iter().flat_map(|descriptor| &descriptor.ordered_factors) {
+            factor.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+        if let Some(slots) = bucket_slots(&self.buckets, hash) {
+            for &slot in slots.slots() {
+                let Some(existing) = self.descriptors.get(slot as usize).and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                if existing.central_factors.as_ref() == central.as_slice() &&
+                    existing.ordered_factors.len() == ordered_len &&
+                    existing.ordered_factors.iter().eq(descriptors
+                        .iter()
+                        .flat_map(|descriptor| &descriptor.ordered_factors))
+                {
+                    return Ok(PreparedOrExistingMonomial::Existing(MonomialId::new(
+                        self.token, slot,
+                    )));
+                }
+            }
+        }
+
+        let mut ordered = Vec::new();
+        ordered.try_reserve_exact(ordered_len).map_err(|_| MonomialError::ArenaExhausted)?;
+        for descriptor in descriptors {
+            ordered.extend_from_slice(&descriptor.ordered_factors);
+        }
+        Ok(PreparedOrExistingMonomial::Prepared(PreparedMonomialDescriptor {
+            descriptor: MonomialDescriptor {
+                central_factors: central.into_boxed_slice(),
+                ordered_factors: ordered.into_boxed_slice(),
+            },
+            hash,
+        }))
     }
 
     fn prepare_descriptor<'descriptor>(
@@ -1477,12 +1549,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(sequential.len(), parallel.len());
-        for (sequential_id, parallel_id) in sequential_outputs.into_iter().zip(parallel_outputs) {
+        for (sequential_id, parallel_id) in
+            sequential_outputs.iter().copied().zip(parallel_outputs.iter().copied())
+        {
             assert_eq!(sequential_id.slot, parallel_id.slot, "commit order must remain stable");
             let sequential_descriptor = sequential.descriptor(sequential_id).unwrap();
             let parallel_descriptor = parallel.descriptor(parallel_id).unwrap();
             assert_eq!(sequential_descriptor, parallel_descriptor);
         }
+
+        for &input in &parallel_inputs {
+            let prepared = parallel
+                .prepare_wrapped_descriptor(Some(parallel_prefix), input, Some(parallel_suffix))
+                .unwrap();
+            assert!(matches!(prepared.intermediate, Some(PreparedOrExistingMonomial::Existing(_))));
+            assert!(matches!(prepared.output, PreparedOrExistingMonomial::Existing(_)));
+        }
+        let before_existing_len = parallel.len();
+        let before_existing_payload = parallel.allocated_payload_since_sweep();
+        let existing_outputs = pool
+            .install(|| {
+                parallel.combine_interned_wrapped_batch(
+                    scope,
+                    Some(parallel_prefix),
+                    &parallel_inputs,
+                    Some(parallel_suffix),
+                )
+            })
+            .unwrap();
+        assert_eq!(existing_outputs, parallel_outputs);
+        assert_eq!(parallel.len(), before_existing_len);
+        assert_eq!(parallel.allocated_payload_since_sweep(), before_existing_payload);
 
         let before_invalid = parallel.len();
         let mut invalid_inputs = parallel_inputs;

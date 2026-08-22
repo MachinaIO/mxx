@@ -1990,6 +1990,29 @@ enum DerivedGadgetRewrite {
     Rewrite(Vec<(DerivedMonomialDescriptor, BigInt)>),
 }
 
+struct ProductGadgetSplice {
+    left: Option<MonomialId>,
+    suffix: Option<MonomialId>,
+    input_nf: Arc<PolynomialNF>,
+    next_after: Option<MonomialId>,
+    coefficient: BigInt,
+}
+
+enum ProductWorkItem {
+    Term(MonomialId, BigInt),
+    GadgetSplice(ProductGadgetSplice),
+}
+
+impl ProductWorkItem {
+    fn monomial_roots(&self) -> impl Iterator<Item = MonomialId> + '_ {
+        let roots = match self {
+            Self::Term(monomial, _) => [Some(*monomial), None],
+            Self::GadgetSplice(splice) => [splice.left, splice.suffix],
+        };
+        roots.into_iter().flatten()
+    }
+}
+
 #[derive(Default)]
 struct ParallelProductRewriteStats {
     processed: u64,
@@ -2360,6 +2383,7 @@ pub struct Normalizer<'a> {
     /// when no current normalization owner references them.
     protected_monomial_prefix: usize,
     monomial_gc_allocation_threshold_bytes: u64,
+    gadget_splice_batch_terms: usize,
     /// A product sweep pins lexical operands and destinations. The following node commit must run
     /// one cleanup sweep even when that product sweep reset the allocation counter to zero.
     in_product_sweep_since_node_commit: bool,
@@ -4733,6 +4757,35 @@ impl<'a> Normalizer<'a> {
         destination: &TermMap<BigInt>,
         scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
+        self.sweep_monomials_at_product_roots(left, right, destination, std::iter::empty(), scope)
+    }
+
+    fn sweep_monomials_during_product_worklist(
+        &mut self,
+        left: &PolynomialNF,
+        right: &PolynomialNF,
+        destination: &TermMap<BigInt>,
+        worklist: &VecDeque<ProductWorkItem>,
+        scope: ProductGcScope<'_>,
+    ) -> Result<(), NormalizeError> {
+        if self.normalization_depth != 1 ||
+            self.monomials.allocated_payload_since_sweep() <
+                self.monomial_gc_allocation_threshold_bytes
+        {
+            return Ok(());
+        }
+        let roots = worklist.iter().flat_map(ProductWorkItem::monomial_roots).collect::<Vec<_>>();
+        self.sweep_monomials_at_product_roots(left, right, destination, roots, scope)
+    }
+
+    fn sweep_monomials_at_product_roots(
+        &mut self,
+        left: &PolynomialNF,
+        right: &PolynomialNF,
+        destination: &TermMap<BigInt>,
+        active_worklist_roots: impl IntoIterator<Item = MonomialId>,
+        scope: ProductGcScope<'_>,
+    ) -> Result<(), NormalizeError> {
         if self.normalization_depth != 1 ||
             self.monomials.allocated_payload_since_sweep() <
                 self.monomial_gc_allocation_threshold_bytes
@@ -4743,6 +4796,7 @@ impl<'a> Normalizer<'a> {
         roots.extend(left.exact_terms.keys().copied());
         roots.extend(right.exact_terms.keys().copied());
         roots.extend(destination.keys().copied());
+        roots.extend(active_worklist_roots);
         if let ProductGcScope::Deferred { root, outputs } = scope {
             roots.extend(self.local_exact_state_leaf_roots(root)?);
             roots.extend(
@@ -5047,6 +5101,7 @@ impl<'a> Normalizer<'a> {
             fold_final_no_match: true,
             protected_monomial_prefix,
             monomial_gc_allocation_threshold_bytes: monomial_gc_allocation_threshold_bytes(),
+            gadget_splice_batch_terms: PARALLEL_GADGET_SPLICE_BATCH_TERMS,
             in_product_sweep_since_node_commit: false,
             gc_counters: DiagnosticGcCounters::default(),
             exact_plan_materializations: 0,
@@ -8842,7 +8897,7 @@ impl<'a> Normalizer<'a> {
         typed_product_plan: bool,
         gc_scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
-        let mut worklist = VecDeque::new();
+        let mut worklist = VecDeque::<ProductWorkItem>::new();
         let parallel_pairs = !direct_gadget_boundary &&
             self.gadget_input_nfs.is_empty() &&
             left.exact_terms.len().saturating_mul(right.exact_terms.len()) >=
@@ -8859,10 +8914,10 @@ impl<'a> Normalizer<'a> {
                             u64::try_from(worklist.len()).unwrap_or(u64::MAX),
                             left.exact_terms
                                 .keys()
-                                .chain(right.exact_terms.keys())
-                                .chain(worklist.iter().map(|(id, _)| id))
-                                .chain(terms.keys())
-                                .copied(),
+                                .copied()
+                                .chain(right.exact_terms.keys().copied())
+                                .chain(worklist.iter().flat_map(ProductWorkItem::monomial_roots))
+                                .chain(terms.keys().copied()),
                         );
                         continue;
                     }
@@ -8918,24 +8973,24 @@ impl<'a> Normalizer<'a> {
                         for (rewritten_monomial, rewritten_coefficient) in
                             rewritten.into_iter().rev()
                         {
-                            worklist.push_front((
+                            worklist.push_front(ProductWorkItem::Term(
                                 rewritten_monomial,
                                 coefficient.clone() * rewritten_coefficient,
                             ));
                         }
                     } else {
                         let product = self.product_monomials(*left_id, *right_id)?;
-                        worklist.push_back((product, coefficient));
+                        worklist.push_back(ProductWorkItem::Term(product, coefficient));
                     }
                     self.watchdog_record_product_generated(
                         true,
                         u64::try_from(worklist.len()).unwrap_or(u64::MAX),
                         left.exact_terms
                             .keys()
-                            .chain(right.exact_terms.keys())
-                            .chain(worklist.iter().map(|(id, _)| id))
-                            .chain(terms.keys())
-                            .copied(),
+                            .copied()
+                            .chain(right.exact_terms.keys().copied())
+                            .chain(worklist.iter().flat_map(ProductWorkItem::monomial_roots))
+                            .chain(terms.keys().copied()),
                     );
                     if self.trace.active {
                         self.trace.product_current_queue =
@@ -8949,7 +9004,7 @@ impl<'a> Normalizer<'a> {
                     // Drain each completed cartesian pair before generating the next one. The same
                     // rewrite queue remains authoritative, but its live size now follows one pair's
                     // recursive splice instead of the full product cardinality.
-                    self.drain_product_worklist(left, right, terms, &mut worklist)?;
+                    self.drain_product_worklist(left, right, terms, &mut worklist, gc_scope)?;
                     self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
                 }
             }
@@ -8980,14 +9035,14 @@ impl<'a> Normalizer<'a> {
                     OwnerCensusReason::LargeProductGenerationEnd,
                     left.exact_terms
                         .keys()
-                        .chain(right.exact_terms.keys())
-                        .chain(worklist.iter().map(|(id, _)| id))
-                        .chain(terms.keys())
-                        .copied(),
+                        .copied()
+                        .chain(right.exact_terms.keys().copied())
+                        .chain(worklist.iter().flat_map(ProductWorkItem::monomial_roots))
+                        .chain(terms.keys().copied()),
                 );
             }
         }
-        self.drain_product_worklist(left, right, terms, &mut worklist)?;
+        self.drain_product_worklist(left, right, terms, &mut worklist, gc_scope)?;
         if self.watchdog.is_some() {
             self.watchdog_product_queue_current = 0;
             self.watchdog_product_output_current = u64::try_from(terms.len()).unwrap_or(u64::MAX);
@@ -9110,9 +9165,69 @@ impl<'a> Normalizer<'a> {
         left: &PolynomialNF,
         right: &PolynomialNF,
         terms: &mut BTreeMap<MonomialId, BigInt>,
-        worklist: &mut VecDeque<(MonomialId, BigInt)>,
+        worklist: &mut VecDeque<ProductWorkItem>,
+        gc_scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
-        while let Some((monomial, coefficient)) = worklist.pop_front() {
+        while let Some(item) = worklist.pop_front() {
+            let ProductWorkItem::Term(monomial, coefficient) = item else {
+                let ProductWorkItem::GadgetSplice(mut splice) = item else { unreachable!() };
+                let lower = splice
+                    .next_after
+                    .map(std::ops::Bound::Excluded)
+                    .unwrap_or(std::ops::Bound::Unbounded);
+                let mut input_terms =
+                    splice.input_nf.exact_terms.range((lower, std::ops::Bound::Unbounded));
+                let batch = input_terms
+                    .by_ref()
+                    .take(self.gadget_splice_batch_terms.max(1))
+                    .map(|(&monomial, coefficient)| (monomial, coefficient.clone()))
+                    .collect::<Vec<_>>();
+                let has_more = input_terms.next().is_some();
+                if batch.is_empty() {
+                    continue;
+                }
+                let input_monomials =
+                    batch.iter().map(|(monomial, _)| *monomial).collect::<Vec<_>>();
+                let replacements = self.monomials.combine_interned_wrapped_batch(
+                    self.scope,
+                    splice.left,
+                    &input_monomials,
+                    splice.suffix,
+                )?;
+                if replacements.len() != batch.len() {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "streamed gadget splice batch length mismatch",
+                    });
+                }
+                let outer_coefficient = splice.coefficient.clone();
+                if has_more {
+                    splice.next_after = batch.last().map(|(monomial, _)| *monomial);
+                    worklist.push_front(ProductWorkItem::GadgetSplice(splice));
+                }
+                for ((_, input_coefficient), replacement) in
+                    batch.into_iter().zip(replacements).rev()
+                {
+                    worklist.push_front(ProductWorkItem::Term(
+                        replacement,
+                        outer_coefficient.clone() * input_coefficient,
+                    ));
+                }
+                if self.trace.active {
+                    let enqueued = u64::try_from(input_monomials.len()).unwrap_or(u64::MAX);
+                    self.trace.product_enqueued =
+                        self.trace.product_enqueued.saturating_add(enqueued);
+                    self.trace.product_peak_queue = self
+                        .trace
+                        .product_peak_queue
+                        .max(u64::try_from(worklist.len()).unwrap_or(u64::MAX));
+                    self.trace.product_current_queue =
+                        u64::try_from(worklist.len()).unwrap_or(u64::MAX);
+                }
+                self.sweep_monomials_during_product_worklist(
+                    left, right, terms, worklist, gc_scope,
+                )?;
+                continue;
+            };
             let queue_current = u64::try_from(worklist.len()).unwrap_or(u64::MAX);
             let output_current = u64::try_from(terms.len()).unwrap_or(u64::MAX);
             self.watchdog_record_product_processed(
@@ -9121,7 +9236,7 @@ impl<'a> Normalizer<'a> {
                 std::iter::once(monomial)
                     .chain(left.exact_terms.keys().copied())
                     .chain(right.exact_terms.keys().copied())
-                    .chain(worklist.iter().map(|(id, _)| *id))
+                    .chain(worklist.iter().flat_map(ProductWorkItem::monomial_roots))
                     .chain(terms.keys().copied()),
             );
             if self.trace.active {
@@ -9148,7 +9263,7 @@ impl<'a> Normalizer<'a> {
             if coefficient.is_zero() {
                 continue;
             }
-            let Some(rewritten) = self.rewrite_gadget_decomposition(monomial)? else {
+            let Some(splice) = self.product_gadget_splice(monomial, coefficient.clone())? else {
                 merge_term(terms, monomial, coefficient);
                 if self.trace.active {
                     self.trace.product_current_output =
@@ -9159,26 +9274,59 @@ impl<'a> Normalizer<'a> {
             if self.trace.active {
                 self.trace.product_rewrites = self.trace.product_rewrites.saturating_add(1);
             }
-            // Process every newly spliced NF term through the same deterministic queue. This
-            // closes multiple adjacent gadget/decomposition pairs without ever reifying `A` as
-            // an opaque raw expression factor.
-            for (rewritten_monomial, rewritten_coefficient) in
-                rewritten.exact_terms.into_iter().rev()
-            {
-                worklist
-                    .push_front((rewritten_monomial, coefficient.clone() * rewritten_coefficient));
-                if self.trace.active {
-                    self.trace.product_enqueued = self.trace.product_enqueued.saturating_add(1);
-                    self.trace.product_peak_queue = self
-                        .trace
-                        .product_peak_queue
-                        .max(u64::try_from(worklist.len()).unwrap_or(u64::MAX));
-                    self.trace.product_current_queue =
-                        u64::try_from(worklist.len()).unwrap_or(u64::MAX);
-                }
-            }
+            // A cursor exposes at most one bounded batch of `A` at a time. Every replacement
+            // still returns to this same deterministic closure worklist, while quiescent GC can
+            // run between batches instead of waiting for the complete input NF to be copied.
+            worklist.push_front(ProductWorkItem::GadgetSplice(splice));
         }
         Ok(())
+    }
+
+    fn product_gadget_splice(
+        &mut self,
+        monomial: MonomialId,
+        coefficient: BigInt,
+    ) -> Result<Option<ProductGadgetSplice>, NormalizeError> {
+        let (central_factors, ordered_factors) = {
+            let descriptor = self.monomials.descriptor(monomial)?;
+            (descriptor.central_factors.to_vec(), descriptor.ordered_factors.to_vec())
+        };
+        for index in 0..ordered_factors.len().saturating_sub(1) {
+            let Some(input) = self
+                .authorized_gadget_pair_input(ordered_factors[index], ordered_factors[index + 1])?
+            else {
+                continue;
+            };
+            let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
+            let left = if central_factors.is_empty() && index == 0 {
+                None
+            } else {
+                Some(self.monomials.intern(
+                    self.expressions,
+                    self.programs,
+                    &central_factors,
+                    &ordered_factors[..index],
+                )?)
+            };
+            let suffix = if index + 2 == ordered_factors.len() {
+                None
+            } else {
+                Some(self.monomials.intern(
+                    self.expressions,
+                    self.programs,
+                    &[],
+                    &ordered_factors[index + 2..],
+                )?)
+            };
+            return Ok(Some(ProductGadgetSplice {
+                left,
+                suffix,
+                input_nf,
+                next_after: None,
+                coefficient,
+            }));
+        }
+        Ok(None)
     }
 
     /// Apply the checked algebraic identity `G(base, small) * D(A) = A`. The relation is
@@ -9290,8 +9438,10 @@ impl<'a> Normalizer<'a> {
         let mut terms = BTreeMap::new();
         let mut input_terms = input_nf.exact_terms.iter();
         loop {
-            let batch =
-                input_terms.by_ref().take(PARALLEL_GADGET_SPLICE_BATCH_TERMS).collect::<Vec<_>>();
+            let batch = input_terms
+                .by_ref()
+                .take(self.gadget_splice_batch_terms.max(1))
+                .collect::<Vec<_>>();
             if batch.is_empty() {
                 break;
             }
@@ -16019,6 +16169,121 @@ mod tests {
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(factors, [first, second].into_iter().collect());
+    }
+
+    #[test]
+    fn product_gadget_splice_streams_batches_and_sweeps_with_live_worklist_roots() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 2, 1).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 6, 1).unwrap();
+        let gadget_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 2, 6).unwrap();
+        let sources = (0..5)
+            .map(|index| {
+                matrix_source(
+                    &mut expressions,
+                    &format!("streamed-splice-{index}"),
+                    input_type.clone(),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let input = sources[1..].iter().fold(sources[0], |left, &right| {
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap()
+        });
+        let gadget = matrix_source(
+            &mut expressions,
+            "streamed-splice-gadget",
+            gadget_type.clone(),
+            Some((2, false)),
+        );
+        let prefix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 2).unwrap();
+        let suffix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
+        let prefix = matrix_source(&mut expressions, "streamed-splice-prefix", prefix_type, None);
+        let suffix = matrix_source(&mut expressions, "streamed-splice-suffix", suffix_type, None);
+        let decomposition = expressions
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    output: decomposition_type.clone(),
+                    base: 2,
+                    small: false,
+                    digit_count: 3,
+                }),
+                Box::new([input]),
+            )
+            .unwrap();
+        let product = product(&mut expressions, &[prefix, gadget, decomposition, suffix]);
+        let registry =
+            recomposition_registry(gadget_type, decomposition_type, input_type, false, 3);
+        let (mut facts, mut monomials, _) = setup(&mut expressions, &mut programs, product);
+        for expression in [gadget, decomposition, input] {
+            insert_matrix_layout_fact(&expressions, &mut facts, expression, false);
+        }
+        let scope = monomials.scope();
+        let scoped = |expression| programs.scoped(&expressions, scope, expression).unwrap();
+        let gadget_id = monomials
+            .intern(&expressions, &programs, &[], &[scoped(prefix), scoped(gadget)])
+            .unwrap();
+        let decomposition_id = monomials
+            .intern(&expressions, &programs, &[], &[scoped(decomposition), scoped(suffix)])
+            .unwrap();
+        let input_terms = sources
+            .iter()
+            .enumerate()
+            .map(|(index, &source)| {
+                let monomial =
+                    monomials.intern(&expressions, &programs, &[], &[scoped(source)]).unwrap();
+                (monomial, BigInt::from(index + 1))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let input_nf = Arc::new(PolynomialNF {
+            exact_terms: input_terms,
+            bounded_summary: BoundedSummary::missing(),
+        });
+        let expected_sources = sources.iter().map(|&source| scoped(source)).collect::<Vec<_>>();
+        let expected_prefix = scoped(prefix);
+        let expected_suffix = scoped(suffix);
+        let left = PolynomialNF {
+            exact_terms: BTreeMap::from([(gadget_id, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::missing(),
+        };
+        let right = PolynomialNF {
+            exact_terms: BTreeMap::from([(decomposition_id, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::missing(),
+        };
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_gadget_recompositions(&registry);
+        normalizer.gadget_input_nfs.insert(input, input_nf);
+        normalizer.gadget_splice_batch_terms = 2;
+        normalizer.monomial_gc_allocation_threshold_bytes = 1;
+        normalizer.normalization_depth = 1;
+        let mut terms = BTreeMap::new();
+        normalizer
+            .execute_product_into(
+                &left,
+                &right,
+                &BigInt::from(1_u8),
+                &mut terms,
+                false,
+                false,
+                ProductGcScope::Eager,
+            )
+            .unwrap();
+        assert_eq!(terms.len(), sources.len());
+        assert!(normalizer.gc_counters.sweep_count >= 2);
+        for (index, source) in expected_sources.into_iter().enumerate() {
+            let coefficient = terms
+                .iter()
+                .find_map(|(monomial, coefficient)| {
+                    let descriptor = normalizer.monomials.descriptor(*monomial).unwrap();
+                    (descriptor.ordered_factors.as_ref() ==
+                        &[expected_prefix, source, expected_suffix])
+                        .then_some(coefficient)
+                })
+                .unwrap();
+            assert_eq!(coefficient, &BigInt::from(index + 1));
+        }
     }
 
     #[test]

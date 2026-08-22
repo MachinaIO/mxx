@@ -87,6 +87,10 @@ pub enum MonomialError {
     CollectedMonomialId {
         slot: u32,
     },
+    InconsistentIndex {
+        expected_occupied: u64,
+        indexed_slots: u64,
+    },
     NotMatrix {
         factor: ScopedExprId,
         actual: ResolvedValueType,
@@ -770,10 +774,55 @@ impl MonomialArena {
     ) -> Result<MonomialSweepReport, MonomialError> {
         let high_water = self.descriptors.len();
         let protected_prefix = protected_prefix.min(high_water);
+        // The hash index is the authoritative set of occupied slots. Enumerating it avoids an
+        // O(high-water) scan through stable tombstones after a large product has been collected.
+        // Slot identities remain monotonic and the descriptor directory remains untouched.
+        let collect_shard_slots = |shard: &HashMap<u64, MonomialBucket>| {
+            shard.values().flat_map(|bucket| bucket.slots().iter().copied()).collect::<Vec<_>>()
+        };
+        let mut occupied_slots = if rayon::current_num_threads() > 1 {
+            self.buckets
+                .par_iter()
+                .map(collect_shard_slots)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        } else {
+            self.buckets.iter().flat_map(|shard| collect_shard_slots(shard)).collect::<Vec<_>>()
+        };
+        // A hash collision bucket may mention the same slot as another synthetic/test bucket.
+        // De-duplicate without sorting so the walk remains linear in indexed live entries.
+        let mut indexed = vec![0_u64; high_water.div_ceil(64)];
+        occupied_slots.retain(|&slot| {
+            let slot = slot as usize;
+            let Some(word) = indexed.get_mut(slot / 64) else { return true };
+            let mask = 1_u64 << (slot % 64);
+            let first = *word & mask == 0;
+            *word |= mask;
+            first
+        });
+        if occupied_slots.len() != self.occupied_descriptor_slots as usize {
+            return Err(MonomialError::InconsistentIndex {
+                expected_occupied: self.occupied_descriptor_slots,
+                indexed_slots: u64::try_from(occupied_slots.len()).unwrap_or(u64::MAX),
+            });
+        }
+        for &slot in &occupied_slots {
+            let Some(entry) = self.descriptors.get(slot as usize) else {
+                return Err(MonomialError::InvalidSlot { slot });
+            };
+            if entry.is_none() {
+                return Err(MonomialError::CollectedMonomialId { slot });
+            }
+        }
         let mut marked = vec![0_u64; high_water.div_ceil(64)];
         let mut protected_report = MonomialSweepOwnerReport::default();
-        for slot in 0..protected_prefix {
-            let Some(descriptor) = self.descriptors[slot].as_ref() else { continue };
+        for &slot in occupied_slots.iter().filter(|&&slot| (slot as usize) < protected_prefix) {
+            let descriptor = self.descriptors[slot as usize]
+                .as_ref()
+                .ok_or(MonomialError::CollectedMonomialId { slot })?;
+            let slot = slot as usize;
             marked[slot / 64] |= 1_u64 << (slot % 64);
             protected_report.descriptor_slots = protected_report.descriptor_slots.saturating_add(1);
             protected_report.payload_lower_bound_bytes = protected_report
@@ -793,10 +842,12 @@ impl MonomialArena {
 
         let mut reclaimed_slots = 0_u64;
         let mut reclaimed_payload = 0_u64;
-        for (slot, entry) in self.descriptors.iter_mut().enumerate() {
+        for &slot in &occupied_slots {
+            let slot = slot as usize;
             if marked.get(slot / 64).is_some_and(|word| word & (1_u64 << (slot % 64)) != 0) {
                 continue;
             }
+            let entry = &mut self.descriptors[slot];
             let Some(descriptor) = entry.take() else { continue };
             let central = u64::try_from(descriptor.central_factors.len()).unwrap_or(u64::MAX);
             let ordered = u64::try_from(descriptor.ordered_factors.len()).unwrap_or(u64::MAX);
@@ -816,16 +867,18 @@ impl MonomialArena {
         {
             return Err(MonomialError::ArenaExhausted);
         }
-        let prepare_bucket = |(slot, descriptor): (usize, &Option<MonomialDescriptor>)| {
-            descriptor.as_ref().map(|descriptor| (structural_hash(descriptor), slot as u32))
+        let prepare_bucket = |&slot: &u32| {
+            self.descriptors[slot as usize]
+                .as_ref()
+                .map(|descriptor| (structural_hash(descriptor), slot))
         };
         let prepared_buckets = if self.occupied_descriptor_slots as usize >=
             PARALLEL_DESCRIPTOR_BATCH_MIN &&
             rayon::current_num_threads() > 1
         {
-            self.descriptors.par_iter().enumerate().filter_map(prepare_bucket).collect::<Vec<_>>()
+            occupied_slots.par_iter().filter_map(prepare_bucket).collect::<Vec<_>>()
         } else {
-            self.descriptors.iter().enumerate().filter_map(prepare_bucket).collect::<Vec<_>>()
+            occupied_slots.iter().filter_map(prepare_bucket).collect::<Vec<_>>()
         };
         let mut prepared_shards =
             (0..MONOMIAL_BUCKET_SHARDS).map(|_| Vec::new()).collect::<Vec<Vec<(u64, u32)>>>();
@@ -1373,7 +1426,6 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-
         let mut sequential = MonomialArena::new(&expressions, &programs, scope).unwrap();
         let sequential_prefix =
             sequential.intern(&expressions, &programs, &[one], &[root]).unwrap();

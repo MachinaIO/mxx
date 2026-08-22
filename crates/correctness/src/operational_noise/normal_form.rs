@@ -8844,7 +8844,7 @@ impl<'a> Normalizer<'a> {
     ) -> Result<(), NormalizeError> {
         let mut worklist = VecDeque::new();
         let parallel_pairs = !direct_gadget_boundary &&
-            !self.gadget_input_nfs.is_empty() &&
+            self.gadget_input_nfs.is_empty() &&
             left.exact_terms.len().saturating_mul(right.exact_terms.len()) >=
                 PARALLEL_PRODUCT_PAIR_BATCH;
         if parallel_pairs {
@@ -8908,30 +8908,6 @@ impl<'a> Normalizer<'a> {
                                 .trace
                                 .next_product_generated_heartbeat
                                 .saturating_add(self.trace.product_heartbeat_interval);
-                        }
-                    }
-                    if direct_rewrite.is_none() && !direct_gadget_boundary {
-                        if let Some(parallel) = self.parallel_rewrite_product_pair(
-                            *left_id,
-                            *right_id,
-                            coefficient.clone(),
-                        )? {
-                            self.watchdog_record_product_generated(
-                                true,
-                                0,
-                                left.exact_terms
-                                    .keys()
-                                    .chain(right.exact_terms.keys())
-                                    .chain(terms.keys())
-                                    .copied(),
-                            );
-                            if self.trace.active {
-                                self.trace.product_enqueued =
-                                    self.trace.product_enqueued.saturating_add(1);
-                            }
-                            self.commit_parallel_product_rewrite(parallel, terms)?;
-                            self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
-                            continue;
                         }
                     }
                     if let Some(rewritten) = direct_rewrite {
@@ -9042,9 +9018,10 @@ impl<'a> Normalizer<'a> {
         Ok(())
     }
 
-    /// Close independent cartesian pairs on Rayon workers without sharing mutable arena state.
-    /// Workers derive immutable descriptors from already-validated monomials; the caller commits
-    /// results in the original BTree iteration order, preserving deterministic IDs and merging.
+    /// Derive ordinary cartesian products on Rayon workers without sharing mutable arena state.
+    /// Gadget-bearing products retain the incremental authoritative rewrite worklist above: a
+    /// recursively expanded branch is intentionally never buffered as a raw parallel result.
+    /// Interning remains ordered and single-threaded, preserving deterministic IDs and merging.
     fn parallel_product_pairs_into(
         &mut self,
         left: &PolynomialNF,
@@ -9053,90 +9030,77 @@ impl<'a> Normalizer<'a> {
         terms: &mut BTreeMap<MonomialId, BigInt>,
         gc_scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
-        let mut product_factors = BTreeSet::new();
-        for &monomial in left.exact_terms.keys().chain(right.exact_terms.keys()) {
-            product_factors
-                .extend(self.monomials.descriptor(monomial)?.ordered_factors.iter().copied());
-        }
-        let Some(authorizations) =
-            self.parallel_gadget_authorizations_from_factors(product_factors)?
-        else {
-            return Err(NormalizeError::InvalidExactPlan {
-                reason: "parallel gadget input missing after authorization",
-            });
-        };
-        let mut pairs = left.exact_terms.iter().flat_map(|(&left_id, left_coefficient)| {
-            right.exact_terms.iter().map(move |(&right_id, right_coefficient)| {
-                (left_id, left_coefficient, right_id, right_coefficient)
-            })
-        });
-        loop {
-            let mut seeds = Vec::with_capacity(PARALLEL_PRODUCT_PAIR_BATCH);
-            while seeds.len() < PARALLEL_PRODUCT_PAIR_BATCH {
-                let Some((left_id, left_coefficient, right_id, right_coefficient)) = pairs.next()
-                else {
-                    break;
-                };
-                let coefficient = left_coefficient * right_coefficient * weight;
-                self.watchdog_record_product_generated(
-                    !coefficient.is_zero(),
-                    0,
-                    left.exact_terms
-                        .keys()
-                        .chain(right.exact_terms.keys())
-                        .chain(terms.keys())
-                        .copied(),
-                );
-                if self.trace.active {
-                    self.trace.product_generated = self.trace.product_generated.saturating_add(1);
+        for (&left_id, left_coefficient) in &left.exact_terms {
+            let mut right_terms = right.exact_terms.iter();
+            loop {
+                let mut right_ids = Vec::with_capacity(PARALLEL_PRODUCT_PAIR_BATCH);
+                let mut coefficients = Vec::with_capacity(PARALLEL_PRODUCT_PAIR_BATCH);
+                while right_ids.len() < PARALLEL_PRODUCT_PAIR_BATCH {
+                    let Some((&right_id, right_coefficient)) = right_terms.next() else {
+                        break;
+                    };
+                    let coefficient = left_coefficient * right_coefficient * weight;
+                    self.watchdog_record_product_generated(
+                        !coefficient.is_zero(),
+                        0,
+                        left.exact_terms
+                            .keys()
+                            .chain(right.exact_terms.keys())
+                            .chain(terms.keys())
+                            .copied(),
+                    );
+                    if self.trace.active {
+                        self.trace.product_generated =
+                            self.trace.product_generated.saturating_add(1);
+                    }
+                    if coefficient.is_zero() {
+                        continue;
+                    }
+                    right_ids.push(right_id);
+                    coefficients.push(coefficient);
                 }
-                if coefficient.is_zero() {
-                    continue;
-                }
-                seeds.push((
-                    self.monomials.derive_product(self.scope, left_id, right_id)?,
-                    coefficient,
-                ));
-            }
-            if seeds.is_empty() {
-                if pairs.next().is_none() {
+                if right_ids.is_empty() {
                     break;
                 }
-                return Err(NormalizeError::InvalidExactPlan {
-                    reason: "parallel product pair iterator drift",
-                });
-            }
-
-            let results = {
-                let context = ParallelGadgetRewriteContext {
-                    monomials: self.monomials,
-                    gadget_inputs: &self.gadget_input_nfs,
-                    authorizations: &authorizations,
-                };
-                seeds
-                    .into_par_iter()
-                    .map(|seed| context.close_branch(seed))
-                    .collect::<Result<Vec<_>, NormalizeError>>()?
-            };
-            if self.trace.active {
-                self.trace.product_enqueued = self
-                    .trace
-                    .product_enqueued
-                    .saturating_add(u64::try_from(results.len()).unwrap_or(u64::MAX));
-                self.trace.product_peak_queue = self
-                    .trace
-                    .product_peak_queue
-                    .max(u64::try_from(results.len()).unwrap_or(u64::MAX));
-            }
-            for result in results {
-                let Some(result) = result else {
+                let products = self.monomials.combine_interned_wrapped_batch(
+                    self.scope,
+                    Some(left_id),
+                    &right_ids,
+                    None,
+                )?;
+                if products.len() != coefficients.len() {
                     return Err(NormalizeError::InvalidExactPlan {
-                        reason: "parallel gadget input disappeared",
+                        reason: "parallel ordinary product batch length mismatch",
                     });
-                };
-                self.commit_parallel_product_rewrite(result, terms)?;
+                }
+                if self.trace.active {
+                    self.trace.product_enqueued = self
+                        .trace
+                        .product_enqueued
+                        .saturating_add(u64::try_from(products.len()).unwrap_or(u64::MAX));
+                    self.trace.product_peak_queue = self
+                        .trace
+                        .product_peak_queue
+                        .max(u64::try_from(products.len()).unwrap_or(u64::MAX));
+                }
+                for (product, coefficient) in products.into_iter().zip(coefficients) {
+                    let output_current = u64::try_from(terms.len()).unwrap_or(u64::MAX);
+                    self.watchdog_record_product_processed(
+                        0,
+                        output_current,
+                        std::iter::once(product)
+                            .chain(left.exact_terms.keys().copied())
+                            .chain(right.exact_terms.keys().copied())
+                            .chain(terms.keys().copied()),
+                    );
+                    if self.trace.active {
+                        self.trace.product_processed =
+                            self.trace.product_processed.saturating_add(1);
+                    }
+                    merge_term(terms, product, coefficient);
+                }
+                self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
             }
-            self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
         }
         Ok(())
     }

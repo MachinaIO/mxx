@@ -808,26 +808,48 @@ impl MonomialArena {
         let closed = self.mark_sweep_owner(&mut marked, closed_roots.into_iter())?;
         let suspended = self.mark_sweep_owner(&mut marked, suspended_roots.into_iter())?;
 
-        let mut reclaimed_slots = 0_u64;
-        let mut reclaimed_payload = 0_u64;
         // Descriptor slots are monotonic and therefore naturally ordered. Even with many
         // tombstones, this contiguous scan is substantially faster than following the hash
-        // index's random slot order and needs no proportional temporary slot vector.
-        for slot in 0..high_water {
+        // index's random slot order and needs no proportional temporary slot vector. Reclaiming
+        // independent slots is parallel: large factor boxes are dropped by workers, then only
+        // aggregate counters are updated at the arena mutation boundary.
+        let reclaim_slot = |(slot, entry): (usize, &mut Option<MonomialDescriptor>)| {
             if marked.get(slot / 64).is_some_and(|word| word & (1_u64 << (slot % 64)) != 0) {
-                continue;
+                return (0_u64, 0_u64, 0_u64, 0_u64);
             }
-            let entry = &mut self.descriptors[slot];
-            let Some(descriptor) = entry.take() else { continue };
+            let Some(descriptor) = entry.take() else {
+                return (0_u64, 0_u64, 0_u64, 0_u64);
+            };
             let central = u64::try_from(descriptor.central_factors.len()).unwrap_or(u64::MAX);
             let ordered = u64::try_from(descriptor.ordered_factors.len()).unwrap_or(u64::MAX);
-            self.central_factor_entries = self.central_factor_entries.saturating_sub(central);
-            self.ordered_factor_entries = self.ordered_factor_entries.saturating_sub(ordered);
-            self.occupied_descriptor_slots = self.occupied_descriptor_slots.saturating_sub(1);
-            reclaimed_slots = reclaimed_slots.saturating_add(1);
-            reclaimed_payload = reclaimed_payload
-                .saturating_add(descriptor_payload_lower_bound_bytes(central, ordered));
-        }
+            (1, central, ordered, descriptor_payload_lower_bound_bytes(central, ordered))
+        };
+        let combine = |left: (u64, u64, u64, u64), right: (u64, u64, u64, u64)| {
+            (
+                left.0.saturating_add(right.0),
+                left.1.saturating_add(right.1),
+                left.2.saturating_add(right.2),
+                left.3.saturating_add(right.3),
+            )
+        };
+        let (reclaimed_slots, reclaimed_central, reclaimed_ordered, reclaimed_payload) = if self
+            .occupied_descriptor_slots
+            as usize >=
+            PARALLEL_DESCRIPTOR_BATCH_MIN &&
+            rayon::current_num_threads() > 1
+        {
+            self.descriptors
+                .par_iter_mut()
+                .enumerate()
+                .map(reclaim_slot)
+                .reduce(|| (0, 0, 0, 0), combine)
+        } else {
+            self.descriptors.iter_mut().enumerate().map(reclaim_slot).fold((0, 0, 0, 0), combine)
+        };
+        self.central_factor_entries = self.central_factor_entries.saturating_sub(reclaimed_central);
+        self.ordered_factor_entries = self.ordered_factor_entries.saturating_sub(reclaimed_ordered);
+        self.occupied_descriptor_slots =
+            self.occupied_descriptor_slots.saturating_sub(reclaimed_slots);
 
         if self
             .descriptors

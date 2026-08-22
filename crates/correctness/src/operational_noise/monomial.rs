@@ -843,12 +843,19 @@ impl MonomialArena {
         // descriptor walk's cache locality while eliminating the dominant high-live-set cost.
         // Collision buckets collapse back to their compact representation at one live slot.
         let descriptors = &self.descriptors;
-        for shard in &mut self.buckets {
+        let prune_shard = |shard: &mut HashMap<u64, MonomialBucket>| {
             shard.retain(|_, bucket| {
                 bucket.retain_slots(|slot| {
                     descriptors.get(slot as usize).is_some_and(Option::is_some)
                 })
             });
+        };
+        if self.occupied_descriptor_slots as usize >= PARALLEL_DESCRIPTOR_BATCH_MIN &&
+            rayon::current_num_threads() > 1
+        {
+            self.buckets.par_iter_mut().for_each(prune_shard);
+        } else {
+            self.buckets.iter_mut().for_each(prune_shard);
         }
         self.allocated_payload_since_sweep = 0;
         Ok(MonomialSweepReport {

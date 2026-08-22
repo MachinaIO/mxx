@@ -61,6 +61,7 @@ const LARGE_PRODUCT_PLANNED_PAIRS: u64 = 100_000;
 const MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 const MONOMIAL_GC_ALLOCATION_THRESHOLD_ENV: &str = "MXX_OPERATIONAL_MONOMIAL_GC_THRESHOLD_BYTES";
 const MONOMIAL_GC_ALLOCATOR_TRIM_RECLAIMED_SLOTS: u64 = 1_000_000;
+const MONOMIAL_GC_ALLOCATOR_TRIM_RECLAIMED_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const MONOMIAL_GC_LOW_YIELD_BACKOFF_MIN_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 const MONOMIAL_GC_LOW_YIELD_BACKOFF_FACTOR: u64 = 4;
 const MONOMIAL_GC_LOW_YIELD_BACKOFF_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
@@ -74,8 +75,10 @@ fn monomial_gc_allocation_threshold_bytes() -> u64 {
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn trim_allocator_after_large_monomial_sweep(reclaimed_slots: u64) {
-    if reclaimed_slots < MONOMIAL_GC_ALLOCATOR_TRIM_RECLAIMED_SLOTS {
+fn trim_allocator_after_large_monomial_sweep(reclaimed_slots: u64, reclaimed_payload_bytes: u64) {
+    if reclaimed_slots < MONOMIAL_GC_ALLOCATOR_TRIM_RECLAIMED_SLOTS &&
+        reclaimed_payload_bytes < MONOMIAL_GC_ALLOCATOR_TRIM_RECLAIMED_PAYLOAD_BYTES
+    {
         return;
     }
     // The arena keeps stable tombstone slots, but factor buffers and bucket nodes dropped by a
@@ -88,7 +91,8 @@ fn trim_allocator_after_large_monomial_sweep(reclaimed_slots: u64) {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn trim_allocator_after_large_monomial_sweep(_reclaimed_slots: u64) {}
+fn trim_allocator_after_large_monomial_sweep(_reclaimed_slots: u64, _reclaimed_payload_bytes: u64) {
+}
 
 fn next_product_gc_backoff_multiplier(
     base_threshold: u64,
@@ -4998,7 +5002,10 @@ impl<'a> Normalizer<'a> {
             self.gc_counters.sweep_total_ns.saturating_add(elapsed_ns);
         self.gc_counters.sweep_max_ns = self.gc_counters.sweep_max_ns.max(elapsed_ns);
         self.gc_counters.sweep_last_ns = elapsed_ns;
-        trim_allocator_after_large_monomial_sweep(report.reclaimed_slots);
+        trim_allocator_after_large_monomial_sweep(
+            report.reclaimed_slots,
+            report.reclaimed_payload_lower_bound_bytes,
+        );
         let gc = self.gc_counters;
         // `watchdog_update` exits before locking when diagnostics are disabled.
         self.watchdog_update(|progress| progress.gc = gc);

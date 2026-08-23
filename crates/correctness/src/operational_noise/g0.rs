@@ -220,6 +220,7 @@ struct InvocationFrame {
     root: super::arena::ScopedExprId,
     range: EventRange,
     results: BTreeMap<ExprId, EventIndex>,
+    pending_bounds: Vec<super::arena::ScopedExprId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1367,6 +1368,7 @@ impl FeasibilitySink for FeasibilityTrace {
             root,
             range: EventRange::checked(start, start)?,
             results: BTreeMap::new(),
+            pending_bounds: Vec::new(),
         });
         Ok(())
     }
@@ -1401,6 +1403,9 @@ impl FeasibilitySink for FeasibilityTrace {
         if frame.results.contains_key(&result.expression()) {
             return Err(G0Error::MissingNormalizationResult);
         }
+        if let Some(index) = frame.pending_bounds.iter().position(|owner| *owner == result) {
+            frame.pending_bounds.remove(index);
+        }
         let index =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
         self.events.push(NormalizerEvent::Result {
@@ -1425,6 +1430,9 @@ impl FeasibilitySink for FeasibilityTrace {
             result.semantic != root ||
             !frame.results.contains_key(&root.expression())
         {
+            return Err(G0Error::MissingNormalizationResult);
+        }
+        if !frame.pending_bounds.is_empty() {
             return Err(G0Error::MissingNormalizationResult);
         }
         let root_index = frame.results[&root.expression()];
@@ -1554,6 +1562,11 @@ impl FeasibilitySink for FeasibilityTrace {
         owner: super::arena::ScopedExprId,
         rule: BoundRule,
     ) -> Result<(), G0Error> {
+        let frame = self.frames.last_mut().ok_or(G0Error::UnsupportedBoundTransfer)?;
+        if frame.root.program() != owner.program() {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        }
+        frame.pending_bounds.push(owner);
         self.events.push(NormalizerEvent::BoundTransfer { owner, rule });
         Ok(())
     }
@@ -1562,16 +1575,20 @@ impl FeasibilitySink for FeasibilityTrace {
         if !self.frames.is_empty() {
             return Err(G0Error::MissingNormalizationResult);
         }
-        let mut stack =
-            Vec::<(super::arena::ScopedExprId, EventIndex, BTreeMap<ExprId, EventIndex>)>::new();
+        let mut stack = Vec::<(
+            super::arena::ScopedExprId,
+            EventIndex,
+            BTreeMap<ExprId, EventIndex>,
+            Vec<super::arena::ScopedExprId>,
+        )>::new();
         for (position, event) in self.events.iter().enumerate() {
             let current = EventIndex(u64::try_from(position).map_err(|_| G0Error::TraceOverflow)?);
             match event {
                 NormalizerEvent::InvocationStart { root } => {
-                    stack.push((*root, current, BTreeMap::new()));
+                    stack.push((*root, current, BTreeMap::new(), Vec::new()));
                 }
                 NormalizerEvent::Result { owner, .. } => {
-                    let Some((root, _, results)) = stack.last_mut() else {
+                    let Some((root, _, results, pending_bounds)) = stack.last_mut() else {
                         return Err(G0Error::MissingNormalizationResult);
                     };
                     if owner.program() != root.program() ||
@@ -1579,9 +1596,14 @@ impl FeasibilitySink for FeasibilityTrace {
                     {
                         return Err(G0Error::MissingNormalizationResult);
                     }
+                    if let Some(index) =
+                        pending_bounds.iter().position(|pending| *pending == *owner)
+                    {
+                        pending_bounds.remove(index);
+                    }
                 }
                 NormalizerEvent::Predecessor { predecessor, source_result, .. } => {
-                    let Some((_, start, results)) = stack.last() else {
+                    let Some((_, start, results, _)) = stack.last() else {
                         return Err(G0Error::MissingNormalizationResult);
                     };
                     if source_result.0 < start.0 ||
@@ -1593,7 +1615,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                 }
                 NormalizerEvent::InvocationEnd { root, result: _, .. } => {
-                    let Some((active_root, _, results)) = stack.pop() else {
+                    let Some((active_root, _, results, pending_bounds)) = stack.pop() else {
                         return Err(G0Error::MissingNormalizationResult);
                     };
                     let Some(result_index) = results.get(&root.expression()).copied() else {
@@ -1603,7 +1625,7 @@ impl FeasibilitySink for FeasibilityTrace {
                         self.events.get(result_index.0 as usize),
                         Some(NormalizerEvent::Result { owner, .. }) if *owner == *root
                     );
-                    if active_root != *root || !result_owner_matches {
+                    if active_root != *root || !result_owner_matches || !pending_bounds.is_empty() {
                         return Err(G0Error::MissingNormalizationResult);
                     }
                 }
@@ -1627,7 +1649,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                 }
                 NormalizerEvent::AppliedRelation(observation) => {
-                    let Some((root, _, _)) = stack.last() else {
+                    let Some((root, _, _, _)) = stack.last() else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
                     if root.program() != observation.owner.program() ||
@@ -1642,7 +1664,7 @@ impl FeasibilitySink for FeasibilityTrace {
                             if observation.owner != *decomposition {
                                 return Err(G0Error::RelationTraceInvariant);
                             }
-                            stack.last().is_some_and(|(_, start, results)| {
+                            stack.last().is_some_and(|(_, start, results, _)| {
                                 input_result.0 >= start.0 && input_result.0 < current.0 &&
                                     results.get(input).copied() == Some(*input_result) &&
                                     matches!(self.events.get(input_result.0 as usize), Some(NormalizerEvent::Result { owner, .. }) if owner.expression() == *input)
@@ -1658,16 +1680,13 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                 }
                 NormalizerEvent::BoundTransfer { owner, .. } => {
-                    let Some((root, _, _)) = stack.last() else {
+                    let Some((root, _, _, pending_bounds)) = stack.last_mut() else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
-                    if root.program() != owner.program() ||
-                        !self.events[position + 1..].iter().any(|event| {
-                            matches!(event, NormalizerEvent::Result { owner: result_owner, .. } if result_owner == owner)
-                        })
-                    {
+                    if root.program() != owner.program() {
                         return Err(G0Error::RelationTraceInvariant);
                     }
+                    pending_bounds.push(*owner);
                 }
             }
         }

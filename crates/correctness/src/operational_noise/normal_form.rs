@@ -10336,6 +10336,8 @@ mod tests {
             )
             .unwrap();
         let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let first_owner = programs.scoped(&expressions, semantic.program(), first).unwrap();
+        let later_owner = programs.scoped(&expressions, semantic.program(), later).unwrap();
         for expression in [first_left, first_right, later_left, later_right] {
             insert_matrix_bound(&mut facts, &expressions, expression, 2);
         }
@@ -10383,27 +10385,36 @@ mod tests {
                     owner,
                     rule:
                         BoundRule::Scale {
-                            value: BoundValueRef::Result { projection, .. },
+                            value: BoundValueRef::Result { event, projection },
                             scale: BoundScale::Magnitude(magnitude),
                         },
                 } if *owner == semantic && *projection == BoundProjection::Summary => {
-                    Some((index, magnitude.clone()))
+                    Some((index, *event, magnitude.clone()))
                 }
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            scales.iter().map(|(_, magnitude)| magnitude).collect::<Vec<_>>(),
+            scales.iter().map(|(_, _, magnitude)| magnitude).collect::<Vec<_>>(),
             [&BigUint::from(2_u8), &BigUint::from(3_u8)]
         );
-        for (scale_index, _) in scales {
+        assert_eq!(scales.len(), 2);
+        for ((scale_index, result_event, _), expected_owner) in
+            scales.iter().zip([first_owner, later_owner])
+        {
+            assert!(matches!(
+                trace.normalization_events().get(result_event.0 as usize),
+                Some(NormalizerEvent::Result { owner, value })
+                    if *owner == expected_owner &&
+                        value.exact_nf.as_ref().is_some_and(|nf| !nf.bounded_summary.is_zero())
+            ));
             assert!(trace.normalization_events()[scale_index + 1..].iter().any(|event| {
                 matches!(
                     event,
                     NormalizerEvent::BoundTransfer {
                         rule: BoundRule::Sum { inputs }, ..
                     } if inputs.iter().any(|input| {
-                        matches!(input, BoundValueRef::Transfer(index) if index.0 == scale_index as u64)
+                        matches!(input, BoundValueRef::Transfer(index) if index.0 == *scale_index as u64)
                     })
                 )
             }));
@@ -10413,6 +10424,30 @@ mod tests {
 
     #[test]
     fn traced_crt_zero_pre_summarized_lane_is_not_referenced() {
+        fn contains_result_ref(rule: &BoundRule, event: EventIndex) -> bool {
+            fn value_ref_contains(value: &BoundValueRef, event: EventIndex) -> bool {
+                matches!(value, BoundValueRef::Result { event: actual, .. } if *actual == event)
+            }
+            match rule {
+                BoundRule::Authority(_) => false,
+                BoundRule::Identity { input } => value_ref_contains(input, event),
+                BoundRule::Sum { inputs } |
+                BoundRule::Maximum { inputs } |
+                BoundRule::WeightedSum { inputs } => {
+                    inputs.iter().any(|input| value_ref_contains(input, event))
+                }
+                BoundRule::Scale { value, scale } => {
+                    value_ref_contains(value, event) ||
+                        matches!(scale, BoundScale::Value(input) if value_ref_contains(input, event))
+                }
+                BoundRule::MonomialProduct { factors, .. } => {
+                    factors.iter().any(|factor| value_ref_contains(&factor.bound, event))
+                }
+                BoundRule::Product { left, right, .. } | BoundRule::Tensor { left, right, .. } => {
+                    value_ref_contains(left, event) || value_ref_contains(right, event)
+                }
+            }
+        }
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let matrix = matrix_type();
@@ -10437,6 +10472,7 @@ mod tests {
             )
             .unwrap();
         let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let zero_owner = programs.scoped(&expressions, semantic.program(), zero_lane).unwrap();
         for expression in [zero_left, zero_right, later_left, later_right] {
             insert_matrix_bound(&mut facts, &expressions, expression, 2);
         }
@@ -10476,6 +10512,27 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(root_scales, [&BigUint::from(3_u8)]);
+        let zero_result = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::Result { owner, value }
+                    if *owner == zero_owner &&
+                        value
+                            .exact_nf
+                            .as_ref()
+                            .is_some_and(|nf| !nf.bounded_summary.is_zero()) =>
+                {
+                    Some(EventIndex(index as u64))
+                }
+                _ => None,
+            })
+            .expect("zero lane result");
+        assert!(!trace.normalization_events().iter().any(|event| {
+            matches!(event, NormalizerEvent::BoundTransfer { rule, .. }
+                if contains_result_ref(rule, zero_result))
+        }));
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
     }
 

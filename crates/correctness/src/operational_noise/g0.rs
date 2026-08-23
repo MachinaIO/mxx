@@ -1531,8 +1531,20 @@ impl FeasibilitySink for FeasibilityTrace {
     }
 
     fn record_applied_relation(&mut self, observation: AppliedRelation) -> Result<(), G0Error> {
-        if self.frames.is_empty() || observation.ordered_start > observation.ordered_end_exclusive {
+        let frame = self.frames.last().ok_or(G0Error::RelationTraceInvariant)?;
+        if frame.root.program() != observation.owner.program() ||
+            observation.ordered_start >= observation.ordered_end_exclusive
+        {
             return Err(G0Error::RelationTraceInvariant);
+        }
+        if let AppliedRelationRule::Gadget { decomposition, input_result, .. } = &observation.rule {
+            if observation.owner != *decomposition ||
+                input_result.0 < frame.range.start.0 ||
+                input_result.0 >=
+                    u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?
+            {
+                return Err(G0Error::RelationTraceInvariant);
+            }
         }
         self.events.push(NormalizerEvent::AppliedRelation(observation));
         Ok(())
@@ -1615,8 +1627,21 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                 }
                 NormalizerEvent::AppliedRelation(observation) => {
+                    let Some((root, _, _)) = stack.last() else {
+                        return Err(G0Error::RelationTraceInvariant);
+                    };
+                    if root.program() != observation.owner.program() ||
+                        observation.ordered_start >= observation.ordered_end_exclusive
+                    {
+                        return Err(G0Error::RelationTraceInvariant);
+                    }
                     let input_valid = match &observation.rule {
-                        AppliedRelationRule::Gadget { input, input_result, .. } => {
+                        AppliedRelationRule::Gadget {
+                            decomposition, input, input_result, ..
+                        } => {
+                            if observation.owner != *decomposition {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
                             stack.last().is_some_and(|(_, start, results)| {
                                 input_result.0 >= start.0 && input_result.0 < current.0 &&
                                     results.get(input).copied() == Some(*input_result) &&
@@ -3377,6 +3402,70 @@ mod tests {
         assert!(evidence.index_uses.is_empty());
         assert!(evidence.slice_groups.is_empty());
         assert_eq!(evidence.l_rows, BigUint::zero());
+    }
+
+    #[test]
+    fn applied_relation_allows_post_closure_result_and_rejects_empty_range() {
+        use crate::operational_noise::{
+            arena::{ArenaToken, ExprArena},
+            monomial::MonomialId,
+            program::{FamilyDomain, ProgramArena},
+        };
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let body = expressions.intern_argument(0, ResolvedValueType::Int).expect("argument");
+        let family = programs
+            .generated_family_from_body(
+                &mut expressions,
+                FamilyDomain::new(0, 1).expect("domain"),
+                body,
+            )
+            .expect("family");
+        let owner = programs.scoped(&expressions, family.program(), body).expect("owner");
+        let pre = crate::operational_noise::normal_form::AnalyzedValue {
+            semantic: owner,
+            exact_nf: None,
+            coefficient_bound: crate::operational_noise::facts::NumericContract::Missing,
+        };
+        let post = crate::operational_noise::normal_form::AnalyzedValue {
+            semantic: owner,
+            exact_nf: None,
+            coefficient_bound: crate::operational_noise::facts::NumericContract::Known(
+                crate::operational_noise::facts::CoefficientBound::ExactZero,
+            ),
+        };
+        let mut trace = FeasibilityTrace::default();
+        trace.record_invocation_start(owner).expect("start");
+        trace.record_normalization_result(owner, &pre).expect("pre result");
+        trace
+            .record_applied_relation(AppliedRelation {
+                owner,
+                source_monomial: MonomialId::new(ArenaToken(0), 0),
+                outer_coefficient: 1.into(),
+                ordered_start: 0,
+                ordered_end_exclusive: 1,
+                rule: AppliedRelationRule::Gadget {
+                    gadget: owner,
+                    decomposition: owner,
+                    input: owner.expression(),
+                    input_result: EventIndex(1),
+                },
+            })
+            .expect("relation");
+        trace.record_invocation_end(owner, &post, &Default::default()).expect("post end");
+        trace.validate_normalization_observations().expect("balanced trace");
+        let mut malformed = trace.clone();
+        if let Some(NormalizerEvent::AppliedRelation(observation)) = malformed
+            .events
+            .iter_mut()
+            .find(|event| matches!(event, NormalizerEvent::AppliedRelation(_)))
+        {
+            observation.ordered_end_exclusive = observation.ordered_start;
+        }
+        assert_eq!(
+            malformed.validate_normalization_observations(),
+            Err(G0Error::RelationTraceInvariant)
+        );
     }
 
     #[test]

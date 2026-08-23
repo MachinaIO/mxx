@@ -10,6 +10,7 @@ use super::{
         ValueOperator,
     },
     error::{OperationalSimulationError, TargetError},
+    g0::FeasibilityTrace,
     lower::{ProductionAdapter, ProductionRoot},
     program::{FamilyValueId, ValueProgramId},
     protocol::ProtocolPlan,
@@ -147,6 +148,7 @@ pub(crate) struct OperationalCertificateRun {
     pub job: super::job::CheckerJob,
     pub projection: OperationalCertificateProjection,
     pub accepted_report: super::report::OperationalReport,
+    pub trace: FeasibilityTrace,
 }
 
 /// The typed dependency inventory rooted at one residual production root.
@@ -359,12 +361,14 @@ pub(crate) fn prepare_operational_certificate(
         .collect::<BTreeMap<_, _>>();
     let plan = ProtocolPlan::build(protocol, &request.target_id)
         .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?;
-    let (job, roots) = ProductionAdapter::new(protocol, &plan, parameters)
-        .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?
-        .lower()
-        .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?;
+    let (job, roots, mut trace) =
+        ProductionAdapter::new_with_feasibility(protocol, &plan, parameters)
+            .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?
+            .lower_with_feasibility()
+            .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?;
     let residual = project_residual_root(&job, &roots.residual, &target)?;
     let closure = collect_residual_closure(&job, &residual)?;
+    trace.retain_residual(&closure);
     let projection = OperationalCertificateProjection {
         target_id,
         plaintext_modulus: plaintext_modulus.clone(),
@@ -419,7 +423,7 @@ pub(crate) fn prepare_operational_certificate(
     if !accepted_report.accepted {
         return Err(CertificateProjectionError::Rejected { target_id: request.target_id.clone() });
     }
-    Ok(OperationalCertificateRun { job, projection, accepted_report })
+    Ok(OperationalCertificateRun { job, projection, accepted_report, trace })
 }
 
 /// Prepare the typed, non-emitting base summary used by the later G0 feasibility evidence stage.
@@ -1610,6 +1614,7 @@ mod tests {
         let run = prepare_operational_certificate(&protocol, &request)
             .expect("valid threshold certificate run");
         assert!(run.accepted_report.accepted);
+        assert!(run.trace.lowering_complete > 0);
         assert_eq!(run.accepted_report.target_id, request.target_id);
         assert_eq!(run.accepted_report.ciphertext_modulus, 256_u16.into());
         assert!(matches!(

@@ -523,80 +523,6 @@ struct G0LutDocument<'a> {
     slice_groups: &'a [SliceLutEvidence],
 }
 
-#[derive(Default)]
-struct CanonicalPlanRefs {
-    expressions: BTreeMap<ExprId, u64>,
-    families: BTreeMap<super::program::FamilyValueId, u64>,
-}
-
-impl CanonicalPlanRefs {
-    fn from_plans(plans: &[&IndexUsePlan]) -> Self {
-        let mut expressions = BTreeSet::new();
-        let mut families = BTreeSet::new();
-        for plan in plans {
-            expressions.insert(plan.index);
-            expressions.extend(plan.frontier.iter().map(|axis| axis.argument));
-            expressions.extend(
-                plan.slice_group
-                    .iter()
-                    .flat_map(|group| group.members.iter().map(|member| member.expression)),
-            );
-            if let Some(expression) = plan.result {
-                expressions.insert(expression);
-            }
-            if let Some(expression) = plan.consumed {
-                expressions.insert(expression);
-            }
-            if let Some(family) = plan.result_family {
-                families.insert(family);
-            }
-            if let Some(family) = plan.consumed_family {
-                families.insert(family);
-            }
-        }
-        Self {
-            expressions: expressions
-                .into_iter()
-                .enumerate()
-                .map(|(row, expression)| (expression, row as u64))
-                .collect(),
-            families: families
-                .into_iter()
-                .enumerate()
-                .map(|(row, family)| (family, row as u64))
-                .collect(),
-        }
-    }
-
-    fn expression(&self, expression: ExprId) -> StablePlanRef {
-        StablePlanRef::Expression { row: self.expressions[&expression] }
-    }
-
-    fn family(&self, family: super::program::FamilyValueId) -> StablePlanRef {
-        StablePlanRef::Family { row: self.families[&family] }
-    }
-
-    fn optional_expression(&self, expression: Option<ExprId>) -> Option<StablePlanRef> {
-        expression.map(|expression| self.expression(expression))
-    }
-
-    fn optional_family(
-        &self,
-        family: Option<super::program::FamilyValueId>,
-    ) -> Option<StablePlanRef> {
-        family.map(|family| self.family(family))
-    }
-
-    fn axis(&self, axis: &IndexFrontierAxis) -> StableFrontierAxis {
-        StableFrontierAxis {
-            owner: stable_observed_occurrence(&axis.owner),
-            argument: self.expression(axis.argument),
-            argument_position: axis.argument_position,
-            domain: (axis.domain.minimum, axis.domain.maximum_exclusive),
-        }
-    }
-}
-
 impl G0LutEvidence {
     pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, G0Error> {
         serde_json::to_vec(&G0LutDocument {
@@ -615,14 +541,77 @@ impl G0LutEvidence {
     }
 }
 
+fn validate_residual_plan(
+    plan: &IndexUsePlan,
+    closure: &CertificateClosure,
+    refs: &CanonicalResidualRefs,
+) -> Result<(), G0Error> {
+    refs.expression(plan.index)?;
+    if !closure.expressions.contains(&plan.index) {
+        return Err(G0Error::CanonicalMissingDependency);
+    }
+    for expression in plan
+        .result
+        .into_iter()
+        .chain(plan.consumed)
+        .chain(plan.frontier.iter().map(|axis| axis.argument))
+    {
+        if !closure.expressions.contains(&expression) {
+            return Err(G0Error::CanonicalMissingDependency);
+        }
+        refs.expression(expression)?;
+    }
+    for family in plan.result_family.into_iter().chain(plan.consumed_family) {
+        if !closure.families.contains(&family) {
+            return Err(G0Error::CanonicalMissingDependency);
+        }
+        refs.family(family)?;
+    }
+    if let Some(group) = &plan.slice_group {
+        for member in &group.members {
+            if !closure.expressions.contains(&member.expression) {
+                return Err(G0Error::CanonicalMissingDependency);
+            }
+            refs.expression(member.expression)?;
+        }
+    }
+    Ok(())
+}
+
+/// Derive opt-in LUT evidence from the residual certificate closure.  All job-local handles are
+/// consumed during construction and replaced by canonical residual row references.
+pub(crate) fn derive_lut_evidence(
+    job: &CheckerJob,
+    closure: &CertificateClosure,
+    trace: &FeasibilityTrace,
+) -> Result<G0LutEvidence, G0Error> {
+    let mut residual = trace.clone();
+    residual.retain_residual(closure);
+    let plans = residual.index_use_plans().collect::<Vec<_>>();
+    let refs = canonical_residual_refs(job, closure, &residual)?;
+    for plan in &plans {
+        validate_residual_plan(plan, closure, &refs)?;
+    }
+    enumerate_lut_evidence_with_refs(job.expressions(), plans, &refs)
+}
+
 /// Enumerate ordinary plans and synchronized slice groups into one deterministic G0 payload.
 /// Group members are consumed as one shared frontier table and never appear in `indexUses`.
+#[cfg(test)]
 pub(crate) fn enumerate_lut_evidence<'a>(
     arena: &ExprArena,
     plans: impl IntoIterator<Item = &'a IndexUsePlan>,
 ) -> Result<G0LutEvidence, G0Error> {
     let plans = plans.into_iter().collect::<Vec<_>>();
-    let refs = CanonicalPlanRefs::from_plans(&plans);
+    let refs = CanonicalResidualRefs::from_plan_handles(&plans)?;
+    enumerate_lut_evidence_with_refs(arena, plans, &refs)
+}
+
+fn enumerate_lut_evidence_with_refs<'a>(
+    arena: &ExprArena,
+    plans: Vec<&'a IndexUsePlan>,
+    refs: &CanonicalResidualRefs,
+) -> Result<G0LutEvidence, G0Error> {
     let mut ordinary = Vec::new();
     let mut groups = BTreeMap::<SliceGroupId, Vec<&IndexUsePlan>>::new();
     for plan in plans {
@@ -656,7 +645,7 @@ fn enumerate_slice_group(
     arena: &ExprArena,
     id: SliceGroupId,
     plans: &[&IndexUsePlan],
-    refs: &CanonicalPlanRefs,
+    refs: &CanonicalResidualRefs,
 ) -> Result<SliceLutEvidence, G0Error> {
     if plans.len() != 4 {
         return Err(G0Error::InvalidSliceGroup);
@@ -755,23 +744,21 @@ fn enumerate_slice_group(
     let members = group
         .members
         .iter()
-        .map(|member| StableSliceMember {
-            role: member.role,
-            expression: refs.expression(member.expression),
-            range: (member.range.minimum, member.range.maximum_exclusive),
+        .map(|member| {
+            Ok(StableSliceMember {
+                role: member.role,
+                expression: refs.stable_expression(member.expression)?,
+                range: (member.range.minimum, member.range.maximum_exclusive),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, G0Error>>()?;
     Ok(SliceLutEvidence {
         id: id.0.to_string(),
         owner: stable_observed_wire(&first.owner),
-        result: refs
-            .optional_expression(first.result)
-            .or_else(|| refs.optional_family(first.result_family)),
-        consumed: refs
-            .optional_expression(first.consumed)
-            .or_else(|| refs.optional_family(first.consumed_family)),
+        result: refs.optional_plan_ref(first.result, first.result_family)?,
+        consumed: refs.optional_plan_ref(first.consumed, first.consumed_family)?,
         output_type: stable_value_type(&first.output_type),
-        frontier: group.frontier.iter().map(|axis| refs.axis(axis)).collect(),
+        frontier: group.frontier.iter().map(|axis| refs.axis(axis)).collect::<Result<_, _>>()?,
         row_span: group.row_span,
         column_span: group.column_span,
         members,
@@ -783,12 +770,13 @@ fn enumerate_slice_group(
 /// Enumerate validated, residual-filtered ordinary index plans into deterministic LUT evidence.
 /// Plans carrying synchronized slice groups are skipped until their dedicated grouped
 /// enumerator is introduced in a later stage.
+#[cfg(test)]
 pub(crate) fn enumerate_index_lut_evidence<'a>(
     arena: &ExprArena,
     plans: impl IntoIterator<Item = &'a IndexUsePlan>,
 ) -> Result<IndexLutEvidenceSet, G0Error> {
     let plans = plans.into_iter().collect::<Vec<_>>();
-    let refs = CanonicalPlanRefs::from_plans(&plans);
+    let refs = CanonicalResidualRefs::from_plan_handles(&plans)?;
     let mut index_uses = Vec::new();
     for plan in plans {
         plan.validate()?;
@@ -803,7 +791,7 @@ pub(crate) fn enumerate_index_lut_evidence<'a>(
 fn enumerate_index_use(
     arena: &ExprArena,
     plan: &IndexUsePlan,
-    refs: &CanonicalPlanRefs,
+    refs: &CanonicalResidualRefs,
 ) -> Result<IndexLutEvidence, G0Error> {
     let output_range = plan.output_range.ok_or(G0Error::MissingIndexOutputRange)?;
     let product = frontier_product(&plan.frontier)?;
@@ -823,17 +811,13 @@ fn enumerate_index_use(
     })?;
     Ok(IndexLutEvidence {
         owner: stable_observed_wire(&plan.owner),
-        result: refs
-            .optional_expression(plan.result)
-            .or_else(|| refs.optional_family(plan.result_family)),
-        consumed: refs
-            .optional_expression(plan.consumed)
-            .or_else(|| refs.optional_family(plan.consumed_family)),
+        result: refs.optional_plan_ref(plan.result, plan.result_family)?,
+        consumed: refs.optional_plan_ref(plan.consumed, plan.consumed_family)?,
         kind: plan.kind,
-        index: refs.expression(plan.index),
+        index: refs.stable_expression(plan.index)?,
         output_range: plan.output_range.map(|range| (range.minimum, range.maximum_exclusive)),
         output_type: stable_value_type(&plan.output_type),
-        frontier: plan.frontier.iter().map(|axis| refs.axis(axis)).collect(),
+        frontier: plan.frontier.iter().map(|axis| refs.axis(axis)).collect::<Result<_, _>>()?,
         frontier_product: product.to_string(),
         rows,
     })
@@ -1553,6 +1537,42 @@ pub(crate) struct CanonicalResidualRefs {
 }
 
 impl CanonicalResidualRefs {
+    #[cfg(test)]
+    fn from_plan_handles(plans: &[&IndexUsePlan]) -> Result<Self, G0Error> {
+        let mut expressions = BTreeSet::new();
+        let mut programs = BTreeSet::new();
+        for plan in plans {
+            expressions.insert(plan.index);
+            expressions.extend(plan.frontier.iter().map(|axis| axis.argument));
+            expressions.extend(
+                plan.slice_group
+                    .iter()
+                    .flat_map(|group| group.members.iter().map(|member| member.expression)),
+            );
+            if let Some(expression) = plan.result {
+                expressions.insert(expression);
+            }
+            if let Some(expression) = plan.consumed {
+                expressions.insert(expression);
+            }
+            if let Some(family) = plan.result_family {
+                programs.insert(family.program());
+            }
+            if let Some(family) = plan.consumed_family {
+                programs.insert(family.program());
+            }
+        }
+        let mut handles = BTreeMap::new();
+        for (row, expression) in expressions.into_iter().enumerate() {
+            handles.insert(CanonicalHandle::Expression(expression), row as u64);
+        }
+        let offset = handles.len() as u64;
+        for (row, program) in programs.into_iter().enumerate() {
+            handles.insert(CanonicalHandle::Program(program), offset + row as u64);
+        }
+        Ok(Self { rows: Vec::new(), handles })
+    }
+
     pub(crate) fn expression(&self, expression: ExprId) -> Result<u64, G0Error> {
         self.handles
             .get(&CanonicalHandle::Expression(expression))
@@ -1565,6 +1585,43 @@ impl CanonicalResidualRefs {
             .get(&CanonicalHandle::Program(program))
             .copied()
             .ok_or(G0Error::CanonicalMissingDependency)
+    }
+
+    pub(crate) fn family(&self, family: super::program::FamilyValueId) -> Result<u64, G0Error> {
+        self.program(family.program())
+    }
+
+    fn stable_expression(&self, expression: ExprId) -> Result<StablePlanRef, G0Error> {
+        Ok(StablePlanRef::Expression { row: self.expression(expression)? })
+    }
+
+    fn stable_family(
+        &self,
+        family: super::program::FamilyValueId,
+    ) -> Result<StablePlanRef, G0Error> {
+        Ok(StablePlanRef::Family { row: self.family(family)? })
+    }
+
+    fn axis(&self, axis: &IndexFrontierAxis) -> Result<StableFrontierAxis, G0Error> {
+        Ok(StableFrontierAxis {
+            owner: stable_observed_occurrence(&axis.owner),
+            argument: self.stable_expression(axis.argument)?,
+            argument_position: axis.argument_position,
+            domain: (axis.domain.minimum, axis.domain.maximum_exclusive),
+        })
+    }
+
+    fn optional_plan_ref(
+        &self,
+        expression: Option<ExprId>,
+        family: Option<super::program::FamilyValueId>,
+    ) -> Result<Option<StablePlanRef>, G0Error> {
+        match (expression, family) {
+            (Some(expression), None) => self.stable_expression(expression).map(Some),
+            (None, Some(family)) => self.stable_family(family).map(Some),
+            (None, None) => Ok(None),
+            (Some(_), Some(_)) => Err(G0Error::CanonicalMissingDependency),
+        }
     }
 
     pub(crate) fn rows(&self) -> &[CanonicalResidualRow] {
@@ -2497,6 +2554,11 @@ mod tests {
         assert_eq!(refs.rows().len(), 1);
         assert_eq!(refs.rows()[0].kind, "expression");
         assert!(serde_json::to_vec(refs.rows()).is_ok());
+        let evidence = derive_lut_evidence(&job, &closure, &FeasibilityTrace::default())
+            .expect("empty residual LUT evidence");
+        assert!(evidence.index_uses.is_empty());
+        assert!(evidence.slice_groups.is_empty());
+        assert_eq!(evidence.l_rows, BigUint::zero());
     }
 
     #[test]

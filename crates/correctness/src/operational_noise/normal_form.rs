@@ -12367,6 +12367,218 @@ mod tests {
     }
 
     #[test]
+    fn specialization_cache_replays_generated_summary_chain_without_cross_frame_refs() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let domain = super::super::arena::FamilyDomain::new(0, 1).unwrap();
+        let range = TrustedIndexRange::new(0, 1).unwrap();
+        let index = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+
+        let preimage_source = preimage_factor(&mut expressions, matrix.clone(), 99_901, 3);
+        let preimage = programs
+            .opaque_generated_family_from_body(&mut expressions, domain, preimage_source)
+            .unwrap();
+        let preimage_call =
+            programs.call_family_in_range(&mut expressions, preimage, index, range).unwrap();
+
+        let public_source = source_with(&mut expressions, matrix.clone(), 99_902);
+        let mut producer_facts = FactStore::new(&expressions);
+        let mut public_source_facts = MatrixFacts::new(
+            matrix.clone(),
+            MatrixMetadata::new(MatrixLayout::row_major(matrix.rows, matrix.columns)),
+        );
+        public_source_facts.coefficient_bound = NumericContract::Known(CoefficientBound::Large);
+        producer_facts
+            .insert(&expressions, public_source, ValueFacts::Matrix(public_source_facts))
+            .unwrap();
+        let public = programs
+            .explicit_family(
+                &mut expressions,
+                &producer_facts,
+                domain,
+                vec![public_source].into_boxed_slice(),
+            )
+            .unwrap();
+
+        let target_large = source_with(&mut expressions, matrix.clone(), 99_903);
+        let target_gaussian = gaussian_factor(&mut expressions, matrix.clone(), 99_904, 3);
+        let target_body = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[target_large, target_gaussian])
+            .unwrap();
+        let target =
+            programs.generated_family_from_body(&mut expressions, domain, target_body).unwrap();
+
+        let trapdoor_body = expressions
+            .intern(
+                ValueOperator::Trapdoor(super::super::arena::TrapdoorOperation::Generate {
+                    descriptor: "cache-replay-trapdoor".to_owned(),
+                    parameters: Box::new([]),
+                    paired_public_event: SampleEventId(99_905),
+                    paired_public_output_role: "value".to_owned(),
+                }),
+                Box::new([]),
+            )
+            .unwrap();
+        let trapdoor =
+            programs.generated_family_from_body(&mut expressions, domain, trapdoor_body).unwrap();
+        let dispatch = UniversalDispatchKey {
+            preimage_family: preimage,
+            preimage_source: SamplerSourceContract { expression: preimage_source },
+            matrix_type: matrix.clone(),
+            trapdoor_source: TrapdoorSourceContract {
+                expression: source_with(&mut expressions, matrix.clone(), 99_906),
+            },
+        };
+        let registration = UniversalRelationRegistration {
+            dispatch: dispatch.clone(),
+            lhs: StaticLhsKey {
+                domain,
+                public_plan: public.program(),
+                preimage_plan: preimage.program(),
+                trapdoor_plan: trapdoor.program(),
+                public_pairing: public.program(),
+                layout: None,
+                factor_order: FactorOrderContract::ordered_public_preimage(),
+                validation: RelationValidationAuthority {
+                    source: dispatch.preimage_source.clone(),
+                    trapdoor_source: dispatch.trapdoor_source.clone(),
+                    matrix_type: matrix.clone(),
+                    public_type: ResolvedValueType::Matrix(matrix.clone()),
+                    preimage_type: ResolvedValueType::Matrix(matrix.clone()),
+                    target_type: ResolvedValueType::Matrix(matrix.clone()),
+                    trapdoor_type: ResolvedValueType::Trapdoor,
+                    layout: None,
+                    factor_order: FactorOrderContract::ordered_public_preimage(),
+                    domain,
+                    index_range: range,
+                    gadget: None,
+                    decomposition: None,
+                },
+            },
+            target_plan: target.program(),
+        };
+        let mut relations = RelationRegistry::new();
+        relations.register_universal(registration).unwrap();
+        relations.freeze();
+
+        // The producer facts are intentionally not passed to `setup` or the normalizer.  The
+        // public explicit family remains the sole authority for its closed family call, while
+        // this preimage-only root exercises specialization without applying the full LHS.
+        let (facts, mut monomials, semantic) =
+            setup(&mut expressions, &mut programs, preimage_call);
+        let mut cache = NormalizationCache::new();
+        let mut trace = FeasibilityTrace::default();
+        let mut normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .with_relations(&relations, &mut cache);
+
+        let first = normalizer.normalize(semantic).unwrap();
+        let first_counters = normalizer.counters();
+        let first_runtime_entries =
+            normalizer.normalization.as_deref().unwrap().runtime_entry_count();
+        let first_rhs_entries = normalizer.normalization.as_deref().unwrap().canonical_rhs_count();
+        let first_events = normalizer.sink.as_deref().unwrap().normalization_events().to_vec();
+        let second = normalizer.normalize(semantic).unwrap();
+        let second_counters = normalizer.counters();
+        let second_runtime_entries =
+            normalizer.normalization.as_deref().unwrap().runtime_entry_count();
+        let second_rhs_entries = normalizer.normalization.as_deref().unwrap().canonical_rhs_count();
+        let all_events = normalizer.sink.as_deref().unwrap().normalization_events().to_vec();
+        drop(normalizer);
+
+        assert_eq!(first.semantic, second.semantic);
+        assert_eq!(first.exact_nf, second.exact_nf);
+        assert_eq!(first.coefficient_bound, second.coefficient_bound);
+        assert_eq!(first_counters, second_counters);
+        assert_eq!(first_runtime_entries, second_runtime_entries);
+        assert_eq!(first_rhs_entries, second_rhs_entries);
+        let computed = first_events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                NormalizerEvent::SpecializationComputed { owner, key, replay } => {
+                    Some((index, *owner, key.clone(), *replay))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(computed.len(), 1);
+        let hits = all_events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                NormalizerEvent::SpecializationCacheHit { owner, key, source } => {
+                    Some((index, *owner, key.clone(), *source))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            all_events
+                .iter()
+                .filter(|event| matches!(event, NormalizerEvent::SpecializationComputed { .. }))
+                .count(),
+            1
+        );
+        let (computed_index, computed_owner, computed_key, computed_range) = computed[0].clone();
+        let (hit_index, hit_owner, hit_key, hit_range) = hits[0].clone();
+        assert!(hit_index > computed_index);
+        assert_eq!(computed_owner, hit_owner);
+        assert_eq!(computed_key, hit_key);
+        assert_eq!(computed_range, hit_range);
+        assert!(computed_range.end.0 < hit_index as u64);
+
+        let target_results = all_events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                NormalizerEvent::Result { owner, value }
+                    if computed_range.start.0 <= index as u64 &&
+                        (index as u64) < computed_range.end.0 &&
+                        owner.expression() == target_body &&
+                        !value
+                            .exact_nf
+                            .as_deref()
+                            .is_none_or(|nf| nf.bounded_summary.is_zero()) =>
+                {
+                    Some((index, *owner))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(target_results.len(), 1);
+        let (target_result_index, target_owner) = target_results[0];
+        let target_monomial = all_events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::MonomialProduct { .. },
+                } if computed_range.start.0 <= index as u64 &&
+                    (index as u64) < computed_range.end.0 &&
+                    *owner == target_owner =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(target_monomial.iter().any(|index| *index < target_result_index));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+    }
+
+    #[test]
     fn matrix_product_bound_trace_preserves_no_feasibility_result_and_rule() {
         assert_bound_trace_matches_no_feasibility(false);
     }

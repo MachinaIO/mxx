@@ -4669,8 +4669,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             ValueOperator::ExtractCoefficient { .. } => {
                 bounds.first().cloned().unwrap_or(NumericContract::Missing)
             }
-            ValueOperator::Sampler { operation, .. } => sampler_bound(operation),
-            ValueOperator::DeterministicHash(_) => NumericContract::Known(CoefficientBound::Large),
             ValueOperator::Source(_) | ValueOperator::Sample { .. } => NumericContract::Missing,
             ValueOperator::Argument { .. } => NumericContract::Missing,
             ValueOperator::ProgramCall { .. } => NumericContract::Missing,
@@ -4684,9 +4682,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 ValueOperator::Constant(constant)
                     if matches!(&constant.value, super::arena::ConstantValue::Int(_)) =>
                 {
-                    BoundRule::Authority(BoundAuthority::Operator)
-                }
-                ValueOperator::Sampler { .. } | ValueOperator::DeterministicHash(_) => {
                     BoundRule::Authority(BoundAuthority::Operator)
                 }
                 ValueOperator::Scalar(ScalarOperation::Add | ScalarOperation::Subtract) => {

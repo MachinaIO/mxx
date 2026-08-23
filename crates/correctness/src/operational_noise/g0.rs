@@ -7,7 +7,7 @@ use super::{
     arena::{
         ArtifactIdentity, ConstantValue, DeterministicHashDefinition, DeterministicHashDescriptor,
         HashVariant, MatrixConstantKind, MatrixLayout, MatrixOperation, ResolvedMatrixType,
-        ResolvedValueType, SampleDescriptor, SamplerOperation, ScalarOperation,
+        ResolvedValueType, SampleDescriptor, SampleEventId, SamplerOperation, ScalarOperation,
         SemanticFamilySourceIdentity, SemanticSourceIdentity, TrapdoorOperation, TypedConstant,
         ValueOperator, ValueTransformOperation,
     },
@@ -28,6 +28,8 @@ pub(crate) trait FeasibilitySink: Default {
     fn record_lowering_complete(&mut self) -> Result<(), G0Error>;
 
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error>;
+
+    fn record_event(&mut self, observation: EventObservation) -> Result<(), G0Error>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -65,6 +67,20 @@ pub(crate) enum InputSourceIdentity {
     Family(SemanticFamilySourceIdentity),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum EventKind {
+    Sample { descriptor: SampleDescriptor },
+    Sampler { operation: SamplerOperation },
+    Trapdoor { operation: TrapdoorOperation },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct EventObservation {
+    pub event: SampleEventId,
+    pub owner: PlannedWire,
+    pub kind: EventKind,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NoFeasibility;
 
@@ -78,12 +94,17 @@ impl FeasibilitySink for NoFeasibility {
     fn record_source(&mut self, _handle: SourceHandle, _class: SourceClass) -> Result<(), G0Error> {
         Ok(())
     }
+
+    fn record_event(&mut self, _observation: EventObservation) -> Result<(), G0Error> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FeasibilityTrace {
     pub lowering_complete: u64,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
+    pub event_observations: BTreeMap<SampleEventId, EventObservation>,
 }
 
 impl From<NoFeasibility> for FeasibilityTrace {
@@ -111,6 +132,17 @@ impl FeasibilitySink for FeasibilityTrace {
             }
         }
     }
+
+    fn record_event(&mut self, observation: EventObservation) -> Result<(), G0Error> {
+        match self.event_observations.get(&observation.event) {
+            Some(existing) if existing != &observation => Err(G0Error::ConflictingEventObservation),
+            Some(_) => Ok(()),
+            None => {
+                self.event_observations.insert(observation.event, observation);
+                Ok(())
+            }
+        }
+    }
 }
 
 impl FeasibilityTrace {
@@ -120,10 +152,15 @@ impl FeasibilityTrace {
             SourceHandle::Expression(expression) => closure.expressions.contains(expression),
             SourceHandle::Family(family) => closure.families.contains(family),
         });
+        self.event_observations.retain(|event, _| closure.event_ids.contains(event));
     }
 
     pub(crate) fn source_observations(&self) -> &BTreeMap<SourceHandle, SourceClass> {
         &self.source_observations
+    }
+
+    pub(crate) fn event_observations(&self) -> &BTreeMap<SampleEventId, EventObservation> {
+        &self.event_observations
     }
 }
 
@@ -464,6 +501,8 @@ pub(crate) enum G0Error {
     MissingEventDescriptor { event: u64 },
     #[error("event {event} has conflicting typed descriptors")]
     ConflictingEventDescriptor { event: u64 },
+    #[error("event has conflicting typed owner or descriptor")]
+    ConflictingEventObservation,
     #[error("G0 descriptor encoding failed: {0}")]
     Encoding(String),
 }
@@ -1049,6 +1088,63 @@ mod tests {
             register_event_descriptors(&sampler, &mut events),
             Err(G0Error::ConflictingEventDescriptor { event: 4 })
         ));
+    }
+
+    #[test]
+    fn event_observations_deduplicate_conflict_and_filter_by_residual_event_ids() {
+        use crate::StageId;
+        use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};
+
+        let owner = PlannedWire {
+            stage: StageId("sample".to_owned()),
+            occurrence: super::super::protocol::ProgramOccurrence {
+                definition: FrozenGraphScopeId::Root,
+                path: 3,
+            },
+            wire: WireRef { node: NodeId(7), port: Port(0) },
+        };
+        let observation = EventObservation {
+            event: SampleEventId(17),
+            owner: owner.clone(),
+            kind: EventKind::Sampler {
+                operation: SamplerOperation::Gaussian {
+                    output: matrix(),
+                    sigma: "1.25".to_owned(),
+                    max_coefficient_bound: 9_u8.into(),
+                },
+            },
+        };
+        let mut trace = FeasibilityTrace::default();
+        trace.record_event(observation.clone()).expect("event observation");
+        trace.record_event(observation).expect("duplicate event observation");
+        assert_eq!(trace.event_observations().len(), 1);
+        let mut conflict = trace.event_observations()[&SampleEventId(17)].clone();
+        conflict.owner.occurrence.path = 4;
+        assert_eq!(trace.record_event(conflict), Err(G0Error::ConflictingEventObservation));
+
+        let closure = CertificateClosure {
+            expressions: BTreeSet::new(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: BTreeSet::new(),
+        };
+        trace.retain_residual(&closure);
+        assert!(trace.event_observations().is_empty());
+
+        let mut ordinary = NoFeasibility;
+        ordinary
+            .record_event(EventObservation {
+                event: SampleEventId(17),
+                owner,
+                kind: EventKind::Sampler {
+                    operation: SamplerOperation::UniformResidue { output: matrix() },
+                },
+            })
+            .expect("ordinary sink is inert");
+        assert_eq!(FeasibilityTrace::from(ordinary), FeasibilityTrace::default());
     }
 
     #[test]

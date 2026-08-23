@@ -14,8 +14,8 @@ use super::{
     },
     facts::{CoefficientBound, MatrixFacts, MatrixMetadata, NumericContract, PolynomialFacts},
     g0::{
-        FeasibilitySink, FeasibilityTrace, InputSourceIdentity, NoFeasibility, SourceClass,
-        SourceHandle,
+        EventKind, EventObservation, FeasibilitySink, FeasibilityTrace, InputSourceIdentity,
+        NoFeasibility, SourceClass, SourceHandle,
     },
     job::{CandidateToken, CheckerJob, JobError},
     program::{FamilyValueId, SelectionSelector},
@@ -359,6 +359,26 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     ProductionAdapterError::Descriptor { reason: error.to_string() }
                 })?;
             }
+        }
+        Ok(())
+    }
+
+    fn record_sampler_event_if_enabled(
+        &mut self,
+        event: SampleEventId,
+        wire: &PlannedWire,
+        operation: &SamplerOperation,
+    ) -> Result<(), ProductionAdapterError> {
+        if S::ENABLED {
+            self.feasibility
+                .record_event(EventObservation {
+                    event,
+                    owner: wire.clone(),
+                    kind: EventKind::Sampler { operation: operation.clone() },
+                })
+                .map_err(|error| ProductionAdapterError::Descriptor {
+                    reason: error.to_string(),
+                })?;
         }
         Ok(())
     }
@@ -2681,6 +2701,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 };
                 let event = self.trapdoor_event(wire)?;
                 if wire.wire.port.0 == 0 {
+                    self.record_sampler_event_if_enabled(event, wire, &operation)?;
                     Value::Expr(
                         self.job
                             .expressions_mut()
@@ -3243,6 +3264,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 wire: wire.clone(),
             }
         })?;
+        self.record_sampler_event_if_enabled(event, wire, &operation)?;
         Ok(Value::Expr(
             self.job
                 .expressions_mut()
@@ -6781,5 +6803,44 @@ mod tests {
         trace.retain_residual(&closure);
         assert_eq!(trace.source_observations().len(), 1);
         assert!(trace.source_observations().contains_key(&retained_handle));
+    }
+
+    #[test]
+    fn opt_in_sampler_events_keep_typed_operations_and_occurrence_owners() {
+        let protocol = compact_tall_gaussian_protocol();
+        let plan =
+            ProtocolPlan::build(&protocol, "compact-tall-gaussian").expect("compact Gaussian plan");
+        let (_, _, mut trace) =
+            ProductionAdapter::new_with_feasibility(&protocol, &plan, BTreeMap::new())
+                .expect("opt-in adapter")
+                .lower_with_feasibility()
+                .expect("opt-in lowering");
+
+        let gaussian_owners = trace
+            .event_observations()
+            .values()
+            .filter_map(|observation| match &observation.kind {
+                EventKind::Sampler { operation: SamplerOperation::Gaussian { .. } } => {
+                    Some(observation.owner.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(gaussian_owners.len() >= 2, "Gaussian event owners={gaussian_owners:?}");
+
+        let retained_event =
+            *trace.event_observations().keys().next().expect("reached sampler event");
+        let closure = super::super::simulation::CertificateClosure {
+            expressions: BTreeSet::new(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::from([retained_event]),
+            constant_expressions: BTreeSet::new(),
+        };
+        trace.retain_residual(&closure);
+        assert_eq!(trace.event_observations().len(), 1);
+        assert!(trace.event_observations().contains_key(&retained_event));
     }
 }

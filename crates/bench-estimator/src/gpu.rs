@@ -165,7 +165,7 @@ impl GpuNodeMeasurementBackend {
         let measurement_count = requests.len();
         let requests = Mutex::new(VecDeque::from(requests));
         info!(
-            gpu_count = self.workers.len(),
+            measurement_parallel_instances = self.workers.len(),
             measurement_count, "measuring collected GPU node shapes in parallel"
         );
         let harness = &self.harness;

@@ -82,6 +82,15 @@ pub(crate) struct OperationalCertificateProjection {
     pub closure: CertificateClosure,
 }
 
+/// The owned job, certificate projection, and ordinary accepted report from one opt-in run.
+/// Arena handles remain tied to this job; callers cannot accidentally pair a projection with a
+/// report or job from another lowering.
+pub(crate) struct OperationalCertificateRun {
+    pub job: super::job::CheckerJob,
+    pub projection: OperationalCertificateProjection,
+    pub accepted_report: super::report::OperationalReport,
+}
+
 /// The typed dependency inventory rooted at one residual production root.
 ///
 /// Expression and program IDs remain job-local.  This inventory is an in-memory boundary only;
@@ -202,6 +211,10 @@ pub(crate) enum CertificateProjectionError {
     Closure(#[from] CertificateClosureError),
     #[error("operational checker rejected certificate projection: {0}")]
     Operational(#[from] OperationalSimulationError),
+    #[error("operational checker report rejected certificate target {target_id:?}")]
+    Rejected { target_id: String },
+    #[error("operational checker report mismatched certificate target {target_id:?}: {detail}")]
+    ReportMismatch { target_id: String, detail: String },
 }
 
 /// Re-runs target resolution and production lowering only when certificate emission is explicitly
@@ -210,6 +223,18 @@ pub(crate) fn project_operational_certificate(
     protocol: &ProtocolDecl,
     request: &super::OperationalCheckRequest,
 ) -> Result<OperationalCertificateProjection, CertificateProjectionError> {
+    Ok(prepare_operational_certificate(protocol, request)?.projection)
+}
+
+/// Resolve, lower, report, and retain one accepted opt-in certificate run.
+///
+/// The report is deliberately produced through the ordinary decoder-inclusive authority.  The
+/// certificate projection still contains only the residual closure, while this run keeps the
+/// owned job alive for later serialization and handle resolution.
+pub(crate) fn prepare_operational_certificate(
+    protocol: &ProtocolDecl,
+    request: &super::OperationalCheckRequest,
+) -> Result<OperationalCertificateRun, CertificateProjectionError> {
     let mut emit = |_| {};
     let mut control = SimulationControl::new(&mut emit);
     request.validate(protocol.params.iter().map(|parameter| parameter.name.clone())).map_err(
@@ -242,13 +267,61 @@ pub(crate) fn project_operational_certificate(
         .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?;
     let residual = project_residual_root(&job, &roots.residual, &target)?;
     let closure = collect_residual_closure(&job, &residual)?;
-    Ok(OperationalCertificateProjection {
+    let projection = OperationalCertificateProjection {
         target_id,
-        plaintext_modulus,
-        ciphertext_modulus: target.ciphertext_modulus,
+        plaintext_modulus: plaintext_modulus.clone(),
+        ciphertext_modulus: target.ciphertext_modulus.clone(),
         residual,
         closure,
-    })
+    };
+    let mut job = job;
+    let accepted_report = analyze_roots(
+        &mut job,
+        &roots,
+        &ReportTarget {
+            target_id: target.target_id.clone(),
+            plaintext_modulus: plaintext_modulus.clone(),
+            ciphertext_modulus: target.ciphertext_modulus.clone(),
+            boolean_interval: false,
+        },
+    )
+    .map_err(|error| {
+        CertificateProjectionError::Operational(OperationalSimulationError::from(
+            super::error::ProductionError::from(error),
+        ))
+    })?;
+    let report_plaintext_modulus = match &accepted_report.acceptance {
+        super::OperationalAcceptanceReport::Threshold { plaintext_modulus, .. } => {
+            plaintext_modulus
+        }
+        _ => {
+            return Err(CertificateProjectionError::ReportMismatch {
+                target_id: target.target_id,
+                detail: "ordinary report did not use threshold acceptance".to_owned(),
+            });
+        }
+    };
+    if accepted_report.target_id != request.target_id ||
+        accepted_report.target_id != projection.target_id ||
+        accepted_report.ciphertext_modulus != projection.ciphertext_modulus ||
+        report_plaintext_modulus != &projection.plaintext_modulus
+    {
+        return Err(CertificateProjectionError::ReportMismatch {
+            target_id: request.target_id.clone(),
+            detail: format!(
+                "report target={:?}, report p={:?}, report q={:?}; resolved p={:?}, resolved q={:?}",
+                accepted_report.target_id,
+                report_plaintext_modulus,
+                accepted_report.ciphertext_modulus,
+                projection.plaintext_modulus,
+                projection.ciphertext_modulus,
+            ),
+        });
+    }
+    if !accepted_report.accepted {
+        return Err(CertificateProjectionError::Rejected { target_id: request.target_id.clone() });
+    }
+    Ok(OperationalCertificateRun { job, projection, accepted_report })
 }
 
 fn project_residual_root(
@@ -1356,8 +1429,17 @@ mod tests {
             layouts: Vec::new(),
             target_id: "certificate-threshold".to_owned(),
         };
-        let projection = project_operational_certificate(&protocol, &request)
-            .expect("valid threshold certificate projection");
+        let run = prepare_operational_certificate(&protocol, &request)
+            .expect("valid threshold certificate run");
+        assert!(run.accepted_report.accepted);
+        assert_eq!(run.accepted_report.target_id, request.target_id);
+        assert_eq!(run.accepted_report.ciphertext_modulus, 256_u16.into());
+        assert!(matches!(
+            run.accepted_report.acceptance,
+            super::super::OperationalAcceptanceReport::Threshold { plaintext_modulus, .. }
+                if plaintext_modulus == 2_u8.into()
+        ));
+        let projection = run.projection;
         assert_eq!(projection.target_id, "certificate-threshold");
         assert_eq!(projection.plaintext_modulus, 2_u8.into());
         assert_eq!(projection.ciphertext_modulus, 256_u16.into());

@@ -1158,8 +1158,8 @@ impl FeasibilityTrace {
         let sources = self
             .source_observations
             .values()
-            .map(stable_observed_source)
-            .collect::<BTreeSet<_>>()
+            .map(|class| stable_observed_source(class, None))
+            .collect::<Result<BTreeSet<_>, _>>()?
             .into_iter()
             .collect::<Vec<_>>();
         serde_json::to_vec(&sources).map_err(|error| G0Error::Encoding(error.to_string()))
@@ -1260,10 +1260,8 @@ pub(crate) struct StableSampleDescriptor {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub(crate) struct StableSourceIdentity {
     pub definition: String,
-    pub invocation: String,
-    pub sample_event: Option<u64>,
+    pub sample_event: Option<StableEventRef>,
     pub output_role: String,
-    pub sampler: Option<StableSampleDescriptor>,
     pub artifact: Option<StableArtifact>,
     pub value_type: StableValueType,
     pub coordinates: Vec<u64>,
@@ -1300,9 +1298,8 @@ pub(crate) enum StableScope {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 struct StableObservedIdentity {
     definition: String,
-    sample_event: Option<u64>,
+    sample_event: Option<StableEventRef>,
     output_role: String,
-    sampler: Option<StableSampleDescriptor>,
     artifact: Option<StableArtifact>,
     value_type: StableValueType,
     coordinates: Vec<u64>,
@@ -1579,20 +1576,6 @@ pub(crate) enum StableOperator {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-pub(crate) struct StableEventDescriptor {
-    pub event: u64,
-    pub descriptor: StableEventKind,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub(crate) enum StableEventKind {
-    Sample { descriptor: StableSampleDescriptor },
-    Sampler { operation: StableSamplerOperation },
-    Trapdoor { operation: StableTrapdoorOperation },
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub(crate) struct StableEventRef {
     pub row: u64,
@@ -1605,7 +1588,7 @@ pub(crate) enum CanonicalEventKind {
     Trapdoor { operation: StableTrapdoorOperation },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub(crate) struct CanonicalEventRow {
     pub owner: StableObservedWire,
     pub kind: CanonicalEventKind,
@@ -1636,12 +1619,12 @@ impl CanonicalEventRows {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct StableG0Inventory {
-    pub operators: Vec<StableOperator>,
+    pub operators: Vec<serde_json::Value>,
     pub sources: Vec<StableSourceIdentity>,
     pub family_sources: Vec<StableFamilySourceIdentity>,
-    pub events: Vec<StableEventDescriptor>,
+    pub events: Vec<CanonicalEventRow>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -1652,8 +1635,6 @@ pub(crate) enum G0Error {
     TraceOverflow,
     #[error("conflicting source classes for one typed lowering handle")]
     ConflictingSourceClass,
-    #[error("residual event {event} has no typed descriptor")]
-    MissingEventDescriptor { event: u64 },
     #[error("event {event} has conflicting typed descriptors")]
     ConflictingEventDescriptor { event: u64 },
     #[error("event has conflicting typed owner or descriptor")]
@@ -1936,25 +1917,23 @@ impl StableG0Inventory {
 pub(crate) fn derive_inventory(
     job: &CheckerJob,
     closure: &CertificateClosure,
+    trace: &FeasibilityTrace,
 ) -> Result<StableG0Inventory, G0Error> {
-    let mut operators = BTreeSet::new();
-    let mut events = BTreeMap::<u64, StableEventKind>::new();
+    let event_rows = derive_canonical_event_rows(closure, trace)?;
+    let mut operators = Vec::new();
     for expression in &closure.expressions {
         let node = job.expressions().node(*expression)?;
-        operators.insert(stable_operator(&node.operator));
-        register_event_descriptors(&node.operator, &mut events)?;
+        operators.push(canonical_expression_operator(&node.operator, &event_rows)?);
     }
-    // `CertificateClosure::event_ids` is collected independently of the operator set because
-    // trapdoor generation and source identities can name an event.  Require the two views to
-    // agree before serializing: a missing descriptor would otherwise produce an incomplete
-    // event inventory and leave the later certificate stage guessing.
-    for event in &closure.event_ids {
-        if !events.contains_key(&event.0) {
-            return Err(G0Error::MissingEventDescriptor { event: event.0 });
-        }
-    }
-    let sources =
-        closure.source_ids.iter().map(stable_source).collect::<BTreeSet<_>>().into_iter().collect();
+    operators.sort_by_key(|operator| operator.to_string());
+    operators.dedup();
+    let sources = closure
+        .source_ids
+        .iter()
+        .map(|source| stable_source_with_events(source, &event_rows))
+        .collect::<Result<BTreeSet<_>, _>>()?
+        .into_iter()
+        .collect();
     let family_sources = closure
         .family_source_ids
         .iter()
@@ -1966,54 +1945,8 @@ pub(crate) fn derive_inventory(
         operators: operators.into_iter().collect(),
         sources,
         family_sources,
-        events: events
-            .into_iter()
-            .map(|(event, descriptor)| StableEventDescriptor { event, descriptor })
-            .collect(),
+        events: event_rows.rows().to_vec(),
     })
-}
-
-fn register_event_descriptors(
-    operator: &ValueOperator,
-    events: &mut BTreeMap<u64, StableEventKind>,
-) -> Result<(), G0Error> {
-    let candidate = match operator {
-        ValueOperator::Source(source) => {
-            source.sample_event.zip(source.sampler.as_ref()).map(|(event, descriptor)| {
-                (event.0, StableEventKind::Sample { descriptor: stable_sample(descriptor) })
-            })
-        }
-        ValueOperator::Sample { event, descriptor } => {
-            Some((event.0, StableEventKind::Sample { descriptor: stable_sample(descriptor) }))
-        }
-        ValueOperator::Sampler { event, operation } => {
-            Some((event.0, StableEventKind::Sampler { operation: stable_sampler(operation) }))
-        }
-        ValueOperator::Trapdoor(TrapdoorOperation::Generate {
-            descriptor,
-            parameters,
-            paired_public_event,
-            paired_public_output_role,
-        }) => Some((
-            paired_public_event.0,
-            StableEventKind::Trapdoor {
-                operation: StableTrapdoorOperation::Generate {
-                    descriptor: descriptor.clone(),
-                    parameters: parameters.to_vec(),
-                    paired_public_event: paired_public_event.0,
-                    paired_public_output_role: paired_public_output_role.clone(),
-                },
-            },
-        )),
-        _ => None,
-    };
-    if let Some((event, descriptor)) = candidate {
-        if events.get(&event).is_some_and(|existing| existing != &descriptor) {
-            return Err(G0Error::ConflictingEventDescriptor { event });
-        }
-        events.insert(event, descriptor);
-    }
-    Ok(())
 }
 
 fn stable_value_type(value: &ResolvedValueType) -> StableValueType {
@@ -2071,15 +2004,22 @@ fn stable_artifact(value: &ArtifactIdentity) -> StableArtifact {
 fn stable_source(value: &SemanticSourceIdentity) -> StableSourceIdentity {
     StableSourceIdentity {
         definition: value.stable_definition.clone(),
-        invocation: value.invocation.clone(),
-        sample_event: value.sample_event.map(|event| event.0),
+        sample_event: value.sample_event.map(|event| StableEventRef { row: event.0 }),
         output_role: value.output_role.clone(),
-        sampler: value.sampler.as_ref().map(stable_sample),
         artifact: value.artifact.as_ref().map(stable_artifact),
         value_type: stable_value_type(&value.value_type),
         coordinates: value.coordinates.to_vec(),
         matrix_constant: value.matrix_constant.as_ref().map(stable_matrix_constant),
     }
+}
+
+fn stable_source_with_events(
+    value: &SemanticSourceIdentity,
+    events: &CanonicalEventRows,
+) -> Result<StableSourceIdentity, G0Error> {
+    let mut source = stable_source(value);
+    source.sample_event = value.sample_event.map(|event| events.event(event)).transpose()?;
+    Ok(source)
 }
 
 fn stable_family_source(value: &SemanticFamilySourceIdentity) -> StableFamilySourceIdentity {
@@ -2133,54 +2073,68 @@ fn stable_scope(value: &mxx_ir_core::FrozenGraphScopeId) -> StableScope {
     }
 }
 
-fn stable_observed_identity(value: &InputSourceIdentity) -> StableObservedIdentityKind {
+fn stable_observed_identity(
+    value: &InputSourceIdentity,
+    events: Option<&CanonicalEventRows>,
+) -> Result<StableObservedIdentityKind, G0Error> {
     match value {
-        InputSourceIdentity::Expression(value) => StableObservedIdentityKind::Expression {
+        InputSourceIdentity::Expression(value) => Ok(StableObservedIdentityKind::Expression {
             identity: StableObservedIdentity {
                 definition: value.stable_definition.clone(),
-                sample_event: value.sample_event.map(|event| event.0),
+                sample_event: value
+                    .sample_event
+                    .map(|event| {
+                        events
+                            .map(|events| events.event(event))
+                            .unwrap_or(Ok(StableEventRef { row: event.0 }))
+                    })
+                    .transpose()?,
                 output_role: value.output_role.clone(),
-                sampler: value.sampler.as_ref().map(stable_sample),
                 artifact: value.artifact.as_ref().map(stable_artifact),
                 value_type: stable_value_type(&value.value_type),
                 coordinates: value.coordinates.to_vec(),
                 matrix_constant: value.matrix_constant.as_ref().map(stable_matrix_constant),
             },
-        },
-        InputSourceIdentity::Family(value) => StableObservedIdentityKind::Family {
+        }),
+        InputSourceIdentity::Family(value) => Ok(StableObservedIdentityKind::Family {
             identity: StableObservedFamilyIdentity {
                 definition: value.stable_definition.clone(),
                 element_type: stable_value_type(&value.element_type),
                 domain: (value.domain.minimum, value.domain.maximum_exclusive),
                 artifact: value.artifact.as_ref().map(stable_artifact),
             },
-        },
+        }),
     }
 }
 
-fn stable_observed_source(class: &SourceClass) -> StableObservedSource {
+fn stable_observed_source(
+    class: &SourceClass,
+    events: Option<&CanonicalEventRows>,
+) -> Result<StableObservedSource, G0Error> {
     match class {
         SourceClass::ScalarConstant { value } => {
-            StableObservedSource::ScalarConstant { value: stable_constant(value) }
+            Ok(StableObservedSource::ScalarConstant { value: stable_constant(value) })
         }
-        SourceClass::MatrixConstant { matrix_type, kind } => StableObservedSource::MatrixConstant {
-            matrix_type: stable_matrix(matrix_type),
-            kind: stable_matrix_constant(kind),
-        },
+        SourceClass::MatrixConstant { matrix_type, kind } => {
+            Ok(StableObservedSource::MatrixConstant {
+                matrix_type: stable_matrix(matrix_type),
+                kind: stable_matrix_constant(kind),
+            })
+        }
         SourceClass::DeclaredProtocolInput { owner, input, identity } => {
-            StableObservedSource::DeclaredProtocolInput {
+            Ok(StableObservedSource::DeclaredProtocolInput {
                 owner: stable_observed_wire(owner),
                 input: input.0.clone(),
-                identity: stable_observed_identity(identity),
-            }
+                identity: stable_observed_identity(identity, events)?,
+            })
         }
         SourceClass::UnboundOccurrenceInput { owner, identity } => {
-            StableObservedSource::UnboundOccurrenceInput {
+            Ok(StableObservedSource::UnboundOccurrenceInput {
                 owner: stable_observed_wire(owner),
-                identity: stable_observed_identity(identity),
-            }
+                identity: stable_observed_identity(identity, events)?,
+            })
         }
-        SourceClass::ProducerArtifact { producer } => StableObservedSource::ProducerArtifact {
+        SourceClass::ProducerArtifact { producer } => Ok(StableObservedSource::ProducerArtifact {
             producer: StableObservedProducer {
                 consumer: stable_observed_wire(&producer.consumer),
                 consumer_input: producer.binding.consumer_input.0.clone(),
@@ -2188,7 +2142,7 @@ fn stable_observed_source(class: &SourceClass) -> StableObservedSource {
                 producer_output: producer.binding.producer_output.0.clone(),
                 producer: stable_observed_wire(&producer.producer),
             },
-        },
+        }),
     }
 }
 
@@ -2571,6 +2525,26 @@ fn canonical_expression_operator(
             }
             operator = serde_json::json!({ "kind": "sampler", "event": event_ref(*event)? });
         }
+        ValueOperator::Source(source) => {
+            if let Some(event) = source.sample_event {
+                if events.kind(event)? !=
+                    &(CanonicalEventKind::Sample {
+                        descriptor: stable_sample(
+                            source
+                                .sampler
+                                .as_ref()
+                                .ok_or(G0Error::ConflictingEventDescriptor { event: event.0 })?,
+                        ),
+                    })
+                {
+                    return Err(G0Error::ConflictingEventDescriptor { event: event.0 });
+                }
+            }
+            operator = serde_json::to_value(StableOperator::Source {
+                identity: stable_source_with_events(source, events)?,
+            })
+            .map_err(|error| G0Error::Encoding(error.to_string()))?;
+        }
         ValueOperator::Trapdoor(TrapdoorOperation::Generate { paired_public_event, .. }) => {
             if !matches!(events.kind(*paired_public_event)?, CanonicalEventKind::Sampler { .. }) {
                 return Err(G0Error::ConflictingEventDescriptor { event: paired_public_event.0 });
@@ -2604,12 +2578,13 @@ pub(crate) fn canonical_residual_refs(
     for &expression in &closure.expressions {
         let node = job.expressions().node(expression)?;
         let source = match &node.operator {
-            ValueOperator::Source(_) => trace
-                .source_observations()
-                .get(&SourceHandle::Expression(expression))
-                .map(stable_observed_source)
-                .ok_or(G0Error::CanonicalMissingDependency)
-                .map(Some)?,
+            ValueOperator::Source(_) => Some(stable_observed_source(
+                trace
+                    .source_observations()
+                    .get(&SourceHandle::Expression(expression))
+                    .ok_or(G0Error::CanonicalMissingDependency)?,
+                Some(&event_rows),
+            )?),
             _ => None,
         };
         let descriptor = serde_json::to_vec(&CanonicalExpressionDescriptor {
@@ -2661,12 +2636,13 @@ pub(crate) fn canonical_residual_refs(
             CanonicalHandle::Expression(expression) => {
                 let node = job.expressions().node(*expression)?;
                 let source = match &node.operator {
-                    ValueOperator::Source(_) => trace
-                        .source_observations()
-                        .get(&SourceHandle::Expression(*expression))
-                        .map(stable_observed_source)
-                        .ok_or(G0Error::CanonicalMissingDependency)
-                        .map(Some)?,
+                    ValueOperator::Source(_) => Some(stable_observed_source(
+                        trace
+                            .source_observations()
+                            .get(&SourceHandle::Expression(*expression))
+                            .ok_or(G0Error::CanonicalMissingDependency)?,
+                        Some(&event_rows),
+                    )?),
                     _ => None,
                 };
                 let descriptor = serde_json::to_vec(&CanonicalExpressionDescriptor {
@@ -2988,7 +2964,12 @@ mod tests {
     #[test]
     fn inventory_encoding_is_repeatable_and_size_is_canonical() {
         let inventory = StableG0Inventory {
-            operators: vec![StableOperator::Scalar { operation: StableScalarOperation::Add }],
+            operators: vec![
+                serde_json::to_value(StableOperator::Scalar {
+                    operation: StableScalarOperation::Add,
+                })
+                .unwrap(),
+            ],
             sources: Vec::new(),
             family_sources: Vec::new(),
             events: Vec::new(),
@@ -3061,36 +3042,6 @@ mod tests {
             first.canonical_source_observation_bytes().unwrap(),
             third.canonical_source_observation_bytes().unwrap()
         );
-    }
-
-    #[test]
-    fn duplicate_event_descriptors_are_deduplicated() {
-        let mut events = BTreeMap::new();
-        let operator = ValueOperator::Sample {
-            event: SampleEventId(4),
-            descriptor: SampleDescriptor::new("sample", ResolvedValueType::Int),
-        };
-        register_event_descriptors(&operator, &mut events).expect("first descriptor");
-        register_event_descriptors(&operator, &mut events).expect("duplicate descriptor");
-        assert_eq!(events.len(), 1);
-    }
-
-    #[test]
-    fn conflicting_event_descriptors_fail_closed() {
-        let mut events = BTreeMap::new();
-        let sample = ValueOperator::Sample {
-            event: SampleEventId(4),
-            descriptor: SampleDescriptor::new("sample", ResolvedValueType::Int),
-        };
-        let sampler = ValueOperator::Sampler {
-            event: SampleEventId(4),
-            operation: SamplerOperation::UniformResidue { output: matrix() },
-        };
-        register_event_descriptors(&sample, &mut events).expect("sample descriptor");
-        assert!(matches!(
-            register_event_descriptors(&sampler, &mut events),
-            Err(G0Error::ConflictingEventDescriptor { event: 4 })
-        ));
     }
 
     #[test]

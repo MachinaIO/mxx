@@ -450,7 +450,8 @@ pub fn prepare_base_feasibility_summary(
     // Build the residual-only Stage-1 inventory from the same owned job and closure.  The base
     // summary does not expose it or claim final artifact completeness, but descriptor conflicts
     // must still fail closed on this opt-in path.
-    super::g0::derive_inventory(&run.job, closure).map_err(|error| error.to_string())?;
+    super::g0::derive_inventory(&run.job, closure, &run.trace)
+        .map_err(|error| error.to_string())?;
     let source_rows = closure
         .source_ids
         .len()
@@ -1737,6 +1738,8 @@ mod tests {
 
     #[test]
     fn residual_closure_collects_typed_sources_and_events_only_from_residual() {
+        use super::super::g0::FeasibilitySink;
+        use mxx_ir_core::NodeId;
         let mut job = super::super::job::CheckerJob::new();
         let (root, source_identity, source_event, sample_event, decoder_event) = job
             .with_arena_stores(|expressions, _, _| {
@@ -1803,20 +1806,53 @@ mod tests {
         assert!(closure.event_ids.contains(&source_event));
         assert!(closure.event_ids.contains(&sample_event));
         assert!(!closure.event_ids.contains(&decoder_event));
-        let inventory = super::super::g0::derive_inventory(&job, &closure)
+        let mut trace = super::super::g0::FeasibilityTrace::default();
+        let owner = |path| super::super::protocol::PlannedWire {
+            stage: crate::StageId("inventory-events".to_owned()),
+            occurrence: super::super::protocol::ProgramOccurrence {
+                definition: FrozenGraphScopeId::Root,
+                path,
+            },
+            wire: WireRef { node: NodeId(path), port: Port(0) },
+        };
+        trace
+            .record_event(super::super::g0::EventObservation {
+                event: source_event,
+                owner: owner(1),
+                kind: super::super::g0::EventKind::Sample {
+                    descriptor: super::super::arena::SampleDescriptor::new(
+                        "source-sampler",
+                        super::super::arena::ResolvedValueType::Int,
+                    ),
+                },
+            })
+            .unwrap();
+        trace
+            .record_event(super::super::g0::EventObservation {
+                event: sample_event,
+                owner: owner(2),
+                kind: super::super::g0::EventKind::Sample {
+                    descriptor: super::super::arena::SampleDescriptor::new(
+                        "sample-definition",
+                        super::super::arena::ResolvedValueType::Int,
+                    ),
+                },
+            })
+            .unwrap();
+        let inventory = super::super::g0::derive_inventory(&job, &closure, &trace)
             .expect("residual descriptor inventory");
         assert_eq!(inventory.events.len(), 2);
-        assert!(inventory.events.iter().any(|event| event.event == source_event.0));
-        assert!(inventory.events.iter().any(|event| event.event == sample_event.0));
         assert_eq!(inventory.sources.len(), 1);
         let first = inventory.encode_canonical().expect("canonical inventory");
         let second = inventory.encode_canonical().expect("canonical inventory");
         assert_eq!(first, second);
         assert_eq!(inventory.canonical_encoded_size().expect("encoded size"), first.len());
-        assert!(inventory.operators.iter().all(|operator| !matches!(
-            operator,
-            super::super::g0::StableOperator::Sample { event: 99, .. }
-        )));
+        assert!(
+            inventory
+                .operators
+                .iter()
+                .all(|operator| !operator.to_string().contains("decoder-only"))
+        );
     }
 
     #[test]

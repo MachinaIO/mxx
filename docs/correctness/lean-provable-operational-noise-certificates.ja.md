@@ -372,6 +372,11 @@ trusted canonical projection が取り出す。生成 proof の data が別の�
 しない。wrapper theorem に `#print axioms` を実行し、許可しない axiom が混入していないことも
 確認する。
 
+G1 でレビュー済みの Lean 標準 axiom の許可リストは `propext` と `Quot.sound` の二つだけである。
+これは certificate 固有の信頼仮定ではなく、Lean kernel library の基礎である。`#print axioms` の結果に
+`sorryAx`、生成または独自の axiom、`native_decide`、またはこの二つ以外の axiom が現れてはならない。
+追加の axiom が必要になった場合は、受理前に別途設計 review を行う。
+
 ## 8. Certificate のデータモデル
 
 certificate 内 ID は、決定的に割り当てる局所自然数である。ID 自体には意味を持たせず、意味を

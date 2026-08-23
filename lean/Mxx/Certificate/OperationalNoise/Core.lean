@@ -63,12 +63,13 @@ structure FamilyDomain where
   upper : Nat
 deriving DecidableEq, Repr
 
-def FamilyDomain.valid (domain : FamilyDomain) : Bool := domain.lower < domain.upper
-
 def FamilyDomain.Contains (domain : FamilyDomain) (selector : Nat) : Prop :=
   domain.lower ≤ selector ∧ selector < domain.upper
 
-def FamilyDomain.u64Representable (endpoint : Nat) : Prop := endpoint ≤ 18446744073709551615
+def FamilyDomain.u64Representable (endpoint : Nat) : Bool := endpoint ≤ 18446744073709551615
+
+def FamilyDomain.valid (domain : FamilyDomain) : Bool :=
+  domain.lower < domain.upper && u64Representable domain.upper
 
 structure SourceId where
   value : Nat
@@ -96,6 +97,9 @@ deriving DecidableEq, Repr
 def MatrixShape.valid (shape : MatrixShape) : Bool :=
   shape.modulus > 0 && shape.ringDimension > 0 && shape.rows > 0 && shape.columns > 0
 
+def MatrixShape.matchesCertificate (shape : MatrixShape) (modulus ringDimension : Nat) : Bool :=
+  shape.valid && shape.modulus = modulus && shape.ringDimension = ringDimension
+
 def MatrixShape.coefficientCount (shape : MatrixShape) : Nat :=
   shape.ringDimension * shape.rows * shape.columns
 
@@ -104,20 +108,28 @@ structure Matrix where
   coefficients : List Int
 deriving DecidableEq, Repr
 
-def Matrix.valid (matrix : Matrix) : Bool :=
-  matrix.shape.valid && matrix.coefficients.length = matrix.shape.coefficientCount
+def Matrix.valid (matrix : Matrix) (modulus ringDimension : Nat) : Bool :=
+  matrix.shape.matchesCertificate modulus ringDimension &&
+    matrix.coefficients.length = matrix.shape.coefficientCount
 
-def centeredCoefficient (coefficient : Int) : Nat := coefficient.natAbs
+def centeredCoefficient (modulus : Nat) (coefficient : Int) : Int :=
+  if modulus = 0 then coefficient
+  else
+    let remainder := coefficient % Int.ofNat modulus
+    if 2 * remainder ≤ Int.ofNat modulus then remainder else remainder - Int.ofNat modulus
+
+def centeredNorm (modulus : Nat) (coefficient : Int) : Nat :=
+  (centeredCoefficient modulus coefficient).natAbs
 
 def maxNatList : List Nat → Nat
   | [] => 0
   | value :: values => Nat.max value (maxNatList values)
 
-def Matrix.maxCenteredCoefficientNorm (matrix : Matrix) : Nat :=
-  maxNatList (matrix.coefficients.map centeredCoefficient)
+def Matrix.maxCenteredCoefficientNorm (matrix : Matrix) (modulus : Nat) : Nat :=
+  maxNatList (matrix.coefficients.map (centeredNorm modulus))
 
-def Matrix.CoefficientBound (matrix : Matrix) (bound : Nat) : Prop :=
-  ∀ coefficient, coefficient ∈ matrix.coefficients → centeredCoefficient coefficient ≤ bound
+def Matrix.CoefficientBound (matrix : Matrix) (modulus bound : Nat) : Prop :=
+  ∀ coefficient, coefficient ∈ matrix.coefficients → centeredNorm modulus coefficient ≤ bound
 
 theorem maxNatList_le_of_forall {values : List Nat} {bound : Nat}
     (hbound : ∀ value, value ∈ values → value ≤ bound) : maxNatList values ≤ bound := by
@@ -133,11 +145,11 @@ theorem maxNatList_le_of_forall {values : List Nat} {bound : Nat}
         exact hbound next (by simp [hnext])
 
 theorem Matrix.maxCenteredCoefficientNorm_le_of_coefficientBound
-    {matrix : Matrix} {bound : Nat} (hbound : matrix.CoefficientBound bound) :
-    matrix.maxCenteredCoefficientNorm ≤ bound := by
+    {matrix : Matrix} {modulus bound : Nat} (hbound : matrix.CoefficientBound modulus bound) :
+    matrix.maxCenteredCoefficientNorm modulus ≤ bound := by
   have mappedBound : ∀ (coefficients : List Int),
-      (∀ coefficient, coefficient ∈ coefficients → centeredCoefficient coefficient ≤ bound) →
-        maxNatList (coefficients.map centeredCoefficient) ≤ bound := by
+      (∀ coefficient, coefficient ∈ coefficients → centeredNorm modulus coefficient ≤ bound) →
+        maxNatList (coefficients.map (centeredNorm modulus)) ≤ bound := by
     intro coefficients
     induction coefficients with
     | nil =>
@@ -146,7 +158,7 @@ theorem Matrix.maxCenteredCoefficientNorm_le_of_coefficientBound
     | cons coefficient coefficients ih =>
         intro coefficientBound
         have headBound := coefficientBound coefficient (List.Mem.head coefficients)
-        have tailBound : ∀ next, next ∈ coefficients → centeredCoefficient next ≤ bound := by
+        have tailBound : ∀ next, next ∈ coefficients → centeredNorm modulus next ≤ bound := by
           intro next hnext
           exact coefficientBound next (List.Mem.tail _ hnext)
         simp only [List.map_cons, maxNatList]
@@ -212,11 +224,11 @@ structure Cert where
   events : RowTable EventRow
   residualRoot : ResidualRoot
 
-def sourceRowsWellFormed (table : RowTable SourceRow) : Bool :=
-  table.allBool (fun _ row => row.shape.valid)
+def sourceRowsWellFormed (cert : Cert) : Bool :=
+  cert.sources.allBool (fun _ row => row.shape.matchesCertificate cert.ciphertextModulus cert.ringDimension)
 
-def eventRowsWellFormed (table : RowTable EventRow) : Bool :=
-  table.allBool (fun _ row => row.shape.valid)
+def eventRowsWellFormed (cert : Cert) : Bool :=
+  cert.events.allBool (fun _ row => row.shape.matchesCertificate cert.ciphertextModulus cert.ringDimension)
 
 def optionIsSome {α : Type} (value : Option α) : Bool :=
   match value with
@@ -224,7 +236,7 @@ def optionIsSome {α : Type} (value : Option α) : Bool :=
   | some _ => true
 
 def expressionRowWellFormed (cert : Cert) : Nat → ExprRow → Bool
-  | _, .constant matrix => matrix.valid
+  | _, .constant matrix => matrix.valid cert.ciphertextModulus cert.ringDimension
   | _, .source access => optionIsSome (cert.sources.lookup access.source.value)
   | _, .sampler access => optionIsSome (cert.events.lookup access.event.value)
 
@@ -241,8 +253,8 @@ def Cert.wellFormed (cert : Cert) : Bool :=
     cert.expressions.wellFormed && cert.programs.wellFormed && cert.sources.wellFormed &&
     cert.events.wellFormed &&
     cert.expressions.allBool (expressionRowWellFormed cert) &&
-    cert.programs.allBool (programRowWellFormed cert) && sourceRowsWellFormed cert.sources &&
-    eventRowsWellFormed cert.events && rootWellFormed cert
+    cert.programs.allBool (programRowWellFormed cert) && sourceRowsWellFormed cert &&
+    eventRowsWellFormed cert && rootWellFormed cert
 
 def Cert.Valid (cert : Cert) : Prop := cert.wellFormed = true
 
@@ -259,14 +271,17 @@ def evalExpr (fuel : Nat) (cert : Cert) (selector : Option Nat)
   | _ + 1 =>
       match cert.expressions.lookup root.value with
       | none => none
-      | some (.constant matrix) => if matrix.valid then some matrix else none
+      | some (.constant matrix) =>
+          if matrix.valid cert.ciphertextModulus cert.ringDimension then some matrix else none
       | some (.source access) =>
           match inputs (access.withSelector selector) with
-          | .matrix matrix => if matrix.valid then some matrix else none
+          | .matrix matrix =>
+              if matrix.valid cert.ciphertextModulus cert.ringDimension then some matrix else none
           | .invalid => none
       | some (.sampler access) =>
           match samplers (access.withSelector selector) with
-          | .matrix matrix => if matrix.valid then some matrix else none
+          | .matrix matrix =>
+              if matrix.valid cert.ciphertextModulus cert.ringDimension then some matrix else none
           | .invalid => none
 
 def evalProgram (fuel : Nat) (cert : Cert) (selector : Nat)
@@ -288,13 +303,17 @@ def InputContract (cert : Cert) (inputs : InputAssignment) : Prop :=
   cert.sources.AllFrom (fun source row =>
     ∀ selector, ∃ matrix,
       inputs { source := ⟨source⟩, selector } = .matrix matrix ∧
-      matrix.valid = true ∧ matrix.shape = row.shape ∧ matrix.CoefficientBound row.coefficientBound)
+      matrix.valid cert.ciphertextModulus cert.ringDimension = true ∧
+      matrix.shape = row.shape ∧
+      matrix.CoefficientBound cert.ciphertextModulus row.coefficientBound)
 
 def SamplerContract (cert : Cert) (samplers : SamplerAssignment) : Prop :=
   cert.events.AllFrom (fun event row =>
     ∀ selector, ∃ matrix,
       samplers { event := ⟨event⟩, selector } = .matrix matrix ∧
-      matrix.valid = true ∧ matrix.shape = row.shape ∧ matrix.CoefficientBound row.coefficientBound)
+      matrix.valid cert.ciphertextModulus cert.ringDimension = true ∧
+      matrix.shape = row.shape ∧
+      matrix.CoefficientBound cert.ciphertextModulus row.coefficientBound)
 
 def OperationalClaim (cert : CheckedCert) : Prop :=
   ∀ (samplers : SamplerAssignment) (inputs : InputAssignment),
@@ -303,13 +322,17 @@ def OperationalClaim (cert : CheckedCert) : Prop :=
       | .closed _ =>
           match evalResidual 4 cert.val none samplers inputs with
           | none => False
-          | some matrix => 2 * cert.val.plaintextModulus * matrix.maxCenteredCoefficientNorm <
+          | some matrix =>
+              2 * cert.val.plaintextModulus *
+                matrix.maxCenteredCoefficientNorm cert.val.ciphertextModulus <
               cert.val.ciphertextModulus
       | .family _ domain =>
           ∀ selector, domain.Contains selector →
             match evalResidual 4 cert.val (some selector) samplers inputs with
             | none => False
-            | some matrix => 2 * cert.val.plaintextModulus * matrix.maxCenteredCoefficientNorm <
+            | some matrix =>
+                2 * cert.val.plaintextModulus *
+                  matrix.maxCenteredCoefficientNorm cert.val.ciphertextModulus <
                 cert.val.ciphertextModulus
 
 end Mxx.Certificate.OperationalNoise

@@ -224,6 +224,11 @@ A fixed acceptance module checks the generated proof at the fully qualified type
 `OperationalClaim checkedCert` and runs `#print axioms` on its wrapper theorem. It does not derive
 or check a runtime decode result.
 
+For G1, the reviewed Lean-standard axiom allowlist is exactly `propext` and `Quot.sound`, which
+are kernel-library foundations rather than certificate-specific trust assumptions. `#print axioms`
+must report no `sorryAx`, generated or custom axiom, `native_decide`, or any axiom outside that
+two-item allowlist. Any additional axiom requires a separate design review before acceptance.
+
 ## 6. Minimal certificate model
 
 IDs are certificate-local natural numbers assigned deterministically. They are references, not

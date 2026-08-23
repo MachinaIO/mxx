@@ -57,9 +57,23 @@ pub(crate) trait FeasibilitySink: Default {
 
     fn abort_invocation(&mut self, root: super::arena::ScopedExprId);
 
-    fn record_specialization(
+    fn specialization_miss_start(
         &mut self,
-        observation: SpecializationObservation,
+        owner: super::arena::ScopedExprId,
+        key: super::relation::RuntimeSpecializationKey,
+    ) -> Result<EventIndex, G0Error>;
+
+    fn record_specialization_computed(
+        &mut self,
+        owner: super::arena::ScopedExprId,
+        key: super::relation::RuntimeSpecializationKey,
+        replay_start: EventIndex,
+    ) -> Result<(), G0Error>;
+
+    fn record_specialization_cache_hit(
+        &mut self,
+        owner: super::arena::ScopedExprId,
+        key: super::relation::RuntimeSpecializationKey,
     ) -> Result<(), G0Error>;
 
     fn record_relation(&mut self, observation: RelationObservation) -> Result<(), G0Error>;
@@ -145,6 +159,14 @@ impl EventRange {
         }
         Ok(Self { start, end })
     }
+
+    fn validate_against(self, end_exclusive: EventIndex) -> Result<(), G0Error> {
+        Self::checked(self.start, self.end)?;
+        if self.end.0 > end_exclusive.0 {
+            return Err(G0Error::MalformedSpecializationRange);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,7 +195,16 @@ pub(crate) enum NormalizerEvent {
         result: RecordedValue,
         counters: super::normal_form::NormalizationCounters,
     },
-    Specialization(SpecializationObservation),
+    SpecializationComputed {
+        owner: super::arena::ScopedExprId,
+        key: super::relation::RuntimeSpecializationKey,
+        replay: EventRange,
+    },
+    SpecializationCacheHit {
+        owner: super::arena::ScopedExprId,
+        key: super::relation::RuntimeSpecializationKey,
+        source: EventRange,
+    },
     Relation(RelationObservation),
     BoundTransfer(BoundTransferObservation),
 }
@@ -183,14 +214,6 @@ struct InvocationFrame {
     root: super::arena::ScopedExprId,
     range: EventRange,
     results: BTreeMap<ExprId, EventIndex>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct SpecializationObservation {
-    pub owner: super::arena::ScopedExprId,
-    pub key: super::relation::RuntimeSpecializationKey,
-    pub hit: bool,
-    pub result: Option<super::arena::ScopedExprId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1242,9 +1265,27 @@ impl FeasibilitySink for NoFeasibility {
 
     fn abort_invocation(&mut self, _root: super::arena::ScopedExprId) {}
 
-    fn record_specialization(
+    fn specialization_miss_start(
         &mut self,
-        _observation: SpecializationObservation,
+        _owner: super::arena::ScopedExprId,
+        _key: super::relation::RuntimeSpecializationKey,
+    ) -> Result<EventIndex, G0Error> {
+        Ok(EventIndex(0))
+    }
+
+    fn record_specialization_computed(
+        &mut self,
+        _owner: super::arena::ScopedExprId,
+        _key: super::relation::RuntimeSpecializationKey,
+        _replay_start: EventIndex,
+    ) -> Result<(), G0Error> {
+        Ok(())
+    }
+
+    fn record_specialization_cache_hit(
+        &mut self,
+        _owner: super::arena::ScopedExprId,
+        _key: super::relation::RuntimeSpecializationKey,
     ) -> Result<(), G0Error> {
         Ok(())
     }
@@ -1288,6 +1329,7 @@ pub(crate) struct FeasibilityTrace {
     frames: Vec<InvocationFrame>,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
+    specialization_ranges: BTreeMap<super::relation::RuntimeSpecializationKey, EventRange>,
     index_use_plans: BTreeSet<IndexUsePlan>,
     next_slice_group_id: u64,
 }
@@ -1300,6 +1342,7 @@ impl Default for FeasibilityTrace {
             frames: Vec::new(),
             source_observations: BTreeMap::new(),
             event_observations: BTreeMap::new(),
+            specialization_ranges: BTreeMap::new(),
             index_use_plans: BTreeSet::new(),
             next_slice_group_id: 1,
         }
@@ -1410,14 +1453,51 @@ impl FeasibilitySink for FeasibilityTrace {
         let _ = self.frames.pop();
     }
 
-    fn record_specialization(
+    fn specialization_miss_start(
         &mut self,
-        observation: SpecializationObservation,
-    ) -> Result<(), G0Error> {
-        if observation.key.index != observation.owner {
-            return Err(G0Error::SpecializationOwnerMismatch);
+        owner: super::arena::ScopedExprId,
+        key: super::relation::RuntimeSpecializationKey,
+    ) -> Result<EventIndex, G0Error> {
+        if key.index != owner || self.specialization_ranges.contains_key(&key) {
+            return Err(G0Error::SpecializationTraceInvariant);
         }
-        self.events.push(NormalizerEvent::Specialization(observation));
+        Ok(EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?))
+    }
+
+    fn record_specialization_computed(
+        &mut self,
+        owner: super::arena::ScopedExprId,
+        key: super::relation::RuntimeSpecializationKey,
+        replay_start: EventIndex,
+    ) -> Result<(), G0Error> {
+        let current =
+            EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
+        if key.index != owner || self.specialization_ranges.contains_key(&key) {
+            return Err(G0Error::SpecializationTraceInvariant);
+        }
+        let replay = EventRange::checked(replay_start, current)?;
+        self.specialization_ranges.insert(key.clone(), replay);
+        self.events.push(NormalizerEvent::SpecializationComputed { owner, key, replay });
+        Ok(())
+    }
+
+    fn record_specialization_cache_hit(
+        &mut self,
+        owner: super::arena::ScopedExprId,
+        key: super::relation::RuntimeSpecializationKey,
+    ) -> Result<(), G0Error> {
+        let current =
+            EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
+        if key.index != owner {
+            return Err(G0Error::SpecializationTraceInvariant);
+        }
+        let source =
+            *self.specialization_ranges.get(&key).ok_or(G0Error::MissingSpecializationRange)?;
+        source.validate_against(current)?;
+        if source.end.0 >= current.0 {
+            return Err(G0Error::SpecializationTraceInvariant);
+        }
+        self.events.push(NormalizerEvent::SpecializationCacheHit { owner, key, source });
         Ok(())
     }
 
@@ -1443,12 +1523,24 @@ impl FeasibilitySink for FeasibilityTrace {
         if !self.frames.is_empty() {
             return Err(G0Error::MissingNormalizationResult);
         }
-        for observation in self.events.iter().filter_map(|event| match event {
-            NormalizerEvent::Specialization(observation) => Some(observation),
-            _ => None,
-        }) {
-            if observation.result != Some(observation.owner) {
-                return Err(G0Error::MissingSpecializationResult);
+        for (position, event) in self.events.iter().enumerate() {
+            let current = EventIndex(u64::try_from(position).map_err(|_| G0Error::TraceOverflow)?);
+            match event {
+                NormalizerEvent::SpecializationComputed { owner, key, replay } => {
+                    if key.index != *owner || replay.validate_against(current).is_err() {
+                        return Err(G0Error::SpecializationTraceInvariant);
+                    }
+                }
+                NormalizerEvent::SpecializationCacheHit { owner, key, source } => {
+                    if key.index != *owner ||
+                        source.validate_against(current).is_err() ||
+                        source.end.0 >= current.0 ||
+                        !self.specialization_ranges.contains_key(key)
+                    {
+                        return Err(G0Error::SpecializationTraceInvariant);
+                    }
+                }
+                _ => {}
             }
         }
         let relations = self
@@ -2013,10 +2105,12 @@ pub(crate) enum G0Error {
     UnsupportedCanonicalEventKind,
     #[error("residual predecessor observation has no normalized consumer result")]
     MissingNormalizationResult,
-    #[error("specialization observation owner does not match its typed key")]
-    SpecializationOwnerMismatch,
-    #[error("specialization observation has no successful typed result")]
-    MissingSpecializationResult,
+    #[error("specialization recorder invariant is violated")]
+    SpecializationTraceInvariant,
+    #[error("specialization cache hit has no earlier trace range")]
+    MissingSpecializationRange,
+    #[error("specialization replay range is malformed or out of bounds")]
+    MalformedSpecializationRange,
     #[error("relation observation owner or typed result is inconsistent")]
     RelationOwnerMismatch,
     #[error("applied relation observation has no typed result")]
@@ -3248,41 +3342,13 @@ mod tests {
         let key = RuntimeSpecializationKey { dispatch, index: owner, generation };
 
         let mut trace = FeasibilityTrace::default();
-        trace
-            .record_specialization(SpecializationObservation {
-                owner,
-                key: key.clone(),
-                hit: false,
-                result: Some(owner),
-            })
-            .expect("miss");
-        trace
-            .record_specialization(SpecializationObservation {
-                owner,
-                key,
-                hit: true,
-                result: Some(owner),
-            })
-            .expect("hit");
-        let specializations = trace
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                NormalizerEvent::Specialization(observation) => Some(observation),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(specializations.len(), 2);
+        let start = trace.specialization_miss_start(owner, key.clone()).expect("miss start");
+        trace.record_specialization_computed(owner, key.clone(), start).expect("miss");
+        trace.record_specialization_cache_hit(owner, key.clone()).expect("hit");
+        trace.record_specialization_cache_hit(owner, key.clone()).expect("repeated hit");
         trace.validate_normalization_observations().expect("typed results");
         let mut ordinary = NoFeasibility;
-        ordinary
-            .record_specialization(SpecializationObservation {
-                owner,
-                key: specializations[0].key.clone(),
-                hit: true,
-                result: Some(owner),
-            })
-            .expect("ordinary sink remains a no-op");
+        ordinary.record_specialization_cache_hit(owner, key.clone()).expect("ordinary no-op");
 
         let other_body = expressions
             .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
@@ -3298,30 +3364,22 @@ mod tests {
             .scoped(&expressions, other_family.program(), other_body)
             .expect("second scoped owner");
         assert_eq!(
-            FeasibilityTrace::default().record_specialization(SpecializationObservation {
-                owner: other,
-                key: specializations[0].key.clone(),
-                hit: true,
-                result: Some(other),
-            }),
-            Err(G0Error::SpecializationOwnerMismatch)
+            FeasibilityTrace::default().specialization_miss_start(other, key.clone()),
+            Err(G0Error::SpecializationTraceInvariant)
         );
-        let mut missing = trace.clone();
-        missing.events = trace
-            .events
-            .iter()
-            .cloned()
-            .map(|event| match event {
-                NormalizerEvent::Specialization(mut observation) => {
-                    observation.result = None;
-                    NormalizerEvent::Specialization(observation)
-                }
-                event => event,
-            })
-            .collect();
         assert_eq!(
-            missing.validate_normalization_observations(),
-            Err(G0Error::MissingSpecializationResult)
+            FeasibilityTrace::default().record_specialization_cache_hit(owner, key),
+            Err(G0Error::MissingSpecializationRange)
+        );
+        let mut malformed = trace.clone();
+        for event in &mut malformed.events {
+            if let NormalizerEvent::SpecializationCacheHit { source, .. } = event {
+                source.end = EventIndex(u64::MAX);
+            }
+        }
+        assert_eq!(
+            malformed.validate_normalization_observations(),
+            Err(G0Error::SpecializationTraceInvariant)
         );
     }
 

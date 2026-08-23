@@ -37,6 +37,8 @@ pub(crate) trait FeasibilitySink: Default {
     fn record_event(&mut self, observation: EventObservation) -> Result<(), G0Error>;
 
     fn record_index_use(&mut self, plan: IndexUsePlan) -> Result<(), G0Error>;
+
+    fn allocate_slice_group_id(&mut self) -> Result<SliceGroupId, G0Error>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -763,14 +765,31 @@ impl FeasibilitySink for NoFeasibility {
     fn record_index_use(&mut self, _plan: IndexUsePlan) -> Result<(), G0Error> {
         Ok(())
     }
+
+    fn allocate_slice_group_id(&mut self) -> Result<SliceGroupId, G0Error> {
+        unreachable!("NoFeasibility slice-group allocation is guarded by FeasibilitySink::ENABLED")
+    }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FeasibilityTrace {
     pub lowering_complete: u64,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
     index_use_plans: BTreeMap<IndexUseKey, IndexUsePlan>,
+    next_slice_group_id: u64,
+}
+
+impl Default for FeasibilityTrace {
+    fn default() -> Self {
+        Self {
+            lowering_complete: 0,
+            source_observations: BTreeMap::new(),
+            event_observations: BTreeMap::new(),
+            index_use_plans: BTreeMap::new(),
+            next_slice_group_id: 1,
+        }
+    }
 }
 
 impl From<NoFeasibility> for FeasibilityTrace {
@@ -822,9 +841,20 @@ impl FeasibilitySink for FeasibilityTrace {
             }
         }
     }
+
+    fn allocate_slice_group_id(&mut self) -> Result<SliceGroupId, G0Error> {
+        let id = self.next_slice_group_id;
+        self.next_slice_group_id = id.checked_add(1).ok_or(G0Error::TraceOverflow)?;
+        Ok(SliceGroupId(id))
+    }
 }
 
 impl FeasibilityTrace {
+    #[cfg(test)]
+    fn set_next_slice_group_id(&mut self, next: u64) {
+        self.next_slice_group_id = next;
+    }
+
     /// Keep only source observations whose typed lowering handle belongs to the residual closure.
     pub(crate) fn retain_residual(&mut self, closure: &CertificateClosure) {
         self.source_observations.retain(|handle, _| match handle {
@@ -1872,6 +1902,21 @@ mod tests {
         assert!(!NoFeasibility::ENABLED);
         assert!(FeasibilityTrace::ENABLED);
         assert_eq!(FeasibilityTrace::from(ordinary), FeasibilityTrace::default());
+    }
+
+    #[test]
+    fn slice_group_ids_are_sink_owned_deterministic_and_checked() {
+        let mut first = FeasibilityTrace::default();
+        assert_eq!(first.allocate_slice_group_id().unwrap(), SliceGroupId(1));
+        assert_eq!(first.allocate_slice_group_id().unwrap(), SliceGroupId(2));
+        let mut second = FeasibilityTrace::default();
+        assert_eq!(second.allocate_slice_group_id().unwrap(), SliceGroupId(1));
+        assert_eq!(second.allocate_slice_group_id().unwrap(), SliceGroupId(2));
+
+        first.set_next_slice_group_id(u64::MAX);
+        assert_eq!(first.allocate_slice_group_id(), Err(G0Error::TraceOverflow));
+        assert_eq!(std::mem::size_of::<NoFeasibility>(), 0);
+        assert_eq!(FeasibilityTrace::from(NoFeasibility), FeasibilityTrace::default());
     }
 
     #[test]

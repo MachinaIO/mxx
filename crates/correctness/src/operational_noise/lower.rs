@@ -15,8 +15,8 @@ use super::{
     facts::{CoefficientBound, MatrixFacts, MatrixMetadata, NumericContract, PolynomialFacts},
     g0::{
         EventKind, EventObservation, FeasibilitySink, FeasibilityTrace, IndexFrontierAxis,
-        IndexUseKind, IndexUsePlan, InputSourceIdentity, NoFeasibility, SliceGroupId,
-        SliceGroupMember, SliceMemberRole, SourceClass, SourceHandle, SynchronizedSliceGroup,
+        IndexUseKind, IndexUsePlan, InputSourceIdentity, NoFeasibility, SliceGroupMember,
+        SliceMemberRole, SourceClass, SourceHandle, SynchronizedSliceGroup,
     },
     job::{CandidateToken, CheckerJob, JobError},
     program::{FamilyValueId, SelectionSelector},
@@ -306,7 +306,6 @@ pub(crate) struct ProductionAdapter<'a, S: FeasibilitySink = NoFeasibility> {
     trapdoor_values: BTreeMap<SampleKey, ExprId>,
     occurrence_descendants: BTreeMap<(StageId, ProgramOccurrence), BTreeSet<ProgramOccurrence>>,
     diagnostic_budget: u16,
-    next_slice_group_id: u64,
     feasibility: S,
 }
 
@@ -843,7 +842,6 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
             trapdoor_values: BTreeMap::new(),
             occurrence_descendants,
             diagnostic_budget: 128,
-            next_slice_group_id: 1,
             feasibility,
         };
         let mut adapter = adapter;
@@ -3668,14 +3666,9 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 });
             }
             let frontier = self.index_frontier_axes_for(&endpoints, wire)?;
-            let id = SliceGroupId(self.next_slice_group_id);
-            self.next_slice_group_id =
-                self.next_slice_group_id.checked_add(1).ok_or_else(|| {
-                    ProductionAdapterError::Structural {
-                        wire: wire.clone(),
-                        reason: "indexed slice group id space exhausted".to_owned(),
-                    }
-                })?;
+            let id = self.feasibility.allocate_slice_group_id().map_err(|error| {
+                ProductionAdapterError::Descriptor { reason: error.to_string() }
+            })?;
             let group = SynchronizedSliceGroup {
                 id,
                 frontier: frontier.clone(),

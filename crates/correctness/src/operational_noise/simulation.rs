@@ -5,10 +5,13 @@
 
 use super::{
     OperationalSimulationDiagnostics, OperationalSimulationReport,
-    arena::{ClosedExprId, FamilyDomain, ResolvedMatrixType, ResolvedValueType},
+    arena::{
+        ArenaError, ClosedExprId, ExprId, FamilyDomain, ResolvedMatrixType, ResolvedValueType,
+        ValueOperator,
+    },
     error::{OperationalSimulationError, TargetError},
     lower::{ProductionAdapter, ProductionRoot},
-    program::FamilyValueId,
+    program::{FamilyValueId, ValueProgramId},
     protocol::ProtocolPlan,
     report::{ReportTarget, analyze_roots},
 };
@@ -20,7 +23,7 @@ use mxx_ir_core::{
 use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -76,6 +79,107 @@ pub(crate) struct OperationalCertificateProjection {
     pub plaintext_modulus: BigUint,
     pub ciphertext_modulus: BigUint,
     pub residual: CertificateResidualRoot,
+    pub closure: CertificateClosure,
+}
+
+/// The typed dependency inventory rooted at one residual production root.
+///
+/// Expression and program IDs remain job-local.  This inventory is an in-memory boundary only;
+/// later serialization must replace these handles with canonical rows without adding decoder data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CertificateClosure {
+    pub expressions: BTreeSet<ExprId>,
+    pub programs: BTreeSet<ValueProgramId>,
+    pub families: BTreeSet<FamilyValueId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub(crate) enum CertificateClosureError {
+    #[error("certificate closure arena reference is invalid: {0}")]
+    Arena(#[from] ArenaError),
+    #[error(
+        "certificate family {family:?} disagrees with its program {program:?}: family body {family_body:?}, program root {program_root:?}"
+    )]
+    FamilyProgramMismatch {
+        family: FamilyValueId,
+        program: ValueProgramId,
+        family_body: ExprId,
+        program_root: ExprId,
+    },
+}
+
+/// Collect the transitive dependency closure of exactly one production root.
+///
+/// Callers pass `ProductionRoots.residual`; this API intentionally accepts no decoder root and
+/// never enumerates family lanes or selectors.
+pub(crate) fn collect_residual_closure(
+    job: &super::job::CheckerJob,
+    root: &ProductionRoot,
+) -> Result<CertificateClosure, CertificateClosureError> {
+    enum Work {
+        Expression(ExprId),
+        Program(ValueProgramId),
+        Family(FamilyValueId),
+    }
+
+    let mut expressions = BTreeSet::new();
+    let mut programs = BTreeSet::new();
+    let mut families = BTreeSet::new();
+    let mut work = Vec::new();
+    match root {
+        ProductionRoot::Closed(root) => work.push(Work::Expression(root.expression())),
+        ProductionRoot::Family(family) => work.push(Work::Family(*family)),
+    }
+
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Expression(expression) => {
+                if !expressions.insert(expression) {
+                    continue;
+                }
+                let node = job.expressions().node(expression)?;
+                let inputs = node.inputs.clone();
+                let program = match &node.operator {
+                    ValueOperator::ProgramCall { program } => Some(*program),
+                    _ => None,
+                };
+                work.extend(inputs.into_iter().map(Work::Expression));
+                if let Some(program) = program {
+                    work.push(Work::Program(program));
+                }
+            }
+            Work::Program(program) => {
+                if !programs.insert(program) {
+                    continue;
+                }
+                let record = job.programs().program(program)?;
+                let root = record.root;
+                if let Some(family) = job.programs().family_for_program(program) {
+                    work.push(Work::Family(family));
+                }
+                work.push(Work::Expression(root));
+            }
+            Work::Family(family) => {
+                if !families.insert(family) {
+                    continue;
+                }
+                let program = family.program();
+                let program_root = job.programs().program(program)?.root;
+                let family_body = job.programs().family_body(family)?;
+                if family_body != program_root {
+                    return Err(CertificateClosureError::FamilyProgramMismatch {
+                        family,
+                        program,
+                        family_body,
+                        program_root,
+                    });
+                }
+                work.push(Work::Program(program));
+            }
+        }
+    }
+
+    Ok(CertificateClosure { expressions, programs, families })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -92,6 +196,8 @@ pub(crate) enum CertificateProjectionError {
     ResidualModulusMismatch { target_id: String, target: BigUint, residual: BigUint },
     #[error("certificate projection failed during lowering: {detail}")]
     Lowering { detail: String },
+    #[error("certificate residual closure failed: {0}")]
+    Closure(#[from] CertificateClosureError),
     #[error("operational checker rejected certificate projection: {0}")]
     Operational(#[from] OperationalSimulationError),
 }
@@ -133,11 +239,13 @@ pub(crate) fn project_operational_certificate(
         .lower()
         .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?;
     let residual = project_residual_root(&job, &roots.residual, &target)?;
+    let closure = collect_residual_closure(&job, &roots.residual)?;
     Ok(OperationalCertificateProjection {
         target_id,
         plaintext_modulus,
         ciphertext_modulus: target.ciphertext_modulus,
         residual,
+        closure,
     })
 }
 
@@ -1256,6 +1364,9 @@ mod tests {
         };
         assert_eq!(matrix.modulus, 256_u16.into());
         assert_eq!(matrix.ring_dimension, 1);
+        assert!(!projection.closure.expressions.is_empty());
+        assert!(projection.closure.programs.is_empty());
+        assert!(projection.closure.families.is_empty());
     }
 
     #[test]
@@ -1318,6 +1429,162 @@ mod tests {
             }) if target_id == "certificate-threshold" &&
                 target == 255_u16.into() &&
                 residual == 256_u16.into()
+        ));
+    }
+
+    #[test]
+    fn residual_closure_traverses_closed_expression_inputs() {
+        let mut job = super::super::job::CheckerJob::new();
+        let (root, left, right) = job
+            .with_arena_stores(|expressions, _, _| {
+                let left = expressions.intern(
+                    ValueOperator::Constant(super::super::arena::TypedConstant::int(1)),
+                    Box::new([]),
+                )?;
+                let right = expressions.intern(
+                    ValueOperator::Constant(super::super::arena::TypedConstant::int(2)),
+                    Box::new([]),
+                )?;
+                let root = expressions.intern_slice(
+                    ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                    &[left, right],
+                )?;
+                Ok::<_, super::super::arena::ArenaError>((expressions.close(root)?, left, right))
+            })
+            .expect("closed expression");
+        let root_expression = root.expression();
+        let closure =
+            collect_residual_closure(&job, &super::super::lower::ProductionRoot::Closed(root))
+                .expect("closed residual closure");
+        assert_eq!(closure.expressions.len(), 3);
+        assert!(closure.expressions.contains(&root_expression));
+        assert!(closure.expressions.contains(&left));
+        assert!(closure.expressions.contains(&right));
+        assert!(closure.programs.is_empty());
+        assert!(closure.families.is_empty());
+    }
+
+    #[test]
+    fn residual_closure_keeps_family_body_typed_without_lane_enumeration() {
+        let mut job = super::super::job::CheckerJob::new();
+        let (family, body) = job
+            .with_arena_stores(|expressions, programs, _| {
+                let body =
+                    expressions.intern_argument(0, super::super::arena::ResolvedValueType::Int)?;
+                let family = programs.generated_family_from_body(
+                    expressions,
+                    super::super::arena::FamilyDomain::new(4, 8)?,
+                    body,
+                )?;
+                Ok::<_, super::super::arena::ArenaError>((family, body))
+            })
+            .expect("indexed family");
+        let closure =
+            collect_residual_closure(&job, &super::super::lower::ProductionRoot::Family(family))
+                .expect("family residual closure");
+        assert_eq!(closure.expressions.len(), 1);
+        assert!(closure.expressions.contains(&body));
+        assert_eq!(closure.programs.len(), 1);
+        assert!(closure.programs.contains(&family.program()));
+        assert_eq!(closure.families.len(), 1);
+        assert!(closure.families.contains(&family));
+    }
+
+    #[test]
+    fn residual_closure_includes_transitive_program_call_bodies() {
+        let mut job = super::super::job::CheckerJob::new();
+        let (root, inner, outer, inner_body, outer_body, one) = job
+            .with_arena_stores(|expressions, programs, _| {
+                let inner_body = expressions.intern(
+                    ValueOperator::Constant(super::super::arena::TypedConstant::int(2)),
+                    Box::new([]),
+                )?;
+                let signature = super::super::arena::ProgramSignature {
+                    inputs: Box::new([]),
+                    output: super::super::arena::ResolvedValueType::Int,
+                };
+                let inner = programs.finalize(expressions, signature.clone(), inner_body)?;
+                let inner_call =
+                    expressions.intern_slice(ValueOperator::ProgramCall { program: inner }, &[])?;
+                let one = expressions.intern(
+                    ValueOperator::Constant(super::super::arena::TypedConstant::int(1)),
+                    Box::new([]),
+                )?;
+                let outer_body = expressions.intern_slice(
+                    ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                    &[inner_call, one],
+                )?;
+                let outer = programs.finalize(expressions, signature, outer_body)?;
+                let root_expression =
+                    expressions.intern_slice(ValueOperator::ProgramCall { program: outer }, &[])?;
+                Ok::<_, super::super::arena::ArenaError>((
+                    expressions.close(root_expression)?,
+                    inner,
+                    outer,
+                    inner_body,
+                    outer_body,
+                    one,
+                ))
+            })
+            .expect("nested program calls");
+        let closure =
+            collect_residual_closure(&job, &super::super::lower::ProductionRoot::Closed(root))
+                .expect("program-call residual closure");
+        assert_eq!(closure.programs, [inner, outer].into_iter().collect());
+        assert!(closure.expressions.contains(&root.expression()));
+        assert!(closure.expressions.contains(&inner_body));
+        assert!(closure.expressions.contains(&outer_body));
+        assert!(closure.expressions.contains(&one));
+        assert!(closure.families.is_empty());
+    }
+
+    #[test]
+    fn residual_closure_excludes_decoder_root() {
+        let mut job = super::super::job::CheckerJob::new();
+        let (residual, decoder) = job
+            .with_arena_stores(|expressions, _, _| {
+                let residual = expressions.intern(
+                    ValueOperator::Constant(super::super::arena::TypedConstant::int(0)),
+                    Box::new([]),
+                )?;
+                let decoder = expressions.intern(
+                    ValueOperator::Constant(super::super::arena::TypedConstant::int(1)),
+                    Box::new([]),
+                )?;
+                Ok::<_, super::super::arena::ArenaError>((
+                    expressions.close(residual)?,
+                    expressions.close(decoder)?,
+                ))
+            })
+            .expect("two roots");
+        let roots = super::super::lower::ProductionRoots {
+            residual: super::super::lower::ProductionRoot::Closed(residual),
+            decoder: super::super::lower::ProductionRoot::Closed(decoder),
+            occurrences: 0,
+            samples: 0,
+        };
+        let closure = collect_residual_closure(&job, &roots.residual).expect("residual closure");
+        assert!(closure.expressions.contains(&residual.expression()));
+        assert!(!closure.expressions.contains(&decoder.expression()));
+    }
+
+    #[test]
+    fn residual_closure_rejects_a_foreign_closed_root() {
+        let mut source = super::super::job::CheckerJob::new();
+        let root = source
+            .expressions_mut()
+            .intern(
+                ValueOperator::Constant(super::super::arena::TypedConstant::int(0)),
+                Box::new([]),
+            )
+            .and_then(|expression| source.expressions().close(expression))
+            .expect("source root");
+        let target = super::super::job::CheckerJob::new();
+        assert!(matches!(
+            collect_residual_closure(&target, &super::super::lower::ProductionRoot::Closed(root),),
+            Err(CertificateClosureError::Arena(
+                super::super::arena::ArenaError::ForeignExpression { .. }
+            ))
         ));
     }
 }

@@ -33,12 +33,7 @@ pub(crate) trait FeasibilitySink: Default {
 
     fn record_lowering_complete(&mut self) -> Result<(), G0Error>;
 
-    fn record_residual_normalization_start(&mut self) -> Result<(), G0Error>;
-
-    fn record_residual_normalization_end(
-        &mut self,
-        counters: &super::normal_form::NormalizationCounters,
-    ) -> Result<(), G0Error>;
+    fn record_invocation_start(&mut self, root: super::arena::ScopedExprId) -> Result<(), G0Error>;
 
     fn record_predecessor(
         &mut self,
@@ -50,7 +45,17 @@ pub(crate) trait FeasibilitySink: Default {
     fn record_normalization_result(
         &mut self,
         result: super::arena::ScopedExprId,
+        value: &super::normal_form::AnalyzedValue,
     ) -> Result<(), G0Error>;
+
+    fn record_invocation_end(
+        &mut self,
+        root: super::arena::ScopedExprId,
+        result: &super::normal_form::AnalyzedValue,
+        counters: &super::normal_form::NormalizationCounters,
+    ) -> Result<(), G0Error>;
+
+    fn abort_invocation(&mut self, root: super::arena::ScopedExprId);
 
     fn record_specialization(
         &mut self,
@@ -124,11 +129,60 @@ pub(crate) struct EventObservation {
     pub kind: EventKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct PredecessorObservation {
-    pub consumer: super::arena::ScopedExprId,
-    pub input_position: u32,
-    pub predecessor: ExprId,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct EventIndex(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct EventRange {
+    pub start: EventIndex,
+    pub end: EventIndex,
+}
+
+impl EventRange {
+    fn checked(start: EventIndex, end: EventIndex) -> Result<Self, G0Error> {
+        if end.0 < start.0 {
+            return Err(G0Error::TraceOverflow);
+        }
+        Ok(Self { start, end })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecordedValue {
+    pub exact_nf: Option<std::sync::Arc<super::normal_form::PolynomialNF>>,
+    pub coefficient_bound: super::facts::NumericContract<super::facts::CoefficientBound>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NormalizerEvent {
+    InvocationStart {
+        root: super::arena::ScopedExprId,
+    },
+    Predecessor {
+        consumer: super::arena::ScopedExprId,
+        input_position: u32,
+        predecessor: ExprId,
+        source_result: EventIndex,
+    },
+    Result {
+        owner: super::arena::ScopedExprId,
+        value: RecordedValue,
+    },
+    InvocationEnd {
+        root: super::arena::ScopedExprId,
+        result: RecordedValue,
+        counters: super::normal_form::NormalizationCounters,
+    },
+    Specialization(SpecializationObservation),
+    Relation(RelationObservation),
+    BoundTransfer(BoundTransferObservation),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InvocationFrame {
+    root: super::arena::ScopedExprId,
+    range: EventRange,
+    results: BTreeMap<ExprId, EventIndex>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1153,12 +1207,17 @@ impl FeasibilitySink for NoFeasibility {
         Ok(())
     }
 
-    fn record_residual_normalization_start(&mut self) -> Result<(), G0Error> {
+    fn record_invocation_start(
+        &mut self,
+        _root: super::arena::ScopedExprId,
+    ) -> Result<(), G0Error> {
         Ok(())
     }
 
-    fn record_residual_normalization_end(
+    fn record_invocation_end(
         &mut self,
+        _root: super::arena::ScopedExprId,
+        _result: &super::normal_form::AnalyzedValue,
         _counters: &super::normal_form::NormalizationCounters,
     ) -> Result<(), G0Error> {
         Ok(())
@@ -1176,9 +1235,12 @@ impl FeasibilitySink for NoFeasibility {
     fn record_normalization_result(
         &mut self,
         _result: super::arena::ScopedExprId,
+        _value: &super::normal_form::AnalyzedValue,
     ) -> Result<(), G0Error> {
         Ok(())
     }
+
+    fn abort_invocation(&mut self, _root: super::arena::ScopedExprId) {}
 
     fn record_specialization(
         &mut self,
@@ -1222,14 +1284,8 @@ impl FeasibilitySink for NoFeasibility {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FeasibilityTrace {
     pub lowering_complete: u64,
-    pub residual_normalization_starts: u64,
-    pub residual_normalization_ends: u64,
-    pub residual_normalization_nodes: u64,
-    pub predecessor_observations: BTreeSet<PredecessorObservation>,
-    pub normalization_results: BTreeSet<super::arena::ScopedExprId>,
-    pub specialization_observations: BTreeSet<SpecializationObservation>,
-    pub relation_observations: Vec<RelationObservation>,
-    pub bound_transfer_observations: Vec<BoundTransferObservation>,
+    pub events: Vec<NormalizerEvent>,
+    frames: Vec<InvocationFrame>,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
     index_use_plans: BTreeSet<IndexUsePlan>,
@@ -1240,14 +1296,8 @@ impl Default for FeasibilityTrace {
     fn default() -> Self {
         Self {
             lowering_complete: 0,
-            residual_normalization_starts: 0,
-            residual_normalization_ends: 0,
-            residual_normalization_nodes: 0,
-            predecessor_observations: BTreeSet::new(),
-            normalization_results: BTreeSet::new(),
-            specialization_observations: BTreeSet::new(),
-            relation_observations: Vec::new(),
-            bound_transfer_observations: Vec::new(),
+            events: Vec::new(),
+            frames: Vec::new(),
             source_observations: BTreeMap::new(),
             event_observations: BTreeMap::new(),
             index_use_plans: BTreeSet::new(),
@@ -1271,22 +1321,15 @@ impl FeasibilitySink for FeasibilityTrace {
         Ok(())
     }
 
-    fn record_residual_normalization_start(&mut self) -> Result<(), G0Error> {
-        self.residual_normalization_starts =
-            self.residual_normalization_starts.checked_add(1).ok_or(G0Error::TraceOverflow)?;
-        Ok(())
-    }
-
-    fn record_residual_normalization_end(
-        &mut self,
-        counters: &super::normal_form::NormalizationCounters,
-    ) -> Result<(), G0Error> {
-        self.residual_normalization_ends =
-            self.residual_normalization_ends.checked_add(1).ok_or(G0Error::TraceOverflow)?;
-        self.residual_normalization_nodes = self
-            .residual_normalization_nodes
-            .checked_add(counters.nodes_processed)
-            .ok_or(G0Error::TraceOverflow)?;
+    fn record_invocation_start(&mut self, root: super::arena::ScopedExprId) -> Result<(), G0Error> {
+        let start =
+            EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
+        self.events.push(NormalizerEvent::InvocationStart { root });
+        self.frames.push(InvocationFrame {
+            root,
+            range: EventRange::checked(start, start)?,
+            results: BTreeMap::new(),
+        });
         Ok(())
     }
 
@@ -1296,10 +1339,14 @@ impl FeasibilitySink for FeasibilityTrace {
         input_position: u32,
         predecessor: ExprId,
     ) -> Result<(), G0Error> {
-        self.predecessor_observations.insert(PredecessorObservation {
+        let frame = self.frames.last().ok_or(G0Error::MissingNormalizationResult)?;
+        let source_result =
+            *frame.results.get(&predecessor).ok_or(G0Error::MissingNormalizationResult)?;
+        self.events.push(NormalizerEvent::Predecessor {
             consumer,
             input_position,
             predecessor,
+            source_result,
         });
         Ok(())
     }
@@ -1307,9 +1354,60 @@ impl FeasibilitySink for FeasibilityTrace {
     fn record_normalization_result(
         &mut self,
         result: super::arena::ScopedExprId,
+        value: &super::normal_form::AnalyzedValue,
     ) -> Result<(), G0Error> {
-        self.normalization_results.insert(result);
+        let frame = self.frames.last_mut().ok_or(G0Error::MissingNormalizationResult)?;
+        if frame.results.contains_key(&result.expression()) {
+            return Err(G0Error::MissingNormalizationResult);
+        }
+        let index =
+            EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
+        self.events.push(NormalizerEvent::Result {
+            owner: result,
+            value: RecordedValue {
+                exact_nf: value.exact_nf.clone(),
+                coefficient_bound: value.coefficient_bound.clone(),
+            },
+        });
+        frame.results.insert(result.expression(), index);
         Ok(())
+    }
+
+    fn record_invocation_end(
+        &mut self,
+        root: super::arena::ScopedExprId,
+        result: &super::normal_form::AnalyzedValue,
+        counters: &super::normal_form::NormalizationCounters,
+    ) -> Result<(), G0Error> {
+        let frame = self.frames.last().ok_or(G0Error::MissingNormalizationResult)?;
+        if frame.root != root ||
+            result.semantic != root ||
+            !frame.results.contains_key(&root.expression())
+        {
+            return Err(G0Error::MissingNormalizationResult);
+        }
+        let end = EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
+        let range = EventRange::checked(
+            frame.range.start,
+            EventIndex(end.0.checked_add(1).ok_or(G0Error::TraceOverflow)?),
+        )?;
+        self.events.push(NormalizerEvent::InvocationEnd {
+            root,
+            result: RecordedValue {
+                exact_nf: result.exact_nf.clone(),
+                coefficient_bound: result.coefficient_bound.clone(),
+            },
+            counters: *counters,
+        });
+        if let Some(frame) = self.frames.last_mut() {
+            frame.range = range;
+        }
+        self.frames.pop();
+        Ok(())
+    }
+
+    fn abort_invocation(&mut self, _root: super::arena::ScopedExprId) {
+        let _ = self.frames.pop();
     }
 
     fn record_specialization(
@@ -1319,7 +1417,7 @@ impl FeasibilitySink for FeasibilityTrace {
         if observation.key.index != observation.owner {
             return Err(G0Error::SpecializationOwnerMismatch);
         }
-        self.specialization_observations.insert(observation);
+        self.events.push(NormalizerEvent::Specialization(observation));
         Ok(())
     }
 
@@ -1329,7 +1427,7 @@ impl FeasibilitySink for FeasibilityTrace {
         {
             return Err(G0Error::MissingRelationResult);
         }
-        self.relation_observations.push(observation);
+        self.events.push(NormalizerEvent::Relation(observation));
         Ok(())
     }
 
@@ -1337,33 +1435,38 @@ impl FeasibilitySink for FeasibilityTrace {
         &mut self,
         observation: BoundTransferObservation,
     ) -> Result<(), G0Error> {
-        self.bound_transfer_observations.push(observation);
+        self.events.push(NormalizerEvent::BoundTransfer(observation));
         Ok(())
     }
 
     fn validate_normalization_observations(&self) -> Result<(), G0Error> {
-        if self
-            .predecessor_observations
-            .iter()
-            .any(|observation| !self.normalization_results.contains(&observation.consumer))
-        {
+        if !self.frames.is_empty() {
             return Err(G0Error::MissingNormalizationResult);
         }
-        if self
-            .specialization_observations
-            .iter()
-            .any(|observation| observation.result != Some(observation.owner))
-        {
-            return Err(G0Error::MissingSpecializationResult);
+        for observation in self.events.iter().filter_map(|event| match event {
+            NormalizerEvent::Specialization(observation) => Some(observation),
+            _ => None,
+        }) {
+            if observation.result != Some(observation.owner) {
+                return Err(G0Error::MissingSpecializationResult);
+            }
         }
-        for (position, observation) in self.relation_observations.iter().enumerate() {
+        let relations = self
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                NormalizerEvent::Relation(observation) => Some(observation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (position, observation) in relations.iter().enumerate() {
             if observation.disposition != RelationObservationDisposition::Applied {
                 continue;
             }
             if observation.result.is_none() {
                 return Err(G0Error::MissingRelationResult);
             }
-            let considered = self.relation_observations[..position].iter().any(|prior| {
+            let considered = relations[..position].iter().any(|prior| {
                 prior.owner == observation.owner &&
                     prior.kind == observation.kind &&
                     prior.disposition == RelationObservationDisposition::Considered &&
@@ -3161,13 +3264,21 @@ mod tests {
                 result: Some(owner),
             })
             .expect("hit");
-        assert_eq!(trace.specialization_observations.len(), 2);
+        let specializations = trace
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                NormalizerEvent::Specialization(observation) => Some(observation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(specializations.len(), 2);
         trace.validate_normalization_observations().expect("typed results");
         let mut ordinary = NoFeasibility;
         ordinary
             .record_specialization(SpecializationObservation {
                 owner,
-                key: trace.specialization_observations.iter().next().unwrap().key.clone(),
+                key: specializations[0].key.clone(),
                 hit: true,
                 result: Some(owner),
             })
@@ -3189,20 +3300,23 @@ mod tests {
         assert_eq!(
             FeasibilityTrace::default().record_specialization(SpecializationObservation {
                 owner: other,
-                key: trace.specialization_observations.iter().next().unwrap().key.clone(),
+                key: specializations[0].key.clone(),
                 hit: true,
                 result: Some(other),
             }),
             Err(G0Error::SpecializationOwnerMismatch)
         );
         let mut missing = trace.clone();
-        missing.specialization_observations = trace
-            .specialization_observations
+        missing.events = trace
+            .events
             .iter()
             .cloned()
-            .map(|mut observation| {
-                observation.result = None;
-                observation
+            .map(|event| match event {
+                NormalizerEvent::Specialization(mut observation) => {
+                    observation.result = None;
+                    NormalizerEvent::Specialization(observation)
+                }
+                event => event,
             })
             .collect();
         assert_eq!(

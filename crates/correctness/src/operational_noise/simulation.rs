@@ -1617,10 +1617,36 @@ mod tests {
             .expect("valid threshold certificate run");
         assert!(run.accepted_report.accepted);
         assert!(run.trace.lowering_complete > 0);
-        assert_eq!(run.trace.residual_normalization_starts, 1);
-        assert_eq!(run.trace.residual_normalization_ends, 1);
-        assert!(run.trace.residual_normalization_nodes > 0);
-        assert!(!run.trace.normalization_results.is_empty());
+        let starts = run
+            .trace
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::operational_noise::g0::NormalizerEvent::InvocationStart { .. }
+                )
+            })
+            .count();
+        let ends = run
+            .trace
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(event, crate::operational_noise::g0::NormalizerEvent::InvocationEnd { .. })
+            })
+            .count();
+        let results = run
+            .trace
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(event, crate::operational_noise::g0::NormalizerEvent::Result { .. })
+            })
+            .count();
+        assert_eq!(starts, 1);
+        assert_eq!(ends, 1);
+        assert!(results > 0);
         assert_eq!(run.accepted_report.target_id, request.target_id);
         assert_eq!(run.accepted_report.ciphertext_modulus, 256_u16.into());
         assert!(matches!(

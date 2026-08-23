@@ -530,6 +530,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         root: ScopedExprId,
         scope_proof: Option<ScopeProof>,
     ) -> Result<AnalyzedValue, NormalizeError> {
+        if S::ENABLED {
+            self.sink
+                .as_deref_mut()
+                .ok_or(super::g0::G0Error::MissingNormalizationResult)?
+                .record_invocation_start(root)?;
+        }
         let outermost = self.normalization_depth == 0;
         if outermost {
             self.protected_monomial_prefix = self.monomials.len();
@@ -537,6 +543,27 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         self.normalization_depth = self.normalization_depth.saturating_add(1);
         let result = self.normalize_inner(root, scope_proof);
         self.normalization_depth = self.normalization_depth.saturating_sub(1);
+        if S::ENABLED {
+            match &result {
+                Ok(value) => {
+                    let counters = self.counters;
+                    let end_result = self
+                        .sink
+                        .as_deref_mut()
+                        .ok_or(super::g0::G0Error::MissingNormalizationResult)?
+                        .record_invocation_end(root, value, &counters);
+                    if let Err(error) = end_result {
+                        self.sink.as_deref_mut().map(|sink| sink.abort_invocation(root));
+                        return Err(error.into());
+                    }
+                }
+                Err(_) => {
+                    if let Some(sink) = self.sink.as_deref_mut() {
+                        sink.abort_invocation(root);
+                    }
+                }
+            }
+        }
         result
     }
 
@@ -1075,12 +1102,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(())
     }
 
-    fn observe_result(&mut self, result: ScopedExprId) -> Result<(), NormalizeError> {
+    fn observe_result(
+        &mut self,
+        result: ScopedExprId,
+        value: &AnalyzedValue,
+    ) -> Result<(), NormalizeError> {
         if S::ENABLED {
             self.sink
                 .as_deref_mut()
                 .ok_or(super::g0::G0Error::MissingNormalizationResult)?
-                .record_normalization_result(result)?;
+                .record_normalization_result(result, value)?;
         }
         Ok(())
     }
@@ -1185,7 +1216,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 normal_form.bounded_summary = BoundedSummary::zero();
             }
         }
-        self.observe_result(semantic)?;
+        self.observe_result(semantic, &value)?;
         Ok(value)
     }
 

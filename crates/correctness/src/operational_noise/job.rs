@@ -1390,9 +1390,6 @@ impl CheckerJob {
         );
         let monomial_arena =
             monomials.ensure(expressions, programs, scope).map_err(JobError::Monomial)?;
-        if S::ENABLED {
-            sink.record_residual_normalization_start().map_err(JobError::Feasibility)?;
-        }
         let mut normalizer =
             Normalizer::new_with_sink(expressions, programs, facts, monomial_arena, sink)
                 .map_err(JobError::Normalize)?
@@ -1403,9 +1400,6 @@ impl CheckerJob {
         drop(normalizer);
         if S::ENABLED {
             sink.validate_normalization_observations().map_err(JobError::Feasibility)?;
-        }
-        if S::ENABLED {
-            sink.record_residual_normalization_end(&counters).map_err(JobError::Feasibility)?;
         }
         self.frozen_resources = Some(self.current_resource_counters());
         Ok((value, counters))

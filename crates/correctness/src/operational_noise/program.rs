@@ -81,6 +81,24 @@ struct ProgramKey {
     root: ExprId,
 }
 
+/// Read-only typed metadata for one finalized value program. Handles are retained only as
+/// lookup capabilities; callers must use the typed fields for canonical identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProgramProjection {
+    pub signature: ProgramSignature,
+    pub root: ExprId,
+    pub family: Option<FamilyProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FamilyProjection {
+    pub domain: FamilyDomain,
+    pub element_type: ResolvedValueType,
+    pub body: ExprId,
+    pub reducible: bool,
+    pub artifact: Option<ArtifactIdentity>,
+}
+
 /// The single job-local authority for finalized value programs and indexed families.
 ///
 /// Families are views over ordinary one-argument programs.  They do not introduce another
@@ -159,6 +177,31 @@ impl ProgramArena {
             return Err(ArenaError::ForeignProgram { expected: self.token, actual: id.arena });
         }
         self.programs.get(id.slot as usize).ok_or(ArenaError::InvalidSlot { slot: id.slot })
+    }
+
+    pub(crate) fn project_program(
+        &self,
+        id: ValueProgramId,
+    ) -> Result<ProgramProjection, ArenaError> {
+        let program = self.program(id)?;
+        let family = self.family_for_program(id).map(|family| {
+            let record = self.families.get(&family).expect("validated family view");
+            FamilyProjection {
+                domain: record.domain,
+                element_type: record.element_type.clone(),
+                body: record.body,
+                reducible: record.reducible,
+                artifact: record.artifact.clone(),
+            }
+        });
+        Ok(ProgramProjection { signature: program.signature.clone(), root: program.root, family })
+    }
+
+    pub(crate) fn project_family(
+        &self,
+        family: FamilyValueId,
+    ) -> Result<ProgramProjection, ArenaError> {
+        self.project_program(family.program())
     }
 
     pub(crate) fn selector(
@@ -2558,5 +2601,31 @@ mod tests {
             ),
             Err(ArenaError::InvalidRange { .. })
         ));
+    }
+
+    #[test]
+    fn program_projection_preserves_typed_family_provenance() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let body = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let domain = FamilyDomain::new(0, 4).unwrap();
+        let reducible =
+            programs.generated_family_from_body(&mut expressions, domain, body).unwrap();
+        let opaque =
+            programs.opaque_generated_family_from_body(&mut expressions, domain, body).unwrap();
+        let reducible_projection = programs.project_family(reducible).unwrap();
+        let opaque_projection = programs.project_family(opaque).unwrap();
+        assert_eq!(reducible_projection.signature, opaque_projection.signature);
+        assert_eq!(reducible_projection.root, opaque_projection.root);
+        assert_eq!(
+            reducible_projection.family.as_ref().unwrap().domain,
+            opaque_projection.family.as_ref().unwrap().domain
+        );
+        assert!(reducible_projection.family.as_ref().unwrap().reducible);
+        assert!(!opaque_projection.family.as_ref().unwrap().reducible);
+        assert_eq!(
+            reducible_projection.family.as_ref().unwrap().body,
+            opaque_projection.family.as_ref().unwrap().body
+        );
     }
 }

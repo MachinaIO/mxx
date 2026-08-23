@@ -88,6 +88,13 @@ pub(crate) trait FeasibilitySink: Default {
 
     fn validate_normalization_observations(&self) -> Result<(), G0Error>;
 
+    fn validate_normalization_observations_with_monomials(
+        &self,
+        _monomials: &super::monomial::MonomialArena,
+    ) -> Result<(), G0Error> {
+        self.validate_normalization_observations()
+    }
+
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error>;
 
     fn record_event(&mut self, observation: EventObservation) -> Result<(), G0Error>;
@@ -1798,6 +1805,13 @@ impl FeasibilitySink for FeasibilityTrace {
         Ok(())
     }
 
+    fn validate_normalization_observations_with_monomials(
+        &self,
+        monomials: &super::monomial::MonomialArena,
+    ) -> Result<(), G0Error> {
+        FeasibilityTrace::validate_normalization_observations_with_monomials(self, monomials)
+    }
+
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error> {
         match self.source_observations.get(&handle) {
             Some(existing) if existing != &class => Err(G0Error::ConflictingSourceClass),
@@ -1839,6 +1853,45 @@ impl FeasibilitySink for FeasibilityTrace {
 }
 
 impl FeasibilityTrace {
+    pub(crate) fn validate_normalization_observations_with_monomials(
+        &self,
+        monomials: &super::monomial::MonomialArena,
+    ) -> Result<(), G0Error> {
+        self.validate_normalization_observations()?;
+        for event in &self.events {
+            let NormalizerEvent::BoundTransfer {
+                rule: BoundRule::MonomialProduct { monomial, factors },
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let descriptor =
+                monomials.descriptor(*monomial).map_err(|_| G0Error::UnsupportedBoundTransfer)?;
+            let expected = descriptor
+                .central_factors
+                .iter()
+                .chain(descriptor.ordered_factors.iter())
+                .collect::<Vec<_>>();
+            if expected.len() != factors.len() {
+                return Err(G0Error::UnsupportedBoundTransfer);
+            }
+            for (factor, evidence) in expected.into_iter().zip(factors) {
+                let BoundValueRef::Result { event, .. } = &evidence.bound else {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                };
+                let Some(NormalizerEvent::Result { owner, .. }) = self.events.get(event.0 as usize)
+                else {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                };
+                if owner.expression() != factor.expression() {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn projection_is_available(value: &RecordedValue, projection: &BoundProjection) -> bool {
         match projection {
             BoundProjection::Coefficient => {

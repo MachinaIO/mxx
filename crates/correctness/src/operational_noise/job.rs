@@ -1399,7 +1399,10 @@ impl CheckerJob {
         let counters = normalizer.counters();
         drop(normalizer);
         if S::ENABLED {
-            sink.validate_normalization_observations().map_err(JobError::Feasibility)?;
+            let monomial_arena =
+                self.monomials.get(scope).ok_or(JobError::MissingMonomialScope { scope })?;
+            sink.validate_normalization_observations_with_monomials(monomial_arena)
+                .map_err(JobError::Feasibility)?;
         }
         self.frozen_resources = Some(self.current_resource_counters());
         Ok((value, counters))

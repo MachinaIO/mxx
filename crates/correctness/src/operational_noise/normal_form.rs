@@ -366,8 +366,6 @@ pub struct Normalizer<'a, S = NoFeasibility> {
     normalization_depth: u32,
     relation_rewriting_enabled: bool,
     fold_final_no_match: bool,
-    /// Owner used for exact-fold observations emitted while evaluating one node.
-    observation_owner: Option<ScopedExprId>,
     /// Slots below this outer-call high-water are externally observable and remain pinned even
     /// when no current normalization owner references them.
     protected_monomial_prefix: usize,
@@ -486,7 +484,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             normalization_depth: 0,
             relation_rewriting_enabled: true,
             fold_final_no_match: true,
-            observation_owner: None,
             protected_monomial_prefix,
             monomial_gc_allocation_threshold_bytes: monomial_gc_allocation_threshold_bytes(),
             gadget_splice_batch_terms: PARALLEL_GADGET_SPLICE_BATCH_TERMS,
@@ -651,7 +648,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 if let Some(exact_nf) = value.exact_nf.as_mut() {
                     let normal_form = Arc::make_mut(exact_nf);
                     let rebound = self.bound_normal_form(normal_form)?;
-                    self.fold_finite_no_match_terms(normal_form, false)?;
+                    self.fold_finite_no_match_terms(Some(root), normal_form, false)?;
                     value.coefficient_bound = rebound;
                     if normal_form.is_zero() {
                         value.coefficient_bound =
@@ -800,7 +797,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let saved_gadget_input_nfs = std::mem::take(&mut self.gadget_input_nfs);
         let saved_counters = self.counters;
         let saved_fold_final_no_match = self.fold_final_no_match;
-        let saved_observation_owner = self.observation_owner;
         self.fold_final_no_match = false;
 
         let value = self.normalize_with_existing_scope_proof(scoped, proof);
@@ -816,7 +812,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         self.gadget_input_nfs = saved_gadget_input_nfs;
         self.counters = saved_counters;
         self.fold_final_no_match = saved_fold_final_no_match;
-        self.observation_owner = saved_observation_owner;
         value
     }
 
@@ -1265,7 +1260,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         // projection. Calling `ProgramArena::scoped` here would walk the remaining sub-DAG once
         // per node and turn a linear chain into O(N^2).
         let semantic = self.expressions.scoped_from_proof(scope_proof, expression)?;
-        self.observation_owner = Some(semantic);
         let mut children = Vec::with_capacity(node.inputs.len());
         for (input_position, child) in node.inputs.iter().enumerate() {
             children.push(self.child_value(*child)?);
@@ -1424,9 +1418,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 let left = children.first().and_then(|value| value.exact_nf.as_ref());
                 let right = children.get(1).and_then(|value| value.exact_nf.as_ref());
                 match (left, right) {
-                    (Some(left), Some(right)) => {
-                        self.add_nf(left, right, matches!(operation, MatrixOperation::Subtract))
-                    }
+                    (Some(left), Some(right)) => self.add_nf(
+                        Some(semantic),
+                        left,
+                        right,
+                        matches!(operation, MatrixOperation::Subtract),
+                    ),
                     _ => Ok(self.atom_nf(scope_proof, semantic)?),
                 }
             }
@@ -1453,7 +1450,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 match (left, right) {
                     (Some(left), Some(right)) => match self.scalar_action_nf(
                         scope_proof,
-                        semantic.expression(),
+                        semantic,
                         node.inputs[0],
                         node.inputs[1],
                         left,
@@ -1474,7 +1471,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                                 return Ok(self.atom_nf(scope_proof, semantic)?);
                             };
                             let right_type = right_type.clone();
-                            self.product_nf(scope_proof, &left_type, &right_type, left, right)
+                            self.product_nf(
+                                scope_proof,
+                                Some(semantic),
+                                &left_type,
+                                &right_type,
+                                left,
+                                right,
+                            )
                         }
                     },
                     _ => Ok(self.atom_nf(scope_proof, semantic)?),
@@ -1502,7 +1506,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 let Some(input) = children.first().and_then(|value| value.exact_nf.as_ref()) else {
                     return Ok(self.atom_nf(scope_proof, semantic)?);
                 };
-                self.transform_nf(scope_proof, input, ValueOperator::Matrix(operation.clone()))
+                self.transform_nf(
+                    scope_proof,
+                    semantic,
+                    input,
+                    ValueOperator::Matrix(operation.clone()),
+                )
             }
             MatrixOperation::Slice {
                 row_start,
@@ -1512,7 +1521,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 ..
             } => {
                 if let Some(restored) =
-                    self.parent_local_slice_nf(scope_proof, semantic.expression(), node, children)?
+                    self.parent_local_slice_nf(scope_proof, semantic, node, children)?
                 {
                     return Ok(restored);
                 }
@@ -1540,7 +1549,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 )? {
                     unreachable!("identity slices are shared before owned normalization")
                 }
-                self.transform_nf(scope_proof, input, ValueOperator::Matrix(operation.clone()))
+                self.transform_nf(
+                    scope_proof,
+                    semantic,
+                    input,
+                    ValueOperator::Matrix(operation.clone()),
+                )
             }
             // Binder-open coordinates are structural semantic inputs; the atom below carries
             // the complete node. Coordinates are first reduced to their range-proved canonical
@@ -1572,7 +1586,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 let Some(input) = children.first().and_then(|value| value.exact_nf.as_ref()) else {
                     return Ok(self.atom_nf(scope_proof, semantic)?);
                 };
-                self.transform_nf(scope_proof, input, ValueOperator::Matrix(operation.clone()))
+                self.transform_nf(
+                    scope_proof,
+                    semantic,
+                    input,
+                    ValueOperator::Matrix(operation.clone()),
+                )
             }
             MatrixOperation::Concat { .. } => {
                 self.concat_nf(scope_proof, semantic, operation, node, children)
@@ -1595,7 +1614,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     match self.tensor_scalar_action_nf(
                         scope_proof,
                         operation,
-                        semantic.expression(),
+                        semantic,
                         node.inputs[0],
                         node.inputs[1],
                         left,
@@ -1609,6 +1628,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                             // multiplication as an ordinary scalar product.
                             self.tensor_nf(
                                 scope_proof,
+                                semantic,
                                 operation,
                                 node.inputs[0],
                                 node.inputs[1],
@@ -1629,7 +1649,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         return Ok(self.atom_nf(scope_proof, semantic)?);
                     };
                     let scaled = self.scale_nf(input, coefficient);
-                    output = self.add_nf(&output, &scaled, false)?;
+                    output = self.add_nf(Some(semantic), &output, &scaled, false)?;
                 }
                 Ok(output)
             }
@@ -1950,6 +1970,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     fn transform_nf(
         &mut self,
         scope_proof: &mut ScopeProof,
+        owner: ScopedExprId,
         input: &PolynomialNF,
         descriptor: ValueOperator,
     ) -> Result<PolynomialNF, NormalizeError> {
@@ -1969,13 +1990,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
         let mut result =
             PolynomialNF { exact_terms: terms, bounded_summary: input.bounded_summary.clone() };
-        self.fold_finite_no_match_terms(&mut result, true)?;
+        self.fold_finite_no_match_terms(Some(owner), &mut result, true)?;
         Ok(result)
     }
 
     fn tensor_nf(
         &mut self,
         scope_proof: &mut ScopeProof,
+        owner: ScopedExprId,
         operation: &MatrixOperation,
         left_expression: ExprId,
         right_expression: ExprId,
@@ -2053,7 +2075,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             exact_terms: terms,
             bounded_summary: BoundedSummary::from_contract(noise)?,
         };
-        self.fold_finite_no_match_terms(&mut result, true)?;
+        self.fold_finite_no_match_terms(Some(owner), &mut result, true)?;
         Ok(result)
     }
 
@@ -2063,7 +2085,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         &mut self,
         scope_proof: &ScopeProof,
         operation: &MatrixOperation,
-        output_expression: ExprId,
+        owner: ScopedExprId,
         left_expression: ExprId,
         right_expression: ExprId,
         left: &PolynomialNF,
@@ -2102,14 +2124,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         {
             return Ok(ScalarActionNormalization::Opaque);
         }
-        self.scalar_action_nf(
-            scope_proof,
-            output_expression,
-            left_expression,
-            right_expression,
-            left,
-            right,
-        )
+        self.scalar_action_nf(scope_proof, owner, left_expression, right_expression, left, right)
     }
 
     /// Canonicalize a typed polynomial-ring scalar action for both ordinary multiplication and
@@ -2119,14 +2134,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     fn scalar_action_nf(
         &mut self,
         scope_proof: &ScopeProof,
-        output_expression: ExprId,
+        owner: ScopedExprId,
         left_expression: ExprId,
         right_expression: ExprId,
         left: &PolynomialNF,
         right: &PolynomialNF,
     ) -> Result<ScalarActionNormalization, NormalizeError> {
         let ResolvedValueType::Matrix(output_type) =
-            self.expressions.value_type(output_expression)?
+            self.expressions.value_type(owner.expression())?
         else {
             return Ok(ScalarActionNormalization::NotApplicable);
         };
@@ -2166,7 +2181,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             // commutativity of the scalar result. The product is centralized only after every
             // surviving ordered factor is proven to have the declared 1x1 output type. In the
             // reversed order no relation applies, so both typed scalar factors remain present.
-            let product = self.product_nf(scope_proof, &left_type, &right_type, left, right)?;
+            let product =
+                self.product_nf(scope_proof, Some(owner), &left_type, &right_type, left, right)?;
             if !self.scalar_nf_ordered_factors_match_type(&product, &output_type)? {
                 return Ok(ScalarActionNormalization::Opaque);
             }
@@ -2190,6 +2206,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         };
         Ok(ScalarActionNormalization::Exact(self.product_nf(
             scope_proof,
+            Some(owner),
             &left_type,
             &right_type,
             &reclassified_left,
@@ -2297,7 +2314,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             exact_terms: terms,
             bounded_summary: BoundedSummary::from_contract(max_bounds(&summaries)?)?,
         };
-        self.fold_finite_no_match_terms(&mut result, true)?;
+        self.fold_finite_no_match_terms(Some(semantic), &mut result, true)?;
         Ok(result)
     }
 
@@ -2611,7 +2628,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     fn parent_local_slice_nf(
         &mut self,
         scope_proof: &ScopeProof,
-        expression: ExprId,
+        owner: ScopedExprId,
         slice: &ExprNode,
         _children: &[Arc<AnalyzedValue>],
     ) -> Result<Option<PolynomialNF>, NormalizeError> {
@@ -2642,7 +2659,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let ResolvedValueType::Matrix(parent_type) = self.expressions.value_type(input)? else {
             return Ok(None);
         };
-        let ResolvedValueType::Matrix(actual_output) = self.expressions.value_type(expression)?
+        let ResolvedValueType::Matrix(actual_output) =
+            self.expressions.value_type(owner.expression())?
         else {
             return Ok(None);
         };
@@ -2700,6 +2718,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 };
                 Ok(Some(self.product_nf(
                     scope_proof,
+                    Some(owner),
                     &left_type,
                     &component_type,
                     left_nf,
@@ -2776,6 +2795,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 };
                 Ok(Some(self.product_nf(
                     scope_proof,
+                    Some(owner),
                     &component_type,
                     &right_type,
                     component_nf,
@@ -2903,6 +2923,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
 
     fn add_nf(
         &mut self,
+        owner: Option<ScopedExprId>,
         left: &PolynomialNF,
         right: &PolynomialNF,
         subtract: bool,
@@ -2926,7 +2947,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 &right.bounded_summary.coefficient_bound(),
             ))?,
         };
-        self.fold_finite_no_match_terms(&mut result, true)?;
+        self.fold_finite_no_match_terms(owner, &mut result, true)?;
         Ok(result)
     }
 
@@ -2962,6 +2983,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     fn product_nf(
         &mut self,
         _scope_proof: &ScopeProof,
+        owner: Option<ScopedExprId>,
         left_type: &ResolvedMatrixType,
         right_type: &ResolvedMatrixType,
         left: &PolynomialNF,
@@ -2970,6 +2992,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let mut terms = BTreeMap::new();
         let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
         self.execute_product_into(
+            owner,
             left_type,
             right_type,
             left,
@@ -3167,6 +3190,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     /// Execute one complete eager product lifecycle.
     fn execute_product_into<A: ExactTermAccumulator>(
         &mut self,
+        owner: Option<ScopedExprId>,
         left_type: &ResolvedMatrixType,
         right_type: &ResolvedMatrixType,
         left: &PolynomialNF,
@@ -3177,13 +3201,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     ) -> Result<(), NormalizeError> {
         let summary_contribution =
             self.product_summary_contract(left_type, left, right_type, right, weight)?;
-        self.product_into_body(left, right, weight, terms, noise)?;
+        self.product_into_body(owner, left, right, weight, terms, noise)?;
         *noise = add_noise_summaries(noise, &summary_contribution);
         Ok(())
     }
 
     fn product_into_body<A: ExactTermAccumulator>(
         &mut self,
+        owner: Option<ScopedExprId>,
         left: &PolynomialNF,
         right: &PolynomialNF,
         weight: &BigInt,
@@ -3202,14 +3227,15 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 // Drain each completed Cartesian pair before generating the next one. The same
                 // rewrite queue remains authoritative, but its live size follows one pair's
                 // recursive splice instead of the full product cardinality.
-                self.drain_product_worklist(terms, noise, &mut worklist)?;
+                self.drain_product_worklist(owner, terms, noise, &mut worklist)?;
             }
         }
-        self.drain_product_worklist(terms, noise, &mut worklist)
+        self.drain_product_worklist(owner, terms, noise, &mut worklist)
     }
 
     fn drain_product_worklist<A: ExactTermAccumulator>(
         &mut self,
+        owner: Option<ScopedExprId>,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         worklist: &mut VecDeque<ProductWorkItem>,
@@ -3281,7 +3307,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 continue;
             }
             let Some(splice) = self.product_gadget_splice(monomial, coefficient.clone())? else {
-                self.merge_product_result_early(monomial, coefficient, terms, noise)?;
+                self.merge_product_result_early(owner, monomial, coefficient, terms, noise)?;
                 continue;
             };
             worklist.push_front(ProductWorkItem::GadgetSplice(splice));
@@ -3295,6 +3321,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     /// every bounded factor, so only an identical full matrix product can cancel it later.
     fn merge_product_result_early<A: ExactTermAccumulator>(
         &mut self,
+        owner: Option<ScopedExprId>,
         monomial: MonomialId,
         coefficient: BigInt,
         terms: &mut A,
@@ -3310,7 +3337,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         ) && self.relations.is_some() &&
             self.normalization_depth == 1;
         if !needs_relation_closure {
-            return self.merge_product_term(monomial, coefficient, initial_bound, terms, noise)
+            return self.merge_product_term(
+                owner,
+                monomial,
+                coefficient,
+                initial_bound,
+                terms,
+                noise,
+            )
         }
 
         let mut candidate = PolynomialNF {
@@ -3321,13 +3355,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         *noise = add_noise_summaries(noise, &candidate.bounded_summary.coefficient_bound());
         for (rewritten, rewritten_coefficient) in candidate.exact_terms {
             let bound = self.bound_monomial(rewritten, &rewritten_coefficient)?;
-            self.merge_product_term(rewritten, rewritten_coefficient, bound, terms, noise)?;
+            self.merge_product_term(owner, rewritten, rewritten_coefficient, bound, terms, noise)?;
         }
         Ok(())
     }
 
     fn merge_product_term<A: ExactTermAccumulator>(
         &mut self,
+        owner: Option<ScopedExprId>,
         monomial: MonomialId,
         coefficient: BigInt,
         bound: NumericContract<CoefficientBound>,
@@ -3344,13 +3379,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     self.counters.bounded_fold_count.saturating_add(1);
                 *noise = add_noise_summaries(noise, &NumericContract::Known(bound));
                 if S::ENABLED {
-                    let input = self.observe_finite_monomial(monomial, &coefficient)?;
-                    let owner =
-                        self.observation_owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
-                    self.observe_bound_transfer(
-                        owner,
-                        BoundRule::Sum { inputs: Box::new([input]) },
-                    )?;
+                    let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                    self.observe_finite_monomial(owner, monomial, &coefficient)?;
                 }
                 Ok(())
             }
@@ -3744,6 +3774,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
 
     fn fold_finite_no_match_terms(
         &mut self,
+        owner: Option<ScopedExprId>,
         normal_form: &mut PolynomialNF,
         preserve_relation_endpoints: bool,
     ) -> Result<(), NormalizeError> {
@@ -3752,7 +3783,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
         let mut retained = BTreeMap::new();
         let mut folded = CoefficientBound::ExactZero;
-        let mut folded_inputs = Vec::new();
         for (monomial, coefficient) in std::mem::take(&mut normal_form.exact_terms) {
             if coefficient.is_zero() {
                 continue;
@@ -3768,7 +3798,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         self.counters.bounded_fold_count.saturating_add(1);
                     folded = add_known_bounds(&folded, &bound);
                     if S::ENABLED {
-                        folded_inputs.push(self.observe_finite_monomial(monomial, &coefficient)?);
+                        let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                        self.observe_finite_monomial(owner, monomial, &coefficient)?;
                     }
                 }
                 NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
@@ -3784,22 +3815,15 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         normal_form.bounded_summary = BoundedSummary::from_contract(NumericContract::Known(
             add_known_bounds(&existing, &folded),
         ))?;
-        if S::ENABLED && !folded_inputs.is_empty() {
-            let owner = self.observation_owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
-            self.observe_bound_transfer(
-                owner,
-                BoundRule::Sum { inputs: folded_inputs.into_boxed_slice() },
-            )?;
-        }
         Ok(())
     }
 
     fn observe_finite_monomial(
         &mut self,
+        owner: ScopedExprId,
         monomial: MonomialId,
         coefficient: &BigInt,
-    ) -> Result<BoundValueRef, NormalizeError> {
-        let owner = self.observation_owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+    ) -> Result<(), NormalizeError> {
         let factor_ids = {
             let descriptor = self.monomials.descriptor(monomial)?;
             descriptor
@@ -3834,16 +3858,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             BoundRule::MonomialProduct { monomial, factors: factors.into_boxed_slice() },
         )?;
         if coefficient.magnitude() == &BigUint::from(1_u8) {
-            return Ok(BoundValueRef::Transfer(monomial_event));
+            return Ok(());
         }
-        let scale_event = self.observe_bound_transfer(
+        self.observe_bound_transfer(
             owner,
             BoundRule::Scale {
                 value: BoundValueRef::Transfer(monomial_event),
                 scale: BoundScale::Magnitude(coefficient.magnitude().clone()),
             },
         )?;
-        Ok(BoundValueRef::Transfer(scale_event))
+        Ok(())
     }
 
     /// Count retained exact terms which still expose a uniquely dispatchable preimage call.
@@ -6339,6 +6363,7 @@ mod tests {
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
         let error = normalizer
             .execute_product_into(
+                None,
                 &matrix_type(),
                 &matrix_type(),
                 &summary,
@@ -8821,7 +8846,7 @@ mod tests {
             .unwrap();
             normalizer.normalize(semantic).unwrap();
             drop(normalizer);
-            trace.validate_normalization_observations().unwrap();
+            trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
             trace
                 .normalization_events()
                 .iter()
@@ -8953,7 +8978,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_finite_folds_record_monomial_evidence_scale_and_sum_in_order() {
+    fn exact_finite_folds_record_monomial_evidence_and_scale_in_order() {
         fn run(
             expressions: &mut ExprArena,
             programs: &mut ProgramArena,
@@ -8987,7 +9012,16 @@ mod tests {
             assert_eq!(ordinary.exact_nf, traced.exact_nf);
             assert_eq!(ordinary.coefficient_bound, traced.coefficient_bound);
             assert_eq!(ordinary_counters, traced_counters);
-            trace.validate_normalization_observations().unwrap();
+            trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+            assert!(!trace.normalization_events().iter().any(|event| {
+                matches!(
+                    event,
+                    NormalizerEvent::BoundTransfer {
+                        rule: BoundRule::Sum { inputs },
+                        ..
+                    } if inputs.iter().all(|input| matches!(input, BoundValueRef::Transfer(_)))
+                )
+            }));
             (traced, traced_counters, trace)
         }
 
@@ -9037,14 +9071,6 @@ mod tests {
             _ => panic!("factor evidence must use a prior result"),
         };
         assert!(factor_result.0 < monomial_index as u64);
-        assert!(trace.normalization_events().iter().enumerate().any(|(index, event)| {
-            matches!(
-                event,
-                NormalizerEvent::BoundTransfer {
-                    rule: BoundRule::Sum { inputs }, ..
-                } if index > monomial_index && inputs.as_ref() == [BoundValueRef::Transfer(EventIndex(monomial_index as u64))]
-            )
-        }));
 
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -9118,7 +9144,7 @@ mod tests {
 
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
-        let factor = gaussian_factor(&mut expressions, matrix_type(), 99_005, 2);
+        let factor = gaussian_factor(&mut expressions, matrix_type(), 99_007, 2);
         let zero_crt = expressions
             .intern_slice(
                 ValueOperator::Matrix(MatrixOperation::CrtRecompose {
@@ -9152,7 +9178,7 @@ mod tests {
         };
         let mut ordinary =
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
-        ordinary.fold_finite_no_match_terms(&mut normal_form, false).unwrap();
+        ordinary.fold_finite_no_match_terms(None, &mut normal_form, false).unwrap();
         assert!(normal_form.exact_terms.is_empty());
         drop(ordinary);
 
@@ -9166,15 +9192,188 @@ mod tests {
             &mut trace,
         )
         .unwrap();
-        traced.observation_owner = Some(semantic);
         let mut malformed = PolynomialNF {
             exact_terms: [(empty, BigInt::from(7_u8))].into_iter().collect(),
             bounded_summary: BoundedSummary::zero(),
         };
         assert_eq!(
-            traced.fold_finite_no_match_terms(&mut malformed, false),
+            traced.fold_finite_no_match_terms(Some(semantic), &mut malformed, false),
             Err(NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer))
         );
+    }
+
+    #[test]
+    fn monomial_gate_checks_mixed_factor_order_and_arena_liveness() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let matrix_type = matrix_type();
+        let central = gaussian_factor(&mut expressions, scalar_type.clone(), 99_007, 2);
+        let ordered = gaussian_factor(&mut expressions, matrix_type, 99_008, 3);
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[central, ordered])
+            .unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut metadata = MatrixMetadata::new(MatrixLayout::row_major(1, 1));
+        metadata.is_constant_polynomial = true;
+        let mut central_facts = MatrixFacts::new(scalar_type, metadata);
+        central_facts.coefficient_bound = NumericContract::Known(CoefficientBound::finite(2_u8));
+        facts.insert(&expressions, central, ValueFacts::Matrix(central_facts)).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let mut normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap();
+        normalizer.normalize(semantic).unwrap();
+        drop(normalizer);
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        let (event_index, monomial, factors) = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::BoundTransfer {
+                    rule: BoundRule::MonomialProduct { monomial, factors },
+                    ..
+                } if factors.len() == 2 => Some((index, *monomial, factors.clone())),
+                _ => None,
+            })
+            .expect("mixed central and ordered evidence");
+        let descriptor = monomials.descriptor(monomial).unwrap();
+        let expected = descriptor
+            .central_factors
+            .iter()
+            .chain(descriptor.ordered_factors.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), 2);
+        for (factor, evidence) in expected.iter().zip(&factors) {
+            let event = match &evidence.bound {
+                BoundValueRef::Result { event, .. } => *event,
+                _ => panic!("mixed factor evidence must use Result"),
+            };
+            assert!(event.0 < event_index as u64);
+            assert!(matches!(
+                trace.normalization_events()[event.0 as usize],
+                NormalizerEvent::Result { owner, .. } if owner == **factor
+            ));
+        }
+
+        let mut swapped = trace.clone();
+        if let Some(NormalizerEvent::BoundTransfer {
+            rule: BoundRule::MonomialProduct { factors, .. },
+            ..
+        }) = swapped.events.iter_mut().find(|event| {
+            matches!(event, NormalizerEvent::BoundTransfer {
+                rule: BoundRule::MonomialProduct { factors, .. }, ..
+            } if factors.len() == 2)
+        }) {
+            let first_event = match &factors[0].bound {
+                BoundValueRef::Result { event, .. } => *event,
+                _ => unreachable!(),
+            };
+            let second_event = match &factors[1].bound {
+                BoundValueRef::Result { event, .. } => *event,
+                _ => unreachable!(),
+            };
+            factors[0].bound = BoundValueRef::Result {
+                event: second_event,
+                projection: BoundProjection::Coefficient,
+            };
+            factors[1].bound = BoundValueRef::Result {
+                event: first_event,
+                projection: BoundProjection::Coefficient,
+            };
+        }
+        assert_eq!(
+            swapped.validate_normalization_observations_with_monomials(&monomials),
+            Err(G0Error::UnsupportedBoundTransfer)
+        );
+
+        let mut foreign = trace.clone();
+        if let Some(NormalizerEvent::BoundTransfer {
+            rule: BoundRule::MonomialProduct { monomial, .. },
+            ..
+        }) = foreign.events.iter_mut().find(|event| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer { rule: BoundRule::MonomialProduct { .. }, .. }
+            )
+        }) {
+            *monomial = MonomialId::new(ArenaToken::fresh(), 0);
+        }
+        assert_eq!(
+            foreign.validate_normalization_observations_with_monomials(&monomials),
+            Err(G0Error::UnsupportedBoundTransfer)
+        );
+
+        monomials.sweep(0, []).unwrap();
+        assert_eq!(
+            trace.validate_normalization_observations_with_monomials(&monomials),
+            Err(G0Error::UnsupportedBoundTransfer)
+        );
+    }
+
+    #[test]
+    fn negative_monomial_coefficients_use_absolute_scale_only() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let factor = gaussian_factor(&mut expressions, matrix_type(), 99_008, 2);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, factor);
+        let (value, counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        let monomial = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        trace.record_invocation_start(semantic).unwrap();
+        trace.record_normalization_result(semantic, &value).unwrap();
+        let mut normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap();
+        normalizer.observe_finite_monomial(semantic, monomial, &BigInt::from(-1_i8)).unwrap();
+        normalizer.observe_finite_monomial(semantic, monomial, &BigInt::from(-2_i8)).unwrap();
+        drop(normalizer);
+        trace.record_invocation_end(semantic, &value, &counters).unwrap();
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        assert_eq!(
+            trace
+                .normalization_events()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        NormalizerEvent::BoundTransfer {
+                            rule: BoundRule::MonomialProduct { .. },
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            2
+        );
+        assert!(trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer {
+                    rule: BoundRule::Scale {
+                        value: BoundValueRef::Transfer(_),
+                        scale: BoundScale::Magnitude(magnitude),
+                    },
+                    ..
+                } if magnitude == &BigUint::from(2_u8)
+            )
+        }));
     }
 
     #[test]

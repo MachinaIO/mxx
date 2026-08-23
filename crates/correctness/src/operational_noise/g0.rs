@@ -1784,6 +1784,11 @@ impl FeasibilityTrace {
     pub(crate) fn index_use_plans(&self) -> impl Iterator<Item = &IndexUsePlan> {
         self.index_use_plans.iter()
     }
+
+    #[cfg(test)]
+    pub(crate) fn normalization_events(&self) -> &[NormalizerEvent] {
+        &self.events
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -3497,6 +3502,120 @@ mod tests {
         assert_eq!(
             malformed.validate_normalization_observations(),
             Err(G0Error::RelationTraceInvariant)
+        );
+    }
+
+    #[test]
+    fn bound_transfer_cannot_be_completed_by_a_nested_result() {
+        use crate::operational_noise::{
+            arena::{ExprArena, FamilyDomain},
+            program::ProgramArena,
+        };
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left_expression = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .expect("left expression");
+        let child_expression = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .expect("child expression");
+        let parent_expression = expressions
+            .intern(
+                ValueOperator::Scalar(ScalarOperation::Add),
+                Box::new([left_expression, child_expression]),
+            )
+            .expect("parent expression");
+        let family = programs
+            .generated_family_from_body(
+                &mut expressions,
+                FamilyDomain::new(0, 1).expect("family domain"),
+                parent_expression,
+            )
+            .expect("family");
+        let parent = programs
+            .scoped(&expressions, family.program(), parent_expression)
+            .expect("parent owner");
+        let child =
+            programs.scoped(&expressions, family.program(), child_expression).expect("child owner");
+        let mut valid = FeasibilityTrace::default();
+        valid.record_invocation_start(parent).expect("start");
+        valid
+            .record_bound_transfer(
+                parent,
+                BoundRule::Tensor {
+                    left_is_constant_polynomial: false,
+                    right_is_constant_polynomial: false,
+                },
+            )
+            .expect("bound transfer");
+        valid
+            .record_normalization_result(
+                parent,
+                &super::super::normal_form::AnalyzedValue {
+                    semantic: parent,
+                    exact_nf: None,
+                    coefficient_bound: super::super::facts::NumericContract::Missing,
+                },
+            )
+            .expect("result");
+        valid
+            .record_invocation_end(
+                parent,
+                &super::super::normal_form::AnalyzedValue {
+                    semantic: parent,
+                    exact_nf: None,
+                    coefficient_bound: super::super::facts::NumericContract::Missing,
+                },
+                &Default::default(),
+            )
+            .expect("end");
+        valid.validate_normalization_observations().expect("same-frame result is valid");
+
+        let mut nested = FeasibilityTrace::default();
+        nested.record_invocation_start(parent).expect("parent start");
+        nested
+            .record_bound_transfer(
+                parent,
+                BoundRule::Tensor {
+                    left_is_constant_polynomial: false,
+                    right_is_constant_polynomial: false,
+                },
+            )
+            .expect("bound transfer");
+        nested.record_invocation_start(child).expect("child start");
+        nested
+            .record_normalization_result(
+                child,
+                &super::super::normal_form::AnalyzedValue {
+                    semantic: child,
+                    exact_nf: None,
+                    coefficient_bound: super::super::facts::NumericContract::Missing,
+                },
+            )
+            .expect("child result");
+        nested
+            .record_invocation_end(
+                child,
+                &super::super::normal_form::AnalyzedValue {
+                    semantic: child,
+                    exact_nf: None,
+                    coefficient_bound: super::super::facts::NumericContract::Missing,
+                },
+                &Default::default(),
+            )
+            .expect("child end");
+        nested.events.push(NormalizerEvent::InvocationEnd {
+            root: parent,
+            result: RecordedValue {
+                exact_nf: None,
+                coefficient_bound: super::super::facts::NumericContract::Missing,
+            },
+            counters: Default::default(),
+        });
+        assert_eq!(
+            nested.validate_normalization_observations(),
+            Err(G0Error::MissingNormalizationResult)
         );
     }
 

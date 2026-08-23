@@ -4847,6 +4847,7 @@ mod tests {
             SemanticSourceIdentity, TrustedIndexRange,
         },
         facts::{MatrixFacts, MatrixMetadata, ValueFacts},
+        g0::{BoundRule, FeasibilityTrace, G0Error, NormalizerEvent},
         relation::{
             FactorOrderContract, GadgetRecompositionRegistry, GadgetRecompositionRule,
             RelationRegistry, RelationValidationAuthority, SamplerSourceContract, StaticLhsKey,
@@ -8336,5 +8337,137 @@ mod tests {
             weighted_sum_bounds(&bounds, &[BigInt::from(0_u8), BigInt::from(3_u8)]).unwrap(),
             NumericContract::Known(CoefficientBound::finite(BigUint::from(21_u8)))
         );
+    }
+
+    fn assert_bound_trace_matches_no_feasibility(tensor: bool) {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input_type = matrix_type();
+        let left = gaussian_factor(&mut expressions, input_type.clone(), 98_001, 3);
+        let right = gaussian_factor(&mut expressions, input_type.clone(), 98_002, 5);
+        let root = if tensor {
+            let output = ResolvedMatrixType::new(
+                input_type.modulus.clone(),
+                input_type.ring_dimension,
+                input_type.rows * input_type.rows,
+                input_type.columns * input_type.columns,
+            )
+            .unwrap();
+            expressions
+                .intern_matrix_transform(
+                    MatrixOperation::Tensor {
+                        output: output.clone(),
+                        left_layout: MatrixLayout::row_major(input_type.rows, input_type.columns),
+                        right_layout: MatrixLayout::row_major(input_type.rows, input_type.columns),
+                        output_layout: MatrixLayout::row_major(output.rows, output.columns),
+                    },
+                    &[left, right],
+                )
+                .unwrap()
+        } else {
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[left, right]).unwrap()
+        };
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+
+        let (ordinary_value, ordinary_counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        let mut trace = FeasibilityTrace::default();
+        let (traced_value, traced_counters) = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+
+        assert_eq!(ordinary_value.semantic, traced_value.semantic);
+        assert_eq!(ordinary_value.exact_nf, traced_value.exact_nf);
+        assert_eq!(ordinary_value.coefficient_bound, traced_value.coefficient_bound);
+        assert_eq!(ordinary_counters, traced_counters);
+        trace.validate_normalization_observations().unwrap();
+
+        let (bound_index, bound_rule) = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::BoundTransfer { owner, rule } if *owner == semantic => {
+                    Some((index, rule))
+                }
+                _ => None,
+            })
+            .expect("root bound transfer observation");
+        match (tensor, bound_rule) {
+            (false, BoundRule::Product { facts }) => {
+                assert_eq!(facts, &MatrixProductFacts::default());
+            }
+            (
+                true,
+                BoundRule::Tensor { left_is_constant_polynomial, right_is_constant_polynomial },
+            ) => {
+                assert!(!left_is_constant_polynomial);
+                assert!(!right_is_constant_polynomial);
+            }
+            _ => panic!("wrong bound rule for operation"),
+        }
+        assert!(trace.normalization_events()[bound_index + 1..].iter().any(|event| {
+            matches!(event, NormalizerEvent::Result { owner, .. } if *owner == semantic)
+        }));
+        assert!(trace.normalization_events().iter().any(|event| {
+            matches!(event, NormalizerEvent::InvocationStart { root } if *root == semantic)
+        }));
+        assert!(trace.normalization_events().iter().any(|event| {
+            matches!(event, NormalizerEvent::InvocationEnd { root, .. } if *root == semantic)
+        }));
+    }
+
+    #[test]
+    fn matrix_product_bound_trace_preserves_no_feasibility_result_and_rule() {
+        assert_bound_trace_matches_no_feasibility(false);
+    }
+
+    #[test]
+    fn tensor_bound_trace_preserves_no_feasibility_result_and_rule() {
+        assert_bound_trace_matches_no_feasibility(true);
+    }
+
+    #[test]
+    fn missing_matrix_product_child_is_missing_without_trace_and_rejected_with_trace() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let left = matrix_source(&mut expressions, "missing-bound-left", matrix.clone(), None);
+        let right = gaussian_factor(&mut expressions, matrix, 98_003, 5);
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[left, right]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+
+        let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        assert_eq!(ordinary.coefficient_bound, NumericContract::Missing);
+
+        let mut trace = FeasibilityTrace::default();
+        let error = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(semantic)
+        .unwrap_err();
+        assert_eq!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer));
     }
 }

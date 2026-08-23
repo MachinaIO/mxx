@@ -2086,24 +2086,38 @@ impl FeasibilitySink for FeasibilityTrace {
     }
 }
 
-fn bound_rule_contains_transfer(rule: &BoundRule, event: EventIndex) -> bool {
-    let value_ref_contains = |value: &BoundValueRef| matches!(value, BoundValueRef::Transfer(candidate) if *candidate == event);
+fn collect_bound_rule_transfers(rule: &BoundRule, transfers: &mut Vec<EventIndex>) {
     match rule {
-        BoundRule::Authority(_) => false,
-        BoundRule::Identity { input } => value_ref_contains(input),
+        BoundRule::Authority(_) => {}
+        BoundRule::Identity { input } => collect_value_ref_transfer(input, transfers),
         BoundRule::Sum { inputs } |
         BoundRule::Maximum { inputs } |
-        BoundRule::WeightedSum { inputs } => inputs.iter().any(value_ref_contains),
+        BoundRule::WeightedSum { inputs } => {
+            for input in inputs.iter() {
+                collect_value_ref_transfer(input, transfers);
+            }
+        }
         BoundRule::Scale { value, scale } => {
-            value_ref_contains(value) ||
-                matches!(scale, BoundScale::Value(value) if value_ref_contains(value))
+            collect_value_ref_transfer(value, transfers);
+            if let BoundScale::Value(value) = scale {
+                collect_value_ref_transfer(value, transfers);
+            }
         }
         BoundRule::MonomialProduct { factors, .. } => {
-            factors.iter().any(|factor| value_ref_contains(&factor.bound))
+            for factor in factors.iter() {
+                collect_value_ref_transfer(&factor.bound, transfers);
+            }
         }
         BoundRule::Product { left, right, .. } | BoundRule::Tensor { left, right, .. } => {
-            value_ref_contains(left) || value_ref_contains(right)
+            collect_value_ref_transfer(left, transfers);
+            collect_value_ref_transfer(right, transfers);
         }
+    }
+}
+
+fn collect_value_ref_transfer(value: &BoundValueRef, transfers: &mut Vec<EventIndex>) {
+    if let BoundValueRef::Transfer(event) = value {
+        transfers.push(*event);
     }
 }
 
@@ -2199,21 +2213,36 @@ impl FeasibilityTrace {
         monomials: &super::monomial::MonomialArena,
         normalization: &super::relation::NormalizationCache,
     ) -> Result<(), G0Error> {
-        macro_rules! invariant {
-            () => {
-                return Err(G0Error::RelationTraceInvariant)
-            };
-        }
         let mut frame_starts = vec![None; self.events.len()];
+        let mut frame_roots = BTreeMap::new();
+        let mut frame_ends = BTreeMap::new();
         let mut frames = Vec::new();
+        let mut result_by_owner = BTreeMap::new();
+        let mut consumed_by = BTreeMap::<EventIndex, BTreeSet<super::arena::ScopedExprId>>::new();
         for (index, event) in self.events.iter().enumerate() {
             let current = EventIndex(index as u64);
-            if matches!(event, NormalizerEvent::InvocationStart { .. }) {
+            if let NormalizerEvent::InvocationStart { root } = event {
                 frames.push(current);
+                frame_roots.insert(current, *root);
             }
-            frame_starts[index] = frames.last().copied();
-            if matches!(event, NormalizerEvent::InvocationEnd { .. }) {
-                frames.pop();
+            let frame_start = frames.last().copied();
+            frame_starts[index] = frame_start;
+            if let (Some(frame_start), NormalizerEvent::Result { owner, .. }) = (frame_start, event)
+            {
+                result_by_owner.insert((frame_start, *owner), current);
+            }
+            if let NormalizerEvent::BoundTransfer { owner, rule } = event {
+                let mut transfers = Vec::new();
+                collect_bound_rule_transfers(rule, &mut transfers);
+                for transfer in transfers {
+                    consumed_by.entry(transfer).or_default().insert(*owner);
+                }
+            }
+            if let NormalizerEvent::InvocationEnd { .. } = event {
+                let Some(frame_start) = frames.pop() else {
+                    return Err(G0Error::RelationTraceInvariant);
+                };
+                frame_ends.insert(frame_start, current);
             }
         }
         for (index, event) in self.events.iter().enumerate() {
@@ -2222,38 +2251,30 @@ impl FeasibilityTrace {
                 continue;
             };
             let Some(entries) = normalization.runtime_get(key) else {
-                invariant!();
+                return Err(G0Error::RelationTraceInvariant);
             };
             let Some(rhs_set) = entries.get(lhs) else {
-                invariant!();
+                return Err(G0Error::RelationTraceInvariant);
             };
             if !rhs_set.contains(rhs) {
-                invariant!();
+                return Err(G0Error::RelationTraceInvariant);
             }
             let source_descriptor = monomials
                 .descriptor(observation.source_monomial)
                 .map_err(|_| G0Error::RelationTraceInvariant)?;
             let lhs_descriptor =
                 monomials.descriptor(lhs.monomial).map_err(|_| G0Error::RelationTraceInvariant)?;
+            if !lhs_descriptor.central_factors.is_empty() {
+                return Err(G0Error::RelationTraceInvariant);
+            }
             let start = observation.ordered_start as usize;
             let end = observation.ordered_end_exclusive as usize;
-            if start > end || end > source_descriptor.ordered_factors.len() ||
+            if start > end ||
+                end > source_descriptor.ordered_factors.len() ||
                 source_descriptor.ordered_factors[start..end] !=
                     lhs_descriptor.ordered_factors[..]
             {
-                invariant!();
-            }
-            let mut remaining_central = source_descriptor.central_factors.to_vec();
-            for factor in &lhs_descriptor.central_factors {
-                let Some(position) =
-                    remaining_central.iter().position(|candidate| candidate == factor)
-                else {
-                    invariant!();
-                };
-                remaining_central.remove(position);
-            }
-            if !remaining_central.is_empty() {
-                invariant!();
+                return Err(G0Error::RelationTraceInvariant);
             }
             let replay =
                 self.specialization_ranges.get(key).ok_or(G0Error::RelationTraceInvariant)?;
@@ -2267,47 +2288,47 @@ impl FeasibilityTrace {
                 ..
             }) = self.events.get(rhs_event.0 as usize)
             else {
-                invariant!();
+                return Err(G0Error::RelationTraceInvariant);
             };
             let cached_rhs =
                 normalization.get(*rhs).map_err(|_| G0Error::RelationTraceInvariant)?;
             if witness_nf.as_ref() != cached_rhs {
-                invariant!();
+                return Err(G0Error::RelationTraceInvariant);
             }
             let Some(frame_start) = frame_starts[index] else {
-                invariant!();
+                return Err(G0Error::RelationTraceInvariant);
             };
-            let Some(NormalizerEvent::InvocationStart { root: frame_root }) =
-                self.events.get(frame_start.0 as usize)
-            else {
-                invariant!();
+            let Some(frame_root) = frame_roots.get(&frame_start) else {
+                return Err(G0Error::RelationTraceInvariant);
             };
             if observation.owner.program() != frame_root.program() {
-                invariant!();
+                return Err(G0Error::RelationTraceInvariant);
             }
-            let Some(result_index) = self.events.iter().enumerate().skip(index + 1).find_map(
-                |(candidate, event)| {
-                    (frame_starts[candidate] == Some(frame_start) &&
-                        matches!(event, NormalizerEvent::Result { owner, .. } if *owner == observation.owner))
-                    .then_some(candidate)
-                },
-            ) else {
-                invariant!();
+            let Some(result_index) = result_by_owner.get(&(frame_start, observation.owner)) else {
+                return Err(G0Error::RelationTraceInvariant);
             };
-            let Some(end_index) = self.events.iter().enumerate().skip(result_index + 1).find_map(
-                |(candidate, event)| {
-                    (frame_starts[candidate] == Some(frame_start) &&
-                        matches!(event, NormalizerEvent::InvocationEnd { root, .. } if *root == *frame_root))
-                    .then_some(candidate)
-                },
-            ) else {
-                invariant!();
+            let Some(end_index) = frame_ends.get(&frame_start) else {
+                return Err(G0Error::RelationTraceInvariant);
             };
-            let has_transfer = self.events.iter().enumerate().skip(index + 1).take(end_index - index - 1).any(
-                |(_, event)| matches!(event, NormalizerEvent::BoundTransfer { owner, rule } if *owner == observation.owner && bound_rule_contains_transfer(rule, EventIndex(index as u64)))
-            );
-            if !has_transfer {
-                invariant!();
+            if *result_index <= EventIndex(index as u64) || result_index >= end_index {
+                return Err(G0Error::RelationTraceInvariant);
+            }
+            let summary = cached_rhs.bounded_summary.coefficient_bound();
+            let requires_transfer = match summary {
+                NumericContract::Known(CoefficientBound::ExactZero) => false,
+                NumericContract::Known(CoefficientBound::Finite(value)) => {
+                    !value.maximum_absolute_coefficient.is_zero()
+                }
+                NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
+                    return Err(G0Error::RelationTraceInvariant)
+                }
+            };
+            if requires_transfer &&
+                !consumed_by
+                    .get(&EventIndex(index as u64))
+                    .is_some_and(|owners| owners.contains(&observation.owner))
+            {
+                return Err(G0Error::RelationTraceInvariant);
             }
         }
         Ok(())

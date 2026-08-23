@@ -12880,6 +12880,75 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(target_monomial.iter().any(|index| *index < target_result_index));
+        let (applied_index, applied_owner) = all_events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::AppliedRelation(observation)
+                    if matches!(observation.rule, AppliedRelationRule::Universal { .. }) =>
+                {
+                    Some((EventIndex(index as u64), observation.owner))
+                }
+                _ => None,
+            })
+            .expect("universal relation application");
+        let identity_index = all_events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Identity { input: BoundValueRef::Transfer(event) },
+                } if *owner == applied_owner && *event == applied_index => {
+                    Some(EventIndex(index as u64))
+                }
+                _ => None,
+            })
+            .expect("relation transfer is owned by consuming product");
+        let root_sum_index = all_events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::BoundTransfer { owner, rule: BoundRule::Sum { inputs } }
+                    if *owner == semantic &&
+                        inputs.len() == 2 &&
+                        inputs.iter().any(|input| {
+                            matches!(
+                                input,
+                                BoundValueRef::Result { projection: BoundProjection::Summary, .. }
+                            )
+                        }) &&
+                        inputs
+                            .iter()
+                            .any(|input| matches!(input, BoundValueRef::Transfer(_))) =>
+                {
+                    Some(EventIndex(index as u64))
+                }
+                _ => None,
+            })
+            .expect("root summary and relation transfer are combined");
+        let root_sum_transfer = match &all_events[root_sum_index.0 as usize] {
+            NormalizerEvent::BoundTransfer { rule: BoundRule::Sum { inputs }, .. } => inputs
+                .iter()
+                .find_map(|input| match input {
+                    BoundValueRef::Transfer(event) => Some(*event),
+                    _ => None,
+                })
+                .expect("root sum transfer input"),
+            _ => unreachable!("root sum index points to a bound transfer"),
+        };
+        let root_end_index = all_events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| {
+                matches!(event, NormalizerEvent::InvocationEnd { root, .. } if *root == semantic)
+                    .then_some(EventIndex(index as u64))
+            })
+            .expect("root invocation end");
+        assert!(applied_index < identity_index);
+        assert!(identity_index < root_sum_transfer);
+        assert!(identity_index < root_sum_index);
+        assert!(root_sum_index < root_end_index);
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
         trace.validate_normalization_observations_with_state(&monomials, &cache).unwrap();
 

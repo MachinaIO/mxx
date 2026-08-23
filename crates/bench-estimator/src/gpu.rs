@@ -136,6 +136,10 @@ impl GpuNodeMeasurementBackend {
             (matrix.columns > 1 && matrix_bytes(matrix, crt_depth) > REPRESENTATIVE_MATRIX_BYTES)
                 .then_some((1, matrix.columns as f64))
         };
+        let capped_rows = |matrix: &ConcreteMatrixType| {
+            (matrix.rows > 1 && matrix_bytes(matrix, crt_depth) > REPRESENTATIVE_MATRIX_BYTES)
+                .then_some((1, matrix.rows as f64))
+        };
         let mut kind = node.kind.clone();
         let mut argument_types = node.concrete_argument_types.clone();
         let mut output_types = node.concrete_output_types.clone();
@@ -144,11 +148,25 @@ impl GpuNodeMeasurementBackend {
         match &mut kind {
             NodeKind::ConstantMatrix { matrix_type, .. } |
             NodeKind::GadgetTrapdoor { matrix_type, .. } |
+            NodeKind::TrapdoorSample { matrix_type, .. } => {
+                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
+                    ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                        Some(matrix)
+                    }
+                    _ => None,
+                }) else {
+                    return (kind, argument_types, output_types, scale);
+                };
+                if let Some((representative_columns, column_scale)) = capped_columns(output) {
+                    output.columns = representative_columns;
+                    matrix_type.columns = mxx_ir_core::IntExpr::constant(representative_columns);
+                    scale = column_scale;
+                }
+            }
             NodeKind::UniformResidueSample { matrix_type } |
             NodeKind::UniformIntervalSample { matrix_type, .. } |
             NodeKind::GaussianSample { matrix_type, .. } |
             NodeKind::HashSample { matrix_type, .. } |
-            NodeKind::TrapdoorSample { matrix_type, .. } |
             NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
                 let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
                     ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
@@ -162,6 +180,10 @@ impl GpuNodeMeasurementBackend {
                     output.columns = representative_columns;
                     matrix_type.columns = mxx_ir_core::IntExpr::constant(representative_columns);
                     scale = column_scale;
+                } else if let Some((representative_rows, row_scale)) = capped_rows(output) {
+                    output.rows = representative_rows;
+                    matrix_type.rows = mxx_ir_core::IntExpr::constant(representative_rows);
+                    scale = row_scale;
                 }
             }
             NodeKind::Slice { rows, columns } => {
@@ -1320,6 +1342,53 @@ mod tests {
         assert_eq!((output.rows, output.columns), (1, 1));
         assert_eq!(matrix_type.columns, IntExpr::constant(1));
         assert_eq!(scale, 8_720.0);
+    }
+
+    #[test]
+    fn oversized_single_column_sampler_uses_one_row() {
+        let concrete = ConcreteMatrixType {
+            rows: 2_621_440,
+            columns: 1,
+            ring_dimension: 65_536,
+            modulus: BigInt::from(257u16),
+        };
+        let symbolic = MatrixType {
+            rows: IntExpr::constant(concrete.rows),
+            columns: IntExpr::constant(concrete.columns),
+            ring_dimension: IntExpr::constant(concrete.ring_dimension),
+            modulus: IntExpr::constant(concrete.modulus.clone()),
+        };
+        let kind = NodeKind::UniformIntervalSample {
+            matrix_type: symbolic,
+            range: mxx_ir_core::node::SampleRange {
+                minimum: IntExpr::constant(-1),
+                maximum: IntExpr::constant(1),
+            },
+        };
+        let scope = FrozenGraphScopeId::Root;
+        let node = MeasurementNode {
+            scope: &scope,
+            id: NodeId(1),
+            kind: &kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: Vec::new(),
+            concrete_output_types: vec![ConcreteWireType::Matrix(concrete)],
+        };
+
+        let (kind, _, output_types, scale) =
+            GpuNodeMeasurementBackend::representative_node(&node, 40);
+        let NodeKind::UniformIntervalSample { matrix_type, .. } = kind else {
+            panic!("uniform representative kind");
+        };
+        let ConcreteWireType::Matrix(output) = &output_types[0] else {
+            panic!("uniform representative output");
+        };
+        assert_eq!((output.rows, output.columns), (1, 1));
+        assert_eq!(matrix_type.rows, IntExpr::constant(1));
+        assert_eq!(scale, 2_621_440.0);
     }
 
     #[test]

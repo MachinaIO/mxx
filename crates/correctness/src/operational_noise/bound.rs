@@ -227,51 +227,6 @@ pub struct MatrixProductFacts {
     pub right_support_upper: Option<usize>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) enum ProductBoundBranch {
-    ExactZero,
-    ScalarScalar,
-    LeftScalar,
-    RightScalar,
-    General,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProductBoundWitness {
-    pub left_is_scalar: bool,
-    pub right_is_scalar: bool,
-    pub left_class: BoundClass,
-    pub right_class: BoundClass,
-    pub left_is_constant_polynomial: bool,
-    pub right_is_constant_polynomial: bool,
-    pub left_support_upper: BigUint,
-    pub right_support_upper: BigUint,
-    pub right_known_zero_rows: Option<BigUint>,
-    pub effective_inner_dimension: Option<BigUint>,
-    pub ring_factor: Option<BigUint>,
-    pub coefficient_factor: BigUint,
-    pub result: MatrixBound,
-    pub branch: ProductBoundBranch,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) enum TensorBoundBranch {
-    ExactZero,
-    Bounded,
-    LargeOrMissing,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TensorBoundWitness {
-    pub left_class: BoundClass,
-    pub right_class: BoundClass,
-    pub left_is_constant_polynomial: bool,
-    pub right_is_constant_polynomial: bool,
-    pub ring_factor: BigUint,
-    pub result: MatrixBound,
-    pub branch: TensorBoundBranch,
-}
-
 /// A resolved matrix constant consumed by the normal-form operation table.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolvedMatrixConstant {
@@ -298,7 +253,7 @@ pub fn product_bound(
     left: &MatrixBound,
     right: &MatrixBound,
 ) -> Result<MatrixBound, BoundArithmeticError> {
-    Ok(product_bound_with_facts_witness(left, right, &MatrixProductFacts::default())?.bound())
+    product_bound_with_facts(left, right, &MatrixProductFacts::default())
 }
 
 /// Product transfer with explicitly supplied value facts.
@@ -307,20 +262,6 @@ pub fn product_bound_with_facts(
     right: &MatrixBound,
     facts: &MatrixProductFacts,
 ) -> Result<MatrixBound, BoundArithmeticError> {
-    Ok(product_bound_with_facts_witness(left, right, facts)?.bound())
-}
-
-impl ProductBoundWitness {
-    fn bound(&self) -> MatrixBound {
-        self.result.clone()
-    }
-}
-
-pub(crate) fn product_bound_with_facts_witness(
-    left: &MatrixBound,
-    right: &MatrixBound,
-    facts: &MatrixProductFacts,
-) -> Result<ProductBoundWitness, BoundArithmeticError> {
     if left.matrix_type.modulus != right.matrix_type.modulus ||
         left.matrix_type.ring_dimension != right.matrix_type.ring_dimension
     {
@@ -353,98 +294,55 @@ pub(crate) fn product_bound_with_facts_witness(
     let right_support =
         if facts.right_is_constant_polynomial { BigUint::one() } else { right_support };
     let ring_dimension = BigUint::from(left.matrix_type.ring_dimension);
-    let (matrix_type, coefficient_factor, effective_inner_dimension, ring_factor, branch) =
-        if left_scalar && right_scalar {
-            // The left scalar acts on the right scalar, so its proved support is
-            // part of this coefficient transfer.  Canonical monomial folding
-            // applies central factors one at a time and therefore remains
-            // association-independent even when the support product is capped.
-            (
-                right.matrix_type.clone(),
-                left_support.clone(),
-                None,
-                None,
-                ProductBoundBranch::ScalarScalar,
-            )
-        } else if left_scalar {
-            (
-                right.matrix_type.clone(),
-                left_support.clone(),
-                None,
-                None,
-                ProductBoundBranch::LeftScalar,
-            )
-        } else if right_scalar {
-            (
-                left.matrix_type.clone(),
-                right_support.clone(),
-                None,
-                None,
-                ProductBoundBranch::RightScalar,
-            )
+    let (matrix_type, coefficient_factor) = if left_scalar && right_scalar {
+        // The left scalar acts on the right scalar, so its proved support is
+        // part of this coefficient transfer.  Canonical monomial folding
+        // applies central factors one at a time and therefore remains
+        // association-independent even when the support product is capped.
+        (right.matrix_type.clone(), left_support)
+    } else if left_scalar {
+        (right.matrix_type.clone(), left_support)
+    } else if right_scalar {
+        (left.matrix_type.clone(), right_support)
+    } else {
+        if left.matrix_type.columns != right.matrix_type.rows {
+            return Err(BoundArithmeticError::IncompatibleMatrixProduct {
+                left: left.matrix_type.clone(),
+                right: right.matrix_type.clone(),
+            });
+        }
+        let rows = BigUint::from(right.matrix_type.rows);
+        let known_zero_rows = facts.right_known_zero_rows.clone().unwrap_or_default();
+        if known_zero_rows > rows {
+            return Err(BoundArithmeticError::InvalidKnownZeroRows {
+                known_zero_rows,
+                row_count: rows,
+            });
+        }
+        let inner = BigUint::from(left.matrix_type.columns) - known_zero_rows;
+        let ring_factor = if facts.left_is_constant_polynomial || facts.right_is_constant_polynomial
+        {
+            BigUint::one()
         } else {
-            if left.matrix_type.columns != right.matrix_type.rows {
-                return Err(BoundArithmeticError::IncompatibleMatrixProduct {
-                    left: left.matrix_type.clone(),
-                    right: right.matrix_type.clone(),
-                });
-            }
-            let rows = BigUint::from(right.matrix_type.rows);
-            let known_zero_rows = facts.right_known_zero_rows.clone().unwrap_or_default();
-            if known_zero_rows > rows {
-                return Err(BoundArithmeticError::InvalidKnownZeroRows {
-                    known_zero_rows,
-                    row_count: rows,
-                });
-            }
-            let inner = BigUint::from(left.matrix_type.columns) - known_zero_rows;
-            let ring_factor =
-                if facts.left_is_constant_polynomial || facts.right_is_constant_polynomial {
-                    BigUint::one()
-                } else {
-                    ring_dimension
-                };
-            (
-                ConcreteMatrixType {
-                    modulus: left.matrix_type.modulus.clone(),
-                    ring_dimension: left.matrix_type.ring_dimension,
-                    rows: left.matrix_type.rows,
-                    columns: right.matrix_type.columns,
-                },
-                inner.clone() * ring_factor.clone(),
-                Some(inner),
-                Some(ring_factor),
-                ProductBoundBranch::General,
-            )
+            ring_dimension
         };
-    let result = MatrixBound {
+        (
+            ConcreteMatrixType {
+                modulus: left.matrix_type.modulus.clone(),
+                ring_dimension: left.matrix_type.ring_dimension,
+                rows: left.matrix_type.rows,
+                columns: right.matrix_type.columns,
+            },
+            inner * ring_factor,
+        )
+    };
+    Ok(MatrixBound {
         matrix_type,
         coefficient_class: multiply_classes(
             &left.coefficient_class,
             &right.coefficient_class,
             &coefficient_factor,
         ),
-    };
-    let branch = if result.coefficient_class == BoundClass::ExactZero {
-        ProductBoundBranch::ExactZero
-    } else {
-        branch
-    };
-    Ok(ProductBoundWitness {
-        left_is_scalar: left_scalar,
-        right_is_scalar: right_scalar,
-        left_class: left.coefficient_class.clone(),
-        right_class: right.coefficient_class.clone(),
-        left_is_constant_polynomial: facts.left_is_constant_polynomial,
-        right_is_constant_polynomial: facts.right_is_constant_polynomial,
-        left_support_upper: left_support,
-        right_support_upper: right_support,
-        right_known_zero_rows: facts.right_known_zero_rows.clone(),
-        effective_inner_dimension,
-        ring_factor,
-        coefficient_factor,
-        result,
-        branch,
     })
 }
 
@@ -458,20 +356,6 @@ pub fn tensor_bound_with_facts(
     right: &MatrixBound,
     facts: &MatrixProductFacts,
 ) -> Result<MatrixBound, BoundArithmeticError> {
-    Ok(tensor_bound_with_facts_witness(left, right, facts)?.bound())
-}
-
-impl TensorBoundWitness {
-    fn bound(&self) -> MatrixBound {
-        self.result.clone()
-    }
-}
-
-pub(crate) fn tensor_bound_with_facts_witness(
-    left: &MatrixBound,
-    right: &MatrixBound,
-    facts: &MatrixProductFacts,
-) -> Result<TensorBoundWitness, BoundArithmeticError> {
     if left.matrix_type.modulus != right.matrix_type.modulus ||
         left.matrix_type.ring_dimension != right.matrix_type.ring_dimension
     {
@@ -480,26 +364,21 @@ pub(crate) fn tensor_bound_with_facts_witness(
             right: right.matrix_type.clone(),
         });
     }
-    let (coefficient_class, branch) = match (&left.coefficient_class, &right.coefficient_class) {
-        (BoundClass::ExactZero, _) | (_, BoundClass::ExactZero) => {
-            (BoundClass::ExactZero, TensorBoundBranch::ExactZero)
-        }
+    let coefficient_class = match (&left.coefficient_class, &right.coefficient_class) {
+        (BoundClass::ExactZero, _) | (_, BoundClass::ExactZero) => BoundClass::ExactZero,
         (
             BoundClass::Bounded { maximum_absolute_coefficient: left_coeff },
             BoundClass::Bounded { maximum_absolute_coefficient: right_coeff },
-        ) => (
-            BoundClass::bounded(
-                left_coeff *
-                    right_coeff *
-                    if facts.left_is_constant_polynomial || facts.right_is_constant_polynomial {
-                        BigUint::from(1_u8)
-                    } else {
-                        BigUint::from(left.matrix_type.ring_dimension)
-                    },
-            ),
-            TensorBoundBranch::Bounded,
+        ) => BoundClass::bounded(
+            left_coeff *
+                right_coeff *
+                if facts.left_is_constant_polynomial || facts.right_is_constant_polynomial {
+                    BigUint::from(1_u8)
+                } else {
+                    BigUint::from(left.matrix_type.ring_dimension)
+                },
         ),
-        _ => (BoundClass::Large, TensorBoundBranch::LargeOrMissing),
+        _ => BoundClass::Large,
     };
     let matrix_type = ConcreteMatrixType {
         modulus: left.matrix_type.modulus.clone(),
@@ -517,21 +396,7 @@ pub(crate) fn tensor_bound_with_facts_witness(
             },
         )?,
     };
-    let result = MatrixBound { matrix_type, coefficient_class };
-    let ring_factor = if facts.left_is_constant_polynomial || facts.right_is_constant_polynomial {
-        BigUint::from(1_u8)
-    } else {
-        BigUint::from(left.matrix_type.ring_dimension)
-    };
-    Ok(TensorBoundWitness {
-        left_class: left.coefficient_class.clone(),
-        right_class: right.coefficient_class.clone(),
-        left_is_constant_polynomial: facts.left_is_constant_polynomial,
-        right_is_constant_polynomial: facts.right_is_constant_polynomial,
-        ring_factor,
-        result,
-        branch,
-    })
+    Ok(MatrixBound { matrix_type, coefficient_class })
 }
 
 fn multiply_classes(left: &BoundClass, right: &BoundClass, factor: &BigUint) -> BoundClass {
@@ -572,43 +437,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual.coefficient_class, BoundClass::bounded(20_u8.into()));
-    }
-
-    #[test]
-    fn witnesses_match_existing_product_and_tensor_wrappers() {
-        let left = bounded(matrix_ring(4, 2, 3), 2);
-        let right = bounded(matrix_ring(4, 3, 2), 3);
-        let facts = MatrixProductFacts {
-            left_support_upper: Some(2),
-            right_support_upper: Some(3),
-            right_known_zero_rows: Some(1_u8.into()),
-            ..Default::default()
-        };
-        let product = product_bound_with_facts(&left, &right, &facts).unwrap();
-        let witness = product_bound_with_facts_witness(&left, &right, &facts).unwrap();
-        assert_eq!(witness.result, product);
-        assert_eq!(witness.branch, ProductBoundBranch::General);
-        assert_eq!(witness.effective_inner_dimension, Some(2_u8.into()));
-        assert_eq!(witness.right_known_zero_rows, facts.right_known_zero_rows);
-
-        let tensor = tensor_bound_with_facts(&left, &right, &facts).unwrap();
-        let tensor_witness = tensor_bound_with_facts_witness(&left, &right, &facts).unwrap();
-        assert_eq!(tensor_witness.result, tensor);
-        assert_eq!(tensor_witness.branch, TensorBoundBranch::Bounded);
-    }
-
-    #[test]
-    fn witnesses_retain_scalar_and_exact_zero_branches() {
-        let scalar = bounded(matrix_ring(8, 1, 1), 0);
-        let row = bounded(matrix_ring(8, 1, 2), 5);
-        let product = product_bound_with_facts_witness(&scalar, &row, &Default::default()).unwrap();
-        assert_eq!(product.branch, ProductBoundBranch::ExactZero);
-        assert!(product.left_is_scalar);
-
-        let large =
-            MatrixBound { matrix_type: matrix_ring(8, 1, 1), coefficient_class: BoundClass::Large };
-        let tensor = tensor_bound_with_facts_witness(&scalar, &large, &Default::default()).unwrap();
-        assert_eq!(tensor.branch, TensorBoundBranch::ExactZero);
     }
 
     #[test]

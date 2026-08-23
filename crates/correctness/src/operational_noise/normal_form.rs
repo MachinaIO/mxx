@@ -1221,6 +1221,38 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(super::g0::EventIndex(0))
     }
 
+    fn append_summary_evidence(
+        &mut self,
+        owner: ScopedExprId,
+        evidence: &mut Option<BoundValueRef>,
+        next: BoundValueRef,
+    ) -> Result<(), NormalizeError> {
+        if !S::ENABLED {
+            return Ok(());
+        }
+        let Some(previous) = evidence.take() else {
+            *evidence = Some(next);
+            return Ok(())
+        };
+        let event = self
+            .observe_bound_transfer(owner, BoundRule::Sum { inputs: Box::new([previous, next]) })?;
+        *evidence = Some(BoundValueRef::Transfer(event));
+        Ok(())
+    }
+
+    fn summary_result_ref(
+        &mut self,
+        expression: ExprId,
+    ) -> Result<Option<BoundValueRef>, NormalizeError> {
+        if !S::ENABLED {
+            return Ok(None);
+        }
+        Ok(Some(BoundValueRef::Result {
+            event: self.relation_input_result(expression)?,
+            projection: BoundProjection::Summary,
+        }))
+    }
+
     fn predecessor_ref(
         input_position: usize,
         projection: BoundProjection,
@@ -1487,6 +1519,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                             self.product_nf(
                                 scope_proof,
                                 Some(semantic),
+                                node.inputs[0],
+                                node.inputs[1],
                                 &left_type,
                                 &right_type,
                                 left,
@@ -2041,17 +2075,42 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             right_bound,
             NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Finite(_))
         ) {
+            let left_evidence = self.whole_summary_evidence(owner, left_expression, left)?;
+            let right_evidence = self.whole_summary_evidence(owner, right_expression, right)?;
+            let summary =
+                self.typed_tensor_contract(&left_type, &left_bound, &right_type, &right_bound)?;
+            if S::ENABLED &&
+                !matches!(summary, NumericContract::Known(CoefficientBound::ExactZero)) &&
+                (left_evidence.is_none() || right_evidence.is_none())
+            {
+                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+            }
+            if let (Some(left_evidence), Some(right_evidence)) = (left_evidence, right_evidence) {
+                let event = self.observe_bound_transfer(
+                    owner,
+                    BoundRule::Tensor {
+                        left: left_evidence,
+                        right: right_evidence,
+                        left_is_constant_polynomial: false,
+                        right_is_constant_polynomial: false,
+                    },
+                )?;
+                let _ = event;
+            }
             return Ok(PolynomialNF {
                 exact_terms: BTreeMap::new(),
-                bounded_summary: BoundedSummary::from_contract(self.typed_tensor_contract(
-                    &left_type,
-                    &left_bound,
-                    &right_type,
-                    &right_bound,
-                )?)?,
+                bounded_summary: BoundedSummary::from_contract(summary)?,
             })
         }
-        let noise = self.tensor_summary_contract(&left_type, left, &right_type, right)?;
+        let (noise, _) = self.tensor_summary_contract(
+            Some(owner),
+            left_expression,
+            right_expression,
+            &left_type,
+            left,
+            &right_type,
+            right,
+        )?;
         let mut terms = BTreeMap::new();
         let mut expressions = BTreeMap::new();
         for (left_id, left_coefficient) in &left.exact_terms {
@@ -2194,8 +2253,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             // commutativity of the scalar result. The product is centralized only after every
             // surviving ordered factor is proven to have the declared 1x1 output type. In the
             // reversed order no relation applies, so both typed scalar factors remain present.
-            let product =
-                self.product_nf(scope_proof, Some(owner), &left_type, &right_type, left, right)?;
+            let product = self.product_nf(
+                scope_proof,
+                Some(owner),
+                left_expression,
+                right_expression,
+                &left_type,
+                &right_type,
+                left,
+                right,
+            )?;
             if !self.scalar_nf_ordered_factors_match_type(&product, &output_type)? {
                 return Ok(ScalarActionNormalization::Opaque);
             }
@@ -2220,6 +2287,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(ScalarActionNormalization::Exact(self.product_nf(
             scope_proof,
             Some(owner),
+            left_expression,
+            right_expression,
             &left_type,
             &right_type,
             &reclassified_left,
@@ -2732,6 +2801,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 Ok(Some(self.product_nf(
                     scope_proof,
                     Some(owner),
+                    left,
+                    component,
                     &left_type,
                     &component_type,
                     left_nf,
@@ -2809,6 +2880,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 Ok(Some(self.product_nf(
                     scope_proof,
                     Some(owner),
+                    component,
+                    right,
                     &component_type,
                     &right_type,
                     component_nf,
@@ -2997,6 +3070,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         &mut self,
         _scope_proof: &ScopeProof,
         owner: Option<ScopedExprId>,
+        left_expression: ExprId,
+        right_expression: ExprId,
         left_type: &ResolvedMatrixType,
         right_type: &ResolvedMatrixType,
         left: &PolynomialNF,
@@ -3006,6 +3081,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
         self.execute_product_into(
             owner,
+            left_expression,
+            right_expression,
             left_type,
             right_type,
             left,
@@ -3022,17 +3099,47 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     }
 
     fn bound_exact_terms(
-        &self,
+        &mut self,
+        owner: Option<ScopedExprId>,
         normal_form: &PolynomialNF,
-    ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
+    ) -> Result<(NumericContract<CoefficientBound>, Option<BoundValueRef>), NormalizeError> {
         let mut total = CoefficientBound::ExactZero;
+        let mut evidence = None;
         for (&monomial, coefficient) in &normal_form.exact_terms {
             let NumericContract::Known(bound) = self.bound_monomial(monomial, coefficient)? else {
-                return Ok(NumericContract::Missing);
+                return Ok((NumericContract::Missing, None));
             };
             total = add_known_bounds(&total, &bound);
+            if S::ENABLED {
+                let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                let transfer = self.observe_finite_monomial(owner, monomial, coefficient)?;
+                self.append_summary_evidence(owner, &mut evidence, transfer)?;
+            }
         }
-        Ok(NumericContract::Known(total))
+        Ok((NumericContract::Known(total), evidence))
+    }
+
+    fn whole_summary_evidence(
+        &mut self,
+        owner: ScopedExprId,
+        expression: ExprId,
+        normal_form: &PolynomialNF,
+    ) -> Result<Option<BoundValueRef>, NormalizeError> {
+        if !S::ENABLED {
+            return Ok(None);
+        }
+        let mut evidence = None;
+        if !normal_form.bounded_summary.is_zero() {
+            let summary = self
+                .summary_result_ref(expression)?
+                .ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+            self.append_summary_evidence(owner, &mut evidence, summary)?;
+        }
+        let (_, exact_evidence) = self.bound_exact_terms(Some(owner), normal_form)?;
+        if let Some(exact_evidence) = exact_evidence {
+            self.append_summary_evidence(owner, &mut evidence, exact_evidence)?;
+        }
+        Ok(evidence)
     }
 
     /// A bounded relation endpoint is not a Large/exact semantic term.  It is kept with identity
@@ -3110,15 +3217,40 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
 
     fn tensor_summary_contract(
         &mut self,
+        owner: Option<ScopedExprId>,
+        left_expression: ExprId,
+        right_expression: ExprId,
         left_type: &ResolvedMatrixType,
         left: &PolynomialNF,
         right_type: &ResolvedMatrixType,
         right: &PolynomialNF,
-    ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
+    ) -> Result<(NumericContract<CoefficientBound>, Option<BoundValueRef>), NormalizeError> {
         let left_summary = left.bounded_summary.coefficient_bound();
         let right_summary = right.bounded_summary.coefficient_bound();
         let mut contribution =
             self.typed_tensor_contract(left_type, &left_summary, right_type, &right_summary)?;
+        let mut evidence = None;
+        if S::ENABLED &&
+            left_summary.as_known().is_some_and(|bound| bound != &CoefficientBound::ExactZero) &&
+            right_summary.as_known().is_some_and(|bound| bound != &CoefficientBound::ExactZero)
+        {
+            let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+            let left_ref = self.summary_result_ref(left_expression)?;
+            let right_ref = self.summary_result_ref(right_expression)?;
+            let (Some(left_ref), Some(right_ref)) = (left_ref, right_ref) else {
+                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+            };
+            let event = self.observe_bound_transfer(
+                owner,
+                BoundRule::Tensor {
+                    left: left_ref,
+                    right: right_ref,
+                    left_is_constant_polynomial: false,
+                    right_is_constant_polynomial: false,
+                },
+            )?;
+            evidence = Some(BoundValueRef::Transfer(event));
+        }
         for (summary, summary_type, exact, exact_type, summary_on_left) in [
             (&left_summary, left_type, right, right_type, true),
             (&right_summary, right_type, left, left_type, false),
@@ -3128,7 +3260,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             {
                 continue
             }
-            let exact_bound = self.bound_exact_terms(exact)?;
+            let (exact_bound, exact_evidence) = self.bound_exact_terms(owner, exact)?;
             if !matches!(
                 exact_bound,
                 NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Finite(_))
@@ -3143,8 +3275,34 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 self.typed_tensor_contract(exact_type, &exact_bound, summary_type, summary)?
             };
             contribution = add_noise_summaries(&contribution, &cross);
+            if S::ENABLED && cross != NumericContract::Known(CoefficientBound::ExactZero) {
+                let Some(exact_evidence) = exact_evidence else {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                };
+                let summary_expression =
+                    if summary_on_left { left_expression } else { right_expression };
+                let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                let summary_ref = self
+                    .summary_result_ref(summary_expression)?
+                    .ok_or(super::g0::G0Error::UnsupportedBoundTransfer)?;
+                let (left_ref, right_ref) = if summary_on_left {
+                    (summary_ref, exact_evidence)
+                } else {
+                    (exact_evidence, summary_ref)
+                };
+                let event = self.observe_bound_transfer(
+                    owner,
+                    BoundRule::Tensor {
+                        left: left_ref,
+                        right: right_ref,
+                        left_is_constant_polynomial: false,
+                        right_is_constant_polynomial: false,
+                    },
+                )?;
+                self.append_summary_evidence(owner, &mut evidence, BoundValueRef::Transfer(event))?;
+            }
         }
-        Ok(contribution)
+        Ok((contribution, evidence))
     }
 
     /// Precompute every contribution involving an already-erased all-bounded summary.
@@ -3155,19 +3313,43 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     /// factor identity and therefore fails closed.
     fn product_summary_contract(
         &mut self,
+        owner: Option<ScopedExprId>,
+        left_expression: ExprId,
+        right_expression: ExprId,
         left_type: &ResolvedMatrixType,
         left: &PolynomialNF,
         right_type: &ResolvedMatrixType,
         right: &PolynomialNF,
         weight: &BigInt,
-    ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
+    ) -> Result<(NumericContract<CoefficientBound>, Option<BoundValueRef>), NormalizeError> {
         if weight.is_zero() {
-            return Ok(NumericContract::Known(CoefficientBound::ExactZero))
+            return Ok((NumericContract::Known(CoefficientBound::ExactZero), None))
         }
         let left_summary = left.bounded_summary.coefficient_bound();
         let right_summary = right.bounded_summary.coefficient_bound();
         let mut contribution =
             self.typed_product_contract(left_type, &left_summary, right_type, &right_summary)?;
+        let mut evidence = None;
+        if S::ENABLED &&
+            left_summary.as_known().is_some_and(|bound| bound != &CoefficientBound::ExactZero) &&
+            right_summary.as_known().is_some_and(|bound| bound != &CoefficientBound::ExactZero)
+        {
+            let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+            let left_ref = self.summary_result_ref(left_expression)?;
+            let right_ref = self.summary_result_ref(right_expression)?;
+            let (Some(left_ref), Some(right_ref)) = (left_ref, right_ref) else {
+                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+            };
+            let event = self.observe_bound_transfer(
+                owner,
+                BoundRule::Product {
+                    left: left_ref,
+                    right: right_ref,
+                    facts: MatrixProductFacts::default(),
+                },
+            )?;
+            evidence = Some(BoundValueRef::Transfer(event));
+        }
 
         // An identityless summary cannot become an ordered exact word again. Cross products with
         // retained exact terms therefore use the complete exact-side bound and fail closed as
@@ -3181,7 +3363,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             {
                 continue
             }
-            let exact_bound = self.bound_exact_terms(exact)?;
+            let (exact_bound, exact_evidence) = self.bound_exact_terms(owner, exact)?;
             if !matches!(
                 exact_bound,
                 NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Finite(_))
@@ -3196,14 +3378,53 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 self.typed_product_contract(exact_type, &exact_bound, summary_type, summary)?
             };
             contribution = add_noise_summaries(&contribution, &cross);
+            if S::ENABLED && cross != NumericContract::Known(CoefficientBound::ExactZero) {
+                let Some(exact_evidence) = exact_evidence else {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                };
+                let summary_expression =
+                    if summary_on_left { left_expression } else { right_expression };
+                let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                let summary_ref = self
+                    .summary_result_ref(summary_expression)?
+                    .ok_or(super::g0::G0Error::UnsupportedBoundTransfer)?;
+                let (left_ref, right_ref) = if summary_on_left {
+                    (summary_ref, exact_evidence)
+                } else {
+                    (exact_evidence, summary_ref)
+                };
+                let event = self.observe_bound_transfer(
+                    owner,
+                    BoundRule::Product {
+                        left: left_ref,
+                        right: right_ref,
+                        facts: MatrixProductFacts::default(),
+                    },
+                )?;
+                self.append_summary_evidence(owner, &mut evidence, BoundValueRef::Transfer(event))?;
+            }
         }
-        Ok(scale_noise_summary(&contribution, weight.magnitude()))
+        if S::ENABLED && weight.magnitude() != &BigUint::from(1_u8) {
+            if let Some(value) = evidence.take() {
+                let event = self.observe_bound_transfer(
+                    owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?,
+                    BoundRule::Scale {
+                        value,
+                        scale: BoundScale::Magnitude(weight.magnitude().clone()),
+                    },
+                )?;
+                evidence = Some(BoundValueRef::Transfer(event));
+            }
+        }
+        Ok((scale_noise_summary(&contribution, weight.magnitude()), evidence))
     }
 
     /// Execute one complete eager product lifecycle.
     fn execute_product_into<A: ExactTermAccumulator>(
         &mut self,
         owner: Option<ScopedExprId>,
+        left_expression: ExprId,
+        right_expression: ExprId,
         left_type: &ResolvedMatrixType,
         right_type: &ResolvedMatrixType,
         left: &PolynomialNF,
@@ -3212,8 +3433,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
     ) -> Result<(), NormalizeError> {
-        let summary_contribution =
-            self.product_summary_contract(left_type, left, right_type, right, weight)?;
+        let (summary_contribution, _) = self.product_summary_contract(
+            owner,
+            left_expression,
+            right_expression,
+            left_type,
+            left,
+            right_type,
+            right,
+            weight,
+        )?;
         self.product_into_body(owner, left, right, weight, terms, noise)?;
         *noise = add_noise_summaries(noise, &summary_contribution);
         Ok(())
@@ -3836,7 +4065,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         owner: ScopedExprId,
         monomial: MonomialId,
         coefficient: &BigInt,
-    ) -> Result<(), NormalizeError> {
+    ) -> Result<BoundValueRef, NormalizeError> {
         let factor_ids = {
             let descriptor = self.monomials.descriptor(monomial)?;
             descriptor
@@ -3871,16 +4100,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             BoundRule::MonomialProduct { monomial, factors: factors.into_boxed_slice() },
         )?;
         if coefficient.magnitude() == &BigUint::from(1_u8) {
-            return Ok(());
+            return Ok(BoundValueRef::Transfer(monomial_event));
         }
-        self.observe_bound_transfer(
+        let scale_event = self.observe_bound_transfer(
             owner,
             BoundRule::Scale {
                 value: BoundValueRef::Transfer(monomial_event),
                 scale: BoundScale::Magnitude(coefficient.magnitude().clone()),
             },
         )?;
-        Ok(())
+        Ok(BoundValueRef::Transfer(scale_event))
     }
 
     /// Count retained exact terms which still expose a uniquely dispatchable preimage call.
@@ -6239,6 +6468,51 @@ mod tests {
     }
 
     #[test]
+    fn traced_product_summary_preserves_summary_exact_operand_order() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left_exact = source_with(&mut expressions, matrix_type(), 95_021);
+        let left_finite = gaussian_factor(&mut expressions, matrix_type(), 95_022, 2);
+        let left = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[left_exact, left_finite])
+            .unwrap();
+        let right = gaussian_factor(&mut expressions, matrix_type(), 95_023, 3);
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[left, right]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut trace = super::super::g0::FeasibilityTrace::default();
+        let value = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer.normalize(semantic).unwrap()
+        };
+        assert!(value.exact_nf.as_ref().is_some_and(|nf| !nf.exact_terms.is_empty()));
+        let products = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    rule: BoundRule::Product { left, right, .. },
+                    ..
+                } => Some((left.clone(), right.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!products.is_empty(), "summary/exact product evidence must be recorded");
+        assert!(products.iter().any(|(left, right)| {
+            matches!(left, BoundValueRef::Result { projection: BoundProjection::Summary, .. }) &&
+                matches!(right, BoundValueRef::Transfer(_))
+        }));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+    }
+
+    #[test]
     fn bounded_only_addition_is_one_summary_without_exact_terms() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -6349,6 +6623,80 @@ mod tests {
     }
 
     #[test]
+    fn traced_tensor_summary_preserves_summary_exact_operand_order() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input_type = matrix_type();
+        let output_type = ResolvedMatrixType::new(
+            input_type.modulus.clone(),
+            input_type.ring_dimension,
+            input_type.rows * input_type.rows,
+            input_type.columns * input_type.columns,
+        )
+        .unwrap();
+        let left_exact = source_with(&mut expressions, input_type.clone(), 95_024);
+        let left_finite = gaussian_factor(&mut expressions, input_type.clone(), 95_025, 2);
+        let left = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[left_exact, left_finite])
+            .unwrap();
+        let right = gaussian_factor(&mut expressions, input_type.clone(), 95_026, 3);
+        let root = expressions
+            .intern_matrix_transform(
+                MatrixOperation::Tensor {
+                    output: output_type.clone(),
+                    left_layout: MatrixLayout::row_major(input_type.rows, input_type.columns),
+                    right_layout: MatrixLayout::row_major(input_type.rows, input_type.columns),
+                    output_layout: MatrixLayout::row_major(output_type.rows, output_type.columns),
+                },
+                &[left, right],
+            )
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut trace = super::super::g0::FeasibilityTrace::default();
+        {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer.normalize(semantic).unwrap();
+        }
+        let tensors = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    rule:
+                        BoundRule::Tensor {
+                            left,
+                            right,
+                            left_is_constant_polynomial,
+                            right_is_constant_polynomial,
+                        },
+                    ..
+                } => Some((
+                    left.clone(),
+                    right.clone(),
+                    *left_is_constant_polynomial,
+                    *right_is_constant_polynomial,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!tensors.is_empty());
+        assert!(tensors.iter().any(|(left, right, left_constant, right_constant)| {
+            matches!(left, BoundValueRef::Result { projection: BoundProjection::Summary, .. }) &&
+                matches!(right, BoundValueRef::Transfer(_)) &&
+                !left_constant &&
+                !right_constant
+        }));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+    }
+
+    #[test]
     fn identical_large_products_cancel_exactly() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -6404,6 +6752,8 @@ mod tests {
         let error = normalizer
             .execute_product_into(
                 None,
+                semantic.expression(),
+                semantic.expression(),
                 &matrix_type(),
                 &matrix_type(),
                 &summary,

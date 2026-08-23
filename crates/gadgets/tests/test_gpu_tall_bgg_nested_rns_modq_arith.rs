@@ -1511,9 +1511,10 @@ fn benchmark_estimation(
         measured_iterations: config.benchmark_iterations,
         memory_poll_interval: Duration::from_millis(1),
     };
-    let encoding_parallel_instances = config.max_parallel_instances.min(device_ids.len()).max(1);
-    let preprocessing_parallel_instances =
-        config.preprocessing_parallel_instances.min(device_ids.len()).max(1);
+    let encoding_parallel_instances = config.max_parallel_instances;
+    let preprocessing_parallel_instances = config.preprocessing_parallel_instances;
+    let measurement_parallel_instances =
+        encoding_parallel_instances.max(preprocessing_parallel_instances);
     let estimator_config =
         EstimateConfig { device_pool_size: encoding_parallel_instances, per_instance_occupancy: 1 };
     let preprocessing_estimator_config = EstimateConfig {
@@ -1522,14 +1523,16 @@ fn benchmark_estimation(
     };
     info!(
         gpu_count = device_ids.len(),
+        measurement_parallel_instances,
         encoding_parallel_instances,
         preprocessing_parallel_instances,
         "effective benchmark estimator parallelism"
     );
-    let backends = device_ids
-        .iter()
-        .copied()
-        .map(|device_id| (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id))
+    let backends = (0..measurement_parallel_instances)
+        .map(|instance| {
+            let device_id = device_ids[instance % device_ids.len()];
+            (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id)
+        })
         .collect();
     let mut backend =
         GpuNodeMeasurementBackend::new(backends, harness, selected.parameters.to_crt().2);

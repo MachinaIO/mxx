@@ -7209,6 +7209,56 @@ mod tests {
     }
 
     #[test]
+    fn opt_in_expression_select_records_typed_plan_and_residual_filter() {
+        let protocol = crate::toy_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let parameters = BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]);
+        let (ordinary_job, ordinary_roots) =
+            ProductionAdapter::new(&protocol, &plan, parameters.clone())
+                .expect("ordinary adapter")
+                .lower()
+                .expect("ordinary lowering");
+        let (trace_job, trace_roots, mut trace) =
+            ProductionAdapter::new_with_feasibility(&protocol, &plan, parameters)
+                .expect("feasibility adapter")
+                .lower_with_feasibility()
+                .expect("feasibility lowering");
+        let selects = trace
+            .index_use_plans()
+            .filter(|plan| plan.kind == IndexUseKind::Select)
+            .collect::<Vec<_>>();
+        assert_eq!(selects.len(), 1, "expression select plans={selects:?}");
+        let select = selects[0];
+        assert!(select.result.is_some());
+        assert!(select.consumed.is_none());
+        assert!(select.consumed_family.is_none());
+        assert_eq!(
+            select.output_range,
+            Some(TrustedIndexRange { minimum: 0, maximum_exclusive: 2 })
+        );
+        assert!(matches!(select.output_type, ResolvedValueType::Matrix(_)));
+        assert!(select.frontier.is_empty());
+
+        let residual = select.result.expect("select result");
+        let closure = super::super::simulation::CertificateClosure {
+            expressions: BTreeSet::from([residual]),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: BTreeSet::new(),
+        };
+        trace.retain_residual(&closure);
+        assert_eq!(trace.index_use_plans().count(), 1);
+        assert_eq!(ordinary_job.expressions().node_count(), trace_job.expressions().node_count());
+        assert_eq!(ordinary_job.programs().len(), trace_job.programs().len());
+        assert_eq!(ordinary_roots.occurrences, trace_roots.occurrences);
+        assert_eq!(ordinary_roots.samples, trace_roots.samples);
+        assert_eq!(ordinary_job.relations().is_frozen(), trace_job.relations().is_frozen());
+    }
+
+    #[test]
     fn opt_in_indexed_slice_registers_one_shared_four_role_group() {
         let protocol = generated_gather_protocol(7);
         let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("slice plan");

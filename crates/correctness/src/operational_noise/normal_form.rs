@@ -146,9 +146,9 @@ struct RelationMatch {
     suffix: Vec<ScopedExprId>,
     remaining_central: Vec<ScopedExprId>,
     rhs: super::relation::CanonicalRhsId,
-    owner: ScopedExprId,
-    dispatch: super::relation::UniversalDispatchKey,
-    lhs: super::relation::CanonicalLhsKey,
+    owner: Option<ScopedExprId>,
+    dispatch: Option<super::relation::UniversalDispatchKey>,
+    lhs: Option<super::relation::CanonicalLhsKey>,
     ordered_start: u32,
     ordered_end_exclusive: u32,
 }
@@ -3621,15 +3621,26 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 )?)
             };
             if S::ENABLED {
+                let owner = relation_match
+                    .owner
+                    .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
+                let dispatch = relation_match
+                    .dispatch
+                    .clone()
+                    .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
+                let lhs = relation_match
+                    .lhs
+                    .clone()
+                    .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
                 self.observe_applied_relation(super::g0::AppliedRelation {
-                    owner: relation_match.owner,
+                    owner,
                     source_monomial: monomial,
                     outer_coefficient: coefficient.clone(),
                     ordered_start: relation_match.ordered_start,
                     ordered_end_exclusive: relation_match.ordered_end_exclusive,
                     rule: super::g0::AppliedRelationRule::Universal {
-                        dispatch: relation_match.dispatch.clone(),
-                        lhs: relation_match.lhs.clone(),
+                        dispatch,
+                        lhs,
                         rhs: relation_match.rhs,
                     },
                 })?;
@@ -3795,13 +3806,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         ordered: &[ScopedExprId],
     ) -> Result<Option<RelationMatch>, NormalizeError> {
         let Some(relations) = self.relations else { return Ok(None) };
-        let mut candidates = BTreeMap::<
-            (usize, usize),
-            BTreeMap<
-                CanonicalLhsKey,
-                BTreeMap<(ScopedExprId, super::relation::UniversalDispatchKey), BTreeSet<_>>,
-            >,
-        >::new();
+        let mut candidates = BTreeMap::<(usize, usize), BTreeSet<_>>::new();
+        let mut provenance = S::ENABLED.then(
+            BTreeMap::<
+                ((usize, usize), super::relation::CanonicalRhsId),
+                BTreeSet<(CanonicalLhsKey, ScopedExprId, super::relation::UniversalDispatchKey)>,
+            >::new,
+        );
         for (k_position, &k_factor) in ordered.iter().enumerate() {
             let node = self.expressions.node(k_factor.expression())?;
             let ValueOperator::ProgramCall { program } = node.operator else { continue };
@@ -3858,15 +3869,20 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     candidates
                         .entry((start, end))
                         .or_default()
-                        .entry(lhs.clone())
-                        .or_default()
-                        .entry((k_factor, dispatch.clone()))
-                        .or_default()
                         .extend(rhs_candidates.iter().copied());
+                    if let Some(provenance) = provenance.as_mut() {
+                        for &rhs in rhs_candidates.iter() {
+                            provenance.entry(((start, end), rhs)).or_default().insert((
+                                lhs.clone(),
+                                k_factor,
+                                dispatch.clone(),
+                            ));
+                        }
+                    }
                 }
             }
         }
-        let Some(((start, end), lhs_candidates)) = candidates.into_iter().min_by(
+        let Some(((start, end), rhs_candidates)) = candidates.into_iter().min_by(
             |((left_start, left_end), _), ((right_start, right_end), _)| {
                 left_start.cmp(right_start).then_with(|| {
                     right_end
@@ -3877,30 +3893,23 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         ) else {
             return Ok(None);
         };
-        let rhs_candidates = lhs_candidates
-            .values()
-            .flat_map(|producers| producers.values().flat_map(|values| values.iter().copied()))
-            .collect::<BTreeSet<_>>();
         let super::relation::RelationResolution::Rewrite(rhs) =
             super::relation::resolve_candidates(Some(&rhs_candidates))?
         else {
             return Ok(None);
         };
-        let lhs = lhs_candidates
-            .iter()
-            .find_map(|(lhs, producers)| {
-                producers.values().any(|values| values.contains(&rhs)).then(|| lhs.clone())
-            })
-            .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
-        let (owner, dispatch) = lhs_candidates
-            .get(&lhs)
-            .and_then(|producers| {
-                producers
-                    .iter()
-                    .find(|(_, values)| values.contains(&rhs))
-                    .map(|(producer, _)| producer.clone())
-            })
-            .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
+        let (owner, dispatch, lhs) = if S::ENABLED {
+            let provenance = provenance
+                .as_ref()
+                .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
+            let (lhs, owner, dispatch) = provenance
+                .get(&((start, end), rhs))
+                .and_then(|items| items.iter().next().cloned())
+                .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
+            (Some(owner), Some(dispatch), Some(lhs))
+        } else {
+            (None, None, None)
+        };
         Ok(Some(RelationMatch {
             prefix: ordered[..start].to_vec(),
             suffix: ordered[end..].to_vec(),

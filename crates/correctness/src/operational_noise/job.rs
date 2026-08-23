@@ -1390,15 +1390,20 @@ impl CheckerJob {
         );
         let monomial_arena =
             monomials.ensure(expressions, programs, scope).map_err(JobError::Monomial)?;
-        let mut normalizer = Normalizer::new(expressions, programs, facts, monomial_arena)
-            .map_err(JobError::Normalize)?
-            .with_relations(relations, normalization)
-            .with_gadget_recompositions(gadget_recompositions);
         if S::ENABLED {
             sink.record_residual_normalization_start().map_err(JobError::Feasibility)?;
         }
+        let mut normalizer =
+            Normalizer::new_with_sink(expressions, programs, facts, monomial_arena, sink)
+                .map_err(JobError::Normalize)?
+                .with_relations(relations, normalization)
+                .with_gadget_recompositions(gadget_recompositions);
         let value = normalizer.normalize(root).map_err(JobError::Normalize)?;
         let counters = normalizer.counters();
+        drop(normalizer);
+        if S::ENABLED {
+            sink.validate_normalization_observations().map_err(JobError::Feasibility)?;
+        }
         if S::ENABLED {
             sink.record_residual_normalization_end(&counters).map_err(JobError::Feasibility)?;
         }

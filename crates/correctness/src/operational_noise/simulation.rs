@@ -1620,6 +1620,7 @@ mod tests {
         assert_eq!(run.trace.residual_normalization_starts, 1);
         assert_eq!(run.trace.residual_normalization_ends, 1);
         assert!(run.trace.residual_normalization_nodes > 0);
+        assert!(!run.trace.normalization_results.is_empty());
         assert_eq!(run.accepted_report.target_id, request.target_id);
         assert_eq!(run.accepted_report.ciphertext_modulus, 256_u16.into());
         assert!(matches!(

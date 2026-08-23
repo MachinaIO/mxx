@@ -39,6 +39,20 @@ pub(crate) trait FeasibilitySink: Default {
         counters: &super::normal_form::NormalizationCounters,
     ) -> Result<(), G0Error>;
 
+    fn record_predecessor(
+        &mut self,
+        consumer: super::arena::ScopedExprId,
+        input_position: u32,
+        predecessor: ExprId,
+    ) -> Result<(), G0Error>;
+
+    fn record_normalization_result(
+        &mut self,
+        result: super::arena::ScopedExprId,
+    ) -> Result<(), G0Error>;
+
+    fn validate_normalization_observations(&self) -> Result<(), G0Error>;
+
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error>;
 
     fn record_event(&mut self, observation: EventObservation) -> Result<(), G0Error>;
@@ -95,6 +109,13 @@ pub(crate) struct EventObservation {
     pub event: SampleEventId,
     pub owner: PlannedWire,
     pub kind: EventKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct PredecessorObservation {
+    pub consumer: super::arena::ScopedExprId,
+    pub input_position: u32,
+    pub predecessor: ExprId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1075,6 +1096,26 @@ impl FeasibilitySink for NoFeasibility {
         Ok(())
     }
 
+    fn record_predecessor(
+        &mut self,
+        _consumer: super::arena::ScopedExprId,
+        _input_position: u32,
+        _predecessor: ExprId,
+    ) -> Result<(), G0Error> {
+        Ok(())
+    }
+
+    fn record_normalization_result(
+        &mut self,
+        _result: super::arena::ScopedExprId,
+    ) -> Result<(), G0Error> {
+        Ok(())
+    }
+
+    fn validate_normalization_observations(&self) -> Result<(), G0Error> {
+        Ok(())
+    }
+
     fn record_source(&mut self, _handle: SourceHandle, _class: SourceClass) -> Result<(), G0Error> {
         Ok(())
     }
@@ -1098,6 +1139,8 @@ pub(crate) struct FeasibilityTrace {
     pub residual_normalization_starts: u64,
     pub residual_normalization_ends: u64,
     pub residual_normalization_nodes: u64,
+    pub predecessor_observations: BTreeSet<PredecessorObservation>,
+    pub normalization_results: BTreeSet<super::arena::ScopedExprId>,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
     index_use_plans: BTreeSet<IndexUsePlan>,
@@ -1111,6 +1154,8 @@ impl Default for FeasibilityTrace {
             residual_normalization_starts: 0,
             residual_normalization_ends: 0,
             residual_normalization_nodes: 0,
+            predecessor_observations: BTreeSet::new(),
+            normalization_results: BTreeSet::new(),
             source_observations: BTreeMap::new(),
             event_observations: BTreeMap::new(),
             index_use_plans: BTreeSet::new(),
@@ -1150,6 +1195,39 @@ impl FeasibilitySink for FeasibilityTrace {
             .residual_normalization_nodes
             .checked_add(counters.nodes_processed)
             .ok_or(G0Error::TraceOverflow)?;
+        Ok(())
+    }
+
+    fn record_predecessor(
+        &mut self,
+        consumer: super::arena::ScopedExprId,
+        input_position: u32,
+        predecessor: ExprId,
+    ) -> Result<(), G0Error> {
+        self.predecessor_observations.insert(PredecessorObservation {
+            consumer,
+            input_position,
+            predecessor,
+        });
+        Ok(())
+    }
+
+    fn record_normalization_result(
+        &mut self,
+        result: super::arena::ScopedExprId,
+    ) -> Result<(), G0Error> {
+        self.normalization_results.insert(result);
+        Ok(())
+    }
+
+    fn validate_normalization_observations(&self) -> Result<(), G0Error> {
+        if self
+            .predecessor_observations
+            .iter()
+            .any(|observation| !self.normalization_results.contains(&observation.consumer))
+        {
+            return Err(G0Error::MissingNormalizationResult);
+        }
         Ok(())
     }
 
@@ -1685,6 +1763,8 @@ pub(crate) enum G0Error {
     ConflictingEventObservation,
     #[error("event kind is unsupported in canonical G0 inventory")]
     UnsupportedCanonicalEventKind,
+    #[error("residual predecessor observation has no normalized consumer result")]
+    MissingNormalizationResult,
     #[error("residual event has no typed lowering observation")]
     MissingEventObservation,
     #[error("independent residual events cannot alias one canonical event row")]

@@ -18,6 +18,7 @@ use super::{
         BoundExpression, CoefficientBound, FactError, FactStore, MatrixFacts, NumericContract,
         ValueFacts,
     },
+    g0::{FeasibilitySink, NoFeasibility},
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
     program::{ArenaError, ProgramArena, ValueProgramId},
     relation::{
@@ -280,6 +281,7 @@ pub enum NormalizeError {
     InvalidExactPlan { reason: &'static str },
     ArithmeticOverflow,
     Relation(RelationRegistryError),
+    Feasibility(super::g0::G0Error),
 }
 
 impl fmt::Display for NormalizeError {
@@ -314,6 +316,12 @@ impl From<RelationRegistryError> for NormalizeError {
     }
 }
 
+impl From<super::g0::G0Error> for NormalizeError {
+    fn from(error: super::g0::G0Error) -> Self {
+        Self::Feasibility(error)
+    }
+}
+
 enum ScalarActionNormalization {
     NotApplicable,
     Opaque,
@@ -322,7 +330,7 @@ enum ScalarActionNormalization {
 
 /// The Stage 3 exact normaliser.  One instance is scoped to one finalized value program and one
 /// job-owned monomial arena.  All traversal state is iterative and is released at last use.
-pub struct Normalizer<'a> {
+pub struct Normalizer<'a, S = NoFeasibility> {
     expressions: &'a mut ExprArena,
     programs: &'a ProgramArena,
     facts: &'a FactStore,
@@ -355,9 +363,21 @@ pub struct Normalizer<'a> {
     protected_monomial_prefix: usize,
     monomial_gc_allocation_threshold_bytes: u64,
     gadget_splice_batch_terms: usize,
+    sink: Option<&'a mut S>,
 }
 
-impl<'a> Normalizer<'a> {
+impl<'a> Normalizer<'a, NoFeasibility> {
+    pub fn new(
+        expressions: &'a mut ExprArena,
+        programs: &'a ProgramArena,
+        facts: &'a FactStore,
+        monomials: &'a mut MonomialArena,
+    ) -> Result<Self, NormalizeError> {
+        Self::from_parts(expressions, programs, facts, monomials, None)
+    }
+}
+
+impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     fn clear_value_cache(&mut self) {
         self.cache.clear();
     }
@@ -411,11 +431,22 @@ impl<'a> Normalizer<'a> {
         Ok(())
     }
 
-    pub fn new(
+    pub fn new_with_sink(
         expressions: &'a mut ExprArena,
         programs: &'a ProgramArena,
         facts: &'a FactStore,
         monomials: &'a mut MonomialArena,
+        sink: &'a mut S,
+    ) -> Result<Self, NormalizeError> {
+        Self::from_parts(expressions, programs, facts, monomials, Some(sink))
+    }
+
+    fn from_parts(
+        expressions: &'a mut ExprArena,
+        programs: &'a ProgramArena,
+        facts: &'a FactStore,
+        monomials: &'a mut MonomialArena,
+        sink: Option<&'a mut S>,
     ) -> Result<Self, NormalizeError> {
         let scope = monomials.scope();
         programs.program(scope)?;
@@ -448,6 +479,7 @@ impl<'a> Normalizer<'a> {
             protected_monomial_prefix,
             monomial_gc_allocation_threshold_bytes: monomial_gc_allocation_threshold_bytes(),
             gadget_splice_batch_terms: PARALLEL_GADGET_SPLICE_BATCH_TERMS,
+            sink,
         })
     }
 
@@ -1025,6 +1057,31 @@ impl<'a> Normalizer<'a> {
         Ok(value)
     }
 
+    fn observe_predecessor(
+        &mut self,
+        consumer: ScopedExprId,
+        input_position: u32,
+        predecessor: ExprId,
+    ) -> Result<(), NormalizeError> {
+        if S::ENABLED {
+            self.sink
+                .as_deref_mut()
+                .ok_or(super::g0::G0Error::MissingNormalizationResult)?
+                .record_predecessor(consumer, input_position, predecessor)?;
+        }
+        Ok(())
+    }
+
+    fn observe_result(&mut self, result: ScopedExprId) -> Result<(), NormalizeError> {
+        if S::ENABLED {
+            self.sink
+                .as_deref_mut()
+                .ok_or(super::g0::G0Error::MissingNormalizationResult)?
+                .record_normalization_result(result)?;
+        }
+        Ok(())
+    }
+
     fn gadget_input_nf(
         &mut self,
         expression: ExprId,
@@ -1056,8 +1113,9 @@ impl<'a> Normalizer<'a> {
         // per node and turn a linear chain into O(N^2).
         let semantic = self.expressions.scoped_from_proof(scope_proof, expression)?;
         let mut children = Vec::with_capacity(node.inputs.len());
-        for child in &node.inputs {
+        for (input_position, child) in node.inputs.iter().enumerate() {
             children.push(self.child_value(*child)?);
+            self.observe_predecessor(semantic, input_position as u32, *child)?;
         }
         let output_type = self.expressions.value_type(expression)?.clone();
         let mut value = if matches!(output_type, ResolvedValueType::Matrix(_)) {
@@ -1077,6 +1135,7 @@ impl<'a> Normalizer<'a> {
                 normal_form.bounded_summary = BoundedSummary::zero();
             }
         }
+        self.observe_result(semantic)?;
         Ok(value)
     }
 

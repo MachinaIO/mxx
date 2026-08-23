@@ -1511,27 +1511,44 @@ fn benchmark_estimation(
         measured_iterations: config.benchmark_iterations,
         memory_poll_interval: Duration::from_millis(1),
     };
-    let estimator_config = EstimateConfig {
-        device_pool_size: config.max_parallel_instances,
-        per_instance_occupancy: 1,
-    };
-    let make_backend = || {
-        GpuNodeMeasurementBackend::new(
-            gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied()),
-            device_ids[0],
-            harness.clone(),
-            selected.parameters.to_crt().2,
-        )
-    };
+    let encoding_parallel_instances = config.max_parallel_instances.min(device_ids.len()).max(1);
+    let preprocessing_parallel_instances =
+        config.preprocessing_parallel_instances.min(device_ids.len()).max(1);
+    let estimator_config =
+        EstimateConfig { device_pool_size: encoding_parallel_instances, per_instance_occupancy: 1 };
     let preprocessing_estimator_config = EstimateConfig {
-        device_pool_size: config.preprocessing_parallel_instances,
+        device_pool_size: preprocessing_parallel_instances,
         per_instance_occupancy: 1,
     };
-    let mut preprocessing_backend = make_backend();
+    info!(
+        gpu_count = device_ids.len(),
+        encoding_parallel_instances,
+        preprocessing_parallel_instances,
+        "effective benchmark estimator parallelism"
+    );
+    let backends = device_ids
+        .iter()
+        .copied()
+        .map(|device_id| (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id))
+        .collect();
+    let mut backend =
+        GpuNodeMeasurementBackend::new(backends, harness, selected.parameters.to_crt().2);
+    info!("collecting unique GPU measurement shapes");
+    estimate(&preprocessing_graph, &mut backend, &preprocessing_estimator_config)
+        .map_err(|error| error.to_string())?;
+    estimate(&encoding_graph, &mut backend, &estimator_config)
+        .map_err(|error| error.to_string())?;
+    let measurement_started = Instant::now();
+    backend.measure_collected().map_err(|error| error.to_string())?;
+    info!(
+        elapsed = ?measurement_started.elapsed(),
+        gpu_count = device_ids.len(),
+        "parallel GPU measurement collection complete"
+    );
     let preprocessing_started = Instant::now();
     info!(subgraph = "preprocessing", "benchmark subgraph estimation begin");
     let preprocessing_report =
-        estimate(&preprocessing_graph, &mut preprocessing_backend, &preprocessing_estimator_config)
+        estimate(&preprocessing_graph, &mut backend, &preprocessing_estimator_config)
             .map_err(|error| error.to_string())?;
     info!(subgraph = "preprocessing", elapsed = ?preprocessing_started.elapsed(), "benchmark subgraph estimation complete");
     info!(
@@ -1540,10 +1557,9 @@ fn benchmark_estimation(
         "estimated lookup preimage sampling"
     );
     log_cost_report("TallBggPreprocessing", &preprocessing_report);
-    let mut encoding_backend = make_backend();
     let encoding_started = Instant::now();
     info!(subgraph = "encoding", "benchmark subgraph estimation begin");
-    let encoding_report = estimate(&encoding_graph, &mut encoding_backend, &estimator_config)
+    let encoding_report = estimate(&encoding_graph, &mut backend, &estimator_config)
         .map_err(|error| error.to_string())?;
     info!(subgraph = "encoding", elapsed = ?encoding_started.elapsed(), "benchmark subgraph estimation complete");
     log_cost_report("TallBggEncoding", &encoding_report);

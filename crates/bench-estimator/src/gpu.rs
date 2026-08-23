@@ -23,6 +23,7 @@ use mxx_runtime::{
 };
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::{collections::HashMap, fmt, sync::Arc};
 use tracing::{debug, info};
@@ -61,23 +62,93 @@ struct PreparedMeasurement {
     preimage_trapdoor: Option<(GpuDCRTPolyMatrix, GpuDCRTTrapdoor, f64, BigInt, usize, BigInt)>,
 }
 
-pub struct GpuNodeMeasurementBackend {
+struct GpuMeasurementWorker {
     backend: GpuDcrtBackend,
     device_id: i32,
+}
+
+struct PendingMeasurement {
+    key: [u8; 32],
+    scope: mxx_ir_core::FrozenGraphScopeId,
+    id: mxx_ir_core::types::NodeId,
+    kind: NodeKind,
+    concrete_argument_types: Vec<ConcreteWireType>,
+    concrete_output_types: Vec<ConcreteWireType>,
+    bindings: ParamEnv,
+    scale: f64,
+    preimage_sample: bool,
+}
+
+pub struct GpuNodeMeasurementBackend {
+    workers: Vec<GpuMeasurementWorker>,
     harness: MeasurementHarnessConfig,
     crt_depth: usize,
     measurements: HashMap<[u8; 32], NodeMeasurement>,
+    pending: HashMap<[u8; 32], PendingMeasurement>,
+    collecting: bool,
 }
 
 impl GpuNodeMeasurementBackend {
     /// Creates a representative GPU measurement backend for validated IR nodes.
     pub fn new(
-        backend: GpuDcrtBackend,
-        device_id: i32,
+        backends: Vec<(GpuDcrtBackend, i32)>,
         harness: MeasurementHarnessConfig,
         crt_depth: usize,
     ) -> Self {
-        Self { backend, device_id, harness, crt_depth, measurements: HashMap::new() }
+        assert!(!backends.is_empty(), "GPU measurement requires at least one backend");
+        let workers = backends
+            .into_iter()
+            .map(|(backend, device_id)| GpuMeasurementWorker { backend, device_id })
+            .collect();
+        Self {
+            workers,
+            harness,
+            crt_depth,
+            measurements: HashMap::new(),
+            pending: HashMap::new(),
+            collecting: true,
+        }
+    }
+
+    /// Measures all shapes collected by prior estimator passes, distributing each unique shape
+    /// to exactly one GPU. Subsequent estimator passes read the completed measurement cache.
+    pub fn measure_collected(&mut self) -> Result<(), GpuMeasurementError> {
+        self.collecting = false;
+        let mut requests = std::mem::take(&mut self.pending).into_values().collect::<Vec<_>>();
+        requests.sort_by(|left, right| right.scale.total_cmp(&left.scale));
+        let mut buckets = (0..self.workers.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+        for (index, request) in requests.into_iter().enumerate() {
+            buckets[index % self.workers.len()].push(request);
+        }
+        info!(
+            gpu_count = self.workers.len(),
+            measurement_count = buckets.iter().map(Vec::len).sum::<usize>(),
+            "measuring collected GPU node shapes in parallel"
+        );
+        let harness = &self.harness;
+        let measured = self
+            .workers
+            .par_iter_mut()
+            .zip(buckets.into_par_iter())
+            .map(|(worker, requests)| {
+                let mut completed = Vec::with_capacity(requests.len());
+                let mut representative_work_seconds = 0.0;
+                for request in requests {
+                    let measurement = Self::measure_request(worker, harness, &request)?;
+                    representative_work_seconds += measurement.work_seconds / request.scale;
+                    completed.push((request.key, measurement));
+                }
+                info!(
+                    device_id = worker.device_id,
+                    measurement_count = completed.len(),
+                    representative_work_seconds,
+                    "completed GPU measurement worker"
+                );
+                Ok(completed)
+            })
+            .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
+        self.measurements.extend(measured.into_iter().flatten());
+        Ok(())
     }
 
     fn measurement_key(
@@ -524,7 +595,7 @@ impl GpuNodeMeasurementBackend {
     }
 
     fn prepare(
-        &mut self,
+        backend: &mut GpuDcrtBackend,
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
     ) -> Result<PreparedMeasurement, GpuMeasurementError> {
@@ -532,8 +603,7 @@ impl GpuNodeMeasurementBackend {
             .concrete_argument_types
             .iter()
             .map(|wire_type| match wire_type {
-                ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => self
-                    .backend
+                ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => backend
                     .constant_matrix(&matrix, &ConstantMatrix::Zero, bindings)
                     .map(|matrix| Some(Arc::new(matrix)))
                     .map_err(|error| GpuMeasurementError(error.to_string())),
@@ -556,8 +626,7 @@ impl GpuNodeMeasurementBackend {
             let sigma = sigma
                 .evaluate_f64(bindings)
                 .map_err(|error| GpuMeasurementError(error.to_string()))?;
-            let (public, trapdoor) = self
-                .backend
+            let (public, trapdoor) = backend
                 .sample_trapdoor(matrix, sigma, gadget_base, *digit_count)
                 .map_err(|error| GpuMeasurementError(error.to_string()))?;
             public.wait_until_ready();
@@ -573,6 +642,82 @@ impl GpuNodeMeasurementBackend {
             None
         };
         Ok(PreparedMeasurement { arguments, preimage_trapdoor })
+    }
+
+    fn measure_request(
+        worker: &mut GpuMeasurementWorker,
+        harness: &MeasurementHarnessConfig,
+        request: &PendingMeasurement,
+    ) -> Result<NodeMeasurement, GpuMeasurementError> {
+        let node = MeasurementNode {
+            scope: &request.scope,
+            id: request.id,
+            kind: &request.kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: request.concrete_argument_types.clone(),
+            concrete_output_types: request.concrete_output_types.clone(),
+        };
+        if request.preimage_sample {
+            info!(
+                device_id = worker.device_id,
+                scope = ?request.scope,
+                node = request.id.0,
+                "measuring representative GPU preimage sampler"
+            );
+        }
+        let prepared = Self::prepare(&mut worker.backend, &node, &request.bindings)?;
+        let probe = GpuMemoryProbe { device_id: worker.device_id };
+        let mut operation_error = None;
+        let measured = measure_batch_operation(harness, &probe, 1, |representative_batch| {
+            if operation_error.is_some() {
+                return;
+            }
+            match Self::run_node(
+                &mut worker.backend,
+                &node,
+                &request.bindings,
+                representative_batch,
+                &prepared,
+            ) {
+                Ok(outputs) => outputs.iter().for_each(GpuDCRTPolyMatrix::wait_until_ready),
+                Err(error) => operation_error = Some(error),
+            }
+        })
+        .map_err(|error| GpuMeasurementError(error.to_string()))?;
+        if let Some(error) = operation_error {
+            return Err(error);
+        }
+        let measurement = NodeMeasurement {
+            work_seconds: measured.measurement.work_seconds * request.scale,
+            latency_seconds: measured.measurement.latency_seconds * request.scale,
+            workspace_bytes: measured.measurement.workspace_bytes,
+        };
+        if request.scale > 1.0 {
+            info!(
+                device_id = worker.device_id,
+                scope = ?request.scope,
+                node = request.id.0,
+                scale = request.scale,
+                representative = ?measured.measurement,
+                extrapolated = ?measurement,
+                "extrapolated GPU column-wave measurement"
+            );
+        }
+        if request.preimage_sample {
+            info!(
+                device_id = worker.device_id,
+                scope = ?request.scope,
+                node = request.id.0,
+                work_seconds = measurement.work_seconds,
+                latency_seconds = measurement.latency_seconds,
+                workspace_bytes = measurement.workspace_bytes,
+                "measured representative GPU preimage sampler"
+            );
+        }
+        Ok(measurement)
     }
 
     fn run_node(
@@ -1035,72 +1180,24 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
             );
             return Ok(measurement.clone());
         }
-        let preimage_sample = matches!(node.kind, NodeKind::PreimageSample { .. });
-        if preimage_sample {
-            info!(
-                scope = ?node.scope,
-                node = node.id.0,
-                "measuring representative GPU preimage sampler"
-            );
+        if !self.collecting {
+            return Err(GpuMeasurementError(format!(
+                "GPU node shape at {:?} node {:?} was not collected before measurement",
+                node.scope, node.id
+            )));
         }
-        let prepared = self.prepare(&representative_node, bindings)?;
-        let probe = GpuMemoryProbe { device_id: self.device_id };
-        let mut operation_error = None;
-        let measured = measure_batch_operation(&self.harness, &probe, 1, |representative_batch| {
-            if operation_error.is_some() {
-                return;
-            }
-            match Self::run_node(
-                &mut self.backend,
-                &representative_node,
-                bindings,
-                representative_batch,
-                &prepared,
-            ) {
-                Ok(outputs) => outputs.iter().for_each(GpuDCRTPolyMatrix::wait_until_ready),
-                Err(error) => operation_error = Some(error),
-            }
-        })
-        .map_err(|error| GpuMeasurementError(error.to_string()))?;
-        if let Some(error) = operation_error {
-            return Err(error);
-        }
-        // The representative allocation is one streamed column wave: time scales with the number
-        // of waves, while workspace remains the high-water mark of one wave.
-        let measurement = NodeMeasurement {
-            work_seconds: measured.measurement.work_seconds * scale,
-            latency_seconds: measured.measurement.latency_seconds * scale,
-            workspace_bytes: measured.measurement.workspace_bytes,
-        };
-        if scale > 1.0 {
-            info!(
-                scope = ?node.scope,
-                node = node.id.0,
-                scale,
-                representative = ?measured.measurement,
-                extrapolated = ?measurement,
-                "extrapolated oversized GPU node measurement"
-            );
-        }
-        if preimage_sample {
-            info!(
-                scope = ?node.scope,
-                node = node.id.0,
-                work_seconds = measurement.work_seconds,
-                latency_seconds = measurement.latency_seconds,
-                workspace_bytes = measurement.workspace_bytes,
-                "measured representative GPU preimage sampler"
-            );
-        }
-        debug!(
-            scope = ?node.scope,
-            node = node.id.0,
-            batch_size = 1,
-            measurement = ?measurement,
-            "measured and cached GPU node measurement"
-        );
-        self.measurements.insert(measurement_key, measurement.clone());
-        Ok(measurement)
+        self.pending.entry(measurement_key).or_insert_with(|| PendingMeasurement {
+            key: measurement_key,
+            scope: node.scope.clone(),
+            id: node.id,
+            kind: representative_node.kind.clone(),
+            concrete_argument_types: representative_node.concrete_argument_types,
+            concrete_output_types: representative_node.concrete_output_types,
+            bindings: bindings.clone(),
+            scale,
+            preimage_sample: matches!(node.kind, NodeKind::PreimageSample { .. }),
+        });
+        Ok(NodeMeasurement::default())
     }
 
     fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {

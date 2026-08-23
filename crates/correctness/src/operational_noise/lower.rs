@@ -427,6 +427,42 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         Ok(())
     }
 
+    fn record_expression_select_index_use_if_enabled(
+        &mut self,
+        wire: &PlannedWire,
+        selector: ExprId,
+        result: ExprId,
+        consumed: Option<ExprId>,
+        branch_count: usize,
+        output_type: ResolvedValueType,
+    ) -> Result<(), ProductionAdapterError> {
+        if S::ENABLED {
+            let maximum_exclusive =
+                u64::try_from(branch_count).map_err(|_| ProductionAdapterError::Descriptor {
+                    reason: "expression select branch count exceeds index range".to_owned(),
+                })?;
+            let frontier = self.index_frontier_axes(selector, wire)?;
+            self.feasibility
+                .record_index_use(IndexUsePlan {
+                    kind: IndexUseKind::Select,
+                    owner: wire.clone(),
+                    result: Some(result),
+                    result_family: None,
+                    consumed,
+                    consumed_family: None,
+                    index: selector,
+                    frontier,
+                    output_type,
+                    output_range: Some(TrustedIndexRange { minimum: 0, maximum_exclusive }),
+                    slice_group: None,
+                })
+                .map_err(|error| ProductionAdapterError::Descriptor {
+                    reason: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
     fn index_frontier_axes(
         &self,
         index: ExprId,
@@ -3252,6 +3288,8 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                         })
                         .collect::<Result<Vec<_>, ProductionAdapterError>>()?;
                     let element_type = self.job.expressions().value_type(values[0])?.clone();
+                    let branch_count = values.len();
+                    let consumed_operand = values.first().copied();
                     let mut body = Vec::with_capacity(values.len() + 1);
                     body.push(selector);
                     body.extend(values);
@@ -3259,11 +3297,19 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     let expression = self.job.expressions_mut().intern(
                         ValueOperator::ExplicitElement {
                             domain: FamilyDomain::new(0, body.len() as u64 - 1)?,
-                            element_type,
+                            element_type: element_type.clone(),
                         },
                         body.into_boxed_slice(),
                     )?;
                     self.job.transfer_explicit_matrix_facts(&branch_values, expression)?;
+                    self.record_expression_select_index_use_if_enabled(
+                        wire,
+                        selector,
+                        expression,
+                        consumed_operand,
+                        branch_count,
+                        element_type,
+                    )?;
                     Value::Expr(expression)
                 } else {
                     return Err(ProductionAdapterError::UnsupportedNode {

@@ -432,7 +432,6 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         wire: &PlannedWire,
         selector: ExprId,
         result: ExprId,
-        consumed: Option<ExprId>,
         branch_count: usize,
         output_type: ResolvedValueType,
     ) -> Result<(), ProductionAdapterError> {
@@ -448,7 +447,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     owner: wire.clone(),
                     result: Some(result),
                     result_family: None,
-                    consumed,
+                    consumed: None,
                     consumed_family: None,
                     index: selector,
                     frontier,
@@ -3289,7 +3288,6 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                         .collect::<Result<Vec<_>, ProductionAdapterError>>()?;
                     let element_type = self.job.expressions().value_type(values[0])?.clone();
                     let branch_count = values.len();
-                    let consumed_operand = values.first().copied();
                     let mut body = Vec::with_capacity(values.len() + 1);
                     body.push(selector);
                     body.extend(values);
@@ -3306,7 +3304,6 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                         wire,
                         selector,
                         expression,
-                        consumed_operand,
                         branch_count,
                         element_type,
                     )?;

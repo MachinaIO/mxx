@@ -731,6 +731,10 @@ derived field があれば拒否する。
 directory から atomic publish し、symlink、nonempty target、artifact 名の不一致を拒否する。dirty
 worktree の `HEAD` から revision を推測しない。
 
+G3 の pre-serialization/render gate では、constant-polynomial fact と polynomial-support fact を
+authoritative な owner/source/family-selected fact から再導出し、記録された値と一致しなければ拒否する。
+recorder が出力したというだけで、記録済み fact を信頼してはならない。
+
 CI は固定 acceptance module を compile し、`#print axioms` の結果に `sorryAx`、生成 axiom、
 `native_decide`、許可していない非標準 axiom があれば失敗する。
 

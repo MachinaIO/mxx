@@ -88,6 +88,12 @@ pub(crate) trait FeasibilitySink: Default {
 
     fn validate_normalization_observations(&self) -> Result<(), G0Error>;
 
+    fn retained_monomial_roots(
+        &self,
+    ) -> Option<&std::collections::HashSet<super::monomial::MonomialId>> {
+        None
+    }
+
     fn validate_normalization_observations_with_monomials(
         &self,
         _monomials: &super::monomial::MonomialArena,
@@ -1399,6 +1405,7 @@ pub(crate) struct FeasibilityTrace {
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
     specialization_ranges: BTreeMap<super::relation::RuntimeSpecializationKey, EventRange>,
     index_use_plans: BTreeSet<IndexUsePlan>,
+    retained_monomial_roots: std::collections::HashSet<super::monomial::MonomialId>,
     next_slice_group_id: u64,
 }
 
@@ -1412,6 +1419,7 @@ impl Default for FeasibilityTrace {
             event_observations: BTreeMap::new(),
             specialization_ranges: BTreeMap::new(),
             index_use_plans: BTreeSet::new(),
+            retained_monomial_roots: std::collections::HashSet::new(),
             next_slice_group_id: 1,
         }
     }
@@ -1487,6 +1495,10 @@ impl FeasibilitySink for FeasibilityTrace {
                 coefficient_bound: value.coefficient_bound.clone(),
             },
         });
+        Self::retain_event_monomials(
+            &self.events[self.events.len() - 1],
+            &mut self.retained_monomial_roots,
+        );
         frame.results.insert(result.expression(), index);
         Ok(())
     }
@@ -1530,6 +1542,10 @@ impl FeasibilitySink for FeasibilityTrace {
             result: root_result,
             counters: *counters,
         });
+        Self::retain_event_monomials(
+            &self.events[self.events.len() - 1],
+            &mut self.retained_monomial_roots,
+        );
         if let Some(frame) = self.frames.last_mut() {
             frame.pending_bounds.remove(&root);
         }
@@ -1545,12 +1561,14 @@ impl FeasibilitySink for FeasibilityTrace {
             self.frames.clear();
             self.events.clear();
             self.specialization_ranges.clear();
+            self.retained_monomial_roots.clear();
             return;
         }
         let Some(frame) = self.frames.pop() else { return };
         let truncate = frame.range.start.0 as usize;
         self.events.truncate(truncate);
         self.specialization_ranges.retain(|_, range| range.end.0 <= truncate as u64);
+        self.rebuild_retained_monomial_roots();
     }
 
     fn specialization_miss_start(
@@ -1630,6 +1648,7 @@ impl FeasibilitySink for FeasibilityTrace {
                 return Err(G0Error::RelationTraceInvariant);
             }
         }
+        self.retained_monomial_roots.insert(observation.source_monomial);
         self.events.push(NormalizerEvent::AppliedRelation(observation));
         Ok(())
     }
@@ -1646,6 +1665,7 @@ impl FeasibilitySink for FeasibilityTrace {
         let index =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
         frame.pending_bounds.insert(owner);
+        Self::retain_bound_rule_monomials(&rule, &mut self.retained_monomial_roots);
         self.events.push(NormalizerEvent::BoundTransfer { owner, rule });
         Ok(index)
     }
@@ -1812,6 +1832,12 @@ impl FeasibilitySink for FeasibilityTrace {
         FeasibilityTrace::validate_normalization_observations_with_monomials(self, monomials)
     }
 
+    fn retained_monomial_roots(
+        &self,
+    ) -> Option<&std::collections::HashSet<super::monomial::MonomialId>> {
+        Some(&self.retained_monomial_roots)
+    }
+
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error> {
         match self.source_observations.get(&handle) {
             Some(existing) if existing != &class => Err(G0Error::ConflictingSourceClass),
@@ -1853,6 +1879,50 @@ impl FeasibilitySink for FeasibilityTrace {
 }
 
 impl FeasibilityTrace {
+    fn retain_recorded_value(
+        value: &RecordedValue,
+        roots: &mut std::collections::HashSet<super::monomial::MonomialId>,
+    ) {
+        if let Some(normal_form) = &value.exact_nf {
+            roots.extend(normal_form.exact_terms.keys().copied());
+        }
+    }
+
+    fn retain_bound_rule_monomials(
+        rule: &BoundRule,
+        roots: &mut std::collections::HashSet<super::monomial::MonomialId>,
+    ) {
+        if let BoundRule::MonomialProduct { monomial, .. } = rule {
+            roots.insert(*monomial);
+        }
+    }
+
+    fn retain_event_monomials(
+        event: &NormalizerEvent,
+        roots: &mut std::collections::HashSet<super::monomial::MonomialId>,
+    ) {
+        match event {
+            NormalizerEvent::Result { value, .. } => Self::retain_recorded_value(value, roots),
+            NormalizerEvent::InvocationEnd { result, .. } => {
+                Self::retain_recorded_value(result, roots)
+            }
+            NormalizerEvent::AppliedRelation(observation) => {
+                roots.insert(observation.source_monomial);
+            }
+            NormalizerEvent::BoundTransfer { rule, .. } => {
+                Self::retain_bound_rule_monomials(rule, roots);
+            }
+            _ => {}
+        }
+    }
+
+    fn rebuild_retained_monomial_roots(&mut self) {
+        self.retained_monomial_roots.clear();
+        for event in &self.events {
+            Self::retain_event_monomials(event, &mut self.retained_monomial_roots);
+        }
+    }
+
     pub(crate) fn validate_normalization_observations_with_monomials(
         &self,
         monomials: &super::monomial::MonomialArena,
@@ -1877,14 +1947,17 @@ impl FeasibilityTrace {
                 return Err(G0Error::UnsupportedBoundTransfer);
             }
             for (factor, evidence) in expected.into_iter().zip(factors) {
-                let BoundValueRef::Result { event, .. } = &evidence.bound else {
+                let BoundValueRef::Result { event, projection } = &evidence.bound else {
                     return Err(G0Error::UnsupportedBoundTransfer);
                 };
+                if projection != &BoundProjection::Coefficient {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
                 let Some(NormalizerEvent::Result { owner, .. }) = self.events.get(event.0 as usize)
                 else {
                     return Err(G0Error::UnsupportedBoundTransfer);
                 };
-                if owner.expression() != factor.expression() {
+                if owner != factor {
                     return Err(G0Error::UnsupportedBoundTransfer);
                 }
             }
@@ -3974,6 +4047,24 @@ mod tests {
             empty_monomial.validate_normalization_observations(),
             Err(G0Error::UnsupportedBoundTransfer)
         );
+
+        let mut rollback = FeasibilityTrace::default();
+        rollback.record_invocation_start(parent).expect("rollback start");
+        let rollback_monomial =
+            super::super::monomial::MonomialId::new(super::super::arena::ArenaToken::fresh(), 4);
+        rollback
+            .record_bound_transfer(
+                parent,
+                BoundRule::MonomialProduct { monomial: rollback_monomial, factors: Box::new([]) },
+            )
+            .expect("rollback transfer");
+        assert!(
+            rollback
+                .retained_monomial_roots()
+                .is_some_and(|roots| roots.contains(&rollback_monomial))
+        );
+        rollback.abort_invocation(parent);
+        assert!(rollback.retained_monomial_roots().is_some_and(|roots| roots.is_empty()));
 
         let mut nested = FeasibilityTrace::default();
         nested.record_invocation_start(parent).expect("parent start");

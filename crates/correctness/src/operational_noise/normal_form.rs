@@ -406,6 +406,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         self.gadget_input_nfs.clear();
     }
 
+    pub(crate) fn retained_monomial_roots(&self) -> Option<&std::collections::HashSet<MonomialId>> {
+        Self::retained_monomial_roots_from_sink(self.sink.as_deref())
+    }
+
+    fn retained_monomial_roots_from_sink(
+        sink: Option<&S>,
+    ) -> Option<&std::collections::HashSet<MonomialId>> {
+        if S::ENABLED { sink.and_then(FeasibilitySink::retained_monomial_roots) } else { None }
+    }
+
     fn insert_gadget_hold(&mut self, expression: ExprId, normal_form: Arc<PolynomialNF>) {
         self.gadget_input_nfs.insert(expression, normal_form);
     }
@@ -432,9 +442,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             self.normalization.as_deref().into_iter().flat_map(NormalizationCache::monomial_roots);
         let arena = self.monomials.token();
         let canonical_roots = canonical_roots.filter(move |root| root.arena() == arena);
+        let observed_roots = Self::retained_monomial_roots_from_sink(self.sink.as_deref())
+            .into_iter()
+            .flat_map(|roots| roots.iter().copied());
         self.monomials.sweep(
             self.protected_monomial_prefix,
-            cache_roots.chain(gadget_roots).chain(canonical_roots),
+            cache_roots.chain(gadget_roots).chain(canonical_roots).chain(observed_roots),
         )?;
         Ok(())
     }
@@ -5427,6 +5440,33 @@ mod tests {
         assert_eq!(forced.exact_nf, disabled.exact_nf);
         assert_eq!(forced_counters, disabled_counters);
         assert!(monomials.len() >= high_water_after_gc, "collected slots are never reused");
+
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut trace = FeasibilityTrace::default();
+        let value = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            assert!(normalizer.retained_monomial_roots().is_some());
+            normalizer.monomial_gc_allocation_threshold_bytes = 1;
+            normalizer.normalize(semantic).unwrap()
+        };
+        assert_eq!(monomials.allocated_payload_since_sweep(), 0);
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        assert!(value.exact_nf.as_ref().is_some_and(|normal_form| {
+            normal_form.exact_terms.keys().all(|monomial| monomials.descriptor(*monomial).is_ok())
+        }));
+        assert!(trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer { rule: BoundRule::MonomialProduct { .. }, .. }
+            )
+        }));
     }
 
     #[test]
@@ -9291,6 +9331,43 @@ mod tests {
         assert_eq!(
             swapped.validate_normalization_observations_with_monomials(&monomials),
             Err(G0Error::UnsupportedBoundTransfer)
+        );
+
+        let mut summary_projection = trace.clone();
+        if let Some(NormalizerEvent::BoundTransfer {
+            rule: BoundRule::MonomialProduct { factors, .. },
+            ..
+        }) = summary_projection.events.iter_mut().find(|event| {
+            matches!(event, NormalizerEvent::BoundTransfer {
+                rule: BoundRule::MonomialProduct { factors, .. }, ..
+            } if factors.len() == 2)
+        }) {
+            if let BoundValueRef::Result { projection, .. } = &mut factors[0].bound {
+                *projection = BoundProjection::Summary;
+            }
+        }
+        assert_eq!(
+            summary_projection.validate_normalization_observations_with_monomials(&monomials),
+            Err(G0Error::UnsupportedBoundTransfer)
+        );
+
+        let foreign_family = programs
+            .generated_family_from_body(
+                &mut expressions,
+                super::super::arena::FamilyDomain::new(2, 3).unwrap(),
+                ordered,
+            )
+            .unwrap();
+        let foreign_ordered =
+            programs.scoped(&expressions, foreign_family.program(), ordered).unwrap();
+        let mut foreign_program = trace.clone();
+        let ordered_result = foreign_program.events.iter_mut().find_map(|event| match event {
+            NormalizerEvent::Result { owner, .. } if *owner == *expected[1] => Some(owner),
+            _ => None,
+        });
+        *ordered_result.expect("ordered result") = foreign_ordered;
+        assert!(
+            foreign_program.validate_normalization_observations_with_monomials(&monomials).is_err()
         );
 
         let mut foreign = trace.clone();

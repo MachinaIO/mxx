@@ -499,6 +499,10 @@ explicit source revision, uses a synchronized staging directory and atomic publi
 symlinks, nonempty targets, and name mismatches. It never infers a dirty worktree's revision from
 `HEAD`.
 
+The G3 pre-serialization/render gate must re-derive constant-polynomial and polynomial-support facts
+from the authoritative owner/source/family-selected facts and reject any mismatch; recorded facts
+are not trusted merely because the recorder emitted them.
+
 CI compiles the fixed acceptance module and rejects `sorryAx`, generated axioms, `native_decide`,
 or non-standard axioms reported by `#print axioms`.
 

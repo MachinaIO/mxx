@@ -1626,6 +1626,11 @@ impl CanonicalEventRows {
         self.refs.get(&event).copied().ok_or(G0Error::CanonicalMissingDependency)
     }
 
+    fn kind(&self, event: SampleEventId) -> Result<&CanonicalEventKind, G0Error> {
+        let row = self.event(event)?.row as usize;
+        self.rows.get(row).map(|row| &row.kind).ok_or(G0Error::CanonicalMissingDependency)
+    }
+
     pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, G0Error> {
         serde_json::to_vec(&self.rows).map_err(|error| G0Error::Encoding(error.to_string()))
     }
@@ -1722,6 +1727,7 @@ pub(crate) struct CanonicalResidualRow {
 pub(crate) struct CanonicalResidualRefs {
     rows: Vec<CanonicalResidualRow>,
     handles: BTreeMap<CanonicalHandle, u64>,
+    event_rows: CanonicalEventRows,
 }
 
 impl CanonicalResidualRefs {
@@ -1758,7 +1764,11 @@ impl CanonicalResidualRefs {
         for (row, program) in programs.into_iter().enumerate() {
             handles.insert(CanonicalHandle::Program(program), offset + row as u64);
         }
-        Ok(Self { rows: Vec::new(), handles })
+        Ok(Self {
+            rows: Vec::new(),
+            handles,
+            event_rows: CanonicalEventRows { rows: Vec::new(), refs: BTreeMap::new() },
+        })
     }
 
     pub(crate) fn expression(&self, expression: ExprId) -> Result<u64, G0Error> {
@@ -1814,6 +1824,10 @@ impl CanonicalResidualRefs {
 
     pub(crate) fn rows(&self) -> &[CanonicalResidualRow] {
         &self.rows
+    }
+
+    pub(crate) fn event_rows(&self) -> &CanonicalEventRows {
+        &self.event_rows
     }
 }
 
@@ -2527,19 +2541,50 @@ fn canonical_program_descriptor(
 
 #[derive(Serialize)]
 struct CanonicalExpressionDescriptor {
-    operator: StableOperator,
+    operator: serde_json::Value,
     value_type: StableValueType,
     source: Option<StableObservedSource>,
 }
 
-fn canonical_expression_operator(value: &ValueOperator) -> StableOperator {
-    let mut operator = stable_operator(value);
-    match &mut operator {
-        StableOperator::Source { identity } => identity.invocation.clear(),
-        StableOperator::OpaqueFamilyElement { identity } => identity.invocation.clear(),
+fn canonical_expression_operator(
+    value: &ValueOperator,
+    events: &CanonicalEventRows,
+) -> Result<serde_json::Value, G0Error> {
+    let mut operator = serde_json::to_value(stable_operator(value))
+        .map_err(|error| G0Error::Encoding(error.to_string()))?;
+    let event_ref = |event: SampleEventId| -> Result<serde_json::Value, G0Error> {
+        serde_json::to_value(events.event(event)?)
+            .map_err(|error| G0Error::Encoding(error.to_string()))
+    };
+    match value {
+        ValueOperator::Sample { event, descriptor } => {
+            let row = events.kind(*event)?;
+            if row != &(CanonicalEventKind::Sample { descriptor: stable_sample(descriptor) }) {
+                return Err(G0Error::ConflictingEventDescriptor { event: event.0 });
+            }
+            operator = serde_json::json!({ "kind": "sample", "event": event_ref(*event)? });
+        }
+        ValueOperator::Sampler { event, operation } => {
+            let row = events.kind(*event)?;
+            if row != &(CanonicalEventKind::Sampler { operation: stable_sampler(operation) }) {
+                return Err(G0Error::ConflictingEventDescriptor { event: event.0 });
+            }
+            operator = serde_json::json!({ "kind": "sampler", "event": event_ref(*event)? });
+        }
+        ValueOperator::Trapdoor(TrapdoorOperation::Generate { paired_public_event, .. }) => {
+            if !matches!(events.kind(*paired_public_event)?, CanonicalEventKind::Sampler { .. }) {
+                return Err(G0Error::ConflictingEventDescriptor { event: paired_public_event.0 });
+            }
+            if let Some(operation) = operator.get_mut("operation") {
+                if let serde_json::Value::Object(operation) = operation {
+                    operation
+                        .insert("paired_public_event".to_owned(), event_ref(*paired_public_event)?);
+                }
+            }
+        }
         _ => {}
     }
-    operator
+    Ok(operator)
 }
 
 pub(crate) fn canonical_residual_refs(
@@ -2547,6 +2592,7 @@ pub(crate) fn canonical_residual_refs(
     closure: &CertificateClosure,
     trace: &FeasibilityTrace,
 ) -> Result<CanonicalResidualRefs, G0Error> {
+    let event_rows = derive_canonical_event_rows(closure, trace)?;
     for &family in &closure.families {
         let program = family.program();
         if !closure.programs.contains(&program) {
@@ -2567,7 +2613,7 @@ pub(crate) fn canonical_residual_refs(
             _ => None,
         };
         let descriptor = serde_json::to_vec(&CanonicalExpressionDescriptor {
-            operator: canonical_expression_operator(&node.operator),
+            operator: canonical_expression_operator(&node.operator, &event_rows)?,
             value_type: stable_value_type(job.expressions().value_type(expression)?),
             source,
         })
@@ -2624,7 +2670,7 @@ pub(crate) fn canonical_residual_refs(
                     _ => None,
                 };
                 let descriptor = serde_json::to_vec(&CanonicalExpressionDescriptor {
-                    operator: canonical_expression_operator(&node.operator),
+                    operator: canonical_expression_operator(&node.operator, &event_rows)?,
                     value_type: stable_value_type(job.expressions().value_type(*expression)?),
                     source,
                 })
@@ -2656,7 +2702,11 @@ pub(crate) fn canonical_residual_refs(
         };
         rows[*row as usize] = Some(CanonicalResidualRow { kind, descriptor, dependencies });
     }
-    Ok(CanonicalResidualRefs { rows: rows.into_iter().map(Option::unwrap).collect(), handles })
+    Ok(CanonicalResidualRefs {
+        rows: rows.into_iter().map(Option::unwrap).collect(),
+        handles,
+        event_rows,
+    })
 }
 
 fn stable_hash(value: &DeterministicHashDescriptor) -> StableOperator {
@@ -2800,6 +2850,68 @@ mod tests {
         assert!(evidence.index_uses.is_empty());
         assert!(evidence.slice_groups.is_empty());
         assert_eq!(evidence.l_rows, BigUint::zero());
+    }
+
+    #[test]
+    fn canonical_expression_sample_uses_event_ref_without_descriptor_duplication() {
+        use crate::StageId;
+        use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};
+
+        let build = |event| {
+            let mut job = CheckerJob::new();
+            let descriptor = SampleDescriptor::new("uniform", ResolvedValueType::Int);
+            let expression = job
+                .expressions_mut()
+                .intern(
+                    ValueOperator::Sample {
+                        event: SampleEventId(event),
+                        descriptor: descriptor.clone(),
+                    },
+                    Box::new([]),
+                )
+                .unwrap();
+            let owner = PlannedWire {
+                stage: StageId("sample-row".to_owned()),
+                occurrence: super::super::protocol::ProgramOccurrence {
+                    definition: FrozenGraphScopeId::Root,
+                    path: 1,
+                },
+                wire: WireRef { node: NodeId(2), port: Port(0) },
+            };
+            let mut trace = FeasibilityTrace::default();
+            trace
+                .record_event(EventObservation {
+                    event: SampleEventId(event),
+                    owner,
+                    kind: EventKind::Sample { descriptor },
+                })
+                .unwrap();
+            let closure = CertificateClosure {
+                expressions: [expression].into_iter().collect(),
+                programs: BTreeSet::new(),
+                families: BTreeSet::new(),
+                source_ids: BTreeSet::new(),
+                family_source_ids: BTreeSet::new(),
+                event_ids: [SampleEventId(event)].into_iter().collect(),
+                constant_expressions: BTreeSet::new(),
+            };
+            (job, closure, trace, expression)
+        };
+        let (first_job, first_closure, first_trace, first_expression) = build(7);
+        let (second_job, second_closure, second_trace, second_expression) = build(41);
+        let first = canonical_residual_refs(&first_job, &first_closure, &first_trace).unwrap();
+        let second = canonical_residual_refs(&second_job, &second_closure, &second_trace).unwrap();
+        assert_eq!(
+            first.event_rows().encode_canonical().unwrap(),
+            second.event_rows().encode_canonical().unwrap()
+        );
+        assert_eq!(first.rows()[0], second.rows()[0]);
+        let encoded = String::from_utf8(first.rows()[0].descriptor.clone()).unwrap();
+        assert!(encoded.contains("event"));
+        assert!(encoded.contains("row"));
+        assert!(!encoded.contains("uniform"));
+        assert!(!encoded.contains("7"));
+        assert_eq!(first.expression(first_expression), second.expression(second_expression));
     }
 
     #[test]

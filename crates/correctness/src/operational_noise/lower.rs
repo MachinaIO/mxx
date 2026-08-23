@@ -465,6 +465,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 }?;
                 Some(IndexFrontierAxis {
                     owner: owner.clone(),
+                    argument: *argument,
                     argument_position: position,
                     domain: *domain,
                 })

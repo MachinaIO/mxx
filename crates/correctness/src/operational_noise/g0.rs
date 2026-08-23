@@ -6,16 +6,18 @@
 use super::{
     arena::{
         ArtifactIdentity, ConstantValue, DeterministicHashDefinition, DeterministicHashDescriptor,
-        HashVariant, MatrixConstantKind, MatrixLayout, MatrixOperation, ResolvedMatrixType,
-        ResolvedValueType, SampleDescriptor, SampleEventId, SamplerOperation, ScalarOperation,
-        SemanticFamilySourceIdentity, SemanticSourceIdentity, TrapdoorOperation, TrustedIndexRange,
-        TypedConstant, ValueOperator, ValueTransformOperation,
+        ExprArena, ExprId, HashVariant, MatrixConstantKind, MatrixLayout, MatrixOperation,
+        ResolvedMatrixType, ResolvedValueType, SampleDescriptor, SampleEventId, SamplerOperation,
+        ScalarOperation, SemanticFamilySourceIdentity, SemanticSourceIdentity, TrapdoorOperation,
+        TrustedIndexRange, TypedConstant, ValueOperator, ValueTransformOperation,
     },
     job::CheckerJob,
     protocol::{ArtifactProducer, PlannedWire, ProgramOccurrence},
     simulation::CertificateClosure,
 };
 use crate::ProtocolInputId;
+use num_bigint::BigInt;
+use num_traits::Zero;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -86,6 +88,7 @@ pub(crate) struct EventObservation {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct IndexFrontierAxis {
     pub owner: ProgramOccurrence,
+    pub argument: ExprId,
     pub argument_position: u32,
     pub domain: TrustedIndexRange,
 }
@@ -186,6 +189,203 @@ impl IndexUsePlan {
             }
         }
         Ok(())
+    }
+}
+
+/// The typed result domain of the arithmetic subset used by index expressions.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum IndexValue {
+    Int(BigInt),
+}
+
+/// One concrete value for a frontier argument. The expression handle is part of the
+/// binding so independent occurrences with the same positional argument cannot alias.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct IndexAxisBinding {
+    pub owner: ProgramOccurrence,
+    pub argument: ExprId,
+    pub value: BigInt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub(crate) enum IndexEvaluationError {
+    #[error("index expression belongs to another arena")]
+    ForeignExpression,
+    #[error("index argument has no binding")]
+    MissingBinding,
+    #[error("index binding owner does not match its frontier axis")]
+    BindingOwnerMismatch,
+    #[error("index binding is duplicated")]
+    DuplicateBinding,
+    #[error("index binding does not match the argument position")]
+    BindingPositionMismatch,
+    #[error("index expression requires an integer")]
+    NonInteger,
+    #[error("index scalar operand types do not match")]
+    TypeMismatch,
+    #[error("index operator is unsupported")]
+    UnsupportedOperator,
+    #[error("index program call has no typed program scope")]
+    ProgramCallUnsupported,
+    #[error("index division or remainder has a zero divisor")]
+    DivisionByZero,
+}
+
+/// Evaluate one typed expression DAG under concrete frontier bindings.
+///
+/// This is deliberately opt-in and has no lowering caller yet. It evaluates only the
+/// integer scalar vocabulary validated by [`ExprArena`]; source, sample, matrix, program-call,
+/// comparison, bit, real, and other value operators fail closed.
+pub(crate) fn evaluate_typed_index(
+    arena: &ExprArena,
+    root: ExprId,
+    frontier: &[IndexFrontierAxis],
+    bindings: &[IndexAxisBinding],
+) -> Result<IndexValue, IndexEvaluationError> {
+    let mut by_argument = BTreeMap::new();
+    for binding in bindings {
+        if by_argument.insert(binding.argument, binding).is_some() {
+            return Err(IndexEvaluationError::DuplicateBinding);
+        }
+        let Some(axis) = frontier.iter().find(|axis| axis.argument == binding.argument) else {
+            return Err(IndexEvaluationError::BindingOwnerMismatch);
+        };
+        if axis.owner != binding.owner {
+            return Err(IndexEvaluationError::BindingOwnerMismatch);
+        }
+        let node =
+            arena.node(binding.argument).map_err(|_| IndexEvaluationError::ForeignExpression)?;
+        let ValueOperator::Argument { position, value_type } = &node.operator else {
+            return Err(IndexEvaluationError::BindingPositionMismatch);
+        };
+        if *position != axis.argument_position || *value_type != ResolvedValueType::Int {
+            return Err(IndexEvaluationError::BindingPositionMismatch);
+        }
+    }
+    for axis in frontier {
+        if !by_argument.contains_key(&axis.argument) {
+            return Err(IndexEvaluationError::MissingBinding);
+        }
+    }
+    evaluate_typed_index_node(arena, root, &by_argument)
+}
+
+fn evaluate_typed_index_node(
+    arena: &ExprArena,
+    expression: ExprId,
+    bindings: &BTreeMap<ExprId, &IndexAxisBinding>,
+) -> Result<IndexValue, IndexEvaluationError> {
+    let node = arena.node(expression).map_err(|_| IndexEvaluationError::ForeignExpression)?;
+    match &node.operator {
+        ValueOperator::Argument { value_type, .. } => {
+            if *value_type != ResolvedValueType::Int {
+                return Err(IndexEvaluationError::NonInteger);
+            }
+            bindings
+                .get(&expression)
+                .map(|binding| IndexValue::Int(binding.value.clone()))
+                .ok_or(IndexEvaluationError::MissingBinding)
+        }
+        ValueOperator::Constant(TypedConstant { value_type, value }) => {
+            if *value_type != ResolvedValueType::Int {
+                return Err(IndexEvaluationError::NonInteger);
+            }
+            let ConstantValue::Int(value) = value else {
+                return Err(IndexEvaluationError::NonInteger);
+            };
+            Ok(IndexValue::Int(value.clone()))
+        }
+        ValueOperator::Scalar(operation) => {
+            let values = node
+                .inputs
+                .iter()
+                .map(|input| evaluate_typed_index_node(arena, *input, bindings))
+                .collect::<Result<Vec<_>, _>>()?;
+            evaluate_typed_scalar(operation, &values)
+        }
+        ValueOperator::ProgramCall { .. } => Err(IndexEvaluationError::ProgramCallUnsupported),
+        ValueOperator::Source(_) |
+        ValueOperator::Sample { .. } |
+        ValueOperator::Sampler { .. } |
+        ValueOperator::DeterministicHash(_) |
+        ValueOperator::OpaqueFamilyElement { .. } |
+        ValueOperator::IndexMap { .. } |
+        ValueOperator::ExplicitElement { .. } |
+        ValueOperator::Transform(_) |
+        ValueOperator::ExtractCoefficient { .. } |
+        ValueOperator::Matrix(_) |
+        ValueOperator::Trapdoor(_) => Err(IndexEvaluationError::UnsupportedOperator),
+    }
+}
+
+fn evaluate_typed_scalar(
+    operation: &ScalarOperation,
+    values: &[IndexValue],
+) -> Result<IndexValue, IndexEvaluationError> {
+    let pair = || {
+        if values.len() == 2 {
+            Ok((require_index_integer(&values[0])?, require_index_integer(&values[1])?))
+        } else {
+            Err(IndexEvaluationError::TypeMismatch)
+        }
+    };
+    match operation {
+        ScalarOperation::Add => {
+            let (left, right) = pair()?;
+            Ok(IndexValue::Int(left + right))
+        }
+        ScalarOperation::Subtract => {
+            let (left, right) = pair()?;
+            Ok(IndexValue::Int(left - right))
+        }
+        ScalarOperation::Multiply => {
+            let (left, right) = pair()?;
+            Ok(IndexValue::Int(left * right))
+        }
+        ScalarOperation::Divide => {
+            let (left, right) = pair()?;
+            if right.is_zero() {
+                return Err(IndexEvaluationError::DivisionByZero);
+            }
+            Ok(IndexValue::Int(left / right))
+        }
+        ScalarOperation::Remainder => {
+            let (left, right) = pair()?;
+            if right.is_zero() {
+                return Err(IndexEvaluationError::DivisionByZero);
+            }
+            Ok(IndexValue::Int(left % right))
+        }
+        ScalarOperation::Negate => {
+            if values.len() != 1 {
+                return Err(IndexEvaluationError::TypeMismatch);
+            }
+            Ok(IndexValue::Int(-require_index_integer(&values[0])?.clone()))
+        }
+        ScalarOperation::Equal |
+        ScalarOperation::Less |
+        ScalarOperation::LessEqual |
+        ScalarOperation::BoolToInt |
+        ScalarOperation::Bit { .. } |
+        ScalarOperation::IntToReal |
+        ScalarOperation::RealAdd |
+        ScalarOperation::RealSubtract |
+        ScalarOperation::RealMultiply |
+        ScalarOperation::RealDivide |
+        ScalarOperation::RealSqrt |
+        ScalarOperation::ThresholdDecode { .. } |
+        ScalarOperation::Slice { .. } |
+        ScalarOperation::Hash { .. } |
+        ScalarOperation::ExtractCoefficient { .. } |
+        ScalarOperation::LiftConstantPolynomial { .. } => {
+            Err(IndexEvaluationError::UnsupportedOperator)
+        }
+    }
+}
+
+fn require_index_integer(value: &IndexValue) -> Result<&BigInt, IndexEvaluationError> {
+    match value {
+        IndexValue::Int(value) => Ok(value),
     }
 }
 
@@ -1365,6 +1565,133 @@ mod tests {
         assert!(trace.source_observations().contains_key(&scalar));
     }
 
+    fn evaluator_axis(
+        argument: ExprId,
+        owner: ProgramOccurrence,
+        position: u32,
+    ) -> IndexFrontierAxis {
+        IndexFrontierAxis {
+            owner,
+            argument,
+            argument_position: position,
+            domain: TrustedIndexRange { minimum: 0, maximum_exclusive: 32 },
+        }
+    }
+
+    #[test]
+    fn typed_index_evaluator_handles_signed_nested_arithmetic() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let minus_seven =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(-7)), Box::new([])).unwrap();
+        let three =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(3)), Box::new([])).unwrap();
+        let quotient = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::Divide), &[minus_seven, three])
+            .unwrap();
+        let remainder = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::Remainder), &[minus_seven, three])
+            .unwrap();
+        let owner =
+            ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path: 1 };
+        let frontier = [];
+        assert_eq!(
+            evaluate_typed_index(&arena, quotient, &frontier, &[]),
+            Ok(IndexValue::Int(BigInt::from(-2_i8)))
+        );
+        assert_eq!(
+            evaluate_typed_index(&arena, remainder, &frontier, &[]),
+            Ok(IndexValue::Int(BigInt::from(-1_i8)))
+        );
+
+        let argument = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([])).unwrap();
+        let nested = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::Multiply), &[argument, one])
+            .unwrap();
+        let axis = evaluator_axis(argument, owner.clone(), 0);
+        let binding = IndexAxisBinding { owner, argument, value: BigInt::from(-9_i8) };
+        assert_eq!(
+            evaluate_typed_index(&arena, nested, &[axis], &[binding]),
+            Ok(IndexValue::Int(BigInt::from(-9_i8)))
+        );
+    }
+
+    #[test]
+    fn typed_index_evaluator_rejects_comparison_and_bit_until_supported() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let five =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(5)), Box::new([])).unwrap();
+        let three =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(3)), Box::new([])).unwrap();
+        let less = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::Less), &[three, five])
+            .unwrap();
+        let bit = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::Bit { position: 2 }), &[five])
+            .unwrap();
+        assert_eq!(
+            evaluate_typed_index(&arena, less, &[], &[]),
+            Err(IndexEvaluationError::UnsupportedOperator)
+        );
+        assert_eq!(
+            evaluate_typed_index(&arena, bit, &[], &[]),
+            Err(IndexEvaluationError::UnsupportedOperator)
+        );
+    }
+
+    #[test]
+    fn typed_index_evaluator_rejects_bad_bindings_zero_and_unsupported_nodes() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let argument = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let owner =
+            ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path: 1 };
+        let axis = evaluator_axis(argument, owner.clone(), 0);
+        assert_eq!(
+            evaluate_typed_index(&arena, argument, &[axis.clone()], &[]),
+            Err(IndexEvaluationError::MissingBinding)
+        );
+        let wrong_owner =
+            ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path: 2 };
+        assert_eq!(
+            evaluate_typed_index(
+                &arena,
+                argument,
+                &[axis],
+                &[IndexAxisBinding { owner: wrong_owner, argument, value: BigInt::from(1_u8) }],
+            ),
+            Err(IndexEvaluationError::BindingOwnerMismatch)
+        );
+
+        let zero =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([])).unwrap();
+        let divide = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::Divide), &[argument, zero])
+            .unwrap();
+        assert_eq!(
+            evaluate_typed_index(
+                &arena,
+                divide,
+                &[evaluator_axis(argument, owner.clone(), 0)],
+                &[IndexAxisBinding { owner: owner.clone(), argument, value: BigInt::from(4_u8) }],
+            ),
+            Err(IndexEvaluationError::DivisionByZero)
+        );
+
+        let real = arena
+            .intern(ValueOperator::Constant(TypedConstant::real("1.0")), Box::new([]))
+            .unwrap();
+        assert_eq!(
+            evaluate_typed_index(&arena, real, &[], &[]),
+            Err(IndexEvaluationError::NonInteger)
+        );
+        let foreign = ExprId::new(super::super::arena::ArenaToken(99_999), 0);
+        assert_eq!(
+            evaluate_typed_index(&arena, foreign, &[], &[]),
+            Err(IndexEvaluationError::ForeignExpression)
+        );
+    }
+
     fn expression(slot: u32) -> super::super::arena::ExprId {
         super::super::arena::ExprId::new(super::super::arena::ArenaToken(7), slot)
     }
@@ -1388,6 +1715,7 @@ mod tests {
     ) -> IndexFrontierAxis {
         IndexFrontierAxis {
             owner: ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path },
+            argument: expression(argument_position),
             argument_position,
             domain: TrustedIndexRange { minimum, maximum_exclusive },
         }

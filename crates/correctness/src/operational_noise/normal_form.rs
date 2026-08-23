@@ -10243,6 +10243,70 @@ mod tests {
     }
 
     #[test]
+    fn traced_crt_zero_lane_emits_no_zero_scale_evidence() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let zero_lane = gaussian_factor(&mut expressions, matrix.clone(), 98_231, 7);
+        let later = gaussian_factor(&mut expressions, matrix.clone(), 98_232, 5);
+        let root = expressions
+            .intern_slice(
+                ValueOperator::Matrix(MatrixOperation::CrtRecompose {
+                    plaintext_moduli: Box::new([BigUint::from(3_u8), BigUint::from(5_u8)]),
+                    reconstruction_coefficients: Box::new([BigInt::from(0_u8), BigInt::from(3_u8)]),
+                    output: matrix,
+                }),
+                &[zero_lane, later],
+            )
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let (ordinary_value, ordinary_counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        let mut trace = FeasibilityTrace::default();
+        let (traced_value, traced_counters) = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        assert_eq!(ordinary_value.exact_nf, traced_value.exact_nf);
+        assert_eq!(ordinary_value.coefficient_bound, traced_value.coefficient_bound);
+        assert_eq!(ordinary_counters, traced_counters);
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        let root_scales = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Scale { scale: BoundScale::Magnitude(magnitude), .. },
+                } if *owner == semantic => Some(magnitude),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(root_scales, [&BigUint::from(3_u8)]);
+        assert!(!trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Scale { scale: BoundScale::Magnitude(magnitude), .. },
+                } if *owner == semantic && magnitude.is_zero()
+            )
+        }));
+    }
+
+    #[test]
     fn traced_concat_summary_evidence_is_ordered_and_has_no_unary_maximum() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();

@@ -578,6 +578,103 @@ fn validate_residual_plan(
     Ok(())
 }
 
+fn canonical_plan_key(
+    plan: &IndexUsePlan,
+    refs: &CanonicalResidualRefs,
+) -> Result<Vec<u8>, G0Error> {
+    let frontier =
+        plan.frontier.iter().map(|axis| refs.axis(axis)).collect::<Result<Vec<_>, _>>()?;
+    let result = refs.optional_plan_ref(plan.result, plan.result_family)?;
+    let consumed = refs.optional_plan_ref(plan.consumed, plan.consumed_family)?;
+    let members = plan
+        .slice_group
+        .iter()
+        .flat_map(|group| group.members.iter())
+        .map(|member| {
+            Ok((
+                member.role,
+                refs.stable_expression(member.expression)?,
+                (member.range.minimum, member.range.maximum_exclusive),
+            ))
+        })
+        .collect::<Result<Vec<_>, G0Error>>()?;
+    let mut members = members;
+    members.sort_by_key(|member| member.0);
+    let group_metadata = if let Some(group) = &plan.slice_group {
+        Some((
+            group.frontier.iter().map(|axis| refs.axis(axis)).collect::<Result<Vec<_>, _>>()?,
+            group.row_span,
+            group.column_span,
+            members.clone(),
+        ))
+    } else {
+        None
+    };
+    serde_json::to_vec(&(
+        stable_observed_wire(&plan.owner),
+        result,
+        consumed,
+        plan.kind,
+        refs.stable_expression(plan.index)?,
+        plan.output_range.map(|range| (range.minimum, range.maximum_exclusive)),
+        stable_value_type(&plan.output_type),
+        frontier,
+        group_metadata,
+    ))
+    .map_err(|error| G0Error::Encoding(error.to_string()))
+}
+
+fn canonical_group_key(
+    plan: &IndexUsePlan,
+    refs: &CanonicalResidualRefs,
+) -> Result<Vec<u8>, G0Error> {
+    let Some(group) = &plan.slice_group else { return Err(G0Error::InvalidSliceGroup) };
+    serde_json::to_vec(&(
+        stable_observed_wire(&plan.owner),
+        refs.optional_plan_ref(plan.result, plan.result_family)?,
+        refs.optional_plan_ref(plan.consumed, plan.consumed_family)?,
+        stable_value_type(&plan.output_type),
+        group.frontier.iter().map(|axis| refs.axis(axis)).collect::<Result<Vec<_>, _>>()?,
+        group.row_span,
+        group.column_span,
+        {
+            let mut members = group
+                .members
+                .iter()
+                .map(|member| {
+                    Ok((
+                        member.role,
+                        refs.stable_expression(member.expression)?,
+                        (member.range.minimum, member.range.maximum_exclusive),
+                    ))
+                })
+                .collect::<Result<Vec<_>, G0Error>>()?;
+            members.sort_by_key(|member| member.0);
+            members
+        },
+    ))
+    .map_err(|error| G0Error::Encoding(error.to_string()))
+}
+
+fn expression_depends_on(
+    arena: &ExprArena,
+    root: ExprId,
+    dependency: ExprId,
+) -> Result<bool, G0Error> {
+    let mut pending = vec![root];
+    let mut seen = BTreeSet::new();
+    while let Some(expression) = pending.pop() {
+        if expression == dependency {
+            return Ok(true);
+        }
+        if !seen.insert(expression) {
+            continue;
+        }
+        pending.extend(arena.node(expression)?.inputs.iter().copied());
+    }
+    Ok(false)
+}
+
 /// Derive opt-in LUT evidence from the residual certificate closure.  All job-local handles are
 /// consumed during construction and replaced by canonical residual row references.
 pub(crate) fn derive_lut_evidence(
@@ -612,31 +709,79 @@ fn enumerate_lut_evidence_with_refs<'a>(
     plans: Vec<&'a IndexUsePlan>,
     refs: &CanonicalResidualRefs,
 ) -> Result<G0LutEvidence, G0Error> {
-    let mut ordinary = Vec::new();
-    let mut groups = BTreeMap::<SliceGroupId, Vec<&IndexUsePlan>>::new();
+    let mut dedup = BTreeMap::<Vec<u8>, &IndexUsePlan>::new();
     for plan in plans {
         plan.validate()?;
-        if let Some(group) = &plan.slice_group {
-            groups.entry(group.id).or_default().push(plan);
-        } else if plan.kind != IndexUseKind::IndexedSlice {
-            ordinary.push(plan);
+        dedup.entry(canonical_plan_key(plan, refs)?).or_insert(plan);
+    }
+    let mut units = BTreeMap::<Vec<u8>, Vec<&IndexUsePlan>>::new();
+    for plan in dedup.into_values() {
+        let key = if plan.slice_group.is_some() {
+            canonical_group_key(plan, refs)?
         } else {
-            return Err(G0Error::InvalidSliceGroup);
+            canonical_plan_key(plan, refs)?
+        };
+        units.entry(key).or_default().push(plan);
+    }
+    let units = units.into_iter().collect::<Vec<_>>();
+    let mut edges = vec![BTreeSet::new(); units.len()];
+    let mut indegree = vec![0_usize; units.len()];
+    for (consumer, (_, consumer_plans)) in units.iter().enumerate() {
+        for (producer, (_, producer_plans)) in units.iter().enumerate() {
+            if consumer == producer {
+                continue;
+            }
+            let mut depends = false;
+            for consumer_plan in consumer_plans {
+                for producer_plan in producer_plans {
+                    if let Some(result) = producer_plan.result {
+                        depends |= expression_depends_on(arena, consumer_plan.index, result)?;
+                    }
+                }
+            }
+            if depends && edges[producer].insert(consumer) {
+                indegree[consumer] += 1;
+            }
         }
     }
-
-    let mut index_uses = Vec::with_capacity(ordinary.len());
-    let mut l_rows = BigUint::zero();
-    for plan in ordinary {
-        let evidence = enumerate_index_use(arena, plan, &refs)?;
-        l_rows += BigUint::from(evidence.rows.len());
-        index_uses.push(evidence);
+    let mut ready = BTreeSet::new();
+    for (position, degree) in indegree.iter().enumerate() {
+        if *degree == 0 {
+            ready.insert((units[position].0.clone(), position));
+        }
     }
-    let mut slice_groups = Vec::with_capacity(groups.len());
-    for (id, plans) in groups {
-        let evidence = enumerate_slice_group(arena, id, &plans, &refs)?;
-        l_rows += BigUint::from(evidence.rows.len());
-        slice_groups.push(evidence);
+    let mut ordered = Vec::with_capacity(units.len());
+    while let Some((_, position)) = ready.pop_first() {
+        ordered.push(position);
+        for &dependent in &edges[position] {
+            indegree[dependent] -= 1;
+            if indegree[dependent] == 0 {
+                ready.insert((units[dependent].0.clone(), dependent));
+            }
+        }
+    }
+    if ordered.len() != units.len() {
+        return Err(G0Error::CanonicalDependencyCycle);
+    }
+
+    let mut index_uses = Vec::new();
+    let mut l_rows = BigUint::zero();
+    let mut slice_groups = Vec::new();
+    let mut next_group_id = 1_u64;
+    for position in ordered {
+        let plans = &units[position].1;
+        if plans[0].slice_group.is_some() {
+            let evidence = enumerate_slice_group(arena, SliceGroupId(next_group_id), plans, refs)?;
+            next_group_id = next_group_id.checked_add(1).ok_or(G0Error::TraceOverflow)?;
+            l_rows += BigUint::from(evidence.rows.len());
+            slice_groups.push(evidence);
+        } else {
+            for plan in plans {
+                let evidence = enumerate_index_use(arena, plan, refs)?;
+                l_rows += BigUint::from(evidence.rows.len());
+                index_uses.push(evidence);
+            }
+        }
     }
     Ok(G0LutEvidence { index_uses, slice_groups, l_rows })
 }
@@ -652,7 +797,7 @@ fn enumerate_slice_group(
     }
     let first = plans[0];
     let group = first.slice_group.as_ref().ok_or(G0Error::InvalidSliceGroup)?;
-    if group.id != id || group.members.len() != 4 {
+    if group.members.len() != 4 {
         return Err(G0Error::InvalidSliceGroup);
     }
     let ResolvedValueType::Matrix(output_type) = &first.output_type else {
@@ -741,7 +886,7 @@ fn enumerate_slice_group(
         });
         Ok(())
     })?;
-    let members = group
+    let mut members = group
         .members
         .iter()
         .map(|member| {
@@ -752,6 +897,7 @@ fn enumerate_slice_group(
             })
         })
         .collect::<Result<Vec<_>, G0Error>>()?;
+    members.sort_by_key(|member| member.role);
     Ok(SliceLutEvidence {
         id: id.0.to_string(),
         owner: stable_observed_wire(&first.owner),

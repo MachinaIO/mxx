@@ -10307,6 +10307,248 @@ mod tests {
     }
 
     #[test]
+    fn traced_crt_pre_summarized_finite_lanes_use_child_summary_results() {
+        fn lane(
+            expressions: &mut ExprArena,
+            output: &ResolvedMatrixType,
+            tag: &str,
+        ) -> (ExprId, ExprId, ExprId) {
+            let left = matrix_source(expressions, &format!("{tag}-left"), output.clone(), None);
+            let right = matrix_source(expressions, &format!("{tag}-right"), output.clone(), None);
+            let child =
+                expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+            (left, right, child)
+        }
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let (first_left, first_right, first) = lane(&mut expressions, &matrix, "crt-first");
+        let (later_left, later_right, later) = lane(&mut expressions, &matrix, "crt-later");
+        let root = expressions
+            .intern_slice(
+                ValueOperator::Matrix(MatrixOperation::CrtRecompose {
+                    plaintext_moduli: Box::new([BigUint::from(3_u8), BigUint::from(5_u8)]),
+                    reconstruction_coefficients: Box::new([BigInt::from(2_u8), BigInt::from(3_u8)]),
+                    output: matrix,
+                }),
+                &[first, later],
+            )
+            .unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        for expression in [first_left, first_right, later_left, later_right] {
+            insert_matrix_bound(&mut facts, &expressions, expression, 2);
+        }
+        let (ordinary_value, ordinary_counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        let mut trace = FeasibilityTrace::default();
+        let (traced_value, traced_counters) = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        assert_eq!(ordinary_value.exact_nf, traced_value.exact_nf);
+        assert_eq!(ordinary_value.coefficient_bound, traced_value.coefficient_bound);
+        assert_eq!(ordinary_counters, traced_counters);
+        let child_summaries = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                NormalizerEvent::Result { owner, value }
+                    if owner.expression() == first || owner.expression() == later =>
+                {
+                    value.exact_nf.as_ref().filter(|nf| !nf.bounded_summary.is_zero())
+                }
+                _ => None,
+            })
+            .count();
+        assert_eq!(child_summaries, 2);
+        let scales = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule:
+                        BoundRule::Scale {
+                            value: BoundValueRef::Result { projection, .. },
+                            scale: BoundScale::Magnitude(magnitude),
+                        },
+                } if *owner == semantic && *projection == BoundProjection::Summary => {
+                    Some((index, magnitude.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scales.iter().map(|(_, magnitude)| magnitude).collect::<Vec<_>>(),
+            [&BigUint::from(2_u8), &BigUint::from(3_u8)]
+        );
+        for (scale_index, _) in scales {
+            assert!(trace.normalization_events()[scale_index + 1..].iter().any(|event| {
+                matches!(
+                    event,
+                    NormalizerEvent::BoundTransfer {
+                        rule: BoundRule::Sum { inputs }, ..
+                    } if inputs.iter().any(|input| {
+                        matches!(input, BoundValueRef::Transfer(index) if index.0 == scale_index as u64)
+                    })
+                )
+            }));
+        }
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+    }
+
+    #[test]
+    fn traced_crt_zero_pre_summarized_lane_is_not_referenced() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let zero_left = matrix_source(&mut expressions, "crt-zero-left", matrix.clone(), None);
+        let zero_right = matrix_source(&mut expressions, "crt-zero-right", matrix.clone(), None);
+        let zero_lane = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[zero_left, zero_right])
+            .unwrap();
+        let later_left = matrix_source(&mut expressions, "crt-later-left", matrix.clone(), None);
+        let later_right = matrix_source(&mut expressions, "crt-later-right", matrix.clone(), None);
+        let later = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[later_left, later_right])
+            .unwrap();
+        let root = expressions
+            .intern_slice(
+                ValueOperator::Matrix(MatrixOperation::CrtRecompose {
+                    plaintext_moduli: Box::new([BigUint::from(3_u8), BigUint::from(5_u8)]),
+                    reconstruction_coefficients: Box::new([BigInt::from(0_u8), BigInt::from(3_u8)]),
+                    output: matrix,
+                }),
+                &[zero_lane, later],
+            )
+            .unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        for expression in [zero_left, zero_right, later_left, later_right] {
+            insert_matrix_bound(&mut facts, &expressions, expression, 2);
+        }
+        let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let traced = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer.normalize(semantic).unwrap()
+        };
+        assert_eq!(ordinary.exact_nf, traced.exact_nf);
+        assert_eq!(ordinary.coefficient_bound, traced.coefficient_bound);
+        let root_scales = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule:
+                        BoundRule::Scale {
+                            value: BoundValueRef::Result { projection, .. },
+                            scale: BoundScale::Magnitude(magnitude),
+                        },
+                } if *owner == semantic && *projection == BoundProjection::Summary => {
+                    Some(magnitude)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(root_scales, [&BigUint::from(3_u8)]);
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+    }
+
+    #[test]
+    fn crt_large_and_missing_lanes_fail_closed_before_root_output() {
+        for large in [false, true] {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let matrix = matrix_type();
+            let source = matrix_source(
+                &mut expressions,
+                if large { "crt-large" } else { "crt-missing" },
+                matrix.clone(),
+                None,
+            );
+            let finite = matrix_source(&mut expressions, "crt-finite", matrix.clone(), None);
+            let child = expressions
+                .intern_matrix_transform(MatrixOperation::Add, &[source, finite])
+                .unwrap();
+            let root = expressions
+                .intern_slice(
+                    ValueOperator::Matrix(MatrixOperation::CrtRecompose {
+                        plaintext_moduli: Box::new([BigUint::from(3_u8)]),
+                        reconstruction_coefficients: Box::new([BigInt::from(1_u8)]),
+                        output: matrix,
+                    }),
+                    &[child],
+                )
+                .unwrap();
+            let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+            if large {
+                let matrix = match expressions.value_type(source).unwrap() {
+                    ResolvedValueType::Matrix(matrix) => matrix.clone(),
+                    _ => unreachable!(),
+                };
+                let layout = MatrixLayout::row_major(matrix.rows, matrix.columns);
+                let mut matrix_facts = MatrixFacts::new(matrix, MatrixMetadata::new(layout));
+                matrix_facts.coefficient_bound = NumericContract::Known(CoefficientBound::Large);
+                facts.insert(&expressions, source, ValueFacts::Matrix(matrix_facts)).unwrap();
+            }
+            insert_matrix_bound(&mut facts, &expressions, finite, 2);
+            let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                .unwrap()
+                .normalize(semantic)
+                .unwrap();
+            assert_eq!(ordinary.coefficient_bound, NumericContract::Missing);
+            let before_len = monomials.len();
+            let before_occupied = monomials.occupied_len();
+            let mut trace = FeasibilityTrace::default();
+            let error = {
+                let mut normalizer = Normalizer::new_with_sink(
+                    &mut expressions,
+                    &programs,
+                    &facts,
+                    &mut monomials,
+                    &mut trace,
+                )
+                .unwrap();
+                normalizer.normalize(semantic).unwrap_err()
+            };
+            assert_eq!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer));
+            assert_eq!(monomials.len(), before_len);
+            assert_eq!(monomials.occupied_len(), before_occupied);
+            assert!(!trace.normalization_events().iter().any(|event| {
+                matches!(
+                    event,
+                    NormalizerEvent::BoundTransfer { owner, .. } if *owner == semantic
+                )
+            }));
+        }
+    }
+
+    #[test]
     fn traced_concat_summary_evidence_is_ordered_and_has_no_unary_maximum() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -10395,6 +10637,179 @@ mod tests {
     }
 
     #[test]
+    fn concat_with_no_summarized_children_emits_no_summary_maximum() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+        let left = gaussian_factor(&mut expressions, input.clone(), 98_271, 3);
+        let right = gaussian_factor(&mut expressions, input.clone(), 98_272, 3);
+        let root = expressions
+            .intern_matrix_transform(
+                MatrixOperation::Concat {
+                    axis: 1,
+                    output: ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 4).unwrap(),
+                    layout: MatrixLayout::row_major(2, 4),
+                },
+                &[left, right],
+            )
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let traced = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer.normalize(semantic).unwrap()
+        };
+        assert_eq!(ordinary.exact_nf, traced.exact_nf);
+        assert_eq!(ordinary.coefficient_bound, traced.coefficient_bound);
+        assert!(!trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Maximum { inputs },
+                } if *owner == semantic && inputs.iter().all(|input| {
+                    matches!(input, BoundValueRef::Result { projection: BoundProjection::Summary, .. })
+                })
+            )
+        }));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+    }
+
+    #[test]
+    fn concat_with_one_summarized_child_uses_direct_summary_without_maximum() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap();
+        let summarized_left =
+            matrix_source(&mut expressions, "concat-single-left", input.clone(), None);
+        let summarized_right =
+            matrix_source(&mut expressions, "concat-single-right", input.clone(), None);
+        let summarized = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[summarized_left, summarized_right])
+            .unwrap();
+        let unsummarized = gaussian_factor(&mut expressions, input.clone(), 98_273, 3);
+        let root = expressions
+            .intern_matrix_transform(
+                MatrixOperation::Concat {
+                    axis: 1,
+                    output: ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 4).unwrap(),
+                    layout: MatrixLayout::row_major(2, 4),
+                },
+                &[summarized, unsummarized],
+            )
+            .unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        insert_matrix_bound(&mut facts, &expressions, summarized_left, 2);
+        insert_matrix_bound(&mut facts, &expressions, summarized_right, 2);
+        let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let traced = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer.normalize(semantic).unwrap()
+        };
+        assert_eq!(ordinary.exact_nf, traced.exact_nf);
+        assert_eq!(ordinary.coefficient_bound, traced.coefficient_bound);
+        assert!(!trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Maximum { inputs },
+                } if *owner == semantic && inputs.iter().all(|input| {
+                    matches!(input, BoundValueRef::Result { projection: BoundProjection::Summary, .. })
+                })
+            )
+        }));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+    }
+
+    #[test]
+    fn transform_summary_seed_keeps_one_c2_identity_without_duplicate_c3_identity() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let left = matrix_source(&mut expressions, "transform-left", matrix.clone(), None);
+        let right = matrix_source(&mut expressions, "transform-right", matrix.clone(), None);
+        let child =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        let root = expressions.intern_matrix_transform(MatrixOperation::Negate, &[child]).unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        insert_matrix_bound(&mut facts, &expressions, left, 2);
+        insert_matrix_bound(&mut facts, &expressions, right, 2);
+        let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let traced = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer.normalize(semantic).unwrap()
+        };
+        assert_eq!(ordinary.exact_nf, traced.exact_nf);
+        assert_eq!(ordinary.coefficient_bound, traced.coefficient_bound);
+        let identities = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                NormalizerEvent::BoundTransfer { owner, rule: BoundRule::Identity { input } }
+                    if *owner == semantic =>
+                {
+                    Some(input)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(identities.len(), 1);
+        assert!(matches!(
+            identities[0],
+            BoundValueRef::Predecessor {
+                input_position: 0,
+                projection: BoundProjection::Coefficient
+            }
+        ));
+        assert!(!trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Identity {
+                        input: BoundValueRef::Result { .. },
+                    },
+                } if *owner == semantic
+            )
+        }));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+    }
+
+    #[test]
     fn shared_summary_consumers_reuse_one_current_frame_result_in_order() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -10461,6 +10876,25 @@ mod tests {
             unreachable!("checked summary result refs")
         };
         assert_eq!(left_event, right_event);
+        let predecessors = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                NormalizerEvent::Predecessor {
+                    consumer,
+                    input_position,
+                    predecessor,
+                    source_result,
+                } if *consumer == semantic => Some((*input_position, *predecessor, *source_result)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(predecessors.len(), 2);
+        assert_eq!(predecessors[0].0, 0);
+        assert_eq!(predecessors[1].0, 1);
+        assert_eq!(predecessors[0].1, shared);
+        assert_eq!(predecessors[1].1, shared);
+        assert_eq!(predecessors[0].2, predecessors[1].2);
     }
 
     fn assert_bound_trace_matches_no_feasibility(tensor: bool) {

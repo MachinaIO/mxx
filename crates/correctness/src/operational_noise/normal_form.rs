@@ -8869,15 +8869,185 @@ mod tests {
         );
         drop(normalizer);
         trace.validate_normalization_observations().unwrap();
-        assert!(trace.normalization_events().iter().any(|event| {
-            matches!(
-                event,
-                NormalizerEvent::BoundTransfer {
-                    owner,
-                    rule: BoundRule::Authority(BoundAuthority::FactStore),
-                } if *owner == semantic
+        let authorities = trace
+            .normalization_events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    NormalizerEvent::BoundTransfer {
+                        owner,
+                        rule: BoundRule::Authority(BoundAuthority::FactStore),
+                    } if *owner == semantic
+                )
+            })
+            .count();
+        assert_eq!(authorities, 1);
+    }
+
+    #[test]
+    fn program_family_fact_authority_is_the_single_call_precedence() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let mut facts = FactStore::new(&expressions);
+        let value = matrix_source(&mut expressions, "family-fact", matrix_type(), None);
+        let mut value_facts = MatrixFacts::new(
+            matrix_type(),
+            MatrixMetadata {
+                is_constant_polynomial: true,
+                ..MatrixMetadata::new(MatrixLayout::row_major(2, 2))
+            },
+        );
+        value_facts.coefficient_bound = NumericContract::Known(CoefficientBound::finite(3_u8));
+        facts.insert(&expressions, value, ValueFacts::Matrix(value_facts)).unwrap();
+        let family = programs
+            .explicit_family(
+                &mut expressions,
+                &facts,
+                super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                vec![value].into_boxed_slice(),
             )
-        }));
+            .unwrap();
+        let index = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let call = programs
+            .call_family_in_range(
+                &mut expressions,
+                family,
+                index,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        let (mut outer_facts, mut monomials, semantic) =
+            setup(&mut expressions, &mut programs, call);
+        outer_facts.finalize_ranges();
+        let mut trace = FeasibilityTrace::default();
+        let mut normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &outer_facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap();
+        normalizer.normalize(semantic).unwrap();
+        drop(normalizer);
+        trace.validate_normalization_observations().unwrap();
+        let authorities = trace
+            .normalization_events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    NormalizerEvent::BoundTransfer {
+                        owner,
+                        rule: BoundRule::Authority(BoundAuthority::ProgramFamilyFact),
+                    } if *owner == semantic
+                )
+            })
+            .count();
+        assert_eq!(authorities, 1);
+    }
+
+    #[test]
+    fn relation_preimage_source_dispatch_is_scoped_and_fail_closed() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let domain = super::super::arena::FamilyDomain::new(0, 1).unwrap();
+        let range = TrustedIndexRange::new(0, 1).unwrap();
+        let index = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let source = preimage_factor(&mut expressions, matrix.clone(), 9_901, 3);
+        let preimage =
+            programs.opaque_generated_family_from_body(&mut expressions, domain, source).unwrap();
+        let call = programs.call_family_in_range(&mut expressions, preimage, index, range).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, call);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+
+        let missing = RelationRegistry::new();
+        let mut cache = NormalizationCache::new();
+        normalizer = normalizer.with_relations(&missing, &mut cache);
+        assert_eq!(normalizer.relation_preimage_source(call, preimage.program()).unwrap(), None);
+        drop(normalizer);
+
+        let public_body = source_with(&mut expressions, matrix.clone(), 9_903);
+        let public =
+            programs.generated_family_from_body(&mut expressions, domain, public_body).unwrap();
+        let trapdoor_body = expressions
+            .intern(
+                ValueOperator::Trapdoor(super::super::arena::TrapdoorOperation::Generate {
+                    descriptor: "relation-authority-trapdoor".to_owned(),
+                    parameters: Box::new([]),
+                    paired_public_event: SampleEventId(9_904),
+                    paired_public_output_role: "value".to_owned(),
+                }),
+                Box::new([]),
+            )
+            .unwrap();
+        let trapdoor =
+            programs.generated_family_from_body(&mut expressions, domain, trapdoor_body).unwrap();
+        let trapdoor_source = source_with(&mut expressions, matrix.clone(), 9_902);
+        let dispatch = UniversalDispatchKey {
+            preimage_family: preimage,
+            preimage_source: SamplerSourceContract { expression: source },
+            matrix_type: matrix.clone(),
+            trapdoor_source: TrapdoorSourceContract { expression: trapdoor_source },
+        };
+        let registration = |dispatch: UniversalDispatchKey| UniversalRelationRegistration {
+            dispatch: dispatch.clone(),
+            lhs: StaticLhsKey {
+                domain,
+                public_plan: public.program(),
+                preimage_plan: preimage.program(),
+                trapdoor_plan: trapdoor.program(),
+                public_pairing: public.program(),
+                layout: None,
+                factor_order: FactorOrderContract::ordered_public_preimage(),
+                validation: RelationValidationAuthority {
+                    source: dispatch.preimage_source.clone(),
+                    trapdoor_source: dispatch.trapdoor_source.clone(),
+                    matrix_type: matrix.clone(),
+                    public_type: ResolvedValueType::Matrix(matrix.clone()),
+                    preimage_type: ResolvedValueType::Matrix(matrix.clone()),
+                    target_type: ResolvedValueType::Matrix(matrix.clone()),
+                    trapdoor_type: ResolvedValueType::Trapdoor,
+                    layout: None,
+                    factor_order: FactorOrderContract::ordered_public_preimage(),
+                    domain,
+                    index_range: range,
+                    gadget: None,
+                    decomposition: None,
+                },
+            },
+            target_plan: public.program(),
+        };
+        let mut unique = RelationRegistry::new();
+        unique.register_universal(registration(dispatch.clone())).unwrap();
+        unique.freeze();
+        let mut unique_cache = NormalizationCache::new();
+        let normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&unique, &mut unique_cache);
+        assert_eq!(
+            normalizer.relation_preimage_source(call, preimage.program()).unwrap(),
+            Some(source)
+        );
+        drop(normalizer);
+
+        let mut ambiguous = RelationRegistry::new();
+        ambiguous.register_universal(registration(dispatch.clone())).unwrap();
+        let mut other = dispatch;
+        other.trapdoor_source.expression = source_with(&mut expressions, matrix.clone(), 9_905);
+        ambiguous.register_universal(registration(other)).unwrap();
+        ambiguous.freeze();
+        let mut ambiguous_cache = NormalizationCache::new();
+        let normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&ambiguous, &mut ambiguous_cache);
+        assert_eq!(normalizer.relation_preimage_source(call, preimage.program()).unwrap(), None);
+        let scoped_source = semantic.with_expression(source);
+        assert_eq!(scoped_source.expression(), source);
+        assert_eq!(scoped_source.program(), semantic.program());
     }
 
     #[test]

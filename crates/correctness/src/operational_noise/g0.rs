@@ -3839,7 +3839,13 @@ mod tests {
                 event: EventIndex(u64::MAX),
                 projection: BoundProjection::Coefficient,
             },
+            BoundValueRef::Result {
+                event: EventIndex(7),
+                projection: BoundProjection::Coefficient,
+            },
             BoundValueRef::Transfer(EventIndex(0)),
+            BoundValueRef::Transfer(EventIndex(6)),
+            BoundValueRef::Transfer(EventIndex(u64::MAX)),
         ] {
             let mut malformed = valid.clone();
             if let Some(NormalizerEvent::BoundTransfer { rule, .. }) = malformed
@@ -3921,6 +3927,71 @@ mod tests {
         assert_eq!(
             nested.validate_normalization_observations(),
             Err(G0Error::MissingNormalizationResult)
+        );
+
+        let value = || RecordedValue {
+            exact_nf: None,
+            coefficient_bound: super::super::facts::NumericContract::Missing,
+        };
+        let mut nested_result_ref = FeasibilityTrace::default();
+        nested_result_ref.events = vec![
+            NormalizerEvent::InvocationStart { root: parent },
+            NormalizerEvent::InvocationStart { root: child },
+            NormalizerEvent::Result { owner: child, value: value() },
+            NormalizerEvent::InvocationEnd {
+                root: child,
+                result: value(),
+                counters: Default::default(),
+            },
+            NormalizerEvent::BoundTransfer {
+                owner: parent,
+                rule: BoundRule::Identity {
+                    input: BoundValueRef::Result {
+                        event: EventIndex(2),
+                        projection: BoundProjection::Coefficient,
+                    },
+                },
+            },
+            NormalizerEvent::Result { owner: parent, value: value() },
+            NormalizerEvent::InvocationEnd {
+                root: parent,
+                result: value(),
+                counters: Default::default(),
+            },
+        ];
+        assert_eq!(
+            nested_result_ref.validate_normalization_observations(),
+            Err(G0Error::UnsupportedBoundTransfer)
+        );
+
+        let mut nested_transfer_ref = FeasibilityTrace::default();
+        nested_transfer_ref.events = vec![
+            NormalizerEvent::InvocationStart { root: parent },
+            NormalizerEvent::InvocationStart { root: child },
+            NormalizerEvent::BoundTransfer {
+                owner: child,
+                rule: BoundRule::Authority(BoundAuthority::Operator),
+            },
+            NormalizerEvent::Result { owner: child, value: value() },
+            NormalizerEvent::InvocationEnd {
+                root: child,
+                result: value(),
+                counters: Default::default(),
+            },
+            NormalizerEvent::BoundTransfer {
+                owner: parent,
+                rule: BoundRule::Identity { input: BoundValueRef::Transfer(EventIndex(2)) },
+            },
+            NormalizerEvent::Result { owner: parent, value: value() },
+            NormalizerEvent::InvocationEnd {
+                root: parent,
+                result: value(),
+                counters: Default::default(),
+            },
+        ];
+        assert_eq!(
+            nested_transfer_ref.validate_normalization_observations(),
+            Err(G0Error::UnsupportedBoundTransfer)
         );
     }
 

@@ -3110,7 +3110,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 return Ok((NumericContract::Missing, None));
             };
             total = add_known_bounds(&total, &bound);
-            if S::ENABLED {
+            if S::ENABLED && matches!(bound, CoefficientBound::Finite(_)) {
                 let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
                 let transfer = self.observe_finite_monomial(owner, monomial, coefficient)?;
                 self.append_summary_evidence(owner, &mut evidence, transfer)?;
@@ -5879,7 +5879,7 @@ mod tests {
             .unwrap();
         assert_eq!(expressions.scope_proof_build_count(), 1);
         assert_eq!(value.coefficient_bound, NumericContract::Missing);
-        let normal_form = value.exact_nf.unwrap();
+        let normal_form = value.exact_nf.as_ref().unwrap();
         assert_eq!(normal_form.exact_terms.len(), 2);
         assert!(
             normal_form.exact_terms.values().all(|coefficient| *coefficient == BigInt::from(8))
@@ -6504,12 +6504,69 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert!(!products.is_empty(), "summary/exact product evidence must be recorded");
         assert!(products.iter().any(|(left, right)| {
             matches!(left, BoundValueRef::Result { projection: BoundProjection::Summary, .. }) &&
                 matches!(right, BoundValueRef::Transfer(_))
         }));
+        assert!(!trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    rule: BoundRule::Sum { inputs }, ..
+                } if inputs.len() < 2
+            )
+        }));
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+    }
+
+    #[test]
+    fn traced_product_summary_rejects_large_or_missing_before_product_output() {
+        for (index, large) in [false, true].into_iter().enumerate() {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let left_exact = source_with(&mut expressions, matrix_type(), 95_030 + index as u64);
+            let left_finite =
+                gaussian_factor(&mut expressions, matrix_type(), 95_040 + index as u64, 2);
+            let left = expressions
+                .intern_matrix_transform(MatrixOperation::Add, &[left_exact, left_finite])
+                .unwrap();
+            let right = source_with(&mut expressions, matrix_type(), 95_050 + index as u64);
+            let root = expressions
+                .intern_matrix_transform(MatrixOperation::Multiply, &[left, right])
+                .unwrap();
+            let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+            if large {
+                let matrix = matrix_type();
+                let mut matrix_facts = MatrixFacts::new(
+                    matrix.clone(),
+                    MatrixMetadata::new(MatrixLayout::row_major(matrix.rows, matrix.columns)),
+                );
+                matrix_facts.coefficient_bound = NumericContract::Known(CoefficientBound::Large);
+                facts.insert(&expressions, right, ValueFacts::Matrix(matrix_facts)).unwrap();
+            }
+            let mut trace = super::super::g0::FeasibilityTrace::default();
+            let error = {
+                let mut normalizer = Normalizer::new_with_sink(
+                    &mut expressions,
+                    &programs,
+                    &facts,
+                    &mut monomials,
+                    &mut trace,
+                )
+                .unwrap();
+                normalizer.normalize(semantic).unwrap_err()
+            };
+            assert!(matches!(error, NormalizeError::InvalidExactPlan { .. }));
+            assert!(!trace.normalization_events().iter().any(|event| {
+                matches!(
+                    event,
+                    super::super::g0::NormalizerEvent::BoundTransfer {
+                        rule: BoundRule::Product { .. },
+                        ..
+                    }
+                )
+            }));
+        }
     }
 
     #[test]
@@ -6610,16 +6667,61 @@ mod tests {
             )
             .unwrap();
         let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
-        let value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-            .unwrap()
-            .normalize(semantic)
-            .unwrap();
-        let normal_form = value.exact_nf.unwrap();
+        let (value, counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        let normal_form = value.exact_nf.as_ref().unwrap();
         assert!(normal_form.exact_terms.is_empty());
         assert!(matches!(
             normal_form.bounded_summary.coefficient_bound(),
             NumericContract::Known(CoefficientBound::Finite(_))
         ));
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = gaussian_factor(&mut expressions, input_type.clone(), 95_014, 3);
+        let right = gaussian_factor(&mut expressions, input_type.clone(), 95_015, 5);
+        let traced_root = expressions
+            .intern_matrix_transform(
+                MatrixOperation::Tensor {
+                    output: output_type.clone(),
+                    left_layout: MatrixLayout::row_major(input_type.rows, input_type.columns),
+                    right_layout: MatrixLayout::row_major(input_type.rows, input_type.columns),
+                    output_layout: MatrixLayout::row_major(output_type.rows, output_type.columns),
+                },
+                &[left, right],
+            )
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, traced_root);
+        let mut trace = super::super::g0::FeasibilityTrace::default();
+        let (traced_value, traced_counters) = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        assert_eq!(traced_value.exact_nf, value.exact_nf);
+        assert_eq!(traced_value.coefficient_bound, value.coefficient_bound);
+        assert_eq!(traced_counters, counters);
+        assert!(trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    rule: BoundRule::Tensor { .. },
+                    ..
+                }
+            )
+        }));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
     }
 
     #[test]

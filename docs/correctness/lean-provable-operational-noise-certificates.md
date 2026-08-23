@@ -469,6 +469,14 @@ normalization, relation selection, bounds, acceptance, or diagnostics. A differe
 the same request with recording off and on and requires identical Rust report bytes and core
 counters, excluding recorder-only metrics.
 
+The compared values are semantic report fields and deterministic core counters produced by the
+ordinary checker. Elapsed-time diagnostics, RSS/GPU observations, and recorder-only metrics are
+excluded because they are operational observations rather than checker semantics.
+
+`docs/correctness/tall-operational-noise-certificate-g0.json` is deterministic G0 review evidence
+for source construction and feasibility only. It is not a G3 certificate artifact and cannot be
+used as `Source.json` or as an acceptance artifact.
+
 The committed artifacts are:
 
 - `Source.json`: the complete output of the single canonical frozen-bundle serializer, exact
@@ -513,7 +521,8 @@ a runtime cutoff, truncate a table, or silently select another semantics.
 
 The phases are:
 
-1. **G0, design feasibility:** complete residual-closure coverage matrix, exact `N`, `L`, and
+1. **G0, design feasibility:** a hard gate before any further G2 or G3 work; complete
+   residual-closure coverage matrix, exact `N`, `L`, and
    frontier products, estimated `T`/artifact bytes/peak memory, zero-axis and synchronized-slice
    LUT tests, and kernel spikes for fuel-stable haves and balanced row-local validity. Failure
    returns the design to review before trusted code is built.

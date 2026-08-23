@@ -563,12 +563,12 @@ fn acceptance_log2(report: &OperationalSimulationReport) -> (f64, f64) {
     (noise_bound_log2, noise_threshold_log2)
 }
 
-fn run_tall_operational_check(
+fn build_tall_operational_source(
     preprocessing: &BuiltGraph,
     encoding: &BuiltGraph,
     parameters: &DCRTPolyParams,
     nested: &NestedRnsPolyContext,
-) -> Result<OperationalSimulationReport, String> {
+) -> Result<(mxx_correctness::ProtocolDecl, OperationalCheckRequest), String> {
     if nested.p_moduli.is_empty() {
         return Err("nested-RNS plaintext contract requires a nonempty p-basis".to_owned());
     }
@@ -694,6 +694,17 @@ fn run_tall_operational_check(
         }],
         target_id: TALL_OPERATIONAL_TARGET_ID.to_owned(),
     };
+    Ok((protocol, request))
+}
+
+fn run_tall_operational_check(
+    preprocessing: &BuiltGraph,
+    encoding: &BuiltGraph,
+    parameters: &DCRTPolyParams,
+    nested: &NestedRnsPolyContext,
+) -> Result<OperationalSimulationReport, String> {
+    let (protocol, request) =
+        build_tall_operational_source(preprocessing, encoding, parameters, nested)?;
     let evaluation_started = Instant::now();
     info!(target = request.target_id, "begin Tall operational noise checker");
     let report = check_operational_noise_candidate_with_progress(&protocol, &request, |event| {

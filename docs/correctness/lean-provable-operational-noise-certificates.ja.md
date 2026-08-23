@@ -710,6 +710,14 @@ acceptance、diagnostic を変更してはならない。
 同じ request を recording off と on で実行し、recorder 専用 metric を除く Rust report bytes と
 core counter が一致することを differential test で確認する。
 
+比較対象は、通常 checker が生成する意味論的な report field と決定的な core counter である。
+elapsed time、RSS/GPU 観測値、recorder 専用 metric は checker の意味論ではないため、この一致
+比較から除外する。
+
+`docs/correctness/tall-operational-noise-certificate-g0.json` は source construction と実現可能性
+だけを確認する決定的な G0 review evidence である。これは G3 certificate artifact ではなく、
+`Source.json` や acceptance artifact として使用してはならない。
+
 G3 で canonical frozen-bundle serializer が完成した後は、その完全な出力である `Source.json`
 だけから clean-room regeneration を実行できなければならない。`Source.json` は canonical な
 frozen bundle、正確な request、pinned version identity だけを持ち、target や environment の
@@ -750,7 +758,7 @@ O(N + T + L)
 
 各 gate は、その段階を通過するまで次段階へ進まないための受入条件である。
 
-### G0: 設計の実現可能性
+### G0: 設計の実現可能性（G2/G3 の前提となる hard gate）
 
 完全な Lean certificate を生成する前に、security-0 と正確な security-128 Tall source の両方で
 次を計算または測定する。

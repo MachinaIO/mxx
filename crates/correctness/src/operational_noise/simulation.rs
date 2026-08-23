@@ -997,6 +997,213 @@ fn wire_consumes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        OutputRef, ProtocolDecl, ProtocolStage, StageId,
+        bundle::{
+            ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor,
+            EndpointAnchors, EndpointSemanticBinding, EndpointSpecId, InputContract,
+            InputContractEntry, InputValueContract, OperationalDecoderTarget, ProtocolInputBinding,
+            ProtocolInputDestination, Workflow,
+        },
+    };
+    use mxx_dsl::{Bool, DslContext, IdealSpec, Int, Ring, SemanticAnchor};
+
+    fn threshold_certificate_protocol() -> ProtocolDecl {
+        let stage_id = StageId("certificate-stage".to_owned());
+        let ring = Ring::new(256, 1);
+        let residual =
+            ring.zero((1, 1)).semantic_anchor("certificate.residual").expect("residual anchor");
+        let decoded = residual
+            .clone()
+            .threshold_decode_bools(IntExpr::constant(2), 1)
+            .into_iter()
+            .next()
+            .expect("decoded output")
+            .semantic_anchor("certificate.decoded")
+            .expect("decoded anchor");
+        let stage = DslContext::new("certificate-stage")
+            .private_output("operational-residual", residual)
+            .expect("residual output")
+            .bool_output("decoded", decoded)
+            .expect("decoded output")
+            .build()
+            .expect("certificate graph");
+        let decoder_node = stage.graph.outputs()["decoded"].value.node;
+        let ideal = IdealSpec::new(
+            DslContext::new("certificate-ideal")
+                .bool_output("result", Bool::constant(false))
+                .expect("ideal output")
+                .build()
+                .expect("ideal graph"),
+        )
+        .expect("pure ideal");
+        let endpoint = EndpointSpecId::ToyThresholdDecode;
+        ProtocolDecl::new(crate::ProtocolDecl {
+            params: Vec::new(),
+            bundle: ClosedProtocolBundle {
+                workflow: Workflow {
+                    stages: vec![ProtocolStage {
+                        id: stage_id.clone(),
+                        graph: stage.graph,
+                        semantic_anchors: stage.anchors,
+                        derivation_attachments: stage.derivation_attachments,
+                        bindings: Vec::new(),
+                    }],
+                    entrypoint: stage_id.clone(),
+                },
+                ideal,
+                requirements: Vec::new(),
+                comparator: ComparatorSpec::Equality {
+                    endpoints: vec![ComparatorEndpointBinding {
+                        endpoint,
+                        actual_input: "decoded".to_owned(),
+                        ideal_input: "result".to_owned(),
+                        result_output: "failure".to_owned(),
+                        failure_value: true,
+                    }],
+                },
+                endpoints: EndpointAnchors {
+                    entries: vec![EndpointAnchor {
+                        spec: endpoint,
+                        stage: stage_id.clone(),
+                        semantic_anchor: "certificate.decoded".to_owned(),
+                        semantics: EndpointSemanticBinding::ThresholdDecode,
+                        workflow_output: OutputRef {
+                            stage: stage_id.clone(),
+                            output: "decoded".to_owned(),
+                        },
+                        ideal_output: "result".to_owned(),
+                    }],
+                },
+                operational_decoder_targets: vec![OperationalDecoderTarget {
+                    target_id: "certificate-threshold".to_owned(),
+                    residual_stage: stage_id.clone(),
+                    residual_output: "operational-residual".to_owned(),
+                    decoder_stage: stage_id,
+                    decoder_node,
+                    kind: OperationalDecoderKind::ThresholdDecode {
+                        plaintext_modulus: IntExpr::constant(2),
+                    },
+                }],
+                endpoint_specs: vec![endpoint],
+                input_contract: InputContract::default(),
+                input_bindings: Vec::new(),
+                precondition_spec: crate::ProtocolPreconditionSpec::default(),
+            },
+        })
+        .expect("threshold certificate protocol")
+    }
+
+    fn boolean_interval_certificate_protocol() -> ProtocolDecl {
+        let stage_id = StageId("boolean-certificate-stage".to_owned());
+        let ring = Ring::new(17, 1);
+        let residual = ring
+            .zero((1, 1))
+            .semantic_anchor("boolean.residual")
+            .expect("residual anchor")
+            .semantic_anchor("boolean.carrier")
+            .expect("carrier anchor");
+        let coefficient = residual.clone().extract_coefficient(0);
+        let quarter = Int::evaluate(IntExpr::RoundDiv(
+            Box::new(IntExpr::Sub(Box::new(IntExpr::constant(17)), Box::new(IntExpr::constant(2)))),
+            Box::new(IntExpr::constant(4)),
+        ));
+        let decoded = quarter
+            .clone()
+            .less_equal(coefficient.clone())
+            .to_int()
+            .add(coefficient.less_equal(quarter.mul(Int::constant(3))).to_int())
+            .equal(Int::constant(2))
+            .semantic_anchor("boolean.decoded")
+            .expect("decoded anchor");
+        let stage = DslContext::new("boolean-certificate-stage")
+            .private_output("operational-residual", residual)
+            .expect("residual output")
+            .bool_output("decoded", decoded)
+            .expect("decoded output")
+            .build()
+            .expect("boolean certificate graph");
+        let decoder_node = stage.graph.outputs()["decoded"].value.node;
+        let message = crate::ProtocolInputId::from("message");
+        let ideal = IdealSpec::new(
+            DslContext::new("boolean-certificate-ideal")
+                .bool_output("result", ring.bool_input("message"))
+                .expect("ideal output")
+                .build()
+                .expect("ideal graph"),
+        )
+        .expect("pure ideal");
+        let endpoint = EndpointSpecId::DiamondBooleanInterval;
+        ProtocolDecl::new(crate::ProtocolDecl {
+            params: Vec::new(),
+            bundle: ClosedProtocolBundle {
+                workflow: Workflow {
+                    stages: vec![ProtocolStage {
+                        id: stage_id.clone(),
+                        graph: stage.graph,
+                        semantic_anchors: stage.anchors,
+                        derivation_attachments: stage.derivation_attachments,
+                        bindings: Vec::new(),
+                    }],
+                    entrypoint: stage_id.clone(),
+                },
+                ideal,
+                requirements: Vec::new(),
+                comparator: ComparatorSpec::Equality {
+                    endpoints: vec![ComparatorEndpointBinding {
+                        endpoint,
+                        actual_input: "decoded".to_owned(),
+                        ideal_input: "result".to_owned(),
+                        result_output: "failure".to_owned(),
+                        failure_value: true,
+                    }],
+                },
+                endpoints: EndpointAnchors {
+                    entries: vec![EndpointAnchor {
+                        spec: endpoint,
+                        stage: stage_id.clone(),
+                        semantic_anchor: "boolean.decoded".to_owned(),
+                        semantics: EndpointSemanticBinding::DiamondBoolean {
+                            residual_stage: stage_id.clone(),
+                            residual_anchor: "boolean.residual".to_owned(),
+                            carrier_stage: stage_id.clone(),
+                            carrier_anchor: "boolean.carrier".to_owned(),
+                            message: message.clone(),
+                        },
+                        workflow_output: OutputRef {
+                            stage: stage_id.clone(),
+                            output: "decoded".to_owned(),
+                        },
+                        ideal_output: "result".to_owned(),
+                    }],
+                },
+                operational_decoder_targets: vec![OperationalDecoderTarget {
+                    target_id: "certificate-boolean".to_owned(),
+                    residual_stage: stage_id.clone(),
+                    residual_output: "operational-residual".to_owned(),
+                    decoder_stage: stage_id,
+                    decoder_node,
+                    kind: OperationalDecoderKind::BooleanInterval,
+                }],
+                endpoint_specs: vec![endpoint],
+                input_contract: InputContract {
+                    inputs: vec![InputContractEntry {
+                        id: message.clone(),
+                        name: "message".to_owned(),
+                        value: InputValueContract::Boolean,
+                    }],
+                },
+                input_bindings: vec![ProtocolInputBinding {
+                    input: message,
+                    destinations: vec![ProtocolInputDestination::Ideal {
+                        input: "message".to_owned(),
+                    }],
+                }],
+                precondition_spec: crate::ProtocolPreconditionSpec::default(),
+            },
+        })
+        .expect("boolean certificate protocol")
+    }
 
     #[test]
     fn closed_target_rejects_a_same_modulus_decoder_that_does_not_consume_the_residual() {
@@ -1033,6 +1240,43 @@ mod tests {
 
     #[test]
     fn certificate_projection_uses_threshold_target_and_residual_root() {
+        let protocol = threshold_certificate_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "certificate-threshold".to_owned(),
+        };
+        let projection = project_operational_certificate(&protocol, &request)
+            .expect("valid threshold certificate projection");
+        assert_eq!(projection.target_id, "certificate-threshold");
+        assert_eq!(projection.plaintext_modulus, 2_u8.into());
+        assert_eq!(projection.ciphertext_modulus, 256_u16.into());
+        let CertificateResidualRoot::Closed { matrix, .. } = projection.residual else {
+            panic!("certificate residual should be the closed production residual root")
+        };
+        assert_eq!(matrix.modulus, 256_u16.into());
+        assert_eq!(matrix.ring_dimension, 1);
+    }
+
+    #[test]
+    fn certificate_projection_rejects_boolean_interval_targets() {
+        let protocol = boolean_interval_certificate_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "certificate-boolean".to_owned(),
+        };
+        assert!(matches!(
+            project_operational_certificate(&protocol, &request),
+            Err(CertificateProjectionError::UnsupportedDecoderKind {
+                target_id,
+                kind: OperationalDecoderKind::BooleanInterval,
+            }) if target_id == "certificate-boolean"
+        ));
+    }
+
+    #[test]
+    fn certificate_projection_rejects_residual_matrix_modulus_mismatch() {
         let mut job = super::super::job::CheckerJob::new();
         let scalar = job
             .expressions_mut()
@@ -1061,45 +1305,19 @@ mod tests {
             job.expressions().close(matrix).expect("closed matrix"),
         );
         let target = ResolvedAcceptanceTarget {
-            target_id: "toy-threshold".to_owned(),
-            ciphertext_modulus: 256_u16.into(),
+            target_id: "certificate-threshold".to_owned(),
+            ciphertext_modulus: 255_u16.into(),
             kind: ResolvedDecoderKind::Threshold { plaintext_modulus: 2_u8.into() },
         };
-        let residual = project_residual_root(&job, &root, &target).expect("root projection");
-        let projection = OperationalCertificateProjection {
-            target_id: target.target_id.clone(),
-            plaintext_modulus: 2_u8.into(),
-            ciphertext_modulus: target.ciphertext_modulus.clone(),
-            residual,
-        };
-        assert_eq!(projection.target_id, "toy-threshold");
-        assert_eq!(projection.plaintext_modulus, 2_u8.into());
-        assert_eq!(projection.ciphertext_modulus, 256_u16.into());
-        let CertificateResidualRoot::Closed { matrix, .. } = projection.residual else {
-            panic!("toy residual should be closed")
-        };
-        assert_eq!(matrix.modulus, 256_u16.into());
-        assert_eq!(matrix.ring_dimension, 1);
-    }
-
-    #[test]
-    fn certificate_projection_rejects_boolean_interval_targets() {
-        let mut protocol = crate::toy_example::protocol();
-        protocol.bundle.operational_decoder_targets[0].kind =
-            OperationalDecoderKind::BooleanInterval;
-        let request = super::super::OperationalCheckRequest {
-            environment: vec![(
-                "cutoff".to_owned(),
-                super::super::OperationalParameterValue::Integer(1.into()),
-            )],
-            layouts: Vec::new(),
-            target_id: "toy-threshold".to_owned(),
-        };
         assert!(matches!(
-            project_operational_certificate(&protocol, &request),
-            Err(CertificateProjectionError::Operational(OperationalSimulationError::Target(
-                TargetError::DecoderKindMismatch { .. }
-            )))
+            project_residual_root(&job, &root, &target),
+            Err(CertificateProjectionError::ResidualModulusMismatch {
+                target_id,
+                target,
+                residual,
+            }) if target_id == "certificate-threshold" &&
+                target == 255_u16.into() &&
+                residual == 256_u16.into()
         ));
     }
 }

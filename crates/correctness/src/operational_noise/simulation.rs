@@ -22,6 +22,7 @@ use mxx_ir_core::{
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -82,6 +83,49 @@ pub(crate) struct OperationalCertificateProjection {
     pub closure: CertificateClosure,
 }
 
+/// Stable schema identity for the non-emitting G0 base summary.
+pub const BASE_FEASIBILITY_SCHEMA_ID: &str = "mxx.operational-noise.base-feasibility";
+pub const BASE_FEASIBILITY_SCHEMA_VERSION: u32 = 1;
+
+/// A typed, deliberately incomplete feasibility summary.  This is not a certificate report and
+/// has no API that can be accepted or emitted as the required G0 artifact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BaseFeasibilitySummary {
+    pub schema_id: &'static str,
+    pub schema_version: u32,
+    pub target_id: String,
+    pub plaintext_modulus: String,
+    pub ciphertext_modulus: String,
+    pub accepted: bool,
+    pub noise_bound: String,
+    pub threshold_left: String,
+    pub margin: String,
+    pub counters: BaseFeasibilityCounters,
+    pub n: BaseNBreakdown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BaseFeasibilityCounters {
+    pub occurrences: u64,
+    pub samples: u64,
+    pub normalization_nodes_processed: u64,
+    pub normalization_nodes_total: u64,
+    pub normalization_exact_term_count: u64,
+    pub normalization_relation_candidates: u64,
+    pub normalization_relation_applied: u64,
+    pub normalization_relation_remaining: u64,
+    pub normalization_bounded_fold_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BaseNBreakdown {
+    pub expression_rows: usize,
+    pub program_rows: usize,
+    pub source_rows: usize,
+    pub event_rows: usize,
+    pub total_rows: usize,
+}
+
 /// The owned job, certificate projection, and ordinary accepted report from one opt-in run.
 /// Arena handles remain tied to this job; callers cannot accidentally pair a projection with a
 /// report or job from another lowering.
@@ -100,6 +144,9 @@ pub(crate) struct CertificateClosure {
     pub expressions: BTreeSet<ExprId>,
     pub programs: BTreeSet<ValueProgramId>,
     pub families: BTreeSet<FamilyValueId>,
+    pub source_ids: BTreeSet<super::arena::SemanticSourceIdentity>,
+    pub family_source_ids: BTreeSet<super::arena::SemanticFamilySourceIdentity>,
+    pub event_ids: BTreeSet<super::arena::SampleEventId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -134,6 +181,9 @@ pub(crate) fn collect_residual_closure(
     let mut expressions = BTreeSet::new();
     let mut programs = BTreeSet::new();
     let mut families = BTreeSet::new();
+    let mut source_ids = BTreeSet::new();
+    let mut family_source_ids = BTreeSet::new();
+    let mut event_ids = BTreeSet::new();
     let mut work = Vec::new();
     match root {
         CertificateResidualRoot::Closed { root, .. } => {
@@ -150,6 +200,27 @@ pub(crate) fn collect_residual_closure(
                 }
                 let node = job.expressions().node(expression)?;
                 let inputs = node.inputs.clone();
+                match &node.operator {
+                    ValueOperator::Source(source) => {
+                        source_ids.insert(source.clone());
+                        if let Some(event) = source.sample_event {
+                            event_ids.insert(event);
+                        }
+                    }
+                    ValueOperator::OpaqueFamilyElement { source } => {
+                        family_source_ids.insert(source.clone());
+                    }
+                    ValueOperator::Sample { event, .. } | ValueOperator::Sampler { event, .. } => {
+                        event_ids.insert(*event);
+                    }
+                    ValueOperator::Trapdoor(super::arena::TrapdoorOperation::Generate {
+                        paired_public_event,
+                        ..
+                    }) => {
+                        event_ids.insert(*paired_public_event);
+                    }
+                    _ => {}
+                }
                 let program = match &node.operator {
                     ValueOperator::ProgramCall { program } => Some(*program),
                     _ => None,
@@ -190,7 +261,14 @@ pub(crate) fn collect_residual_closure(
         }
     }
 
-    Ok(CertificateClosure { expressions, programs, families })
+    Ok(CertificateClosure {
+        expressions,
+        programs,
+        families,
+        source_ids,
+        family_source_ids,
+        event_ids,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -322,6 +400,78 @@ pub(crate) fn prepare_operational_certificate(
         return Err(CertificateProjectionError::Rejected { target_id: request.target_id.clone() });
     }
     Ok(OperationalCertificateRun { job, projection, accepted_report })
+}
+
+/// Prepare the typed, non-emitting base summary used by the later G0 feasibility evidence stage.
+/// Coverage, frontier/L, proof-payload T, artifact-byte, and retained-memory observations are
+/// intentionally absent; this type cannot represent a final certificate artifact.
+pub fn prepare_base_feasibility_summary(
+    protocol: &ProtocolDecl,
+    request: &super::OperationalCheckRequest,
+) -> Result<BaseFeasibilitySummary, String> {
+    let run =
+        prepare_operational_certificate(protocol, request).map_err(|error| error.to_string())?;
+    let (plaintext_modulus, threshold_left, margin) = match &run.accepted_report.acceptance {
+        super::OperationalAcceptanceReport::Threshold {
+            plaintext_modulus,
+            threshold_left,
+            margin,
+        } => (plaintext_modulus, threshold_left, margin),
+        super::OperationalAcceptanceReport::BooleanInterval { .. } => {
+            return Err("base feasibility summary requires threshold acceptance".to_owned());
+        }
+    };
+    let normalization = run.accepted_report.counters.normalization;
+    let closure = &run.projection.closure;
+    let source_rows = closure
+        .source_ids
+        .len()
+        .checked_add(closure.family_source_ids.len())
+        .ok_or_else(|| "base feasibility source-row count overflow".to_owned())?;
+    let total_rows = closure
+        .expressions
+        .len()
+        .checked_add(closure.programs.len())
+        .and_then(|total| total.checked_add(source_rows))
+        .and_then(|total| total.checked_add(closure.event_ids.len()))
+        .ok_or_else(|| "base feasibility N count overflow".to_owned())?;
+    Ok(BaseFeasibilitySummary {
+        schema_id: BASE_FEASIBILITY_SCHEMA_ID,
+        schema_version: BASE_FEASIBILITY_SCHEMA_VERSION,
+        target_id: run.accepted_report.target_id,
+        plaintext_modulus: plaintext_modulus.to_string(),
+        ciphertext_modulus: run.accepted_report.ciphertext_modulus.to_string(),
+        accepted: run.accepted_report.accepted,
+        noise_bound: run.accepted_report.noise_bound.to_string(),
+        threshold_left: threshold_left.to_string(),
+        margin: margin.to_string(),
+        counters: BaseFeasibilityCounters {
+            occurrences: run.accepted_report.counters.occurrences,
+            samples: run.accepted_report.counters.samples,
+            normalization_nodes_processed: normalization.nodes_processed,
+            normalization_nodes_total: normalization.nodes_total,
+            normalization_exact_term_count: normalization.final_exact_term_count,
+            normalization_relation_candidates: normalization.relation_candidates,
+            normalization_relation_applied: normalization.relation_applied,
+            normalization_relation_remaining: normalization.relation_remaining,
+            normalization_bounded_fold_count: normalization.bounded_fold_count,
+        },
+        n: BaseNBreakdown {
+            expression_rows: closure.expressions.len(),
+            program_rows: closure.programs.len(),
+            source_rows,
+            event_rows: closure.event_ids.len(),
+            total_rows,
+        },
+    })
+}
+
+/// Serialize a base summary deterministically.  It remains a review/input summary, not an
+/// acceptance or certificate-emission API.
+pub fn serialize_base_feasibility_summary(
+    summary: &BaseFeasibilitySummary,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(summary)
 }
 
 fn project_residual_root(
@@ -1552,6 +1702,73 @@ mod tests {
     }
 
     #[test]
+    fn residual_closure_collects_typed_sources_and_events_only_from_residual() {
+        let mut job = super::super::job::CheckerJob::new();
+        let (root, source_identity, source_event, sample_event, decoder_event) = job
+            .with_arena_stores(|expressions, _, _| {
+                let source_identity = super::super::arena::SemanticSourceIdentity {
+                    stable_definition: "source-definition".to_owned(),
+                    invocation: "source-invocation".to_owned(),
+                    sample_event: Some(super::super::arena::SampleEventId(41)),
+                    output_role: "source-output".to_owned(),
+                    sampler: None,
+                    artifact: None,
+                    value_type: super::super::arena::ResolvedValueType::Int,
+                    coordinates: Box::new([3]),
+                    matrix_constant: None,
+                };
+                let source = expressions
+                    .intern(ValueOperator::Source(source_identity.clone()), Box::new([]))?;
+                let sample_event = super::super::arena::SampleEventId(7);
+                let sample = expressions.intern(
+                    ValueOperator::Sample {
+                        event: sample_event,
+                        descriptor: super::super::arena::SampleDescriptor::new(
+                            "sample-definition",
+                            super::super::arena::ResolvedValueType::Int,
+                        ),
+                    },
+                    Box::new([]),
+                )?;
+                let root = expressions.intern_slice(
+                    ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                    &[source, sample],
+                )?;
+                let decoder_event = super::super::arena::SampleEventId(99);
+                let decoder = expressions.intern(
+                    ValueOperator::Sample {
+                        event: decoder_event,
+                        descriptor: super::super::arena::SampleDescriptor::new(
+                            "decoder-only",
+                            super::super::arena::ResolvedValueType::Int,
+                        ),
+                    },
+                    Box::new([]),
+                )?;
+                let _decoder = expressions.close(decoder)?;
+                Ok::<_, super::super::arena::ArenaError>((
+                    expressions.close(root)?,
+                    source_identity,
+                    super::super::arena::SampleEventId(41),
+                    sample_event,
+                    decoder_event,
+                ))
+            })
+            .expect("source and event expressions");
+        let projected = CertificateResidualRoot::Closed {
+            root,
+            matrix: super::super::arena::ResolvedMatrixType::new(17_u8.into(), 1, 1, 1)
+                .expect("matrix type"),
+        };
+        let closure = collect_residual_closure(&job, &projected).expect("residual closure");
+        assert_eq!(closure.source_ids, [source_identity].into_iter().collect());
+        assert_eq!(closure.event_ids.len(), 2);
+        assert!(closure.event_ids.contains(&source_event));
+        assert!(closure.event_ids.contains(&sample_event));
+        assert!(!closure.event_ids.contains(&decoder_event));
+    }
+
+    #[test]
     fn residual_closure_keeps_family_body_typed_without_lane_enumeration() {
         let mut job = super::super::job::CheckerJob::new();
         let (family, body) = job
@@ -1685,5 +1902,36 @@ mod tests {
                 super::super::arena::ArenaError::ForeignExpression { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn base_summary_is_typed_incomplete_and_serializes_deterministically() {
+        let protocol = threshold_certificate_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "certificate-threshold".to_owned(),
+        };
+        let first = prepare_base_feasibility_summary(&protocol, &request)
+            .expect("base feasibility summary");
+        let second = prepare_base_feasibility_summary(&protocol, &request)
+            .expect("repeat base feasibility summary");
+        assert_eq!(first.schema_id, BASE_FEASIBILITY_SCHEMA_ID);
+        assert_eq!(first.schema_version, BASE_FEASIBILITY_SCHEMA_VERSION);
+        assert!(first.accepted);
+        assert_eq!(
+            first.n.total_rows,
+            first.n.expression_rows +
+                first.n.program_rows +
+                first.n.source_rows +
+                first.n.event_rows
+        );
+        assert_eq!(first, second);
+        let first_bytes = serialize_base_feasibility_summary(&first).expect("serialize summary");
+        let second_bytes = serialize_base_feasibility_summary(&second).expect("serialize repeat");
+        assert_eq!(first_bytes, second_bytes);
+        let json = String::from_utf8(first_bytes).expect("UTF-8 JSON");
+        assert!(!json.contains("milliseconds"));
+        assert!(!json.contains("artifact_emission"));
     }
 }

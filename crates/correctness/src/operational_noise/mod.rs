@@ -29,8 +29,10 @@ pub use error::{
     ProductionPhase, ProductionRootRole, ProductionValueType, RequestError,
 };
 pub use simulation::{
-    ProgressEvent, ProgressEventKind, check_operational_noise_candidate,
-    check_operational_noise_candidate_with_progress,
+    BASE_FEASIBILITY_SCHEMA_ID, BASE_FEASIBILITY_SCHEMA_VERSION, BaseFeasibilityCounters,
+    BaseFeasibilitySummary, BaseNBreakdown, ProgressEvent, ProgressEventKind,
+    check_operational_noise_candidate, check_operational_noise_candidate_with_progress,
+    prepare_base_feasibility_summary, serialize_base_feasibility_summary,
 };
 
 /// A concrete value supplied for one named protocol parameter.

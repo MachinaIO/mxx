@@ -108,7 +108,8 @@ pub(crate) enum IndexUseKind {
     IndexedSlice,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum SliceMemberRole {
     RowStart,
     RowEndExclusive,
@@ -414,9 +415,37 @@ pub(crate) struct IndexLutRow {
     pub output: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum StablePlanRef {
+    Expression { row: u64 },
+    Family { row: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub(crate) struct StableFrontierAxis {
+    pub owner: StableObservedOccurrence,
+    pub argument: StablePlanRef,
+    pub argument_position: u32,
+    pub domain: (u64, u64),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub(crate) struct StableObservedOccurrence {
+    pub definition: StableScope,
+    pub path: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct IndexLutEvidence {
+    pub owner: StableObservedWire,
+    pub result: Option<StablePlanRef>,
+    pub consumed: Option<StablePlanRef>,
     pub kind: IndexUseKind,
+    pub index: StablePlanRef,
+    pub output_range: Option<(u64, u64)>,
+    pub output_type: StableValueType,
+    pub frontier: Vec<StableFrontierAxis>,
     #[serde(rename = "frontierProduct")]
     pub frontier_product: String,
     pub rows: Vec<IndexLutRow>,
@@ -460,9 +489,24 @@ pub(crate) struct SliceLutRow {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct SliceLutEvidence {
     pub id: String,
+    pub owner: StableObservedWire,
+    pub result: Option<StablePlanRef>,
+    pub consumed: Option<StablePlanRef>,
+    pub output_type: StableValueType,
+    pub frontier: Vec<StableFrontierAxis>,
+    pub row_span: Option<usize>,
+    pub column_span: Option<usize>,
+    pub members: Vec<StableSliceMember>,
     #[serde(rename = "frontierProduct")]
     pub frontier_product: String,
     pub rows: Vec<SliceLutRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct StableSliceMember {
+    pub role: SliceMemberRole,
+    pub expression: StablePlanRef,
+    pub range: (u64, u64),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -477,6 +521,80 @@ pub(crate) struct G0LutEvidence {
 struct G0LutDocument<'a> {
     index_uses: &'a [IndexLutEvidence],
     slice_groups: &'a [SliceLutEvidence],
+}
+
+#[derive(Default)]
+struct CanonicalPlanRefs {
+    expressions: BTreeMap<ExprId, u64>,
+    families: BTreeMap<super::program::FamilyValueId, u64>,
+}
+
+impl CanonicalPlanRefs {
+    fn from_plans(plans: &[&IndexUsePlan]) -> Self {
+        let mut expressions = BTreeSet::new();
+        let mut families = BTreeSet::new();
+        for plan in plans {
+            expressions.insert(plan.index);
+            expressions.extend(plan.frontier.iter().map(|axis| axis.argument));
+            expressions.extend(
+                plan.slice_group
+                    .iter()
+                    .flat_map(|group| group.members.iter().map(|member| member.expression)),
+            );
+            if let Some(expression) = plan.result {
+                expressions.insert(expression);
+            }
+            if let Some(expression) = plan.consumed {
+                expressions.insert(expression);
+            }
+            if let Some(family) = plan.result_family {
+                families.insert(family);
+            }
+            if let Some(family) = plan.consumed_family {
+                families.insert(family);
+            }
+        }
+        Self {
+            expressions: expressions
+                .into_iter()
+                .enumerate()
+                .map(|(row, expression)| (expression, row as u64))
+                .collect(),
+            families: families
+                .into_iter()
+                .enumerate()
+                .map(|(row, family)| (family, row as u64))
+                .collect(),
+        }
+    }
+
+    fn expression(&self, expression: ExprId) -> StablePlanRef {
+        StablePlanRef::Expression { row: self.expressions[&expression] }
+    }
+
+    fn family(&self, family: super::program::FamilyValueId) -> StablePlanRef {
+        StablePlanRef::Family { row: self.families[&family] }
+    }
+
+    fn optional_expression(&self, expression: Option<ExprId>) -> Option<StablePlanRef> {
+        expression.map(|expression| self.expression(expression))
+    }
+
+    fn optional_family(
+        &self,
+        family: Option<super::program::FamilyValueId>,
+    ) -> Option<StablePlanRef> {
+        family.map(|family| self.family(family))
+    }
+
+    fn axis(&self, axis: &IndexFrontierAxis) -> StableFrontierAxis {
+        StableFrontierAxis {
+            owner: stable_observed_occurrence(&axis.owner),
+            argument: self.expression(axis.argument),
+            argument_position: axis.argument_position,
+            domain: (axis.domain.minimum, axis.domain.maximum_exclusive),
+        }
+    }
 }
 
 impl G0LutEvidence {
@@ -503,6 +621,8 @@ pub(crate) fn enumerate_lut_evidence<'a>(
     arena: &ExprArena,
     plans: impl IntoIterator<Item = &'a IndexUsePlan>,
 ) -> Result<G0LutEvidence, G0Error> {
+    let plans = plans.into_iter().collect::<Vec<_>>();
+    let refs = CanonicalPlanRefs::from_plans(&plans);
     let mut ordinary = Vec::new();
     let mut groups = BTreeMap::<SliceGroupId, Vec<&IndexUsePlan>>::new();
     for plan in plans {
@@ -519,13 +639,13 @@ pub(crate) fn enumerate_lut_evidence<'a>(
     let mut index_uses = Vec::with_capacity(ordinary.len());
     let mut l_rows = BigUint::zero();
     for plan in ordinary {
-        let evidence = enumerate_index_use(arena, plan)?;
+        let evidence = enumerate_index_use(arena, plan, &refs)?;
         l_rows += BigUint::from(evidence.rows.len());
         index_uses.push(evidence);
     }
     let mut slice_groups = Vec::with_capacity(groups.len());
     for (id, plans) in groups {
-        let evidence = enumerate_slice_group(arena, id, &plans)?;
+        let evidence = enumerate_slice_group(arena, id, &plans, &refs)?;
         l_rows += BigUint::from(evidence.rows.len());
         slice_groups.push(evidence);
     }
@@ -536,6 +656,7 @@ fn enumerate_slice_group(
     arena: &ExprArena,
     id: SliceGroupId,
     plans: &[&IndexUsePlan],
+    refs: &CanonicalPlanRefs,
 ) -> Result<SliceLutEvidence, G0Error> {
     if plans.len() != 4 {
         return Err(G0Error::InvalidSliceGroup);
@@ -631,7 +752,32 @@ fn enumerate_slice_group(
         });
         Ok(())
     })?;
-    Ok(SliceLutEvidence { id: id.0.to_string(), frontier_product: product.to_string(), rows })
+    let members = group
+        .members
+        .iter()
+        .map(|member| StableSliceMember {
+            role: member.role,
+            expression: refs.expression(member.expression),
+            range: (member.range.minimum, member.range.maximum_exclusive),
+        })
+        .collect();
+    Ok(SliceLutEvidence {
+        id: id.0.to_string(),
+        owner: stable_observed_wire(&first.owner),
+        result: refs
+            .optional_expression(first.result)
+            .or_else(|| refs.optional_family(first.result_family)),
+        consumed: refs
+            .optional_expression(first.consumed)
+            .or_else(|| refs.optional_family(first.consumed_family)),
+        output_type: stable_value_type(&first.output_type),
+        frontier: group.frontier.iter().map(|axis| refs.axis(axis)).collect(),
+        row_span: group.row_span,
+        column_span: group.column_span,
+        members,
+        frontier_product: product.to_string(),
+        rows,
+    })
 }
 
 /// Enumerate validated, residual-filtered ordinary index plans into deterministic LUT evidence.
@@ -641,13 +787,15 @@ pub(crate) fn enumerate_index_lut_evidence<'a>(
     arena: &ExprArena,
     plans: impl IntoIterator<Item = &'a IndexUsePlan>,
 ) -> Result<IndexLutEvidenceSet, G0Error> {
+    let plans = plans.into_iter().collect::<Vec<_>>();
+    let refs = CanonicalPlanRefs::from_plans(&plans);
     let mut index_uses = Vec::new();
     for plan in plans {
         plan.validate()?;
         if plan.slice_group.is_some() || plan.kind == IndexUseKind::IndexedSlice {
             continue;
         }
-        index_uses.push(enumerate_index_use(arena, plan)?);
+        index_uses.push(enumerate_index_use(arena, plan, &refs)?);
     }
     Ok(IndexLutEvidenceSet { index_uses })
 }
@@ -655,6 +803,7 @@ pub(crate) fn enumerate_index_lut_evidence<'a>(
 fn enumerate_index_use(
     arena: &ExprArena,
     plan: &IndexUsePlan,
+    refs: &CanonicalPlanRefs,
 ) -> Result<IndexLutEvidence, G0Error> {
     let output_range = plan.output_range.ok_or(G0Error::MissingIndexOutputRange)?;
     let product = frontier_product(&plan.frontier)?;
@@ -672,7 +821,22 @@ fn enumerate_index_use(
         });
         Ok(())
     })?;
-    Ok(IndexLutEvidence { kind: plan.kind, frontier_product: product.to_string(), rows })
+    Ok(IndexLutEvidence {
+        owner: stable_observed_wire(&plan.owner),
+        result: refs
+            .optional_expression(plan.result)
+            .or_else(|| refs.optional_family(plan.result_family)),
+        consumed: refs
+            .optional_expression(plan.consumed)
+            .or_else(|| refs.optional_family(plan.consumed_family)),
+        kind: plan.kind,
+        index: refs.expression(plan.index),
+        output_range: plan.output_range.map(|range| (range.minimum, range.maximum_exclusive)),
+        output_type: stable_value_type(&plan.output_type),
+        frontier: plan.frontier.iter().map(|axis| refs.axis(axis)).collect(),
+        frontier_product: product.to_string(),
+        rows,
+    })
 }
 
 fn frontier_product(frontier: &[IndexFrontierAxis]) -> Result<BigUint, G0Error> {
@@ -986,7 +1150,7 @@ pub(crate) struct StableFamilySourceIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-struct StableObservedWire {
+pub(crate) struct StableObservedWire {
     stage: String,
     definition: StableScope,
     path: u64,
@@ -996,7 +1160,7 @@ struct StableObservedWire {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
-enum StableScope {
+pub(crate) enum StableScope {
     Root,
     Subgraph { canonical_name: String },
     ParallelBody { parent: Box<StableScope>, owner: u64 },
@@ -1545,6 +1709,10 @@ fn stable_observed_wire(value: &PlannedWire) -> StableObservedWire {
         node: value.wire.node.0,
         port: value.wire.port.0,
     }
+}
+
+fn stable_observed_occurrence(value: &ProgramOccurrence) -> StableObservedOccurrence {
+    StableObservedOccurrence { definition: stable_scope(&value.definition), path: value.path }
 }
 
 fn stable_scope(value: &mxx_ir_core::FrozenGraphScopeId) -> StableScope {

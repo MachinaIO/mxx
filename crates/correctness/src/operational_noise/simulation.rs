@@ -443,6 +443,10 @@ pub fn prepare_base_feasibility_summary(
     };
     let normalization = run.accepted_report.counters.normalization;
     let closure = &run.projection.closure;
+    // Build the residual-only Stage-1 inventory from the same owned job and closure.  The base
+    // summary does not expose it or claim final artifact completeness, but descriptor conflicts
+    // must still fail closed on this opt-in path.
+    super::g0::derive_inventory(&run.job, closure).map_err(|error| error.to_string())?;
     let source_rows = closure
         .source_ids
         .len()
@@ -1736,7 +1740,10 @@ mod tests {
                     invocation: "source-invocation".to_owned(),
                     sample_event: Some(super::super::arena::SampleEventId(41)),
                     output_role: "source-output".to_owned(),
-                    sampler: None,
+                    sampler: Some(super::super::arena::SampleDescriptor::new(
+                        "source-sampler",
+                        super::super::arena::ResolvedValueType::Int,
+                    )),
                     artifact: None,
                     value_type: super::super::arena::ResolvedValueType::Int,
                     coordinates: Box::new([3]),
@@ -1791,6 +1798,20 @@ mod tests {
         assert!(closure.event_ids.contains(&source_event));
         assert!(closure.event_ids.contains(&sample_event));
         assert!(!closure.event_ids.contains(&decoder_event));
+        let inventory = super::super::g0::derive_inventory(&job, &closure)
+            .expect("residual descriptor inventory");
+        assert_eq!(inventory.events.len(), 2);
+        assert!(inventory.events.iter().any(|event| event.event == source_event.0));
+        assert!(inventory.events.iter().any(|event| event.event == sample_event.0));
+        assert_eq!(inventory.sources.len(), 1);
+        let first = inventory.encode_canonical().expect("canonical inventory");
+        let second = inventory.encode_canonical().expect("canonical inventory");
+        assert_eq!(first, second);
+        assert_eq!(inventory.canonical_encoded_size().expect("encoded size"), first.len());
+        assert!(inventory.operators.iter().all(|operator| !matches!(
+            operator,
+            super::super::g0::StableOperator::Sample { event: 99, .. }
+        )));
     }
 
     #[test]

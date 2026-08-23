@@ -6,6 +6,7 @@
 // egg-era normal-form authorities are intentionally not compiled.
 pub(crate) mod arena;
 pub(crate) mod facts;
+pub(crate) mod g0;
 pub(crate) mod job;
 pub(crate) mod lower;
 pub(crate) mod monomial;

@@ -12892,6 +12892,7 @@ mod tests {
                 _ => None,
             })
             .expect("universal relation application");
+        assert_ne!(applied_owner, semantic);
         let identity_index = all_events
             .iter()
             .enumerate()
@@ -12937,6 +12938,22 @@ mod tests {
                 .expect("root sum transfer input"),
             _ => unreachable!("root sum index points to a bound transfer"),
         };
+        let root_sum_result = match &all_events[root_sum_index.0 as usize] {
+            NormalizerEvent::BoundTransfer { rule: BoundRule::Sum { inputs }, .. } => inputs
+                .iter()
+                .find_map(|input| match input {
+                    BoundValueRef::Result { event, projection: BoundProjection::Summary } => {
+                        Some(*event)
+                    }
+                    _ => None,
+                })
+                .expect("root sum result input"),
+            _ => unreachable!("root sum index points to a bound transfer"),
+        };
+        assert!(matches!(
+            all_events[root_sum_result.0 as usize],
+            NormalizerEvent::Result { owner, .. } if owner == applied_owner
+        ));
         let root_end_index = all_events
             .iter()
             .enumerate()

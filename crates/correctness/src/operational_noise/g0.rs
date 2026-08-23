@@ -22,7 +22,7 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     mem::size_of,
 };
 use thiserror::Error;
@@ -1980,7 +1980,9 @@ impl FeasibilitySink for FeasibilityTrace {
                                     ..
                                 }) if matches!(
                                     nf.bounded_summary.coefficient_bound(),
-                                    NumericContract::Known(CoefficientBound::Finite(_))
+                                    NumericContract::Known(
+                                        CoefficientBound::ExactZero | CoefficientBound::Finite(_)
+                                    )
                                 )
                             );
                             if !(owner_ok && range_ok && association_ok && summary_ok) {
@@ -2086,38 +2088,38 @@ impl FeasibilitySink for FeasibilityTrace {
     }
 }
 
-fn collect_bound_rule_transfers(rule: &BoundRule, transfers: &mut Vec<EventIndex>) {
+fn visit_bound_rule_transfers(rule: &BoundRule, mut visit: impl FnMut(EventIndex)) {
     match rule {
         BoundRule::Authority(_) => {}
-        BoundRule::Identity { input } => collect_value_ref_transfer(input, transfers),
+        BoundRule::Identity { input } => visit_value_ref_transfer(input, &mut visit),
         BoundRule::Sum { inputs } |
         BoundRule::Maximum { inputs } |
         BoundRule::WeightedSum { inputs } => {
             for input in inputs.iter() {
-                collect_value_ref_transfer(input, transfers);
+                visit_value_ref_transfer(input, &mut visit);
             }
         }
         BoundRule::Scale { value, scale } => {
-            collect_value_ref_transfer(value, transfers);
+            visit_value_ref_transfer(value, &mut visit);
             if let BoundScale::Value(value) = scale {
-                collect_value_ref_transfer(value, transfers);
+                visit_value_ref_transfer(value, &mut visit);
             }
         }
         BoundRule::MonomialProduct { factors, .. } => {
             for factor in factors.iter() {
-                collect_value_ref_transfer(&factor.bound, transfers);
+                visit_value_ref_transfer(&factor.bound, &mut visit);
             }
         }
         BoundRule::Product { left, right, .. } | BoundRule::Tensor { left, right, .. } => {
-            collect_value_ref_transfer(left, transfers);
-            collect_value_ref_transfer(right, transfers);
+            visit_value_ref_transfer(left, &mut visit);
+            visit_value_ref_transfer(right, &mut visit);
         }
     }
 }
 
-fn collect_value_ref_transfer(value: &BoundValueRef, transfers: &mut Vec<EventIndex>) {
+fn visit_value_ref_transfer(value: &BoundValueRef, visit: &mut impl FnMut(EventIndex)) {
     if let BoundValueRef::Transfer(event) = value {
-        transfers.push(*event);
+        visit(*event);
     }
 }
 
@@ -2214,35 +2216,33 @@ impl FeasibilityTrace {
         normalization: &super::relation::NormalizationCache,
     ) -> Result<(), G0Error> {
         let mut frame_starts = vec![None; self.events.len()];
-        let mut frame_roots = BTreeMap::new();
-        let mut frame_ends = BTreeMap::new();
+        let mut frame_roots = vec![None; self.events.len()];
+        let mut frame_ends = vec![None; self.events.len()];
         let mut frames = Vec::new();
-        let mut result_by_owner = BTreeMap::new();
-        let mut consumed_by = BTreeMap::<EventIndex, BTreeSet<super::arena::ScopedExprId>>::new();
+        let mut result_by_owner = HashMap::new();
+        let mut consumed_by = HashSet::new();
         for (index, event) in self.events.iter().enumerate() {
             let current = EventIndex(index as u64);
             if let NormalizerEvent::InvocationStart { root } = event {
                 frames.push(current);
-                frame_roots.insert(current, *root);
+                frame_roots[current.0 as usize] = Some(*root);
             }
             let frame_start = frames.last().copied();
             frame_starts[index] = frame_start;
             if let (Some(frame_start), NormalizerEvent::Result { owner, .. }) = (frame_start, event)
             {
-                result_by_owner.insert((frame_start, *owner), current);
+                result_by_owner.insert((frame_start.0, *owner), current);
             }
             if let NormalizerEvent::BoundTransfer { owner, rule } = event {
-                let mut transfers = Vec::new();
-                collect_bound_rule_transfers(rule, &mut transfers);
-                for transfer in transfers {
-                    consumed_by.entry(transfer).or_default().insert(*owner);
-                }
+                visit_bound_rule_transfers(rule, |transfer| {
+                    consumed_by.insert((transfer.0, *owner));
+                });
             }
             if let NormalizerEvent::InvocationEnd { .. } = event {
                 let Some(frame_start) = frames.pop() else {
                     return Err(G0Error::RelationTraceInvariant);
                 };
-                frame_ends.insert(frame_start, current);
+                frame_ends[frame_start.0 as usize] = Some(current);
             }
         }
         for (index, event) in self.events.iter().enumerate() {
@@ -2298,19 +2298,21 @@ impl FeasibilityTrace {
             let Some(frame_start) = frame_starts[index] else {
                 return Err(G0Error::RelationTraceInvariant);
             };
-            let Some(frame_root) = frame_roots.get(&frame_start) else {
+            let Some(frame_root) = frame_roots.get(frame_start.0 as usize).copied().flatten()
+            else {
                 return Err(G0Error::RelationTraceInvariant);
             };
             if observation.owner.program() != frame_root.program() {
                 return Err(G0Error::RelationTraceInvariant);
             }
-            let Some(result_index) = result_by_owner.get(&(frame_start, observation.owner)) else {
+            let Some(result_index) = result_by_owner.get(&(frame_start.0, observation.owner))
+            else {
                 return Err(G0Error::RelationTraceInvariant);
             };
-            let Some(end_index) = frame_ends.get(&frame_start) else {
+            let Some(end_index) = frame_ends.get(frame_start.0 as usize).copied().flatten() else {
                 return Err(G0Error::RelationTraceInvariant);
             };
-            if *result_index <= EventIndex(index as u64) || result_index >= end_index {
+            if *result_index <= EventIndex(index as u64) || *result_index >= end_index {
                 return Err(G0Error::RelationTraceInvariant);
             }
             let summary = cached_rhs.bounded_summary.coefficient_bound();
@@ -2323,11 +2325,7 @@ impl FeasibilityTrace {
                     return Err(G0Error::RelationTraceInvariant)
                 }
             };
-            if requires_transfer &&
-                !consumed_by
-                    .get(&EventIndex(index as u64))
-                    .is_some_and(|owners| owners.contains(&observation.owner))
-            {
+            if requires_transfer && !consumed_by.contains(&(index as u64, observation.owner)) {
                 return Err(G0Error::RelationTraceInvariant);
             }
         }

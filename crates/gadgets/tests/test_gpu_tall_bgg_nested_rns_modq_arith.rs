@@ -374,6 +374,7 @@ enum TallRunMode {
     ZeroNoise,
     Simulation,
     Benchmark,
+    BenchmarkSelected,
     Full,
 }
 
@@ -384,9 +385,10 @@ impl TallRunMode {
             "zero-noise" => Ok(Self::ZeroNoise),
             "simulation" => Ok(Self::Simulation),
             "benchmark" => Ok(Self::Benchmark),
+            "benchmark-selected" => Ok(Self::BenchmarkSelected),
             "full" => Ok(Self::Full),
             value => Err(format!(
-                "MXX_TALL_NESTED_RNS_MODE must be graph, zero-noise, simulation, benchmark, or full (got {value})"
+                "MXX_TALL_NESTED_RNS_MODE must be graph, zero-noise, simulation, benchmark, benchmark-selected, or full (got {value})"
             )),
         }
     }
@@ -401,8 +403,13 @@ fn validate_error_sigma(run_mode: TallRunMode, error_sigma: f64) -> Result<(), S
     if !error_sigma.is_finite() || error_sigma < 0.0 {
         return Err("MXX_TALL_NESTED_RNS_ERROR_SIGMA must be finite and nonnegative".to_owned());
     }
-    if matches!(run_mode, TallRunMode::Simulation | TallRunMode::Benchmark | TallRunMode::Full) &&
-        error_sigma == 0.0
+    if matches!(
+        run_mode,
+        TallRunMode::Simulation |
+            TallRunMode::Benchmark |
+            TallRunMode::BenchmarkSelected |
+            TallRunMode::Full
+    ) && error_sigma == 0.0
     {
         return Err(format!(
             "MXX_TALL_NESTED_RNS_ERROR_SIGMA must be greater than zero in {run_mode:?} mode; use zero-noise mode for an exact noiseless smoke test"
@@ -1442,6 +1449,31 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
     Err("no configured CRT depth and ring dimension satisfy security and noise".to_owned())
 }
 
+fn prepare_selected_benchmark_candidate(config: &TestConfig) -> Result<PreparedCandidate, String> {
+    let (crt_depth, log_ring_dimension, parameters) =
+        selected_cpu_parameters(config, "selected-parameter Tall benchmark")?;
+    let achieved_security_bits = if config.security_bits == 0 {
+        0
+    } else {
+        lattice_security_bits(&parameters, config.error_sigma)?
+    };
+    if achieved_security_bits < config.security_bits {
+        return Err(format!(
+            "selected Tall benchmark parameters provide {achieved_security_bits} security bits, below the required {}",
+            config.security_bits
+        ));
+    }
+    info!(
+        crt_depth,
+        log_ring_dimension,
+        ring_dimension = parameters.ring_dimension(),
+        achieved_security_bits,
+        required_security_bits = config.security_bits,
+        "preparing previously accepted selected parameters without rerunning operational simulation"
+    );
+    prepare_candidate(parameters, config, achieved_security_bits, CandidatePreparation::RuntimeOnly)
+}
+
 fn log_cost_report(label: &str, report: &CostReport) {
     info!(
         label,
@@ -2138,7 +2170,12 @@ fn test_tall_bgg_nested_rns_security_estimation() -> Result<(), String> {
 
 #[test]
 fn noisy_modes_require_positive_error_sigma_but_zero_noise_does_not() {
-    for mode in [TallRunMode::Simulation, TallRunMode::Benchmark, TallRunMode::Full] {
+    for mode in [
+        TallRunMode::Simulation,
+        TallRunMode::Benchmark,
+        TallRunMode::BenchmarkSelected,
+        TallRunMode::Full,
+    ] {
         assert!(validate_error_sigma(mode, 0.0).is_err(), "{mode:?} must reject zero sigma");
         validate_error_sigma(mode, f64::MIN_POSITIVE).expect("positive sigma is valid");
     }
@@ -2488,6 +2525,11 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
             .expect("Tall graph construction");
             (requested_config, selected)
         }
+        TallRunMode::BenchmarkSelected => {
+            let selected = prepare_selected_benchmark_candidate(&requested_config)
+                .expect("previously accepted selected parameters");
+            (requested_config, selected)
+        }
         TallRunMode::Simulation | TallRunMode::Benchmark | TallRunMode::Full => {
             let selected = select_parameters(&requested_config).expect("parameter simulation");
             (requested_config, selected)
@@ -2525,8 +2567,11 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
     );
     let _reports = benchmark_estimation(&selected, &config, &gpu_parameters, &device_ids)
         .expect("benchmark estimation");
-    if requested_mode == TallRunMode::Benchmark {
-        info!("completed Tall benchmark-only mode before preprocessing execution");
+    if matches!(requested_mode, TallRunMode::Benchmark | TallRunMode::BenchmarkSelected) {
+        info!(
+            skipped_operational_simulation = requested_mode == TallRunMode::BenchmarkSelected,
+            "completed Tall benchmark-only mode before preprocessing execution"
+        );
         return;
     }
     let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)

@@ -39,7 +39,6 @@ pub(crate) trait FeasibilitySink: Default {
         &mut self,
         consumer: super::arena::ScopedExprId,
         input_position: u32,
-        input_arity: u32,
         predecessor: ExprId,
     ) -> Result<(), G0Error>;
 
@@ -187,7 +186,6 @@ pub(crate) enum NormalizerEvent {
     Predecessor {
         consumer: super::arena::ScopedExprId,
         input_position: u32,
-        input_arity: u32,
         predecessor: ExprId,
         source_result: EventIndex,
     },
@@ -268,7 +266,7 @@ pub(crate) enum BoundAuthority {
     FactStore,
     ProgramFamilyFact,
     Operator,
-    RelationPreimageSource { source: super::arena::ScopedExprId },
+    RelationPreimageSource { source: super::arena::ExprId },
     Unavailable,
 }
 
@@ -1297,7 +1295,6 @@ impl FeasibilitySink for NoFeasibility {
         &mut self,
         _consumer: super::arena::ScopedExprId,
         _input_position: u32,
-        _input_arity: u32,
         _predecessor: ExprId,
     ) -> Result<(), G0Error> {
         Ok(())
@@ -1434,7 +1431,6 @@ impl FeasibilitySink for FeasibilityTrace {
         &mut self,
         consumer: super::arena::ScopedExprId,
         input_position: u32,
-        input_arity: u32,
         predecessor: ExprId,
     ) -> Result<(), G0Error> {
         let frame = self.frames.last().ok_or(G0Error::MissingNormalizationResult)?;
@@ -1443,7 +1439,6 @@ impl FeasibilitySink for FeasibilityTrace {
         self.events.push(NormalizerEvent::Predecessor {
             consumer,
             input_position,
-            input_arity,
             predecessor,
             source_result,
         });
@@ -1646,17 +1641,18 @@ impl FeasibilitySink for FeasibilityTrace {
             EventIndex,
             BTreeMap<ExprId, EventIndex>,
             BTreeSet<super::arena::ScopedExprId>,
+            BTreeMap<(super::arena::ScopedExprId, u32), (ExprId, EventIndex)>,
         )>::new();
         let mut frame_starts = vec![None; self.events.len()];
         for (position, event) in self.events.iter().enumerate() {
             let current = EventIndex(u64::try_from(position).map_err(|_| G0Error::TraceOverflow)?);
             match event {
                 NormalizerEvent::InvocationStart { root } => {
-                    stack.push((*root, current, BTreeMap::new(), BTreeSet::new()));
+                    stack.push((*root, current, BTreeMap::new(), BTreeSet::new(), BTreeMap::new()));
                     frame_starts[position] = Some(current);
                 }
                 NormalizerEvent::Result { owner, .. } => {
-                    let Some((root, _, results, pending_bounds)) = stack.last_mut() else {
+                    let Some((root, _, results, pending_bounds, _)) = stack.last_mut() else {
                         return Err(G0Error::MissingNormalizationResult);
                     };
                     if owner.program() != root.program() ||
@@ -1668,20 +1664,32 @@ impl FeasibilitySink for FeasibilityTrace {
                         pending_bounds.remove(owner);
                     }
                 }
-                NormalizerEvent::Predecessor { predecessor, source_result, .. } => {
-                    let Some((_, start, results, _)) = stack.last() else {
+                NormalizerEvent::Predecessor {
+                    consumer,
+                    input_position,
+                    predecessor,
+                    source_result,
+                } => {
+                    let Some((root, start, results, _, predecessors)) = stack.last_mut() else {
                         return Err(G0Error::MissingNormalizationResult);
                     };
-                    if source_result.0 < start.0 ||
+                    if consumer.program() != root.program() ||
+                        source_result.0 < start.0 ||
                         source_result.0 >= current.0 ||
                         results.get(predecessor).copied() != Some(*source_result) ||
                         !matches!(self.events.get(source_result.0 as usize), Some(NormalizerEvent::Result { owner, .. }) if owner.expression() == *predecessor)
                     {
                         return Err(G0Error::MissingNormalizationResult);
                     }
+                    if predecessors
+                        .insert((*consumer, *input_position), (*predecessor, *source_result))
+                        .is_some()
+                    {
+                        return Err(G0Error::MissingNormalizationResult);
+                    }
                 }
                 NormalizerEvent::InvocationEnd { root, result: _, .. } => {
-                    let Some((active_root, _, results, pending_bounds)) = stack.pop() else {
+                    let Some((active_root, _, results, pending_bounds, _)) = stack.pop() else {
                         return Err(G0Error::MissingNormalizationResult);
                     };
                     let Some(result_index) = results.get(&root.expression()).copied() else {
@@ -1717,7 +1725,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                 }
                 NormalizerEvent::AppliedRelation(observation) => {
-                    let Some((root, _, _, _)) = stack.last() else {
+                    let Some((root, _, _, _, _)) = stack.last() else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
                     if root.program() != observation.owner.program() ||
@@ -1732,7 +1740,7 @@ impl FeasibilitySink for FeasibilityTrace {
                             if observation.owner != *decomposition {
                                 return Err(G0Error::RelationTraceInvariant);
                             }
-                            stack.last().is_some_and(|(_, start, results, _)| {
+                            stack.last().is_some_and(|(_, start, results, _, _)| {
                                 input_result.0 >= start.0 && input_result.0 < current.0 &&
                                     results.get(input).copied() == Some(*input_result) &&
                                     matches!(self.events.get(input_result.0 as usize), Some(NormalizerEvent::Result { owner, .. }) if owner.expression() == *input)
@@ -1748,7 +1756,8 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                 }
                 NormalizerEvent::BoundTransfer { owner, .. } => {
-                    let Some((root, start, _, pending_bounds)) = stack.last_mut() else {
+                    let Some((root, start, _, pending_bounds, predecessors)) = stack.last_mut()
+                    else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
                     if root.program() != owner.program() {
@@ -1756,12 +1765,20 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                     frame_starts[position] = Some(*start);
                     let NormalizerEvent::BoundTransfer { rule, .. } = event else { unreachable!() };
-                    self.validate_bound_rule(*root, *owner, *start, current, &frame_starts, rule)?;
+                    self.validate_bound_rule(
+                        *root,
+                        *owner,
+                        *start,
+                        current,
+                        &frame_starts,
+                        predecessors,
+                        rule,
+                    )?;
                     pending_bounds.insert(*owner);
                 }
             }
             if frame_starts[position].is_none() {
-                frame_starts[position] = stack.last().map(|(_, start, _, _)| *start);
+                frame_starts[position] = stack.last().map(|(_, start, _, _, _)| *start);
             }
         }
         if !stack.is_empty() {
@@ -1827,6 +1844,7 @@ impl FeasibilityTrace {
         frame_start: EventIndex,
         current: EventIndex,
         frame_starts: &[Option<EventIndex>],
+        predecessors: &BTreeMap<(super::arena::ScopedExprId, u32), (ExprId, EventIndex)>,
         value_ref: &BoundValueRef,
     ) -> Result<(), G0Error> {
         let same_frame = |index: EventIndex| {
@@ -1835,43 +1853,23 @@ impl FeasibilityTrace {
         };
         match value_ref {
             BoundValueRef::Predecessor { input_position, projection } => {
-                let mut found = false;
-                for index in frame_start.0..current.0 {
-                    let event_index = EventIndex(index);
-                    let Some(NormalizerEvent::Predecessor {
-                        consumer,
-                        input_position: position,
-                        input_arity,
-                        predecessor,
-                        source_result,
-                    }) = self.events.get(index as usize)
-                    else {
-                        continue;
-                    };
-                    if *consumer != owner ||
-                        *position != *input_position ||
-                        *position >= *input_arity
-                    {
-                        continue;
-                    }
-                    if !same_frame(event_index) || !same_frame(*source_result) {
-                        continue;
-                    }
-                    let Some(NormalizerEvent::Result { owner: result_owner, value }) =
-                        self.events.get(source_result.0 as usize)
-                    else {
-                        continue;
-                    };
-                    if result_owner.program() != root.program() ||
-                        result_owner.expression() != *predecessor ||
-                        !Self::projection_is_available(value, projection)
-                    {
-                        continue;
-                    }
-                    found = true;
-                    break;
+                let Some((predecessor, source_result)) =
+                    predecessors.get(&(owner, *input_position))
+                else {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                };
+                if !same_frame(*source_result) {
+                    return Err(G0Error::UnsupportedBoundTransfer);
                 }
-                if !found {
+                let Some(NormalizerEvent::Result { owner: result_owner, value }) =
+                    self.events.get(source_result.0 as usize)
+                else {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                };
+                if result_owner.program() != root.program() ||
+                    result_owner.expression() != *predecessor ||
+                    !Self::projection_is_available(value, projection)
+                {
                     return Err(G0Error::UnsupportedBoundTransfer);
                 }
             }
@@ -1914,6 +1912,7 @@ impl FeasibilityTrace {
         frame_start: EventIndex,
         current: EventIndex,
         frame_starts: &[Option<EventIndex>],
+        predecessors: &BTreeMap<(super::arena::ScopedExprId, u32), (ExprId, EventIndex)>,
         rule: &BoundRule,
     ) -> Result<(), G0Error> {
         let mut refs = Vec::new();
@@ -1944,6 +1943,7 @@ impl FeasibilityTrace {
                 frame_start,
                 current,
                 frame_starts,
+                predecessors,
                 value_ref,
             )
         })
@@ -3770,8 +3770,8 @@ mod tests {
         };
         valid.record_normalization_result(left, &left_value).expect("left result");
         valid.record_normalization_result(child, &child_value).expect("child result");
-        valid.record_predecessor(parent, 0, 2, left_expression).expect("left predecessor");
-        valid.record_predecessor(parent, 1, 2, child_expression).expect("child predecessor");
+        valid.record_predecessor(parent, 0, left_expression).expect("left predecessor");
+        valid.record_predecessor(parent, 1, child_expression).expect("child predecessor");
         valid
             .record_bound_transfer(
                 parent,
@@ -3829,6 +3829,18 @@ mod tests {
                 .filter(|event| matches!(event, NormalizerEvent::BoundTransfer { owner, .. } if *owner == parent))
                 .count(),
             2
+        );
+        let mut duplicate_predecessor = valid.clone();
+        let predecessor = duplicate_predecessor
+            .events
+            .iter()
+            .find(|event| matches!(event, NormalizerEvent::Predecessor { .. }))
+            .cloned()
+            .expect("predecessor");
+        duplicate_predecessor.events.insert(5, predecessor);
+        assert_eq!(
+            duplicate_predecessor.validate_normalization_observations(),
+            Err(G0Error::MissingNormalizationResult)
         );
         for replacement in [
             BoundValueRef::Predecessor {

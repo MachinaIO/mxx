@@ -1096,14 +1096,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         &mut self,
         consumer: ScopedExprId,
         input_position: u32,
-        input_arity: u32,
         predecessor: ExprId,
     ) -> Result<(), NormalizeError> {
         if S::ENABLED {
             self.sink
                 .as_deref_mut()
                 .ok_or(super::g0::G0Error::MissingNormalizationResult)?
-                .record_predecessor(consumer, input_position, input_arity, predecessor)?;
+                .record_predecessor(consumer, input_position, predecessor)?;
         }
         Ok(())
     }
@@ -1264,12 +1263,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let mut children = Vec::with_capacity(node.inputs.len());
         for (input_position, child) in node.inputs.iter().enumerate() {
             children.push(self.child_value(*child)?);
-            self.observe_predecessor(
-                semantic,
-                input_position as u32,
-                u32::try_from(node.inputs.len()).map_err(|_| NormalizeError::ArithmeticOverflow)?,
-                *child,
-            )?;
+            self.observe_predecessor(semantic, input_position as u32, *child)?;
         }
         let output_type = self.expressions.value_type(expression)?.clone();
         let mut value = if matches!(output_type, ResolvedValueType::Matrix(_)) {
@@ -4210,9 +4204,10 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             ValueOperator::Sampler { operation, .. } => sampler_bound(operation),
             ValueOperator::DeterministicHash(_) => NumericContract::Known(CoefficientBound::Large),
             ValueOperator::Transform(operation) => transform_bound(operation),
-            ValueOperator::ProgramCall { program } => {
-                self.relation_live_preimage_bound(expression, *program)?
-            }
+            ValueOperator::ProgramCall { program } => self
+                .relation_live_preimage(expression, *program)?
+                .map(|(_, bound)| bound)
+                .unwrap_or(NumericContract::Missing),
             _ => NumericContract::Missing,
         };
         Ok(derived)
@@ -4221,40 +4216,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     /// An opaque `ProgramCall` is finite only when its exact program is the unique frozen
     /// preimage-family dispatch and that dispatch's source is the family body itself.  The source
     /// sampler's cutoff is the authority; a same-shaped or merely named program is insufficient.
-    fn relation_live_preimage_bound(
+    fn relation_live_preimage(
         &self,
         expression: ExprId,
         program: ValueProgramId,
-    ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
+    ) -> Result<Option<(ExprId, NumericContract<CoefficientBound>)>, NormalizeError> {
         let Some(relations) = self.relations else {
-            return Ok(NumericContract::Missing);
+            return Ok(None);
         };
-        let dispatch = match relations.dispatch_for_preimage_program(program) {
-            Ok(Some(dispatch)) => dispatch,
-            Ok(None) | Err(RelationRegistryError::AmbiguousPreimageDispatch) => {
-                return Ok(NumericContract::Missing)
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let [index] = self.expressions.node(expression)?.inputs.as_ref() else {
-            return Ok(NumericContract::Missing);
-        };
-        if self.expressions.value_type(*index)? != &ResolvedValueType::Int {
-            return Ok(NumericContract::Missing);
-        }
-        let family_body = self.programs.family_body(dispatch.preimage_family)?;
-        if family_body != dispatch.preimage_source.expression {
-            return Ok(NumericContract::Missing);
-        }
-        self.authoritative_source_bound(dispatch.preimage_source.expression)
-    }
-
-    fn relation_preimage_source(
-        &self,
-        expression: ExprId,
-        program: ValueProgramId,
-    ) -> Result<Option<ExprId>, NormalizeError> {
-        let Some(relations) = self.relations else { return Ok(None) };
         let dispatch = match relations.dispatch_for_preimage_program(program) {
             Ok(Some(dispatch)) => dispatch,
             Ok(None) | Err(RelationRegistryError::AmbiguousPreimageDispatch) => return Ok(None),
@@ -4270,7 +4239,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         if family_body != dispatch.preimage_source.expression {
             return Ok(None);
         }
-        Ok(Some(dispatch.preimage_source.expression))
+        let source = dispatch.preimage_source.expression;
+        Ok(Some((source, self.authoritative_source_bound(source)?)))
     }
 
     fn authoritative_source_bound(
@@ -4341,20 +4311,21 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     }
                     bound
                 } else {
-                    let bound = self.relation_live_preimage_bound(expression, *program)?;
-                    if S::ENABLED {
-                        let Some(source) = self.relation_preimage_source(expression, *program)?
-                        else {
+                    let Some((source, bound)) =
+                        self.relation_live_preimage(expression, *program)?
+                    else {
+                        if S::ENABLED {
                             return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
-                        };
+                        }
+                        return Ok(NumericContract::Missing);
+                    };
+                    if S::ENABLED {
                         if bound.is_missing() {
                             return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
                         }
                         self.observe_bound_transfer(
                             owner,
-                            BoundRule::Authority(BoundAuthority::RelationPreimageSource {
-                                source: owner.with_expression(source),
-                            }),
+                            BoundRule::Authority(BoundAuthority::RelationPreimageSource { source }),
                         )?;
                     }
                     bound
@@ -5081,7 +5052,7 @@ mod tests {
             SemanticSourceIdentity, TrustedIndexRange,
         },
         facts::{MatrixFacts, MatrixMetadata, ValueFacts},
-        g0::{BoundRule, FeasibilityTrace, G0Error, NormalizerEvent},
+        g0::{BoundAuthority, BoundRule, EventIndex, FeasibilityTrace, G0Error, NormalizerEvent},
         relation::{
             FactorOrderContract, GadgetRecompositionRegistry, GadgetRecompositionRule,
             RelationRegistry, RelationValidationAuthority, SamplerSourceContract, StaticLhsKey,
@@ -8967,7 +8938,13 @@ mod tests {
         let missing = RelationRegistry::new();
         let mut cache = NormalizationCache::new();
         normalizer = normalizer.with_relations(&missing, &mut cache);
-        assert_eq!(normalizer.relation_preimage_source(call, preimage.program()).unwrap(), None);
+        assert_eq!(
+            normalizer
+                .relation_live_preimage(call, preimage.program())
+                .unwrap()
+                .map(|(source, _)| source),
+            None
+        );
         drop(normalizer);
 
         let public_body = source_with(&mut expressions, matrix.clone(), 9_903);
@@ -9029,10 +9006,116 @@ mod tests {
             .unwrap()
             .with_relations(&unique, &mut unique_cache);
         assert_eq!(
-            normalizer.relation_preimage_source(call, preimage.program()).unwrap(),
+            normalizer
+                .relation_live_preimage(call, preimage.program())
+                .unwrap()
+                .map(|(source, _)| source),
             Some(source)
         );
         drop(normalizer);
+
+        let mut trace = FeasibilityTrace::default();
+        let mut normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .with_relations(&unique, &mut unique_cache);
+        normalizer.normalize(semantic).unwrap();
+        drop(normalizer);
+        trace.validate_normalization_observations().unwrap();
+        let mut active_frames = Vec::new();
+        let mut event_frames = vec![None; trace.normalization_events().len()];
+        for (index, event) in trace.normalization_events().iter().enumerate() {
+            let current = EventIndex(index as u64);
+            if matches!(event, NormalizerEvent::InvocationStart { .. }) {
+                active_frames.push(current);
+            }
+            event_frames[index] = active_frames.last().copied();
+            if matches!(event, NormalizerEvent::InvocationEnd { .. }) {
+                active_frames.pop();
+            }
+        }
+        let transfers = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                NormalizerEvent::BoundTransfer { owner, rule } => Some((
+                    EventIndex(index as u64),
+                    event_frames[index].expect("transfer frame"),
+                    *owner,
+                    rule.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let outer_relation = transfers
+            .iter()
+            .find(|(_, frame, owner, rule)| {
+                *frame == EventIndex(0) &&
+                    *owner == semantic &&
+                    matches!(rule, BoundRule::Authority(BoundAuthority::RelationPreimageSource { source: actual }) if *actual == source)
+            })
+            .cloned()
+            .expect("outer relation source transfer");
+        let nested_source_operator = transfers
+            .iter()
+            .find(|(_, frame, owner, rule)| {
+                *frame != outer_relation.1 &&
+                    owner.expression() == public_body &&
+                    matches!(rule, BoundRule::Authority(BoundAuthority::Operator))
+            })
+            .cloned()
+            .expect("nested source-body operator transfer");
+        assert_eq!(
+            transfers
+                .iter()
+                .filter(|(_, frame, owner, rule)| {
+                    *frame == outer_relation.1 &&
+                        *owner == semantic &&
+                        matches!(rule, BoundRule::Authority(BoundAuthority::RelationPreimageSource { source: actual }) if *actual == source)
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            transfers
+                .iter()
+                .filter(|(_, frame, owner, rule)| {
+                    *frame == nested_source_operator.1 &&
+                        owner.expression() == public_body &&
+                        matches!(rule, BoundRule::Authority(BoundAuthority::Operator))
+                })
+                .count(),
+            1
+        );
+        let selected_roles = transfers
+            .iter()
+            .filter(|(_, frame, owner, rule)| {
+                (*frame == outer_relation.1 && *owner == semantic &&
+                    matches!(rule, BoundRule::Authority(BoundAuthority::RelationPreimageSource { source: actual }) if *actual == source)) ||
+                    (*frame == nested_source_operator.1 && owner.expression() == public_body &&
+                        matches!(rule, BoundRule::Authority(BoundAuthority::Operator)))
+            })
+            .count();
+        assert_eq!(selected_roles, 2);
+        assert_ne!(outer_relation.2, nested_source_operator.2);
+        assert_ne!(outer_relation.1, nested_source_operator.1);
+
+        let mut mismatched_dispatch = dispatch.clone();
+        mismatched_dispatch.preimage_source.expression = public_body;
+        let mut mismatched = RelationRegistry::new();
+        mismatched.register_universal(registration(mismatched_dispatch)).unwrap();
+        mismatched.freeze();
+        let mut mismatched_cache = NormalizationCache::new();
+        let normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&mismatched, &mut mismatched_cache);
+        assert_eq!(normalizer.relation_live_preimage(call, preimage.program()).unwrap(), None);
 
         let mut ambiguous = RelationRegistry::new();
         ambiguous.register_universal(registration(dispatch.clone())).unwrap();
@@ -9044,7 +9127,13 @@ mod tests {
         let normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
             .unwrap()
             .with_relations(&ambiguous, &mut ambiguous_cache);
-        assert_eq!(normalizer.relation_preimage_source(call, preimage.program()).unwrap(), None);
+        assert_eq!(
+            normalizer
+                .relation_live_preimage(call, preimage.program())
+                .unwrap()
+                .map(|(source, _)| source),
+            None
+        );
         let scoped_source = semantic.with_expression(source);
         assert_eq!(scoped_source.expression(), source);
         assert_eq!(scoped_source.program(), semantic.program());

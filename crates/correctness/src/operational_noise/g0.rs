@@ -429,6 +429,193 @@ impl IndexLutEvidenceSet {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct SliceLutRow {
+    pub tuple: Vec<String>,
+    #[serde(rename = "rowStart")]
+    pub row_start: String,
+    #[serde(rename = "rowEndExclusive")]
+    pub row_end_exclusive: String,
+    #[serde(rename = "columnStart")]
+    pub column_start: String,
+    #[serde(rename = "columnEndExclusive")]
+    pub column_end_exclusive: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct SliceLutEvidence {
+    pub id: String,
+    #[serde(rename = "frontierProduct")]
+    pub frontier_product: String,
+    pub rows: Vec<SliceLutRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct G0LutEvidence {
+    pub index_uses: Vec<IndexLutEvidence>,
+    pub slice_groups: Vec<SliceLutEvidence>,
+    pub l_rows: BigUint,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct G0LutDocument<'a> {
+    index_uses: &'a [IndexLutEvidence],
+    slice_groups: &'a [SliceLutEvidence],
+}
+
+impl G0LutEvidence {
+    pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, G0Error> {
+        serde_json::to_vec(&G0LutDocument {
+            index_uses: &self.index_uses,
+            slice_groups: &self.slice_groups,
+        })
+        .map_err(|error| G0Error::Encoding(error.to_string()))
+    }
+
+    pub(crate) fn canonical_encoded_byte_size(&self) -> Result<usize, G0Error> {
+        Ok(self.encode_canonical()?.len())
+    }
+
+    pub(crate) fn l_bytes(&self) -> Result<usize, G0Error> {
+        self.canonical_encoded_byte_size()
+    }
+}
+
+/// Enumerate ordinary plans and synchronized slice groups into one deterministic G0 payload.
+/// Group members are consumed as one shared frontier table and never appear in `indexUses`.
+pub(crate) fn enumerate_lut_evidence<'a>(
+    arena: &ExprArena,
+    plans: impl IntoIterator<Item = &'a IndexUsePlan>,
+) -> Result<G0LutEvidence, G0Error> {
+    let mut ordinary = Vec::new();
+    let mut groups = BTreeMap::<SliceGroupId, Vec<&IndexUsePlan>>::new();
+    for plan in plans {
+        plan.validate()?;
+        if let Some(group) = &plan.slice_group {
+            groups.entry(group.id).or_default().push(plan);
+        } else if plan.kind != IndexUseKind::IndexedSlice {
+            ordinary.push(plan);
+        } else {
+            return Err(G0Error::InvalidSliceGroup);
+        }
+    }
+
+    let mut index_uses = Vec::with_capacity(ordinary.len());
+    let mut l_rows = BigUint::zero();
+    for plan in ordinary {
+        let evidence = enumerate_index_use(arena, plan)?;
+        l_rows += BigUint::from(evidence.rows.len());
+        index_uses.push(evidence);
+    }
+    let mut slice_groups = Vec::with_capacity(groups.len());
+    for (id, plans) in groups {
+        let evidence = enumerate_slice_group(arena, id, &plans)?;
+        l_rows += BigUint::from(evidence.rows.len());
+        slice_groups.push(evidence);
+    }
+    Ok(G0LutEvidence { index_uses, slice_groups, l_rows })
+}
+
+fn enumerate_slice_group(
+    arena: &ExprArena,
+    id: SliceGroupId,
+    plans: &[&IndexUsePlan],
+) -> Result<SliceLutEvidence, G0Error> {
+    if plans.len() != 4 {
+        return Err(G0Error::InvalidSliceGroup);
+    }
+    let first = plans[0];
+    let group = first.slice_group.as_ref().ok_or(G0Error::InvalidSliceGroup)?;
+    if group.id != id || group.members.len() != 4 {
+        return Err(G0Error::InvalidSliceGroup);
+    }
+    let ResolvedValueType::Matrix(output_type) = &first.output_type else {
+        return Err(G0Error::InvalidSliceGroup);
+    };
+    if group.row_span != Some(output_type.rows) || group.column_span != Some(output_type.columns) {
+        return Err(G0Error::InvalidSliceSpan);
+    }
+    let consumed = first.consumed.ok_or(G0Error::InvalidSliceGroup)?;
+    let ResolvedValueType::Matrix(input_type) = arena.value_type(consumed)? else {
+        return Err(G0Error::InvalidSliceGroup);
+    };
+    let mut member_by_expression = BTreeMap::new();
+    for member in &group.members {
+        if member_by_expression.insert(member.expression, member).is_some() {
+            return Err(G0Error::DuplicateSliceGroupMember);
+        }
+    }
+    let mut seen_roles = BTreeSet::new();
+    for plan in plans {
+        if plan.kind != IndexUseKind::IndexedSlice ||
+            plan.frontier != first.frontier ||
+            plan.owner != first.owner ||
+            plan.consumed != Some(consumed) ||
+            plan.output_type != first.output_type
+        {
+            return Err(G0Error::SliceGroupAxesMismatch);
+        }
+        let Some(member) = member_by_expression.get(&plan.index) else {
+            return Err(G0Error::MissingSliceGroupMember);
+        };
+        if plan.output_range != Some(member.range) || !seen_roles.insert(member.role) {
+            return Err(G0Error::DuplicateSliceGroupMember);
+        }
+        if plan.slice_group.as_ref() != Some(group) {
+            return Err(G0Error::SliceGroupAxesMismatch);
+        }
+    }
+    if seen_roles.len() != 4 {
+        return Err(G0Error::MissingSliceGroupMember);
+    }
+
+    let product = frontier_product(&group.frontier)?;
+    let row_count = checked_row_capacity::<SliceLutRow>(&product)?;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(row_count).map_err(|_| G0Error::InfeasibleIndexRows)?;
+    enumerate_frontier(&group.frontier, row_count, |tuple| {
+        let bindings = axis_bindings(&group.frontier, tuple);
+        let mut values = BTreeMap::new();
+        for member in &group.members {
+            let value = evaluated_integer(evaluate_typed_index(
+                arena,
+                member.expression,
+                &group.frontier,
+                &bindings,
+            )?)?;
+            verify_output_range(&value, member.range)?;
+            values.insert(member.role, value);
+        }
+        let row_start = values.remove(&SliceMemberRole::RowStart).unwrap();
+        let row_end_exclusive = values.remove(&SliceMemberRole::RowEndExclusive).unwrap();
+        let column_start = values.remove(&SliceMemberRole::ColumnStart).unwrap();
+        let column_end_exclusive = values.remove(&SliceMemberRole::ColumnEndExclusive).unwrap();
+        if row_end_exclusive <= row_start || column_end_exclusive <= column_start {
+            return Err(G0Error::InvalidSliceSpan);
+        }
+        if row_end_exclusive > BigInt::from(input_type.rows) ||
+            column_end_exclusive > BigInt::from(input_type.columns)
+        {
+            return Err(G0Error::SliceBoundsEscape);
+        }
+        if &row_end_exclusive - &row_start != BigInt::from(output_type.rows) ||
+            &column_end_exclusive - &column_start != BigInt::from(output_type.columns)
+        {
+            return Err(G0Error::InvalidSliceSpan);
+        }
+        rows.push(SliceLutRow {
+            tuple: tuple.iter().map(ToString::to_string).collect(),
+            row_start: row_start.to_string(),
+            row_end_exclusive: row_end_exclusive.to_string(),
+            column_start: column_start.to_string(),
+            column_end_exclusive: column_end_exclusive.to_string(),
+        });
+        Ok(())
+    })?;
+    Ok(SliceLutEvidence { id: id.0.to_string(), frontier_product: product.to_string(), rows })
+}
+
 /// Enumerate validated, residual-filtered ordinary index plans into deterministic LUT evidence.
 /// Plans carrying synchronized slice groups are skipped until their dedicated grouped
 /// enumerator is introduced in a later stage.
@@ -1027,6 +1214,8 @@ pub(crate) enum G0Error {
     MissingIndexOutputRange,
     #[error("evaluated index output is outside its declared half-open range")]
     IndexOutputOutOfRange,
+    #[error("indexed-slice endpoint escapes the consumed matrix extent")]
+    SliceBoundsEscape,
     #[error("typed index evaluator rejected the expression: {0}")]
     IndexEvaluation(#[from] IndexEvaluationError),
     #[error("G0 descriptor encoding failed: {0}")]
@@ -1970,8 +2159,260 @@ mod tests {
         assert!(evidence.index_uses.is_empty());
     }
 
+    #[test]
+    fn synchronized_slice_lut_has_one_zero_axis_row_and_exact_total_bytes() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let slice_plans = slice_plans(&mut arena, 2, 2, 1, 1, [0, 1, 0, 1], 41);
+        let ordinary =
+            index_plan(IndexUseKind::IntegerExpression, constant_int(&mut arena, 7), Vec::new());
+        let mut plans = vec![ordinary];
+        plans.extend(slice_plans);
+        let evidence = enumerate_lut_evidence(&arena, plans.iter()).unwrap();
+        assert_eq!(evidence.index_uses.len(), 1);
+        assert_eq!(evidence.slice_groups.len(), 1);
+        assert_eq!(evidence.slice_groups[0].frontier_product, "1");
+        assert_eq!(evidence.slice_groups[0].rows.len(), 1);
+        assert_eq!(evidence.slice_groups[0].rows[0].row_start, "0");
+        assert_eq!(evidence.slice_groups[0].rows[0].row_end_exclusive, "1");
+        assert_eq!(evidence.l_rows, BigUint::from(2_u8));
+        let bytes = evidence.encode_canonical().unwrap();
+        assert_eq!(bytes, evidence.encode_canonical().unwrap());
+        assert_eq!(evidence.l_bytes().unwrap(), bytes.len());
+        assert_eq!(evidence.canonical_encoded_byte_size().unwrap(), bytes.len());
+        let json = String::from_utf8(bytes).unwrap();
+        assert!(json.contains("\"indexUses\":["));
+        assert!(json.contains("\"sliceGroups\":["));
+    }
+
+    #[test]
+    fn synchronized_slice_lut_shares_two_axis_frontier_and_order() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let row = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let column = arena.intern_argument(1, ResolvedValueType::Int).unwrap();
+        let one = constant_int(&mut arena, 1);
+        let row_end =
+            arena.intern_slice(ValueOperator::Scalar(ScalarOperation::Add), &[row, one]).unwrap();
+        let column_end = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::Add), &[column, one])
+            .unwrap();
+        let owner =
+            ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path: 52 };
+        let frontier = vec![
+            actual_axis(row, owner.clone(), 0, 0, 2),
+            actual_axis(column, owner.clone(), 1, 0, 2),
+        ];
+        let consumed = matrix_source(&mut arena, 3, 3);
+        let output_type = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
+        let ranges = [
+            TrustedIndexRange { minimum: 0, maximum_exclusive: 2 },
+            TrustedIndexRange { minimum: 1, maximum_exclusive: 3 },
+            TrustedIndexRange { minimum: 0, maximum_exclusive: 2 },
+            TrustedIndexRange { minimum: 1, maximum_exclusive: 3 },
+        ];
+        let expressions = [row, row_end, column, column_end];
+        let group = SynchronizedSliceGroup {
+            id: SliceGroupId(52),
+            frontier: frontier.clone().into_boxed_slice(),
+            members: vec![
+                SliceGroupMember {
+                    role: SliceMemberRole::RowStart,
+                    expression: row,
+                    range: ranges[0],
+                },
+                SliceGroupMember {
+                    role: SliceMemberRole::RowEndExclusive,
+                    expression: row_end,
+                    range: ranges[1],
+                },
+                SliceGroupMember {
+                    role: SliceMemberRole::ColumnStart,
+                    expression: column,
+                    range: ranges[2],
+                },
+                SliceGroupMember {
+                    role: SliceMemberRole::ColumnEndExclusive,
+                    expression: column_end,
+                    range: ranges[3],
+                },
+            ]
+            .into_boxed_slice(),
+            row_span: Some(1),
+            column_span: Some(1),
+        };
+        let plans = expressions
+            .into_iter()
+            .zip(ranges)
+            .map(|(index, output_range)| IndexUsePlan {
+                kind: IndexUseKind::IndexedSlice,
+                owner: planned_owner(52),
+                result: Some(consumed),
+                result_family: None,
+                consumed: Some(consumed),
+                consumed_family: None,
+                index,
+                frontier: frontier.clone().into_boxed_slice(),
+                output_type: ResolvedValueType::Matrix(output_type.clone()),
+                output_range: Some(output_range),
+                slice_group: Some(group.clone()),
+            })
+            .collect::<Vec<_>>();
+        let evidence = enumerate_lut_evidence(&arena, plans.iter()).unwrap();
+        assert!(evidence.index_uses.is_empty());
+        let rows = &evidence.slice_groups[0].rows;
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows.iter().map(|row| row.tuple.clone()).collect::<Vec<_>>(),
+            vec![
+                vec!["0".to_owned(), "0".to_owned()],
+                vec!["0".to_owned(), "1".to_owned()],
+                vec!["1".to_owned(), "0".to_owned()],
+                vec!["1".to_owned(), "1".to_owned()],
+            ]
+        );
+        assert_eq!(rows[1].row_start, "0");
+        assert_eq!(rows[1].column_start, "1");
+        assert_eq!(evidence.l_rows, BigUint::from(4_u8));
+    }
+
+    #[test]
+    fn synchronized_slice_lut_rejects_span_and_extent_errors() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let invalid_span = slice_plans(&mut arena, 3, 3, 1, 1, [0, 2, 0, 1], 61);
+        assert_eq!(
+            enumerate_lut_evidence(&arena, invalid_span.iter()),
+            Err(G0Error::InvalidSliceSpan)
+        );
+        let invalid_extent = slice_plans(&mut arena, 1, 1, 2, 1, [0, 2, 0, 1], 62);
+        assert_eq!(
+            enumerate_lut_evidence(&arena, invalid_extent.iter()),
+            Err(G0Error::SliceBoundsEscape)
+        );
+    }
+
+    fn matrix_source(
+        arena: &mut super::super::arena::ExprArena,
+        rows: usize,
+        columns: usize,
+    ) -> ExprId {
+        let matrix_type = ResolvedMatrixType::new(17_u8.into(), 1, rows, columns).unwrap();
+        arena
+            .intern(
+                ValueOperator::Source(SemanticSourceIdentity {
+                    stable_definition: "matrix-input".to_owned(),
+                    invocation: "root".to_owned(),
+                    sample_event: None,
+                    output_role: "value".to_owned(),
+                    sampler: None,
+                    artifact: None,
+                    value_type: ResolvedValueType::Matrix(matrix_type),
+                    coordinates: Box::new([]),
+                    matrix_constant: None,
+                }),
+                Box::new([]),
+            )
+            .unwrap()
+    }
+
+    fn slice_plans(
+        arena: &mut super::super::arena::ExprArena,
+        input_rows: usize,
+        input_columns: usize,
+        output_rows: usize,
+        output_columns: usize,
+        endpoints: [i64; 4],
+        id: u64,
+    ) -> Vec<IndexUsePlan> {
+        let consumed = matrix_source(arena, input_rows, input_columns);
+        let output_type =
+            ResolvedMatrixType::new(17_u8.into(), 1, output_rows, output_columns).unwrap();
+        let expressions = [
+            distinct_endpoint(arena, endpoints[0], 0),
+            distinct_endpoint(arena, endpoints[1], 1),
+            distinct_endpoint(arena, endpoints[2], 2),
+            distinct_endpoint(arena, endpoints[3], 3),
+        ];
+        let endpoint_range = TrustedIndexRange {
+            minimum: 0,
+            maximum_exclusive: (input_rows.max(input_columns) + 2) as u64,
+        };
+        let ranges = [endpoint_range; 4];
+        let group = SynchronizedSliceGroup {
+            id: SliceGroupId(id),
+            frontier: Box::new([]),
+            members: vec![
+                SliceGroupMember {
+                    role: SliceMemberRole::RowStart,
+                    expression: expressions[0],
+                    range: ranges[0],
+                },
+                SliceGroupMember {
+                    role: SliceMemberRole::RowEndExclusive,
+                    expression: expressions[1],
+                    range: ranges[1],
+                },
+                SliceGroupMember {
+                    role: SliceMemberRole::ColumnStart,
+                    expression: expressions[2],
+                    range: ranges[2],
+                },
+                SliceGroupMember {
+                    role: SliceMemberRole::ColumnEndExclusive,
+                    expression: expressions[3],
+                    range: ranges[3],
+                },
+            ]
+            .into_boxed_slice(),
+            row_span: Some(output_rows),
+            column_span: Some(output_columns),
+        };
+        expressions
+            .into_iter()
+            .zip(ranges)
+            .map(|(index, output_range)| IndexUsePlan {
+                kind: IndexUseKind::IndexedSlice,
+                owner: planned_owner(id),
+                result: Some(consumed),
+                result_family: None,
+                consumed: Some(consumed),
+                consumed_family: None,
+                index,
+                frontier: Box::new([]),
+                output_type: ResolvedValueType::Matrix(output_type.clone()),
+                output_range: Some(output_range),
+                slice_group: Some(group.clone()),
+            })
+            .collect()
+    }
+
     fn constant_int(arena: &mut super::super::arena::ExprArena, value: i64) -> ExprId {
         arena.intern(ValueOperator::Constant(TypedConstant::int(value)), Box::new([])).unwrap()
+    }
+
+    fn distinct_endpoint(
+        arena: &mut super::super::arena::ExprArena,
+        value: i64,
+        role: u8,
+    ) -> ExprId {
+        let value = constant_int(arena, value);
+        let zero = constant_int(arena, 0);
+        match role {
+            0 => value,
+            1 => {
+                let negated = arena
+                    .intern_slice(ValueOperator::Scalar(ScalarOperation::Negate), &[value])
+                    .unwrap();
+                arena
+                    .intern_slice(ValueOperator::Scalar(ScalarOperation::Negate), &[negated])
+                    .unwrap()
+            }
+            2 => arena
+                .intern_slice(ValueOperator::Scalar(ScalarOperation::Add), &[value, zero])
+                .unwrap(),
+            3 => arena
+                .intern_slice(ValueOperator::Scalar(ScalarOperation::Subtract), &[value, zero])
+                .unwrap(),
+            _ => unreachable!(),
+        }
     }
 
     fn expression(slot: u32) -> super::super::arena::ExprId {

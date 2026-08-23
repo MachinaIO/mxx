@@ -3616,9 +3616,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             bounded_summary: BoundedSummary::zero(),
         };
         self.rewrite_relations(&mut candidate)?;
-        if S::ENABLED && !candidate.bounded_summary.is_zero() {
-            return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
-        }
         *noise = add_noise_summaries(noise, &candidate.bounded_summary.coefficient_bound());
         for (rewritten, rewritten_coefficient) in candidate.exact_terms {
             let bound = self.bound_monomial(rewritten, &rewritten_coefficient)?;
@@ -3771,6 +3768,15 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 return Ok(None);
             };
             if S::ENABLED {
+                let summary_factor = outer_coefficient
+                    .map_or(BigUint::from(1_u8), |coefficient| coefficient.magnitude().clone());
+                let summary_noise = scale_noise_summary(
+                    &normal_form.bounded_summary.coefficient_bound(),
+                    &summary_factor,
+                );
+                if summary_noise != NumericContract::Known(CoefficientBound::ExactZero) {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                }
                 let input_result = self.relation_input_result(input)?;
                 self.observe_applied_relation(super::g0::AppliedRelation {
                     owner: decomposition,
@@ -3915,13 +3921,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 self.rewrite_gadget_decomposition(monomial, S::ENABLED.then_some(&coefficient))?
             {
                 changed = true;
-                relation_noise = add_noise_summaries(
-                    &relation_noise,
-                    &scale_noise_summary(
-                        &rewritten.bounded_summary.coefficient_bound(),
-                        coefficient.magnitude(),
-                    ),
+                let rewritten_noise = scale_noise_summary(
+                    &rewritten.bounded_summary.coefficient_bound(),
+                    coefficient.magnitude(),
                 );
+                relation_noise = add_noise_summaries(&relation_noise, &rewritten_noise);
                 for (rewritten_monomial, rewritten_coefficient) in
                     rewritten.exact_terms.into_iter().rev()
                 {
@@ -3933,19 +3937,40 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 continue;
             }
 
-            self.counters.relation_candidates = self.counters.relation_candidates.saturating_add(1);
             let Some(relation_match) = self.find_relation_match(monomial)? else {
+                self.counters.relation_candidates =
+                    self.counters.relation_candidates.saturating_add(1);
                 merge_term(&mut result, monomial, coefficient);
                 continue;
             };
-            changed = true;
-            self.counters.relation_applied = self.counters.relation_applied.saturating_add(1);
             let rhs = self
                 .normalization
                 .as_deref()
                 .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?
                 .get_arc(relation_match.rhs)?;
             self.validate_relation_rhs(&rhs)?;
+            let rhs_noise = scale_noise_summary(
+                &rhs.bounded_summary.coefficient_bound(),
+                coefficient.magnitude(),
+            );
+            let has_left_context =
+                !(relation_match.remaining_central.is_empty() && relation_match.prefix.is_empty());
+            let has_suffix_context = !relation_match.suffix.is_empty();
+            if rhs_noise != NumericContract::Known(CoefficientBound::ExactZero) {
+                // A summary has no multiplicative identity. It may be preserved only when the
+                // relation replaces the complete monomial without an exact prefix or suffix.
+                if has_left_context || has_suffix_context {
+                    return Err(NormalizeError::Relation(
+                        RelationRegistryError::InvalidCanonicalRhs,
+                    ));
+                }
+                if S::ENABLED {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                }
+            }
+            changed = true;
+            self.counters.relation_candidates = self.counters.relation_candidates.saturating_add(1);
+            self.counters.relation_applied = self.counters.relation_applied.saturating_add(1);
             let left = if relation_match.remaining_central.is_empty() &&
                 relation_match.prefix.is_empty()
             {
@@ -3993,18 +4018,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     },
                 })?;
             }
-            let rhs_noise = scale_noise_summary(
-                &rhs.bounded_summary.coefficient_bound(),
-                coefficient.magnitude(),
-            );
             if rhs_noise != NumericContract::Known(CoefficientBound::ExactZero) {
-                // A summary has no multiplicative identity. It may be preserved only when the
-                // relation replaces the complete monomial without an exact prefix or suffix.
-                if left.is_some() || suffix.is_some() {
-                    return Err(NormalizeError::Relation(
-                        RelationRegistryError::InvalidCanonicalRhs,
-                    ));
-                }
                 relation_noise = add_noise_summaries(&relation_noise, &rhs_noise);
             }
             let mut recombined = Vec::with_capacity(rhs.exact_terms.len());

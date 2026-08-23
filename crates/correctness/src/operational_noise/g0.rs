@@ -76,7 +76,9 @@ pub(crate) trait FeasibilitySink: Default {
         key: super::relation::RuntimeSpecializationKey,
     ) -> Result<(), G0Error>;
 
-    fn record_relation(&mut self, observation: RelationObservation) -> Result<(), G0Error>;
+    fn resolve_result(&self, expression: ExprId) -> Result<EventIndex, G0Error>;
+
+    fn record_applied_relation(&mut self, observation: AppliedRelation) -> Result<(), G0Error>;
 
     fn record_bound_transfer(
         &mut self,
@@ -205,7 +207,7 @@ pub(crate) enum NormalizerEvent {
         key: super::relation::RuntimeSpecializationKey,
         source: EventRange,
     },
-    Relation(RelationObservation),
+    AppliedRelation(AppliedRelation),
     BoundTransfer(BoundTransferObservation),
 }
 
@@ -217,38 +219,28 @@ struct InvocationFrame {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) enum RelationObservationKind {
+pub(crate) enum AppliedRelationRule {
     Universal {
         dispatch: super::relation::UniversalDispatchKey,
-        lhs: Option<super::relation::CanonicalLhsKey>,
-        rhs: Option<super::relation::CanonicalRhsId>,
+        lhs: super::relation::CanonicalLhsKey,
+        rhs: super::relation::CanonicalRhsId,
     },
     Gadget {
         gadget: super::arena::ScopedExprId,
         decomposition: super::arena::ScopedExprId,
         input: ExprId,
+        input_result: EventIndex,
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) enum RelationObservationDisposition {
-    Considered,
-    NoMatch,
-    Applied,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) enum RelationResult {
-    Universal(super::relation::CanonicalRhsId),
-    Gadget(super::monomial::MonomialId),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct RelationObservation {
+pub(crate) struct AppliedRelation {
     pub owner: super::arena::ScopedExprId,
-    pub kind: RelationObservationKind,
-    pub disposition: RelationObservationDisposition,
-    pub result: Option<RelationResult>,
+    pub source_monomial: super::monomial::MonomialId,
+    pub outer_coefficient: BigInt,
+    pub ordered_start: u32,
+    pub ordered_end_exclusive: u32,
+    pub rule: AppliedRelationRule,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1290,7 +1282,11 @@ impl FeasibilitySink for NoFeasibility {
         Ok(())
     }
 
-    fn record_relation(&mut self, _observation: RelationObservation) -> Result<(), G0Error> {
+    fn resolve_result(&self, _expression: ExprId) -> Result<EventIndex, G0Error> {
+        Ok(EventIndex(0))
+    }
+
+    fn record_applied_relation(&mut self, _observation: AppliedRelation) -> Result<(), G0Error> {
         Ok(())
     }
 
@@ -1450,7 +1446,10 @@ impl FeasibilitySink for FeasibilityTrace {
     }
 
     fn abort_invocation(&mut self, _root: super::arena::ScopedExprId) {
-        let _ = self.frames.pop();
+        let Some(frame) = self.frames.pop() else { return };
+        let truncate = frame.range.start.0 as usize;
+        self.events.truncate(truncate);
+        self.specialization_ranges.retain(|_, range| range.end.0 <= truncate as u64);
     }
 
     fn specialization_miss_start(
@@ -1458,7 +1457,10 @@ impl FeasibilitySink for FeasibilityTrace {
         owner: super::arena::ScopedExprId,
         key: super::relation::RuntimeSpecializationKey,
     ) -> Result<EventIndex, G0Error> {
-        if key.index != owner || self.specialization_ranges.contains_key(&key) {
+        if self.frames.is_empty() ||
+            key.index != owner ||
+            self.specialization_ranges.contains_key(&key)
+        {
             return Err(G0Error::SpecializationTraceInvariant);
         }
         Ok(EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?))
@@ -1472,7 +1474,10 @@ impl FeasibilitySink for FeasibilityTrace {
     ) -> Result<(), G0Error> {
         let current =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
-        if key.index != owner || self.specialization_ranges.contains_key(&key) {
+        if self.frames.is_empty() ||
+            key.index != owner ||
+            self.specialization_ranges.contains_key(&key)
+        {
             return Err(G0Error::SpecializationTraceInvariant);
         }
         let replay = EventRange::checked(replay_start, current)?;
@@ -1488,7 +1493,7 @@ impl FeasibilitySink for FeasibilityTrace {
     ) -> Result<(), G0Error> {
         let current =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
-        if key.index != owner {
+        if self.frames.is_empty() || key.index != owner {
             return Err(G0Error::SpecializationTraceInvariant);
         }
         let source =
@@ -1501,13 +1506,18 @@ impl FeasibilitySink for FeasibilityTrace {
         Ok(())
     }
 
-    fn record_relation(&mut self, observation: RelationObservation) -> Result<(), G0Error> {
-        if observation.disposition == RelationObservationDisposition::Applied &&
-            observation.result.is_none()
-        {
-            return Err(G0Error::MissingRelationResult);
+    fn resolve_result(&self, expression: ExprId) -> Result<EventIndex, G0Error> {
+        self.frames
+            .last()
+            .and_then(|frame| frame.results.get(&expression).copied())
+            .ok_or(G0Error::RelationTraceInvariant)
+    }
+
+    fn record_applied_relation(&mut self, observation: AppliedRelation) -> Result<(), G0Error> {
+        if self.frames.is_empty() || observation.ordered_start > observation.ordered_end_exclusive {
+            return Err(G0Error::RelationTraceInvariant);
         }
-        self.events.push(NormalizerEvent::Relation(observation));
+        self.events.push(NormalizerEvent::AppliedRelation(observation));
         Ok(())
     }
 
@@ -1523,50 +1533,84 @@ impl FeasibilitySink for FeasibilityTrace {
         if !self.frames.is_empty() {
             return Err(G0Error::MissingNormalizationResult);
         }
+        let mut stack =
+            Vec::<(super::arena::ScopedExprId, EventIndex, BTreeMap<ExprId, EventIndex>)>::new();
         for (position, event) in self.events.iter().enumerate() {
             let current = EventIndex(u64::try_from(position).map_err(|_| G0Error::TraceOverflow)?);
             match event {
+                NormalizerEvent::InvocationStart { root } => {
+                    stack.push((*root, current, BTreeMap::new()));
+                }
+                NormalizerEvent::Result { owner, .. } => {
+                    let Some((_, _, results)) = stack.last_mut() else {
+                        return Err(G0Error::MissingNormalizationResult);
+                    };
+                    if results.insert(owner.expression(), current).is_some() {
+                        return Err(G0Error::MissingNormalizationResult);
+                    }
+                }
+                NormalizerEvent::Predecessor { predecessor, source_result, .. } => {
+                    let Some((_, start, results)) = stack.last() else {
+                        return Err(G0Error::MissingNormalizationResult);
+                    };
+                    if source_result.0 < start.0 ||
+                        source_result.0 >= current.0 ||
+                        results.get(predecessor).copied() != Some(*source_result) ||
+                        !matches!(self.events.get(source_result.0 as usize), Some(NormalizerEvent::Result { owner, .. }) if owner.expression() == *predecessor)
+                    {
+                        return Err(G0Error::MissingNormalizationResult);
+                    }
+                }
+                NormalizerEvent::InvocationEnd { root, .. } => {
+                    let Some((active_root, _, results)) = stack.pop() else {
+                        return Err(G0Error::MissingNormalizationResult);
+                    };
+                    if active_root != *root || !results.contains_key(&root.expression()) {
+                        return Err(G0Error::MissingNormalizationResult);
+                    }
+                }
                 NormalizerEvent::SpecializationComputed { owner, key, replay } => {
-                    if key.index != *owner || replay.validate_against(current).is_err() {
+                    if stack.is_empty() ||
+                        key.index != *owner ||
+                        replay.validate_against(current).is_err() ||
+                        self.specialization_ranges.get(key).copied() != Some(*replay)
+                    {
                         return Err(G0Error::SpecializationTraceInvariant);
                     }
                 }
                 NormalizerEvent::SpecializationCacheHit { owner, key, source } => {
-                    if key.index != *owner ||
+                    if stack.is_empty() ||
+                        key.index != *owner ||
                         source.validate_against(current).is_err() ||
                         source.end.0 >= current.0 ||
-                        !self.specialization_ranges.contains_key(key)
+                        self.specialization_ranges.get(key).copied() != Some(*source)
                     {
                         return Err(G0Error::SpecializationTraceInvariant);
+                    }
+                }
+                NormalizerEvent::AppliedRelation(observation) => {
+                    let input_valid = match &observation.rule {
+                        AppliedRelationRule::Gadget { input, input_result, .. } => {
+                            stack.last().is_some_and(|(_, start, results)| {
+                                input_result.0 >= start.0 && input_result.0 < current.0 &&
+                                    results.get(input).copied() == Some(*input_result) &&
+                                    matches!(self.events.get(input_result.0 as usize), Some(NormalizerEvent::Result { owner, .. }) if owner.expression() == *input)
+                            })
+                        }
+                        AppliedRelationRule::Universal { .. } => true,
+                    };
+                    if stack.is_empty() ||
+                        observation.ordered_start > observation.ordered_end_exclusive ||
+                        !input_valid
+                    {
+                        return Err(G0Error::RelationTraceInvariant);
                     }
                 }
                 _ => {}
             }
         }
-        let relations = self
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                NormalizerEvent::Relation(observation) => Some(observation),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        for (position, observation) in relations.iter().enumerate() {
-            if observation.disposition != RelationObservationDisposition::Applied {
-                continue;
-            }
-            if observation.result.is_none() {
-                return Err(G0Error::MissingRelationResult);
-            }
-            let considered = relations[..position].iter().any(|prior| {
-                prior.owner == observation.owner &&
-                    prior.kind == observation.kind &&
-                    prior.disposition == RelationObservationDisposition::Considered &&
-                    prior.result == observation.result
-            });
-            if !considered {
-                return Err(G0Error::RelationAppliedWithoutConsideration);
-            }
+        if !stack.is_empty() {
+            return Err(G0Error::MissingNormalizationResult);
         }
         Ok(())
     }
@@ -2111,12 +2155,8 @@ pub(crate) enum G0Error {
     MissingSpecializationRange,
     #[error("specialization replay range is malformed or out of bounds")]
     MalformedSpecializationRange,
-    #[error("relation observation owner or typed result is inconsistent")]
-    RelationOwnerMismatch,
-    #[error("applied relation observation has no typed result")]
-    MissingRelationResult,
-    #[error("applied relation observation has no prior considered candidate")]
-    RelationAppliedWithoutConsideration,
+    #[error("relation recorder invariant is violated")]
+    RelationTraceInvariant,
     #[error("residual event has no typed lowering observation")]
     MissingEventObservation,
     #[error("independent residual events cannot alias one canonical event row")]
@@ -3342,10 +3382,24 @@ mod tests {
         let key = RuntimeSpecializationKey { dispatch, index: owner, generation };
 
         let mut trace = FeasibilityTrace::default();
+        trace.record_invocation_start(owner).expect("invocation start");
         let start = trace.specialization_miss_start(owner, key.clone()).expect("miss start");
         trace.record_specialization_computed(owner, key.clone(), start).expect("miss");
         trace.record_specialization_cache_hit(owner, key.clone()).expect("hit");
         trace.record_specialization_cache_hit(owner, key.clone()).expect("repeated hit");
+        let value = crate::operational_noise::normal_form::AnalyzedValue {
+            semantic: owner,
+            exact_nf: None,
+            coefficient_bound: crate::operational_noise::facts::NumericContract::Missing,
+        };
+        trace.record_normalization_result(owner, &value).expect("result");
+        trace
+            .record_invocation_end(
+                owner,
+                &value,
+                &crate::operational_noise::normal_form::NormalizationCounters::default(),
+            )
+            .expect("invocation end");
         trace.validate_normalization_observations().expect("typed results");
         let mut ordinary = NoFeasibility;
         ordinary.record_specialization_cache_hit(owner, key.clone()).expect("ordinary no-op");
@@ -3367,8 +3421,10 @@ mod tests {
             FeasibilityTrace::default().specialization_miss_start(other, key.clone()),
             Err(G0Error::SpecializationTraceInvariant)
         );
+        let mut missing = FeasibilityTrace::default();
+        missing.record_invocation_start(owner).expect("invocation start");
         assert_eq!(
-            FeasibilityTrace::default().record_specialization_cache_hit(owner, key),
+            missing.record_specialization_cache_hit(owner, key),
             Err(G0Error::MissingSpecializationRange)
         );
         let mut malformed = trace.clone();

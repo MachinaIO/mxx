@@ -1533,6 +1533,45 @@ pub(crate) struct CanonicalDagNode<H> {
     pub authoritative_alias: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum CanonicalHandle {
+    Expression(ExprId),
+    Program(super::arena::ValueProgramId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CanonicalResidualRow {
+    pub kind: String,
+    pub descriptor: Vec<u8>,
+    pub dependencies: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalResidualRefs {
+    rows: Vec<CanonicalResidualRow>,
+    handles: BTreeMap<CanonicalHandle, u64>,
+}
+
+impl CanonicalResidualRefs {
+    pub(crate) fn expression(&self, expression: ExprId) -> Result<u64, G0Error> {
+        self.handles
+            .get(&CanonicalHandle::Expression(expression))
+            .copied()
+            .ok_or(G0Error::CanonicalMissingDependency)
+    }
+
+    pub(crate) fn program(&self, program: super::arena::ValueProgramId) -> Result<u64, G0Error> {
+        self.handles
+            .get(&CanonicalHandle::Program(program))
+            .copied()
+            .ok_or(G0Error::CanonicalMissingDependency)
+    }
+
+    pub(crate) fn rows(&self) -> &[CanonicalResidualRow] {
+        &self.rows
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct CanonicalDagKey {
     row_kind: String,
@@ -2148,6 +2187,180 @@ fn stable_trapdoor(value: &TrapdoorOperation) -> StableTrapdoorOperation {
     }
 }
 
+#[derive(Serialize)]
+struct CanonicalProgramDescriptor {
+    signature: Vec<(StableValueType, Option<(u64, u64)>)>,
+    output: StableValueType,
+    family: Option<CanonicalFamilyDescriptor>,
+}
+
+#[derive(Serialize)]
+struct CanonicalFamilyDescriptor {
+    domain: (u64, u64),
+    element_type: StableValueType,
+    reducible: bool,
+    artifact: Option<StableArtifact>,
+}
+
+fn canonical_program_descriptor(
+    projection: &super::program::ProgramProjection,
+) -> CanonicalProgramDescriptor {
+    CanonicalProgramDescriptor {
+        signature: projection
+            .signature
+            .inputs
+            .iter()
+            .map(|input| {
+                (
+                    stable_value_type(&input.value_type),
+                    input.trusted_index_range.map(|range| (range.minimum, range.maximum_exclusive)),
+                )
+            })
+            .collect(),
+        output: stable_value_type(&projection.signature.output),
+        family: projection.family.as_ref().map(|family| CanonicalFamilyDescriptor {
+            domain: (family.domain.minimum, family.domain.maximum_exclusive),
+            element_type: stable_value_type(&family.element_type),
+            reducible: family.reducible,
+            artifact: family.artifact.as_ref().map(stable_artifact),
+        }),
+    }
+}
+
+#[derive(Serialize)]
+struct CanonicalExpressionDescriptor {
+    operator: StableOperator,
+    value_type: StableValueType,
+    source: Option<StableObservedSource>,
+}
+
+fn canonical_expression_operator(value: &ValueOperator) -> StableOperator {
+    let mut operator = stable_operator(value);
+    match &mut operator {
+        StableOperator::Source { identity } => identity.invocation.clear(),
+        StableOperator::OpaqueFamilyElement { identity } => identity.invocation.clear(),
+        _ => {}
+    }
+    operator
+}
+
+pub(crate) fn canonical_residual_refs(
+    job: &CheckerJob,
+    closure: &CertificateClosure,
+    trace: &FeasibilityTrace,
+) -> Result<CanonicalResidualRefs, G0Error> {
+    for &family in &closure.families {
+        let program = family.program();
+        if !closure.programs.contains(&program) {
+            return Err(G0Error::CanonicalMissingDependency);
+        }
+        job.programs().project_family(family)?;
+    }
+    let mut nodes = Vec::new();
+    for &expression in &closure.expressions {
+        let node = job.expressions().node(expression)?;
+        let source = match &node.operator {
+            ValueOperator::Source(_) => trace
+                .source_observations()
+                .get(&SourceHandle::Expression(expression))
+                .map(stable_observed_source)
+                .ok_or(G0Error::CanonicalMissingDependency)
+                .map(Some)?,
+            _ => None,
+        };
+        let descriptor = serde_json::to_vec(&CanonicalExpressionDescriptor {
+            operator: canonical_expression_operator(&node.operator),
+            value_type: stable_value_type(job.expressions().value_type(expression)?),
+            source,
+        })
+        .map_err(|error| G0Error::Encoding(error.to_string()))?;
+        let mut dependencies = Vec::new();
+        for &input in &node.inputs {
+            if !closure.expressions.contains(&input) {
+                return Err(G0Error::CanonicalMissingDependency);
+            }
+            dependencies.push(CanonicalHandle::Expression(input));
+        }
+        if let ValueOperator::ProgramCall { program } = node.operator {
+            if !closure.programs.contains(&program) {
+                return Err(G0Error::CanonicalMissingDependency);
+            }
+            dependencies.push(CanonicalHandle::Program(program));
+        }
+        nodes.push(CanonicalDagNode {
+            handle: CanonicalHandle::Expression(expression),
+            row_kind: "expression".to_owned(),
+            descriptor,
+            dependencies,
+            authoritative_alias: true,
+        });
+    }
+    for &program in &closure.programs {
+        let projection = job.programs().project_program(program)?;
+        if !closure.expressions.contains(&projection.root) {
+            return Err(G0Error::CanonicalMissingDependency);
+        }
+        let descriptor = serde_json::to_vec(&canonical_program_descriptor(&projection))
+            .map_err(|error| G0Error::Encoding(error.to_string()))?;
+        nodes.push(CanonicalDagNode {
+            handle: CanonicalHandle::Program(program),
+            row_kind: "program".to_owned(),
+            descriptor,
+            dependencies: vec![CanonicalHandle::Expression(projection.root)],
+            authoritative_alias: true,
+        });
+    }
+    let handles = canonical_dependency_rows(nodes)?;
+    let mut rows = vec![None; handles.len()];
+    for (handle, row) in &handles {
+        let (kind, descriptor, dependencies) = match handle {
+            CanonicalHandle::Expression(expression) => {
+                let node = job.expressions().node(*expression)?;
+                let source = match &node.operator {
+                    ValueOperator::Source(_) => trace
+                        .source_observations()
+                        .get(&SourceHandle::Expression(*expression))
+                        .map(stable_observed_source)
+                        .ok_or(G0Error::CanonicalMissingDependency)
+                        .map(Some)?,
+                    _ => None,
+                };
+                let descriptor = serde_json::to_vec(&CanonicalExpressionDescriptor {
+                    operator: canonical_expression_operator(&node.operator),
+                    value_type: stable_value_type(job.expressions().value_type(*expression)?),
+                    source,
+                })
+                .map_err(|error| G0Error::Encoding(error.to_string()))?;
+                (
+                    "expression".to_owned(),
+                    descriptor,
+                    node.inputs
+                        .iter()
+                        .map(|input| handles[&CanonicalHandle::Expression(*input)])
+                        .chain(match node.operator {
+                            ValueOperator::ProgramCall { program } => {
+                                Some(handles[&CanonicalHandle::Program(program)])
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            }
+            CanonicalHandle::Program(program) => {
+                let projection = job.programs().project_program(*program)?;
+                (
+                    "program".to_owned(),
+                    serde_json::to_vec(&canonical_program_descriptor(&projection))
+                        .map_err(|error| G0Error::Encoding(error.to_string()))?,
+                    vec![handles[&CanonicalHandle::Expression(projection.root)]],
+                )
+            }
+        };
+        rows[*row as usize] = Some(CanonicalResidualRow { kind, descriptor, dependencies });
+    }
+    Ok(CanonicalResidualRefs { rows: rows.into_iter().map(Option::unwrap).collect(), handles })
+}
+
 fn stable_hash(value: &DeterministicHashDescriptor) -> StableOperator {
     let definition = match value.definition {
         DeterministicHashDefinition::MxxPolynomialHash => StableHashDefinition::MxxPolynomialHash,
@@ -2260,6 +2473,30 @@ mod tests {
         assert_eq!(forward[&1], reverse[&10]);
         assert_eq!(forward[&2], reverse[&20]);
         assert_eq!(forward[&3], reverse[&30]);
+    }
+
+    #[test]
+    fn canonical_residual_refs_project_typed_expression_rows_without_raw_handles() {
+        let mut job = CheckerJob::new();
+        let expression = job
+            .expressions_mut()
+            .intern(ValueOperator::Constant(TypedConstant::int(7)), Box::new([]))
+            .expect("constant expression");
+        let closure = CertificateClosure {
+            expressions: [expression].into_iter().collect(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: [expression].into_iter().collect(),
+        };
+        let refs = canonical_residual_refs(&job, &closure, &FeasibilityTrace::default())
+            .expect("canonical residual refs");
+        assert_eq!(refs.expression(expression), Ok(0));
+        assert_eq!(refs.rows().len(), 1);
+        assert_eq!(refs.rows()[0].kind, "expression");
+        assert!(serde_json::to_vec(refs.rows()).is_ok());
     }
 
     #[test]

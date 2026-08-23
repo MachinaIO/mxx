@@ -7146,6 +7146,51 @@ mod tests {
     }
 
     #[test]
+    fn compact_gaussian_event_rows_are_owner_distinct_and_residual_only() {
+        let protocol = compact_tall_gaussian_protocol();
+        let plan =
+            ProtocolPlan::build(&protocol, "compact-tall-gaussian").expect("compact Gaussian plan");
+        let (_, _, mut trace) =
+            ProductionAdapter::new_with_feasibility(&protocol, &plan, BTreeMap::new())
+                .expect("opt-in adapter")
+                .lower_with_feasibility()
+                .expect("opt-in lowering");
+
+        let gaussian_events = trace
+            .event_observations()
+            .iter()
+            .filter_map(|(event, observation)| {
+                matches!(
+                    observation.kind,
+                    EventKind::Sampler { operation: SamplerOperation::Gaussian { .. } }
+                )
+                .then_some(*event)
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(gaussian_events.len() >= 2, "Gaussian events={gaussian_events:?}");
+        let closure = super::super::simulation::CertificateClosure {
+            expressions: BTreeSet::new(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: gaussian_events.clone(),
+            constant_expressions: BTreeSet::new(),
+        };
+        trace.retain_residual(&closure);
+        assert_eq!(trace.event_observations().len(), gaussian_events.len());
+        let rows = super::super::g0::derive_canonical_event_rows(&closure, &trace)
+            .expect("canonical Gaussian rows");
+        assert_eq!(rows.rows().len(), gaussian_events.len());
+        assert_eq!(
+            rows.rows().iter().map(|row| &row.owner).collect::<BTreeSet<_>>().len(),
+            gaussian_events.len(),
+            "reached Gaussian occurrences retain distinct typed owners"
+        );
+        assert_eq!(rows.encode_canonical().unwrap(), rows.encode_canonical().unwrap());
+    }
+
+    #[test]
     fn opt_in_family_and_select_index_uses_keep_typed_kinds_and_frontiers() {
         let protocol = parallel_range_protocol();
         let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("parallel plan");

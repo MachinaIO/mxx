@@ -3055,6 +3055,87 @@ mod tests {
     }
 
     #[test]
+    fn source_event_refs_are_canonical_and_require_matching_observations() {
+        use super::super::arena::ArenaToken;
+        use crate::protocol::StageId;
+        use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};
+
+        let owner = PlannedWire {
+            stage: StageId("source-event".to_owned()),
+            occurrence: ProgramOccurrence { definition: FrozenGraphScopeId::Root, path: 1 },
+            wire: WireRef { node: NodeId(2), port: Port(0) },
+        };
+        let make_trace = |event: SampleEventId| {
+            let descriptor = SampleDescriptor::new("source-sampler", ResolvedValueType::Int);
+            let identity = InputSourceIdentity::Expression(SemanticSourceIdentity {
+                stable_definition: "protocol-input".to_owned(),
+                invocation: format!("legacy-{}", event.0),
+                sample_event: Some(event),
+                output_role: "value".to_owned(),
+                sampler: Some(descriptor.clone()),
+                artifact: None,
+                value_type: ResolvedValueType::Int,
+                coordinates: Box::new([]),
+                matrix_constant: None,
+            });
+            let expression = ExprId::new(ArenaToken(77), event.0 as u32);
+            let mut trace = FeasibilityTrace::default();
+            trace
+                .record_source(
+                    SourceHandle::Expression(expression),
+                    SourceClass::DeclaredProtocolInput {
+                        owner: owner.clone(),
+                        input: ProtocolInputId::from("input"),
+                        identity,
+                    },
+                )
+                .unwrap();
+            trace
+                .record_event(EventObservation {
+                    event,
+                    owner: owner.clone(),
+                    kind: EventKind::Sample { descriptor },
+                })
+                .unwrap();
+            trace
+        };
+        let first = make_trace(SampleEventId(7));
+        let second = make_trace(SampleEventId(41));
+        let first_bytes = first.canonical_source_observation_bytes().unwrap();
+        assert_eq!(first_bytes, second.canonical_source_observation_bytes().unwrap());
+        assert!(!String::from_utf8(first_bytes).unwrap().contains("source-sampler"));
+
+        let mut missing = FeasibilityTrace::default();
+        missing
+            .record_source(
+                SourceHandle::Expression(ExprId::new(ArenaToken(77), 7)),
+                SourceClass::DeclaredProtocolInput {
+                    owner,
+                    input: ProtocolInputId::from("input"),
+                    identity: InputSourceIdentity::Expression(SemanticSourceIdentity {
+                        stable_definition: "protocol-input".to_owned(),
+                        invocation: "legacy-7".to_owned(),
+                        sample_event: Some(SampleEventId(7)),
+                        output_role: "value".to_owned(),
+                        sampler: Some(SampleDescriptor::new(
+                            "source-sampler",
+                            ResolvedValueType::Int,
+                        )),
+                        artifact: None,
+                        value_type: ResolvedValueType::Int,
+                        coordinates: Box::new([]),
+                        matrix_constant: None,
+                    }),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            missing.canonical_source_observation_bytes(),
+            Err(G0Error::CanonicalMissingDependency)
+        );
+    }
+
+    #[test]
     fn event_observations_deduplicate_conflict_and_filter_by_residual_event_ids() {
         use crate::StageId;
         use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};

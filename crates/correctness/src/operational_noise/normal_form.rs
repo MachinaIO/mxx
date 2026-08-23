@@ -18,7 +18,10 @@ use super::{
         BoundExpression, CoefficientBound, FactError, FactStore, MatrixFacts, NumericContract,
         ValueFacts,
     },
-    g0::{BoundRule, FeasibilitySink, NoFeasibility},
+    g0::{
+        BoundAuthority, BoundProjection, BoundRule, BoundScale, BoundValueRef, FeasibilitySink,
+        NoFeasibility,
+    },
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
     program::{ArenaError, ProgramArena, ValueProgramId},
     relation::{
@@ -1193,14 +1196,38 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         &mut self,
         owner: ScopedExprId,
         rule: BoundRule,
-    ) -> Result<(), NormalizeError> {
+    ) -> Result<super::g0::EventIndex, NormalizeError> {
         if S::ENABLED {
-            self.sink
+            return self
+                .sink
                 .as_deref_mut()
                 .ok_or(super::g0::G0Error::RelationTraceInvariant)?
-                .record_bound_transfer(owner, rule)?;
+                .record_bound_transfer(owner, rule)
+                .map_err(NormalizeError::from);
         }
-        Ok(())
+        Ok(super::g0::EventIndex(0))
+    }
+
+    fn predecessor_ref(
+        input_position: usize,
+        projection: BoundProjection,
+    ) -> Result<BoundValueRef, NormalizeError> {
+        Ok(BoundValueRef::Predecessor {
+            input_position: u32::try_from(input_position)
+                .map_err(|_| NormalizeError::ArithmeticOverflow)?,
+            projection,
+        })
+    }
+
+    fn predecessor_refs(
+        input_positions: impl IntoIterator<Item = usize>,
+        projection: BoundProjection,
+    ) -> Result<Box<[BoundValueRef]>, NormalizeError> {
+        input_positions
+            .into_iter()
+            .map(|position| Self::predecessor_ref(position, projection.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Vec::into_boxed_slice)
     }
 
     fn gadget_input_nf(
@@ -4216,6 +4243,30 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         self.authoritative_source_bound(dispatch.preimage_source.expression)
     }
 
+    fn relation_preimage_source(
+        &self,
+        expression: ExprId,
+        program: ValueProgramId,
+    ) -> Result<Option<ExprId>, NormalizeError> {
+        let Some(relations) = self.relations else { return Ok(None) };
+        let dispatch = match relations.dispatch_for_preimage_program(program) {
+            Ok(Some(dispatch)) => dispatch,
+            Ok(None) | Err(RelationRegistryError::AmbiguousPreimageDispatch) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let [index] = self.expressions.node(expression)?.inputs.as_ref() else {
+            return Ok(None);
+        };
+        if self.expressions.value_type(*index)? != &ResolvedValueType::Int {
+            return Ok(None);
+        }
+        let family_body = self.programs.family_body(dispatch.preimage_family)?;
+        if family_body != dispatch.preimage_source.expression {
+            return Ok(None);
+        }
+        Ok(Some(dispatch.preimage_source.expression))
+    }
+
     fn authoritative_source_bound(
         &self,
         source: ExprId,
@@ -4250,6 +4301,15 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         children: &[Arc<AnalyzedValue>],
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
         if let Some(bound) = self.fact_bound(expression)? {
+            if S::ENABLED {
+                if bound.is_missing() {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                }
+                self.observe_bound_transfer(
+                    owner,
+                    BoundRule::Authority(BoundAuthority::FactStore),
+                )?;
+            }
             return Ok(bound);
         }
         let child_bounds =
@@ -4261,17 +4321,85 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             ValueOperator::Sampler { operation, .. } => sampler_bound(operation),
             ValueOperator::DeterministicHash(_) => NumericContract::Known(CoefficientBound::Large),
             ValueOperator::Source(_) | ValueOperator::Sample { .. } => NumericContract::Missing,
-            ValueOperator::ProgramCall { .. } => self
-                .program_call_matrix_facts(expression)
-                .map(|facts| facts.coefficient_bound.clone())
-                .unwrap_or(NumericContract::Missing),
+            ValueOperator::ProgramCall { program } => {
+                if let Some(facts) = self.program_call_matrix_facts(expression) {
+                    let bound = facts.coefficient_bound.clone();
+                    if S::ENABLED {
+                        if bound.is_missing() {
+                            return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                        }
+                        self.observe_bound_transfer(
+                            owner,
+                            BoundRule::Authority(BoundAuthority::ProgramFamilyFact),
+                        )?;
+                    }
+                    bound
+                } else {
+                    let bound = self.relation_live_preimage_bound(expression, *program)?;
+                    if S::ENABLED {
+                        let Some(source) = self.relation_preimage_source(expression, *program)?
+                        else {
+                            return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                        };
+                        if bound.is_missing() {
+                            return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                        }
+                        self.observe_bound_transfer(
+                            owner,
+                            BoundRule::Authority(BoundAuthority::RelationPreimageSource {
+                                source: owner.with_expression(source),
+                            }),
+                        )?;
+                    }
+                    bound
+                }
+            }
             // Input zero is the selector. Arena validation proves the remaining nonempty inputs
             // are the complete, same-typed branch set, so their maximum is the exact compact
             // transfer and a missing branch remains fail-closed.
-            ValueOperator::ExplicitElement { .. } => max_bounds(&child_bounds[1..])?,
+            ValueOperator::ExplicitElement { .. } => {
+                let bound = max_bounds(&child_bounds[1..])?;
+                if S::ENABLED {
+                    if bound.is_missing() {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    }
+                    self.observe_bound_transfer(
+                        owner,
+                        BoundRule::Maximum {
+                            inputs: Self::predecessor_refs(
+                                1..child_bounds.len(),
+                                BoundProjection::Coefficient,
+                            )?,
+                        },
+                    )?;
+                }
+                bound
+            }
             ValueOperator::Transform(_) => NumericContract::Missing,
             _ => child_bounds.into_iter().next().unwrap_or(NumericContract::Missing),
         };
+        if S::ENABLED {
+            match &node.operator {
+                ValueOperator::Sampler { .. } | ValueOperator::DeterministicHash(_) => {
+                    if bound.is_missing() {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    }
+                    self.observe_bound_transfer(
+                        owner,
+                        BoundRule::Authority(BoundAuthority::Operator),
+                    )?;
+                }
+                ValueOperator::Source(_) |
+                ValueOperator::Sample { .. } |
+                ValueOperator::Transform(_) => {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                }
+                _ if bound.is_missing() => {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                }
+                _ => {}
+            }
+        }
         Ok(bound)
     }
 
@@ -4283,24 +4411,115 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         bounds: &[NumericContract<CoefficientBound>],
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
         match operation {
-            MatrixOperation::Add | MatrixOperation::Subtract => add_bounds(bounds),
+            MatrixOperation::Add | MatrixOperation::Subtract => {
+                let bound = add_bounds(bounds)?;
+                if S::ENABLED {
+                    if bound.is_missing() {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    }
+                    self.observe_bound_transfer(
+                        owner,
+                        BoundRule::Sum {
+                            inputs: Self::predecessor_refs(
+                                0..bounds.len(),
+                                BoundProjection::Coefficient,
+                            )?,
+                        },
+                    )?;
+                }
+                Ok(bound)
+            }
             MatrixOperation::Negate |
             MatrixOperation::Transpose |
             MatrixOperation::Slice { .. } |
             MatrixOperation::IndexedSlice { .. } |
             MatrixOperation::View { .. } => {
-                Ok(bounds.first().cloned().unwrap_or(NumericContract::Missing))
+                let bound = bounds.first().cloned().unwrap_or(NumericContract::Missing);
+                if S::ENABLED {
+                    if bound.is_missing() {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    }
+                    self.observe_bound_transfer(
+                        owner,
+                        BoundRule::Identity {
+                            input: Self::predecessor_ref(0, BoundProjection::Coefficient)?,
+                        },
+                    )?;
+                }
+                Ok(bound)
             }
-            MatrixOperation::Scale => product_bounds(bounds),
+            MatrixOperation::Scale => {
+                let bound = product_bounds(bounds)?;
+                if S::ENABLED {
+                    if bound.is_missing() {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    }
+                    self.observe_bound_transfer(
+                        owner,
+                        BoundRule::Scale {
+                            value: Self::predecessor_ref(0, BoundProjection::Coefficient)?,
+                            scale: BoundScale::Value(Self::predecessor_ref(
+                                1,
+                                BoundProjection::Coefficient,
+                            )?),
+                        },
+                    )?;
+                }
+                Ok(bound)
+            }
             MatrixOperation::Multiply => self.matrix_product_bound(owner, node, bounds),
             MatrixOperation::Tensor { .. } => self.tensor_bound(owner, node, bounds),
-            MatrixOperation::Concat { .. } => max_bounds(bounds),
+            MatrixOperation::Concat { .. } => {
+                let bound = max_bounds(bounds)?;
+                if S::ENABLED {
+                    if bound.is_missing() {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    }
+                    self.observe_bound_transfer(
+                        owner,
+                        BoundRule::Maximum {
+                            inputs: Self::predecessor_refs(
+                                0..bounds.len(),
+                                BoundProjection::Coefficient,
+                            )?,
+                        },
+                    )?;
+                }
+                Ok(bound)
+            }
             MatrixOperation::CrtRecompose { reconstruction_coefficients, .. } => {
-                weighted_sum_bounds(bounds, reconstruction_coefficients)
+                let bound = weighted_sum_bounds(bounds, reconstruction_coefficients)?;
+                if S::ENABLED {
+                    if bound.is_missing() {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    }
+                    self.observe_bound_transfer(
+                        owner,
+                        BoundRule::WeightedSum {
+                            inputs: Self::predecessor_refs(
+                                0..bounds.len(),
+                                BoundProjection::Coefficient,
+                            )?,
+                        },
+                    )?;
+                }
+                Ok(bound)
             }
             MatrixOperation::ExtractCoefficient { .. } |
             MatrixOperation::LiftConstantPolynomial { .. } => {
-                Ok(bounds.first().cloned().unwrap_or(NumericContract::Missing))
+                let bound = bounds.first().cloned().unwrap_or(NumericContract::Missing);
+                if S::ENABLED {
+                    if bound.is_missing() {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    }
+                    self.observe_bound_transfer(
+                        owner,
+                        BoundRule::Identity {
+                            input: Self::predecessor_ref(0, BoundProjection::Coefficient)?,
+                        },
+                    )?;
+                }
+                Ok(bound)
             }
         }
     }
@@ -4355,6 +4574,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             self.observe_bound_transfer(
                 owner,
                 BoundRule::Tensor {
+                    left: Self::predecessor_ref(0, BoundProjection::Coefficient)?,
+                    right: Self::predecessor_ref(1, BoundProjection::Coefficient)?,
                     left_is_constant_polynomial: facts.left_is_constant_polynomial,
                     right_is_constant_polynomial: facts.right_is_constant_polynomial,
                 },
@@ -4427,7 +4648,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         )
         .map_err(|_| NormalizeError::ArithmeticOverflow)?;
         if S::ENABLED {
-            self.observe_bound_transfer(owner, BoundRule::Product { facts })?;
+            self.observe_bound_transfer(
+                owner,
+                BoundRule::Product {
+                    left: Self::predecessor_ref(0, BoundProjection::Coefficient)?,
+                    right: Self::predecessor_ref(1, BoundProjection::Coefficient)?,
+                    facts,
+                },
+            )?;
         }
         Ok(NumericContract::Known(coefficient_bound(&result.coefficient_class)))
     }
@@ -8407,15 +8635,48 @@ mod tests {
             })
             .expect("root bound transfer observation");
         match (tensor, bound_rule) {
-            (false, BoundRule::Product { facts }) => {
+            (false, BoundRule::Product { facts, left, right }) => {
                 assert_eq!(facts, &MatrixProductFacts::default());
+                assert_eq!(
+                    left,
+                    &BoundValueRef::Predecessor {
+                        input_position: 0,
+                        projection: BoundProjection::Coefficient,
+                    }
+                );
+                assert_eq!(
+                    right,
+                    &BoundValueRef::Predecessor {
+                        input_position: 1,
+                        projection: BoundProjection::Coefficient,
+                    }
+                );
             }
             (
                 true,
-                BoundRule::Tensor { left_is_constant_polynomial, right_is_constant_polynomial },
+                BoundRule::Tensor {
+                    left_is_constant_polynomial,
+                    right_is_constant_polynomial,
+                    left,
+                    right,
+                },
             ) => {
                 assert!(!left_is_constant_polynomial);
                 assert!(!right_is_constant_polynomial);
+                assert_eq!(
+                    left,
+                    &BoundValueRef::Predecessor {
+                        input_position: 0,
+                        projection: BoundProjection::Coefficient,
+                    }
+                );
+                assert_eq!(
+                    right,
+                    &BoundValueRef::Predecessor {
+                        input_position: 1,
+                        projection: BoundProjection::Coefficient,
+                    }
+                );
             }
             _ => panic!("wrong bound rule for operation"),
         }
@@ -8428,6 +8689,156 @@ mod tests {
         assert!(trace.normalization_events().iter().any(|event| {
             matches!(event, NormalizerEvent::InvocationEnd { root, .. } if *root == semantic)
         }));
+    }
+
+    #[test]
+    fn matrix_bound_rules_record_typed_predecessors_for_compact_operations() {
+        fn root_rule(
+            expressions: &mut ExprArena,
+            programs: &mut ProgramArena,
+            root: ExprId,
+        ) -> BoundRule {
+            let (facts, mut monomials, semantic) = setup(expressions, programs, root);
+            let mut trace = FeasibilityTrace::default();
+            let mut normalizer = Normalizer::new_with_sink(
+                expressions,
+                programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer.normalize(semantic).unwrap();
+            drop(normalizer);
+            trace.validate_normalization_observations().unwrap();
+            trace
+                .normalization_events()
+                .iter()
+                .find_map(|event| match event {
+                    NormalizerEvent::BoundTransfer { owner, rule } if *owner == semantic => {
+                        Some(rule.clone())
+                    }
+                    _ => None,
+                })
+                .expect("root bound transfer")
+        }
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let left = gaussian_factor(&mut expressions, matrix.clone(), 98_101, 3);
+        let right = gaussian_factor(&mut expressions, matrix.clone(), 98_102, 5);
+        let add =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        assert_eq!(
+            root_rule(&mut expressions, &mut programs, add),
+            BoundRule::Sum {
+                inputs: Box::new([
+                    BoundValueRef::Predecessor {
+                        input_position: 0,
+                        projection: BoundProjection::Coefficient,
+                    },
+                    BoundValueRef::Predecessor {
+                        input_position: 1,
+                        projection: BoundProjection::Coefficient,
+                    },
+                ])
+            }
+        );
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let input = gaussian_factor(&mut expressions, matrix.clone(), 98_103, 3);
+        let negate =
+            expressions.intern_matrix_transform(MatrixOperation::Negate, &[input]).unwrap();
+        assert_eq!(
+            root_rule(&mut expressions, &mut programs, negate),
+            BoundRule::Identity {
+                input: BoundValueRef::Predecessor {
+                    input_position: 0,
+                    projection: BoundProjection::Coefficient,
+                }
+            }
+        );
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let input = gaussian_factor(&mut expressions, matrix.clone(), 98_104, 3);
+        let scalar = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .unwrap();
+        let scale =
+            expressions.intern_matrix_transform(MatrixOperation::Scale, &[input, scalar]).unwrap();
+        assert_eq!(
+            root_rule(&mut expressions, &mut programs, scale),
+            BoundRule::Scale {
+                value: BoundValueRef::Predecessor {
+                    input_position: 0,
+                    projection: BoundProjection::Coefficient,
+                },
+                scale: BoundScale::Value(BoundValueRef::Predecessor {
+                    input_position: 1,
+                    projection: BoundProjection::Coefficient,
+                }),
+            }
+        );
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = gaussian_factor(
+            &mut expressions,
+            ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap(),
+            98_105,
+            3,
+        );
+        let right = gaussian_factor(
+            &mut expressions,
+            ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 2).unwrap(),
+            98_106,
+            5,
+        );
+        let concat = expressions
+            .intern_matrix_transform(
+                MatrixOperation::Concat {
+                    axis: 1,
+                    output: ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 4).unwrap(),
+                    layout: MatrixLayout::row_major(2, 4),
+                },
+                &[left, right],
+            )
+            .unwrap();
+        assert!(matches!(
+            root_rule(&mut expressions, &mut programs, concat),
+            BoundRule::Maximum { inputs } if inputs.as_ref() == [
+                BoundValueRef::Predecessor { input_position: 0, projection: BoundProjection::Coefficient },
+                BoundValueRef::Predecessor { input_position: 1, projection: BoundProjection::Coefficient },
+            ]
+        ));
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let left = gaussian_factor(&mut expressions, matrix.clone(), 98_107, 3);
+        let right = gaussian_factor(&mut expressions, matrix, 98_108, 5);
+        let crt = expressions
+            .intern_slice(
+                ValueOperator::Matrix(MatrixOperation::CrtRecompose {
+                    plaintext_moduli: Box::new([BigUint::from(3_u8), BigUint::from(5_u8)]),
+                    reconstruction_coefficients: Box::new([
+                        BigInt::from(2_u8),
+                        BigInt::from(12_u8),
+                    ]),
+                    output: matrix_type(),
+                }),
+                &[left, right],
+            )
+            .unwrap();
+        assert!(matches!(
+            root_rule(&mut expressions, &mut programs, crt),
+            BoundRule::WeightedSum { inputs } if inputs.len() == 2
+        ));
     }
 
     #[test]

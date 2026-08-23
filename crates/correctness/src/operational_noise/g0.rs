@@ -84,7 +84,7 @@ pub(crate) trait FeasibilitySink: Default {
         &mut self,
         owner: super::arena::ScopedExprId,
         rule: BoundRule,
-    ) -> Result<(), G0Error>;
+    ) -> Result<EventIndex, G0Error>;
 
     fn validate_normalization_observations(&self) -> Result<(), G0Error>;
 
@@ -220,7 +220,7 @@ struct InvocationFrame {
     root: super::arena::ScopedExprId,
     range: EventRange,
     results: BTreeMap<ExprId, EventIndex>,
-    pending_bounds: Vec<super::arena::ScopedExprId>,
+    pending_bounds: BTreeSet<super::arena::ScopedExprId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -248,10 +248,64 @@ pub(crate) struct AppliedRelation {
     pub rule: AppliedRelationRule,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum BoundProjection {
+    Coefficient,
+    Summary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum BoundValueRef {
+    Predecessor { input_position: u32, projection: BoundProjection },
+    Result { event: EventIndex, projection: BoundProjection },
+    Transfer(EventIndex),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum BoundAuthority {
+    FactStore,
+    ProgramFamilyFact,
+    Operator,
+    RelationPreimageSource { source: super::arena::ScopedExprId },
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum BoundScale {
+    Value(BoundValueRef),
+    Magnitude(BigUint),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BoundRule {
-    Product { facts: MatrixProductFacts },
-    Tensor { left_is_constant_polynomial: bool, right_is_constant_polynomial: bool },
+    Authority(BoundAuthority),
+    Identity {
+        input: BoundValueRef,
+    },
+    Sum {
+        inputs: Box<[BoundValueRef]>,
+    },
+    Maximum {
+        inputs: Box<[BoundValueRef]>,
+    },
+    Scale {
+        value: BoundValueRef,
+        scale: BoundScale,
+    },
+    WeightedSum {
+        inputs: Box<[BoundValueRef]>,
+    },
+    Product {
+        left: BoundValueRef,
+        right: BoundValueRef,
+        facts: MatrixProductFacts,
+    },
+    Tensor {
+        left: BoundValueRef,
+        right: BoundValueRef,
+        left_is_constant_polynomial: bool,
+        right_is_constant_polynomial: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1293,8 +1347,8 @@ impl FeasibilitySink for NoFeasibility {
         &mut self,
         _owner: super::arena::ScopedExprId,
         _rule: BoundRule,
-    ) -> Result<(), G0Error> {
-        Ok(())
+    ) -> Result<EventIndex, G0Error> {
+        Ok(EventIndex(0))
     }
 
     fn validate_normalization_observations(&self) -> Result<(), G0Error> {
@@ -1368,7 +1422,7 @@ impl FeasibilitySink for FeasibilityTrace {
             root,
             range: EventRange::checked(start, start)?,
             results: BTreeMap::new(),
-            pending_bounds: Vec::new(),
+            pending_bounds: BTreeSet::new(),
         });
         Ok(())
     }
@@ -1403,8 +1457,8 @@ impl FeasibilitySink for FeasibilityTrace {
         if frame.results.contains_key(&result.expression()) {
             return Err(G0Error::MissingNormalizationResult);
         }
-        if let Some(index) = frame.pending_bounds.iter().position(|owner| *owner == result) {
-            frame.pending_bounds.remove(index);
+        if result != frame.root {
+            frame.pending_bounds.remove(&result);
         }
         let index =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
@@ -1432,7 +1486,9 @@ impl FeasibilitySink for FeasibilityTrace {
         {
             return Err(G0Error::MissingNormalizationResult);
         }
-        if !frame.pending_bounds.is_empty() {
+        let mut pending_bounds = frame.pending_bounds.clone();
+        pending_bounds.remove(&root);
+        if !pending_bounds.is_empty() {
             return Err(G0Error::MissingNormalizationResult);
         }
         let root_index = frame.results[&root.expression()];
@@ -1456,6 +1512,9 @@ impl FeasibilitySink for FeasibilityTrace {
             result: root_result,
             counters: *counters,
         });
+        if let Some(frame) = self.frames.last_mut() {
+            frame.pending_bounds.remove(&root);
+        }
         if let Some(frame) = self.frames.last_mut() {
             frame.range = range;
         }
@@ -1561,14 +1620,16 @@ impl FeasibilitySink for FeasibilityTrace {
         &mut self,
         owner: super::arena::ScopedExprId,
         rule: BoundRule,
-    ) -> Result<(), G0Error> {
+    ) -> Result<EventIndex, G0Error> {
         let frame = self.frames.last_mut().ok_or(G0Error::UnsupportedBoundTransfer)?;
         if frame.root.program() != owner.program() {
             return Err(G0Error::UnsupportedBoundTransfer);
         }
-        frame.pending_bounds.push(owner);
+        let index =
+            EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
+        frame.pending_bounds.insert(owner);
         self.events.push(NormalizerEvent::BoundTransfer { owner, rule });
-        Ok(())
+        Ok(index)
     }
 
     fn validate_normalization_observations(&self) -> Result<(), G0Error> {
@@ -1579,13 +1640,13 @@ impl FeasibilitySink for FeasibilityTrace {
             super::arena::ScopedExprId,
             EventIndex,
             BTreeMap<ExprId, EventIndex>,
-            Vec<super::arena::ScopedExprId>,
+            BTreeSet<super::arena::ScopedExprId>,
         )>::new();
         for (position, event) in self.events.iter().enumerate() {
             let current = EventIndex(u64::try_from(position).map_err(|_| G0Error::TraceOverflow)?);
             match event {
                 NormalizerEvent::InvocationStart { root } => {
-                    stack.push((*root, current, BTreeMap::new(), Vec::new()));
+                    stack.push((*root, current, BTreeMap::new(), BTreeSet::new()));
                 }
                 NormalizerEvent::Result { owner, .. } => {
                     let Some((root, _, results, pending_bounds)) = stack.last_mut() else {
@@ -1596,10 +1657,8 @@ impl FeasibilitySink for FeasibilityTrace {
                     {
                         return Err(G0Error::MissingNormalizationResult);
                     }
-                    if let Some(index) =
-                        pending_bounds.iter().position(|pending| *pending == *owner)
-                    {
-                        pending_bounds.remove(index);
+                    if *owner != *root {
+                        pending_bounds.remove(owner);
                     }
                 }
                 NormalizerEvent::Predecessor { predecessor, source_result, .. } => {
@@ -1625,6 +1684,8 @@ impl FeasibilitySink for FeasibilityTrace {
                         self.events.get(result_index.0 as usize),
                         Some(NormalizerEvent::Result { owner, .. }) if *owner == *root
                     );
+                    let mut pending_bounds = pending_bounds;
+                    pending_bounds.remove(root);
                     if active_root != *root || !result_owner_matches || !pending_bounds.is_empty() {
                         return Err(G0Error::MissingNormalizationResult);
                     }
@@ -1686,7 +1747,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     if root.program() != owner.program() {
                         return Err(G0Error::RelationTraceInvariant);
                     }
-                    pending_bounds.push(*owner);
+                    pending_bounds.insert(*owner);
                 }
             }
         }
@@ -3544,11 +3605,30 @@ mod tests {
             .record_bound_transfer(
                 parent,
                 BoundRule::Tensor {
+                    left: BoundValueRef::Predecessor {
+                        input_position: 0,
+                        projection: BoundProjection::Coefficient,
+                    },
+                    right: BoundValueRef::Predecessor {
+                        input_position: 1,
+                        projection: BoundProjection::Coefficient,
+                    },
                     left_is_constant_polynomial: false,
                     right_is_constant_polynomial: false,
                 },
             )
             .expect("bound transfer");
+        valid
+            .record_bound_transfer(
+                parent,
+                BoundRule::Identity {
+                    input: BoundValueRef::Predecessor {
+                        input_position: 0,
+                        projection: BoundProjection::Coefficient,
+                    },
+                },
+            )
+            .expect("second same-owner transfer");
         valid
             .record_normalization_result(
                 parent,
@@ -3571,6 +3651,14 @@ mod tests {
             )
             .expect("end");
         valid.validate_normalization_observations().expect("same-frame result is valid");
+        assert_eq!(
+            valid
+                .normalization_events()
+                .iter()
+                .filter(|event| matches!(event, NormalizerEvent::BoundTransfer { owner, .. } if *owner == parent))
+                .count(),
+            2
+        );
 
         let mut nested = FeasibilityTrace::default();
         nested.record_invocation_start(parent).expect("parent start");
@@ -3578,6 +3666,14 @@ mod tests {
             .record_bound_transfer(
                 child,
                 BoundRule::Tensor {
+                    left: BoundValueRef::Predecessor {
+                        input_position: 0,
+                        projection: BoundProjection::Coefficient,
+                    },
+                    right: BoundValueRef::Predecessor {
+                        input_position: 1,
+                        projection: BoundProjection::Coefficient,
+                    },
                     left_is_constant_polynomial: false,
                     right_is_constant_polynomial: false,
                 },

@@ -2135,6 +2135,10 @@ impl ScopedExprId {
     pub(crate) const fn expression(self) -> ExprId {
         self.expression
     }
+
+    pub(crate) const fn with_expression(self, expression: ExprId) -> Self {
+        Self { program: self.program, expression }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]

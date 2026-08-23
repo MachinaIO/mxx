@@ -12621,7 +12621,9 @@ mod tests {
         assert!(matches!(normalizer.normalize(semantic), Err(error) if error == expected));
         drop(normalizer);
         assert_eq!(cache.runtime_entry_count(), baseline_runtime);
-        assert!(cache.canonical_rhs_count() >= baseline_rhs);
+        let first_rhs_count = cache.canonical_rhs_count();
+        let first_rhs_fingerprint = cache.canonical_state_fingerprint();
+        assert!(first_rhs_count > baseline_rhs);
         assert!(trace.normalization_events().is_empty());
         let mut normalizer = Normalizer::new_with_sink(
             &mut expressions,
@@ -12635,6 +12637,8 @@ mod tests {
         assert!(matches!(normalizer.normalize(semantic), Err(error) if error == expected));
         drop(normalizer);
         assert_eq!(cache.runtime_entry_count(), baseline_runtime);
+        assert_eq!(cache.canonical_rhs_count(), first_rhs_count);
+        assert_eq!(cache.canonical_state_fingerprint(), first_rhs_fingerprint);
         assert!(trace.normalization_events().is_empty());
     }
 

@@ -12,14 +12,13 @@ use super::{
     },
     bound::{
         BoundClass, MatrixBound as CanonicalMatrixBound, MatrixProductFacts,
-        product_bound_with_facts, product_bound_with_facts_witness, tensor_bound_with_facts,
-        tensor_bound_with_facts_witness,
+        product_bound_with_facts, tensor_bound_with_facts,
     },
     facts::{
         BoundExpression, CoefficientBound, FactError, FactStore, MatrixFacts, NumericContract,
         ValueFacts,
     },
-    g0::{BoundTransferObservation, BoundTransferWitness, FeasibilitySink, NoFeasibility},
+    g0::{BoundRule, FeasibilitySink, NoFeasibility},
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
     program::{ArenaError, ProgramArena, ValueProgramId},
     relation::{
@@ -1193,13 +1192,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     fn observe_bound_transfer(
         &mut self,
         owner: ScopedExprId,
-        witness: BoundTransferWitness,
+        rule: BoundRule,
     ) -> Result<(), NormalizeError> {
         if S::ENABLED {
             self.sink
                 .as_deref_mut()
                 .ok_or(super::g0::G0Error::RelationTraceInvariant)?
-                .record_bound_transfer(BoundTransferObservation { owner, witness })?;
+                .record_bound_transfer(owner, rule)?;
         }
         Ok(())
     }
@@ -4313,20 +4312,34 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         bounds: &[NumericContract<CoefficientBound>],
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
         let [left_bound, right_bound] = bounds else {
+            if S::ENABLED {
+                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+            }
             return Ok(NumericContract::Missing);
         };
         let (NumericContract::Known(left_bound), NumericContract::Known(right_bound)) =
             (left_bound, right_bound)
         else {
+            if S::ENABLED {
+                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+            }
             return Ok(NumericContract::Missing);
         };
         let (ResolvedValueType::Matrix(left_type), ResolvedValueType::Matrix(right_type)) = (
             self.expressions.value_type(node.inputs[0])?,
             self.expressions.value_type(node.inputs[1])?,
         ) else {
+            if S::ENABLED {
+                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+            }
             return Ok(NumericContract::Missing);
         };
-        let canonical = tensor_bound_with_facts_witness(
+        let facts = MatrixProductFacts {
+            left_is_constant_polynomial: self.constant_polynomial_fact(node.inputs[0]),
+            right_is_constant_polynomial: self.constant_polynomial_fact(node.inputs[1]),
+            ..MatrixProductFacts::default()
+        };
+        let canonical = tensor_bound_with_facts(
             &CanonicalMatrixBound {
                 matrix_type: concrete_type(left_type),
                 coefficient_class: canonical_class(left_bound),
@@ -4335,17 +4348,19 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 matrix_type: concrete_type(right_type),
                 coefficient_class: canonical_class(right_bound),
             },
-            &MatrixProductFacts {
-                left_is_constant_polynomial: self.constant_polynomial_fact(node.inputs[0]),
-                right_is_constant_polynomial: self.constant_polynomial_fact(node.inputs[1]),
-                ..MatrixProductFacts::default()
-            },
+            &facts,
         )
         .map_err(|_| NormalizeError::ArithmeticOverflow)?;
         if S::ENABLED {
-            self.observe_bound_transfer(owner, BoundTransferWitness::Tensor(canonical.clone()))?;
+            self.observe_bound_transfer(
+                owner,
+                BoundRule::Tensor {
+                    left_is_constant_polynomial: facts.left_is_constant_polynomial,
+                    right_is_constant_polynomial: facts.right_is_constant_polynomial,
+                },
+            )?;
         }
-        Ok(NumericContract::Known(coefficient_bound(&canonical.result.coefficient_class)))
+        Ok(NumericContract::Known(coefficient_bound(&canonical.coefficient_class)))
     }
 
     fn constant_polynomial_fact(&self, expression: ExprId) -> bool {
@@ -4368,12 +4383,18 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
         let [NumericContract::Known(left_bound), NumericContract::Known(right_bound)] = bounds
         else {
+            if S::ENABLED {
+                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+            }
             return Ok(NumericContract::Missing);
         };
         let (ResolvedValueType::Matrix(left_type), ResolvedValueType::Matrix(right_type)) = (
             self.expressions.value_type(node.inputs[0])?,
             self.expressions.value_type(node.inputs[1])?,
         ) else {
+            if S::ENABLED {
+                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+            }
             return Ok(NumericContract::Missing);
         };
         let left_facts = self.matrix_value_facts(node.inputs[0]);
@@ -4384,7 +4405,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 NumericContract::Missing => None,
             })
         };
-        let result = product_bound_with_facts_witness(
+        let facts = MatrixProductFacts {
+            left_is_constant_polynomial: left_facts
+                .is_some_and(|facts| facts.metadata.is_constant_polynomial),
+            right_is_constant_polynomial: right_facts
+                .is_some_and(|facts| facts.metadata.is_constant_polynomial),
+            left_support_upper: support(left_facts),
+            right_support_upper: support(right_facts),
+            ..MatrixProductFacts::default()
+        };
+        let result = product_bound_with_facts(
             &CanonicalMatrixBound {
                 matrix_type: concrete_type(left_type),
                 coefficient_class: canonical_class(left_bound),
@@ -4393,21 +4423,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 matrix_type: concrete_type(right_type),
                 coefficient_class: canonical_class(right_bound),
             },
-            &MatrixProductFacts {
-                left_is_constant_polynomial: left_facts
-                    .is_some_and(|facts| facts.metadata.is_constant_polynomial),
-                right_is_constant_polynomial: right_facts
-                    .is_some_and(|facts| facts.metadata.is_constant_polynomial),
-                left_support_upper: support(left_facts),
-                right_support_upper: support(right_facts),
-                ..MatrixProductFacts::default()
-            },
+            &facts,
         )
         .map_err(|_| NormalizeError::ArithmeticOverflow)?;
         if S::ENABLED {
-            self.observe_bound_transfer(owner, BoundTransferWitness::Product(result.clone()))?;
+            self.observe_bound_transfer(owner, BoundRule::Product { facts })?;
         }
-        Ok(NumericContract::Known(coefficient_bound(&result.result.coefficient_class)))
+        Ok(NumericContract::Known(coefficient_bound(&result.coefficient_class)))
     }
 
     fn nonmatrix_bound(

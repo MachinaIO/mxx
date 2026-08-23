@@ -11,7 +11,7 @@ use super::{
         ScalarOperation, SemanticFamilySourceIdentity, SemanticSourceIdentity, TrapdoorOperation,
         TrustedIndexRange, TypedConstant, ValueOperator, ValueTransformOperation,
     },
-    bound::{ProductBoundWitness, TensorBoundWitness},
+    bound::MatrixProductFacts,
     job::CheckerJob,
     protocol::{ArtifactProducer, PlannedWire, ProgramOccurrence},
     simulation::CertificateClosure,
@@ -82,7 +82,8 @@ pub(crate) trait FeasibilitySink: Default {
 
     fn record_bound_transfer(
         &mut self,
-        observation: BoundTransferObservation,
+        owner: super::arena::ScopedExprId,
+        rule: BoundRule,
     ) -> Result<(), G0Error>;
 
     fn validate_normalization_observations(&self) -> Result<(), G0Error>;
@@ -208,7 +209,10 @@ pub(crate) enum NormalizerEvent {
         source: EventRange,
     },
     AppliedRelation(AppliedRelation),
-    BoundTransfer(BoundTransferObservation),
+    BoundTransfer {
+        owner: super::arena::ScopedExprId,
+        rule: BoundRule,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -244,15 +248,9 @@ pub(crate) struct AppliedRelation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BoundTransferWitness {
-    Product(ProductBoundWitness),
-    Tensor(TensorBoundWitness),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BoundTransferObservation {
-    pub owner: super::arena::ScopedExprId,
-    pub witness: BoundTransferWitness,
+pub(crate) enum BoundRule {
+    Product { facts: MatrixProductFacts },
+    Tensor { left_is_constant_polynomial: bool, right_is_constant_polynomial: bool },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1292,7 +1290,8 @@ impl FeasibilitySink for NoFeasibility {
 
     fn record_bound_transfer(
         &mut self,
-        _observation: BoundTransferObservation,
+        _owner: super::arena::ScopedExprId,
+        _rule: BoundRule,
     ) -> Result<(), G0Error> {
         Ok(())
     }
@@ -1552,9 +1551,10 @@ impl FeasibilitySink for FeasibilityTrace {
 
     fn record_bound_transfer(
         &mut self,
-        observation: BoundTransferObservation,
+        owner: super::arena::ScopedExprId,
+        rule: BoundRule,
     ) -> Result<(), G0Error> {
-        self.events.push(NormalizerEvent::BoundTransfer(observation));
+        self.events.push(NormalizerEvent::BoundTransfer { owner, rule });
         Ok(())
     }
 
@@ -1657,7 +1657,18 @@ impl FeasibilitySink for FeasibilityTrace {
                         return Err(G0Error::RelationTraceInvariant);
                     }
                 }
-                _ => {}
+                NormalizerEvent::BoundTransfer { owner, .. } => {
+                    let Some((root, _, _)) = stack.last() else {
+                        return Err(G0Error::RelationTraceInvariant);
+                    };
+                    if root.program() != owner.program() ||
+                        !self.events[position + 1..].iter().any(|event| {
+                            matches!(event, NormalizerEvent::Result { owner: result_owner, .. } if result_owner == owner)
+                        })
+                    {
+                        return Err(G0Error::RelationTraceInvariant);
+                    }
+                }
             }
         }
         if !stack.is_empty() {
@@ -2208,6 +2219,8 @@ pub(crate) enum G0Error {
     MalformedSpecializationRange,
     #[error("relation recorder invariant is violated")]
     RelationTraceInvariant,
+    #[error("reached product or tensor bound has unsupported typed operands")]
+    UnsupportedBoundTransfer,
     #[error("residual event has no typed lowering observation")]
     MissingEventObservation,
     #[error("independent residual events cannot alias one canonical event row")]

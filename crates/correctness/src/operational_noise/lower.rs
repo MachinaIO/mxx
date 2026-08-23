@@ -14,8 +14,8 @@ use super::{
     },
     facts::{CoefficientBound, MatrixFacts, MatrixMetadata, NumericContract, PolynomialFacts},
     g0::{
-        EventKind, EventObservation, FeasibilitySink, FeasibilityTrace, InputSourceIdentity,
-        NoFeasibility, SourceClass, SourceHandle,
+        EventKind, EventObservation, FeasibilitySink, FeasibilityTrace, IndexFrontierAxis,
+        IndexUseKind, IndexUsePlan, InputSourceIdentity, NoFeasibility, SourceClass, SourceHandle,
     },
     job::{CandidateToken, CheckerJob, JobError},
     program::{FamilyValueId, SelectionSelector},
@@ -381,6 +381,102 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 })?;
         }
         Ok(())
+    }
+
+    fn record_family_index_use_if_enabled(
+        &mut self,
+        kind: IndexUseKind,
+        wire: &PlannedWire,
+        index: ExprId,
+        result: Option<ExprId>,
+        consumed_family: Option<FamilyValueId>,
+        result_family: Option<FamilyValueId>,
+    ) -> Result<(), ProductionAdapterError> {
+        if S::ENABLED {
+            let family = result_family.or(consumed_family).ok_or_else(|| {
+                ProductionAdapterError::Structural {
+                    wire: wire.clone(),
+                    reason: "index use has no typed family owner".to_owned(),
+                }
+            })?;
+            let frontier = self.index_frontier_axes(index, wire)?;
+            let domain = self.job.programs().family_domain(family)?;
+            let output_type = self.job.programs().family_element_type(family)?;
+            self.feasibility
+                .record_index_use(IndexUsePlan {
+                    kind,
+                    owner: wire.clone(),
+                    result,
+                    result_family,
+                    consumed: None,
+                    consumed_family,
+                    index,
+                    frontier,
+                    output_type,
+                    output_range: Some(TrustedIndexRange {
+                        minimum: domain.minimum,
+                        maximum_exclusive: domain.maximum_exclusive,
+                    }),
+                    slice_group: None,
+                })
+                .map_err(|error| ProductionAdapterError::Descriptor {
+                    reason: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    fn index_frontier_axes(
+        &self,
+        index: ExprId,
+        wire: &PlannedWire,
+    ) -> Result<Box<[IndexFrontierAxis]>, ProductionAdapterError> {
+        let mut reachable = BTreeSet::new();
+        let mut pending = vec![index];
+        while let Some(expression) = pending.pop() {
+            if !reachable.insert(expression) {
+                continue;
+            }
+            pending.extend(self.job.expressions().node(expression)?.inputs.iter().copied());
+        }
+        let mut axes = self
+            .active_loop_argument_ranges
+            .iter()
+            .filter_map(|((owner, argument), domain)| {
+                if !reachable.contains(argument) {
+                    return None;
+                }
+                let position = match self.job.expressions().node(*argument) {
+                    Ok(node) => match &node.operator {
+                        ValueOperator::Argument { position, .. } => Some(*position),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                }?;
+                Some(IndexFrontierAxis {
+                    owner: owner.clone(),
+                    argument_position: position,
+                    domain: *domain,
+                })
+            })
+            .collect::<Vec<_>>();
+        axes.sort_by(|left, right| {
+            left.argument_position
+                .cmp(&right.argument_position)
+                .then_with(|| left.owner.cmp(&right.owner))
+                .then_with(|| left.domain.cmp(&right.domain))
+        });
+        let free_arguments = self.job.expressions().free_arguments(index)?;
+        if free_arguments
+            .iter()
+            .any(|(position, _)| !axes.iter().any(|axis| axis.argument_position == *position))
+        {
+            return Err(ProductionAdapterError::Structural {
+                wire: wire.clone(),
+                reason: "index expression has no exact active binder range".to_owned(),
+            });
+        }
+        Ok(axes.into_boxed_slice())
     }
 
     fn is_artifact_producer_wire(&self, wire: &PlannedWire) -> bool {
@@ -3041,7 +3137,18 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                         reason: "static family selector did not close during prepass".to_owned(),
                     }
                 })?;
-                Value::Expr(self.call_family(family_id, index)?)
+                let result = self.call_family(family_id, index)?;
+                if S::ENABLED {
+                    self.record_family_index_use_if_enabled(
+                        IndexUseKind::FamilyGetStatic,
+                        wire,
+                        index,
+                        Some(result),
+                        Some(family_id),
+                        None,
+                    )?;
+                }
+                Value::Expr(result)
             }
             NodeKind::FamilyGetDynamic => {
                 let family_id = family(inputs, 0)?;
@@ -3051,7 +3158,18 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 else {
                     return Err(ProductionAdapterError::MissingSelectorRange { wire: wire.clone() });
                 };
-                Value::Expr(self.call_family_with_wire(family_id, index, wire.clone())?)
+                let result = self.call_family_with_wire(family_id, index, wire.clone())?;
+                if S::ENABLED {
+                    self.record_family_index_use_if_enabled(
+                        IndexUseKind::FamilyGetDynamic,
+                        wire,
+                        index,
+                        Some(result),
+                        Some(family_id),
+                        None,
+                    )?;
+                }
+                Value::Expr(result)
             }
             NodeKind::Select { .. } => {
                 let Value::Expr(selector) = inputs.first().copied().ok_or_else(|| {
@@ -3078,15 +3196,28 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                         minimum: family_domain.minimum,
                         maximum_exclusive: family_domain.maximum_exclusive,
                     };
-                    let selector = match self.binder_open_selector(selector, family_range, wire)? {
-                        Some(selector) => selector,
-                        None => SelectionSelector::Closed(self.close_expression(
+                    let selector_root = selector;
+                    let selector =
+                        match self.binder_open_selector(selector_root, family_range, wire)? {
+                            Some(selector) => selector,
+                            None => SelectionSelector::Closed(self.close_expression(
+                                wire,
+                                selector_root,
+                                "close closed-family selector",
+                            )?),
+                        };
+                    let result = self.select_family(selector, &families)?;
+                    if S::ENABLED {
+                        self.record_family_index_use_if_enabled(
+                            IndexUseKind::Select,
                             wire,
-                            selector,
-                            "close closed-family selector",
-                        )?),
-                    };
-                    Value::Family(self.select_family(selector, &families)?)
+                            selector_root,
+                            None,
+                            None,
+                            Some(result),
+                        )?;
+                    }
+                    Value::Family(result)
                 } else if branches.iter().all(|value| matches!(value, Value::Expr(_))) {
                     let values = branches
                         .iter()
@@ -5184,7 +5315,7 @@ mod tests {
             InputContractEntry, InputValueContract, ProtocolInputBinding, ProtocolInputDestination,
             ProtocolInputId, StageInputName,
         };
-        use mxx_dsl::{DslContext, Ring};
+        use mxx_dsl::{DslContext, Family, Int, Ring};
         let ring = Ring::new(256, 1);
         let left = ring.input_family("left-family", 5, (1, 1));
         let right = ring.input_family("right-family", 7, (1, 1));
@@ -5194,7 +5325,10 @@ mod tests {
             .parallel_zip_offset(right.clone(), 2, |_, first, second| first + second)
             .unwrap();
         let independent = right.parallel_map(|_, value| value).unwrap();
-        let residual = early + zipped.get_static(0) + independent.get_static(0);
+        let selected = Family::select(Int::constant(0), vec![left.clone()])
+            .expect("same-shaped family selection");
+        let residual =
+            early + zipped.get_static(0) + independent.get_static(0) + selected.get_static(0);
         let encrypt = DslContext::new("parallel-range-encrypt")
             .int_parameter("cutoff")
             .public_output("ciphertext", residual.clone())
@@ -6842,5 +6976,68 @@ mod tests {
         trace.retain_residual(&closure);
         assert_eq!(trace.event_observations().len(), 1);
         assert!(trace.event_observations().contains_key(&retained_event));
+    }
+
+    #[test]
+    fn opt_in_family_and_select_index_uses_keep_typed_kinds_and_frontiers() {
+        let protocol = parallel_range_protocol();
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("parallel plan");
+        let (_, _, trace) = ProductionAdapter::new_with_feasibility(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("opt-in adapter")
+        .lower_with_feasibility()
+        .expect("opt-in lowering");
+        let uses = trace.index_use_plans().collect::<Vec<_>>();
+        assert!(uses.iter().any(|plan| plan.kind == IndexUseKind::FamilyGetStatic));
+        assert!(uses.iter().any(|plan| plan.kind == IndexUseKind::Select));
+        assert!(uses.iter().any(|plan| {
+            plan.kind == IndexUseKind::FamilyGetStatic && plan.frontier.is_empty()
+        }));
+
+        let dynamic_protocol = generated_gather_protocol(7);
+        let dynamic_plan =
+            ProtocolPlan::build(&dynamic_protocol, "toy-threshold").expect("dynamic plan");
+        let (_, _, dynamic_trace) = ProductionAdapter::new_with_feasibility(
+            &dynamic_protocol,
+            &dynamic_plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("dynamic opt-in adapter")
+        .lower_with_feasibility()
+        .expect("dynamic opt-in lowering");
+        let dynamic = dynamic_trace
+            .index_use_plans()
+            .find(|plan| plan.kind == IndexUseKind::FamilyGetDynamic)
+            .expect("dynamic family use");
+        assert!(!dynamic.frontier.is_empty());
+        assert!(dynamic.frontier.windows(2).all(|axes| {
+            axes[0].argument_position < axes[1].argument_position ||
+                (axes[0].argument_position == axes[1].argument_position &&
+                    axes[0].owner <= axes[1].owner)
+        }));
+        assert!(
+            uses.iter()
+                .any(|plan| { plan.kind == IndexUseKind::Select && plan.frontier.is_empty() })
+        );
+
+        let residual_expression = dynamic_trace
+            .index_use_plans()
+            .find_map(|plan| plan.result)
+            .expect("expression-backed family use");
+        let mut retained = dynamic_trace;
+        let closure = super::super::simulation::CertificateClosure {
+            expressions: BTreeSet::from([residual_expression]),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: BTreeSet::new(),
+        };
+        retained.retain_residual(&closure);
+        assert!(retained.index_use_plans().all(|plan| plan.result == Some(residual_expression)));
     }
 }

@@ -5,8 +5,10 @@
 
 use super::{
     OperationalSimulationDiagnostics, OperationalSimulationReport,
+    arena::{ClosedExprId, FamilyDomain, ResolvedMatrixType, ResolvedValueType},
     error::{OperationalSimulationError, TargetError},
-    lower::ProductionAdapter,
+    lower::{ProductionAdapter, ProductionRoot},
+    program::FamilyValueId,
     protocol::ProtocolPlan,
     report::{ReportTarget, analyze_roots},
 };
@@ -25,6 +27,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use thiserror::Error;
 use tracing::{debug, error, info};
 
 const PROGRESS_TIME_CADENCE: Duration = Duration::from_secs(1);
@@ -51,6 +54,139 @@ pub(crate) struct ResolvedAcceptanceTarget {
 pub(crate) enum ResolvedDecoderKind {
     Threshold { plaintext_modulus: BigUint },
     BooleanInterval,
+}
+
+/// The residual root projected for later certificate recording.
+///
+/// Arena handles remain crate-local so a future serializer must replace them with statement rows
+/// before data crosses the crate boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CertificateResidualRoot {
+    Closed { root: ClosedExprId, matrix: ResolvedMatrixType },
+    Family { family: FamilyValueId, domain: FamilyDomain, matrix: ResolvedMatrixType },
+}
+
+/// Typed statement data selected by the pinned checker for one opt-in certificate emission.
+///
+/// This projection contains only threshold `p`, resolved `q`, and `ProductionRoots.residual`.
+/// It deliberately has no decoder root or decoder result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OperationalCertificateProjection {
+    pub target_id: String,
+    pub plaintext_modulus: BigUint,
+    pub ciphertext_modulus: BigUint,
+    pub residual: CertificateResidualRoot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub(crate) enum CertificateProjectionError {
+    #[error(
+        "certificate projection requires a threshold decoder for target {target_id:?}, got {kind:?}"
+    )]
+    UnsupportedDecoderKind { target_id: String, kind: OperationalDecoderKind },
+    #[error("certificate residual root for target {target_id:?} is not a matrix: {actual:?}")]
+    ResidualRootNotMatrix { target_id: String, actual: ResolvedValueType },
+    #[error(
+        "certificate residual modulus mismatch for target {target_id:?}: target q={target:?}, residual q={residual:?}"
+    )]
+    ResidualModulusMismatch { target_id: String, target: BigUint, residual: BigUint },
+    #[error("certificate projection failed during lowering: {detail}")]
+    Lowering { detail: String },
+    #[error("operational checker rejected certificate projection: {0}")]
+    Operational(#[from] OperationalSimulationError),
+}
+
+/// Re-runs target resolution and production lowering only when certificate emission is explicitly
+/// requested. Normal simulation entry points never call this function.
+pub(crate) fn project_operational_certificate(
+    protocol: &ProtocolDecl,
+    request: &super::OperationalCheckRequest,
+) -> Result<OperationalCertificateProjection, CertificateProjectionError> {
+    let mut emit = |_| {};
+    let mut control = SimulationControl::new(&mut emit);
+    request.validate(protocol.params.iter().map(|parameter| parameter.name.clone())).map_err(
+        |error| CertificateProjectionError::Operational(OperationalSimulationError::Request(error)),
+    )?;
+    let target = resolve_target(protocol, request, &mut control)?;
+    let target_id = target.target_id.clone();
+    let plaintext_modulus = match &target.kind {
+        ResolvedDecoderKind::Threshold { plaintext_modulus } => plaintext_modulus.clone(),
+        ResolvedDecoderKind::BooleanInterval => {
+            return Err(CertificateProjectionError::UnsupportedDecoderKind {
+                target_id,
+                kind: OperationalDecoderKind::BooleanInterval,
+            });
+        }
+    };
+    let parameters = request
+        .environment
+        .iter()
+        .filter_map(|(name, value)| match value {
+            super::OperationalParameterValue::Integer(value) => Some((name.clone(), value.clone())),
+            super::OperationalParameterValue::Rational { .. } => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let plan = ProtocolPlan::build(protocol, &request.target_id)
+        .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?;
+    let (job, roots) = ProductionAdapter::new(protocol, &plan, parameters)
+        .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?
+        .lower()
+        .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?;
+    let residual = project_residual_root(&job, &roots.residual, &target)?;
+    Ok(OperationalCertificateProjection {
+        target_id,
+        plaintext_modulus,
+        ciphertext_modulus: target.ciphertext_modulus,
+        residual,
+    })
+}
+
+fn project_residual_root(
+    job: &super::job::CheckerJob,
+    root: &ProductionRoot,
+    target: &ResolvedAcceptanceTarget,
+) -> Result<CertificateResidualRoot, CertificateProjectionError> {
+    let projected = match root {
+        ProductionRoot::Closed(root) => {
+            let actual = job.expressions().value_type(root.expression()).map_err(|error| {
+                CertificateProjectionError::Lowering { detail: error.to_string() }
+            })?;
+            let ResolvedValueType::Matrix(matrix) = actual else {
+                return Err(CertificateProjectionError::ResidualRootNotMatrix {
+                    target_id: target.target_id.clone(),
+                    actual: actual.clone(),
+                });
+            };
+            CertificateResidualRoot::Closed { root: *root, matrix: matrix.clone() }
+        }
+        ProductionRoot::Family(family) => {
+            let actual = job.programs().family_element_type(*family).map_err(|error| {
+                CertificateProjectionError::Lowering { detail: error.to_string() }
+            })?;
+            let ResolvedValueType::Matrix(matrix) = actual else {
+                return Err(CertificateProjectionError::ResidualRootNotMatrix {
+                    target_id: target.target_id.clone(),
+                    actual,
+                });
+            };
+            let domain = job.programs().family_domain(*family).map_err(|error| {
+                CertificateProjectionError::Lowering { detail: error.to_string() }
+            })?;
+            CertificateResidualRoot::Family { family: *family, domain, matrix: matrix.clone() }
+        }
+    };
+    let modulus = match &projected {
+        CertificateResidualRoot::Closed { matrix, .. } |
+        CertificateResidualRoot::Family { matrix, .. } => &matrix.modulus,
+    };
+    if modulus != &target.ciphertext_modulus {
+        return Err(CertificateProjectionError::ResidualModulusMismatch {
+            target_id: target.target_id.clone(),
+            target: target.ciphertext_modulus.clone(),
+            residual: modulus.clone(),
+        });
+    }
+    Ok(projected)
 }
 
 /// One structured, allocation-free progress record supplied at instrumented checker boundaries.
@@ -893,5 +1029,77 @@ mod tests {
         assert!(control.reserve_owned_elements(usize::MAX).is_ok());
         assert!(control.reserve_owned_elements(3).is_ok());
         assert_eq!(control.owned_elements.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    fn certificate_projection_uses_threshold_target_and_residual_root() {
+        let mut job = super::super::job::CheckerJob::new();
+        let scalar = job
+            .expressions_mut()
+            .intern(
+                super::super::arena::ValueOperator::Constant(
+                    super::super::arena::TypedConstant::int(0),
+                ),
+                Box::new([]),
+            )
+            .expect("zero scalar");
+        let matrix_type = super::super::arena::ResolvedMatrixType::new(256_u16.into(), 1, 1, 1)
+            .expect("matrix type");
+        let matrix = job
+            .expressions_mut()
+            .intern(
+                super::super::arena::ValueOperator::Matrix(
+                    super::super::arena::MatrixOperation::LiftConstantPolynomial {
+                        output: matrix_type,
+                        coefficient_bits: 8,
+                    },
+                ),
+                Box::new([scalar]),
+            )
+            .expect("zero matrix");
+        let root = super::super::lower::ProductionRoot::Closed(
+            job.expressions().close(matrix).expect("closed matrix"),
+        );
+        let target = ResolvedAcceptanceTarget {
+            target_id: "toy-threshold".to_owned(),
+            ciphertext_modulus: 256_u16.into(),
+            kind: ResolvedDecoderKind::Threshold { plaintext_modulus: 2_u8.into() },
+        };
+        let residual = project_residual_root(&job, &root, &target).expect("root projection");
+        let projection = OperationalCertificateProjection {
+            target_id: target.target_id.clone(),
+            plaintext_modulus: 2_u8.into(),
+            ciphertext_modulus: target.ciphertext_modulus.clone(),
+            residual,
+        };
+        assert_eq!(projection.target_id, "toy-threshold");
+        assert_eq!(projection.plaintext_modulus, 2_u8.into());
+        assert_eq!(projection.ciphertext_modulus, 256_u16.into());
+        let CertificateResidualRoot::Closed { matrix, .. } = projection.residual else {
+            panic!("toy residual should be closed")
+        };
+        assert_eq!(matrix.modulus, 256_u16.into());
+        assert_eq!(matrix.ring_dimension, 1);
+    }
+
+    #[test]
+    fn certificate_projection_rejects_boolean_interval_targets() {
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.operational_decoder_targets[0].kind =
+            OperationalDecoderKind::BooleanInterval;
+        let request = super::super::OperationalCheckRequest {
+            environment: vec![(
+                "cutoff".to_owned(),
+                super::super::OperationalParameterValue::Integer(1.into()),
+            )],
+            layouts: Vec::new(),
+            target_id: "toy-threshold".to_owned(),
+        };
+        assert!(matches!(
+            project_operational_certificate(&protocol, &request),
+            Err(CertificateProjectionError::Operational(OperationalSimulationError::Target(
+                TargetError::DecoderKindMismatch { .. }
+            )))
+        ));
     }
 }

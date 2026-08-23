@@ -163,10 +163,12 @@ Boolean の検査結果を結ぶ共通 lemma を用意し、固定 theorem
 
 定理の主張を決めるデータと、その証明の書き方を分離する。
 
-- `Source.json`: 入力となる固定 protocol bundle、request、pinned source/evaluator version
+- `Source.json`: G3 で追加する単一 canonical frozen-bundle serializer の完全な出力、request、
+  pinned source/evaluator version。既存 bundle の第二の実行意味モデルではなく、target/environment
+  の重複、normal form、LUT output、bound ledger、proof を含めない
 - `Cert.lean`: certificate の statement data と局所 validity proof
 - `Proof.lean`: 固定された主張を証明する通常の Lean proof
-- `AcceptedCertificates.lean`: 最終受理だけを行う固定 module
+- G3 で追加する、最終受理だけを行う固定 acceptance module
 
 これにより、証明生成器が証明しやすい別の主張へ差し替えることを防ぐ。
 
@@ -194,9 +196,11 @@ Lean kernel の検査だけでは、選択された source が実際に運用し
 
 ### 6.2 Source artifact
 
-canonical source artifact は次を含む。
+canonical source artifact は、certificate 用に追加する単一の canonical frozen-bundle serializer
+の完全な出力として次を含む。これは `ProtocolDecl` や `ClosedProtocolBundle` の第二の実行
+意味モデルではなく、既存データを表す wire format である。
 
-- 既存形式で serialize された固定 protocol bundle
+- 固定 protocol bundle の完全な serializer 出力
 - 正確な `OperationalCheckRequest`
 - 固定した source と evaluator の version
 
@@ -209,7 +213,8 @@ canonical source artifact は次を含む。
 modulus の不一致が一つでもあれば certificate 生成を拒否する。具体的には、resolved
 `target_id` と request の `target_id`、project した `q` と residual ring modulus、project した
 `p`/`q` と Rust threshold acceptance report が使った値がそれぞれ一致しなければならない。
-digest は監査用に含めてもよいが、semantic identity として使わない。
+clean-room regeneration の主張は、この serializer が G3 で完成するまで行わない。digest は
+監査用に含めてもよいが、semantic identity として使わない。
 
 ### 6.3 実行へ適用するための外部条件
 
@@ -220,7 +225,8 @@ Lean theorem は条件付きの定理である。ある実行へ適用するに�
   canonical source artifact と完全に一致すること。target ID と parameter environment は request
   自体に含まれる
 - residual proof closure 内の各 `SourceAccess` について、実行時に供給した値が、同じ型付き
-  source、owner invocation、scoped substitution、optional signed selector に割り当てた値と等しく、
+  source、owner invocation、scoped substitution、optional signed selector（非負なら `Nat` family
+  selector への写像も含む）に割り当てた値と等しく、
   `InputContract` の生の事実を満たすこと
 - residual proof closure 内の各 scoped event occurrence について、実行時に生成した値が、
   その exact event と owner invocation に割り当てた値と等しく、`SamplerContract` の型、
@@ -316,21 +322,25 @@ def OperationalClaim (cert : CheckedCert) : Prop :=
               (evalClosedResidual samplers inputs cert root) <
           cert.val.ciphertextModulus
     | .family family domain =>
-        ∀ (selector : Int), domain.Contains selector →
+        ∀ (selector : Int), 0 ≤ selector →
+          domain.ContainsNat selector.toNat →
           2 * cert.val.plaintextModulus *
               maxCenteredCoefficientNorm
-                (evalFamilyResidual samplers inputs cert family selector) <
+                (evalFamilyResidual samplers inputs cert family selector.toNat) <
             cert.val.ciphertextModulus
 ```
 
 `ResidualRoot` は現在の Rust と同じ二種類だけを持つ。
 
 - `closed`: 自由引数を持たない matrix expression
-- `family`: 正確な signed domain を持つ一引数の matrix family
+- `family`: Rust の `FamilyDomain`（`u64` の非負半開区間、Lean では `Nat` endpoint）を持つ一引数の
+  matrix family
 
-closed root は引数なしで評価する。family root は domain 内の全 selector に対して記号的に
-bound を証明する。root 引数はこの検査済み構造から内部的に決め、型のない外部 list として
-受け取らない。
+closed root は引数なしで評価する。Lean theorem は一般の `Int` selector を受け取るが、
+`0 ≤ selector` と `ContainsNat selector.toNat` を確認してから `Nat` selector へ写す。負の selector
+は拒否し、負の family selector 対応は追加しない。family root はこの正確な非負半開区間内の
+全 selector に対して記号的に bound を証明する。root 引数はこの検査済み構造から内部的に決め、
+型のない外部 list として受け取らない。
 
 `OperationalClaim` は、各対象 residual の最大 centered coefficient norm を `noise` としたとき、
 
@@ -356,7 +366,7 @@ trusted canonical projection が取り出す。生成 proof の data が別の�
 この theorem の対象外である。
 
 `OperationalClaim` は certificate 固有の数学的な最終地点である。closed root なら狭義不等式を
-一つ、family root なら正確な signed domain 内の全 selector に対して同じ不等式を証明する。
+一つ、family root なら正確な非負半開区間内の全 selector に対して同じ不等式を証明する。
 等号は不合格であり、整数除算を使う弱い条件へ書き換えてはならない。
 
 固定 acceptance module は、生成 proof の型が完全修飾された
@@ -471,8 +481,8 @@ fuel-stable な一段 lemma を用いる。Rust は子の評価結果を memoize
   あること
 - operator の arity と `Bytes` を含む全 `Value` type が正確であること
 - matrix の係数数、modulus、ring dimension、rows、columns、logical shape が正しいこと
-- residual root が closed または一引数 family として正しく分類され、family なら正確な signed
-  domain、closed なら自由引数がないこと
+- residual root が closed または一引数 family として正しく分類され、family なら正確な非負
+  `FamilyDomain`、closed なら自由引数がないこと
 - plaintext/ciphertext modulus が正で、residual の modulus と ring が正確に一致すること
 - program signature、引数 ownership、family domain、call substitution が正しいこと
 - source、event、relation link、index-use row の owner が一意で、serialize した全 row が
@@ -482,7 +492,8 @@ fuel-stable な一段 lemma を用いる。Rust は子の評価結果を memoize
 - 検査済み dependency DAG から十分な fuel が得られること
 
 Tall target では、canonical projection が frozen Rust source から再構成した pinned checker run
-の `ProductionRoots.residual` から、宣言済み residual root と正確な family domain を選ぶ。
+の `ProductionRoots.residual` から、宣言済み residual root と、`u64`/`Nat` endpoint の正確な
+`FamilyDomain` を選ぶ。
 `Cert.Valid` はその構造と residual-only closure を検査する。どちらも実行時に渡す仮定ではない。
 
 Rust の物理的な `MatrixLayout` は source artifact に残し、既存 Rust arena が引き続き検査する。
@@ -498,14 +509,16 @@ Lean は interpreter が使う logical routing と shape をすべて検査す�
 - source reference
 - normalized owner invocation
 - 検査済みの scoped substitution
-- family access の場合だけ存在する、評価済みの signed selector
+- family access の場合だけ存在する、評価済みの signed selector と、非負なら optional な `Nat`
+  family selector
 
 `InputAssignment` は `SourceAccess` から `Value` への total function である。同じ owner invocation
 内でも、同じ family を異なる selector で読めば別の access になる。
 
-`Cert.Valid` は substitution と owner program signature の一致、および selector と signed family
-domain の一致を検査する。`InputContract` は valid な各 access の resolved type と、Rust analysis
-が実際に使った生の事実だけを要求する。
+`Cert.Valid` は substitution と owner program signature の一致、および非負 selector と Rust の
+`FamilyDomain` endpoint の一致を検査する。負の selector は拒否し、family element として解釈
+しない。`InputContract` は valid な各 access の resolved type と、Rust analysis が実際に使った
+生の事実だけを要求する。
 
 polynomial に関する次の三種類の情報を混同しない。
 
@@ -516,7 +529,8 @@ polynomial に関する次の三種類の情報を混同しない。
 係数から index を取り出すときの domain 根拠に使えるのは canonical coefficient exclusive
 upper だけである。support upper は owner、source、family access を正確に選んだ値で、ring
 dimension 以下でなければならず、それ以後の polynomial position が 0 になることを表す。
-現在の integer fact は signed half-open range として記録する。派生する range、support、
+現在の integer fact は signed half-open range として記録する。family domain と family-access
+selector だけは上記の signed-to-`Nat` 境界を使う。派生する range、support、
 sparsity、constant 性は Lean で証明し、入力条件として追加しない。
 
 ### 10.2 SamplerAssignment と SamplerContract
@@ -546,7 +560,8 @@ B * K(i) = T(i)
 ```
 
 である。validity proof は `B` の program root が program argument に到達せず、selector を
-変えても同じ値になることを再帰的に証明する。`K(i)` と `T(i)` は同じ signed selector を使う。
+変えても同じ値になることを再帰的に証明する。`K(i)` と `T(i)` は同じ非負 family selector へ
+写した値を使う。selector を計算する signed integer arithmetic の意味は signed のまま保つ。
 
 ## 11. Index を安全に使うための LUT
 
@@ -579,7 +594,7 @@ consumer ではない。
 
 consumer ごとの要求 domain は次のとおりである。
 
-- family lookup: signed family domain
+- family lookup: 非負 endpoint の `FamilyDomain`
 - `ExplicitElement`: 正確な branch domain
 - dynamic row start/end: `[0, input.rows + 1)`
 - dynamic column start/end: `[0, input.columns + 1)`
@@ -694,8 +709,9 @@ acceptance、diagnostic を変更してはならない。
 同じ request を recording off と on で実行し、recorder 専用 metric を除く Rust report bytes と
 core counter が一致することを differential test で確認する。
 
-`Source.json` だけから clean-room regeneration を実行できなければならない。`Source.json` は
-canonical な frozen bundle、正確な request、pinned version identity だけを持ち、target や environment の
+G3 で canonical frozen-bundle serializer が完成した後は、その完全な出力である `Source.json`
+だけから clean-room regeneration を実行できなければならない。`Source.json` は canonical な
+frozen bundle、正確な request、pinned version identity だけを持ち、target や environment の
 重複 field、normal form、LUT output、bound ledger、proof は持たない。regenerator は checker run を
 再構築し、residual proof closure 内の全 row と proof を再計算し、decoder-only data を省く。新しい
 `Cert.lean` と `Proof.lean` は committed file と byte 単位で比較する。`Source.json` に未知の
@@ -739,27 +755,33 @@ O(N + T + L)
 次を計算または測定する。
 
 - 正確な `N`
-- `T` の総 payload
 - 各 frontier の cardinality 積
-- `L` の総 payload
-- artifact byte 数の見積り
-- peak memory の見積り
+- 正確な `L` とその payload
+- `T`、artifact byte 数、peak memory の見積り
 - 現在の checker との比較
 
 加えて、residual-closure coverage matrix、zero-axis LUT test、synchronized-slice LUT test、
 fuel-stable `have` と balanced row-local validity の kernel spike を完了する。
+
+security-0 では G3 に `T`、artifact byte 数、peak memory を実測し、security-128 では G4 に
+同じ三つを正確に実測する。
 
 production 規模で実現不可能なら設計 review に戻る。runtime cutoff、LUT の切り捨て、別の意味論
 への暗黙の変更で通過させない。
 
 ### G1: 固定 Lean core
 
-- closed な小規模 certificate の手書き proof
-- family root を持ち、異なる index で異なる sampler 値を使う小規模 proof
-- 狭義不等式の正確な proof
-- axiom 検査
-- malformed certificate の拒否
-- 独立した設計 review
+新規配置は次の通りとする。
+
+- `lean/lean-toolchain`
+- `lean/lakefile.toml`
+- `lean/Mxx/Certificate/OperationalNoise/Core.lean`
+- `lean/Mxx/Certificate/OperationalNoise/Fixtures.lean`
+
+closed な小規模 certificate、異なる index で異なる sampler 値を使う family-root certificate、
+狭義不等式、axiom 検査、malformed certificate の拒否、独立した設計 review を完了する。gate は
+`cd lean && lake build Mxx.Certificate.OperationalNoise.Fixtures` と axiom scan である。
+`AcceptedCertificates` は G3 まで不要である。
 
 を完了する。
 
@@ -775,6 +797,7 @@ bound を過大評価せず再現し、未対応ケースは fail closed とす�
 - owner-local で完全な cache-hit replay
 - byte-identical な clean-room regeneration
 - 固定 Lean acceptance module の compile
+- canonical frozen-bundle serializer の完全な `Source.json` 出力
 
 を完了する。
 

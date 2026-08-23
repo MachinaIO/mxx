@@ -85,8 +85,11 @@ does not prove that the selected source is the deployment intended by an operato
 
 ### 4.2 Protocol-dependent audited data
 
-The canonical source artifact contains exactly the existing serialized frozen protocol bundle,
-the exact `OperationalCheckRequest`, and the pinned source/evaluator versions. The request already
+The canonical source artifact contains exactly the complete output of the single canonical
+frozen-bundle serializer introduced for this feature, the exact `OperationalCheckRequest`, and the
+pinned source/evaluator versions. This serializer is a wire-format boundary, not a second execution
+semantics for `ProtocolDecl` or `ClosedProtocolBundle`; it may represent their data without
+reimplementing their behavior. The request already
 contains `target_id` and the parameter environment, so neither is duplicated as another source
 field. Canonical projection reruns the pinned checker and requires exactly one successfully
 resolved `ResolvedAcceptanceTarget`. Its kind must be
@@ -95,9 +98,9 @@ resolved `ResolvedAcceptanceTarget`. Its kind must be
 `BooleanInterval` target, target-resolution failure, missing or multiple resolved targets, or any
 of the following mismatches rejects certificate emission: the resolved `target_id` differs from
 the request's `target_id`; the projected `q` differs from the residual ring modulus; or the
-projected `p` or `q` differs from the values used by the Rust threshold acceptance report. Existing
-canonical serialization is reused. A digest may be included as an audit aid but is never semantic
-identity.
+projected `p` or `q` differs from the values used by the Rust threshold acceptance report. The
+clean-room claim below is not available until this serializer is complete at G3. A digest may be
+included as an audit aid but is never semantic identity.
 
 ### 4.3 External applicability obligations
 
@@ -108,7 +111,8 @@ The Lean theorem is conditional. Applying it to one execution requires external 
   environment;
 - for every `SourceAccess` in the residual proof closure, the value supplied by the execution is
   the value assigned to that same typed source, owner invocation, scoped substitution, and optional
-  signed selector, and it satisfies the raw facts in `InputContract`; and
+  signed selector (and its optional `Nat` family projection when nonnegative), and it satisfies the
+  raw facts in `InputContract`; and
 - for every scoped event occurrence in the residual proof closure, the value produced by the
   execution is the value assigned to that exact event and owner invocation, and it satisfies the
   typing, cutoff, support, and relation clauses in `SamplerContract`.
@@ -187,18 +191,23 @@ def OperationalClaim (cert : CheckedCert) : Prop :=
               (evalClosedResidual samplers inputs cert root) <
           cert.val.ciphertextModulus
     | .family family domain =>
-        ∀ (selector : Int), domain.Contains selector →
+        ∀ (selector : Int), 0 ≤ selector →
+          domain.ContainsNat selector.toNat →
           2 * cert.val.plaintextModulus *
               maxCenteredCoefficientNorm
-                (evalFamilyResidual samplers inputs cert family selector) <
+                (evalFamilyResidual samplers inputs cert family selector.toNat) <
             cert.val.ciphertextModulus
 ```
 
 `ResidualRoot` mirrors the Rust root classification exactly: it is either a closed matrix
-expression or a one-argument matrix family with its exact signed domain. A closed root has no
-caller-supplied arguments. A family root is bounded symbolically for every selector in its domain.
-Root arguments are derived from this checked root structure rather than supplied as an untyped
-external list.
+expression or a one-argument matrix family. Rust's `FamilyDomain` is an exact nonnegative
+half-open interval with `u64` endpoints; Lean stores the same endpoints as `Nat`. The theorem may
+receive a general `Int` selector because expression facts are signed, but `0 ≤ selector` and
+`ContainsNat selector.toNat` are required before the selector is mapped to `Nat`. A negative selector
+is rejected; negative family-selector support is not added. A closed root has no caller-supplied
+arguments, and a family root is bounded for every selector in this exact nonnegative domain. Root
+arguments are derived from this checked root structure rather than supplied as an untyped external
+list.
 
 `Cert` stores `plaintextModulus` and `ciphertextModulus` directly. `Cert.wellFormed` requires
 `plaintextModulus > 0`, `ciphertextModulus > 0`, and a closed matrix or matrix-family residual over
@@ -209,7 +218,7 @@ outside the theorem.
 
 `OperationalClaim` is the only certificate-specific mathematical endpoint. For a closed root it
 proves one strict inequality. For a family root it proves the same inequality symbolically for
-every selector in the exact signed domain. Equality is rejected, and the direct product
+every selector in the exact nonnegative half-open domain. Equality is rejected, and the direct product
 inequality must not be replaced with a condition involving truncated integer division.
 
 The fixed theorem `Cert.Valid.wellFormed` derives `Cert.wellFormed cert = true` without reducing
@@ -321,7 +330,8 @@ shared validation obligations include at least:
 - sufficient evaluation fuel derived from the checked combined DAG.
 
 For the Tall target, the canonical projection selects `ProductionRoots.residual` and its exact
-family domain from the pinned checker run reconstructed from the frozen Rust source. `Cert.Valid`
+`FamilyDomain` (with `u64`/`Nat` endpoints) from the pinned checker run reconstructed from the frozen
+Rust source. `Cert.Valid`
 checks that structure and the residual-only closure; neither is an execution-supplied hypothesis.
 
 Physical Rust `MatrixLayout` metadata remains in the canonical source and continues to be checked
@@ -332,16 +342,19 @@ uses, but does not duplicate unused physical stride checks.
 
 `InputAssignment` is one total function from `SourceAccess` to `Value`. A `SourceAccess` contains
 the source reference, normalized owner invocation, the exact checked scoped substitution, and an
-optional evaluated signed family selector. The selector is present exactly for a family access;
-two accesses to the same family at different selectors are therefore distinct even within one
-owner invocation. `Cert.Valid` checks the substitution against the owning program signature and
-the selector against the signed family domain. `InputContract` requires the recorded resolved type
+optional evaluated signed family selector and, when nonnegative, its optional `Nat` family selector.
+The selector is present exactly for a family access; two accesses to the same family at different
+selectors are therefore distinct even within one owner invocation. `Cert.Valid` checks the
+substitution against the owning program signature and checks the nonnegative selector against the
+Rust `FamilyDomain` endpoints. A negative selector is rejected and is not interpreted as a family
+element. `InputContract` requires the recorded resolved type
 for every valid access and only the raw facts consumed by the fixed Rust analysis. Centered
 coefficient bounds, canonical coefficient exclusive uppers, and polynomial-support uppers are
 separate fields and predicates. Only a canonical exclusive upper can justify an
 extracted-coefficient index domain. A support upper must be owner/source/family-access-selected
 exactly, must not exceed the ring dimension, and proves that all later polynomial positions reduce
-to zero. Current integer facts are declared signed half-open ranges. Derived range, support,
+to zero. Current integer facts are declared signed half-open ranges. Family domains and
+family-access selectors are the separate signed-to-`Nat` boundary described above. Derived range,
 sparsity, and constant facts are proved, not silently assumed.
 
 `SamplerAssignment` is one total function from an event reference and owner arguments to `Value`.
@@ -363,8 +376,9 @@ scope, argument-substitution, type, and descriptor conditions.
 For Tall's universal preimage relation, the public matrix is selector-independent:
 `B * K(i) = T(i)`. The public program remains represented through the generic family-lifting API,
 but validity recursively proves that its root reaches no program argument and that its evaluation
-is identical for any two matching selector arguments. `K(i)` and `T(i)` retain the same signed
-selector. The certificate must not restate this relation as `B(i) * K(i) = T(i)`.
+is identical for any two matching selector arguments. `K(i)` and `T(i)` use the same mapped
+nonnegative family selector; signed integer arithmetic used to compute that selector remains signed.
+The certificate must not restate this relation as `B(i) * K(i) = T(i)`.
 
 ## 9. Exhaustive index-use semantics without a second analyzer
 
@@ -373,7 +387,7 @@ index: family lookup, `ExplicitElement` operand 0, and the four dynamic `Indexed
 coordinates. Integer-looking nodes are never found by a heuristic scan. Hash tags, scale factors,
 comparisons and fixed descriptors are not consumers merely because they are integers.
 
-The required domains are the signed family domain for family lookup, the exact branch domain for
+The required domains are the exact nonnegative `FamilyDomain` for family lookup, the exact branch domain for
 `ExplicitElement`, `[0, input.rows + 1)` for both dynamic row endpoints, and
 `[0, input.columns + 1)` for both dynamic column endpoints.
 
@@ -458,14 +472,17 @@ counters, excluding recorder-only metrics.
 
 The committed artifacts are:
 
-- `Source.json`: canonical existing frozen bundle, exact request, and pinned version identities;
-  no duplicated target/environment fields, normal form, LUT output, bound ledger, or proof;
+- `Source.json`: the complete output of the single canonical frozen-bundle serializer, exact
+  request, and pinned version identities; no duplicated target/environment fields, normal form,
+  LUT output, bound ledger, or proof. This serializer is added at G3 and is not a second execution
+  semantics for the existing bundle types;
 - `Cert.lean`: statement data and local compositional validity witnesses;
 - `Proof.lean`: ordinary `have` declarations ending in the proof term at the fixed
   `OperationalClaim`; and
-- the fixed `AcceptedCertificates.lean` acceptance module.
+- the fixed acceptance module introduced at G3.
 
-Clean-room regeneration receives only `Source.json`. It reconstructs the current checker run,
+After G3, clean-room regeneration receives only the complete `Source.json` emitted by the canonical
+frozen-bundle serializer. It reconstructs the current checker run,
 recomputes every row and proof in the residual proof closure, omits decoder-only data, and
 byte-compares fresh `Cert.lean` and `Proof.lean` with the committed files. Unknown derived fields in
 `Source.json` reject regeneration. First-run publication requires an explicit output directory and
@@ -488,21 +505,26 @@ is included in `N`. For each LUT, its row count is exactly the product of its fi
 frontier-domain cardinalities, and `L` includes the serialized tuple and proof payload per row.
 
 Before implementation, G0 computes or measures, without full Lean certificate generation, the
-exact `N`, total `T` payload, every frontier product, total `L` payload, artifact-byte estimate,
-and peak-memory estimate for both the security-0 and exact security-128 Tall sources. It compares
-them with the current checker. If the
+exact `N`, every frontier product, and exact `L` payload for both the security-0 and exact
+security-128 Tall sources. It estimates `T` payload, artifact bytes, and peak memory, and compares
+them with the current checker. G3 measures exact `T`, artifact bytes, and peak memory at security 0;
+G4 measures them exactly at security 128. If the
 production estimate is infeasible, the design returns to review; the implementation must not add
 a runtime cutoff, truncate a table, or silently select another semantics.
 
 The phases are:
 
-1. **G0, design feasibility:** complete residual-closure coverage matrix, exact
-   security-0/security-128 size and complexity inventory, zero-axis and synchronized-slice LUT
-   tests, and kernel spikes for fuel-stable haves and balanced row-local validity. Failure returns
-   the design to review before trusted code is built.
-2. **G1, fixed Lean core:** hand-proved toy closed and family-root certificates with different
-   sampler values at different indices, exact strict inequalities, clean axioms, malformed-data
-   rejection, and independent design review.
+1. **G0, design feasibility:** complete residual-closure coverage matrix, exact `N`, `L`, and
+   frontier products, estimated `T`/artifact bytes/peak memory, zero-axis and synchronized-slice
+   LUT tests, and kernel spikes for fuel-stable haves and balanced row-local validity. Failure
+   returns the design to review before trusted code is built.
+2. **G1, fixed Lean core:** place the new project under `lean/lean-toolchain`,
+   `lean/lakefile.toml`, `lean/Mxx/Certificate/OperationalNoise/Core.lean`, and
+   `lean/Mxx/Certificate/OperationalNoise/Fixtures.lean`. Hand-prove toy closed and family-root
+   certificates with different sampler values at different indices, exact strict inequalities,
+   clean axioms, malformed-data rejection, and independent design review. The gate is
+   `cd lean && lake build Mxx.Certificate.OperationalNoise.Fixtures` followed by the axiom scan.
+   `AcceptedCertificates` is not required before G3.
 3. **G2, replay library:** every G0 coverage row has a checked lemma or deliberate rejection;
    exact current Rust bounds are reproduced without overestimation; unsupported cases fail closed.
 4. **G3, security 0:** opt-in recorder and deterministic generator complete; recording on/off is

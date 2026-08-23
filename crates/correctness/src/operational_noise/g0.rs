@@ -8,11 +8,11 @@ use super::{
         ArtifactIdentity, ConstantValue, DeterministicHashDefinition, DeterministicHashDescriptor,
         HashVariant, MatrixConstantKind, MatrixLayout, MatrixOperation, ResolvedMatrixType,
         ResolvedValueType, SampleDescriptor, SampleEventId, SamplerOperation, ScalarOperation,
-        SemanticFamilySourceIdentity, SemanticSourceIdentity, TrapdoorOperation, TypedConstant,
-        ValueOperator, ValueTransformOperation,
+        SemanticFamilySourceIdentity, SemanticSourceIdentity, TrapdoorOperation, TrustedIndexRange,
+        TypedConstant, ValueOperator, ValueTransformOperation,
     },
     job::CheckerJob,
-    protocol::{ArtifactProducer, PlannedWire},
+    protocol::{ArtifactProducer, PlannedWire, ProgramOccurrence},
     simulation::CertificateClosure,
 };
 use crate::ProtocolInputId;
@@ -30,6 +30,8 @@ pub(crate) trait FeasibilitySink: Default {
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error>;
 
     fn record_event(&mut self, observation: EventObservation) -> Result<(), G0Error>;
+
+    fn record_index_use(&mut self, plan: IndexUsePlan) -> Result<(), G0Error>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -81,6 +83,115 @@ pub(crate) struct EventObservation {
     pub kind: EventKind,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct IndexFrontierAxis {
+    pub owner: ProgramOccurrence,
+    pub argument_position: u32,
+    pub domain: TrustedIndexRange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum IndexUseKind {
+    IntegerExpression,
+    FamilyGetStatic,
+    FamilyGetDynamic,
+    Select,
+    IndexedSlice,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum SliceMemberRole {
+    RowStart,
+    RowEndExclusive,
+    ColumnStart,
+    ColumnEndExclusive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct SliceGroupMember {
+    pub role: SliceMemberRole,
+    pub expression: super::arena::ExprId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct SynchronizedSliceGroup {
+    pub id: SliceGroupId,
+    pub frontier: Box<[IndexFrontierAxis]>,
+    pub members: Box<[SliceGroupMember]>,
+    pub row_span: Option<usize>,
+    pub column_span: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) struct SliceGroupId(pub u64);
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct IndexUsePlan {
+    pub kind: IndexUseKind,
+    pub owner: PlannedWire,
+    pub result: Option<super::arena::ExprId>,
+    pub result_family: Option<super::program::FamilyValueId>,
+    pub consumed: Option<super::arena::ExprId>,
+    pub consumed_family: Option<super::program::FamilyValueId>,
+    pub index: super::arena::ExprId,
+    pub frontier: Box<[IndexFrontierAxis]>,
+    pub output_type: ResolvedValueType,
+    pub output_range: Option<TrustedIndexRange>,
+    pub slice_group: Option<SynchronizedSliceGroup>,
+}
+
+impl IndexUsePlan {
+    fn validate(&self) -> Result<(), G0Error> {
+        if self.frontier.iter().any(|axis| axis.domain.minimum > axis.domain.maximum_exclusive) {
+            return Err(G0Error::InvalidIndexAxisRange);
+        }
+        if self.output_range.is_some_and(|range| range.minimum > range.maximum_exclusive) {
+            return Err(G0Error::InvalidIndexOutputRange);
+        }
+        if let Some(group) = &self.slice_group {
+            if self.kind != IndexUseKind::IndexedSlice {
+                return Err(G0Error::InvalidSliceGroup);
+            }
+            if group.frontier != self.frontier {
+                return Err(G0Error::SliceGroupAxesMismatch);
+            }
+            if group.members.len() != 4 {
+                return Err(G0Error::InvalidSliceGroup);
+            }
+            let mut roles = BTreeSet::new();
+            let mut expressions = BTreeSet::new();
+            for member in &group.members {
+                if !roles.insert(member.role) || !expressions.insert(member.expression) {
+                    return Err(G0Error::DuplicateSliceGroupMember);
+                }
+            }
+            if roles !=
+                BTreeSet::from([
+                    SliceMemberRole::RowStart,
+                    SliceMemberRole::RowEndExclusive,
+                    SliceMemberRole::ColumnStart,
+                    SliceMemberRole::ColumnEndExclusive,
+                ])
+            {
+                return Err(G0Error::MissingSliceGroupMember);
+            }
+            if group.row_span.is_some_and(|span| span == 0) ||
+                group.column_span.is_some_and(|span| span == 0)
+            {
+                return Err(G0Error::InvalidSliceSpan);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct IndexUseKey {
+    owner: PlannedWire,
+    kind: IndexUseKind,
+    index: super::arena::ExprId,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NoFeasibility;
 
@@ -98,6 +209,10 @@ impl FeasibilitySink for NoFeasibility {
     fn record_event(&mut self, _observation: EventObservation) -> Result<(), G0Error> {
         Ok(())
     }
+
+    fn record_index_use(&mut self, _plan: IndexUsePlan) -> Result<(), G0Error> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -105,6 +220,7 @@ pub(crate) struct FeasibilityTrace {
     pub lowering_complete: u64,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
+    index_use_plans: BTreeMap<IndexUseKey, IndexUsePlan>,
 }
 
 impl From<NoFeasibility> for FeasibilityTrace {
@@ -143,6 +259,19 @@ impl FeasibilitySink for FeasibilityTrace {
             }
         }
     }
+
+    fn record_index_use(&mut self, plan: IndexUsePlan) -> Result<(), G0Error> {
+        plan.validate()?;
+        let key = IndexUseKey { owner: plan.owner.clone(), kind: plan.kind, index: plan.index };
+        match self.index_use_plans.get(&key) {
+            Some(existing) if existing != &plan => Err(G0Error::ConflictingIndexUsePlan),
+            Some(_) => Ok(()),
+            None => {
+                self.index_use_plans.insert(key, plan);
+                Ok(())
+            }
+        }
+    }
 }
 
 impl FeasibilityTrace {
@@ -153,6 +282,12 @@ impl FeasibilityTrace {
             SourceHandle::Family(family) => closure.families.contains(family),
         });
         self.event_observations.retain(|event, _| closure.event_ids.contains(event));
+        self.index_use_plans.retain(|_, plan| {
+            plan.result.is_some_and(|expression| closure.expressions.contains(&expression)) ||
+                plan.result_family.is_some_and(|family| closure.families.contains(&family)) ||
+                plan.consumed.is_some_and(|expression| closure.expressions.contains(&expression)) ||
+                plan.consumed_family.is_some_and(|family| closure.families.contains(&family))
+        });
     }
 
     pub(crate) fn source_observations(&self) -> &BTreeMap<SourceHandle, SourceClass> {
@@ -161,6 +296,10 @@ impl FeasibilityTrace {
 
     pub(crate) fn event_observations(&self) -> &BTreeMap<SampleEventId, EventObservation> {
         &self.event_observations
+    }
+
+    pub(crate) fn index_use_plans(&self) -> impl Iterator<Item = &IndexUsePlan> {
+        self.index_use_plans.values()
     }
 }
 
@@ -503,6 +642,22 @@ pub(crate) enum G0Error {
     ConflictingEventDescriptor { event: u64 },
     #[error("event has conflicting typed owner or descriptor")]
     ConflictingEventObservation,
+    #[error("conflicting typed index-use plans for one lowering use")]
+    ConflictingIndexUsePlan,
+    #[error("invalid half-open index frontier range")]
+    InvalidIndexAxisRange,
+    #[error("invalid half-open index output range")]
+    InvalidIndexOutputRange,
+    #[error("invalid synchronized indexed-slice group")]
+    InvalidSliceGroup,
+    #[error("indexed-slice group is missing a member role")]
+    MissingSliceGroupMember,
+    #[error("indexed-slice group contains a duplicate role or expression")]
+    DuplicateSliceGroupMember,
+    #[error("indexed-slice group axes do not match the use frontier")]
+    SliceGroupAxesMismatch,
+    #[error("indexed-slice span must be positive")]
+    InvalidSliceSpan,
     #[error("G0 descriptor encoding failed: {0}")]
     Encoding(String),
 }
@@ -1204,6 +1359,205 @@ mod tests {
         trace.retain_residual(&closure);
         assert_eq!(trace.source_observations().len(), 1);
         assert!(trace.source_observations().contains_key(&scalar));
+    }
+
+    fn expression(slot: u32) -> super::super::arena::ExprId {
+        super::super::arena::ExprId::new(super::super::arena::ArenaToken(7), slot)
+    }
+
+    fn planned_owner(path: u64) -> PlannedWire {
+        use crate::StageId;
+        use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};
+
+        PlannedWire {
+            stage: StageId("index".to_owned()),
+            occurrence: ProgramOccurrence { definition: FrozenGraphScopeId::Root, path },
+            wire: WireRef { node: NodeId(path), port: Port(0) },
+        }
+    }
+
+    fn axis(
+        path: u64,
+        argument_position: u32,
+        minimum: u64,
+        maximum_exclusive: u64,
+    ) -> IndexFrontierAxis {
+        IndexFrontierAxis {
+            owner: ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path },
+            argument_position,
+            domain: TrustedIndexRange { minimum, maximum_exclusive },
+        }
+    }
+
+    fn index_plan(
+        kind: IndexUseKind,
+        index: super::super::arena::ExprId,
+        frontier: Vec<IndexFrontierAxis>,
+    ) -> IndexUsePlan {
+        IndexUsePlan {
+            kind,
+            owner: planned_owner(1),
+            result: Some(index),
+            result_family: None,
+            consumed: None,
+            consumed_family: None,
+            index,
+            frontier: frontier.into_boxed_slice(),
+            output_type: ResolvedValueType::Int,
+            output_range: Some(TrustedIndexRange { minimum: 0, maximum_exclusive: 8 }),
+            slice_group: None,
+        }
+    }
+
+    fn slice_group(frontier: Vec<IndexFrontierAxis>) -> SynchronizedSliceGroup {
+        SynchronizedSliceGroup {
+            id: SliceGroupId(3),
+            frontier: frontier.into_boxed_slice(),
+            members: vec![
+                SliceGroupMember { role: SliceMemberRole::RowStart, expression: expression(10) },
+                SliceGroupMember {
+                    role: SliceMemberRole::RowEndExclusive,
+                    expression: expression(11),
+                },
+                SliceGroupMember { role: SliceMemberRole::ColumnStart, expression: expression(12) },
+                SliceGroupMember {
+                    role: SliceMemberRole::ColumnEndExclusive,
+                    expression: expression(13),
+                },
+            ]
+            .into_boxed_slice(),
+            row_span: Some(2),
+            column_span: Some(3),
+        }
+    }
+
+    #[test]
+    fn index_use_zero_axes_are_accepted() {
+        let plan = index_plan(IndexUseKind::IntegerExpression, expression(1), Vec::new());
+        let mut trace = FeasibilityTrace::default();
+        trace.record_index_use(plan).expect("zero-axis use is valid");
+        assert_eq!(trace.index_use_plans().count(), 1);
+    }
+
+    #[test]
+    fn index_use_preserves_frontier_program_order() {
+        let frontier = vec![axis(20, 4, 0, 8), axis(10, 1, 0, 2)];
+        let plan = index_plan(IndexUseKind::FamilyGetDynamic, expression(2), frontier.clone());
+        let mut trace = FeasibilityTrace::default();
+        trace.record_index_use(plan).expect("ordered axes");
+        assert_eq!(trace.index_use_plans().next().unwrap().frontier.as_ref(), frontier);
+    }
+
+    #[test]
+    fn synchronized_slice_group_requires_one_complete_group() {
+        let frontier = vec![axis(4, 0, 0, 5)];
+        let mut plan = index_plan(IndexUseKind::IndexedSlice, expression(3), frontier.clone());
+        plan.output_type = ResolvedValueType::Matrix(matrix());
+        plan.slice_group = Some(slice_group(frontier));
+        let mut trace = FeasibilityTrace::default();
+        trace.record_index_use(plan).expect("complete slice group");
+        let group = trace.index_use_plans().next().unwrap().slice_group.as_ref().unwrap();
+        assert_eq!(group.id, SliceGroupId(3));
+        assert_eq!(group.members.len(), 4);
+        assert_eq!(group.row_span, Some(2));
+        assert_eq!(group.column_span, Some(3));
+    }
+
+    #[test]
+    fn malformed_index_use_groups_and_ranges_fail_closed() {
+        let frontier = vec![axis(4, 0, 0, 5)];
+
+        let mut duplicate = index_plan(IndexUseKind::IndexedSlice, expression(4), frontier.clone());
+        let mut group = slice_group(frontier.clone());
+        group.members[1].role = SliceMemberRole::RowStart;
+        duplicate.slice_group = Some(group);
+        assert_eq!(
+            FeasibilityTrace::default().record_index_use(duplicate),
+            Err(G0Error::DuplicateSliceGroupMember)
+        );
+
+        let mut missing = index_plan(IndexUseKind::IndexedSlice, expression(5), frontier.clone());
+        let mut group = slice_group(frontier.clone());
+        group.members = group.members[..3].to_vec().into_boxed_slice();
+        missing.slice_group = Some(group);
+        assert_eq!(
+            FeasibilityTrace::default().record_index_use(missing),
+            Err(G0Error::InvalidSliceGroup)
+        );
+
+        let mut mismatch = index_plan(IndexUseKind::IndexedSlice, expression(6), frontier.clone());
+        mismatch.slice_group = Some(slice_group(vec![axis(8, 0, 0, 5)]));
+        assert_eq!(
+            FeasibilityTrace::default().record_index_use(mismatch),
+            Err(G0Error::SliceGroupAxesMismatch)
+        );
+
+        let invalid_axis = index_plan(IndexUseKind::Select, expression(7), vec![axis(1, 0, 9, 8)]);
+        assert_eq!(
+            FeasibilityTrace::default().record_index_use(invalid_axis),
+            Err(G0Error::InvalidIndexAxisRange)
+        );
+
+        let mut invalid_output = index_plan(IndexUseKind::Select, expression(9), Vec::new());
+        invalid_output.output_range = Some(TrustedIndexRange { minimum: 4, maximum_exclusive: 3 });
+        assert_eq!(
+            FeasibilityTrace::default().record_index_use(invalid_output),
+            Err(G0Error::InvalidIndexOutputRange)
+        );
+
+        let mut invalid_span = index_plan(IndexUseKind::IndexedSlice, expression(8), frontier);
+        let mut group = slice_group(invalid_span.frontier.to_vec());
+        group.row_span = Some(0);
+        invalid_span.slice_group = Some(group);
+        assert_eq!(
+            FeasibilityTrace::default().record_index_use(invalid_span),
+            Err(G0Error::InvalidSliceSpan)
+        );
+    }
+
+    #[test]
+    fn index_use_plans_deduplicate_conflicts_and_order_deterministically() {
+        let first = index_plan(IndexUseKind::Select, expression(20), vec![axis(2, 0, 0, 4)]);
+        let second =
+            index_plan(IndexUseKind::IntegerExpression, expression(21), vec![axis(1, 0, 0, 4)]);
+        let mut trace = FeasibilityTrace::default();
+        trace.record_index_use(first.clone()).expect("first plan");
+        trace.record_index_use(first.clone()).expect("duplicate plan");
+        assert_eq!(trace.index_use_plans().count(), 1);
+
+        let mut conflict = first.clone();
+        conflict.output_range = Some(TrustedIndexRange { minimum: 0, maximum_exclusive: 9 });
+        assert_eq!(trace.record_index_use(conflict), Err(G0Error::ConflictingIndexUsePlan));
+
+        let mut forward = FeasibilityTrace::default();
+        forward.record_index_use(first.clone()).expect("first plan");
+        forward.record_index_use(second.clone()).expect("second plan");
+        let mut reverse = FeasibilityTrace::default();
+        reverse.record_index_use(second).expect("second plan");
+        reverse.record_index_use(first).expect("first plan");
+        let forward_plans = forward.index_use_plans().cloned().collect::<Vec<_>>();
+        let reverse_plans = reverse.index_use_plans().cloned().collect::<Vec<_>>();
+        assert_eq!(forward_plans, reverse_plans);
+
+        let residual = expression(20);
+        let closure = CertificateClosure {
+            expressions: BTreeSet::from([residual]),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: BTreeSet::new(),
+        };
+        forward.retain_residual(&closure);
+        assert_eq!(forward.index_use_plans().count(), 1);
+        assert_eq!(forward.index_use_plans().next().unwrap().result, Some(residual));
+
+        let mut ordinary = NoFeasibility;
+        ordinary
+            .record_index_use(index_plan(IndexUseKind::Select, expression(30), Vec::new()))
+            .unwrap();
+        assert_eq!(FeasibilityTrace::from(ordinary), FeasibilityTrace::default());
     }
 
     fn scalar_expression(handle: SourceHandle) -> super::super::arena::ExprId {

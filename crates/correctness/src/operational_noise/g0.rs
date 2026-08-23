@@ -16,10 +16,13 @@ use super::{
     simulation::CertificateClosure,
 };
 use crate::ProtocolInputId;
-use num_bigint::BigInt;
-use num_traits::Zero;
+use num_bigint::{BigInt, BigUint};
+use num_traits::{One, ToPrimitive, Zero};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem::size_of,
+};
 use thiserror::Error;
 
 /// One opt-in observation boundary.  Stage2a1 deliberately carries only a typed completion
@@ -93,7 +96,8 @@ pub(crate) struct IndexFrontierAxis {
     pub domain: TrustedIndexRange,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum IndexUseKind {
     IntegerExpression,
     FamilyGetStatic,
@@ -387,6 +391,161 @@ fn require_index_integer(value: &IndexValue) -> Result<&BigInt, IndexEvaluationE
     match value {
         IndexValue::Int(value) => Ok(value),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct IndexLutRow {
+    pub tuple: Vec<String>,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct IndexLutEvidence {
+    pub kind: IndexUseKind,
+    #[serde(rename = "frontierProduct")]
+    pub frontier_product: String,
+    pub rows: Vec<IndexLutRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IndexLutEvidenceSet {
+    pub index_uses: Vec<IndexLutEvidence>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexLutDocument<'a> {
+    index_uses: &'a [IndexLutEvidence],
+}
+
+impl IndexLutEvidenceSet {
+    pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, G0Error> {
+        serde_json::to_vec(&IndexLutDocument { index_uses: &self.index_uses })
+            .map_err(|error| G0Error::Encoding(error.to_string()))
+    }
+
+    pub(crate) fn canonical_encoded_byte_size(&self) -> Result<usize, G0Error> {
+        Ok(self.encode_canonical()?.len())
+    }
+}
+
+/// Enumerate validated, residual-filtered ordinary index plans into deterministic LUT evidence.
+/// Plans carrying synchronized slice groups are skipped until their dedicated grouped
+/// enumerator is introduced in a later stage.
+pub(crate) fn enumerate_index_lut_evidence<'a>(
+    arena: &ExprArena,
+    plans: impl IntoIterator<Item = &'a IndexUsePlan>,
+) -> Result<IndexLutEvidenceSet, G0Error> {
+    let mut index_uses = Vec::new();
+    for plan in plans {
+        plan.validate()?;
+        if plan.slice_group.is_some() || plan.kind == IndexUseKind::IndexedSlice {
+            continue;
+        }
+        index_uses.push(enumerate_index_use(arena, plan)?);
+    }
+    Ok(IndexLutEvidenceSet { index_uses })
+}
+
+fn enumerate_index_use(
+    arena: &ExprArena,
+    plan: &IndexUsePlan,
+) -> Result<IndexLutEvidence, G0Error> {
+    let output_range = plan.output_range.ok_or(G0Error::MissingIndexOutputRange)?;
+    let product = frontier_product(&plan.frontier)?;
+    let row_count = checked_row_capacity::<IndexLutRow>(&product)?;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(row_count).map_err(|_| G0Error::InfeasibleIndexRows)?;
+    enumerate_frontier(&plan.frontier, row_count, |tuple| {
+        let bindings = axis_bindings(&plan.frontier, tuple);
+        let output = evaluate_typed_index(arena, plan.index, &plan.frontier, &bindings)?;
+        let output = evaluated_integer(output)?;
+        verify_output_range(&output, output_range)?;
+        rows.push(IndexLutRow {
+            tuple: tuple.iter().map(ToString::to_string).collect(),
+            output: output.to_string(),
+        });
+        Ok(())
+    })?;
+    Ok(IndexLutEvidence { kind: plan.kind, frontier_product: product.to_string(), rows })
+}
+
+fn frontier_product(frontier: &[IndexFrontierAxis]) -> Result<BigUint, G0Error> {
+    let mut product = BigUint::one();
+    for axis in frontier {
+        if axis.domain.minimum > axis.domain.maximum_exclusive {
+            return Err(G0Error::InvalidIndexAxisRange);
+        }
+        product *= BigUint::from(axis.domain.maximum_exclusive - axis.domain.minimum);
+    }
+    Ok(product)
+}
+
+fn checked_row_capacity<T>(product: &BigUint) -> Result<usize, G0Error> {
+    let rows = product.to_usize().ok_or(G0Error::InfeasibleIndexRows)?;
+    if rows > isize::MAX as usize / size_of::<T>().max(1) {
+        return Err(G0Error::InfeasibleIndexRows);
+    }
+    Ok(rows)
+}
+
+fn enumerate_frontier(
+    frontier: &[IndexFrontierAxis],
+    row_count: usize,
+    mut visit: impl FnMut(&[BigInt]) -> Result<(), G0Error>,
+) -> Result<(), G0Error> {
+    if row_count == 0 {
+        return Ok(());
+    }
+    let widths = frontier
+        .iter()
+        .map(|axis| axis.domain.maximum_exclusive - axis.domain.minimum)
+        .collect::<Vec<_>>();
+    let mut offsets = vec![0_u64; frontier.len()];
+    for row in 0..row_count {
+        let tuple = frontier
+            .iter()
+            .zip(&offsets)
+            .map(|(axis, offset)| BigInt::from(axis.domain.minimum) + BigInt::from(*offset))
+            .collect::<Vec<_>>();
+        visit(&tuple)?;
+        if row + 1 == row_count {
+            break;
+        }
+        for index in (0..offsets.len()).rev() {
+            offsets[index] += 1;
+            if offsets[index] < widths[index] {
+                break;
+            }
+            offsets[index] = 0;
+        }
+    }
+    Ok(())
+}
+
+fn axis_bindings(frontier: &[IndexFrontierAxis], tuple: &[BigInt]) -> Vec<IndexAxisBinding> {
+    frontier
+        .iter()
+        .zip(tuple)
+        .map(|(axis, value)| IndexAxisBinding {
+            owner: axis.owner.clone(),
+            argument: axis.argument,
+            value: value.clone(),
+        })
+        .collect()
+}
+
+fn evaluated_integer(value: IndexValue) -> Result<BigInt, G0Error> {
+    match value {
+        IndexValue::Int(value) => Ok(value),
+    }
+}
+
+fn verify_output_range(value: &BigInt, range: TrustedIndexRange) -> Result<(), G0Error> {
+    if value < &BigInt::from(range.minimum) || value >= &BigInt::from(range.maximum_exclusive) {
+        return Err(G0Error::IndexOutputOutOfRange);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -862,6 +1021,14 @@ pub(crate) enum G0Error {
     SliceGroupAxesMismatch,
     #[error("indexed-slice span must be positive")]
     InvalidSliceSpan,
+    #[error("G0 infeasible: index frontier rows cannot address memory")]
+    InfeasibleIndexRows,
+    #[error("index use has no declared output range")]
+    MissingIndexOutputRange,
+    #[error("evaluated index output is outside its declared half-open range")]
+    IndexOutputOutOfRange,
+    #[error("typed index evaluator rejected the expression: {0}")]
+    IndexEvaluation(#[from] IndexEvaluationError),
     #[error("G0 descriptor encoding failed: {0}")]
     Encoding(String),
 }
@@ -1690,6 +1857,121 @@ mod tests {
             evaluate_typed_index(&arena, foreign, &[], &[]),
             Err(IndexEvaluationError::ForeignExpression)
         );
+    }
+
+    fn actual_axis(
+        argument: ExprId,
+        owner: ProgramOccurrence,
+        position: u32,
+        minimum: u64,
+        maximum_exclusive: u64,
+    ) -> IndexFrontierAxis {
+        IndexFrontierAxis {
+            owner,
+            argument,
+            argument_position: position,
+            domain: TrustedIndexRange { minimum, maximum_exclusive },
+        }
+    }
+
+    #[test]
+    fn ordinary_index_lut_has_one_empty_tuple_without_axes() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let constant =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(7)), Box::new([])).unwrap();
+        let plan = index_plan(IndexUseKind::IntegerExpression, constant, Vec::new());
+        let evidence = enumerate_index_lut_evidence(&arena, [&plan]).unwrap();
+        assert_eq!(evidence.index_uses.len(), 1);
+        assert_eq!(evidence.index_uses[0].frontier_product, "1");
+        assert_eq!(evidence.index_uses[0].rows.len(), 1);
+        assert_eq!(evidence.index_uses[0].rows[0].tuple, Vec::<String>::new());
+        assert_eq!(evidence.index_uses[0].rows[0].output, "7");
+        let first = evidence.encode_canonical().unwrap();
+        assert_eq!(first, evidence.encode_canonical().unwrap());
+        assert_eq!(evidence.canonical_encoded_byte_size().unwrap(), first.len());
+        let json = String::from_utf8(first).unwrap();
+        assert!(json.starts_with("{\"indexUses\":["));
+        assert!(!json.contains("sliceGroups"));
+    }
+
+    #[test]
+    fn ordinary_index_lut_preserves_lexicographic_order_and_zero_width() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let left = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let right = arena.intern_argument(1, ResolvedValueType::Int).unwrap();
+        let index = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::Add), &[left, right])
+            .unwrap();
+        let owner =
+            ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path: 8 };
+        let frontier =
+            vec![actual_axis(left, owner.clone(), 0, 2, 4), actual_axis(right, owner, 1, 10, 12)];
+        let mut plan = index_plan(IndexUseKind::Select, index, frontier);
+        plan.output_range = Some(TrustedIndexRange { minimum: 0, maximum_exclusive: 32 });
+        let evidence = enumerate_index_lut_evidence(&arena, [&plan]).unwrap();
+        let rows = &evidence.index_uses[0].rows;
+        assert_eq!(evidence.index_uses[0].frontier_product, "4");
+        assert_eq!(
+            rows.iter().map(|row| (row.tuple.clone(), row.output.clone())).collect::<Vec<_>>(),
+            vec![
+                (vec!["2".to_owned(), "10".to_owned()], "12".to_owned()),
+                (vec!["2".to_owned(), "11".to_owned()], "13".to_owned()),
+                (vec!["3".to_owned(), "10".to_owned()], "13".to_owned()),
+                (vec!["3".to_owned(), "11".to_owned()], "14".to_owned()),
+            ]
+        );
+
+        let zero_argument = arena.intern_argument(2, ResolvedValueType::Int).unwrap();
+        let zero_plan = index_plan(
+            IndexUseKind::FamilyGetDynamic,
+            constant_int(&mut arena, 1),
+            vec![actual_axis(
+                zero_argument,
+                ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path: 9 },
+                2,
+                4,
+                4,
+            )],
+        );
+        let zero = enumerate_index_lut_evidence(&arena, [&zero_plan]).unwrap();
+        assert_eq!(zero.index_uses[0].frontier_product, "0");
+        assert!(zero.index_uses[0].rows.is_empty());
+    }
+
+    #[test]
+    fn ordinary_index_lut_rejects_output_escape_and_unaddressable_products() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let value = constant_int(&mut arena, 5);
+        let mut out_of_range = index_plan(IndexUseKind::Select, value, Vec::new());
+        out_of_range.output_range = Some(TrustedIndexRange { minimum: 0, maximum_exclusive: 5 });
+        assert_eq!(
+            enumerate_index_lut_evidence(&arena, [&out_of_range]),
+            Err(G0Error::IndexOutputOutOfRange)
+        );
+
+        let huge_frontier = vec![axis(1, 0, 0, u64::MAX), axis(2, 1, 0, u64::MAX)];
+        let huge_plan = index_plan(IndexUseKind::IntegerExpression, expression(100), huge_frontier);
+        assert_eq!(
+            enumerate_index_lut_evidence(&arena, [&huge_plan]),
+            Err(G0Error::InfeasibleIndexRows)
+        );
+    }
+
+    #[test]
+    fn ordinary_index_lut_skips_slice_groups_until_group_stage() {
+        let plan = {
+            let frontier = vec![axis(4, 0, 0, 2)];
+            let mut plan = index_plan(IndexUseKind::IndexedSlice, expression(3), frontier.clone());
+            plan.slice_group = Some(slice_group(frontier));
+            plan
+        };
+        let arena = super::super::arena::ExprArena::new();
+        let evidence = enumerate_index_lut_evidence(&arena, [&plan]).unwrap();
+        assert!(evidence.index_uses.is_empty());
+    }
+
+    fn constant_int(arena: &mut super::super::arena::ExprArena, value: i64) -> ExprId {
+        arena.intern(ValueOperator::Constant(TypedConstant::int(value)), Box::new([])).unwrap()
     }
 
     fn expression(slot: u32) -> super::super::arena::ExprId {

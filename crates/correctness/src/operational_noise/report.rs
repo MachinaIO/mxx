@@ -9,6 +9,7 @@ use super::{
     OperationalAcceptanceReport, OperationalSimulationDiagnostics, OperationalSimulationReport,
     arena::ResolvedValueType,
     facts::{CoefficientBound, NumericContract},
+    g0::{FeasibilitySink, NoFeasibility},
     job::{CheckerJob, ExactTermDiagnostic, JobError, ProofAnalysisResult},
     lower::{ProductionRoot, ProductionRoots},
     normal_form::{AnalyzedValue, NormalizationCounters},
@@ -134,7 +135,17 @@ pub(crate) fn analyze_roots(
     roots: &ProductionRoots,
     target: &ReportTarget,
 ) -> Result<OperationalReport, ReportError> {
-    let residual = analyze_root(job, RootRole::Residual, &roots.residual)?;
+    let mut sink = NoFeasibility;
+    analyze_roots_with_sink(job, roots, target, &mut sink)
+}
+
+pub(crate) fn analyze_roots_with_sink<S: FeasibilitySink>(
+    job: &mut CheckerJob,
+    roots: &ProductionRoots,
+    target: &ReportTarget,
+    sink: &mut S,
+) -> Result<OperationalReport, ReportError> {
+    let residual = analyze_root_with_sink(job, RootRole::Residual, &roots.residual, sink)?;
     let decoder = match &roots.decoder {
         ProductionRoot::Closed(root)
             if matches!(
@@ -153,7 +164,10 @@ pub(crate) fn analyze_roots(
                 counters: NormalizationCounters::default(),
             }
         }
-        _ => analyze_root(job, RootRole::Decoder, &roots.decoder)?,
+        _ => {
+            let mut decoder_sink = NoFeasibility;
+            analyze_root_with_sink(job, RootRole::Decoder, &roots.decoder, &mut decoder_sink)?
+        }
     };
     let counters = ReportCounters {
         occurrences: roots.occurrences,
@@ -177,17 +191,27 @@ fn analyze_root(
     role: RootRole,
     root: &ProductionRoot,
 ) -> Result<RootAnalysis, ReportError> {
+    let mut sink = NoFeasibility;
+    analyze_root_with_sink(job, role, root, &mut sink)
+}
+
+fn analyze_root_with_sink(
+    job: &mut CheckerJob,
+    role: RootRole,
+    root: &ProductionRoot,
+    sink: &mut impl FeasibilitySink,
+) -> Result<RootAnalysis, ReportError> {
     classify_root(job, role, root)?;
     Ok(match root {
         ProductionRoot::Closed(root) => {
-            let analysis = job.normalize_closed_root(*root)?;
+            let analysis = job.normalize_closed_root_with_sink(*root, sink)?;
             RootAnalysis {
                 value: analyzed_root(&analysis.value, analysis.exact_term_diagnostics),
                 counters: analysis.counters,
             }
         }
         ProductionRoot::Family(root) => {
-            let result = job.analyze_family_root(*root)?;
+            let result = job.analyze_family_root_with_sink(*root, sink)?;
             RootAnalysis { value: analyzed_family_root(&result), counters: result.counters }
         }
     })

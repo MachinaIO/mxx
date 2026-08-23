@@ -32,6 +32,13 @@ pub(crate) trait FeasibilitySink: Default {
 
     fn record_lowering_complete(&mut self) -> Result<(), G0Error>;
 
+    fn record_residual_normalization_start(&mut self) -> Result<(), G0Error>;
+
+    fn record_residual_normalization_end(
+        &mut self,
+        counters: &super::normal_form::NormalizationCounters,
+    ) -> Result<(), G0Error>;
+
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error>;
 
     fn record_event(&mut self, observation: EventObservation) -> Result<(), G0Error>;
@@ -1057,6 +1064,17 @@ impl FeasibilitySink for NoFeasibility {
         Ok(())
     }
 
+    fn record_residual_normalization_start(&mut self) -> Result<(), G0Error> {
+        Ok(())
+    }
+
+    fn record_residual_normalization_end(
+        &mut self,
+        _counters: &super::normal_form::NormalizationCounters,
+    ) -> Result<(), G0Error> {
+        Ok(())
+    }
+
     fn record_source(&mut self, _handle: SourceHandle, _class: SourceClass) -> Result<(), G0Error> {
         Ok(())
     }
@@ -1077,6 +1095,9 @@ impl FeasibilitySink for NoFeasibility {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FeasibilityTrace {
     pub lowering_complete: u64,
+    pub residual_normalization_starts: u64,
+    pub residual_normalization_ends: u64,
+    pub residual_normalization_nodes: u64,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
     index_use_plans: BTreeSet<IndexUsePlan>,
@@ -1087,6 +1108,9 @@ impl Default for FeasibilityTrace {
     fn default() -> Self {
         Self {
             lowering_complete: 0,
+            residual_normalization_starts: 0,
+            residual_normalization_ends: 0,
+            residual_normalization_nodes: 0,
             source_observations: BTreeMap::new(),
             event_observations: BTreeMap::new(),
             index_use_plans: BTreeSet::new(),
@@ -1107,6 +1131,25 @@ impl FeasibilitySink for FeasibilityTrace {
     fn record_lowering_complete(&mut self) -> Result<(), G0Error> {
         self.lowering_complete =
             self.lowering_complete.checked_add(1).ok_or_else(|| G0Error::TraceOverflow)?;
+        Ok(())
+    }
+
+    fn record_residual_normalization_start(&mut self) -> Result<(), G0Error> {
+        self.residual_normalization_starts =
+            self.residual_normalization_starts.checked_add(1).ok_or(G0Error::TraceOverflow)?;
+        Ok(())
+    }
+
+    fn record_residual_normalization_end(
+        &mut self,
+        counters: &super::normal_form::NormalizationCounters,
+    ) -> Result<(), G0Error> {
+        self.residual_normalization_ends =
+            self.residual_normalization_ends.checked_add(1).ok_or(G0Error::TraceOverflow)?;
+        self.residual_normalization_nodes = self
+            .residual_normalization_nodes
+            .checked_add(counters.nodes_processed)
+            .ok_or(G0Error::TraceOverflow)?;
         Ok(())
     }
 

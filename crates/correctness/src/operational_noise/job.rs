@@ -12,6 +12,7 @@ use super::{
         ResolvedMatrixType, ResolvedValueType, ScopedExprId, TrustedIndexRange,
     },
     facts::{FactStore, IndexFacts, MatrixFacts, ScalarFacts, TrapdoorFacts, ValueFacts},
+    g0::{FeasibilitySink, G0Error},
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
     normal_form::{
         AnalyzedValue, BoundedSummary, NormalizationCounters, NormalizeError, Normalizer,
@@ -1075,6 +1076,15 @@ impl CheckerJob {
         &mut self,
         root: ClosedExprId,
     ) -> Result<ClosedRootAnalysis, JobError> {
+        let mut sink = super::g0::NoFeasibility;
+        self.normalize_closed_root_with_sink(root, &mut sink)
+    }
+
+    pub(crate) fn normalize_closed_root_with_sink<S: FeasibilitySink>(
+        &mut self,
+        root: ClosedExprId,
+        sink: &mut S,
+    ) -> Result<ClosedRootAnalysis, JobError> {
         self.validate_frozen_resources()?;
         let expression = root.expression();
         let output = self.expressions.value_type(expression).map_err(JobError::Arena)?.clone();
@@ -1088,7 +1098,7 @@ impl CheckerJob {
             .map_err(JobError::Arena)?;
         let scoped = self.programs.root(&self.expressions, program).map_err(JobError::Arena)?;
         self.frozen_resources = Some(self.current_resource_counters());
-        let (value, counters) = self.normalize(scoped)?;
+        let (value, counters) = self.normalize_with_sink(scoped, sink)?;
         let exact_term_diagnostics = value.exact_nf.as_ref().map_or_else(
             || Ok::<Box<[ExactTermDiagnostic]>, JobError>(Box::new([])),
             |normal_form| self.exact_term_diagnostics(program, &normal_form.exact_terms),
@@ -1101,6 +1111,15 @@ impl CheckerJob {
     pub fn analyze_family_root(
         &mut self,
         family: FamilyValueId,
+    ) -> Result<ProofAnalysisResult, JobError> {
+        let mut sink = super::g0::NoFeasibility;
+        self.analyze_family_root_with_sink(family, &mut sink)
+    }
+
+    pub(crate) fn analyze_family_root_with_sink<S: FeasibilitySink>(
+        &mut self,
+        family: FamilyValueId,
+        sink: &mut S,
     ) -> Result<ProofAnalysisResult, JobError> {
         self.validate_frozen_resources()?;
         let domain = self.programs.family_domain(family).map_err(JobError::Arena)?;
@@ -1123,15 +1142,16 @@ impl CheckerJob {
         }
         let root =
             self.programs.root(&self.expressions, family.program()).map_err(JobError::Arena)?;
-        self.analyze_family_root_in_context(family, domain, element_type, root)
+        self.analyze_family_root_in_context(family, domain, element_type, root, sink)
     }
 
-    fn analyze_family_root_in_context(
+    fn analyze_family_root_in_context<S: FeasibilitySink>(
         &mut self,
         family: FamilyValueId,
         domain: FamilyDomain,
         element_type: ResolvedMatrixType,
         root: ScopedExprId,
+        sink: &mut S,
     ) -> Result<ProofAnalysisResult, JobError> {
         if self.programs.family_domain(family).map_err(JobError::Arena)? != domain ||
             root.program() != family.program()
@@ -1156,7 +1176,7 @@ impl CheckerJob {
         // concrete RHS, but must not mutate the frozen canonical registry or retain runtime IDs
         // whose backing slots are rolled back after this analysis.
         let checkpoint = self.normalization.checkpoint();
-        let normalized = self.normalize(root);
+        let normalized = self.normalize_with_sink(root, sink);
         self.normalization.rollback(checkpoint);
         self.normalization.clear_runtime();
         let (analyzed, counters) = normalized?;
@@ -1340,6 +1360,15 @@ impl CheckerJob {
         &mut self,
         root: super::arena::ScopedExprId,
     ) -> Result<(AnalyzedValue, NormalizationCounters), JobError> {
+        let mut sink = super::g0::NoFeasibility;
+        self.normalize_with_sink(root, &mut sink)
+    }
+
+    pub(crate) fn normalize_with_sink<S: FeasibilitySink>(
+        &mut self,
+        root: super::arena::ScopedExprId,
+        sink: &mut S,
+    ) -> Result<(AnalyzedValue, NormalizationCounters), JobError> {
         self.validate_frozen_resources()?;
         let scope = root.program();
         let (
@@ -1365,8 +1394,14 @@ impl CheckerJob {
             .map_err(JobError::Normalize)?
             .with_relations(relations, normalization)
             .with_gadget_recompositions(gadget_recompositions);
+        if S::ENABLED {
+            sink.record_residual_normalization_start().map_err(JobError::Feasibility)?;
+        }
         let value = normalizer.normalize(root).map_err(JobError::Normalize)?;
         let counters = normalizer.counters();
+        if S::ENABLED {
+            sink.record_residual_normalization_end(&counters).map_err(JobError::Feasibility)?;
+        }
         self.frozen_resources = Some(self.current_resource_counters());
         Ok((value, counters))
     }
@@ -1497,6 +1532,7 @@ pub enum JobError {
     Monomial(MonomialError),
     Relation(RelationRegistryError),
     Normalize(NormalizeError),
+    Feasibility(G0Error),
     MissingMonomialScope {
         scope: super::arena::ValueProgramId,
     },

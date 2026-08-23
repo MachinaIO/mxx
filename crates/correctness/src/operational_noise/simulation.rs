@@ -14,7 +14,7 @@ use super::{
     lower::{ProductionAdapter, ProductionRoot},
     program::{FamilyValueId, ValueProgramId},
     protocol::ProtocolPlan,
-    report::{ReportTarget, analyze_roots},
+    report::{ReportTarget, analyze_roots, analyze_roots_with_sink},
 };
 use crate::{OperationalDecoderKind, ProtocolDecl};
 use mxx_ir_core::{
@@ -377,7 +377,7 @@ pub(crate) fn prepare_operational_certificate(
         closure,
     };
     let mut job = job;
-    let accepted_report = analyze_roots(
+    let accepted_report = analyze_roots_with_sink(
         &mut job,
         &roots,
         &ReportTarget {
@@ -386,6 +386,7 @@ pub(crate) fn prepare_operational_certificate(
             ciphertext_modulus: target.ciphertext_modulus.clone(),
             boolean_interval: false,
         },
+        &mut trace,
     )
     .map_err(|error| {
         CertificateProjectionError::Operational(OperationalSimulationError::from(
@@ -1616,6 +1617,9 @@ mod tests {
             .expect("valid threshold certificate run");
         assert!(run.accepted_report.accepted);
         assert!(run.trace.lowering_complete > 0);
+        assert_eq!(run.trace.residual_normalization_starts, 1);
+        assert_eq!(run.trace.residual_normalization_ends, 1);
+        assert!(run.trace.residual_normalization_nodes > 0);
         assert_eq!(run.accepted_report.target_id, request.target_id);
         assert_eq!(run.accepted_report.ciphertext_modulus, 256_u16.into());
         assert!(matches!(

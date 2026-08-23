@@ -12502,6 +12502,143 @@ mod tests {
     }
 
     #[test]
+    fn failed_contextual_specialization_rolls_back_runtime_entry_for_retry() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let domain = super::super::arena::FamilyDomain::new(0, 1).unwrap();
+        let range = TrustedIndexRange::new(0, 1).unwrap();
+        let index = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let preimage_source = preimage_factor(&mut expressions, matrix.clone(), 99_921, 3);
+        let preimage = programs
+            .opaque_generated_family_from_body(&mut expressions, domain, preimage_source)
+            .unwrap();
+        let preimage_call =
+            programs.call_family_in_range(&mut expressions, preimage, index, range).unwrap();
+
+        let public_source = source_with(&mut expressions, matrix.clone(), 99_922);
+        let mut producer_facts = FactStore::new(&expressions);
+        let mut public_source_facts = MatrixFacts::new(
+            matrix.clone(),
+            MatrixMetadata::new(MatrixLayout::row_major(matrix.rows, matrix.columns)),
+        );
+        public_source_facts.coefficient_bound = NumericContract::Known(CoefficientBound::Large);
+        producer_facts
+            .insert(&expressions, public_source, ValueFacts::Matrix(public_source_facts))
+            .unwrap();
+        let public = programs
+            .explicit_family(
+                &mut expressions,
+                &producer_facts,
+                domain,
+                vec![public_source].into_boxed_slice(),
+            )
+            .unwrap();
+        let public_call =
+            programs.call_family_in_range(&mut expressions, public, index, range).unwrap();
+
+        let target_large = source_with(&mut expressions, matrix.clone(), 99_923);
+        let target_gaussian = gaussian_factor(&mut expressions, matrix.clone(), 99_924, 3);
+        let target_body = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[target_large, target_gaussian])
+            .unwrap();
+        let target =
+            programs.generated_family_from_body(&mut expressions, domain, target_body).unwrap();
+        let trapdoor_body = expressions
+            .intern(
+                ValueOperator::Trapdoor(super::super::arena::TrapdoorOperation::Generate {
+                    descriptor: "rollback-trapdoor".to_owned(),
+                    parameters: Box::new([]),
+                    paired_public_event: SampleEventId(99_925),
+                    paired_public_output_role: "value".to_owned(),
+                }),
+                Box::new([]),
+            )
+            .unwrap();
+        let trapdoor =
+            programs.generated_family_from_body(&mut expressions, domain, trapdoor_body).unwrap();
+        let dispatch = UniversalDispatchKey {
+            preimage_family: preimage,
+            preimage_source: SamplerSourceContract { expression: preimage_source },
+            matrix_type: matrix.clone(),
+            trapdoor_source: TrapdoorSourceContract {
+                expression: source_with(&mut expressions, matrix.clone(), 99_926),
+            },
+        };
+        let registration = UniversalRelationRegistration {
+            dispatch: dispatch.clone(),
+            lhs: StaticLhsKey {
+                domain,
+                public_plan: public.program(),
+                preimage_plan: preimage.program(),
+                trapdoor_plan: trapdoor.program(),
+                public_pairing: public.program(),
+                layout: None,
+                factor_order: FactorOrderContract::ordered_public_preimage(),
+                validation: RelationValidationAuthority {
+                    source: dispatch.preimage_source.clone(),
+                    trapdoor_source: dispatch.trapdoor_source.clone(),
+                    matrix_type: matrix.clone(),
+                    public_type: ResolvedValueType::Matrix(matrix.clone()),
+                    preimage_type: ResolvedValueType::Matrix(matrix.clone()),
+                    target_type: ResolvedValueType::Matrix(matrix.clone()),
+                    trapdoor_type: ResolvedValueType::Trapdoor,
+                    layout: None,
+                    factor_order: FactorOrderContract::ordered_public_preimage(),
+                    domain,
+                    index_range: range,
+                    gadget: None,
+                    decomposition: None,
+                },
+            },
+            target_plan: target.program(),
+        };
+        let mut relations = RelationRegistry::new();
+        relations.register_universal(registration).unwrap();
+        relations.freeze();
+
+        // The extra prefix is an intentional semantic context: the finite RHS summary cannot
+        // be spliced into it, so specialization succeeds before the normalizer rejects it.
+        let prefix = gaussian_factor(&mut expressions, matrix.clone(), 99_927, 2);
+        let root = product(&mut expressions, &[prefix, public_call, preimage_call]);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut cache = NormalizationCache::new();
+        let baseline_rhs = cache.canonical_rhs_count();
+        let baseline_runtime = cache.runtime_entry_count();
+        let mut trace = FeasibilityTrace::default();
+        let mut normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .with_relations(&relations, &mut cache);
+        let expected = NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs);
+        assert!(matches!(normalizer.normalize(semantic), Err(error) if error == expected));
+        drop(normalizer);
+        assert_eq!(cache.runtime_entry_count(), baseline_runtime);
+        assert!(cache.canonical_rhs_count() >= baseline_rhs);
+        assert!(trace.normalization_events().is_empty());
+        let mut normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .with_relations(&relations, &mut cache);
+        assert!(matches!(normalizer.normalize(semantic), Err(error) if error == expected));
+        drop(normalizer);
+        assert_eq!(cache.runtime_entry_count(), baseline_runtime);
+        assert!(trace.normalization_events().is_empty());
+    }
+
+    #[test]
     fn specialization_cache_replays_generated_summary_chain_without_cross_frame_refs() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();

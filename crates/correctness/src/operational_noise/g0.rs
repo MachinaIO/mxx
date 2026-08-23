@@ -1396,6 +1396,9 @@ impl FeasibilitySink for FeasibilityTrace {
         value: &super::normal_form::AnalyzedValue,
     ) -> Result<(), G0Error> {
         let frame = self.frames.last_mut().ok_or(G0Error::MissingNormalizationResult)?;
+        if result.program() != frame.root.program() {
+            return Err(G0Error::MissingNormalizationResult);
+        }
         if frame.results.contains_key(&result.expression()) {
             return Err(G0Error::MissingNormalizationResult);
         }
@@ -1425,6 +1428,18 @@ impl FeasibilitySink for FeasibilityTrace {
         {
             return Err(G0Error::MissingNormalizationResult);
         }
+        let root_result = RecordedValue {
+            exact_nf: result.exact_nf.clone(),
+            coefficient_bound: result.coefficient_bound.clone(),
+        };
+        let root_index = frame.results[&root.expression()];
+        if !matches!(
+            self.events.get(root_index.0 as usize),
+            Some(NormalizerEvent::Result { owner, value })
+                if *owner == root && *value == root_result
+        ) {
+            return Err(G0Error::MissingNormalizationResult);
+        }
         let end = EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
         let range = EventRange::checked(
             frame.range.start,
@@ -1432,10 +1447,7 @@ impl FeasibilitySink for FeasibilityTrace {
         )?;
         self.events.push(NormalizerEvent::InvocationEnd {
             root,
-            result: RecordedValue {
-                exact_nf: result.exact_nf.clone(),
-                coefficient_bound: result.coefficient_bound.clone(),
-            },
+            result: root_result,
             counters: *counters,
         });
         if let Some(frame) = self.frames.last_mut() {
@@ -1446,6 +1458,12 @@ impl FeasibilitySink for FeasibilityTrace {
     }
 
     fn abort_invocation(&mut self, _root: super::arena::ScopedExprId) {
+        if self.frames.last().is_none_or(|frame| frame.root != _root) {
+            self.frames.clear();
+            self.events.clear();
+            self.specialization_ranges.clear();
+            return;
+        }
         let Some(frame) = self.frames.pop() else { return };
         let truncate = frame.range.start.0 as usize;
         self.events.truncate(truncate);
@@ -1542,10 +1560,12 @@ impl FeasibilitySink for FeasibilityTrace {
                     stack.push((*root, current, BTreeMap::new()));
                 }
                 NormalizerEvent::Result { owner, .. } => {
-                    let Some((_, _, results)) = stack.last_mut() else {
+                    let Some((root, _, results)) = stack.last_mut() else {
                         return Err(G0Error::MissingNormalizationResult);
                     };
-                    if results.insert(owner.expression(), current).is_some() {
+                    if owner.program() != root.program() ||
+                        results.insert(owner.expression(), current).is_some()
+                    {
                         return Err(G0Error::MissingNormalizationResult);
                     }
                 }
@@ -1561,11 +1581,19 @@ impl FeasibilitySink for FeasibilityTrace {
                         return Err(G0Error::MissingNormalizationResult);
                     }
                 }
-                NormalizerEvent::InvocationEnd { root, .. } => {
+                NormalizerEvent::InvocationEnd { root, result, .. } => {
                     let Some((active_root, _, results)) = stack.pop() else {
                         return Err(G0Error::MissingNormalizationResult);
                     };
-                    if active_root != *root || !results.contains_key(&root.expression()) {
+                    let Some(result_index) = results.get(&root.expression()).copied() else {
+                        return Err(G0Error::MissingNormalizationResult);
+                    };
+                    let result_matches = matches!(
+                        self.events.get(result_index.0 as usize),
+                        Some(NormalizerEvent::Result { owner, value })
+                            if *owner == *root && *value == *result
+                    );
+                    if active_root != *root || !result_matches {
                         return Err(G0Error::MissingNormalizationResult);
                     }
                 }
@@ -3401,6 +3429,16 @@ mod tests {
             )
             .expect("invocation end");
         trace.validate_normalization_observations().expect("typed results");
+        let mut tampered = trace.clone();
+        if let Some(NormalizerEvent::InvocationEnd { result, .. }) = tampered.events.last_mut() {
+            result.coefficient_bound = crate::operational_noise::facts::NumericContract::Known(
+                crate::operational_noise::facts::CoefficientBound::ExactZero,
+            );
+        }
+        assert_eq!(
+            tampered.validate_normalization_observations(),
+            Err(G0Error::MissingNormalizationResult)
+        );
         let mut ordinary = NoFeasibility;
         ordinary.record_specialization_cache_hit(owner, key.clone()).expect("ordinary no-op");
 

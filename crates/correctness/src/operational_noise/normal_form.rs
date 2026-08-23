@@ -3362,24 +3362,30 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     &ordered_factors[index + 2..],
                 )?)
             };
-            let input_result = self.relation_input_result(input)?;
-            self.observe_applied_relation(super::g0::AppliedRelation {
-                owner: ordered_factors[index + 1],
-                source_monomial: monomial,
-                outer_coefficient: coefficient.clone(),
-                ordered_start: u32::try_from(index).map_err(|_| {
-                    NormalizeError::InvalidExactPlan { reason: "gadget relation index overflow" }
-                })?,
-                ordered_end_exclusive: u32::try_from(index + 2).map_err(|_| {
-                    NormalizeError::InvalidExactPlan { reason: "gadget relation index overflow" }
-                })?,
-                rule: super::g0::AppliedRelationRule::Gadget {
-                    gadget: ordered_factors[index],
-                    decomposition: ordered_factors[index + 1],
-                    input,
-                    input_result,
-                },
-            })?;
+            if S::ENABLED {
+                let input_result = self.relation_input_result(input)?;
+                self.observe_applied_relation(super::g0::AppliedRelation {
+                    owner: ordered_factors[index + 1],
+                    source_monomial: monomial,
+                    outer_coefficient: coefficient.clone(),
+                    ordered_start: u32::try_from(index).map_err(|_| {
+                        NormalizeError::InvalidExactPlan {
+                            reason: "gadget relation index overflow",
+                        }
+                    })?,
+                    ordered_end_exclusive: u32::try_from(index + 2).map_err(|_| {
+                        NormalizeError::InvalidExactPlan {
+                            reason: "gadget relation index overflow",
+                        }
+                    })?,
+                    rule: super::g0::AppliedRelationRule::Gadget {
+                        gadget: ordered_factors[index],
+                        decomposition: ordered_factors[index + 1],
+                        input,
+                        input_result,
+                    },
+                })?;
+            }
             return Ok(Some(ProductGadgetSplice {
                 left,
                 suffix,
@@ -3398,7 +3404,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     fn rewrite_gadget_decomposition(
         &mut self,
         monomial: MonomialId,
-        outer_coefficient: BigInt,
+        outer_coefficient: Option<&BigInt>,
     ) -> Result<Option<PolynomialNF>, NormalizeError> {
         let (central_factors, ordered_factors) = {
             let descriptor = self.monomials.descriptor(monomial)?;
@@ -3416,24 +3422,34 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             else {
                 return Ok(None);
             };
-            let input_result = self.relation_input_result(input)?;
-            self.observe_applied_relation(super::g0::AppliedRelation {
-                owner: decomposition,
-                source_monomial: monomial,
-                outer_coefficient,
-                ordered_start: u32::try_from(index).map_err(|_| {
-                    NormalizeError::InvalidExactPlan { reason: "gadget relation index overflow" }
-                })?,
-                ordered_end_exclusive: u32::try_from(index + 2).map_err(|_| {
-                    NormalizeError::InvalidExactPlan { reason: "gadget relation index overflow" }
-                })?,
-                rule: super::g0::AppliedRelationRule::Gadget {
-                    gadget,
-                    decomposition,
-                    input,
-                    input_result,
-                },
-            })?;
+            if S::ENABLED {
+                let input_result = self.relation_input_result(input)?;
+                self.observe_applied_relation(super::g0::AppliedRelation {
+                    owner: decomposition,
+                    source_monomial: monomial,
+                    outer_coefficient: outer_coefficient.cloned().ok_or(
+                        NormalizeError::InvalidExactPlan {
+                            reason: "missing gadget relation coefficient",
+                        },
+                    )?,
+                    ordered_start: u32::try_from(index).map_err(|_| {
+                        NormalizeError::InvalidExactPlan {
+                            reason: "gadget relation index overflow",
+                        }
+                    })?,
+                    ordered_end_exclusive: u32::try_from(index + 2).map_err(|_| {
+                        NormalizeError::InvalidExactPlan {
+                            reason: "gadget relation index overflow",
+                        }
+                    })?,
+                    rule: super::g0::AppliedRelationRule::Gadget {
+                        gadget,
+                        decomposition,
+                        input,
+                        input_result,
+                    },
+                })?;
+            }
             return Ok(Some(normal_form));
         }
         Ok(None)
@@ -3548,7 +3564,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             // Relation RHS splices can create a new gadget/decomposition adjacency, so ordinary
             // gadget closure must run on every item returned to this worklist.
             if let Some(rewritten) =
-                self.rewrite_gadget_decomposition(monomial, coefficient.clone())?
+                self.rewrite_gadget_decomposition(monomial, S::ENABLED.then_some(&coefficient))?
             {
                 changed = true;
                 relation_noise = add_noise_summaries(
@@ -3604,18 +3620,20 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     &relation_match.suffix,
                 )?)
             };
-            self.observe_applied_relation(super::g0::AppliedRelation {
-                owner: relation_match.owner,
-                source_monomial: monomial,
-                outer_coefficient: coefficient.clone(),
-                ordered_start: relation_match.ordered_start,
-                ordered_end_exclusive: relation_match.ordered_end_exclusive,
-                rule: super::g0::AppliedRelationRule::Universal {
-                    dispatch: relation_match.dispatch.clone(),
-                    lhs: relation_match.lhs.clone(),
-                    rhs: relation_match.rhs,
-                },
-            })?;
+            if S::ENABLED {
+                self.observe_applied_relation(super::g0::AppliedRelation {
+                    owner: relation_match.owner,
+                    source_monomial: monomial,
+                    outer_coefficient: coefficient.clone(),
+                    ordered_start: relation_match.ordered_start,
+                    ordered_end_exclusive: relation_match.ordered_end_exclusive,
+                    rule: super::g0::AppliedRelationRule::Universal {
+                        dispatch: relation_match.dispatch.clone(),
+                        lhs: relation_match.lhs.clone(),
+                        rhs: relation_match.rhs,
+                    },
+                })?;
+            }
             let rhs_noise = scale_noise_summary(
                 &rhs.bounded_summary.coefficient_bound(),
                 coefficient.magnitude(),
@@ -3777,8 +3795,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         ordered: &[ScopedExprId],
     ) -> Result<Option<RelationMatch>, NormalizeError> {
         let Some(relations) = self.relations else { return Ok(None) };
-        let mut candidates =
-            BTreeMap::<(usize, usize), BTreeMap<CanonicalLhsKey, BTreeSet<_>>>::new();
+        let mut candidates = BTreeMap::<
+            (usize, usize),
+            BTreeMap<
+                CanonicalLhsKey,
+                BTreeMap<(ScopedExprId, super::relation::UniversalDispatchKey), BTreeSet<_>>,
+            >,
+        >::new();
         let mut attempted_dispatches = Vec::new();
         for (k_position, &k_factor) in ordered.iter().enumerate() {
             let node = self.expressions.node(k_factor.expression())?;
@@ -3839,6 +3862,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         .or_default()
                         .entry(lhs.clone())
                         .or_default()
+                        .entry((k_factor, dispatch.clone()))
+                        .or_default()
                         .extend(rhs_candidates.iter().copied());
                 }
             }
@@ -3856,7 +3881,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         };
         let rhs_candidates = lhs_candidates
             .values()
-            .flat_map(|values| values.iter().copied())
+            .flat_map(|producers| producers.values().flat_map(|values| values.iter().copied()))
             .collect::<BTreeSet<_>>();
         let super::relation::RelationResolution::Rewrite(rhs) =
             super::relation::resolve_candidates(Some(&rhs_candidates))?
@@ -3865,24 +3890,26 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         };
         let lhs = lhs_candidates
             .iter()
-            .find(|(_, values)| values.contains(&rhs))
-            .map(|(lhs, _)| lhs.clone())
+            .find_map(|(lhs, producers)| {
+                producers.values().any(|values| values.contains(&rhs)).then(|| lhs.clone())
+            })
+            .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
+        let (owner, dispatch) = lhs_candidates
+            .get(&lhs)
+            .and_then(|producers| {
+                producers
+                    .iter()
+                    .find(|(_, values)| values.contains(&rhs))
+                    .map(|(producer, _)| producer.clone())
+            })
             .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
         Ok(Some(RelationMatch {
             prefix: ordered[..start].to_vec(),
             suffix: ordered[end..].to_vec(),
             remaining_central: central.to_vec(),
             rhs,
-            owner: attempted_dispatches
-                .iter()
-                .find(|(owner, _)| ordered[start..end].contains(owner))
-                .map(|(owner, _)| *owner)
-                .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?,
-            dispatch: attempted_dispatches
-                .iter()
-                .find(|(owner, _)| ordered[start..end].contains(owner))
-                .map(|(_, dispatch)| dispatch.clone())
-                .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?,
+            owner,
+            dispatch,
             lhs,
             ordered_start: u32::try_from(start).map_err(|_| {
                 NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs)

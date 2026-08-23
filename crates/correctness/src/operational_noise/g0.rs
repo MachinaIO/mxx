@@ -1513,6 +1513,111 @@ pub(crate) enum G0Error {
     IndexEvaluation(#[from] IndexEvaluationError),
     #[error("G0 descriptor encoding failed: {0}")]
     Encoding(String),
+    #[error("canonical DAG node references a missing dependency")]
+    CanonicalMissingDependency,
+    #[error("canonical DAG key is ambiguous without authoritative aliasing")]
+    AmbiguousCanonicalKey,
+    #[error("canonical DAG contains a dependency cycle")]
+    CanonicalDependencyCycle,
+}
+
+/// A typed, handle-local DAG input for canonical residual row assignment. The handle is used
+/// only for lookup; row ordering and serialized identity are derived from the typed kind,
+/// descriptor, and ordered dependency row references.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalDagNode<H> {
+    pub handle: H,
+    pub row_kind: String,
+    pub descriptor: Vec<u8>,
+    pub dependencies: Vec<H>,
+    pub authoritative_alias: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct CanonicalDagKey {
+    row_kind: String,
+    descriptor: Vec<u8>,
+    dependencies: Vec<u64>,
+}
+
+/// Assign deterministic dependency-first rows without using opaque handles as tie-breakers.
+pub(crate) fn canonical_dependency_rows<H: Clone + Ord>(
+    nodes: impl IntoIterator<Item = CanonicalDagNode<H>>,
+) -> Result<BTreeMap<H, u64>, G0Error> {
+    let nodes = nodes.into_iter().collect::<Vec<_>>();
+    let mut positions = BTreeMap::new();
+    for (position, node) in nodes.iter().enumerate() {
+        if positions.insert(node.handle.clone(), position).is_some() {
+            return Err(G0Error::AmbiguousCanonicalKey);
+        }
+    }
+    let mut indegree = vec![0_usize; nodes.len()];
+    let mut dependents = vec![Vec::<usize>::new(); nodes.len()];
+    for (position, node) in nodes.iter().enumerate() {
+        for dependency in &node.dependencies {
+            let Some(&dependency_position) = positions.get(dependency) else {
+                return Err(G0Error::CanonicalMissingDependency);
+            };
+            indegree[position] += 1;
+            dependents[dependency_position].push(position);
+        }
+    }
+    let mut ready = BTreeSet::new();
+    for (position, degree) in indegree.iter().enumerate() {
+        if *degree == 0 {
+            ready.insert(position);
+        }
+    }
+    let mut rows = BTreeMap::new();
+    let mut next_row = 0_u64;
+    while !ready.is_empty() {
+        let mut keyed = Vec::with_capacity(ready.len());
+        for &position in &ready {
+            let node = &nodes[position];
+            let dependencies =
+                node.dependencies.iter().map(|dependency| rows[dependency]).collect::<Vec<_>>();
+            keyed.push((
+                CanonicalDagKey {
+                    row_kind: node.row_kind.clone(),
+                    descriptor: node.descriptor.clone(),
+                    dependencies,
+                },
+                position,
+            ));
+        }
+        keyed.sort_by(|left, right| left.0.cmp(&right.0));
+        let key = keyed[0].0.clone();
+        let aliases = keyed
+            .iter()
+            .take_while(|(candidate, _)| *candidate == key)
+            .map(|(_, position)| *position)
+            .collect::<Vec<_>>();
+        if aliases.len() > 1 && aliases.iter().any(|position| !nodes[*position].authoritative_alias)
+        {
+            return Err(G0Error::AmbiguousCanonicalKey);
+        }
+        for position in aliases {
+            ready.remove(&position);
+            rows.insert(nodes[position].handle.clone(), next_row);
+        }
+        next_row = next_row.checked_add(1).ok_or(G0Error::TraceOverflow)?;
+        for position in keyed
+            .iter()
+            .take_while(|(candidate, _)| *candidate == key)
+            .map(|(_, position)| *position)
+        {
+            for &dependent in &dependents[position] {
+                indegree[dependent] -= 1;
+                if indegree[dependent] == 0 {
+                    ready.insert(dependent);
+                }
+            }
+        }
+    }
+    if rows.len() != nodes.len() {
+        return Err(G0Error::CanonicalDependencyCycle);
+    }
+    Ok(rows)
 }
 
 impl StableG0Inventory {
@@ -2118,6 +2223,84 @@ mod tests {
 
     fn matrix() -> ResolvedMatrixType {
         ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).expect("matrix type")
+    }
+
+    fn dag_node(
+        handle: u8,
+        kind: &str,
+        descriptor: &str,
+        dependencies: &[u8],
+        authoritative_alias: bool,
+    ) -> CanonicalDagNode<u8> {
+        CanonicalDagNode {
+            handle,
+            row_kind: kind.to_owned(),
+            descriptor: descriptor.as_bytes().to_vec(),
+            dependencies: dependencies.to_vec(),
+            authoritative_alias,
+        }
+    }
+
+    #[test]
+    fn canonical_dag_rows_are_dependency_first_and_handle_independent() {
+        let forward = canonical_dependency_rows([
+            dag_node(1, "leaf", "a", &[], false),
+            dag_node(2, "leaf", "b", &[], false),
+            dag_node(3, "join", "c", &[1, 2], false),
+        ])
+        .unwrap();
+        let reverse = canonical_dependency_rows([
+            dag_node(30, "join", "c", &[10, 20], false),
+            dag_node(20, "leaf", "b", &[], false),
+            dag_node(10, "leaf", "a", &[], false),
+        ])
+        .unwrap();
+        assert_eq!(forward.values().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(reverse.values().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(forward[&1], reverse[&10]);
+        assert_eq!(forward[&2], reverse[&20]);
+        assert_eq!(forward[&3], reverse[&30]);
+    }
+
+    #[test]
+    fn canonical_dag_rows_preserve_child_order_and_alias_authority() {
+        let ordered = canonical_dependency_rows([
+            dag_node(1, "leaf", "a", &[], false),
+            dag_node(2, "leaf", "b", &[], false),
+            dag_node(3, "ordered", "c", &[1, 2], false),
+            dag_node(4, "ordered", "c", &[2, 1], false),
+        ])
+        .unwrap();
+        assert_ne!(ordered[&3], ordered[&4]);
+
+        let aliases = canonical_dependency_rows([
+            dag_node(1, "leaf", "a", &[], true),
+            dag_node(2, "leaf", "a", &[], true),
+        ])
+        .unwrap();
+        assert_eq!(aliases[&1], aliases[&2]);
+        assert_eq!(
+            canonical_dependency_rows([
+                dag_node(1, "leaf", "a", &[], false),
+                dag_node(2, "leaf", "a", &[], false),
+            ]),
+            Err(G0Error::AmbiguousCanonicalKey)
+        );
+    }
+
+    #[test]
+    fn canonical_dag_rows_reject_missing_dependencies_and_cycles() {
+        assert_eq!(
+            canonical_dependency_rows([dag_node(1, "node", "a", &[9], false)]),
+            Err(G0Error::CanonicalMissingDependency)
+        );
+        assert_eq!(
+            canonical_dependency_rows([
+                dag_node(1, "node", "a", &[2], false),
+                dag_node(2, "node", "b", &[1], false),
+            ]),
+            Err(G0Error::CanonicalDependencyCycle)
+        );
     }
 
     #[test]

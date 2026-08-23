@@ -12,13 +12,14 @@ use super::{
     },
     bound::{
         BoundClass, MatrixBound as CanonicalMatrixBound, MatrixProductFacts,
-        product_bound_with_facts, tensor_bound_with_facts,
+        product_bound_with_facts, product_bound_with_facts_witness, tensor_bound_with_facts,
+        tensor_bound_with_facts_witness,
     },
     facts::{
         BoundExpression, CoefficientBound, FactError, FactStore, MatrixFacts, NumericContract,
         ValueFacts,
     },
-    g0::{FeasibilitySink, NoFeasibility},
+    g0::{BoundTransferObservation, BoundTransferWitness, FeasibilitySink, NoFeasibility},
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
     program::{ArenaError, ProgramArena, ValueProgramId},
     relation::{
@@ -1117,6 +1118,20 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(())
     }
 
+    fn observe_bound_transfer(
+        &mut self,
+        owner: ScopedExprId,
+        witness: BoundTransferWitness,
+    ) -> Result<(), NormalizeError> {
+        if S::ENABLED {
+            self.sink
+                .as_deref_mut()
+                .ok_or(super::g0::G0Error::RelationOwnerMismatch)?
+                .record_bound_transfer(BoundTransferObservation { owner, witness })?;
+        }
+        Ok(())
+    }
+
     fn gadget_input_nf(
         &mut self,
         expression: ExprId,
@@ -1182,7 +1197,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         node: &ExprNode,
         children: &[Arc<AnalyzedValue>],
     ) -> Result<AnalyzedValue, NormalizeError> {
-        let bound = self.matrix_bound(expression, node, children)?;
+        let bound = self.matrix_bound(semantic, expression, node, children)?;
         if let ValueOperator::Matrix(operation) = &node.operator {
             if let Some(exact_nf) = self.shared_identity_nf(node, operation, children)? {
                 return Ok(AnalyzedValue {
@@ -4110,7 +4125,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     }
 
     fn matrix_bound(
-        &self,
+        &mut self,
+        owner: ScopedExprId,
         expression: ExprId,
         node: &ExprNode,
         children: &[Arc<AnalyzedValue>],
@@ -4122,7 +4138,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             children.iter().map(|value| value.coefficient_bound.clone()).collect::<Vec<_>>();
         let bound = match &node.operator {
             ValueOperator::Matrix(operation) => {
-                self.matrix_operation_bound(operation, node, &child_bounds)?
+                self.matrix_operation_bound(owner, operation, node, &child_bounds)?
             }
             ValueOperator::Sampler { operation, .. } => sampler_bound(operation),
             ValueOperator::DeterministicHash(_) => NumericContract::Known(CoefficientBound::Large),
@@ -4142,7 +4158,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     }
 
     fn matrix_operation_bound(
-        &self,
+        &mut self,
+        owner: ScopedExprId,
         operation: &MatrixOperation,
         node: &ExprNode,
         bounds: &[NumericContract<CoefficientBound>],
@@ -4157,8 +4174,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 Ok(bounds.first().cloned().unwrap_or(NumericContract::Missing))
             }
             MatrixOperation::Scale => product_bounds(bounds),
-            MatrixOperation::Multiply => self.matrix_product_bound(node, bounds),
-            MatrixOperation::Tensor { .. } => self.tensor_bound(node, bounds),
+            MatrixOperation::Multiply => self.matrix_product_bound(owner, node, bounds),
+            MatrixOperation::Tensor { .. } => self.tensor_bound(owner, node, bounds),
             MatrixOperation::Concat { .. } => max_bounds(bounds),
             MatrixOperation::CrtRecompose { reconstruction_coefficients, .. } => {
                 weighted_sum_bounds(bounds, reconstruction_coefficients)
@@ -4171,7 +4188,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     }
 
     fn tensor_bound(
-        &self,
+        &mut self,
+        owner: ScopedExprId,
         node: &ExprNode,
         bounds: &[NumericContract<CoefficientBound>],
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
@@ -4189,7 +4207,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         ) else {
             return Ok(NumericContract::Missing);
         };
-        let canonical = tensor_bound_with_facts(
+        let canonical = tensor_bound_with_facts_witness(
             &CanonicalMatrixBound {
                 matrix_type: concrete_type(left_type),
                 coefficient_class: canonical_class(left_bound),
@@ -4205,7 +4223,10 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             },
         )
         .map_err(|_| NormalizeError::ArithmeticOverflow)?;
-        Ok(NumericContract::Known(coefficient_bound(&canonical.coefficient_class)))
+        if S::ENABLED {
+            self.observe_bound_transfer(owner, BoundTransferWitness::Tensor(canonical.clone()))?;
+        }
+        Ok(NumericContract::Known(coefficient_bound(&canonical.result.coefficient_class)))
     }
 
     fn constant_polynomial_fact(&self, expression: ExprId) -> bool {
@@ -4221,7 +4242,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     }
 
     fn matrix_product_bound(
-        &self,
+        &mut self,
+        owner: ScopedExprId,
         node: &ExprNode,
         bounds: &[NumericContract<CoefficientBound>],
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
@@ -4243,7 +4265,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 NumericContract::Missing => None,
             })
         };
-        let result = product_bound_with_facts(
+        let result = product_bound_with_facts_witness(
             &CanonicalMatrixBound {
                 matrix_type: concrete_type(left_type),
                 coefficient_class: canonical_class(left_bound),
@@ -4263,7 +4285,10 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             },
         )
         .map_err(|_| NormalizeError::ArithmeticOverflow)?;
-        Ok(NumericContract::Known(coefficient_bound(&result.coefficient_class)))
+        if S::ENABLED {
+            self.observe_bound_transfer(owner, BoundTransferWitness::Product(result.clone()))?;
+        }
+        Ok(NumericContract::Known(coefficient_bound(&result.result.coefficient_class)))
     }
 
     fn nonmatrix_bound(

@@ -11,6 +11,7 @@ use super::{
         ScalarOperation, SemanticFamilySourceIdentity, SemanticSourceIdentity, TrapdoorOperation,
         TrustedIndexRange, TypedConstant, ValueOperator, ValueTransformOperation,
     },
+    bound::{ProductBoundWitness, TensorBoundWitness},
     job::CheckerJob,
     protocol::{ArtifactProducer, PlannedWire, ProgramOccurrence},
     simulation::CertificateClosure,
@@ -57,6 +58,11 @@ pub(crate) trait FeasibilitySink: Default {
     ) -> Result<(), G0Error>;
 
     fn record_relation(&mut self, observation: RelationObservation) -> Result<(), G0Error>;
+
+    fn record_bound_transfer(
+        &mut self,
+        observation: BoundTransferObservation,
+    ) -> Result<(), G0Error>;
 
     fn validate_normalization_observations(&self) -> Result<(), G0Error>;
 
@@ -166,6 +172,18 @@ pub(crate) struct RelationObservation {
     pub kind: RelationObservationKind,
     pub disposition: RelationObservationDisposition,
     pub result: Option<RelationResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BoundTransferWitness {
+    Product(ProductBoundWitness),
+    Tensor(TensorBoundWitness),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BoundTransferObservation {
+    pub owner: super::arena::ScopedExprId,
+    pub witness: BoundTransferWitness,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1173,6 +1191,13 @@ impl FeasibilitySink for NoFeasibility {
         Ok(())
     }
 
+    fn record_bound_transfer(
+        &mut self,
+        _observation: BoundTransferObservation,
+    ) -> Result<(), G0Error> {
+        Ok(())
+    }
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error> {
         Ok(())
     }
@@ -1204,6 +1229,7 @@ pub(crate) struct FeasibilityTrace {
     pub normalization_results: BTreeSet<super::arena::ScopedExprId>,
     pub specialization_observations: BTreeSet<SpecializationObservation>,
     pub relation_observations: Vec<RelationObservation>,
+    pub bound_transfer_observations: Vec<BoundTransferObservation>,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
     index_use_plans: BTreeSet<IndexUsePlan>,
@@ -1221,6 +1247,7 @@ impl Default for FeasibilityTrace {
             normalization_results: BTreeSet::new(),
             specialization_observations: BTreeSet::new(),
             relation_observations: Vec::new(),
+            bound_transfer_observations: Vec::new(),
             source_observations: BTreeMap::new(),
             event_observations: BTreeMap::new(),
             index_use_plans: BTreeSet::new(),
@@ -1303,6 +1330,14 @@ impl FeasibilitySink for FeasibilityTrace {
             return Err(G0Error::MissingRelationResult);
         }
         self.relation_observations.push(observation);
+        Ok(())
+    }
+
+    fn record_bound_transfer(
+        &mut self,
+        observation: BoundTransferObservation,
+    ) -> Result<(), G0Error> {
+        self.bound_transfer_observations.push(observation);
         Ok(())
     }
 

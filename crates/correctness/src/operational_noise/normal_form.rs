@@ -3433,7 +3433,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
     ) -> Result<(), NormalizeError> {
-        let (summary_contribution, _) = self.product_summary_contract(
+        let (summary_contribution, summary_evidence) = self.product_summary_contract(
             owner,
             left_expression,
             right_expression,
@@ -3443,7 +3443,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             right,
             weight,
         )?;
-        self.product_into_body(owner, left, right, weight, terms, noise)?;
+        let mut evidence = None;
+        self.product_into_body(owner, left, right, weight, terms, noise, &mut evidence)?;
+        if let Some(summary_evidence) = summary_evidence {
+            let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+            self.append_summary_evidence(owner, &mut evidence, summary_evidence)?;
+        }
         *noise = add_noise_summaries(noise, &summary_contribution);
         Ok(())
     }
@@ -3456,6 +3461,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         weight: &BigInt,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
+        evidence: &mut Option<BoundValueRef>,
     ) -> Result<(), NormalizeError> {
         let mut worklist = VecDeque::<ProductWorkItem>::new();
         for (left_id, left_coefficient) in &left.exact_terms {
@@ -3469,10 +3475,10 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 // Drain each completed Cartesian pair before generating the next one. The same
                 // rewrite queue remains authoritative, but its live size follows one pair's
                 // recursive splice instead of the full product cardinality.
-                self.drain_product_worklist(owner, terms, noise, &mut worklist)?;
+                self.drain_product_worklist(owner, terms, noise, evidence, &mut worklist)?;
             }
         }
-        self.drain_product_worklist(owner, terms, noise, &mut worklist)
+        self.drain_product_worklist(owner, terms, noise, evidence, &mut worklist)
     }
 
     fn drain_product_worklist<A: ExactTermAccumulator>(
@@ -3480,11 +3486,18 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         owner: Option<ScopedExprId>,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
+        evidence: &mut Option<BoundValueRef>,
         worklist: &mut VecDeque<ProductWorkItem>,
     ) -> Result<(), NormalizeError> {
         while let Some(item) = worklist.pop_front() {
             let ProductWorkItem::Term(monomial, coefficient) = item else {
                 let ProductWorkItem::GadgetSplice(mut splice) = item else { unreachable!() };
+                if S::ENABLED &&
+                    splice.summary_pending &&
+                    !splice.input_nf.bounded_summary.is_zero()
+                {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                }
                 let lower = splice
                     .next_after
                     .map(std::ops::Bound::Excluded)
@@ -3549,7 +3562,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 continue;
             }
             let Some(splice) = self.product_gadget_splice(monomial, coefficient.clone())? else {
-                self.merge_product_result_early(owner, monomial, coefficient, terms, noise)?;
+                self.merge_product_result_early(
+                    owner,
+                    monomial,
+                    coefficient,
+                    terms,
+                    noise,
+                    evidence,
+                )?;
                 continue;
             };
             worklist.push_front(ProductWorkItem::GadgetSplice(splice));
@@ -3568,6 +3588,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         coefficient: BigInt,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
+        evidence: &mut Option<BoundValueRef>,
     ) -> Result<(), NormalizeError> {
         if coefficient.is_zero() {
             return Ok(())
@@ -3586,6 +3607,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 initial_bound,
                 terms,
                 noise,
+                evidence,
             )
         }
 
@@ -3594,10 +3616,21 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             bounded_summary: BoundedSummary::zero(),
         };
         self.rewrite_relations(&mut candidate)?;
+        if S::ENABLED && !candidate.bounded_summary.is_zero() {
+            return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+        }
         *noise = add_noise_summaries(noise, &candidate.bounded_summary.coefficient_bound());
         for (rewritten, rewritten_coefficient) in candidate.exact_terms {
             let bound = self.bound_monomial(rewritten, &rewritten_coefficient)?;
-            self.merge_product_term(owner, rewritten, rewritten_coefficient, bound, terms, noise)?;
+            self.merge_product_term(
+                owner,
+                rewritten,
+                rewritten_coefficient,
+                bound,
+                terms,
+                noise,
+                evidence,
+            )?;
         }
         Ok(())
     }
@@ -3610,6 +3643,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         bound: NumericContract<CoefficientBound>,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
+        evidence: &mut Option<BoundValueRef>,
     ) -> Result<(), NormalizeError> {
         match bound {
             NumericContract::Known(CoefficientBound::ExactZero) => Ok(()),
@@ -3619,11 +3653,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 }
                 self.counters.bounded_fold_count =
                     self.counters.bounded_fold_count.saturating_add(1);
-                *noise = add_noise_summaries(noise, &NumericContract::Known(bound));
                 if S::ENABLED {
                     let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
-                    self.observe_finite_monomial(owner, monomial, &coefficient)?;
+                    let transfer = self.observe_finite_monomial(owner, monomial, &coefficient)?;
+                    self.append_summary_evidence(owner, evidence, transfer)?;
                 }
+                *noise = add_noise_summaries(noise, &NumericContract::Known(bound));
                 Ok(())
             }
             NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
@@ -6921,6 +6956,141 @@ mod tests {
             matches!(event, super::super::g0::NormalizerEvent::BoundTransfer { .. })
         }));
         close_summary_trace(&mut trace, semantic, &zero_bound, &monomials);
+    }
+
+    #[test]
+    fn product_execution_chains_exact_folds_before_final_summary_evidence() {
+        let (
+            mut expressions,
+            programs,
+            facts,
+            mut monomials,
+            semantic,
+            left,
+            right,
+            _left_monomial,
+            _right_monomial,
+            mut left_nf,
+            mut right_nf,
+        ) = summary_contract_fixture();
+        let left_scoped = programs.scoped(&expressions, semantic.program(), left).unwrap();
+        let right_scoped = programs.scoped(&expressions, semantic.program(), right).unwrap();
+        let left_extra_monomial =
+            monomials.intern(&expressions, &programs, &[], &[left_scoped, left_scoped]).unwrap();
+        let right_extra_monomial =
+            monomials.intern(&expressions, &programs, &[], &[right_scoped, right_scoped]).unwrap();
+        left_nf.exact_terms.insert(left_extra_monomial, BigInt::from(1_u8));
+        right_nf.exact_terms.insert(right_extra_monomial, BigInt::from(1_u8));
+
+        let (ordinary_terms, ordinary_noise, ordinary_counters) = {
+            let mut terms = BTreeMap::new();
+            let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            normalizer
+                .execute_product_into(
+                    None,
+                    left,
+                    right,
+                    &matrix_type(),
+                    &matrix_type(),
+                    &left_nf,
+                    &right_nf,
+                    &BigInt::from(1_u8),
+                    &mut terms,
+                    &mut noise,
+                )
+                .unwrap();
+            (terms, noise, normalizer.counters())
+        };
+
+        let mut trace = super::super::g0::FeasibilityTrace::default();
+        record_summary_inputs(&mut trace, semantic, left_scoped, right_scoped, &left_nf, &right_nf);
+        let mut terms = BTreeMap::new();
+        let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
+        let (root_nf, root_bound, traced_counters) = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer
+                .execute_product_into(
+                    Some(semantic),
+                    left,
+                    right,
+                    &matrix_type(),
+                    &matrix_type(),
+                    &left_nf,
+                    &right_nf,
+                    &BigInt::from(1_u8),
+                    &mut terms,
+                    &mut noise,
+                )
+                .unwrap();
+            let root_nf = PolynomialNF {
+                exact_terms: terms.clone(),
+                bounded_summary: BoundedSummary::from_contract(noise.clone()).unwrap(),
+            };
+            (root_nf, noise.clone(), normalizer.counters())
+        };
+        assert_eq!(terms, ordinary_terms);
+        assert_eq!(noise, ordinary_noise);
+        assert_eq!(traced_counters, ordinary_counters);
+        let root_value = AnalyzedValue {
+            semantic,
+            exact_nf: Some(Arc::new(root_nf)),
+            coefficient_bound: root_bound,
+        };
+        trace.record_normalization_result(semantic, &root_value).unwrap();
+        trace.record_invocation_end(semantic, &root_value, &traced_counters).unwrap();
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+
+        let fold_events = trace
+            .normalization_events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    super::super::g0::NormalizerEvent::BoundTransfer {
+                        rule: BoundRule::MonomialProduct { .. },
+                        owner,
+                    } if *owner == semantic
+                )
+            })
+            .count();
+        assert!(fold_events >= 2);
+        let root_result = trace
+            .normalization_events()
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    super::super::g0::NormalizerEvent::Result { owner, .. } if *owner == semantic
+                )
+            })
+            .expect("root result follows the local evidence");
+        let final_transfer = trace.normalization_events()[..root_result]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, event)| {
+                matches!(event, super::super::g0::NormalizerEvent::BoundTransfer { owner, .. } if *owner == semantic)
+                    .then_some((index, event))
+            })
+            .expect("final local evidence transfer");
+        assert!(matches!(
+            final_transfer.1,
+            super::super::g0::NormalizerEvent::BoundTransfer {
+                rule: BoundRule::Sum { inputs },
+                ..
+            } if inputs.len() == 2
+        ));
+        assert!(final_transfer.0 > 0);
+        assert!(final_transfer.0 < root_result);
     }
 
     #[test]

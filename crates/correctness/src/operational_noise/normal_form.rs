@@ -1401,7 +1401,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         node: &ExprNode,
         children: &[Arc<AnalyzedValue>],
     ) -> Result<AnalyzedValue, NormalizeError> {
-        let bound = self.nonmatrix_bound(expression, node, children)?;
+        let bound = self.nonmatrix_bound(semantic, expression, node, children)?;
         Ok(AnalyzedValue { semantic, exact_nf: None, coefficient_bound: bound })
     }
 
@@ -4638,16 +4638,27 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     }
 
     fn nonmatrix_bound(
-        &self,
+        &mut self,
+        owner: ScopedExprId,
         expression: ExprId,
         node: &ExprNode,
         children: &[Arc<AnalyzedValue>],
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
         if let Some(bound) = self.fact_bound(expression)? {
+            if S::ENABLED {
+                if bound.is_missing() {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                }
+                self.observe_bound_transfer(
+                    owner,
+                    BoundRule::Authority(BoundAuthority::FactStore),
+                )?;
+            }
             return Ok(bound);
         }
         let bounds =
             children.iter().map(|value| value.coefficient_bound.clone()).collect::<Vec<_>>();
+        let mut program_call_authority = None;
         let bound = match &node.operator {
             ValueOperator::Constant(constant) => match &constant.value {
                 super::arena::ConstantValue::Int(value) => {
@@ -4662,11 +4673,81 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             ValueOperator::Sampler { operation, .. } => sampler_bound(operation),
             ValueOperator::DeterministicHash(_) => NumericContract::Known(CoefficientBound::Large),
             ValueOperator::Source(_) | ValueOperator::Sample { .. } => NumericContract::Missing,
-            ValueOperator::Argument { .. } | ValueOperator::ProgramCall { .. } => {
-                NumericContract::Missing
+            ValueOperator::Argument { .. } => NumericContract::Missing,
+            ValueOperator::ProgramCall { program } => {
+                if let Some(facts) = self.program_call_matrix_facts(expression) {
+                    if S::ENABLED {
+                        program_call_authority = Some(BoundAuthority::ProgramFamilyFact);
+                    }
+                    facts.coefficient_bound.clone()
+                } else if let Some((source, bound)) =
+                    self.relation_live_preimage(expression, *program)?
+                {
+                    if S::ENABLED {
+                        program_call_authority =
+                            Some(BoundAuthority::RelationPreimageSource { source });
+                    }
+                    bound
+                } else {
+                    NumericContract::Missing
+                }
             }
             _ => bounds.first().cloned().unwrap_or(NumericContract::Missing),
         };
+        if S::ENABLED {
+            if bound.is_missing() {
+                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+            }
+            let rule = match &node.operator {
+                ValueOperator::Constant(constant)
+                    if matches!(&constant.value, super::arena::ConstantValue::Int(_)) =>
+                {
+                    BoundRule::Authority(BoundAuthority::Operator)
+                }
+                ValueOperator::Sampler { .. } | ValueOperator::DeterministicHash(_) => {
+                    BoundRule::Authority(BoundAuthority::Operator)
+                }
+                ValueOperator::Scalar(ScalarOperation::Add | ScalarOperation::Subtract) => {
+                    BoundRule::Sum {
+                        inputs: Self::predecessor_refs(
+                            0..bounds.len(),
+                            BoundProjection::Coefficient,
+                        )?,
+                    }
+                }
+                ValueOperator::Scalar(ScalarOperation::Multiply) => BoundRule::Scale {
+                    value: Self::predecessor_ref(0, BoundProjection::Coefficient)?,
+                    scale: BoundScale::Value(Self::predecessor_ref(
+                        1,
+                        BoundProjection::Coefficient,
+                    )?),
+                },
+                ValueOperator::Scalar(
+                    ScalarOperation::Negate |
+                    ScalarOperation::BoolToInt |
+                    ScalarOperation::IntToReal |
+                    ScalarOperation::ExtractCoefficient { .. } |
+                    ScalarOperation::LiftConstantPolynomial { .. },
+                ) |
+                ValueOperator::ExtractCoefficient { .. } => BoundRule::Identity {
+                    input: Self::predecessor_ref(0, BoundProjection::Coefficient)?,
+                },
+                ValueOperator::ProgramCall { .. } => {
+                    let Some(authority) = program_call_authority else {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    };
+                    BoundRule::Authority(authority)
+                }
+                ValueOperator::Source(_) |
+                ValueOperator::Sample { .. } |
+                ValueOperator::Argument { .. } |
+                ValueOperator::Transform(_) => {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                }
+                _ => return Err(super::g0::G0Error::UnsupportedBoundTransfer.into()),
+            };
+            self.observe_bound_transfer(owner, rule)?;
+        }
         Ok(bound)
     }
 
@@ -5051,7 +5132,7 @@ mod tests {
             ResolvedMatrixType, SampleEventId, SamplerOperation, SemanticFamilySourceIdentity,
             SemanticSourceIdentity, TrustedIndexRange,
         },
-        facts::{MatrixFacts, MatrixMetadata, ValueFacts},
+        facts::{MatrixFacts, MatrixMetadata, ScalarFacts, ValueFacts},
         g0::{BoundAuthority, BoundRule, EventIndex, FeasibilityTrace, G0Error, NormalizerEvent},
         relation::{
             FactorOrderContract, GadgetRecompositionRegistry, GadgetRecompositionRule,
@@ -8819,6 +8900,221 @@ mod tests {
     }
 
     #[test]
+    fn nonmatrix_bound_rules_preserve_results_and_record_typed_transfers() {
+        fn constant(expressions: &mut ExprArena, value: i64) -> ExprId {
+            expressions
+                .intern(ValueOperator::Constant(TypedConstant::int(value)), Box::new([]))
+                .unwrap()
+        }
+
+        fn root_rule(
+            expressions: &mut ExprArena,
+            programs: &mut ProgramArena,
+            root: ExprId,
+        ) -> (NumericContract<CoefficientBound>, BoundRule) {
+            let (facts, mut monomials, semantic) = setup(expressions, programs, root);
+            let (ordinary_value, ordinary_counters) = {
+                let mut normalizer =
+                    Normalizer::new(expressions, programs, &facts, &mut monomials).unwrap();
+                let value = normalizer.normalize(semantic).unwrap();
+                (value, normalizer.counters())
+            };
+            let mut trace = FeasibilityTrace::default();
+            let (traced_value, traced_counters) = {
+                let mut normalizer = Normalizer::new_with_sink(
+                    expressions,
+                    programs,
+                    &facts,
+                    &mut monomials,
+                    &mut trace,
+                )
+                .unwrap();
+                let value = normalizer.normalize(semantic).unwrap();
+                (value, normalizer.counters())
+            };
+            assert_eq!(ordinary_value.semantic, traced_value.semantic);
+            assert_eq!(ordinary_value.exact_nf, traced_value.exact_nf);
+            assert_eq!(ordinary_value.coefficient_bound, traced_value.coefficient_bound);
+            assert_eq!(ordinary_counters, traced_counters);
+            trace.validate_normalization_observations().unwrap();
+            let rule = trace
+                .normalization_events()
+                .iter()
+                .find_map(|event| match event {
+                    NormalizerEvent::BoundTransfer { owner, rule } if *owner == semantic => {
+                        Some(rule.clone())
+                    }
+                    _ => None,
+                })
+                .expect("root bound transfer");
+            (traced_value.coefficient_bound, rule)
+        }
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = constant(&mut expressions, 2);
+        let right = constant(&mut expressions, 3);
+        let add = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), Box::new([left, right]))
+            .unwrap();
+        let (bound, rule) = root_rule(&mut expressions, &mut programs, add);
+        assert_eq!(bound, NumericContract::Known(CoefficientBound::finite(5_u8)));
+        assert_eq!(
+            rule,
+            BoundRule::Sum {
+                inputs: Box::new([
+                    BoundValueRef::Predecessor {
+                        input_position: 0,
+                        projection: BoundProjection::Coefficient,
+                    },
+                    BoundValueRef::Predecessor {
+                        input_position: 1,
+                        projection: BoundProjection::Coefficient,
+                    },
+                ])
+            }
+        );
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = constant(&mut expressions, 2);
+        let right = constant(&mut expressions, 3);
+        let multiply = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Multiply), Box::new([left, right]))
+            .unwrap();
+        let (bound, rule) = root_rule(&mut expressions, &mut programs, multiply);
+        assert_eq!(bound, NumericContract::Known(CoefficientBound::finite(6_u8)));
+        assert_eq!(
+            rule,
+            BoundRule::Scale {
+                value: BoundValueRef::Predecessor {
+                    input_position: 0,
+                    projection: BoundProjection::Coefficient,
+                },
+                scale: BoundScale::Value(BoundValueRef::Predecessor {
+                    input_position: 1,
+                    projection: BoundProjection::Coefficient,
+                }),
+            }
+        );
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = constant(&mut expressions, 0);
+        let right = constant(&mut expressions, 3);
+        let zero_multiply = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Multiply), Box::new([left, right]))
+            .unwrap();
+        let (bound, _) = root_rule(&mut expressions, &mut programs, zero_multiply);
+        assert_eq!(bound, NumericContract::Known(CoefficientBound::ExactZero));
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input = constant(&mut expressions, 2);
+        let negate = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Negate), Box::new([input]))
+            .unwrap();
+        let (bound, rule) = root_rule(&mut expressions, &mut programs, negate);
+        assert_eq!(bound, NumericContract::Known(CoefficientBound::finite(2_u8)));
+        assert_eq!(
+            rule,
+            BoundRule::Identity {
+                input: BoundValueRef::Predecessor {
+                    input_position: 0,
+                    projection: BoundProjection::Coefficient,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn nonmatrix_fact_authority_precedes_operator_and_missing_is_fail_closed() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let source = expressions
+            .intern(
+                ValueOperator::Source(SemanticSourceIdentity {
+                    stable_definition: "scalar-fact".to_owned(),
+                    invocation: "scalar-fact".to_owned(),
+                    sample_event: None,
+                    output_role: "value".to_owned(),
+                    sampler: None,
+                    artifact: None,
+                    value_type: ResolvedValueType::Int,
+                    coordinates: Box::new([]),
+                    matrix_constant: None,
+                }),
+                Box::new([]),
+            )
+            .unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, source);
+        let mut scalar_facts = ScalarFacts::new(ResolvedValueType::Int).unwrap();
+        scalar_facts.coefficient_bound = NumericContract::Known(CoefficientBound::finite(7_u8));
+        facts.insert(&expressions, source, ValueFacts::Scalar(scalar_facts)).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let mut normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap();
+        assert_eq!(
+            normalizer.normalize(semantic).unwrap().coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(7_u8))
+        );
+        drop(normalizer);
+        trace.validate_normalization_observations().unwrap();
+        assert!(trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Authority(BoundAuthority::FactStore),
+                } if *owner == semantic
+            )
+        }));
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let source = expressions
+            .intern(
+                ValueOperator::Source(SemanticSourceIdentity {
+                    stable_definition: "scalar-missing".to_owned(),
+                    invocation: "scalar-missing".to_owned(),
+                    sample_event: None,
+                    output_role: "value".to_owned(),
+                    sampler: None,
+                    artifact: None,
+                    value_type: ResolvedValueType::Int,
+                    coordinates: Box::new([]),
+                    matrix_constant: None,
+                }),
+                Box::new([]),
+            )
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, source);
+        let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        assert_eq!(ordinary.coefficient_bound, NumericContract::Missing);
+        let mut trace = FeasibilityTrace::default();
+        let error = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(semantic)
+        .unwrap_err();
+        assert!(matches!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer)));
+    }
+
+    #[test]
     fn fact_store_authority_precedes_source_operator_fallback() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -8879,7 +9175,9 @@ mod tests {
                 vec![value].into_boxed_slice(),
             )
             .unwrap();
-        let index = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let index = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
         let call = programs
             .call_family_in_range(
                 &mut expressions,
@@ -8926,7 +9224,9 @@ mod tests {
         let matrix = matrix_type();
         let domain = super::super::arena::FamilyDomain::new(0, 1).unwrap();
         let range = TrustedIndexRange::new(0, 1).unwrap();
-        let index = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let index = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
         let source = preimage_factor(&mut expressions, matrix.clone(), 9_901, 3);
         let preimage =
             programs.opaque_generated_family_from_body(&mut expressions, domain, source).unwrap();

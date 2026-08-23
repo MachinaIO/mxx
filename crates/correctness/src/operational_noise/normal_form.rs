@@ -661,7 +661,15 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 if let Some(exact_nf) = value.exact_nf.as_mut() {
                     let normal_form = Arc::make_mut(exact_nf);
                     let rebound = self.bound_normal_form(normal_form)?;
-                    self.fold_finite_no_match_terms(Some(root), normal_form, false)?;
+                    let mut evidence = if S::ENABLED && !normal_form.bounded_summary.is_zero() {
+                        Some(BoundValueRef::Result {
+                            event: self.relation_input_result(root.expression())?,
+                            projection: BoundProjection::Summary,
+                        })
+                    } else {
+                        None
+                    };
+                    self.fold_finite_no_match_terms(Some(root), normal_form, false, &mut evidence)?;
                     value.coefficient_bound = rebound;
                     if normal_form.is_zero() {
                         value.coefficient_bound =
@@ -1465,9 +1473,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 match (left, right) {
                     (Some(left), Some(right)) => self.add_nf(
                         Some(semantic),
+                        Some(node.inputs[0]),
+                        Some(node.inputs[1]),
                         left,
                         right,
                         matches!(operation, MatrixOperation::Subtract),
+                        &mut None,
                     ),
                     _ => Ok(self.atom_nf(scope_proof, semantic)?),
                 }
@@ -1556,6 +1567,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 self.transform_nf(
                     scope_proof,
                     semantic,
+                    node.inputs[0],
                     input,
                     ValueOperator::Matrix(operation.clone()),
                 )
@@ -1599,6 +1611,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 self.transform_nf(
                     scope_proof,
                     semantic,
+                    node.inputs[0],
                     input,
                     ValueOperator::Matrix(operation.clone()),
                 )
@@ -1636,6 +1649,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 self.transform_nf(
                     scope_proof,
                     semantic,
+                    node.inputs[0],
                     input,
                     ValueOperator::Matrix(operation.clone()),
                 )
@@ -1691,12 +1705,23 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     return Ok(self.atom_nf(scope_proof, semantic)?);
                 }
                 let mut output = PolynomialNF::zero();
-                for (child, coefficient) in children.iter().zip(reconstruction_coefficients) {
+                let mut output_evidence = None;
+                for (_child_expression, (child, coefficient)) in
+                    node.inputs.iter().zip(children.iter().zip(reconstruction_coefficients))
+                {
                     let Some(input) = child.exact_nf.as_ref() else {
                         return Ok(self.atom_nf(scope_proof, semantic)?);
                     };
                     let scaled = self.scale_nf(input, coefficient);
-                    output = self.add_nf(Some(semantic), &output, &scaled, false)?;
+                    output = self.add_nf(
+                        Some(semantic),
+                        None,
+                        None,
+                        &output,
+                        &scaled,
+                        false,
+                        &mut output_evidence,
+                    )?;
                 }
                 Ok(output)
             }
@@ -2018,6 +2043,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         &mut self,
         scope_proof: &mut ScopeProof,
         owner: ScopedExprId,
+        input_expression: ExprId,
         input: &PolynomialNF,
         descriptor: ValueOperator,
     ) -> Result<PolynomialNF, NormalizeError> {
@@ -2037,7 +2063,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
         let mut result =
             PolynomialNF { exact_terms: terms, bounded_summary: input.bounded_summary.clone() };
-        self.fold_finite_no_match_terms(Some(owner), &mut result, true)?;
+        let mut evidence = None;
+        if S::ENABLED && !input.bounded_summary.is_zero() {
+            evidence = self.summary_result_ref(input_expression)?;
+        }
+        self.fold_finite_no_match_terms(Some(owner), &mut result, true, &mut evidence)?;
         Ok(result)
     }
 
@@ -2102,7 +2132,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 bounded_summary: BoundedSummary::from_contract(summary)?,
             })
         }
-        let (noise, _) = self.tensor_summary_contract(
+        let (noise, mut evidence) = self.tensor_summary_contract(
             Some(owner),
             left_expression,
             right_expression,
@@ -2147,7 +2177,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             exact_terms: terms,
             bounded_summary: BoundedSummary::from_contract(noise)?,
         };
-        self.fold_finite_no_match_terms(Some(owner), &mut result, true)?;
+        self.fold_finite_no_match_terms(Some(owner), &mut result, true, &mut evidence)?;
         Ok(result)
     }
 
@@ -2396,7 +2426,30 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             exact_terms: terms,
             bounded_summary: BoundedSummary::from_contract(max_bounds(&summaries)?)?,
         };
-        self.fold_finite_no_match_terms(Some(semantic), &mut result, true)?;
+        let mut evidence = None;
+        if S::ENABLED {
+            let mut selected = None;
+            for (index, child) in children.iter().enumerate() {
+                let Some(normal_form) = child.exact_nf.as_ref() else { continue };
+                let bound = normal_form.bounded_summary.coefficient_bound();
+                let NumericContract::Known(CoefficientBound::Finite(value)) = bound else {
+                    continue
+                };
+                if value.maximum_absolute_coefficient.is_zero() {
+                    continue
+                }
+                let replace = selected.as_ref().is_none_or(|(_, current): &(usize, BigUint)| {
+                    value.maximum_absolute_coefficient > *current
+                });
+                if replace {
+                    selected = Some((index, value.maximum_absolute_coefficient.clone()));
+                }
+            }
+            if let Some((index, _)) = selected {
+                evidence = self.summary_result_ref(node.inputs[index])?;
+            }
+        }
+        self.fold_finite_no_match_terms(Some(semantic), &mut result, true, &mut evidence)?;
         Ok(result)
     }
 
@@ -3010,9 +3063,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     fn add_nf(
         &mut self,
         owner: Option<ScopedExprId>,
+        left_expression: Option<ExprId>,
+        right_expression: Option<ExprId>,
         left: &PolynomialNF,
         right: &PolynomialNF,
         subtract: bool,
+        evidence: &mut Option<BoundValueRef>,
     ) -> Result<PolynomialNF, NormalizeError> {
         let mut terms = BTreeMap::new();
         for (id, coefficient) in &left.exact_terms {
@@ -3033,7 +3089,24 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 &right.bounded_summary.coefficient_bound(),
             ))?,
         };
-        self.fold_finite_no_match_terms(owner, &mut result, true)?;
+        if S::ENABLED {
+            for (expression, input) in [(left_expression, left), (right_expression, right)] {
+                if !input.bounded_summary.is_zero() {
+                    let Some(expression) = expression else {
+                        if evidence.is_some() {
+                            continue;
+                        }
+                        return Err(super::g0::G0Error::RelationTraceInvariant.into());
+                    };
+                    let summary = self
+                        .summary_result_ref(expression)?
+                        .ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                    let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                    self.append_summary_evidence(owner, evidence, summary)?;
+                }
+            }
+        }
+        self.fold_finite_no_match_terms(owner, &mut result, true, evidence)?;
         Ok(result)
     }
 
@@ -4068,6 +4141,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         owner: Option<ScopedExprId>,
         normal_form: &mut PolynomialNF,
         preserve_relation_endpoints: bool,
+        evidence: &mut Option<BoundValueRef>,
     ) -> Result<(), NormalizeError> {
         if normal_form.exact_terms.is_empty() {
             return Ok(());
@@ -4090,7 +4164,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     folded = add_known_bounds(&folded, &bound);
                     if S::ENABLED {
                         let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
-                        self.observe_finite_monomial(owner, monomial, &coefficient)?;
+                        let transfer =
+                            self.observe_finite_monomial(owner, monomial, &coefficient)?;
+                        self.append_summary_evidence(owner, evidence, transfer)?;
                     }
                 }
                 NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
@@ -10507,7 +10583,10 @@ mod tests {
         };
         let mut ordinary =
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
-        ordinary.fold_finite_no_match_terms(None, &mut normal_form, false).unwrap();
+        let mut ordinary_evidence = None;
+        ordinary
+            .fold_finite_no_match_terms(None, &mut normal_form, false, &mut ordinary_evidence)
+            .unwrap();
         assert!(normal_form.exact_terms.is_empty());
         drop(ordinary);
 
@@ -10525,8 +10604,14 @@ mod tests {
             exact_terms: [(empty, BigInt::from(7_u8))].into_iter().collect(),
             bounded_summary: BoundedSummary::zero(),
         };
+        let mut traced_evidence = None;
         assert_eq!(
-            traced.fold_finite_no_match_terms(Some(semantic), &mut malformed, false),
+            traced.fold_finite_no_match_terms(
+                Some(semantic),
+                &mut malformed,
+                false,
+                &mut traced_evidence,
+            ),
             Err(NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer))
         );
     }
@@ -10740,6 +10825,62 @@ mod tests {
                 } if magnitude == &BigUint::from(2_u8)
             )
         }));
+    }
+
+    #[test]
+    fn root_final_fold_is_after_result_and_before_invocation_end() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = gaussian_factor(&mut expressions, matrix_type(), 99_021, 3);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut relations = RelationRegistry::new();
+        relations.freeze();
+        let mut normalization = NormalizationCache::new();
+        let mut trace = FeasibilityTrace::default();
+        let value = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .with_relations(&relations, &mut normalization);
+            let value = normalizer.normalize(semantic).unwrap();
+            assert_eq!(normalizer.counters().relation_candidates, 1);
+            value
+        };
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        let result_index = trace
+            .normalization_events()
+            .iter()
+            .position(|event| matches!(event, NormalizerEvent::Result { owner, .. } if *owner == semantic))
+            .expect("root result");
+        let fold_index = trace
+            .normalization_events()
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    NormalizerEvent::BoundTransfer {
+                        owner,
+                        rule: BoundRule::MonomialProduct { .. },
+                    } if *owner == semantic
+                )
+            })
+            .expect("final finite survivor transfer");
+        let end_index = trace
+            .normalization_events()
+            .iter()
+            .position(|event| matches!(event, NormalizerEvent::InvocationEnd { root, .. } if *root == semantic))
+            .expect("invocation end");
+        assert!(result_index < fold_index);
+        assert!(fold_index < end_index);
+        assert!(
+            value.exact_nf.as_ref().is_some_and(|normal_form| normal_form.exact_terms.is_empty())
+        );
+        assert_eq!(value.coefficient_bound, NumericContract::Known(CoefficientBound::finite(3_u8)));
     }
 
     #[test]

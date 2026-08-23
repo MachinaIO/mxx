@@ -5618,6 +5618,94 @@ mod tests {
             .collect()
     }
 
+    fn summary_contract_fixture() -> (
+        ExprArena,
+        ProgramArena,
+        FactStore,
+        MonomialArena,
+        ScopedExprId,
+        ExprId,
+        ExprId,
+        MonomialId,
+        MonomialId,
+        PolynomialNF,
+        PolynomialNF,
+    ) {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = source_with(&mut expressions, matrix_type(), 96_001);
+        let right = source_with(&mut expressions, matrix_type(), 96_002);
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[left, right]).unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        insert_matrix_bound(&mut facts, &expressions, left, 2);
+        insert_matrix_bound(&mut facts, &expressions, right, 3);
+        let left_scoped = programs.scoped(&expressions, semantic.program(), left).unwrap();
+        let right_scoped = programs.scoped(&expressions, semantic.program(), right).unwrap();
+        let left_monomial = monomials.intern(&expressions, &programs, &[], &[left_scoped]).unwrap();
+        let right_monomial =
+            monomials.intern(&expressions, &programs, &[], &[right_scoped]).unwrap();
+        let left_nf = PolynomialNF {
+            exact_terms: BTreeMap::from([(left_monomial, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::finite(BoundExpression::new(BigUint::from(2_u8))),
+        };
+        let right_nf = PolynomialNF {
+            exact_terms: BTreeMap::from([(right_monomial, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::finite(BoundExpression::new(BigUint::from(3_u8))),
+        };
+        (
+            expressions,
+            programs,
+            facts,
+            monomials,
+            semantic,
+            left,
+            right,
+            left_monomial,
+            right_monomial,
+            left_nf,
+            right_nf,
+        )
+    }
+
+    fn record_summary_inputs(
+        trace: &mut super::super::g0::FeasibilityTrace,
+        semantic: ScopedExprId,
+        left: ScopedExprId,
+        right: ScopedExprId,
+    ) {
+        trace.record_invocation_start(semantic).unwrap();
+        for input in [left, right] {
+            trace
+                .record_normalization_result(
+                    input,
+                    &AnalyzedValue {
+                        semantic: input,
+                        exact_nf: Some(Arc::new(PolynomialNF::zero())),
+                        coefficient_bound: NumericContract::Known(CoefficientBound::finite(1_u8)),
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    fn assert_summary_result_owner(
+        trace: &super::super::g0::FeasibilityTrace,
+        value: &BoundValueRef,
+        expected: ExprId,
+    ) {
+        let BoundValueRef::Result { event, projection } = value else {
+            panic!("expected a Result reference")
+        };
+        assert_eq!(projection, &BoundProjection::Summary);
+        let super::super::g0::NormalizerEvent::Result { owner, .. } =
+            &trace.normalization_events()[event.0 as usize]
+        else {
+            panic!("summary reference must target a Result event")
+        };
+        assert_eq!(owner.expression(), expected);
+    }
+
     #[test]
     fn forced_monomial_gc_preserves_exact_nf_bound_and_counters_at_node_commit() {
         let mut expressions = ExprArena::new();
@@ -6468,6 +6556,227 @@ mod tests {
     }
 
     #[test]
+    fn direct_product_summary_contract_records_all_ordered_contributions() {
+        let (
+            mut expressions,
+            programs,
+            facts,
+            mut monomials,
+            semantic,
+            left,
+            right,
+            _left_monomial,
+            _right_monomial,
+            left_nf,
+            right_nf,
+        ) = summary_contract_fixture();
+        let left_scoped = programs.scoped(&expressions, semantic.program(), left).unwrap();
+        let right_scoped = programs.scoped(&expressions, semantic.program(), right).unwrap();
+        let mut trace = super::super::g0::FeasibilityTrace::default();
+        record_summary_inputs(&mut trace, semantic, left_scoped, right_scoped);
+        let (bound, evidence) = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer
+                .product_summary_contract(
+                    Some(semantic),
+                    left,
+                    right,
+                    &matrix_type(),
+                    &left_nf,
+                    &matrix_type(),
+                    &right_nf,
+                    &BigInt::from(1_u8),
+                )
+                .unwrap()
+        };
+        assert!(matches!(bound, NumericContract::Known(CoefficientBound::Finite(_))));
+        assert!(matches!(evidence, Some(BoundValueRef::Transfer(_))));
+        let products = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    rule: BoundRule::Product { left, right, facts },
+                    ..
+                } => Some((left.clone(), right.clone(), facts.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(products.len(), 3);
+        assert_summary_result_owner(&trace, &products[0].0, left);
+        assert_summary_result_owner(&trace, &products[0].1, right);
+        assert_summary_result_owner(&trace, &products[1].0, left);
+        assert!(matches!(products[1].1, BoundValueRef::Transfer(_)));
+        assert!(matches!(products[2].0, BoundValueRef::Transfer(_)));
+        assert_summary_result_owner(&trace, &products[2].1, right);
+        assert!(products.iter().all(|(_, _, facts)| *facts == MatrixProductFacts::default()));
+        let sums = trace
+            .normalization_events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    super::super::g0::NormalizerEvent::BoundTransfer {
+                        rule: BoundRule::Sum { inputs }, ..
+                    } if inputs.len() == 2
+                )
+            })
+            .count();
+        assert_eq!(sums, 2);
+    }
+
+    #[test]
+    fn direct_tensor_summary_contract_records_all_ordered_contributions() {
+        let (
+            mut expressions,
+            programs,
+            facts,
+            mut monomials,
+            semantic,
+            left,
+            right,
+            _left_monomial,
+            _right_monomial,
+            left_nf,
+            right_nf,
+        ) = summary_contract_fixture();
+        let left_scoped = programs.scoped(&expressions, semantic.program(), left).unwrap();
+        let right_scoped = programs.scoped(&expressions, semantic.program(), right).unwrap();
+        let mut trace = super::super::g0::FeasibilityTrace::default();
+        record_summary_inputs(&mut trace, semantic, left_scoped, right_scoped);
+        let (bound, evidence) = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer
+                .tensor_summary_contract(
+                    Some(semantic),
+                    left,
+                    right,
+                    &matrix_type(),
+                    &left_nf,
+                    &matrix_type(),
+                    &right_nf,
+                )
+                .unwrap()
+        };
+        assert!(matches!(bound, NumericContract::Known(CoefficientBound::Finite(_))));
+        assert!(matches!(evidence, Some(BoundValueRef::Transfer(_))));
+        let tensors = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    rule:
+                        BoundRule::Tensor {
+                            left,
+                            right,
+                            left_is_constant_polynomial,
+                            right_is_constant_polynomial,
+                        },
+                    ..
+                } => Some((
+                    left.clone(),
+                    right.clone(),
+                    *left_is_constant_polynomial,
+                    *right_is_constant_polynomial,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tensors.len(), 3);
+        assert_summary_result_owner(&trace, &tensors[0].0, left);
+        assert_summary_result_owner(&trace, &tensors[0].1, right);
+        assert_summary_result_owner(&trace, &tensors[1].0, left);
+        assert!(matches!(tensors[1].1, BoundValueRef::Transfer(_)));
+        assert!(matches!(tensors[2].0, BoundValueRef::Transfer(_)));
+        assert_summary_result_owner(&trace, &tensors[2].1, right);
+        assert!(
+            tensors
+                .iter()
+                .all(|(_, _, left_constant, right_constant)| { !left_constant && !right_constant })
+        );
+    }
+
+    #[test]
+    fn direct_product_summary_nonunit_weight_has_one_final_scale() {
+        let (
+            mut expressions,
+            programs,
+            facts,
+            mut monomials,
+            semantic,
+            left,
+            right,
+            _left_monomial,
+            _right_monomial,
+            left_nf,
+            right_nf,
+        ) = summary_contract_fixture();
+        let left_scoped = programs.scoped(&expressions, semantic.program(), left).unwrap();
+        let right_scoped = programs.scoped(&expressions, semantic.program(), right).unwrap();
+        let mut trace = super::super::g0::FeasibilityTrace::default();
+        record_summary_inputs(&mut trace, semantic, left_scoped, right_scoped);
+        let evidence = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer
+                .product_summary_contract(
+                    Some(semantic),
+                    left,
+                    right,
+                    &matrix_type(),
+                    &left_nf,
+                    &matrix_type(),
+                    &right_nf,
+                    &BigInt::from(-7_i8),
+                )
+                .unwrap()
+                .1
+        };
+        let BoundValueRef::Transfer(final_event) = evidence.expect("weighted evidence") else {
+            panic!("weighted evidence must be a transfer")
+        };
+        let scales = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    rule:
+                        BoundRule::Scale {
+                            value: BoundValueRef::Transfer(value_event),
+                            scale: BoundScale::Magnitude(magnitude),
+                        },
+                    ..
+                } => Some((index, value_event, magnitude)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(scales.len(), 1);
+        assert_eq!(scales[0].0 as u64, final_event.0);
+        assert_eq!(scales[0].2, &BigUint::from(7_u8));
+    }
+
+    #[test]
     fn traced_product_summary_preserves_summary_exact_operand_order() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -6545,6 +6854,8 @@ mod tests {
                 facts.insert(&expressions, right, ValueFacts::Matrix(matrix_facts)).unwrap();
             }
             let mut trace = super::super::g0::FeasibilityTrace::default();
+            let before_len = monomials.len();
+            let before_occupied = monomials.occupied_len();
             let error = {
                 let mut normalizer = Normalizer::new_with_sink(
                     &mut expressions,
@@ -6557,6 +6868,8 @@ mod tests {
                 normalizer.normalize(semantic).unwrap_err()
             };
             assert!(matches!(error, NormalizeError::InvalidExactPlan { .. }));
+            assert_eq!(monomials.len(), before_len + 3);
+            assert_eq!(monomials.occupied_len(), before_occupied + 3);
             assert!(!trace.normalization_events().iter().any(|event| {
                 matches!(
                     event,

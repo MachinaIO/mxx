@@ -24,6 +24,20 @@ pub(crate) trait FeasibilitySink: Default {
     const ENABLED: bool;
 
     fn record_lowering_complete(&mut self) -> Result<(), G0Error>;
+
+    fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum SourceHandle {
+    Expression(super::arena::ExprId),
+    Family(super::program::FamilyValueId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum SourceClass {
+    ScalarConstant { value: TypedConstant },
+    MatrixConstant { matrix_type: ResolvedMatrixType, kind: MatrixConstantKind },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -35,11 +49,16 @@ impl FeasibilitySink for NoFeasibility {
     fn record_lowering_complete(&mut self) -> Result<(), G0Error> {
         Ok(())
     }
+
+    fn record_source(&mut self, _handle: SourceHandle, _class: SourceClass) -> Result<(), G0Error> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FeasibilityTrace {
     pub lowering_complete: u64,
+    pub source_observations: BTreeMap<SourceHandle, SourceClass>,
 }
 
 impl From<NoFeasibility> for FeasibilityTrace {
@@ -55,6 +74,31 @@ impl FeasibilitySink for FeasibilityTrace {
         self.lowering_complete =
             self.lowering_complete.checked_add(1).ok_or_else(|| G0Error::TraceOverflow)?;
         Ok(())
+    }
+
+    fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error> {
+        match self.source_observations.get(&handle) {
+            Some(existing) if existing != &class => Err(G0Error::ConflictingSourceClass),
+            Some(_) => Ok(()),
+            None => {
+                self.source_observations.insert(handle, class);
+                Ok(())
+            }
+        }
+    }
+}
+
+impl FeasibilityTrace {
+    /// Keep only source observations whose typed lowering handle belongs to the residual closure.
+    pub(crate) fn retain_residual(&mut self, closure: &CertificateClosure) {
+        self.source_observations.retain(|handle, _| match handle {
+            SourceHandle::Expression(expression) => closure.expressions.contains(expression),
+            SourceHandle::Family(family) => closure.families.contains(family),
+        });
+    }
+
+    pub(crate) fn source_observations(&self) -> &BTreeMap<SourceHandle, SourceClass> {
+        &self.source_observations
     }
 }
 
@@ -389,6 +433,8 @@ pub(crate) enum G0Error {
     Arena(#[from] super::arena::ArenaError),
     #[error("feasibility trace counter overflow")]
     TraceOverflow,
+    #[error("conflicting source classes for one typed lowering handle")]
+    ConflictingSourceClass,
     #[error("residual event {event} has no typed descriptor")]
     MissingEventDescriptor { event: u64 },
     #[error("event {event} has conflicting typed descriptors")]
@@ -990,5 +1036,59 @@ mod tests {
         assert!(!NoFeasibility::ENABLED);
         assert!(FeasibilityTrace::ENABLED);
         assert_eq!(FeasibilityTrace::from(ordinary), FeasibilityTrace::default());
+    }
+
+    #[test]
+    fn constant_observations_deduplicate_conflicts_and_filter_to_residual() {
+        let scalar = SourceHandle::Expression(super::super::arena::ExprId::new(
+            super::super::arena::ArenaToken(91),
+            0,
+        ));
+        let matrix = SourceHandle::Expression(super::super::arena::ExprId::new(
+            super::super::arena::ArenaToken(91),
+            1,
+        ));
+        let matrix_type = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        trace
+            .record_source(scalar, SourceClass::ScalarConstant { value: TypedConstant::int(7) })
+            .unwrap();
+        trace
+            .record_source(scalar, SourceClass::ScalarConstant { value: TypedConstant::int(7) })
+            .unwrap();
+        trace
+            .record_source(
+                matrix,
+                SourceClass::MatrixConstant { matrix_type, kind: MatrixConstantKind::Zero },
+            )
+            .unwrap();
+        assert_eq!(trace.source_observations().len(), 2);
+        assert_eq!(
+            trace.record_source(
+                scalar,
+                SourceClass::ScalarConstant { value: TypedConstant::int(8) },
+            ),
+            Err(G0Error::ConflictingSourceClass)
+        );
+
+        let closure = CertificateClosure {
+            expressions: BTreeSet::from([scalar_expression(scalar)]),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: BTreeSet::new(),
+        };
+        trace.retain_residual(&closure);
+        assert_eq!(trace.source_observations().len(), 1);
+        assert!(trace.source_observations().contains_key(&scalar));
+    }
+
+    fn scalar_expression(handle: SourceHandle) -> super::super::arena::ExprId {
+        match handle {
+            SourceHandle::Expression(expression) => expression,
+            SourceHandle::Family(_) => unreachable!(),
+        }
     }
 }

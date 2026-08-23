@@ -13,7 +13,7 @@ use super::{
         TrustedIndexRange, TypedConstant, ValueOperator, ValueTransformOperation,
     },
     facts::{CoefficientBound, MatrixFacts, MatrixMetadata, NumericContract, PolynomialFacts},
-    g0::{FeasibilitySink, FeasibilityTrace, NoFeasibility},
+    g0::{FeasibilitySink, FeasibilityTrace, NoFeasibility, SourceClass, SourceHandle},
     job::{CandidateToken, CheckerJob, JobError},
     program::{FamilyValueId, SelectionSelector},
     protocol::{PlannedWire, ProgramOccurrence, ProtocolPlan},
@@ -306,6 +306,24 @@ pub(crate) struct ProductionAdapter<'a, S: FeasibilitySink = NoFeasibility> {
 }
 
 impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
+    fn record_expression_source_if_enabled<F>(
+        &mut self,
+        expression: ExprId,
+        build: F,
+    ) -> Result<(), ProductionAdapterError>
+    where
+        F: FnOnce(&Self) -> SourceClass,
+    {
+        if S::ENABLED {
+            self.feasibility
+                .record_source(SourceHandle::Expression(expression), build(self))
+                .map_err(|error| ProductionAdapterError::Descriptor {
+                    reason: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
     /// Intern one graph-node operation while preserving the typed production boundary.
     ///
     /// `ArenaError::IncompatibleMatrixTypes` alone is not actionable for a real Graph: the
@@ -1382,11 +1400,28 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         Ok(())
     }
 
+    fn intern_scalar_constant(
+        &mut self,
+        value: TypedConstant,
+    ) -> Result<ExprId, ProductionAdapterError> {
+        let expression =
+            self.job.expressions_mut().intern(ValueOperator::Constant(value), Box::new([]))?;
+        self.record_expression_source_if_enabled(expression, |adapter| {
+            let node = adapter
+                .job
+                .expressions()
+                .node(expression)
+                .expect("interned scalar constant must remain in the expression arena");
+            let ValueOperator::Constant(value) = &node.operator else {
+                unreachable!("scalar constant helper interned a non-constant operator")
+            };
+            SourceClass::ScalarConstant { value: value.clone() }
+        })?;
+        Ok(expression)
+    }
+
     fn intern_index_constant(&mut self, value: BigInt) -> Result<ExprId, ProductionAdapterError> {
-        Ok(self
-            .job
-            .expressions_mut()
-            .intern(ValueOperator::Constant(TypedConstant::int(value)), Box::new([]))?)
+        self.intern_scalar_constant(TypedConstant::int(value))
     }
 
     /// Lower an integer descriptor without evaluating away an active loop binder.  Parallel
@@ -2297,19 +2332,15 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     reason: "artifact was not reached through producer alias".to_owned(),
                 })
             }
-            NodeKind::ConstantInt(value) => Value::Expr(self.job.expressions_mut().intern(
-                ValueOperator::Constant(TypedConstant::int(value.clone())),
-                Box::new([]),
-            )?),
-            NodeKind::ConstantReal(value) => Value::Expr(self.job.expressions_mut().intern(
-                ValueOperator::Constant(TypedConstant::real(real_descriptor(value)?)),
-                Box::new([]),
-            )?),
-            NodeKind::ConstantBool(value) => Value::Expr(
-                self.job
-                    .expressions_mut()
-                    .intern(ValueOperator::Constant(TypedConstant::bool(*value)), Box::new([]))?,
+            NodeKind::ConstantInt(value) => {
+                Value::Expr(self.intern_scalar_constant(TypedConstant::int(value.clone()))?)
+            }
+            NodeKind::ConstantReal(value) => Value::Expr(
+                self.intern_scalar_constant(TypedConstant::real(real_descriptor(value)?))?,
             ),
+            NodeKind::ConstantBool(value) => {
+                Value::Expr(self.intern_scalar_constant(TypedConstant::bool(*value))?)
+            }
             NodeKind::EvaluateInt(expression) => {
                 Value::Expr(self.intern_int_expression(expression, wire)?)
             }
@@ -3551,6 +3582,23 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         };
         let expression =
             self.job.expressions_mut().intern(ValueOperator::Source(descriptor), Box::new([]))?;
+        self.record_expression_source_if_enabled(expression, |adapter| {
+            let node = adapter
+                .job
+                .expressions()
+                .node(expression)
+                .expect("interned matrix constant must remain in the expression arena");
+            let ValueOperator::Source(source) = &node.operator else {
+                unreachable!("matrix constant helper interned a non-source operator")
+            };
+            let ResolvedValueType::Matrix(matrix_type) = &source.value_type else {
+                unreachable!("matrix constant source has a non-matrix type")
+            };
+            let Some(kind) = source.matrix_constant.as_ref() else {
+                unreachable!("matrix constant source has no typed matrix descriptor")
+            };
+            SourceClass::MatrixConstant { matrix_type: matrix_type.clone(), kind: kind.clone() }
+        })?;
         self.job.insert_matrix_facts(self.token, expression, facts)?;
         Ok(expression)
     }
@@ -6448,6 +6496,12 @@ mod tests {
                 .expect("opt-in lowering");
 
         assert_eq!(trace.lowering_complete, 1);
+        assert!(
+            trace
+                .source_observations()
+                .values()
+                .any(|class| { matches!(class, SourceClass::MatrixConstant { .. }) })
+        );
         assert_eq!(ordinary_job.expressions().node_count(), trace_job.expressions().node_count());
         assert_eq!(ordinary_job.programs().len(), trace_job.programs().len());
         assert_eq!(ordinary_roots.occurrences, trace_roots.occurrences);
@@ -6461,5 +6515,42 @@ mod tests {
             matches!(trace_roots.decoder, ProductionRoot::Closed(_))
         );
         assert_eq!(ordinary_job.relations().is_frozen(), trace_job.relations().is_frozen());
+    }
+
+    #[test]
+    fn opt_in_constant_helpers_capture_scalar_and_matrix_descriptors() {
+        use mxx_ir_core::{IntExpr, node::ConstantMatrix, types::MatrixType};
+
+        let protocol = crate::toy_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let mut adapter = ProductionAdapter::<FeasibilityTrace>::new_with_feasibility(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("opt-in adapter");
+        adapter.intern_scalar_constant(TypedConstant::int(23)).expect("scalar constant");
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        adapter.constant_matrix(&matrix, &ConstantMatrix::Zero).expect("matrix constant");
+
+        assert!(
+            adapter
+                .feasibility
+                .source_observations()
+                .values()
+                .any(|class| matches!(class, SourceClass::ScalarConstant { .. }))
+        );
+        assert!(
+            adapter
+                .feasibility
+                .source_observations()
+                .values()
+                .any(|class| matches!(class, SourceClass::MatrixConstant { .. }))
+        );
     }
 }

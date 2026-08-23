@@ -148,8 +148,9 @@ struct RelationMatch {
     suffix: Vec<ScopedExprId>,
     remaining_central: Vec<ScopedExprId>,
     rhs: super::relation::CanonicalRhsId,
-    owner: Option<ScopedExprId>,
-    dispatch: Option<super::relation::UniversalDispatchKey>,
+    key: Option<RuntimeSpecializationKey>,
+    source: Option<super::g0::EventRange>,
+    rhs_result: Option<super::g0::EventIndex>,
     lhs: Option<super::relation::CanonicalLhsKey>,
     ordered_start: u32,
     ordered_end_exclusive: u32,
@@ -647,10 +648,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 NormalizeError::SharedRootCacheValue { expression: root.expression() }
             })?;
             self.relation_rewriting_enabled = saved_relation_rewriting;
+            let mut relation_evidence = None;
             if self.relations.is_some() && self.relation_rewriting_enabled {
                 if let Some(exact_nf) = value.exact_nf.as_mut() {
                     let normal_form = Arc::make_mut(exact_nf);
-                    self.rewrite_relations(normal_form)?;
+                    self.rewrite_relations(root, normal_form, &mut relation_evidence)?;
                     value.coefficient_bound = self.bound_normal_form(normal_form)?;
                 }
             }
@@ -661,7 +663,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 if let Some(exact_nf) = value.exact_nf.as_mut() {
                     let normal_form = Arc::make_mut(exact_nf);
                     let rebound = self.bound_normal_form(normal_form)?;
-                    let mut evidence = if S::ENABLED && !normal_form.bounded_summary.is_zero() {
+                    let mut evidence = if relation_evidence.is_some() {
+                        relation_evidence
+                    } else if S::ENABLED && !normal_form.bounded_summary.is_zero() {
                         Some(BoundValueRef::Result {
                             event: self.relation_input_result(root.expression())?,
                             projection: BoundProjection::Summary,
@@ -701,27 +705,39 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         dispatch: &super::relation::UniversalDispatchKey,
         index: ScopedExprId,
         index_range: super::arena::TrustedIndexRange,
-    ) -> Result<BTreeMap<CanonicalLhsKey, BTreeSet<super::relation::CanonicalRhsId>>, NormalizeError>
-    {
+    ) -> Result<
+        (
+            BTreeMap<CanonicalLhsKey, BTreeSet<super::relation::CanonicalRhsId>>,
+            Vec<(super::relation::CanonicalRhsId, super::g0::EventIndex)>,
+        ),
+        NormalizeError,
+    > {
         let registrations = self
             .relations
             .ok_or(NormalizeError::Relation(RelationRegistryError::NotFrozen))?
             .universal_candidates(dispatch)?
             .cloned();
         let Some(registrations) = registrations else {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), Vec::new()));
         };
         let mut result = BTreeMap::<CanonicalLhsKey, BTreeSet<_>>::new();
+        let mut rhs_results = Vec::new();
         for (static_lhs, targets) in registrations {
             if !static_lhs.domain.contains(index_range) {
                 return Err(NormalizeError::Relation(RelationRegistryError::IndexOutOfDomain));
             }
             for registration in targets.into_values() {
-                let (lhs, rhs) = self.specialize_registration(index, index_range, &registration)?;
+                let (lhs, rhs, target_end) =
+                    self.specialize_registration(index, index_range, &registration)?;
                 result.entry(lhs).or_default().insert(rhs);
+                if let Some(target_end) = target_end {
+                    rhs_results.push((rhs, target_end));
+                }
             }
         }
-        Ok(result)
+        rhs_results.sort_by_key(|(rhs, _)| *rhs);
+        rhs_results.dedup_by_key(|(rhs, _)| *rhs);
+        Ok((result, rhs_results))
     }
 
     fn specialize_registration(
@@ -729,7 +745,10 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         index: ScopedExprId,
         index_range: super::arena::TrustedIndexRange,
         registration: &UniversalRelationRegistration,
-    ) -> Result<(CanonicalLhsKey, super::relation::CanonicalRhsId), NormalizeError> {
+    ) -> Result<
+        (CanonicalLhsKey, super::relation::CanonicalRhsId, Option<super::g0::EventIndex>),
+        NormalizeError,
+    > {
         // Keep the exact family-call provenance in the LHS.  Opaque producer families must stay
         // as `ProgramCall(plan, h(i))`; beta-reducing them to their body would erase the only
         // authority tying this relation to the reached preimage selector. Reducible generated
@@ -775,13 +794,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         // registration/specialization.
         let product = self.normalize_specialized_root_without_relations(product_root)?;
         let monomial = canonical_lhs_monomial(product.exact_nf.as_deref())?;
-        let (_, target) = self.normalize_plan(registration.target_plan, index)?;
+        let (_, target, target_end) = self.normalize_plan(registration.target_plan, index)?;
         let rhs = self
             .normalization
             .as_deref_mut()
             .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?
             .intern_arc(target)?;
-        Ok((CanonicalLhsKey { layout: registration.lhs.layout.clone(), monomial }, rhs))
+        Ok((CanonicalLhsKey { layout: registration.lhs.layout.clone(), monomial }, rhs, target_end))
     }
 
     fn specialize_family_plan(
@@ -851,14 +870,21 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         &mut self,
         plan: ValueProgramId,
         index: ScopedExprId,
-    ) -> Result<(ExprId, Arc<PolynomialNF>), NormalizeError> {
+    ) -> Result<(ExprId, Arc<PolynomialNF>, Option<super::g0::EventIndex>), NormalizeError> {
         let root = self.programs.beta_reduce(self.expressions, plan, &[index.expression()])?;
+        let target_owner = if S::ENABLED {
+            let proof = self.expressions.scope_proof(self.scope, root)?;
+            Some(self.expressions.scoped_from_proof(&proof, root)?)
+        } else {
+            None
+        };
         let value = self.normalize_specialized_root(root)?;
         let normal_form =
             value.exact_nf.clone().ok_or_else(|| NormalizeError::UnsupportedOperator {
                 operator: "relation plan without exact normal form".into(),
             })?;
-        Ok((root, normal_form))
+        let target_end = target_owner.map(|owner| self.invocation_end_for(owner)).transpose()?;
+        Ok((root, normal_form, target_end))
     }
 
     fn compute_use_counts(&mut self, root: ExprId) -> Result<BTreeSet<ExprId>, NormalizeError> {
@@ -1162,12 +1188,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         owner: ScopedExprId,
         key: RuntimeSpecializationKey,
         replay_start: super::g0::EventIndex,
+        rhs_results: Box<[(super::relation::CanonicalRhsId, super::g0::EventIndex)]>,
     ) -> Result<(), NormalizeError> {
         if S::ENABLED {
             self.sink
                 .as_deref_mut()
                 .ok_or(super::g0::G0Error::SpecializationTraceInvariant)?
-                .record_specialization_computed(owner, key, replay_start)?;
+                .record_specialization_computed(owner, key, replay_start, rhs_results)?;
         }
         Ok(())
     }
@@ -1186,17 +1213,46 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(())
     }
 
+    fn specialization_replay(
+        &self,
+        key: &RuntimeSpecializationKey,
+    ) -> Result<super::g0::SpecializationReplay, NormalizeError> {
+        if S::ENABLED {
+            return Ok(self
+                .sink
+                .as_deref()
+                .ok_or(super::g0::G0Error::SpecializationTraceInvariant)?
+                .specialization_replay(key)?);
+        }
+        Err(super::g0::G0Error::SpecializationTraceInvariant.into())
+    }
+
+    fn invocation_end_for(
+        &self,
+        root: ScopedExprId,
+    ) -> Result<super::g0::EventIndex, NormalizeError> {
+        if S::ENABLED {
+            return Ok(self
+                .sink
+                .as_deref()
+                .ok_or(super::g0::G0Error::SpecializationTraceInvariant)?
+                .invocation_end_for(root)?);
+        }
+        Ok(super::g0::EventIndex(0))
+    }
+
     fn observe_applied_relation(
         &mut self,
         observation: super::g0::AppliedRelation,
-    ) -> Result<(), NormalizeError> {
+    ) -> Result<super::g0::EventIndex, NormalizeError> {
         if S::ENABLED {
-            self.sink
+            return Ok(self
+                .sink
                 .as_deref_mut()
                 .ok_or(super::g0::G0Error::RelationTraceInvariant)?
-                .record_applied_relation(observation)?;
+                .record_applied_relation(observation)?);
         }
-        Ok(())
+        Ok(super::g0::EventIndex(0))
     }
 
     fn relation_input_result(
@@ -1326,7 +1382,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         };
         if let Some(normal_form) = value.exact_nf.as_mut().and_then(Arc::get_mut) {
             if self.relations.is_some() && self.relation_rewriting_enabled {
-                self.rewrite_relations(normal_form)?;
+                let mut relation_evidence = None;
+                self.rewrite_relations(semantic, normal_form, &mut relation_evidence)?;
                 value.coefficient_bound = self.bound_normal_form(normal_form)?;
             }
         }
@@ -3739,7 +3796,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             exact_terms: BTreeMap::from([(monomial, coefficient)]),
             bounded_summary: BoundedSummary::zero(),
         };
-        self.rewrite_relations(&mut candidate)?;
+        let relation_owner = match owner {
+            Some(owner) => owner,
+            None => self.programs.root(self.expressions, self.scope)?,
+        };
+        self.rewrite_relations(relation_owner, &mut candidate, evidence)?;
         *noise = add_noise_summaries(noise, &candidate.bounded_summary.coefficient_bound());
         for (rewritten, rewritten_coefficient) in candidate.exact_terms {
             let bound = self.bound_monomial(rewritten, &rewritten_coefficient)?;
@@ -4028,7 +4089,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     /// and coefficient multiplication all remain part of the next match.
     fn rewrite_relations(
         &mut self,
+        owner: ScopedExprId,
         normal_form: &mut PolynomialNF,
+        evidence: &mut Option<BoundValueRef>,
     ) -> Result<bool, NormalizeError> {
         let initial = std::mem::take(&mut normal_form.exact_terms);
         let mut worklist = initial.into_iter().collect::<VecDeque<_>>();
@@ -4088,9 +4151,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         RelationRegistryError::InvalidCanonicalRhs,
                     ));
                 }
-                if S::ENABLED {
-                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
-                }
             }
             changed = true;
             self.counters.relation_candidates = self.counters.relation_candidates.saturating_add(1);
@@ -4118,29 +4178,47 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 )?)
             };
             if S::ENABLED {
-                let owner = relation_match
-                    .owner
-                    .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
-                let dispatch = relation_match
-                    .dispatch
+                let key = relation_match
+                    .key
                     .clone()
+                    .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
+                let source = relation_match
+                    .source
                     .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
                 let lhs = relation_match
                     .lhs
                     .clone()
                     .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
-                self.observe_applied_relation(super::g0::AppliedRelation {
+                let applied_event = self.observe_applied_relation(super::g0::AppliedRelation {
                     owner,
                     source_monomial: monomial,
                     outer_coefficient: coefficient.clone(),
                     ordered_start: relation_match.ordered_start,
                     ordered_end_exclusive: relation_match.ordered_end_exclusive,
                     rule: super::g0::AppliedRelationRule::Universal {
-                        dispatch,
+                        key,
+                        source,
                         lhs,
                         rhs: relation_match.rhs,
                     },
                 })?;
+                if rhs_noise != NumericContract::Known(CoefficientBound::ExactZero) {
+                    let NumericContract::Known(CoefficientBound::Finite(_)) = rhs_noise else {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    };
+                    let mut relation_evidence = BoundValueRef::Transfer(applied_event);
+                    if coefficient.magnitude() != &BigUint::from(1_u8) {
+                        let scale_event = self.observe_bound_transfer(
+                            owner,
+                            BoundRule::Scale {
+                                value: relation_evidence,
+                                scale: BoundScale::Magnitude(coefficient.magnitude().clone()),
+                            },
+                        )?;
+                        relation_evidence = BoundValueRef::Transfer(scale_event);
+                    }
+                    self.append_summary_evidence(owner, evidence, relation_evidence)?;
+                }
             }
             if rhs_noise != NumericContract::Known(CoefficientBound::ExactZero) {
                 relation_noise = add_noise_summaries(&relation_noise, &rhs_noise);
@@ -4359,7 +4437,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let mut provenance = S::ENABLED.then(
             BTreeMap::<
                 ((usize, usize), super::relation::CanonicalRhsId),
-                BTreeSet<(CanonicalLhsKey, ScopedExprId, super::relation::UniversalDispatchKey)>,
+                BTreeSet<(
+                    CanonicalLhsKey,
+                    RuntimeSpecializationKey,
+                    super::g0::EventRange,
+                    super::g0::EventIndex,
+                )>,
             >::new,
         );
         for (k_position, &k_factor) in ordered.iter().enumerate() {
@@ -4380,7 +4463,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 .into());
             }
             let Some(index_range) = self.universal_index_range(index)? else { continue };
-            let specialized = self.specialized_universal_cached(dispatch, index, index_range)?;
+            let (specialized, replay) =
+                self.specialized_universal_cached(dispatch, index, index_range)?;
+            if S::ENABLED && replay.is_none() {
+                return Err(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs));
+            }
             for (lhs, rhs_candidates) in specialized {
                 let descriptor = self.monomials.descriptor(lhs.monomial)?;
                 let descriptor_ordered = descriptor.ordered_factors.to_vec();
@@ -4420,11 +4507,21 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         .or_default()
                         .extend(rhs_candidates.iter().copied());
                     if let Some(provenance) = provenance.as_mut() {
+                        let (specialization_key, replay) = replay.as_ref().ok_or(
+                            NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs),
+                        )?;
+                        let rhs_results =
+                            replay.rhs_results.iter().copied().collect::<BTreeMap<_, _>>();
                         for &rhs in rhs_candidates.iter() {
+                            let rhs_result =
+                                rhs_results.get(&rhs).copied().ok_or(NormalizeError::Relation(
+                                    RelationRegistryError::InvalidCanonicalRhs,
+                                ))?;
                             provenance.entry(((start, end), rhs)).or_default().insert((
                                 lhs.clone(),
-                                k_factor,
-                                dispatch.clone(),
+                                specialization_key.clone(),
+                                replay.range,
+                                rhs_result,
                             ));
                         }
                     }
@@ -4447,25 +4544,26 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         else {
             return Ok(None);
         };
-        let (owner, dispatch, lhs) = if S::ENABLED {
+        let (key, source, rhs_result, lhs) = if S::ENABLED {
             let provenance = provenance
                 .as_ref()
                 .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
-            let (lhs, owner, dispatch) = provenance
+            let (lhs, key, source, rhs_result) = provenance
                 .get(&((start, end), rhs))
                 .and_then(|items| items.iter().next().cloned())
                 .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
-            (Some(owner), Some(dispatch), Some(lhs))
+            (Some(key), Some(source), Some(rhs_result), Some(lhs))
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
         Ok(Some(RelationMatch {
             prefix: ordered[..start].to_vec(),
             suffix: ordered[end..].to_vec(),
             remaining_central: central.to_vec(),
             rhs,
-            owner,
-            dispatch,
+            key,
+            source,
+            rhs_result,
             lhs,
             ordered_start: u32::try_from(start).map_err(|_| {
                 NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs)
@@ -4590,8 +4688,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         dispatch: &super::relation::UniversalDispatchKey,
         index: ScopedExprId,
         index_range: super::arena::TrustedIndexRange,
-    ) -> Result<BTreeMap<CanonicalLhsKey, BTreeSet<super::relation::CanonicalRhsId>>, NormalizeError>
-    {
+    ) -> Result<
+        (
+            BTreeMap<CanonicalLhsKey, BTreeSet<super::relation::CanonicalRhsId>>,
+            Option<(RuntimeSpecializationKey, super::g0::SpecializationReplay)>,
+        ),
+        NormalizeError,
+    > {
         let relations =
             self.relations.ok_or(NormalizeError::Relation(RelationRegistryError::NotFrozen))?;
         let generation = relations.frozen_generation()?;
@@ -4599,17 +4702,28 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         if let Some(cached) =
             self.normalization.as_deref().and_then(|cache| cache.runtime_get(&key)).cloned()
         {
-            self.record_specialization_cache_hit(index, key)?;
-            return Ok(cached);
+            self.record_specialization_cache_hit(index, key.clone())?;
+            let replay = S::ENABLED
+                .then(|| self.specialization_replay(&key).map(|replay| (key.clone(), replay)))
+                .transpose()?;
+            return Ok((cached, replay));
         }
         let replay_start = self.specialization_miss_start(index, key.clone())?;
-        let specialized = self.specialize_universal(dispatch, index, index_range)?;
-        self.record_specialization_computed(index, key.clone(), replay_start)?;
+        let (specialized, rhs_results) = self.specialize_universal(dispatch, index, index_range)?;
+        self.record_specialization_computed(
+            index,
+            key.clone(),
+            replay_start,
+            rhs_results.into_boxed_slice(),
+        )?;
+        let replay = S::ENABLED
+            .then(|| self.specialization_replay(&key).map(|replay| (key.clone(), replay)))
+            .transpose()?;
         self.normalization
             .as_deref_mut()
             .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?
             .runtime_insert(key, specialized.clone());
-        Ok(specialized)
+        Ok((specialized, replay))
     }
 
     /// Recompute the numeric transfer after exact relation rewriting. This is intentionally based
@@ -5628,7 +5742,10 @@ mod tests {
             TrustedIndexRange,
         },
         facts::{MatrixFacts, MatrixMetadata, PolynomialFacts, ScalarFacts, ValueFacts},
-        g0::{BoundAuthority, BoundRule, EventIndex, FeasibilityTrace, G0Error, NormalizerEvent},
+        g0::{
+            AppliedRelationRule, BoundAuthority, BoundRule, EventIndex, FeasibilityTrace, G0Error,
+            NormalizerEvent,
+        },
         relation::{
             FactorOrderContract, GadgetRecompositionRegistry, GadgetRecompositionRule,
             RelationRegistry, RelationValidationAuthority, SamplerSourceContract, StaticLhsKey,
@@ -12402,6 +12519,8 @@ mod tests {
                 vec![public_source].into_boxed_slice(),
             )
             .unwrap();
+        let public_call =
+            programs.call_family_in_range(&mut expressions, public, index, range).unwrap();
 
         let target_large = source_with(&mut expressions, matrix.clone(), 99_903);
         let target_gaussian = gaussian_factor(&mut expressions, matrix.clone(), 99_904, 3);
@@ -12465,10 +12584,19 @@ mod tests {
         relations.freeze();
 
         // The producer facts are intentionally not passed to `setup` or the normalizer.  The
-        // public explicit family remains the sole authority for its closed family call, while
-        // this preimage-only root exercises specialization without applying the full LHS.
-        let (facts, mut monomials, semantic) =
-            setup(&mut expressions, &mut programs, preimage_call);
+        // public explicit family remains the sole authority for its closed family call.
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[public_call, preimage_call])
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut ordinary_cache = NormalizationCache::new();
+        let mut ordinary_normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                .unwrap()
+                .with_relations(&relations, &mut ordinary_cache);
+        let ordinary = ordinary_normalizer.normalize(semantic).unwrap();
+        let ordinary_counters = ordinary_normalizer.counters();
+        drop(ordinary_normalizer);
         let mut cache = NormalizationCache::new();
         let mut trace = FeasibilityTrace::default();
         let mut normalizer = Normalizer::new_with_sink(
@@ -12499,6 +12627,10 @@ mod tests {
         assert_eq!(first.exact_nf, second.exact_nf);
         assert_eq!(first.coefficient_bound, second.coefficient_bound);
         assert_eq!(first_counters, second_counters);
+        assert_eq!(first.semantic, ordinary.semantic);
+        assert_eq!(first.exact_nf, ordinary.exact_nf);
+        assert_eq!(first.coefficient_bound, ordinary.coefficient_bound);
+        assert_eq!(first_counters, ordinary_counters);
         assert_eq!(first_runtime_entries, second_runtime_entries);
         assert_eq!(first_rhs_entries, second_rhs_entries);
         let computed = first_events
@@ -12506,7 +12638,7 @@ mod tests {
             .enumerate()
             .filter_map(|(index, event)| match event {
                 NormalizerEvent::SpecializationComputed { owner, key, replay } => {
-                    Some((index, *owner, key.clone(), *replay))
+                    Some((index, *owner, key.clone(), replay.clone()))
                 }
                 _ => None,
             })
@@ -12530,21 +12662,21 @@ mod tests {
                 .count(),
             1
         );
-        let (computed_index, computed_owner, computed_key, computed_range) = computed[0].clone();
+        let (computed_index, computed_owner, computed_key, computed_replay) = computed[0].clone();
         let (hit_index, hit_owner, hit_key, hit_range) = hits[0].clone();
         assert!(hit_index > computed_index);
         assert_eq!(computed_owner, hit_owner);
         assert_eq!(computed_key, hit_key);
-        assert_eq!(computed_range, hit_range);
-        assert!(computed_range.end.0 < hit_index as u64);
+        assert_eq!(computed_replay.range, hit_range);
+        assert!(computed_replay.range.end.0 < hit_index as u64);
 
         let target_results = all_events
             .iter()
             .enumerate()
             .filter_map(|(index, event)| match event {
                 NormalizerEvent::Result { owner, value }
-                    if computed_range.start.0 <= index as u64 &&
-                        (index as u64) < computed_range.end.0 &&
+                    if computed_replay.range.start.0 <= index as u64 &&
+                        (index as u64) < computed_replay.range.end.0 &&
                         owner.expression() == target_body &&
                         !value
                             .exact_nf
@@ -12565,8 +12697,8 @@ mod tests {
                 NormalizerEvent::BoundTransfer {
                     owner,
                     rule: BoundRule::MonomialProduct { .. },
-                } if computed_range.start.0 <= index as u64 &&
-                    (index as u64) < computed_range.end.0 &&
+                } if computed_replay.range.start.0 <= index as u64 &&
+                    (index as u64) < computed_replay.range.end.0 &&
                     *owner == target_owner =>
                 {
                     Some(index)
@@ -12576,6 +12708,60 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(target_monomial.iter().any(|index| *index < target_result_index));
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+
+        // Replay witnesses are authoritative invocation ends, not arbitrary events from the
+        // nested specialization.  Mutating one to a nested Result must fail closed.
+        let nested_result_event = all_events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| {
+                (computed_replay.range.start.0 <= index as u64 &&
+                    (index as u64) < computed_replay.range.end.0 &&
+                    matches!(event, NormalizerEvent::Result { .. }))
+                .then_some(EventIndex(index as u64))
+            })
+            .expect("specialization contains a nested result");
+        let mut malformed_witness = trace.clone();
+        for event in &mut malformed_witness.events {
+            if let NormalizerEvent::SpecializationComputed { replay, .. } = event {
+                replay.rhs_results[0].1 = nested_result_event;
+                break;
+            }
+        }
+        assert!(
+            malformed_witness
+                .validate_normalization_observations_with_monomials(&monomials)
+                .is_err()
+        );
+
+        // A universal application must point to the exact replay key and source range.  Both
+        // mutations below model stale or forged cache provenance and are rejected independently.
+        let mut malformed_key = trace.clone();
+        for event in &mut malformed_key.events {
+            if let NormalizerEvent::AppliedRelation(observation) = event {
+                if let AppliedRelationRule::Universal { key, .. } = &mut observation.rule {
+                    key.index = target_owner;
+                    break;
+                }
+            }
+        }
+        assert!(
+            malformed_key.validate_normalization_observations_with_monomials(&monomials).is_err()
+        );
+        let mut malformed_source = trace.clone();
+        for event in &mut malformed_source.events {
+            if let NormalizerEvent::AppliedRelation(observation) = event {
+                if let AppliedRelationRule::Universal { source, .. } = &mut observation.rule {
+                    source.start = EventIndex(0);
+                    break;
+                }
+            }
+        }
+        assert!(
+            malformed_source
+                .validate_normalization_observations_with_monomials(&monomials)
+                .is_err()
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ use super::{
         TrustedIndexRange, TypedConstant, ValueOperator, ValueTransformOperation,
     },
     bound::MatrixProductFacts,
+    facts::{CoefficientBound, NumericContract},
     job::CheckerJob,
     protocol::{ArtifactProducer, PlannedWire, ProgramOccurrence},
     simulation::CertificateClosure,
@@ -68,6 +69,7 @@ pub(crate) trait FeasibilitySink: Default {
         owner: super::arena::ScopedExprId,
         key: super::relation::RuntimeSpecializationKey,
         replay_start: EventIndex,
+        rhs_results: Box<[(super::relation::CanonicalRhsId, EventIndex)]>,
     ) -> Result<(), G0Error>;
 
     fn record_specialization_cache_hit(
@@ -76,9 +78,19 @@ pub(crate) trait FeasibilitySink: Default {
         key: super::relation::RuntimeSpecializationKey,
     ) -> Result<(), G0Error>;
 
+    fn specialization_replay(
+        &self,
+        key: &super::relation::RuntimeSpecializationKey,
+    ) -> Result<SpecializationReplay, G0Error>;
+
+    fn invocation_end_for(&self, root: super::arena::ScopedExprId) -> Result<EventIndex, G0Error>;
+
     fn resolve_result(&self, expression: ExprId) -> Result<EventIndex, G0Error>;
 
-    fn record_applied_relation(&mut self, observation: AppliedRelation) -> Result<(), G0Error>;
+    fn record_applied_relation(
+        &mut self,
+        observation: AppliedRelation,
+    ) -> Result<EventIndex, G0Error>;
 
     fn record_bound_transfer(
         &mut self,
@@ -168,6 +180,12 @@ pub(crate) struct EventRange {
     pub end: EventIndex,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct SpecializationReplay {
+    pub range: EventRange,
+    pub rhs_results: Box<[(super::relation::CanonicalRhsId, EventIndex)]>,
+}
+
 impl EventRange {
     fn checked(start: EventIndex, end: EventIndex) -> Result<Self, G0Error> {
         if end.0 < start.0 {
@@ -214,7 +232,7 @@ pub(crate) enum NormalizerEvent {
     SpecializationComputed {
         owner: super::arena::ScopedExprId,
         key: super::relation::RuntimeSpecializationKey,
-        replay: EventRange,
+        replay: SpecializationReplay,
     },
     SpecializationCacheHit {
         owner: super::arena::ScopedExprId,
@@ -239,7 +257,8 @@ struct InvocationFrame {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) enum AppliedRelationRule {
     Universal {
-        dispatch: super::relation::UniversalDispatchKey,
+        key: super::relation::RuntimeSpecializationKey,
+        source: EventRange,
         lhs: super::relation::CanonicalLhsKey,
         rhs: super::relation::CanonicalRhsId,
     },
@@ -1347,6 +1366,7 @@ impl FeasibilitySink for NoFeasibility {
         _owner: super::arena::ScopedExprId,
         _key: super::relation::RuntimeSpecializationKey,
         _replay_start: EventIndex,
+        _rhs_results: Box<[(super::relation::CanonicalRhsId, EventIndex)]>,
     ) -> Result<(), G0Error> {
         Ok(())
     }
@@ -1359,12 +1379,26 @@ impl FeasibilitySink for NoFeasibility {
         Ok(())
     }
 
+    fn specialization_replay(
+        &self,
+        _key: &super::relation::RuntimeSpecializationKey,
+    ) -> Result<SpecializationReplay, G0Error> {
+        Err(G0Error::SpecializationTraceInvariant)
+    }
+
+    fn invocation_end_for(&self, _root: super::arena::ScopedExprId) -> Result<EventIndex, G0Error> {
+        Ok(EventIndex(0))
+    }
+
     fn resolve_result(&self, _expression: ExprId) -> Result<EventIndex, G0Error> {
         Ok(EventIndex(0))
     }
 
-    fn record_applied_relation(&mut self, _observation: AppliedRelation) -> Result<(), G0Error> {
-        Ok(())
+    fn record_applied_relation(
+        &mut self,
+        _observation: AppliedRelation,
+    ) -> Result<EventIndex, G0Error> {
+        Ok(EventIndex(0))
     }
 
     fn record_bound_transfer(
@@ -1403,7 +1437,8 @@ pub(crate) struct FeasibilityTrace {
     frames: Vec<InvocationFrame>,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
-    specialization_ranges: BTreeMap<super::relation::RuntimeSpecializationKey, EventRange>,
+    specialization_ranges:
+        BTreeMap<super::relation::RuntimeSpecializationKey, SpecializationReplay>,
     index_use_plans: BTreeSet<IndexUsePlan>,
     retained_monomial_roots: std::collections::HashSet<super::monomial::MonomialId>,
     next_slice_group_id: u64,
@@ -1567,7 +1602,7 @@ impl FeasibilitySink for FeasibilityTrace {
         let Some(frame) = self.frames.pop() else { return };
         let truncate = frame.range.start.0 as usize;
         self.events.truncate(truncate);
-        self.specialization_ranges.retain(|_, range| range.end.0 <= truncate as u64);
+        self.specialization_ranges.retain(|_, replay| replay.range.end.0 <= truncate as u64);
         self.rebuild_retained_monomial_roots();
     }
 
@@ -1590,6 +1625,7 @@ impl FeasibilitySink for FeasibilityTrace {
         owner: super::arena::ScopedExprId,
         key: super::relation::RuntimeSpecializationKey,
         replay_start: EventIndex,
+        rhs_results: Box<[(super::relation::CanonicalRhsId, EventIndex)]>,
     ) -> Result<(), G0Error> {
         let current =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
@@ -1599,8 +1635,23 @@ impl FeasibilitySink for FeasibilityTrace {
         {
             return Err(G0Error::SpecializationTraceInvariant);
         }
-        let replay = EventRange::checked(replay_start, current)?;
-        self.specialization_ranges.insert(key.clone(), replay);
+        if rhs_results.windows(2).any(|window| window[0].0 >= window[1].0) {
+            return Err(G0Error::SpecializationTraceInvariant);
+        }
+        let range = EventRange::checked(replay_start, current)?;
+        for (_, event) in &rhs_results {
+            if event.0 < range.start.0 ||
+                event.0 >= range.end.0 ||
+                !matches!(
+                    self.events.get(event.0 as usize),
+                    Some(NormalizerEvent::InvocationEnd { .. })
+                )
+            {
+                return Err(G0Error::SpecializationTraceInvariant);
+            }
+        }
+        let replay = SpecializationReplay { range, rhs_results };
+        self.specialization_ranges.insert(key.clone(), replay.clone());
         self.events.push(NormalizerEvent::SpecializationComputed { owner, key, replay });
         Ok(())
     }
@@ -1615,14 +1666,42 @@ impl FeasibilitySink for FeasibilityTrace {
         if self.frames.is_empty() || key.index != owner {
             return Err(G0Error::SpecializationTraceInvariant);
         }
-        let source =
-            *self.specialization_ranges.get(&key).ok_or(G0Error::MissingSpecializationRange)?;
-        source.validate_against(current)?;
-        if source.end.0 >= current.0 {
+        let source = self
+            .specialization_ranges
+            .get(&key)
+            .ok_or(G0Error::MissingSpecializationRange)?
+            .clone();
+        source.range.validate_against(current)?;
+        if source.range.end.0 >= current.0 {
             return Err(G0Error::SpecializationTraceInvariant);
         }
-        self.events.push(NormalizerEvent::SpecializationCacheHit { owner, key, source });
+        self.events.push(NormalizerEvent::SpecializationCacheHit {
+            owner,
+            key,
+            source: source.range,
+        });
         Ok(())
+    }
+
+    fn specialization_replay(
+        &self,
+        key: &super::relation::RuntimeSpecializationKey,
+    ) -> Result<SpecializationReplay, G0Error> {
+        self.specialization_ranges.get(key).cloned().ok_or(G0Error::MissingSpecializationRange)
+    }
+
+    fn invocation_end_for(&self, root: super::arena::ScopedExprId) -> Result<EventIndex, G0Error> {
+        self.events
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::InvocationEnd { root: actual, .. } if *actual == root => {
+                    Some(EventIndex(index as u64))
+                }
+                _ => None,
+            })
+            .ok_or(G0Error::MissingNormalizationResult)
     }
 
     fn resolve_result(&self, expression: ExprId) -> Result<EventIndex, G0Error> {
@@ -1632,7 +1711,10 @@ impl FeasibilitySink for FeasibilityTrace {
             .ok_or(G0Error::RelationTraceInvariant)
     }
 
-    fn record_applied_relation(&mut self, observation: AppliedRelation) -> Result<(), G0Error> {
+    fn record_applied_relation(
+        &mut self,
+        observation: AppliedRelation,
+    ) -> Result<EventIndex, G0Error> {
         let frame = self.frames.last().ok_or(G0Error::RelationTraceInvariant)?;
         if frame.root.program() != observation.owner.program() ||
             observation.ordered_start >= observation.ordered_end_exclusive
@@ -1649,8 +1731,10 @@ impl FeasibilitySink for FeasibilityTrace {
             }
         }
         self.retained_monomial_roots.insert(observation.source_monomial);
+        let index =
+            EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
         self.events.push(NormalizerEvent::AppliedRelation(observation));
-        Ok(())
+        Ok(index)
     }
 
     fn record_bound_transfer(
@@ -1746,8 +1830,20 @@ impl FeasibilitySink for FeasibilityTrace {
                 NormalizerEvent::SpecializationComputed { owner, key, replay } => {
                     if stack.is_empty() ||
                         key.index != *owner ||
-                        replay.validate_against(current).is_err() ||
-                        self.specialization_ranges.get(key).copied() != Some(*replay)
+                        replay.range.validate_against(current).is_err() ||
+                        self.specialization_ranges.get(key).cloned() != Some(replay.clone())
+                    {
+                        return Err(G0Error::SpecializationTraceInvariant);
+                    }
+                    if replay.rhs_results.windows(2).any(|window| window[0].0 >= window[1].0) ||
+                        replay.rhs_results.iter().any(|(_, event)| {
+                            event.0 < replay.range.start.0 ||
+                                event.0 >= replay.range.end.0 ||
+                                !matches!(
+                                    self.events.get(event.0 as usize),
+                                    Some(NormalizerEvent::InvocationEnd { .. })
+                                )
+                        })
                     {
                         return Err(G0Error::SpecializationTraceInvariant);
                     }
@@ -1757,7 +1853,9 @@ impl FeasibilitySink for FeasibilityTrace {
                         key.index != *owner ||
                         source.validate_against(current).is_err() ||
                         source.end.0 >= current.0 ||
-                        self.specialization_ranges.get(key).copied() != Some(*source)
+                        self.specialization_ranges
+                            .get(key)
+                            .is_none_or(|replay| replay.range != *source)
                     {
                         return Err(G0Error::SpecializationTraceInvariant);
                     }
@@ -1784,7 +1882,39 @@ impl FeasibilitySink for FeasibilityTrace {
                                     matches!(self.events.get(input_result.0 as usize), Some(NormalizerEvent::Result { owner, .. }) if owner.expression() == *input)
                             })
                         }
-                        AppliedRelationRule::Universal { .. } => true,
+                        AppliedRelationRule::Universal { key, source, rhs, .. } => {
+                            let Some((active_root, _, _, _, _)) = stack.last() else {
+                                return Err(G0Error::RelationTraceInvariant);
+                            };
+                            let Some(replay) = self.specialization_ranges.get(key) else {
+                                return Err(G0Error::SpecializationTraceInvariant);
+                            };
+                            let Some((_, rhs_event)) =
+                                replay.rhs_results.iter().find(|(candidate, _)| candidate == rhs)
+                            else {
+                                return Err(G0Error::SpecializationTraceInvariant);
+                            };
+                            let owner_ok = observation.owner == *active_root;
+                            let range_ok = source.validate_against(current).is_ok() &&
+                                source.end.0 < current.0;
+                            let association_ok = replay.range == *source &&
+                                rhs_event.0 >= source.start.0 &&
+                                rhs_event.0 < source.end.0;
+                            let summary_ok = matches!(
+                                self.events.get(rhs_event.0 as usize),
+                                Some(NormalizerEvent::InvocationEnd {
+                                    result: RecordedValue { exact_nf: Some(nf), .. },
+                                    ..
+                                }) if matches!(
+                                    nf.bounded_summary.coefficient_bound(),
+                                    NumericContract::Known(CoefficientBound::Finite(_))
+                                )
+                            );
+                            if !(owner_ok && range_ok && association_ok && summary_ok) {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
+                            true
+                        }
                     };
                     if stack.is_empty() ||
                         observation.ordered_start > observation.ordered_end_exclusive ||
@@ -2029,13 +2159,45 @@ impl FeasibilityTrace {
                 if !same_frame(*event) {
                     return Err(G0Error::UnsupportedBoundTransfer);
                 }
-                let Some(NormalizerEvent::BoundTransfer { owner: transfer_owner, .. }) =
-                    self.events.get(event.0 as usize)
-                else {
-                    return Err(G0Error::UnsupportedBoundTransfer);
-                };
-                if transfer_owner.program() != root.program() {
-                    return Err(G0Error::UnsupportedBoundTransfer);
+                match self.events.get(event.0 as usize) {
+                    Some(NormalizerEvent::BoundTransfer { owner: transfer_owner, .. }) => {
+                        if transfer_owner.program() != root.program() {
+                            return Err(G0Error::UnsupportedBoundTransfer);
+                        }
+                    }
+                    Some(NormalizerEvent::AppliedRelation(observation)) => {
+                        if observation.owner != owner {
+                            return Err(G0Error::UnsupportedBoundTransfer);
+                        }
+                        let AppliedRelationRule::Universal { key, source, rhs, .. } =
+                            &observation.rule
+                        else {
+                            return Err(G0Error::UnsupportedBoundTransfer);
+                        };
+                        let Some(replay) = self.specialization_ranges.get(key) else {
+                            return Err(G0Error::UnsupportedBoundTransfer);
+                        };
+                        let Some((_, rhs_event)) =
+                            replay.rhs_results.iter().find(|(candidate, _)| candidate == rhs)
+                        else {
+                            return Err(G0Error::UnsupportedBoundTransfer);
+                        };
+                        if replay.range != *source ||
+                            !matches!(
+                                self.events.get(rhs_event.0 as usize),
+                                Some(NormalizerEvent::InvocationEnd {
+                                    result: RecordedValue { exact_nf: Some(nf), .. },
+                                    ..
+                                }) if matches!(
+                                    nf.bounded_summary.coefficient_bound(),
+                                    NumericContract::Known(CoefficientBound::Finite(_))
+                                )
+                            )
+                        {
+                            return Err(G0Error::UnsupportedBoundTransfer);
+                        }
+                    }
+                    _ => return Err(G0Error::UnsupportedBoundTransfer),
                 }
             }
         }
@@ -4217,7 +4379,9 @@ mod tests {
         let mut trace = FeasibilityTrace::default();
         trace.record_invocation_start(owner).expect("invocation start");
         let start = trace.specialization_miss_start(owner, key.clone()).expect("miss start");
-        trace.record_specialization_computed(owner, key.clone(), start).expect("miss");
+        trace
+            .record_specialization_computed(owner, key.clone(), start, Box::new([]))
+            .expect("miss");
         trace.record_specialization_cache_hit(owner, key.clone()).expect("hit");
         trace.record_specialization_cache_hit(owner, key.clone()).expect("repeated hit");
         let value = crate::operational_noise::normal_form::AnalyzedValue {

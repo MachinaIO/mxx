@@ -13,7 +13,10 @@ use super::{
         TrustedIndexRange, TypedConstant, ValueOperator, ValueTransformOperation,
     },
     facts::{CoefficientBound, MatrixFacts, MatrixMetadata, NumericContract, PolynomialFacts},
-    g0::{FeasibilitySink, FeasibilityTrace, NoFeasibility, SourceClass, SourceHandle},
+    g0::{
+        FeasibilitySink, FeasibilityTrace, InputSourceIdentity, NoFeasibility, SourceClass,
+        SourceHandle,
+    },
     job::{CandidateToken, CheckerJob, JobError},
     program::{FamilyValueId, SelectionSelector},
     protocol::{PlannedWire, ProgramOccurrence, ProtocolPlan},
@@ -322,6 +325,26 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 })?;
         }
         Ok(())
+    }
+
+    fn record_family_source_if_enabled<F>(
+        &mut self,
+        family: FamilyValueId,
+        build: F,
+    ) -> Result<(), ProductionAdapterError>
+    where
+        F: FnOnce(&Self) -> SourceClass,
+    {
+        if S::ENABLED {
+            self.feasibility.record_source(SourceHandle::Family(family), build(self)).map_err(
+                |error| ProductionAdapterError::Descriptor { reason: error.to_string() },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn declared_protocol_input(&self, wire: &PlannedWire, name: &str) -> Option<ProtocolInputId> {
+        self.protocol_inputs.get(&(wire.stage.clone(), StageInputName(name.to_owned()))).cloned()
     }
 
     /// Intern one graph-node operation while preserving the typed production boundary.
@@ -2277,6 +2300,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     let protocol_input = self
                         .protocol_inputs
                         .get(&(wire.stage.clone(), StageInputName(name.to_owned())));
+                    let declared_protocol_input = protocol_input.is_some();
                     let source = SemanticFamilySourceIdentity {
                         stable_definition: protocol_input
                             .map(|_| "protocol-input".to_owned())
@@ -2307,9 +2331,38 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     let family = self.job.with_arena_stores(|expressions, programs, _| {
                         programs.source_family(expressions, source, explicit_matrix_facts)
                     })?;
+                    self.record_family_source_if_enabled(family, |adapter| {
+                        let body = adapter
+                            .job
+                            .programs()
+                            .family_body(family)
+                            .expect("source family body must remain in the program arena");
+                        let node = adapter
+                            .job
+                            .expressions()
+                            .node(body)
+                            .expect("source family body must remain in the expression arena");
+                        let ValueOperator::OpaqueFamilyElement { source } = &node.operator else {
+                            unreachable!("source family body must be an opaque family element")
+                        };
+                        let identity = InputSourceIdentity::Family(source.clone());
+                        if declared_protocol_input {
+                            let input = adapter
+                                .declared_protocol_input(wire, name)
+                                .expect("declared source family must have a protocol input");
+                            SourceClass::DeclaredProtocolInput {
+                                owner: wire.clone(),
+                                input,
+                                identity,
+                            }
+                        } else {
+                            SourceClass::UnboundOccurrenceInput { owner: wire.clone(), identity }
+                        }
+                    })?;
                     Value::Family(family)
                 } else {
-                    let source = self.source_identity(wire, name, wire_type)?;
+                    let (source, declared_protocol_input) =
+                        self.source_identity(wire, name, wire_type)?;
                     let facts = match &source.value_type {
                         ResolvedValueType::Matrix(matrix) => {
                             self.declared_input_matrix_facts(wire, name, matrix, false)?
@@ -2320,6 +2373,29 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                         .job
                         .expressions_mut()
                         .intern(ValueOperator::Source(source), Box::new([]))?;
+                    self.record_expression_source_if_enabled(expression, |adapter| {
+                        let node = adapter
+                            .job
+                            .expressions()
+                            .node(expression)
+                            .expect("source input must remain in the expression arena");
+                        let ValueOperator::Source(source) = &node.operator else {
+                            unreachable!("source input must be a source operator")
+                        };
+                        let identity = InputSourceIdentity::Expression(source.clone());
+                        if declared_protocol_input {
+                            let input = adapter
+                                .declared_protocol_input(wire, name)
+                                .expect("declared source must have a protocol input");
+                            SourceClass::DeclaredProtocolInput {
+                                owner: wire.clone(),
+                                input,
+                                identity,
+                            }
+                        } else {
+                            SourceClass::UnboundOccurrenceInput { owner: wire.clone(), identity }
+                        }
+                    })?;
                     if let Some(facts) = facts {
                         self.job.insert_matrix_facts(self.token, expression, facts)?;
                     }
@@ -3231,11 +3307,11 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         wire: &PlannedWire,
         name: &str,
         wire_type: &WireType,
-    ) -> Result<SemanticSourceIdentity, ProductionAdapterError> {
+    ) -> Result<(SemanticSourceIdentity, bool), ProductionAdapterError> {
         let value_type = self.resolved_type(wire_type, wire)?;
         let protocol_input =
             self.protocol_inputs.get(&(wire.stage.clone(), StageInputName(name.to_owned())));
-        Ok(SemanticSourceIdentity {
+        let identity = SemanticSourceIdentity {
             stable_definition: protocol_input.map(|_| "protocol-input".to_owned()).unwrap_or_else(
                 || {
                     format!(
@@ -3262,7 +3338,8 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
             value_type,
             coordinates: Box::new([]),
             matrix_constant: None,
-        })
+        };
+        Ok((identity, protocol_input.is_some()))
     }
     fn resolved_type(
         &self,
@@ -6552,5 +6629,67 @@ mod tests {
                 .values()
                 .any(|class| matches!(class, SourceClass::MatrixConstant { .. }))
         );
+    }
+
+    #[test]
+    fn opt_in_input_sources_keep_declared_and_unbound_occurrence_identity() {
+        let protocol = captured_nested_parallel_protocol();
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("captured plan");
+        let (_, _, trace) =
+            ProductionAdapter::new_with_feasibility(&protocol, &plan, BTreeMap::new())
+                .expect("opt-in adapter")
+                .lower_with_feasibility()
+                .expect("opt-in lowering");
+
+        let declared = trace
+            .source_observations()
+            .values()
+            .filter_map(|class| match class {
+                SourceClass::DeclaredProtocolInput { owner, input, identity } => {
+                    Some((owner.clone(), input.clone(), identity.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let unbound = trace
+            .source_observations()
+            .values()
+            .filter_map(|class| match class {
+                SourceClass::UnboundOccurrenceInput { owner, identity } => {
+                    Some((owner.clone(), identity.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!declared.is_empty(), "declared={declared:?}");
+        assert!(!unbound.is_empty(), "unbound={unbound:?}");
+        assert!(declared.iter().all(|(_, input, identity)| {
+            *input == crate::ProtocolInputId::from("outer-family") &&
+                matches!(identity, InputSourceIdentity::Family(_))
+        }));
+        assert!(unbound.iter().all(|(owner, identity)| {
+            owner.occurrence.path > 0 && matches!(identity, InputSourceIdentity::Family(_))
+        }));
+    }
+
+    #[test]
+    fn opt_in_declared_inputs_keep_repeated_occurrences_distinct() {
+        let protocol = repeated_named_parallel_artifact_protocol();
+        let plan = ProtocolPlan::build(&protocol, "named-parallel-artifact")
+            .expect("repeated artifact plan");
+        let (_, _, trace) =
+            ProductionAdapter::new_with_feasibility(&protocol, &plan, BTreeMap::new())
+                .expect("opt-in adapter")
+                .lower_with_feasibility()
+                .expect("opt-in lowering");
+        let owners = trace
+            .source_observations()
+            .values()
+            .filter_map(|class| match class {
+                SourceClass::DeclaredProtocolInput { owner, .. } => Some(owner.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(owners.len() >= 2, "declared input owners={owners:?}");
     }
 }

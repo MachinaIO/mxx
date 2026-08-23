@@ -12,8 +12,10 @@ use super::{
         ValueOperator, ValueTransformOperation,
     },
     job::CheckerJob,
+    protocol::PlannedWire,
     simulation::CertificateClosure,
 };
+use crate::ProtocolInputId;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -36,8 +38,28 @@ pub(crate) enum SourceHandle {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) enum SourceClass {
-    ScalarConstant { value: TypedConstant },
-    MatrixConstant { matrix_type: ResolvedMatrixType, kind: MatrixConstantKind },
+    ScalarConstant {
+        value: TypedConstant,
+    },
+    MatrixConstant {
+        matrix_type: ResolvedMatrixType,
+        kind: MatrixConstantKind,
+    },
+    DeclaredProtocolInput {
+        owner: PlannedWire,
+        input: ProtocolInputId,
+        identity: InputSourceIdentity,
+    },
+    UnboundOccurrenceInput {
+        owner: PlannedWire,
+        identity: InputSourceIdentity,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum InputSourceIdentity {
+    Expression(SemanticSourceIdentity),
+    Family(SemanticFamilySourceIdentity),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

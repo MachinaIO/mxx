@@ -15,7 +15,8 @@ use super::{
     facts::{CoefficientBound, MatrixFacts, MatrixMetadata, NumericContract, PolynomialFacts},
     g0::{
         EventKind, EventObservation, FeasibilitySink, FeasibilityTrace, IndexFrontierAxis,
-        IndexUseKind, IndexUsePlan, InputSourceIdentity, NoFeasibility, SourceClass, SourceHandle,
+        IndexUseKind, IndexUsePlan, InputSourceIdentity, NoFeasibility, SliceGroupId,
+        SliceGroupMember, SliceMemberRole, SourceClass, SourceHandle, SynchronizedSliceGroup,
     },
     job::{CandidateToken, CheckerJob, JobError},
     program::{FamilyValueId, SelectionSelector},
@@ -305,6 +306,7 @@ pub(crate) struct ProductionAdapter<'a, S: FeasibilitySink = NoFeasibility> {
     trapdoor_values: BTreeMap<SampleKey, ExprId>,
     occurrence_descendants: BTreeMap<(StageId, ProgramOccurrence), BTreeSet<ProgramOccurrence>>,
     diagnostic_budget: u16,
+    next_slice_group_id: u64,
     feasibility: S,
 }
 
@@ -431,8 +433,16 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         index: ExprId,
         wire: &PlannedWire,
     ) -> Result<Box<[IndexFrontierAxis]>, ProductionAdapterError> {
+        self.index_frontier_axes_for(&[index], wire)
+    }
+
+    fn index_frontier_axes_for(
+        &self,
+        indices: &[ExprId],
+        wire: &PlannedWire,
+    ) -> Result<Box<[IndexFrontierAxis]>, ProductionAdapterError> {
         let mut reachable = BTreeSet::new();
-        let mut pending = vec![index];
+        let mut pending = indices.to_vec();
         while let Some(expression) = pending.pop() {
             if !reachable.insert(expression) {
                 continue;
@@ -466,15 +476,17 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 .then_with(|| left.owner.cmp(&right.owner))
                 .then_with(|| left.domain.cmp(&right.domain))
         });
-        let free_arguments = self.job.expressions().free_arguments(index)?;
-        if free_arguments
-            .iter()
-            .any(|(position, _)| !axes.iter().any(|axis| axis.argument_position == *position))
-        {
-            return Err(ProductionAdapterError::Structural {
-                wire: wire.clone(),
-                reason: "index expression has no exact active binder range".to_owned(),
-            });
+        for index in indices {
+            let free_arguments = self.job.expressions().free_arguments(*index)?;
+            if free_arguments
+                .iter()
+                .any(|(position, _)| !axes.iter().any(|axis| axis.argument_position == *position))
+            {
+                return Err(ProductionAdapterError::Structural {
+                    wire: wire.clone(),
+                    reason: "index expression has no exact active binder range".to_owned(),
+                });
+            }
         }
         Ok(axes.into_boxed_slice())
     }
@@ -830,6 +842,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
             trapdoor_values: BTreeMap::new(),
             occurrence_descendants,
             diagnostic_budget: 128,
+            next_slice_group_id: 1,
             feasibility,
         };
         let mut adapter = adapter;
@@ -2658,23 +2671,36 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                             wire: wire.clone(),
                             reason: "indexed slice is missing its matrix input".to_owned(),
                         })?;
-                    let (operation, endpoints) = self.indexed_slice_operation(
-                        output,
-                        matrix,
-                        rows.as_ref(),
-                        columns.as_ref(),
-                        wire,
-                    )?;
+                    let (operation, endpoints, endpoint_ranges, row_span, column_span) = self
+                        .indexed_slice_operation(
+                            output,
+                            matrix,
+                            rows.as_ref(),
+                            columns.as_ref(),
+                            wire,
+                        )?;
                     let mut operation_inputs = Vec::with_capacity(5);
                     operation_inputs.push(matrix);
-                    operation_inputs.extend(endpoints);
-                    Value::Expr(self.intern_node_operator(
+                    operation_inputs.extend(endpoints.iter().copied());
+                    let result = self.intern_node_operator(
                         wire,
                         output,
                         ValueOperator::Matrix(operation),
                         operation_inputs.into_boxed_slice(),
                         true,
-                    )?)
+                    )?;
+                    if S::ENABLED {
+                        self.record_indexed_slice_uses_if_enabled(
+                            wire,
+                            matrix,
+                            result,
+                            endpoints,
+                            endpoint_ranges,
+                            row_span,
+                            column_span,
+                        )?;
+                    }
+                    Value::Expr(result)
                 }
             }
             NodeKind::Tensor => {
@@ -3611,6 +3637,95 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         })
     }
 
+    fn record_indexed_slice_uses_if_enabled(
+        &mut self,
+        wire: &PlannedWire,
+        matrix: ExprId,
+        result: ExprId,
+        endpoints: [ExprId; 4],
+        endpoint_ranges: [TrustedIndexRange; 4],
+        row_span: usize,
+        column_span: usize,
+    ) -> Result<(), ProductionAdapterError> {
+        if S::ENABLED {
+            let ResolvedValueType::Matrix(output_type) =
+                self.job.expressions().value_type(result)?.clone()
+            else {
+                return Err(ProductionAdapterError::Structural {
+                    wire: wire.clone(),
+                    reason: "indexed slice result is not a matrix".to_owned(),
+                });
+            };
+            if row_span == 0 ||
+                column_span == 0 ||
+                row_span != output_type.rows ||
+                column_span != output_type.columns
+            {
+                return Err(ProductionAdapterError::Structural {
+                    wire: wire.clone(),
+                    reason: "indexed slice span does not match the output shape".to_owned(),
+                });
+            }
+            let frontier = self.index_frontier_axes_for(&endpoints, wire)?;
+            let id = SliceGroupId(self.next_slice_group_id);
+            self.next_slice_group_id =
+                self.next_slice_group_id.checked_add(1).ok_or_else(|| {
+                    ProductionAdapterError::Structural {
+                        wire: wire.clone(),
+                        reason: "indexed slice group id space exhausted".to_owned(),
+                    }
+                })?;
+            let group = SynchronizedSliceGroup {
+                id,
+                frontier: frontier.clone(),
+                members: Box::new([
+                    SliceGroupMember {
+                        role: SliceMemberRole::RowStart,
+                        expression: endpoints[0],
+                        range: endpoint_ranges[0],
+                    },
+                    SliceGroupMember {
+                        role: SliceMemberRole::RowEndExclusive,
+                        expression: endpoints[1],
+                        range: endpoint_ranges[1],
+                    },
+                    SliceGroupMember {
+                        role: SliceMemberRole::ColumnStart,
+                        expression: endpoints[2],
+                        range: endpoint_ranges[2],
+                    },
+                    SliceGroupMember {
+                        role: SliceMemberRole::ColumnEndExclusive,
+                        expression: endpoints[3],
+                        range: endpoint_ranges[3],
+                    },
+                ]),
+                row_span: Some(row_span),
+                column_span: Some(column_span),
+            };
+            for (index, range) in endpoints.into_iter().zip(endpoint_ranges) {
+                self.feasibility
+                    .record_index_use(IndexUsePlan {
+                        kind: IndexUseKind::IndexedSlice,
+                        owner: wire.clone(),
+                        result: Some(result),
+                        result_family: None,
+                        consumed: Some(matrix),
+                        consumed_family: None,
+                        index,
+                        frontier: frontier.clone(),
+                        output_type: ResolvedValueType::Matrix(output_type.clone()),
+                        output_range: Some(range),
+                        slice_group: Some(group.clone()),
+                    })
+                    .map_err(|error| ProductionAdapterError::Descriptor {
+                        reason: error.to_string(),
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Lower a binder-open matrix slice without evaluating its coordinates. The four integer
     /// endpoints remain DAG children of `IndexedSlice`; the descriptor contains only the fixed
     /// output shape/layout. We require one affine binder and an exact constant span on each axis,
@@ -3622,7 +3737,10 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         rows: Option<&mxx_ir_core::node::IndexRange>,
         columns: Option<&mxx_ir_core::node::IndexRange>,
         wire: &PlannedWire,
-    ) -> Result<(MatrixOperation, [ExprId; 4]), ProductionAdapterError> {
+    ) -> Result<
+        (MatrixOperation, [ExprId; 4], [TrustedIndexRange; 4], usize, usize),
+        ProductionAdapterError,
+    > {
         let ResolvedValueType::Matrix(input_type) =
             self.job.expressions().value_type(matrix)?.clone()
         else {
@@ -3656,20 +3774,21 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         let column_end =
             endpoint(self, columns.map(|range| &range.end), input_type.columns as u64)?;
 
-        let row_span = self.validate_indexed_slice_axis(
+        let (row_span, row_start_range, row_end_range) = self.validate_indexed_slice_axis(
             row_start,
             row_end,
             input_type.rows,
             output_type.rows,
             wire,
         )?;
-        let column_span = self.validate_indexed_slice_axis(
-            column_start,
-            column_end,
-            input_type.columns,
-            output_type.columns,
-            wire,
-        )?;
+        let (column_span, column_start_range, column_end_range) = self
+            .validate_indexed_slice_axis(
+                column_start,
+                column_end,
+                input_type.columns,
+                output_type.columns,
+                wire,
+            )?;
         debug_assert_eq!(row_span, output_type.rows);
         debug_assert_eq!(column_span, output_type.columns);
         Ok((
@@ -3678,6 +3797,9 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 layout: MatrixLayout::row_major(output_type.rows, output_type.columns),
             },
             [row_start, row_end, column_start, column_end],
+            [row_start_range, row_end_range, column_start_range, column_end_range],
+            row_span,
+            column_span,
         ))
     }
 
@@ -3688,7 +3810,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         input_extent: usize,
         output_extent: usize,
         wire: &PlannedWire,
-    ) -> Result<usize, ProductionAdapterError> {
+    ) -> Result<(usize, TrustedIndexRange, TrustedIndexRange), ProductionAdapterError> {
         let start_form = self.indexed_slice_affine_form(start, wire)?;
         let end_form = self.indexed_slice_affine_form(end, wire)?;
         let Some((start_binder, start_coeff, start_offset)) = start_form else {
@@ -3708,7 +3830,10 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
             output_extent,
         )
         .map_err(|reason| ProductionAdapterError::Structural { wire: wire.clone(), reason })?;
-        for (name, expression) in [("start", start), ("end", end)] {
+        let mut endpoint_ranges = [None, None];
+        for (position, (name, expression)) in
+            [("start", start), ("end", end)].into_iter().enumerate()
+        {
             let Some(range) = self.indexed_slice_endpoint_range(expression, wire)? else {
                 return Err(ProductionAdapterError::MissingSelectorRange { wire: wire.clone() });
             };
@@ -3723,8 +3848,13 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     ),
                 });
             }
+            endpoint_ranges[position] = Some(range);
         }
-        Ok(span)
+        Ok((
+            span,
+            endpoint_ranges[0].expect("start range validated"),
+            endpoint_ranges[1].expect("end range validated"),
+        ))
     }
 
     fn indexed_slice_endpoint_range(
@@ -7039,5 +7169,77 @@ mod tests {
         };
         retained.retain_residual(&closure);
         assert!(retained.index_use_plans().all(|plan| plan.result == Some(residual_expression)));
+    }
+
+    #[test]
+    fn opt_in_indexed_slice_registers_one_shared_four_role_group() {
+        let protocol = generated_gather_protocol(7);
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("slice plan");
+        let (ordinary_job, ordinary_roots) = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("ordinary adapter")
+        .lower()
+        .expect("ordinary lowering");
+        let (trace_job, trace_roots, trace) = ProductionAdapter::new_with_feasibility(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("opt-in adapter")
+        .lower_with_feasibility()
+        .expect("opt-in lowering");
+        assert_eq!(ordinary_job.expressions().node_count(), trace_job.expressions().node_count());
+        assert_eq!(ordinary_roots.occurrences, trace_roots.occurrences);
+        assert_eq!(ordinary_roots.samples, trace_roots.samples);
+        assert_eq!(
+            matches!(ordinary_roots.residual, ProductionRoot::Closed(_)),
+            matches!(trace_roots.residual, ProductionRoot::Closed(_))
+        );
+        assert_eq!(
+            matches!(ordinary_roots.decoder, ProductionRoot::Closed(_)),
+            matches!(trace_roots.decoder, ProductionRoot::Closed(_))
+        );
+
+        let slice_uses = trace
+            .index_use_plans()
+            .filter(|plan| plan.kind == IndexUseKind::IndexedSlice)
+            .collect::<Vec<_>>();
+        assert_eq!(slice_uses.len(), 4, "one associated use per typed endpoint");
+        let group_ids = slice_uses
+            .iter()
+            .map(|plan| plan.slice_group.as_ref().expect("slice group").id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(group_ids.len(), 1);
+        let group = slice_uses[0].slice_group.as_ref().expect("slice group");
+        assert_eq!(group.members.len(), 4);
+        assert_eq!(group.row_span, Some(1));
+        assert_eq!(group.column_span, Some(1));
+        assert!(slice_uses.iter().all(|plan| {
+            plan.frontier == group.frontier &&
+                plan.slice_group.as_ref().expect("slice group").members == group.members
+        }));
+        assert!(slice_uses.iter().all(|plan| plan.result == Some(slice_uses[0].result.unwrap())));
+
+        let residual = slice_uses[0].result.expect("indexed slice result");
+        let mut retained = trace;
+        retained.retain_residual(&super::super::simulation::CertificateClosure {
+            expressions: BTreeSet::from([residual]),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: BTreeSet::new(),
+        });
+        assert_eq!(
+            retained
+                .index_use_plans()
+                .filter(|plan| plan.kind == IndexUseKind::IndexedSlice)
+                .count(),
+            4
+        );
     }
 }

@@ -111,6 +111,7 @@ pub(crate) enum SliceMemberRole {
 pub(crate) struct SliceGroupMember {
     pub role: SliceMemberRole,
     pub expression: super::arena::ExprId,
+    pub range: TrustedIndexRange,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -161,6 +162,9 @@ impl IndexUsePlan {
             let mut roles = BTreeSet::new();
             let mut expressions = BTreeSet::new();
             for member in &group.members {
+                if member.range.minimum > member.range.maximum_exclusive {
+                    return Err(G0Error::InvalidIndexAxisRange);
+                }
                 if !roles.insert(member.role) || !expressions.insert(member.expression) {
                     return Err(G0Error::DuplicateSliceGroupMember);
                 }
@@ -1414,15 +1418,25 @@ mod tests {
             id: SliceGroupId(3),
             frontier: frontier.into_boxed_slice(),
             members: vec![
-                SliceGroupMember { role: SliceMemberRole::RowStart, expression: expression(10) },
+                SliceGroupMember {
+                    role: SliceMemberRole::RowStart,
+                    expression: expression(10),
+                    range: TrustedIndexRange { minimum: 0, maximum_exclusive: 1 },
+                },
                 SliceGroupMember {
                     role: SliceMemberRole::RowEndExclusive,
                     expression: expression(11),
+                    range: TrustedIndexRange { minimum: 1, maximum_exclusive: 2 },
                 },
-                SliceGroupMember { role: SliceMemberRole::ColumnStart, expression: expression(12) },
+                SliceGroupMember {
+                    role: SliceMemberRole::ColumnStart,
+                    expression: expression(12),
+                    range: TrustedIndexRange { minimum: 0, maximum_exclusive: 1 },
+                },
                 SliceGroupMember {
                     role: SliceMemberRole::ColumnEndExclusive,
                     expression: expression(13),
+                    range: TrustedIndexRange { minimum: 1, maximum_exclusive: 2 },
                 },
             ]
             .into_boxed_slice(),

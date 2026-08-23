@@ -151,6 +151,19 @@ pub(crate) struct IndexUsePlan {
 }
 
 impl IndexUsePlan {
+    fn same_use_identity(&self, other: &Self) -> bool {
+        self.kind == other.kind &&
+            self.owner == other.owner &&
+            self.result == other.result &&
+            self.result_family == other.result_family &&
+            self.consumed == other.consumed &&
+            self.consumed_family == other.consumed_family &&
+            self.index == other.index &&
+            self.frontier == other.frontier &&
+            self.output_type == other.output_type &&
+            self.slice_group == other.slice_group
+    }
+
     fn validate(&self) -> Result<(), G0Error> {
         if self.frontier.iter().any(|axis| axis.domain.minimum > axis.domain.maximum_exclusive) {
             return Err(G0Error::InvalidIndexAxisRange);
@@ -553,7 +566,10 @@ fn enumerate_slice_group(
         if plan.kind != IndexUseKind::IndexedSlice ||
             plan.frontier != first.frontier ||
             plan.owner != first.owner ||
+            plan.result != first.result ||
+            plan.result_family != first.result_family ||
             plan.consumed != Some(consumed) ||
+            plan.consumed_family != first.consumed_family ||
             plan.output_type != first.output_type
         {
             return Err(G0Error::SliceGroupAxesMismatch);
@@ -737,13 +753,6 @@ fn verify_output_range(value: &BigInt, range: TrustedIndexRange) -> Result<(), G
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct IndexUseKey {
-    owner: PlannedWire,
-    kind: IndexUseKind,
-    index: super::arena::ExprId,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NoFeasibility;
 
@@ -776,7 +785,7 @@ pub(crate) struct FeasibilityTrace {
     pub lowering_complete: u64,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
-    index_use_plans: BTreeMap<IndexUseKey, IndexUsePlan>,
+    index_use_plans: BTreeSet<IndexUsePlan>,
     next_slice_group_id: u64,
 }
 
@@ -786,7 +795,7 @@ impl Default for FeasibilityTrace {
             lowering_complete: 0,
             source_observations: BTreeMap::new(),
             event_observations: BTreeMap::new(),
-            index_use_plans: BTreeMap::new(),
+            index_use_plans: BTreeSet::new(),
             next_slice_group_id: 1,
         }
     }
@@ -831,15 +840,13 @@ impl FeasibilitySink for FeasibilityTrace {
 
     fn record_index_use(&mut self, plan: IndexUsePlan) -> Result<(), G0Error> {
         plan.validate()?;
-        let key = IndexUseKey { owner: plan.owner.clone(), kind: plan.kind, index: plan.index };
-        match self.index_use_plans.get(&key) {
-            Some(existing) if existing != &plan => Err(G0Error::ConflictingIndexUsePlan),
-            Some(_) => Ok(()),
-            None => {
-                self.index_use_plans.insert(key, plan);
-                Ok(())
-            }
+        if self.index_use_plans.iter().any(|existing| {
+            existing.same_use_identity(&plan) && existing.output_range != plan.output_range
+        }) {
+            return Err(G0Error::ConflictingIndexUsePlan);
         }
+        self.index_use_plans.insert(plan);
+        Ok(())
     }
 
     fn allocate_slice_group_id(&mut self) -> Result<SliceGroupId, G0Error> {
@@ -876,7 +883,7 @@ impl FeasibilityTrace {
             SourceHandle::Family(family) => closure.families.contains(family),
         });
         self.event_observations.retain(|event, _| closure.event_ids.contains(event));
-        self.index_use_plans.retain(|_, plan| {
+        self.index_use_plans.retain(|plan| {
             plan.result.is_some_and(|expression| closure.expressions.contains(&expression)) ||
                 plan.result_family.is_some_and(|family| closure.families.contains(&family)) ||
                 plan.consumed.is_some_and(|expression| closure.expressions.contains(&expression)) ||
@@ -893,7 +900,7 @@ impl FeasibilityTrace {
     }
 
     pub(crate) fn index_use_plans(&self) -> impl Iterator<Item = &IndexUsePlan> {
-        self.index_use_plans.values()
+        self.index_use_plans.iter()
     }
 }
 
@@ -2882,6 +2889,13 @@ mod tests {
         trace.record_index_use(first.clone()).expect("first plan");
         trace.record_index_use(first.clone()).expect("duplicate plan");
         assert_eq!(trace.index_use_plans().count(), 1);
+
+        let mut distinct_consumer = first.clone();
+        distinct_consumer.result = Some(expression(99));
+        trace
+            .record_index_use(distinct_consumer)
+            .expect("same computation with a distinct consumer");
+        assert_eq!(trace.index_use_plans().count(), 2);
 
         let mut conflict = first.clone();
         conflict.output_range = Some(TrustedIndexRange { minimum: 0, maximum_exclusive: 9 });

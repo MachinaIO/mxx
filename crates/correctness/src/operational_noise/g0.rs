@@ -3576,7 +3576,7 @@ mod tests {
         nested.record_invocation_start(parent).expect("parent start");
         nested
             .record_bound_transfer(
-                parent,
+                child,
                 BoundRule::Tensor {
                     left_is_constant_polynomial: false,
                     right_is_constant_polynomial: false,
@@ -3605,6 +3605,16 @@ mod tests {
                 &Default::default(),
             )
             .expect("child end");
+        nested
+            .record_normalization_result(
+                parent,
+                &super::super::normal_form::AnalyzedValue {
+                    semantic: parent,
+                    exact_nf: None,
+                    coefficient_bound: super::super::facts::NumericContract::Missing,
+                },
+            )
+            .expect("parent result");
         nested.events.push(NormalizerEvent::InvocationEnd {
             root: parent,
             result: RecordedValue {
@@ -3613,6 +3623,10 @@ mod tests {
             },
             counters: Default::default(),
         });
+        // The direct sink API correctly refuses to emit this end event while `child` is still a
+        // pending parent transfer.  Strip only the construction frames so the complete malformed
+        // event stream is exercised by the public validator below.
+        nested.frames.clear();
         assert_eq!(
             nested.validate_normalization_observations(),
             Err(G0Error::MissingNormalizationResult)

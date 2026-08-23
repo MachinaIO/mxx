@@ -25,8 +25,12 @@ use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::{collections::HashMap, fmt, sync::Arc};
-use tracing::{debug, info};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt,
+    sync::{Arc, Mutex},
+};
+use tracing::info;
 
 // Oversized column-separable operations are measured as one-column waves. The logical output size
 // remains unchanged in the estimator's persistent-memory model.
@@ -79,6 +83,43 @@ struct PendingMeasurement {
     preimage_sample: bool,
 }
 
+impl PendingMeasurement {
+    fn representative_bytes(&self) -> u128 {
+        fn wire_bytes(wire_type: &ConcreteWireType) -> u128 {
+            match wire_type {
+                ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                    (matrix.rows as u128)
+                        .saturating_mul(matrix.columns as u128)
+                        .saturating_mul(matrix.ring_dimension as u128)
+                        .saturating_mul(8)
+                }
+                ConcreteWireType::Trapdoor { matrix, .. } => (matrix.rows as u128)
+                    .saturating_mul(matrix.columns as u128)
+                    .saturating_mul(matrix.ring_dimension as u128)
+                    .saturating_mul(8),
+                ConcreteWireType::IndexedFamily { element, count } => {
+                    wire_bytes(element).saturating_mul(*count as u128)
+                }
+                ConcreteWireType::Bytes { length } => *length as u128,
+                ConcreteWireType::TypedBlob { .. } |
+                ConcreteWireType::ConstantInt |
+                ConcreteWireType::ConstantReal |
+                ConcreteWireType::ConstantBool |
+                ConcreteWireType::Int |
+                ConcreteWireType::Real |
+                ConcreteWireType::Bool => 0,
+            }
+        }
+
+        self.concrete_argument_types
+            .iter()
+            .chain(&self.concrete_output_types)
+            .map(wire_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 pub struct GpuNodeMeasurementBackend {
     workers: Vec<GpuMeasurementWorker>,
     harness: MeasurementHarnessConfig,
@@ -115,25 +156,33 @@ impl GpuNodeMeasurementBackend {
     pub fn measure_collected(&mut self) -> Result<(), GpuMeasurementError> {
         self.collecting = false;
         let mut requests = std::mem::take(&mut self.pending).into_values().collect::<Vec<_>>();
-        requests.sort_by(|left, right| right.scale.total_cmp(&left.scale));
-        let mut buckets = (0..self.workers.len()).map(|_| Vec::new()).collect::<Vec<_>>();
-        for (index, request) in requests.into_iter().enumerate() {
-            buckets[index % self.workers.len()].push(request);
-        }
+        requests.sort_by(|left, right| {
+            right
+                .preimage_sample
+                .cmp(&left.preimage_sample)
+                .then_with(|| right.representative_bytes().cmp(&left.representative_bytes()))
+        });
+        let measurement_count = requests.len();
+        let requests = Mutex::new(VecDeque::from(requests));
         info!(
             gpu_count = self.workers.len(),
-            measurement_count = buckets.iter().map(Vec::len).sum::<usize>(),
-            "measuring collected GPU node shapes in parallel"
+            measurement_count, "measuring collected GPU node shapes in parallel"
         );
         let harness = &self.harness;
         let measured = self
             .workers
             .par_iter_mut()
-            .zip(buckets.into_par_iter())
-            .map(|(worker, requests)| {
-                let mut completed = Vec::with_capacity(requests.len());
+            .map(|worker| {
+                let mut completed = Vec::new();
                 let mut representative_work_seconds = 0.0;
-                for request in requests {
+                loop {
+                    let Some(request) = requests
+                        .lock()
+                        .expect("GPU measurement request queue poisoned")
+                        .pop_front()
+                    else {
+                        break;
+                    };
                     let measurement = Self::measure_request(worker, harness, &request)?;
                     representative_work_seconds += measurement.work_seconds / request.scale;
                     completed.push((request.key, measurement));
@@ -1172,12 +1221,6 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
         };
         let measurement_key = Self::measurement_key(node, bindings)?;
         if let Some(measurement) = self.measurements.get(&measurement_key) {
-            debug!(
-                scope = ?node.scope,
-                node = node.id.0,
-                measurement = ?measurement,
-                "reused cached GPU node measurement"
-            );
             return Ok(measurement.clone());
         }
         if !self.collecting {

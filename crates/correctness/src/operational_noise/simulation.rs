@@ -110,11 +110,11 @@ pub(crate) enum CertificateClosureError {
 
 /// Collect the transitive dependency closure of exactly one production root.
 ///
-/// Callers pass `ProductionRoots.residual`; this API intentionally accepts no decoder root and
+/// Callers pass the already projected residual root; this API cannot accept a decoder root and
 /// never enumerates family lanes or selectors.
 pub(crate) fn collect_residual_closure(
     job: &super::job::CheckerJob,
-    root: &ProductionRoot,
+    root: &CertificateResidualRoot,
 ) -> Result<CertificateClosure, CertificateClosureError> {
     enum Work {
         Expression(ExprId),
@@ -127,8 +127,10 @@ pub(crate) fn collect_residual_closure(
     let mut families = BTreeSet::new();
     let mut work = Vec::new();
     match root {
-        ProductionRoot::Closed(root) => work.push(Work::Expression(root.expression())),
-        ProductionRoot::Family(family) => work.push(Work::Family(*family)),
+        CertificateResidualRoot::Closed { root, .. } => {
+            work.push(Work::Expression(root.expression()))
+        }
+        CertificateResidualRoot::Family { family, .. } => work.push(Work::Family(*family)),
     }
 
     while let Some(item) = work.pop() {
@@ -239,7 +241,7 @@ pub(crate) fn project_operational_certificate(
         .lower()
         .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?;
     let residual = project_residual_root(&job, &roots.residual, &target)?;
-    let closure = collect_residual_closure(&job, &roots.residual)?;
+    let closure = collect_residual_closure(&job, &residual)?;
     Ok(OperationalCertificateProjection {
         target_id,
         plaintext_modulus,
@@ -1453,9 +1455,12 @@ mod tests {
             })
             .expect("closed expression");
         let root_expression = root.expression();
-        let closure =
-            collect_residual_closure(&job, &super::super::lower::ProductionRoot::Closed(root))
-                .expect("closed residual closure");
+        let projected = CertificateResidualRoot::Closed {
+            root,
+            matrix: super::super::arena::ResolvedMatrixType::new(17_u8.into(), 1, 1, 1)
+                .expect("matrix type"),
+        };
+        let closure = collect_residual_closure(&job, &projected).expect("closed residual closure");
         assert_eq!(closure.expressions.len(), 3);
         assert!(closure.expressions.contains(&root_expression));
         assert!(closure.expressions.contains(&left));
@@ -1479,9 +1484,13 @@ mod tests {
                 Ok::<_, super::super::arena::ArenaError>((family, body))
             })
             .expect("indexed family");
-        let closure =
-            collect_residual_closure(&job, &super::super::lower::ProductionRoot::Family(family))
-                .expect("family residual closure");
+        let projected = CertificateResidualRoot::Family {
+            family,
+            domain: super::super::arena::FamilyDomain::new(4, 8).expect("family domain"),
+            matrix: super::super::arena::ResolvedMatrixType::new(17_u8.into(), 1, 1, 1)
+                .expect("matrix type"),
+        };
+        let closure = collect_residual_closure(&job, &projected).expect("family residual closure");
         assert_eq!(closure.expressions.len(), 1);
         assert!(closure.expressions.contains(&body));
         assert_eq!(closure.programs.len(), 1);
@@ -1527,9 +1536,13 @@ mod tests {
                 ))
             })
             .expect("nested program calls");
+        let projected = CertificateResidualRoot::Closed {
+            root,
+            matrix: super::super::arena::ResolvedMatrixType::new(17_u8.into(), 1, 1, 1)
+                .expect("matrix type"),
+        };
         let closure =
-            collect_residual_closure(&job, &super::super::lower::ProductionRoot::Closed(root))
-                .expect("program-call residual closure");
+            collect_residual_closure(&job, &projected).expect("program-call residual closure");
         assert_eq!(closure.programs, [inner, outer].into_iter().collect());
         assert!(closure.expressions.contains(&root.expression()));
         assert!(closure.expressions.contains(&inner_body));
@@ -1557,13 +1570,12 @@ mod tests {
                 ))
             })
             .expect("two roots");
-        let roots = super::super::lower::ProductionRoots {
-            residual: super::super::lower::ProductionRoot::Closed(residual),
-            decoder: super::super::lower::ProductionRoot::Closed(decoder),
-            occurrences: 0,
-            samples: 0,
+        let projected = CertificateResidualRoot::Closed {
+            root: residual,
+            matrix: super::super::arena::ResolvedMatrixType::new(17_u8.into(), 1, 1, 1)
+                .expect("matrix type"),
         };
-        let closure = collect_residual_closure(&job, &roots.residual).expect("residual closure");
+        let closure = collect_residual_closure(&job, &projected).expect("residual closure");
         assert!(closure.expressions.contains(&residual.expression()));
         assert!(!closure.expressions.contains(&decoder.expression()));
     }
@@ -1580,8 +1592,13 @@ mod tests {
             .and_then(|expression| source.expressions().close(expression))
             .expect("source root");
         let target = super::super::job::CheckerJob::new();
+        let projected = CertificateResidualRoot::Closed {
+            root,
+            matrix: super::super::arena::ResolvedMatrixType::new(17_u8.into(), 1, 1, 1)
+                .expect("matrix type"),
+        };
         assert!(matches!(
-            collect_residual_closure(&target, &super::super::lower::ProductionRoot::Closed(root),),
+            collect_residual_closure(&target, &projected),
             Err(CertificateClosureError::Arena(
                 super::super::arena::ArenaError::ForeignExpression { .. }
             ))

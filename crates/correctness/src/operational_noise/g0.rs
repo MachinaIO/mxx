@@ -1155,10 +1155,12 @@ impl FeasibilityTrace {
     /// intentionally excluded: ownership, protocol aliases, and artifact bindings below are
     /// the canonical identity authority for this opt-in trace.
     pub(crate) fn canonical_source_observation_bytes(&self) -> Result<Vec<u8>, G0Error> {
+        let event_ids = self.event_observations.keys().copied().collect::<BTreeSet<_>>();
+        let events = derive_canonical_event_rows_for_ids(&event_ids, self)?;
         let sources = self
             .source_observations
             .values()
-            .map(|class| stable_observed_source(class, None))
+            .map(|class| stable_observed_source(class, Some(&events)))
             .collect::<Result<BTreeSet<_>, _>>()?
             .into_iter()
             .collect::<Vec<_>>();
@@ -1504,7 +1506,7 @@ pub(crate) enum StableTrapdoorOperation {
     Generate {
         descriptor: String,
         parameters: Vec<u64>,
-        paired_public_event: u64,
+        paired_public_event: Option<StableEventRef>,
         paired_public_output_role: String,
     },
     Transform {
@@ -1528,11 +1530,11 @@ pub(crate) enum StableOperator {
         identity: StableSourceIdentity,
     },
     Sample {
-        event: u64,
+        event: Option<StableEventRef>,
         descriptor: StableSampleDescriptor,
     },
     Sampler {
-        event: u64,
+        event: Option<StableEventRef>,
         operation: StableSamplerOperation,
     },
     DeterministicHash {
@@ -1585,7 +1587,6 @@ pub(crate) struct StableEventRef {
 pub(crate) enum CanonicalEventKind {
     Sample { descriptor: StableSampleDescriptor },
     Sampler { operation: StableSamplerOperation },
-    Trapdoor { operation: StableTrapdoorOperation },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -1639,6 +1640,8 @@ pub(crate) enum G0Error {
     ConflictingEventDescriptor { event: u64 },
     #[error("event has conflicting typed owner or descriptor")]
     ConflictingEventObservation,
+    #[error("event kind is unsupported in canonical G0 inventory")]
+    UnsupportedCanonicalEventKind,
     #[error("residual event has no typed lowering observation")]
     MissingEventObservation,
     #[error("independent residual events cannot alias one canonical event row")]
@@ -1930,7 +1933,7 @@ pub(crate) fn derive_inventory(
     let sources = closure
         .source_ids
         .iter()
-        .map(|source| stable_source_with_events(source, &event_rows))
+        .map(|source| stable_source(source, &event_rows))
         .collect::<Result<BTreeSet<_>, _>>()?
         .into_iter()
         .collect();
@@ -2001,10 +2004,10 @@ fn stable_artifact(value: &ArtifactIdentity) -> StableArtifact {
     }
 }
 
-fn stable_source(value: &SemanticSourceIdentity) -> StableSourceIdentity {
+fn stable_source_without_event(value: &SemanticSourceIdentity) -> StableSourceIdentity {
     StableSourceIdentity {
         definition: value.stable_definition.clone(),
-        sample_event: value.sample_event.map(|event| StableEventRef { row: event.0 }),
+        sample_event: None,
         output_role: value.output_role.clone(),
         artifact: value.artifact.as_ref().map(stable_artifact),
         value_type: stable_value_type(&value.value_type),
@@ -2013,11 +2016,11 @@ fn stable_source(value: &SemanticSourceIdentity) -> StableSourceIdentity {
     }
 }
 
-fn stable_source_with_events(
+fn stable_source(
     value: &SemanticSourceIdentity,
     events: &CanonicalEventRows,
 ) -> Result<StableSourceIdentity, G0Error> {
-    let mut source = stable_source(value);
+    let mut source = stable_source_without_event(value);
     source.sample_event = value.sample_event.map(|event| events.event(event)).transpose()?;
     Ok(source)
 }
@@ -2085,8 +2088,8 @@ fn stable_observed_identity(
                     .sample_event
                     .map(|event| {
                         events
-                            .map(|events| events.event(event))
-                            .unwrap_or(Ok(StableEventRef { row: event.0 }))
+                            .ok_or(G0Error::CanonicalMissingDependency)
+                            .and_then(|events| events.event(event))
                     })
                     .transpose()?,
                 output_role: value.output_role.clone(),
@@ -2382,12 +2385,12 @@ fn stable_trapdoor(value: &TrapdoorOperation) -> StableTrapdoorOperation {
         TrapdoorOperation::Generate {
             descriptor,
             parameters,
-            paired_public_event,
+            paired_public_event: _paired_public_event,
             paired_public_output_role,
         } => StableTrapdoorOperation::Generate {
             descriptor: descriptor.clone(),
             parameters: parameters.to_vec(),
-            paired_public_event: paired_public_event.0,
+            paired_public_event: None,
             paired_public_output_role: paired_public_output_role.clone(),
         },
         TrapdoorOperation::Transform { descriptor, output, parameters } => {
@@ -2400,17 +2403,15 @@ fn stable_trapdoor(value: &TrapdoorOperation) -> StableTrapdoorOperation {
     }
 }
 
-fn canonical_event_kind(kind: &EventKind) -> CanonicalEventKind {
+fn canonical_event_kind(kind: &EventKind) -> Result<CanonicalEventKind, G0Error> {
     match kind {
         EventKind::Sample { descriptor } => {
-            CanonicalEventKind::Sample { descriptor: stable_sample(descriptor) }
+            Ok(CanonicalEventKind::Sample { descriptor: stable_sample(descriptor) })
         }
         EventKind::Sampler { operation } => {
-            CanonicalEventKind::Sampler { operation: stable_sampler(operation) }
+            Ok(CanonicalEventKind::Sampler { operation: stable_sampler(operation) })
         }
-        EventKind::Trapdoor { operation } => {
-            CanonicalEventKind::Trapdoor { operation: stable_trapdoor(operation) }
-        }
+        EventKind::Trapdoor { .. } => Err(G0Error::UnsupportedCanonicalEventKind),
     }
 }
 
@@ -2420,14 +2421,21 @@ pub(crate) fn derive_canonical_event_rows(
     closure: &CertificateClosure,
     trace: &FeasibilityTrace,
 ) -> Result<CanonicalEventRows, G0Error> {
+    derive_canonical_event_rows_for_ids(&closure.event_ids, trace)
+}
+
+fn derive_canonical_event_rows_for_ids(
+    event_ids: &BTreeSet<SampleEventId>,
+    trace: &FeasibilityTrace,
+) -> Result<CanonicalEventRows, G0Error> {
     let mut candidates = Vec::new();
-    for &event in &closure.event_ids {
+    for &event in event_ids {
         let observation =
             trace.event_observations().get(&event).ok_or(G0Error::MissingEventObservation)?;
         candidates.push((
             event,
             stable_observed_wire(&observation.owner),
-            canonical_event_kind(&observation.kind),
+            canonical_event_kind(&observation.kind)?,
         ));
     }
     let mut by_identity =
@@ -2541,7 +2549,7 @@ fn canonical_expression_operator(
                 }
             }
             operator = serde_json::to_value(StableOperator::Source {
-                identity: stable_source_with_events(source, events)?,
+                identity: stable_source(source, events)?,
             })
             .map_err(|error| G0Error::Encoding(error.to_string()))?;
         }
@@ -2711,12 +2719,14 @@ fn stable_operator(value: &ValueOperator) -> StableOperator {
         ValueOperator::Constant(value) => {
             StableOperator::Constant { value: stable_constant(value) }
         }
-        ValueOperator::Source(value) => StableOperator::Source { identity: stable_source(value) },
-        ValueOperator::Sample { event, descriptor } => {
-            StableOperator::Sample { event: event.0, descriptor: stable_sample(descriptor) }
+        ValueOperator::Source(value) => {
+            StableOperator::Source { identity: stable_source_without_event(value) }
         }
-        ValueOperator::Sampler { event, operation } => {
-            StableOperator::Sampler { event: event.0, operation: stable_sampler(operation) }
+        ValueOperator::Sample { event: _, descriptor } => {
+            StableOperator::Sample { event: None, descriptor: stable_sample(descriptor) }
+        }
+        ValueOperator::Sampler { event: _, operation } => {
+            StableOperator::Sampler { event: None, operation: stable_sampler(operation) }
         }
         ValueOperator::DeterministicHash(value) => stable_hash(value),
         ValueOperator::OpaqueFamilyElement { source } => {
@@ -3168,6 +3178,26 @@ mod tests {
         owners_closure.event_ids.insert(SampleEventId(41));
         let rows = derive_canonical_event_rows(&owners_closure, &owners).unwrap();
         assert_eq!(rows.rows().len(), 2);
+
+        let trapdoor_event = SampleEventId(99);
+        let mut trapdoor = FeasibilityTrace::default();
+        trapdoor
+            .record_event(EventObservation {
+                event: trapdoor_event,
+                owner,
+                kind: EventKind::Trapdoor {
+                    operation: TrapdoorOperation::Transform {
+                        descriptor: "unsupported-test".to_owned(),
+                        output: ResolvedValueType::Int,
+                        parameters: Box::new([]),
+                    },
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            derive_canonical_event_rows(&closure(99), &trapdoor),
+            Err(G0Error::UnsupportedCanonicalEventKind)
+        );
     }
 
     #[test]

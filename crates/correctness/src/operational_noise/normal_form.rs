@@ -7179,6 +7179,102 @@ mod tests {
     }
 
     #[test]
+    fn actual_gadget_pair_summary_rejects_before_destination_mutation() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let modulus = BigUint::from(17_u8);
+        let input_type = ResolvedMatrixType::new(modulus.clone(), 1, 1, 1).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(modulus.clone(), 1, 3, 1).unwrap();
+        let gadget_type = ResolvedMatrixType::new(modulus, 1, 1, 3).unwrap();
+        let (gadget, decomposition, input) = gadget_product(
+            &mut expressions,
+            false,
+            3,
+            gadget_type.clone(),
+            decomposition_type.clone(),
+            input_type.clone(),
+            Some((2, false)),
+        );
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[gadget, decomposition])
+            .unwrap();
+        let (mut facts, mut monomials, _semantic) = setup(&mut expressions, &mut programs, root);
+        for (expression, bound) in [(gadget, 2), (decomposition, 3), (input, 4)] {
+            insert_matrix_bound(&mut facts, &expressions, expression, bound);
+        }
+        let registry =
+            recomposition_registry(gadget_type, decomposition_type, input_type, false, 3);
+        let scope = monomials.scope();
+        let scoped_gadget = programs.scoped(&expressions, scope, gadget).unwrap();
+        let scoped_decomposition = programs.scoped(&expressions, scope, decomposition).unwrap();
+        let scoped_input = programs.scoped(&expressions, scope, input).unwrap();
+        let input_monomial =
+            monomials.intern(&expressions, &programs, &[], &[scoped_input]).unwrap();
+        let pair_monomial = monomials
+            .intern(&expressions, &programs, &[], &[scoped_gadget, scoped_decomposition])
+            .unwrap();
+        let descriptor = monomials.descriptor(pair_monomial).unwrap();
+        assert!(descriptor.central_factors.is_empty());
+        assert_eq!(descriptor.ordered_factors.as_ref(), &[scoped_gadget, scoped_decomposition]);
+
+        // The input NF has both an exact term and a nonzero summary.  The splice therefore uses
+        // the actual original-ID combine path before the enabled gate is reached.
+        let input_nf = Arc::new(PolynomialNF {
+            exact_terms: BTreeMap::from([(input_monomial, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::finite(BoundExpression::new(BigUint::from(3_u8))),
+        });
+        let destination_before = PolynomialNF {
+            exact_terms: BTreeMap::from([(pair_monomial, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::zero(),
+        };
+        let before_len = monomials.len();
+        let before_occupied = monomials.occupied_len();
+        let coefficient = BigInt::from(1_u8);
+
+        let (ordinary_output, ordinary_counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                    .unwrap()
+                    .with_gadget_recompositions(&registry);
+            normalizer.insert_gadget_hold(input, input_nf.clone());
+            let output = normalizer
+                .rewrite_gadget_decomposition(pair_monomial, Some(&coefficient))
+                .unwrap()
+                .expect("typed gadget pair reaches the actual splice helper");
+            assert_eq!(normalizer.monomials.len(), before_len);
+            assert_eq!(normalizer.monomials.occupied_len(), before_occupied);
+            (output, normalizer.counters())
+        };
+        assert_eq!(ordinary_output.exact_terms, input_nf.exact_terms);
+        assert_eq!(ordinary_output.bounded_summary, input_nf.bounded_summary);
+
+        let mut trace = FeasibilityTrace::default();
+        let error = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .with_gadget_recompositions(&registry);
+            normalizer.insert_gadget_hold(input, input_nf);
+            let error = normalizer
+                .rewrite_gadget_decomposition(pair_monomial, Some(&coefficient))
+                .unwrap_err();
+            assert_eq!(normalizer.counters(), ordinary_counters);
+            assert_eq!(normalizer.monomials.len(), before_len);
+            assert_eq!(normalizer.monomials.occupied_len(), before_occupied);
+            error
+        };
+        assert_eq!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer));
+        assert!(trace.normalization_events().is_empty());
+        assert_eq!(destination_before.exact_terms.len(), 1);
+        assert!(destination_before.bounded_summary.is_zero());
+    }
+
+    #[test]
     fn traced_product_summary_preserves_summary_exact_operand_order() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();

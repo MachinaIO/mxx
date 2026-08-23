@@ -106,6 +106,15 @@ pub struct BaseFeasibilitySummary {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BaseFeasibilityCounters {
+    /// Counters from the ordinary accepted report, which combines residual and decoder
+    /// normalization.  These are not residual-only certificate trace counters.
+    pub ordinary_baseline: OrdinaryBaselineCounters,
+    /// Reserved as a distinct type for later residual recorder observations.
+    pub residual_trace: ResidualTraceCounters,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OrdinaryBaselineCounters {
     pub occurrences: u64,
     pub samples: u64,
     pub normalization_nodes_processed: u64,
@@ -116,6 +125,11 @@ pub struct BaseFeasibilityCounters {
     pub normalization_relation_remaining: u64,
     pub normalization_bounded_fold_count: u64,
 }
+
+/// Residual-only recorder counters are intentionally absent in the base summary.  A distinct
+/// empty type keeps that absence explicit without introducing a collection of optional fields.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ResidualTraceCounters {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BaseNBreakdown {
@@ -147,6 +161,7 @@ pub(crate) struct CertificateClosure {
     pub source_ids: BTreeSet<super::arena::SemanticSourceIdentity>,
     pub family_source_ids: BTreeSet<super::arena::SemanticFamilySourceIdentity>,
     pub event_ids: BTreeSet<super::arena::SampleEventId>,
+    pub constant_expressions: BTreeSet<ExprId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -184,6 +199,7 @@ pub(crate) fn collect_residual_closure(
     let mut source_ids = BTreeSet::new();
     let mut family_source_ids = BTreeSet::new();
     let mut event_ids = BTreeSet::new();
+    let mut constant_expressions = BTreeSet::new();
     let mut work = Vec::new();
     match root {
         CertificateResidualRoot::Closed { root, .. } => {
@@ -201,6 +217,9 @@ pub(crate) fn collect_residual_closure(
                 let node = job.expressions().node(expression)?;
                 let inputs = node.inputs.clone();
                 match &node.operator {
+                    ValueOperator::Constant(_) => {
+                        constant_expressions.insert(expression);
+                    }
                     ValueOperator::Source(source) => {
                         source_ids.insert(source.clone());
                         if let Some(event) = source.sample_event {
@@ -268,6 +287,7 @@ pub(crate) fn collect_residual_closure(
         source_ids,
         family_source_ids,
         event_ids,
+        constant_expressions,
     })
 }
 
@@ -427,6 +447,7 @@ pub fn prepare_base_feasibility_summary(
         .source_ids
         .len()
         .checked_add(closure.family_source_ids.len())
+        .and_then(|count| count.checked_add(closure.constant_expressions.len()))
         .ok_or_else(|| "base feasibility source-row count overflow".to_owned())?;
     let total_rows = closure
         .expressions
@@ -446,15 +467,18 @@ pub fn prepare_base_feasibility_summary(
         threshold_left: threshold_left.to_string(),
         margin: margin.to_string(),
         counters: BaseFeasibilityCounters {
-            occurrences: run.accepted_report.counters.occurrences,
-            samples: run.accepted_report.counters.samples,
-            normalization_nodes_processed: normalization.nodes_processed,
-            normalization_nodes_total: normalization.nodes_total,
-            normalization_exact_term_count: normalization.final_exact_term_count,
-            normalization_relation_candidates: normalization.relation_candidates,
-            normalization_relation_applied: normalization.relation_applied,
-            normalization_relation_remaining: normalization.relation_remaining,
-            normalization_bounded_fold_count: normalization.bounded_fold_count,
+            ordinary_baseline: OrdinaryBaselineCounters {
+                occurrences: run.accepted_report.counters.occurrences,
+                samples: run.accepted_report.counters.samples,
+                normalization_nodes_processed: normalization.nodes_processed,
+                normalization_nodes_total: normalization.nodes_total,
+                normalization_exact_term_count: normalization.final_exact_term_count,
+                normalization_relation_candidates: normalization.relation_candidates,
+                normalization_relation_applied: normalization.relation_applied,
+                normalization_relation_remaining: normalization.relation_remaining,
+                normalization_bounded_fold_count: normalization.bounded_fold_count,
+            },
+            residual_trace: ResidualTraceCounters::default(),
         },
         n: BaseNBreakdown {
             expression_rows: closure.expressions.len(),
@@ -1697,6 +1721,7 @@ mod tests {
         assert!(closure.expressions.contains(&root_expression));
         assert!(closure.expressions.contains(&left));
         assert!(closure.expressions.contains(&right));
+        assert_eq!(closure.constant_expressions.len(), 2);
         assert!(closure.programs.is_empty());
         assert!(closure.families.is_empty());
     }
@@ -1876,6 +1901,7 @@ mod tests {
         };
         let closure = collect_residual_closure(&job, &projected).expect("residual closure");
         assert!(closure.expressions.contains(&residual.expression()));
+        assert_eq!(closure.constant_expressions, [residual.expression()].into_iter().collect());
         assert!(!closure.expressions.contains(&decoder.expression()));
     }
 
@@ -1919,6 +1945,22 @@ mod tests {
         assert_eq!(first.schema_id, BASE_FEASIBILITY_SCHEMA_ID);
         assert_eq!(first.schema_version, BASE_FEASIBILITY_SCHEMA_VERSION);
         assert!(first.accepted);
+        let run = prepare_operational_certificate(&protocol, &request)
+            .expect("ordinary accepted baseline");
+        let expected_source_rows = run
+            .projection
+            .closure
+            .source_ids
+            .len()
+            .checked_add(run.projection.closure.family_source_ids.len())
+            .and_then(|count| count.checked_add(run.projection.closure.constant_expressions.len()))
+            .expect("source rows");
+        assert_eq!(first.n.source_rows, expected_source_rows);
+        assert_eq!(first.counters.residual_trace, ResidualTraceCounters::default());
+        assert_eq!(
+            first.counters.ordinary_baseline.normalization_nodes_processed,
+            run.accepted_report.counters.normalization.nodes_processed
+        );
         assert_eq!(
             first.n.total_rows,
             first.n.expression_rows +

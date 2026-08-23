@@ -39,6 +39,7 @@ pub(crate) trait FeasibilitySink: Default {
         &mut self,
         consumer: super::arena::ScopedExprId,
         input_position: u32,
+        input_arity: u32,
         predecessor: ExprId,
     ) -> Result<(), G0Error>;
 
@@ -186,6 +187,7 @@ pub(crate) enum NormalizerEvent {
     Predecessor {
         consumer: super::arena::ScopedExprId,
         input_position: u32,
+        input_arity: u32,
         predecessor: ExprId,
         source_result: EventIndex,
     },
@@ -1295,6 +1297,7 @@ impl FeasibilitySink for NoFeasibility {
         &mut self,
         _consumer: super::arena::ScopedExprId,
         _input_position: u32,
+        _input_arity: u32,
         _predecessor: ExprId,
     ) -> Result<(), G0Error> {
         Ok(())
@@ -1431,6 +1434,7 @@ impl FeasibilitySink for FeasibilityTrace {
         &mut self,
         consumer: super::arena::ScopedExprId,
         input_position: u32,
+        input_arity: u32,
         predecessor: ExprId,
     ) -> Result<(), G0Error> {
         let frame = self.frames.last().ok_or(G0Error::MissingNormalizationResult)?;
@@ -1439,6 +1443,7 @@ impl FeasibilitySink for FeasibilityTrace {
         self.events.push(NormalizerEvent::Predecessor {
             consumer,
             input_position,
+            input_arity,
             predecessor,
             source_result,
         });
@@ -1642,11 +1647,13 @@ impl FeasibilitySink for FeasibilityTrace {
             BTreeMap<ExprId, EventIndex>,
             BTreeSet<super::arena::ScopedExprId>,
         )>::new();
+        let mut frame_starts = vec![None; self.events.len()];
         for (position, event) in self.events.iter().enumerate() {
             let current = EventIndex(u64::try_from(position).map_err(|_| G0Error::TraceOverflow)?);
             match event {
                 NormalizerEvent::InvocationStart { root } => {
                     stack.push((*root, current, BTreeMap::new(), BTreeSet::new()));
+                    frame_starts[position] = Some(current);
                 }
                 NormalizerEvent::Result { owner, .. } => {
                     let Some((root, _, results, pending_bounds)) = stack.last_mut() else {
@@ -1741,14 +1748,20 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                 }
                 NormalizerEvent::BoundTransfer { owner, .. } => {
-                    let Some((root, _, _, pending_bounds)) = stack.last_mut() else {
+                    let Some((root, start, _, pending_bounds)) = stack.last_mut() else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
                     if root.program() != owner.program() {
                         return Err(G0Error::RelationTraceInvariant);
                     }
+                    frame_starts[position] = Some(*start);
+                    let NormalizerEvent::BoundTransfer { rule, .. } = event else { unreachable!() };
+                    self.validate_bound_rule(*root, *owner, *start, current, &frame_starts, rule)?;
                     pending_bounds.insert(*owner);
                 }
+            }
+            if frame_starts[position].is_none() {
+                frame_starts[position] = stack.last().map(|(_, start, _, _)| *start);
             }
         }
         if !stack.is_empty() {
@@ -1798,6 +1811,144 @@ impl FeasibilitySink for FeasibilityTrace {
 }
 
 impl FeasibilityTrace {
+    fn projection_is_available(value: &RecordedValue, projection: &BoundProjection) -> bool {
+        match projection {
+            BoundProjection::Coefficient => {
+                !matches!(value.coefficient_bound, super::facts::NumericContract::Missing)
+            }
+            BoundProjection::Summary => value.exact_nf.is_some(),
+        }
+    }
+
+    fn validate_bound_value_ref(
+        &self,
+        root: super::arena::ScopedExprId,
+        owner: super::arena::ScopedExprId,
+        frame_start: EventIndex,
+        current: EventIndex,
+        frame_starts: &[Option<EventIndex>],
+        value_ref: &BoundValueRef,
+    ) -> Result<(), G0Error> {
+        let same_frame = |index: EventIndex| {
+            index.0 < current.0 &&
+                frame_starts.get(index.0 as usize).copied().flatten() == Some(frame_start)
+        };
+        match value_ref {
+            BoundValueRef::Predecessor { input_position, projection } => {
+                let mut found = false;
+                for index in frame_start.0..current.0 {
+                    let event_index = EventIndex(index);
+                    let Some(NormalizerEvent::Predecessor {
+                        consumer,
+                        input_position: position,
+                        input_arity,
+                        predecessor,
+                        source_result,
+                    }) = self.events.get(index as usize)
+                    else {
+                        continue;
+                    };
+                    if *consumer != owner ||
+                        *position != *input_position ||
+                        *position >= *input_arity
+                    {
+                        continue;
+                    }
+                    if !same_frame(event_index) || !same_frame(*source_result) {
+                        continue;
+                    }
+                    let Some(NormalizerEvent::Result { owner: result_owner, value }) =
+                        self.events.get(source_result.0 as usize)
+                    else {
+                        continue;
+                    };
+                    if result_owner.program() != root.program() ||
+                        result_owner.expression() != *predecessor ||
+                        !Self::projection_is_available(value, projection)
+                    {
+                        continue;
+                    }
+                    found = true;
+                    break;
+                }
+                if !found {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+            }
+            BoundValueRef::Result { event, projection } => {
+                if !same_frame(*event) {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                let Some(NormalizerEvent::Result { owner: result_owner, value }) =
+                    self.events.get(event.0 as usize)
+                else {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                };
+                if result_owner.program() != root.program() ||
+                    !Self::projection_is_available(value, projection)
+                {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+            }
+            BoundValueRef::Transfer(event) => {
+                if !same_frame(*event) {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                let Some(NormalizerEvent::BoundTransfer { owner: transfer_owner, .. }) =
+                    self.events.get(event.0 as usize)
+                else {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                };
+                if transfer_owner.program() != root.program() {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_bound_rule(
+        &self,
+        root: super::arena::ScopedExprId,
+        owner: super::arena::ScopedExprId,
+        frame_start: EventIndex,
+        current: EventIndex,
+        frame_starts: &[Option<EventIndex>],
+        rule: &BoundRule,
+    ) -> Result<(), G0Error> {
+        let mut refs = Vec::new();
+        match rule {
+            BoundRule::Authority(BoundAuthority::Unavailable) => {
+                return Err(G0Error::UnsupportedBoundTransfer)
+            }
+            BoundRule::Authority(_) => {}
+            BoundRule::Identity { input } => refs.push(input),
+            BoundRule::Sum { inputs } |
+            BoundRule::Maximum { inputs } |
+            BoundRule::WeightedSum { inputs } => refs.extend(inputs.iter()),
+            BoundRule::Scale { value, scale } => {
+                refs.push(value);
+                if let BoundScale::Value(value) = scale {
+                    refs.push(value);
+                }
+            }
+            BoundRule::Product { left, right, .. } | BoundRule::Tensor { left, right, .. } => {
+                refs.push(left);
+                refs.push(right);
+            }
+        }
+        refs.into_iter().try_for_each(|value_ref| {
+            self.validate_bound_value_ref(
+                root,
+                owner,
+                frame_start,
+                current,
+                frame_starts,
+                value_ref,
+            )
+        })
+    }
+
     /// Encode only typed lowering observations. Legacy semantic `invocation` strings are
     /// intentionally excluded: ownership, protocol aliases, and artifact bindings below are
     /// the canonical identity authority for this opt-in trace.
@@ -3599,8 +3750,28 @@ mod tests {
             .expect("parent owner");
         let child =
             programs.scoped(&expressions, family.program(), child_expression).expect("child owner");
+        let left =
+            programs.scoped(&expressions, family.program(), left_expression).expect("left owner");
         let mut valid = FeasibilityTrace::default();
         valid.record_invocation_start(parent).expect("start");
+        let child_value = super::super::normal_form::AnalyzedValue {
+            semantic: child,
+            exact_nf: None,
+            coefficient_bound: super::super::facts::NumericContract::Known(
+                super::super::facts::CoefficientBound::finite(2_u8),
+            ),
+        };
+        let left_value = super::super::normal_form::AnalyzedValue {
+            semantic: left,
+            exact_nf: None,
+            coefficient_bound: super::super::facts::NumericContract::Known(
+                super::super::facts::CoefficientBound::finite(1_u8),
+            ),
+        };
+        valid.record_normalization_result(left, &left_value).expect("left result");
+        valid.record_normalization_result(child, &child_value).expect("child result");
+        valid.record_predecessor(parent, 0, 2, left_expression).expect("left predecessor");
+        valid.record_predecessor(parent, 1, 2, child_expression).expect("child predecessor");
         valid
             .record_bound_transfer(
                 parent,
@@ -3659,25 +3830,49 @@ mod tests {
                 .count(),
             2
         );
+        for replacement in [
+            BoundValueRef::Predecessor {
+                input_position: 9,
+                projection: BoundProjection::Coefficient,
+            },
+            BoundValueRef::Result {
+                event: EventIndex(u64::MAX),
+                projection: BoundProjection::Coefficient,
+            },
+            BoundValueRef::Transfer(EventIndex(0)),
+        ] {
+            let mut malformed = valid.clone();
+            if let Some(NormalizerEvent::BoundTransfer { rule, .. }) = malformed
+                .events
+                .iter_mut()
+                .find(|event| matches!(event, NormalizerEvent::BoundTransfer { .. }))
+            {
+                if let BoundRule::Tensor { left, .. } = rule {
+                    *left = replacement;
+                }
+            }
+            assert_eq!(
+                malformed.validate_normalization_observations(),
+                Err(G0Error::UnsupportedBoundTransfer)
+            );
+        }
+        let mut unavailable = valid.clone();
+        if let Some(NormalizerEvent::BoundTransfer { rule, .. }) = unavailable
+            .events
+            .iter_mut()
+            .find(|event| matches!(event, NormalizerEvent::BoundTransfer { .. }))
+        {
+            *rule = BoundRule::Authority(BoundAuthority::Unavailable);
+        }
+        assert_eq!(
+            unavailable.validate_normalization_observations(),
+            Err(G0Error::UnsupportedBoundTransfer)
+        );
 
         let mut nested = FeasibilityTrace::default();
         nested.record_invocation_start(parent).expect("parent start");
         nested
-            .record_bound_transfer(
-                child,
-                BoundRule::Tensor {
-                    left: BoundValueRef::Predecessor {
-                        input_position: 0,
-                        projection: BoundProjection::Coefficient,
-                    },
-                    right: BoundValueRef::Predecessor {
-                        input_position: 1,
-                        projection: BoundProjection::Coefficient,
-                    },
-                    left_is_constant_polynomial: false,
-                    right_is_constant_polynomial: false,
-                },
-            )
+            .record_bound_transfer(child, BoundRule::Authority(BoundAuthority::Operator))
             .expect("bound transfer");
         nested.record_invocation_start(child).expect("child start");
         nested

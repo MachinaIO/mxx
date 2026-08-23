@@ -1096,13 +1096,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         &mut self,
         consumer: ScopedExprId,
         input_position: u32,
+        input_arity: u32,
         predecessor: ExprId,
     ) -> Result<(), NormalizeError> {
         if S::ENABLED {
             self.sink
                 .as_deref_mut()
                 .ok_or(super::g0::G0Error::MissingNormalizationResult)?
-                .record_predecessor(consumer, input_position, predecessor)?;
+                .record_predecessor(consumer, input_position, input_arity, predecessor)?;
         }
         Ok(())
     }
@@ -1263,7 +1264,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let mut children = Vec::with_capacity(node.inputs.len());
         for (input_position, child) in node.inputs.iter().enumerate() {
             children.push(self.child_value(*child)?);
-            self.observe_predecessor(semantic, input_position as u32, *child)?;
+            self.observe_predecessor(
+                semantic,
+                input_position as u32,
+                u32::try_from(node.inputs.len()).map_err(|_| NormalizeError::ArithmeticOverflow)?,
+                *child,
+            )?;
         }
         let output_type = self.expressions.value_type(expression)?.clone();
         let mut value = if matches!(output_type, ResolvedValueType::Matrix(_)) {
@@ -8839,6 +8845,39 @@ mod tests {
             root_rule(&mut expressions, &mut programs, crt),
             BoundRule::WeightedSum { inputs } if inputs.len() == 2
         ));
+    }
+
+    #[test]
+    fn fact_store_authority_precedes_source_operator_fallback() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let source = matrix_source(&mut expressions, "fact-authority", matrix_type(), None);
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, source);
+        insert_matrix_bound(&mut facts, &expressions, source, 4);
+        let mut trace = FeasibilityTrace::default();
+        let mut normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap();
+        assert_eq!(
+            normalizer.normalize(semantic).unwrap().coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(4_u8))
+        );
+        drop(normalizer);
+        trace.validate_normalization_observations().unwrap();
+        assert!(trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Authority(BoundAuthority::FactStore),
+                } if *owner == semantic
+            )
+        }));
     }
 
     #[test]

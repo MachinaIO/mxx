@@ -276,6 +276,13 @@ pub(crate) enum BoundScale {
     Magnitude(BigUint),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct MonomialFactorEvidence {
+    pub bound: BoundValueRef,
+    pub is_constant_polynomial: bool,
+    pub support_upper: Option<usize>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BoundRule {
     Authority(BoundAuthority),
@@ -291,6 +298,10 @@ pub(crate) enum BoundRule {
     Scale {
         value: BoundValueRef,
         scale: BoundScale,
+    },
+    MonomialProduct {
+        monomial: super::monomial::MonomialId,
+        factors: Box<[MonomialFactorEvidence]>,
     },
     WeightedSum {
         inputs: Box<[BoundValueRef]>,
@@ -1930,6 +1941,12 @@ impl FeasibilityTrace {
                 if let BoundScale::Value(value) = scale {
                     refs.push(value);
                 }
+            }
+            BoundRule::MonomialProduct { factors, .. } => {
+                if factors.is_empty() {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                refs.extend(factors.iter().map(|factor| &factor.bound));
             }
             BoundRule::Product { left, right, .. } | BoundRule::Tensor { left, right, .. } => {
                 refs.push(left);
@@ -3884,6 +3901,24 @@ mod tests {
         }
         assert_eq!(
             unavailable.validate_normalization_observations(),
+            Err(G0Error::UnsupportedBoundTransfer)
+        );
+        let mut empty_monomial = valid.clone();
+        if let Some(NormalizerEvent::BoundTransfer { rule, .. }) = empty_monomial
+            .events
+            .iter_mut()
+            .find(|event| matches!(event, NormalizerEvent::BoundTransfer { .. }))
+        {
+            *rule = BoundRule::MonomialProduct {
+                monomial: super::super::monomial::MonomialId::new(
+                    super::super::arena::ArenaToken::fresh(),
+                    0,
+                ),
+                factors: Box::new([]),
+            };
+        }
+        assert_eq!(
+            empty_monomial.validate_normalization_observations(),
             Err(G0Error::UnsupportedBoundTransfer)
         );
 

@@ -43,21 +43,6 @@ pub struct MonomialDescriptor {
     pub ordered_factors: Box<[ScopedExprId]>,
 }
 
-/// An owned descriptor derived exclusively from already validated monomials in one arena.
-/// Its private fields prevent callers from turning raw scoped factors into an interning
-/// capability without passing the arena's normal validation boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DerivedMonomialDescriptor {
-    descriptor: MonomialDescriptor,
-    hash: u64,
-}
-
-impl DerivedMonomialDescriptor {
-    pub(crate) fn ordered_factors(&self) -> &[ScopedExprId] {
-        &self.descriptor.ordered_factors
-    }
-}
-
 /// The exact-term map deliberately stores IDs, never factor trees.
 pub type TermMap<V> = BTreeMap<MonomialId, V>;
 
@@ -221,45 +206,8 @@ struct PreparedWrappedDescriptor {
 pub(crate) struct MonomialSweepReport {
     pub high_water_slots: u64,
     pub occupied_slots: u64,
-    pub protected_prefix_occupied_slots: u64,
     pub reclaimed_slots: u64,
     pub reclaimed_payload_lower_bound_bytes: u64,
-    pub bucket_entries: u64,
-    pub occupied_central_factor_entries: u64,
-    pub occupied_ordered_factor_entries: u64,
-    pub occupied_factor_payload_lower_bound_bytes: u64,
-    pub protected_prefix: MonomialSweepOwnerReport,
-    pub value_cache: MonomialSweepOwnerReport,
-    pub exact_plan: MonomialSweepOwnerReport,
-    pub gadget: MonomialSweepOwnerReport,
-    pub canonical_runtime: MonomialSweepOwnerReport,
-    pub closed: MonomialSweepOwnerReport,
-    pub suspended: MonomialSweepOwnerReport,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct MonomialSweepOwnerReport {
-    pub descriptor_slots: u64,
-    pub payload_lower_bound_bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct MonomialOwnerCensus {
-    pub allocated_descriptor_slots: u64,
-    pub retained_descriptor_slots: u64,
-    pub reclaimed_descriptor_slots: u64,
-    pub reachable_descriptor_slots: u64,
-    pub reachable_central_factor_entries: u64,
-    pub reachable_ordered_factor_entries: u64,
-    pub reachable_max_factor_word: u64,
-    /// Descriptor and boxed-factor payload only. This deliberately excludes allocator metadata,
-    /// `Vec` spare capacity, and `BTreeMap` node overhead, so it is a transparent lower bound.
-    pub owned_payload_lower_bound_bytes: u64,
-    pub unreachable_descriptor_slots: u64,
-    pub unreachable_central_factor_entries: u64,
-    pub unreachable_ordered_factor_entries: u64,
-    pub unreachable_payload_lower_bound_bytes: u64,
-    pub invalid_root_count: u64,
 }
 
 impl MonomialArena {
@@ -407,77 +355,6 @@ impl MonomialArena {
         })
     }
 
-    pub(crate) fn derive_product(
-        &self,
-        scope: ValueProgramId,
-        left: MonomialId,
-        right: MonomialId,
-    ) -> Result<DerivedMonomialDescriptor, MonomialError> {
-        if scope != self.scope {
-            return Err(MonomialError::ForeignScope { expected: self.scope, actual: scope });
-        }
-        let left = self.descriptor(left)?;
-        let right = self.descriptor(right)?;
-        Self::derive_from_descriptors([left, right])
-    }
-
-    pub(crate) fn derive_gadget_splice(
-        &self,
-        source: &DerivedMonomialDescriptor,
-        index: usize,
-        input: MonomialId,
-    ) -> Result<DerivedMonomialDescriptor, MonomialError> {
-        let input = self.descriptor(input)?;
-        let ordered = source.descriptor.ordered_factors.as_ref();
-        if index.checked_add(1).is_none_or(|right| right >= ordered.len()) {
-            return Err(MonomialError::ArenaExhausted);
-        }
-        let central_len = source
-            .descriptor
-            .central_factors
-            .len()
-            .checked_add(input.central_factors.len())
-            .ok_or(MonomialError::ArenaExhausted)?;
-        let ordered_len = ordered
-            .len()
-            .checked_sub(2)
-            .and_then(|len| len.checked_add(input.ordered_factors.len()))
-            .ok_or(MonomialError::ArenaExhausted)?;
-        let mut central = Vec::new();
-        central.try_reserve_exact(central_len).map_err(|_| MonomialError::ArenaExhausted)?;
-        central.extend_from_slice(&source.descriptor.central_factors);
-        central.extend_from_slice(&input.central_factors);
-        central.sort_unstable();
-        let mut replacement = Vec::new();
-        replacement.try_reserve_exact(ordered_len).map_err(|_| MonomialError::ArenaExhausted)?;
-        replacement.extend_from_slice(&ordered[..index]);
-        replacement.extend_from_slice(&input.ordered_factors);
-        replacement.extend_from_slice(&ordered[index + 2..]);
-        let descriptor = MonomialDescriptor {
-            central_factors: central.into_boxed_slice(),
-            ordered_factors: replacement.into_boxed_slice(),
-        };
-        let hash = structural_hash(&descriptor);
-        Ok(DerivedMonomialDescriptor { descriptor, hash })
-    }
-
-    pub(crate) fn intern_derived(
-        &mut self,
-        derived: DerivedMonomialDescriptor,
-    ) -> Result<MonomialId, MonomialError> {
-        self.intern_prepared_descriptor(PreparedMonomialDescriptor {
-            descriptor: derived.descriptor,
-            hash: derived.hash,
-        })
-    }
-
-    fn derive_from_descriptors<'descriptor>(
-        descriptors: impl IntoIterator<Item = &'descriptor MonomialDescriptor>,
-    ) -> Result<DerivedMonomialDescriptor, MonomialError> {
-        let prepared = Self::prepare_descriptor(descriptors)?;
-        Ok(DerivedMonomialDescriptor { descriptor: prepared.descriptor, hash: prepared.hash })
-    }
-
     /// Wrap many already-validated input monomials in the same optional prefix and suffix.
     ///
     /// Descriptor construction and structural hashing are read-only and therefore run in
@@ -610,33 +487,6 @@ impl MonomialArena {
         Ok(PreparedOrExistingMonomial::Prepared(PreparedMonomialDescriptor { descriptor, hash }))
     }
 
-    fn prepare_descriptor<'descriptor>(
-        descriptors: impl IntoIterator<Item = &'descriptor MonomialDescriptor>,
-    ) -> Result<PreparedMonomialDescriptor, MonomialError> {
-        let descriptors = descriptors.into_iter().collect::<Vec<_>>();
-        let central_len = descriptors.iter().try_fold(0_usize, |len, descriptor| {
-            len.checked_add(descriptor.central_factors.len()).ok_or(MonomialError::ArenaExhausted)
-        })?;
-        let ordered_len = descriptors.iter().try_fold(0_usize, |len, descriptor| {
-            len.checked_add(descriptor.ordered_factors.len()).ok_or(MonomialError::ArenaExhausted)
-        })?;
-        let mut central = Vec::new();
-        central.try_reserve_exact(central_len).map_err(|_| MonomialError::ArenaExhausted)?;
-        let mut ordered = Vec::new();
-        ordered.try_reserve_exact(ordered_len).map_err(|_| MonomialError::ArenaExhausted)?;
-        for descriptor in descriptors {
-            central.extend_from_slice(&descriptor.central_factors);
-            ordered.extend_from_slice(&descriptor.ordered_factors);
-        }
-        central.sort_unstable();
-        let descriptor = MonomialDescriptor {
-            central_factors: central.into_boxed_slice(),
-            ordered_factors: ordered.into_boxed_slice(),
-        };
-        let hash = structural_hash(&descriptor);
-        Ok(PreparedMonomialDescriptor { descriptor, hash })
-    }
-
     /// Find an exact descriptor which has already been validated and interned in this arena.
     ///
     /// Relation fixed-point matching uses this for RHS-derived subwords which are not necessarily
@@ -732,80 +582,6 @@ impl MonomialArena {
         Ok(MonomialId::new(self.token, slot))
     }
 
-    pub(crate) fn owner_census(
-        &self,
-        roots: impl IntoIterator<Item = MonomialId>,
-    ) -> MonomialOwnerCensus {
-        let allocated_descriptor_slots = u64::try_from(self.descriptors.len()).unwrap_or(u64::MAX);
-        let retained_descriptor_slots = self.occupied_descriptor_slots;
-        let mut marked = vec![0_u64; self.descriptors.len().div_ceil(64)];
-        let mut invalid_root_count = 0_u64;
-        for root in roots {
-            if root.arena != self.token ||
-                self.descriptors.get(root.slot as usize).and_then(Option::as_ref).is_none()
-            {
-                invalid_root_count = invalid_root_count.saturating_add(1);
-                continue;
-            }
-            let slot = root.slot as usize;
-            marked[slot / 64] |= 1_u64 << (slot % 64);
-        }
-        let mut reachable_descriptor_slots = 0_u64;
-        let mut reachable_central = 0_u64;
-        let mut reachable_ordered = 0_u64;
-        let mut max_factor_word = 0_u64;
-        for (slot, descriptor) in self.descriptors.iter().enumerate() {
-            let Some(descriptor) = descriptor.as_ref() else { continue };
-            if marked.get(slot / 64).is_some_and(|word| word & (1_u64 << (slot % 64)) != 0) {
-                reachable_descriptor_slots = reachable_descriptor_slots.saturating_add(1);
-                let central = u64::try_from(descriptor.central_factors.len()).unwrap_or(u64::MAX);
-                let ordered = u64::try_from(descriptor.ordered_factors.len()).unwrap_or(u64::MAX);
-                reachable_central = reachable_central.saturating_add(central);
-                reachable_ordered = reachable_ordered.saturating_add(ordered);
-                max_factor_word = max_factor_word.max(central.saturating_add(ordered));
-            }
-        }
-        let factor_entries = reachable_central.saturating_add(reachable_ordered);
-        let descriptor_bytes = reachable_descriptor_slots.saturating_mul(
-            u64::try_from(std::mem::size_of::<MonomialDescriptor>()).unwrap_or(u64::MAX),
-        );
-        let factor_bytes = factor_entries
-            .saturating_mul(u64::try_from(std::mem::size_of::<ScopedExprId>()).unwrap_or(u64::MAX));
-        MonomialOwnerCensus {
-            allocated_descriptor_slots,
-            retained_descriptor_slots,
-            reclaimed_descriptor_slots: allocated_descriptor_slots
-                .saturating_sub(retained_descriptor_slots),
-            reachable_descriptor_slots,
-            reachable_central_factor_entries: reachable_central,
-            reachable_ordered_factor_entries: reachable_ordered,
-            reachable_max_factor_word: max_factor_word,
-            owned_payload_lower_bound_bytes: descriptor_bytes.saturating_add(factor_bytes),
-            unreachable_descriptor_slots: retained_descriptor_slots
-                .saturating_sub(reachable_descriptor_slots),
-            unreachable_central_factor_entries: self
-                .central_factor_entries
-                .saturating_sub(reachable_central),
-            unreachable_ordered_factor_entries: self
-                .ordered_factor_entries
-                .saturating_sub(reachable_ordered),
-            unreachable_payload_lower_bound_bytes: retained_descriptor_slots
-                .saturating_sub(reachable_descriptor_slots)
-                .saturating_mul(
-                    u64::try_from(std::mem::size_of::<MonomialDescriptor>()).unwrap_or(u64::MAX),
-                )
-                .saturating_add(
-                    self.central_factor_entries
-                        .saturating_add(self.ordered_factor_entries)
-                        .saturating_sub(factor_entries)
-                        .saturating_mul(
-                            u64::try_from(std::mem::size_of::<ScopedExprId>()).unwrap_or(u64::MAX),
-                        ),
-                ),
-            invalid_root_count,
-        }
-    }
-
     pub fn descriptor(&self, id: MonomialId) -> Result<&MonomialDescriptor, MonomialError> {
         if id.arena != self.token {
             return Err(MonomialError::InvalidMonomialId { expected: self.token, actual: id.arena });
@@ -817,69 +593,22 @@ impl MonomialArena {
             .ok_or(MonomialError::CollectedMonomialId { slot: id.slot })
     }
 
-    pub(crate) fn descriptor_payload_lower_bound_bytes(
-        &self,
-        id: MonomialId,
-    ) -> Result<u64, MonomialError> {
-        let descriptor = self.descriptor(id)?;
-        Ok(descriptor_payload_lower_bound_bytes(
-            u64::try_from(descriptor.central_factors.len()).unwrap_or(u64::MAX),
-            u64::try_from(descriptor.ordered_factors.len()).unwrap_or(u64::MAX),
-        ))
-    }
-
     /// Collect unrooted descriptors without changing any surviving or future slot identity.
     /// Every supplied root is authoritative: foreign, out-of-range, or already-collected roots
     /// fail closed before the arena is mutated.
-    #[cfg(test)]
     pub(crate) fn sweep(
         &mut self,
         protected_prefix: usize,
         roots: impl IntoIterator<Item = MonomialId>,
     ) -> Result<MonomialSweepReport, MonomialError> {
-        self.sweep_with_owners(
-            protected_prefix,
-            roots,
-            std::iter::empty(),
-            std::iter::empty(),
-            std::iter::empty(),
-            std::iter::empty(),
-            std::iter::empty(),
-        )
-    }
-
-    pub(crate) fn sweep_with_owners(
-        &mut self,
-        protected_prefix: usize,
-        value_cache_roots: impl IntoIterator<Item = MonomialId>,
-        exact_plan_roots: impl IntoIterator<Item = MonomialId>,
-        gadget_roots: impl IntoIterator<Item = MonomialId>,
-        canonical_runtime_roots: impl IntoIterator<Item = MonomialId>,
-        closed_roots: impl IntoIterator<Item = MonomialId>,
-        suspended_roots: impl IntoIterator<Item = MonomialId>,
-    ) -> Result<MonomialSweepReport, MonomialError> {
         let high_water = self.descriptors.len();
         let protected_prefix = protected_prefix.min(high_water);
         let mut marked = vec![0_u64; high_water.div_ceil(64)];
-        let mut protected_report = MonomialSweepOwnerReport::default();
         for slot in 0..protected_prefix {
-            let Some(descriptor) = self.descriptors[slot].as_ref() else { continue };
+            let Some(_) = self.descriptors[slot].as_ref() else { continue };
             marked[slot / 64] |= 1_u64 << (slot % 64);
-            protected_report.descriptor_slots = protected_report.descriptor_slots.saturating_add(1);
-            protected_report.payload_lower_bound_bytes = protected_report
-                .payload_lower_bound_bytes
-                .saturating_add(descriptor_payload_lower_bound_bytes(
-                    u64::try_from(descriptor.central_factors.len()).unwrap_or(u64::MAX),
-                    u64::try_from(descriptor.ordered_factors.len()).unwrap_or(u64::MAX),
-                ));
         }
-        let value_cache = self.mark_sweep_owner(&mut marked, value_cache_roots.into_iter())?;
-        let exact_plan = self.mark_sweep_owner(&mut marked, exact_plan_roots.into_iter())?;
-        let gadget = self.mark_sweep_owner(&mut marked, gadget_roots.into_iter())?;
-        let canonical_runtime =
-            self.mark_sweep_owner(&mut marked, canonical_runtime_roots.into_iter())?;
-        let closed = self.mark_sweep_owner(&mut marked, closed_roots.into_iter())?;
-        let suspended = self.mark_sweep_owner(&mut marked, suspended_roots.into_iter())?;
+        self.mark_sweep_roots(&mut marked, roots.into_iter())?;
 
         // Descriptor slots are monotonic and therefore naturally ordered. Even with many
         // tombstones, this contiguous scan is substantially faster than following the hash
@@ -956,34 +685,16 @@ impl MonomialArena {
         Ok(MonomialSweepReport {
             high_water_slots: u64::try_from(high_water).unwrap_or(u64::MAX),
             occupied_slots: self.occupied_descriptor_slots,
-            protected_prefix_occupied_slots: protected_report.descriptor_slots,
             reclaimed_slots,
             reclaimed_payload_lower_bound_bytes: reclaimed_payload,
-            bucket_entries: self.occupied_descriptor_slots,
-            occupied_central_factor_entries: self.central_factor_entries,
-            occupied_ordered_factor_entries: self.ordered_factor_entries,
-            occupied_factor_payload_lower_bound_bytes: self
-                .central_factor_entries
-                .saturating_add(self.ordered_factor_entries)
-                .saturating_mul(
-                    u64::try_from(std::mem::size_of::<ScopedExprId>()).unwrap_or(u64::MAX),
-                ),
-            protected_prefix: protected_report,
-            value_cache,
-            exact_plan,
-            gadget,
-            canonical_runtime,
-            closed,
-            suspended,
         })
     }
 
-    fn mark_sweep_owner(
+    fn mark_sweep_roots(
         &self,
         marked: &mut [u64],
         roots: impl Iterator<Item = MonomialId>,
-    ) -> Result<MonomialSweepOwnerReport, MonomialError> {
-        let mut report = MonomialSweepOwnerReport::default();
+    ) -> Result<(), MonomialError> {
         for root in roots {
             if root.arena != self.token {
                 return Err(MonomialError::InvalidMonomialId {
@@ -994,7 +705,7 @@ impl MonomialArena {
             let Some(entry) = self.descriptors.get(root.slot as usize) else {
                 return Err(MonomialError::InvalidSlot { slot: root.slot });
             };
-            let Some(descriptor) = entry.as_ref() else {
+            let Some(_) = entry.as_ref() else {
                 return Err(MonomialError::CollectedMonomialId { slot: root.slot });
             };
             let slot = root.slot as usize;
@@ -1003,15 +714,8 @@ impl MonomialArena {
                 continue;
             }
             marked[slot / 64] |= mask;
-            report.descriptor_slots = report.descriptor_slots.saturating_add(1);
-            report.payload_lower_bound_bytes = report.payload_lower_bound_bytes.saturating_add(
-                descriptor_payload_lower_bound_bytes(
-                    u64::try_from(descriptor.central_factors.len()).unwrap_or(u64::MAX),
-                    u64::try_from(descriptor.ordered_factors.len()).unwrap_or(u64::MAX),
-                ),
-            );
         }
-        Ok(report)
+        Ok(())
     }
 
     fn validate_factors(
@@ -1225,40 +929,6 @@ mod tests {
     }
 
     #[test]
-    fn owner_census_tracks_append_only_descriptor_and_factor_payloads() {
-        let (expressions, programs, scope, one, _, _) = fixture();
-        let mut arena = MonomialArena::new(&expressions, &programs, scope).unwrap();
-        let root = programs.root(&expressions, scope).unwrap();
-        let first = arena.intern(&expressions, &programs, &[root, one], &[one]).unwrap();
-        // A byte-identical hit owns no additional descriptor or factor payload.
-        let hit = arena.intern(&expressions, &programs, &[one, root], &[one]).unwrap();
-        let second = arena.intern(&expressions, &programs, &[], &[root, one]).unwrap();
-        assert_eq!(first, hit);
-
-        // Repeated references are deliberately non-additive in the exact reachable union.
-        let census = arena.owner_census([first, hit, second]);
-        assert_eq!(census.retained_descriptor_slots, 2);
-        assert_eq!(census.reachable_descriptor_slots, 2);
-        assert_eq!(census.reachable_central_factor_entries, 2);
-        assert_eq!(census.reachable_ordered_factor_entries, 3);
-        assert_eq!(census.reachable_max_factor_word, 3);
-        assert_eq!(
-            census.owned_payload_lower_bound_bytes,
-            2 * u64::try_from(std::mem::size_of::<MonomialDescriptor>()).unwrap() +
-                5 * u64::try_from(std::mem::size_of::<ScopedExprId>()).unwrap()
-        );
-
-        let released = arena.owner_census(std::iter::empty());
-        assert_eq!(released.retained_descriptor_slots, 2);
-        assert_eq!(released.reachable_descriptor_slots, 0);
-        assert_eq!(released.unreachable_descriptor_slots, 2);
-        assert_eq!(released.unreachable_central_factor_entries, 2);
-        assert_eq!(released.unreachable_ordered_factor_entries, 3);
-        let invalid = arena.owner_census([MonomialId::new(ArenaToken::fresh(), 0)]);
-        assert_eq!(invalid.invalid_root_count, 1);
-    }
-
-    #[test]
     fn sweep_tombstones_dead_slots_and_reinterns_at_fresh_monotonic_slot() {
         let (expressions, programs, scope, one, _, _) = fixture();
         let mut arena = MonomialArena::new(&expressions, &programs, scope).unwrap();
@@ -1277,10 +947,6 @@ mod tests {
         assert_eq!(report.reclaimed_slots, 1);
         assert!(report.reclaimed_payload_lower_bound_bytes > 0);
         assert_eq!(arena.occupied_len(), 1);
-        let census = arena.owner_census([live]);
-        assert_eq!(census.allocated_descriptor_slots, 2);
-        assert_eq!(census.retained_descriptor_slots, 1);
-        assert_eq!(census.reclaimed_descriptor_slots, 1);
         assert_eq!(arena.allocated_payload_since_sweep(), 0);
         assert!(matches!(
             arena.descriptor(dead),
@@ -1340,68 +1006,6 @@ mod tests {
             arena.descriptor(dead),
             Err(MonomialError::CollectedMonomialId { slot }) if slot == dead.slot
         ));
-    }
-
-    #[test]
-    fn sweep_attributes_unique_roots_in_fixed_owner_precedence() {
-        let (expressions, programs, scope, one, _, _) = fixture();
-        let mut arena = MonomialArena::new(&expressions, &programs, scope).unwrap();
-        let root = programs.root(&expressions, scope).unwrap();
-        let protected = arena.intern(&expressions, &programs, &[one], &[]).unwrap();
-        let value = arena.intern(&expressions, &programs, &[], &[root]).unwrap();
-        let exact = arena.intern(&expressions, &programs, &[], &[root, one]).unwrap();
-        let gadget = arena.intern(&expressions, &programs, &[], &[root, one, root]).unwrap();
-        let canonical =
-            arena.intern(&expressions, &programs, &[], &[root, one, root, one]).unwrap();
-        let closed =
-            arena.intern(&expressions, &programs, &[], &[root, one, root, one, root]).unwrap();
-        let suspended =
-            arena.intern(&expressions, &programs, &[], &[root, one, root, one, root, one]).unwrap();
-        let dead = arena
-            .intern(&expressions, &programs, &[], &[root, root, one, one, root, root])
-            .unwrap();
-
-        let report = arena
-            .sweep_with_owners(
-                1,
-                [protected, value],
-                [value, exact],
-                [exact, gadget],
-                [gadget, canonical],
-                [canonical, closed],
-                [closed, suspended, protected],
-            )
-            .unwrap();
-        assert_eq!(report.protected_prefix.descriptor_slots, 1);
-        assert_eq!(report.value_cache.descriptor_slots, 1);
-        assert_eq!(report.exact_plan.descriptor_slots, 1);
-        assert_eq!(report.gadget.descriptor_slots, 1);
-        assert_eq!(report.canonical_runtime.descriptor_slots, 1);
-        assert_eq!(report.closed.descriptor_slots, 1);
-        assert_eq!(report.suspended.descriptor_slots, 1);
-        for owner in [
-            report.protected_prefix,
-            report.value_cache,
-            report.exact_plan,
-            report.gadget,
-            report.canonical_runtime,
-            report.closed,
-            report.suspended,
-        ] {
-            assert!(owner.payload_lower_bound_bytes > 0);
-        }
-        assert_eq!(report.protected_prefix_occupied_slots, 1);
-        assert_eq!(report.high_water_slots, 8);
-        assert_eq!(report.occupied_slots, 7);
-        assert_eq!(report.reclaimed_slots, 1);
-        assert_eq!(report.bucket_entries, 7);
-        assert_eq!(report.occupied_central_factor_entries, 1);
-        assert_eq!(report.occupied_ordered_factor_entries, 21);
-        assert_eq!(
-            report.occupied_factor_payload_lower_bound_bytes,
-            22 * u64::try_from(std::mem::size_of::<ScopedExprId>()).unwrap()
-        );
-        assert!(matches!(arena.descriptor(dead), Err(MonomialError::CollectedMonomialId { .. })));
     }
 
     #[test]

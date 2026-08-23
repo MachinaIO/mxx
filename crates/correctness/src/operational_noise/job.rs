@@ -8,29 +8,23 @@
 
 use super::{
     arena::{
-        ArenaError, ArtifactIdentity, ClosedExprId, ExprArena, FamilyDomain, MatrixLayout,
-        ProgramSignature, ResolvedMatrixType, ResolvedValueType, ScopedExprId, TrustedIndexRange,
+        ArenaError, ArtifactIdentity, ClosedExprId, ExprArena, FamilyDomain, ProgramSignature,
+        ResolvedMatrixType, ResolvedValueType, ScopedExprId, TrustedIndexRange,
     },
     facts::{FactStore, IndexFacts, MatrixFacts, ScalarFacts, TrapdoorFacts, ValueFacts},
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
     normal_form::{
         AnalyzedValue, BoundedSummary, NormalizationCounters, NormalizeError, Normalizer,
-        ProofResolutionOwned,
     },
     program::{FamilyValueId, ProgramArena},
     relation::{
-        CanonicalLhsKey, ClosedRelationRegistration, DecompositionContract, FrozenGeneration,
-        GadgetContract, GadgetRecompositionRegistry, GadgetRecompositionRule, NormalizationCache,
-        RelationRegistry, RelationRegistryError, UniversalDispatchKey,
-        UniversalRelationRegistration,
+        FrozenGeneration, GadgetRecompositionRegistry, GadgetRecompositionRule, NormalizationCache,
+        RelationRegistry, RelationRegistryError, UniversalRelationRegistration,
     },
 };
-use num_bigint::BigInt;
-use num_traits::{ToPrimitive, Zero};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    marker::PhantomData,
     sync::atomic::{AtomicU64, Ordering},
 };
 use tracing::info;
@@ -38,19 +32,10 @@ use tracing::info;
 static NEXT_CANDIDATE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ProofDiagnostic {
-    NoMatch,
-    Rewrite { exact_term_count: usize },
-    Ambiguous { candidate_count: usize },
-    ResolutionFailed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProofAnalysisResult {
     pub bounded_summary: BoundedSummary,
     pub exact_term_count: u64,
     pub counters: NormalizationCounters,
-    pub diagnostics: Box<[ProofDiagnostic]>,
     pub exact_term_diagnostics: Box<[ExactTermDiagnostic]>,
 }
 
@@ -79,86 +64,6 @@ pub struct ClosedRootAnalysis {
     pub value: AnalyzedValue,
     pub counters: NormalizationCounters,
     pub exact_term_diagnostics: Box<[ExactTermDiagnostic]>,
-}
-
-/// A reached universal LHS issued only after the job has tied the exact index/range/monomial to
-/// the exact preimage-family access in one finalized scope.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ReachedUniversalLhs {
-    dispatch: UniversalDispatchKey,
-    index: ScopedExprId,
-    index_range: TrustedIndexRange,
-    layout: Option<MatrixLayout>,
-    monomial: MonomialId,
-}
-
-impl ReachedUniversalLhs {
-    pub(super) fn parts(
-        &self,
-    ) -> (&UniversalDispatchKey, ScopedExprId, TrustedIndexRange, Option<&MatrixLayout>, MonomialId)
-    {
-        (&self.dispatch, self.index, self.index_range, self.layout.as_ref(), self.monomial)
-    }
-
-    #[cfg(test)]
-    pub(super) fn fixture(
-        dispatch: UniversalDispatchKey,
-        index: ScopedExprId,
-        index_range: TrustedIndexRange,
-        layout: Option<MatrixLayout>,
-        monomial: MonomialId,
-    ) -> Self {
-        Self { dispatch, index, index_range, layout, monomial }
-    }
-
-    #[cfg(test)]
-    pub(super) fn dispatch(&self) -> &UniversalDispatchKey {
-        &self.dispatch
-    }
-}
-
-struct UniversalResolutionProof<'proof> {
-    reached: ReachedUniversalLhs,
-    generation: FrozenGeneration,
-    brand: PhantomData<&'proof mut &'proof ()>,
-}
-
-pub struct ProofReachedUniversalLhs<'proof> {
-    proof: UniversalResolutionProof<'proof>,
-}
-
-impl ProofReachedUniversalLhs<'_> {
-    pub(super) fn into_parts(self) -> (ReachedUniversalLhs, FrozenGeneration) {
-        (self.proof.reached, self.proof.generation)
-    }
-
-    #[cfg(test)]
-    pub(super) fn fixture(reached: ReachedUniversalLhs, generation: FrozenGeneration) -> Self {
-        Self { proof: UniversalResolutionProof { reached, generation, brand: PhantomData } }
-    }
-}
-
-/// Closure-scoped proof capability for one finalized family root. It is intentionally neither
-/// `Clone` nor `Copy`; the invariant brand prevents the capability from escaping the HRTB call.
-pub struct FamilyRootProof<'proof> {
-    context: FamilyRootContext<'proof>,
-    brand: PhantomData<&'proof mut &'proof ()>,
-}
-
-impl FamilyRootProof<'_> {
-    pub fn analyze(self) -> Result<ProofAnalysisResult, JobError> {
-        let FamilyRootContext { job, family, domain, element_type, argument, root } = self.context;
-        job.analyze_family_root_in_context(family, domain, element_type, argument, root)
-    }
-}
-
-struct FamilyRootContext<'proof> {
-    job: &'proof mut CheckerJob,
-    family: FamilyValueId,
-    domain: FamilyDomain,
-    element_type: ResolvedMatrixType,
-    argument: super::arena::ExprId,
-    root: ScopedExprId,
 }
 
 /// A capability naming one active candidate in one checker job.
@@ -1035,192 +940,6 @@ impl CheckerJob {
         Ok(())
     }
 
-    /// Validate and canonicalize a concrete production relation before the registry is frozen.
-    /// The job creates the canonical zero-argument normalization scope internally; no family,
-    /// scoped expression, monomial, or canonical RHS identity crosses the caller boundary.
-    pub fn register_closed_production_relation(
-        &mut self,
-        registration: ClosedRelationRegistration,
-    ) -> Result<(), JobError> {
-        if self.relations.is_frozen() {
-            return Err(JobError::Relation(RelationRegistryError::Frozen));
-        }
-        let public = registration.public.expression();
-        let preimage = registration.preimage.expression();
-        let trapdoor = registration.trapdoor.expression();
-        let target = registration.target.expression();
-        let validation = &registration.validation;
-        for (expression, expected) in [
-            (public, &validation.public_type),
-            (preimage, &validation.preimage_type),
-            (trapdoor, &validation.trapdoor_type),
-            (target, &validation.target_type),
-        ] {
-            if self.expressions.value_type(expression).map_err(JobError::Arena)? != expected {
-                return Err(JobError::RelationTypeMismatch);
-            }
-        }
-        if validation.source.expression != preimage {
-            return Err(JobError::RelationSourceMismatch);
-        }
-        if validation.trapdoor_source.expression != trapdoor {
-            return Err(JobError::RelationTrapdoorMismatch);
-        }
-        let (paired_event, paired_role, trapdoor_descriptor, trapdoor_parameters) = match &self
-            .expressions
-            .node(trapdoor)
-            .map_err(JobError::Arena)?
-            .operator
-        {
-            super::arena::ValueOperator::Trapdoor(super::arena::TrapdoorOperation::Generate {
-                descriptor,
-                parameters,
-                paired_public_event,
-                paired_public_output_role,
-                ..
-            }) => {
-                (*paired_public_event, paired_public_output_role.as_str(), descriptor, parameters)
-            }
-            _ => return Err(JobError::RelationTrapdoorMismatch),
-        };
-        match self.facts.facts(trapdoor) {
-            Ok(ValueFacts::Trapdoor(facts))
-                if facts.paired_public_event == paired_event &&
-                    facts.paired_public_output_role == paired_role => {}
-            _ => return Err(JobError::RelationTrapdoorMismatch),
-        }
-        let public_pairing = match &self.expressions.node(public).map_err(JobError::Arena)?.operator
-        {
-            super::arena::ValueOperator::Source(source) => {
-                source.sample_event.map(|event| (event, source.output_role.as_str()))
-            }
-            super::arena::ValueOperator::Sample { event, .. } |
-            super::arena::ValueOperator::Sampler { event, .. } => Some((*event, "value")),
-            _ => None,
-        };
-        if public_pairing != Some((paired_event, paired_role)) {
-            return Err(JobError::RelationPairingMismatch);
-        }
-        let decomposition = [target, public].into_iter().find_map(|expression| {
-            let node = self.expressions.node(expression).ok()?;
-            match &node.operator {
-                super::arena::ValueOperator::Transform(
-                    super::arena::ValueTransformOperation::GadgetDecompose {
-                        base,
-                        small,
-                        digit_count,
-                        ..
-                    },
-                ) => Some(DecompositionContract {
-                    kind: if *small { "small-gadget-decompose" } else { "gadget-decompose" }
-                        .to_owned(),
-                    parameters: Box::new([*base, u64::from(*digit_count)]),
-                }),
-                super::arena::ValueOperator::Sampler {
-                    operation:
-                        super::arena::SamplerOperation::Hash {
-                            variant:
-                                super::arena::HashVariant::Decomposed |
-                                super::arena::HashVariant::SmallDecomposed,
-                            base: Some(base),
-                            digit_count: Some(digit_count),
-                            ..
-                        },
-                    ..
-                } => Some(DecompositionContract {
-                    kind: "decomposed-hash".to_owned(),
-                    parameters: Box::new([*base, u64::from(*digit_count)]),
-                }),
-                _ => None,
-            }
-        });
-        if validation.decomposition != decomposition {
-            return Err(JobError::Relation(RelationRegistryError::Validation(
-                super::relation::RelationValidationError::DecompositionMismatch,
-            )));
-        }
-        let gadget = decomposition.as_ref().map(|_| GadgetContract {
-            definition: trapdoor_descriptor.clone(),
-            parameters: trapdoor_parameters.clone(),
-        });
-        if validation.gadget != gadget {
-            return Err(JobError::Relation(RelationRegistryError::Validation(
-                super::relation::RelationValidationError::GadgetMismatch,
-            )));
-        }
-        if let Some(layout) = validation.layout.as_ref() {
-            for expression in [public, preimage, target] {
-                if !matches!(self.facts.facts(expression),
-                    Ok(ValueFacts::Matrix(facts)) if &facts.metadata.layout == layout)
-                {
-                    return Err(JobError::RelationLayoutMismatch);
-                }
-            }
-        }
-        validation
-            .validate_closed(validation.layout.as_ref(), &validation.factor_order)
-            .map_err(|error| JobError::Relation(RelationRegistryError::Validation(error)))?;
-
-        let (first, second) = if validation.factor_order.public_precedes_preimage {
-            (public, preimage)
-        } else {
-            (preimage, public)
-        };
-        let product = self
-            .expressions
-            .intern(
-                super::arena::ValueOperator::Matrix(super::arena::MatrixOperation::Multiply),
-                Box::new([first, second]),
-            )
-            .map_err(JobError::Arena)?;
-        let anchor = self
-            .expressions
-            .intern(
-                super::arena::ValueOperator::Matrix(super::arena::MatrixOperation::Subtract),
-                Box::new([product, target]),
-            )
-            .map_err(JobError::Arena)?;
-        let output = self.expressions.value_type(anchor).map_err(JobError::Arena)?.clone();
-        let scope = self
-            .programs
-            .finalize(
-                &mut self.expressions,
-                ProgramSignature { inputs: Box::new([]), output },
-                anchor,
-            )
-            .map_err(JobError::Arena)?;
-        let product =
-            self.programs.scoped(&self.expressions, scope, product).map_err(JobError::Arena)?;
-        let target =
-            self.programs.scoped(&self.expressions, scope, target).map_err(JobError::Arena)?;
-        let monomial_arena = self
-            .monomials
-            .ensure(&self.expressions, &self.programs, scope)
-            .map_err(JobError::Monomial)?;
-        let mut normalizer =
-            Normalizer::new(&mut self.expressions, &self.programs, &self.facts, monomial_arena)
-                .map_err(JobError::Normalize)?;
-        let lhs = normalizer.normalize(product).map_err(JobError::Normalize)?;
-        let rhs = normalizer.normalize(target).map_err(JobError::Normalize)?;
-        let lhs = lhs.exact_nf.ok_or(JobError::RelationNonCanonicalClosedLhs)?;
-        let mut terms = lhs.exact_terms.iter();
-        let Some((&monomial, coefficient)) = terms.next() else {
-            return Err(JobError::RelationNonCanonicalClosedLhs);
-        };
-        if terms.next().is_some() || coefficient != &num_bigint::BigInt::from(1_u8) {
-            return Err(JobError::RelationNonCanonicalClosedLhs);
-        }
-        let rhs = rhs.exact_nf.ok_or(JobError::RelationNonCanonicalClosedRhs)?;
-        let rhs = self.normalization.intern((*rhs).clone()).map_err(JobError::Relation)?;
-        self.relations
-            .register_closed(
-                CanonicalLhsKey { layout: validation.layout.clone(), monomial },
-                rhs,
-                validation,
-            )
-            .map_err(JobError::Relation)
-    }
-
     /// Validate all program/family handles and the concrete domain/type contract before the
     /// authority-only registry receives a universal registration.
     pub fn register_universal_relation(
@@ -1314,9 +1033,6 @@ impl CheckerJob {
         if public_identity != Some((paired_public_event, paired_public_output_role)) {
             return Err(JobError::RelationPairingMismatch);
         }
-        if !registration.lhs.remaining_contracts.is_empty() {
-            return Err(JobError::RelationRemainingContractsMismatch);
-        }
         if let Some(expected_layout) = registration.lhs.layout.as_ref() {
             for plan in [
                 registration.lhs.public_plan,
@@ -1353,234 +1069,6 @@ impl CheckerJob {
         Ok(generation)
     }
 
-    fn reached_universal_lhs(
-        &mut self,
-        scope: super::arena::ValueProgramId,
-        dispatch: UniversalDispatchKey,
-        index: ScopedExprId,
-        monomial: MonomialId,
-        layout: Option<MatrixLayout>,
-    ) -> Result<ReachedUniversalLhs, JobError> {
-        self.validate_frozen_resources()?;
-        self.relations.frozen_generation().map_err(JobError::Relation)?;
-        if index.program() != scope {
-            return Err(JobError::RelationScopeMismatch {
-                expected: scope,
-                actual: index.program(),
-            });
-        }
-        let domain =
-            self.programs.family_domain(dispatch.preimage_family).map_err(JobError::Arena)?;
-        let expected_source =
-            self.programs.family_body(dispatch.preimage_family).map_err(JobError::Arena)?;
-        if dispatch.preimage_source.expression != expected_source {
-            return Err(JobError::RelationSourceMismatch);
-        }
-        let actual_type =
-            self.programs.family_element_type(dispatch.preimage_family).map_err(JobError::Arena)?;
-        if actual_type != ResolvedValueType::Matrix(dispatch.matrix_type.clone()) {
-            return Err(JobError::RelationTypeMismatch);
-        }
-        self.expressions
-            .value_type(dispatch.trapdoor_source.expression)
-            .map_err(JobError::Arena)?;
-        let arena = self.monomials.get(scope).ok_or(JobError::MissingMonomialScope { scope })?;
-        let descriptor = arena.descriptor(monomial).map_err(JobError::Monomial)?;
-        let mut selectors = descriptor
-            .central_factors
-            .iter()
-            .chain(descriptor.ordered_factors.iter())
-            .filter_map(|factor| (factor.program() == scope).then_some(factor.expression()))
-            .filter_map(|factor| {
-                let node = self.expressions.node(factor).ok()?;
-                let super::arena::ValueOperator::ProgramCall { program } = node.operator else {
-                    return None;
-                };
-                (program == dispatch.preimage_family.program())
-                    .then_some((factor, node.inputs.clone()))
-            })
-            .collect::<Vec<_>>();
-        if selectors.len() != 1 {
-            return Err(JobError::RelationFamilyAccessMismatch);
-        }
-        let (_preimage_call, inputs) = selectors.pop().expect("one selector checked");
-        let [selector] = inputs.as_ref() else {
-            return Err(JobError::RelationFamilyAccessMismatch);
-        };
-        let selector = self
-            .programs
-            .scoped(&self.expressions, scope, *selector)
-            .map_err(|_| JobError::RelationFamilyAccessMismatch)?;
-        let index_range = self.finalized_scoped_index_range(selector)?;
-        if !domain.contains(index_range) {
-            return Err(JobError::Relation(RelationRegistryError::IndexOutOfDomain));
-        }
-        if let Some(expected_layout) = layout.as_ref() {
-            let layout_matches = descriptor.central_factors.iter()
-                .chain(descriptor.ordered_factors.iter()).any(|factor| {
-                    matches!(self.facts.facts(factor.expression()),
-                        Ok(super::facts::ValueFacts::Matrix(facts)) if &facts.metadata.layout == expected_layout)
-                });
-            if !layout_matches {
-                return Err(JobError::RelationLayoutMismatch);
-            }
-        }
-        Ok(ReachedUniversalLhs { dispatch, index: selector, index_range, layout, monomial })
-    }
-
-    /// Resolve the range of the exact scoped binder used by a family proof.  Closed indices use
-    /// the ordinary finalized fact table; a binder-open index instead gets its authority from
-    /// the finalized unary program signature that owns the `ScopedExprId`.  This is deliberately
-    /// scope- and position-qualified: it never attaches a range to the shared raw `Argument(0)`.
-    fn finalized_scoped_index_range(
-        &self,
-        index: ScopedExprId,
-    ) -> Result<TrustedIndexRange, JobError> {
-        let node = self.expressions.node(index.expression()).map_err(JobError::Arena)?;
-        if matches!(
-            &node.operator,
-            super::arena::ValueOperator::Argument { position: 0, value_type }
-                if *value_type == ResolvedValueType::Int
-        ) {
-            let program = self.programs.program(index.program()).map_err(JobError::Arena)?;
-            let [input] = program.signature.inputs.as_ref() else {
-                return Err(JobError::MissingFinalizedIndexRange { index });
-            };
-            if input.value_type != ResolvedValueType::Int {
-                return Err(JobError::MissingFinalizedIndexRange { index });
-            }
-            return input.trusted_index_range.ok_or(JobError::MissingFinalizedIndexRange { index });
-        }
-        if let super::arena::ValueOperator::ExtractCoefficient {
-            canonical_input_exclusive_upper: Some(upper),
-            ..
-        } = &node.operator
-        {
-            let Some(maximum_exclusive) = upper.to_u64() else {
-                return Err(JobError::MissingFinalizedIndexRange { index });
-            };
-            return Ok(TrustedIndexRange { minimum: 0, maximum_exclusive });
-        }
-        let program = self.programs.program(index.program()).map_err(JobError::Arena)?;
-        let Some(input) = program.signature.inputs.first() else {
-            return Err(JobError::MissingFinalizedIndexRange { index });
-        };
-        if input.value_type != ResolvedValueType::Int {
-            return Err(JobError::MissingFinalizedIndexRange { index });
-        }
-        if let Some(argument_range) = input.trusted_index_range {
-            if let Some((coefficient, offset)) = self.scoped_affine_form(index.expression(), 0) {
-                let (minimum, maximum_exclusive) =
-                    scoped_affine_range(argument_range, coefficient, offset);
-                let (Some(minimum), Some(maximum_exclusive)) =
-                    (minimum.to_u64(), maximum_exclusive.to_u64())
-                else {
-                    return Err(JobError::MissingFinalizedIndexRange { index });
-                };
-                if minimum < maximum_exclusive {
-                    return Ok(TrustedIndexRange { minimum, maximum_exclusive });
-                }
-            }
-        }
-        self.facts
-            .trusted_index_range(index.expression())
-            .map_err(|_| JobError::MissingFinalizedIndexRange { index })
-    }
-
-    /// Return an affine form in one finalized program binder.  This is intentionally a small,
-    /// fail-closed subset: selectors involving division, remainder, or multiple binders must
-    /// still have an explicit fact range rather than inheriting a guessed interval.
-    fn scoped_affine_form(
-        &self,
-        expression: super::arena::ExprId,
-        argument_position: u32,
-    ) -> Option<(BigInt, BigInt)> {
-        let node = self.expressions.node(expression).ok()?;
-        if let super::arena::ValueOperator::Argument { position, value_type } = &node.operator {
-            return (*position == argument_position && *value_type == ResolvedValueType::Int)
-                .then_some((BigInt::from(1_u8), BigInt::from(0_u8)));
-        }
-        if let super::arena::ValueOperator::Constant(super::arena::TypedConstant {
-            value: super::arena::ConstantValue::Int(value),
-            ..
-        }) = &node.operator
-        {
-            return Some((BigInt::from(0_u8), value.clone()));
-        }
-        let super::arena::ValueOperator::Scalar(operation) = &node.operator else {
-            return None;
-        };
-        match operation {
-            super::arena::ScalarOperation::Negate => {
-                let [input] = node.inputs.as_ref() else { return None };
-                let (coefficient, offset) = self.scoped_affine_form(*input, argument_position)?;
-                Some((-coefficient, -offset))
-            }
-            super::arena::ScalarOperation::Add |
-            super::arena::ScalarOperation::Subtract |
-            super::arena::ScalarOperation::Multiply => {
-                let [left, right] = node.inputs.as_ref() else { return None };
-                let left = self.scoped_affine_form(*left, argument_position)?;
-                let right = self.scoped_affine_form(*right, argument_position)?;
-                match operation {
-                    super::arena::ScalarOperation::Add => {
-                        Some((left.0 + right.0, left.1 + right.1))
-                    }
-                    super::arena::ScalarOperation::Subtract => {
-                        Some((left.0 - right.0, left.1 - right.1))
-                    }
-                    super::arena::ScalarOperation::Multiply if left.0.is_zero() => {
-                        Some((right.0 * left.1.clone(), right.1 * left.1))
-                    }
-                    super::arena::ScalarOperation::Multiply if right.0.is_zero() => {
-                        Some((left.0 * right.1.clone(), left.1 * right.1))
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn resolve_family_root_owned(
-        &mut self,
-        reached: ReachedUniversalLhs,
-    ) -> Result<(Result<ProofResolutionOwned, NormalizeError>, NormalizationCounters), JobError>
-    {
-        self.validate_frozen_resources()?;
-        let generation = self.relations.frozen_generation().map_err(JobError::Relation)?;
-        let scope = reached.index.program();
-        let (
-            expressions,
-            programs,
-            facts,
-            monomials,
-            relations,
-            gadget_recompositions,
-            normalization,
-        ) = (
-            &mut self.expressions,
-            &self.programs,
-            &self.facts,
-            &mut self.monomials,
-            &self.relations,
-            &self.gadget_recompositions,
-            &mut self.normalization,
-        );
-        let monomial_arena =
-            monomials.ensure(expressions, programs, scope).map_err(JobError::Monomial)?;
-        let mut normalizer = Normalizer::new(expressions, programs, facts, monomial_arena)
-            .map_err(JobError::Normalize)?
-            .with_relations(relations, normalization)
-            .with_gadget_recompositions(gadget_recompositions);
-        let resolution = normalizer.resolve_universal_proof(ProofReachedUniversalLhs {
-            proof: UniversalResolutionProof { reached, generation, brand: PhantomData },
-        });
-        let counters = normalizer.counters();
-        self.frozen_resources = Some(self.current_resource_counters());
-        Ok((resolution, counters))
-    }
-
     /// Analyze a closed expression without requiring callers to manufacture a scoped handle.
     /// The zero-argument program is canonicalized by the job's existing program authority.
     pub fn normalize_closed_root(
@@ -1610,12 +1098,9 @@ impl CheckerJob {
 
     /// Analyze one finalized family symbolically at its existing formal `Argument(0)`. No lane
     /// is enumerated and no caller-provided scope or reached-LHS capability is accepted.
-    pub fn with_family_root_proof(
+    pub fn analyze_family_root(
         &mut self,
         family: FamilyValueId,
-        operation: impl for<'proof> FnOnce(
-            FamilyRootProof<'proof>,
-        ) -> Result<ProofAnalysisResult, JobError>,
     ) -> Result<ProofAnalysisResult, JobError> {
         self.validate_frozen_resources()?;
         let domain = self.programs.family_domain(family).map_err(JobError::Arena)?;
@@ -1624,8 +1109,6 @@ impl CheckerJob {
                 ResolvedValueType::Matrix(element_type) => element_type,
                 _ => return Err(JobError::RelationTypeMismatch),
             };
-        let argument =
-            self.expressions.intern_argument(0, ResolvedValueType::Int).map_err(JobError::Arena)?;
         let expected_range = TrustedIndexRange {
             minimum: domain.minimum,
             maximum_exclusive: domain.maximum_exclusive,
@@ -1640,17 +1123,7 @@ impl CheckerJob {
         }
         let root =
             self.programs.root(&self.expressions, family.program()).map_err(JobError::Arena)?;
-        operation(FamilyRootProof {
-            context: FamilyRootContext { job: self, family, domain, element_type, argument, root },
-            brand: PhantomData,
-        })
-    }
-
-    pub fn analyze_family_root(
-        &mut self,
-        family: FamilyValueId,
-    ) -> Result<ProofAnalysisResult, JobError> {
-        self.with_family_root_proof(family, |proof| proof.analyze())
+        self.analyze_family_root_in_context(family, domain, element_type, root)
     }
 
     fn analyze_family_root_in_context(
@@ -1658,7 +1131,6 @@ impl CheckerJob {
         family: FamilyValueId,
         domain: FamilyDomain,
         element_type: ResolvedMatrixType,
-        _argument: super::arena::ExprId,
         root: ScopedExprId,
     ) -> Result<ProofAnalysisResult, JobError> {
         if self.programs.family_domain(family).map_err(JobError::Arena)? != domain ||
@@ -1680,11 +1152,11 @@ impl CheckerJob {
             family.program(),
         );
         self.log_family_program_paths(root.expression(), family.program())?;
-        // Family analysis is proof-local: relation specialization may transiently intern a
+        // Family analysis is local: relation specialization may transiently intern a
         // concrete RHS, but must not mutate the frozen canonical registry or retain runtime IDs
         // whose backing slots are rolled back after this analysis.
         let checkpoint = self.normalization.checkpoint();
-        let normalized = self.normalize_with_trace(root);
+        let normalized = self.normalize(root);
         self.normalization.rollback(checkpoint);
         self.normalization.clear_runtime();
         let (analyzed, counters) = normalized?;
@@ -1694,22 +1166,15 @@ impl CheckerJob {
                     .map_err(JobError::Normalize)?,
                 exact_term_count: 0,
                 counters,
-                diagnostics: Box::new([ProofDiagnostic::NoMatch]),
                 exact_term_diagnostics: Box::new([]),
             });
         };
         let scope = family.program();
         let exact_term_diagnostics = self.exact_term_diagnostics(scope, &exact.exact_terms)?;
-        let diagnostics = if counters.relation_applied > 0 {
-            Box::new([ProofDiagnostic::Rewrite { exact_term_count: exact.term_count() }])
-        } else {
-            Box::new([ProofDiagnostic::NoMatch])
-        };
         Ok(ProofAnalysisResult {
             bounded_summary: exact.bounded_summary.clone(),
             exact_term_count: exact.term_count() as u64,
             counters,
-            diagnostics,
             exact_term_diagnostics,
         })
     }
@@ -1875,21 +1340,6 @@ impl CheckerJob {
         &mut self,
         root: super::arena::ScopedExprId,
     ) -> Result<(AnalyzedValue, NormalizationCounters), JobError> {
-        self.normalize_with_trace_authority(root, false)
-    }
-
-    fn normalize_with_trace(
-        &mut self,
-        root: super::arena::ScopedExprId,
-    ) -> Result<(AnalyzedValue, NormalizationCounters), JobError> {
-        self.normalize_with_trace_authority(root, true)
-    }
-
-    fn normalize_with_trace_authority(
-        &mut self,
-        root: super::arena::ScopedExprId,
-        trace: bool,
-    ) -> Result<(AnalyzedValue, NormalizationCounters), JobError> {
         self.validate_frozen_resources()?;
         let scope = root.program();
         let (
@@ -1915,9 +1365,7 @@ impl CheckerJob {
             .map_err(JobError::Normalize)?
             .with_relations(relations, normalization)
             .with_gadget_recompositions(gadget_recompositions);
-        let value =
-            if trace { normalizer.normalize_with_trace(root) } else { normalizer.normalize(root) }
-                .map_err(JobError::Normalize)?;
+        let value = normalizer.normalize(root).map_err(JobError::Normalize)?;
         let counters = normalizer.counters();
         self.frozen_resources = Some(self.current_resource_counters());
         Ok((value, counters))
@@ -2042,27 +1490,6 @@ impl CheckerJob {
     }
 }
 
-fn scoped_affine_range(
-    argument_range: TrustedIndexRange,
-    coefficient: BigInt,
-    offset: BigInt,
-) -> (BigInt, BigInt) {
-    if coefficient >= BigInt::from(0_u8) {
-        (
-            coefficient.clone() * BigInt::from(argument_range.minimum) + offset.clone(),
-            coefficient * BigInt::from(argument_range.maximum_exclusive.saturating_sub(1)) +
-                offset +
-                BigInt::from(1_u8),
-        )
-    } else {
-        (
-            coefficient.clone() * BigInt::from(argument_range.maximum_exclusive.saturating_sub(1)) +
-                offset.clone(),
-            coefficient * BigInt::from(argument_range.minimum) + offset + BigInt::from(1_u8),
-        )
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobError {
     Arena(ArenaError),
@@ -2075,25 +1502,18 @@ pub enum JobError {
     },
     UnfinalizedIndexRanges,
     FactsAlreadyFinalized,
-    MissingFinalizedIndexRange {
-        index: ScopedExprId,
-    },
     RelationScopeMismatch {
         expected: super::arena::ValueProgramId,
         actual: super::arena::ValueProgramId,
     },
     RelationSourceMismatch,
     RelationTypeMismatch,
-    RelationFamilyAccessMismatch,
     RelationLayoutMismatch,
     RelationProgramContractMismatch {
         plan: super::arena::ValueProgramId,
     },
     RelationTrapdoorMismatch,
     RelationPairingMismatch,
-    RelationRemainingContractsMismatch,
-    RelationNonCanonicalClosedLhs,
-    RelationNonCanonicalClosedRhs,
     CandidateAlreadyFrozen,
     MissingFrozenResourceSnapshot,
     FrozenResourcesChanged {
@@ -2150,11 +1570,10 @@ mod tests {
     use super::*;
     use crate::operational_noise::{
         arena::{
-            ProgramInput, ProgramSignature, SampleEventId, SamplerOperation,
+            MatrixLayout, ProgramInput, ProgramSignature, SampleEventId, SamplerOperation,
             SemanticFamilySourceIdentity, TypedConstant, ValueOperator,
         },
         program::TrustedIndexRange,
-        relation::RelationValidationAuthority,
     };
     use num_bigint::BigUint;
 
@@ -2532,120 +1951,6 @@ mod tests {
     }
 
     #[test]
-    fn closed_production_relation_canonicalizes_decomposed_hash_and_rejects_contract_mismatch() {
-        let mut job = CheckerJob::new();
-        let public_event = SampleEventId(801);
-        let matrix = matrix_type();
-        let public = job
-            .expressions
-            .intern(
-                ValueOperator::Sampler {
-                    event: public_event,
-                    operation: SamplerOperation::UniformResidue { output: matrix.clone() },
-                },
-                Box::new([]),
-            )
-            .unwrap();
-        let preimage = job
-            .expressions
-            .intern(
-                ValueOperator::Sampler {
-                    event: SampleEventId(802),
-                    operation: SamplerOperation::Preimage {
-                        output: matrix.clone(),
-                        max_coefficient_bound: num_bigint::BigInt::from(3_u8),
-                    },
-                },
-                Box::new([]),
-            )
-            .unwrap();
-        let target = job
-            .expressions
-            .intern(
-                ValueOperator::Sampler {
-                    event: SampleEventId(803),
-                    operation: SamplerOperation::Hash {
-                        output: matrix.clone(),
-                        variant: super::super::arena::HashVariant::Decomposed,
-                        tag_prefix: Box::new([]),
-                        tag_expressions: Box::new([]),
-                        tag_decimal_expressions: Box::new([]),
-                        tag_u64_le_expressions: Box::new([]),
-                        base: Some(4),
-                        digit_count: Some(2),
-                    },
-                },
-                Box::new([]),
-            )
-            .unwrap();
-        let trapdoor = job
-            .expressions
-            .intern(
-                ValueOperator::Trapdoor(super::super::arena::TrapdoorOperation::Generate {
-                    descriptor: "closed-gadget".to_owned(),
-                    parameters: Box::new([4, 2]),
-                    paired_public_event: public_event,
-                    paired_public_output_role: "value".to_owned(),
-                }),
-                Box::new([]),
-            )
-            .unwrap();
-        job.facts
-            .insert(
-                &job.expressions,
-                trapdoor,
-                ValueFacts::Trapdoor(TrapdoorFacts {
-                    coefficient_bound: super::super::facts::NumericContract::Missing,
-                    descriptor: "closed-gadget".to_owned(),
-                    paired_public_event: public_event,
-                    paired_public_output_role: "value".to_owned(),
-                }),
-            )
-            .unwrap();
-        let value_type = ResolvedValueType::Matrix(matrix.clone());
-        let validation = RelationValidationAuthority {
-            source: super::super::relation::SamplerSourceContract { expression: preimage },
-            trapdoor_source: super::super::relation::TrapdoorSourceContract {
-                expression: trapdoor,
-            },
-            matrix_type: matrix,
-            public_type: value_type.clone(),
-            preimage_type: value_type.clone(),
-            target_type: value_type,
-            trapdoor_type: ResolvedValueType::Trapdoor,
-            layout: None,
-            factor_order: super::super::relation::FactorOrderContract::ordered_public_preimage(),
-            domain: FamilyDomain::new(0, 1).unwrap(),
-            index_range: TrustedIndexRange::new(0, 1).unwrap(),
-            gadget: Some(GadgetContract {
-                definition: "closed-gadget".to_owned(),
-                parameters: Box::new([4, 2]),
-            }),
-            decomposition: Some(DecompositionContract {
-                kind: "decomposed-hash".to_owned(),
-                parameters: Box::new([4, 2]),
-            }),
-        };
-        let registration = ClosedRelationRegistration {
-            public: job.expressions.close(public).unwrap(),
-            preimage: job.expressions.close(preimage).unwrap(),
-            trapdoor: job.expressions.close(trapdoor).unwrap(),
-            target: job.expressions.close(target).unwrap(),
-            validation,
-        };
-        let mut mismatch = registration.clone();
-        mismatch.validation.decomposition.as_mut().unwrap().parameters = Box::new([8, 2]);
-        assert!(matches!(
-            job.register_closed_production_relation(mismatch),
-            Err(JobError::Relation(RelationRegistryError::Validation(
-                super::super::relation::RelationValidationError::DecompositionMismatch
-            )))
-        ));
-        job.register_closed_production_relation(registration).unwrap();
-        assert_eq!(job.relations.generation(), 1);
-    }
-
-    #[test]
     fn finalized_static_call_can_precede_later_program_scoped_offset_call() {
         let mut job = CheckerJob::new();
         let token = job.begin_candidate().unwrap();
@@ -2719,127 +2024,6 @@ mod tests {
             FamilyDomain::new(0, 5).unwrap()
         );
         assert!(job.facts.ranges_finalized());
-    }
-
-    #[test]
-    fn scoped_binder_range_comes_from_owning_program_signature() {
-        let mut job = CheckerJob::new();
-        let argument = job.expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
-        let narrow = job
-            .programs
-            .generated_family_from_body(
-                &mut job.expressions,
-                FamilyDomain::new(0, 4).unwrap(),
-                argument,
-            )
-            .unwrap();
-        let wide = job
-            .programs
-            .generated_family_from_body(
-                &mut job.expressions,
-                FamilyDomain::new(0, 7).unwrap(),
-                argument,
-            )
-            .unwrap();
-        job.facts.finalize_ranges();
-
-        let narrow_index =
-            job.programs.scoped(&job.expressions, narrow.program(), argument).unwrap();
-        let wide_index = job.programs.scoped(&job.expressions, wide.program(), argument).unwrap();
-        assert_eq!(
-            job.finalized_scoped_index_range(narrow_index).unwrap(),
-            TrustedIndexRange::new(0, 4).unwrap()
-        );
-        assert_eq!(
-            job.finalized_scoped_index_range(wide_index).unwrap(),
-            TrustedIndexRange::new(0, 7).unwrap()
-        );
-
-        let one = job
-            .expressions
-            .intern(
-                ValueOperator::Constant(super::super::arena::TypedConstant::int(1)),
-                Box::new([]),
-            )
-            .unwrap();
-        let composite = job
-            .expressions
-            .intern(
-                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
-                Box::new([argument, one]),
-            )
-            .unwrap();
-        let composite_family = job
-            .programs
-            .generated_family_from_body(
-                &mut job.expressions,
-                FamilyDomain::new(0, 4).unwrap(),
-                composite,
-            )
-            .unwrap();
-        let composite_index =
-            job.programs.root(&job.expressions, composite_family.program()).unwrap();
-        assert_eq!(
-            job.finalized_scoped_index_range(composite_index).unwrap(),
-            TrustedIndexRange::new(1, 5).unwrap()
-        );
-    }
-
-    #[test]
-    fn interned_argument_selector_ranges_are_local_to_each_scope() {
-        let mut job = CheckerJob::new();
-        let argument = job.expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
-        let narrow = job
-            .programs
-            .generated_family_from_body(
-                &mut job.expressions,
-                FamilyDomain::new(0, 841).unwrap(),
-                argument,
-            )
-            .unwrap();
-        let wide = job
-            .programs
-            .generated_family_from_body(
-                &mut job.expressions,
-                FamilyDomain::new(0, 10_241).unwrap(),
-                argument,
-            )
-            .unwrap();
-
-        // `argument` is one interned node, but the two finalized unary programs bind it
-        // independently. Calling either family must therefore use only that family's domain.
-        job.call_family_in_program_scope(
-            narrow,
-            argument,
-            TrustedIndexRange { minimum: 0, maximum_exclusive: 841 },
-        )
-        .unwrap();
-        job.call_family_in_program_scope(
-            wide,
-            argument,
-            TrustedIndexRange { minimum: 0, maximum_exclusive: 10_241 },
-        )
-        .unwrap();
-        assert!(matches!(
-            job.call_family_in_program_scope(
-                narrow,
-                argument,
-                TrustedIndexRange { minimum: 0, maximum_exclusive: 10_241 },
-            ),
-            Err(ArenaError::InvalidRange { minimum: 0, maximum_exclusive: 10_241 })
-        ));
-
-        let narrow_index =
-            job.programs.scoped(&job.expressions, narrow.program(), argument).unwrap();
-        let wide_index = job.programs.scoped(&job.expressions, wide.program(), argument).unwrap();
-        assert_eq!(
-            job.finalized_scoped_index_range(narrow_index).unwrap(),
-            TrustedIndexRange { minimum: 0, maximum_exclusive: 841 }
-        );
-        assert_eq!(
-            job.finalized_scoped_index_range(wide_index).unwrap(),
-            TrustedIndexRange { minimum: 0, maximum_exclusive: 10_241 }
-        );
     }
 
     #[test]

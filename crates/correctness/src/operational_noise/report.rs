@@ -748,9 +748,6 @@ mod tests {
             bounded_summary: super::super::normal_form::BoundedSummary::zero(),
             exact_term_count: 0,
             counters: NormalizationCounters::default(),
-            diagnostics: Box::new([super::super::job::ProofDiagnostic::Rewrite {
-                exact_term_count: 0,
-            }]),
             exact_term_diagnostics: Box::new([]),
         };
         let family = analyzed_family_root(&result);

@@ -17,9 +17,9 @@ use super::{
     program::{FamilyValueId, SelectionSelector},
     protocol::{PlannedWire, ProgramOccurrence, ProtocolPlan},
     relation::{
-        ClosedRelationRegistration, DecompositionContract, FactorOrderContract, GadgetContract,
-        GadgetRecompositionRule, RelationValidationAuthority, SamplerSourceContract, StaticLhsKey,
-        TrapdoorSourceContract, UniversalDispatchKey, UniversalRelationRegistration,
+        DecompositionContract, FactorOrderContract, GadgetContract, GadgetRecompositionRule,
+        RelationValidationAuthority, SamplerSourceContract, StaticLhsKey, TrapdoorSourceContract,
+        UniversalDispatchKey, UniversalRelationRegistration,
     },
 };
 use crate::{
@@ -1069,87 +1069,10 @@ impl<'a> ProductionAdapter<'a> {
             let Some((preimage_family, public_family, trapdoor_family, target_family)) =
                 candidate.family_operands
             else {
-                if [candidate.public, candidate.trapdoor, candidate.target].iter().any(|operand| {
-                    self.generated_families
-                        .contains_key(&(candidate.wire.occurrence.clone(), *operand))
-                }) {
-                    return Err(ProductionAdapterError::Structural {
-                        wire: candidate.wire,
-                        reason: "preimage relation mixes closed and family operands".to_owned(),
-                    });
-                }
-                let matrix_type =
-                    self.relation_matrix_type(candidate.preimage, &candidate.wire, "preimage")?;
-                let public_matrix_type =
-                    self.relation_matrix_type(candidate.public, &candidate.wire, "public")?;
-                let target_matrix_type =
-                    self.relation_matrix_type(candidate.target, &candidate.wire, "target")?;
-                self.validate_relation_matrix_product(
-                    &public_matrix_type,
-                    &matrix_type,
-                    &target_matrix_type,
-                    &candidate.wire,
-                )?;
-                let matrix_value_type = ResolvedValueType::Matrix(matrix_type.clone());
-                let (descriptor, parameters) =
-                    match &self.job.expressions().node(candidate.trapdoor)?.operator {
-                        ValueOperator::Trapdoor(TrapdoorOperation::Generate {
-                            descriptor,
-                            parameters,
-                            ..
-                        }) => (descriptor.clone(), parameters.clone()),
-                        _ => return Err(ProductionAdapterError::Structural {
-                            wire: candidate.wire,
-                            reason:
-                                "closed preimage relation trapdoor operand is not a trapdoor sample"
-                                    .to_owned(),
-                        }),
-                    };
-                let decomposition =
-                    decomposition_contract(self.job.expressions(), candidate.target).or_else(
-                        || decomposition_contract(self.job.expressions(), candidate.public),
-                    );
-                let gadget = decomposition
-                    .as_ref()
-                    .map(|_| GadgetContract { definition: descriptor, parameters });
-                self.job.register_closed_production_relation(ClosedRelationRegistration {
-                    public: self.close_expression(
-                        &candidate.wire,
-                        candidate.public,
-                        "close closed-relation public",
-                    )?,
-                    preimage: self.close_expression(
-                        &candidate.wire,
-                        candidate.preimage,
-                        "close closed-relation preimage",
-                    )?,
-                    trapdoor: self.close_expression(
-                        &candidate.wire,
-                        candidate.trapdoor,
-                        "close closed-relation trapdoor",
-                    )?,
-                    target: self.close_expression(
-                        &candidate.wire,
-                        candidate.target,
-                        "close closed-relation target",
-                    )?,
-                    validation: RelationValidationAuthority {
-                        source: SamplerSourceContract { expression: candidate.preimage },
-                        trapdoor_source: TrapdoorSourceContract { expression: candidate.trapdoor },
-                        matrix_type,
-                        public_type: ResolvedValueType::Matrix(public_matrix_type),
-                        preimage_type: matrix_value_type.clone(),
-                        target_type: ResolvedValueType::Matrix(target_matrix_type),
-                        trapdoor_type: ResolvedValueType::Trapdoor,
-                        layout: None,
-                        factor_order: FactorOrderContract::ordered_public_preimage(),
-                        domain: FamilyDomain::new(0, 1)?,
-                        index_range: TrustedIndexRange { minimum: 0, maximum_exclusive: 1 },
-                        gadget,
-                        decomposition,
-                    },
-                })?;
-                continue;
+                return Err(ProductionAdapterError::Structural {
+                    wire: candidate.wire,
+                    reason: "preimage relation was not lifted into a family".to_owned(),
+                });
             };
             let domain = self.job.programs().family_domain(preimage_family)?;
             for family in [public_family, trapdoor_family, target_family] {
@@ -1256,7 +1179,6 @@ impl<'a> ProductionAdapter<'a> {
                     public_pairing: public_family.program(),
                     layout: None,
                     factor_order: FactorOrderContract::ordered_public_preimage(),
-                    remaining_contracts: Box::new([]),
                     validation,
                 },
                 target_plan: target_family.program(),
@@ -2653,15 +2575,43 @@ impl<'a> ProductionAdapter<'a> {
                             .to_owned(),
                     });
                 };
+                let closed = [public, trapdoor, target, preimage].into_iter().all(|expression| {
+                    self.job
+                        .expressions()
+                        .free_arguments(expression)
+                        .is_ok_and(|arguments| arguments.is_empty())
+                });
+                let family_operands = if closed {
+                    let domain = FamilyDomain::new(0, 1)?;
+                    let occurrence = &wire.occurrence;
+                    Some((
+                        self.opaque_generated_family(occurrence, domain, preimage)?,
+                        self.generated_family(occurrence, domain, public)?,
+                        self.generated_family(occurrence, domain, trapdoor)?,
+                        self.generated_family(occurrence, domain, target)?,
+                    ))
+                } else {
+                    None
+                };
+                let returned_preimage = if let Some((preimage_family, ..)) = family_operands {
+                    let index = self.intern_index_constant(BigInt::ZERO)?;
+                    self.call_family_in_program_scope(
+                        preimage_family,
+                        index,
+                        TrustedIndexRange { minimum: 0, maximum_exclusive: 1 },
+                    )?
+                } else {
+                    preimage
+                };
                 self.relation_candidates.push(RelationCandidate {
                     preimage,
                     public,
                     trapdoor,
                     target,
-                    family_operands: None,
+                    family_operands,
                     wire: wire.clone(),
                 });
-                Value::Expr(preimage)
+                Value::Expr(returned_preimage)
             }
             NodeKind::GadgetDecompose { base, small, digit_count } => {
                 let matrix_output = self.matrix_type(output)?;
@@ -4701,6 +4651,108 @@ mod tests {
             },
         )
         .expect("compact Tall operational protocol")
+    }
+
+    fn singleton_preimage_protocol() -> crate::ProtocolDecl {
+        use crate::{
+            ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
+            EndpointSemanticBinding, EndpointSpecId, OperationalDecoderKind,
+            OperationalDecoderTarget, OutputRef, StageId, operational_protocol_from_graphs,
+        };
+        use mxx_dsl::{Bool, DslContext, IdealSpec, Ring, SemanticAnchor};
+        use mxx_ir_core::IntExpr;
+
+        let ring = Ring::new(257, 1);
+        let trapdoor = ring.sample_trapdoor(1, 3, 4, 2, 8);
+        let public = trapdoor.public_matrix();
+        let target = ring.uniform_residue((1, 1));
+        let preimage = trapdoor.sample_preimage(target.clone(), (4, 1)).as_mat();
+        let residual = public * preimage - target;
+        let decoded = residual
+            .clone()
+            .threshold_decode_bools(2, 1)
+            .into_iter()
+            .next()
+            .expect("decoder output")
+            .semantic_anchor("singleton-preimage.decoder")
+            .expect("decoder anchor");
+        let consumer = DslContext::new("singleton-preimage-consumer")
+            .private_output("operational-residual", residual)
+            .expect("residual output")
+            .bool_output("decoded", decoded)
+            .expect("decoder output")
+            .build()
+            .expect("consumer graph");
+        let decoder_node = consumer.graph.outputs()["decoded"].value.node;
+        let endpoint = EndpointSpecId::ToyThresholdDecode;
+        let decoder_stage = StageId("consumer".to_owned());
+        operational_protocol_from_graphs(
+            vec![("consumer".to_owned(), &consumer)],
+            "consumer",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            |bundle| {
+                bundle.ideal = IdealSpec::new(
+                    DslContext::new("singleton-preimage-ideal")
+                        .bool_output("decoded", Bool::constant(false))
+                        .expect("ideal decoder output")
+                        .build()
+                        .expect("ideal graph"),
+                )
+                .expect("ideal spec");
+                bundle.comparator = ComparatorSpec::Equality {
+                    endpoints: vec![ComparatorEndpointBinding {
+                        endpoint,
+                        actual_input: "decoded".to_owned(),
+                        ideal_input: "decoded".to_owned(),
+                        result_output: "failure".to_owned(),
+                        failure_value: true,
+                    }],
+                };
+                bundle.endpoints = EndpointAnchors {
+                    entries: vec![EndpointAnchor {
+                        spec: endpoint,
+                        stage: decoder_stage.clone(),
+                        semantic_anchor: "singleton-preimage.decoder".to_owned(),
+                        semantics: EndpointSemanticBinding::ThresholdDecode,
+                        workflow_output: OutputRef {
+                            stage: decoder_stage.clone(),
+                            output: "decoded".to_owned(),
+                        },
+                        ideal_output: "decoded".to_owned(),
+                    }],
+                };
+                bundle.operational_decoder_targets = vec![OperationalDecoderTarget {
+                    target_id: "singleton-preimage".to_owned(),
+                    residual_stage: decoder_stage.clone(),
+                    residual_output: "operational-residual".to_owned(),
+                    decoder_stage,
+                    decoder_node,
+                    kind: OperationalDecoderKind::ThresholdDecode {
+                        plaintext_modulus: IntExpr::constant(2),
+                    },
+                }];
+                bundle.endpoint_specs = vec![endpoint];
+            },
+        )
+        .expect("singleton preimage operational protocol")
+    }
+
+    #[test]
+    fn singleton_preimage_uses_universal_relation_and_rewrites() {
+        let protocol = singleton_preimage_protocol();
+        let plan = ProtocolPlan::build(&protocol, "singleton-preimage").expect("protocol plan");
+        let adapter =
+            ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).expect("production adapter");
+        let (mut job, roots) = adapter.lower().expect("production lowering");
+        assert_eq!(job.relations().generation(), 1);
+        assert_eq!(job.relations().has_universal_relations(), Ok(true));
+
+        let ProductionRoot::Closed(residual) = roots.residual else { panic!("closed residual") };
+        let analysis = job.normalize_closed_root(residual).expect("residual normalization");
+        assert_eq!(analysis.counters.relation_applied, 1);
+        let exact = analysis.value.exact_nf.as_ref().expect("exact residual");
+        assert!(exact.exact_terms.is_empty());
     }
 
     #[test]

@@ -4,13 +4,12 @@
 //! records are immutable authority;
 //! [`Normalizer`](super::normal_form::Normalizer) owns specialization, exact
 //! matching, and deterministic worklist traversal. Canonical RHS values and the ordinary runtime
-//! memo live in [`NormalizationCache`], so proof-root work can use a separate one-shot cache
-//! without mutating runtime state.
+//! memo live in [`NormalizationCache`].
 
 use super::{
     arena::{
-        ArenaToken, ArtifactIdentity, ClosedExprId, FamilyDomain, MatrixLayout, ResolvedMatrixType,
-        ResolvedValueType, ScopedExprId, TrustedIndexRange, ValueProgramId,
+        ArenaToken, FamilyDomain, MatrixLayout, ResolvedMatrixType, ResolvedValueType,
+        ScopedExprId, TrustedIndexRange, ValueProgramId,
     },
     monomial::MonomialId,
     normal_form::PolynomialNF,
@@ -41,16 +40,8 @@ pub struct UniversalDispatchKey {
     pub trapdoor_source: TrapdoorSourceContract,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum FactorPlacement {
-    Central,
-    Ordered,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct FactorOrderContract {
-    pub public: FactorPlacement,
-    pub preimage: FactorPlacement,
     pub public_precedes_preimage: bool,
 }
 
@@ -82,10 +73,6 @@ pub struct GadgetRecompositionRegistry {
 impl GadgetRecompositionRegistry {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn is_frozen(&self) -> bool {
-        self.frozen
     }
 
     #[cfg(test)]
@@ -158,24 +145,6 @@ impl GadgetRecompositionRegistry {
             })
     }
 
-    pub(crate) fn allows_gadget_half(
-        &self,
-        base: u64,
-        small: bool,
-        gadget_type: &ResolvedMatrixType,
-        gadget_layout: Option<&MatrixLayout>,
-    ) -> Result<bool, RelationRegistryError> {
-        if !self.frozen {
-            return Err(RelationRegistryError::NotFrozen);
-        }
-        Ok(self.rules.iter().any(|rule| {
-            rule.base == base &&
-                rule.small == small &&
-                &rule.gadget_type == gadget_type &&
-                rule.gadget_layout.as_ref() == gadget_layout
-        }))
-    }
-
     pub(crate) fn allows_decomposition_half(
         &self,
         base: u64,
@@ -203,11 +172,7 @@ impl GadgetRecompositionRegistry {
 
 impl FactorOrderContract {
     pub fn ordered_public_preimage() -> Self {
-        Self {
-            public: FactorPlacement::Ordered,
-            preimage: FactorPlacement::Ordered,
-            public_precedes_preimage: true,
-        }
+        Self { public_precedes_preimage: true }
     }
 }
 
@@ -283,14 +248,6 @@ impl RelationValidationAuthority {
         self.validate_common(lhs.layout.as_ref(), &lhs.factor_order, lhs.domain)
     }
 
-    pub(crate) fn validate_closed(
-        &self,
-        layout: Option<&MatrixLayout>,
-        order: &FactorOrderContract,
-    ) -> Result<(), RelationValidationError> {
-        self.validate_common(layout, order, self.domain)
-    }
-
     fn validate_common(
         &self,
         layout: Option<&MatrixLayout>,
@@ -341,14 +298,6 @@ impl RelationValidationAuthority {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum StaticValueContract {
-    Artifact(ArtifactIdentity),
-    ClosedValue(ScopedExprId),
-    UnsignedParameter { definition: u64, value: u64 },
-    BytesParameter { definition: u64, value: Box<[u8]> },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct StaticLhsKey {
     pub domain: FamilyDomain,
     pub public_plan: ValueProgramId,
@@ -357,7 +306,6 @@ pub struct StaticLhsKey {
     pub public_pairing: ValueProgramId,
     pub layout: Option<MatrixLayout>,
     pub factor_order: FactorOrderContract,
-    pub remaining_contracts: Box<[StaticValueContract]>,
     pub validation: RelationValidationAuthority,
 }
 
@@ -366,18 +314,6 @@ pub struct UniversalRelationRegistration {
     pub dispatch: UniversalDispatchKey,
     pub lhs: StaticLhsKey,
     pub target_plan: ValueProgramId,
-}
-
-/// A concrete production relation whose four operands have already been closed by the expression
-/// arena. The job validates the operands against `validation` and owns canonicalization; callers
-/// cannot provide monomial, scope, or canonical-RHS handles.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClosedRelationRegistration {
-    pub public: ClosedExprId,
-    pub preimage: ClosedExprId,
-    pub trapdoor: ClosedExprId,
-    pub target: ClosedExprId,
-    pub validation: RelationValidationAuthority,
 }
 
 /// Exact instantiated LHS. Monomial identity already contains the sorted central factors and the
@@ -410,27 +346,11 @@ pub struct NormalizationCache {
     rhs_interner: BTreeMap<u64, Vec<u32>>,
     runtime:
         BTreeMap<RuntimeSpecializationKey, BTreeMap<CanonicalLhsKey, BTreeSet<CanonicalRhsId>>>,
-    rhs_exact_terms: u64,
-    rhs_exact_terms_max: u64,
-    rhs_exact_terms_peak: u64,
-    runtime_lhs_keys: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct NormalizationCacheOwnerCensus {
-    pub canonical_rhs_entries: u64,
-    pub canonical_rhs_exact_terms: u64,
-    pub canonical_rhs_exact_terms_peak: u64,
-    pub canonical_rhs_largest_nf_terms: u64,
-    pub runtime_entries: u64,
-    pub runtime_lhs_keys: u64,
 }
 
 pub(crate) struct NormalizationCheckpoint {
     rhs_len: usize,
     rhs_interner: BTreeMap<u64, Vec<u32>>,
-    rhs_exact_terms: u64,
-    rhs_exact_terms_max: u64,
 }
 
 impl Default for NormalizationCache {
@@ -452,10 +372,6 @@ impl NormalizationCache {
             rhs: Vec::new(),
             rhs_interner: BTreeMap::new(),
             runtime: BTreeMap::new(),
-            rhs_exact_terms: 0,
-            rhs_exact_terms_max: 0,
-            rhs_exact_terms_peak: 0,
-            runtime_lhs_keys: 0,
         }
     }
     pub fn intern(&mut self, rhs: PolynomialNF) -> Result<CanonicalRhsId, RelationRegistryError> {
@@ -482,10 +398,6 @@ impl NormalizationCache {
         // Misses retain the caller's immutable allocation. Lookup remains expected O(1) by
         // content hash plus full equality within one collision bucket; pointer identity is only
         // a comparison fast path and never contributes to hashing, ordering, or canonical IDs.
-        let exact_terms = u64::try_from(rhs.exact_terms.len()).unwrap_or(u64::MAX);
-        self.rhs_exact_terms = self.rhs_exact_terms.saturating_add(exact_terms);
-        self.rhs_exact_terms_max = self.rhs_exact_terms_max.max(exact_terms);
-        self.rhs_exact_terms_peak = self.rhs_exact_terms_peak.max(self.rhs_exact_terms);
         self.rhs.push(rhs);
         self.rhs_interner.entry(hash).or_default().push(slot);
         Ok(CanonicalRhsId { arena: self.token, slot })
@@ -519,13 +431,7 @@ impl NormalizationCache {
         key: RuntimeSpecializationKey,
         value: BTreeMap<CanonicalLhsKey, BTreeSet<CanonicalRhsId>>,
     ) {
-        let new_lhs_keys = u64::try_from(value.len()).unwrap_or(u64::MAX);
-        if let Some(previous) = self.runtime.insert(key, value) {
-            self.runtime_lhs_keys = self
-                .runtime_lhs_keys
-                .saturating_sub(u64::try_from(previous.len()).unwrap_or(u64::MAX));
-        }
-        self.runtime_lhs_keys = self.runtime_lhs_keys.saturating_add(new_lhs_keys);
+        self.runtime.insert(key, value);
     }
     pub fn runtime_entry_count(&self) -> usize {
         self.runtime.len()
@@ -540,42 +446,19 @@ impl NormalizationCache {
         hasher.finish()
     }
     pub(crate) fn checkpoint(&self) -> NormalizationCheckpoint {
-        NormalizationCheckpoint {
-            rhs_len: self.rhs.len(),
-            rhs_interner: self.rhs_interner.clone(),
-            rhs_exact_terms: self.rhs_exact_terms,
-            rhs_exact_terms_max: self.rhs_exact_terms_max,
-        }
+        NormalizationCheckpoint { rhs_len: self.rhs.len(), rhs_interner: self.rhs_interner.clone() }
     }
     pub(crate) fn rollback(&mut self, checkpoint: NormalizationCheckpoint) {
         self.rhs.truncate(checkpoint.rhs_len);
         self.rhs_interner = checkpoint.rhs_interner;
-        self.rhs_exact_terms = checkpoint.rhs_exact_terms;
-        self.rhs_exact_terms_max = checkpoint.rhs_exact_terms_max;
     }
     pub(crate) fn clear_runtime(&mut self) {
         self.runtime.clear();
-        self.runtime_lhs_keys = 0;
-    }
-    pub(crate) fn owner_census(&self) -> NormalizationCacheOwnerCensus {
-        NormalizationCacheOwnerCensus {
-            canonical_rhs_entries: u64::try_from(self.rhs.len()).unwrap_or(u64::MAX),
-            canonical_rhs_exact_terms: self.rhs_exact_terms,
-            canonical_rhs_exact_terms_peak: self.rhs_exact_terms_peak,
-            canonical_rhs_largest_nf_terms: self.rhs_exact_terms_max,
-            runtime_entries: u64::try_from(self.runtime.len()).unwrap_or(u64::MAX),
-            runtime_lhs_keys: self.runtime_lhs_keys,
-        }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct FrozenGeneration(u64);
-impl FrozenGeneration {
-    pub fn value(self) -> u64 {
-        self.0
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RelationResolution {
@@ -587,7 +470,6 @@ pub enum RelationResolution {
 pub enum RelationRegistryError {
     Frozen,
     NotFrozen,
-    StaleGeneration { expected: u64, actual: u64 },
     InvalidDomain,
     AmbiguousPreimageDispatch,
     IndexOutOfDomain,
@@ -610,7 +492,6 @@ pub(crate) type UniversalBucket =
 
 /// Non-generic, frozen registration authority. It never calls user code and never normalizes.
 pub struct RelationRegistry {
-    closed: BTreeMap<CanonicalLhsKey, BTreeSet<CanonicalRhsId>>,
     universal: BTreeMap<UniversalDispatchKey, UniversalBucket>,
     /// Candidate discovery is keyed by the exact preimage family program.  A body-shaped
     /// expression is not sufficient provenance: the same expression can occur under multiple
@@ -623,7 +504,6 @@ pub struct RelationRegistry {
 impl Default for RelationRegistry {
     fn default() -> Self {
         Self {
-            closed: BTreeMap::new(),
             universal: BTreeMap::new(),
             universal_by_preimage: BTreeMap::new(),
             generation: 0,
@@ -642,23 +522,6 @@ impl RelationRegistry {
     }
     pub fn is_frozen(&self) -> bool {
         self.frozen
-    }
-    pub(crate) fn closed_monomial_roots(&self) -> impl Iterator<Item = MonomialId> + '_ {
-        self.closed.keys().filter(move |_| self.frozen).map(|lhs| lhs.monomial)
-    }
-    pub fn register_closed(
-        &mut self,
-        lhs: CanonicalLhsKey,
-        rhs: CanonicalRhsId,
-        authority: &RelationValidationAuthority,
-    ) -> Result<(), RelationRegistryError> {
-        self.require_mutable()?;
-        authority
-            .validate_closed(lhs.layout.as_ref(), &authority.factor_order)
-            .map_err(RelationRegistryError::Validation)?;
-        self.closed.entry(lhs).or_default().insert(rhs);
-        self.bump();
-        Ok(())
     }
     pub fn register_universal(
         &mut self,
@@ -698,31 +561,11 @@ impl RelationRegistry {
             Err(RelationRegistryError::NotFrozen)
         }
     }
-    /// Report whether the frozen authority contains any concrete closed relations.
-    ///
-    /// This capability is derived directly from the authoritative closed map. It carries no
-    /// factor summary or matching heuristic and is unavailable while registration is mutable.
-    pub fn has_closed_relations(&self) -> Result<bool, RelationRegistryError> {
-        if !self.frozen {
-            return Err(RelationRegistryError::NotFrozen);
-        }
-        Ok(!self.closed.is_empty())
-    }
-
     pub(crate) fn has_universal_relations(&self) -> Result<bool, RelationRegistryError> {
         if !self.frozen {
             return Err(RelationRegistryError::NotFrozen);
         }
         Ok(!self.universal.is_empty())
-    }
-    pub fn resolve_closed(
-        &self,
-        lhs: &CanonicalLhsKey,
-    ) -> Result<RelationResolution, RelationRegistryError> {
-        if !self.frozen {
-            return Err(RelationRegistryError::NotFrozen);
-        }
-        resolve_candidates(self.closed.get(lhs))
     }
     pub(crate) fn universal_candidates(
         &self,
@@ -850,7 +693,10 @@ mod tests {
         let target = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
         let authority =
             typed_authority(source_expression, trapdoor_expression, public, preimage, target);
-        assert_eq!(authority.validate_closed(None, &authority.factor_order), Ok(()));
+        assert_eq!(
+            authority.validate_common(None, &authority.factor_order, authority.domain),
+            Ok(())
+        );
     }
 
     #[test]
@@ -886,7 +732,7 @@ mod tests {
             let authority =
                 typed_authority(source_expression, trapdoor_expression, public, preimage, target);
             assert_eq!(
-                authority.validate_closed(None, &authority.factor_order),
+                authority.validate_common(None, &authority.factor_order, authority.domain),
                 Err(RelationValidationError::TypeMismatch)
             );
         }
@@ -1053,33 +899,6 @@ mod tests {
     }
 
     #[test]
-    fn owner_census_tracks_canonical_rhs_and_rollback_without_changing_fingerprint() {
-        let mut cache = NormalizationCache::new();
-        let first = cache.intern(empty_nf()).unwrap();
-        let checkpoint = cache.checkpoint();
-        let fingerprint = cache.canonical_state_fingerprint();
-        let mut two_terms = empty_nf();
-        let token = ArenaToken::fresh();
-        two_terms.exact_terms.insert(MonomialId::new(token, 0), BigInt::from(1));
-        two_terms.exact_terms.insert(MonomialId::new(token, 1), BigInt::from(1));
-        cache.intern(two_terms).unwrap();
-        let grown = cache.owner_census();
-        assert_eq!(grown.canonical_rhs_entries, 2);
-        assert_eq!(grown.canonical_rhs_exact_terms, 2);
-        assert_eq!(grown.canonical_rhs_exact_terms_peak, 2);
-        assert_eq!(grown.canonical_rhs_largest_nf_terms, 2);
-
-        cache.rollback(checkpoint);
-        let restored = cache.owner_census();
-        assert_eq!(restored.canonical_rhs_entries, 1);
-        assert_eq!(restored.canonical_rhs_exact_terms, 0);
-        assert_eq!(restored.canonical_rhs_exact_terms_peak, 2);
-        assert_eq!(restored.canonical_rhs_largest_nf_terms, 0);
-        assert_eq!(cache.get(first), Ok(&empty_nf()));
-        assert_eq!(cache.canonical_state_fingerprint(), fingerprint);
-    }
-
-    #[test]
     fn owned_and_arc_interning_have_identical_structure_and_fingerprint() {
         let mut value = empty_nf();
         value.exact_terms.insert(MonomialId::new(ArenaToken::fresh(), 0), BigInt::from(3));
@@ -1110,32 +929,6 @@ mod tests {
     }
 
     #[test]
-    fn closed_registry_is_authority_only_and_reports_deterministic_ambiguity() {
-        let mut cache = NormalizationCache::new();
-        let mut rhs = empty_nf();
-        let first = cache.intern(rhs.clone()).unwrap();
-        rhs.exact_terms.insert(MonomialId::new(ArenaToken::fresh(), 0), BigInt::from(1));
-        let second = cache.intern(rhs).unwrap();
-        let lhs =
-            CanonicalLhsKey { layout: None, monomial: MonomialId::new(ArenaToken::fresh(), 0) };
-        let source = expression(0);
-        let trapdoor = expression(1);
-        let mut registry = RelationRegistry::new();
-        registry.register_closed(lhs.clone(), first, &authority(source, trapdoor)).unwrap();
-        registry.register_closed(lhs.clone(), first, &authority(source, trapdoor)).unwrap();
-        registry.register_closed(lhs.clone(), second, &authority(source, trapdoor)).unwrap();
-        registry.freeze();
-        assert_eq!(
-            registry.resolve_closed(&lhs),
-            Err(RelationRegistryError::Ambiguous { candidates: Box::new([first, second]) })
-        );
-        assert_eq!(
-            registry.register_closed(lhs, first, &authority(source, trapdoor)),
-            Err(RelationRegistryError::Frozen)
-        );
-    }
-
-    #[test]
     fn universal_stage_a_is_exact_and_does_not_scan_other_dispatches() {
         let mut expressions = super::super::arena::ExprArena::new();
         let mut programs = super::super::program::ProgramArena::new();
@@ -1162,7 +955,6 @@ mod tests {
             public_pairing: plan.program(),
             layout: None,
             factor_order: order(),
-            remaining_contracts: Box::new([]),
             validation: authority(arg, arg),
         };
         let registration = UniversalRelationRegistration {
@@ -1209,7 +1001,6 @@ mod tests {
             public_pairing: family.program(),
             layout: None,
             factor_order: order(),
-            remaining_contracts: Box::new([]),
             validation: mismatched,
         };
         let mut registry = RelationRegistry::new();
@@ -1226,38 +1017,9 @@ mod tests {
     #[test]
     fn frozen_generation_is_required_and_stable() {
         let mut registry = RelationRegistry::new();
-        let lhs =
-            CanonicalLhsKey { layout: None, monomial: MonomialId::new(ArenaToken::fresh(), 0) };
-        assert_eq!(registry.resolve_closed(&lhs), Err(RelationRegistryError::NotFrozen));
+        assert_eq!(registry.frozen_generation(), Err(RelationRegistryError::NotFrozen));
         let generation = registry.freeze();
         assert_eq!(generation, registry.frozen_generation().unwrap());
-        assert_eq!(registry.resolve_closed(&lhs), Ok(RelationResolution::NoMatch));
-    }
-
-    #[test]
-    fn frozen_closed_relation_capability_is_authoritative_and_fail_closed() {
-        let mut empty = RelationRegistry::new();
-        assert_eq!(empty.has_closed_relations(), Err(RelationRegistryError::NotFrozen));
-        empty.freeze();
-        assert_eq!(empty.has_closed_relations(), Ok(false));
-
-        let source = expression(0);
-        let trapdoor = expression(1);
-        let lhs =
-            CanonicalLhsKey { layout: None, monomial: MonomialId::new(ArenaToken::fresh(), 0) };
-        let rhs = CanonicalRhsId { arena: ArenaToken::fresh(), slot: 0 };
-        let mut populated = RelationRegistry::new();
-        populated.register_closed(lhs.clone(), rhs, &authority(source, trapdoor)).unwrap();
-        assert!(populated.closed_monomial_roots().next().is_none());
-        assert_eq!(populated.has_closed_relations(), Err(RelationRegistryError::NotFrozen));
-        populated.freeze();
-        assert_eq!(populated.has_closed_relations(), Ok(true));
-        assert_eq!(populated.closed_monomial_roots().collect::<Vec<_>>(), vec![lhs.monomial]);
-        assert_eq!(
-            populated.register_closed(lhs.clone(), rhs, &authority(source, trapdoor)),
-            Err(RelationRegistryError::Frozen)
-        );
-        assert_eq!(populated.has_closed_relations(), Ok(true));
     }
 
     #[test]
@@ -1320,9 +1082,7 @@ mod tests {
             RuntimeSpecializationKey { dispatch: dispatch.clone(), index: first, generation },
             BTreeMap::from([(lhs, BTreeSet::from([rhs]))]),
         );
-        let census = cache.owner_census();
-        assert_eq!(census.runtime_entries, 1);
-        assert_eq!(census.runtime_lhs_keys, 1);
+        assert_eq!(cache.runtime_entry_count(), 1);
         assert!(
             cache
                 .runtime_get(&RuntimeSpecializationKey { dispatch, index: second, generation })

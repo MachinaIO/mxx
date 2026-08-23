@@ -100,9 +100,27 @@ impl GpuNodeMeasurementBackend {
             reals: bindings.reals.clone(),
             loop_indices: Default::default(),
         };
+        let mut shape_kind = node.kind.clone();
+        if let NodeKind::HashSample {
+            tag_prefix,
+            tag_expressions,
+            tag_decimal_expressions,
+            tag_u64_le_expressions,
+            ..
+        } = &mut shape_kind
+        {
+            tag_prefix.fill(0);
+            for expression in tag_expressions
+                .iter_mut()
+                .chain(tag_decimal_expressions.iter_mut())
+                .chain(tag_u64_le_expressions.iter_mut())
+            {
+                *expression = mxx_ir_core::IntExpr::constant(0);
+            }
+        }
 
         encoding::hash_canonical(&MeasurementKey {
-            kind: node.kind,
+            kind: &shape_kind,
             concrete_argument_types: &node.concrete_argument_types,
             concrete_output_types: &node.concrete_output_types,
             bindings: &shape_bindings,
@@ -1201,6 +1219,54 @@ mod tests {
         let first_key = GpuNodeMeasurementBackend::measurement_key(&node, &first_bindings)
             .expect("first cache key");
         let second_key = GpuNodeMeasurementBackend::measurement_key(&node, &second_bindings)
+            .expect("second cache key");
+
+        assert_eq!(first_key, second_key);
+    }
+
+    #[test]
+    fn measurement_cache_key_ignores_hash_tag_values() {
+        let matrix = ConcreteWireType::Matrix(ConcreteMatrixType {
+            rows: 80,
+            columns: 80,
+            ring_dimension: 65_536,
+            modulus: BigInt::from(257u16),
+        });
+        let hash_kind = |tag_prefix, tag_expression| NodeKind::HashSample {
+            matrix_type: MatrixType {
+                rows: IntExpr::constant(80),
+                columns: IntExpr::constant(80),
+                ring_dimension: IntExpr::constant(65_536),
+                modulus: IntExpr::constant(257),
+            },
+            variant: HashVariant::Decomposed,
+            tag_prefix,
+            tag_expressions: vec![tag_expression],
+            tag_decimal_expressions: Vec::new(),
+            tag_u64_le_expressions: Vec::new(),
+            base: Some(IntExpr::constant(16_384)),
+            digit_count: Some(IntExpr::constant(80)),
+        };
+        let first_kind = hash_kind(vec![1, 2, 3], IntExpr::constant(7));
+        let second_kind = hash_kind(vec![9, 8, 7], IntExpr::constant(3_720));
+        let scope = FrozenGraphScopeId::Root;
+        let node = |kind| MeasurementNode {
+            scope: &scope,
+            id: NodeId(1),
+            kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: Vec::new(),
+            concrete_output_types: vec![matrix.clone()],
+        };
+
+        let first = node(&first_kind);
+        let second = node(&second_kind);
+        let first_key = GpuNodeMeasurementBackend::measurement_key(&first, &ParamEnv::default())
+            .expect("first cache key");
+        let second_key = GpuNodeMeasurementBackend::measurement_key(&second, &ParamEnv::default())
             .expect("second cache key");
 
         assert_eq!(first_key, second_key);

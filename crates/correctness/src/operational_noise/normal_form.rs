@@ -7094,6 +7094,77 @@ mod tests {
     }
 
     #[test]
+    fn enabled_gadget_summary_rejects_before_destination_mutation() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let root = source_with(&mut expressions, matrix_type(), 96_005);
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let input_nf = PolynomialNF {
+            exact_terms: BTreeMap::new(),
+            bounded_summary: BoundedSummary::finite(BoundExpression::new(BigUint::from(3_u8))),
+        };
+        let splice = || {
+            ProductWorkItem::GadgetSplice(ProductGadgetSplice {
+                left: None,
+                suffix: None,
+                input_nf: Arc::new(input_nf.clone()),
+                next_after: None,
+                coefficient: BigInt::from(1_u8),
+                summary_pending: true,
+            })
+        };
+
+        let (ordinary_terms, ordinary_noise) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let mut terms = BTreeMap::new();
+            let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
+            let mut evidence = None;
+            let mut worklist = VecDeque::from([splice()]);
+            normalizer
+                .drain_product_worklist(None, &mut terms, &mut noise, &mut evidence, &mut worklist)
+                .unwrap();
+            (terms, noise)
+        };
+        assert!(ordinary_terms.is_empty());
+        assert_eq!(ordinary_noise, NumericContract::Known(CoefficientBound::finite(3_u8)));
+
+        let mut trace = FeasibilityTrace::default();
+        let before_len = monomials.len();
+        let before_occupied = monomials.occupied_len();
+        let error = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            let mut terms = BTreeMap::new();
+            let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
+            let mut evidence = None;
+            let mut worklist = VecDeque::from([splice()]);
+            let error = normalizer
+                .drain_product_worklist(
+                    Some(semantic),
+                    &mut terms,
+                    &mut noise,
+                    &mut evidence,
+                    &mut worklist,
+                )
+                .unwrap_err();
+            assert!(terms.is_empty());
+            assert_eq!(noise, NumericContract::Known(CoefficientBound::ExactZero));
+            assert!(evidence.is_none());
+            assert_eq!(normalizer.monomials.len(), before_len);
+            assert_eq!(normalizer.monomials.occupied_len(), before_occupied);
+            error
+        };
+        assert_eq!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer));
+    }
+
+    #[test]
     fn traced_product_summary_preserves_summary_exact_operand_order() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();

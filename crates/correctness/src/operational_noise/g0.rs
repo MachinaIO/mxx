@@ -1593,6 +1593,44 @@ pub(crate) enum StableEventKind {
     Trapdoor { operation: StableTrapdoorOperation },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub(crate) struct StableEventRef {
+    pub row: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub(crate) enum CanonicalEventKind {
+    Sample { descriptor: StableSampleDescriptor },
+    Sampler { operation: StableSamplerOperation },
+    Trapdoor { operation: StableTrapdoorOperation },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CanonicalEventRow {
+    pub owner: StableObservedWire,
+    pub kind: CanonicalEventKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalEventRows {
+    rows: Vec<CanonicalEventRow>,
+    refs: BTreeMap<SampleEventId, StableEventRef>,
+}
+
+impl CanonicalEventRows {
+    pub(crate) fn rows(&self) -> &[CanonicalEventRow] {
+        &self.rows
+    }
+
+    pub(crate) fn event(&self, event: SampleEventId) -> Result<StableEventRef, G0Error> {
+        self.refs.get(&event).copied().ok_or(G0Error::CanonicalMissingDependency)
+    }
+
+    pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, G0Error> {
+        serde_json::to_vec(&self.rows).map_err(|error| G0Error::Encoding(error.to_string()))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub(crate) struct StableG0Inventory {
     pub operators: Vec<StableOperator>,
@@ -1615,6 +1653,10 @@ pub(crate) enum G0Error {
     ConflictingEventDescriptor { event: u64 },
     #[error("event has conflicting typed owner or descriptor")]
     ConflictingEventObservation,
+    #[error("residual event has no typed lowering observation")]
+    MissingEventObservation,
+    #[error("independent residual events cannot alias one canonical event row")]
+    CanonicalEventAliasConflict,
     #[error("conflicting typed index-use plans for one lowering use")]
     ConflictingIndexUsePlan,
     #[error("invalid half-open index frontier range")]
@@ -2390,6 +2432,59 @@ fn stable_trapdoor(value: &TrapdoorOperation) -> StableTrapdoorOperation {
     }
 }
 
+fn canonical_event_kind(kind: &EventKind) -> CanonicalEventKind {
+    match kind {
+        EventKind::Sample { descriptor } => {
+            CanonicalEventKind::Sample { descriptor: stable_sample(descriptor) }
+        }
+        EventKind::Sampler { operation } => {
+            CanonicalEventKind::Sampler { operation: stable_sampler(operation) }
+        }
+        EventKind::Trapdoor { operation } => {
+            CanonicalEventKind::Trapdoor { operation: stable_trapdoor(operation) }
+        }
+    }
+}
+
+/// Derive dense event rows from only residual event IDs and typed lowering observations.  Raw
+/// event IDs remain an in-memory lookup map and never participate in row ordering or encoding.
+pub(crate) fn derive_canonical_event_rows(
+    closure: &CertificateClosure,
+    trace: &FeasibilityTrace,
+) -> Result<CanonicalEventRows, G0Error> {
+    let mut candidates = Vec::new();
+    for &event in &closure.event_ids {
+        let observation =
+            trace.event_observations().get(&event).ok_or(G0Error::MissingEventObservation)?;
+        candidates.push((
+            event,
+            stable_observed_wire(&observation.owner),
+            canonical_event_kind(&observation.kind),
+        ));
+    }
+    let mut by_identity =
+        BTreeMap::<(StableObservedWire, CanonicalEventKind), SampleEventId>::new();
+    let mut by_owner = BTreeMap::<StableObservedWire, CanonicalEventKind>::new();
+    for (event, owner, kind) in candidates {
+        if by_owner.insert(owner.clone(), kind.clone()).is_some_and(|existing| existing != kind) {
+            return Err(G0Error::ConflictingEventObservation);
+        }
+        if by_identity.insert((owner, kind), event).is_some() {
+            return Err(G0Error::CanonicalEventAliasConflict);
+        }
+    }
+    let mut identities = by_identity.into_iter().collect::<Vec<_>>();
+    identities.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut refs = BTreeMap::new();
+    let mut rows = Vec::with_capacity(identities.len());
+    for (row, ((owner, kind), event)) in identities.into_iter().enumerate() {
+        let row = u64::try_from(row).map_err(|_| G0Error::TraceOverflow)?;
+        refs.insert(event, StableEventRef { row });
+        rows.push(CanonicalEventRow { owner, kind });
+    }
+    Ok(CanonicalEventRows { rows, refs })
+}
+
 #[derive(Serialize)]
 struct CanonicalProgramDescriptor {
     signature: Vec<(StableValueType, Option<(u64, u64)>)>,
@@ -2941,6 +3036,75 @@ mod tests {
             })
             .expect("ordinary sink is inert");
         assert_eq!(FeasibilityTrace::from(ordinary), FeasibilityTrace::default());
+    }
+
+    #[test]
+    fn canonical_event_rows_exclude_raw_ids_and_reject_ambiguous_aliases() {
+        use crate::StageId;
+        use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};
+
+        let owner = PlannedWire {
+            stage: StageId("event-row".to_owned()),
+            occurrence: super::super::protocol::ProgramOccurrence {
+                definition: FrozenGraphScopeId::Root,
+                path: 2,
+            },
+            wire: WireRef { node: NodeId(3), port: Port(0) },
+        };
+        let observation = |event| EventObservation {
+            event: SampleEventId(event),
+            owner: owner.clone(),
+            kind: EventKind::Sample {
+                descriptor: SampleDescriptor::new("uniform", ResolvedValueType::Int),
+            },
+        };
+        let closure = |event| CertificateClosure {
+            expressions: BTreeSet::new(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: [SampleEventId(event)].into_iter().collect(),
+            constant_expressions: BTreeSet::new(),
+        };
+        let mut first = FeasibilityTrace::default();
+        first.record_event(observation(7)).unwrap();
+        let mut second = FeasibilityTrace::default();
+        second.record_event(observation(41)).unwrap();
+        let first_rows = derive_canonical_event_rows(&closure(7), &first).unwrap();
+        let second_rows = derive_canonical_event_rows(&closure(41), &second).unwrap();
+        assert_eq!(first_rows.encode_canonical().unwrap(), second_rows.encode_canonical().unwrap());
+        assert_eq!(first_rows.event(SampleEventId(7)).unwrap(), StableEventRef { row: 0 });
+        assert!(
+            !String::from_utf8(first_rows.encode_canonical().unwrap())
+                .unwrap()
+                .contains("\"event\":")
+        );
+
+        let mut conflict = FeasibilityTrace::default();
+        conflict.record_event(observation(7)).unwrap();
+        conflict.record_event(observation(41)).unwrap();
+        let mut conflict_closure = closure(7);
+        conflict_closure.event_ids.insert(SampleEventId(41));
+        assert_eq!(
+            derive_canonical_event_rows(&conflict_closure, &conflict),
+            Err(G0Error::CanonicalEventAliasConflict)
+        );
+        assert_eq!(
+            derive_canonical_event_rows(&closure(41), &FeasibilityTrace::default()),
+            Err(G0Error::MissingEventObservation)
+        );
+
+        let mut different_owner = observation(7);
+        different_owner.event = SampleEventId(41);
+        different_owner.owner.wire.node = NodeId(4);
+        let mut owners = FeasibilityTrace::default();
+        owners.record_event(observation(7)).unwrap();
+        owners.record_event(different_owner).unwrap();
+        let mut owners_closure = closure(7);
+        owners_closure.event_ids.insert(SampleEventId(41));
+        let rows = derive_canonical_event_rows(&owners_closure, &owners).unwrap();
+        assert_eq!(rows.rows().len(), 2);
     }
 
     #[test]

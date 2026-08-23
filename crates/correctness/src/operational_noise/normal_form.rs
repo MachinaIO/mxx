@@ -663,7 +663,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 NormalizeError::SharedRootCacheValue { expression: root.expression() }
             })?;
             self.relation_rewriting_enabled = saved_relation_rewriting;
-            let mut relation_evidence = None;
+            let mut relation_evidence = if S::ENABLED &&
+                value.exact_nf.as_ref().is_some_and(|nf| !nf.bounded_summary.is_zero())
+            {
+                Some(BoundValueRef::Result {
+                    event: self.relation_input_result(root.expression())?,
+                    projection: BoundProjection::Summary,
+                })
+            } else {
+                None
+            };
             if self.relations.is_some() && self.relation_rewriting_enabled {
                 if let Some(exact_nf) = value.exact_nf.as_mut() {
                     let normal_form = Arc::make_mut(exact_nf);
@@ -678,16 +687,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 if let Some(exact_nf) = value.exact_nf.as_mut() {
                     let normal_form = Arc::make_mut(exact_nf);
                     let rebound = self.bound_normal_form(normal_form)?;
-                    let mut evidence = if relation_evidence.is_some() {
-                        relation_evidence
-                    } else if S::ENABLED && !normal_form.bounded_summary.is_zero() {
-                        Some(BoundValueRef::Result {
-                            event: self.relation_input_result(root.expression())?,
-                            projection: BoundProjection::Summary,
-                        })
-                    } else {
-                        None
-                    };
+                    let mut evidence = relation_evidence;
                     self.fold_finite_no_match_terms(Some(root), normal_form, false, &mut evidence)?;
                     value.coefficient_bound = rebound;
                     if normal_form.is_zero() {
@@ -3830,7 +3830,17 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             Some(owner) => owner,
             None => self.programs.root(self.expressions, self.scope)?,
         };
+        let had_evidence = evidence.is_some();
         self.rewrite_relations(relation_owner, &mut candidate, evidence)?;
+        if S::ENABLED && !had_evidence {
+            if let Some(BoundValueRef::Transfer(applied_event)) = evidence.take() {
+                let identity_event = self.observe_bound_transfer(
+                    relation_owner,
+                    BoundRule::Identity { input: BoundValueRef::Transfer(applied_event) },
+                )?;
+                *evidence = Some(BoundValueRef::Transfer(identity_event));
+            }
+        }
         *noise = add_noise_summaries(noise, &candidate.bounded_summary.coefficient_bound());
         for (rewritten, rewritten_coefficient) in candidate.exact_terms {
             let bound = self.bound_monomial(rewritten, &rewritten_coefficient)?;
@@ -12744,8 +12754,12 @@ mod tests {
 
         // The producer facts are intentionally not passed to `setup` or the normalizer.  The
         // public explicit family remains the sole authority for its closed family call.
-        let root = expressions
+        let relation_product = expressions
             .intern_matrix_transform(MatrixOperation::Multiply, &[public_call, preimage_call])
+            .unwrap();
+        let root_gaussian = gaussian_factor(&mut expressions, matrix.clone(), 99_907, 2);
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[relation_product, root_gaussian])
             .unwrap();
         let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
         let mut ordinary_cache = NormalizationCache::new();
@@ -12867,6 +12881,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(target_monomial.iter().any(|index| *index < target_result_index));
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        trace.validate_normalization_observations_with_state(&monomials, &cache).unwrap();
 
         // Replay witnesses are authoritative invocation ends, not arbitrary events from the
         // nested specialization.  Mutating one to a nested Result must fail closed.

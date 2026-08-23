@@ -122,6 +122,16 @@ pub(crate) trait FeasibilitySink: Default {
         self.validate_normalization_observations()
     }
 
+    fn validate_normalization_observations_with_state(
+        &self,
+        monomials: &super::monomial::MonomialArena,
+        normalization: &super::relation::NormalizationCache,
+    ) -> Result<(), G0Error> {
+        self.validate_normalization_observations_with_monomials(monomials)?;
+        let _ = normalization;
+        Ok(())
+    }
+
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error>;
 
     fn record_event(&mut self, observation: EventObservation) -> Result<(), G0Error>;
@@ -1819,12 +1829,22 @@ impl FeasibilitySink for FeasibilityTrace {
             HashMap<(super::arena::ScopedExprId, u32), (ExprId, EventIndex)>,
         )>::new();
         let mut frame_starts = vec![None; self.events.len()];
+        let mut frame_stack = Vec::new();
+        for (position, event) in self.events.iter().enumerate() {
+            let current = EventIndex(u64::try_from(position).map_err(|_| G0Error::TraceOverflow)?);
+            if matches!(event, NormalizerEvent::InvocationStart { .. }) {
+                frame_stack.push(current);
+            }
+            frame_starts[position] = frame_stack.last().copied();
+            if matches!(event, NormalizerEvent::InvocationEnd { .. }) {
+                frame_stack.pop();
+            }
+        }
         for (position, event) in self.events.iter().enumerate() {
             let current = EventIndex(u64::try_from(position).map_err(|_| G0Error::TraceOverflow)?);
             match event {
                 NormalizerEvent::InvocationStart { root } => {
                     stack.push((*root, current, BTreeMap::new(), BTreeSet::new(), HashMap::new()));
-                    frame_starts[position] = Some(current);
                 }
                 NormalizerEvent::Result { owner, .. } => {
                     let Some((root, _, results, pending_bounds, _)) = stack.last_mut() else {
@@ -1947,7 +1967,7 @@ impl FeasibilitySink for FeasibilityTrace {
                             else {
                                 return Err(G0Error::SpecializationTraceInvariant);
                             };
-                            let owner_ok = observation.owner == *active_root;
+                            let owner_ok = observation.owner.program() == active_root.program();
                             let range_ok = source.validate_against(current).is_ok() &&
                                 source.end.0 < current.0;
                             let association_ok = replay.range == *source &&
@@ -1984,7 +2004,6 @@ impl FeasibilitySink for FeasibilityTrace {
                     if root.program() != owner.program() {
                         return Err(G0Error::RelationTraceInvariant);
                     }
-                    frame_starts[position] = Some(*start);
                     let NormalizerEvent::BoundTransfer { rule, .. } = event else { unreachable!() };
                     self.validate_bound_rule(
                         *root,
@@ -1998,9 +2017,6 @@ impl FeasibilitySink for FeasibilityTrace {
                     pending_bounds.insert(*owner);
                 }
             }
-            if frame_starts[position].is_none() {
-                frame_starts[position] = stack.last().map(|(_, start, _, _, _)| *start);
-            }
         }
         if !stack.is_empty() {
             return Err(G0Error::MissingNormalizationResult);
@@ -2013,6 +2029,15 @@ impl FeasibilitySink for FeasibilityTrace {
         monomials: &super::monomial::MonomialArena,
     ) -> Result<(), G0Error> {
         FeasibilityTrace::validate_normalization_observations_with_monomials(self, monomials)
+    }
+
+    fn validate_normalization_observations_with_state(
+        &self,
+        monomials: &super::monomial::MonomialArena,
+        normalization: &super::relation::NormalizationCache,
+    ) -> Result<(), G0Error> {
+        self.validate_normalization_observations_with_monomials(monomials)?;
+        self.validate_universal_state(monomials, normalization)
     }
 
     fn retained_monomial_roots(
@@ -2058,6 +2083,27 @@ impl FeasibilitySink for FeasibilityTrace {
         let id = self.next_slice_group_id;
         self.next_slice_group_id = id.checked_add(1).ok_or(G0Error::TraceOverflow)?;
         Ok(SliceGroupId(id))
+    }
+}
+
+fn bound_rule_contains_transfer(rule: &BoundRule, event: EventIndex) -> bool {
+    let value_ref_contains = |value: &BoundValueRef| matches!(value, BoundValueRef::Transfer(candidate) if *candidate == event);
+    match rule {
+        BoundRule::Authority(_) => false,
+        BoundRule::Identity { input } => value_ref_contains(input),
+        BoundRule::Sum { inputs } |
+        BoundRule::Maximum { inputs } |
+        BoundRule::WeightedSum { inputs } => inputs.iter().any(value_ref_contains),
+        BoundRule::Scale { value, scale } => {
+            value_ref_contains(value) ||
+                matches!(scale, BoundScale::Value(value) if value_ref_contains(value))
+        }
+        BoundRule::MonomialProduct { factors, .. } => {
+            factors.iter().any(|factor| value_ref_contains(&factor.bound))
+        }
+        BoundRule::Product { left, right, .. } | BoundRule::Tensor { left, right, .. } => {
+            value_ref_contains(left) || value_ref_contains(right)
+        }
     }
 }
 
@@ -2148,6 +2194,125 @@ impl FeasibilityTrace {
         Ok(())
     }
 
+    fn validate_universal_state(
+        &self,
+        monomials: &super::monomial::MonomialArena,
+        normalization: &super::relation::NormalizationCache,
+    ) -> Result<(), G0Error> {
+        macro_rules! invariant {
+            () => {
+                return Err(G0Error::RelationTraceInvariant)
+            };
+        }
+        let mut frame_starts = vec![None; self.events.len()];
+        let mut frames = Vec::new();
+        for (index, event) in self.events.iter().enumerate() {
+            let current = EventIndex(index as u64);
+            if matches!(event, NormalizerEvent::InvocationStart { .. }) {
+                frames.push(current);
+            }
+            frame_starts[index] = frames.last().copied();
+            if matches!(event, NormalizerEvent::InvocationEnd { .. }) {
+                frames.pop();
+            }
+        }
+        for (index, event) in self.events.iter().enumerate() {
+            let NormalizerEvent::AppliedRelation(observation) = event else { continue };
+            let AppliedRelationRule::Universal { key, lhs, rhs, .. } = &observation.rule else {
+                continue;
+            };
+            let Some(entries) = normalization.runtime_get(key) else {
+                invariant!();
+            };
+            let Some(rhs_set) = entries.get(lhs) else {
+                invariant!();
+            };
+            if !rhs_set.contains(rhs) {
+                invariant!();
+            }
+            let source_descriptor = monomials
+                .descriptor(observation.source_monomial)
+                .map_err(|_| G0Error::RelationTraceInvariant)?;
+            let lhs_descriptor =
+                monomials.descriptor(lhs.monomial).map_err(|_| G0Error::RelationTraceInvariant)?;
+            let start = observation.ordered_start as usize;
+            let end = observation.ordered_end_exclusive as usize;
+            if start > end || end > source_descriptor.ordered_factors.len() ||
+                source_descriptor.ordered_factors[start..end] !=
+                    lhs_descriptor.ordered_factors[..]
+            {
+                invariant!();
+            }
+            let mut remaining_central = source_descriptor.central_factors.to_vec();
+            for factor in &lhs_descriptor.central_factors {
+                let Some(position) =
+                    remaining_central.iter().position(|candidate| candidate == factor)
+                else {
+                    invariant!();
+                };
+                remaining_central.remove(position);
+            }
+            if !remaining_central.is_empty() {
+                invariant!();
+            }
+            let replay =
+                self.specialization_ranges.get(key).ok_or(G0Error::RelationTraceInvariant)?;
+            let rhs_event = replay
+                .rhs_results
+                .binary_search_by_key(rhs, |(candidate, _)| *candidate)
+                .map(|position| replay.rhs_results[position].1)
+                .map_err(|_| G0Error::RelationTraceInvariant)?;
+            let Some(NormalizerEvent::InvocationEnd {
+                result: RecordedValue { exact_nf: Some(witness_nf), .. },
+                ..
+            }) = self.events.get(rhs_event.0 as usize)
+            else {
+                invariant!();
+            };
+            let cached_rhs =
+                normalization.get(*rhs).map_err(|_| G0Error::RelationTraceInvariant)?;
+            if witness_nf.as_ref() != cached_rhs {
+                invariant!();
+            }
+            let Some(frame_start) = frame_starts[index] else {
+                invariant!();
+            };
+            let Some(NormalizerEvent::InvocationStart { root: frame_root }) =
+                self.events.get(frame_start.0 as usize)
+            else {
+                invariant!();
+            };
+            if observation.owner.program() != frame_root.program() {
+                invariant!();
+            }
+            let Some(result_index) = self.events.iter().enumerate().skip(index + 1).find_map(
+                |(candidate, event)| {
+                    (frame_starts[candidate] == Some(frame_start) &&
+                        matches!(event, NormalizerEvent::Result { owner, .. } if *owner == observation.owner))
+                    .then_some(candidate)
+                },
+            ) else {
+                invariant!();
+            };
+            let Some(end_index) = self.events.iter().enumerate().skip(result_index + 1).find_map(
+                |(candidate, event)| {
+                    (frame_starts[candidate] == Some(frame_start) &&
+                        matches!(event, NormalizerEvent::InvocationEnd { root, .. } if *root == *frame_root))
+                    .then_some(candidate)
+                },
+            ) else {
+                invariant!();
+            };
+            let has_transfer = self.events.iter().enumerate().skip(index + 1).take(end_index - index - 1).any(
+                |(_, event)| matches!(event, NormalizerEvent::BoundTransfer { owner, rule } if *owner == observation.owner && bound_rule_contains_transfer(rule, EventIndex(index as u64)))
+            );
+            if !has_transfer {
+                invariant!();
+            }
+        }
+        Ok(())
+    }
+
     fn projection_is_available(value: &RecordedValue, projection: &BoundProjection) -> bool {
         match projection {
             BoundProjection::Coefficient => {
@@ -2214,7 +2379,7 @@ impl FeasibilityTrace {
                 }
                 match self.events.get(event.0 as usize) {
                     Some(NormalizerEvent::BoundTransfer { owner: transfer_owner, .. }) => {
-                        if transfer_owner.program() != root.program() {
+                        if *transfer_owner != owner {
                             return Err(G0Error::UnsupportedBoundTransfer);
                         }
                     }

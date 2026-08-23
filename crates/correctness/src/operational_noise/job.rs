@@ -1401,8 +1401,11 @@ impl CheckerJob {
         if S::ENABLED {
             let monomial_arena =
                 self.monomials.get(scope).ok_or(JobError::MissingMonomialScope { scope })?;
-            sink.validate_normalization_observations_with_monomials(monomial_arena)
-                .map_err(JobError::Feasibility)?;
+            sink.validate_normalization_observations_with_state(
+                monomial_arena,
+                &self.normalization,
+            )
+            .map_err(JobError::Feasibility)?;
         }
         self.frozen_resources = Some(self.current_resource_counters());
         Ok((value, counters))

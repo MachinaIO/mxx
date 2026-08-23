@@ -1082,6 +1082,26 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(())
     }
 
+    fn observe_specialization(
+        &mut self,
+        owner: ScopedExprId,
+        key: RuntimeSpecializationKey,
+        hit: bool,
+    ) -> Result<(), NormalizeError> {
+        if S::ENABLED {
+            self.sink
+                .as_deref_mut()
+                .ok_or(super::g0::G0Error::MissingSpecializationResult)?
+                .record_specialization(super::g0::SpecializationObservation {
+                    owner,
+                    key,
+                    hit,
+                    result: Some(owner),
+                })?;
+        }
+        Ok(())
+    }
+
     fn gadget_input_nf(
         &mut self,
         expression: ExprId,
@@ -3812,9 +3832,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         if let Some(cached) =
             self.normalization.as_deref().and_then(|cache| cache.runtime_get(&key)).cloned()
         {
+            self.observe_specialization(index, key, true)?;
             return Ok(cached);
         }
         let specialized = self.specialize_universal(dispatch, index, index_range)?;
+        self.observe_specialization(index, key.clone(), false)?;
         self.normalization
             .as_deref_mut()
             .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?

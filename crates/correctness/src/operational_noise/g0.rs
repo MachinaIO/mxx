@@ -51,6 +51,11 @@ pub(crate) trait FeasibilitySink: Default {
         result: super::arena::ScopedExprId,
     ) -> Result<(), G0Error>;
 
+    fn record_specialization(
+        &mut self,
+        observation: SpecializationObservation,
+    ) -> Result<(), G0Error>;
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error>;
 
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error>;
@@ -116,6 +121,14 @@ pub(crate) struct PredecessorObservation {
     pub consumer: super::arena::ScopedExprId,
     pub input_position: u32,
     pub predecessor: ExprId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct SpecializationObservation {
+    pub owner: super::arena::ScopedExprId,
+    pub key: super::relation::RuntimeSpecializationKey,
+    pub hit: bool,
+    pub result: Option<super::arena::ScopedExprId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1112,6 +1125,13 @@ impl FeasibilitySink for NoFeasibility {
         Ok(())
     }
 
+    fn record_specialization(
+        &mut self,
+        _observation: SpecializationObservation,
+    ) -> Result<(), G0Error> {
+        Ok(())
+    }
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error> {
         Ok(())
     }
@@ -1141,6 +1161,7 @@ pub(crate) struct FeasibilityTrace {
     pub residual_normalization_nodes: u64,
     pub predecessor_observations: BTreeSet<PredecessorObservation>,
     pub normalization_results: BTreeSet<super::arena::ScopedExprId>,
+    pub specialization_observations: BTreeSet<SpecializationObservation>,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
     index_use_plans: BTreeSet<IndexUsePlan>,
@@ -1156,6 +1177,7 @@ impl Default for FeasibilityTrace {
             residual_normalization_nodes: 0,
             predecessor_observations: BTreeSet::new(),
             normalization_results: BTreeSet::new(),
+            specialization_observations: BTreeSet::new(),
             source_observations: BTreeMap::new(),
             event_observations: BTreeMap::new(),
             index_use_plans: BTreeSet::new(),
@@ -1220,6 +1242,17 @@ impl FeasibilitySink for FeasibilityTrace {
         Ok(())
     }
 
+    fn record_specialization(
+        &mut self,
+        observation: SpecializationObservation,
+    ) -> Result<(), G0Error> {
+        if observation.key.index != observation.owner {
+            return Err(G0Error::SpecializationOwnerMismatch);
+        }
+        self.specialization_observations.insert(observation);
+        Ok(())
+    }
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error> {
         if self
             .predecessor_observations
@@ -1227,6 +1260,13 @@ impl FeasibilitySink for FeasibilityTrace {
             .any(|observation| !self.normalization_results.contains(&observation.consumer))
         {
             return Err(G0Error::MissingNormalizationResult);
+        }
+        if self
+            .specialization_observations
+            .iter()
+            .any(|observation| observation.result != Some(observation.owner))
+        {
+            return Err(G0Error::MissingSpecializationResult);
         }
         Ok(())
     }
@@ -1765,6 +1805,10 @@ pub(crate) enum G0Error {
     UnsupportedCanonicalEventKind,
     #[error("residual predecessor observation has no normalized consumer result")]
     MissingNormalizationResult,
+    #[error("specialization observation owner does not match its typed key")]
+    SpecializationOwnerMismatch,
+    #[error("specialization observation has no successful typed result")]
+    MissingSpecializationResult,
     #[error("residual event has no typed lowering observation")]
     MissingEventObservation,
     #[error("independent residual events cannot alias one canonical event row")]
@@ -2959,6 +3003,101 @@ mod tests {
         assert!(evidence.index_uses.is_empty());
         assert!(evidence.slice_groups.is_empty());
         assert_eq!(evidence.l_rows, BigUint::zero());
+    }
+
+    #[test]
+    fn specialization_observations_retain_typed_hit_miss_and_owner_context() {
+        use crate::operational_noise::{
+            arena::{ExprArena, FamilyDomain},
+            program::ProgramArena,
+            relation::*,
+        };
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let body = expressions.intern_argument(0, ResolvedValueType::Int).expect("typed argument");
+        let family = programs
+            .generated_family_from_body(
+                &mut expressions,
+                FamilyDomain::new(0, 2).expect("domain"),
+                body,
+            )
+            .expect("generated family");
+        let owner = programs.scoped(&expressions, family.program(), body).expect("scoped owner");
+        let dispatch = UniversalDispatchKey {
+            preimage_family: family,
+            preimage_source: SamplerSourceContract { expression: body },
+            matrix_type: matrix(),
+            trapdoor_source: TrapdoorSourceContract { expression: body },
+        };
+        let generation = RelationRegistry::new().freeze();
+        let key = RuntimeSpecializationKey { dispatch, index: owner, generation };
+
+        let mut trace = FeasibilityTrace::default();
+        trace
+            .record_specialization(SpecializationObservation {
+                owner,
+                key: key.clone(),
+                hit: false,
+                result: Some(owner),
+            })
+            .expect("miss");
+        trace
+            .record_specialization(SpecializationObservation {
+                owner,
+                key,
+                hit: true,
+                result: Some(owner),
+            })
+            .expect("hit");
+        assert_eq!(trace.specialization_observations.len(), 2);
+        trace.validate_normalization_observations().expect("typed results");
+        let mut ordinary = NoFeasibility;
+        ordinary
+            .record_specialization(SpecializationObservation {
+                owner,
+                key: trace.specialization_observations.iter().next().unwrap().key.clone(),
+                hit: true,
+                result: Some(owner),
+            })
+            .expect("ordinary sink remains a no-op");
+
+        let other_body = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .expect("second typed argument");
+        let other_family = programs
+            .generated_family_from_body(
+                &mut expressions,
+                FamilyDomain::new(0, 2).expect("second domain"),
+                other_body,
+            )
+            .expect("second family");
+        let other = programs
+            .scoped(&expressions, other_family.program(), other_body)
+            .expect("second scoped owner");
+        assert_eq!(
+            FeasibilityTrace::default().record_specialization(SpecializationObservation {
+                owner: other,
+                key: trace.specialization_observations.iter().next().unwrap().key.clone(),
+                hit: true,
+                result: Some(other),
+            }),
+            Err(G0Error::SpecializationOwnerMismatch)
+        );
+        let mut missing = trace.clone();
+        missing.specialization_observations = trace
+            .specialization_observations
+            .iter()
+            .cloned()
+            .map(|mut observation| {
+                observation.result = None;
+                observation
+            })
+            .collect();
+        assert_eq!(
+            missing.validate_normalization_observations(),
+            Err(G0Error::MissingSpecializationResult)
+        );
     }
 
     #[test]

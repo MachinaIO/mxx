@@ -105,6 +105,22 @@ impl GpuNodeMeasurementBackend {
         node: &'a MeasurementNode<'a>,
         crt_depth: usize,
     ) -> (NodeKind, Vec<ConcreteWireType>, Vec<ConcreteWireType>, f64) {
+        let capped_columns = |matrix: &ConcreteMatrixType| {
+            let bytes_per_column = u64::try_from(matrix.rows)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::try_from(matrix.ring_dimension).unwrap_or(u64::MAX))
+                .saturating_mul(u64::try_from(crt_depth).unwrap_or(u64::MAX))
+                .saturating_mul(8);
+            let maximum_columns = usize::try_from(
+                REPRESENTATIVE_MATRIX_BYTES.checked_div(bytes_per_column).unwrap_or(0).max(1),
+            )
+            .unwrap_or(usize::MAX);
+            let representative_columns = matrix.columns.min(maximum_columns).max(1);
+            (representative_columns < matrix.columns).then_some((
+                representative_columns,
+                matrix.columns as f64 / representative_columns as f64,
+            ))
+        };
         let mut kind = node.kind.clone();
         let mut argument_types = node.concrete_argument_types.clone();
         let mut output_types = node.concrete_output_types.clone();
@@ -120,26 +136,10 @@ impl GpuNodeMeasurementBackend {
                 }) else {
                     return (kind, argument_types, output_types, scale);
                 };
-                let original_entries = output.rows.saturating_mul(output.columns);
-                let bytes_per_entry = u64::try_from(output.ring_dimension)
-                    .unwrap_or(u64::MAX)
-                    .saturating_mul(u64::try_from(crt_depth).unwrap_or(u64::MAX))
-                    .saturating_mul(8);
-                let maximum_entries = usize::try_from(
-                    REPRESENTATIVE_MATRIX_BYTES.checked_div(bytes_per_entry).unwrap_or(0).max(1),
-                )
-                .unwrap_or(usize::MAX);
-                if original_entries > maximum_entries {
-                    let representative_rows = output.rows.min(maximum_entries).max(1);
-                    let representative_columns =
-                        output.columns.min((maximum_entries / representative_rows).max(1)).max(1);
-                    let representative_entries =
-                        representative_rows.saturating_mul(representative_columns);
-                    output.rows = representative_rows;
+                if let Some((representative_columns, column_scale)) = capped_columns(output) {
                     output.columns = representative_columns;
-                    matrix_type.rows = mxx_ir_core::IntExpr::constant(representative_rows);
                     matrix_type.columns = mxx_ir_core::IntExpr::constant(representative_columns);
-                    scale = original_entries as f64 / representative_entries as f64;
+                    scale = column_scale;
                 }
             }
             NodeKind::Slice { rows, columns } => {
@@ -174,6 +174,128 @@ impl GpuNodeMeasurementBackend {
                         range.start = mxx_ir_core::IntExpr::constant(0);
                         range.end = mxx_ir_core::IntExpr::constant(output.columns);
                     }
+                }
+            }
+            NodeKind::GadgetDecompose { .. } => {
+                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
+                    ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                        Some(matrix)
+                    }
+                    _ => None,
+                }) else {
+                    return (kind, argument_types, output_types, scale);
+                };
+                if let Some((representative_columns, column_scale)) = capped_columns(output) {
+                    let Some(input) =
+                        argument_types.first_mut().and_then(|wire_type| match wire_type {
+                            ConcreteWireType::Matrix(matrix) |
+                            ConcreteWireType::Preimage(matrix) => Some(matrix),
+                            _ => None,
+                        })
+                    else {
+                        return (kind, argument_types, output_types, scale);
+                    };
+                    input.columns = representative_columns;
+                    output.columns = representative_columns;
+                    scale = column_scale;
+                }
+            }
+            NodeKind::MatrixScale { .. } | NodeKind::MatrixNegate => {
+                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
+                    ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                        Some(matrix)
+                    }
+                    _ => None,
+                }) else {
+                    return (kind, argument_types, output_types, scale);
+                };
+                if let Some((representative_columns, column_scale)) = capped_columns(output) {
+                    let Some(input) =
+                        argument_types.first_mut().and_then(|wire_type| match wire_type {
+                            ConcreteWireType::Matrix(matrix) |
+                            ConcreteWireType::Preimage(matrix) => Some(matrix),
+                            _ => None,
+                        })
+                    else {
+                        return (kind, argument_types, output_types, scale);
+                    };
+                    input.columns = representative_columns;
+                    output.columns = representative_columns;
+                    scale = column_scale;
+                }
+            }
+            NodeKind::MatrixBinary(operation) => {
+                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
+                    ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                        Some(matrix)
+                    }
+                    _ => None,
+                }) else {
+                    return (kind, argument_types, output_types, scale);
+                };
+                match operation {
+                    MatrixBinaryOp::Add | MatrixBinaryOp::Subtract => {
+                        if let Some((representative_columns, column_scale)) = capped_columns(output)
+                        {
+                            for index in [0, 1] {
+                                let Some(input) =
+                                    argument_types.get_mut(index).and_then(|wire_type| {
+                                        match wire_type {
+                                            ConcreteWireType::Matrix(matrix) |
+                                            ConcreteWireType::Preimage(matrix) => Some(matrix),
+                                            _ => None,
+                                        }
+                                    })
+                                else {
+                                    return (kind, argument_types, output_types, scale);
+                                };
+                                input.columns = representative_columns;
+                            }
+                            output.columns = representative_columns;
+                            scale = column_scale;
+                        }
+                    }
+                    MatrixBinaryOp::Multiply => {
+                        let Some(rhs) =
+                            argument_types.get_mut(1).and_then(|wire_type| match wire_type {
+                                ConcreteWireType::Matrix(matrix) |
+                                ConcreteWireType::Preimage(matrix) => Some(matrix),
+                                _ => None,
+                            })
+                        else {
+                            return (kind, argument_types, output_types, scale);
+                        };
+                        if let Some((representative_columns, column_scale)) = capped_columns(rhs) {
+                            rhs.columns = representative_columns;
+                            output.columns = representative_columns;
+                            scale = column_scale;
+                        }
+                    }
+                }
+            }
+            NodeKind::PreimageSample { matrix_type, .. } => {
+                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
+                    ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                        Some(matrix)
+                    }
+                    _ => None,
+                }) else {
+                    return (kind, argument_types, output_types, scale);
+                };
+                if let Some((representative_columns, column_scale)) = capped_columns(output) {
+                    let Some(target) =
+                        argument_types.get_mut(2).and_then(|wire_type| match wire_type {
+                            ConcreteWireType::Matrix(matrix) |
+                            ConcreteWireType::Preimage(matrix) => Some(matrix),
+                            _ => None,
+                        })
+                    else {
+                        return (kind, argument_types, output_types, scale);
+                    };
+                    target.columns = representative_columns;
+                    output.columns = representative_columns;
+                    matrix_type.columns = mxx_ir_core::IntExpr::constant(representative_columns);
+                    scale = column_scale;
                 }
             }
             _ => {}
@@ -723,12 +845,12 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
         if let Some(error) = operation_error {
             return Err(error);
         }
+        // The representative allocation is one streamed column wave: time scales with the number
+        // of waves, while workspace remains the high-water mark of one wave.
         let measurement = NodeMeasurement {
             work_seconds: measured.measurement.work_seconds * scale,
             latency_seconds: measured.measurement.latency_seconds * scale,
-            workspace_bytes: ((measured.measurement.workspace_bytes as f64) * scale)
-                .ceil()
-                .min(u64::MAX as f64) as u64,
+            workspace_bytes: measured.measurement.workspace_bytes,
         };
         if scale > 1.0 {
             info!(
@@ -797,7 +919,7 @@ mod tests {
     use crate::MeasurementNode;
     use mxx_ir_core::{
         FrozenGraphScopeId, IntExpr, ParamEnv,
-        node::{HashVariant, IndexRange, NodeKind},
+        node::{HashVariant, IndexRange, MatrixBinaryOp, NodeKind},
         types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId},
     };
     use num_bigint::BigInt;
@@ -943,5 +1065,122 @@ mod tests {
         assert_eq!(columns.start, IntExpr::constant(0));
         assert_eq!(columns.end, IntExpr::constant(80));
         assert_eq!(scale, 1.0);
+    }
+
+    #[test]
+    fn column_separable_measurements_do_not_materialize_full_digit_matrices() {
+        let matrix = |rows, columns| ConcreteMatrixType {
+            rows,
+            columns,
+            ring_dimension: 65_536,
+            modulus: BigInt::from(257u16),
+        };
+        let scope = FrozenGraphScopeId::Root;
+        let gadget_kind = NodeKind::GadgetDecompose {
+            base: IntExpr::constant(16_384),
+            small: false,
+            digit_count: IntExpr::constant(80),
+        };
+        let gadget_node = MeasurementNode {
+            scope: &scope,
+            id: NodeId(1),
+            kind: &gadget_kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: vec![ConcreteWireType::Matrix(matrix(1, 80))],
+            concrete_output_types: vec![ConcreteWireType::Preimage(matrix(80, 80))],
+        };
+        let (_, gadget_arguments, gadget_outputs, gadget_scale) =
+            GpuNodeMeasurementBackend::representative_node(&gadget_node, 40);
+        let ConcreteWireType::Matrix(gadget_input) = &gadget_arguments[0] else {
+            panic!("gadget representative input");
+        };
+        let ConcreteWireType::Preimage(gadget_output) = &gadget_outputs[0] else {
+            panic!("gadget representative output");
+        };
+        assert_eq!((gadget_input.rows, gadget_input.columns), (1, 1));
+        assert_eq!((gadget_output.rows, gadget_output.columns), (80, 1));
+        assert_eq!(gadget_scale, 80.0);
+
+        let multiply_kind = NodeKind::MatrixBinary(MatrixBinaryOp::Multiply);
+        let multiply_node = MeasurementNode {
+            scope: &scope,
+            id: NodeId(2),
+            kind: &multiply_kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: vec![
+                ConcreteWireType::Matrix(matrix(1, 80)),
+                ConcreteWireType::Matrix(matrix(80, 80)),
+            ],
+            concrete_output_types: vec![ConcreteWireType::Matrix(matrix(1, 80))],
+        };
+        let (_, multiply_arguments, multiply_outputs, multiply_scale) =
+            GpuNodeMeasurementBackend::representative_node(&multiply_node, 40);
+        let ConcreteWireType::Matrix(rhs) = &multiply_arguments[1] else {
+            panic!("multiply representative rhs");
+        };
+        let ConcreteWireType::Matrix(product) = &multiply_outputs[0] else {
+            panic!("multiply representative output");
+        };
+        assert_eq!((rhs.rows, rhs.columns), (80, 1));
+        assert_eq!((product.rows, product.columns), (1, 1));
+        assert_eq!(multiply_scale, 80.0);
+    }
+
+    #[test]
+    fn preimage_measurement_uses_one_target_column() {
+        let matrix = |rows, columns| ConcreteMatrixType {
+            rows,
+            columns,
+            ring_dimension: 65_536,
+            modulus: BigInt::from(257u16),
+        };
+        let symbolic = MatrixType {
+            rows: IntExpr::constant(82),
+            columns: IntExpr::constant(80),
+            ring_dimension: IntExpr::constant(65_536),
+            modulus: IntExpr::constant(257),
+        };
+        let kind = NodeKind::PreimageSample {
+            matrix_type: symbolic,
+            max_coefficient_bound: IntExpr::constant(100),
+        };
+        let scope = FrozenGraphScopeId::Root;
+        let node = MeasurementNode {
+            scope: &scope,
+            id: NodeId(1),
+            kind: &kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: vec![
+                ConcreteWireType::Matrix(matrix(1, 82)),
+                ConcreteWireType::Bytes { length: 0 },
+                ConcreteWireType::Matrix(matrix(1, 80)),
+            ],
+            concrete_output_types: vec![ConcreteWireType::Preimage(matrix(82, 80))],
+        };
+
+        let (kind, arguments, outputs, scale) =
+            GpuNodeMeasurementBackend::representative_node(&node, 40);
+        let NodeKind::PreimageSample { matrix_type, .. } = kind else {
+            panic!("preimage representative kind");
+        };
+        let ConcreteWireType::Matrix(target) = &arguments[2] else {
+            panic!("preimage representative target");
+        };
+        let ConcreteWireType::Preimage(output) = &outputs[0] else {
+            panic!("preimage representative output");
+        };
+        assert_eq!(target.columns, 1);
+        assert_eq!((output.rows, output.columns), (82, 1));
+        assert_eq!(matrix_type.columns, IntExpr::constant(1));
+        assert_eq!(scale, 80.0);
     }
 }

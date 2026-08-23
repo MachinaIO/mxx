@@ -4658,7 +4658,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
         let bounds =
             children.iter().map(|value| value.coefficient_bound.clone()).collect::<Vec<_>>();
-        let mut program_call_authority = None;
         let bound = match &node.operator {
             ValueOperator::Constant(constant) => match &constant.value {
                 super::arena::ConstantValue::Int(value) => {
@@ -4674,24 +4673,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             ValueOperator::DeterministicHash(_) => NumericContract::Known(CoefficientBound::Large),
             ValueOperator::Source(_) | ValueOperator::Sample { .. } => NumericContract::Missing,
             ValueOperator::Argument { .. } => NumericContract::Missing,
-            ValueOperator::ProgramCall { program } => {
-                if let Some(facts) = self.program_call_matrix_facts(expression) {
-                    if S::ENABLED {
-                        program_call_authority = Some(BoundAuthority::ProgramFamilyFact);
-                    }
-                    facts.coefficient_bound.clone()
-                } else if let Some((source, bound)) =
-                    self.relation_live_preimage(expression, *program)?
-                {
-                    if S::ENABLED {
-                        program_call_authority =
-                            Some(BoundAuthority::RelationPreimageSource { source });
-                    }
-                    bound
-                } else {
-                    NumericContract::Missing
-                }
-            }
+            ValueOperator::ProgramCall { .. } => NumericContract::Missing,
             _ => bounds.first().cloned().unwrap_or(NumericContract::Missing),
         };
         if S::ENABLED {
@@ -4732,12 +4714,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 ValueOperator::ExtractCoefficient { .. } => BoundRule::Identity {
                     input: Self::predecessor_ref(0, BoundProjection::Coefficient)?,
                 },
-                ValueOperator::ProgramCall { .. } => {
-                    let Some(authority) = program_call_authority else {
-                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
-                    };
-                    BoundRule::Authority(authority)
-                }
                 ValueOperator::Source(_) |
                 ValueOperator::Sample { .. } |
                 ValueOperator::Argument { .. } |
@@ -5128,9 +5104,10 @@ mod tests {
     use super::*;
     use crate::operational_noise::{
         arena::{
-            ArenaToken, HashVariant, MatrixLayout, MatrixOperation, ProgramInput, ProgramSignature,
-            ResolvedMatrixType, SampleEventId, SamplerOperation, SemanticFamilySourceIdentity,
-            SemanticSourceIdentity, TrustedIndexRange,
+            ArenaToken, DeterministicHashDefinition, DeterministicHashDescriptor, HashVariant,
+            MatrixLayout, MatrixOperation, ProgramInput, ProgramSignature, ResolvedMatrixType,
+            SampleEventId, SamplerOperation, SemanticFamilySourceIdentity, SemanticSourceIdentity,
+            TrustedIndexRange,
         },
         facts::{MatrixFacts, MatrixMetadata, ScalarFacts, ValueFacts},
         g0::{BoundAuthority, BoundRule, EventIndex, FeasibilityTrace, G0Error, NormalizerEvent},
@@ -8977,6 +8954,26 @@ mod tests {
 
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
+        let left = constant(&mut expressions, 5);
+        let right = constant(&mut expressions, 3);
+        let subtract = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Subtract), Box::new([left, right]))
+            .unwrap();
+        let (bound, rule) = root_rule(&mut expressions, &mut programs, subtract);
+        assert_eq!(bound, NumericContract::Known(CoefficientBound::finite(8_u8)));
+        assert!(matches!(rule, BoundRule::Sum { ref inputs } if inputs.as_ref() == [
+            BoundValueRef::Predecessor {
+                input_position: 0,
+                projection: BoundProjection::Coefficient,
+            },
+            BoundValueRef::Predecessor {
+                input_position: 1,
+                projection: BoundProjection::Coefficient,
+            },
+        ]));
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
         let left = constant(&mut expressions, 2);
         let right = constant(&mut expressions, 3);
         let multiply = expressions
@@ -9112,6 +9109,87 @@ mod tests {
         .normalize(semantic)
         .unwrap_err();
         assert!(matches!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer)));
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, argument);
+        let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        assert_eq!(ordinary.coefficient_bound, NumericContract::Missing);
+        let mut trace = FeasibilityTrace::default();
+        let error = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(semantic)
+        .unwrap_err();
+        assert!(matches!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer)));
+    }
+
+    #[test]
+    fn deterministic_hash_enabled_trace_records_one_operator_authority() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let output = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
+        let key = expressions
+            .intern(ValueOperator::Constant(TypedConstant::bytes(vec![0_u8; 32])), Box::new([]))
+            .unwrap();
+        let hash = expressions
+            .intern(
+                ValueOperator::DeterministicHash(DeterministicHashDescriptor {
+                    definition: DeterministicHashDefinition::MxxPolynomialHash,
+                    version: 1,
+                    key_byte_length: 32,
+                    output,
+                    tag_prefix: Box::new([]),
+                    binary_tag_count: 0,
+                    decimal_tag_count: 0,
+                    u64_le_tag_count: 0,
+                    dynamic_tag_count: 0,
+                }),
+                Box::new([key]),
+            )
+            .unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, hash);
+        let mut key_facts = ScalarFacts::new(ResolvedValueType::Bytes).unwrap();
+        key_facts.coefficient_bound = NumericContract::Known(CoefficientBound::finite(0_u8));
+        facts.insert(&expressions, key, ValueFacts::Scalar(key_facts)).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let mut normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap();
+        assert_eq!(
+            normalizer.normalize(semantic).unwrap().coefficient_bound,
+            NumericContract::Known(CoefficientBound::Large)
+        );
+        drop(normalizer);
+        trace.validate_normalization_observations().unwrap();
+        let authorities = trace
+            .normalization_events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    NormalizerEvent::BoundTransfer {
+                        owner,
+                        rule: BoundRule::Authority(BoundAuthority::Operator),
+                    } if *owner == semantic
+                )
+            })
+            .count();
+        assert_eq!(authorities, 1);
     }
 
     #[test]

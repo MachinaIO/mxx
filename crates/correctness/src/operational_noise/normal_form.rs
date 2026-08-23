@@ -25,8 +25,9 @@ use super::{
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
     program::{ArenaError, ProgramArena, ValueProgramId},
     relation::{
-        CanonicalLhsKey, GadgetRecompositionRegistry, NormalizationCache, RelationRegistry,
-        RelationRegistryError, RuntimeSpecializationKey, UniversalRelationRegistration,
+        CanonicalLhsKey, CanonicalRhsId, GadgetRecompositionRegistry, NormalizationCache,
+        RelationRegistry, RelationRegistryError, RuntimeSpecializationKey,
+        UniversalRelationRegistration,
     },
 };
 use mxx_ir_core::types::ConcreteMatrixType;
@@ -150,7 +151,6 @@ struct RelationMatch {
     rhs: super::relation::CanonicalRhsId,
     key: Option<RuntimeSpecializationKey>,
     source: Option<super::g0::EventRange>,
-    rhs_result: Option<super::g0::EventIndex>,
     lhs: Option<super::relation::CanonicalLhsKey>,
     ordered_start: u32,
     ordered_end_exclusive: u32,
@@ -572,18 +572,33 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         .ok_or(super::g0::G0Error::MissingNormalizationResult)?
                         .record_invocation_end(root, value, &counters);
                     if let Err(error) = end_result {
-                        self.sink.as_deref_mut().map(|sink| sink.abort_invocation(root));
+                        let discarded = self
+                            .sink
+                            .as_deref_mut()
+                            .map(|sink| sink.abort_invocation(root))
+                            .unwrap_or_default();
+                        self.rollback_runtime_specializations(discarded);
                         return Err(error.into());
                     }
                 }
                 Err(_) => {
-                    if let Some(sink) = self.sink.as_deref_mut() {
-                        sink.abort_invocation(root);
-                    }
+                    let discarded = self
+                        .sink
+                        .as_deref_mut()
+                        .map(|sink| sink.abort_invocation(root))
+                        .unwrap_or_default();
+                    self.rollback_runtime_specializations(discarded);
                 }
             }
         }
         result
+    }
+
+    fn rollback_runtime_specializations(&mut self, keys: Box<[RuntimeSpecializationKey]>) {
+        let Some(cache) = self.normalization.as_deref_mut() else { return };
+        for key in keys {
+            cache.runtime_remove_if_inserted(&key);
+        }
     }
 
     fn normalize_inner(
@@ -1213,16 +1228,31 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(())
     }
 
-    fn specialization_replay(
+    fn specialization_range(
         &self,
         key: &RuntimeSpecializationKey,
-    ) -> Result<super::g0::SpecializationReplay, NormalizeError> {
+    ) -> Result<super::g0::EventRange, NormalizeError> {
         if S::ENABLED {
             return Ok(self
                 .sink
                 .as_deref()
                 .ok_or(super::g0::G0Error::SpecializationTraceInvariant)?
-                .specialization_replay(key)?);
+                .specialization_range(key)?);
+        }
+        Err(super::g0::G0Error::SpecializationTraceInvariant.into())
+    }
+
+    fn specialization_rhs_result(
+        &self,
+        key: &RuntimeSpecializationKey,
+        rhs: CanonicalRhsId,
+    ) -> Result<super::g0::EventIndex, NormalizeError> {
+        if S::ENABLED {
+            return Ok(self
+                .sink
+                .as_deref()
+                .ok_or(super::g0::G0Error::SpecializationTraceInvariant)?
+                .specialization_rhs_result(key, rhs)?);
         }
         Err(super::g0::G0Error::SpecializationTraceInvariant.into())
     }
@@ -4437,12 +4467,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let mut provenance = S::ENABLED.then(
             BTreeMap::<
                 ((usize, usize), super::relation::CanonicalRhsId),
-                BTreeSet<(
-                    CanonicalLhsKey,
-                    RuntimeSpecializationKey,
-                    super::g0::EventRange,
-                    super::g0::EventIndex,
-                )>,
+                BTreeSet<(CanonicalLhsKey, RuntimeSpecializationKey, super::g0::EventRange)>,
             >::new,
         );
         for (k_position, &k_factor) in ordered.iter().enumerate() {
@@ -4507,21 +4532,15 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         .or_default()
                         .extend(rhs_candidates.iter().copied());
                     if let Some(provenance) = provenance.as_mut() {
-                        let (specialization_key, replay) = replay.as_ref().ok_or(
+                        let (specialization_key, replay_range) = replay.as_ref().ok_or(
                             NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs),
                         )?;
-                        let rhs_results =
-                            replay.rhs_results.iter().copied().collect::<BTreeMap<_, _>>();
                         for &rhs in rhs_candidates.iter() {
-                            let rhs_result =
-                                rhs_results.get(&rhs).copied().ok_or(NormalizeError::Relation(
-                                    RelationRegistryError::InvalidCanonicalRhs,
-                                ))?;
+                            self.specialization_rhs_result(specialization_key, rhs)?;
                             provenance.entry(((start, end), rhs)).or_default().insert((
                                 lhs.clone(),
                                 specialization_key.clone(),
-                                replay.range,
-                                rhs_result,
+                                *replay_range,
                             ));
                         }
                     }
@@ -4544,17 +4563,17 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         else {
             return Ok(None);
         };
-        let (key, source, rhs_result, lhs) = if S::ENABLED {
+        let (key, source, lhs) = if S::ENABLED {
             let provenance = provenance
                 .as_ref()
                 .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
-            let (lhs, key, source, rhs_result) = provenance
+            let (lhs, key, source) = provenance
                 .get(&((start, end), rhs))
                 .and_then(|items| items.iter().next().cloned())
                 .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
-            (Some(key), Some(source), Some(rhs_result), Some(lhs))
+            (Some(key), Some(source), Some(lhs))
         } else {
-            (None, None, None, None)
+            (None, None, None)
         };
         Ok(Some(RelationMatch {
             prefix: ordered[..start].to_vec(),
@@ -4563,7 +4582,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             rhs,
             key,
             source,
-            rhs_result,
             lhs,
             ordered_start: u32::try_from(start).map_err(|_| {
                 NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs)
@@ -4691,7 +4709,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     ) -> Result<
         (
             BTreeMap<CanonicalLhsKey, BTreeSet<super::relation::CanonicalRhsId>>,
-            Option<(RuntimeSpecializationKey, super::g0::SpecializationReplay)>,
+            Option<(RuntimeSpecializationKey, super::g0::EventRange)>,
         ),
         NormalizeError,
     > {
@@ -4704,7 +4722,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         {
             self.record_specialization_cache_hit(index, key.clone())?;
             let replay = S::ENABLED
-                .then(|| self.specialization_replay(&key).map(|replay| (key.clone(), replay)))
+                .then(|| self.specialization_range(&key).map(|range| (key.clone(), range)))
                 .transpose()?;
             return Ok((cached, replay));
         }
@@ -4717,7 +4735,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             rhs_results.into_boxed_slice(),
         )?;
         let replay = S::ENABLED
-            .then(|| self.specialization_replay(&key).map(|replay| (key.clone(), replay)))
+            .then(|| self.specialization_range(&key).map(|range| (key.clone(), range)))
             .transpose()?;
         self.normalization
             .as_deref_mut()

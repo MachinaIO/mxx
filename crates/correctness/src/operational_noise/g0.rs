@@ -56,7 +56,10 @@ pub(crate) trait FeasibilitySink: Default {
         counters: &super::normal_form::NormalizationCounters,
     ) -> Result<(), G0Error>;
 
-    fn abort_invocation(&mut self, root: super::arena::ScopedExprId);
+    fn abort_invocation(
+        &mut self,
+        root: super::arena::ScopedExprId,
+    ) -> Box<[super::relation::RuntimeSpecializationKey]>;
 
     fn specialization_miss_start(
         &mut self,
@@ -78,10 +81,16 @@ pub(crate) trait FeasibilitySink: Default {
         key: super::relation::RuntimeSpecializationKey,
     ) -> Result<(), G0Error>;
 
-    fn specialization_replay(
+    fn specialization_range(
         &self,
         key: &super::relation::RuntimeSpecializationKey,
-    ) -> Result<SpecializationReplay, G0Error>;
+    ) -> Result<EventRange, G0Error>;
+
+    fn specialization_rhs_result(
+        &self,
+        key: &super::relation::RuntimeSpecializationKey,
+        rhs: super::relation::CanonicalRhsId,
+    ) -> Result<EventIndex, G0Error>;
 
     fn invocation_end_for(&self, root: super::arena::ScopedExprId) -> Result<EventIndex, G0Error>;
 
@@ -1351,7 +1360,12 @@ impl FeasibilitySink for NoFeasibility {
         Ok(())
     }
 
-    fn abort_invocation(&mut self, _root: super::arena::ScopedExprId) {}
+    fn abort_invocation(
+        &mut self,
+        _root: super::arena::ScopedExprId,
+    ) -> Box<[super::relation::RuntimeSpecializationKey]> {
+        Box::new([])
+    }
 
     fn specialization_miss_start(
         &mut self,
@@ -1379,10 +1393,18 @@ impl FeasibilitySink for NoFeasibility {
         Ok(())
     }
 
-    fn specialization_replay(
+    fn specialization_range(
         &self,
         _key: &super::relation::RuntimeSpecializationKey,
-    ) -> Result<SpecializationReplay, G0Error> {
+    ) -> Result<EventRange, G0Error> {
+        Err(G0Error::SpecializationTraceInvariant)
+    }
+
+    fn specialization_rhs_result(
+        &self,
+        _key: &super::relation::RuntimeSpecializationKey,
+        _rhs: super::relation::CanonicalRhsId,
+    ) -> Result<EventIndex, G0Error> {
         Err(G0Error::SpecializationTraceInvariant)
     }
 
@@ -1591,19 +1613,38 @@ impl FeasibilitySink for FeasibilityTrace {
         Ok(())
     }
 
-    fn abort_invocation(&mut self, _root: super::arena::ScopedExprId) {
+    fn abort_invocation(
+        &mut self,
+        _root: super::arena::ScopedExprId,
+    ) -> Box<[super::relation::RuntimeSpecializationKey]> {
+        let mut discarded = Vec::new();
         if self.frames.last().is_none_or(|frame| frame.root != _root) {
+            for event in &self.events {
+                if let NormalizerEvent::SpecializationComputed { key, .. } = event {
+                    discarded.push(key.clone());
+                }
+            }
+            discarded.sort();
+            discarded.dedup();
             self.frames.clear();
             self.events.clear();
             self.specialization_ranges.clear();
             self.retained_monomial_roots.clear();
-            return;
+            return discarded.into_boxed_slice();
         }
-        let Some(frame) = self.frames.pop() else { return };
+        let Some(frame) = self.frames.pop() else { return discarded.into_boxed_slice() };
         let truncate = frame.range.start.0 as usize;
+        for event in self.events.iter().skip(truncate) {
+            if let NormalizerEvent::SpecializationComputed { key, .. } = event {
+                discarded.push(key.clone());
+            }
+        }
+        discarded.sort();
+        discarded.dedup();
         self.events.truncate(truncate);
         self.specialization_ranges.retain(|_, replay| replay.range.end.0 <= truncate as u64);
         self.rebuild_retained_monomial_roots();
+        discarded.into_boxed_slice()
     }
 
     fn specialization_miss_start(
@@ -1683,25 +1724,37 @@ impl FeasibilitySink for FeasibilityTrace {
         Ok(())
     }
 
-    fn specialization_replay(
+    fn specialization_range(
         &self,
         key: &super::relation::RuntimeSpecializationKey,
-    ) -> Result<SpecializationReplay, G0Error> {
-        self.specialization_ranges.get(key).cloned().ok_or(G0Error::MissingSpecializationRange)
+    ) -> Result<EventRange, G0Error> {
+        self.specialization_ranges
+            .get(key)
+            .map(|replay| replay.range)
+            .ok_or(G0Error::MissingSpecializationRange)
+    }
+
+    fn specialization_rhs_result(
+        &self,
+        key: &super::relation::RuntimeSpecializationKey,
+        rhs: super::relation::CanonicalRhsId,
+    ) -> Result<EventIndex, G0Error> {
+        let replay =
+            self.specialization_ranges.get(key).ok_or(G0Error::MissingSpecializationRange)?;
+        replay
+            .rhs_results
+            .binary_search_by_key(&rhs, |(candidate, _)| *candidate)
+            .map(|index| replay.rhs_results[index].1)
+            .map_err(|_| G0Error::SpecializationTraceInvariant)
     }
 
     fn invocation_end_for(&self, root: super::arena::ScopedExprId) -> Result<EventIndex, G0Error> {
-        self.events
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, event)| match event {
-                NormalizerEvent::InvocationEnd { root: actual, .. } if *actual == root => {
-                    Some(EventIndex(index as u64))
-                }
-                _ => None,
-            })
-            .ok_or(G0Error::MissingNormalizationResult)
+        match self.events.last() {
+            Some(NormalizerEvent::InvocationEnd { root: actual, .. }) if *actual == root => {
+                Ok(EventIndex((self.events.len() - 1) as u64))
+            }
+            _ => Err(G0Error::MissingNormalizationResult),
+        }
     }
 
     fn resolve_result(&self, expression: ExprId) -> Result<EventIndex, G0Error> {
@@ -4398,6 +4451,9 @@ mod tests {
             )
             .expect("invocation end");
         trace.validate_normalization_observations().expect("typed results");
+        let mut rolled_back = trace.clone();
+        assert_eq!(rolled_back.abort_invocation(owner), vec![key.clone()].into_boxed_slice());
+        assert!(rolled_back.normalization_events().is_empty());
         let mut ordinary = NoFeasibility;
         ordinary.record_specialization_cache_hit(owner, key.clone()).expect("ordinary no-op");
 

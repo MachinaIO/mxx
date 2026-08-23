@@ -433,6 +433,9 @@ impl NormalizationCache {
     ) {
         self.runtime.insert(key, value);
     }
+    pub(crate) fn runtime_remove_if_inserted(&mut self, key: &RuntimeSpecializationKey) {
+        self.runtime.remove(key);
+    }
     pub fn runtime_entry_count(&self) -> usize {
         self.runtime.len()
     }

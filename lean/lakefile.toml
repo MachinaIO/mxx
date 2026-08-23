@@ -1,0 +1,6 @@
+name = "Mxx"
+version = "0.1.0"
+defaultTargets = ["Mxx.Certificate.OperationalNoise.Fixtures"]
+
+[[lean_lib]]
+name = "Mxx"

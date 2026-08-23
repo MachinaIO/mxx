@@ -21,7 +21,7 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     mem::size_of,
 };
 use thiserror::Error;
@@ -1641,14 +1641,14 @@ impl FeasibilitySink for FeasibilityTrace {
             EventIndex,
             BTreeMap<ExprId, EventIndex>,
             BTreeSet<super::arena::ScopedExprId>,
-            BTreeMap<(super::arena::ScopedExprId, u32), (ExprId, EventIndex)>,
+            HashMap<(super::arena::ScopedExprId, u32), (ExprId, EventIndex)>,
         )>::new();
         let mut frame_starts = vec![None; self.events.len()];
         for (position, event) in self.events.iter().enumerate() {
             let current = EventIndex(u64::try_from(position).map_err(|_| G0Error::TraceOverflow)?);
             match event {
                 NormalizerEvent::InvocationStart { root } => {
-                    stack.push((*root, current, BTreeMap::new(), BTreeSet::new(), BTreeMap::new()));
+                    stack.push((*root, current, BTreeMap::new(), BTreeSet::new(), HashMap::new()));
                     frame_starts[position] = Some(current);
                 }
                 NormalizerEvent::Result { owner, .. } => {
@@ -1844,7 +1844,7 @@ impl FeasibilityTrace {
         frame_start: EventIndex,
         current: EventIndex,
         frame_starts: &[Option<EventIndex>],
-        predecessors: &BTreeMap<(super::arena::ScopedExprId, u32), (ExprId, EventIndex)>,
+        predecessors: &HashMap<(super::arena::ScopedExprId, u32), (ExprId, EventIndex)>,
         value_ref: &BoundValueRef,
     ) -> Result<(), G0Error> {
         let same_frame = |index: EventIndex| {
@@ -1912,7 +1912,7 @@ impl FeasibilityTrace {
         frame_start: EventIndex,
         current: EventIndex,
         frame_starts: &[Option<EventIndex>],
-        predecessors: &BTreeMap<(super::arena::ScopedExprId, u32), (ExprId, EventIndex)>,
+        predecessors: &HashMap<(super::arena::ScopedExprId, u32), (ExprId, EventIndex)>,
         rule: &BoundRule,
     ) -> Result<(), G0Error> {
         let mut refs = Vec::new();

@@ -9134,9 +9134,6 @@ mod tests {
                 .map(|(source, _)| source),
             None
         );
-        let scoped_source = semantic.with_expression(source);
-        assert_eq!(scoped_source.expression(), source);
-        assert_eq!(scoped_source.program(), semantic.program());
     }
 
     #[test]

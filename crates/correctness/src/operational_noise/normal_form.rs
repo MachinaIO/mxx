@@ -1478,6 +1478,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         left,
                         right,
                         matches!(operation, MatrixOperation::Subtract),
+                        false,
                         &mut None,
                     ),
                     _ => Ok(self.atom_nf(scope_proof, semantic)?),
@@ -1705,23 +1706,63 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     return Ok(self.atom_nf(scope_proof, semantic)?);
                 }
                 let mut output = PolynomialNF::zero();
-                let mut output_evidence = None;
-                for (_child_expression, (child, coefficient)) in
-                    node.inputs.iter().zip(children.iter().zip(reconstruction_coefficients))
-                {
-                    let Some(input) = child.exact_nf.as_ref() else {
-                        return Ok(self.atom_nf(scope_proof, semantic)?);
-                    };
-                    let scaled = self.scale_nf(input, coefficient);
-                    output = self.add_nf(
-                        Some(semantic),
-                        None,
-                        None,
-                        &output,
-                        &scaled,
-                        false,
-                        &mut output_evidence,
-                    )?;
+                if S::ENABLED {
+                    let mut output_evidence = None;
+                    for ((child, coefficient), child_expression) in
+                        children.iter().zip(reconstruction_coefficients).zip(node.inputs.iter())
+                    {
+                        let Some(input) = child.exact_nf.as_ref() else {
+                            return Ok(self.atom_nf(scope_proof, semantic)?);
+                        };
+                        let scaled = self.scale_nf(input, coefficient);
+                        if !scaled.bounded_summary.is_zero() {
+                            let summary = self
+                                .summary_result_ref(*child_expression)?
+                                .ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                            let summary = if coefficient.magnitude() == &BigUint::from(1_u8) {
+                                summary
+                            } else {
+                                let event = self.observe_bound_transfer(
+                                    semantic,
+                                    BoundRule::Scale {
+                                        value: summary,
+                                        scale: BoundScale::Magnitude(
+                                            coefficient.magnitude().clone(),
+                                        ),
+                                    },
+                                )?;
+                                BoundValueRef::Transfer(event)
+                            };
+                            self.append_summary_evidence(semantic, &mut output_evidence, summary)?;
+                        }
+                        output = self.add_nf(
+                            Some(semantic),
+                            None,
+                            None,
+                            &output,
+                            &scaled,
+                            false,
+                            true,
+                            &mut output_evidence,
+                        )?;
+                    }
+                } else {
+                    for (child, coefficient) in children.iter().zip(reconstruction_coefficients) {
+                        let Some(input) = child.exact_nf.as_ref() else {
+                            return Ok(self.atom_nf(scope_proof, semantic)?);
+                        };
+                        let scaled = self.scale_nf(input, coefficient);
+                        output = self.add_nf(
+                            Some(semantic),
+                            None,
+                            None,
+                            &output,
+                            &scaled,
+                            false,
+                            true,
+                            &mut None,
+                        )?;
+                    }
                 }
                 Ok(output)
             }
@@ -2428,7 +2469,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         };
         let mut evidence = None;
         if S::ENABLED {
-            let mut selected = None;
+            let mut summary_refs = Vec::new();
             for (index, child) in children.iter().enumerate() {
                 let Some(normal_form) = child.exact_nf.as_ref() else { continue };
                 let bound = normal_form.bounded_summary.coefficient_bound();
@@ -2438,15 +2479,18 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 if value.maximum_absolute_coefficient.is_zero() {
                     continue
                 }
-                let replace = selected.as_ref().is_none_or(|(_, current): &(usize, BigUint)| {
-                    value.maximum_absolute_coefficient > *current
-                });
-                if replace {
-                    selected = Some((index, value.maximum_absolute_coefficient.clone()));
-                }
+                let summary = self
+                    .summary_result_ref(node.inputs[index])?
+                    .ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                summary_refs.push(summary);
             }
-            if let Some((index, _)) = selected {
-                evidence = self.summary_result_ref(node.inputs[index])?;
+            evidence = match summary_refs.len() {
+                0 => None,
+                1 => summary_refs.pop(),
+                _ => Some(BoundValueRef::Transfer(self.observe_bound_transfer(
+                    semantic,
+                    BoundRule::Maximum { inputs: summary_refs.into_boxed_slice() },
+                )?)),
             }
         }
         self.fold_finite_no_match_terms(Some(semantic), &mut result, true, &mut evidence)?;
@@ -3068,6 +3112,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         left: &PolynomialNF,
         right: &PolynomialNF,
         subtract: bool,
+        summary_evidence_supplied: bool,
         evidence: &mut Option<BoundValueRef>,
     ) -> Result<PolynomialNF, NormalizeError> {
         let mut terms = BTreeMap::new();
@@ -3092,12 +3137,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         if S::ENABLED {
             for (expression, input) in [(left_expression, left), (right_expression, right)] {
                 if !input.bounded_summary.is_zero() {
-                    let Some(expression) = expression else {
-                        if evidence.is_some() {
-                            continue;
-                        }
-                        return Err(super::g0::G0Error::RelationTraceInvariant.into());
-                    };
+                    if summary_evidence_supplied {
+                        continue
+                    }
+                    let expression =
+                        expression.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
                     let summary = self
                         .summary_result_ref(expression)?
                         .ok_or(super::g0::G0Error::RelationTraceInvariant)?;

@@ -92,11 +92,20 @@ impl GpuNodeMeasurementBackend {
             bindings: &'a ParamEnv,
         }
 
+        // Loop-index values select different logical family elements, but they do not change the
+        // GPU operation shape. Keeping them in the key forces the same lookup-body operation to be
+        // measured once per table entry. Compile-time integer and real parameters remain keyed.
+        let shape_bindings = ParamEnv {
+            integers: bindings.integers.clone(),
+            reals: bindings.reals.clone(),
+            loop_indices: Default::default(),
+        };
+
         encoding::hash_canonical(&MeasurementKey {
             kind: node.kind,
             concrete_argument_types: &node.concrete_argument_types,
             concrete_output_types: &node.concrete_output_types,
-            bindings,
+            bindings: &shape_bindings,
         })
         .map_err(|error| GpuMeasurementError(error.to_string()))
     }
@@ -1145,6 +1154,54 @@ mod tests {
             .expect("cache key");
         let second_key = GpuNodeMeasurementBackend::measurement_key(&second, &ParamEnv::default())
             .expect("cache key");
+
+        assert_eq!(first_key, second_key);
+    }
+
+    #[test]
+    fn measurement_cache_key_ignores_loop_index_values() {
+        let matrix = ConcreteWireType::Matrix(ConcreteMatrixType {
+            rows: 80,
+            columns: 80,
+            ring_dimension: 65_536,
+            modulus: BigInt::from(257u16),
+        });
+        let kind = NodeKind::HashSample {
+            matrix_type: MatrixType {
+                rows: IntExpr::constant(80),
+                columns: IntExpr::constant(80),
+                ring_dimension: IntExpr::constant(65_536),
+                modulus: IntExpr::constant(257),
+            },
+            variant: HashVariant::Decomposed,
+            tag_prefix: Vec::new(),
+            tag_expressions: vec![IntExpr::LoopIndex(0)],
+            tag_decimal_expressions: Vec::new(),
+            tag_u64_le_expressions: Vec::new(),
+            base: Some(IntExpr::constant(16_384)),
+            digit_count: Some(IntExpr::constant(80)),
+        };
+        let scope = FrozenGraphScopeId::Root;
+        let node = MeasurementNode {
+            scope: &scope,
+            id: NodeId(1),
+            kind: &kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: Vec::new(),
+            concrete_output_types: vec![matrix],
+        };
+        let mut first_bindings = ParamEnv::default();
+        first_bindings.loop_indices.insert(0, BigInt::from(1));
+        let mut second_bindings = ParamEnv::default();
+        second_bindings.loop_indices.insert(0, BigInt::from(3_720));
+
+        let first_key = GpuNodeMeasurementBackend::measurement_key(&node, &first_bindings)
+            .expect("first cache key");
+        let second_key = GpuNodeMeasurementBackend::measurement_key(&node, &second_bindings)
+            .expect("second cache key");
 
         assert_eq!(first_key, second_key);
     }

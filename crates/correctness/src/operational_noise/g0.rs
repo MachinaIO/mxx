@@ -850,6 +850,20 @@ impl FeasibilitySink for FeasibilityTrace {
 }
 
 impl FeasibilityTrace {
+    /// Encode only typed lowering observations. Legacy semantic `invocation` strings are
+    /// intentionally excluded: ownership, protocol aliases, and artifact bindings below are
+    /// the canonical identity authority for this opt-in trace.
+    pub(crate) fn canonical_source_observation_bytes(&self) -> Result<Vec<u8>, G0Error> {
+        let sources = self
+            .source_observations
+            .values()
+            .map(stable_observed_source)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&sources).map_err(|error| G0Error::Encoding(error.to_string()))
+    }
+
     #[cfg(test)]
     fn set_next_slice_group_id(&mut self, next: u64) {
         self.next_slice_group_id = next;
@@ -962,6 +976,84 @@ pub(crate) struct StableFamilySourceIdentity {
     pub element_type: StableValueType,
     pub domain: (u64, u64),
     pub artifact: Option<StableArtifact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct StableObservedWire {
+    stage: String,
+    definition: StableScope,
+    path: u64,
+    node: u64,
+    port: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum StableScope {
+    Root,
+    Subgraph { canonical_name: String },
+    ParallelBody { parent: Box<StableScope>, owner: u64 },
+    SequentialBody { parent: Box<StableScope>, owner: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct StableObservedIdentity {
+    definition: String,
+    sample_event: Option<u64>,
+    output_role: String,
+    sampler: Option<StableSampleDescriptor>,
+    artifact: Option<StableArtifact>,
+    value_type: StableValueType,
+    coordinates: Vec<u64>,
+    matrix_constant: Option<StableMatrixConstantKind>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct StableObservedFamilyIdentity {
+    definition: String,
+    element_type: StableValueType,
+    domain: (u64, u64),
+    artifact: Option<StableArtifact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum StableObservedIdentityKind {
+    Expression { identity: StableObservedIdentity },
+    Family { identity: StableObservedFamilyIdentity },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case", tag = "source_kind")]
+enum StableObservedSource {
+    ScalarConstant {
+        value: StableConstant,
+    },
+    MatrixConstant {
+        matrix_type: StableValueType,
+        kind: StableMatrixConstantKind,
+    },
+    DeclaredProtocolInput {
+        owner: StableObservedWire,
+        input: String,
+        identity: StableObservedIdentityKind,
+    },
+    UnboundOccurrenceInput {
+        owner: StableObservedWire,
+        identity: StableObservedIdentityKind,
+    },
+    ProducerArtifact {
+        producer: StableObservedProducer,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct StableObservedProducer {
+    consumer: StableObservedWire,
+    consumer_input: String,
+    producer_stage: String,
+    producer_output: String,
+    producer: StableObservedWire,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -1426,6 +1518,102 @@ fn stable_family_source(value: &SemanticFamilySourceIdentity) -> StableFamilySou
     }
 }
 
+fn stable_observed_wire(value: &PlannedWire) -> StableObservedWire {
+    let definition = match &value.occurrence.definition {
+        mxx_ir_core::FrozenGraphScopeId::Root => StableScope::Root,
+        mxx_ir_core::FrozenGraphScopeId::Subgraph { canonical_name } => {
+            StableScope::Subgraph { canonical_name: canonical_name.clone() }
+        }
+        mxx_ir_core::FrozenGraphScopeId::ParallelBody { parent, owner } => {
+            StableScope::ParallelBody { parent: Box::new(stable_scope(parent)), owner: owner.0 }
+        }
+        mxx_ir_core::FrozenGraphScopeId::SequentialBody { parent, owner } => {
+            StableScope::SequentialBody { parent: Box::new(stable_scope(parent)), owner: owner.0 }
+        }
+    };
+    StableObservedWire {
+        stage: value.stage.0.clone(),
+        definition,
+        path: value.occurrence.path,
+        node: value.wire.node.0,
+        port: value.wire.port.0,
+    }
+}
+
+fn stable_scope(value: &mxx_ir_core::FrozenGraphScopeId) -> StableScope {
+    match value {
+        mxx_ir_core::FrozenGraphScopeId::Root => StableScope::Root,
+        mxx_ir_core::FrozenGraphScopeId::Subgraph { canonical_name } => {
+            StableScope::Subgraph { canonical_name: canonical_name.clone() }
+        }
+        mxx_ir_core::FrozenGraphScopeId::ParallelBody { parent, owner } => {
+            StableScope::ParallelBody { parent: Box::new(stable_scope(parent)), owner: owner.0 }
+        }
+        mxx_ir_core::FrozenGraphScopeId::SequentialBody { parent, owner } => {
+            StableScope::SequentialBody { parent: Box::new(stable_scope(parent)), owner: owner.0 }
+        }
+    }
+}
+
+fn stable_observed_identity(value: &InputSourceIdentity) -> StableObservedIdentityKind {
+    match value {
+        InputSourceIdentity::Expression(value) => StableObservedIdentityKind::Expression {
+            identity: StableObservedIdentity {
+                definition: value.stable_definition.clone(),
+                sample_event: value.sample_event.map(|event| event.0),
+                output_role: value.output_role.clone(),
+                sampler: value.sampler.as_ref().map(stable_sample),
+                artifact: value.artifact.as_ref().map(stable_artifact),
+                value_type: stable_value_type(&value.value_type),
+                coordinates: value.coordinates.to_vec(),
+                matrix_constant: value.matrix_constant.as_ref().map(stable_matrix_constant),
+            },
+        },
+        InputSourceIdentity::Family(value) => StableObservedIdentityKind::Family {
+            identity: StableObservedFamilyIdentity {
+                definition: value.stable_definition.clone(),
+                element_type: stable_value_type(&value.element_type),
+                domain: (value.domain.minimum, value.domain.maximum_exclusive),
+                artifact: value.artifact.as_ref().map(stable_artifact),
+            },
+        },
+    }
+}
+
+fn stable_observed_source(class: &SourceClass) -> StableObservedSource {
+    match class {
+        SourceClass::ScalarConstant { value } => {
+            StableObservedSource::ScalarConstant { value: stable_constant(value) }
+        }
+        SourceClass::MatrixConstant { matrix_type, kind } => StableObservedSource::MatrixConstant {
+            matrix_type: stable_matrix(matrix_type),
+            kind: stable_matrix_constant(kind),
+        },
+        SourceClass::DeclaredProtocolInput { owner, input, identity } => {
+            StableObservedSource::DeclaredProtocolInput {
+                owner: stable_observed_wire(owner),
+                input: input.0.clone(),
+                identity: stable_observed_identity(identity),
+            }
+        }
+        SourceClass::UnboundOccurrenceInput { owner, identity } => {
+            StableObservedSource::UnboundOccurrenceInput {
+                owner: stable_observed_wire(owner),
+                identity: stable_observed_identity(identity),
+            }
+        }
+        SourceClass::ProducerArtifact { producer } => StableObservedSource::ProducerArtifact {
+            producer: StableObservedProducer {
+                consumer: stable_observed_wire(&producer.consumer),
+                consumer_input: producer.binding.consumer_input.0.clone(),
+                producer_stage: producer.binding.producer_stage.0.clone(),
+                producer_output: producer.binding.producer_output.0.clone(),
+                producer: stable_observed_wire(&producer.producer),
+            },
+        },
+    }
+}
+
 fn stable_matrix_constant(value: &MatrixConstantKind) -> StableMatrixConstantKind {
     match value {
         MatrixConstantKind::Zero => StableMatrixConstantKind::Zero,
@@ -1802,6 +1990,66 @@ mod tests {
         assert_eq!(
             inventory.canonical_encoded_byte_size().expect("encoded byte size"),
             first.len()
+        );
+    }
+
+    #[test]
+    fn observed_source_encoding_uses_typed_owner_not_legacy_invocation() {
+        use crate::protocol::StageId;
+        use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};
+
+        let owner = PlannedWire {
+            stage: StageId("stage".to_owned()),
+            occurrence: ProgramOccurrence { definition: FrozenGraphScopeId::Root, path: 7 },
+            wire: WireRef { node: NodeId(3), port: Port(1) },
+        };
+        let identity = |invocation: &str| {
+            InputSourceIdentity::Expression(SemanticSourceIdentity {
+                stable_definition: "protocol-input".to_owned(),
+                invocation: invocation.to_owned(),
+                sample_event: None,
+                output_role: "value".to_owned(),
+                sampler: None,
+                artifact: None,
+                value_type: ResolvedValueType::Int,
+                coordinates: Box::new([]),
+                matrix_constant: None,
+            })
+        };
+        let class = |invocation| SourceClass::DeclaredProtocolInput {
+            owner: owner.clone(),
+            input: ProtocolInputId::from("shared"),
+            identity: identity(invocation),
+        };
+        let mut first = FeasibilityTrace::default();
+        let mut second = FeasibilityTrace::default();
+        let mut arena = ExprArena::new();
+        let expression = arena
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .expect("expression");
+        first.record_source(SourceHandle::Expression(expression), class("legacy-a")).unwrap();
+        second.record_source(SourceHandle::Expression(expression), class("legacy-b")).unwrap();
+        assert_eq!(
+            first.canonical_source_observation_bytes().unwrap(),
+            second.canonical_source_observation_bytes().unwrap()
+        );
+
+        let mut distinct_owner = owner;
+        distinct_owner.occurrence.path = 8;
+        let mut third = FeasibilityTrace::default();
+        third
+            .record_source(
+                SourceHandle::Expression(expression),
+                SourceClass::DeclaredProtocolInput {
+                    owner: distinct_owner,
+                    input: ProtocolInputId::from("shared"),
+                    identity: identity("legacy-a"),
+                },
+            )
+            .unwrap();
+        assert_ne!(
+            first.canonical_source_observation_bytes().unwrap(),
+            third.canonical_source_observation_bytes().unwrap()
         );
     }
 

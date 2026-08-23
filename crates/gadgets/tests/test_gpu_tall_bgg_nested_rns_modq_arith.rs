@@ -134,6 +134,12 @@ struct TestConfig {
     min_log_ring_dimension: usize,
     max_log_ring_dimension: usize,
     selected_parameters: Option<(usize, usize)>,
+    /// Number of DCRT evaluation slots carried through the nested-RNS/Tall encoding. `None`
+    /// retains all slots from the ambient DCRT ring.
+    encoding_ring_dimension: Option<usize>,
+    /// Number of leading q-CRT towers carried through the nested-RNS/Tall encoding. `None`
+    /// retains the full DCRT basis.
+    encoding_crt_depth: Option<usize>,
     security_bits: u64,
     crt_modulus_bits: usize,
     /// Explicit nested-RNS p-basis width. `None` selects the smallest width supporting the
@@ -183,6 +189,10 @@ impl TestConfig {
             min_log_ring_dimension: env_usize("MXX_TALL_NESTED_RNS_MIN_LOG_RING_DIMENSION", 5)?,
             max_log_ring_dimension: env_usize("MXX_TALL_NESTED_RNS_MAX_LOG_RING_DIMENSION", 16)?,
             selected_parameters,
+            encoding_ring_dimension: env_optional_usize(
+                "MXX_TALL_NESTED_RNS_ENCODING_RING_DIMENSION",
+            )?,
+            encoding_crt_depth: env_optional_usize("MXX_TALL_NESTED_RNS_ENCODING_CRT_DEPTH")?,
             // n = 8 is intentionally an execution smoke parameter and has no positive lattice
             // security estimate. A caller may request a positive target, which will reject it.
             security_bits: env_u64("MXX_TALL_NESTED_RNS_SECURITY_BITS", 100)?,
@@ -239,6 +249,8 @@ impl TestConfig {
             config.min_log_ring_dimension > config.max_log_ring_dimension ||
             u32::try_from(config.max_log_ring_dimension).is_err() ||
             1u32.checked_shl(config.max_log_ring_dimension as u32).is_none() ||
+            config.encoding_ring_dimension.is_some_and(|dimension| !dimension.is_power_of_two()) ||
+            config.encoding_crt_depth == Some(0) ||
             config.crt_modulus_bits == 0 ||
             config.gadget_base_bits == 0 ||
             config.max_unreduced_muls == 0 ||
@@ -264,6 +276,14 @@ impl TestConfig {
         {
             return Err("invalid selected Tall nested-RNS parameters".to_owned());
         }
+        let (largest_crt_depth, largest_log_ring_dimension) = config
+            .selected_parameters
+            .unwrap_or((config.max_crt_depth, config.max_log_ring_dimension));
+        let largest_ring_dimension = 1usize
+            .checked_shl(largest_log_ring_dimension as u32)
+            .ok_or_else(|| "largest available ring dimension exceeds usize".to_owned())?;
+        config.encoding_ring_dimension(largest_ring_dimension)?;
+        config.encoding_crt_depth(largest_crt_depth)?;
         Ok(config)
     }
 
@@ -275,6 +295,43 @@ impl TestConfig {
             self.max_log_ring_dimension,
             self.selected_parameters,
         )
+        .into_iter()
+        .filter(|(crt_depth, log_ring_dimension)| {
+            self.encoding_crt_depth
+                .is_none_or(|encoding_crt_depth| encoding_crt_depth <= *crt_depth) &&
+                self.encoding_ring_dimension.is_none_or(|encoding_ring_dimension| {
+                    1usize
+                        .checked_shl(*log_ring_dimension as u32)
+                        .is_some_and(|ring_dimension| encoding_ring_dimension <= ring_dimension)
+                })
+        })
+        .collect()
+    }
+
+    fn encoding_ring_dimension(&self, dcrt_ring_dimension: usize) -> Result<usize, String> {
+        let encoding_ring_dimension = self.encoding_ring_dimension.unwrap_or(dcrt_ring_dimension);
+        if !encoding_ring_dimension.is_power_of_two() {
+            return Err("encoding ring dimension must be a positive power of two".to_owned());
+        }
+        if encoding_ring_dimension > dcrt_ring_dimension {
+            return Err(format!(
+                "encoding ring dimension {encoding_ring_dimension} exceeds DCRT ring dimension {dcrt_ring_dimension}"
+            ));
+        }
+        Ok(encoding_ring_dimension)
+    }
+
+    fn encoding_crt_depth(&self, dcrt_crt_depth: usize) -> Result<usize, String> {
+        let encoding_crt_depth = self.encoding_crt_depth.unwrap_or(dcrt_crt_depth);
+        if encoding_crt_depth == 0 {
+            return Err("encoding CRT depth must be positive".to_owned());
+        }
+        if encoding_crt_depth > dcrt_crt_depth {
+            return Err(format!(
+                "encoding CRT depth {encoding_crt_depth} exceeds DCRT CRT depth {dcrt_crt_depth}"
+            ));
+        }
+        Ok(encoding_crt_depth)
     }
 }
 
@@ -304,6 +361,9 @@ struct CircuitBundle {
 
 struct PreparedCandidate {
     parameters: DCRTPolyParams,
+    encoding_ring_dimension: usize,
+    encoding_crt_depth: usize,
+    physical_slots: usize,
     circuit: PolyCircuit<DCRTPoly>,
     nested: Arc<NestedRnsPolyContext>,
     layout: BggSamplerLayout,
@@ -435,6 +495,8 @@ fn log_invocation(config: &TestConfig, selected: Option<&PreparedCandidate>) {
         ?environment,
         requested_mode = ?config.run_mode,
         configured_selected_parameters = ?config.selected_parameters,
+        configured_encoding_ring_dimension = ?config.encoding_ring_dimension,
+        configured_encoding_crt_depth = ?config.encoding_crt_depth,
         error_sigma = config.error_sigma,
         "Tall nested-RNS reproducibility invocation"
     );
@@ -443,6 +505,9 @@ fn log_invocation(config: &TestConfig, selected: Option<&PreparedCandidate>) {
             selected_crt_depth = selected.parameters.to_crt().2,
             selected_ring_dimension = selected.parameters.ring_dimension(),
             selected_log_ring_dimension = selected.parameters.ring_dimension().ilog2(),
+            selected_encoding_ring_dimension = selected.encoding_ring_dimension,
+            selected_encoding_crt_depth = selected.encoding_crt_depth,
+            selected_physical_slots = selected.physical_slots,
             selected_security_bits = selected.achieved_security_bits,
             selected_operational_noise_bound = ?selected
                 .operational_report
@@ -457,6 +522,7 @@ fn build_modq_multiplication_circuit(
     parameters: &DCRTPolyParams,
     config: &TestConfig,
     evaluation_slots: usize,
+    encoding_crt_depth: usize,
     p_modulus_bits: usize,
 ) -> CircuitBundle {
     let mut circuit = PolyCircuit::new();
@@ -474,7 +540,7 @@ fn build_modq_multiplication_circuit(
             NestedRnsPoly::input(
                 nested.clone(),
                 evaluation_slots,
-                CrtWindow::full(nested.q_moduli_depth),
+                CrtWindow::new(0, encoding_crt_depth, nested.q_moduli_depth),
                 &mut circuit,
             )
         })
@@ -773,7 +839,9 @@ fn prepare_candidate(
     preparation: CandidatePreparation,
 ) -> Result<PreparedCandidate, String> {
     let ring_dimension = parameters.ring_dimension() as usize;
-    let (q_moduli, _, _) = parameters.to_crt();
+    let encoding_ring_dimension = config.encoding_ring_dimension(ring_dimension)?;
+    let (q_moduli, _, dcrt_crt_depth) = parameters.to_crt();
+    let encoding_crt_depth = config.encoding_crt_depth(dcrt_crt_depth)?;
     let p_modulus_bits = match config.p_moduli_bits {
         Some(bits) => bits,
         None => minimum_p_moduli_bits(
@@ -782,15 +850,28 @@ fn prepare_candidate(
         )
         .ok_or_else(|| "no nested-RNS p-modulus basis supports the selected q basis".to_owned())?,
     };
-    let CircuitBundle { circuit, nested } =
-        build_modq_multiplication_circuit(&parameters, config, ring_dimension, p_modulus_bits);
-    let scalar_circuit = build_modq_multiplication_circuit(&parameters, config, 1, p_modulus_bits);
+    let CircuitBundle { circuit, nested } = build_modq_multiplication_circuit(
+        &parameters,
+        config,
+        encoding_ring_dimension,
+        encoding_crt_depth,
+        p_modulus_bits,
+    );
+    let scalar_circuit = build_modq_multiplication_circuit(
+        &parameters,
+        config,
+        1,
+        encoding_crt_depth,
+        p_modulus_bits,
+    );
     if gate_kind_counts(&circuit) != gate_kind_counts(&scalar_circuit.circuit) {
         return Err("nested-RNS gate counts depend on the coefficient slot count".to_owned());
     }
     let preprocessing_graph_started = Instant::now();
     log_graph_phase("preprocessing_construction", "start", None);
-    let physical_slots = ring_dimension * nested.q_moduli_depth;
+    let physical_slots = encoding_ring_dimension
+        .checked_mul(encoding_crt_depth)
+        .ok_or_else(|| "physical slot count exceeds usize".to_owned())?;
     let modulus = BigInt::from(parameters.modulus().as_ref().clone());
     let gadget_base = BigInt::from(1u8) << config.gadget_base_bits;
     let error_sigma_decimal = BigDecimal::from_f64(config.error_sigma)
@@ -961,6 +1042,8 @@ fn prepare_candidate(
     log_graph_phase("validated_and_lookup_drop", "end", None);
     info!(
         ring_dimension,
+        encoding_ring_dimension,
+        encoding_crt_depth,
         crt_depth = parameters.to_crt().2,
         p_modulus_bits,
         physical_slots,
@@ -979,6 +1062,7 @@ fn prepare_candidate(
         &lookup_compilers,
         &rotation_offsets,
         physical_slots,
+        encoding_crt_depth,
         config.error_sigma,
         true,
     )?;
@@ -997,6 +1081,9 @@ fn prepare_candidate(
     };
     Ok(PreparedCandidate {
         parameters,
+        encoding_ring_dimension,
+        encoding_crt_depth,
+        physical_slots,
         circuit,
         nested,
         layout,
@@ -1096,6 +1183,7 @@ fn build_encoding_graph(
     lookup_compilers: &[mxx_bgg::LweLookupCompiler],
     rotation_offsets: &[u32],
     physical_slots: usize,
+    encoding_crt_depth: usize,
     error_sigma: f64,
     include_operational_residual: bool,
 ) -> Result<BuiltGraph, String> {
@@ -1251,13 +1339,23 @@ fn build_encoding_graph(
     let BggTallPlaintext::Diagonal(output_plaintexts) = output.plaintext else {
         return Err("nested-RNS output plaintext is hidden".to_owned());
     };
-    let crt_depth = parameters.to_crt().2;
-    let anchor_count = physical_slots.div_ceil(crt_depth);
+    let (q_moduli, _, dcrt_crt_depth) = parameters.to_crt();
+    if encoding_crt_depth == 0 || encoding_crt_depth > dcrt_crt_depth {
+        return Err(format!(
+            "encoding CRT depth {encoding_crt_depth} is outside DCRT CRT depth {dcrt_crt_depth}"
+        ));
+    }
+    if physical_slots % encoding_crt_depth != 0 {
+        return Err(format!(
+            "physical slot count {physical_slots} is not coefficient-major for encoding CRT depth {encoding_crt_depth}"
+        ));
+    }
+    let anchor_count = physical_slots / encoding_crt_depth;
     // Keep the anchor selection as one generated gather family. A packed list of static gets
     // lowers to an opaque explicit family and prevents the checker from beta-reducing the source
     // row expression; this generated index map retains one shared mapped-index authority.
     let anchor_index_family = Parallel::range(anchor_count)
-        .map_values(|index| index.as_int().mul(Int::constant(crt_depth)))
+        .map_values(|index| index.as_int().mul(Int::constant(encoding_crt_depth)))
         .map_err(|error| error.to_string())?;
     let encoding_rows = output
         .rows
@@ -1305,7 +1403,7 @@ fn build_encoding_graph(
             )
             .semantic_anchor(TALL_DECODER_RESIDUAL_ANCHOR)
             .map_err(|error| error.to_string())?;
-        let q_max = parameters.to_crt().0.into_iter().max().expect("nonempty CRT basis");
+        let q_max = q_moduli.into_iter().max().expect("nonempty CRT basis");
         let decoded = decoder_input
             .threshold_decode_bools(IntExpr::constant(q_max), 1)
             .into_iter()
@@ -1366,6 +1464,8 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
         max_crt_depth = config.max_crt_depth,
         min_log_ring_dimension = config.min_log_ring_dimension,
         max_log_ring_dimension = config.max_log_ring_dimension,
+        encoding_ring_dimension = ?config.encoding_ring_dimension,
+        encoding_crt_depth = ?config.encoding_crt_depth,
         gadget_base_bits = config.gadget_base_bits,
         scale = config.scale,
         parallelism = config.parameter_simulation_parallelism,
@@ -1432,6 +1532,9 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
             info!(
                 crt_depth = *crt_depth,
                 ring_dimension = 1usize << *log_ring_dimension,
+                encoding_ring_dimension = candidate.encoding_ring_dimension,
+                encoding_crt_depth = candidate.encoding_crt_depth,
+                physical_slots = candidate.physical_slots,
                 operational_noise_bound = %operational_report.noise_bound,
                 noise_bound_log2 = (noise_bound_log2 * 10.0).round() / 10.0,
                 noise_threshold_log2 = (noise_threshold_log2 * 10.0).round() / 10.0,
@@ -1688,6 +1791,8 @@ fn reload_preprocessing(
 
 fn random_operands(selected: &PreparedCandidate, config: &TestConfig) -> Vec<Vec<BigUint>> {
     let modulus = selected.parameters.modulus().as_ref().clone();
+    // Keep a complete ambient-ring evaluation vector for the independent DCRT oracle. The Tall
+    // input encoder below intentionally consumes only the configured active prefix.
     (0..=config.mul_count)
         .into_par_iter()
         .map(|_| {
@@ -1721,16 +1826,34 @@ fn encoding_inputs(
     operands: &[Vec<BigUint>],
 ) -> Result<BTreeMap<String, RuntimeValue<GpuDcrtBackend>>, String> {
     let encoded = operands
-        .iter()
-        .flat_map(|coefficients| {
-            encode_nested_rns_poly::<DCRTPoly>(
+        .par_iter()
+        .map(|evaluation_slots| {
+            // DCRT evaluation multiplication is pointwise, so the active prefix can be checked
+            // directly against the corresponding prefix of the full-ring GPU oracle.
+            let active_slots = evaluation_slots
+                .get(..selected.encoding_ring_dimension)
+                .ok_or_else(|| {
+                    format!(
+                        "DCRT operand has {} evaluation slots, fewer than the configured encoding ring dimension {}",
+                        evaluation_slots.len(),
+                        selected.encoding_ring_dimension
+                    )
+                })?;
+            Ok(encode_nested_rns_poly::<DCRTPoly>(
                 selected.nested.p_moduli_bits,
                 selected.nested.max_unreduced_muls,
                 &selected.parameters,
-                coefficients,
-                CrtWindow::full(selected.nested.q_moduli_depth),
-            )
+                active_slots,
+                CrtWindow::new(
+                    0,
+                    selected.encoding_crt_depth,
+                    selected.nested.q_moduli_depth,
+                ),
+            ))
         })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
     if encoded.len() != selected.circuit.num_input() {
         return Err(format!(
@@ -1873,7 +1996,8 @@ fn end_to_end_processing(
         selected.production.clone(),
         &selected.lookup_compilers,
         &selected.rotation_offsets,
-        selected.parameters.ring_dimension() as usize * selected.nested.q_moduli_depth,
+        selected.physical_slots,
+        selected.encoding_crt_depth,
         config.error_sigma,
         true,
     )?;
@@ -1929,7 +2053,7 @@ fn measure_runtime_residual(
     outputs: EndToEndOutputs,
 ) -> Result<(BigUint, (usize, usize, usize)), String> {
     info!("stage 4/4: runtime verification");
-    let anchor_count = selected.parameters.ring_dimension() as usize;
+    let anchor_count = selected.encoding_ring_dimension;
     if outputs.encoding_rows.len() != anchor_count ||
         outputs.output_plaintexts.len() != anchor_count ||
         outputs.residuals.len() != anchor_count
@@ -1937,6 +2061,9 @@ fn measure_runtime_residual(
         return Err("Tall output family cardinality differs from the q1 anchor count".to_owned());
     }
     let modulus = selected.parameters.modulus().as_ref().clone();
+    let active_modulus = selected.parameters.to_crt().0[..selected.encoding_crt_depth]
+        .iter()
+        .fold(BigUint::from(1u8), |product, modulus| product * BigUint::from(*modulus));
     let half_modulus = &modulus / BigUint::from(2u8);
     let mut maximum_noise = BigUint::zero();
     let mut maximum_location = (0usize, 0usize, 0usize);
@@ -1945,7 +2072,8 @@ fn measure_runtime_residual(
             .expected_evaluation_slots
             .get(anchor)
             .cloned()
-            .ok_or_else(|| "GPU oracle omitted an expected evaluation slot".to_owned())?;
+            .ok_or_else(|| "GPU oracle omitted an expected evaluation slot".to_owned())? %
+            &active_modulus;
         let expected_poly = DCRTPoly::from_biguint_to_constant(&selected.parameters, expected);
         let expected_cpu =
             DCRTPolyMatrix::from_poly_vec_row(&selected.parameters, vec![expected_poly]);
@@ -2022,6 +2150,56 @@ fn runtime_verification(
 #[test]
 fn selected_parameters_produce_exactly_one_candidate() {
     assert_eq!(candidate_dimensions(1, 16, 3, 8, Some((7, 5))), vec![(7, 5)]);
+}
+
+#[test]
+fn encoding_ring_dimension_defaults_to_dcrt_and_rejects_invalid_subdimensions() {
+    let mut config = noiseless_runtime_config();
+    assert_eq!(config.encoding_ring_dimension(8), Ok(8));
+
+    config.encoding_ring_dimension = Some(4);
+    assert_eq!(config.encoding_ring_dimension(8), Ok(4));
+
+    config.encoding_ring_dimension = Some(16);
+    assert!(config.encoding_ring_dimension(8).is_err());
+
+    config.encoding_ring_dimension = Some(3);
+    assert!(config.encoding_ring_dimension(8).is_err());
+}
+
+#[test]
+fn candidate_search_excludes_dcrt_rings_smaller_than_the_encoding_ring() {
+    let mut config = noiseless_runtime_config();
+    config.selected_parameters = None;
+    config.min_log_ring_dimension = 1;
+    config.max_log_ring_dimension = 3;
+    config.encoding_ring_dimension = Some(4);
+    assert_eq!(config.candidate_dimensions(), vec![(1, 2), (1, 3)]);
+}
+
+#[test]
+fn encoding_crt_depth_defaults_to_dcrt_and_rejects_invalid_subdepths() {
+    let mut config = noiseless_runtime_config();
+    assert_eq!(config.encoding_crt_depth(8), Ok(8));
+
+    config.encoding_crt_depth = Some(4);
+    assert_eq!(config.encoding_crt_depth(8), Ok(4));
+
+    config.encoding_crt_depth = Some(0);
+    assert!(config.encoding_crt_depth(8).is_err());
+
+    config.encoding_crt_depth = Some(16);
+    assert!(config.encoding_crt_depth(8).is_err());
+}
+
+#[test]
+fn candidate_search_excludes_dcrt_depths_smaller_than_the_encoding_depth() {
+    let mut config = noiseless_runtime_config();
+    config.selected_parameters = None;
+    config.min_crt_depth = 1;
+    config.max_crt_depth = 3;
+    config.encoding_crt_depth = Some(2);
+    assert_eq!(config.candidate_dimensions(), vec![(2, 1), (3, 1)]);
 }
 
 #[test]
@@ -2129,10 +2307,18 @@ fn test_tall_bgg_nested_rns_planning_stats() -> Result<(), String> {
             "no nested-RNS p-modulus basis supports the selected q basis".to_owned()
         })?,
     };
-    let CircuitBundle { circuit, nested } =
-        build_modq_multiplication_circuit(&parameters, &config, 1, p_modulus_bits);
-    let physical_slots = (parameters.ring_dimension() as usize)
-        .checked_mul(nested.q_moduli_depth)
+    let encoding_crt_depth = config.encoding_crt_depth(actual_crt_depth)?;
+    let CircuitBundle { circuit, nested } = build_modq_multiplication_circuit(
+        &parameters,
+        &config,
+        1,
+        encoding_crt_depth,
+        p_modulus_bits,
+    );
+    let encoding_ring_dimension =
+        config.encoding_ring_dimension(parameters.ring_dimension() as usize)?;
+    let physical_slots = encoding_ring_dimension
+        .checked_mul(encoding_crt_depth)
         .ok_or_else(|| "physical slot count exceeds usize".to_owned())?;
     let lookup_stats = lookup_planning_stats(&circuit)?;
     info!(
@@ -2140,6 +2326,8 @@ fn test_tall_bgg_nested_rns_planning_stats() -> Result<(), String> {
         crt_depth,
         log_ring_dimension,
         ring_dimension = parameters.ring_dimension(),
+        encoding_ring_dimension,
+        encoding_crt_depth,
         q_moduli = ?q_moduli,
         q_modulus_bits = parameters.modulus().bits(),
         p_modulus_bits = nested.p_moduli_bits,
@@ -2420,6 +2608,8 @@ fn noiseless_runtime_config() -> TestConfig {
         min_log_ring_dimension: 1,
         max_log_ring_dimension: 1,
         selected_parameters: Some((1, 1)),
+        encoding_ring_dimension: None,
+        encoding_crt_depth: None,
         security_bits: 0,
         crt_modulus_bits: 10,
         p_moduli_bits: None,
@@ -2496,6 +2686,9 @@ fn test_tall_bgg_nested_rns_parameter_simulation() {
     info!(
         crt_depth = selected.parameters.to_crt().2,
         ring_dimension = selected.parameters.ring_dimension(),
+        encoding_ring_dimension = selected.encoding_ring_dimension,
+        encoding_crt_depth = selected.encoding_crt_depth,
+        physical_slots = selected.physical_slots,
         operational_noise_bound = %operational_report.noise_bound,
         operational_accepted = operational_report.accepted,
         "completed Rust-only Tall parameter simulation"
@@ -2564,8 +2757,9 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
     info!(
         crt_depth = selected.parameters.to_crt().2,
         ring_dimension = selected.parameters.ring_dimension(),
-        physical_slots = selected.parameters.ring_dimension() as usize *
-            selected.nested.q_moduli_depth,
+        encoding_ring_dimension = selected.encoding_ring_dimension,
+        encoding_crt_depth = selected.encoding_crt_depth,
+        physical_slots = selected.physical_slots,
         achieved_security_bits = selected.achieved_security_bits,
         operational_noise_bound = ?operational_report.map(|report| &report.noise_bound),
         operational_accepted = ?operational_report.map(|report| report.accepted),

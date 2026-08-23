@@ -145,6 +145,8 @@ struct RelationMatch {
     suffix: Vec<ScopedExprId>,
     remaining_central: Vec<ScopedExprId>,
     rhs: super::relation::CanonicalRhsId,
+    owner: ScopedExprId,
+    kind: super::g0::RelationObservationKind,
 }
 
 impl PolynomialNF {
@@ -1098,6 +1100,19 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     hit,
                     result: Some(owner),
                 })?;
+        }
+        Ok(())
+    }
+
+    fn observe_relation(
+        &mut self,
+        observation: super::g0::RelationObservation,
+    ) -> Result<(), NormalizeError> {
+        if S::ENABLED {
+            self.sink
+                .as_deref_mut()
+                .ok_or(super::g0::G0Error::RelationOwnerMismatch)?
+                .record_relation(observation)?;
         }
         Ok(())
     }
@@ -3290,11 +3305,35 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             let Some(input) = self.authorized_gadget_pair_input(gadget, decomposition)? else {
                 continue;
             };
+            let kind = super::g0::RelationObservationKind::Gadget { gadget, decomposition, input };
+            self.observe_relation(super::g0::RelationObservation {
+                owner: decomposition,
+                kind: kind.clone(),
+                disposition: super::g0::RelationObservationDisposition::Considered,
+                result: None,
+            })?;
             let Some(normal_form) =
                 self.splice_gadget_decomposition(&central_factors, &ordered_factors, index, input)?
             else {
+                self.observe_relation(super::g0::RelationObservation {
+                    owner: decomposition,
+                    kind,
+                    disposition: super::g0::RelationObservationDisposition::NoMatch,
+                    result: None,
+                })?;
                 return Ok(None);
             };
+            self.observe_relation(super::g0::RelationObservation {
+                owner: decomposition,
+                kind,
+                disposition: super::g0::RelationObservationDisposition::Applied,
+                result: normal_form
+                    .exact_terms
+                    .keys()
+                    .next()
+                    .copied()
+                    .map(super::g0::RelationResult::Gadget),
+            })?;
             return Ok(Some(normal_form));
         }
         Ok(None)
@@ -3435,6 +3474,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             };
             changed = true;
             self.counters.relation_applied = self.counters.relation_applied.saturating_add(1);
+            self.observe_relation(super::g0::RelationObservation {
+                owner: relation_match.owner,
+                kind: relation_match.kind.clone(),
+                disposition: super::g0::RelationObservationDisposition::Applied,
+                result: Some(super::g0::RelationResult::Universal(relation_match.rhs)),
+            })?;
             let rhs = self
                 .normalization
                 .as_deref()
@@ -3625,6 +3670,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     ) -> Result<Option<RelationMatch>, NormalizeError> {
         let Some(relations) = self.relations else { return Ok(None) };
         let mut candidates = BTreeMap::<(usize, usize), BTreeSet<_>>::new();
+        let mut attempted_dispatches = Vec::new();
         for (k_position, &k_factor) in ordered.iter().enumerate() {
             let node = self.expressions.node(k_factor.expression())?;
             let ValueOperator::ProgramCall { program } = node.operator else { continue };
@@ -3634,6 +3680,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             let Some(dispatch) = relations.dispatch_for_preimage_program(program)? else {
                 continue;
             };
+            attempted_dispatches.push((k_factor, dispatch.clone()));
             let index = self.expressions.scoped_only_input(k_factor)?;
             if index.program() != self.scope {
                 return Err(ArenaError::ScopeMismatch {
@@ -3645,8 +3692,22 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             let Some(index_range) = self.universal_index_range(index)? else { continue };
             let specialized = self.specialized_universal_cached(dispatch, index, index_range)?;
             for (lhs, rhs_candidates) in specialized {
+                for rhs in &rhs_candidates {
+                    self.observe_relation(super::g0::RelationObservation {
+                        owner: k_factor,
+                        kind: super::g0::RelationObservationKind::Universal {
+                            dispatch: dispatch.clone(),
+                            lhs: None,
+                            rhs: Some(*rhs),
+                        },
+                        disposition: super::g0::RelationObservationDisposition::Considered,
+                        result: Some(super::g0::RelationResult::Universal(*rhs)),
+                    })?;
+                }
                 let descriptor = self.monomials.descriptor(lhs.monomial)?;
-                if descriptor.ordered_factors.is_empty() || !descriptor.central_factors.is_empty() {
+                let descriptor_ordered = descriptor.ordered_factors.to_vec();
+                let descriptor_central = descriptor.central_factors.to_vec();
+                if descriptor_ordered.is_empty() || !descriptor_central.is_empty() {
                     continue;
                 }
                 if lhs.layout.is_some() {
@@ -3662,20 +3723,18 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         continue;
                     }
                 }
-                for lhs_k_position in descriptor
-                    .ordered_factors
+                for lhs_k_position in descriptor_ordered
                     .iter()
                     .enumerate()
                     .filter_map(|(position, factor)| (*factor == k_factor).then_some(position))
                 {
-                    let ordered_len = descriptor.ordered_factors.len();
+                    let ordered_len = descriptor_ordered.len();
                     let Some(start) = k_position.checked_sub(lhs_k_position) else { continue };
                     let Some(end) = start.checked_add(ordered_len) else { continue };
-                    if end > ordered.len() || ordered[start..end] != descriptor.ordered_factors[..]
-                    {
+                    if end > ordered.len() || ordered[start..end] != descriptor_ordered[..] {
                         continue;
                     }
-                    if remove_central_subword(central, &descriptor.central_factors).is_none() {
+                    if remove_central_subword(central, &descriptor_central).is_none() {
                         continue;
                     }
                     candidates
@@ -3694,6 +3753,18 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 })
             },
         ) else {
+            for (owner, dispatch) in attempted_dispatches {
+                self.observe_relation(super::g0::RelationObservation {
+                    owner,
+                    kind: super::g0::RelationObservationKind::Universal {
+                        dispatch,
+                        lhs: None,
+                        rhs: None,
+                    },
+                    disposition: super::g0::RelationObservationDisposition::NoMatch,
+                    result: None,
+                })?;
+            }
             return Ok(None);
         };
         let super::relation::RelationResolution::Rewrite(rhs) =
@@ -3706,6 +3777,20 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             suffix: ordered[end..].to_vec(),
             remaining_central: central.to_vec(),
             rhs,
+            owner: attempted_dispatches
+                .iter()
+                .find(|(owner, _)| ordered[start..end].contains(owner))
+                .map(|(owner, _)| *owner)
+                .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?,
+            kind: super::g0::RelationObservationKind::Universal {
+                dispatch: attempted_dispatches
+                    .iter()
+                    .find(|(owner, _)| ordered[start..end].contains(owner))
+                    .map(|(_, dispatch)| dispatch.clone())
+                    .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?,
+                lhs: None,
+                rhs: Some(rhs),
+            },
         }))
     }
 

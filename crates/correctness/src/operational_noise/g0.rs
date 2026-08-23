@@ -56,6 +56,8 @@ pub(crate) trait FeasibilitySink: Default {
         observation: SpecializationObservation,
     ) -> Result<(), G0Error>;
 
+    fn record_relation(&mut self, observation: RelationObservation) -> Result<(), G0Error>;
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error>;
 
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error>;
@@ -129,6 +131,41 @@ pub(crate) struct SpecializationObservation {
     pub key: super::relation::RuntimeSpecializationKey,
     pub hit: bool,
     pub result: Option<super::arena::ScopedExprId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum RelationObservationKind {
+    Universal {
+        dispatch: super::relation::UniversalDispatchKey,
+        lhs: Option<super::relation::CanonicalLhsKey>,
+        rhs: Option<super::relation::CanonicalRhsId>,
+    },
+    Gadget {
+        gadget: super::arena::ScopedExprId,
+        decomposition: super::arena::ScopedExprId,
+        input: ExprId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum RelationObservationDisposition {
+    Considered,
+    NoMatch,
+    Applied,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum RelationResult {
+    Universal(super::relation::CanonicalRhsId),
+    Gadget(super::monomial::MonomialId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct RelationObservation {
+    pub owner: super::arena::ScopedExprId,
+    pub kind: RelationObservationKind,
+    pub disposition: RelationObservationDisposition,
+    pub result: Option<RelationResult>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1132,6 +1169,10 @@ impl FeasibilitySink for NoFeasibility {
         Ok(())
     }
 
+    fn record_relation(&mut self, _observation: RelationObservation) -> Result<(), G0Error> {
+        Ok(())
+    }
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error> {
         Ok(())
     }
@@ -1162,6 +1203,7 @@ pub(crate) struct FeasibilityTrace {
     pub predecessor_observations: BTreeSet<PredecessorObservation>,
     pub normalization_results: BTreeSet<super::arena::ScopedExprId>,
     pub specialization_observations: BTreeSet<SpecializationObservation>,
+    pub relation_observations: Vec<RelationObservation>,
     pub source_observations: BTreeMap<SourceHandle, SourceClass>,
     pub event_observations: BTreeMap<SampleEventId, EventObservation>,
     index_use_plans: BTreeSet<IndexUsePlan>,
@@ -1178,6 +1220,7 @@ impl Default for FeasibilityTrace {
             predecessor_observations: BTreeSet::new(),
             normalization_results: BTreeSet::new(),
             specialization_observations: BTreeSet::new(),
+            relation_observations: Vec::new(),
             source_observations: BTreeMap::new(),
             event_observations: BTreeMap::new(),
             index_use_plans: BTreeSet::new(),
@@ -1253,6 +1296,16 @@ impl FeasibilitySink for FeasibilityTrace {
         Ok(())
     }
 
+    fn record_relation(&mut self, observation: RelationObservation) -> Result<(), G0Error> {
+        if observation.disposition == RelationObservationDisposition::Applied &&
+            observation.result.is_none()
+        {
+            return Err(G0Error::MissingRelationResult);
+        }
+        self.relation_observations.push(observation);
+        Ok(())
+    }
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error> {
         if self
             .predecessor_observations
@@ -1267,6 +1320,23 @@ impl FeasibilitySink for FeasibilityTrace {
             .any(|observation| observation.result != Some(observation.owner))
         {
             return Err(G0Error::MissingSpecializationResult);
+        }
+        for (position, observation) in self.relation_observations.iter().enumerate() {
+            if observation.disposition != RelationObservationDisposition::Applied {
+                continue;
+            }
+            if observation.result.is_none() {
+                return Err(G0Error::MissingRelationResult);
+            }
+            let considered = self.relation_observations[..position].iter().any(|prior| {
+                prior.owner == observation.owner &&
+                    prior.kind == observation.kind &&
+                    prior.disposition == RelationObservationDisposition::Considered &&
+                    prior.result == observation.result
+            });
+            if !considered {
+                return Err(G0Error::RelationAppliedWithoutConsideration);
+            }
         }
         Ok(())
     }
@@ -1809,6 +1879,12 @@ pub(crate) enum G0Error {
     SpecializationOwnerMismatch,
     #[error("specialization observation has no successful typed result")]
     MissingSpecializationResult,
+    #[error("relation observation owner or typed result is inconsistent")]
+    RelationOwnerMismatch,
+    #[error("applied relation observation has no typed result")]
+    MissingRelationResult,
+    #[error("applied relation observation has no prior considered candidate")]
+    RelationAppliedWithoutConsideration,
     #[error("residual event has no typed lowering observation")]
     MissingEventObservation,
     #[error("independent residual events cannot alias one canonical event row")]

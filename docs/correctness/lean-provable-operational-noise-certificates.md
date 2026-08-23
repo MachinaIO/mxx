@@ -2,14 +2,16 @@
 
 ## 1. Status and authority
 
-This is a design specification. It does not authorize implementation yet.
+This is a design specification. Implementation is authorized by the current task, subject to the
+gates below and review of every change.
 
 The operational-noise Rust implementation at the pinned source revision is the semantic and
 performance authority. In particular, the behavior of `arena.rs`, `program.rs`, `lower.rs`,
 `normal_form.rs`, `bound.rs`, `relation.rs`, `report.rs`, and `simulation.rs` is not changed by
 this design. Certificate support may add opt-in observation hooks, a recorder, serialization,
 proof rendering, and fixed Lean definitions. Any proposed change to the existing Rust core
-semantics requires separate review and explicit approval.
+semantics requires separate review and explicit approval; the existing Rust core remains the
+semantic and performance authority.
 
 If this document and the pinned Rust core disagree, certificate emission fails until the
 certificate or Lean replay is corrected. It must not silently reinterpret the Rust result.
@@ -502,20 +504,26 @@ or non-standard axioms reported by `#print axioms`.
 
 ## 12. Complexity and implementation gates
 
-Let `N` be the total size of expression/program/source/event rows in the residual proof closure,
-`T` the total emitted proof/context payload size, and `L` the total size of exhaustive index-use
-tables in that closure. `T` includes every serialized predecessor polynomial, prefix/suffix
+Let `N` be the exact logical item count of expression/program/source/event rows in the residual
+proof closure, `T` the exact emitted proof/context payload logical-item count, and `L` the exact
+size of exhaustive index-use tables in that closure. The allowed size views are these logical
+counts, canonical encoded byte lengths, actual generated-artifact byte lengths where artifacts
+exist, and recorder/generator logical peak retained items (optionally canonical retained bytes).
+`T` includes every serialized predecessor polynomial, prefix/suffix
 context, rule parameter, coefficient merge, survivor fold, and final polynomial, not merely the
 number of `have` declarations. Certificate recording and rendering are `O(N + T + L)` time and
 space, apart from the unchanged Rust checker work. No matrix-family or parallel-loop cardinality
 is included in `N`. For each LUT, its row count is exactly the product of its finite
 frontier-domain cardinalities, and `L` includes the serialized tuple and proof payload per row.
 
-Before implementation, G0 computes or measures, without full Lean certificate generation, the
+Before implementation, G0 computes or estimates, without full Lean certificate generation, the
 exact `N`, every frontier product, and exact `L` payload for both the security-0 and exact
-security-128 Tall sources. It estimates `T` payload, artifact bytes, and peak memory, and compares
-them with the current checker. G3 measures exact `T`, artifact bytes, and peak memory at security 0;
-G4 measures them exactly at security 128. If the
+security-128 Tall sources. It estimates only logical proof-payload items and canonical encoded
+bytes, actual generated-artifact byte lengths where artifacts exist, and recorder/generator
+logical peak retained items (optionally canonical retained bytes). G3 and G4 measure these
+quantities exactly where the corresponding artifacts exist. `size_of`, RSS, elapsed time,
+benchmark estimation, runtime/GPU estimates, and current-checker benchmark comparison are
+explicitly excluded. If the
 production estimate is infeasible, the design returns to review; the implementation must not add
 a runtime cutoff, truncate a table, or silently select another semantics.
 
@@ -523,7 +531,8 @@ The phases are:
 
 1. **G0, design feasibility:** a hard gate before any further G2 or G3 work; complete
    residual-closure coverage matrix, exact `N`, `L`, and
-   frontier products, estimated `T`/artifact bytes/peak memory, zero-axis and synchronized-slice
+   frontier products, estimates of the allowed logical items/canonical bytes/artifact bytes/logical
+   retained items, zero-axis and synchronized-slice
    LUT tests, and kernel spikes for fuel-stable haves and balanced row-local validity. Failure
    returns the design to review before trusted code is built.
 2. **G1, fixed Lean core:** place the new project under `lean/lean-toolchain`,
@@ -539,8 +548,10 @@ The phases are:
    Rust-semantics-identical; cache-hit replay is owner-local and complete; clean-room regeneration
    is byte-identical; fixed Lean acceptance compiles.
 5. **G4, security 128:** full generation and
-   kernel checking complete; elapsed time, peak memory, artifact size, exact LUT counts,
-   and Rust-versus-Lean differential results are recorded; the trust inventory receives
+   kernel checking complete; the allowed logical-item counts, canonical bytes, generated artifact
+   byte lengths, logical retained-item peaks, exact LUT counts, and Rust-versus-Lean differential
+   results are recorded; elapsed time, RSS, `size_of`, benchmark estimates, and runtime/GPU
+   estimates are excluded; the trust inventory receives
    independent review.
 
 Passing a Rust compile or unit-test gate is not certificate acceptance. Passing the conditional

@@ -3,8 +3,8 @@
 ## 1. この文書の目的
 
 この文書は、mxx の Rust 実装が行う operational-noise 判定について、同じ判定根拠を
-Lean で独立に検証できる certificate を作るための設計仕様である。まだ実装開始を許可する
-文書ではない。
+Lean で独立に検証できる certificate を作るための設計仕様である。現在の task により実装は
+許可されているが、以下の gate と各変更の review を必須とする。
 
 対応する英語版は
 `docs/correctness/lean-provable-operational-noise-certificates.md` である。両文書は同じ要件を
@@ -93,6 +93,7 @@ Rust checker は、復号の正しさに影響する最終的な誤差式を記�
 ## 3. 既存 Rust 実装との関係
 
 固定した source revision にある operational-noise Rust 実装を、意味論と性能の正本とする。
+既存 Rust core の意味論を変更する提案には別途 review と明示的承認が必要である。
 特に、次のファイルの既存動作はこの設計によって変更しない。
 
 - `arena.rs`
@@ -737,14 +738,18 @@ CI は固定 acceptance module を compile し、`#print axioms` の結果に `s
 
 次の三つの量で certificate 生成の大きさを表す。
 
-- `N`: residual proof closure 内の expression、program、source、event row の総 payload size
-- `T`: 出力する proof/context の総 payload size
-- `L`: residual proof closure 内の exhaustive index-use table の総 payload size
+- `N`: residual proof closure 内の expression、program、source、event row の正確な論理 item 数
+- `T`: 出力する proof/context payload の正確な論理 item 数
+- `L`: residual proof closure 内の exhaustive index-use table の正確な大きさ
 
 `T` は `have` の個数ではない。serialized predecessor polynomial、prefix/suffix context、rule
 parameter、coefficient merge、survivor fold、final polynomial の全量を含む。
 
-`L` は row 数だけでなく、各 row の tuple と proof payload も含む。
+`L` は row 数だけでなく、各 row の tuple と proof payload も含む。許可する size 指標は、これらの
+論理 item 数、canonical encoded byte 数、artifact が存在する場合の実生成 artifact byte 数、
+recorder/generator が保持する論理 item の peak（任意で canonical retained byte 数）だけである。
+`size_of`、RSS、elapsed time、benchmark estimation、runtime/GPU estimate、現在の checker との
+benchmark 比較は明示的に除外する。
 
 既存 Rust checker の計算を除き、recording と rendering の時間・空間計算量を
 
@@ -766,14 +771,15 @@ O(N + T + L)
 - 正確な `N`
 - 各 frontier の cardinality 積
 - 正確な `L` とその payload
-- `T`、artifact byte 数、peak memory の見積り
-- 現在の checker との比較
+- 許可された論理 item 数、canonical byte 数、artifact が存在する場合の実 artifact byte 数、
+  recorder/generator の論理 retained item peak の見積り
 
 加えて、residual-closure coverage matrix、zero-axis LUT test、synchronized-slice LUT test、
 fuel-stable `have` と balanced row-local validity の kernel spike を完了する。
 
-security-0 では G3 に `T`、artifact byte 数、peak memory を実測し、security-128 では G4 に
-同じ三つを正確に実測する。
+security-0 では G3 に、artifact が存在する範囲で許可された量を実測し、security-128 では G4 に
+同じ量を正確に実測する。`size_of`、RSS、elapsed time、benchmark estimation、runtime/GPU
+estimate、現在の checker との benchmark 比較は実測対象ではない。
 
 production 規模で実現不可能なら設計 review に戻る。runtime cutoff、LUT の切り捨て、別の意味論
 への暗黙の変更で通過させない。
@@ -812,9 +818,10 @@ bound を過大評価せず再現し、未対応ケースは fail closed とす�
 
 ### G4: Security 128
 
-security-128 の全生成と kernel checking を完了し、elapsed time、peak memory、artifact size、正確な
-LUT row 数、Rust と Lean の differential result を記録する。最後に trust inventory の独立 review
-を受ける。
+security-128 の全生成と kernel checking を完了し、許可された論理 item 数、canonical byte 数、
+実生成 artifact byte 数、論理 retained item peak、正確な LUT row 数、Rust と Lean の differential
+result を記録する。elapsed time、RSS、`size_of`、benchmark estimate、runtime/GPU estimate は
+除外する。最後に trust inventory の独立 review を受ける。
 
 Rust の compile や unit test だけでは certificate を受理したことにならない。また、条件付き Lean
 theorem の成立だけでは、特定の runtime 実行が第6.3節の外部条件を満たしたことにはならない。
@@ -829,4 +836,5 @@ theorem の成立だけでは、特定の runtime 実行が第6.3節の外部条
 4. source だけから生成物を再現でき、byte 単位で一致する。
 5. residual proof closure 内の全 index use、relation、bound rule、cache hit が scope と
    identity を保ったまま証明される。
-6. 実測した時間、memory、artifact size が G0 の実現可能性判断と整合する。
+6. 許可された論理 item 数、canonical byte 数、実生成 artifact byte 数、論理 retained item peak が
+   G0 の実現可能性判断と整合する。

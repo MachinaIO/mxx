@@ -12,7 +12,7 @@ use super::{
         ValueOperator, ValueTransformOperation,
     },
     job::CheckerJob,
-    protocol::PlannedWire,
+    protocol::{ArtifactProducer, PlannedWire},
     simulation::CertificateClosure,
 };
 use crate::ProtocolInputId;
@@ -53,6 +53,9 @@ pub(crate) enum SourceClass {
     UnboundOccurrenceInput {
         owner: PlannedWire,
         identity: InputSourceIdentity,
+    },
+    ProducerArtifact {
+        producer: ArtifactProducer,
     },
 }
 

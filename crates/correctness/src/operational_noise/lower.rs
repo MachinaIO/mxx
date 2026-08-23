@@ -19,7 +19,7 @@ use super::{
     },
     job::{CandidateToken, CheckerJob, JobError},
     program::{FamilyValueId, SelectionSelector},
-    protocol::{PlannedWire, ProgramOccurrence, ProtocolPlan},
+    protocol::{ArtifactProducer, PlannedWire, ProgramOccurrence, ProtocolPlan},
     relation::{
         DecompositionContract, FactorOrderContract, GadgetContract, GadgetRecompositionRule,
         RelationValidationAuthority, SamplerSourceContract, StaticLhsKey, TrapdoorSourceContract,
@@ -341,6 +341,34 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
             )?;
         }
         Ok(())
+    }
+
+    fn record_producer_artifact_if_enabled(
+        &mut self,
+        wire: &PlannedWire,
+        value: Value,
+    ) -> Result<(), ProductionAdapterError> {
+        if S::ENABLED {
+            if let Some(producer) = self.artifact_producer(wire) {
+                let class = SourceClass::ProducerArtifact { producer };
+                let handle = match value {
+                    Value::Expr(expression) => SourceHandle::Expression(expression),
+                    Value::Family(family) => SourceHandle::Family(family),
+                };
+                self.feasibility.record_source(handle, class).map_err(|error| {
+                    ProductionAdapterError::Descriptor { reason: error.to_string() }
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_artifact_producer_wire(&self, wire: &PlannedWire) -> bool {
+        self.plan.artifact_producers().iter().any(|producer| producer.producer == *wire)
+    }
+
+    fn artifact_producer(&self, wire: &PlannedWire) -> Option<ArtifactProducer> {
+        self.plan.artifact_producers().iter().find(|producer| producer.consumer == *wire).cloned()
     }
 
     fn declared_protocol_input(&self, wire: &PlannedWire, name: &str) -> Option<ProtocolInputId> {
@@ -1759,6 +1787,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                         wire: wire.clone(),
                         reason: "worklist completed without a child value".to_owned(),
                     })?;
+                    self.record_producer_artifact_if_enabled(&wire, value)?;
                     self.values.insert(wire, value);
                     result = Some(value);
                 }
@@ -2024,6 +2053,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                         });
                     }
                     ResolveFrame::Store { wire } => {
+                        self.record_producer_artifact_if_enabled(&wire, value)?;
                         self.values.insert(wire, value);
                         result = Some(value);
                     }
@@ -2331,34 +2361,39 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     let family = self.job.with_arena_stores(|expressions, programs, _| {
                         programs.source_family(expressions, source, explicit_matrix_facts)
                     })?;
-                    self.record_family_source_if_enabled(family, |adapter| {
-                        let body = adapter
-                            .job
-                            .programs()
-                            .family_body(family)
-                            .expect("source family body must remain in the program arena");
-                        let node = adapter
-                            .job
-                            .expressions()
-                            .node(body)
-                            .expect("source family body must remain in the expression arena");
-                        let ValueOperator::OpaqueFamilyElement { source } = &node.operator else {
-                            unreachable!("source family body must be an opaque family element")
-                        };
-                        let identity = InputSourceIdentity::Family(source.clone());
-                        if declared_protocol_input {
-                            let input = adapter
-                                .declared_protocol_input(wire, name)
-                                .expect("declared source family must have a protocol input");
-                            SourceClass::DeclaredProtocolInput {
-                                owner: wire.clone(),
-                                input,
-                                identity,
+                    if !(S::ENABLED && self.is_artifact_producer_wire(wire)) {
+                        self.record_family_source_if_enabled(family, |adapter| {
+                            let body = adapter
+                                .job
+                                .programs()
+                                .family_body(family)
+                                .expect("source family body must remain in the program arena");
+                            let node =
+                                adapter.job.expressions().node(body).expect(
+                                    "source family body must remain in the expression arena",
+                                );
+                            let ValueOperator::OpaqueFamilyElement { source } = &node.operator
+                            else {
+                                unreachable!("source family body must be an opaque family element")
+                            };
+                            let identity = InputSourceIdentity::Family(source.clone());
+                            if declared_protocol_input {
+                                let input = adapter
+                                    .declared_protocol_input(wire, name)
+                                    .expect("declared source family must have a protocol input");
+                                SourceClass::DeclaredProtocolInput {
+                                    owner: wire.clone(),
+                                    input,
+                                    identity,
+                                }
+                            } else {
+                                SourceClass::UnboundOccurrenceInput {
+                                    owner: wire.clone(),
+                                    identity,
+                                }
                             }
-                        } else {
-                            SourceClass::UnboundOccurrenceInput { owner: wire.clone(), identity }
-                        }
-                    })?;
+                        })?;
+                    }
                     Value::Family(family)
                 } else {
                     let (source, declared_protocol_input) =
@@ -2373,29 +2408,34 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                         .job
                         .expressions_mut()
                         .intern(ValueOperator::Source(source), Box::new([]))?;
-                    self.record_expression_source_if_enabled(expression, |adapter| {
-                        let node = adapter
-                            .job
-                            .expressions()
-                            .node(expression)
-                            .expect("source input must remain in the expression arena");
-                        let ValueOperator::Source(source) = &node.operator else {
-                            unreachable!("source input must be a source operator")
-                        };
-                        let identity = InputSourceIdentity::Expression(source.clone());
-                        if declared_protocol_input {
-                            let input = adapter
-                                .declared_protocol_input(wire, name)
-                                .expect("declared source must have a protocol input");
-                            SourceClass::DeclaredProtocolInput {
-                                owner: wire.clone(),
-                                input,
-                                identity,
+                    if !(S::ENABLED && self.is_artifact_producer_wire(wire)) {
+                        self.record_expression_source_if_enabled(expression, |adapter| {
+                            let node = adapter
+                                .job
+                                .expressions()
+                                .node(expression)
+                                .expect("source input must remain in the expression arena");
+                            let ValueOperator::Source(source) = &node.operator else {
+                                unreachable!("source input must be a source operator")
+                            };
+                            let identity = InputSourceIdentity::Expression(source.clone());
+                            if declared_protocol_input {
+                                let input = adapter
+                                    .declared_protocol_input(wire, name)
+                                    .expect("declared source must have a protocol input");
+                                SourceClass::DeclaredProtocolInput {
+                                    owner: wire.clone(),
+                                    input,
+                                    identity,
+                                }
+                            } else {
+                                SourceClass::UnboundOccurrenceInput {
+                                    owner: wire.clone(),
+                                    identity,
+                                }
                             }
-                        } else {
-                            SourceClass::UnboundOccurrenceInput { owner: wire.clone(), identity }
-                        }
-                    })?;
+                        })?;
+                    }
                     if let Some(facts) = facts {
                         self.job.insert_matrix_facts(self.token, expression, facts)?;
                     }
@@ -6691,5 +6731,55 @@ mod tests {
             })
             .collect::<BTreeSet<_>>();
         assert!(owners.len() >= 2, "declared input owners={owners:?}");
+    }
+
+    #[test]
+    fn opt_in_artifact_sources_preserve_typed_producers_and_deduplicate_aliases() {
+        let protocol = repeated_named_parallel_artifact_protocol();
+        let plan = ProtocolPlan::build(&protocol, "named-parallel-artifact")
+            .expect("repeated artifact plan");
+        let (_, _, mut trace) =
+            ProductionAdapter::new_with_feasibility(&protocol, &plan, BTreeMap::new())
+                .expect("opt-in adapter")
+                .lower_with_feasibility()
+                .expect("opt-in lowering");
+
+        let producers = trace
+            .source_observations()
+            .values()
+            .filter_map(|class| match class {
+                SourceClass::ProducerArtifact { producer } => Some(producer.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(producers, plan.artifact_producers().clone());
+
+        let retained_handle = trace
+            .source_observations()
+            .iter()
+            .find_map(|(handle, class)| {
+                matches!(class, SourceClass::ProducerArtifact { .. }).then_some(*handle)
+            })
+            .expect("artifact observation handle");
+        let mut closure = super::super::simulation::CertificateClosure {
+            expressions: BTreeSet::new(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: BTreeSet::new(),
+        };
+        match retained_handle {
+            SourceHandle::Expression(expression) => {
+                closure.expressions.insert(expression);
+            }
+            SourceHandle::Family(family) => {
+                closure.families.insert(family);
+            }
+        }
+        trace.retain_residual(&closure);
+        assert_eq!(trace.source_observations().len(), 1);
+        assert!(trace.source_observations().contains_key(&retained_handle));
     }
 }

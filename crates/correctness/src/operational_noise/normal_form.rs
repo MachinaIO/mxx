@@ -3802,7 +3802,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 BTreeMap<(ScopedExprId, super::relation::UniversalDispatchKey), BTreeSet<_>>,
             >,
         >::new();
-        let mut attempted_dispatches = Vec::new();
         for (k_position, &k_factor) in ordered.iter().enumerate() {
             let node = self.expressions.node(k_factor.expression())?;
             let ValueOperator::ProgramCall { program } = node.operator else { continue };
@@ -3812,7 +3811,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             let Some(dispatch) = relations.dispatch_for_preimage_program(program)? else {
                 continue;
             };
-            attempted_dispatches.push((k_factor, dispatch.clone()));
             let index = self.expressions.scoped_only_input(k_factor)?;
             if index.program() != self.scope {
                 return Err(ArenaError::ScopeMismatch {

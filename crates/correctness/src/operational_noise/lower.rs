@@ -13,6 +13,7 @@ use super::{
         TrustedIndexRange, TypedConstant, ValueOperator, ValueTransformOperation,
     },
     facts::{CoefficientBound, MatrixFacts, MatrixMetadata, NumericContract, PolynomialFacts},
+    g0::{FeasibilitySink, FeasibilityTrace, NoFeasibility},
     job::{CandidateToken, CheckerJob, JobError},
     program::{FamilyValueId, SelectionSelector},
     protocol::{PlannedWire, ProgramOccurrence, ProtocolPlan},
@@ -277,7 +278,7 @@ fn classify_node_kind(kind: &NodeKind) -> NodeKindClass {
 }
 
 /// Direct adapter from reached frozen Graph IR wires to one candidate-local [`CheckerJob`].
-pub(crate) struct ProductionAdapter<'a> {
+pub(crate) struct ProductionAdapter<'a, S: FeasibilitySink = NoFeasibility> {
     plan: &'a ProtocolPlan,
     graphs: BTreeMap<StageId, &'a Graph>,
     params: ParamEnv,
@@ -301,9 +302,10 @@ pub(crate) struct ProductionAdapter<'a> {
     trapdoor_values: BTreeMap<SampleKey, ExprId>,
     occurrence_descendants: BTreeMap<(StageId, ProgramOccurrence), BTreeSet<ProgramOccurrence>>,
     diagnostic_budget: u16,
+    feasibility: S,
 }
 
-impl<'a> ProductionAdapter<'a> {
+impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
     /// Intern one graph-node operation while preserving the typed production boundary.
     ///
     /// `ArenaError::IncompatibleMatrixTypes` alone is not actionable for a real Graph: the
@@ -572,10 +574,11 @@ impl<'a> ProductionAdapter<'a> {
             programs.select(expressions, facts, selector, families)
         })?)
     }
-    pub(crate) fn new(
+    fn new_with_sink(
         protocol: &'a ProtocolDecl,
         plan: &'a ProtocolPlan,
         parameters: BTreeMap<String, BigInt>,
+        feasibility: S,
     ) -> Result<Self, ProductionAdapterError> {
         let graphs = protocol
             .stages()
@@ -642,6 +645,7 @@ impl<'a> ProductionAdapter<'a> {
             trapdoor_values: BTreeMap::new(),
             occurrence_descendants,
             diagnostic_budget: 128,
+            feasibility,
         };
         let mut adapter = adapter;
         adapter.assign_sample_events()?;
@@ -652,7 +656,7 @@ impl<'a> ProductionAdapter<'a> {
         Ok(adapter)
     }
 
-    pub(crate) fn lower(mut self) -> Result<(CheckerJob, ProductionRoots), ProductionAdapterError> {
+    fn lower_inner(mut self) -> Result<(CheckerJob, ProductionRoots, S), ProductionAdapterError> {
         let residual = self.resolve(self.plan.target().residual.clone(), &BTreeMap::new())?;
         let decoder = self.resolve(self.plan.target().decoder.clone(), &BTreeMap::new())?;
         self.register_reached_relations()?;
@@ -667,7 +671,12 @@ impl<'a> ProductionAdapter<'a> {
             occurrences: self.plan.counters().occurrences,
             samples: self.sample_events.len() as u64,
         };
-        Ok((self.job, roots))
+        if S::ENABLED {
+            self.feasibility.record_lowering_complete().map_err(|error| {
+                ProductionAdapterError::Descriptor { reason: error.to_string() }
+            })?;
+        }
+        Ok((self.job, roots, self.feasibility))
     }
 
     fn close_root(
@@ -4037,6 +4046,37 @@ fn matrix_binary(op: MatrixBinaryOp) -> MatrixOperation {
         MatrixBinaryOp::Multiply => MatrixOperation::Multiply,
     }
 }
+impl<'a> ProductionAdapter<'a, NoFeasibility> {
+    pub(crate) fn new(
+        protocol: &'a ProtocolDecl,
+        plan: &'a ProtocolPlan,
+        parameters: BTreeMap<String, BigInt>,
+    ) -> Result<Self, ProductionAdapterError> {
+        Self::new_with_sink(protocol, plan, parameters, NoFeasibility)
+    }
+
+    pub(crate) fn lower(self) -> Result<(CheckerJob, ProductionRoots), ProductionAdapterError> {
+        let (job, roots, _) = self.lower_inner()?;
+        Ok((job, roots))
+    }
+}
+
+impl<'a> ProductionAdapter<'a, FeasibilityTrace> {
+    pub(crate) fn new_with_feasibility(
+        protocol: &'a ProtocolDecl,
+        plan: &'a ProtocolPlan,
+        parameters: BTreeMap<String, BigInt>,
+    ) -> Result<Self, ProductionAdapterError> {
+        Self::new_with_sink(protocol, plan, parameters, FeasibilityTrace::default())
+    }
+
+    pub(crate) fn lower_with_feasibility(
+        self,
+    ) -> Result<(CheckerJob, ProductionRoots, FeasibilityTrace), ProductionAdapterError> {
+        self.lower_inner()
+    }
+}
+
 fn real_descriptor(value: &RealExpr) -> Result<String, ProductionAdapterError> {
     serde_json::to_string(value).map_err(|error| ProductionAdapterError::Descriptor {
         reason: format!("real descriptor serialization failed: {error}"),
@@ -6389,5 +6429,37 @@ mod tests {
             .expect("deep test thread")
             .join()
             .expect("deep production lowering thread");
+    }
+
+    #[test]
+    fn opt_in_feasibility_lowering_preserves_ordinary_shape_and_records_one_marker() {
+        let protocol = crate::toy_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let parameters = BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]);
+        let (ordinary_job, ordinary_roots) =
+            ProductionAdapter::new(&protocol, &plan, parameters.clone())
+                .expect("ordinary adapter")
+                .lower()
+                .expect("ordinary lowering");
+        let (trace_job, trace_roots, trace) =
+            ProductionAdapter::new_with_feasibility(&protocol, &plan, parameters)
+                .expect("opt-in adapter")
+                .lower_with_feasibility()
+                .expect("opt-in lowering");
+
+        assert_eq!(trace.lowering_complete, 1);
+        assert_eq!(ordinary_job.expressions().node_count(), trace_job.expressions().node_count());
+        assert_eq!(ordinary_job.programs().len(), trace_job.programs().len());
+        assert_eq!(ordinary_roots.occurrences, trace_roots.occurrences);
+        assert_eq!(ordinary_roots.samples, trace_roots.samples);
+        assert_eq!(
+            matches!(ordinary_roots.residual, ProductionRoot::Closed(_)),
+            matches!(trace_roots.residual, ProductionRoot::Closed(_))
+        );
+        assert_eq!(
+            matches!(ordinary_roots.decoder, ProductionRoot::Closed(_)),
+            matches!(trace_roots.decoder, ProductionRoot::Closed(_))
+        );
+        assert_eq!(ordinary_job.relations().is_frozen(), trace_job.relations().is_frozen());
     }
 }

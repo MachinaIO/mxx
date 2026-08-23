@@ -18,6 +18,46 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
+/// One opt-in observation boundary.  Stage2a1 deliberately carries only a typed completion
+/// marker; source/event payloads are added by a later stage at the same boundary.
+pub(crate) trait FeasibilitySink: Default {
+    const ENABLED: bool;
+
+    fn record_lowering_complete(&mut self) -> Result<(), G0Error>;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NoFeasibility;
+
+impl FeasibilitySink for NoFeasibility {
+    const ENABLED: bool = false;
+
+    fn record_lowering_complete(&mut self) -> Result<(), G0Error> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FeasibilityTrace {
+    pub lowering_complete: u64,
+}
+
+impl From<NoFeasibility> for FeasibilityTrace {
+    fn from(_: NoFeasibility) -> Self {
+        Self::default()
+    }
+}
+
+impl FeasibilitySink for FeasibilityTrace {
+    const ENABLED: bool = true;
+
+    fn record_lowering_complete(&mut self) -> Result<(), G0Error> {
+        self.lowering_complete =
+            self.lowering_complete.checked_add(1).ok_or_else(|| G0Error::TraceOverflow)?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum StableValueType {
@@ -347,6 +387,8 @@ pub(crate) struct StableG0Inventory {
 pub(crate) enum G0Error {
     #[error("G0 descriptor arena reference is invalid: {0}")]
     Arena(#[from] super::arena::ArenaError),
+    #[error("feasibility trace counter overflow")]
+    TraceOverflow,
     #[error("residual event {event} has no typed descriptor")]
     MissingEventDescriptor { event: u64 },
     #[error("event {event} has conflicting typed descriptors")]
@@ -936,5 +978,17 @@ mod tests {
             register_event_descriptors(&sampler, &mut events),
             Err(G0Error::ConflictingEventDescriptor { event: 4 })
         ));
+    }
+
+    #[test]
+    fn feasibility_sinks_keep_ordinary_empty_and_opt_in_marker_typed() {
+        let mut ordinary = NoFeasibility;
+        ordinary.record_lowering_complete().expect("ordinary sink is inert");
+        let mut trace = FeasibilityTrace::default();
+        trace.record_lowering_complete().expect("opt-in marker");
+        assert_eq!(trace.lowering_complete, 1);
+        assert!(!NoFeasibility::ENABLED);
+        assert!(FeasibilityTrace::ENABLED);
+        assert_eq!(FeasibilityTrace::from(ordinary), FeasibilityTrace::default());
     }
 }

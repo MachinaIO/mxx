@@ -1021,7 +1021,7 @@ mod tests {
         }
     }
     fn empty_nf() -> PolynomialNF {
-        PolynomialNF { exact_terms: BTreeMap::new(), bounded_summary: BoundedSummary::missing() }
+        PolynomialNF { exact_terms: BTreeMap::new(), bounded_summary: BoundedSummary::zero() }
     }
 
     #[test]

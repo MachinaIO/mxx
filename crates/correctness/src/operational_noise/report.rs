@@ -196,7 +196,7 @@ fn analyze_root(
 fn analyzed_family_root(result: &ProofAnalysisResult) -> AnalyzedRoot {
     AnalyzedRoot {
         exact_term_count: result.exact_term_count,
-        bound: result.bounded_summary.coefficient_bound.clone(),
+        bound: result.bounded_summary.coefficient_bound(),
         exact_terms: result.exact_term_diagnostics.clone(),
     }
 }
@@ -745,9 +745,7 @@ mod tests {
     #[test]
     fn family_cancellation_a_plus_negative_a_is_exact_zero() {
         let result = ProofAnalysisResult {
-            bounded_summary: super::super::normal_form::BoundedSummary::known(
-                CoefficientBound::ExactZero,
-            ),
+            bounded_summary: super::super::normal_form::BoundedSummary::zero(),
             exact_term_count: 0,
             counters: NormalizationCounters::default(),
             diagnostics: Box::new([super::super::job::ProofDiagnostic::Rewrite {

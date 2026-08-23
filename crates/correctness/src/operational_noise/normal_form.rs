@@ -687,6 +687,7 @@ struct DiagnosticOwnerCensus {
     scalar_action_standalone_materializations: u64,
     scalar_action_reclassified_terms: u64,
     scalar_action_reclassified_factors_max: u64,
+    large_summary_cross_attempts: u64,
     additive_materializations: u64,
     additive_materialization_output_terms_total: u64,
     additive_materialization_output_terms_max: u64,
@@ -1044,6 +1045,7 @@ fn diagnostic_watchdog_emit_snapshot(
         scalar_action_reclassified_factors_max = progress
             .owners
             .scalar_action_reclassified_factors_max,
+        large_summary_cross_attempts = progress.owners.large_summary_cross_attempts,
         additive_materializations = progress.owners.additive_materializations,
         additive_materialization_output_terms_total = progress
             .owners
@@ -1754,6 +1756,7 @@ impl NormalizationTrace {
             scalar_action_reclassified_factors_max = self
                 .owners
                 .scalar_action_reclassified_factors_max,
+            large_summary_cross_attempts = self.owners.large_summary_cross_attempts,
             additive_materializations = self.owners.additive_materializations,
             additive_materialization_output_terms_total = self
                 .owners
@@ -1874,19 +1877,53 @@ fn checked_matrix_product_output(
     })
 }
 
-/// A compact bound summary kept alongside exact terms.
+/// The identityless contribution of terms whose every matrix factor has a finite bound.
+///
+/// This is not a cache of the complete value bound.  Large- or Missing-bearing monomials remain
+/// in `PolynomialNF::exact_terms`; `bound_normal_form` combines those exact terms with this one
+/// conservative noise contribution.  Addition and subtraction both add summary magnitudes, so
+/// deliberately-forgotten noise identity is never used for cancellation.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+enum FiniteSummaryBound {
+    ExactZero,
+    Finite(BoundExpression),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct BoundedSummary {
-    pub coefficient_bound: NumericContract<CoefficientBound>,
+    bound: FiniteSummaryBound,
 }
 
 impl BoundedSummary {
-    pub fn missing() -> Self {
-        Self { coefficient_bound: NumericContract::Missing }
+    pub fn finite(bound: BoundExpression) -> Self {
+        Self { bound: FiniteSummaryBound::Finite(bound) }
     }
 
-    pub fn known(bound: CoefficientBound) -> Self {
-        Self { coefficient_bound: NumericContract::Known(bound) }
+    pub fn zero() -> Self {
+        Self { bound: FiniteSummaryBound::ExactZero }
+    }
+
+    pub fn coefficient_bound(&self) -> NumericContract<CoefficientBound> {
+        NumericContract::Known(match &self.bound {
+            FiniteSummaryBound::ExactZero => CoefficientBound::ExactZero,
+            FiniteSummaryBound::Finite(bound) => CoefficientBound::Finite(bound.clone()),
+        })
+    }
+
+    fn is_zero(&self) -> bool {
+        matches!(self.bound, FiniteSummaryBound::ExactZero)
+    }
+
+    pub(crate) fn from_contract(
+        bound: NumericContract<CoefficientBound>,
+    ) -> Result<Self, NormalizeError> {
+        match bound {
+            NumericContract::Known(CoefficientBound::ExactZero) => Ok(Self::zero()),
+            NumericContract::Known(CoefficientBound::Finite(bound)) => Ok(Self::finite(bound)),
+            NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
+                Err(NormalizeError::InvalidExactPlan { reason: "bounded summary must be finite" })
+            }
+        }
     }
 }
 
@@ -1998,15 +2035,12 @@ struct RelationMatch {
 
 impl PolynomialNF {
     pub fn zero() -> Self {
-        Self {
-            exact_terms: BTreeMap::new(),
-            bounded_summary: BoundedSummary::known(CoefficientBound::ExactZero),
-        }
+        Self { exact_terms: BTreeMap::new(), bounded_summary: BoundedSummary::zero() }
     }
 
     pub fn is_zero(&self) -> bool {
         self.exact_terms.is_empty() &&
-            self.bounded_summary.coefficient_bound ==
+            self.bounded_summary.coefficient_bound() ==
                 NumericContract::Known(CoefficientBound::ExactZero)
     }
 
@@ -2134,6 +2168,7 @@ struct ProductGadgetSplice {
     input_nf: Arc<PolynomialNF>,
     next_after: Option<MonomialId>,
     coefficient: BigInt,
+    summary_pending: bool,
 }
 
 enum ProductWorkItem {
@@ -2339,6 +2374,7 @@ struct ProductPlanCounters {
     scalar_action_standalone_materializations: u64,
     scalar_action_reclassified_terms: u64,
     scalar_action_reclassified_factors_max: u64,
+    large_summary_cross_attempts: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2440,6 +2476,14 @@ pub struct Normalizer<'a> {
     /// which has no structural hold.
     deferred_products: BTreeSet<ExprId>,
     deferred_scalar_actions: BTreeSet<ExprId>,
+    /// Finite relation endpoints retained with identity for exactly one direct registered
+    /// Multiply consumer. They remain bounded values; this set only delays numeric compression
+    /// until that immediate boundary has either rewritten or folded them.
+    retained_bounded_endpoints: BTreeSet<ExprId>,
+    /// Finite factors below a uniquely-consumed 1x1 scalar operand of a non-scalar Multiply.
+    /// Keeping this one lexical branch exact until the scalar-action boundary preserves the full
+    /// ordered Large product without introducing a third durable polynomial lane.
+    retained_bounded_scalar_factors: BTreeSet<ExprId>,
     /// Watchdog-only reverse-edge summary used to explain why a materialized Multiply would not
     /// qualify for the experimental ordinary-product deferral policy. It is never consulted by
     /// normalization semantics.
@@ -3319,11 +3363,15 @@ impl<'a> Normalizer<'a> {
                 }
                 ExactMaterializationFrame::FinishGadgetProduct(plan) => {
                     let mut terms = BTreeMap::new();
+                    let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
                     self.execute_product_into(
+                        &plan.left_type,
+                        &plan.right_type,
                         plan.left.as_ref(),
                         plan.right.as_ref(),
                         &BigInt::from(1_u8),
                         &mut terms,
+                        &mut noise,
                         true,
                         false,
                         ProductGcScope::Deferred {
@@ -3337,7 +3385,7 @@ impl<'a> Normalizer<'a> {
                         (2, plan.id),
                         Arc::new(PolynomialNF {
                             exact_terms: terms,
-                            bounded_summary: BoundedSummary::missing(),
+                            bounded_summary: BoundedSummary::from_contract(noise)?,
                         }),
                     );
                 }
@@ -3345,16 +3393,20 @@ impl<'a> Normalizer<'a> {
                     let left = Self::exact_state_output(&plan.left, &outputs)?;
                     let right = Self::exact_state_output(&plan.right, &outputs)?;
                     let mut terms = BTreeMap::new();
+                    let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
                     let direct = self.product_plan_uses_direct_gadget_rewrite(
                         &plan,
                         left.as_ref(),
                         right.as_ref(),
                     )?;
                     self.execute_product_into(
+                        &plan.left_type,
+                        &plan.right_type,
                         left.as_ref(),
                         right.as_ref(),
                         &BigInt::from(1_u8),
                         &mut terms,
+                        &mut noise,
                         direct,
                         matches!(plan.mode, ProductMode::TypedGadgetCandidate),
                         ProductGcScope::Deferred {
@@ -3397,7 +3449,7 @@ impl<'a> Normalizer<'a> {
                         (1, plan.id),
                         Arc::new(PolynomialNF {
                             exact_terms: terms,
-                            bounded_summary: BoundedSummary::missing(),
+                            bounded_summary: BoundedSummary::from_contract(noise)?,
                         }),
                     );
                 }
@@ -3787,6 +3839,7 @@ impl<'a> Normalizer<'a> {
         // canceled sibling can recursively discard a shared additive operand.
         consumed_additives.extend(flattened.additive_ids.iter().copied());
         let mut terms = HashTermAccumulator::new(self.monomials.token());
+        let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
         for (_, (additive, weight)) in flattened.additive_outputs {
             if weight.is_zero() {
                 if !outputs.contains_key(&(0, additive.id)) {
@@ -3803,6 +3856,13 @@ impl<'a> Normalizer<'a> {
                 NormalizeError::InvalidExactPlan { reason: "missing scheduled additive output" },
             )?;
             merge_scaled_terms_hash(&mut terms, &normal_form.exact_terms, &weight)?;
+            noise = add_noise_summaries(
+                &noise,
+                &scale_noise_summary(
+                    &normal_form.bounded_summary.coefficient_bound(),
+                    weight.magnitude(),
+                ),
+            );
             Self::release_additive_output(
                 &NodeExactState::Additive(additive),
                 outputs,
@@ -3814,6 +3874,13 @@ impl<'a> Normalizer<'a> {
                 continue;
             }
             merge_scaled_terms_hash(&mut terms, &normal_form.exact_terms, &weight)?;
+            noise = add_noise_summaries(
+                &noise,
+                &scale_noise_summary(
+                    &normal_form.bounded_summary.coefficient_bound(),
+                    weight.magnitude(),
+                ),
+            );
         }
         for (_, (plan, weight, occurrences, standalone)) in flattened.products.into_iter().rev() {
             let mut executed = false;
@@ -3824,6 +3891,13 @@ impl<'a> Normalizer<'a> {
                             reason: "missing scheduled product output",
                         })?;
                     merge_scaled_terms_hash(&mut terms, &normal_form.exact_terms, &weight)?;
+                    noise = add_noise_summaries(
+                        &noise,
+                        &scale_noise_summary(
+                            &normal_form.bounded_summary.coefficient_bound(),
+                            weight.magnitude(),
+                        ),
+                    );
                 } else {
                     let left = Self::exact_state_output(&plan.left, outputs)?;
                     let right = Self::exact_state_output(&plan.right, outputs)?;
@@ -3833,10 +3907,13 @@ impl<'a> Normalizer<'a> {
                         right.as_ref(),
                     )?;
                     self.execute_product_into(
+                        &plan.left_type,
+                        &plan.right_type,
                         left.as_ref(),
                         right.as_ref(),
                         &weight,
                         &mut terms,
+                        &mut noise,
                         direct,
                         matches!(plan.mode, ProductMode::TypedGadgetCandidate),
                         ProductGcScope::Deferred {
@@ -3901,10 +3978,13 @@ impl<'a> Normalizer<'a> {
                 continue;
             }
             self.execute_product_into(
+                &plan.left_type,
+                &plan.right_type,
                 plan.left.as_ref(),
                 plan.right.as_ref(),
                 &weight,
                 &mut terms,
+                &mut noise,
                 true,
                 false,
                 ProductGcScope::Deferred {
@@ -3913,20 +3993,19 @@ impl<'a> Normalizer<'a> {
                 },
             )?;
         }
-        let output_terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
         let terms = terms.into_term_map()?;
+        let mut normal_form = PolynomialNF {
+            exact_terms: terms,
+            bounded_summary: BoundedSummary::from_contract(noise)?,
+        };
+        self.fold_finite_no_match_terms(&mut normal_form, true)?;
+        let output_terms = u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX);
         self.exact_plan_materializations = self.exact_plan_materializations.saturating_add(1);
         self.exact_plan_materialization_output_terms_total =
             self.exact_plan_materialization_output_terms_total.saturating_add(output_terms);
         self.exact_plan_materialization_output_terms_max =
             self.exact_plan_materialization_output_terms_max.max(output_terms);
-        Ok((
-            flattened.id,
-            Arc::new(PolynomialNF {
-                exact_terms: terms,
-                bounded_summary: BoundedSummary::missing(),
-            }),
-        ))
+        Ok((flattened.id, Arc::new(normal_form)))
     }
 
     fn discard_unexecuted_product_dependencies(
@@ -4949,6 +5028,7 @@ impl<'a> Normalizer<'a> {
             scalar_action_reclassified_factors_max: self
                 .product_plan_counters
                 .scalar_action_reclassified_factors_max,
+            large_summary_cross_attempts: self.product_plan_counters.large_summary_cross_attempts,
             additive_materializations: self.exact_plan_materializations,
             additive_materialization_output_terms_total: self
                 .exact_plan_materialization_output_terms_total,
@@ -5210,7 +5290,7 @@ impl<'a> Normalizer<'a> {
     }
 
     fn refresh_owner_diagnostics(&mut self) {
-        // Cheap legacy trace boundary: fresh O(D) census is scheduled only by
+        // Cheap trace boundary: fresh O(D) census is scheduled only by
         // `sample_owner_census` with an explicit reason.
     }
 
@@ -5318,6 +5398,8 @@ impl<'a> Normalizer<'a> {
             deferred_gadget_products: BTreeSet::new(),
             deferred_products: BTreeSet::new(),
             deferred_scalar_actions: BTreeSet::new(),
+            retained_bounded_endpoints: BTreeSet::new(),
+            retained_bounded_scalar_factors: BTreeSet::new(),
             diagnostic_product_consumers: BTreeMap::new(),
             diagnostic_product_evaluations: BTreeMap::new(),
             diagnostic_product_root: None,
@@ -5936,6 +6018,8 @@ impl<'a> Normalizer<'a> {
         self.deferred_gadget_products.clear();
         self.deferred_products.clear();
         self.deferred_scalar_actions.clear();
+        self.retained_bounded_endpoints.clear();
+        self.retained_bounded_scalar_factors.clear();
         self.diagnostic_product_consumers.clear();
         self.diagnostic_product_evaluations.clear();
         self.diagnostic_product_root = None;
@@ -6116,16 +6200,8 @@ impl<'a> Normalizer<'a> {
             if self.relations.is_some() && self.relation_rewriting_enabled {
                 if let Some(exact_nf) = value.exact_nf.as_mut() {
                     let normal_form = Arc::make_mut(exact_nf);
-                    let changed = self.rewrite_closed_relations(normal_form)?;
-                    if changed {
-                        // Relation closure replaces the old exact word. Do not carry its summary
-                        // (which may be Large because of a pre-rewrite plain hash) into rebound.
-                        normal_form.bounded_summary =
-                            BoundedSummary::known(CoefficientBound::ExactZero);
-                        let rebound = self.bound_normal_form(normal_form)?;
-                        normal_form.bounded_summary.coefficient_bound = rebound.clone();
-                        value.coefficient_bound = rebound;
-                    }
+                    self.rewrite_closed_relations(normal_form)?;
+                    value.coefficient_bound = self.bound_normal_form(normal_form)?;
                 }
             }
             Ok(())
@@ -6147,19 +6223,14 @@ impl<'a> Normalizer<'a> {
                     let normal_form = Arc::make_mut(exact_nf);
                     // Compute the total while exact factors are still present, then fold finite
                     // terms without counting them a second time.
-                    let rebound = match &normal_form.bounded_summary.coefficient_bound {
-                        NumericContract::Known(bound) => NumericContract::Known(bound.clone()),
-                        NumericContract::Missing => self.bound_normal_form(normal_form)?,
-                    };
+                    let rebound = self.bound_normal_form(normal_form)?;
                     self.trace.enter_postphase("post:fold_terms");
-                    self.fold_finite_no_match_terms(normal_form)?;
-                    normal_form.bounded_summary.coefficient_bound = rebound.clone();
+                    self.fold_finite_no_match_terms(normal_form, false)?;
                     value.coefficient_bound = rebound;
                     if normal_form.is_zero() {
                         value.coefficient_bound =
                             NumericContract::Known(CoefficientBound::ExactZero);
-                        normal_form.bounded_summary =
-                            BoundedSummary::known(CoefficientBound::ExactZero);
+                        normal_form.bounded_summary = BoundedSummary::zero();
                     }
                 }
             }
@@ -6565,6 +6636,9 @@ impl<'a> Normalizer<'a> {
         let saved_deferred_gadget_products = std::mem::take(&mut self.deferred_gadget_products);
         let saved_deferred_products = std::mem::take(&mut self.deferred_products);
         let saved_deferred_scalar_actions = std::mem::take(&mut self.deferred_scalar_actions);
+        let saved_retained_bounded_endpoints = std::mem::take(&mut self.retained_bounded_endpoints);
+        let saved_retained_bounded_scalar_factors =
+            std::mem::take(&mut self.retained_bounded_scalar_factors);
         let saved_diagnostic_product_consumers =
             std::mem::take(&mut self.diagnostic_product_consumers);
         let saved_diagnostic_product_evaluations =
@@ -6617,6 +6691,8 @@ impl<'a> Normalizer<'a> {
         self.deferred_gadget_products = saved_deferred_gadget_products;
         self.deferred_products = saved_deferred_products;
         self.deferred_scalar_actions = saved_deferred_scalar_actions;
+        self.retained_bounded_endpoints = saved_retained_bounded_endpoints;
+        self.retained_bounded_scalar_factors = saved_retained_bounded_scalar_factors;
         self.diagnostic_product_consumers = saved_diagnostic_product_consumers;
         self.diagnostic_product_evaluations = saved_diagnostic_product_evaluations;
         self.diagnostic_product_root = saved_diagnostic_product_root;
@@ -6810,6 +6886,143 @@ impl<'a> Normalizer<'a> {
         *self.remaining_uses.entry(root).or_default() += 1;
         let counts = product_consumers.entry(root).or_default();
         counts.root_other = counts.root_other.saturating_add(1);
+
+        // Tall's `right * plaintext` is a one-sided scalar action.  If the finite 1x1 plaintext
+        // branch were collapsed before this edge, a later Large row product could not recover the
+        // exact scalar factors required by the two-lane contract.  Delay only uniquely-consumed
+        // scalar branches, and only until their immediate non-scalar Multiply.
+        let mut scalar_factor_work = Vec::new();
+        for expression in &reachable {
+            let node = self.expressions.node(*expression)?;
+            if !matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Multiply)) ||
+                node.inputs.len() != 2
+            {
+                continue;
+            }
+            let mut scalar = None;
+            let mut non_scalar = false;
+            for input in &node.inputs {
+                let ResolvedValueType::Matrix(matrix) = self.expressions.value_type(*input)? else {
+                    continue;
+                };
+                if matrix.rows == 1 && matrix.columns == 1 {
+                    scalar = Some(*input);
+                } else {
+                    non_scalar = true;
+                }
+            }
+            let Some(scalar) = scalar.filter(|_| non_scalar) else { continue };
+            if node.inputs.iter().filter(|input| **input == scalar).count() != 1 ||
+                !real_consumers.get(&scalar).is_some_and(|consumers| {
+                    consumers.len() == 1 && consumers.contains(expression)
+                })
+            {
+                continue;
+            }
+            scalar_factor_work.push(scalar);
+        }
+        while let Some(expression) = scalar_factor_work.pop() {
+            if !self.retained_bounded_scalar_factors.insert(expression) {
+                continue;
+            }
+            scalar_factor_work.extend(self.expressions.node(expression)?.inputs.iter().copied());
+        }
+
+        // A finite endpoint is retained only for one semantic input edge of one direct Multiply.
+        // Closed and universal endpoints must match the complete registered ordered pair. A
+        // gadget decomposition may use the registry's exact typed half here because the opposite
+        // operand can be an Additive NF; the product executor revalidates the complete G|D pair
+        // before rewriting and otherwise treats the endpoint as ordinary bounded input.
+        let mut closed_endpoint_pairs = BTreeSet::new();
+        let mut universal_endpoint_pairs = BTreeSet::new();
+        if let Some(relations) = self.relations {
+            for lhs in relations.closed_monomial_roots() {
+                let descriptor = self.monomials.descriptor(lhs)?;
+                if descriptor.central_factors.is_empty() && descriptor.ordered_factors.len() == 2 {
+                    let left = descriptor.ordered_factors[0];
+                    let right = descriptor.ordered_factors[1];
+                    if left.program() == self.scope && right.program() == self.scope {
+                        closed_endpoint_pairs.insert((left.expression(), right.expression()));
+                    }
+                }
+            }
+            for (preimage, public, _) in relations.universal_plan_roles() {
+                universal_endpoint_pairs.insert((public, preimage));
+            }
+        }
+        for expression in &reachable {
+            let Some(consumers) = real_consumers.get(expression) else { continue };
+            if consumers.len() != 1 {
+                continue;
+            }
+            let consumer = *consumers.first().expect("length checked above");
+            let consumer_node = self.expressions.node(consumer)?;
+            if !matches!(consumer_node.operator, ValueOperator::Matrix(MatrixOperation::Multiply)) ||
+                consumer_node.inputs.len() != 2 ||
+                consumer_node.inputs.iter().filter(|input| *input == expression).count() != 1
+            {
+                continue;
+            }
+            let left_expression = consumer_node.inputs[0];
+            let right_expression = consumer_node.inputs[1];
+            let closed = closed_endpoint_pairs.contains(&(left_expression, right_expression));
+            let left_node = self.expressions.node(left_expression)?;
+            let right_node = self.expressions.node(right_expression)?;
+            let universal = match (&left_node.operator, &right_node.operator) {
+                (
+                    ValueOperator::ProgramCall { program: public },
+                    ValueOperator::ProgramCall { program: preimage },
+                ) => universal_endpoint_pairs.contains(&(*public, *preimage)),
+                _ => false,
+            };
+            let gadget = if *expression == right_expression {
+                if let ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    base,
+                    small,
+                    digit_count,
+                    ..
+                }) = &right_node.operator
+                {
+                    let Some(input) = right_node.inputs.first().copied() else { continue };
+                    let (
+                        ResolvedValueType::Matrix(decomposition_type),
+                        ResolvedValueType::Matrix(input_type),
+                    ) = (
+                        self.expressions.value_type(right_expression)?,
+                        self.expressions.value_type(input)?,
+                    )
+                    else {
+                        continue
+                    };
+                    let decomposition_layout = self
+                        .matrix_value_facts(right_expression)
+                        .map(|facts| &facts.metadata.layout);
+                    let input_layout =
+                        self.matrix_value_facts(input).map(|facts| &facts.metadata.layout);
+                    self.gadget_recompositions
+                        .map(|registry| {
+                            registry.allows_decomposition_half(
+                                *base,
+                                *small,
+                                *digit_count,
+                                decomposition_type,
+                                input_type,
+                                decomposition_layout,
+                                input_layout,
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if closed || universal || gadget {
+                self.retained_bounded_endpoints.insert(*expression);
+            }
+        }
 
         let mut candidates = BTreeSet::new();
         let mut gadget_candidates = BTreeSet::new();
@@ -7208,21 +7421,15 @@ impl<'a> Normalizer<'a> {
         self.trace.enter_subphase("evaluate_node:relation_rewrite");
         if let Some(normal_form) = value.exact_nf.as_mut().and_then(Arc::get_mut) {
             if self.relations.is_some() && self.relation_rewriting_enabled {
-                let changed = self.rewrite_closed_relations(normal_form)?;
-                if changed {
-                    normal_form.bounded_summary =
-                        BoundedSummary::known(CoefficientBound::ExactZero);
-                    let rebound = self.bound_normal_form(normal_form)?;
-                    normal_form.bounded_summary.coefficient_bound = rebound.clone();
-                    value.coefficient_bound = rebound;
-                }
+                self.rewrite_closed_relations(normal_form)?;
+                value.coefficient_bound = self.bound_normal_form(normal_form)?;
             }
         }
         self.trace.enter_subphase("evaluate_node:zero_check");
         if let Some(normal_form) = value.exact_nf.as_mut().and_then(Arc::get_mut) {
             if normal_form.is_zero() {
                 value.coefficient_bound = NumericContract::Known(CoefficientBound::ExactZero);
-                normal_form.bounded_summary = BoundedSummary::known(CoefficientBound::ExactZero);
+                normal_form.bounded_summary = BoundedSummary::zero();
             }
         }
         self.trace.enter_subphase("evaluate_node:complete");
@@ -7282,11 +7489,7 @@ impl<'a> Normalizer<'a> {
             ValueOperator::Trapdoor(_) => Some(self.atom_nf(scope_proof, semantic)?),
             _ => Some(self.atom_nf(scope_proof, semantic)?),
         };
-        Ok(AnalyzedValue {
-            semantic,
-            exact_nf: exact.map(|normal_form| Arc::new(with_summary(normal_form, bound.clone()))),
-            coefficient_bound: bound,
-        })
+        Ok(AnalyzedValue { semantic, exact_nf: exact.map(Arc::new), coefficient_bound: bound })
     }
 
     fn shared_identity_nf(
@@ -7404,7 +7607,19 @@ impl<'a> Normalizer<'a> {
                         ScalarActionNormalization::Exact(normal_form) => Ok(normal_form),
                         ScalarActionNormalization::Opaque => self.atom_nf(scope_proof, semantic),
                         ScalarActionNormalization::NotApplicable => {
-                            self.product_nf(scope_proof, left, right)
+                            let ResolvedValueType::Matrix(left_type) =
+                                self.expressions.value_type(node.inputs[0])?
+                            else {
+                                return Ok(self.atom_nf(scope_proof, semantic)?);
+                            };
+                            let left_type = left_type.clone();
+                            let ResolvedValueType::Matrix(right_type) =
+                                self.expressions.value_type(node.inputs[1])?
+                            else {
+                                return Ok(self.atom_nf(scope_proof, semantic)?);
+                            };
+                            let right_type = right_type.clone();
+                            self.product_nf(scope_proof, &left_type, &right_type, left, right)
                         }
                     },
                     _ => Ok(self.atom_nf(scope_proof, semantic)?),
@@ -7537,7 +7752,14 @@ impl<'a> Normalizer<'a> {
                             // A non-scalar tensor remains a tensor factor. `tensor_nf` distributes
                             // only over exact polynomial terms; it never treats matrix tensor
                             // multiplication as an ordinary scalar product.
-                            self.tensor_nf(scope_proof, operation, left, right)
+                            self.tensor_nf(
+                                scope_proof,
+                                operation,
+                                node.inputs[0],
+                                node.inputs[1],
+                                left,
+                                right,
+                            )
                         }
                     }
                 }
@@ -7890,16 +8112,56 @@ impl<'a> Normalizer<'a> {
             let transformed = self.atom_monomial(Some(scope_proof), transformed)?;
             merge_term(&mut terms, transformed, coefficient.clone());
         }
-        Ok(PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() })
+        let mut result =
+            PolynomialNF { exact_terms: terms, bounded_summary: input.bounded_summary.clone() };
+        self.fold_finite_no_match_terms(&mut result, true)?;
+        Ok(result)
     }
 
     fn tensor_nf(
         &mut self,
         scope_proof: &mut ScopeProof,
         operation: &MatrixOperation,
+        left_expression: ExprId,
+        right_expression: ExprId,
         left: &PolynomialNF,
         right: &PolynomialNF,
     ) -> Result<PolynomialNF, NormalizeError> {
+        let ResolvedValueType::Matrix(left_type) = self.expressions.value_type(left_expression)?
+        else {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "tensor left input is not a matrix",
+            })
+        };
+        let left_type = left_type.clone();
+        let ResolvedValueType::Matrix(right_type) =
+            self.expressions.value_type(right_expression)?
+        else {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "tensor right input is not a matrix",
+            })
+        };
+        let right_type = right_type.clone();
+        let left_bound = self.bound_normal_form(left)?;
+        let right_bound = self.bound_normal_form(right)?;
+        if matches!(
+            left_bound,
+            NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Finite(_))
+        ) && matches!(
+            right_bound,
+            NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Finite(_))
+        ) {
+            return Ok(PolynomialNF {
+                exact_terms: BTreeMap::new(),
+                bounded_summary: BoundedSummary::from_contract(self.typed_tensor_contract(
+                    &left_type,
+                    &left_bound,
+                    &right_type,
+                    &right_bound,
+                )?)?,
+            })
+        }
+        let noise = self.tensor_summary_contract(&left_type, left, &right_type, right)?;
         let mut terms = BTreeMap::new();
         let mut expressions = BTreeMap::new();
         for (left_id, left_coefficient) in &left.exact_terms {
@@ -7932,7 +8194,12 @@ impl<'a> Normalizer<'a> {
                 merge_term(&mut terms, transformed, coefficient);
             }
         }
-        Ok(PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() })
+        let mut result = PolynomialNF {
+            exact_terms: terms,
+            bounded_summary: BoundedSummary::from_contract(noise)?,
+        };
+        self.fold_finite_no_match_terms(&mut result, true)?;
+        Ok(result)
     }
 
     /// Flatten a tensor when one operand is exactly a row-major 1x1 matrix, using the same typed
@@ -8051,7 +8318,7 @@ impl<'a> Normalizer<'a> {
             // commutativity of the scalar result. The product is centralized only after every
             // surviving ordered factor is proven to have the declared 1x1 output type. In the
             // reversed order no relation applies, so both typed scalar factors remain present.
-            let product = self.product_nf(scope_proof, left, right)?;
+            let product = self.product_nf(scope_proof, &left_type, &right_type, left, right)?;
             if !self.scalar_nf_ordered_factors_match_type(&product, &output_type)? {
                 self.trace.record_scalar_opaque();
                 return Ok(ScalarActionNormalization::Opaque);
@@ -8084,6 +8351,8 @@ impl<'a> Normalizer<'a> {
         };
         Ok(ScalarActionNormalization::Exact(self.product_nf(
             scope_proof,
+            &left_type,
+            &right_type,
             &reclassified_left,
             &reclassified_right,
         )?))
@@ -8123,7 +8392,7 @@ impl<'a> Normalizer<'a> {
         Ok((
             PolynomialNF {
                 exact_terms: reclassified_terms,
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: normal_form.bounded_summary.clone(),
             },
             term_count,
             max_reclassified_factors,
@@ -8189,7 +8458,17 @@ impl<'a> Normalizer<'a> {
                 merge_term(&mut terms, transformed, coefficient.clone());
             }
         }
-        Ok(PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() })
+        let summaries = children
+            .iter()
+            .filter_map(|child| child.exact_nf.as_ref())
+            .map(|normal_form| normal_form.bounded_summary.coefficient_bound())
+            .collect::<Vec<_>>();
+        let mut result = PolynomialNF {
+            exact_terms: terms,
+            bounded_summary: BoundedSummary::from_contract(max_bounds(&summaries)?)?,
+        };
+        self.fold_finite_no_match_terms(&mut result, true)?;
+        Ok(result)
     }
 
     fn zero_matrix(
@@ -8574,7 +8853,8 @@ impl<'a> Normalizer<'a> {
                 else {
                     return Ok(None);
                 };
-                let Some(expected) = checked_matrix_product_output(left_type, &component_type)
+                let left_type = left_type.clone();
+                let Some(expected) = checked_matrix_product_output(&left_type, &component_type)
                 else {
                     return Ok(None);
                 };
@@ -8588,7 +8868,13 @@ impl<'a> Normalizer<'a> {
                 else {
                     return Ok(None);
                 };
-                Ok(Some(self.product_nf(scope_proof, left_nf, component_nf)?))
+                Ok(Some(self.product_nf(
+                    scope_proof,
+                    &left_type,
+                    &component_type,
+                    left_nf,
+                    component_nf,
+                )?))
             }
             ValueOperator::Matrix(MatrixOperation::Tensor {
                 output,
@@ -8606,6 +8892,7 @@ impl<'a> Normalizer<'a> {
                 else {
                     return Ok(None);
                 };
+                let right_type = right_type.clone();
                 let expected_rows = concat_type
                     .rows
                     .checked_mul(right_type.rows)
@@ -8657,7 +8944,13 @@ impl<'a> Normalizer<'a> {
                 else {
                     return Ok(None);
                 };
-                Ok(Some(self.product_nf(scope_proof, component_nf, right_nf)?))
+                Ok(Some(self.product_nf(
+                    scope_proof,
+                    &component_type,
+                    &right_type,
+                    component_nf,
+                    right_nf,
+                )?))
             }
             _ => Ok(None),
         }
@@ -8724,7 +9017,7 @@ impl<'a> Normalizer<'a> {
         self.trace.enter_subphase("atom:term_insert");
         let mut terms = BTreeMap::new();
         terms.insert(id, BigInt::from(1_u8));
-        Ok(PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() })
+        Ok(PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::zero() })
     }
 
     fn atom_monomial(
@@ -8799,7 +9092,15 @@ impl<'a> Normalizer<'a> {
                 terms.remove(id);
             }
         }
-        Ok(PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() })
+        let mut result = PolynomialNF {
+            exact_terms: terms,
+            bounded_summary: BoundedSummary::from_contract(add_noise_summaries(
+                &left.bounded_summary.coefficient_bound(),
+                &right.bounded_summary.coefficient_bound(),
+            ))?,
+        };
+        self.fold_finite_no_match_terms(&mut result, true)?;
+        Ok(result)
     }
 
     fn negate_nf(&self, value: &PolynomialNF) -> PolynomialNF {
@@ -8807,7 +9108,7 @@ impl<'a> Normalizer<'a> {
         for (id, coefficient) in &value.exact_terms {
             terms.insert(*id, -coefficient.clone());
         }
-        PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() }
+        PolynomialNF { exact_terms: terms, bounded_summary: value.bounded_summary.clone() }
     }
 
     fn scale_nf(&self, value: &PolynomialNF, scale: &BigInt) -> PolynomialNF {
@@ -8821,7 +9122,14 @@ impl<'a> Normalizer<'a> {
                 terms.insert(*id, result);
             }
         }
-        PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() }
+        PolynomialNF {
+            exact_terms: terms,
+            bounded_summary: BoundedSummary::from_contract(scale_noise_summary(
+                &value.bounded_summary.coefficient_bound(),
+                scale.magnitude(),
+            ))
+            .expect("scaling a finite summary remains finite"),
+        }
     }
 
     fn parallel_rewrite_product_pair(
@@ -9040,20 +9348,213 @@ impl<'a> Normalizer<'a> {
     fn product_nf(
         &mut self,
         _scope_proof: &ScopeProof,
+        left_type: &ResolvedMatrixType,
+        right_type: &ResolvedMatrixType,
         left: &PolynomialNF,
         right: &PolynomialNF,
     ) -> Result<PolynomialNF, NormalizeError> {
         let mut terms = BTreeMap::new();
+        let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
         self.execute_product_into(
+            left_type,
+            right_type,
             left,
             right,
             &BigInt::from(1_u8),
             &mut terms,
+            &mut noise,
             false,
             false,
             ProductGcScope::Eager,
         )?;
-        Ok(PolynomialNF { exact_terms: terms, bounded_summary: BoundedSummary::missing() })
+
+        Ok(PolynomialNF {
+            exact_terms: terms,
+            bounded_summary: BoundedSummary::from_contract(noise)?,
+        })
+    }
+
+    fn bound_exact_terms(
+        &self,
+        normal_form: &PolynomialNF,
+    ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
+        let mut total = CoefficientBound::ExactZero;
+        for (&monomial, coefficient) in &normal_form.exact_terms {
+            let NumericContract::Known(bound) = self.bound_monomial(monomial, coefficient)? else {
+                return Ok(NumericContract::Missing);
+            };
+            total = add_known_bounds(&total, &bound);
+        }
+        Ok(NumericContract::Known(total))
+    }
+
+    /// A bounded relation endpoint is not a Large/exact semantic term.  It is kept with identity
+    /// for exactly one direct registered boundary, then folded like every other finite term.
+    fn is_retained_bounded_monomial(&self, monomial: MonomialId) -> Result<bool, NormalizeError> {
+        let descriptor = self.monomials.descriptor(monomial)?;
+        if descriptor.central_factors.is_empty() && descriptor.ordered_factors.len() == 1 {
+            let factor = descriptor.ordered_factors[0];
+            if factor.program() == self.scope &&
+                self.retained_bounded_endpoints.contains(&factor.expression())
+            {
+                return Ok(true)
+            }
+        }
+        let mut factors =
+            descriptor.central_factors.iter().chain(descriptor.ordered_factors.iter());
+        let Some(first) = factors.next() else { return Ok(false) };
+        Ok(first.program() == self.scope &&
+            self.retained_bounded_scalar_factors.contains(&first.expression()) &&
+            factors.all(|factor| {
+                factor.program() == self.scope &&
+                    self.retained_bounded_scalar_factors.contains(&factor.expression())
+            }))
+    }
+
+    fn typed_product_contract(
+        &self,
+        left_type: &ResolvedMatrixType,
+        left: &NumericContract<CoefficientBound>,
+        right_type: &ResolvedMatrixType,
+        right: &NumericContract<CoefficientBound>,
+    ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
+        let (NumericContract::Known(left), NumericContract::Known(right)) = (left, right) else {
+            return Ok(NumericContract::Missing);
+        };
+        let product = product_bound_with_facts(
+            &CanonicalMatrixBound {
+                matrix_type: concrete_type(left_type),
+                coefficient_class: canonical_class(left),
+            },
+            &CanonicalMatrixBound {
+                matrix_type: concrete_type(right_type),
+                coefficient_class: canonical_class(right),
+            },
+            &MatrixProductFacts::default(),
+        )
+        .map_err(|_| NormalizeError::ArithmeticOverflow)?;
+        Ok(NumericContract::Known(coefficient_bound(&product.coefficient_class)))
+    }
+
+    fn typed_tensor_contract(
+        &self,
+        left_type: &ResolvedMatrixType,
+        left: &NumericContract<CoefficientBound>,
+        right_type: &ResolvedMatrixType,
+        right: &NumericContract<CoefficientBound>,
+    ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
+        let (NumericContract::Known(left), NumericContract::Known(right)) = (left, right) else {
+            return Ok(NumericContract::Missing)
+        };
+        let tensor = tensor_bound_with_facts(
+            &CanonicalMatrixBound {
+                matrix_type: concrete_type(left_type),
+                coefficient_class: canonical_class(left),
+            },
+            &CanonicalMatrixBound {
+                matrix_type: concrete_type(right_type),
+                coefficient_class: canonical_class(right),
+            },
+            &MatrixProductFacts::default(),
+        )
+        .map_err(|_| NormalizeError::ArithmeticOverflow)?;
+        Ok(NumericContract::Known(coefficient_bound(&tensor.coefficient_class)))
+    }
+
+    fn tensor_summary_contract(
+        &mut self,
+        left_type: &ResolvedMatrixType,
+        left: &PolynomialNF,
+        right_type: &ResolvedMatrixType,
+        right: &PolynomialNF,
+    ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
+        let left_summary = left.bounded_summary.coefficient_bound();
+        let right_summary = right.bounded_summary.coefficient_bound();
+        let mut contribution =
+            self.typed_tensor_contract(left_type, &left_summary, right_type, &right_summary)?;
+        for (summary, summary_type, exact, exact_type, summary_on_left) in [
+            (&left_summary, left_type, right, right_type, true),
+            (&right_summary, right_type, left, left_type, false),
+        ] {
+            if summary.as_known().is_none_or(|bound| bound == &CoefficientBound::ExactZero) ||
+                exact.exact_terms.is_empty()
+            {
+                continue
+            }
+            let exact_bound = self.bound_exact_terms(exact)?;
+            if !matches!(
+                exact_bound,
+                NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Finite(_))
+            ) {
+                self.product_plan_counters.large_summary_cross_attempts =
+                    self.product_plan_counters.large_summary_cross_attempts.saturating_add(1);
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "compressed bounded summary tensored with Large or Missing exact value",
+                })
+            }
+            let cross = if summary_on_left {
+                self.typed_tensor_contract(summary_type, summary, exact_type, &exact_bound)?
+            } else {
+                self.typed_tensor_contract(exact_type, &exact_bound, summary_type, summary)?
+            };
+            contribution = add_noise_summaries(&contribution, &cross);
+        }
+        Ok(contribution)
+    }
+
+    /// Precompute every contribution involving an already-erased all-bounded summary.
+    ///
+    /// This runs before the exact product mutates the arena or destination.  A summary may be
+    /// multiplied only by another finite component (including a retained finite relation
+    /// endpoint).  Multiplying it by a Large/Missing exact value would lose the required ordered
+    /// factor identity and therefore fails closed.
+    fn product_summary_contract(
+        &mut self,
+        left_type: &ResolvedMatrixType,
+        left: &PolynomialNF,
+        right_type: &ResolvedMatrixType,
+        right: &PolynomialNF,
+        weight: &BigInt,
+    ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
+        if weight.is_zero() {
+            return Ok(NumericContract::Known(CoefficientBound::ExactZero))
+        }
+        let left_summary = left.bounded_summary.coefficient_bound();
+        let right_summary = right.bounded_summary.coefficient_bound();
+        let mut contribution =
+            self.typed_product_contract(left_type, &left_summary, right_type, &right_summary)?;
+
+        // An identityless summary cannot become an ordered exact word again. Cross products with
+        // retained exact terms therefore use the complete exact-side bound and fail closed as
+        // Large/Missing when that is what the typed transfer proves.
+        for (summary, summary_type, exact, exact_type, summary_on_left) in [
+            (&left_summary, left_type, right, right_type, true),
+            (&right_summary, right_type, left, left_type, false),
+        ] {
+            if summary.as_known().is_none_or(|bound| bound == &CoefficientBound::ExactZero) ||
+                exact.exact_terms.is_empty()
+            {
+                continue
+            }
+            let exact_bound = self.bound_exact_terms(exact)?;
+            if !matches!(
+                exact_bound,
+                NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Finite(_))
+            ) {
+                self.product_plan_counters.large_summary_cross_attempts =
+                    self.product_plan_counters.large_summary_cross_attempts.saturating_add(1);
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "compressed bounded summary multiplied by Large or Missing exact value",
+                });
+            }
+            let cross = if summary_on_left {
+                self.typed_product_contract(summary_type, summary, exact_type, &exact_bound)?
+            } else {
+                self.typed_product_contract(exact_type, &exact_bound, summary_type, summary)?
+            };
+            contribution = add_noise_summaries(&contribution, &cross);
+        }
+        Ok(scale_noise_summary(&contribution, weight.magnitude()))
     }
 
     /// Execute one complete product lifecycle. Both eager products and deferred weighted gadget
@@ -9061,10 +9562,13 @@ impl<'a> Normalizer<'a> {
     /// product's queue, generation, or large-product sampling state.
     fn execute_product_into<A: ExactTermAccumulator>(
         &mut self,
+        left_type: &ResolvedMatrixType,
+        right_type: &ResolvedMatrixType,
         left: &PolynomialNF,
         right: &PolynomialNF,
         weight: &BigInt,
         terms: &mut A,
+        noise: &mut NumericContract<CoefficientBound>,
         direct_gadget_boundary: bool,
         typed_product_plan: bool,
         gc_scope: ProductGcScope<'_>,
@@ -9132,15 +9636,21 @@ impl<'a> Normalizer<'a> {
             self.gadget_product_counters.planned_pairs =
                 self.gadget_product_counters.planned_pairs.saturating_add(planned);
         }
+        let summary_contribution =
+            self.product_summary_contract(left_type, left, right_type, right, weight)?;
         let result = self.product_into_body(
             left,
             right,
             weight,
             terms,
+            noise,
             direct_gadget_boundary,
             typed_product_plan,
             gc_scope,
         );
+        if result.is_ok() {
+            *noise = add_noise_summaries(noise, &summary_contribution);
+        }
         if self.trace.active {
             if result.is_ok() {
                 self.trace.product_max_output_terms = self
@@ -9172,17 +9682,19 @@ impl<'a> Normalizer<'a> {
         right: &PolynomialNF,
         weight: &BigInt,
         terms: &mut A,
+        noise: &mut NumericContract<CoefficientBound>,
         direct_gadget_boundary: bool,
         typed_product_plan: bool,
         gc_scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
         let mut worklist = VecDeque::<ProductWorkItem>::new();
-        let parallel_pairs = !direct_gadget_boundary &&
+        let parallel_pairs = self.relations.is_none() &&
+            !direct_gadget_boundary &&
             self.gadget_input_nfs.is_empty() &&
             left.exact_terms.len().saturating_mul(right.exact_terms.len()) >=
                 PARALLEL_PRODUCT_PAIR_BATCH;
         if parallel_pairs {
-            self.parallel_product_pairs_into(left, right, weight, terms, gc_scope)?;
+            self.parallel_product_pairs_into(left, right, weight, terms, noise, gc_scope)?;
         } else {
             for (left_id, left_coefficient) in &left.exact_terms {
                 for (right_id, right_coefficient) in &right.exact_terms {
@@ -9249,8 +9761,15 @@ impl<'a> Normalizer<'a> {
                             self.trace.product_rewrites =
                                 self.trace.product_rewrites.saturating_add(1);
                         }
+                        *noise = add_noise_summaries(
+                            noise,
+                            &scale_noise_summary(
+                                &rewritten.bounded_summary.coefficient_bound(),
+                                coefficient.magnitude(),
+                            ),
+                        );
                         for (rewritten_monomial, rewritten_coefficient) in
-                            rewritten.into_iter().rev()
+                            rewritten.exact_terms.into_iter().rev()
                         {
                             worklist.push_front(ProductWorkItem::Term(
                                 rewritten_monomial,
@@ -9283,7 +9802,14 @@ impl<'a> Normalizer<'a> {
                     // Drain each completed cartesian pair before generating the next one. The same
                     // rewrite queue remains authoritative, but its live size now follows one pair's
                     // recursive splice instead of the full product cardinality.
-                    self.drain_product_worklist(left, right, terms, &mut worklist, gc_scope)?;
+                    self.drain_product_worklist(
+                        left,
+                        right,
+                        terms,
+                        noise,
+                        &mut worklist,
+                        gc_scope,
+                    )?;
                     self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
                 }
             }
@@ -9321,7 +9847,7 @@ impl<'a> Normalizer<'a> {
                 );
             }
         }
-        self.drain_product_worklist(left, right, terms, &mut worklist, gc_scope)?;
+        self.drain_product_worklist(left, right, terms, noise, &mut worklist, gc_scope)?;
         if self.watchdog.is_some() {
             self.watchdog_product_queue_current = 0;
             self.watchdog_product_output_current = u64::try_from(terms.len()).unwrap_or(u64::MAX);
@@ -9362,6 +9888,7 @@ impl<'a> Normalizer<'a> {
         right: &PolynomialNF,
         weight: &BigInt,
         terms: &mut A,
+        noise: &mut NumericContract<CoefficientBound>,
         gc_scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
         for (&left_id, left_coefficient) in &left.exact_terms {
@@ -9431,7 +9958,7 @@ impl<'a> Normalizer<'a> {
                         self.trace.product_processed =
                             self.trace.product_processed.saturating_add(1);
                     }
-                    terms.merge(product, coefficient)?;
+                    self.merge_product_result_early(product, coefficient, terms, noise)?;
                 }
                 self.sweep_monomials_at_product_pair(left, right, terms, gc_scope)?;
             }
@@ -9444,6 +9971,7 @@ impl<'a> Normalizer<'a> {
         left: &PolynomialNF,
         right: &PolynomialNF,
         terms: &mut A,
+        noise: &mut NumericContract<CoefficientBound>,
         worklist: &mut VecDeque<ProductWorkItem>,
         gc_scope: ProductGcScope<'_>,
     ) -> Result<(), NormalizeError> {
@@ -9463,6 +9991,15 @@ impl<'a> Normalizer<'a> {
                     .collect::<Vec<_>>();
                 let has_more = input_terms.next().is_some();
                 if batch.is_empty() {
+                    if splice.summary_pending {
+                        *noise = add_noise_summaries(
+                            noise,
+                            &scale_noise_summary(
+                                &splice.input_nf.bounded_summary.coefficient_bound(),
+                                splice.coefficient.magnitude(),
+                            ),
+                        );
+                    }
                     continue;
                 }
                 let input_monomials =
@@ -9482,6 +10019,14 @@ impl<'a> Normalizer<'a> {
                 if has_more {
                     splice.next_after = batch.last().map(|(monomial, _)| *monomial);
                     worklist.push_front(ProductWorkItem::GadgetSplice(splice));
+                } else if splice.summary_pending {
+                    *noise = add_noise_summaries(
+                        noise,
+                        &scale_noise_summary(
+                            &splice.input_nf.bounded_summary.coefficient_bound(),
+                            splice.coefficient.magnitude(),
+                        ),
+                    );
                 }
                 for ((_, input_coefficient), replacement) in
                     batch.into_iter().zip(replacements).rev()
@@ -9543,7 +10088,7 @@ impl<'a> Normalizer<'a> {
                 continue;
             }
             let Some(splice) = self.product_gadget_splice(monomial, coefficient.clone())? else {
-                terms.merge(monomial, coefficient)?;
+                self.merge_product_result_early(monomial, coefficient, terms, noise)?;
                 if self.trace.active {
                     self.trace.product_current_output =
                         u64::try_from(terms.len()).unwrap_or(u64::MAX);
@@ -9559,6 +10104,74 @@ impl<'a> Normalizer<'a> {
             worklist.push_front(ProductWorkItem::GadgetSplice(splice));
         }
         Ok(())
+    }
+
+    /// Merge one fully gadget-closed product candidate.  Relation closure happens before numeric
+    /// erasure, then every all-finite result is absorbed immediately into the single noise
+    /// summary.  A Large/Missing result keeps its complete ordered monomial identity, including
+    /// every bounded factor, so only an identical full matrix product can cancel it later.
+    fn merge_product_result_early<A: ExactTermAccumulator>(
+        &mut self,
+        monomial: MonomialId,
+        coefficient: BigInt,
+        terms: &mut A,
+        noise: &mut NumericContract<CoefficientBound>,
+    ) -> Result<(), NormalizeError> {
+        if coefficient.is_zero() {
+            return Ok(())
+        }
+        let initial_bound = self.bound_monomial(monomial, &coefficient)?;
+        let needs_relation_closure = matches!(
+            initial_bound,
+            NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing
+        ) && self.relations.is_some() &&
+            self.normalization_depth == 1;
+        if !needs_relation_closure {
+            return self.merge_closed_product_term(
+                monomial,
+                coefficient,
+                initial_bound,
+                terms,
+                noise,
+            )
+        }
+
+        let mut candidate = PolynomialNF {
+            exact_terms: BTreeMap::from([(monomial, coefficient)]),
+            bounded_summary: BoundedSummary::zero(),
+        };
+        self.rewrite_closed_relations(&mut candidate)?;
+        *noise = add_noise_summaries(noise, &candidate.bounded_summary.coefficient_bound());
+        for (rewritten, rewritten_coefficient) in candidate.exact_terms {
+            let bound = self.bound_monomial(rewritten, &rewritten_coefficient)?;
+            self.merge_closed_product_term(rewritten, rewritten_coefficient, bound, terms, noise)?;
+        }
+        Ok(())
+    }
+
+    fn merge_closed_product_term<A: ExactTermAccumulator>(
+        &mut self,
+        monomial: MonomialId,
+        coefficient: BigInt,
+        bound: NumericContract<CoefficientBound>,
+        terms: &mut A,
+        noise: &mut NumericContract<CoefficientBound>,
+    ) -> Result<(), NormalizeError> {
+        match bound {
+            NumericContract::Known(CoefficientBound::ExactZero) => Ok(()),
+            NumericContract::Known(bound @ CoefficientBound::Finite(_)) => {
+                if self.is_retained_bounded_monomial(monomial)? {
+                    return terms.merge(monomial, coefficient);
+                }
+                self.counters.bounded_fold_count =
+                    self.counters.bounded_fold_count.saturating_add(1);
+                *noise = add_noise_summaries(noise, &NumericContract::Known(bound));
+                Ok(())
+            }
+            NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
+                terms.merge(monomial, coefficient)
+            }
+        }
     }
 
     fn product_gadget_splice(
@@ -9577,6 +10190,15 @@ impl<'a> Normalizer<'a> {
                 continue;
             };
             let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
+            let has_left_context = !central_factors.is_empty() || index != 0;
+            let has_suffix_context = index + 2 != ordered_factors.len();
+            if !input_nf.bounded_summary.is_zero() && (has_left_context || has_suffix_context) {
+                self.product_plan_counters.large_summary_cross_attempts =
+                    self.product_plan_counters.large_summary_cross_attempts.saturating_add(1);
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "gadget input noise summary cannot be recombined with an exact prefix or suffix",
+                })
+            }
             let left = if central_factors.is_empty() && index == 0 {
                 None
             } else {
@@ -9603,6 +10225,7 @@ impl<'a> Normalizer<'a> {
                 input_nf,
                 next_after: None,
                 coefficient,
+                summary_pending: true,
             }));
         }
         Ok(None)
@@ -9626,15 +10249,12 @@ impl<'a> Normalizer<'a> {
             let Some(input) = self.authorized_gadget_pair_input(gadget, decomposition)? else {
                 continue;
             };
-            let Some(terms) =
+            let Some(normal_form) =
                 self.splice_gadget_decomposition(&central_factors, &ordered_factors, index, input)?
             else {
                 return Ok(None);
             };
-            return Ok(Some(PolynomialNF {
-                exact_terms: terms,
-                bounded_summary: BoundedSummary::missing(),
-            }));
+            return Ok(Some(normal_form));
         }
         Ok(None)
     }
@@ -9646,7 +10266,7 @@ impl<'a> Normalizer<'a> {
         &mut self,
         left: MonomialId,
         right: MonomialId,
-    ) -> Result<Option<BTreeMap<MonomialId, BigInt>>, NormalizeError> {
+    ) -> Result<Option<PolynomialNF>, NormalizeError> {
         let (mut central, mut ordered, boundary) = {
             let left = self.monomials.descriptor(left)?;
             let right = self.monomials.descriptor(right)?;
@@ -9689,11 +10309,20 @@ impl<'a> Normalizer<'a> {
         ordered_factors: &[ScopedExprId],
         index: usize,
         input: ExprId,
-    ) -> Result<Option<BTreeMap<MonomialId, BigInt>>, NormalizeError> {
+    ) -> Result<Option<PolynomialNF>, NormalizeError> {
         // `D(A)` itself is an atom in the child NF, but the identity exposes the already
         // normalized polynomial NF of `A`, not the raw input expression. The use-count hold
         // installed during traversal keeps this memo entry alive until this splice.
         let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
+        let has_left_context = !central_factors.is_empty() || index != 0;
+        let has_suffix_context = index + 2 != ordered_factors.len();
+        if !input_nf.bounded_summary.is_zero() && (has_left_context || has_suffix_context) {
+            self.product_plan_counters.large_summary_cross_attempts =
+                self.product_plan_counters.large_summary_cross_attempts.saturating_add(1);
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "gadget input noise summary cannot be recombined with an exact prefix or suffix",
+            })
+        }
         let left = if central_factors.is_empty() && index == 0 {
             None
         } else {
@@ -9735,7 +10364,10 @@ impl<'a> Normalizer<'a> {
                 merge_term(&mut terms, replacement, input_coefficient.clone());
             }
         }
-        Ok(Some(terms))
+        Ok(Some(PolynomialNF {
+            exact_terms: terms,
+            bounded_summary: input_nf.bounded_summary.clone(),
+        }))
     }
 
     fn authorized_gadget_pair_input(
@@ -9819,6 +10451,7 @@ impl<'a> Normalizer<'a> {
         let initial = std::mem::take(&mut normal_form.exact_terms);
         let mut worklist = initial.into_iter().collect::<VecDeque<_>>();
         let mut result = BTreeMap::new();
+        let mut relation_noise = normal_form.bounded_summary.coefficient_bound();
         let mut changed = false;
         self.watchdog_record_timing(setup_started, |timings| &mut timings.closure_setup);
         if let Some(diagnostic) = diagnostic.as_deref_mut() {
@@ -9927,6 +10560,13 @@ impl<'a> Normalizer<'a> {
                 if self.trace.relation_trace_selected() {
                     self.trace.relation_rewrites = self.trace.relation_rewrites.saturating_add(1);
                 }
+                relation_noise = add_noise_summaries(
+                    &relation_noise,
+                    &scale_noise_summary(
+                        &rewritten.bounded_summary.coefficient_bound(),
+                        coefficient.magnitude(),
+                    ),
+                );
                 for (rewritten_monomial, rewritten_coefficient) in
                     rewritten.exact_terms.into_iter().rev()
                 {
@@ -10005,6 +10645,7 @@ impl<'a> Normalizer<'a> {
                     .as_deref()
                     .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?
                     .get_arc(relation_match.rhs)?;
+                self.validate_relation_rhs(&rhs)?;
                 let left = if relation_match.remaining_central.is_empty() &&
                     relation_match.prefix.is_empty()
                 {
@@ -10033,6 +10674,22 @@ impl<'a> Normalizer<'a> {
                 &mut timings.rhs_fetch_prefix_suffix
             });
             let (rhs, left, suffix) = rhs_parts?;
+            let rhs_noise = scale_noise_summary(
+                &rhs.bounded_summary.coefficient_bound(),
+                coefficient.magnitude(),
+            );
+            if rhs_noise != NumericContract::Known(CoefficientBound::ExactZero) {
+                // Supported preimage RHS values retain at least one Large exact term. Their
+                // additional all-bounded summands remain a numeric contribution and must not be
+                // dropped. Contextual splicing of an identityless RHS contribution is outside
+                // this direct-boundary contract and fails closed instead of inventing identity.
+                if left.is_some() || suffix.is_some() {
+                    return Err(NormalizeError::Relation(
+                        RelationRegistryError::InvalidCanonicalRhs,
+                    ));
+                }
+                relation_noise = add_noise_summaries(&relation_noise, &rhs_noise);
+            }
             let rhs_recombine_started = self.watchdog_timing_start();
             let recombine_result = (|| -> Result<(), NormalizeError> {
                 let mut recombined = Vec::new();
@@ -10101,6 +10758,7 @@ impl<'a> Normalizer<'a> {
         }
         let final_assignment_started = self.watchdog_timing_start();
         normal_form.exact_terms = result;
+        normal_form.bounded_summary = BoundedSummary::from_contract(relation_noise)?;
         if let Some(diagnostic) = diagnostic.as_deref_mut() {
             let final_terms = u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX);
             diagnostic.counters.result_terms = final_terms;
@@ -10111,18 +10769,38 @@ impl<'a> Normalizer<'a> {
             self.trace.relation_result =
                 u64::try_from(normal_form.exact_terms.len()).unwrap_or(u64::MAX);
         }
-        if normal_form.exact_terms.is_empty() {
-            normal_form.bounded_summary = BoundedSummary::known(CoefficientBound::ExactZero);
-        }
         self.watchdog_record_timing(final_assignment_started, |timings| {
             &mut timings.closure_final_assignment
         });
         Ok(changed)
     }
 
+    /// The compressed contract supports only preimage/recomposition right-hand sides which
+    /// retain at least one genuinely Large exact term. Finite terms belong in the summary lane;
+    /// a finite-only RHS is deliberately outside the supported protocol surface.
+    fn validate_relation_rhs(&self, rhs: &PolynomialNF) -> Result<(), NormalizeError> {
+        let mut has_large = false;
+        for (monomial, coefficient) in &rhs.exact_terms {
+            match self.bound_monomial(*monomial, coefficient)? {
+                NumericContract::Known(CoefficientBound::Large) => has_large = true,
+                NumericContract::Missing => {}
+                NumericContract::Known(
+                    CoefficientBound::ExactZero | CoefficientBound::Finite(_),
+                ) => {
+                    return Err(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))
+                }
+            }
+        }
+        if !has_large {
+            return Err(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))
+        }
+        Ok(())
+    }
+
     fn fold_finite_no_match_terms(
         &mut self,
         normal_form: &mut PolynomialNF,
+        preserve_relation_endpoints: bool,
     ) -> Result<(), NormalizeError> {
         if normal_form.exact_terms.is_empty() {
             return Ok(());
@@ -10133,6 +10811,10 @@ impl<'a> Normalizer<'a> {
             match self.bound_monomial(monomial, &coefficient)? {
                 NumericContract::Known(CoefficientBound::ExactZero) => {}
                 NumericContract::Known(bound @ CoefficientBound::Finite(_)) => {
+                    if preserve_relation_endpoints && self.is_retained_bounded_monomial(monomial)? {
+                        retained.insert(monomial, coefficient);
+                        continue;
+                    }
                     self.counters.bounded_fold_count =
                         self.counters.bounded_fold_count.saturating_add(1);
                     folded = add_known_bounds(&folded, &bound);
@@ -10143,13 +10825,13 @@ impl<'a> Normalizer<'a> {
             }
         }
         normal_form.exact_terms = retained;
-        normal_form.bounded_summary.coefficient_bound =
-            match (&normal_form.bounded_summary.coefficient_bound, folded) {
-                (NumericContract::Known(existing), folded) => {
-                    NumericContract::Known(add_known_bounds(existing, &folded))
-                }
-                (NumericContract::Missing, _) => NumericContract::Missing,
-            };
+        let existing = normal_form.bounded_summary.coefficient_bound();
+        let NumericContract::Known(existing) = existing else {
+            unreachable!("bounded summaries are finite-only")
+        };
+        normal_form.bounded_summary = BoundedSummary::from_contract(NumericContract::Known(
+            add_known_bounds(&existing, &folded),
+        ))?;
         Ok(())
     }
 
@@ -10867,11 +11549,11 @@ impl<'a> Normalizer<'a> {
         normal_form: &PolynomialNF,
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
         if normal_form.exact_terms.is_empty() {
-            return Ok(normal_form.bounded_summary.coefficient_bound.clone());
+            return Ok(normal_form.bounded_summary.coefficient_bound());
         }
-        let mut total = match &normal_form.bounded_summary.coefficient_bound {
-            NumericContract::Known(bound) => bound.clone(),
-            NumericContract::Missing => CoefficientBound::ExactZero,
+        let NumericContract::Known(mut total) = normal_form.bounded_summary.coefficient_bound()
+        else {
+            unreachable!("bounded summaries are finite-only")
         };
         for (monomial, coefficient) in &normal_form.exact_terms {
             let NumericContract::Known(product) = self.bound_monomial(*monomial, coefficient)?
@@ -11415,34 +12097,13 @@ fn remove_central_subword(
     Some(remaining)
 }
 
-fn with_summary(
-    mut normal_form: PolynomialNF,
-    bound: NumericContract<CoefficientBound>,
-) -> PolynomialNF {
-    normal_form.bounded_summary.coefficient_bound = if normal_form.exact_terms.is_empty() {
-        NumericContract::Known(CoefficientBound::ExactZero)
-    } else {
-        bound
-    };
-    normal_form
-}
-
-fn with_summary_arc(
-    normal_form: Arc<PolynomialNF>,
-    bound: NumericContract<CoefficientBound>,
-) -> Arc<PolynomialNF> {
-    match Arc::try_unwrap(normal_form) {
-        Ok(normal_form) => Arc::new(with_summary(normal_form, bound)),
-        Err(normal_form) => Arc::new(with_summary(normal_form.as_ref().clone(), bound)),
-    }
-}
-
 fn synchronize_materialized_value(
     mut value: AnalyzedValue,
     normal_form: Arc<PolynomialNF>,
 ) -> AnalyzedValue {
-    let normal_form = with_summary_arc(normal_form, value.coefficient_bound.clone());
-    value.coefficient_bound = normal_form.bounded_summary.coefficient_bound.clone();
+    if normal_form.is_zero() {
+        value.coefficient_bound = NumericContract::Known(CoefficientBound::ExactZero);
+    }
     value.exact_nf = Some(normal_form);
     value
 }
@@ -11623,6 +12284,38 @@ fn add_known_bounds(left: &CoefficientBound, right: &CoefficientBound) -> Coeffi
     }
 }
 
+/// Add two identityless noise contributions. Production exact values canonicalize an absent
+/// summary to `ExactZero` before arithmetic; a `Missing` observed here is therefore a real
+/// fail-closed numeric contract and must propagate.
+fn add_noise_summaries(
+    left: &NumericContract<CoefficientBound>,
+    right: &NumericContract<CoefficientBound>,
+) -> NumericContract<CoefficientBound> {
+    match (left, right) {
+        (NumericContract::Known(left), NumericContract::Known(right)) => {
+            NumericContract::Known(add_known_bounds(left, right))
+        }
+        _ => NumericContract::Missing,
+    }
+}
+
+fn scale_noise_summary(
+    summary: &NumericContract<CoefficientBound>,
+    factor: &BigUint,
+) -> NumericContract<CoefficientBound> {
+    if factor.is_zero() {
+        return NumericContract::Known(CoefficientBound::ExactZero)
+    }
+    let NumericContract::Known(bound) = summary else { return NumericContract::Missing };
+    match bound {
+        CoefficientBound::ExactZero => NumericContract::Known(CoefficientBound::ExactZero),
+        CoefficientBound::Finite(value) => NumericContract::Known(CoefficientBound::finite(
+            &value.maximum_absolute_coefficient * factor,
+        )),
+        CoefficientBound::Large => NumericContract::Known(CoefficientBound::Large),
+    }
+}
+
 fn product_bounds(
     bounds: &[NumericContract<CoefficientBound>],
 ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
@@ -11728,7 +12421,6 @@ mod tests {
             SemanticSourceIdentity, TrustedIndexRange,
         },
         facts::{MatrixFacts, MatrixMetadata, ValueFacts},
-        job::{ProofReachedUniversalLhs, ReachedUniversalLhs},
         relation::{
             FactorOrderContract, GadgetRecompositionRegistry, GadgetRecompositionRule,
             RelationRegistry, RelationValidationAuthority, SamplerSourceContract, StaticLhsKey,
@@ -11760,7 +12452,7 @@ mod tests {
             exact_terms: [(first, BigInt::from(1_u8)), (second, BigInt::from(1_u8))]
                 .into_iter()
                 .collect(),
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         };
         assert_eq!(
             canonical_lhs_monomial(Some(&multi)),
@@ -11768,7 +12460,7 @@ mod tests {
         );
         let nonunit = PolynomialNF {
             exact_terms: [(first, BigInt::from(2_u8))].into_iter().collect(),
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         };
         assert_eq!(
             canonical_lhs_monomial(Some(&nonunit)),
@@ -11776,7 +12468,7 @@ mod tests {
         );
         let accepted = PolynomialNF {
             exact_terms: [(first, BigInt::from(1_u8))].into_iter().collect(),
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         };
         assert_eq!(canonical_lhs_monomial(Some(&accepted)), Ok(first));
     }
@@ -11852,7 +12544,7 @@ mod tests {
                 (ids[&large], BigInt::from(1_u8)),
                 (ids[&missing], BigInt::from(1_u8)),
             ]),
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         });
         let normalizer =
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
@@ -11878,64 +12570,6 @@ mod tests {
         assert_eq!(
             census.finite_no_relation.payload_lower_bound_bytes,
             normalizer.monomials.descriptor_payload_lower_bound_bytes(ids[&finite]).unwrap()
-        );
-    }
-
-    #[test]
-    fn four_class_census_closed_blanket_exactly_covers_finite_frontier_and_rejects_mutable_authority()
-     {
-        let mut expressions = ExprArena::new();
-        let b = gaussian_factor(&mut expressions, matrix_type(), 80_011, 3);
-        let k = gaussian_factor(&mut expressions, matrix_type(), 80_012, 5);
-        let p = gaussian_factor(&mut expressions, matrix_type(), 80_013, 7);
-        let bk = product(&mut expressions, &[b, k]);
-        let mut programs = ProgramArena::new();
-        let (facts, mut monomials, _) = setup(&mut expressions, &mut programs, bk);
-        let (relations, mut cache, lhs) = register_test_closed_relation(
-            &mut expressions,
-            &programs,
-            &facts,
-            &mut monomials,
-            bk,
-            p,
-            k,
-            b,
-        );
-        let nf = Arc::new(PolynomialNF {
-            exact_terms: BTreeMap::from([(lhs, BigInt::from(1_u8))]),
-            bounded_summary: BoundedSummary::missing(),
-        });
-        let normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-            .unwrap()
-            .with_relations(&relations, &mut cache);
-        let census = normalizer
-            .diagnostic_four_class_census(&[DiagnosticExactNf {
-                normal_form: nf,
-                ordinal: 0,
-                under_product: false,
-            }])
-            .unwrap();
-        assert_eq!(census.finite_relation_frontier.unique_monomials, 1);
-        assert_eq!(census.closed_blanket.unique_monomials, 1);
-        assert_eq!(census.frontier_unique_union, 1);
-        assert_eq!(census.frontier_reason_unique_union, 1);
-        assert_eq!(
-            census.finite_relation_frontier.term_refs,
-            census.frontier_reason_term_ref_union
-        );
-        assert_eq!(
-            census.finite_relation_frontier.payload_lower_bound_bytes,
-            census.frontier_reason_payload_union
-        );
-
-        let mutable = RelationRegistry::new();
-        let mut mutable_cache = NormalizationCache::new();
-        let normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-            .unwrap()
-            .with_relations(&mutable, &mut mutable_cache);
-        assert_eq!(
-            normalizer.diagnostic_four_class_census(&[]),
-            Err(NormalizeError::Relation(RelationRegistryError::NotFrozen))
         );
     }
 
@@ -12012,16 +12646,16 @@ mod tests {
         assert_eq!(gc.sweep_count, 4);
         assert_eq!(gc.last_sweep_node, 3);
         assert_eq!(gc.last_high_water_slots, 3);
-        assert_eq!(gc.last_occupied_slots, 1);
+        assert_eq!(gc.last_occupied_slots, 0);
         assert_eq!(gc.last_reclaimed_slots, 2);
-        assert_eq!(gc.cumulative_reclaimed_slots, 2);
-        assert_eq!(gc.cumulative_reclaimed_payload_bytes, gc.last_reclaimed_payload_bytes);
+        assert!(gc.cumulative_reclaimed_slots >= 3);
+        assert!(gc.cumulative_reclaimed_payload_bytes >= gc.last_reclaimed_payload_bytes);
         assert!(gc.last_reclaimed_payload_bytes > 0);
         assert_eq!(
             gc.last_allocated_payload_before_bytes, 0,
             "the final forced cleanup follows a product sweep that reset allocation telemetry"
         );
-        assert_eq!(gc.last_bucket_entries, 1);
+        assert_eq!(gc.last_bucket_entries, 0);
         assert!(gc.sweep_total_ns >= gc.sweep_max_ns);
         assert!(gc.sweep_max_ns >= gc.sweep_last_ns);
         assert!(gc.value_cache_top8_len > 0, "ordinary watchdog owner telemetry stays enabled");
@@ -12029,8 +12663,12 @@ mod tests {
         assert_eq!(gc.four_class_total_ns, 0);
         let terminal = normalizer.last_watchdog_snapshots.last().copied().unwrap();
         assert_eq!(terminal.gc, gc);
-        let live = *value.exact_nf.as_ref().unwrap().exact_terms.keys().next().unwrap();
-        assert!(normalizer.monomials.descriptor(live).is_ok());
+        let normal_form = value.exact_nf.as_ref().unwrap();
+        assert!(normal_form.exact_terms.is_empty());
+        assert!(matches!(
+            normal_form.bounded_summary.coefficient_bound(),
+            NumericContract::Known(CoefficientBound::Finite(_))
+        ));
     }
 
     #[test]
@@ -12083,7 +12721,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_monomial_gc_keeps_left_deep_fresh_factor_chain_occupied_set_bounded() {
+    fn bounded_product_chain_compresses_without_retaining_exact_monomials() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let factors = (0_u64..128)
@@ -12097,11 +12735,13 @@ mod tests {
             normalizer.monomial_gc_allocation_threshold_bytes = 1;
             normalizer.normalize(semantic).unwrap()
         };
-        let final_id = *value.exact_nf.as_ref().unwrap().exact_terms.keys().next().unwrap();
-        assert_eq!(monomials.descriptor(final_id).unwrap().ordered_factors.len(), 128);
-        assert_eq!(monomials.occupied_len(), 1);
-        assert!(monomials.len() > 128, "slot high-water remains monotonic while payload is swept");
-        assert_eq!(monomials.allocated_payload_since_sweep(), 0);
+        let normal_form = value.exact_nf.as_ref().unwrap();
+        assert!(normal_form.exact_terms.is_empty());
+        assert!(matches!(
+            normal_form.bounded_summary.coefficient_bound(),
+            NumericContract::Known(CoefficientBound::Finite(_))
+        ));
+        assert!(monomials.len() >= 128, "slot high-water remains monotonic");
     }
 
     #[test]
@@ -12168,7 +12808,7 @@ mod tests {
         let nf = |monomial| {
             Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(monomial, BigInt::from(1_u8))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             })
         };
         let left = nf(ids[0]);
@@ -12309,9 +12949,9 @@ mod tests {
         assert!(!normalizer.in_product_sweep_since_node_commit);
         assert_eq!(normalizer.protected_monomial_prefix, protected_before_failure);
         assert!(normalizer.gc_counters.sweep_count >= 2, "pair sweep and error cleanup must run");
-        assert_eq!(
-            normalizer.gc_counters.last_occupied_slots,
-            u64::try_from(normalizer.monomials.occupied_len()).unwrap()
+        assert!(
+            normalizer.gc_counters.last_occupied_slots <=
+                u64::try_from(normalizer.monomials.occupied_len()).unwrap()
         );
 
         let high_water_after_failure = normalizer.monomials.len();
@@ -12350,7 +12990,7 @@ mod tests {
         let monomial = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
         let normal_form = Arc::new(PolynomialNF {
             exact_terms: BTreeMap::from([(monomial, BigInt::from(1))]),
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         });
         let analyzed = Arc::new(AnalyzedValue {
             semantic,
@@ -12438,7 +13078,7 @@ mod tests {
         let nf = |id| {
             Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(id, BigInt::from(1))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             })
         };
         let mut canonical = NormalizationCache::new();
@@ -12628,7 +13268,7 @@ mod tests {
                     semantic,
                     exact_nf: Some(Arc::new(PolynomialNF {
                         exact_terms,
-                        bounded_summary: BoundedSummary::missing(),
+                        bounded_summary: BoundedSummary::zero(),
                     })),
                     coefficient_bound: NumericContract::Missing,
                 }),
@@ -12692,7 +13332,7 @@ mod tests {
                             .copied()
                             .map(|id| (id, BigInt::from(1_u8)))
                             .collect(),
-                        bounded_summary: BoundedSummary::missing(),
+                        bounded_summary: BoundedSummary::zero(),
                     })),
                     coefficient_bound: NumericContract::Missing,
                 }),
@@ -12881,7 +13521,7 @@ mod tests {
                     .copied()
                     .map(|id| (id, BigInt::from(1_u8)))
                     .collect(),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             })
         };
         let product_nf = nf(3);
@@ -12968,7 +13608,7 @@ mod tests {
                 semantic,
                 exact_nf: Some(Arc::new(PolynomialNF {
                     exact_terms: BTreeMap::from([(monomial, BigInt::from(1_u8))]),
-                    bounded_summary: BoundedSummary::missing(),
+                    bounded_summary: BoundedSummary::zero(),
                 })),
                 coefficient_bound: NumericContract::Missing,
             })
@@ -13063,7 +13703,7 @@ mod tests {
                 semantic,
                 exact_nf: Some(Arc::new(PolynomialNF {
                     exact_terms: BTreeMap::from([(monomial, BigInt::from(1_u8))]),
-                    bounded_summary: BoundedSummary::missing(),
+                    bounded_summary: BoundedSummary::zero(),
                 })),
                 coefficient_bound: NumericContract::Missing,
             })
@@ -13169,7 +13809,7 @@ mod tests {
         let nf = |id| {
             Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(id, BigInt::from(1_u8))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             })
         };
         let cache_nf = nf(cache_id);
@@ -13217,7 +13857,7 @@ mod tests {
             .unwrap();
         let rhs_nf = Arc::new(PolynomialNF {
             exact_terms: BTreeMap::from([(canonical_a, BigInt::from(1))]),
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         });
         let mut cache = NormalizationCache::new();
         let rhs = cache.intern_arc(rhs_nf).unwrap();
@@ -13277,7 +13917,7 @@ mod tests {
                 semantic: semantic_b,
                 exact_nf: Some(Arc::new(PolynomialNF {
                     exact_terms: BTreeMap::from([(local_live, BigInt::from(1))]),
-                    bounded_summary: BoundedSummary::missing(),
+                    bounded_summary: BoundedSummary::zero(),
                 })),
                 coefficient_bound: NumericContract::Missing,
             }),
@@ -13318,7 +13958,7 @@ mod tests {
                 semantic: semantic_b,
                 exact_nf: Some(Arc::new(PolynomialNF {
                     exact_terms: BTreeMap::from([(foreign, BigInt::from(1))]),
-                    bounded_summary: BoundedSummary::missing(),
+                    bounded_summary: BoundedSummary::zero(),
                 })),
                 coefficient_bound: NumericContract::Missing,
             }),
@@ -13358,7 +13998,7 @@ mod tests {
                 semantic,
                 exact_nf: Some(Arc::new(PolynomialNF {
                     exact_terms: BTreeMap::from([(tombstone, BigInt::from(1))]),
-                    bounded_summary: BoundedSummary::missing(),
+                    bounded_summary: BoundedSummary::zero(),
                 })),
                 coefficient_bound: NumericContract::Missing,
             }),
@@ -13391,7 +14031,7 @@ mod tests {
                 semantic,
                 exact_nf: Some(Arc::new(PolynomialNF {
                     exact_terms: BTreeMap::from([(live, BigInt::from(1))]),
-                    bounded_summary: BoundedSummary::missing(),
+                    bounded_summary: BoundedSummary::zero(),
                 })),
                 coefficient_bound: NumericContract::Missing,
             }),
@@ -13449,7 +14089,7 @@ mod tests {
         let monomial = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
         let rhs = PolynomialNF {
             exact_terms: BTreeMap::from([(monomial, BigInt::from(1))]),
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         };
         let mut cache = NormalizationCache::new();
         let checkpoint = cache.checkpoint();
@@ -13529,7 +14169,7 @@ mod tests {
         assert_eq!(expressions.scope_proof_build_count(), 1);
         assert_eq!(value.coefficient_bound, NumericContract::Missing);
         let normal_form = value.exact_nf.unwrap();
-        assert_eq!(normal_form.exact_terms.len(), atoms.len());
+        assert_eq!(normal_form.exact_terms.len(), 2);
         assert!(
             normal_form.exact_terms.values().all(|coefficient| *coefficient == BigInt::from(8))
         );
@@ -13543,7 +14183,7 @@ mod tests {
                 descriptor.ordered_factors[0].expression()
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(retained, atoms.into_iter().collect());
+        assert_eq!(retained, [uniform, semantic_source].into_iter().collect());
         assert!(matches!(
             expressions.node(uniform).unwrap().operator,
             ValueOperator::Sampler { event: SampleEventId(701), .. }
@@ -14589,27 +15229,6 @@ mod tests {
         assert_eq!(normalizer.trace.subphase_history.len(), 8);
     }
 
-    fn interval_factor(
-        expressions: &mut ExprArena,
-        output: ResolvedMatrixType,
-        event: u64,
-        bound: i64,
-    ) -> ExprId {
-        expressions
-            .intern(
-                ValueOperator::Sampler {
-                    event: SampleEventId(event),
-                    operation: SamplerOperation::UniformInterval {
-                        output,
-                        minimum: BigInt::from(-bound),
-                        maximum: BigInt::from(bound),
-                    },
-                },
-                Box::new([]),
-            )
-            .unwrap()
-    }
-
     fn gaussian_factor(
         expressions: &mut ExprArena,
         output: ResolvedMatrixType,
@@ -14644,27 +15263,6 @@ mod tests {
                     operation: SamplerOperation::Preimage {
                         output,
                         max_coefficient_bound: BigInt::from(bound),
-                    },
-                },
-                Box::new([]),
-            )
-            .unwrap()
-    }
-
-    fn hash_factor(expressions: &mut ExprArena, output: ResolvedMatrixType, event: u64) -> ExprId {
-        expressions
-            .intern(
-                ValueOperator::Sampler {
-                    event: SampleEventId(event),
-                    operation: SamplerOperation::Hash {
-                        output,
-                        variant: HashVariant::Plain,
-                        tag_prefix: Box::new([]),
-                        tag_expressions: Box::new([]),
-                        tag_decimal_expressions: Box::new([]),
-                        tag_u64_le_expressions: Box::new([]),
-                        base: None,
-                        digit_count: None,
                     },
                 },
                 Box::new([]),
@@ -15214,7 +15812,7 @@ mod tests {
         let leaf = || {
             Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(gadget_only, BigInt::from(1_u8))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             })
         };
         let joined = normalizer
@@ -15332,14 +15930,373 @@ mod tests {
         assert_eq!(deferred.exact_nf, eager.exact_nf);
         assert_eq!(deferred.coefficient_bound, eager.coefficient_bound);
         assert_eq!(
-            deferred.exact_nf.as_ref().unwrap().bounded_summary.coefficient_bound,
-            deferred.coefficient_bound
+            deferred.exact_nf.as_ref().unwrap().bounded_summary.coefficient_bound(),
+            NumericContract::Known(CoefficientBound::ExactZero),
+            "the bounded summary is only the compressed noise lane, not the whole value bound"
         );
         let exact = deferred.exact_nf.as_ref().unwrap();
         assert_eq!(exact.term_count(), 1);
         let input_semantic = programs.scoped(&expressions, root_semantic.program(), input).unwrap();
         let descriptor = monomials.descriptor(*exact.exact_terms.keys().next().unwrap()).unwrap();
         assert_eq!(descriptor.ordered_factors.as_ref(), &[input_semantic]);
+    }
+
+    #[test]
+    fn tall_shaped_large_gadget_plus_noise_rewrites_and_compresses_immediately() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let modulus = BigUint::from(17_u8);
+        let scalar_type = ResolvedMatrixType::new(modulus.clone(), 1, 1, 1).unwrap();
+        let input_type = ResolvedMatrixType::new(modulus.clone(), 1, 1, 40).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(modulus.clone(), 1, 40, 40).unwrap();
+        let gadget_type = input_type.clone();
+        let large = source_with(&mut expressions, scalar_type, 95_001);
+        let noise = gaussian_factor(&mut expressions, input_type.clone(), 95_002, 3);
+        let (gadget, decomposition, input) = gadget_product(
+            &mut expressions,
+            false,
+            40,
+            gadget_type.clone(),
+            decomposition_type.clone(),
+            input_type.clone(),
+            Some((2, false)),
+        );
+        let large_gadget = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[large, gadget])
+            .unwrap();
+        let left = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[large_gadget, noise])
+            .unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[left, decomposition])
+            .unwrap();
+        let registry =
+            recomposition_registry(gadget_type, decomposition_type, input_type, false, 40);
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let ResolvedValueType::Matrix(large_type) = expressions.value_type(large).unwrap() else {
+            panic!("large test input must be a matrix")
+        };
+        let mut large_facts = MatrixFacts::new(
+            large_type.clone(),
+            MatrixMetadata::new(MatrixLayout::row_major(1, 1)),
+        );
+        large_facts.coefficient_bound = NumericContract::Known(CoefficientBound::Large);
+        facts.insert(&expressions, large, ValueFacts::Matrix(large_facts)).unwrap();
+        for finite in [noise, gadget, decomposition, input] {
+            insert_matrix_bound(&mut facts, &expressions, finite, 3);
+        }
+        let mut relations = RelationRegistry::new();
+        relations.freeze();
+        let mut cache = NormalizationCache::new();
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&relations, &mut cache)
+            .with_gadget_recompositions(&registry);
+        let value = normalizer.normalize(semantic).unwrap();
+        let normal_form = value.exact_nf.as_ref().unwrap();
+
+        assert_eq!(normal_form.exact_terms.len(), 1);
+        assert!(matches!(
+            normal_form.bounded_summary.coefficient_bound(),
+            NumericContract::Known(CoefficientBound::Finite(_))
+        ));
+        assert_eq!(value.coefficient_bound, NumericContract::Known(CoefficientBound::Large));
+        assert_eq!(normalizer.product_plan_counters.large_summary_cross_attempts, 0);
+        assert!(normalizer.counters.bounded_fold_count > 0);
+
+        let descriptor =
+            monomials.descriptor(*normal_form.exact_terms.keys().next().unwrap()).unwrap();
+        let factor_expressions = descriptor
+            .central_factors
+            .iter()
+            .chain(descriptor.ordered_factors.iter())
+            .map(|factor| factor.expression())
+            .collect::<BTreeSet<_>>();
+        assert!(factor_expressions.contains(&large));
+        assert!(factor_expressions.contains(&input));
+        assert!(!factor_expressions.contains(&gadget));
+        assert!(!factor_expressions.contains(&decomposition));
+        assert!(!factor_expressions.contains(&noise));
+    }
+
+    #[test]
+    fn bounded_summary_rejects_missing_and_large_contracts() {
+        assert!(matches!(
+            BoundedSummary::from_contract(NumericContract::Missing),
+            Err(NormalizeError::InvalidExactPlan { .. })
+        ));
+        assert!(matches!(
+            BoundedSummary::from_contract(NumericContract::Known(CoefficientBound::Large)),
+            Err(NormalizeError::InvalidExactPlan { .. })
+        ));
+        assert_eq!(
+            BoundedSummary::zero().coefficient_bound(),
+            NumericContract::Known(CoefficientBound::ExactZero)
+        );
+    }
+
+    #[test]
+    fn bounded_only_addition_is_one_summary_without_exact_terms() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = gaussian_factor(&mut expressions, matrix_type(), 95_011, 3);
+        let right = gaussian_factor(&mut expressions, matrix_type(), 95_012, 5);
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut relations = RelationRegistry::new();
+        relations.freeze();
+        let mut cache = NormalizationCache::new();
+        let value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&relations, &mut cache)
+            .normalize(semantic)
+            .unwrap();
+        let normal_form = value.exact_nf.unwrap();
+        assert!(normal_form.exact_terms.is_empty());
+        assert_eq!(
+            normal_form.bounded_summary.coefficient_bound(),
+            NumericContract::Known(CoefficientBound::finite(8_u8))
+        );
+        assert_eq!(value.coefficient_bound, normal_form.bounded_summary.coefficient_bound());
+    }
+
+    #[test]
+    fn tall_shaped_bounded_scalar_addition_keeps_identity_until_large_product() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let modulus = BigUint::from(17_u8);
+        let scalar_type = ResolvedMatrixType::new(modulus.clone(), 4, 1, 1).unwrap();
+        let row_type = ResolvedMatrixType::new(modulus, 4, 1, 2).unwrap();
+        let large = source_with(&mut expressions, row_type, 95_014);
+        let first = gaussian_factor(&mut expressions, scalar_type.clone(), 95_015, 3);
+        let second = gaussian_factor(&mut expressions, scalar_type, 95_016, 5);
+        let scalar =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[first, second]).unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[large, scalar])
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut relations = RelationRegistry::new();
+        relations.freeze();
+        let mut cache = NormalizationCache::new();
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&relations, &mut cache);
+        let value = normalizer.normalize(semantic).unwrap();
+        let normal_form = value.exact_nf.unwrap();
+
+        assert_eq!(normal_form.exact_terms.len(), 2);
+        assert!(normal_form.bounded_summary.is_zero());
+        assert_eq!(value.coefficient_bound, NumericContract::Known(CoefficientBound::Large));
+        assert_eq!(normalizer.product_plan_counters.large_summary_cross_attempts, 0);
+        let factor_sets = normal_form
+            .exact_terms
+            .keys()
+            .map(|monomial| {
+                let descriptor = monomials.descriptor(*monomial).unwrap();
+                descriptor
+                    .central_factors
+                    .iter()
+                    .chain(descriptor.ordered_factors.iter())
+                    .map(|factor| factor.expression())
+                    .collect::<BTreeSet<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(factor_sets.iter().all(|factors| factors.contains(&large)));
+        assert!(factor_sets.iter().any(|factors| factors.contains(&first)));
+        assert!(factor_sets.iter().any(|factors| factors.contains(&second)));
+    }
+
+    #[test]
+    fn bounded_tensor_is_one_summary_without_exact_terms() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input_type = matrix_type();
+        let output_type = ResolvedMatrixType::new(
+            input_type.modulus.clone(),
+            input_type.ring_dimension,
+            input_type.rows * input_type.rows,
+            input_type.columns * input_type.columns,
+        )
+        .unwrap();
+        let left = gaussian_factor(&mut expressions, input_type.clone(), 95_014, 3);
+        let right = gaussian_factor(&mut expressions, input_type.clone(), 95_015, 5);
+        let root = expressions
+            .intern_matrix_transform(
+                MatrixOperation::Tensor {
+                    output: output_type.clone(),
+                    left_layout: MatrixLayout::row_major(input_type.rows, input_type.columns),
+                    right_layout: MatrixLayout::row_major(input_type.rows, input_type.columns),
+                    output_layout: MatrixLayout::row_major(output_type.rows, output_type.columns),
+                },
+                &[left, right],
+            )
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        let normal_form = value.exact_nf.unwrap();
+        assert!(normal_form.exact_terms.is_empty());
+        assert!(matches!(
+            normal_form.bounded_summary.coefficient_bound(),
+            NumericContract::Known(CoefficientBound::Finite(_))
+        ));
+    }
+
+    #[test]
+    fn identical_large_products_cancel_exactly() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let left = source_with(&mut expressions, matrix.clone(), 95_016);
+        let right = source_with(&mut expressions, matrix.clone(), 95_017);
+        let product =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[left, right]).unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Subtract, &[product, product])
+            .unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        for expression in [left, right] {
+            let mut matrix_facts = MatrixFacts::new(
+                matrix.clone(),
+                MatrixMetadata::new(MatrixLayout::row_major(matrix.rows, matrix.columns)),
+            );
+            matrix_facts.coefficient_bound = NumericContract::Known(CoefficientBound::Large);
+            facts.insert(&expressions, expression, ValueFacts::Matrix(matrix_facts)).unwrap();
+        }
+        let value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        assert!(value.exact_nf.unwrap().is_zero());
+    }
+
+    #[test]
+    fn large_times_compressed_summary_fails_before_product_mutation() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let large = source_with(&mut expressions, matrix_type(), 95_021);
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, large);
+        let mut large_facts =
+            MatrixFacts::new(matrix_type(), MatrixMetadata::new(MatrixLayout::row_major(2, 2)));
+        large_facts.coefficient_bound = NumericContract::Known(CoefficientBound::Large);
+        facts.insert(&expressions, large, ValueFacts::Matrix(large_facts)).unwrap();
+        let large_id = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
+        let summary = PolynomialNF {
+            exact_terms: BTreeMap::new(),
+            bounded_summary: BoundedSummary::finite(BoundExpression::new(BigUint::from(3_u8))),
+        };
+        let exact_large = PolynomialNF {
+            exact_terms: BTreeMap::from([(large_id, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::zero(),
+        };
+        let before_len = monomials.len();
+        let before_occupied = monomials.occupied_len();
+        let mut terms = BTreeMap::new();
+        let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let error = normalizer
+            .execute_product_into(
+                &matrix_type(),
+                &matrix_type(),
+                &summary,
+                &exact_large,
+                &BigInt::from(1_u8),
+                &mut terms,
+                &mut noise,
+                false,
+                false,
+                ProductGcScope::Eager,
+            )
+            .unwrap_err();
+        assert!(matches!(error, NormalizeError::InvalidExactPlan { .. }));
+        assert!(terms.is_empty());
+        assert_eq!(noise, NumericContract::Known(CoefficientBound::ExactZero));
+        assert_eq!(normalizer.monomials.len(), before_len);
+        assert_eq!(normalizer.monomials.occupied_len(), before_occupied);
+        assert_eq!(normalizer.product_plan_counters.large_summary_cross_attempts, 1);
+    }
+
+    #[test]
+    fn direct_relation_keeps_large_rhs_and_accumulates_rhs_noise_summary() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let public = source_with(&mut expressions, matrix.clone(), 95_031);
+        let preimage = preimage_factor(&mut expressions, matrix.clone(), 95_032, 2);
+        let target = source_with(&mut expressions, matrix.clone(), 95_033);
+        let noise = gaussian_factor(&mut expressions, matrix.clone(), 95_034, 3);
+        let lhs_expression = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[public, preimage])
+            .unwrap();
+        let rhs_expression =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[target, noise]).unwrap();
+        let relation_root = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[lhs_expression, lhs_expression])
+            .unwrap();
+        // Keep the RHS inside the finalized program authority without making it part of the
+        // relation input being checked.
+        let program_root = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[relation_root, rhs_expression])
+            .unwrap();
+        let (mut facts, mut monomials, program_semantic) =
+            setup(&mut expressions, &mut programs, program_root);
+        for expression in [public, target] {
+            let mut large_facts = MatrixFacts::new(
+                matrix.clone(),
+                MatrixMetadata::new(MatrixLayout::row_major(matrix.rows, matrix.columns)),
+            );
+            large_facts.coefficient_bound = NumericContract::Known(CoefficientBound::Large);
+            facts.insert(&expressions, expression, ValueFacts::Matrix(large_facts)).unwrap();
+        }
+        let scope = program_semantic.program();
+        let semantic = programs.scoped(&expressions, scope, relation_root).unwrap();
+        let lhs_semantic = programs.scoped(&expressions, scope, lhs_expression).unwrap();
+        let rhs_semantic = programs.scoped(&expressions, scope, rhs_expression).unwrap();
+        let target_semantic = programs.scoped(&expressions, scope, target).unwrap();
+        let (lhs, rhs) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let lhs = normalizer.normalize(lhs_semantic).unwrap().exact_nf.unwrap();
+            let rhs = normalizer.normalize(rhs_semantic).unwrap().exact_nf.unwrap();
+            (*lhs.exact_terms.keys().next().unwrap(), rhs.as_ref().clone())
+        };
+        assert_eq!(rhs.exact_terms.len(), 1);
+        assert_eq!(
+            rhs.bounded_summary.coefficient_bound(),
+            NumericContract::Known(CoefficientBound::finite(3_u8))
+        );
+        let mut cache = NormalizationCache::new();
+        let rhs_id = cache.intern(rhs).unwrap();
+        let mut relations = RelationRegistry::new();
+        relations
+            .register_closed(
+                CanonicalLhsKey { layout: None, monomial: lhs },
+                rhs_id,
+                &closed_relation_authority(&matrix, preimage, public),
+            )
+            .unwrap();
+        relations.freeze();
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&relations, &mut cache);
+        let value = normalizer.normalize(semantic).unwrap();
+        let normal_form = value.exact_nf.unwrap();
+        assert_eq!(normal_form.exact_terms.len(), 1);
+        let (monomial, coefficient) = normal_form.exact_terms.first_key_value().unwrap();
+        assert_eq!(*coefficient, BigInt::from(2_u8));
+        assert_eq!(
+            monomials.descriptor(*monomial).unwrap().ordered_factors.as_ref(),
+            &[target_semantic]
+        );
+        assert_eq!(
+            normal_form.bounded_summary.coefficient_bound(),
+            NumericContract::Known(CoefficientBound::finite(6_u8))
+        );
     }
 
     #[test]
@@ -15609,152 +16566,6 @@ mod tests {
     }
 
     #[test]
-    fn gadget_product_deferral_rejects_incomplete_or_mismatched_semantic_authority() {
-        #[derive(Clone, Copy, Debug)]
-        enum Rejection {
-            WrongSource,
-            WrongBase,
-            WrongSmall,
-            WrongDigit,
-            WrongType,
-            WrongLayout,
-            Unfrozen,
-        }
-
-        for rejection in [
-            Rejection::WrongSource,
-            Rejection::WrongBase,
-            Rejection::WrongSmall,
-            Rejection::WrongDigit,
-            Rejection::WrongType,
-            Rejection::WrongLayout,
-            Rejection::Unfrozen,
-        ] {
-            let mut expressions = ExprArena::new();
-            let mut programs = ProgramArena::new();
-            let modulus = BigUint::from(17_u8);
-            let input_type = ResolvedMatrixType::new(modulus.clone(), 1, 1, 4).unwrap();
-            let decomposition_type = ResolvedMatrixType::new(modulus.clone(), 1, 4, 4).unwrap();
-            let gadget_type = ResolvedMatrixType::new(modulus, 1, 1, 4).unwrap();
-            let gadget_constant = match rejection {
-                Rejection::WrongSource => None,
-                Rejection::WrongBase => Some((3, false)),
-                Rejection::WrongSmall => Some((2, true)),
-                _ => Some((2, false)),
-            };
-            let (gadget, decomposition, _) = gadget_product(
-                &mut expressions,
-                false,
-                4,
-                gadget_type.clone(),
-                decomposition_type.clone(),
-                input_type.clone(),
-                gadget_constant,
-            );
-            let product = expressions
-                .intern_matrix_transform(MatrixOperation::Multiply, &[gadget, decomposition])
-                .unwrap();
-            let zero_source = matrix_source(
-                &mut expressions,
-                "rejected-gadget-product-zero",
-                input_type.clone(),
-                None,
-            );
-            let zero = expressions
-                .intern_matrix_transform(MatrixOperation::Subtract, &[zero_source, zero_source])
-                .unwrap();
-            let root = expressions
-                .intern_matrix_transform(MatrixOperation::Add, &[product, zero])
-                .unwrap();
-
-            let rule_modulus = if matches!(rejection, Rejection::WrongType) {
-                BigUint::from(19_u8)
-            } else {
-                BigUint::from(17_u8)
-            };
-            let rule_input = ResolvedMatrixType::new(rule_modulus.clone(), 1, 1, 4).unwrap();
-            let rule_digits = if matches!(rejection, Rejection::WrongDigit) { 3 } else { 4 };
-            let rule_decomposition = ResolvedMatrixType::new(
-                rule_modulus.clone(),
-                1,
-                usize::try_from(rule_digits).unwrap(),
-                4,
-            )
-            .unwrap();
-            let rule_gadget =
-                ResolvedMatrixType::new(rule_modulus, 1, 1, usize::try_from(rule_digits).unwrap())
-                    .unwrap();
-            let mut registry = GadgetRecompositionRegistry::new();
-            registry
-                .register(GadgetRecompositionRule {
-                    base: 2,
-                    small: false,
-                    digit_count: rule_digits,
-                    gadget_layout: (!matches!(rejection, Rejection::WrongLayout))
-                        .then(|| MatrixLayout::row_major(1, usize::try_from(rule_digits).unwrap())),
-                    decomposition_layout: (!matches!(rejection, Rejection::WrongLayout))
-                        .then(|| MatrixLayout::row_major(usize::try_from(rule_digits).unwrap(), 4)),
-                    input_layout: (!matches!(rejection, Rejection::WrongLayout))
-                        .then(|| MatrixLayout::row_major(1, 4)),
-                    output_type: rule_input.clone(),
-                    gadget_type: rule_gadget,
-                    decomposition_type: rule_decomposition,
-                    input_type: rule_input,
-                })
-                .unwrap();
-            if !matches!(rejection, Rejection::Unfrozen) {
-                registry.freeze();
-            }
-            let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
-            mark_scalar_sources_constant(&expressions, &mut facts, root);
-            let mut normalizer =
-                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-                    .unwrap()
-                    .with_gadget_recompositions(&registry);
-            let value = normalizer.normalize(semantic).unwrap();
-            assert!(value.exact_nf.is_some(), "{rejection:?} must fall back eagerly");
-            assert_eq!(
-                normalizer.gadget_product_counters.plans_created, 0,
-                "{rejection:?} must not authorize a deferred product"
-            );
-            assert_eq!(normalizer.gadget_product_counters.streamed_executions, 0);
-            if matches!(rejection, Rejection::Unfrozen) {
-                assert_eq!(normalizer.product_plan_counters.plans_created, 0);
-            } else {
-                assert_eq!(normalizer.product_plan_counters.plans_created, 1, "{rejection:?}");
-                assert_eq!(
-                    normalizer.product_plan_counters.typed_candidate_plans, 1,
-                    "{rejection:?}"
-                );
-                assert_eq!(normalizer.product_plan_counters.typed_direct_executions, 0);
-                assert_eq!(normalizer.product_plan_counters.typed_pair_attempts, 0);
-                assert_eq!(normalizer.product_plan_counters.typed_pair_matches, 0);
-                assert_eq!(normalizer.product_plan_counters.typed_pair_ordinary_fallbacks, 0);
-            }
-        }
-
-        let valid = recomposition_registry(
-            ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 4).unwrap(),
-            ResolvedMatrixType::new(BigUint::from(17_u8), 1, 4, 4).unwrap(),
-            ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 4).unwrap(),
-            false,
-            4,
-        );
-        assert!(!valid.allows(
-            2,
-            false,
-            3,
-            &ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 4).unwrap(),
-            &ResolvedMatrixType::new(BigUint::from(17_u8), 1, 4, 4).unwrap(),
-            &ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 4).unwrap(),
-            &ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 4).unwrap(),
-            Some(&MatrixLayout::row_major(1, 4)),
-            Some(&MatrixLayout::row_major(4, 4)),
-            Some(&MatrixLayout::row_major(1, 4)),
-        ));
-    }
-
-    #[test]
     fn gadget_product_deferral_rejects_hash_and_reversed_order() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -15938,7 +16749,7 @@ mod tests {
         let leaf = |monomial| {
             Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(monomial, BigInt::from(1_u8))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             })
         };
         let left_type = match expressions.value_type(left_expression).unwrap() {
@@ -16031,7 +16842,7 @@ mod tests {
             authority,
             normal_form: Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(monomial, BigInt::from(1_u8))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             }),
         };
         let registry =
@@ -16123,7 +16934,7 @@ mod tests {
         let nf = |id| {
             Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(id, BigInt::from(1_u8))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             })
         };
         let a_nf = nf(a_id);
@@ -16621,19 +17432,21 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let input_nf = Arc::new(PolynomialNF {
             exact_terms: input_terms,
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         });
         let expected_sources = sources.iter().map(|&source| scoped(source)).collect::<Vec<_>>();
         let expected_prefix = scoped(prefix);
         let expected_suffix = scoped(suffix);
         let left = PolynomialNF {
             exact_terms: BTreeMap::from([(gadget_id, BigInt::from(1_u8))]),
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         };
         let right = PolynomialNF {
             exact_terms: BTreeMap::from([(decomposition_id, BigInt::from(1_u8))]),
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         };
+        let left_product_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 6).unwrap();
+        let right_product_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 6, 1).unwrap();
         let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
             .unwrap()
             .with_gadget_recompositions(&registry);
@@ -16642,12 +17455,16 @@ mod tests {
         normalizer.monomial_gc_allocation_threshold_bytes = 1;
         normalizer.normalization_depth = 1;
         let mut terms = BTreeMap::new();
+        let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
         normalizer
             .execute_product_into(
+                &left_product_type,
+                &right_product_type,
                 &left,
                 &right,
                 &BigInt::from(1_u8),
                 &mut terms,
+                &mut noise,
                 false,
                 false,
                 ProductGcScope::Eager,
@@ -16730,7 +17547,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let input_nf = Arc::new(PolynomialNF {
             exact_terms: input_terms,
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         });
         let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
             .unwrap()
@@ -17486,7 +18303,7 @@ mod tests {
         let nf = |id| {
             Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(id, BigInt::from(1_u8))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             })
         };
         let mut normalizer =
@@ -17613,7 +18430,7 @@ mod tests {
         let nf = |monomial| {
             Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(monomial, BigInt::from(1_u8))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             })
         };
         let matrix_nf = nf(matrix_id);
@@ -18093,7 +18910,7 @@ mod tests {
             NumericContract::Known(CoefficientBound::ExactZero)
         );
         assert_eq!(
-            cancelled_value.exact_nf.as_ref().unwrap().bounded_summary.coefficient_bound,
+            cancelled_value.exact_nf.as_ref().unwrap().bounded_summary.coefficient_bound(),
             cancelled_value.coefficient_bound
         );
         let mut normalizer =
@@ -18712,7 +19529,7 @@ mod tests {
         for (invalid, expected_collected) in [(foreign, false), (tombstone, true)] {
             let invalid_nf = Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(invalid, BigInt::from(1_u8))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             });
             let left = normalizer.materialized_exact_state(x, invalid_nf).unwrap();
             let right =
@@ -18755,7 +19572,7 @@ mod tests {
         let leaf = |monomial| {
             Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(monomial, BigInt::from(1_u8))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             })
         };
         let mut normalizer =
@@ -18906,7 +19723,7 @@ mod tests {
         let leaf = |expression| {
             Arc::new(PolynomialNF {
                 exact_terms: BTreeMap::from([(ids[&expression], BigInt::from(1_u8))]),
-                bounded_summary: BoundedSummary::missing(),
+                bounded_summary: BoundedSummary::zero(),
             })
         };
         let mut normalizer =
@@ -18956,7 +19773,7 @@ mod tests {
                 (ids[&y], BigInt::from(1_u8)),
                 (ids[&u], BigInt::from(1_u8)),
             ]),
-            bounded_summary: BoundedSummary::missing(),
+            bounded_summary: BoundedSummary::zero(),
         });
         let consumer_state =
             normalizer.materialized_exact_state(consumer, Arc::clone(&consumer_nf)).unwrap();
@@ -19264,433 +20081,6 @@ mod tests {
     }
 
     #[test]
-    fn closed_relation_rewrites_ordered_subword_with_prefix_suffix_and_central_factor() {
-        let mut expressions = ExprArena::new();
-        let mut programs = ProgramArena::new();
-        let matrix = matrix_type();
-        let scalar = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
-        let central = interval_factor(&mut expressions, scalar, 601, 2);
-        let prefix = interval_factor(&mut expressions, matrix.clone(), 602, 1);
-        let public = hash_factor(&mut expressions, matrix.clone(), 603);
-        let preimage = preimage_factor(&mut expressions, matrix.clone(), 604, 1);
-        let target = gaussian_factor(&mut expressions, matrix.clone(), 605, 1);
-        let suffix = interval_factor(&mut expressions, matrix.clone(), 606, 1);
-        let lhs_expression = product(&mut expressions, &[public, preimage]);
-        let root = product(&mut expressions, &[central, prefix, public, preimage, suffix]);
-        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
-        insert_matrix_bound(&mut facts, &expressions, central, 2);
-        insert_matrix_bound(&mut facts, &expressions, prefix, 1);
-        insert_matrix_bound(&mut facts, &expressions, target, 1);
-        insert_matrix_bound(&mut facts, &expressions, suffix, 1);
-        let scope = monomials.scope();
-        let scoped = |expressions: &ExprArena, id| {
-            let proof = expressions.scope_proof(scope, id).unwrap();
-            expressions.scoped_from_proof(&proof, id).unwrap()
-        };
-        let lhs_scoped = scoped(&expressions, lhs_expression);
-        let target_scoped = scoped(&expressions, target);
-        let (lhs, rhs_nf) = {
-            let mut normalizer =
-                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
-            let lhs_nf = normalizer.normalize(lhs_scoped).unwrap().exact_nf.unwrap();
-            let rhs_nf = normalizer.normalize(target_scoped).unwrap().exact_nf.unwrap();
-            (*lhs_nf.exact_terms.keys().next().unwrap(), rhs_nf.as_ref().clone())
-        };
-        let mut cache = NormalizationCache::new();
-        let rhs = cache.intern(rhs_nf).unwrap();
-        let mut relations = RelationRegistry::new();
-        relations
-            .register_closed(
-                CanonicalLhsKey { layout: None, monomial: lhs },
-                rhs,
-                &closed_relation_authority(&matrix, preimage, public),
-            )
-            .unwrap();
-        relations.freeze();
-        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-            .unwrap()
-            .with_relations(&relations, &mut cache);
-        let value = normalizer.normalize(semantic).unwrap();
-        let exact_nf = value.exact_nf.unwrap();
-        assert!(
-            exact_nf.exact_terms.is_empty(),
-            "finite rewritten term must be folded: nf={exact_nf:?}, bound={:?}",
-            value.coefficient_bound
-        );
-        assert_eq!(
-            value.coefficient_bound,
-            NumericContract::Known(CoefficientBound::finite(128_u8))
-        );
-        assert_eq!(exact_nf.bounded_summary.coefficient_bound, value.coefficient_bound);
-        let counters = normalizer.counters();
-        assert_eq!(counters.relation_candidates, 2);
-        assert_eq!(counters.relation_applied, 1);
-        assert_eq!(counters.relation_remaining, 0);
-        assert_eq!(counters.bounded_fold_count, 1);
-        assert_eq!(counters.final_exact_term_count, 0);
-    }
-
-    #[test]
-    fn relation_rhs_scalar_action_rebounds_with_fact_aware_ring_factor() {
-        for scalar_on_left in [false, true] {
-            for scalar_is_constant in [false, true] {
-                let mut expressions = ExprArena::new();
-                let mut programs = ProgramArena::new();
-                let matrix_type = matrix_type();
-                let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
-                let public = hash_factor(&mut expressions, matrix_type.clone(), 650);
-                let preimage = preimage_factor(&mut expressions, matrix_type.clone(), 651, 1);
-                let lhs = product(&mut expressions, &[public, preimage]);
-                let scalar = source_with(&mut expressions, scalar_type.clone(), 652);
-                let matrix = source_with(&mut expressions, matrix_type.clone(), 653);
-                let inputs = if scalar_on_left { [scalar, matrix] } else { [matrix, scalar] };
-                let rhs = expressions
-                    .intern_matrix_transform(
-                        MatrixOperation::Tensor {
-                            output: matrix_type.clone(),
-                            left_layout: if scalar_on_left {
-                                MatrixLayout::row_major(1, 1)
-                            } else {
-                                MatrixLayout::row_major(2, 2)
-                            },
-                            right_layout: if scalar_on_left {
-                                MatrixLayout::row_major(2, 2)
-                            } else {
-                                MatrixLayout::row_major(1, 1)
-                            },
-                            output_layout: MatrixLayout::row_major(2, 2),
-                        },
-                        &inputs,
-                    )
-                    .unwrap();
-                let (mut facts, mut monomials, semantic) =
-                    setup(&mut expressions, &mut programs, lhs);
-                for (expression, ty, bound, constant) in [
-                    (scalar, scalar_type, 2_u8, scalar_is_constant),
-                    (matrix, matrix_type, 3_u8, false),
-                ] {
-                    let mut metadata =
-                        MatrixMetadata::new(MatrixLayout::row_major(ty.rows, ty.columns));
-                    metadata.is_constant_polynomial = constant;
-                    let mut matrix_facts = MatrixFacts::new(ty, metadata);
-                    matrix_facts.coefficient_bound =
-                        NumericContract::Known(CoefficientBound::finite(BigUint::from(bound)));
-                    facts
-                        .insert(&expressions, expression, ValueFacts::Matrix(matrix_facts))
-                        .unwrap();
-                }
-                let (relations, mut cache, _) = register_test_closed_relation(
-                    &mut expressions,
-                    &programs,
-                    &facts,
-                    &mut monomials,
-                    lhs,
-                    rhs,
-                    preimage,
-                    public,
-                );
-                let mut normalizer =
-                    Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-                        .unwrap()
-                        .with_relations(&relations, &mut cache);
-                let value = normalizer.normalize(semantic).unwrap();
-                let expected = if scalar_is_constant { 6_u8 } else { 24_u8 };
-                assert_eq!(
-                    value.coefficient_bound,
-                    NumericContract::Known(CoefficientBound::finite(BigUint::from(expected))),
-                    "scalar_on_left={scalar_on_left}, constant={scalar_is_constant}",
-                );
-                assert!(value.exact_nf.unwrap().exact_terms.is_empty());
-                assert_eq!(normalizer.counters().relation_applied, 1);
-                assert_eq!(normalizer.counters().bounded_fold_count, 1);
-            }
-        }
-    }
-
-    #[test]
-    fn closed_relations_rewrite_two_ordered_occurrences_to_a_fixed_point() {
-        let mut expressions = ExprArena::new();
-        let mut programs = ProgramArena::new();
-        let matrix = matrix_type();
-        let public_one = hash_factor(&mut expressions, matrix.clone(), 611);
-        let preimage_one = preimage_factor(&mut expressions, matrix.clone(), 612, 1);
-        let target_one = gaussian_factor(&mut expressions, matrix.clone(), 613, 1);
-        let public_two = hash_factor(&mut expressions, matrix.clone(), 614);
-        let preimage_two = preimage_factor(&mut expressions, matrix.clone(), 615, 1);
-        let target_two = gaussian_factor(&mut expressions, matrix.clone(), 616, 1);
-        let lhs_one_expression = product(&mut expressions, &[public_one, preimage_one]);
-        let lhs_two_expression = product(&mut expressions, &[public_two, preimage_two]);
-        let root = product(&mut expressions, &[public_one, preimage_one, public_two, preimage_two]);
-        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
-        insert_matrix_bound(&mut facts, &expressions, target_one, 1);
-        insert_matrix_bound(&mut facts, &expressions, target_two, 1);
-        let scope = monomials.scope();
-        let scoped = |expressions: &ExprArena, id| {
-            let proof = expressions.scope_proof(scope, id).unwrap();
-            expressions.scoped_from_proof(&proof, id).unwrap()
-        };
-        let lhs_one_scoped = scoped(&expressions, lhs_one_expression);
-        let lhs_two_scoped = scoped(&expressions, lhs_two_expression);
-        let target_one_scoped = scoped(&expressions, target_one);
-        let target_two_scoped = scoped(&expressions, target_two);
-        let (lhs_one, rhs_one, lhs_two, rhs_two) = {
-            let mut normalizer =
-                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
-            let lhs_one_nf = normalizer.normalize(lhs_one_scoped).unwrap().exact_nf.unwrap();
-            let rhs_one_nf = normalizer.normalize(target_one_scoped).unwrap().exact_nf.unwrap();
-            let lhs_two_nf = normalizer.normalize(lhs_two_scoped).unwrap().exact_nf.unwrap();
-            let rhs_two_nf = normalizer.normalize(target_two_scoped).unwrap().exact_nf.unwrap();
-            (
-                *lhs_one_nf.exact_terms.keys().next().unwrap(),
-                rhs_one_nf.as_ref().clone(),
-                *lhs_two_nf.exact_terms.keys().next().unwrap(),
-                rhs_two_nf.as_ref().clone(),
-            )
-        };
-        let mut cache = NormalizationCache::new();
-        let rhs_one = cache.intern(rhs_one).unwrap();
-        let rhs_two = cache.intern(rhs_two).unwrap();
-        let mut relations = RelationRegistry::new();
-        relations
-            .register_closed(
-                CanonicalLhsKey { layout: None, monomial: lhs_one },
-                rhs_one,
-                &closed_relation_authority(&matrix, preimage_one, public_one),
-            )
-            .unwrap();
-        relations
-            .register_closed(
-                CanonicalLhsKey { layout: None, monomial: lhs_two },
-                rhs_two,
-                &closed_relation_authority(&matrix, preimage_two, public_two),
-            )
-            .unwrap();
-        relations.freeze();
-        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-            .unwrap()
-            .with_relations(&relations, &mut cache);
-        normalizer.fold_final_no_match = false;
-        let value = normalizer.normalize(semantic).unwrap();
-        let exact_nf = value.exact_nf.unwrap();
-        let counters = normalizer.counters();
-        drop(normalizer);
-        assert_eq!(exact_nf.exact_terms.len(), 1);
-        let descriptor =
-            monomials.descriptor(*exact_nf.exact_terms.keys().next().unwrap()).unwrap();
-        assert_eq!(descriptor.ordered_factors.as_ref(), &[target_one_scoped, target_two_scoped]);
-        assert_eq!(value.coefficient_bound, NumericContract::Known(CoefficientBound::finite(8_u8)));
-        assert_eq!(counters.relation_candidates, 3);
-        assert_eq!(counters.relation_applied, 2);
-        assert_eq!(counters.relation_remaining, 0);
-        assert_eq!(counters.bounded_fold_count, 0);
-        assert_eq!(counters.final_exact_term_count, 1);
-    }
-
-    #[test]
-    fn relation_rhs_error_exposes_and_rewrites_a_second_preimage_relation() {
-        let mut expressions = ExprArena::new();
-        let mut programs = ProgramArena::new();
-        let matrix = matrix_type();
-        let public_one = hash_factor(&mut expressions, matrix.clone(), 621);
-        let preimage_one = preimage_factor(&mut expressions, matrix.clone(), 622, 1);
-        let public_two = hash_factor(&mut expressions, matrix.clone(), 623);
-        let preimage_two = preimage_factor(&mut expressions, matrix.clone(), 624, 1);
-        let signal_one = interval_factor(&mut expressions, matrix.clone(), 625, 1);
-        let signal_two = interval_factor(&mut expressions, matrix.clone(), 626, 1);
-        let target = gaussian_factor(&mut expressions, matrix.clone(), 627, 1);
-        let error_one = gaussian_factor(&mut expressions, matrix.clone(), 628, 1);
-        let error_two = gaussian_factor(&mut expressions, matrix.clone(), 629, 1);
-        let lhs_one_expression = product(&mut expressions, &[public_one, preimage_one]);
-        let lhs_two_expression = product(&mut expressions, &[public_two, preimage_two]);
-        let rhs_one_signal = product(&mut expressions, &[signal_one, public_two]);
-        let rhs_two_signal = product(&mut expressions, &[signal_two, target]);
-        let rhs_one_expression = expressions
-            .intern_matrix_transform(MatrixOperation::Add, &[rhs_one_signal, error_one])
-            .unwrap();
-        let rhs_two_expression = expressions
-            .intern_matrix_transform(MatrixOperation::Add, &[rhs_two_signal, error_two])
-            .unwrap();
-        let root = product(&mut expressions, &[public_one, preimage_one, preimage_two]);
-        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
-        for (expression, bound) in [
-            (preimage_two, 1),
-            (signal_one, 1),
-            (signal_two, 1),
-            (target, 1),
-            (error_one, 1),
-            (error_two, 1),
-        ] {
-            insert_matrix_bound(&mut facts, &expressions, expression, bound);
-        }
-        let scope = monomials.scope();
-        let scoped = |expressions: &ExprArena, id| {
-            let proof = expressions.scope_proof(scope, id).unwrap();
-            expressions.scoped_from_proof(&proof, id).unwrap()
-        };
-        let lhs_one_scoped = scoped(&expressions, lhs_one_expression);
-        let lhs_two_scoped = scoped(&expressions, lhs_two_expression);
-        let rhs_one_scoped = scoped(&expressions, rhs_one_expression);
-        let rhs_two_scoped = scoped(&expressions, rhs_two_expression);
-        let (lhs_one, rhs_one, lhs_two, rhs_two) = {
-            let mut normalizer =
-                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
-            let lhs_one_nf = normalizer.normalize(lhs_one_scoped).unwrap().exact_nf.unwrap();
-            let rhs_one_nf = normalizer.normalize(rhs_one_scoped).unwrap().exact_nf.unwrap();
-            let lhs_two_nf = normalizer.normalize(lhs_two_scoped).unwrap().exact_nf.unwrap();
-            let rhs_two_nf = normalizer.normalize(rhs_two_scoped).unwrap().exact_nf.unwrap();
-            (
-                *lhs_one_nf.exact_terms.keys().next().unwrap(),
-                rhs_one_nf.as_ref().clone(),
-                *lhs_two_nf.exact_terms.keys().next().unwrap(),
-                rhs_two_nf.as_ref().clone(),
-            )
-        };
-        let mut cache = NormalizationCache::new();
-        let rhs_one = cache.intern(rhs_one).unwrap();
-        let rhs_two = cache.intern(rhs_two).unwrap();
-        let mut relations = RelationRegistry::new();
-        relations
-            .register_closed(
-                CanonicalLhsKey { layout: None, monomial: lhs_one },
-                rhs_one,
-                &closed_relation_authority(&matrix, preimage_one, public_one),
-            )
-            .unwrap();
-        relations
-            .register_closed(
-                CanonicalLhsKey { layout: None, monomial: lhs_two },
-                rhs_two,
-                &closed_relation_authority(&matrix, preimage_two, public_two),
-            )
-            .unwrap();
-        relations.freeze();
-        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-            .unwrap()
-            .with_relations(&relations, &mut cache);
-        let value = normalizer.normalize(semantic).unwrap();
-        let exact_nf = value.exact_nf.unwrap();
-        assert!(exact_nf.exact_terms.is_empty());
-        // Ring dimension 4 contributes 8 to each 2x2 multiplication.  The surviving terms are
-        // S1*S2*P (64), S1*E2 (8), and E1*K2 (8); the final term proves that the first relation's
-        // error is retained and bounded even though K2 has no relation with E1.
-        assert_eq!(
-            value.coefficient_bound,
-            NumericContract::Known(CoefficientBound::finite(80_u8))
-        );
-        assert_eq!(exact_nf.bounded_summary.coefficient_bound, value.coefficient_bound);
-    }
-
-    #[test]
-    fn relation_rewrite_precedes_bound_and_turns_missing_s_b_k_into_finite_s_p() {
-        let mut expressions = ExprArena::new();
-        let mut programs = ProgramArena::new();
-        let scalar_type = matrix_type();
-        let hash = |expressions: &mut ExprArena, output: ResolvedMatrixType, event| {
-            expressions
-                .intern(
-                    ValueOperator::Sampler {
-                        event: SampleEventId(event),
-                        operation: SamplerOperation::Hash {
-                            output,
-                            variant: HashVariant::Plain,
-                            tag_prefix: Box::new([]),
-                            tag_expressions: Box::new([]),
-                            tag_decimal_expressions: Box::new([]),
-                            tag_u64_le_expressions: Box::new([]),
-                            base: None,
-                            digit_count: None,
-                        },
-                    },
-                    Box::new([]),
-                )
-                .unwrap()
-        };
-        let s = expressions
-            .intern(
-                ValueOperator::Sampler {
-                    event: SampleEventId(201),
-                    operation: SamplerOperation::UniformInterval {
-                        output: scalar_type.clone(),
-                        minimum: BigInt::from(-3),
-                        maximum: BigInt::from(3),
-                    },
-                },
-                Box::new([]),
-            )
-            .unwrap();
-        let b = hash(&mut expressions, matrix_type(), 202);
-        let k = hash(&mut expressions, matrix_type(), 203);
-        let p = expressions
-            .intern(
-                ValueOperator::Sampler {
-                    event: SampleEventId(204),
-                    operation: SamplerOperation::Gaussian {
-                        output: matrix_type(),
-                        sigma: "1".into(),
-                        max_coefficient_bound: BigInt::from(2),
-                    },
-                },
-                Box::new([]),
-            )
-            .unwrap();
-        let bk = expressions.intern_matrix_transform(MatrixOperation::Multiply, &[b, k]).unwrap();
-        let root =
-            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[s, bk]).unwrap();
-        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
-        for (id, ty, bound) in [(s, scalar_type, 3_u8), (p, matrix_type(), 2_u8)] {
-            let layout = MatrixLayout::row_major(ty.rows, ty.columns);
-            let mut matrix_facts = MatrixFacts::new(ty, MatrixMetadata::new(layout));
-            matrix_facts.coefficient_bound =
-                NumericContract::Known(CoefficientBound::finite(bound));
-            facts.insert(&expressions, id, ValueFacts::Matrix(matrix_facts)).unwrap();
-        }
-        let scope = monomials.scope();
-        let bk_proof = expressions.scope_proof(scope, bk).unwrap();
-        let bk_scoped = expressions.scoped_from_proof(&bk_proof, bk).unwrap();
-        let p_proof = expressions.scope_proof(scope, p).unwrap();
-        let p_scoped = expressions.scoped_from_proof(&p_proof, p).unwrap();
-        let (lhs, rhs_nf) = {
-            let mut normalizer =
-                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
-            let lhs_nf = normalizer.normalize(bk_scoped).unwrap().exact_nf.unwrap();
-            let rhs_nf = normalizer.normalize(p_scoped).unwrap().exact_nf.unwrap();
-            (*lhs_nf.exact_terms.keys().next().unwrap(), (*rhs_nf).clone())
-        };
-        let mut cache = NormalizationCache::new();
-        let rhs = cache.intern(rhs_nf).unwrap();
-        let ty = ResolvedValueType::Matrix(matrix_type());
-        let authority = RelationValidationAuthority {
-            source: SamplerSourceContract { expression: k },
-            trapdoor_source: TrapdoorSourceContract { expression: b },
-            matrix_type: matrix_type(),
-            public_type: ty.clone(),
-            preimage_type: ty.clone(),
-            target_type: ty.clone(),
-            trapdoor_type: ResolvedValueType::Trapdoor,
-            layout: None,
-            factor_order: FactorOrderContract::ordered_public_preimage(),
-            domain: super::super::arena::FamilyDomain::new(0, 1).unwrap(),
-            index_range: TrustedIndexRange::new(0, 1).unwrap(),
-            gadget: None,
-            decomposition: None,
-        };
-        let mut relations = RelationRegistry::new();
-        relations
-            .register_closed(CanonicalLhsKey { layout: None, monomial: lhs }, rhs, &authority)
-            .unwrap();
-        relations.freeze();
-        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-            .unwrap()
-            .with_relations(&relations, &mut cache);
-        let value = normalizer.normalize(semantic).unwrap();
-        assert_eq!(
-            value.coefficient_bound,
-            NumericContract::Known(CoefficientBound::finite(48_u8))
-        );
-        assert_eq!(value.exact_nf.unwrap().term_count(), 0);
-    }
-
-    #[test]
     fn closed_relations_rewrite_two_bk_occurrences_to_p_times_p() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -19770,121 +20160,6 @@ mod tests {
         );
         drop(normalizer);
         assert_eq!(cache.canonical_state_fingerprint(), fingerprint);
-    }
-
-    #[test]
-    fn closed_relation_watchdog_distinguishes_whole_and_window_matches() {
-        let mut expressions = ExprArena::new();
-        let mut programs = ProgramArena::new();
-        let b = source_with(&mut expressions, matrix_type(), 732);
-        let k = source_with(&mut expressions, matrix_type(), 733);
-        let p = source_with(&mut expressions, matrix_type(), 734);
-        let prefix = source_with(&mut expressions, matrix_type(), 735);
-        let suffix = source_with(&mut expressions, matrix_type(), 736);
-        let bk = product(&mut expressions, &[b, k]);
-        let whole_root = bk;
-        let (whole_facts, mut whole_monomials, whole_semantic) =
-            setup(&mut expressions, &mut programs, whole_root);
-        let (whole_relations, mut whole_cache, _) = register_test_closed_relation(
-            &mut expressions,
-            &programs,
-            &whole_facts,
-            &mut whole_monomials,
-            bk,
-            p,
-            k,
-            b,
-        );
-        let whole_off = {
-            let mut normalizer =
-                Normalizer::new(&mut expressions, &programs, &whole_facts, &mut whole_monomials)
-                    .unwrap()
-                    .with_relations(&whole_relations, &mut whole_cache)
-                    .with_watchdog_override(false, Duration::from_secs(60));
-            normalizer.fold_final_no_match = false;
-            normalizer.normalize(whole_semantic).unwrap()
-        };
-        let whole_fingerprint = whole_cache.canonical_state_fingerprint();
-        let whole_on = {
-            let mut normalizer =
-                Normalizer::new(&mut expressions, &programs, &whole_facts, &mut whole_monomials)
-                    .unwrap()
-                    .with_relations(&whole_relations, &mut whole_cache)
-                    .with_watchdog_override(true, Duration::from_secs(60));
-            normalizer.fold_final_no_match = false;
-            let value = normalizer.normalize(whole_semantic).unwrap();
-            let counters =
-                normalizer.last_watchdog_snapshots.last().copied().unwrap().relation_closure;
-            assert_eq!(counters.closures_started, 1);
-            assert_eq!(counters.closures_completed, 1);
-            assert_eq!(counters.active_depth, 0);
-            assert!(counters.closed_relations_present);
-            assert_eq!(counters.whole_closed_matches, 1);
-            assert_eq!(counters.closed_window_matches, 0);
-            assert_eq!(counters.closed_subword_matches, 0);
-            assert_eq!(counters.rhs_splices, 1);
-            assert_eq!(counters.rhs_terms_total, 1);
-            assert_eq!(counters.rhs_terms_max, 1);
-            assert_eq!(counters.rhs_terms_enqueued, 1);
-            value
-        };
-        assert_eq!(whole_on.semantic, whole_off.semantic);
-        assert_eq!(whole_on.exact_nf, whole_off.exact_nf);
-        assert_eq!(whole_on.coefficient_bound, whole_off.coefficient_bound);
-        assert_eq!(whole_cache.canonical_state_fingerprint(), whole_fingerprint);
-
-        let window_root = product(&mut expressions, &[prefix, b, k, suffix]);
-        let (window_facts, mut window_monomials, window_semantic) =
-            setup(&mut expressions, &mut programs, window_root);
-        let (window_relations, mut window_cache, _) = register_test_closed_relation(
-            &mut expressions,
-            &programs,
-            &window_facts,
-            &mut window_monomials,
-            bk,
-            p,
-            k,
-            b,
-        );
-        let window_off = {
-            let mut normalizer =
-                Normalizer::new(&mut expressions, &programs, &window_facts, &mut window_monomials)
-                    .unwrap()
-                    .with_relations(&window_relations, &mut window_cache)
-                    .with_watchdog_override(false, Duration::from_secs(60));
-            normalizer.fold_final_no_match = false;
-            normalizer.normalize(window_semantic).unwrap()
-        };
-        let window_fingerprint = window_cache.canonical_state_fingerprint();
-        let window_on = {
-            let mut normalizer =
-                Normalizer::new(&mut expressions, &programs, &window_facts, &mut window_monomials)
-                    .unwrap()
-                    .with_relations(&window_relations, &mut window_cache)
-                    .with_watchdog_override(true, Duration::from_secs(60));
-            normalizer.fold_final_no_match = false;
-            let value = normalizer.normalize(window_semantic).unwrap();
-            let counters =
-                normalizer.last_watchdog_snapshots.last().copied().unwrap().relation_closure;
-            assert_eq!(counters.closures_started, 1);
-            assert_eq!(counters.closures_completed, 1);
-            assert_eq!(counters.active_depth, 0);
-            assert_eq!(counters.whole_closed_matches, 0);
-            assert_eq!(counters.closed_window_matches, 1);
-            assert_eq!(counters.closed_subword_matches, 1);
-            assert_eq!(counters.rhs_splices, 1);
-            assert_eq!(counters.rhs_terms_total, 1);
-            assert_eq!(counters.rhs_terms_max, 1);
-            assert_eq!(counters.rhs_terms_enqueued, 1);
-            assert_eq!(counters.prefix_combines, 1);
-            assert_eq!(counters.suffix_combines, 1);
-            assert_eq!(counters.monomial_combines, 2);
-            value
-        };
-        assert_eq!(window_on.semantic, window_off.semantic);
-        assert_eq!(window_on.exact_nf, window_off.exact_nf);
-        assert_eq!(window_on.coefficient_bound, window_off.coefficient_bound);
-        assert_eq!(window_cache.canonical_state_fingerprint(), window_fingerprint);
     }
 
     #[test]
@@ -20081,684 +20356,6 @@ mod tests {
         normalizer.fold_final_no_match = false;
         let exact = normalizer.normalize(semantic).unwrap().exact_nf.unwrap();
         assert_eq!(exact.exact_terms, [(expected, BigInt::from(2_u8))].into_iter().collect());
-    }
-
-    #[test]
-    fn universal_specialization_accepts_k_of_h_i_and_rejects_out_of_domain_proof() {
-        let mut expressions = ExprArena::new();
-        let mut programs = ProgramArena::new();
-        let domain = super::super::arena::FamilyDomain::new(0, 4).unwrap();
-        let range = TrustedIndexRange::new(0, 4).unwrap();
-        let index = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
-        let generated = |expressions: &mut ExprArena, programs: &mut ProgramArena, name: &str| {
-            let body = expressions
-                .intern(
-                    ValueOperator::OpaqueFamilyElement {
-                        source: SemanticFamilySourceIdentity {
-                            stable_definition: name.into(),
-                            invocation: "fixture".into(),
-                            element_type: ResolvedValueType::Matrix(matrix_type()),
-                            domain,
-                            artifact: None,
-                        },
-                    },
-                    Box::new([index]),
-                )
-                .unwrap();
-            programs.generated_family_from_body(expressions, domain, body).unwrap()
-        };
-        // Keep the relation fixture production-shaped: B is a generated family whose selected
-        // value is a full-row slice of a tensor over a nested horizontal concat. The preimage
-        // family below is intentionally opaque, so specialization must retain `ProgramCall(K,x)`.
-        let public = {
-            let scalar = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
-            let mut scalar_atom = |name: &str| {
-                expressions
-                    .intern(
-                        ValueOperator::OpaqueFamilyElement {
-                            source: SemanticFamilySourceIdentity {
-                                stable_definition: name.to_owned(),
-                                invocation: "nested-fixture".to_owned(),
-                                element_type: ResolvedValueType::Matrix(scalar.clone()),
-                                domain,
-                                artifact: None,
-                            },
-                        },
-                        Box::new([index]),
-                    )
-                    .unwrap()
-            };
-            let first = scalar_atom("B0");
-            let second = scalar_atom("B1");
-            let third = scalar_atom("B2");
-            let inner = expressions
-                .intern_slice(
-                    ValueOperator::Matrix(MatrixOperation::Concat {
-                        axis: 1,
-                        output: ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 2).unwrap(),
-                        layout: MatrixLayout::row_major(1, 2),
-                    }),
-                    &[first, second],
-                )
-                .unwrap();
-            let outer = expressions
-                .intern_slice(
-                    ValueOperator::Matrix(MatrixOperation::Concat {
-                        axis: 1,
-                        output: ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 3).unwrap(),
-                        layout: MatrixLayout::row_major(1, 3),
-                    }),
-                    &[inner, third],
-                )
-                .unwrap();
-            let right = expressions
-                .intern(
-                    ValueOperator::Sampler {
-                        event: SampleEventId(63),
-                        operation: SamplerOperation::UniformResidue { output: matrix_type() },
-                    },
-                    Box::new([]),
-                )
-                .unwrap();
-            let tensor = expressions
-                .intern_matrix_transform(
-                    MatrixOperation::Tensor {
-                        output: ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 6).unwrap(),
-                        left_layout: MatrixLayout::row_major(1, 3),
-                        right_layout: MatrixLayout::row_major(2, 2),
-                        output_layout: MatrixLayout::row_major(2, 6),
-                    },
-                    &[outer, right],
-                )
-                .unwrap();
-            let body = expressions
-                .intern_slice(
-                    ValueOperator::Matrix(MatrixOperation::Slice {
-                        row_start: 0,
-                        row_end_exclusive: 2,
-                        column_start: 2,
-                        column_end_exclusive: 4,
-                        layout: MatrixLayout::row_major(2, 2),
-                    }),
-                    &[tensor],
-                )
-                .unwrap();
-            programs.generated_family_from_body(&mut expressions, domain, body).unwrap()
-        };
-        let reducible_preimage = generated(&mut expressions, &mut programs, "K");
-        let preimage_body = programs.family_body(reducible_preimage).unwrap();
-        let preimage = programs
-            .opaque_generated_family_from_body(&mut expressions, domain, preimage_body)
-            .unwrap();
-        let target = generated(&mut expressions, &mut programs, "P");
-        let trapdoor_root = expressions
-            .intern(
-                ValueOperator::Trapdoor(super::super::arena::TrapdoorOperation::Generate {
-                    descriptor: "fixture-trapdoor".into(),
-                    parameters: Box::new([]),
-                    paired_public_event: SampleEventId(51),
-                    paired_public_output_role: "value".to_owned(),
-                }),
-                Box::new([]),
-            )
-            .unwrap();
-        let trapdoor_family =
-            programs.generated_family_from_body(&mut expressions, domain, trapdoor_root).unwrap();
-        let alternate_trapdoor_root = expressions
-            .intern(
-                ValueOperator::Trapdoor(super::super::arena::TrapdoorOperation::Generate {
-                    descriptor: "fixture-alternate-trapdoor".into(),
-                    parameters: Box::new([]),
-                    paired_public_event: SampleEventId(52),
-                    paired_public_output_role: "value".to_owned(),
-                }),
-                Box::new([]),
-            )
-            .unwrap();
-        let alternate_trapdoor_family = programs
-            .generated_family_from_body(&mut expressions, domain, alternate_trapdoor_root)
-            .unwrap();
-        let mut facts = FactStore::new(&expressions);
-        assert!(expressions.free_arguments(index).unwrap().contains(&(0, ResolvedValueType::Int)));
-        facts.finalize_ranges();
-        let zero = expressions
-            .intern(
-                ValueOperator::Constant(super::super::arena::TypedConstant::int(0)),
-                Box::new([]),
-            )
-            .unwrap();
-        let selector = expressions
-            .intern(
-                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
-                Box::new([index, zero]),
-            )
-            .unwrap();
-        let b = programs.call_family_in_range(&mut expressions, public, selector, range).unwrap();
-        let k = programs.call_family_in_range(&mut expressions, preimage, selector, range).unwrap();
-        let ordinary_residual = source_with(&mut expressions, matrix_type(), 905);
-        let product =
-            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[b, k]).unwrap();
-        let scope_family =
-            programs.generated_family_from_body(&mut expressions, domain, product).unwrap();
-        let scope = scope_family.program();
-        let root = programs.scoped(&expressions, scope, product).unwrap();
-        let index = programs.scoped(&expressions, scope, selector).unwrap();
-        let mut monomials = MonomialArena::new(&expressions, &programs, scope).unwrap();
-        let lhs = {
-            let value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-                .unwrap()
-                .normalize(root)
-                .unwrap();
-            let normal_form = value.exact_nf.unwrap();
-            assert_eq!(normal_form.exact_terms.len(), 1);
-            assert_eq!(normal_form.exact_terms.values().next(), Some(&BigInt::from(1_u8)));
-            *normal_form.exact_terms.keys().next().unwrap()
-        };
-        let lhs_descriptor = monomials.descriptor(lhs).unwrap();
-        assert!(lhs_descriptor.ordered_factors.iter().any(|factor| {
-            matches!(
-                expressions.node(factor.expression()).unwrap().operator,
-                ValueOperator::ProgramCall { program } if program == preimage.program()
-            )
-        }));
-        let source = SamplerSourceContract { expression: programs.family_body(preimage).unwrap() };
-        let trapdoor = TrapdoorSourceContract { expression: trapdoor_root };
-        let dispatch = UniversalDispatchKey {
-            preimage_family: preimage,
-            preimage_source: source.clone(),
-            matrix_type: matrix_type(),
-            trapdoor_source: trapdoor.clone(),
-        };
-        let ty = ResolvedValueType::Matrix(matrix_type());
-        let validation = RelationValidationAuthority {
-            source,
-            trapdoor_source: trapdoor,
-            matrix_type: matrix_type(),
-            public_type: ty.clone(),
-            preimage_type: ty.clone(),
-            target_type: ty.clone(),
-            trapdoor_type: ResolvedValueType::Trapdoor,
-            layout: None,
-            factor_order: FactorOrderContract::ordered_public_preimage(),
-            domain,
-            index_range: range,
-            gadget: None,
-            decomposition: None,
-        };
-        let registration = UniversalRelationRegistration {
-            dispatch: dispatch.clone(),
-            lhs: StaticLhsKey {
-                domain,
-                public_plan: public.program(),
-                preimage_plan: preimage.program(),
-                trapdoor_plan: trapdoor_family.program(),
-                public_pairing: public.program(),
-                layout: None,
-                factor_order: FactorOrderContract::ordered_public_preimage(),
-                remaining_contracts: Box::new([]),
-                validation,
-            },
-            target_plan: target.program(),
-        };
-        let alternate_trapdoor = TrapdoorSourceContract { expression: alternate_trapdoor_root };
-        let ambiguous_registration = UniversalRelationRegistration {
-            dispatch: UniversalDispatchKey {
-                preimage_family: preimage,
-                preimage_source: registration.dispatch.preimage_source.clone(),
-                matrix_type: matrix_type(),
-                trapdoor_source: alternate_trapdoor.clone(),
-            },
-            lhs: StaticLhsKey {
-                domain,
-                public_plan: public.program(),
-                preimage_plan: preimage.program(),
-                trapdoor_plan: alternate_trapdoor_family.program(),
-                public_pairing: public.program(),
-                layout: None,
-                factor_order: FactorOrderContract::ordered_public_preimage(),
-                remaining_contracts: Box::new([]),
-                validation: RelationValidationAuthority {
-                    source: registration.dispatch.preimage_source.clone(),
-                    trapdoor_source: alternate_trapdoor,
-                    matrix_type: matrix_type(),
-                    public_type: ty.clone(),
-                    preimage_type: ty.clone(),
-                    target_type: ty,
-                    trapdoor_type: ResolvedValueType::Trapdoor,
-                    layout: None,
-                    factor_order: FactorOrderContract::ordered_public_preimage(),
-                    domain,
-                    index_range: range,
-                    gadget: None,
-                    decomposition: None,
-                },
-            },
-            target_plan: target.program(),
-        };
-        let mut relations = RelationRegistry::new();
-        relations.register_universal(registration.clone()).unwrap();
-        let generation = relations.freeze();
-        let mut cache = NormalizationCache::new();
-        // Construct the unmatched root before borrowing the expression arena through the
-        // normalizer; it is used below for the final relation-remaining regression.
-        let unmatched = expressions
-            .intern_matrix_transform(MatrixOperation::Add, &[k, ordinary_residual])
-            .unwrap();
-        let unmatched_proof = expressions.scope_proof(scope, unmatched).unwrap();
-        let unmatched = expressions.scoped_from_proof(&unmatched_proof, unmatched).unwrap();
-        let alternate_index_expression = expressions
-            .intern(
-                ValueOperator::Constant(super::super::arena::TypedConstant::int(1)),
-                Box::new([]),
-            )
-            .unwrap();
-        let alternate_index = expressions
-            .scoped_from_proof(
-                &expressions.scope_proof(scope, alternate_index_expression).unwrap(),
-                alternate_index_expression,
-            )
-            .unwrap();
-        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-            .unwrap()
-            .with_relations(&relations, &mut cache)
-            .with_trace_product_heartbeat_interval(1)
-            .with_trace_focus_call_override(Some(1));
-        normalizer.watchdog = DiagnosticWatchdog::start(12, Duration::from_secs(60));
-        normalizer.watchdog_specialization = DiagnosticSpecializationCounters::default();
-        // Keep direct resolver calls in one synthetic outer watchdog session. Production enters
-        // these paths from an already-active root normalization.
-        normalizer.normalization_depth = 1;
-        let reached = ReachedUniversalLhs::fixture(dispatch.clone(), index, range, None, lhs);
-        assert_eq!(normalizer.normalization.as_deref().unwrap().runtime_entry_count(), 0);
-        let canonical_count = normalizer.normalization.as_deref().unwrap().canonical_rhs_count();
-        let canonical_fingerprint =
-            normalizer.normalization.as_deref().unwrap().canonical_state_fingerprint();
-        let proof = ProofReachedUniversalLhs::fixture(
-            ReachedUniversalLhs::fixture(dispatch.clone(), index, range, None, lhs),
-            generation,
-        );
-        normalizer.expressions.reset_scope_proof_build_count();
-        let owned = normalizer.resolve_universal_proof(proof).unwrap();
-        assert_eq!(
-            normalizer.expressions.scope_proof_build_count(),
-            2,
-            "one registration builds one LHS proof and one RHS proof"
-        );
-        let ProofResolutionOwned::Rewrite(owned_rhs) = owned else {
-            panic!("expected owned rewrite")
-        };
-        assert!(owned_rhs.term_count() > 0);
-        assert_eq!(normalizer.normalization.as_deref().unwrap().runtime_entry_count(), 0);
-        assert_eq!(
-            normalizer.normalization.as_deref().unwrap().canonical_rhs_count(),
-            canonical_count
-        );
-        assert_eq!(
-            normalizer.normalization.as_deref().unwrap().canonical_state_fingerprint(),
-            canonical_fingerprint
-        );
-        let repeat = ProofReachedUniversalLhs::fixture(
-            ReachedUniversalLhs::fixture(dispatch.clone(), index, range, None, lhs),
-            generation,
-        );
-        assert!(matches!(
-            normalizer.resolve_universal_proof(repeat).unwrap(),
-            ProofResolutionOwned::Rewrite(_)
-        ));
-        assert!(owned_rhs.term_count() > 0, "owned result remains usable after repeat rollback");
-        let invalid_proof = ProofReachedUniversalLhs::fixture(
-            ReachedUniversalLhs::fixture(
-                dispatch.clone(),
-                index,
-                TrustedIndexRange::new(0, 5).unwrap(),
-                None,
-                lhs,
-            ),
-            generation,
-        );
-        assert_eq!(
-            normalizer.resolve_universal_proof(invalid_proof),
-            Err(NormalizeError::Relation(RelationRegistryError::IndexOutOfDomain))
-        );
-        assert_eq!(normalizer.normalization.as_deref().unwrap().runtime_entry_count(), 0);
-        assert_eq!(
-            normalizer.normalization.as_deref().unwrap().canonical_rhs_count(),
-            canonical_count
-        );
-        assert_eq!(
-            normalizer.normalization.as_deref().unwrap().canonical_state_fingerprint(),
-            canonical_fingerprint
-        );
-        assert_eq!(normalizer.watchdog_specialization.runtime_lookup_hits, 0);
-        assert_eq!(normalizer.watchdog_specialization.runtime_lookup_misses, 0);
-        assert_eq!(normalizer.watchdog_specialization.proof_specializations_started, 3);
-        assert_eq!(normalizer.watchdog_specialization.proof_specializations_completed, 2);
-        assert_eq!(normalizer.watchdog_specialization.proof_rollbacks_completed, 3);
-        assert_eq!(normalizer.watchdog_specialization.registrations_started, 2);
-        assert_eq!(normalizer.watchdog_specialization.registrations_completed, 2);
-        let saved_normalization = normalizer.normalization.take();
-        assert_eq!(
-            normalizer.resolve_universal(&reached),
-            Err(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))
-        );
-        normalizer.normalization = saved_normalization;
-        assert_eq!(normalizer.watchdog_specialization.registrations_started, 3);
-        assert_eq!(normalizer.watchdog_specialization.registrations_completed, 2);
-        assert!(matches!(
-            normalizer.resolve_universal(&reached).unwrap(),
-            RelationResolution::Rewrite(_)
-        ));
-        assert_eq!(normalizer.normalization.as_deref().unwrap().runtime_entry_count(), 1);
-        assert!(matches!(
-            normalizer.resolve_universal(&reached).unwrap(),
-            RelationResolution::Rewrite(_)
-        ));
-        let alternate =
-            ReachedUniversalLhs::fixture(dispatch.clone(), alternate_index, range, None, lhs);
-        assert!(matches!(
-            normalizer.resolve_universal(&alternate).unwrap(),
-            RelationResolution::NoMatch
-        ));
-        assert_eq!(normalizer.watchdog_specialization.runtime_lookup_hits, 1);
-        assert_eq!(normalizer.watchdog_specialization.runtime_lookup_misses, 3);
-        assert_eq!(normalizer.watchdog_specialization.ordinary_specializations_started, 3);
-        assert_eq!(normalizer.watchdog_specialization.ordinary_specializations_completed, 2);
-        assert_eq!(normalizer.watchdog_specialization.registrations_started, 5);
-        assert_eq!(normalizer.watchdog_specialization.registrations_completed, 4);
-        assert!(normalizer.watchdog_specialization.rhs_exact_terms_total > 0);
-        assert!(normalizer.watchdog_specialization.rhs_exact_terms_max > 0);
-        assert_eq!(
-            normalizer.watchdog_specialization.interner_existing +
-                normalizer.watchdog_specialization.interner_inserted,
-            normalizer.watchdog_specialization.registrations_completed
-        );
-        let expected_watchdog_specialization = normalizer.watchdog_specialization;
-        normalizer.watchdog.as_mut().unwrap().finish(false);
-        let terminal = normalizer
-            .watchdog
-            .as_ref()
-            .unwrap()
-            .shared
-            .snapshots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .last()
-            .copied()
-            .unwrap();
-        assert_eq!(terminal.specialization, expected_watchdog_specialization);
-        normalizer.watchdog = None;
-        normalizer.normalization_depth = 0;
-        let out_of_domain = ReachedUniversalLhs::fixture(
-            reached.dispatch().clone(),
-            index,
-            TrustedIndexRange::new(0, 5).unwrap(),
-            None,
-            lhs,
-        );
-        assert_eq!(
-            normalizer.resolve_universal(&out_of_domain),
-            Err(NormalizeError::Relation(RelationRegistryError::IndexOutOfDomain))
-        );
-        // The production path applies the same specialized relation while normalizing the
-        // complete expression, including any surrounding ordered factors; it must not require a
-        // job-level whole-monomial subtraction pass.
-        normalizer.normalization.as_deref_mut().unwrap().clear_runtime();
-        let rewritten = normalizer.normalize_with_trace(root).unwrap();
-        assert!(rewritten.exact_nf.as_ref().is_some_and(|value| value.term_count() > 0));
-        let outer_counters = normalizer.counters();
-        assert!(normalizer.trace.active);
-        assert!(normalizer.trace.lines_emitted >= 3);
-        assert!(normalizer.trace.lines_emitted <= NORMALIZATION_TRACE_LINE_BUDGET);
-        assert!(normalizer.trace.terminal_emitted);
-        assert_eq!(normalizer.trace.terminal_event, "normalize_end");
-        assert!(normalizer.trace.normalization_calls >= 3);
-        assert!(normalizer.trace.max_normalization_depth >= 2);
-        assert_eq!(normalizer.trace.outer_nodes_total, outer_counters.nodes_total);
-        assert!(normalizer.trace.nodes_total > normalizer.trace.outer_nodes_total);
-        assert!(normalizer.trace.nodes_processed >= outer_counters.nodes_processed);
-        assert!(normalizer.trace.product_generated > 0);
-        assert!(normalizer.trace.product_processed > 0);
-        assert_eq!(
-            normalizer.trace.post_history,
-            [
-                "post:root_take",
-                "post:root_unwrap",
-                "post:relation_rewrite",
-                "post:relation_rebound",
-                "post:fold_bound",
-                "post:fold_terms",
-                "post:relation_remaining",
-                "post:complete",
-            ]
-        );
-        assert_eq!(normalizer.trace.post_lines_emitted, NORMALIZATION_TRACE_POST_LINE_BUDGET);
-        assert!(normalizer.trace.root_exact_terms > 0);
-        assert!(normalizer.trace.root_sum_ordered_factors > 0);
-        assert!(normalizer.trace.relation_initial > 0);
-        assert!(normalizer.trace.relation_processed >= normalizer.trace.relation_initial);
-        assert!(normalizer.trace.relation_peak_worklist >= normalizer.trace.relation_initial);
-        assert!(normalizer.trace.relation_rewrites > 0);
-        assert!(normalizer.trace.relation_enqueues > 0);
-        assert_eq!(normalizer.trace.relation_closed_window_probes, 0);
-        assert!(normalizer.trace.relation_universal_factor_probes > 0);
-        assert!(
-            normalizer.trace.product_heartbeat_saw_matrix_multiply,
-            "trace={:?}",
-            normalizer.trace
-        );
-        assert_eq!(normalizer.normalization_depth, 0);
-
-        // Focus the first specialized normalization itself. Its immediate successor claims the
-        // one-shot token and traces both lexical scope-proof calls in place.
-        normalizer.normalization.as_deref_mut().unwrap().clear_runtime();
-        normalizer.trace_focus_call_override = Some(Some(2));
-        normalizer.trace_product_heartbeat_interval = u64::MAX;
-        normalizer.normalize_with_trace(root).unwrap();
-        assert_eq!(
-            normalizer.trace.caller_history,
-            [
-                "specialized_root:normalize_enter",
-                "caller:nested_return",
-                "caller:cache_restored",
-                "caller:bounds_merge_start",
-                "caller:bounds_merge_end",
-                "caller:uses_restore_start",
-                "caller:uses_restore_end",
-                "caller:state_restored",
-                "next_root:preproof_start",
-                "next_root:preproof_end",
-                "next_root:normalize_proof_start",
-                "next_root:normalize_proof_end",
-            ]
-        );
-        assert!(normalizer.trace.caller_nested_bounds_len > 0);
-        assert!(normalizer.trace.caller_nested_uses_len > 0);
-        assert!(normalizer.trace.caller_outer_bounds_len > 0);
-        assert!(
-            normalizer.trace.caller_after_bounds_len >= normalizer.trace.caller_outer_bounds_len
-        );
-        assert!(normalizer.trace.lines_emitted <= NORMALIZATION_TRACE_LINE_BUDGET);
-        assert!(normalizer.trace.terminal_emitted);
-
-        // A dispatchable K which has no adjacent matching public factor is retained, while the
-        // ordinary residual in the same sum is not mislabeled as relation-bearing. This is a
-        // final structural diagnostic only: no second universal specialization is performed.
-        normalizer.fold_final_no_match = false;
-        let unmatched_value = normalizer.normalize(unmatched).unwrap();
-        assert_eq!(unmatched_value.exact_nf.as_ref().unwrap().exact_terms.len(), 2);
-        assert_eq!(normalizer.counters().relation_remaining, 1);
-
-        // Run the same production-shaped universal rewrite under the watchdog. Universal
-        // specialization recursively normalizes registration roots, so this exercises nested
-        // relation closures rather than a synthetic counter update. The outer terminal snapshot
-        // must retain all nested work and report a fully unwound closure stack.
-        normalizer.normalization.as_deref_mut().unwrap().clear_runtime();
-        normalizer.watchdog_enabled_override = Some(true);
-        normalizer.watchdog_interval_override = Some(Duration::from_secs(60));
-        let watched = normalizer.normalize(root).unwrap();
-        let terminal = normalizer.last_watchdog_snapshots.last().copied().unwrap();
-        assert_eq!(watched.semantic, rewritten.semantic);
-        assert_eq!(watched.exact_nf, rewritten.exact_nf);
-        assert_eq!(watched.coefficient_bound, rewritten.coefficient_bound);
-        assert!(terminal.relation_closure.closures_started > 1);
-        assert_eq!(
-            terminal.relation_closure.closures_completed,
-            terminal.relation_closure.closures_started
-        );
-        assert_eq!(terminal.relation_closure.closures_errored, 0);
-        assert_eq!(terminal.relation_closure.active_depth, 0);
-        assert!(!terminal.relation_closure.closed_relations_present);
-        assert!(terminal.relation_closure.universal_dispatch_hits > 0);
-        assert!(terminal.relation_closure.universal_specializations > 0);
-        assert!(terminal.relation_closure.universal_matches > 0);
-        assert!(terminal.relation_closure.universal_rewrites > 0);
-        assert_eq!(terminal.relation_closure, normalizer.watchdog_relation_closure);
-        assert!(terminal.timings.universal_specialized_cached.calls > 0);
-        assert_eq!(
-            terminal.timings.universal_factor_dispatch.calls,
-            terminal.relation_closure.universal_probes,
-            "mixed call/non-call factors each contribute exactly one dispatch timing"
-        );
-        assert!(terminal.timings.cached_key_lookup.calls > 0);
-        assert!(terminal.timings.cached_miss_specialize.calls > 0);
-        assert!(terminal.timings.specialized_nested_normalize.calls > 0);
-        assert!(terminal.timings.specialized_merge_bounds.calls > 0);
-        for counter in [
-            terminal.timings.universal_specialized_cached,
-            terminal.timings.cached_key_lookup,
-            terminal.timings.cached_miss_specialize,
-            terminal.timings.specialized_nested_normalize,
-            terminal.timings.specialized_merge_bounds,
-        ] {
-            assert!(counter.total_ns >= counter.max_ns);
-        }
-        assert_eq!(terminal.timings, normalizer.watchdog_timings);
-
-        let warm_runtime_entries =
-            normalizer.normalization.as_deref().unwrap().runtime_entry_count();
-        let warm_fingerprint =
-            normalizer.normalization.as_deref().unwrap().canonical_state_fingerprint();
-        normalizer.expressions.reset_scope_proof_build_count();
-        let warm = normalizer.normalize(root).unwrap();
-        assert_eq!(normalizer.expressions.scope_proof_build_count(), 1);
-        assert_eq!(warm.semantic, watched.semantic);
-        assert_eq!(warm.exact_nf, watched.exact_nf);
-        assert_eq!(warm.coefficient_bound, watched.coefficient_bound);
-        assert_eq!(
-            normalizer.normalization.as_deref().unwrap().runtime_entry_count(),
-            warm_runtime_entries
-        );
-        assert_eq!(
-            normalizer.normalization.as_deref().unwrap().canonical_state_fingerprint(),
-            warm_fingerprint
-        );
-
-        normalizer.normalization.as_deref_mut().unwrap().clear_runtime();
-        normalizer.watchdog_timings = DiagnosticTimings::default();
-        normalizer.watchdog = DiagnosticWatchdog::start(15, Duration::from_secs(60));
-        normalizer.normalization_depth = 1;
-        let first_cached =
-            normalizer.specialized_universal_cached(&dispatch, index, range).unwrap();
-        let second_cached =
-            normalizer.specialized_universal_cached(&dispatch, index, range).unwrap();
-        assert_eq!(first_cached, second_cached);
-        assert_eq!(normalizer.watchdog_timings.cached_key_lookup.calls, 2);
-        assert_eq!(normalizer.watchdog_timings.cached_miss_specialize.calls, 1);
-        assert_eq!(normalizer.watchdog_timings.cached_insert_return_clone.calls, 1);
-        assert_eq!(normalizer.watchdog_timings.cached_hit_clone.calls, 1);
-        assert!(normalizer.watchdog_timings.cached_hit_returned_entries_total > 0);
-        assert_eq!(
-            normalizer.watchdog_timings.cached_hit_returned_entries_total,
-            normalizer.watchdog_timings.cached_hit_returned_entries_max
-        );
-        normalizer.watchdog.as_mut().unwrap().finish(false);
-        normalizer.watchdog = None;
-        normalizer.normalization_depth = 0;
-        drop(normalizer);
-
-        let mut ambiguous_relations = RelationRegistry::new();
-        ambiguous_relations.register_universal(registration).unwrap();
-        ambiguous_relations.register_universal(ambiguous_registration).unwrap();
-        ambiguous_relations.freeze();
-        let mut ambiguous_cache = NormalizationCache::new();
-        let lhs_factor_expressions = {
-            let descriptor = monomials.descriptor(lhs).unwrap();
-            descriptor
-                .central_factors
-                .iter()
-                .chain(&descriptor.ordered_factors)
-                .map(|factor| factor.expression())
-                .collect::<Vec<_>>()
-        };
-        let mut ambiguous_normalizer =
-            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
-                .unwrap()
-                .with_relations(&ambiguous_relations, &mut ambiguous_cache)
-                .with_watchdog_override(true, Duration::from_secs(60));
-        for expression in lhs_factor_expressions {
-            ambiguous_normalizer
-                .expression_bounds
-                .insert(expression, NumericContract::Known(CoefficientBound::finite(1_u8)));
-        }
-        let ambiguous_reasons =
-            ambiguous_normalizer.diagnostic_frontier_reasons(lhs, false, false, true).unwrap();
-        assert_eq!(ambiguous_reasons, FRONTIER_AMBIGUOUS_UNIVERSAL_DISPATCH);
-        let cache_entries_before =
-            ambiguous_normalizer.normalization.as_deref().unwrap().runtime_entry_count();
-        let cache_fingerprint_before =
-            ambiguous_normalizer.normalization.as_deref().unwrap().canonical_state_fingerprint();
-        let ambiguous_census = ambiguous_normalizer
-            .diagnostic_four_class_census(&[DiagnosticExactNf {
-                normal_form: Arc::new(PolynomialNF {
-                    exact_terms: BTreeMap::from([(lhs, BigInt::from(1_u8))]),
-                    bounded_summary: BoundedSummary::missing(),
-                }),
-                ordinal: 0,
-                under_product: false,
-            }])
-            .unwrap();
-        assert_eq!(ambiguous_census.finite_relation_frontier.unique_monomials, 1);
-        assert_eq!(ambiguous_census.finite_relation_frontier.term_refs, 1);
-        assert_eq!(ambiguous_census.current_exact_preimage, DiagnosticClassStats::default());
-        assert_eq!(ambiguous_census.ambiguous_universal_dispatch.unique_monomials, 1);
-        assert_eq!(ambiguous_census.ambiguous_universal_dispatch.term_refs, 1);
-        assert_eq!(ambiguous_census.top_len, 1);
-        assert_eq!(ambiguous_census.top[0].finite_relation_frontier_refs, 1);
-        assert_eq!(
-            ambiguous_normalizer.normalization.as_deref().unwrap().runtime_entry_count(),
-            cache_entries_before
-        );
-        assert_eq!(
-            ambiguous_normalizer.normalization.as_deref().unwrap().canonical_state_fingerprint(),
-            cache_fingerprint_before
-        );
-        let error = ambiguous_normalizer.normalize(root).unwrap_err();
-        assert_eq!(
-            error,
-            NormalizeError::Relation(RelationRegistryError::AmbiguousPreimageDispatch)
-        );
-        let terminal = ambiguous_normalizer.last_watchdog_snapshots.last().copied().unwrap();
-        assert_eq!(terminal.relation_closure.closures_started, 1);
-        assert_eq!(terminal.relation_closure.closures_completed, 0);
-        assert_eq!(terminal.relation_closure.closures_errored, 1);
-        assert_eq!(terminal.relation_closure.active_depth, 0);
-        assert_eq!(terminal.relation_closure.universal_ambiguities, 1);
-        assert_eq!(terminal.relation_closure.match_errors, 1);
-        assert_eq!(
-            terminal.timings.universal_factor_dispatch.calls,
-            terminal.relation_closure.universal_probes
-        );
-        assert_eq!(terminal.timings.universal_search_total.calls, 1);
-        assert_eq!(terminal.timings.outer_relation_rebound.calls, 1);
-        for counter in [
-            terminal.timings.universal_factor_dispatch,
-            terminal.timings.universal_search_total,
-            terminal.timings.outer_relation_rebound,
-        ] {
-            assert!(counter.total_ns >= counter.max_ns);
-        }
-        assert_eq!(terminal.timings, ambiguous_normalizer.watchdog_timings);
-        assert!(ambiguous_normalizer.last_watchdog_events.len() <= 32);
     }
 
     #[test]

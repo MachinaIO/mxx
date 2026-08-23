@@ -111,8 +111,7 @@ The Lean theorem is conditional. Applying it to one execution requires external 
   environment;
 - for every `SourceAccess` in the residual proof closure, the value supplied by the execution is
   the value assigned to that same typed source, owner invocation, scoped substitution, and optional
-  signed selector (and its optional `Nat` family projection when nonnegative), and it satisfies the
-  raw facts in `InputContract`; and
+  `Nat` family selector, and it satisfies the raw facts in `InputContract`; and
 - for every scoped event occurrence in the residual proof closure, the value produced by the
   execution is the value assigned to that exact event and owner invocation, and it satisfies the
   typing, cutoff, support, and relation clauses in `SamplerContract`.
@@ -191,23 +190,19 @@ def OperationalClaim (cert : CheckedCert) : Prop :=
               (evalClosedResidual samplers inputs cert root) <
           cert.val.ciphertextModulus
     | .family family domain =>
-        ∀ (selector : Int), 0 ≤ selector →
-          domain.ContainsNat selector.toNat →
+        ∀ (selector : Nat), domain.Contains selector →
           2 * cert.val.plaintextModulus *
               maxCenteredCoefficientNorm
-                (evalFamilyResidual samplers inputs cert family selector.toNat) <
+                (evalFamilyResidual samplers inputs cert family selector) <
             cert.val.ciphertextModulus
 ```
 
 `ResidualRoot` mirrors the Rust root classification exactly: it is either a closed matrix
-expression or a one-argument matrix family. Rust's `FamilyDomain` is an exact nonnegative
-half-open interval with `u64` endpoints; Lean stores the same endpoints as `Nat`. The theorem may
-receive a general `Int` selector because expression facts are signed, but `0 ≤ selector` and
-`ContainsNat selector.toNat` are required before the selector is mapped to `Nat`. A negative selector
-is rejected; negative family-selector support is not added. A closed root has no caller-supplied
-arguments, and a family root is bounded for every selector in this exact nonnegative domain. Root
-arguments are derived from this checked root structure rather than supplied as an untyped external
-list.
+expression or a one-argument matrix family. Rust's `FamilyDomain` is an exact half-open interval
+with `u64` endpoints; Lean stores the same endpoints as `Nat`. A family selector is only a `Nat`
+and must satisfy `domain.Contains selector`. A closed root has no caller-supplied arguments, and a
+family root is bounded for every selector in this exact domain. Root arguments are derived from
+this checked root structure rather than supplied as an untyped external list.
 
 `Cert` stores `plaintextModulus` and `ciphertextModulus` directly. `Cert.wellFormed` requires
 `plaintextModulus > 0`, `ciphertextModulus > 0`, and a closed matrix or matrix-family residual over
@@ -218,7 +213,7 @@ outside the theorem.
 
 `OperationalClaim` is the only certificate-specific mathematical endpoint. For a closed root it
 proves one strict inequality. For a family root it proves the same inequality symbolically for
-every selector in the exact nonnegative half-open domain. Equality is rejected, and the direct product
+every selector contained in the exact half-open domain. Equality is rejected, and the direct product
 inequality must not be replaced with a condition involving truncated integer division.
 
 The fixed theorem `Cert.Valid.wellFormed` derives `Cert.wellFormed cert = true` without reducing
@@ -342,19 +337,18 @@ uses, but does not duplicate unused physical stride checks.
 
 `InputAssignment` is one total function from `SourceAccess` to `Value`. A `SourceAccess` contains
 the source reference, normalized owner invocation, the exact checked scoped substitution, and an
-optional evaluated signed family selector and, when nonnegative, its optional `Nat` family selector.
-The selector is present exactly for a family access; two accesses to the same family at different
-selectors are therefore distinct even within one owner invocation. `Cert.Valid` checks the
-substitution against the owning program signature and checks the nonnegative selector against the
-Rust `FamilyDomain` endpoints. A negative selector is rejected and is not interpreted as a family
-element. `InputContract` requires the recorded resolved type
+optional `Nat` family selector. The selector is present exactly for a family access; two accesses
+to the same family at different selectors are therefore distinct even within one owner invocation.
+`Cert.Valid` checks the substitution against the owning program signature and checks the selector
+with `domain.Contains selector`. `InputContract` requires the recorded resolved type
 for every valid access and only the raw facts consumed by the fixed Rust analysis. Centered
 coefficient bounds, canonical coefficient exclusive uppers, and polynomial-support uppers are
 separate fields and predicates. Only a canonical exclusive upper can justify an
 extracted-coefficient index domain. A support upper must be owner/source/family-access-selected
 exactly, must not exceed the ring dimension, and proves that all later polynomial positions reduce
 to zero. Current integer facts are declared signed half-open ranges. Family domains and
-family-access selectors are the separate signed-to-`Nat` boundary described above. Derived range,
+family-access selectors use `Nat`; this does not change the signed representation of other integer
+facts. Derived range,
 sparsity, and constant facts are proved, not silently assumed.
 
 `SamplerAssignment` is one total function from an event reference and owner arguments to `Value`.
@@ -376,8 +370,8 @@ scope, argument-substitution, type, and descriptor conditions.
 For Tall's universal preimage relation, the public matrix is selector-independent:
 `B * K(i) = T(i)`. The public program remains represented through the generic family-lifting API,
 but validity recursively proves that its root reaches no program argument and that its evaluation
-is identical for any two matching selector arguments. `K(i)` and `T(i)` use the same mapped
-nonnegative family selector; signed integer arithmetic used to compute that selector remains signed.
+is identical for any two matching selector arguments. `K(i)` and `T(i)` use the same `Nat` family
+selector. Signed integer arithmetic facts elsewhere remain signed.
 The certificate must not restate this relation as `B(i) * K(i) = T(i)`.
 
 ## 9. Exhaustive index-use semantics without a second analyzer

@@ -64,8 +64,8 @@ Rust checker は、復号の正しさに影響する最終的な誤差式を記�
 
 `program` は引数を受け取り式を評価する再利用可能な計算単位である。
 
-`family` は、整数で指定した要素を取得できる値の集合である。その要素を選ぶ整数を `selector`
-と呼ぶ。たとえば `K(i)` の `i` が selector である。
+`family` は、`Nat` で指定した要素を取得できる値の集合である。その要素を選ぶ `Nat` を
+`selector` と呼ぶ。たとえば `K(i)` の `i` が selector である。
 
 同じ式や event が別の program 呼び出しから使われる場合、それぞれの呼び出し文脈を区別する
 必要がある。この文脈を `owner scope`、ある scope の引数を別の scope へ対応付ける写像を
@@ -225,8 +225,8 @@ Lean theorem は条件付きの定理である。ある実行へ適用するに�
   canonical source artifact と完全に一致すること。target ID と parameter environment は request
   自体に含まれる
 - residual proof closure 内の各 `SourceAccess` について、実行時に供給した値が、同じ型付き
-  source、owner invocation、scoped substitution、optional signed selector（非負なら `Nat` family
-  selector への写像も含む）に割り当てた値と等しく、
+  source、owner invocation、scoped substitution、optional `Nat` family selector に割り当てた
+  値と等しく、
   `InputContract` の生の事実を満たすこと
 - residual proof closure 内の各 scoped event occurrence について、実行時に生成した値が、
   その exact event と owner invocation に割り当てた値と等しく、`SamplerContract` の型、
@@ -322,11 +322,10 @@ def OperationalClaim (cert : CheckedCert) : Prop :=
               (evalClosedResidual samplers inputs cert root) <
           cert.val.ciphertextModulus
     | .family family domain =>
-        ∀ (selector : Int), 0 ≤ selector →
-          domain.ContainsNat selector.toNat →
+        ∀ (selector : Nat), domain.Contains selector →
           2 * cert.val.plaintextModulus *
               maxCenteredCoefficientNorm
-                (evalFamilyResidual samplers inputs cert family selector.toNat) <
+                (evalFamilyResidual samplers inputs cert family selector) <
             cert.val.ciphertextModulus
 ```
 
@@ -336,10 +335,9 @@ def OperationalClaim (cert : CheckedCert) : Prop :=
 - `family`: Rust の `FamilyDomain`（`u64` の非負半開区間、Lean では `Nat` endpoint）を持つ一引数の
   matrix family
 
-closed root は引数なしで評価する。Lean theorem は一般の `Int` selector を受け取るが、
-`0 ≤ selector` と `ContainsNat selector.toNat` を確認してから `Nat` selector へ写す。負の selector
-は拒否し、負の family selector 対応は追加しない。family root はこの正確な非負半開区間内の
-全 selector に対して記号的に bound を証明する。root 引数はこの検査済み構造から内部的に決め、
+closed root は引数なしで評価する。family selector は `Nat` だけで表し、
+`domain.Contains selector` を確認する。family root はこの正確な半開区間内の全 selector に
+対して記号的に bound を証明する。root 引数はこの検査済み構造から内部的に決め、
 型のない外部 list として受け取らない。
 
 `OperationalClaim` は、各対象 residual の最大 centered coefficient norm を `noise` としたとき、
@@ -509,16 +507,14 @@ Lean は interpreter が使う logical routing と shape をすべて検査す�
 - source reference
 - normalized owner invocation
 - 検査済みの scoped substitution
-- family access の場合だけ存在する、評価済みの signed selector と、非負なら optional な `Nat`
-  family selector
+- family access の場合だけ存在する、評価済みの optional `Nat` family selector
 
 `InputAssignment` は `SourceAccess` から `Value` への total function である。同じ owner invocation
 内でも、同じ family を異なる selector で読めば別の access になる。
 
-`Cert.Valid` は substitution と owner program signature の一致、および非負 selector と Rust の
-`FamilyDomain` endpoint の一致を検査する。負の selector は拒否し、family element として解釈
-しない。`InputContract` は valid な各 access の resolved type と、Rust analysis が実際に使った
-生の事実だけを要求する。
+`Cert.Valid` は substitution と owner program signature の一致、および `domain.Contains selector`
+を検査する。`InputContract` は valid な各 access の resolved type と、Rust analysis が実際に
+使った生の事実だけを要求する。
 
 polynomial に関する次の三種類の情報を混同しない。
 
@@ -530,7 +526,7 @@ polynomial に関する次の三種類の情報を混同しない。
 upper だけである。support upper は owner、source、family access を正確に選んだ値で、ring
 dimension 以下でなければならず、それ以後の polynomial position が 0 になることを表す。
 現在の integer fact は signed half-open range として記録する。family domain と family-access
-selector だけは上記の signed-to-`Nat` 境界を使う。派生する range、support、
+selector は `Nat` として扱うが、他の integer fact の signed 表現は変更しない。派生する range、support、
 sparsity、constant 性は Lean で証明し、入力条件として追加しない。
 
 ### 10.2 SamplerAssignment と SamplerContract
@@ -560,8 +556,8 @@ B * K(i) = T(i)
 ```
 
 である。validity proof は `B` の program root が program argument に到達せず、selector を
-変えても同じ値になることを再帰的に証明する。`K(i)` と `T(i)` は同じ非負 family selector へ
-写した値を使う。selector を計算する signed integer arithmetic の意味は signed のまま保つ。
+変えても同じ値になることを再帰的に証明する。`K(i)` と `T(i)` は同じ `Nat` family selector
+を使う。他の signed integer arithmetic fact の意味は signed のまま保つ。
 
 ## 11. Index を安全に使うための LUT
 

@@ -13,6 +13,7 @@ pub(crate) mod normal_form;
 pub(crate) mod program;
 pub(crate) mod protocol;
 pub(crate) mod relation;
+pub(crate) mod replay;
 pub(crate) mod report;
 
 pub mod bound;

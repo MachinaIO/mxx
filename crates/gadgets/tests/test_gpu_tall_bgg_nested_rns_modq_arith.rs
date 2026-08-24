@@ -1308,11 +1308,11 @@ fn build_encoding_graph(
         ),
         reveal_plaintext: true,
     };
-    let mut slots = BggTallSlotLowering {
-        compiler: BggTallEncodingCompiler { public_key: public_key_compiler.clone() },
+    let mut slots = BggTallSlotLowering::new(
+        BggTallEncodingCompiler { public_key: public_key_compiler.clone() },
         diagonal_mask_public_key,
-        secret_rows: secret_rows.clone(),
-        sampler: BggTallEncodingSampler {
+        secret_rows.clone(),
+        BggTallEncodingSampler {
             layout: layout.clone(),
             gaussian_sigma: Some(
                 RealExpr::from_f64_exact(error_sigma).map_err(|error| error.to_string())?,
@@ -1326,8 +1326,8 @@ fn build_encoding_graph(
             ),
         },
         rotations,
-    };
-    let output = PolyCircuitCompiler { public_key: public_key_compiler }
+    );
+    let outputs = PolyCircuitCompiler { public_key: public_key_compiler }
         .compile_tall_encodings_with_lowerings(
             circuit,
             sample.encodings[0].clone(),
@@ -1335,10 +1335,13 @@ fn build_encoding_graph(
             &mut lookup,
             &mut slots,
         )
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "encoding circuit has no output".to_owned())?;
+        .map_err(|error| error.to_string())?;
+    info!(
+        repeated_lane_mask_encodings = slots.repeated_lane_mask_encoding_count(),
+        "reused Tall repeated-lane mask encodings"
+    );
+    let output =
+        outputs.into_iter().next().ok_or_else(|| "encoding circuit has no output".to_owned())?;
     let BggTallPlaintext::Diagonal(output_plaintexts) = output.plaintext else {
         return Err("nested-RNS output plaintext is hidden".to_owned());
     };

@@ -1581,11 +1581,11 @@ mod tests {
             plaintext: BggTallPlaintext::Diagonal(ring.input_family("one-plaintexts", 2, (1, 1))),
             canonical_input_exclusive_upper: None,
         };
-        let mut lowering = BggTallSlotLowering {
-            compiler: BggTallEncodingCompiler { public_key: public_compiler.clone() },
+        let mut lowering = BggTallSlotLowering::new(
+            BggTallEncodingCompiler { public_key: public_compiler.clone() },
             diagonal_mask_public_key,
-            secret_rows: ring.input_family("secret-rows", 2, (1, 1)),
-            sampler: BggTallEncodingSampler {
+            ring.input_family("secret-rows", 2, (1, 1)),
+            BggTallEncodingSampler {
                 layout: BggSamplerLayout {
                     modulus: 257.into(),
                     ring_dimension: 8.into(),
@@ -1596,8 +1596,8 @@ mod tests {
                 gaussian_sigma: None,
                 gaussian_max_coefficient_bound: None,
             },
-            rotations: BTreeMap::new(),
-        };
+            BTreeMap::new(),
+        );
         let mut no_lookup = crate::NoPublicLookup::default();
         let output = circuit_compiler
             .compile_tall_encodings_with_lowerings(
@@ -1627,16 +1627,25 @@ mod tests {
     }
 
     #[test]
-    fn compact_identity_lane_mask_graph_scales_with_lanes_not_slots() {
+    fn compact_identity_lane_mask_graph_reuses_encodings_and_scales_with_lanes_not_slots() {
         fn build(slot_count: usize, lanes: usize) -> BuiltGraph {
             assert_eq!(slot_count % lanes, 0);
             let ring = Ring::new(257, 8);
             let mut circuit = PolyCircuit::<DCRTPoly>::new();
             let input_gate = circuit.input(1).as_single_wire();
-            let transferred = circuit.slot_identity_repeated_lanes_gate(
+            let lane_scalars = (0..lanes).map(|lane| Some((lane % 3) as u32)).collect::<Vec<_>>();
+            let first = circuit.slot_identity_repeated_lanes_gate(
                 input_gate,
                 slot_count / lanes,
-                (0..lanes).map(|lane| Some((lane % 3) as u32)).collect(),
+                lane_scalars.clone(),
+            );
+            let transferred = circuit.slot_identity_repeated_lanes_gate(
+                first,
+                slot_count / lanes,
+                lane_scalars
+                    .into_iter()
+                    .map(|scalar| if scalar == Some(1) { None } else { scalar })
+                    .collect(),
             );
             circuit.output([transferred]);
             let public_compiler =
@@ -1691,11 +1700,11 @@ mod tests {
                 )),
                 canonical_input_exclusive_upper: None,
             };
-            let mut lowering = BggTallSlotLowering {
-                compiler: BggTallEncodingCompiler { public_key: public_compiler.clone() },
+            let mut lowering = BggTallSlotLowering::new(
+                BggTallEncodingCompiler { public_key: public_compiler.clone() },
                 diagonal_mask_public_key,
-                secret_rows: ring.input_family("compact-secret-rows", slot_count, (1, 1)),
-                sampler: BggTallEncodingSampler {
+                ring.input_family("compact-secret-rows", slot_count, (1, 1)),
+                BggTallEncodingSampler {
                     layout: BggSamplerLayout {
                         modulus: 257.into(),
                         ring_dimension: 8.into(),
@@ -1706,8 +1715,8 @@ mod tests {
                     gaussian_sigma: None,
                     gaussian_max_coefficient_bound: None,
                 },
-                rotations: BTreeMap::new(),
-            };
+                BTreeMap::new(),
+            );
             let output = circuit_compiler
                 .compile_tall_encodings_with_lowerings(
                     &circuit,
@@ -1739,8 +1748,8 @@ mod tests {
                     .iter()
                     .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
                     .count(),
-                3,
-                "mask generation, Tall sampling, and SIMD multiplication each retain one loop"
+                4,
+                "one mask-generation loop and one sampling loop are shared by two SIMD multiplies"
             );
         }
         let graph_size = |graph: &BuiltGraph| {

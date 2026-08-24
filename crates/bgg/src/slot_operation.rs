@@ -2009,18 +2009,44 @@ mod tall {
     #[derive(Clone)]
     pub struct BggTallSlotLowering {
         /// Tall arithmetic compiler.
-        pub compiler: BggTallEncodingCompiler,
+        compiler: BggTallEncodingCompiler,
         /// Public key used for every per-row diagonal mask.
-        pub diagonal_mask_public_key: BggPublicKeyWire,
+        diagonal_mask_public_key: BggPublicKeyWire,
         /// The one fresh Tall secret-row family owned by the online graph.
-        pub secret_rows: Family<Mat>,
+        secret_rows: Family<Mat>,
         /// Error configuration for direct diagonal-mask encodings.
-        pub sampler: BggTallEncodingSampler,
+        sampler: BggTallEncodingSampler,
         /// Direct tall-rotation encodings keyed by `(num_slots, normalized_offset)`.
-        pub rotations: BTreeMap<TallRotationEncodingKey, TallRotationEncodingWires>,
+        rotations: BTreeMap<TallRotationEncodingKey, TallRotationEncodingWires>,
+        /// Reusable encodings of compact repeated-lane masks, keyed by their canonical scalars.
+        ///
+        /// The configured slot count fixes the repetition count, so the short lane pattern is a
+        /// complete semantic key. `None` and `Some(1)` are both canonicalized to `1`.
+        repeated_lane_mask_encodings: BTreeMap<Vec<u32>, BggTallEncodingWire>,
     }
 
     impl BggTallSlotLowering {
+        pub fn new(
+            compiler: BggTallEncodingCompiler,
+            diagonal_mask_public_key: BggPublicKeyWire,
+            secret_rows: Family<Mat>,
+            sampler: BggTallEncodingSampler,
+            rotations: BTreeMap<TallRotationEncodingKey, TallRotationEncodingWires>,
+        ) -> Self {
+            Self {
+                compiler,
+                diagonal_mask_public_key,
+                secret_rows,
+                sampler,
+                rotations,
+                repeated_lane_mask_encodings: BTreeMap::new(),
+            }
+        }
+
+        pub fn repeated_lane_mask_encoding_count(&self) -> usize {
+            self.repeated_lane_mask_encodings.len()
+        }
+
         fn transfer(
             &self,
             input: &BggTallEncodingWire,
@@ -2053,7 +2079,7 @@ mod tall {
         }
 
         fn transfer_identity_repeated_lanes(
-            &self,
+            &mut self,
             input: &BggTallEncodingWire,
             num_blocks: u32,
             lane_scalars: &[Option<u32>],
@@ -2065,16 +2091,23 @@ mod tall {
                 self.configured_slot_count(),
                 gate,
             )?;
-            let masks = identity_repeated_lane_masks(
-                &self.sampler.layout.ring(),
-                total_slots,
-                lane_scalars,
-            )?;
-            let mask = self.sampler.sample_diagonal(
-                self.secret_rows.clone(),
-                self.diagonal_mask_public_key.clone(),
-                masks,
-            )?;
+            let key = canonical_lane_scalar_pattern(lane_scalars);
+            let mask = if let Some(mask) = self.repeated_lane_mask_encodings.get(&key) {
+                mask.clone()
+            } else {
+                let masks = identity_repeated_lane_masks(
+                    &self.sampler.layout.ring(),
+                    total_slots,
+                    lane_scalars,
+                )?;
+                let mask = self.sampler.sample_diagonal(
+                    self.secret_rows.clone(),
+                    self.diagonal_mask_public_key.clone(),
+                    masks,
+                )?;
+                self.repeated_lane_mask_encodings.insert(key, mask.clone());
+                mask
+            };
             Ok(self.compiler.simd_mul(&mask, input)?)
         }
     }
@@ -2208,6 +2241,20 @@ mod tall {
                     .collect(),
             )
         })
+    }
+
+    fn canonical_lane_scalar_pattern(lane_scalars: &[Option<u32>]) -> Vec<u32> {
+        let scalars = lane_scalars.iter().map(|scalar| scalar.unwrap_or(1)).collect::<Vec<_>>();
+        let period = (1..=scalars.len())
+            .find(|period| {
+                scalars.len() % period == 0 &&
+                    scalars
+                        .iter()
+                        .enumerate()
+                        .all(|(index, scalar)| scalar == &scalars[index % period])
+            })
+            .expect("a scalar pattern always repeats over its full length");
+        scalars[..period].to_vec()
     }
 
     #[cfg(test)]

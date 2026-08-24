@@ -4577,14 +4577,14 @@ mod tests {
                 );
                 circuit.output([transferred]);
                 let circuit_compiler = PolyCircuitCompiler { public_key: public_compiler.clone() };
-                let mut lowering = BggTallSlotLowering {
-                    compiler: BggTallEncodingCompiler { public_key: public_compiler.clone() },
-                    diagonal_mask_public_key: BggPublicKeyWire {
+                let mut lowering = BggTallSlotLowering::new(
+                    BggTallEncodingCompiler { public_key: public_compiler.clone() },
+                    BggPublicKeyWire {
                         matrix: diagonal_mask_public_key.clone(),
                         reveal_plaintext: true,
                     },
-                    secret_rows: secret_rows.clone(),
-                    sampler: BggTallEncodingSampler {
+                    secret_rows.clone(),
+                    BggTallEncodingSampler {
                         layout: BggSamplerLayout {
                             modulus: 257.into(),
                             ring_dimension: 1.into(),
@@ -4595,8 +4595,8 @@ mod tests {
                         gaussian_sigma: Some(RealExpr::from(3)),
                         gaussian_max_coefficient_bound: Some(5.into()),
                     },
-                    rotations: BTreeMap::new(),
-                };
+                    BTreeMap::new(),
+                );
                 circuit_compiler
                     .compile_tall_encodings_with_lowerings(
                         &circuit,

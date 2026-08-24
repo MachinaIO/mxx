@@ -1,4 +1,4 @@
-import Mxx.Certificate.OperationalNoise.Core
+import Mxx.Certificate.OperationalNoise.BoundReplay
 
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
@@ -174,8 +174,81 @@ theorem g2_replay_composition :
   exact ⟨by decide, by decide, by decide, addCancellation, addSurvivor, subtractContribution,
     productBound, by rw [addSurvivor]; decide, survivorFold, invocationEnd⟩
 
+def g2aFinite2 : CoeffClass := .finite ⟨2, by decide⟩
+def g2aFinite3 : CoeffClass := .finite ⟨3, by decide⟩
+def g2aFinite5 : CoeffClass := .finite ⟨5, by decide⟩
+def g2aFinite6 : CoeffClass := .finite ⟨6, by decide⟩
+def g2aFinite8 : CoeffClass := .finite ⟨8, by decide⟩
+def g2aFinite12 : CoeffClass := .finite ⟨12, by decide⟩
+def g2aFinite24 : CoeffClass := .finite ⟨24, by decide⟩
+def g2aFinite30 : CoeffClass := .finite ⟨30, by decide⟩
+
+def g2aNoProductFacts : ProductFacts :=
+  { leftConstantPolynomial := false
+    rightConstantPolynomial := false
+    rightKnownZeroRows := none
+    leftSupportUpper := none
+    rightSupportUpper := none }
+
+def g2aLeftSupportFacts : ProductFacts :=
+  { g2aNoProductFacts with leftSupportUpper := some 2 }
+
+def g2aLeftConstantFacts : ProductFacts :=
+  { g2aNoProductFacts with leftConstantPolynomial := true }
+
+def g2aRightConstantFacts : ProductFacts :=
+  { g2aNoProductFacts with rightConstantPolynomial := true }
+
+def g2aZeroRowFacts : ProductFacts :=
+  { g2aNoProductFacts with rightKnownZeroRows := some 1 }
+
+def g2aInvalidSupportFacts : ProductFacts :=
+  { g2aNoProductFacts with leftSupportUpper := some 5 }
+
+def g2aInvalidZeroRowFacts : ProductFacts :=
+  { g2aNoProductFacts with rightKnownZeroRows := some 4 }
+
+theorem g2a_bound_replay :
+    addKnown g2aFinite2 g2aFinite3 = g2aFinite5 ∧
+      maxKnown g2aFinite2 g2aFinite3 = g2aFinite3 ∧
+      scaleMagnitude 4 g2aFinite2 = g2aFinite8 ∧
+      scaleValue g2aFinite2 g2aFinite3 = g2aFinite6 ∧
+      productWithFactor 7 .exactZero g2aFinite3 = .exactZero ∧
+      productWithFactor 7 .exactZero .large = .exactZero ∧
+      productWithFactor 7 .large .exactZero = .exactZero ∧
+      productWithFactor 7 .large g2aFinite3 = .large ∧
+      productFactor 1 1 1 1 4 g2aNoProductFacts = some 4 ∧
+      productFactor 1 1 2 3 4 g2aNoProductFacts = some 4 ∧
+      productFactor 2 3 1 1 4 g2aNoProductFacts = some 4 ∧
+      productFactor 2 3 3 4 4 g2aNoProductFacts = some 12 ∧
+      productFactor 1 1 2 3 4 g2aLeftSupportFacts = some 2 ∧
+      productFactor 2 3 3 4 4 g2aLeftConstantFacts = some 3 ∧
+      productFactor 2 3 3 4 4 g2aRightConstantFacts = some 3 ∧
+      productFactor 2 3 3 4 4 g2aZeroRowFacts = some 8 ∧
+      productFactor 2 3 3 4 4 g2aInvalidSupportFacts = none ∧
+      productFactor 2 3 3 4 4 g2aInvalidZeroRowFacts = none ∧
+      productFactor 2 2 3 4 4 g2aNoProductFacts = none ∧
+      productFactor 2 3 3 4 0 g2aNoProductFacts = none ∧
+      tensorFactor 4 g2aNoProductFacts = 4 ∧
+      tensorFactor 4 g2aLeftConstantFacts = 1 ∧
+      tensorFactor 4 g2aRightConstantFacts = 1 ∧
+      productNonempty g2aFinite2 [g2aFinite3] = g2aFinite6 ∧
+      productNonempty g2aFinite2 [g2aFinite3, g2aFinite5] = g2aFinite30 ∧
+      productFoldWithFactor 4 g2aFinite2 [g2aFinite3] = g2aFinite24 := by
+  decide
+
 #print axioms g2_four_role_product_kernel
 #print axioms operatorProductContribution_natAbs_le
 #print axioms g2_replay_composition
+#print axioms addKnown_sound
+#print axioms maxKnown_sound
+#print axioms productWithFactor_sound
+#print axioms scaleMagnitude_sound
+#print axioms scaleValue_sound
+#print axioms productNonempty_sound
+#print axioms productWithFacts_sound
+#print axioms productFoldWithFactor_sound
+#print axioms tensorWithFacts_sound
+#print axioms g2a_bound_replay
 
 end Mxx.Certificate.OperationalNoise.EventReplay

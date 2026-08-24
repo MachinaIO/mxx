@@ -8,6 +8,7 @@ defaultTargets = [
   "Mxx.Certificate.OperationalNoise.RelationReplay",
   "Mxx.Certificate.OperationalNoise.G2Fixtures",
   "Mxx.Certificate.OperationalNoise.SchemaV1Fixtures",
+  "Mxx.Certificate.OperationalNoise.ToyABIFixtures",
 ]
 
 [[lean_lib]]

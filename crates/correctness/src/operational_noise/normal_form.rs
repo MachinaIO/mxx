@@ -20,7 +20,8 @@ use super::{
     },
     g0::{
         BoundAuthority, BoundProjection, BoundRule, BoundScale, BoundValueRef, CoefficientMerge,
-        FeasibilitySink, MonomialFactorEvidence, NoFeasibility, RecordedTermRef,
+        CoefficientMergeSource, FeasibilitySink, MonomialFactorEvidence, NoFeasibility,
+        RecordedTermRef,
     },
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
     program::{ArenaError, ProgramArena, ValueProgramId},
@@ -1198,10 +1199,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 .ok_or(super::g0::G0Error::RelationTraceInvariant)?
                 .record_coefficient_merge(CoefficientMerge {
                     owner,
-                    sources: Box::new([
-                        RecordedTermRef { value_event: left_event, monomial },
-                        RecordedTermRef { value_event: right_event, monomial },
-                    ]),
+                    source: CoefficientMergeSource::Operator {
+                        inputs: [
+                            RecordedTermRef { value_event: left_event, monomial },
+                            RecordedTermRef { value_event: right_event, monomial },
+                        ],
+                    },
                     output: monomial,
                     signed_contribution,
                 })?;
@@ -4187,7 +4190,27 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             .ok_or(super::g0::G0Error::RelationTraceInvariant)?
             .record_coefficient_merge(CoefficientMerge {
                 owner,
-                sources: Box::new(sources),
+                source: CoefficientMergeSource::Operator { inputs: sources },
+                output,
+                signed_contribution,
+            })?;
+        Ok(())
+    }
+
+    fn observe_relation_merge(
+        &mut self,
+        owner: ScopedExprId,
+        application: super::g0::EventIndex,
+        source_term: MonomialId,
+        output: MonomialId,
+        signed_contribution: BigInt,
+    ) -> Result<(), NormalizeError> {
+        self.sink
+            .as_deref_mut()
+            .ok_or(super::g0::G0Error::RelationTraceInvariant)?
+            .record_coefficient_merge(CoefficientMerge {
+                owner,
+                source: CoefficientMergeSource::Relation { application, source_term },
                 output,
                 signed_contribution,
             })?;
@@ -4640,7 +4663,17 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 if let Some(suffix) = suffix {
                     combined = self.monomials.combine_interned(self.scope, combined, suffix)?;
                 }
-                recombined.push((combined, &coefficient * rhs_coefficient));
+                let signed_contribution = &coefficient * rhs_coefficient;
+                if S::ENABLED && !signed_contribution.is_zero() {
+                    self.observe_relation_merge(
+                        owner,
+                        applied_event.ok_or(super::g0::G0Error::RelationTraceInvariant)?,
+                        *rhs_monomial,
+                        combined,
+                        signed_contribution.clone(),
+                    )?;
+                }
+                recombined.push((combined, signed_contribution));
             }
             for term in recombined.into_iter().rev() {
                 worklist.push_front(term);
@@ -8032,11 +8065,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!merges.is_empty(), "retained product terms must carry merge provenance");
         assert!(merges.iter().all(|merge| {
-            merge.sources.len() == 2 &&
-                !merge.signed_contribution.is_zero() &&
-                merge.sources.iter().all(|source| {
-                    source.value_event.0 < trace.normalization_events().len() as u64
-                })
+            matches!(
+                &merge.source,
+                super::super::g0::CoefficientMergeSource::Operator { inputs }
+                    if !merge.signed_contribution.is_zero() &&
+                        inputs.iter().all(|source| {
+                            source.value_event.0 < trace.normalization_events().len() as u64
+                        })
+            )
         }));
         assert!(!trace.normalization_events().iter().any(|event| {
             matches!(
@@ -9878,10 +9914,13 @@ mod tests {
             assert_eq!(merges.len(), 1);
             let merge = merges[0];
             assert_eq!(merge.owner, semantic);
-            assert_eq!(merge.sources.len(), 2);
-            let first_monomial = merge.sources[0].monomial;
+            let super::super::g0::CoefficientMergeSource::Operator { inputs } = &merge.source
+            else {
+                panic!("add/sub merge must use operator inputs")
+            };
+            let first_monomial = inputs[0].monomial;
             assert_eq!(merge.output, first_monomial);
-            assert!(merge.sources.iter().all(|reference| reference.monomial == merge.output));
+            assert!(inputs.iter().all(|reference| reference.monomial == merge.output));
             assert_eq!(merge.signed_contribution, BigInt::from(if subtract { -1 } else { 1 }));
             let output = trace
                 .normalization_events()

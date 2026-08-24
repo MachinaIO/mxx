@@ -245,9 +245,15 @@ pub(crate) struct RecordedTermRef {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum CoefficientMergeSource {
+    Operator { inputs: [RecordedTermRef; 2] },
+    Relation { application: EventIndex, source_term: super::monomial::MonomialId },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct CoefficientMerge {
     pub owner: super::arena::ScopedExprId,
-    pub sources: Box<[RecordedTermRef]>,
+    pub source: CoefficientMergeSource,
     pub output: super::monomial::MonomialId,
     pub signed_contribution: BigInt,
 }
@@ -1878,58 +1884,101 @@ impl FeasibilitySink for FeasibilityTrace {
         let current =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
         let in_frame = |event: EventIndex| event.0 >= frame.range.start.0 && event.0 < current.0;
-        let mut source_coefficients = Vec::new();
-        if observation.sources.len() != 2 {
-            return Err(G0Error::RelationTraceInvariant);
-        }
-        for (input_position, reference) in observation.sources.iter().enumerate() {
-            let expected = self.events[frame.range.start.0 as usize..current.0 as usize]
-                .iter()
-                .rev()
-                .find_map(|event| match event {
-                    NormalizerEvent::Predecessor {
-                        consumer,
-                        input_position: position,
-                        source_result,
-                        ..
-                    } if *consumer == observation.owner && *position == input_position as u32 => {
-                        Some(*source_result)
+        match &observation.source {
+            CoefficientMergeSource::Operator { inputs } => {
+                let mut source_coefficients = Vec::new();
+                for (input_position, reference) in inputs.iter().enumerate() {
+                    let expected = self.events[frame.range.start.0 as usize..current.0 as usize]
+                        .iter()
+                        .rev()
+                        .find_map(|event| match event {
+                            NormalizerEvent::Predecessor {
+                                consumer,
+                                input_position: position,
+                                source_result,
+                                ..
+                            } if *consumer == observation.owner &&
+                                *position == input_position as u32 =>
+                            {
+                                Some(*source_result)
+                            }
+                            _ => None,
+                        });
+                    if expected != Some(reference.value_event) {
+                        return Err(G0Error::RelationTraceInvariant);
                     }
-                    _ => None,
-                });
-            if expected != Some(reference.value_event) {
-                return Err(G0Error::RelationTraceInvariant);
-            }
-            let (event, monomial) = (reference.value_event, reference.monomial);
-            if !in_frame(event) {
-                return Err(G0Error::RelationTraceInvariant);
-            }
-            let value = match self.events.get(event.0 as usize) {
-                Some(NormalizerEvent::Result { value, .. }) |
-                Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
-                _ => {
+                    let (event, monomial) = (reference.value_event, reference.monomial);
+                    if !in_frame(event) {
+                        return Err(G0Error::RelationTraceInvariant);
+                    }
+                    let value = match self.events.get(event.0 as usize) {
+                        Some(NormalizerEvent::Result { value, .. }) |
+                        Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
+                        _ => return Err(G0Error::RelationTraceInvariant),
+                    };
+                    let Some(normal_form) = value.exact_nf.as_ref() else {
+                        return Err(G0Error::RelationTraceInvariant);
+                    };
+                    let Some(coefficient) = normal_form.exact_terms.get(&monomial) else {
+                        return Err(G0Error::RelationTraceInvariant);
+                    };
+                    source_coefficients.push(coefficient.clone());
+                }
+                if source_coefficients.len() != 2 {
                     return Err(G0Error::RelationTraceInvariant);
                 }
-            };
-            let Some(normal_form) = value.exact_nf.as_ref() else {
-                return Err(G0Error::RelationTraceInvariant);
-            };
-            let Some(coefficient) = normal_form.exact_terms.get(&monomial) else {
-                return Err(G0Error::RelationTraceInvariant);
-            };
-            source_coefficients.push(coefficient.clone());
-        }
-        if source_coefficients.len() != 2 {
-            return Err(G0Error::RelationTraceInvariant);
-        }
-        let right = &source_coefficients[1];
-        let product = &source_coefficients[0] * right;
-        if *right != observation.signed_contribution &&
-            -right.clone() != observation.signed_contribution &&
-            product != observation.signed_contribution
-        {
-            return Err(G0Error::RelationTraceInvariant);
-        }
+                let right = &source_coefficients[1];
+                let product = &source_coefficients[0] * right;
+                if *right != observation.signed_contribution &&
+                    -right.clone() != observation.signed_contribution &&
+                    product != observation.signed_contribution
+                {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
+            }
+            CoefficientMergeSource::Relation { application, source_term } => {
+                if !in_frame(*application) {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
+                let Some(NormalizerEvent::AppliedRelation(applied)) =
+                    self.events.get(application.0 as usize)
+                else {
+                    return Err(G0Error::RelationTraceInvariant);
+                };
+                if applied.owner != observation.owner {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
+                let source_event = match &applied.rule {
+                    AppliedRelationRule::Universal { key, rhs, .. } => {
+                        self.specialization_rhs_result(key, *rhs)?
+                    }
+                    AppliedRelationRule::Gadget { input_result, .. } => *input_result,
+                };
+                let source_must_be_in_frame =
+                    matches!(&applied.rule, AppliedRelationRule::Gadget { .. });
+                if source_event.0 >= current.0 ||
+                    (source_must_be_in_frame && !in_frame(source_event))
+                {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
+                let value = match self.events.get(source_event.0 as usize) {
+                    Some(NormalizerEvent::Result { value, .. }) |
+                    Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
+                    _ => return Err(G0Error::RelationTraceInvariant),
+                };
+                let Some(normal_form) = value.exact_nf.as_ref() else {
+                    return Err(G0Error::RelationTraceInvariant);
+                };
+                let Some(source_coefficient) = normal_form.exact_terms.get(source_term) else {
+                    return Err(G0Error::RelationTraceInvariant);
+                };
+                if &applied.outer_coefficient * source_coefficient !=
+                    observation.signed_contribution
+                {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
+            }
+        };
         let index = current;
         self.events.push(NormalizerEvent::CoefficientMerge(observation));
         Ok(index)
@@ -2178,56 +2227,116 @@ impl FeasibilitySink for FeasibilityTrace {
                     if root.program() != observation.owner.program() {
                         return Err(G0Error::RelationTraceInvariant);
                     }
-                    let mut coefficients = Vec::new();
-                    for (input_position, reference) in observation.sources.iter().enumerate() {
-                        let event = reference.value_event;
-                        let Some((_, predecessor_event)) =
-                            predecessors.get(&(observation.owner, input_position as u32))
-                        else {
-                            return Err(G0Error::RelationTraceInvariant);
-                        };
-                        if *predecessor_event != event {
-                            return Err(G0Error::RelationTraceInvariant);
+                    let pending_left = match &observation.source {
+                        CoefficientMergeSource::Operator { inputs } => {
+                            let mut coefficients = Vec::new();
+                            for (input_position, reference) in inputs.iter().enumerate() {
+                                let event = reference.value_event;
+                                let Some((_, predecessor_event)) =
+                                    predecessors.get(&(observation.owner, input_position as u32))
+                                else {
+                                    return Err(G0Error::RelationTraceInvariant);
+                                };
+                                if *predecessor_event != event {
+                                    return Err(G0Error::RelationTraceInvariant);
+                                }
+                                if event.0 < start.0 ||
+                                    event.0 >= current.0 ||
+                                    !matches!(
+                                        self.events.get(event.0 as usize),
+                                        Some(NormalizerEvent::Result { .. }) |
+                                            Some(NormalizerEvent::InvocationEnd { .. })
+                                    )
+                                {
+                                    return Err(G0Error::RelationTraceInvariant);
+                                }
+                                let value = match self.events.get(event.0 as usize) {
+                                    Some(NormalizerEvent::Result { value, .. }) |
+                                    Some(NormalizerEvent::InvocationEnd {
+                                        result: value, ..
+                                    }) => value,
+                                    _ => return Err(G0Error::RelationTraceInvariant),
+                                };
+                                let Some(normal_form) = value.exact_nf.as_ref() else {
+                                    return Err(G0Error::RelationTraceInvariant);
+                                };
+                                let Some(coefficient) =
+                                    normal_form.exact_terms.get(&reference.monomial)
+                                else {
+                                    return Err(G0Error::RelationTraceInvariant);
+                                };
+                                coefficients.push(coefficient.clone());
+                            }
+                            if coefficients.len() != 2 {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
+                            let right = &coefficients[1];
+                            if *right != observation.signed_contribution &&
+                                -right.clone() != observation.signed_contribution &&
+                                &coefficients[0] * right != observation.signed_contribution
+                            {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
+                            coefficients[0].clone()
                         }
-                        if event.0 < start.0 ||
-                            event.0 >= current.0 ||
-                            !matches!(
-                                self.events.get(event.0 as usize),
-                                Some(NormalizerEvent::Result { .. }) |
-                                    Some(NormalizerEvent::InvocationEnd { .. })
-                            )
-                        {
-                            return Err(G0Error::RelationTraceInvariant);
+                        CoefficientMergeSource::Relation { application, source_term } => {
+                            if application.0 < start.0 || application.0 >= current.0 {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
+                            let Some(NormalizerEvent::AppliedRelation(applied)) =
+                                self.events.get(application.0 as usize)
+                            else {
+                                return Err(G0Error::RelationTraceInvariant);
+                            };
+                            if applied.owner != observation.owner {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
+                            let source_event = match &applied.rule {
+                                AppliedRelationRule::Universal { key, rhs, .. } => {
+                                    let replay = self
+                                        .specialization_ranges
+                                        .get(key)
+                                        .ok_or(G0Error::SpecializationTraceInvariant)?;
+                                    replay
+                                        .rhs_results
+                                        .binary_search_by_key(rhs, |(candidate, _)| *candidate)
+                                        .map(|index| replay.rhs_results[index].1)
+                                        .map_err(|_| G0Error::SpecializationTraceInvariant)?
+                                }
+                                AppliedRelationRule::Gadget { input_result, .. } => *input_result,
+                            };
+                            let source_must_be_in_frame =
+                                matches!(&applied.rule, AppliedRelationRule::Gadget { .. });
+                            if source_event.0 >= current.0 ||
+                                (source_must_be_in_frame && source_event.0 < start.0)
+                            {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
+                            let value = match self.events.get(source_event.0 as usize) {
+                                Some(NormalizerEvent::Result { value, .. }) |
+                                Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
+                                _ => return Err(G0Error::RelationTraceInvariant),
+                            };
+                            let Some(normal_form) = value.exact_nf.as_ref() else {
+                                return Err(G0Error::RelationTraceInvariant);
+                            };
+                            let Some(source_coefficient) = normal_form.exact_terms.get(source_term)
+                            else {
+                                return Err(G0Error::RelationTraceInvariant);
+                            };
+                            if &applied.outer_coefficient * source_coefficient !=
+                                observation.signed_contribution
+                            {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
+                            BigInt::from(0_u8)
                         }
-                        let value = match self.events.get(event.0 as usize) {
-                            Some(NormalizerEvent::Result { value, .. }) |
-                            Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
-                            _ => return Err(G0Error::RelationTraceInvariant),
-                        };
-                        let Some(normal_form) = value.exact_nf.as_ref() else {
-                            return Err(G0Error::RelationTraceInvariant);
-                        };
-                        let Some(coefficient) = normal_form.exact_terms.get(&reference.monomial)
-                        else {
-                            return Err(G0Error::RelationTraceInvariant);
-                        };
-                        coefficients.push(coefficient.clone());
-                    }
-                    if coefficients.len() != 2 {
-                        return Err(G0Error::RelationTraceInvariant);
-                    }
-                    let right = &coefficients[1];
-                    if *right != observation.signed_contribution &&
-                        -right.clone() != observation.signed_contribution &&
-                        &coefficients[0] * right != observation.signed_contribution
-                    {
-                        return Err(G0Error::RelationTraceInvariant);
-                    }
+                    };
                     let entry = pending_merges
                         .entry(observation.owner)
                         .or_default()
                         .entry(observation.output)
-                        .or_insert_with(|| (BigInt::from(0_u8), coefficients[0].clone()));
+                        .or_insert_with(|| (BigInt::from(0_u8), pending_left));
                     entry.0 += &observation.signed_contribution;
                 }
             }

@@ -1896,7 +1896,7 @@ mod tall {
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
-    use mxx_ir_core::IntExpr;
+    use mxx_ir_core::{IntExpr, ValueHandle};
     use std::collections::BTreeMap;
 
     /// Public-key slot lowering for the secret-transfer-free Tall subset.
@@ -2067,6 +2067,8 @@ mod tall {
         /// The configured slot count fixes the repetition count, so the short lane pattern is a
         /// complete semantic key. `None` and `Some(1)` are both canonicalized to `1`.
         repeated_lane_mask_encodings: BTreeMap<Vec<u32>, BggTallEncodingWire>,
+        /// Decomposition shared by consecutive masks applied to the same Tall input.
+        cached_rhs_decomposition: Option<(ValueHandle, Mat)>,
     }
 
     impl BggTallSlotLowering {
@@ -2089,6 +2091,7 @@ mod tall {
                 rotations,
                 anchor_reduce,
                 repeated_lane_mask_encodings: BTreeMap::new(),
+                cached_rhs_decomposition: None,
             }
         }
 
@@ -2097,7 +2100,7 @@ mod tall {
         }
 
         fn transfer(
-            &self,
+            &mut self,
             input: &BggTallEncodingWire,
             source_slots: &[(u32, Option<u32>)],
             gate: GateInstance<'_>,
@@ -2115,7 +2118,7 @@ mod tall {
                 self.diagonal_mask_public_key.clone(),
                 masks,
             )?;
-            Ok(self.compiler.simd_mul(&mask, input)?)
+            self.multiply_mask(&mask, input)
         }
 
         fn configured_slot_count(&self) -> usize {
@@ -2125,6 +2128,26 @@ mod tall {
                 }
                 _ => unreachable!("Tall slot lowering requires a concrete secret-row family"),
             }
+        }
+
+        fn multiply_mask(
+            &mut self,
+            mask: &BggTallEncodingWire,
+            input: &BggTallEncodingWire,
+        ) -> Result<BggTallEncodingWire, CircuitCompileError> {
+            let input_handle = input.pubkey.matrix.value_handle();
+            let decomposition = match &self.cached_rhs_decomposition {
+                Some((cached_handle, decomposition)) if cached_handle == input_handle => {
+                    decomposition.clone()
+                }
+                _ => {
+                    let decomposition = self.compiler.public_key.decompose(&input.pubkey);
+                    self.cached_rhs_decomposition =
+                        Some((input_handle.clone(), decomposition.clone()));
+                    decomposition
+                }
+            };
+            Ok(self.compiler.simd_mul_with_decomposition(mask, input, decomposition)?)
         }
 
         fn transfer_identity_repeated_lanes(
@@ -2157,7 +2180,7 @@ mod tall {
                 self.repeated_lane_mask_encodings.insert(key, mask.clone());
                 mask
             };
-            Ok(self.compiler.simd_mul(&mask, input)?)
+            self.multiply_mask(&mask, input)
         }
     }
 

@@ -146,20 +146,31 @@ impl BggTallEncodingCompiler {
         lhs: &BggTallEncodingWire,
         rhs: &BggTallEncodingWire,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
+        let decomposed_rhs = self.public_key.decompose(&rhs.pubkey);
+        self.simd_mul_with_decomposition(lhs, rhs, decomposed_rhs)
+    }
+
+    pub(crate) fn simd_mul_with_decomposition(
+        &self,
+        lhs: &BggTallEncodingWire,
+        rhs: &BggTallEncodingWire,
+        decomposed_rhs: Mat,
+    ) -> Result<BggTallEncodingWire, TallCompileError> {
         validate_pair(lhs, rhs)?;
         let BggTallPlaintext::Diagonal(lhs_plaintexts) = &lhs.plaintext else {
             return Err(TallCompileError::MissingLeftPlaintext);
         };
-        let decomposed_rhs = rhs
-            .pubkey
-            .matrix
-            .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+        let row_decomposition = decomposed_rhs.clone();
         let rows = lhs.rows.clone().parallel_zip3(
             rhs.rows.clone(),
             lhs_plaintexts.clone(),
-            move |_, left, right, plaintext| left * decomposed_rhs.clone() + right * plaintext,
+            move |_, left, right, plaintext| {
+                let scaled_right = right * plaintext;
+                Mat::multi_row_gemm_accumulate(
+                    vec![(1, left, row_decomposition.clone())],
+                    Some(scaled_right),
+                )
+            },
         )?;
         let plaintext = match &rhs.plaintext {
             BggTallPlaintext::Diagonal(rhs_plaintexts) => BggTallPlaintext::Diagonal(
@@ -171,7 +182,11 @@ impl BggTallEncodingCompiler {
         };
         Ok(BggTallEncodingWire {
             rows,
-            pubkey: self.public_key.mul(&lhs.pubkey, &rhs.pubkey),
+            pubkey: self.public_key.mul_with_decomposition(
+                &lhs.pubkey,
+                &rhs.pubkey,
+                decomposed_rhs,
+            ),
             plaintext,
             canonical_input_exclusive_upper: None,
         })
@@ -349,19 +364,27 @@ impl BggTallEncodingCompiler {
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
             .as_mat();
-        let intermediate = left_rows
-            .parallel_zip(left_times_input_rows, move |_, left, input| {
-                left * decomposed_input.clone() + input
+        let intermediate =
+            left_rows.parallel_zip(left_times_input_rows, move |_, left, input| {
+                Mat::multi_row_gemm_accumulate(
+                    vec![(1, left, decomposed_input.clone())],
+                    Some(input),
+                )
             })?;
         let decomposed_right = transform
             .right_matrix
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
             .as_mat();
-        let rows = intermediate
-            .parallel_zip(left_message_times_right_rows, move |_, intermediate, right| {
-                intermediate * decomposed_right.clone() + right
-            })?;
+        let rows = intermediate.parallel_zip(
+            left_message_times_right_rows,
+            move |_, intermediate, right| {
+                Mat::multi_row_gemm_accumulate(
+                    vec![(1, intermediate, decomposed_right.clone())],
+                    Some(right),
+                )
+            },
+        )?;
         Ok(BggTallEncodingWire {
             rows,
             pubkey: self.linear_transform_public_key(
@@ -1905,6 +1928,11 @@ mod tests {
                 slot_count / lanes,
                 lane_scalars.clone(),
             );
+            let sibling = circuit.slot_identity_repeated_lanes_gate(
+                input_gate,
+                slot_count / lanes,
+                lane_scalars.iter().map(|scalar| scalar.map(|value| value + 2)).collect(),
+            );
             let transferred = circuit.slot_identity_repeated_lanes_gate(
                 first,
                 slot_count / lanes,
@@ -1913,7 +1941,7 @@ mod tests {
                     .map(|scalar| if scalar == Some(1) { None } else { scalar })
                     .collect(),
             );
-            circuit.output([transferred]);
+            circuit.output([transferred, sibling]);
             let public_compiler =
                 BggPublicKeyCompiler { ring: ring.clone(), base: 4.into(), digit_count: 2.into() };
             let one_public = BggPublicKeyWire {
@@ -1985,7 +2013,7 @@ mod tests {
                 BTreeMap::new(),
                 None,
             );
-            let output = circuit_compiler
+            let mut outputs = circuit_compiler
                 .compile_tall_encodings_with_lowerings(
                     &circuit,
                     one,
@@ -1993,10 +2021,13 @@ mod tests {
                     &mut crate::NoPublicLookup::default(),
                     &mut lowering,
                 )
-                .expect("compact Tall transfer")
-                .remove(0);
+                .expect("compact Tall transfer");
+            let output = outputs.remove(0);
+            let sibling_output = outputs.remove(0);
             DslContext::new("compact-tall-slot-transfer")
                 .family_output("rows", output.rows)
+                .unwrap()
+                .family_output("sibling-rows", sibling_output.rows)
                 .unwrap()
                 .output("public", public_output.matrix)
                 .unwrap()
@@ -2014,10 +2045,18 @@ mod tests {
             assert_eq!(
                 nodes
                     .iter()
-                    .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+                    .filter(|node| matches!(node.kind(), NodeKind::GadgetDecompose { .. }))
                     .count(),
                 4,
-                "one mask-generation loop and one sampling loop are shared by two SIMD multiplies"
+                "the public pass uses two decompositions; Tall sibling masks share one and their child uses another"
+            );
+            assert_eq!(
+                nodes
+                    .iter()
+                    .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+                    .count(),
+                7,
+                "two distinct mask-generation paths remain shared across their uses"
             );
         }
         let graph_size = |graph: &BuiltGraph| {

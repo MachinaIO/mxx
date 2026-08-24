@@ -84,9 +84,12 @@ impl BggPublicKeyCompiler {
 
     /// Builds `lhs * G^-1(rhs)` directly in the executable core DAG.
     pub fn mul(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
-        let decomposed =
-            rhs.matrix.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat();
+        let decomposed = self.decompose(rhs);
         self.mul_with_decomposition(lhs, rhs, decomposed)
+    }
+
+    pub(crate) fn decompose(&self, input: &BggPublicKeyWire) -> Mat {
+        input.matrix.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat()
     }
 
     pub(crate) fn mul_with_decomposition(

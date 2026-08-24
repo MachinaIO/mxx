@@ -1668,14 +1668,20 @@ fn logical_coefficient_merge(observation: &CoefficientMerge) -> Result<u64, G0Er
     logical_sum([1, source, 1, 1])
 }
 
+fn logical_normalization_counters(_: &super::normal_form::NormalizationCounters) -> u64 {
+    9
+}
+
 fn logical_event(event: &NormalizerEvent) -> Result<u64, G0Error> {
     let fields = match event {
         NormalizerEvent::InvocationStart { .. } => 1,
         NormalizerEvent::Predecessor { .. } => 4,
         NormalizerEvent::Result { value, .. } => logical_add(1, logical_recorded_value(value)?)?,
-        NormalizerEvent::InvocationEnd { result, .. } => {
-            logical_add(1, logical_recorded_value(result)?)?
-        }
+        NormalizerEvent::InvocationEnd { result, counters, .. } => logical_sum([
+            1,
+            logical_recorded_value(result)?,
+            logical_normalization_counters(counters),
+        ])?,
         NormalizerEvent::SpecializationComputed { replay, .. } => {
             logical_add(2, logical_specialization_replay(replay)?)?
         }
@@ -1828,10 +1834,13 @@ impl FeasibilityTrace {
     }
 
     fn update_normalization_items(&mut self, added: u64, removed: u64) -> Result<(), G0Error> {
-        let normalization = logical_add(self.normalization_retained_items, added)?
-            .checked_sub(removed)
-            .ok_or(G0Error::TraceOverflow)?;
-        self.commit_retention(self.lowering_retained_items, normalization)
+        let grown = logical_add(self.normalization_retained_items, added)?;
+        let grown_total = logical_add(self.lowering_retained_items, grown)?;
+        let normalization = grown.checked_sub(removed).ok_or(G0Error::TraceOverflow)?;
+        logical_add(self.lowering_retained_items, normalization)?;
+        self.normalization_retained_items = normalization;
+        self.retention_peak_items = self.retention_peak_items.max(grown_total);
+        Ok(())
     }
 
     fn novel_event_root_items(&self, event: &NormalizerEvent) -> Result<u64, G0Error> {
@@ -1873,31 +1882,6 @@ impl FeasibilityTrace {
                     .iter()
                     .map(logical_index_plan)
                     .collect::<Result<Vec<_>, _>>()?,
-            )?,
-        ])
-    }
-
-    #[cfg(test)]
-    fn recompute_normalization_items(&self) -> Result<u64, G0Error> {
-        logical_sum([
-            logical_sequence(
-                self.events.len(),
-                self.events.iter().map(logical_event).collect::<Result<Vec<_>, _>>()?,
-            )?,
-            logical_sequence(
-                self.frames.len(),
-                self.frames.iter().map(logical_frame).collect::<Result<Vec<_>, _>>()?,
-            )?,
-            logical_sequence(
-                self.specialization_ranges.len(),
-                self.specialization_ranges
-                    .iter()
-                    .map(|(_, replay)| logical_add(1, logical_specialization_replay(replay)?))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )?,
-            logical_sequence(
-                self.retained_monomial_roots.len(),
-                self.retained_monomial_roots.iter().map(|_| 1),
             )?,
         ])
     }
@@ -5289,12 +5273,210 @@ mod tests {
         ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).expect("matrix type")
     }
 
+    fn oracle_sequence(items: impl IntoIterator<Item = u64>) -> u64 {
+        let items = items.into_iter().collect::<Vec<_>>();
+        1 + items.len() as u64 + items.into_iter().sum::<u64>()
+    }
+
+    fn oracle_option(item: Option<u64>) -> u64 {
+        1 + item.unwrap_or(0)
+    }
+
+    fn oracle_contract(bound: &NumericContract<CoefficientBound>) -> u64 {
+        match bound {
+            NumericContract::Missing => 1,
+            NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Large) => 2,
+            NumericContract::Known(CoefficientBound::Finite(_)) => 3,
+        }
+    }
+
+    fn oracle_polynomial(polynomial: &super::super::normal_form::PolynomialNF) -> u64 {
+        oracle_sequence(polynomial.exact_terms.iter().map(|_| 2)) +
+            oracle_contract(&polynomial.bounded_summary.coefficient_bound())
+    }
+
+    fn oracle_value(value: &RecordedValue) -> u64 {
+        oracle_option(value.exact_nf.as_deref().map(oracle_polynomial)) +
+            oracle_contract(&value.coefficient_bound)
+    }
+
+    fn oracle_value_ref(value: &BoundValueRef) -> u64 {
+        match value {
+            BoundValueRef::Predecessor { .. } | BoundValueRef::Result { .. } => 3,
+            BoundValueRef::Transfer(_) => 2,
+        }
+    }
+
+    fn oracle_bound_rule(rule: &BoundRule) -> u64 {
+        1 + match rule {
+            BoundRule::Authority(BoundAuthority::RelationPreimageSource { .. }) => 2,
+            BoundRule::Authority(_) => 1,
+            BoundRule::Identity { input } => oracle_value_ref(input),
+            BoundRule::Sum { inputs } |
+            BoundRule::Maximum { inputs } |
+            BoundRule::WeightedSum { inputs } => {
+                oracle_sequence(inputs.iter().map(oracle_value_ref))
+            }
+            BoundRule::Scale { value, scale } => {
+                oracle_value_ref(value) +
+                    match scale {
+                        BoundScale::Value(value) => 1 + oracle_value_ref(value),
+                        BoundScale::Magnitude(_) => 2,
+                    }
+            }
+            BoundRule::MonomialProduct { factors, .. } => {
+                1 + oracle_sequence(factors.iter().map(|factor| {
+                    oracle_value_ref(&factor.bound) +
+                        1 +
+                        oracle_option(factor.support_upper.map(|_| 1))
+                }))
+            }
+            BoundRule::Product { left, right, facts } => {
+                oracle_value_ref(left) +
+                    oracle_value_ref(right) +
+                    1 +
+                    1 +
+                    oracle_option(facts.right_known_zero_rows.as_ref().map(|_| 1)) +
+                    oracle_option(facts.left_support_upper.map(|_| 1)) +
+                    oracle_option(facts.right_support_upper.map(|_| 1))
+            }
+            BoundRule::Tensor { left, right, .. } => {
+                oracle_value_ref(left) + oracle_value_ref(right) + 1 + 1
+            }
+        }
+    }
+
+    fn oracle_replay(replay: &SpecializationReplay) -> u64 {
+        2 + oracle_sequence(replay.rhs_results.iter().map(|_| 2))
+    }
+
+    fn oracle_event(event: &NormalizerEvent) -> u64 {
+        1 + match event {
+            NormalizerEvent::InvocationStart { .. } => 1,
+            NormalizerEvent::Predecessor { .. } => 4,
+            NormalizerEvent::Result { value, .. } => 1 + oracle_value(value),
+            NormalizerEvent::InvocationEnd { result, counters, .. } => {
+                let _ = (
+                    counters.nodes_processed,
+                    counters.nodes_total,
+                    counters.final_exact_term_count,
+                    counters.remaining_use_releases,
+                    counters.relation_candidates,
+                    counters.relation_applied,
+                    counters.relation_remaining,
+                    counters.bounded_fold_count,
+                    counters.peak_cached_values,
+                );
+                1 + oracle_value(result) + 9
+            }
+            NormalizerEvent::SpecializationComputed { replay, .. } => 2 + oracle_replay(replay),
+            NormalizerEvent::SpecializationCacheHit { .. } => 4,
+            NormalizerEvent::AppliedRelation(observation) => {
+                1 + 1 +
+                    1 +
+                    1 +
+                    1 +
+                    match observation.rule {
+                        AppliedRelationRule::Universal { .. } => 6,
+                        AppliedRelationRule::Gadget { .. } => 5,
+                    }
+            }
+            NormalizerEvent::BoundTransfer { rule, .. } => 1 + oracle_bound_rule(rule),
+            NormalizerEvent::CoefficientMerge(observation) => {
+                1 + match observation.source {
+                    CoefficientMergeSource::Operator { .. } => 5,
+                    CoefficientMergeSource::Relation { .. } => 3,
+                } + 1 +
+                    1
+            }
+            NormalizerEvent::SurvivorFold(_) => 2,
+            NormalizerEvent::PreFoldPolynomial(observation) => {
+                oracle_polynomial(&observation.polynomial) +
+                    oracle_option(observation.summary_evidence.as_ref().map(oracle_value_ref))
+            }
+        }
+    }
+
+    fn oracle_frame(frame: &InvocationFrame) -> u64 {
+        1 + 2 +
+            oracle_sequence(frame.results.iter().map(|_| 2)) +
+            oracle_sequence(frame.pending_bounds.iter().map(|_| 1))
+    }
+
+    fn oracle_source(handle: &SourceHandle, class: &SourceClass) -> u64 {
+        let handle = match handle {
+            SourceHandle::Expression(_) | SourceHandle::Family(_) => 2,
+        };
+        handle +
+            match class {
+                SourceClass::ScalarConstant { .. } => 2,
+                SourceClass::MatrixConstant { .. } => 3,
+                SourceClass::DeclaredProtocolInput { identity, .. } => {
+                    1 + 1 +
+                        1 +
+                        match identity {
+                            InputSourceIdentity::Expression(_) | InputSourceIdentity::Family(_) => {
+                                2
+                            }
+                        }
+                }
+                SourceClass::UnboundOccurrenceInput { identity, .. } => {
+                    1 + 1 +
+                        match identity {
+                            InputSourceIdentity::Expression(_) | InputSourceIdentity::Family(_) => {
+                                2
+                            }
+                        }
+                }
+                SourceClass::ProducerArtifact { .. } => 2,
+            }
+    }
+
+    fn oracle_index_plan(plan: &IndexUsePlan) -> u64 {
+        let frontier = oracle_sequence(plan.frontier.iter().map(|_| 5));
+        let slice = plan.slice_group.as_ref().map(|group| {
+            1 + oracle_sequence(group.frontier.iter().map(|_| 5)) +
+                oracle_sequence(group.members.iter().map(|_| 4)) +
+                oracle_option(group.row_span.map(|_| 1)) +
+                oracle_option(group.column_span.map(|_| 1))
+        });
+        1 + 1 +
+            oracle_option(plan.result.map(|_| 1)) +
+            oracle_option(plan.result_family.map(|_| 1)) +
+            oracle_option(plan.consumed.map(|_| 1)) +
+            oracle_option(plan.consumed_family.map(|_| 1)) +
+            1 +
+            frontier +
+            1 +
+            oracle_option(plan.output_range.map(|_| 2)) +
+            oracle_option(slice)
+    }
+
+    fn oracle_lowering(trace: &FeasibilityTrace) -> u64 {
+        oracle_sequence(
+            trace.source_observations.iter().map(|(handle, class)| oracle_source(handle, class)),
+        ) + oracle_sequence(trace.event_observations.iter().map(|(_, observation)| {
+            1 + 1 +
+                1 +
+                match observation.kind {
+                    EventKind::Sample { .. } |
+                    EventKind::Sampler { .. } |
+                    EventKind::Trapdoor { .. } => 2,
+                }
+        })) + oracle_sequence(trace.index_use_plans.iter().map(oracle_index_plan))
+    }
+
+    fn oracle_normalization(trace: &FeasibilityTrace) -> u64 {
+        oracle_sequence(trace.events.iter().map(oracle_event)) +
+            oracle_sequence(trace.frames.iter().map(oracle_frame)) +
+            oracle_sequence(
+                trace.specialization_ranges.iter().map(|(_, replay)| 1 + oracle_replay(replay)),
+            ) +
+            oracle_sequence(trace.retained_monomial_roots.iter().map(|_| 1))
+    }
+
     fn assert_retention_oracle(trace: &FeasibilityTrace) {
-        let expected = logical_add(
-            trace.recompute_lowering_items().expect("lowering logical items"),
-            trace.recompute_normalization_items().expect("normalization logical items"),
-        )
-        .expect("total logical items");
+        let expected = oracle_lowering(trace) + oracle_normalization(trace);
         let retention = trace.recorder_retention();
         assert_eq!(retention.current_logical_items, expected);
         assert!(retention.peak_logical_items >= retention.current_logical_items);
@@ -5909,7 +6091,9 @@ mod tests {
         assert_eq!(trace.recorder_retention().current_logical_items, 38);
         assert_retention_oracle(&trace);
         trace.record_invocation_end(child, &value, &Default::default()).expect("child end");
-        assert_eq!(trace.recorder_retention().current_logical_items, 34);
+        assert_eq!(trace.recorder_retention().current_logical_items, 43);
+        // The end event is retained before the child frame is released: 43 final + 9 frame.
+        assert_eq!(trace.recorder_retention().peak_logical_items, 52);
         assert_retention_oracle(&trace);
         let peak_before_abort = trace.recorder_retention().peak_logical_items;
         assert!(trace.abort_invocation(parent).is_empty());
@@ -5957,6 +6141,272 @@ mod tests {
         assert_eq!(trace.recorder_retention().current_logical_items, 12);
         assert_eq!(trace.recorder_retention().peak_logical_items, peak_before_mismatch);
         assert_retention_oracle(&trace);
+    }
+
+    #[test]
+    fn recorder_peak_observes_result_growth_before_pending_release() {
+        use crate::operational_noise::{
+            arena::{ExprArena, FamilyDomain},
+            program::ProgramArena,
+        };
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let child_expression = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .expect("child expression");
+        let parent_expression = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Negate), Box::new([child_expression]))
+            .expect("parent expression");
+        let family = programs
+            .generated_family_from_body(
+                &mut expressions,
+                FamilyDomain::new(0, 1).expect("domain"),
+                parent_expression,
+            )
+            .expect("family");
+        let parent =
+            programs.scoped(&expressions, family.program(), parent_expression).expect("parent");
+        let child =
+            programs.scoped(&expressions, family.program(), child_expression).expect("child");
+        let value = super::super::normal_form::AnalyzedValue {
+            semantic: child,
+            exact_nf: None,
+            coefficient_bound: NumericContract::Missing,
+        };
+        let mut trace = FeasibilityTrace::default();
+        trace.record_invocation_start(parent).expect("start");
+        trace
+            .record_bound_transfer(child, BoundRule::Authority(BoundAuthority::Operator))
+            .expect("pending transfer");
+        assert_eq!(trace.recorder_retention().current_logical_items, 23);
+        trace.record_normalization_result(child, &value).expect("result releases pending");
+        assert_eq!(trace.recorder_retention().current_logical_items, 29);
+        assert_eq!(trace.recorder_retention().peak_logical_items, 31);
+        assert_retention_oracle(&trace);
+    }
+
+    #[test]
+    fn independent_retention_oracle_covers_every_retained_variant() {
+        use crate::operational_noise::{
+            arena::{ArenaToken, ExprArena, FamilyDomain},
+            monomial::MonomialId,
+            program::ProgramArena,
+            relation::{
+                RelationRegistry, RuntimeSpecializationKey, SamplerSourceContract,
+                TrapdoorSourceContract, UniversalDispatchKey,
+            },
+        };
+        use std::sync::Arc;
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let expression = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .expect("expression");
+        let family = programs
+            .generated_family_from_body(
+                &mut expressions,
+                FamilyDomain::new(0, 1).expect("domain"),
+                expression,
+            )
+            .expect("family");
+        let owner = programs.scoped(&expressions, family.program(), expression).expect("owner");
+        let key = RuntimeSpecializationKey {
+            dispatch: UniversalDispatchKey {
+                preimage_family: family,
+                preimage_source: SamplerSourceContract { expression },
+                matrix_type: matrix(),
+                trapdoor_source: TrapdoorSourceContract { expression },
+            },
+            index: owner,
+            generation: RelationRegistry::new().freeze(),
+        };
+        let monomial = MonomialId::new(ArenaToken::fresh(), 0);
+        let value_ref = BoundValueRef::Transfer(EventIndex(0));
+        let polynomial = Arc::new(super::super::normal_form::PolynomialNF::zero());
+        let value = RecordedValue {
+            exact_nf: Some(polynomial.clone()),
+            coefficient_bound: NumericContract::Known(CoefficientBound::finite(3_u8)),
+        };
+        let replay = SpecializationReplay {
+            range: EventRange { start: EventIndex(0), end: EventIndex(1) },
+            rhs_results: Box::new([]),
+        };
+        let rules = vec![
+            BoundRule::Authority(BoundAuthority::RelationPreimageSource { source: expression }),
+            BoundRule::Identity { input: value_ref.clone() },
+            BoundRule::Sum { inputs: vec![value_ref.clone()].into_boxed_slice() },
+            BoundRule::Maximum { inputs: vec![value_ref.clone()].into_boxed_slice() },
+            BoundRule::Scale {
+                value: value_ref.clone(),
+                scale: BoundScale::Magnitude(BigUint::from(2_u8)),
+            },
+            BoundRule::MonomialProduct {
+                monomial,
+                factors: vec![MonomialFactorEvidence {
+                    bound: value_ref.clone(),
+                    is_constant_polynomial: true,
+                    support_upper: Some(1),
+                }]
+                .into_boxed_slice(),
+            },
+            BoundRule::WeightedSum { inputs: vec![value_ref.clone()].into_boxed_slice() },
+            BoundRule::Product {
+                left: value_ref.clone(),
+                right: value_ref.clone(),
+                facts: MatrixProductFacts {
+                    left_is_constant_polynomial: true,
+                    right_is_constant_polynomial: false,
+                    right_known_zero_rows: Some(BigUint::from(1_u8)),
+                    left_support_upper: Some(1),
+                    right_support_upper: None,
+                },
+            },
+            BoundRule::Tensor {
+                left: value_ref.clone(),
+                right: value_ref.clone(),
+                left_is_constant_polynomial: true,
+                right_is_constant_polynomial: false,
+            },
+        ];
+        let mut events = vec![
+            NormalizerEvent::InvocationStart { root: owner },
+            NormalizerEvent::Predecessor {
+                consumer: owner,
+                input_position: 0,
+                predecessor: expression,
+                source_result: EventIndex(0),
+            },
+            NormalizerEvent::Result { owner, value: value.clone() },
+            NormalizerEvent::InvocationEnd {
+                root: owner,
+                result: value.clone(),
+                counters: super::super::normal_form::NormalizationCounters {
+                    nodes_processed: 1,
+                    nodes_total: 2,
+                    final_exact_term_count: 3,
+                    remaining_use_releases: 4,
+                    relation_candidates: 5,
+                    relation_applied: 6,
+                    relation_remaining: 7,
+                    bounded_fold_count: 8,
+                    peak_cached_values: 9,
+                },
+            },
+            NormalizerEvent::SpecializationComputed {
+                owner,
+                key: key.clone(),
+                replay: replay.clone(),
+            },
+            NormalizerEvent::SpecializationCacheHit {
+                owner,
+                key: key.clone(),
+                source: replay.range,
+            },
+            NormalizerEvent::AppliedRelation(AppliedRelation {
+                owner,
+                source_monomial: monomial,
+                outer_coefficient: BigInt::from(-1_i8),
+                ordered_start: 0,
+                ordered_end_exclusive: 1,
+                rule: AppliedRelationRule::Gadget {
+                    gadget: owner,
+                    decomposition: owner,
+                    input: expression,
+                    input_result: EventIndex(2),
+                },
+            }),
+            NormalizerEvent::CoefficientMerge(CoefficientMerge {
+                owner,
+                source: CoefficientMergeSource::Operator {
+                    inputs: [
+                        RecordedTermRef { value_event: EventIndex(2), monomial },
+                        RecordedTermRef { value_event: EventIndex(2), monomial },
+                    ],
+                },
+                output: monomial,
+                signed_contribution: BigInt::from(-1_i8),
+            }),
+            NormalizerEvent::CoefficientMerge(CoefficientMerge {
+                owner,
+                source: CoefficientMergeSource::Relation {
+                    application: EventIndex(6),
+                    source_term: monomial,
+                },
+                output: monomial,
+                signed_contribution: BigInt::from(1_u8),
+            }),
+            NormalizerEvent::SurvivorFold(SurvivorFold {
+                coefficient: BigInt::from(-1_i8),
+                bound: EventIndex(0),
+            }),
+            NormalizerEvent::PreFoldPolynomial(PreFoldPolynomial {
+                polynomial,
+                summary_evidence: Some(value_ref),
+            }),
+        ];
+        events.extend(rules.into_iter().map(|rule| NormalizerEvent::BoundTransfer { owner, rule }));
+
+        let mut trace = FeasibilityTrace::default();
+        trace.events = events;
+        trace.frames.push(InvocationFrame {
+            root: owner,
+            range: replay.range,
+            results: [(expression, EventIndex(2))].into_iter().collect(),
+            pending_bounds: [owner].into_iter().collect(),
+            normalization_items_before_start: 4,
+        });
+        trace.specialization_ranges.insert(key, replay);
+        trace.retained_monomial_roots.insert(monomial);
+        trace.source_observations.insert(
+            SourceHandle::Expression(expression),
+            SourceClass::ScalarConstant { value: TypedConstant::int(1) },
+        );
+        trace.event_observations.insert(
+            SampleEventId(1),
+            EventObservation {
+                event: SampleEventId(1),
+                owner: planned_owner(1),
+                kind: EventKind::Sample {
+                    descriptor: SampleDescriptor::new("oracle-sample", ResolvedValueType::Int),
+                },
+            },
+        );
+        trace.index_use_plans.insert(index_plan(
+            IndexUseKind::IntegerExpression,
+            expression,
+            vec![axis(1, 0, 0, 2)],
+        ));
+
+        let production_lowering = trace.recompute_lowering_items().expect("production lowering");
+        let production_normalization = logical_sum([
+            logical_sequence(
+                trace.events.len(),
+                trace.events.iter().map(logical_event).collect::<Result<Vec<_>, _>>().unwrap(),
+            )
+            .unwrap(),
+            logical_sequence(
+                trace.frames.len(),
+                trace.frames.iter().map(logical_frame).collect::<Result<Vec<_>, _>>().unwrap(),
+            )
+            .unwrap(),
+            logical_sequence(
+                trace.specialization_ranges.len(),
+                trace
+                    .specialization_ranges
+                    .values()
+                    .map(|replay| 1 + logical_specialization_replay(replay).unwrap()),
+            )
+            .unwrap(),
+            logical_sequence(
+                trace.retained_monomial_roots.len(),
+                trace.retained_monomial_roots.iter().map(|_| 1),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(oracle_lowering(&trace), production_lowering);
+        assert_eq!(oracle_normalization(&trace), production_normalization);
     }
 
     #[test]

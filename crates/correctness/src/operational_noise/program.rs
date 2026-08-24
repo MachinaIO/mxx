@@ -16,7 +16,8 @@ pub use super::arena::ScopedExprId;
 use super::{
     arena::{ArtifactIdentity, ScopeProof},
     facts::{
-        CoefficientBound, FactStore, MatrixFacts, NumericContract, PolynomialFacts, ValueFacts,
+        CoefficientBound, FactStore, MatrixFacts, NumericContract, PolynomialFacts, ScalarFacts,
+        ValueFacts,
     },
 };
 
@@ -72,7 +73,7 @@ struct FamilyRecord {
     /// are the only programs eligible for beta reduction.
     reducible: bool,
     artifact: Option<ArtifactIdentity>,
-    explicit_matrix_facts: Option<MatrixFacts>,
+    explicit_facts: Option<ValueFacts>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -512,7 +513,7 @@ impl ProgramArena {
                 body,
                 reducible: true,
                 artifact: None,
-                explicit_matrix_facts: None,
+                explicit_facts: None,
             },
         )
     }
@@ -561,7 +562,7 @@ impl ProgramArena {
                 body,
                 reducible: false,
                 artifact: None,
-                explicit_matrix_facts: None,
+                explicit_facts: None,
             },
         )
     }
@@ -626,7 +627,7 @@ impl ProgramArena {
                 body,
                 reducible: false,
                 artifact: source.artifact,
-                explicit_matrix_facts,
+                explicit_facts: explicit_matrix_facts.map(ValueFacts::Matrix),
             },
         )
     }
@@ -640,6 +641,17 @@ impl ProgramArena {
         facts: &FactStore,
         domain: FamilyDomain,
         values: Box<[ExprId]>,
+    ) -> Result<FamilyValueId, ArenaError> {
+        self.explicit_family_with_scalar_summary(expressions, facts, domain, values, false)
+    }
+
+    pub(crate) fn explicit_family_with_scalar_summary(
+        &mut self,
+        expressions: &mut ExprArena,
+        facts: &FactStore,
+        domain: FamilyDomain,
+        values: Box<[ExprId]>,
+        summarize_scalar: bool,
     ) -> Result<FamilyValueId, ArenaError> {
         let domain = domain.nonempty()?;
         let width = domain.maximum_exclusive.checked_sub(domain.minimum).ok_or(
@@ -670,7 +682,13 @@ impl ProgramArena {
                 });
             }
         }
-        let explicit_matrix_facts = self.explicit_matrix_summary(expressions, facts, &values)?;
+        let explicit_facts = self.explicit_value_summary(
+            expressions,
+            facts,
+            &element_type,
+            &values,
+            summarize_scalar,
+        )?;
         let argument = expressions.intern_argument(0, ResolvedValueType::Int)?;
         let mut body_inputs = Vec::with_capacity(values.len() + 1);
         body_inputs.push(argument);
@@ -690,9 +708,53 @@ impl ProgramArena {
                 body,
                 reducible: false,
                 artifact: None,
-                explicit_matrix_facts,
+                explicit_facts,
             },
         )
+    }
+
+    fn explicit_value_summary(
+        &self,
+        expressions: &ExprArena,
+        facts: &FactStore,
+        element_type: &ResolvedValueType,
+        values: &[ExprId],
+        summarize_scalar: bool,
+    ) -> Result<Option<ValueFacts>, ArenaError> {
+        match element_type {
+            ResolvedValueType::Matrix(_) => Ok(self
+                .explicit_matrix_summary(expressions, facts, values)?
+                .map(ValueFacts::Matrix)),
+            ResolvedValueType::Int if summarize_scalar => {
+                let mut maximum = CoefficientBound::ExactZero;
+                for value in values {
+                    let bound = match facts.facts(*value) {
+                        Ok(ValueFacts::Scalar(summary))
+                            if summary.value_type == ResolvedValueType::Int &&
+                                !summary.coefficient_bound.is_missing() =>
+                        {
+                            summary.coefficient_bound.clone()
+                        }
+                        _ => match &expressions.node(*value)?.operator {
+                            ValueOperator::Constant(super::arena::TypedConstant {
+                                value: super::arena::ConstantValue::Int(value),
+                                ..
+                            }) => NumericContract::Known(CoefficientBound::finite(
+                                value.magnitude().clone(),
+                            )),
+                            _ => return Ok(None),
+                        },
+                    };
+                    let NumericContract::Known(bound) = bound else { return Ok(None) };
+                    maximum = maximum.max(bound);
+                }
+                let mut summary = ScalarFacts::new(ResolvedValueType::Int)
+                    .expect("integer explicit-family facts must be scalar facts");
+                summary.coefficient_bound = NumericContract::Known(maximum);
+                Ok(Some(ValueFacts::Scalar(summary)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Summarize explicit matrix branches without enumerating a family domain.  Missing branch
@@ -730,7 +792,20 @@ impl ProgramArena {
         &self,
         family: FamilyValueId,
     ) -> Result<Option<&MatrixFacts>, ArenaError> {
-        Ok(self.family(family)?.explicit_matrix_facts.as_ref())
+        Ok(match self.family(family)?.explicit_facts.as_ref() {
+            Some(ValueFacts::Matrix(facts)) => Some(facts),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn family_scalar_facts(
+        &self,
+        family: FamilyValueId,
+    ) -> Result<Option<&ScalarFacts>, ArenaError> {
+        Ok(match self.family(family)?.explicit_facts.as_ref() {
+            Some(ValueFacts::Scalar(facts)) => Some(facts),
+            _ => None,
+        })
     }
 
     /// Look up the summary owned by the explicit-family callee of one exact ProgramCall.
@@ -752,13 +827,29 @@ impl ProgramArena {
         self.family_matrix_facts(family)
     }
 
+    pub(crate) fn program_call_family_scalar_facts(
+        &self,
+        expressions: &ExprArena,
+        expression: ExprId,
+    ) -> Result<Option<&ScalarFacts>, ArenaError> {
+        let program = match expressions.node(expression)?.operator {
+            ValueOperator::ProgramCall { program } => program,
+            _ => return Ok(None),
+        };
+        let Some(family) = self.family_for_program(program) else { return Ok(None) };
+        self.family_scalar_facts(family)
+    }
+
     fn join_family_matrix_facts(
         &self,
         families: &[FamilyValueId],
     ) -> Result<Option<MatrixFacts>, ArenaError> {
         let Some(summaries) = families
             .iter()
-            .map(|family| self.family(*family).ok()?.explicit_matrix_facts.as_ref())
+            .map(|family| match self.family(*family).ok()?.explicit_facts.as_ref()? {
+                ValueFacts::Matrix(facts) => Some(facts),
+                _ => None,
+            })
             .collect::<Option<Vec<_>>>()
         else {
             return Ok(None);
@@ -1133,7 +1224,7 @@ impl ProgramArena {
             },
             body_inputs.into_boxed_slice(),
         )?;
-        let explicit_matrix_facts = self.join_family_matrix_facts(families)?;
+        let explicit_facts = self.join_family_matrix_facts(families)?.map(ValueFacts::Matrix);
         let signature = family_signature(family_domain, element_type);
         let program = self.finalize(expressions, signature, body)?;
         let id = self.intern_family(
@@ -1145,7 +1236,7 @@ impl ProgramArena {
                 body,
                 reducible: false,
                 artifact: None,
-                explicit_matrix_facts,
+                explicit_facts,
             },
         )?;
         Ok(id)
@@ -1543,6 +1634,78 @@ mod tests {
             expressions.node(explicit_call).unwrap().operator,
             ValueOperator::ProgramCall { .. }
         ));
+    }
+
+    #[test]
+    fn enabled_explicit_integer_summary_uses_exact_literals_and_fails_closed() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let facts = FactStore::new(&expressions);
+        let values = [-7_i64, 0, 5]
+            .into_iter()
+            .map(|value| {
+                expressions
+                    .intern(ValueOperator::Constant(TypedConstant::int(value)), Box::new([]))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let family = programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &facts,
+                FamilyDomain::new(0, 3).unwrap(),
+                values.into_boxed_slice(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            programs.family_scalar_facts(family).unwrap().unwrap().coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(7_u64))
+        );
+
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let two = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .unwrap();
+        let unsupported = expressions
+            .intern(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                Box::new([one, two]),
+            )
+            .unwrap();
+        let missing = programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &facts,
+                FamilyDomain::new(0, 2).unwrap(),
+                Box::new([one, unsupported]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(programs.family_scalar_facts(missing).unwrap(), None);
+
+        let mut ordinary_expressions = ExprArena::new();
+        let mut ordinary_programs = ProgramArena::new();
+        let ordinary_facts = FactStore::new(&ordinary_expressions);
+        let ordinary_values = [-7_i64, 0, 5]
+            .into_iter()
+            .map(|value| {
+                ordinary_expressions
+                    .intern(ValueOperator::Constant(TypedConstant::int(value)), Box::new([]))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let ordinary = ordinary_programs
+            .explicit_family(
+                &mut ordinary_expressions,
+                &ordinary_facts,
+                FamilyDomain::new(0, 3).unwrap(),
+                ordinary_values.into_boxed_slice(),
+            )
+            .unwrap();
+        assert_eq!(ordinary_programs.family_scalar_facts(ordinary).unwrap(), None);
     }
 
     #[test]

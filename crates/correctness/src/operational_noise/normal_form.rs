@@ -3446,6 +3446,10 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         self.programs.program_call_family_matrix_facts(self.expressions, expression).ok().flatten()
     }
 
+    fn program_call_scalar_facts(&self, expression: ExprId) -> Option<&super::facts::ScalarFacts> {
+        self.programs.program_call_family_scalar_facts(self.expressions, expression).ok().flatten()
+    }
+
     fn add_nf(
         &mut self,
         owner: Option<ScopedExprId>,
@@ -6019,6 +6023,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
         let bounds =
             children.iter().map(|value| value.coefficient_bound.clone()).collect::<Vec<_>>();
+        let mut program_family_fact = false;
         let mut bound = match &node.operator {
             ValueOperator::Constant(constant) => match &constant.value {
                 super::arena::ConstantValue::Int(value) => {
@@ -6036,6 +6041,15 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             _ => bounds.first().cloned().unwrap_or(NumericContract::Missing),
         };
         if S::ENABLED {
+            if bound.is_missing() &&
+                matches!(&node.operator, ValueOperator::ProgramCall { .. }) &&
+                self.expressions.value_type(expression)? == &ResolvedValueType::Int &&
+                let Some(facts) = self.program_call_scalar_facts(expression) &&
+                !facts.coefficient_bound.is_missing()
+            {
+                bound = facts.coefficient_bound.clone();
+                program_family_fact = true;
+            }
             if bound.is_missing() &&
                 let ValueOperator::Argument { position: 0, value_type: ResolvedValueType::Int } =
                     &node.operator
@@ -6118,7 +6132,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 ValueOperator::Argument { position: 0, value_type: ResolvedValueType::Int } => {
                     BoundRule::Authority(BoundAuthority::Operator)
                 }
-                ValueOperator::ProgramCall { .. } => BoundRule::Authority(BoundAuthority::Operator),
+                ValueOperator::ProgramCall { .. } => BoundRule::Authority(if program_family_fact {
+                    BoundAuthority::ProgramFamilyFact
+                } else {
+                    BoundAuthority::Operator
+                }),
                 ValueOperator::Scalar(ScalarOperation::Add | ScalarOperation::Subtract) => {
                     BoundRule::Sum {
                         inputs: Self::predecessor_refs(
@@ -14352,6 +14370,188 @@ mod tests {
                 )
             }));
         }
+    }
+
+    #[test]
+    fn explicit_integer_family_calls_reuse_the_program_owned_summary() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let facts = FactStore::new(&expressions);
+        let branches = [-7_i64, 0, 5]
+            .into_iter()
+            .map(|value| {
+                expressions
+                    .intern(ValueOperator::Constant(TypedConstant::int(value)), Box::new([]))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let domain = super::super::arena::FamilyDomain::new(0, 3).unwrap();
+        let explicit = programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &facts,
+                domain,
+                branches.into_boxed_slice(),
+                true,
+            )
+            .unwrap();
+        let first_index = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let second_index = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let first = programs
+            .call_family_in_range(
+                &mut expressions,
+                explicit,
+                first_index,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        let second = programs
+            .call_family_in_range(
+                &mut expressions,
+                explicit,
+                second_index,
+                TrustedIndexRange::new(1, 2).unwrap(),
+            )
+            .unwrap();
+        let sum = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), Box::new([first, second]))
+            .unwrap();
+        let caller = programs
+            .opaque_generated_family_from_body(
+                &mut expressions,
+                super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                sum,
+            )
+            .unwrap()
+            .program();
+        let owner = programs.scoped(&expressions, caller, sum).unwrap();
+        let first_owner = programs.scoped(&expressions, caller, first).unwrap();
+        let second_owner = programs.scoped(&expressions, caller, second).unwrap();
+
+        let mut ordinary_monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
+        assert_eq!(
+            Normalizer::new(&mut expressions, &programs, &facts, &mut ordinary_monomials)
+                .unwrap()
+                .normalize(owner)
+                .unwrap()
+                .coefficient_bound,
+            NumericContract::Missing
+        );
+
+        let mut monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let traced = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(owner)
+        .unwrap();
+        assert_eq!(
+            traced.coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(14_u64))
+        );
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        assert_eq!(
+            trace
+                .normalization_events()
+                .iter()
+                .filter_map(|event| match event {
+                    NormalizerEvent::BoundTransfer {
+                        owner,
+                        rule: BoundRule::Authority(BoundAuthority::ProgramFamilyFact),
+                    } => Some(*owner),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_owner, second_owner])
+        );
+        assert_eq!(
+            trace
+                .normalization_events()
+                .iter()
+                .filter(|event| matches!(event, NormalizerEvent::InvocationStart { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            expressions.node(first).unwrap().operator,
+            ValueOperator::ProgramCall { program } if program == explicit.program()
+        ));
+        assert!(matches!(
+            expressions.node(second).unwrap().operator,
+            ValueOperator::ProgramCall { program } if program == explicit.program()
+        ));
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let facts = FactStore::new(&expressions);
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let two = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .unwrap();
+        let unsupported = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), Box::new([one, two]))
+            .unwrap();
+        let explicit = programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &facts,
+                super::super::arena::FamilyDomain::new(0, 2).unwrap(),
+                Box::new([one, unsupported]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(programs.family_scalar_facts(explicit).unwrap(), None);
+        let call = programs
+            .call_family_in_range(
+                &mut expressions,
+                explicit,
+                one,
+                TrustedIndexRange::new(1, 2).unwrap(),
+            )
+            .unwrap();
+        let caller = programs
+            .opaque_generated_family_from_body(
+                &mut expressions,
+                super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                call,
+            )
+            .unwrap()
+            .program();
+        let owner = programs.scoped(&expressions, caller, call).unwrap();
+        let mut ordinary_monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
+        assert_eq!(
+            Normalizer::new(&mut expressions, &programs, &facts, &mut ordinary_monomials)
+                .unwrap()
+                .normalize(owner)
+                .unwrap()
+                .coefficient_bound,
+            NumericContract::Missing
+        );
+        let mut monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        assert!(matches!(
+            Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .normalize(owner),
+            Err(NormalizeError::UnsupportedProgramCallBound(_))
+        ));
     }
 
     #[test]

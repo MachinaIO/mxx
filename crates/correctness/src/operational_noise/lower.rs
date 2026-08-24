@@ -794,7 +794,13 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         values: Box<[ExprId]>,
     ) -> Result<FamilyValueId, ProductionAdapterError> {
         Ok(self.job.with_arena_stores(|expressions, programs, facts| {
-            programs.explicit_family(expressions, facts, domain, values)
+            programs.explicit_family_with_scalar_summary(
+                expressions,
+                facts,
+                domain,
+                values,
+                S::ENABLED,
+            )
         })?)
     }
     fn select_family(

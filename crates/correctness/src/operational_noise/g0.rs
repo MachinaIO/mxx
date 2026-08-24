@@ -2030,7 +2030,6 @@ impl FeasibilitySink for FeasibilityTrace {
                 super::arena::ScopedExprId,
                 BTreeMap<super::monomial::MonomialId, (BigInt, BigInt)>,
             >,
-            BTreeMap<super::arena::ScopedExprId, BTreeSet<super::monomial::MonomialId>>,
         )>::new();
         let mut frame_starts = vec![None; self.events.len()];
         let mut frame_stack = Vec::new();
@@ -2055,11 +2054,10 @@ impl FeasibilitySink for FeasibilityTrace {
                         BTreeSet::new(),
                         HashMap::new(),
                         BTreeMap::new(),
-                        BTreeMap::new(),
                     ));
                 }
                 NormalizerEvent::Result { owner, .. } => {
-                    let Some((root, _, results, pending_bounds, _, pending_merges, pending_folds)) =
+                    let Some((root, _, results, pending_bounds, _, pending_merges)) =
                         stack.last_mut()
                     else {
                         return Err(G0Error::MissingNormalizationResult);
@@ -2089,20 +2087,6 @@ impl FeasibilitySink for FeasibilityTrace {
                             }
                         }
                     }
-                    if let Some(folds) = pending_folds.remove(owner) {
-                        let NormalizerEvent::Result { value, .. } = event else {
-                            unreachable!("matched result event")
-                        };
-                        let Some(normal_form) = value.exact_nf.as_ref() else {
-                            return Err(G0Error::RelationTraceInvariant);
-                        };
-                        if folds
-                            .iter()
-                            .any(|monomial| normal_form.exact_terms.contains_key(monomial))
-                        {
-                            return Err(G0Error::RelationTraceInvariant);
-                        }
-                    }
                     if *owner != *root {
                         pending_bounds.remove(owner);
                     }
@@ -2113,8 +2097,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     predecessor,
                     source_result,
                 } => {
-                    let Some((root, start, results, _, predecessors, _, _)) = stack.last_mut()
-                    else {
+                    let Some((root, start, results, _, predecessors, _)) = stack.last_mut() else {
                         return Err(G0Error::MissingNormalizationResult);
                     };
                     if consumer.program() != root.program() ||
@@ -2133,15 +2116,8 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                 }
                 NormalizerEvent::InvocationEnd { root, .. } => {
-                    let Some((
-                        active_root,
-                        _,
-                        results,
-                        pending_bounds,
-                        _,
-                        pending_merges,
-                        _pending_folds,
-                    )) = stack.pop()
+                    let Some((active_root, _, results, pending_bounds, _, pending_merges)) =
+                        stack.pop()
                     else {
                         return Err(G0Error::MissingNormalizationResult);
                     };
@@ -2196,7 +2172,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                 }
                 NormalizerEvent::AppliedRelation(observation) => {
-                    let Some((root, _, _, _, _, _, _)) = stack.last() else {
+                    let Some((root, _, _, _, _, _)) = stack.last() else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
                     if root.program() != observation.owner.program() ||
@@ -2206,14 +2182,14 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                     let input_valid = match &observation.rule {
                         AppliedRelationRule::Gadget { input, input_result, .. } => {
-                            stack.last().is_some_and(|(_, start, results, _, _, _, _)| {
+                            stack.last().is_some_and(|(_, start, results, _, _, _)| {
                                 input_result.0 >= start.0 && input_result.0 < current.0 &&
                                     results.get(input).copied() == Some(*input_result) &&
                                     matches!(self.events.get(input_result.0 as usize), Some(NormalizerEvent::Result { owner, .. }) if owner.expression() == *input)
                             })
                         }
                         AppliedRelationRule::Universal { key, source, rhs, .. } => {
-                            let Some((active_root, _, _, _, _, _, _)) = stack.last() else {
+                            let Some((active_root, _, _, _, _, _)) = stack.last() else {
                                 return Err(G0Error::RelationTraceInvariant);
                             };
                             let Some(replay) = self.specialization_ranges.get(key) else {
@@ -2254,7 +2230,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     {
                         return Err(G0Error::RelationTraceInvariant);
                     }
-                    if let Some((_, _, _, _, _, pending_merges, _)) = stack.last_mut() {
+                    if let Some((_, _, _, _, _, pending_merges)) = stack.last_mut() {
                         let remove_owner =
                             pending_merges.get_mut(&observation.owner).is_some_and(|merges| {
                                 merges.remove(&observation.source_monomial);
@@ -2266,8 +2242,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                 }
                 NormalizerEvent::BoundTransfer { owner, .. } => {
-                    let Some((root, start, _, pending_bounds, predecessors, _, _)) =
-                        stack.last_mut()
+                    let Some((root, start, _, pending_bounds, predecessors, _)) = stack.last_mut()
                     else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
@@ -2287,8 +2262,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     pending_bounds.insert(*owner);
                 }
                 NormalizerEvent::CoefficientMerge(observation) => {
-                    let Some((root, start, _, _, predecessors, pending_merges, pending_folds)) =
-                        stack.last_mut()
+                    let Some((root, start, _, _, predecessors, pending_merges)) = stack.last_mut()
                     else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
@@ -2407,24 +2381,16 @@ impl FeasibilitySink for FeasibilityTrace {
                             .entry(observation.output)
                             .or_insert_with(|| (BigInt::from(0_u8), pending_left));
                         entry.0 += &observation.signed_contribution;
-                        let remove_folds =
-                            pending_folds.get_mut(&observation.owner).is_some_and(|folds| {
-                                folds.remove(&observation.output);
-                                folds.is_empty()
-                            });
-                        if remove_folds {
-                            pending_folds.remove(&observation.owner);
-                        }
                     }
                 }
                 NormalizerEvent::SurvivorFold(observation) => {
-                    let Some((root, start, _, _, _, _, _)) = stack.last() else {
+                    let Some((root, start, _, _, _, _)) = stack.last() else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
                     if observation.bound.0 < start.0 || observation.bound.0 >= current.0 {
                         return Err(G0Error::RelationTraceInvariant);
                     }
-                    let (owner, monomial, magnitude) =
+                    let (owner, _, magnitude) =
                         self.resolve_survivor_bound_in_frame(observation.bound, *start)?;
                     if owner.program() != root.program() {
                         return Err(G0Error::RelationTraceInvariant);
@@ -2432,12 +2398,8 @@ impl FeasibilitySink for FeasibilityTrace {
                     if *observation.coefficient.magnitude() != magnitude {
                         return Err(G0Error::RelationTraceInvariant);
                     }
-                    let Some((_, _, _, _, _, _, pending_folds)) = stack.last_mut() else {
-                        return Err(G0Error::RelationTraceInvariant);
-                    };
-                    if pending_folds.entry(owner).or_default().insert(monomial) == false {
-                        return Err(G0Error::RelationTraceInvariant);
-                    }
+                    // Association with accumulator removal is deferred to the imminent
+                    // PreFoldPolynomial replay; this event validates only its bound evidence.
                 }
             }
         }

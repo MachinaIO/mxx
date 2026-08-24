@@ -1234,12 +1234,10 @@ impl<'a> ProofPayloadProjector<'a> {
             },
             NormalizerEvent::SurvivorFold(observation) => {
                 self.prior_event(observation.bound, current)?;
-                let (owner, monomial, magnitude) =
-                    trace.resolve_survivor_bound(observation.bound)?;
+                let (_, _, magnitude) = trace.resolve_survivor_bound(observation.bound)?;
                 if *observation.coefficient.magnitude() != magnitude {
                     return Err(G0Error::RelationTraceInvariant);
                 }
-                let _ = (self.owner(owner)?, self.monomial(monomial)?);
                 ProofPayloadEvent::SurvivorFold(ProofPayloadSurvivorFold {
                     coefficient: observation.coefficient.clone(),
                     bound: observation.bound.0,

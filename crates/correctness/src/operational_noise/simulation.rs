@@ -3262,7 +3262,7 @@ mod tests {
             InputContractEntry, InputValueContract, OperationalDecoderTarget, ProtocolInputBinding,
             ProtocolInputDestination, Workflow,
         },
-        operational_noise::facts::{CoefficientBound, NumericContract},
+        operational_noise::facts::{BoundExpression, CoefficientBound, NumericContract},
     };
     use mxx_dsl::{Bool, DslContext, IdealSpec, Int, Ring, SemanticAnchor};
     use mxx_ir_core::{IntExpr, node::ConstantMatrix};
@@ -4698,6 +4698,158 @@ mod tests {
             threshold_payload.encode_canonical().expect("threshold canonical payload")
         );
         assert_ne!(singleton_payload.logical_items(), threshold_payload.logical_items());
+    }
+
+    #[test]
+    fn representative_payload_audits_recursive_encoding_and_logical_items() {
+        let owner = ProofPayloadOwner {
+            scope: ProofPayloadScope::Closed { root_expression_row: 7 },
+            expression_row: 11,
+        };
+        // scope = 1 tag + 1 row = 2; owner = scope 2 + expression row 1 = 3.
+        let monomial = ProofPayloadMonomial {
+            central_factors: vec![owner],
+            ordered_factors: vec![owner, owner],
+        };
+        // central Vec = 1 length + 1 element + owner 3 = 5;
+        // ordered Vec = 1 length + 2 elements + 2 * owner 3 = 9;
+        // monomial = 5 + 9 = 14; term = monomial 14 + coefficient 1 = 15.
+        let term =
+            ProofPayloadTerm { monomial: monomial.clone(), coefficient: BigInt::from(-7_i32) };
+        let exact = ProofPayloadValue::Exact {
+            terms: vec![term.clone()],
+            summary: super::super::normal_form::BoundedSummary::finite(BoundExpression::new(
+                BigUint::from(2_u8),
+            )),
+        };
+        // finite summary = Known tag 1 + (Finite tag 1 + BigUint 1) = 3;
+        // Exact value = enum tag 1 + terms Vec (1 + length 1 + term 15) + summary 3 = 21.
+        let product_facts = super::super::bound::MatrixProductFacts {
+            left_is_constant_polynomial: true,
+            right_is_constant_polynomial: false,
+            right_known_zero_rows: Some(BigUint::from(3_u8)),
+            left_support_upper: Some(2),
+            right_support_upper: None,
+        };
+        // Product refs: Result = 1 tag + event 1 + projection 1 = 3;
+        // Transfer = 1 tag + event 1 = 2; facts = 1 + 1 + 2 + 2 + 1 = 7;
+        // Product rule = enum tag 1 + 3 + 2 + 7 = 13; BoundTransfer = 1 + owner 3 + rule 13 = 17.
+        let product_rule = ProofPayloadRule::Product {
+            left: ProofPayloadValueRef::Result { event: 1, projection: BoundProjection::Summary },
+            right: ProofPayloadValueRef::Transfer(0),
+            facts: product_facts,
+        };
+        let operator_merge = ProofPayloadCoefficientMerge {
+            owner,
+            source: ProofPayloadCoefficientMergeSource::Operator {
+                inputs: [
+                    ProofPayloadTermRef { value_event: 1, term_ordinal: 0 },
+                    ProofPayloadTermRef { value_event: 1, term_ordinal: 0 },
+                ],
+            },
+            output: monomial.clone(),
+            signed_contribution: BigInt::from(-7_i32),
+        };
+        // TermRef = 1 + 1 = 2; Operator source = tag 1 + 2 * 2 = 5;
+        // merge = owner 3 + source 5 + monomial 14 + integer 1 = 23;
+        // CoefficientMerge event = tag 1 + merge 23 = 24.
+        let relation_merge = ProofPayloadCoefficientMerge {
+            owner,
+            source: ProofPayloadCoefficientMergeSource::Relation {
+                application: 2,
+                source_term_ordinal: 0,
+            },
+            output: monomial.clone(),
+            signed_contribution: BigInt::from(5_i32),
+        };
+        // Relation source = tag 1 + application 1 + ordinal 1 = 3;
+        // relation merge = 3 + 3 + 14 + 1 = 21; event = 1 + 21 = 22.
+        let pre_fold = ProofPayloadPreFoldPolynomial {
+            terms: vec![term],
+            summary: super::super::normal_form::BoundedSummary::finite(BoundExpression::new(
+                BigUint::from(2_u8),
+            )),
+            summary_evidence: Some(ProofPayloadValueRef::Result {
+                event: 1,
+                projection: BoundProjection::Coefficient,
+            }),
+        };
+        // PreFold = terms Vec 17 + summary 3 + Some(ref (1 + 1 + 1) = 4) = 24;
+        // event = tag 1 + 24 = 25. SurvivorFold = event tag 1 + (integer 1 + bound 1) = 3.
+        let payload = OperationalProofPayload {
+            events: vec![
+                ProofPayloadEvent::InvocationStart { root: owner }, // 1 + 3 = 4
+                ProofPayloadEvent::Result { owner, value: exact },  // 1 + 3 + 21 = 25
+                ProofPayloadEvent::BoundTransfer { owner, rule: product_rule }, // 17
+                ProofPayloadEvent::CoefficientMerge(operator_merge), // 24
+                ProofPayloadEvent::CoefficientMerge(relation_merge), // 22
+                ProofPayloadEvent::PreFoldPolynomial(pre_fold),     // 25
+                ProofPayloadEvent::SurvivorFold(ProofPayloadSurvivorFold {
+                    coefficient: BigInt::from(-2_i32),
+                    bound: 5,
+                }), // 3
+            ],
+        };
+        // OperationalProofPayload is the events Vec: 1 + length 7 +
+        // (4 + 25 + 17 + 24 + 22 + 25 + 3) = 8 + 120 = 128.
+        assert_eq!(payload.logical_items(), Ok(128));
+        let canonical_payload_bytes = payload.encode_canonical().expect("representative payload");
+
+        // Scalar changes are semantically represented bytes but remain one logical item.
+        let mut scalar_changed = payload.clone();
+        if let ProofPayloadEvent::Result { value: ProofPayloadValue::Exact { terms, .. }, .. } =
+            &mut scalar_changed.events[1]
+        {
+            terms[0].coefficient = BigInt::from(42_i32);
+        } else {
+            panic!("representative result value");
+        }
+        assert_ne!(
+            canonical_payload_bytes,
+            scalar_changed.encode_canonical().expect("scalar-changed payload")
+        );
+        assert_eq!(scalar_changed.logical_items(), Ok(128));
+
+        // Removing one Some option changes the structural count by exactly one.
+        let mut product_changed = payload.clone();
+        if let ProofPayloadEvent::BoundTransfer {
+            rule: ProofPayloadRule::Product { facts, .. },
+            ..
+        } = &mut product_changed.events[2]
+        {
+            facts.right_support_upper = Some(4);
+        } else {
+            panic!("representative product rule");
+        }
+        assert_ne!(
+            canonical_payload_bytes,
+            product_changed.encode_canonical().expect("product-changed payload")
+        );
+        assert_eq!(product_changed.logical_items(), Ok(129));
+
+        let mut evidence_removed = payload.clone();
+        if let ProofPayloadEvent::PreFoldPolynomial(polynomial) = &mut evidence_removed.events[5] {
+            polynomial.summary_evidence = None;
+        } else {
+            panic!("representative PreFold");
+        }
+        assert_ne!(
+            canonical_payload_bytes,
+            evidence_removed.encode_canonical().expect("evidence-removed payload")
+        );
+        assert_eq!(evidence_removed.logical_items(), Ok(125));
+
+        let mut survivor_changed = payload.clone();
+        if let ProofPayloadEvent::SurvivorFold(fold) = &mut survivor_changed.events[6] {
+            fold.bound = 9;
+        } else {
+            panic!("representative SurvivorFold");
+        }
+        assert_ne!(
+            canonical_payload_bytes,
+            survivor_changed.encode_canonical().expect("survivor-changed payload")
+        );
+        assert_eq!(survivor_changed.logical_items(), Ok(128));
     }
 
     #[test]

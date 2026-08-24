@@ -6,8 +6,8 @@
 use super::{
     OperationalSimulationDiagnostics, OperationalSimulationReport,
     arena::{
-        ArenaError, ClosedExprId, ExprId, FamilyDomain, ResolvedMatrixType, ResolvedValueType,
-        ValueOperator,
+        ArenaError, ClosedExprId, ExprId, FamilyDomain, MatrixLayout, ResolvedMatrixType,
+        ResolvedValueType, ValueOperator,
     },
     error::{OperationalSimulationError, TargetError},
     g0::{
@@ -157,8 +157,14 @@ pub(crate) struct OperationalCertificateRun {
 /// A stable owner reference used by the proof-payload boundary.  The numbers are rows in
 /// `CanonicalResidualRefs`; they are never arena slots or raw handles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum ProofPayloadScope {
+    Closed { root_expression_row: u64 },
+    Program { program_row: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct ProofPayloadOwner {
-    pub program_row: u64,
+    pub scope: ProofPayloadScope,
     pub expression_row: u64,
 }
 
@@ -175,10 +181,18 @@ pub(crate) struct ProofPayloadTerm {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProofPayloadPolynomial {
-    pub exact_terms: Vec<ProofPayloadTerm>,
-    pub bounded_summary: Option<super::normal_form::BoundedSummary>,
-    pub coefficient_bound: super::facts::NumericContract<super::facts::CoefficientBound>,
+pub(crate) enum ProofPayloadValue {
+    Exact { terms: Vec<ProofPayloadTerm>, summary: super::normal_form::BoundedSummary },
+    Coefficient { bound: super::facts::NumericContract<super::facts::CoefficientBound> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProofPayloadSpecializationKey {
+    pub preimage_family: u64,
+    pub preimage_source: u64,
+    pub matrix_type: ResolvedMatrixType,
+    pub trapdoor_source: u64,
+    pub index: ProofPayloadOwner,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -192,7 +206,8 @@ pub(crate) enum ProofPayloadRelationRule {
     Universal {
         source: ProofPayloadRange,
         lhs: ProofPayloadMonomial,
-        rhs: ProofPayloadPolynomial,
+        lhs_layout: Option<MatrixLayout>,
+        rhs_result: u64,
     },
     Gadget {
         gadget: ProofPayloadOwner,
@@ -223,8 +238,17 @@ pub(crate) enum ProofPayloadScale {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProofPayloadAuthority {
+    FactStore,
+    ProgramFamilyFact,
+    Operator,
+    RelationPreimageSource { source: u64 },
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProofPayloadRule {
-    Authority(BoundAuthority),
+    Authority(ProofPayloadAuthority),
     Identity {
         input: ProofPayloadValueRef,
     },
@@ -273,20 +297,21 @@ pub(crate) enum ProofPayloadEvent {
     },
     Result {
         owner: ProofPayloadOwner,
-        value: ProofPayloadPolynomial,
+        value: ProofPayloadValue,
     },
     InvocationEnd {
         root: ProofPayloadOwner,
-        result: ProofPayloadPolynomial,
-        counters: super::normal_form::NormalizationCounters,
+        result: ProofPayloadValue,
     },
     SpecializationComputed {
         owner: ProofPayloadOwner,
+        key: ProofPayloadSpecializationKey,
         source: ProofPayloadRange,
-        rhs_results: Vec<(ProofPayloadPolynomial, u64)>,
+        rhs_results: Vec<u64>,
     },
     SpecializationCacheHit {
         owner: ProofPayloadOwner,
+        key: ProofPayloadSpecializationKey,
         source: ProofPayloadRange,
     },
     AppliedRelation {
@@ -490,26 +515,52 @@ pub(crate) fn project_operational_certificate(
 pub(crate) fn derive_proof_payload(
     run: &OperationalCertificateRun,
 ) -> Result<OperationalProofPayload, CertificateProjectionError> {
-    let closure = collect_residual_closure(&run.job, &run.projection.residual)
-        .map_err(|error| CertificateProjectionError::Closure(error))?;
+    let mut closure = run.projection.closure.clone();
+    extend_certificate_closure(&run.job, &mut closure, &run.trace)
+        .map_err(CertificateProjectionError::Closure)?;
     let mut residual = run.trace.clone();
     residual.retain_residual(&closure);
     let refs = super::g0::canonical_residual_refs(&run.job, &closure, &residual)
         .map_err(proof_payload_error)?;
-    let scopes = proof_payload_scopes(&closure, &residual);
-    let projector = ProofPayloadProjector { job: &run.job, refs: &refs, scopes };
+    let mut monomial_arenas = BTreeMap::new();
+    for scope in closure.programs.iter().copied() {
+        if let Some(arena) = run.job.monomials().get(scope) {
+            monomial_arenas.insert(arena.token(), arena);
+        }
+    }
+    for event in &residual.events {
+        let scope = match event {
+            NormalizerEvent::InvocationStart { root } |
+            NormalizerEvent::Result { owner: root, .. } |
+            NormalizerEvent::InvocationEnd { root, .. } |
+            NormalizerEvent::SpecializationComputed { owner: root, .. } |
+            NormalizerEvent::SpecializationCacheHit { owner: root, .. } |
+            NormalizerEvent::BoundTransfer { owner: root, .. } => root.program(),
+            NormalizerEvent::Predecessor { consumer, .. } => consumer.program(),
+            NormalizerEvent::AppliedRelation(observation) => observation.owner.program(),
+        };
+        if let Some(arena) = run.job.monomials().get(scope) {
+            monomial_arenas.insert(arena.token(), arena);
+        }
+    }
+    let projector = ProofPayloadProjector { refs: &refs, monomial_arenas, trace: &residual };
     projector.project(&residual)
 }
 
-fn proof_payload_error(error: G0Error) -> CertificateProjectionError {
-    CertificateProjectionError::ProofPayload { detail: error.to_string() }
-}
-
-fn proof_payload_scopes(
-    closure: &CertificateClosure,
+/// Add trace-owned scopes and relation dependencies to the same residual closure before any
+/// canonical rows are assigned.  This keeps the closure, trace filtering, and canonical refs on
+/// one authority instead of creating a second scope inventory for payload projection.
+fn extend_certificate_closure(
+    job: &super::job::CheckerJob,
+    closure: &mut CertificateClosure,
     trace: &FeasibilityTrace,
-) -> BTreeSet<super::arena::ValueProgramId> {
-    let mut scopes = closure.programs.clone();
+) -> Result<(), CertificateClosureError> {
+    enum Work {
+        Expression(ExprId),
+        Program(ValueProgramId),
+        Family(FamilyValueId),
+    }
+    let mut work = Vec::new();
     for event in &trace.events {
         match event {
             NormalizerEvent::InvocationStart { root } |
@@ -518,32 +569,100 @@ fn proof_payload_scopes(
             NormalizerEvent::SpecializationComputed { owner: root, .. } |
             NormalizerEvent::SpecializationCacheHit { owner: root, .. } |
             NormalizerEvent::BoundTransfer { owner: root, .. } => {
-                scopes.insert(root.program());
+                work.push(Work::Program(root.program()));
+                work.push(Work::Expression(root.expression()));
             }
-            NormalizerEvent::Predecessor { consumer, .. } => {
-                scopes.insert(consumer.program());
+            NormalizerEvent::Predecessor { consumer, predecessor, .. } => {
+                work.push(Work::Program(consumer.program()));
+                work.push(Work::Expression(consumer.expression()));
+                work.push(Work::Expression(*predecessor));
             }
             NormalizerEvent::AppliedRelation(observation) => {
-                scopes.insert(observation.owner.program());
+                work.push(Work::Program(observation.owner.program()));
+                work.push(Work::Expression(observation.owner.expression()));
                 match &observation.rule {
                     AppliedRelationRule::Universal { key, .. } => {
-                        scopes.insert(key.index.program());
+                        work.push(Work::Family(key.dispatch.preimage_family));
+                        work.push(Work::Expression(key.dispatch.preimage_source.expression));
+                        work.push(Work::Expression(key.dispatch.trapdoor_source.expression));
+                        work.push(Work::Expression(key.index.expression()));
+                        work.push(Work::Program(key.index.program()));
                     }
-                    AppliedRelationRule::Gadget { gadget, decomposition, .. } => {
-                        scopes.insert(gadget.program());
-                        scopes.insert(decomposition.program());
+                    AppliedRelationRule::Gadget { gadget, decomposition, input, .. } => {
+                        work.push(Work::Program(gadget.program()));
+                        work.push(Work::Program(decomposition.program()));
+                        work.push(Work::Expression(gadget.expression()));
+                        work.push(Work::Expression(decomposition.expression()));
+                        work.push(Work::Expression(*input));
                     }
                 }
             }
         }
     }
-    scopes
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Expression(expression) => {
+                if !closure.expressions.insert(expression) {
+                    continue;
+                }
+                let node = job.expressions().node(expression)?;
+                if let ValueOperator::Source(source) = &node.operator {
+                    closure.source_ids.insert(source.clone());
+                    if let Some(event) = source.sample_event {
+                        closure.event_ids.insert(event);
+                    }
+                }
+                if let ValueOperator::OpaqueFamilyElement { source } = &node.operator {
+                    closure.family_source_ids.insert(source.clone());
+                }
+                if let ValueOperator::Constant(_) = &node.operator {
+                    closure.constant_expressions.insert(expression);
+                }
+                work.extend(node.inputs.iter().copied().map(Work::Expression));
+                if let ValueOperator::ProgramCall { program } = node.operator {
+                    work.push(Work::Program(program));
+                }
+            }
+            Work::Program(program) => {
+                if !closure.programs.insert(program) {
+                    continue;
+                }
+                let record = job.programs().program(program)?;
+                work.push(Work::Expression(record.root));
+                if let Some(family) = job.programs().family_for_program(program) {
+                    work.push(Work::Family(family));
+                }
+            }
+            Work::Family(family) => {
+                if !closure.families.insert(family) {
+                    continue;
+                }
+                let program = family.program();
+                let family_body = job.programs().family_body(family)?;
+                let program_root = job.programs().program(program)?.root;
+                if family_body != program_root {
+                    return Err(CertificateClosureError::FamilyProgramMismatch {
+                        family,
+                        program,
+                        family_body,
+                        program_root,
+                    });
+                }
+                work.push(Work::Program(program));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn proof_payload_error(error: G0Error) -> CertificateProjectionError {
+    CertificateProjectionError::ProofPayload { detail: error.to_string() }
 }
 
 struct ProofPayloadProjector<'a> {
-    job: &'a super::job::CheckerJob,
     refs: &'a CanonicalResidualRefs,
-    scopes: BTreeSet<super::arena::ValueProgramId>,
+    monomial_arenas: BTreeMap<super::arena::ArenaToken, &'a super::monomial::MonomialArena>,
+    trace: &'a FeasibilityTrace,
 }
 
 impl<'a> ProofPayloadProjector<'a> {
@@ -560,65 +679,61 @@ impl<'a> ProofPayloadProjector<'a> {
     }
 
     fn owner(&self, owner: super::arena::ScopedExprId) -> Result<ProofPayloadOwner, G0Error> {
-        Ok(ProofPayloadOwner {
-            // Closed roots do not have a separate program row in the residual DAG.  In that
-            // case the canonical expression row is the owner-local scope row.
-            program_row: self
-                .refs
-                .program(owner.program())
-                .or_else(|_| self.refs.expression(owner.expression()))?,
-            expression_row: self.refs.expression(owner.expression())?,
-        })
+        let expression_row = self.refs.expression(owner.expression())?;
+        let scope = match self.refs.program(owner.program()) {
+            Ok(program_row) => ProofPayloadScope::Program { program_row },
+            Err(_) => ProofPayloadScope::Closed { root_expression_row: expression_row },
+        };
+        Ok(ProofPayloadOwner { scope, expression_row })
     }
 
     fn expression(&self, expression: super::arena::ExprId) -> Result<u64, G0Error> {
         self.refs.expression(expression)
     }
 
+    fn authority(&self, authority: &BoundAuthority) -> Result<ProofPayloadAuthority, G0Error> {
+        Ok(match authority {
+            BoundAuthority::FactStore => ProofPayloadAuthority::FactStore,
+            BoundAuthority::ProgramFamilyFact => ProofPayloadAuthority::ProgramFamilyFact,
+            BoundAuthority::Operator => ProofPayloadAuthority::Operator,
+            BoundAuthority::Unavailable => ProofPayloadAuthority::Unavailable,
+            BoundAuthority::RelationPreimageSource { source } => {
+                ProofPayloadAuthority::RelationPreimageSource { source: self.expression(*source)? }
+            }
+        })
+    }
+
     fn monomial(
         &self,
         monomial: super::monomial::MonomialId,
     ) -> Result<ProofPayloadMonomial, G0Error> {
-        for scope in &self.scopes {
-            let Some(arena) = self.job.monomials().get(*scope) else { continue };
-            let Ok(descriptor) = arena.descriptor(monomial) else { continue };
-            return Ok(ProofPayloadMonomial {
-                central_factors: descriptor
-                    .central_factors
-                    .iter()
-                    .copied()
-                    .map(|factor| self.owner(factor))
-                    .collect::<Result<Vec<_>, _>>()?,
-                ordered_factors: descriptor
-                    .ordered_factors
-                    .iter()
-                    .copied()
-                    .map(|factor| self.owner(factor))
-                    .collect::<Result<Vec<_>, _>>()?,
-            });
-        }
-        Err(G0Error::UnsupportedBoundTransfer)
+        let arena =
+            self.monomial_arenas.get(&monomial.arena()).ok_or(G0Error::UnsupportedBoundTransfer)?;
+        let descriptor =
+            arena.descriptor(monomial).map_err(|_| G0Error::UnsupportedBoundTransfer)?;
+        let mut central_factors = descriptor
+            .central_factors
+            .iter()
+            .copied()
+            .map(|factor| self.owner(factor))
+            .collect::<Result<Vec<_>, _>>()?;
+        central_factors.sort();
+        Ok(ProofPayloadMonomial {
+            central_factors,
+            ordered_factors: descriptor
+                .ordered_factors
+                .iter()
+                .copied()
+                .map(|factor| self.owner(factor))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
     }
 
-    fn polynomial(
-        &self,
-        value: &super::g0::RecordedValue,
-    ) -> Result<ProofPayloadPolynomial, G0Error> {
+    fn value(&self, value: &super::g0::RecordedValue) -> Result<ProofPayloadValue, G0Error> {
         let Some(normal_form) = &value.exact_nf else {
-            return Ok(ProofPayloadPolynomial {
-                exact_terms: Vec::new(),
-                bounded_summary: None,
-                coefficient_bound: value.coefficient_bound.clone(),
-            });
+            return Ok(ProofPayloadValue::Coefficient { bound: value.coefficient_bound.clone() });
         };
-        self.polynomial_nf(normal_form)
-    }
-
-    fn polynomial_nf(
-        &self,
-        normal_form: &super::normal_form::PolynomialNF,
-    ) -> Result<ProofPayloadPolynomial, G0Error> {
-        let mut exact_terms = normal_form
+        let mut terms = normal_form
             .exact_terms
             .iter()
             .map(|(monomial, coefficient)| {
@@ -628,21 +743,8 @@ impl<'a> ProofPayloadProjector<'a> {
                 })
             })
             .collect::<Result<Vec<_>, G0Error>>()?;
-        exact_terms.sort_by(|left, right| left.monomial.cmp(&right.monomial));
-        Ok(ProofPayloadPolynomial {
-            exact_terms,
-            bounded_summary: Some(normal_form.bounded_summary.clone()),
-            coefficient_bound: normal_form.bounded_summary.coefficient_bound(),
-        })
-    }
-
-    fn cached_polynomial(
-        &self,
-        rhs: super::relation::CanonicalRhsId,
-    ) -> Result<ProofPayloadPolynomial, G0Error> {
-        let value =
-            self.job.normalization().get_arc(rhs).map_err(|_| G0Error::RelationTraceInvariant)?;
-        self.polynomial_nf(value.as_ref())
+        terms.sort_by(|left, right| left.monomial.cmp(&right.monomial));
+        Ok(ProofPayloadValue::Exact { terms, summary: normal_form.bounded_summary.clone() })
     }
 
     fn range(
@@ -693,7 +795,9 @@ impl<'a> ProofPayloadProjector<'a> {
     fn rule(&self, rule: &BoundRule, current: usize) -> Result<ProofPayloadRule, G0Error> {
         let value = |value: &BoundValueRef| self.value_ref(value, current);
         Ok(match rule {
-            BoundRule::Authority(authority) => ProofPayloadRule::Authority(authority.clone()),
+            BoundRule::Authority(authority) => {
+                ProofPayloadRule::Authority(self.authority(authority)?)
+            }
             BoundRule::Identity { input } => ProofPayloadRule::Identity { input: value(input)? },
             BoundRule::Sum { inputs } => ProofPayloadRule::Sum {
                 inputs: inputs.iter().map(value).collect::<Result<Vec<_>, _>>()?,
@@ -757,11 +861,13 @@ impl<'a> ProofPayloadProjector<'a> {
         current: usize,
     ) -> Result<ProofPayloadRelationRule, G0Error> {
         Ok(match rule {
-            AppliedRelationRule::Universal { source, lhs, rhs, .. } => {
+            AppliedRelationRule::Universal { key, source, lhs, rhs } => {
+                let rhs_result = self.rhs_event(key, *rhs, current)?;
                 ProofPayloadRelationRule::Universal {
                     source: self.range(*source, current)?,
                     lhs: self.monomial(lhs.monomial)?,
-                    rhs: self.cached_polynomial(*rhs)?,
+                    lhs_layout: lhs.layout.clone(),
+                    rhs_result,
                 }
             }
             AppliedRelationRule::Gadget { gadget, decomposition, input, input_result } => {
@@ -774,6 +880,40 @@ impl<'a> ProofPayloadProjector<'a> {
                 }
             }
         })
+    }
+
+    fn specialization_key(
+        &self,
+        key: &super::relation::RuntimeSpecializationKey,
+    ) -> Result<ProofPayloadSpecializationKey, G0Error> {
+        Ok(ProofPayloadSpecializationKey {
+            preimage_family: self.refs.family(key.dispatch.preimage_family)?,
+            preimage_source: self.refs.expression(key.dispatch.preimage_source.expression)?,
+            matrix_type: key.dispatch.matrix_type.clone(),
+            trapdoor_source: self.refs.expression(key.dispatch.trapdoor_source.expression)?,
+            index: self.owner(key.index)?,
+        })
+    }
+
+    fn rhs_event(
+        &self,
+        key: &super::relation::RuntimeSpecializationKey,
+        rhs: super::relation::CanonicalRhsId,
+        current: usize,
+    ) -> Result<u64, G0Error> {
+        for event in self.trace.events[..current].iter().rev() {
+            if let NormalizerEvent::SpecializationComputed { key: candidate, replay, .. } = event {
+                if candidate == key {
+                    if let Some((_, result)) =
+                        replay.rhs_results.iter().find(|(candidate, _)| *candidate == rhs)
+                    {
+                        self.prior_event(*result, current)?;
+                        return Ok(result.0);
+                    }
+                }
+            }
+        }
+        Err(G0Error::RelationTraceInvariant)
     }
 
     fn event(&self, current: usize, event: &NormalizerEvent) -> Result<ProofPayloadEvent, G0Error> {
@@ -795,34 +935,34 @@ impl<'a> ProofPayloadProjector<'a> {
                     source_result: source_result.0,
                 }
             }
-            NormalizerEvent::Result { owner, value } => ProofPayloadEvent::Result {
-                owner: self.owner(*owner)?,
-                value: self.polynomial(value)?,
-            },
-            NormalizerEvent::InvocationEnd { root, result, counters } => {
+            NormalizerEvent::Result { owner, value } => {
+                ProofPayloadEvent::Result { owner: self.owner(*owner)?, value: self.value(value)? }
+            }
+            NormalizerEvent::InvocationEnd { root, result, .. } => {
                 ProofPayloadEvent::InvocationEnd {
                     root: self.owner(*root)?,
-                    result: self.polynomial(result)?,
-                    counters: counters.clone(),
+                    result: self.value(result)?,
                 }
             }
-            NormalizerEvent::SpecializationComputed { owner, replay, .. } => {
+            NormalizerEvent::SpecializationComputed { owner, key, replay } => {
                 ProofPayloadEvent::SpecializationComputed {
                     owner: self.owner(*owner)?,
+                    key: self.specialization_key(key)?,
                     source: self.range(replay.range, current)?,
                     rhs_results: replay
                         .rhs_results
                         .iter()
-                        .map(|(rhs, result)| {
+                        .map(|(_, result)| {
                             self.prior_event(*result, current)?;
-                            Ok((self.cached_polynomial(*rhs)?, result.0))
+                            Ok(result.0)
                         })
                         .collect::<Result<Vec<_>, G0Error>>()?,
                 }
             }
-            NormalizerEvent::SpecializationCacheHit { owner, source, .. } => {
+            NormalizerEvent::SpecializationCacheHit { owner, key, source } => {
                 ProofPayloadEvent::SpecializationCacheHit {
                     owner: self.owner(*owner)?,
+                    key: self.specialization_key(key)?,
                     source: self.range(*source, current)?,
                 }
             }

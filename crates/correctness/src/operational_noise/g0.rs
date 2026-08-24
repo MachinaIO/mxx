@@ -963,6 +963,14 @@ impl G0LutEvidence {
     pub(crate) fn l_bytes(&self) -> Result<usize, G0Error> {
         self.canonical_encoded_byte_size()
     }
+
+    pub(crate) fn retained_logical_items(&self) -> Result<u64, G0Error> {
+        checked_add(
+            self.logical_items().map_err(|_| G0Error::TraceOverflow)?,
+            self.l_rows.logical_items().map_err(|_| G0Error::TraceOverflow)?,
+        )
+        .map_err(|_| G0Error::TraceOverflow)
+    }
 }
 
 fn logical_range(range: &(u64, u64)) -> Result<u64, CanonicalPayloadError> {
@@ -4391,6 +4399,193 @@ pub(crate) struct CanonicalEventRow {
     pub kind: CanonicalEventKind,
 }
 
+impl LogicalItems for serde_json::Value {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Null => Ok(1),
+            Self::Bool(value) => checked_add(1, value.logical_items()?),
+            Self::Number(_) => Ok(2),
+            Self::String(value) => checked_add(1, value.logical_items()?),
+            Self::Array(values) => checked_add(1, logical_vec(values)?),
+            Self::Object(fields) => checked_add(
+                1,
+                checked_add(
+                    checked_add(
+                        1,
+                        u64::try_from(fields.len())
+                            .map_err(|_| CanonicalPayloadError::LengthOverflow)?,
+                    )?,
+                    fields.iter().try_fold(0_u64, |total, (key, value)| {
+                        checked_add(
+                            total,
+                            checked_sum([key.logical_items(), value.logical_items()])?,
+                        )
+                    })?,
+                )?,
+            ),
+        }
+    }
+}
+
+impl LogicalItems for StableEventRef {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        self.row.logical_items()
+    }
+}
+
+impl LogicalItems for StableMatrixConstantKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_add(
+            1,
+            match self {
+                Self::Zero | Self::Identity => 0,
+                Self::UnitRow { index } |
+                Self::UnitColumn { index } |
+                Self::Rotation { exponent: index } => index.logical_items()?,
+                Self::Gadget { base, small } => {
+                    checked_sum([base.logical_items(), small.logical_items()])?
+                }
+                Self::PowerOfBase { base, exponent } => {
+                    checked_sum([base.logical_items(), exponent.logical_items()])?
+                }
+                Self::Polynomial { coefficients } => logical_vec(coefficients)?,
+            },
+        )
+    }
+}
+
+impl LogicalItems for StableArtifact {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.definition.logical_items(),
+            self.version.logical_items(),
+            self.confidentiality.logical_items(),
+            self.value_type.logical_items(),
+            self.layout.logical_items(),
+            logical_optional_range(&self.domain),
+        ])
+    }
+}
+
+impl LogicalItems for StableSourceIdentity {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.definition.logical_items(),
+            self.sample_event.logical_items(),
+            self.output_role.logical_items(),
+            self.artifact.logical_items(),
+            self.value_type.logical_items(),
+            logical_vec(&self.coordinates),
+            self.matrix_constant.logical_items(),
+        ])
+    }
+}
+
+impl LogicalItems for StableFamilySourceIdentity {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.definition.logical_items(),
+            self.invocation.logical_items(),
+            self.element_type.logical_items(),
+            logical_range(&self.domain),
+            self.artifact.logical_items(),
+        ])
+    }
+}
+
+impl LogicalItems for StableSampleDescriptor {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.definition.logical_items(),
+            logical_vec(&self.parameters),
+            self.output_type.logical_items(),
+            self.gadget_base.logical_items(),
+            self.digit_count.logical_items(),
+            self.decomposition.logical_items(),
+        ])
+    }
+}
+
+impl LogicalItems for StableHashVariant {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for StableSamplerOperation {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_add(
+            1,
+            match self {
+                Self::UniformResidue { output } => output.logical_items()?,
+                Self::UniformInterval { output, minimum, maximum } => checked_sum([
+                    output.logical_items(),
+                    minimum.logical_items(),
+                    maximum.logical_items(),
+                ])?,
+                Self::Gaussian { output, sigma, max_coefficient_bound } => checked_sum([
+                    output.logical_items(),
+                    sigma.logical_items(),
+                    max_coefficient_bound.logical_items(),
+                ])?,
+                Self::Hash {
+                    output,
+                    variant,
+                    tag_prefix,
+                    tag_expressions,
+                    tag_decimal_expressions,
+                    tag_u64_le_expressions,
+                    base,
+                    digit_count,
+                } => checked_sum([
+                    output.logical_items(),
+                    variant.logical_items(),
+                    logical_vec(tag_prefix),
+                    logical_vec(tag_expressions),
+                    logical_vec(tag_decimal_expressions),
+                    logical_vec(tag_u64_le_expressions),
+                    base.logical_items(),
+                    digit_count.logical_items(),
+                ])?,
+                Self::Trapdoor {
+                    output,
+                    sigma,
+                    gadget_base,
+                    digit_count,
+                    preimage_max_coefficient_bound,
+                } => checked_sum([
+                    output.logical_items(),
+                    sigma.logical_items(),
+                    gadget_base.logical_items(),
+                    digit_count.logical_items(),
+                    preimage_max_coefficient_bound.logical_items(),
+                ])?,
+                Self::Preimage { output, max_coefficient_bound } => {
+                    checked_sum([output.logical_items(), max_coefficient_bound.logical_items()])?
+                }
+            },
+        )
+    }
+}
+
+impl LogicalItems for CanonicalEventKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_add(
+            1,
+            match self {
+                Self::Sample { descriptor } => descriptor.logical_items()?,
+                Self::Sampler { operation } => operation.logical_items()?,
+            },
+        )
+    }
+}
+
+impl LogicalItems for CanonicalEventRow {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([self.owner.logical_items(), self.kind.logical_items()])
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalEventRows {
     rows: Vec<CanonicalEventRow>,
@@ -4406,90 +4601,8 @@ fn logical_uniform_sequence(len: usize, item: u64) -> Result<u64, G0Error> {
     logical_add(1, logical_multiply(len, logical_add(1, item)?)?)
 }
 
-fn logical_stable_value_type(value: &StableValueType) -> Result<u64, G0Error> {
-    Ok(match value {
-        StableValueType::Matrix { .. } => 5,
-        StableValueType::Bool |
-        StableValueType::Int |
-        StableValueType::Real |
-        StableValueType::Bytes |
-        StableValueType::Trapdoor => 1,
-    })
-}
-
-fn logical_stable_scope(scope: &StableScope) -> Result<u64, G0Error> {
-    match scope {
-        StableScope::Root => Ok(1),
-        StableScope::Subgraph { .. } => Ok(2),
-        StableScope::ParallelBody { parent, .. } | StableScope::SequentialBody { parent, .. } => {
-            logical_add(1, logical_add(logical_stable_scope(parent)?, 1)?)
-        }
-    }
-}
-
-fn logical_stable_owner(owner: &StableObservedWire) -> Result<u64, G0Error> {
-    logical_sum([1, logical_stable_scope(&owner.definition)?, 1, 1, 1])
-}
-
-fn logical_stable_sample(descriptor: &StableSampleDescriptor) -> Result<u64, G0Error> {
-    logical_sum([
-        1,
-        logical_uniform_sequence(descriptor.parameters.len(), 1)?,
-        logical_stable_value_type(&descriptor.output_type)?,
-        logical_option(descriptor.gadget_base.as_ref().map(|_| 1))?,
-        logical_option(descriptor.digit_count.map(|_| 1))?,
-        logical_option(descriptor.decomposition.as_ref().map(|_| 1))?,
-    ])
-}
-
-fn logical_stable_sampler(operation: &StableSamplerOperation) -> Result<u64, G0Error> {
-    let fields = match operation {
-        StableSamplerOperation::UniformResidue { output } => logical_stable_value_type(output)?,
-        StableSamplerOperation::UniformInterval { output, .. } |
-        StableSamplerOperation::Gaussian { output, .. } => {
-            logical_add(logical_stable_value_type(output)?, 2)?
-        }
-        StableSamplerOperation::Hash {
-            output,
-            tag_prefix,
-            tag_expressions,
-            tag_decimal_expressions,
-            tag_u64_le_expressions,
-            base,
-            digit_count,
-            ..
-        } => logical_sum([
-            logical_stable_value_type(output)?,
-            1,
-            logical_uniform_sequence(tag_prefix.len(), 1)?,
-            logical_uniform_sequence(tag_expressions.len(), 1)?,
-            logical_uniform_sequence(tag_decimal_expressions.len(), 1)?,
-            logical_uniform_sequence(tag_u64_le_expressions.len(), 1)?,
-            logical_option(base.map(|_| 1))?,
-            logical_option(digit_count.map(|_| 1))?,
-        ])?,
-        StableSamplerOperation::Trapdoor { output, .. } => {
-            logical_add(logical_stable_value_type(output)?, 4)?
-        }
-        StableSamplerOperation::Preimage { output, .. } => {
-            logical_add(logical_stable_value_type(output)?, 1)?
-        }
-    };
-    logical_add(1, fields)
-}
-
-fn logical_canonical_event_kind(kind: &CanonicalEventKind) -> Result<u64, G0Error> {
-    logical_add(
-        1,
-        match kind {
-            CanonicalEventKind::Sample { descriptor } => logical_stable_sample(descriptor)?,
-            CanonicalEventKind::Sampler { operation } => logical_stable_sampler(operation)?,
-        },
-    )
-}
-
 fn logical_canonical_event_row(row: &CanonicalEventRow) -> Result<u64, G0Error> {
-    logical_add(logical_stable_owner(&row.owner)?, logical_canonical_event_kind(&row.kind)?)
+    row.logical_items().map_err(|_| G0Error::TraceOverflow)
 }
 
 fn logical_canonical_residual_row(row: &CanonicalResidualRow) -> Result<u64, G0Error> {
@@ -4995,6 +5108,16 @@ impl StableG0Inventory {
     /// Return the byte size of this inventory's canonical compact encoding.
     pub(crate) fn canonical_encoded_byte_size(&self) -> Result<usize, G0Error> {
         self.canonical_encoded_size()
+    }
+
+    pub(crate) fn retained_logical_items(&self) -> Result<u64, G0Error> {
+        checked_sum([
+            logical_vec(&self.operators),
+            logical_vec(&self.sources),
+            logical_vec(&self.family_sources),
+            logical_vec(&self.events),
+        ])
+        .map_err(|_| G0Error::TraceOverflow)
     }
 }
 
@@ -7742,6 +7865,100 @@ mod tests {
     }
 
     #[test]
+    fn inventory_retention_matches_an_independent_mixed_oracle() {
+        fn oracle_vec(items: impl IntoIterator<Item = u64>) -> u64 {
+            let items = items.into_iter().collect::<Vec<_>>();
+            1 + items.len() as u64 + items.into_iter().sum::<u64>()
+        }
+
+        fn oracle_json(value: &serde_json::Value) -> u64 {
+            match value {
+                serde_json::Value::Null => 1,
+                serde_json::Value::Bool(_) |
+                serde_json::Value::Number(_) |
+                serde_json::Value::String(_) => 2,
+                serde_json::Value::Array(values) => 1 + oracle_vec(values.iter().map(oracle_json)),
+                serde_json::Value::Object(fields) => {
+                    1 + oracle_vec(fields.values().map(|value| 1 + oracle_json(value)))
+                }
+            }
+        }
+
+        let matrix_type = StableValueType::Matrix {
+            modulus: "17".to_owned(),
+            ring_dimension: 4,
+            rows: 1,
+            columns: 2,
+        };
+        let artifact = StableArtifact {
+            definition: "artifact".to_owned(),
+            version: 1,
+            confidentiality: 0,
+            value_type: matrix_type.clone(),
+            layout: "row-major".to_owned(),
+            domain: Some((0, 2)),
+        };
+        let operator = serde_json::to_value(StableOperator::Scalar {
+            operation: StableScalarOperation::Hash {
+                tag: "inventory".to_owned(),
+                dynamic_tags: vec![2, 3],
+            },
+        })
+        .unwrap();
+        let owner = StableObservedWire {
+            stage: "stage".to_owned(),
+            definition: StableScope::Root,
+            path: 0,
+            node: 1,
+            port: 0,
+        };
+        let inventory = StableG0Inventory {
+            operators: vec![operator],
+            sources: vec![StableSourceIdentity {
+                definition: "source".to_owned(),
+                sample_event: Some(StableEventRef { row: 0 }),
+                output_role: "value".to_owned(),
+                artifact: Some(artifact),
+                value_type: matrix_type.clone(),
+                coordinates: vec![0, 1],
+                matrix_constant: Some(StableMatrixConstantKind::Polynomial {
+                    coefficients: vec!["-1".to_owned(), "2".to_owned()],
+                }),
+            }],
+            family_sources: vec![StableFamilySourceIdentity {
+                definition: "family".to_owned(),
+                invocation: "call".to_owned(),
+                element_type: StableValueType::Int,
+                domain: (0, 2),
+                artifact: None,
+            }],
+            events: vec![CanonicalEventRow {
+                owner,
+                kind: CanonicalEventKind::Sampler {
+                    operation: StableSamplerOperation::Hash {
+                        output: matrix_type,
+                        variant: StableHashVariant::Decomposed,
+                        tag_prefix: vec![1, 2],
+                        tag_expressions: vec![3],
+                        tag_decimal_expressions: Vec::new(),
+                        tag_u64_le_expressions: vec![4],
+                        base: Some(2),
+                        digit_count: Some(3),
+                    },
+                },
+            }],
+        };
+
+        // The typed rows are calculated independently from the published recursion:
+        // source=34, family=6, event=29; each surrounding Vec contributes 1+len.
+        let expected = oracle_vec(inventory.operators.iter().map(oracle_json)) +
+            oracle_vec([34]) +
+            oracle_vec([6]) +
+            oracle_vec([29]);
+        assert_eq!(inventory.retained_logical_items().unwrap(), expected);
+    }
+
+    #[test]
     fn observed_source_encoding_uses_typed_owner_not_legacy_invocation() {
         use crate::protocol::StageId;
         use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};
@@ -8554,6 +8771,11 @@ mod tests {
         assert_eq!(evidence.index_uses[0].rows.len(), 1);
         assert_eq!(evidence.index_uses[0].rows[0].tuple, Vec::<String>::new());
         assert_eq!(evidence.index_uses[0].rows[0].output, "7");
+        let retained = enumerate_lut_evidence(&arena, [&plan]).unwrap();
+        assert_eq!(
+            retained.retained_logical_items().unwrap(),
+            retained.logical_items().unwrap() + 1
+        );
         let first = evidence.encode_canonical().unwrap();
         assert_eq!(first, evidence.encode_canonical().unwrap());
         assert_eq!(evidence.canonical_encoded_byte_size().unwrap(), first.len());
@@ -8587,6 +8809,11 @@ mod tests {
                 (vec!["3".to_owned(), "10".to_owned()], "13".to_owned()),
                 (vec!["3".to_owned(), "11".to_owned()], "14".to_owned()),
             ]
+        );
+        let retained = enumerate_lut_evidence(&arena, [&plan]).unwrap();
+        assert_eq!(
+            retained.retained_logical_items().unwrap(),
+            retained.logical_items().unwrap() + 1
         );
 
         let zero_argument = arena.intern_argument(2, ResolvedValueType::Int).unwrap();
@@ -8655,6 +8882,10 @@ mod tests {
         assert_eq!(evidence.slice_groups[0].rows[0].row_end_exclusive, "1");
         assert_eq!(evidence.l_rows, BigUint::from(2_u8));
         assert_eq!(evidence.logical_items().unwrap(), oracle_lut_document(&evidence));
+        assert_eq!(
+            evidence.retained_logical_items().unwrap(),
+            evidence.logical_items().unwrap() + 1
+        );
         let bytes = evidence.encode_canonical().unwrap();
         assert_eq!(bytes, evidence.encode_canonical().unwrap());
         assert_eq!(evidence.l_bytes().unwrap(), bytes.len());
@@ -8810,6 +9041,10 @@ mod tests {
         assert_eq!(rows[1].row_start, "0");
         assert_eq!(rows[1].column_start, "1");
         assert_eq!(evidence.l_rows, BigUint::from(4_u8));
+        assert_eq!(
+            evidence.retained_logical_items().unwrap(),
+            evidence.logical_items().unwrap() + 1
+        );
     }
 
     #[test]

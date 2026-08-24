@@ -148,7 +148,7 @@ pub struct BaseNBreakdown {
 }
 
 const G0_CPU_EVIDENCE_SCHEMA_ID: &str = "mxx.operational-noise.g0-cpu-evidence";
-const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 4;
+const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 enum G0CpuEvidenceStatus {
@@ -166,11 +166,14 @@ struct G0CpuLutObservation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct G0CpuMetrics {
     descriptor_inventory_canonical_encoded_bytes: u64,
+    inventory_retained_logical_items: u64,
     proof_payload_logical_items: u64,
     proof_payload_canonical_encoded_bytes: u64,
     lut_canonical_encoded_bytes: u64,
+    lut_retained_logical_items: u64,
     recorder_peak_retained_logical_items: u64,
     proof_projection_peak_retained_logical_items: u64,
+    generator_peak_retained_logical_items: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -826,6 +829,12 @@ pub(crate) fn logical_vec<T: LogicalItems>(items: &[T]) -> Result<u64, Canonical
 }
 
 impl LogicalItems for bool {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for u8 {
     fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
         Ok(1)
     }
@@ -4081,6 +4090,15 @@ fn g0_cpu_lut_observation(lut: &super::g0::G0LutEvidence) -> Result<G0CpuLutObse
     })
 }
 
+fn aggregate_generator_peak_retained_logical_items<I>(
+    phases: I,
+) -> Result<u64, CanonicalPayloadError>
+where
+    I: IntoIterator<Item = Result<u64, CanonicalPayloadError>>,
+{
+    phases.into_iter().try_fold(0_u64, |peak, phase| Ok(peak.max(phase?)))
+}
+
 /// Produce deterministic CPU-observation evidence bytes without emitting a file or claiming a
 /// G0 hard gate, Tall execution, or GPU evidence.
 pub fn prepare_g0_cpu_evidence_bytes(
@@ -4106,6 +4124,8 @@ pub fn prepare_g0_cpu_evidence_bytes(
     if checked_cardinality(inventory.events.len(), "canonical event row")? != n.event_rows {
         return Err("G0 CPU evidence event-row authority mismatch".to_owned());
     }
+    let inventory_retained_logical_items =
+        inventory.retained_logical_items().map_err(|error| error.to_string())?;
     let descriptor_inventory_canonical_encoded_bytes = checked_cardinality(
         inventory.encode_canonical().map_err(|error| error.to_string())?.len(),
         "descriptor inventory byte",
@@ -4115,6 +4135,8 @@ pub fn prepare_g0_cpu_evidence_bytes(
     let lut = super::g0::derive_lut_evidence(&run.job, closure, &run.trace)
         .map_err(|error| error.to_string())?;
     let lut_observation = g0_cpu_lut_observation(&lut)?;
+    let lut_retained_logical_items =
+        lut.retained_logical_items().map_err(|error| error.to_string())?;
     let lut_canonical_encoded_bytes = checked_cardinality(
         lut.encode_canonical().map_err(|error| error.to_string())?.len(),
         "LUT byte",
@@ -4123,7 +4145,7 @@ pub fn prepare_g0_cpu_evidence_bytes(
 
     let ProofPayloadProjection {
         payload,
-        generator_peak_retained_logical_items,
+        generator_peak_retained_logical_items: proof_projection_peak_retained_logical_items,
         observed_coverage,
     } = derive_proof_payload_projection(&run).map_err(|error| error.to_string())?;
     let residual_coverage_matrix =
@@ -4139,6 +4161,12 @@ pub fn prepare_g0_cpu_evidence_bytes(
         "proof payload byte",
     )?;
     let retention = run.trace.recorder_retention();
+    let generator_peak_retained_logical_items = aggregate_generator_peak_retained_logical_items([
+        Ok(inventory_retained_logical_items),
+        Ok(lut_retained_logical_items),
+        Ok(proof_projection_peak_retained_logical_items),
+    ])
+    .map_err(|_| "G0 CPU evidence generator retention overflow".to_owned())?;
 
     let base_source_rows = n
         .source_rows
@@ -4164,11 +4192,14 @@ pub fn prepare_g0_cpu_evidence_bytes(
         lut: lut_observation,
         metrics: G0CpuMetrics {
             descriptor_inventory_canonical_encoded_bytes,
+            inventory_retained_logical_items,
             proof_payload_logical_items,
             proof_payload_canonical_encoded_bytes,
             lut_canonical_encoded_bytes,
+            lut_retained_logical_items,
             recorder_peak_retained_logical_items: retention.peak_logical_items,
-            proof_projection_peak_retained_logical_items: generator_peak_retained_logical_items,
+            proof_projection_peak_retained_logical_items,
+            generator_peak_retained_logical_items,
         },
     };
     serde_json::to_vec(&evidence).map_err(|error| error.to_string())
@@ -7649,6 +7680,19 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_generator_retention_is_each_phase_max_and_propagates_overflow() {
+        assert_eq!(aggregate_generator_peak_retained_logical_items([Ok(7), Ok(11), Ok(5)]), Ok(11));
+        assert_eq!(
+            aggregate_generator_peak_retained_logical_items([
+                Ok(7),
+                Err(CanonicalPayloadError::LengthOverflow),
+                Ok(11),
+            ]),
+            Err(CanonicalPayloadError::LengthOverflow)
+        );
+    }
+
+    #[test]
     fn g0_cpu_evidence_is_deterministic_exact_and_explicitly_pre_gate() {
         fn object_keys(value: &serde_json::Value) -> BTreeSet<&str> {
             value.as_object().expect("JSON object").keys().map(String::as_str).collect()
@@ -7697,7 +7741,7 @@ mod tests {
         );
         assert_eq!(document["schema_id"], G0_CPU_EVIDENCE_SCHEMA_ID);
         assert_eq!(document["schema_version"], G0_CPU_EVIDENCE_SCHEMA_VERSION);
-        assert_eq!(document["schema_version"], 4);
+        assert_eq!(document["schema_version"], 5);
         assert_eq!(document["status"], "CpuObservationOnlyNotG0HardGateOrTallEvidence");
         let base = &document["base_feasibility"];
         assert_eq!(
@@ -7798,11 +7842,14 @@ mod tests {
             object_keys(&document["metrics"]),
             [
                 "descriptor_inventory_canonical_encoded_bytes",
+                "inventory_retained_logical_items",
                 "proof_payload_logical_items",
                 "proof_payload_canonical_encoded_bytes",
                 "lut_canonical_encoded_bytes",
+                "lut_retained_logical_items",
                 "recorder_peak_retained_logical_items",
                 "proof_projection_peak_retained_logical_items",
+                "generator_peak_retained_logical_items",
             ]
             .into_iter()
             .collect()
@@ -7826,9 +7873,11 @@ mod tests {
         assert_eq!(inventory.family_sources.len() as u64, n.family_source_rows);
         assert_eq!(inventory.events.len() as u64, n.event_rows);
         let inventory_bytes = inventory.encode_canonical().unwrap().len() as u64;
+        let inventory_retained = inventory.retained_logical_items().unwrap();
         let lut = super::super::g0::derive_lut_evidence(&run.job, closure, &run.trace)
             .expect("comparison LUT");
         let lut_bytes = lut.encode_canonical().unwrap().len() as u64;
+        let lut_retained = lut.retained_logical_items().unwrap();
         let frontier_sum = document["lut"]["index_use_frontier_products"]
             .as_array()
             .unwrap()
@@ -7845,13 +7894,21 @@ mod tests {
         let retention = run.trace.recorder_retention();
         let metrics = &document["metrics"];
         assert_eq!(metrics["descriptor_inventory_canonical_encoded_bytes"], inventory_bytes);
+        assert_eq!(metrics["inventory_retained_logical_items"], inventory_retained);
         assert_eq!(metrics["proof_payload_logical_items"], payload_t);
         assert_eq!(metrics["proof_payload_canonical_encoded_bytes"], payload_bytes);
         assert_eq!(metrics["lut_canonical_encoded_bytes"], lut_bytes);
+        assert_eq!(metrics["lut_retained_logical_items"], lut_retained);
         assert_eq!(metrics["recorder_peak_retained_logical_items"], retention.peak_logical_items);
         assert_eq!(
             metrics["proof_projection_peak_retained_logical_items"],
             projection.generator_peak_retained_logical_items
+        );
+        assert_eq!(
+            metrics["generator_peak_retained_logical_items"],
+            inventory_retained
+                .max(lut_retained)
+                .max(projection.generator_peak_retained_logical_items)
         );
         let expected_matrix =
             derive_residual_coverage_matrix(&projection.observed_coverage).unwrap();

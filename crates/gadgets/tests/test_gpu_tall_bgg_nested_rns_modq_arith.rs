@@ -97,7 +97,7 @@ const TALL_DECODER_RESULT_ANCHOR: &str = "tall.decoder.result";
 const TALL_G0_REVIEW_SCHEMA_ID: &str = "mxx.operational-noise.tall-g0-review-evidence";
 const TALL_G0_REVIEW_SCHEMA_VERSION: u32 = 1;
 const G0_CPU_OBSERVATION_SCHEMA_ID: &str = "mxx.operational-noise.g0-cpu-evidence";
-const G0_CPU_OBSERVATION_SCHEMA_VERSION: u32 = 4;
+const G0_CPU_OBSERVATION_SCHEMA_VERSION: u32 = 5;
 const G0_CPU_OBSERVATION_STATUS: &str = "CpuObservationOnlyNotG0HardGateOrTallEvidence";
 const TALL_G0_GOLDEN_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

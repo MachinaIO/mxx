@@ -6365,7 +6365,15 @@ fn derive_statement_events(
                 NormalizerEvent::AppliedRelation(observation) => {
                     retain_scoped(observation.owner);
                     match &observation.rule {
-                        AppliedRelationRule::Universal { key, .. } => retain_scoped(key.index),
+                        AppliedRelationRule::Universal { key, .. } => {
+                            retain_scoped(key.index);
+                            retain_scoped(
+                                key.index.with_expression(key.dispatch.preimage_source.expression),
+                            );
+                            retain_scoped(
+                                key.index.with_expression(key.dispatch.trapdoor_source.expression),
+                            );
+                        }
                         AppliedRelationRule::Gadget { gadget, decomposition, .. } => {
                             retain_scoped(*gadget);
                             retain_scoped(*decomposition);
@@ -6596,9 +6604,17 @@ mod tests {
     }
 
     fn statement_gadget(job: &mut CheckerJob) -> (ExprId, ExprId, ExprId) {
+        statement_gadget_with(job, 1, 4)
+    }
+
+    fn statement_gadget_with(
+        job: &mut CheckerJob,
+        value: i64,
+        base: u64,
+    ) -> (ExprId, ExprId, ExprId) {
         let scalar = job
             .expressions_mut()
-            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .intern(ValueOperator::Constant(TypedConstant::int(value)), Box::new([]))
             .unwrap();
         let input = job
             .expressions_mut()
@@ -6615,7 +6631,7 @@ mod tests {
             .intern(
                 ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
                     output: ResolvedMatrixType::new(17_u8.into(), 1, 2, 1).unwrap(),
-                    base: 4,
+                    base,
                     small: false,
                     digit_count: 2,
                 }),
@@ -7073,6 +7089,114 @@ mod tests {
             }] if *root == root_row && *expression == gadget_row
         ));
         assert!(rows.expression_refs.get(&ignored_expression).is_none());
+    }
+
+    #[test]
+    fn universal_source_selectors_seed_detached_gadget_events() {
+        use crate::operational_noise::{
+            arena::{ArenaToken, FamilyDomain},
+            monomial::MonomialId,
+            normal_form::PolynomialNF,
+            relation::{
+                CanonicalLhsKey, NormalizationCache, RelationRegistry, RuntimeSpecializationKey,
+                SamplerSourceContract, TrapdoorSourceContract, UniversalDispatchKey,
+            },
+        };
+
+        let mut job = CheckerJob::new();
+        let (preimage_scalar, preimage_input, preimage_gadget) =
+            statement_gadget_with(&mut job, 1, 4);
+        let (trapdoor_scalar, trapdoor_input, trapdoor_gadget) =
+            statement_gadget_with(&mut job, 2, 8);
+        let (index, program, family) = job
+            .with_arena_stores(|expressions, programs, _| {
+                let index = expressions
+                    .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))?;
+                let family = programs.generated_family_from_body(
+                    expressions,
+                    FamilyDomain::new(0, 1)?,
+                    index,
+                )?;
+                let program = family.program();
+                Ok((index, program, family))
+            })
+            .unwrap();
+        let owner = job.programs().scoped(job.expressions(), program, index).unwrap();
+        let key = RuntimeSpecializationKey {
+            dispatch: UniversalDispatchKey {
+                preimage_family: family,
+                preimage_source: SamplerSourceContract { expression: preimage_gadget },
+                matrix_type: matrix(),
+                trapdoor_source: TrapdoorSourceContract { expression: trapdoor_gadget },
+            },
+            index: owner,
+            generation: RelationRegistry::new().freeze(),
+        };
+        let mut normalization = NormalizationCache::new();
+        let rhs = normalization.intern(PolynomialNF::zero()).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        trace.events.push(NormalizerEvent::AppliedRelation(AppliedRelation {
+            owner,
+            source_monomial: MonomialId::new(ArenaToken::fresh(), 0),
+            outer_coefficient: BigInt::from(1_u8),
+            ordered_start: 0,
+            ordered_end_exclusive: 0,
+            rule: AppliedRelationRule::Universal {
+                key,
+                source: EventRange { start: EventIndex(0), end: EventIndex(0) },
+                lhs: CanonicalLhsKey {
+                    layout: None,
+                    monomial: MonomialId::new(ArenaToken::fresh(), 0),
+                },
+                rhs,
+            },
+        }));
+        let closure = CertificateClosure {
+            expressions: [
+                index,
+                preimage_scalar,
+                preimage_input,
+                preimage_gadget,
+                trapdoor_scalar,
+                trapdoor_input,
+                trapdoor_gadget,
+            ]
+            .into_iter()
+            .collect(),
+            programs: [program].into_iter().collect(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: [index, preimage_scalar, trapdoor_scalar].into_iter().collect(),
+        };
+        let rows = derive_certificate_statement_rows(&job, &closure, &trace, None).unwrap();
+        assert_eq!(rows.events().len(), 2);
+        for (gadget, input, base) in
+            [(preimage_gadget, preimage_input, 4), (trapdoor_gadget, trapdoor_input, 8)]
+        {
+            let gadget_row = rows.expression(gadget).unwrap() as usize;
+            let CanonicalExpressionDescriptor::Event {
+                operator: CanonicalEventOperator::GadgetDecompose { events },
+            } = &rows.expressions()[gadget_row].descriptor
+            else {
+                panic!("selector gadget must reference its statement event");
+            };
+            assert_eq!(events.len(), 1);
+            assert!(matches!(
+                &rows.events()[events[0].row as usize],
+                CanonicalStatementEventRow::GadgetDecompose {
+                    scope: CanonicalStatementScope::Program { program: event_program },
+                    expression,
+                    base: event_base,
+                    input: event_input,
+                    ..
+                } if *event_program == rows.program(program).unwrap()
+                    && *expression == gadget_row as u64
+                    && *event_base == base
+                    && *event_input == rows.expression(input).unwrap()
+            ));
+        }
     }
 
     #[test]

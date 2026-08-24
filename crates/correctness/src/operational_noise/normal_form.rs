@@ -1333,15 +1333,42 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(())
     }
 
-    fn append_relation_evidence(
+    fn append_contextual_relation_evidence(
         &mut self,
         owner: ScopedExprId,
         evidence: &mut Option<BoundValueRef>,
         applied_event: super::g0::EventIndex,
         coefficient: &BigInt,
-    ) -> Result<(), NormalizeError> {
+        relation_bound: &NumericContract<CoefficientBound>,
+        left_context: Option<MonomialId>,
+        suffix_context: Option<MonomialId>,
+    ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
         if !S::ENABLED {
-            return Ok(())
+            return Ok(relation_bound.clone())
+        }
+        let mut context_bounds = Vec::new();
+        for context in [left_context, suffix_context].into_iter().flatten() {
+            let bound = self.bound_monomial(context, &BigInt::from(1_u8))?;
+            match &bound {
+                NumericContract::Known(CoefficientBound::ExactZero) => {
+                    let relation_evidence = if evidence.is_none() {
+                        let identity_event = self.observe_bound_transfer(
+                            owner,
+                            BoundRule::Identity { input: BoundValueRef::Transfer(applied_event) },
+                        )?;
+                        BoundValueRef::Transfer(identity_event)
+                    } else {
+                        BoundValueRef::Transfer(applied_event)
+                    };
+                    self.append_summary_evidence(owner, evidence, relation_evidence)?;
+                    return Ok(NumericContract::Known(CoefficientBound::ExactZero));
+                }
+                NumericContract::Known(CoefficientBound::Finite(_)) => {}
+                NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into())
+                }
+            }
+            context_bounds.push(bound);
         }
         let mut relation_evidence = BoundValueRef::Transfer(applied_event);
         if coefficient.magnitude() != &BigUint::from(1_u8) {
@@ -1353,12 +1380,42 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 },
             )?;
             relation_evidence = BoundValueRef::Transfer(scale_event);
-        } else if evidence.is_none() {
+        } else if left_context.is_none() && suffix_context.is_none() && evidence.is_none() {
             let identity_event = self
                 .observe_bound_transfer(owner, BoundRule::Identity { input: relation_evidence })?;
             relation_evidence = BoundValueRef::Transfer(identity_event);
         }
-        self.append_summary_evidence(owner, evidence, relation_evidence)
+        let mut current_bound = relation_bound.clone();
+        for (context, context_bound, left) in [
+            (left_context, context_bounds.first(), true),
+            (suffix_context, context_bounds.last(), false),
+        ] {
+            let Some(context) = context else { continue };
+            let Some(context_bound) = context_bound else { continue };
+            let context_evidence =
+                self.observe_finite_monomial(owner, context, &BigInt::from(1_u8))?;
+            let product = product_bounds_with_factor(
+                &[context_bound.clone(), current_bound.clone()],
+                &BigUint::from(1_u8),
+            )?;
+            current_bound = product;
+            let (left_evidence, right_evidence) = if left {
+                (context_evidence, relation_evidence)
+            } else {
+                (relation_evidence, context_evidence)
+            };
+            let product_event = self.observe_bound_transfer(
+                owner,
+                BoundRule::Product {
+                    left: left_evidence,
+                    right: right_evidence,
+                    facts: MatrixProductFacts::default(),
+                },
+            )?;
+            relation_evidence = BoundValueRef::Transfer(product_event);
+        }
+        self.append_summary_evidence(owner, evidence, relation_evidence)?;
+        Ok(current_bound)
     }
 
     fn summary_result_ref(
@@ -3903,8 +3960,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 continue;
             };
             let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
-            let has_left_context = !central_factors.is_empty() || index != 0;
-            let has_suffix_context = index + 2 != ordered_factors.len();
             let summary_noise = scale_noise_summary(
                 &input_nf.bounded_summary.coefficient_bound(),
                 coefficient.magnitude(),
@@ -3916,11 +3971,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 )
             {
                 return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
-            }
-            if !input_nf.bounded_summary.is_zero() && (has_left_context || has_suffix_context) {
-                return Err(NormalizeError::InvalidExactPlan {
-                    reason: "gadget input noise summary cannot be recombined with an exact prefix or suffix",
-                })
             }
             let left = if central_factors.is_empty() && index == 0 {
                 None
@@ -3976,7 +4026,23 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     }
                 };
                 if nonzero_summary {
-                    self.append_relation_evidence(owner, evidence, applied_event, &coefficient)?;
+                    let contextual_bound = self.append_contextual_relation_evidence(
+                        owner,
+                        evidence,
+                        applied_event,
+                        &coefficient,
+                        &summary_noise,
+                        left,
+                        suffix,
+                    )?;
+                    *noise = add_noise_summaries(noise, &contextual_bound);
+                    return Ok(Some(ProductGadgetSplice {
+                        left,
+                        suffix,
+                        input_nf,
+                        next_after: None,
+                        coefficient,
+                    }));
                 }
             }
             *noise = add_noise_summaries(noise, &summary_noise);
@@ -4012,7 +4078,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             let Some(input) = self.authorized_gadget_pair_input(gadget, decomposition)? else {
                 continue;
             };
-            let Some(normal_form) = self.splice_gadget_decomposition(
+            let Some((mut normal_form, left, suffix)) = self.splice_gadget_decomposition(
                 &central_factors,
                 &ordered_factors,
                 index,
@@ -4055,7 +4121,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     }
                 };
                 if nonzero_summary {
-                    self.append_relation_evidence(owner, evidence, applied_event, coefficient)?;
+                    let contextual_bound = self.append_contextual_relation_evidence(
+                        owner,
+                        evidence,
+                        applied_event,
+                        coefficient,
+                        &normal_form.bounded_summary.coefficient_bound(),
+                        left,
+                        suffix,
+                    )?;
+                    normal_form.bounded_summary = BoundedSummary::from_contract(contextual_bound)?;
                 }
             }
             return Ok(Some(normal_form));
@@ -4073,18 +4148,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         index: usize,
         input: ExprId,
         coefficient: &BigInt,
-    ) -> Result<Option<PolynomialNF>, NormalizeError> {
+    ) -> Result<Option<(PolynomialNF, Option<MonomialId>, Option<MonomialId>)>, NormalizeError>
+    {
         // `D(A)` itself is an atom in the child NF, but the identity exposes the already
         // normalized polynomial NF of `A`, not the raw input expression. The use-count hold
         // installed during traversal keeps this memo entry alive until this splice.
         let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
-        let has_left_context = !central_factors.is_empty() || index != 0;
-        let has_suffix_context = index + 2 != ordered_factors.len();
-        if !input_nf.bounded_summary.is_zero() && (has_left_context || has_suffix_context) {
-            return Err(NormalizeError::InvalidExactPlan {
-                reason: "gadget input noise summary cannot be recombined with an exact prefix or suffix",
-            })
-        }
         let left = if central_factors.is_empty() && index == 0 {
             None
         } else {
@@ -4126,13 +4195,17 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 merge_term(&mut terms, replacement, input_coefficient.clone());
             }
         }
-        Ok(Some(PolynomialNF {
-            exact_terms: terms,
-            bounded_summary: BoundedSummary::from_contract(scale_noise_summary(
-                &input_nf.bounded_summary.coefficient_bound(),
-                coefficient.magnitude(),
-            ))?,
-        }))
+        Ok(Some((
+            PolynomialNF {
+                exact_terms: terms,
+                bounded_summary: BoundedSummary::from_contract(scale_noise_summary(
+                    &input_nf.bounded_summary.coefficient_bound(),
+                    coefficient.magnitude(),
+                ))?,
+            },
+            left,
+            suffix,
+        )))
     }
 
     fn authorized_gadget_pair_input(
@@ -4278,7 +4351,15 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     let NumericContract::Known(CoefficientBound::Finite(_)) = rhs_noise else {
                         return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
                     };
-                    self.append_relation_evidence(owner, evidence, applied_event, &coefficient)?;
+                    self.append_contextual_relation_evidence(
+                        owner,
+                        evidence,
+                        applied_event,
+                        &coefficient,
+                        &rhs_noise,
+                        None,
+                        None,
+                    )?;
                 }
             }
             if rhs_noise != NumericContract::Known(CoefficientBound::ExactZero) {
@@ -8316,6 +8397,301 @@ mod tests {
                 BoundValueRef::Transfer(source) if *source == applied[0]
             ))
         )));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        trace
+            .validate_normalization_observations_with_state(&monomials, &NormalizationCache::new())
+            .unwrap();
+    }
+
+    #[test]
+    fn traced_product_gadget_splice_exact_zero_context_has_no_transfer() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let modulus = BigUint::from(17_u8);
+        let input_type = ResolvedMatrixType::new(modulus.clone(), 1, 1, 1).unwrap();
+        let gadget_type = ResolvedMatrixType::new(modulus.clone(), 1, 1, 3).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(modulus.clone(), 1, 3, 1).unwrap();
+        let suffix_type = ResolvedMatrixType::new(modulus, 1, 1, 2).unwrap();
+        let gadget = matrix_source(
+            &mut expressions,
+            "context-gadget",
+            gadget_type.clone(),
+            Some((2, false)),
+        );
+        let central = matrix_source(&mut expressions, "context-central", input_type.clone(), None);
+        let input_source =
+            matrix_source(&mut expressions, "context-input", input_type.clone(), None);
+        let input_noise = gaussian_factor(&mut expressions, input_type.clone(), 96_201, 3);
+        let input = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[input_source, input_noise])
+            .unwrap();
+        let decomposition = expressions
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    output: decomposition_type.clone(),
+                    base: 2,
+                    small: false,
+                    digit_count: 3,
+                }),
+                Box::new([input]),
+            )
+            .unwrap();
+        let suffix = matrix_source(&mut expressions, "context-suffix", suffix_type, None);
+        let root = product(&mut expressions, &[gadget, central, decomposition, suffix]);
+        let registry =
+            recomposition_registry(gadget_type, decomposition_type, input_type, false, 3);
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        for expression in [gadget, central, decomposition, input_source, input, suffix] {
+            insert_matrix_bound(&mut facts, &expressions, expression, 3);
+        }
+        let ordinary = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                    .unwrap()
+                    .with_gadget_recompositions(&registry);
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        let mut trace = FeasibilityTrace::default();
+        let traced = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .with_gadget_recompositions(&registry);
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        assert_eq!(ordinary.0.semantic, traced.0.semantic);
+        assert_eq!(ordinary.0.exact_nf, traced.0.exact_nf);
+        assert_eq!(ordinary.0.coefficient_bound, traced.0.coefficient_bound);
+        assert_eq!(ordinary.1, traced.1);
+
+        let applied = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event, super::super::g0::NormalizerEvent::AppliedRelation(_))
+                    .then_some(super::super::g0::EventIndex(index as u64))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(applied.len(), 1);
+        assert!(!trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    rule: BoundRule::Scale {
+                        value: BoundValueRef::Transfer(source), ..
+                    },
+                    ..
+                } if *source == applied[0]
+            ) || matches!(
+                event,
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    rule: BoundRule::Product { left, right, .. },
+                    ..
+                } if matches!(left, BoundValueRef::Transfer(source) if *source == applied[0]) ||
+                    matches!(right, BoundValueRef::Transfer(source) if *source == applied[0])
+            )
+        }));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        trace
+            .validate_normalization_observations_with_state(&monomials, &NormalizationCache::new())
+            .unwrap();
+    }
+
+    #[test]
+    fn contextual_gadget_summary_records_ordered_products() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let modulus = BigUint::from(17_u8);
+        let input_type = ResolvedMatrixType::new(modulus.clone(), 1, 1, 1).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(modulus.clone(), 1, 3, 1).unwrap();
+        let gadget_type = ResolvedMatrixType::new(modulus.clone(), 1, 1, 3).unwrap();
+        let suffix_type = ResolvedMatrixType::new(modulus, 1, 1, 2).unwrap();
+        let (gadget, decomposition, input) = gadget_product(
+            &mut expressions,
+            false,
+            3,
+            gadget_type.clone(),
+            decomposition_type.clone(),
+            input_type.clone(),
+            Some((2, false)),
+        );
+        let central = matrix_source(&mut expressions, "context-central", input_type.clone(), None);
+        let suffix = matrix_source(&mut expressions, "context-suffix", suffix_type, None);
+        let root = product(&mut expressions, &[gadget, central, decomposition, suffix]);
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        for (expression, bound) in
+            [(gadget, 2), (decomposition, 3), (input, 4), (central, 3), (suffix, 3)]
+        {
+            insert_matrix_bound(&mut facts, &expressions, expression, bound);
+        }
+        let registry =
+            recomposition_registry(gadget_type, decomposition_type, input_type, false, 3);
+        let scope = monomials.scope();
+        let scoped_gadget = programs.scoped(&expressions, scope, gadget).unwrap();
+        let scoped_decomposition = programs.scoped(&expressions, scope, decomposition).unwrap();
+        let scoped_input = programs.scoped(&expressions, scope, input).unwrap();
+        let scoped_central = programs.scoped(&expressions, scope, central).unwrap();
+        let scoped_suffix = programs.scoped(&expressions, scope, suffix).unwrap();
+        let input_monomial =
+            monomials.intern(&expressions, &programs, &[], &[scoped_input]).unwrap();
+        let central_monomial =
+            monomials.intern(&expressions, &programs, &[], &[scoped_central]).unwrap();
+        let suffix_monomial =
+            monomials.intern(&expressions, &programs, &[], &[scoped_suffix]).unwrap();
+        let source_monomial = monomials
+            .intern(
+                &expressions,
+                &programs,
+                &[scoped_central],
+                &[scoped_gadget, scoped_decomposition, scoped_suffix],
+            )
+            .unwrap();
+        let input_nf = Arc::new(PolynomialNF {
+            exact_terms: BTreeMap::from([(input_monomial, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::finite(BoundExpression::new(BigUint::from(3_u8))),
+        });
+        let coefficient = BigInt::from(2_u8);
+        let ordinary_output = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                    .unwrap()
+                    .with_gadget_recompositions(&registry);
+            normalizer.insert_gadget_hold(input, input_nf.clone());
+            let mut evidence = None;
+            normalizer
+                .rewrite_gadget_decomposition(
+                    semantic,
+                    source_monomial,
+                    &coefficient,
+                    &mut evidence,
+                )
+                .unwrap()
+                .expect("contextual gadget pair reaches splice")
+        };
+        assert_eq!(
+            ordinary_output.bounded_summary,
+            BoundedSummary::finite(BoundExpression::new(BigUint::from(6_u8)))
+        );
+
+        let central_nf = Arc::new(PolynomialNF {
+            exact_terms: BTreeMap::from([(central_monomial, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::zero(),
+        });
+        let suffix_nf = Arc::new(PolynomialNF {
+            exact_terms: BTreeMap::from([(suffix_monomial, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::zero(),
+        });
+        let mut trace = FeasibilityTrace::default();
+        trace.record_invocation_start(semantic).unwrap();
+        for (scoped, exact_nf) in [
+            (scoped_input, input_nf.clone()),
+            (scoped_central, central_nf),
+            (scoped_suffix, suffix_nf),
+        ] {
+            let value = AnalyzedValue {
+                semantic: scoped,
+                exact_nf: Some(exact_nf),
+                coefficient_bound: NumericContract::Known(CoefficientBound::finite(3_u64)),
+            };
+            trace.record_normalization_result(scoped, &value).unwrap();
+        }
+        let (enabled_output, enabled_counters, evidence) = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .with_gadget_recompositions(&registry);
+            normalizer.insert_gadget_hold(input, input_nf.clone());
+            let mut evidence = None;
+            let output = normalizer
+                .rewrite_gadget_decomposition(
+                    semantic,
+                    source_monomial,
+                    &coefficient,
+                    &mut evidence,
+                )
+                .unwrap()
+                .expect("contextual gadget pair reaches splice");
+            (output, normalizer.counters(), evidence.expect("context summary evidence"))
+        };
+        assert_eq!(
+            enabled_output.bounded_summary,
+            BoundedSummary::finite(BoundExpression::new(BigUint::from(54_u8)))
+        );
+        let applied_event = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| {
+                matches!(event, super::super::g0::NormalizerEvent::AppliedRelation(_))
+                    .then_some(super::super::g0::EventIndex(index as u64))
+            })
+            .expect("gadget application event");
+        let products = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Product { left, right, .. },
+                } if *owner == semantic => {
+                    Some((super::super::g0::EventIndex(index as u64), left.clone(), right.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(products.len(), 2);
+        let scale_event = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| {
+                matches!(
+                    event,
+                    super::super::g0::NormalizerEvent::BoundTransfer {
+                        rule: BoundRule::Scale {
+                            value: BoundValueRef::Transfer(source), ..
+                        },
+                        ..
+                    } if *source == applied_event
+                )
+                .then_some(super::super::g0::EventIndex(index as u64))
+            })
+            .expect("relation scale follows applied event");
+        assert!(matches!(
+            products[0].1,
+            BoundValueRef::Transfer(event) if event != applied_event && event != scale_event
+        ));
+        assert!(matches!(
+            products[0].2,
+            BoundValueRef::Transfer(event) if event == scale_event
+        ));
+        assert!(matches!(
+            products[1].1,
+            BoundValueRef::Transfer(event) if event == products[0].0
+        ));
+        assert!(matches!(products[1].2, BoundValueRef::Transfer(_)));
+        assert!(matches!(evidence, BoundValueRef::Transfer(event) if event == products[1].0));
+        let root_value = AnalyzedValue {
+            semantic,
+            exact_nf: Some(Arc::new(enabled_output.clone())),
+            coefficient_bound: enabled_output.bounded_summary.coefficient_bound(),
+        };
+        trace.record_normalization_result(semantic, &root_value).unwrap();
+        trace.record_invocation_end(semantic, &root_value, &enabled_counters).unwrap();
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
         trace
             .validate_normalization_observations_with_state(&monomials, &NormalizationCache::new())

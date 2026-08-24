@@ -2227,9 +2227,8 @@ impl FeasibilityTrace {
                 };
                 let start = observation.ordered_start as usize;
                 let end = observation.ordered_end_exclusive as usize;
-                if !descriptor.central_factors.is_empty() ||
-                    start != 0 ||
-                    end != descriptor.ordered_factors.len() ||
+                if start > end ||
+                    end > descriptor.ordered_factors.len() ||
                     descriptor.ordered_factors.get(start..end) !=
                         Some(&[gadget.clone(), decomposition.clone()][..])
                 {

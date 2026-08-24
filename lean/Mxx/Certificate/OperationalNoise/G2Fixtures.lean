@@ -1,4 +1,4 @@
-import Mxx.Certificate.OperationalNoise.ContractReplay
+import Mxx.Certificate.OperationalNoise.RelationReplay
 
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
@@ -348,6 +348,70 @@ theorem g2c_contract_replay :
       (by intro bound impossible; cases impossible)
       (by intro _ bound impossible; cases impossible) (by decide)⟩
 
+def g2dCollisionKeyA : MonomialKey :=
+  { centralFactors := [2, 3], orderedFactors := [17] }
+
+def g2dCollisionKeyB : MonomialKey :=
+  { centralFactors := [3, 2], orderedFactors := [17] }
+
+def g2dContext : MonomialContext :=
+  { exteriorCentral := [5], prefixFactors := [11], suffixFactors := [19] }
+
+def g2dValuation (_ : MonomialKey) : Int := 1
+
+/-- A pure Universal-shaped base relation: the scoped `B * K(i)` side and `T(i)` target.
+    Selector resolution and the selector-independent identity of `B` belong to the typed bridge. -/
+def g2dUniversalPublicProduct : Polynomial := [{ coefficient := 3, key := g2dCollisionKeyA }]
+def g2dUniversalTarget : Polynomial :=
+  [{ coefficient := 4, key := g2dCollisionKeyA },
+   { coefficient := -1, key := g2dCollisionKeyB }]
+
+/-- A pure Gadget-shaped base relation: the `G * D` product and reconstructed input. -/
+def g2dGadgetProduct : Polynomial := [{ coefficient := 5, key := g2dCollisionKeyA }]
+def g2dGadgetInput : Polynomial :=
+  [{ coefficient := 7, key := g2dCollisionKeyA },
+   { coefficient := -2, key := g2dCollisionKeyB }]
+
+theorem g2d_context_sound :
+    ∀ key, g2dValuation (g2dContext.plug key) = 1 * g2dValuation key := by
+  intro key
+  simp [g2dValuation]
+
+theorem g2d_universal_replay :
+    evaluatePolynomial g2dValuation
+        (relationReplacement g2dContext (-2) g2dUniversalPublicProduct) =
+      evaluatePolynomial g2dValuation
+        (relationReplacement g2dContext (-2) g2dUniversalTarget) := by
+  apply relationReplacement_congruent g2dValuation g2dContext 1 (-2)
+  · exact g2d_context_sound
+  · decide
+
+theorem g2d_gadget_replay :
+    evaluatePolynomial g2dValuation
+        (relationReplacement g2dContext (-2) g2dGadgetProduct) =
+      evaluatePolynomial g2dValuation
+        (relationReplacement g2dContext (-2) g2dGadgetInput) := by
+  apply relationReplacement_congruent g2dValuation g2dContext 1 (-2)
+  · exact g2d_context_sound
+  · decide
+
+def g2dUniversalReplacement : Polynomial :=
+  relationReplacement g2dContext (-2) g2dUniversalTarget
+
+def g2dUniversalCancelled : Polynomial :=
+  add g2dUniversalReplacement
+    [{ coefficient := 6, key := g2dContext.plug g2dCollisionKeyA }]
+
+theorem g2d_relation_replay :
+    g2dContext.plug g2dCollisionKeyA = g2dContext.plug g2dCollisionKeyB ∧
+      coefficient (g2dContext.plug g2dCollisionKeyA) g2dUniversalReplacement = -6 ∧
+      coefficient (g2dContext.plug g2dCollisionKeyA) g2dUniversalCancelled = 0 ∧
+      evaluatePolynomial g2dValuation g2dUniversalPublicProduct =
+        evaluatePolynomial g2dValuation g2dUniversalTarget ∧
+      evaluatePolynomial g2dValuation g2dGadgetProduct =
+        evaluatePolynomial g2dValuation g2dGadgetInput := by
+  exact ⟨by decide, by decide, by decide, by decide, by decide⟩
+
 #print axioms g2_four_role_product_kernel
 #print axioms operatorProductContribution_natAbs_le
 #print axioms g2_replay_composition
@@ -378,5 +442,9 @@ theorem g2c_contract_replay :
 #print axioms programFamilyFactAuthority_sound
 #print axioms resolveRelationPreimageSource_sound
 #print axioms g2c_contract_replay
+#print axioms relationReplacement_congruent
+#print axioms g2d_universal_replay
+#print axioms g2d_gadget_replay
+#print axioms g2d_relation_replay
 
 end Mxx.Certificate.OperationalNoise.EventReplay

@@ -1340,7 +1340,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         applied_event: super::g0::EventIndex,
         coefficient: &BigInt,
         relation_bound: &NumericContract<CoefficientBound>,
-        relation_type: Option<ResolvedMatrixType>,
+        relation_type: Option<ConcreteMatrixType>,
         left_context: Option<MonomialId>,
         suffix_context: Option<MonomialId>,
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
@@ -1384,7 +1384,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             return Ok(relation_bound.clone());
         };
         let mut current_typed = CanonicalMatrixBound {
-            matrix_type: concrete_type(&relation_type),
+            matrix_type: relation_type,
             coefficient_class: canonical_class(relation_value),
         };
         let mut current_bound = relation_bound.clone();
@@ -4051,7 +4051,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             };
             if nonzero_summary {
                 let relation_type = match self.expressions.value_type(input)? {
-                    ResolvedValueType::Matrix(matrix) => Some(matrix.clone()),
+                    ResolvedValueType::Matrix(matrix) => Some(concrete_type(matrix)),
                     _ => None,
                 };
                 let contextual_bound = self.append_contextual_relation_evidence(
@@ -4157,7 +4157,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             };
             if nonzero_summary {
                 let relation_type = match self.expressions.value_type(input)? {
-                    ResolvedValueType::Matrix(matrix) => Some(matrix.clone()),
+                    ResolvedValueType::Matrix(matrix) => Some(concrete_type(matrix)),
                     _ => None,
                 };
                 let contextual_bound = self.append_contextual_relation_evidence(
@@ -4319,7 +4319,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 .as_deref()
                 .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?
                 .get_arc(relation_match.rhs)?;
-            self.validate_relation_rhs(&rhs)?;
+            let relation_type = self.validate_relation_rhs(&rhs)?;
             let rhs_noise = scale_noise_summary(
                 &rhs.bounded_summary.coefficient_bound(),
                 coefficient.magnitude(),
@@ -4384,18 +4384,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 {
                     return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
                 }
-                let relation_type = rhs
-                    .exact_terms
-                    .keys()
-                    .next()
-                    .and_then(|monomial| self.monomial_matrix_type(*monomial));
                 let contextual_bound = self.append_contextual_relation_evidence(
                     Some(owner),
                     evidence,
                     applied_event.unwrap_or(super::g0::EventIndex(0)),
                     &coefficient,
                     &rhs_noise,
-                    relation_type,
+                    Some(relation_type.clone()),
                     left,
                     suffix,
                 )?;
@@ -4424,23 +4419,50 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     /// The compressed contract supports only preimage/recomposition right-hand sides which
     /// retain at least one genuinely Large exact term. Finite terms belong in the summary lane;
     /// a finite-only RHS is deliberately outside the supported protocol surface.
-    fn validate_relation_rhs(&self, rhs: &PolynomialNF) -> Result<(), NormalizeError> {
-        let mut has_large = false;
+    fn validate_relation_rhs(
+        &self,
+        rhs: &PolynomialNF,
+    ) -> Result<ConcreteMatrixType, NormalizeError> {
+        let mut relation_type = None;
         for (monomial, coefficient) in &rhs.exact_terms {
-            match self.bound_monomial(*monomial, coefficient)? {
-                NumericContract::Known(CoefficientBound::Large) => has_large = true,
-                NumericContract::Missing => {}
-                NumericContract::Known(
-                    CoefficientBound::ExactZero | CoefficientBound::Finite(_),
-                ) => {
-                    return Err(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))
+            let canonical = self.canonical_monomial_bound(*monomial)?;
+            match canonical {
+                NumericContract::Known(product) => {
+                    let bound = product_bounds_with_factor(
+                        &[
+                            NumericContract::Known(coefficient_bound(&product.coefficient_class)),
+                            NumericContract::Known(CoefficientBound::finite(
+                                coefficient.magnitude().clone(),
+                            )),
+                        ],
+                        &BigUint::from(1_u8),
+                    )?;
+                    match bound {
+                        NumericContract::Known(CoefficientBound::Large) => {
+                            if let Some(existing) = &relation_type {
+                                if existing != &product.matrix_type {
+                                    return Err(NormalizeError::Relation(
+                                        RelationRegistryError::InvalidCanonicalRhs,
+                                    ));
+                                }
+                            } else {
+                                relation_type = Some(product.matrix_type.clone());
+                            }
+                        }
+                        NumericContract::Known(
+                            CoefficientBound::ExactZero | CoefficientBound::Finite(_),
+                        ) => {
+                            return Err(NormalizeError::Relation(
+                                RelationRegistryError::InvalidCanonicalRhs,
+                            ))
+                        }
+                        NumericContract::Missing => {}
+                    }
                 }
+                NumericContract::Missing => {}
             }
         }
-        if !has_large {
-            return Err(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))
-        }
-        Ok(())
+        relation_type.ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))
     }
 
     fn fold_finite_no_match_terms(
@@ -4986,27 +5008,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             return Ok(NumericContract::Missing);
         };
         Ok(NumericContract::Known(product))
-    }
-
-    fn monomial_matrix_type(&self, monomial: MonomialId) -> Option<ResolvedMatrixType> {
-        let descriptor = self.monomials.descriptor(monomial).ok()?;
-        let mut factors =
-            descriptor.central_factors.iter().chain(descriptor.ordered_factors.iter());
-        let first = factors.next()?.expression();
-        let ResolvedValueType::Matrix(mut matrix_type) =
-            self.expressions.value_type(first).ok()?.clone()
-        else {
-            return None;
-        };
-        for factor in factors {
-            let ResolvedValueType::Matrix(right) =
-                self.expressions.value_type(factor.expression()).ok()?.clone()
-            else {
-                return None;
-            };
-            matrix_type = checked_matrix_product_output(&matrix_type, &right)?;
-        }
-        Some(matrix_type)
     }
 
     /// Resolve the compact value-level transfer for one exact factor.  A released child may no
@@ -13464,6 +13465,67 @@ mod tests {
         }));
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
         trace.validate_normalization_observations_with_state(&monomials, &cache).unwrap();
+
+        let missing = source_with(&mut expressions, matrix.clone(), 99_929);
+        let abort_root =
+            product(&mut expressions, &[prefix, public_call, preimage_call, suffix, missing]);
+        let abort_output = expressions.value_type(abort_root).unwrap().clone();
+        let abort_family = programs
+            .generated_family(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: Some(range),
+                    }]),
+                    output: abort_output,
+                },
+                abort_root,
+            )
+            .unwrap();
+        let abort_semantic =
+            programs.scoped(&expressions, abort_family.program(), abort_root).unwrap();
+        let abort_facts = FactStore::new(&expressions);
+        let mut abort_monomials =
+            MonomialArena::new(&expressions, &programs, abort_family.program()).unwrap();
+        let mut abort_cache = NormalizationCache::new();
+        let baseline_runtime = abort_cache.runtime_entry_count();
+        let baseline_rhs = abort_cache.canonical_rhs_count();
+        let mut abort_trace = FeasibilityTrace::default();
+        let mut abort_normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &abort_facts,
+            &mut abort_monomials,
+            &mut abort_trace,
+        )
+        .unwrap()
+        .with_relations(&relations, &mut abort_cache);
+        let expected = NormalizeError::InvalidExactPlan {
+            reason: "compressed bounded summary multiplied by Large or Missing exact value",
+        };
+        assert_eq!(abort_normalizer.normalize(abort_semantic).unwrap_err(), expected);
+        drop(abort_normalizer);
+        assert_eq!(abort_cache.runtime_entry_count(), baseline_runtime);
+        let first_rhs = abort_cache.canonical_rhs_count();
+        let first_fingerprint = abort_cache.canonical_state_fingerprint();
+        assert!(first_rhs > baseline_rhs);
+        assert!(abort_trace.normalization_events().is_empty());
+        let mut abort_normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &abort_facts,
+            &mut abort_monomials,
+            &mut abort_trace,
+        )
+        .unwrap()
+        .with_relations(&relations, &mut abort_cache);
+        assert_eq!(abort_normalizer.normalize(abort_semantic).unwrap_err(), expected);
+        drop(abort_normalizer);
+        assert_eq!(abort_cache.runtime_entry_count(), baseline_runtime);
+        assert_eq!(abort_cache.canonical_rhs_count(), first_rhs);
+        assert_eq!(abort_cache.canonical_state_fingerprint(), first_fingerprint);
+        assert!(abort_trace.normalization_events().is_empty());
     }
 
     fn bound_rule_has_transfer(rule: &BoundRule, event: EventIndex) -> bool {

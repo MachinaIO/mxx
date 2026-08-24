@@ -4090,6 +4090,109 @@ pub(crate) struct CanonicalEventRows {
     refs: BTreeMap<SampleEventId, StableEventRef>,
 }
 
+fn logical_multiply(left: u64, right: u64) -> Result<u64, G0Error> {
+    left.checked_mul(right).ok_or(G0Error::TraceOverflow)
+}
+
+fn logical_uniform_sequence(len: usize, item: u64) -> Result<u64, G0Error> {
+    let len = u64::try_from(len).map_err(|_| G0Error::TraceOverflow)?;
+    logical_add(1, logical_multiply(len, logical_add(1, item)?)?)
+}
+
+fn logical_stable_value_type(value: &StableValueType) -> Result<u64, G0Error> {
+    Ok(match value {
+        StableValueType::Matrix { .. } => 5,
+        StableValueType::Bool |
+        StableValueType::Int |
+        StableValueType::Real |
+        StableValueType::Bytes |
+        StableValueType::Trapdoor => 1,
+    })
+}
+
+fn logical_stable_scope(scope: &StableScope) -> Result<u64, G0Error> {
+    match scope {
+        StableScope::Root => Ok(1),
+        StableScope::Subgraph { .. } => Ok(2),
+        StableScope::ParallelBody { parent, .. } | StableScope::SequentialBody { parent, .. } => {
+            logical_add(1, logical_add(logical_stable_scope(parent)?, 1)?)
+        }
+    }
+}
+
+fn logical_stable_owner(owner: &StableObservedWire) -> Result<u64, G0Error> {
+    logical_sum([1, logical_stable_scope(&owner.definition)?, 1, 1, 1])
+}
+
+fn logical_stable_sample(descriptor: &StableSampleDescriptor) -> Result<u64, G0Error> {
+    logical_sum([
+        1,
+        logical_uniform_sequence(descriptor.parameters.len(), 1)?,
+        logical_stable_value_type(&descriptor.output_type)?,
+        logical_option(descriptor.gadget_base.as_ref().map(|_| 1))?,
+        logical_option(descriptor.digit_count.map(|_| 1))?,
+        logical_option(descriptor.decomposition.as_ref().map(|_| 1))?,
+    ])
+}
+
+fn logical_stable_sampler(operation: &StableSamplerOperation) -> Result<u64, G0Error> {
+    let fields = match operation {
+        StableSamplerOperation::UniformResidue { output } => logical_stable_value_type(output)?,
+        StableSamplerOperation::UniformInterval { output, .. } |
+        StableSamplerOperation::Gaussian { output, .. } => {
+            logical_add(logical_stable_value_type(output)?, 2)?
+        }
+        StableSamplerOperation::Hash {
+            output,
+            tag_prefix,
+            tag_expressions,
+            tag_decimal_expressions,
+            tag_u64_le_expressions,
+            base,
+            digit_count,
+            ..
+        } => logical_sum([
+            logical_stable_value_type(output)?,
+            1,
+            logical_uniform_sequence(tag_prefix.len(), 1)?,
+            logical_uniform_sequence(tag_expressions.len(), 1)?,
+            logical_uniform_sequence(tag_decimal_expressions.len(), 1)?,
+            logical_uniform_sequence(tag_u64_le_expressions.len(), 1)?,
+            logical_option(base.map(|_| 1))?,
+            logical_option(digit_count.map(|_| 1))?,
+        ])?,
+        StableSamplerOperation::Trapdoor { output, .. } => {
+            logical_add(logical_stable_value_type(output)?, 4)?
+        }
+        StableSamplerOperation::Preimage { output, .. } => {
+            logical_add(logical_stable_value_type(output)?, 1)?
+        }
+    };
+    logical_add(1, fields)
+}
+
+fn logical_canonical_event_kind(kind: &CanonicalEventKind) -> Result<u64, G0Error> {
+    logical_add(
+        1,
+        match kind {
+            CanonicalEventKind::Sample { descriptor } => logical_stable_sample(descriptor)?,
+            CanonicalEventKind::Sampler { operation } => logical_stable_sampler(operation)?,
+        },
+    )
+}
+
+fn logical_canonical_event_row(row: &CanonicalEventRow) -> Result<u64, G0Error> {
+    logical_add(logical_stable_owner(&row.owner)?, logical_canonical_event_kind(&row.kind)?)
+}
+
+fn logical_canonical_residual_row(row: &CanonicalResidualRow) -> Result<u64, G0Error> {
+    logical_sum([
+        1,
+        logical_uniform_sequence(row.descriptor.len(), 1)?,
+        logical_uniform_sequence(row.dependencies.len(), 1)?,
+    ])
+}
+
 impl CanonicalEventRows {
     pub(crate) fn rows(&self) -> &[CanonicalEventRow] {
         &self.rows
@@ -4106,6 +4209,16 @@ impl CanonicalEventRows {
 
     pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, G0Error> {
         serde_json::to_vec(&self.rows).map_err(|error| G0Error::Encoding(error.to_string()))
+    }
+
+    fn retained_logical_items(&self) -> Result<u64, G0Error> {
+        logical_add(
+            logical_sequence(
+                self.rows.len(),
+                self.rows.iter().map(logical_canonical_event_row).collect::<Result<Vec<_>, _>>()?,
+            )?,
+            logical_uniform_sequence(self.refs.len(), 2)?,
+        )
     }
 }
 
@@ -4313,6 +4426,20 @@ impl CanonicalResidualRefs {
 
     pub(crate) fn event_rows(&self) -> &CanonicalEventRows {
         &self.event_rows
+    }
+
+    pub(crate) fn retained_logical_items(&self) -> Result<u64, G0Error> {
+        logical_sum([
+            logical_sequence(
+                self.rows.len(),
+                self.rows
+                    .iter()
+                    .map(logical_canonical_residual_row)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?,
+            logical_uniform_sequence(self.handles.len(), 2)?,
+            self.event_rows.retained_logical_items()?,
+        ])
     }
 }
 
@@ -5549,6 +5676,94 @@ mod tests {
         assert!(evidence.index_uses.is_empty());
         assert!(evidence.slice_groups.is_empty());
         assert_eq!(evidence.l_rows, BigUint::zero());
+    }
+
+    #[test]
+    fn canonical_residual_retention_counts_descriptor_and_dependency_sequences() {
+        let retained = |descriptor: Vec<u8>, dependencies: Vec<u64>| {
+            CanonicalResidualRefs {
+                rows: vec![CanonicalResidualRow {
+                    kind: "expression".to_owned(),
+                    descriptor,
+                    dependencies,
+                }],
+                handles: BTreeMap::new(),
+                event_rows: CanonicalEventRows { rows: Vec::new(), refs: BTreeMap::new() },
+            }
+            .retained_logical_items()
+            .expect("retained canonical refs")
+        };
+        // Row = kind 1 + descriptor (1 + 2 length + 2 bytes) + dependencies
+        // (1 + 1 length + 1 ref) = 9. The row sequence is 1 + 1 + 9, followed by
+        // one empty handle map and the two empty event-row collections: 11 + 1 + 2 = 14.
+        let baseline = retained(vec![4, 5], vec![0]);
+        assert_eq!(baseline, 14);
+        assert_eq!(retained(vec![4, 5, 6], vec![0]), baseline + 2);
+        assert_eq!(retained(vec![4, 5], vec![0, 1]), baseline + 2);
+    }
+
+    #[test]
+    fn canonical_event_retention_recurses_options_sequences_and_lookup_maps() {
+        let owner = StableObservedWire {
+            stage: "stage".to_owned(),
+            definition: StableScope::ParallelBody {
+                parent: Box::new(StableScope::Subgraph { canonical_name: "body".to_owned() }),
+                owner: 3,
+            },
+            path: 4,
+            node: 5,
+            port: 0,
+        };
+        let event = CanonicalEventRow {
+            owner,
+            kind: CanonicalEventKind::Sampler {
+                operation: StableSamplerOperation::Hash {
+                    output: StableValueType::Int,
+                    variant: StableHashVariant::Decomposed,
+                    tag_prefix: vec![1, 2],
+                    tag_expressions: vec![3],
+                    tag_decimal_expressions: Vec::new(),
+                    tag_u64_le_expressions: Vec::new(),
+                    base: Some(2),
+                    digit_count: None,
+                },
+            },
+        };
+        let mut event_rows = CanonicalEventRows {
+            rows: vec![event],
+            refs: [(SampleEventId(7), StableEventRef { row: 0 })].into_iter().collect(),
+        };
+        // Nested owner = 8. Hash sampler = tag 1 + fields 15 = 16; event-kind tag adds 1,
+        // so the row is 25. Row sequence = 1 + 1 + 25 = 27; one key/ref map = 1 + 3 = 4.
+        assert_eq!(event_rows.retained_logical_items(), Ok(31));
+        let CanonicalEventKind::Sampler {
+            operation: StableSamplerOperation::Hash { tag_decimal_expressions, digit_count, .. },
+        } = &mut event_rows.rows[0].kind
+        else {
+            unreachable!("fixture is a hash sampler")
+        };
+        tag_decimal_expressions.push(9);
+        *digit_count = Some(4);
+        assert_eq!(event_rows.retained_logical_items(), Ok(34));
+
+        let refs = CanonicalResidualRefs {
+            rows: Vec::new(),
+            handles: [
+                (CanonicalHandle::Expression(expression(0)), 0),
+                (CanonicalHandle::Expression(expression(1)), 1),
+            ]
+            .into_iter()
+            .collect(),
+            event_rows,
+        };
+        // Empty residual rows 1 + two handle entries (1 + 3 * 2) + event rows 34.
+        assert_eq!(refs.retained_logical_items(), Ok(42));
+    }
+
+    #[test]
+    fn canonical_retention_helpers_reject_checked_overflow() {
+        assert_eq!(logical_multiply(u64::MAX, 2), Err(G0Error::TraceOverflow));
+        assert_eq!(logical_add(u64::MAX, 1), Err(G0Error::TraceOverflow));
     }
 
     #[test]

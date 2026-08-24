@@ -370,7 +370,7 @@ pub(crate) struct OperationalProofPayload {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProofPayloadProjection {
     payload: OperationalProofPayload,
-    projection_peak_retained_logical_items: u64,
+    generator_peak_retained_logical_items: u64,
 }
 
 /// Errors from the canonical proof-payload boundary.  The payload itself is already projected
@@ -1541,19 +1541,19 @@ fn derive_proof_payload_projection(
             .transpose()
             .map_err(proof_payload_error)?,
     };
-    let retained_support_items = projection_support_logical_items(
-        closure,
+    let retained_support_items = generator_support_logical_items(
+        refs.retained_logical_items().map_err(proof_payload_error)?,
         &projector.monomial_arenas,
         &projector.rhs_events,
         projector.closed_program,
         projector.closed_root_expression,
     )
-    .map_err(proof_payload_retention_error)?;
+    .map_err(generator_retention_error)?;
     projector.project(&run.trace, retained_support_items)
 }
 
-fn projection_support_logical_items(
-    closure: &CertificateClosure,
+fn generator_support_logical_items(
+    canonical_refs_items: u64,
     monomial_arenas: &HashMap<super::arena::ArenaToken, &super::monomial::MonomialArena>,
     rhs_events: &HashMap<
         (
@@ -1566,19 +1566,8 @@ fn projection_support_logical_items(
     closed_program: Option<ValueProgramId>,
     closed_root_expression: Option<u64>,
 ) -> Result<u64, CanonicalPayloadError> {
-    let canonical_handle_entries = closure
-        .expressions
-        .len()
-        .checked_add(closure.programs.len())
-        .ok_or(CanonicalPayloadError::LengthOverflow)?;
-    // Canonical descriptor rows belong to the already-built G0 boundary and are not duplicated
-    // into this payload. Projection retention counts only its handle and event-ref lookups.
-    let canonical_refs = checked_add(
-        logical_uniform_collection(canonical_handle_entries, 2)?,
-        logical_uniform_collection(closure.event_ids.len(), 2)?,
-    )?;
     checked_sum([
-        Ok(canonical_refs),
+        Ok(canonical_refs_items),
         logical_uniform_collection(monomial_arenas.len(), 2),
         // One RHS lookup key contains three typed references (specialization, range, RHS); its
         // value contains the Computed and Result event references.
@@ -1673,9 +1662,9 @@ fn proof_payload_error(error: G0Error) -> CertificateProjectionError {
     CertificateProjectionError::ProofPayload { detail: error.to_string() }
 }
 
-fn proof_payload_retention_error(_: CanonicalPayloadError) -> CertificateProjectionError {
+fn generator_retention_error(_: CanonicalPayloadError) -> CertificateProjectionError {
     CertificateProjectionError::ProofPayload {
-        detail: "proof payload projection retention overflow".to_owned(),
+        detail: "proof payload generator retention overflow".to_owned(),
     }
 }
 
@@ -1704,22 +1693,22 @@ impl<'a> ProofPayloadProjector<'a> {
         let event_count = trace.events.len();
         let mut events = Vec::with_capacity(event_count);
         let mut current_retained_logical_items = retained_support_items;
-        let mut projection_peak_retained_logical_items = retained_support_items;
+        let mut generator_peak_retained_logical_items = retained_support_items;
         for (index, event) in trace.events.iter().enumerate() {
             let projected = self.event(trace, index, event).map_err(proof_payload_error)?;
             current_retained_logical_items = checked_add(
                 current_retained_logical_items,
-                checked_add(1, projected.logical_items().map_err(proof_payload_retention_error)?)
-                    .map_err(proof_payload_retention_error)?,
+                checked_add(1, projected.logical_items().map_err(generator_retention_error)?)
+                    .map_err(generator_retention_error)?,
             )
-            .map_err(proof_payload_retention_error)?;
-            projection_peak_retained_logical_items =
-                projection_peak_retained_logical_items.max(current_retained_logical_items);
+            .map_err(generator_retention_error)?;
+            generator_peak_retained_logical_items =
+                generator_peak_retained_logical_items.max(current_retained_logical_items);
             events.push(projected);
         }
         Ok(ProofPayloadProjection {
             payload: OperationalProofPayload { events },
-            projection_peak_retained_logical_items,
+            generator_peak_retained_logical_items,
         })
     }
 
@@ -3448,10 +3437,17 @@ mod tests {
         (outer, immediate)
     }
 
-    fn manual_projection_support_items(run: &OperationalCertificateRun) -> (u64, usize, usize) {
+    fn manual_projection_support_items(
+        run: &OperationalCertificateRun,
+    ) -> (u64, usize, usize, u64, u64) {
         let closure = &run.projection.closure;
-        let handles = closure.expressions.len() + closure.programs.len();
-        let event_refs = closure.event_ids.len();
+        let refs = super::super::g0::canonical_residual_refs(&run.job, closure, &run.trace)
+            .expect("canonical refs for manual pipeline count");
+        let canonical_refs_items =
+            refs.retained_logical_items().expect("canonical refs retained count");
+        let shallow_refs_items = (1 + 3 * (closure.expressions.len() + closure.programs.len()))
+            as u64 +
+            (1 + 3 * closure.event_ids.len()) as u64;
         let mut arena_tokens = BTreeSet::new();
         for program in &closure.programs {
             if let Some(arena) = run.job.monomials().get(*program) {
@@ -3501,17 +3497,14 @@ mod tests {
                 matches!(event, NormalizerEvent::InvocationStart { root: owner } if owner.expression() == root)
             })
         });
-        let handles = handles as u64;
-        let event_refs = event_refs as u64;
         let arenas = arena_tokens.len() as u64;
         let rhs = rhs_lookups as u64;
-        let support = (1 + 3 * handles) +
-            (1 + 3 * event_refs) +
+        let support = canonical_refs_items +
             (1 + 3 * arenas) +
             (1 + 6 * rhs) +
             (1 + u64::from(closed_program)) +
             (1 + u64::from(closed_root.is_some()));
-        (support, arena_tokens.len(), rhs_lookups)
+        (support, arena_tokens.len(), rhs_lookups, canonical_refs_items, shallow_refs_items)
     }
 
     fn repeat_certificate_normalization(run: &mut OperationalCertificateRun) {
@@ -4831,16 +4824,16 @@ mod tests {
         assert_eq!(first_canonical_payload_bytes, second_canonical_payload_bytes);
         assert_eq!(first_payload.logical_items(), second_payload.logical_items());
         assert_eq!(
-            first_projection.projection_peak_retained_logical_items,
-            second_projection.projection_peak_retained_logical_items,
+            first_projection.generator_peak_retained_logical_items,
+            second_projection.generator_peak_retained_logical_items,
         );
-        let (manual_support, _, _) = manual_projection_support_items(&first_run);
+        let (manual_support, _, _, _, _) = manual_projection_support_items(&first_run);
         let payload_items = first_payload.logical_items().expect("logical item count");
         assert_eq!(
-            first_projection.projection_peak_retained_logical_items,
+            first_projection.generator_peak_retained_logical_items,
             manual_support + payload_items,
         );
-        assert!(first_projection.projection_peak_retained_logical_items >= payload_items);
+        assert!(first_projection.generator_peak_retained_logical_items >= payload_items);
         assert!(first_payload.logical_items().expect("logical item count") > 0);
 
         // The empty vector contributes its length field and nothing else; this is a small
@@ -4851,7 +4844,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_payload_projection_peak_counts_nested_rhs_lifecycle_once() {
+    fn proof_payload_generator_peak_counts_nested_rhs_lifecycle_once() {
         let protocol = super::super::lower::tests::singleton_preimage_protocol();
         let request = super::super::OperationalCheckRequest {
             environment: Vec::new(),
@@ -4867,12 +4860,14 @@ mod tests {
         assert!(frames.iter().any(|(start, end, _)| {
             (*start..=*end).any(|index| immediate[index].is_some_and(|parent| parent != *start))
         }));
-        let (manual_support, arena_count, rhs_count) = manual_projection_support_items(&run);
+        let (manual_support, arena_count, rhs_count, canonical_refs_items, shallow_refs_items) =
+            manual_projection_support_items(&run);
         assert!(arena_count > 0);
         assert!(rhs_count > 0);
+        assert!(canonical_refs_items > shallow_refs_items);
         let payload_items = projection.payload.logical_items().expect("payload logical items");
         assert_eq!(
-            projection.projection_peak_retained_logical_items,
+            projection.generator_peak_retained_logical_items,
             manual_support + payload_items,
         );
         assert_payload_event_refs_are_local(&projection.payload);

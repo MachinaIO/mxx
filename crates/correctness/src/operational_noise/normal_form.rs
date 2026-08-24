@@ -12652,8 +12652,27 @@ mod tests {
         assert!(trace.normalization_events().is_empty());
     }
 
-    #[test]
-    fn specialization_cache_replays_generated_summary_chain_without_cross_frame_refs() {
+    fn bound_rule_has_transfer(rule: &BoundRule, event: EventIndex) -> bool {
+        let value_has = |value: &BoundValueRef| matches!(value, BoundValueRef::Transfer(candidate) if *candidate == event);
+        match rule {
+            BoundRule::Authority(_) => false,
+            BoundRule::Identity { input } => value_has(input),
+            BoundRule::Sum { inputs } |
+            BoundRule::Maximum { inputs } |
+            BoundRule::WeightedSum { inputs } => inputs.iter().any(value_has),
+            BoundRule::Scale { value, scale } => {
+                value_has(value) || matches!(scale, BoundScale::Value(value) if value_has(value))
+            }
+            BoundRule::MonomialProduct { factors, .. } => {
+                factors.iter().any(|factor| value_has(&factor.bound))
+            }
+            BoundRule::Product { left, right, .. } | BoundRule::Tensor { left, right, .. } => {
+                value_has(left) || value_has(right)
+            }
+        }
+    }
+
+    fn run_specialization_cache_fixture(target_bound: i64) {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let matrix = matrix_type();
@@ -12692,10 +12711,15 @@ mod tests {
             programs.call_family_in_range(&mut expressions, public, index, range).unwrap();
 
         let target_large = source_with(&mut expressions, matrix.clone(), 99_903);
-        let target_gaussian = gaussian_factor(&mut expressions, matrix.clone(), 99_904, 3);
-        let target_body = expressions
-            .intern_matrix_transform(MatrixOperation::Add, &[target_large, target_gaussian])
-            .unwrap();
+        let target_gaussian =
+            gaussian_factor(&mut expressions, matrix.clone(), 99_904, target_bound);
+        let target_body = if target_bound == 0 {
+            target_large
+        } else {
+            expressions
+                .intern_matrix_transform(MatrixOperation::Add, &[target_large, target_gaussian])
+                .unwrap()
+        };
         let target =
             programs.generated_family_from_body(&mut expressions, domain, target_body).unwrap();
 
@@ -12757,11 +12781,29 @@ mod tests {
         let relation_product = expressions
             .intern_matrix_transform(MatrixOperation::Multiply, &[public_call, preimage_call])
             .unwrap();
-        let root_gaussian = gaussian_factor(&mut expressions, matrix.clone(), 99_907, 2);
-        let root = expressions
-            .intern_matrix_transform(MatrixOperation::Add, &[relation_product, root_gaussian])
-            .unwrap();
-        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let root_scalar = if target_bound == 0 {
+            let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+            Some(gaussian_factor(&mut expressions, scalar_type, 99_908, 1))
+        } else {
+            None
+        };
+        let root = if let Some(root_scalar) = root_scalar {
+            expressions
+                .intern_matrix_transform(
+                    MatrixOperation::Multiply,
+                    &[root_scalar, relation_product],
+                )
+                .unwrap()
+        } else {
+            let root_gaussian = gaussian_factor(&mut expressions, matrix.clone(), 99_907, 2);
+            expressions
+                .intern_matrix_transform(MatrixOperation::Add, &[relation_product, root_gaussian])
+                .unwrap()
+        };
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        if let Some(root_scalar) = root_scalar {
+            insert_matrix_bound(&mut facts, &expressions, root_scalar, 1);
+        }
         let mut ordinary_cache = NormalizationCache::new();
         let mut ordinary_normalizer =
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
@@ -12850,11 +12892,7 @@ mod tests {
                 NormalizerEvent::Result { owner, value }
                     if computed_replay.range.start.0 <= index as u64 &&
                         (index as u64) < computed_replay.range.end.0 &&
-                        owner.expression() == target_body &&
-                        !value
-                            .exact_nf
-                            .as_deref()
-                            .is_none_or(|nf| nf.bounded_summary.is_zero()) =>
+                        owner.expression() == target_body =>
                 {
                     Some((index, *owner))
                 }
@@ -12863,98 +12901,107 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(target_results.len(), 1);
         let (target_result_index, target_owner) = target_results[0];
-        let target_monomial = all_events
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| match event {
-                NormalizerEvent::BoundTransfer {
-                    owner,
-                    rule: BoundRule::MonomialProduct { .. },
-                } if computed_replay.range.start.0 <= index as u64 &&
-                    (index as u64) < computed_replay.range.end.0 &&
-                    *owner == target_owner =>
-                {
-                    Some(index)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(target_monomial.iter().any(|index| *index < target_result_index));
-        let (applied_index, applied_owner) = all_events
-            .iter()
-            .enumerate()
-            .find_map(|(index, event)| match event {
-                NormalizerEvent::AppliedRelation(observation)
-                    if matches!(observation.rule, AppliedRelationRule::Universal { .. }) =>
-                {
-                    Some((EventIndex(index as u64), observation.owner))
-                }
-                _ => None,
-            })
-            .expect("universal relation application");
-        assert_ne!(applied_owner, semantic);
-        let identity_index = all_events
-            .iter()
-            .enumerate()
-            .find_map(|(index, event)| match event {
-                NormalizerEvent::BoundTransfer {
-                    owner,
-                    rule: BoundRule::Identity { input: BoundValueRef::Transfer(event) },
-                } if *owner == applied_owner && *event == applied_index => {
-                    Some(EventIndex(index as u64))
-                }
-                _ => None,
-            })
-            .expect("relation transfer is owned by consuming product");
-        let root_sum_index = all_events
-            .iter()
-            .enumerate()
-            .find_map(|(index, event)| match event {
-                NormalizerEvent::BoundTransfer { owner, rule: BoundRule::Sum { inputs } }
-                    if *owner == semantic &&
-                        inputs.len() == 2 &&
-                        inputs.iter().any(|input| {
-                            matches!(
-                                input,
-                                BoundValueRef::Result { projection: BoundProjection::Summary, .. }
-                            )
-                        }) &&
-                        inputs
-                            .iter()
-                            .any(|input| matches!(input, BoundValueRef::Transfer(_))) =>
-                {
-                    Some(EventIndex(index as u64))
-                }
-                _ => None,
-            })
-            .expect("root summary and relation transfer are combined");
-        let root_sum_transfer = match &all_events[root_sum_index.0 as usize] {
-            NormalizerEvent::BoundTransfer { rule: BoundRule::Sum { inputs }, .. } => inputs
+        if target_bound != 0 {
+            assert!(matches!(
+                &all_events[target_result_index],
+                NormalizerEvent::Result { value, .. }
+                    if value.exact_nf.as_deref().is_some_and(|nf| !nf.bounded_summary.is_zero())
+            ));
+            let target_monomial = all_events
                 .iter()
-                .find_map(|input| match input {
-                    BoundValueRef::Transfer(event) => Some(*event),
-                    _ => None,
-                })
-                .expect("root sum transfer input"),
-            _ => unreachable!("root sum index points to a bound transfer"),
-        };
-        let root_sum_result = match &all_events[root_sum_index.0 as usize] {
-            NormalizerEvent::BoundTransfer { rule: BoundRule::Sum { inputs }, .. } => inputs
-                .iter()
-                .find_map(|input| match input {
-                    BoundValueRef::Result { event, projection: BoundProjection::Summary } => {
-                        Some(*event)
+                .enumerate()
+                .filter_map(|(index, event)| match event {
+                    NormalizerEvent::BoundTransfer {
+                        owner,
+                        rule: BoundRule::MonomialProduct { .. },
+                    } if computed_replay.range.start.0 <= index as u64 &&
+                        (index as u64) < computed_replay.range.end.0 &&
+                        *owner == target_owner =>
+                    {
+                        Some(index)
                     }
                     _ => None,
                 })
-                .expect("root sum result input"),
-            _ => unreachable!("root sum index points to a bound transfer"),
-        };
-        assert!(matches!(
-            all_events[root_sum_result.0 as usize],
-            NormalizerEvent::Result { owner, .. } if owner == applied_owner
-        ));
-        let root_end_index = all_events
+                .collect::<Vec<_>>();
+            assert!(target_monomial.iter().any(|index| *index < target_result_index));
+            let (applied_index, applied_owner) = all_events
+                .iter()
+                .enumerate()
+                .find_map(|(index, event)| match event {
+                    NormalizerEvent::AppliedRelation(observation)
+                        if matches!(observation.rule, AppliedRelationRule::Universal { .. }) =>
+                    {
+                        Some((EventIndex(index as u64), observation.owner))
+                    }
+                    _ => None,
+                })
+                .expect("universal relation application");
+            assert_ne!(applied_owner, semantic);
+            let identity_index = all_events
+                .iter()
+                .enumerate()
+                .find_map(|(index, event)| match event {
+                    NormalizerEvent::BoundTransfer {
+                        owner,
+                        rule: BoundRule::Identity { input: BoundValueRef::Transfer(event) },
+                    } if *owner == applied_owner && *event == applied_index => {
+                        Some(EventIndex(index as u64))
+                    }
+                    _ => None,
+                })
+                .expect("relation transfer is owned by consuming product");
+            let root_sum_index = all_events
+                .iter()
+                .enumerate()
+                .find_map(|(index, event)| match event {
+                    NormalizerEvent::BoundTransfer { owner, rule: BoundRule::Sum { inputs } }
+                        if *owner == semantic &&
+                            inputs.len() == 2 &&
+                            inputs.iter().any(|input| {
+                                matches!(
+                                    input,
+                                    BoundValueRef::Result {
+                                        projection: BoundProjection::Summary,
+                                        ..
+                                    }
+                                )
+                            }) &&
+                            inputs
+                                .iter()
+                                .any(|input| matches!(input, BoundValueRef::Transfer(_))) =>
+                    {
+                        Some(EventIndex(index as u64))
+                    }
+                    _ => None,
+                })
+                .expect("root summary and relation transfer are combined");
+            let root_sum_transfer = match &all_events[root_sum_index.0 as usize] {
+                NormalizerEvent::BoundTransfer { rule: BoundRule::Sum { inputs }, .. } => inputs
+                    .iter()
+                    .find_map(|input| match input {
+                        BoundValueRef::Transfer(event) => Some(*event),
+                        _ => None,
+                    })
+                    .expect("root sum transfer input"),
+                _ => unreachable!("root sum index points to a bound transfer"),
+            };
+            let root_sum_result = match &all_events[root_sum_index.0 as usize] {
+                NormalizerEvent::BoundTransfer { rule: BoundRule::Sum { inputs }, .. } => inputs
+                    .iter()
+                    .find_map(|input| match input {
+                        BoundValueRef::Result { event, projection: BoundProjection::Summary } => {
+                            Some(*event)
+                        }
+                        _ => None,
+                    })
+                    .expect("root sum result input"),
+                _ => unreachable!("root sum index points to a bound transfer"),
+            };
+            assert!(matches!(
+                all_events[root_sum_result.0 as usize],
+                NormalizerEvent::Result { owner, .. } if owner == applied_owner
+            ));
+            let root_end_index = all_events
             .iter()
             .enumerate()
             .find_map(|(index, event)| {
@@ -12962,66 +13009,96 @@ mod tests {
                     .then_some(EventIndex(index as u64))
             })
             .expect("root invocation end");
-        assert!(applied_index < identity_index);
-        assert!(identity_index < root_sum_transfer);
-        assert!(identity_index < root_sum_index);
-        assert!(root_sum_index < root_end_index);
-        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
-        trace.validate_normalization_observations_with_state(&monomials, &cache).unwrap();
+            assert!(applied_index < identity_index);
+            assert!(identity_index < root_sum_transfer);
+            assert!(identity_index < root_sum_index);
+            assert!(root_sum_index < root_end_index);
+            trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+            trace.validate_normalization_observations_with_state(&monomials, &cache).unwrap();
 
-        // Replay witnesses are authoritative invocation ends, not arbitrary events from the
-        // nested specialization.  Mutating one to a nested Result must fail closed.
-        let nested_result_event = all_events
-            .iter()
-            .enumerate()
-            .find_map(|(index, event)| {
-                (computed_replay.range.start.0 <= index as u64 &&
-                    (index as u64) < computed_replay.range.end.0 &&
-                    matches!(event, NormalizerEvent::Result { .. }))
-                .then_some(EventIndex(index as u64))
-            })
-            .expect("specialization contains a nested result");
-        let mut malformed_witness = trace.clone();
-        for event in &mut malformed_witness.events {
-            if let NormalizerEvent::SpecializationComputed { replay, .. } = event {
-                replay.rhs_results[0].1 = nested_result_event;
-                break;
-            }
-        }
-        assert!(
-            malformed_witness
-                .validate_normalization_observations_with_monomials(&monomials)
-                .is_err()
-        );
-
-        // A universal application must point to the exact replay key and source range.  Both
-        // mutations below model stale or forged cache provenance and are rejected independently.
-        let mut malformed_key = trace.clone();
-        for event in &mut malformed_key.events {
-            if let NormalizerEvent::AppliedRelation(observation) = event {
-                if let AppliedRelationRule::Universal { key, .. } = &mut observation.rule {
-                    key.index = target_owner;
+            // Replay witnesses are authoritative invocation ends, not arbitrary events from the
+            // nested specialization.  Mutating one to a nested Result must fail closed.
+            let nested_result_event = all_events
+                .iter()
+                .enumerate()
+                .find_map(|(index, event)| {
+                    (computed_replay.range.start.0 <= index as u64 &&
+                        (index as u64) < computed_replay.range.end.0 &&
+                        matches!(event, NormalizerEvent::Result { .. }))
+                    .then_some(EventIndex(index as u64))
+                })
+                .expect("specialization contains a nested result");
+            let mut malformed_witness = trace.clone();
+            for event in &mut malformed_witness.events {
+                if let NormalizerEvent::SpecializationComputed { replay, .. } = event {
+                    replay.rhs_results[0].1 = nested_result_event;
                     break;
                 }
             }
-        }
-        assert!(
-            malformed_key.validate_normalization_observations_with_monomials(&monomials).is_err()
-        );
-        let mut malformed_source = trace.clone();
-        for event in &mut malformed_source.events {
-            if let NormalizerEvent::AppliedRelation(observation) = event {
-                if let AppliedRelationRule::Universal { source, .. } = &mut observation.rule {
-                    source.start = EventIndex(0);
-                    break;
+            assert!(
+                malformed_witness
+                    .validate_normalization_observations_with_monomials(&monomials)
+                    .is_err()
+            );
+
+            // A universal application must point to the exact replay key and source range.  Both
+            // mutations below model stale or forged cache provenance and are rejected
+            // independently.
+            let mut malformed_key = trace.clone();
+            for event in &mut malformed_key.events {
+                if let NormalizerEvent::AppliedRelation(observation) = event {
+                    if let AppliedRelationRule::Universal { key, .. } = &mut observation.rule {
+                        key.index = target_owner;
+                        break;
+                    }
                 }
             }
+            assert!(
+                malformed_key
+                    .validate_normalization_observations_with_monomials(&monomials)
+                    .is_err()
+            );
+            let mut malformed_source = trace.clone();
+            for event in &mut malformed_source.events {
+                if let NormalizerEvent::AppliedRelation(observation) = event {
+                    if let AppliedRelationRule::Universal { source, .. } = &mut observation.rule {
+                        source.start = EventIndex(0);
+                        break;
+                    }
+                }
+            }
+            assert!(
+                malformed_source
+                    .validate_normalization_observations_with_monomials(&monomials)
+                    .is_err()
+            );
+        } else {
+            let applied_index = all_events
+                .iter()
+                .enumerate()
+                .find_map(|(index, event)| {
+                    matches!(event, NormalizerEvent::AppliedRelation(observation)
+                        if matches!(observation.rule, AppliedRelationRule::Universal { .. }))
+                    .then_some(EventIndex(index as u64))
+                })
+                .expect("zero-summary universal relation application");
+            assert!(!all_events.iter().any(|event| {
+                matches!(event, NormalizerEvent::BoundTransfer { rule, .. }
+                    if bound_rule_has_transfer(rule, applied_index))
+            }));
+            trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+            trace.validate_normalization_observations_with_state(&monomials, &cache).unwrap();
         }
-        assert!(
-            malformed_source
-                .validate_normalization_observations_with_monomials(&monomials)
-                .is_err()
-        );
+    }
+
+    #[test]
+    fn specialization_cache_replays_generated_summary_chain_without_cross_frame_refs() {
+        run_specialization_cache_fixture(3);
+    }
+
+    #[test]
+    fn zero_summary_universal_relation_preserves_exact_contract() {
+        run_specialization_cache_fixture(0);
     }
 
     #[test]

@@ -463,12 +463,19 @@ operator-specific transfers in `bound.rs` and `normal_form.rs`. A looser replace
 accepted merely because it is conservative; it can change parameter acceptance and is unnecessary
 noise overestimation.
 
-At G0, an exhaustive coverage matrix is produced for every operator, transform, sampler kind,
-relation kind, and bound rule in the exact Tall residual proof closure. Each row names the Rust
-source location, fixed Lean semantics lemma, fixed Lean bound/relation lemma, or deliberate
-fail-closed result. Decoder-only rows and `ThresholdDecode` lemmas are outside this matrix.
-Differential fixtures cover signed divide/remainder, scalar broadcast, tensor, CRT recomposition,
-tag encoding, regular/small decomposition, slice/view routing, and polynomial packing.
+At G0, the generator derives one private residual coverage row from every `ObservedCoverage` row
+in the exact residual proof closure. It neither performs semantic lookup nor changes the ordinary
+checker path. Each row preserves the kind, exact count, and sorted unique sites; adds a stable,
+repository-relative Rust item; and is tagged `CheckedLean`, `G2LeanObligation`, or
+`RejectBeforeGeneration`. `CheckedLean` is used only when the exact compiled Lean semantics and
+transfer lemmas already exist. All remaining reachable operator, transform, sampler, relation, and
+bound cases stay explicit G2 obligations. Regular and small gadget decomposition, and plain,
+decomposed, and small-decomposed hash sampling, have distinct rows.
+
+`ThresholdDecode`, `BoundAuthority::Unavailable`, and raw `EventKind::Trapdoor` are rejected before
+matrix generation or canonical event projection. Decoder-only expressions are not part of the
+residual closure. A reject-tagged row therefore cannot occur in emitted schema-version-3 CPU
+evidence.
 
 An unsupported reachable operator, missing relation lemma, surviving `Large`, missing bound, or
 unproved side condition rejects emission.

@@ -700,13 +700,18 @@ Lean の bound lemma は、受理された実行で Rust が使った rule を�
 安全側であっても不要に大きい bound へ置き換えない。bound が大きくなると Rust が受理した
 parameter を Lean が拒否し、同じ判定を証明したことにならないためである。
 
-Tall の residual proof closure 内にある operator、transform、sampler kind、relation kind、
-bound rule について coverage matrix を作り、それぞれを Rust source location、固定 Lean
-semantics lemma、固定 Lean bound/relation lemma、または明示的な fail-closed 結果へ対応付ける。
-decoder-only の row と `ThresholdDecode` lemma はこの matrix の対象外である。
+G0 では、正確な residual proof closure の各 `ObservedCoverage` row から、private な residual
+coverage row を一対一で作る。この変換は意味論の検索に使わず、通常の checker 経路も変更しない。
+各 row は kind、正確な count、sort 済みで重複のない site をそのまま保持し、repository-relative
+で安定した Rust item と、`CheckedLean`、`G2LeanObligation`、`RejectBeforeGeneration` のいずれかを
+付ける。`CheckedLean` は、正確な semantics lemma と transfer lemma が既に Lean で compile 済みの
+場合だけ使用する。それ以外の到達可能な operator、transform、sampler、relation、bound は明示的な
+G2 obligation とする。regular/small gadget decomposition と、plain/decomposed/small-decomposed hash
+sampling はそれぞれ別の row にする。
 
-signed division/remainder、scalar broadcast、tensor、CRT recomposition、tag encoding、regular/small
-decomposition、slice/view routing、polynomial packing は Rust と Lean の differential fixture で照合する。
+`ThresholdDecode`、`BoundAuthority::Unavailable`、raw `EventKind::Trapdoor` は、matrix 生成または
+canonical event projection より前に拒否する。decoder-only expression は residual closure に含めない。
+したがって schema version 3 の CPU evidence に reject-tagged row が現れることはない。
 
 到達した操作に lemma がない場合、`Large` が残る場合、bound がない場合、side condition を証明
 できない場合は certificate 生成を拒否する。

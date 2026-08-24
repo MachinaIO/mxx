@@ -13,8 +13,8 @@ use super::{
     error::{OperationalSimulationError, TargetError},
     g0::{
         AppliedRelationRule, BoundAuthority, BoundProjection, BoundRule, BoundScale, BoundValueRef,
-        CanonicalEventKind, CanonicalResidualRefs, FeasibilityTrace, G0Error,
-        MonomialFactorEvidence, NormalizerEvent, StableSamplerOperation,
+        CanonicalEventKind, CanonicalResidualRefs, EventKind, FeasibilityTrace, G0Error,
+        MonomialFactorEvidence, NormalizerEvent, StableHashVariant, StableSamplerOperation,
     },
     lower::{ProductionAdapter, ProductionRoot},
     program::{FamilyValueId, ValueProgramId},
@@ -147,7 +147,7 @@ pub struct BaseNBreakdown {
 }
 
 const G0_CPU_EVIDENCE_SCHEMA_ID: &str = "mxx.operational-noise.g0-cpu-evidence";
-const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 enum G0CpuEvidenceStatus {
@@ -178,7 +178,7 @@ struct G0CpuEvidence {
     schema_version: u32,
     status: G0CpuEvidenceStatus,
     base_feasibility: BaseFeasibilitySummary,
-    observed_coverage: ObservedCoverage,
+    residual_coverage_matrix: ResidualCoverageMatrix,
     lut: G0CpuLutObservation,
     metrics: G0CpuMetrics,
 }
@@ -490,8 +490,23 @@ pub(crate) enum ObservedOperatorKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ObservedTransformKind {
-    GadgetDecompose,
+    GadgetDecompose(ObservedGadgetKind),
     PackPolynomialCoefficients,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservedGadgetKind {
+    Regular,
+    Small,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservedHashKind {
+    Plain,
+    Decomposed,
+    SmallDecomposed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -501,7 +516,7 @@ pub(crate) enum ObservedSamplerKind {
     UniformResidue,
     UniformInterval,
     Gaussian,
-    Hash,
+    Hash(ObservedHashKind),
     Trapdoor,
     Preimage,
 }
@@ -516,7 +531,7 @@ pub(crate) enum ObservedRelationKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ObservedBoundKind {
-    Authority,
+    Authority(ObservedAuthorityKind),
     Identity,
     Sum,
     Maximum,
@@ -525,6 +540,16 @@ pub(crate) enum ObservedBoundKind {
     WeightedSum,
     Product,
     Tensor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservedAuthorityKind {
+    FactStore,
+    ProgramFamilyFact,
+    Operator,
+    RelationPreimageSource,
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -555,6 +580,40 @@ pub(crate) struct ObservedCoverageRow {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct ObservedCoverage {
     pub rows: Vec<ObservedCoverageRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ResidualCoverageMatrix {
+    rows: Vec<ResidualCoverageRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ResidualCoverageRow {
+    kind: ObservedCoverageKind,
+    count: u64,
+    sites: Vec<ObservedCoverageSite>,
+    rust_item: &'static str,
+    disposition: ResidualCoverageDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "disposition")]
+enum ResidualCoverageDisposition {
+    CheckedLean { semantics: &'static str, transfer: &'static str },
+    G2LeanObligation { semantics: &'static str, transfer: &'static str },
+    RejectBeforeGeneration { reason: &'static str },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidualCoverageClassification {
+    rust_item: &'static str,
+    disposition: ResidualCoverageDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RawEventCoverageDisposition {
+    CanonicalProjection,
+    RejectBeforeCanonicalProjection { reason: &'static str },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -623,13 +682,42 @@ impl LogicalItems for ObservedOperatorKind {
 
 impl LogicalItems for ObservedTransformKind {
     fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_add(
+            1,
+            match self {
+                Self::GadgetDecompose(kind) => kind.logical_items()?,
+                Self::PackPolynomialCoefficients => 0,
+            },
+        )
+    }
+}
+
+impl LogicalItems for ObservedGadgetKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for ObservedHashKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
         Ok(1)
     }
 }
 
 impl LogicalItems for ObservedSamplerKind {
     fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
-        Ok(1)
+        checked_add(
+            1,
+            match self {
+                Self::Hash(kind) => kind.logical_items()?,
+                Self::Sample |
+                Self::UniformResidue |
+                Self::UniformInterval |
+                Self::Gaussian |
+                Self::Trapdoor |
+                Self::Preimage => 0,
+            },
+        )
     }
 }
 
@@ -640,6 +728,25 @@ impl LogicalItems for ObservedRelationKind {
 }
 
 impl LogicalItems for ObservedBoundKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_add(
+            1,
+            match self {
+                Self::Authority(kind) => kind.logical_items()?,
+                Self::Identity |
+                Self::Sum |
+                Self::Maximum |
+                Self::Scale |
+                Self::MonomialProduct |
+                Self::WeightedSum |
+                Self::Product |
+                Self::Tensor => 0,
+            },
+        )
+    }
+}
+
+impl LogicalItems for ObservedAuthorityKind {
     fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
         Ok(1)
     }
@@ -1820,6 +1927,7 @@ pub(crate) fn derive_proof_payload(
 pub(crate) fn derive_proof_payload_projection(
     run: &OperationalCertificateRun,
 ) -> Result<ProofPayloadProjection, CertificateProjectionError> {
+    validate_raw_event_coverage(&run.trace)?;
     let closure = &run.projection.closure;
     let closed_root_expression = match &run.projection.residual {
         CertificateResidualRoot::Closed { root, .. } => Some(root.expression()),
@@ -1887,6 +1995,31 @@ pub(crate) fn derive_proof_payload_projection(
     )
     .map_err(generator_retention_error)?;
     projector.project(&run.trace, closure, retained_support_items)
+}
+
+fn raw_event_coverage_disposition(kind: &EventKind) -> RawEventCoverageDisposition {
+    match kind {
+        EventKind::Sample { .. } | EventKind::Sampler { .. } => {
+            RawEventCoverageDisposition::CanonicalProjection
+        }
+        EventKind::Trapdoor { .. } => {
+            RawEventCoverageDisposition::RejectBeforeCanonicalProjection {
+                reason: "raw EventKind::Trapdoor has no canonical residual event projection",
+            }
+        }
+    }
+}
+
+fn validate_raw_event_coverage(trace: &FeasibilityTrace) -> Result<(), CertificateProjectionError> {
+    for observation in trace.event_observations().values() {
+        match raw_event_coverage_disposition(&observation.kind) {
+            RawEventCoverageDisposition::CanonicalProjection => {}
+            RawEventCoverageDisposition::RejectBeforeCanonicalProjection { reason } => {
+                return Err(CertificateProjectionError::ProofPayload { detail: reason.to_owned() });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn observed_scalar_kind(operation: &ScalarOperation) -> ObservedScalarKind {
@@ -1968,13 +2101,30 @@ fn observed_operator_kind(operator: &ValueOperator) -> Option<ObservedOperatorKi
 
 fn observed_transform_kind(operator: &ValueOperator) -> Option<ObservedTransformKind> {
     match operator {
-        ValueOperator::Transform(ValueTransformOperation::GadgetDecompose { .. }) => {
-            Some(ObservedTransformKind::GadgetDecompose)
+        ValueOperator::Transform(ValueTransformOperation::GadgetDecompose { small, .. }) => {
+            Some(ObservedTransformKind::GadgetDecompose(if *small {
+                ObservedGadgetKind::Small
+            } else {
+                ObservedGadgetKind::Regular
+            }))
         }
         ValueOperator::Transform(ValueTransformOperation::PackPolynomialCoefficients {
             ..
         }) => Some(ObservedTransformKind::PackPolynomialCoefficients),
-        _ => None,
+        ValueOperator::Argument { .. } |
+        ValueOperator::Constant(_) |
+        ValueOperator::Source(_) |
+        ValueOperator::Sample { .. } |
+        ValueOperator::Sampler { .. } |
+        ValueOperator::DeterministicHash(_) |
+        ValueOperator::OpaqueFamilyElement { .. } |
+        ValueOperator::IndexMap { .. } |
+        ValueOperator::ExplicitElement { .. } |
+        ValueOperator::ProgramCall { .. } |
+        ValueOperator::ExtractCoefficient { .. } |
+        ValueOperator::Scalar(_) |
+        ValueOperator::Matrix(_) |
+        ValueOperator::Trapdoor(_) => None,
     }
 }
 
@@ -1985,7 +2135,13 @@ fn observed_sampler_kind(kind: &CanonicalEventKind) -> ObservedSamplerKind {
             StableSamplerOperation::UniformResidue { .. } => ObservedSamplerKind::UniformResidue,
             StableSamplerOperation::UniformInterval { .. } => ObservedSamplerKind::UniformInterval,
             StableSamplerOperation::Gaussian { .. } => ObservedSamplerKind::Gaussian,
-            StableSamplerOperation::Hash { .. } => ObservedSamplerKind::Hash,
+            StableSamplerOperation::Hash { variant, .. } => {
+                ObservedSamplerKind::Hash(match variant {
+                    StableHashVariant::Plain => ObservedHashKind::Plain,
+                    StableHashVariant::Decomposed => ObservedHashKind::Decomposed,
+                    StableHashVariant::SmallDecomposed => ObservedHashKind::SmallDecomposed,
+                })
+            }
             StableSamplerOperation::Trapdoor { .. } => ObservedSamplerKind::Trapdoor,
             StableSamplerOperation::Preimage { .. } => ObservedSamplerKind::Preimage,
         },
@@ -2001,7 +2157,15 @@ fn observed_relation_kind(rule: &ProofPayloadRelationRule) -> ObservedRelationKi
 
 fn observed_bound_kind(rule: &ProofPayloadRule) -> ObservedBoundKind {
     match rule {
-        ProofPayloadRule::Authority(_) => ObservedBoundKind::Authority,
+        ProofPayloadRule::Authority(authority) => ObservedBoundKind::Authority(match authority {
+            ProofPayloadAuthority::FactStore => ObservedAuthorityKind::FactStore,
+            ProofPayloadAuthority::ProgramFamilyFact => ObservedAuthorityKind::ProgramFamilyFact,
+            ProofPayloadAuthority::Operator => ObservedAuthorityKind::Operator,
+            ProofPayloadAuthority::RelationPreimageSource { .. } => {
+                ObservedAuthorityKind::RelationPreimageSource
+            }
+            ProofPayloadAuthority::Unavailable => ObservedAuthorityKind::Unavailable,
+        }),
         ProofPayloadRule::Identity { .. } => ObservedBoundKind::Identity,
         ProofPayloadRule::Sum { .. } => ObservedBoundKind::Sum,
         ProofPayloadRule::Maximum { .. } => ObservedBoundKind::Maximum,
@@ -2079,6 +2243,313 @@ fn finalize_observed_coverage(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ObservedCoverage { rows })
+}
+
+const NORMALIZE_RUST_ITEM: &str =
+    "crates/correctness/src/operational_noise/normal_form.rs::Normalizer::normalize_inner";
+const SAMPLER_BOUND_RUST_ITEM: &str =
+    "crates/correctness/src/operational_noise/normal_form.rs::sampler_bound";
+const RELATION_RUST_ITEM: &str = "crates/correctness/src/operational_noise/normal_form.rs::\
+Normalizer::append_contextual_relation_evidence";
+const BOUND_RUST_ITEM: &str =
+    "crates/correctness/src/operational_noise/normal_form.rs::Normalizer::bound_normal_form";
+
+fn checked_lean(
+    rust_item: &'static str,
+    semantics: &'static str,
+    transfer: &'static str,
+) -> ResidualCoverageClassification {
+    ResidualCoverageClassification {
+        rust_item,
+        disposition: ResidualCoverageDisposition::CheckedLean { semantics, transfer },
+    }
+}
+
+fn g2_obligation(
+    rust_item: &'static str,
+    semantics: &'static str,
+    transfer: &'static str,
+) -> ResidualCoverageClassification {
+    ResidualCoverageClassification {
+        rust_item,
+        disposition: ResidualCoverageDisposition::G2LeanObligation { semantics, transfer },
+    }
+}
+
+fn reject_before_generation(
+    rust_item: &'static str,
+    reason: &'static str,
+) -> ResidualCoverageClassification {
+    ResidualCoverageClassification {
+        rust_item,
+        disposition: ResidualCoverageDisposition::RejectBeforeGeneration { reason },
+    }
+}
+
+fn scalar_coverage_classification(kind: ObservedScalarKind) -> ResidualCoverageClassification {
+    match kind {
+        ObservedScalarKind::Add => checked_lean(
+            NORMALIZE_RUST_ITEM,
+            "Mxx.Certificate.OperationalNoise.coefficient_add",
+            "Mxx.Certificate.OperationalNoise.EventReplay.boundTransfer_sum",
+        ),
+        ObservedScalarKind::Subtract => checked_lean(
+            NORMALIZE_RUST_ITEM,
+            "Mxx.Certificate.OperationalNoise.coefficient_subtract",
+            "Mxx.Certificate.OperationalNoise.EventReplay.boundTransfer_sum",
+        ),
+        ObservedScalarKind::Multiply => checked_lean(
+            NORMALIZE_RUST_ITEM,
+            "Mxx.Certificate.OperationalNoise.EventReplay.\
+productMerge_contribution_coefficient",
+            "Mxx.Certificate.OperationalNoise.EventReplay.boundTransfer_product",
+        ),
+        ObservedScalarKind::ThresholdDecode => reject_before_generation(
+            NORMALIZE_RUST_ITEM,
+            "threshold decoding is outside residual certificate generation",
+        ),
+        ObservedScalarKind::Divide |
+        ObservedScalarKind::Remainder |
+        ObservedScalarKind::Negate |
+        ObservedScalarKind::Equal |
+        ObservedScalarKind::Less |
+        ObservedScalarKind::LessEqual |
+        ObservedScalarKind::BoolToInt |
+        ObservedScalarKind::IntToReal |
+        ObservedScalarKind::RealAdd |
+        ObservedScalarKind::RealSubtract |
+        ObservedScalarKind::RealMultiply |
+        ObservedScalarKind::RealDivide |
+        ObservedScalarKind::RealSqrt |
+        ObservedScalarKind::Bit |
+        ObservedScalarKind::Slice |
+        ObservedScalarKind::Hash |
+        ObservedScalarKind::ExtractCoefficient |
+        ObservedScalarKind::LiftConstantPolynomial => g2_obligation(
+            NORMALIZE_RUST_ITEM,
+            "exact scalar normalization semantics",
+            "coefficient-bound transfer",
+        ),
+    }
+}
+
+fn matrix_coverage_classification(kind: ObservedMatrixKind) -> ResidualCoverageClassification {
+    match kind {
+        ObservedMatrixKind::Add |
+        ObservedMatrixKind::Subtract |
+        ObservedMatrixKind::Multiply |
+        ObservedMatrixKind::Negate |
+        ObservedMatrixKind::Scale |
+        ObservedMatrixKind::Transpose |
+        ObservedMatrixKind::Slice |
+        ObservedMatrixKind::IndexedSlice |
+        ObservedMatrixKind::View |
+        ObservedMatrixKind::Concat |
+        ObservedMatrixKind::Tensor |
+        ObservedMatrixKind::CrtRecompose |
+        ObservedMatrixKind::ExtractCoefficient |
+        ObservedMatrixKind::LiftConstantPolynomial => g2_obligation(
+            NORMALIZE_RUST_ITEM,
+            "exact matrix normalization semantics",
+            "matrix coefficient-bound transfer",
+        ),
+    }
+}
+
+fn operator_coverage_classification(kind: ObservedOperatorKind) -> ResidualCoverageClassification {
+    match kind {
+        ObservedOperatorKind::Scalar(kind) => scalar_coverage_classification(kind),
+        ObservedOperatorKind::Matrix(kind) => matrix_coverage_classification(kind),
+        ObservedOperatorKind::Trapdoor(
+            ObservedTrapdoorKind::Generate | ObservedTrapdoorKind::Transform,
+        ) => g2_obligation(
+            NORMALIZE_RUST_ITEM,
+            "trapdoor operator normalization semantics",
+            "trapdoor operator coefficient-bound transfer",
+        ),
+        ObservedOperatorKind::Argument |
+        ObservedOperatorKind::Constant |
+        ObservedOperatorKind::Source |
+        ObservedOperatorKind::DeterministicHash |
+        ObservedOperatorKind::OpaqueFamilyElement |
+        ObservedOperatorKind::IndexMap |
+        ObservedOperatorKind::ExplicitElement |
+        ObservedOperatorKind::ProgramCall |
+        ObservedOperatorKind::ExtractCoefficient => g2_obligation(
+            NORMALIZE_RUST_ITEM,
+            "exact value normalization semantics",
+            "value coefficient-bound transfer",
+        ),
+    }
+}
+
+fn transform_coverage_classification(
+    kind: ObservedTransformKind,
+) -> ResidualCoverageClassification {
+    match kind {
+        ObservedTransformKind::GadgetDecompose(ObservedGadgetKind::Regular) => g2_obligation(
+            NORMALIZE_RUST_ITEM,
+            "regular gadget decomposition semantics",
+            "regular gadget decomposition bound transfer",
+        ),
+        ObservedTransformKind::GadgetDecompose(ObservedGadgetKind::Small) => g2_obligation(
+            NORMALIZE_RUST_ITEM,
+            "small gadget decomposition semantics",
+            "small gadget decomposition bound transfer",
+        ),
+        ObservedTransformKind::PackPolynomialCoefficients => g2_obligation(
+            NORMALIZE_RUST_ITEM,
+            "polynomial coefficient packing semantics",
+            "packing coefficient-bound transfer",
+        ),
+    }
+}
+
+fn sampler_coverage_classification(kind: ObservedSamplerKind) -> ResidualCoverageClassification {
+    match kind {
+        ObservedSamplerKind::Sample => g2_obligation(
+            SAMPLER_BOUND_RUST_ITEM,
+            "declared sample semantics",
+            "declared sample bound transfer",
+        ),
+        ObservedSamplerKind::UniformResidue => g2_obligation(
+            SAMPLER_BOUND_RUST_ITEM,
+            "uniform residue sampler semantics",
+            "uniform residue sampler bound transfer",
+        ),
+        ObservedSamplerKind::UniformInterval => g2_obligation(
+            SAMPLER_BOUND_RUST_ITEM,
+            "uniform interval sampler semantics",
+            "uniform interval sampler bound transfer",
+        ),
+        ObservedSamplerKind::Gaussian => g2_obligation(
+            SAMPLER_BOUND_RUST_ITEM,
+            "Gaussian sampler semantics",
+            "Gaussian sampler bound transfer",
+        ),
+        ObservedSamplerKind::Hash(ObservedHashKind::Plain) => g2_obligation(
+            SAMPLER_BOUND_RUST_ITEM,
+            "plain hash sampler semantics",
+            "plain hash sampler bound transfer",
+        ),
+        ObservedSamplerKind::Hash(ObservedHashKind::Decomposed) => g2_obligation(
+            SAMPLER_BOUND_RUST_ITEM,
+            "decomposed hash sampler semantics",
+            "decomposed hash sampler bound transfer",
+        ),
+        ObservedSamplerKind::Hash(ObservedHashKind::SmallDecomposed) => g2_obligation(
+            SAMPLER_BOUND_RUST_ITEM,
+            "small decomposed hash sampler semantics",
+            "small decomposed hash sampler bound transfer",
+        ),
+        ObservedSamplerKind::Trapdoor => g2_obligation(
+            SAMPLER_BOUND_RUST_ITEM,
+            "canonical trapdoor sampler semantics",
+            "canonical trapdoor sampler bound transfer",
+        ),
+        ObservedSamplerKind::Preimage => g2_obligation(
+            SAMPLER_BOUND_RUST_ITEM,
+            "preimage sampler semantics",
+            "preimage sampler bound transfer",
+        ),
+    }
+}
+
+fn relation_coverage_classification(kind: ObservedRelationKind) -> ResidualCoverageClassification {
+    match kind {
+        ObservedRelationKind::Universal => g2_obligation(
+            RELATION_RUST_ITEM,
+            "universal relation replacement association",
+            "universal relation replacement bound transfer",
+        ),
+        ObservedRelationKind::Gadget => g2_obligation(
+            RELATION_RUST_ITEM,
+            "gadget relation replacement association",
+            "gadget relation replacement bound transfer",
+        ),
+    }
+}
+
+fn bound_coverage_classification(kind: ObservedBoundKind) -> ResidualCoverageClassification {
+    match kind {
+        ObservedBoundKind::Authority(ObservedAuthorityKind::Unavailable) => {
+            reject_before_generation(
+                BOUND_RUST_ITEM,
+                "unavailable bound authority cannot justify a residual certificate",
+            )
+        }
+        ObservedBoundKind::Authority(
+            ObservedAuthorityKind::FactStore |
+            ObservedAuthorityKind::ProgramFamilyFact |
+            ObservedAuthorityKind::Operator |
+            ObservedAuthorityKind::RelationPreimageSource,
+        ) => g2_obligation(
+            BOUND_RUST_ITEM,
+            "bound authority association",
+            "authority-provided coefficient bound",
+        ),
+        ObservedBoundKind::Identity |
+        ObservedBoundKind::Sum |
+        ObservedBoundKind::Maximum |
+        ObservedBoundKind::Scale |
+        ObservedBoundKind::MonomialProduct |
+        ObservedBoundKind::WeightedSum |
+        ObservedBoundKind::Product |
+        ObservedBoundKind::Tensor => g2_obligation(
+            BOUND_RUST_ITEM,
+            "bound-rule operand association",
+            "bound-rule arithmetic transfer",
+        ),
+    }
+}
+
+fn residual_coverage_classification(kind: ObservedCoverageKind) -> ResidualCoverageClassification {
+    match kind {
+        ObservedCoverageKind::Operator(kind) => operator_coverage_classification(kind),
+        ObservedCoverageKind::Transform(kind) => transform_coverage_classification(kind),
+        ObservedCoverageKind::Sampler(kind) => sampler_coverage_classification(kind),
+        ObservedCoverageKind::Relation(kind) => relation_coverage_classification(kind),
+        ObservedCoverageKind::Bound(kind) => bound_coverage_classification(kind),
+    }
+}
+
+fn derive_residual_coverage_matrix(
+    coverage: &ObservedCoverage,
+) -> Result<ResidualCoverageMatrix, CertificateProjectionError> {
+    let mut previous_kind = None;
+    let mut rows = Vec::with_capacity(coverage.rows.len());
+    for row in &coverage.rows {
+        if previous_kind.is_some_and(|previous| previous >= row.kind) {
+            return Err(CertificateProjectionError::ProofPayload {
+                detail: "observed coverage rows must be sorted and unique".to_owned(),
+            });
+        }
+        if row.count !=
+            u64::try_from(row.sites.len())
+                .map_err(|_| generator_retention_error(CanonicalPayloadError::LengthOverflow))? ||
+            !row.sites.windows(2).all(|sites| sites[0] < sites[1])
+        {
+            return Err(CertificateProjectionError::ProofPayload {
+                detail: "observed coverage sites must be sorted, unique, and counted exactly"
+                    .to_owned(),
+            });
+        }
+        let classification = residual_coverage_classification(row.kind);
+        if let ResidualCoverageDisposition::RejectBeforeGeneration { reason } =
+            classification.disposition
+        {
+            return Err(CertificateProjectionError::ProofPayload { detail: reason.to_owned() });
+        }
+        rows.push(ResidualCoverageRow {
+            kind: row.kind,
+            count: row.count,
+            sites: row.sites.clone(),
+            rust_item: classification.rust_item,
+            disposition: classification.disposition,
+        });
+        previous_kind = Some(row.kind);
+    }
+    Ok(ResidualCoverageMatrix { rows })
 }
 
 fn generator_support_logical_items(
@@ -3139,6 +3610,8 @@ pub fn prepare_g0_cpu_evidence_bytes(
         generator_peak_retained_logical_items,
         observed_coverage,
     } = derive_proof_payload_projection(&run).map_err(|error| error.to_string())?;
+    let residual_coverage_matrix =
+        derive_residual_coverage_matrix(&observed_coverage).map_err(|error| error.to_string())?;
     let proof_payload_logical_items = payload
         .logical_items()
         .map_err(|_| "G0 CPU evidence proof payload logical-item overflow".to_owned())?;
@@ -3171,7 +3644,7 @@ pub fn prepare_g0_cpu_evidence_bytes(
         schema_version: G0_CPU_EVIDENCE_SCHEMA_VERSION,
         status: G0CpuEvidenceStatus::CpuObservationOnlyNotG0HardGateOrTallEvidence,
         base_feasibility,
-        observed_coverage,
+        residual_coverage_matrix,
         lut: lut_observation,
         metrics: G0CpuMetrics {
             descriptor_inventory_canonical_encoded_bytes,
@@ -4226,7 +4699,7 @@ mod tests {
                         digit_count: None,
                     },
                 },
-                ObservedSamplerKind::Hash,
+                ObservedSamplerKind::Hash(ObservedHashKind::Plain),
             ),
             (
                 CanonicalEventKind::Sampler {
@@ -4260,7 +4733,7 @@ mod tests {
         let bound_cases = vec![
             (
                 ProofPayloadRule::Authority(ProofPayloadAuthority::Operator),
-                ObservedBoundKind::Authority,
+                ObservedBoundKind::Authority(ObservedAuthorityKind::Operator),
             ),
             (ProofPayloadRule::Identity { input: value.clone() }, ObservedBoundKind::Identity),
             (ProofPayloadRule::Sum { inputs: vec![value.clone()] }, ObservedBoundKind::Sum),
@@ -4338,7 +4811,18 @@ mod tests {
                     digit_count: 1,
                 }
             )),
-            Some(ObservedTransformKind::GadgetDecompose),
+            Some(ObservedTransformKind::GadgetDecompose(ObservedGadgetKind::Small)),
+        );
+        assert_eq!(
+            observed_transform_kind(&ValueOperator::Transform(
+                ValueTransformOperation::GadgetDecompose {
+                    output: matrix.clone(),
+                    base: 2,
+                    small: false,
+                    digit_count: 1,
+                }
+            )),
+            Some(ObservedTransformKind::GadgetDecompose(ObservedGadgetKind::Regular)),
         );
         assert_eq!(
             observed_transform_kind(&ValueOperator::Transform(
@@ -4358,6 +4842,54 @@ mod tests {
             )),
             None,
         );
+
+        for variant in [
+            StableHashVariant::Plain,
+            StableHashVariant::Decomposed,
+            StableHashVariant::SmallDecomposed,
+        ] {
+            let expected = match variant {
+                StableHashVariant::Plain => ObservedHashKind::Plain,
+                StableHashVariant::Decomposed => ObservedHashKind::Decomposed,
+                StableHashVariant::SmallDecomposed => ObservedHashKind::SmallDecomposed,
+            };
+            assert_eq!(
+                observed_sampler_kind(&CanonicalEventKind::Sampler {
+                    operation: StableSamplerOperation::Hash {
+                        output: super::super::g0::StableValueType::Matrix {
+                            modulus: "17".to_owned(),
+                            ring_dimension: 1,
+                            rows: 1,
+                            columns: 1,
+                        },
+                        variant,
+                        tag_prefix: vec![],
+                        tag_expressions: vec![],
+                        tag_decimal_expressions: vec![],
+                        tag_u64_le_expressions: vec![],
+                        base: None,
+                        digit_count: None,
+                    },
+                }),
+                ObservedSamplerKind::Hash(expected),
+            );
+        }
+
+        for (authority, expected) in [
+            (ProofPayloadAuthority::FactStore, ObservedAuthorityKind::FactStore),
+            (ProofPayloadAuthority::ProgramFamilyFact, ObservedAuthorityKind::ProgramFamilyFact),
+            (ProofPayloadAuthority::Operator, ObservedAuthorityKind::Operator),
+            (
+                ProofPayloadAuthority::RelationPreimageSource { source: 0 },
+                ObservedAuthorityKind::RelationPreimageSource,
+            ),
+            (ProofPayloadAuthority::Unavailable, ObservedAuthorityKind::Unavailable),
+        ] {
+            assert_eq!(
+                observed_bound_kind(&ProofPayloadRule::Authority(authority)),
+                ObservedBoundKind::Authority(expected),
+            );
+        }
 
         let source = super::super::arena::SemanticSourceIdentity {
             stable_definition: "source".to_owned(),
@@ -4489,6 +5021,91 @@ mod tests {
         // sites Vec 1 + len 2 + sites 4 = 7; row 3 + count 1 + sites 7 = 11;
         // rows Vec 1 + len 1 + row 11 = 13.
         assert_eq!(coverage.logical_items(), Ok(13));
+    }
+
+    #[test]
+    fn residual_coverage_classification_splits_variants_and_rejects_unsupported_rows() {
+        let checked = residual_coverage_classification(ObservedCoverageKind::Operator(
+            ObservedOperatorKind::Scalar(ObservedScalarKind::Add),
+        ));
+        assert!(matches!(checked.disposition, ResidualCoverageDisposition::CheckedLean { .. }));
+        let regular = residual_coverage_classification(ObservedCoverageKind::Transform(
+            ObservedTransformKind::GadgetDecompose(ObservedGadgetKind::Regular),
+        ));
+        let small = residual_coverage_classification(ObservedCoverageKind::Transform(
+            ObservedTransformKind::GadgetDecompose(ObservedGadgetKind::Small),
+        ));
+        assert_ne!(regular.disposition, small.disposition);
+        let hash_classifications = [
+            ObservedHashKind::Plain,
+            ObservedHashKind::Decomposed,
+            ObservedHashKind::SmallDecomposed,
+        ]
+        .map(|hash| {
+            residual_coverage_classification(ObservedCoverageKind::Sampler(
+                ObservedSamplerKind::Hash(hash),
+            ))
+        });
+        for classification in hash_classifications {
+            assert!(matches!(
+                classification.disposition,
+                ResidualCoverageDisposition::G2LeanObligation { .. }
+            ));
+        }
+        assert!(hash_classifications.windows(2).all(|pair| pair[0] != pair[1]));
+        for rejected in [
+            ObservedCoverageKind::Operator(ObservedOperatorKind::Scalar(
+                ObservedScalarKind::ThresholdDecode,
+            )),
+            ObservedCoverageKind::Bound(ObservedBoundKind::Authority(
+                ObservedAuthorityKind::Unavailable,
+            )),
+        ] {
+            let coverage = ObservedCoverage {
+                rows: vec![ObservedCoverageRow {
+                    kind: rejected,
+                    count: 1,
+                    sites: vec![ObservedCoverageSite::ExpressionRow { row: 0 }],
+                }],
+            };
+            assert!(derive_residual_coverage_matrix(&coverage).is_err());
+        }
+    }
+
+    #[test]
+    fn raw_event_coverage_classifier_is_exhaustive_and_rejects_trapdoors() {
+        let matrix = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
+        let cases = [
+            EventKind::Sample {
+                descriptor: super::super::arena::SampleDescriptor::new(
+                    "sample",
+                    ResolvedValueType::Int,
+                ),
+            },
+            EventKind::Sampler {
+                operation: super::super::arena::SamplerOperation::UniformResidue { output: matrix },
+            },
+            EventKind::Trapdoor {
+                operation: TrapdoorOperation::Generate {
+                    descriptor: "trapdoor".to_owned(),
+                    parameters: Box::new([]),
+                    paired_public_event: super::super::arena::SampleEventId(0),
+                    paired_public_output_role: "public".to_owned(),
+                },
+            },
+        ];
+        assert!(matches!(
+            raw_event_coverage_disposition(&cases[0]),
+            RawEventCoverageDisposition::CanonicalProjection
+        ));
+        assert!(matches!(
+            raw_event_coverage_disposition(&cases[1]),
+            RawEventCoverageDisposition::CanonicalProjection
+        ));
+        assert!(matches!(
+            raw_event_coverage_disposition(&cases[2]),
+            RawEventCoverageDisposition::RejectBeforeCanonicalProjection { .. }
+        ));
     }
 
     fn payload_rule_mentions_transfer(rule: &ProofPayloadRule, event: usize) -> bool {
@@ -6450,7 +7067,7 @@ mod tests {
                 "schema_version",
                 "status",
                 "base_feasibility",
-                "observed_coverage",
+                "residual_coverage_matrix",
                 "lut",
                 "metrics",
             ]
@@ -6459,7 +7076,7 @@ mod tests {
         );
         assert_eq!(document["schema_id"], G0_CPU_EVIDENCE_SCHEMA_ID);
         assert_eq!(document["schema_version"], G0_CPU_EVIDENCE_SCHEMA_VERSION);
-        assert_eq!(document["schema_version"], 2);
+        assert_eq!(document["schema_version"], 3);
         assert_eq!(document["status"], "CpuObservationOnlyNotG0HardGateOrTallEvidence");
         let base = &document["base_feasibility"];
         assert_eq!(
@@ -6507,18 +7124,38 @@ mod tests {
                 .into_iter()
                 .collect()
         );
-        assert_eq!(object_keys(&document["observed_coverage"]), ["rows"].into_iter().collect());
-        for row in document["observed_coverage"]["rows"].as_array().expect("coverage rows") {
-            assert_eq!(object_keys(row), ["kind", "count", "sites"].into_iter().collect());
+        assert_eq!(
+            object_keys(&document["residual_coverage_matrix"]),
+            ["rows"].into_iter().collect()
+        );
+        for row in document["residual_coverage_matrix"]["rows"].as_array().expect("coverage rows") {
+            assert_eq!(
+                object_keys(row),
+                ["kind", "count", "sites", "rust_item", "disposition"].into_iter().collect()
+            );
             assert_eq!(object_keys(&row["kind"]), ["domain", "kind"].into_iter().collect());
             if let Some(nested_kind) = row["kind"]["kind"].as_object() {
                 assert_eq!(nested_kind.len(), 1);
-                assert!(
-                    nested_kind
-                        .keys()
-                        .all(|key| { matches!(key.as_str(), "scalar" | "matrix" | "trapdoor") })
-                );
+                assert!(nested_kind.keys().all(|key| matches!(
+                    key.as_str(),
+                    "scalar" | "matrix" | "trapdoor" | "gadget_decompose" | "hash" | "authority"
+                )));
             }
+            assert!(
+                row["rust_item"]
+                    .as_str()
+                    .expect("Rust item")
+                    .starts_with("crates/correctness/src/operational_noise/")
+            );
+            let disposition = &row["disposition"];
+            assert_eq!(
+                object_keys(disposition),
+                ["disposition", "semantics", "transfer"].into_iter().collect()
+            );
+            assert!(matches!(
+                disposition["disposition"].as_str(),
+                Some("checked_lean" | "g2_lean_obligation")
+            ));
             for site in row["sites"].as_array().expect("coverage sites") {
                 let expected =
                     if site["site"] == "trace_event" { ["site", "index"] } else { ["site", "row"] };
@@ -6595,9 +7232,26 @@ mod tests {
             metrics["proof_projection_peak_retained_logical_items"],
             projection.generator_peak_retained_logical_items
         );
+        let expected_matrix =
+            derive_residual_coverage_matrix(&projection.observed_coverage).unwrap();
+        assert_eq!(expected_matrix.rows.len(), projection.observed_coverage.rows.len());
+        for (matrix_row, observed_row) in
+            expected_matrix.rows.iter().zip(&projection.observed_coverage.rows)
+        {
+            assert_eq!(matrix_row.kind, observed_row.kind);
+            assert_eq!(matrix_row.count, observed_row.count);
+            assert_eq!(matrix_row.sites, observed_row.sites);
+            assert_eq!(matrix_row.count, matrix_row.sites.len() as u64);
+            assert!(matrix_row.sites.windows(2).all(|sites| sites[0] < sites[1]));
+            assert!(!matches!(
+                matrix_row.disposition,
+                ResidualCoverageDisposition::RejectBeforeGeneration { .. }
+            ));
+        }
+        assert!(expected_matrix.rows.windows(2).all(|rows| rows[0].kind < rows[1].kind));
         assert_eq!(
-            document["observed_coverage"],
-            serde_json::to_value(&projection.observed_coverage).unwrap()
+            document["residual_coverage_matrix"],
+            serde_json::to_value(expected_matrix).unwrap()
         );
 
         let mut all_keys = BTreeSet::new();

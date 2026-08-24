@@ -93,6 +93,22 @@ struct RepresentativeMeasurement {
     concrete_output_types: Vec<ConcreteWireType>,
 }
 
+fn extrapolate_column_waves(
+    full_wave: &NodeMeasurement,
+    full_wave_count: f64,
+    remainder_wave: Option<&NodeMeasurement>,
+) -> NodeMeasurement {
+    NodeMeasurement {
+        work_seconds: full_wave.work_seconds * full_wave_count +
+            remainder_wave.map_or(0.0, |value| value.work_seconds),
+        latency_seconds: full_wave.latency_seconds * full_wave_count +
+            remainder_wave.map_or(0.0, |value| value.latency_seconds),
+        workspace_bytes: remainder_wave.map_or(full_wave.workspace_bytes, |value| {
+            full_wave.workspace_bytes.max(value.workspace_bytes)
+        }),
+    }
+}
+
 impl PendingMeasurement {
     fn representative_bytes(&self) -> u128 {
         fn wire_bytes(wire_type: &ConcreteWireType) -> u128 {
@@ -887,15 +903,7 @@ impl GpuNodeMeasurementBackend {
                 )
             })
             .transpose()?;
-        let measurement = NodeMeasurement {
-            work_seconds: measured.work_seconds * request.scale +
-                remainder.as_ref().map_or(0.0, |value| value.work_seconds),
-            latency_seconds: measured.latency_seconds * request.scale +
-                remainder.as_ref().map_or(0.0, |value| value.latency_seconds),
-            workspace_bytes: remainder.as_ref().map_or(measured.workspace_bytes, |value| {
-                measured.workspace_bytes.max(value.workspace_bytes)
-            }),
-        };
+        let measurement = extrapolate_column_waves(&measured, request.scale, remainder.as_ref());
         if request.scale > 1.0 || request.remainder.is_some() {
             info!(
                 device_id = worker.device_id,
@@ -1498,14 +1506,28 @@ fn matrix_bytes(matrix: &ConcreteMatrixType, crt_depth: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuNodeMeasurementBackend, matrix_bytes};
-    use crate::MeasurementNode;
+    use super::{GpuNodeMeasurementBackend, extrapolate_column_waves, matrix_bytes};
+    use crate::{MeasurementNode, NodeMeasurement};
     use mxx_ir_core::{
         FrozenGraphScopeId, IntExpr, ParamEnv,
         node::{HashVariant, IndexRange, MatrixBinaryOp, NodeKind},
         types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId},
     };
     use num_bigint::BigInt;
+
+    #[test]
+    fn column_wave_extrapolation_measures_the_remainder_separately() {
+        let full_wave =
+            NodeMeasurement { work_seconds: 38.0, latency_seconds: 39.0, workspace_bytes: 56 };
+        let remainder_wave =
+            NodeMeasurement { work_seconds: 25.0, latency_seconds: 26.0, workspace_bytes: 35 };
+
+        let measurement = extrapolate_column_waves(&full_wave, 6.0, Some(&remainder_wave));
+
+        assert_eq!(measurement.work_seconds, 253.0);
+        assert_eq!(measurement.latency_seconds, 260.0);
+        assert_eq!(measurement.workspace_bytes, 56);
+    }
 
     #[test]
     fn matrix_storage_counts_entries_coefficients_and_crt_limbs() {
@@ -1700,7 +1722,7 @@ mod tests {
             concrete_output_types: vec![ConcreteWireType::Matrix(concrete)],
         };
 
-        let (kind, _, output_types, scale, _) =
+        let (kind, _, output_types, scale, remainder_columns) =
             GpuNodeMeasurementBackend::representative_node(&node, 40, 4);
         let NodeKind::HashSample { matrix_type, .. } = kind else {
             panic!("hash representative kind");
@@ -1710,7 +1732,8 @@ mod tests {
         };
         assert_eq!((output.rows, output.columns), (1, 4));
         assert_eq!(matrix_type.columns, IntExpr::constant(4));
-        assert_eq!(scale, 2_181.0);
+        assert_eq!(scale, 2_180.0);
+        assert_eq!(remainder_columns, Some(2));
     }
 
     #[test]

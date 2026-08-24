@@ -6665,9 +6665,39 @@ mod tests {
             })),
             coefficient_bound: bound.clone(),
         };
-        trace.record_normalization_result(semantic, &value).unwrap();
+        let result_event = trace.record_normalization_result(semantic, &value).unwrap();
+        let summary_evidence =
+            (!value.exact_nf.as_ref().unwrap().bounded_summary.is_zero()).then_some(
+                BoundValueRef::Result { event: result_event, projection: BoundProjection::Summary },
+            );
+        trace
+            .record_pre_fold_polynomial(
+                semantic,
+                value.exact_nf.as_ref().unwrap().clone(),
+                summary_evidence,
+            )
+            .unwrap();
         trace.record_invocation_end(semantic, &value, &NormalizationCounters::default()).unwrap();
         trace.validate_normalization_observations_with_monomials(monomials).unwrap();
+    }
+
+    fn record_root_result_and_snapshot(
+        trace: &mut FeasibilityTrace,
+        semantic: ScopedExprId,
+        value: &AnalyzedValue,
+    ) {
+        let result_event = trace.record_normalization_result(semantic, value).unwrap();
+        let summary_evidence =
+            (!value.exact_nf.as_ref().unwrap().bounded_summary.is_zero()).then_some(
+                BoundValueRef::Result { event: result_event, projection: BoundProjection::Summary },
+            );
+        trace
+            .record_pre_fold_polynomial(
+                semantic,
+                value.exact_nf.as_ref().unwrap().clone(),
+                summary_evidence,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -7938,7 +7968,7 @@ mod tests {
             exact_nf: Some(Arc::new(root_nf)),
             coefficient_bound: root_bound,
         };
-        trace.record_normalization_result(semantic, &root_value).unwrap();
+        record_root_result_and_snapshot(&mut trace, semantic, &root_value);
         trace.record_invocation_end(semantic, &root_value, &traced_counters).unwrap();
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
 
@@ -8177,7 +8207,7 @@ mod tests {
             exact_nf: Some(Arc::new(enabled_output.clone())),
             coefficient_bound: enabled_output.bounded_summary.coefficient_bound(),
         };
-        trace.record_normalization_result(semantic, &root_value).unwrap();
+        record_root_result_and_snapshot(&mut trace, semantic, &root_value);
         trace.record_invocation_end(semantic, &root_value, &enabled_counters).unwrap();
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
         trace
@@ -9575,7 +9605,7 @@ mod tests {
             exact_nf: Some(Arc::new(enabled_output.clone())),
             coefficient_bound: enabled_output.bounded_summary.coefficient_bound(),
         };
-        trace.record_normalization_result(semantic, &root_value).unwrap();
+        record_root_result_and_snapshot(&mut trace, semantic, &root_value);
         trace.record_invocation_end(semantic, &root_value, &enabled_counters).unwrap();
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
         trace
@@ -9735,7 +9765,7 @@ mod tests {
             exact_nf: Some(Arc::new(enabled.clone())),
             coefficient_bound: enabled.bounded_summary.coefficient_bound(),
         };
-        trace.record_normalization_result(semantic, &root_value).unwrap();
+        record_root_result_and_snapshot(&mut trace, semantic, &root_value);
         trace.record_invocation_end(semantic, &root_value, &enabled_counters).unwrap();
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
         trace
@@ -13468,7 +13498,7 @@ mod tests {
         let monomial = monomials.intern(&expressions, &programs, &[], &[semantic]).unwrap();
         let mut trace = FeasibilityTrace::default();
         trace.record_invocation_start(semantic).unwrap();
-        trace.record_normalization_result(semantic, &value).unwrap();
+        record_root_result_and_snapshot(&mut trace, semantic, &value);
         let mut normalizer = Normalizer::new_with_sink(
             &mut expressions,
             &programs,
@@ -13634,6 +13664,21 @@ mod tests {
             .iter()
             .rposition(|event| matches!(event, NormalizerEvent::PreFoldPolynomial(_)))
             .expect("pre-fold snapshot");
+        let NormalizerEvent::PreFoldPolynomial(pre_fold) =
+            &trace.normalization_events()[pre_fold_index]
+        else {
+            unreachable!("pre-fold index must point to its snapshot")
+        };
+        assert!(pre_fold.summary_evidence.is_none());
+        let folded_monomial = match &trace.normalization_events()[fold_index] {
+            NormalizerEvent::BoundTransfer {
+                rule: BoundRule::MonomialProduct { monomial, .. },
+                ..
+            } => *monomial,
+            _ => panic!("root final fold must consume its monomial product"),
+        };
+        assert!(pre_fold.polynomial.exact_terms.contains_key(&folded_monomial));
+        assert!(pre_fold.polynomial.bounded_summary.is_zero());
         let survivor_index = trace
             .normalization_events()
             .iter()

@@ -244,6 +244,13 @@ pub(crate) struct ProofPayloadSurvivorFold {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProofPayloadPreFoldPolynomial {
+    pub terms: Vec<ProofPayloadTerm>,
+    pub summary: super::normal_form::BoundedSummary,
+    pub summary_evidence: Option<ProofPayloadValueRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProofPayloadFactorEvidence {
     pub bound: ProofPayloadValueRef,
     pub is_constant_polynomial: bool,
@@ -351,6 +358,7 @@ pub(crate) enum ProofPayloadEvent {
         rule: ProofPayloadRule,
     },
     CoefficientMerge(ProofPayloadCoefficientMerge),
+    PreFoldPolynomial(ProofPayloadPreFoldPolynomial),
     SurvivorFold(ProofPayloadSurvivorFold),
 }
 
@@ -569,8 +577,8 @@ pub(crate) fn derive_proof_payload(
                     _ => return Err(proof_payload_error(G0Error::RelationTraceInvariant)),
                 }
             }
-            // PreFoldPolynomial is intentionally deferred from the proof payload until its
-            // dedicated replay projection stage.
+            // PreFoldPolynomial has no owner field; its monomial arenas are already covered by
+            // the invocation roots in the residual closure.
             NormalizerEvent::PreFoldPolynomial(_) => continue,
         };
         if let Some(arena) = run.job.monomials().get(scope) {
@@ -707,9 +715,6 @@ impl<'a> ProofPayloadProjector<'a> {
         let event_count = trace.events.len();
         let mut events = Vec::with_capacity(event_count);
         for (index, event) in trace.events.iter().enumerate() {
-            if matches!(event, NormalizerEvent::PreFoldPolynomial(_)) {
-                continue;
-            }
             events.push(self.event(trace, index, event).map_err(proof_payload_error)?);
         }
         Ok(OperationalProofPayload { events })
@@ -781,6 +786,16 @@ impl<'a> ProofPayloadProjector<'a> {
         let Some(normal_form) = &value.exact_nf else {
             return Ok(ProofPayloadValue::Coefficient { bound: value.coefficient_bound.clone() });
         };
+        Ok(ProofPayloadValue::Exact {
+            terms: self.terms(normal_form)?,
+            summary: normal_form.bounded_summary.clone(),
+        })
+    }
+
+    fn terms(
+        &self,
+        normal_form: &super::normal_form::PolynomialNF,
+    ) -> Result<Vec<ProofPayloadTerm>, G0Error> {
         let mut terms = normal_form
             .exact_terms
             .iter()
@@ -792,7 +807,23 @@ impl<'a> ProofPayloadProjector<'a> {
             })
             .collect::<Result<Vec<_>, G0Error>>()?;
         terms.sort_by(|left, right| left.monomial.cmp(&right.monomial));
-        Ok(ProofPayloadValue::Exact { terms, summary: normal_form.bounded_summary.clone() })
+        Ok(terms)
+    }
+
+    fn pre_fold(
+        &self,
+        observation: &super::g0::PreFoldPolynomial,
+        current: usize,
+    ) -> Result<ProofPayloadPreFoldPolynomial, G0Error> {
+        Ok(ProofPayloadPreFoldPolynomial {
+            terms: self.terms(&observation.polynomial)?,
+            summary: observation.polynomial.bounded_summary.clone(),
+            summary_evidence: observation
+                .summary_evidence
+                .as_ref()
+                .map(|evidence| self.value_ref(evidence, current))
+                .transpose()?,
+        })
     }
 
     fn range(
@@ -1250,7 +1281,9 @@ impl<'a> ProofPayloadProjector<'a> {
                     bound: observation.bound.0,
                 })
             }
-            NormalizerEvent::PreFoldPolynomial(_) => Err(G0Error::RelationTraceInvariant)?,
+            NormalizerEvent::PreFoldPolynomial(observation) => {
+                ProofPayloadEvent::PreFoldPolynomial(self.pre_fold(observation, current)?)
+            }
             NormalizerEvent::CoefficientMerge(observation) => ProofPayloadEvent::CoefficientMerge(
                 self.coefficient_merge(trace, observation, current)?,
             ),
@@ -2321,6 +2354,7 @@ mod tests {
             InputContractEntry, InputValueContract, OperationalDecoderTarget, ProtocolInputBinding,
             ProtocolInputDestination, Workflow,
         },
+        operational_noise::facts::{CoefficientBound, NumericContract},
     };
     use mxx_dsl::{Bool, DslContext, IdealSpec, Int, Ring, SemanticAnchor};
     use mxx_ir_core::{IntExpr, node::ConstantMatrix};
@@ -2341,6 +2375,48 @@ mod tests {
             }
             ProofPayloadRule::Product { left, right, .. } |
             ProofPayloadRule::Tensor { left, right, .. } => value(left) || value(right),
+        }
+    }
+
+    fn assert_payload_event_refs_are_local(payload: &OperationalProofPayload) {
+        for (index, event) in payload.events.iter().enumerate() {
+            let before = |reference: u64| assert!((reference as usize) < index);
+            match event {
+                ProofPayloadEvent::Predecessor { source_result, .. } => before(*source_result),
+                ProofPayloadEvent::SpecializationComputed { source, .. } |
+                ProofPayloadEvent::SpecializationCacheHit { source, .. } => {
+                    assert!((source.end as usize) <= index);
+                    assert!(source.start <= source.end);
+                }
+                ProofPayloadEvent::AppliedRelation { rule, .. } => match rule {
+                    ProofPayloadRelationRule::Universal { computed, rhs_result, .. } => {
+                        before(*computed);
+                        before(*rhs_result);
+                    }
+                    ProofPayloadRelationRule::Gadget { input_result, .. } => before(*input_result),
+                },
+                ProofPayloadEvent::CoefficientMerge(observation) => match &observation.source {
+                    ProofPayloadCoefficientMergeSource::Operator { inputs } => {
+                        for input in inputs {
+                            before(input.value_event);
+                        }
+                    }
+                    ProofPayloadCoefficientMergeSource::Relation { application, .. } => {
+                        before(*application)
+                    }
+                },
+                ProofPayloadEvent::PreFoldPolynomial(snapshot) => {
+                    if let Some(
+                        ProofPayloadValueRef::Result { event, .. } |
+                        ProofPayloadValueRef::Transfer(event),
+                    ) = &snapshot.summary_evidence
+                    {
+                        before(*event);
+                    }
+                }
+                ProofPayloadEvent::SurvivorFold(observation) => before(observation.bound),
+                _ => {}
+            }
         }
     }
 
@@ -2716,6 +2792,7 @@ mod tests {
             )
             .expect("threshold product state validates");
         let payload = derive_proof_payload(&run).expect("canonical proof payload");
+        assert_payload_event_refs_are_local(&payload);
         let survivor_folds = payload
             .events
             .iter()
@@ -2728,40 +2805,28 @@ mod tests {
         assert!(!survivor_folds.is_empty(), "accepted payload must contain a survivor fold");
         assert!(survivor_folds.iter().all(|(index, fold)| fold.bound < *index as u64));
         for (_, fold) in &survivor_folds {
-            let Some(NormalizerEvent::BoundTransfer { owner, rule }) =
-                run.trace.events.get(fold.bound as usize)
+            let Some(ProofPayloadEvent::BoundTransfer { owner, rule }) =
+                payload.events.get(fold.bound as usize)
             else {
                 panic!("survivor fold must point to a bound transfer")
             };
             match rule {
-                BoundRule::MonomialProduct { monomial, .. } => {
+                ProofPayloadRule::MonomialProduct { .. } => {
                     assert_eq!(fold.coefficient.magnitude(), &BigUint::from(1_u8));
-                    run.job
-                        .monomials()
-                        .get(owner.program())
-                        .expect("fold owner monomial arena")
-                        .descriptor(*monomial)
-                        .expect("fold monomial remains live");
                 }
-                BoundRule::Scale {
-                    value: BoundValueRef::Transfer(previous),
-                    scale: BoundScale::Magnitude(magnitude),
+                ProofPayloadRule::Scale {
+                    value: ProofPayloadValueRef::Transfer(previous),
+                    scale: ProofPayloadScale::Magnitude(magnitude),
                 } => {
                     assert_eq!(fold.coefficient.magnitude(), magnitude);
-                    let Some(NormalizerEvent::BoundTransfer {
+                    let Some(ProofPayloadEvent::BoundTransfer {
                         owner: previous_owner,
-                        rule: BoundRule::MonomialProduct { monomial, .. },
-                    }) = run.trace.events.get(previous.0 as usize)
+                        rule: ProofPayloadRule::MonomialProduct { .. },
+                    }) = payload.events.get(*previous as usize)
                     else {
                         panic!("scale must consume its monomial product")
                     };
                     assert_eq!(owner, previous_owner);
-                    run.job
-                        .monomials()
-                        .get(owner.program())
-                        .expect("scaled fold owner monomial arena")
-                        .descriptor(*monomial)
-                        .expect("scaled fold monomial remains live");
                 }
                 _ => panic!("survivor fold must resolve to monomial product or scale"),
             }
@@ -2770,13 +2835,41 @@ mod tests {
             .expect("equivalent threshold certificate run");
         let second_payload = derive_proof_payload(&second).expect("canonical second payload");
         assert_eq!(payload, second_payload);
-        let omitted_pre_fold_events = run
-            .trace
+        assert_eq!(payload.events.len(), run.trace.events.len());
+        let snapshots = payload
             .events
             .iter()
-            .filter(|event| matches!(event, NormalizerEvent::PreFoldPolynomial(_)))
-            .count();
-        assert_eq!(payload.events.len() + omitted_pre_fold_events, run.trace.events.len());
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                ProofPayloadEvent::PreFoldPolynomial(snapshot) => Some((index, snapshot)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!snapshots.is_empty(), "accepted payload must retain pre-fold snapshots");
+        for (index, snapshot) in &snapshots {
+            if let Some(evidence) = &snapshot.summary_evidence {
+                match evidence {
+                    ProofPayloadValueRef::Result { event, .. } |
+                    ProofPayloadValueRef::Transfer(event) => {
+                        assert!((*event as usize) < *index)
+                    }
+                    ProofPayloadValueRef::Predecessor { .. } => {}
+                }
+            }
+        }
+        assert!(snapshots.iter().any(|(index, snapshot)| {
+            matches!(
+                snapshot.summary.coefficient_bound(),
+                NumericContract::Known(CoefficientBound::Finite(_))
+            ) && matches!(
+                snapshot.summary_evidence,
+                Some(ProofPayloadValueRef::Result {
+                    event,
+                    projection: BoundProjection::Summary,
+                }) if (event as usize) < *index &&
+                    matches!(payload.events.get(event as usize), Some(ProofPayloadEvent::Result { .. }))
+            )
+        }));
         assert!(
             payload
                 .events
@@ -2886,6 +2979,7 @@ mod tests {
             ProofPayloadEvent::CoefficientMerge(observation) => Some(observation.owner.scope),
             ProofPayloadEvent::SurvivorFold(_) => None,
             ProofPayloadEvent::Predecessor { consumer, .. } => Some(consumer.scope),
+            ProofPayloadEvent::PreFoldPolynomial(_) => None,
         };
         let scopes = payload.events.iter().filter_map(owner_scope).collect::<Vec<_>>();
         let expected_scope = scopes.first().copied().expect("payload owner scope");
@@ -2905,6 +2999,7 @@ mod tests {
             .expect("singleton universal certificate run");
         repeat_certificate_normalization(&mut run);
         let payload = derive_proof_payload(&run).expect("singleton universal payload");
+        assert_payload_event_refs_are_local(&payload);
         assert_eq!(run.projection.closure.families.len(), 1);
         let computed = payload
             .events
@@ -2918,7 +3013,7 @@ mod tests {
             })
             .expect("universal specialization computation");
         assert!(computed.3.start < computed.3.end);
-        assert!(computed.3.end <= run.trace.events.len() as u64);
+        assert!(computed.3.end <= payload.events.len() as u64);
         let applied = payload
             .events
             .iter()
@@ -2942,15 +3037,15 @@ mod tests {
         else {
             unreachable!("filtered universal relation")
         };
-        assert!((*applied_computed as usize) < run.trace.events.len());
+        assert!((*applied_computed as usize) < payload.events.len());
         assert!(*rhs_result as usize >= computed.3.start as usize);
-        assert!((*rhs_result as usize) < run.trace.events.len());
+        assert!((*rhs_result as usize) < payload.events.len());
         assert!(lhs.central_factors.is_empty());
         assert!(lhs.ordered_factors.len() >= 2);
         assert!(lhs_layout.is_none());
         assert!(matches!(
-            run.trace.events.get(*rhs_result as usize),
-            Some(NormalizerEvent::InvocationEnd { .. })
+            payload.events.get(*rhs_result as usize),
+            Some(ProofPayloadEvent::InvocationEnd { .. })
         ));
         assert_eq!(applied.1.scope, computed.1.scope);
         let relation_merges = payload
@@ -2974,8 +3069,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!relation_merges.is_empty(), "universal RHS terms carry relation provenance");
         for (index, application, source_term_ordinal, merge) in &relation_merges {
-            assert!(*application < run.trace.events.len() as u64);
+            assert!(*application < payload.events.len() as u64);
             assert!(*index < payload.events.len());
+            assert!(*application < *index as u64);
             assert_eq!(merge.owner, applied.1);
             let _ = source_term_ordinal;
         }

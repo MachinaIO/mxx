@@ -2043,9 +2043,7 @@ impl FeasibilitySink for FeasibilityTrace {
         let current =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
         if frame.root != root {
-            // Specialized relation plans are normalized in the caller's frame; their
-            // intermediate snapshot is not an invocation-root event.
-            return Ok(());
+            return Err(G0Error::RelationTraceInvariant);
         }
         let Some(result_index) = frame.results.get(&root.expression()).copied() else {
             return Err(G0Error::RelationTraceInvariant);
@@ -2247,17 +2245,18 @@ impl FeasibilitySink for FeasibilityTrace {
                         return Err(G0Error::MissingNormalizationResult);
                     }
                     if let Some((expected, seen_pre_fold)) = scratch {
-                        if seen_pre_fold {
-                            let Some(normal_form) = result.exact_nf.as_ref() else {
-                                return Err(G0Error::RelationTraceInvariant);
-                            };
-                            if normal_form.exact_terms.len() != expected.len() ||
-                                normal_form.exact_terms.iter().any(|(monomial, coefficient)| {
-                                    expected.get(monomial) != Some(coefficient)
-                                })
-                            {
-                                return Err(G0Error::RelationTraceInvariant);
-                            }
+                        if !seen_pre_fold {
+                            return Err(G0Error::RelationTraceInvariant);
+                        }
+                        let Some(normal_form) = result.exact_nf.as_ref() else {
+                            return Err(G0Error::RelationTraceInvariant);
+                        };
+                        if normal_form.exact_terms.len() != expected.len() ||
+                            normal_form.exact_terms.iter().any(|(monomial, coefficient)| {
+                                expected.get(monomial) != Some(coefficient)
+                            })
+                        {
+                            return Err(G0Error::RelationTraceInvariant);
                         }
                     }
                 }
@@ -2298,6 +2297,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     let Some((root, _, _, _, _, _, _)) = stack.last() else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
+                    let active_root = *root;
                     if root.program() != observation.owner.program() ||
                         observation.ordered_start >= observation.ordered_end_exclusive
                     {
@@ -2368,7 +2368,12 @@ impl FeasibilitySink for FeasibilityTrace {
                             }
                         }
                         if let Some((map, _)) = scratch {
-                            map.remove(&observation.source_monomial);
+                            if observation.owner != active_root ||
+                                map.remove(&observation.source_monomial) !=
+                                    Some(observation.outer_coefficient.clone())
+                            {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
                         }
                     }
                 }

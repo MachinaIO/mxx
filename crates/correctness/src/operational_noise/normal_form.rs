@@ -6026,6 +6026,19 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             {
                 bound = bounds[1].clone();
             }
+            if bound.is_missing() &&
+                let ValueOperator::ProgramCall { program } = &node.operator &&
+                self.expressions.value_type(expression)? == &ResolvedValueType::Int &&
+                let Some(range) = self
+                    .programs
+                    .selector(self.expressions, *program)
+                    .ok()
+                    .and_then(|selector| selector.output_range()) &&
+                let Some(maximum) = range.maximum_exclusive.checked_sub(1)
+            {
+                bound =
+                    NumericContract::Known(CoefficientBound::finite(range.minimum.max(maximum)));
+            }
             if bound.is_missing() {
                 return Err(NormalizeError::UnsupportedNonmatrixBound {
                     owner,
@@ -6042,6 +6055,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 ValueOperator::Argument { position: 0, value_type: ResolvedValueType::Int } => {
                     BoundRule::Authority(BoundAuthority::Operator)
                 }
+                ValueOperator::ProgramCall { .. } => BoundRule::Authority(BoundAuthority::Operator),
                 ValueOperator::Scalar(ScalarOperation::Add | ScalarOperation::Subtract) => {
                     BoundRule::Sum {
                         inputs: Self::predecessor_refs(
@@ -14275,6 +14289,170 @@ mod tests {
                 )
             }));
         }
+    }
+
+    #[test]
+    fn selector_program_calls_use_exact_callee_ranges_without_nested_normalization() {
+        for shifted_remainder in [false, true] {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+            let (callee_root, input_range, expected_bound) = if shifted_remainder {
+                let offset = expressions
+                    .intern(ValueOperator::Constant(TypedConstant::int(3)), Box::new([]))
+                    .unwrap();
+                let shifted = expressions
+                    .intern(
+                        ValueOperator::Scalar(ScalarOperation::Add),
+                        Box::new([argument, offset]),
+                    )
+                    .unwrap();
+                let divisor = expressions
+                    .intern(ValueOperator::Constant(TypedConstant::int(4)), Box::new([]))
+                    .unwrap();
+                let remainder = expressions
+                    .intern(
+                        ValueOperator::Scalar(ScalarOperation::Remainder),
+                        Box::new([shifted, divisor]),
+                    )
+                    .unwrap();
+                (remainder, TrustedIndexRange { minimum: 0, maximum_exclusive: 32 }, 3_u64)
+            } else {
+                (argument, TrustedIndexRange { minimum: 7, maximum_exclusive: 9 }, 8_u64)
+            };
+            let callee = programs
+                .finalize(
+                    &mut expressions,
+                    ProgramSignature {
+                        inputs: Box::new([ProgramInput {
+                            value_type: ResolvedValueType::Int,
+                            trusted_index_range: Some(input_range),
+                        }]),
+                        output: ResolvedValueType::Int,
+                    },
+                    callee_root,
+                )
+                .unwrap();
+            let call = expressions
+                .intern(ValueOperator::ProgramCall { program: callee }, Box::new([argument]))
+                .unwrap();
+            let caller = programs
+                .generated_family(
+                    &mut expressions,
+                    ProgramSignature {
+                        inputs: Box::new([ProgramInput {
+                            value_type: ResolvedValueType::Int,
+                            trusted_index_range: Some(input_range),
+                        }]),
+                        output: ResolvedValueType::Int,
+                    },
+                    call,
+                )
+                .unwrap()
+                .program();
+            let owner = programs.scoped(&expressions, caller, call).unwrap();
+            let facts = FactStore::new(&expressions);
+
+            let mut ordinary_monomials =
+                MonomialArena::new(&expressions, &programs, caller).unwrap();
+            let ordinary =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut ordinary_monomials)
+                    .unwrap()
+                    .normalize(owner)
+                    .unwrap();
+            assert_eq!(ordinary.coefficient_bound, NumericContract::Missing);
+
+            let mut monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
+            let mut trace = FeasibilityTrace::default();
+            let traced = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .normalize(owner)
+            .unwrap();
+            assert_eq!(
+                traced.coefficient_bound,
+                NumericContract::Known(CoefficientBound::finite(expected_bound))
+            );
+            trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+            assert_eq!(
+                trace
+                    .normalization_events()
+                    .iter()
+                    .filter(|event| matches!(event, NormalizerEvent::InvocationStart { .. }))
+                    .count(),
+                1,
+                "the selector capability must not normalize the callee"
+            );
+            assert_eq!(
+                trace
+                    .normalization_events()
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        NormalizerEvent::BoundTransfer {
+                            owner: observed,
+                            rule: BoundRule::Authority(BoundAuthority::Operator),
+                        } if *observed == owner
+                    ))
+                    .count(),
+                1
+            );
+            assert!(matches!(
+                expressions.node(call).unwrap().operator,
+                ValueOperator::ProgramCall { program } if program == callee
+            ));
+            assert_eq!(programs.project_program(caller).unwrap().root, call);
+        }
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let unsupported_root = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), Box::new([argument, one]))
+            .unwrap();
+        let signature = ProgramSignature {
+            inputs: Box::new([ProgramInput {
+                value_type: ResolvedValueType::Int,
+                trusted_index_range: Some(TrustedIndexRange { minimum: 0, maximum_exclusive: 8 }),
+            }]),
+            output: ResolvedValueType::Int,
+        };
+        let callee =
+            programs.finalize(&mut expressions, signature.clone(), unsupported_root).unwrap();
+        let call = expressions
+            .intern(ValueOperator::ProgramCall { program: callee }, Box::new([argument]))
+            .unwrap();
+        let caller =
+            programs.generated_family(&mut expressions, signature, call).unwrap().program();
+        let owner = programs.scoped(&expressions, caller, call).unwrap();
+        let facts = FactStore::new(&expressions);
+        let mut monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        assert_eq!(
+            Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .normalize(owner)
+            .unwrap_err(),
+            NormalizeError::UnsupportedNonmatrixBound {
+                owner,
+                expression: call,
+                operator: Box::new(ValueOperator::ProgramCall { program: callee }),
+            }
+        );
     }
 
     #[test]

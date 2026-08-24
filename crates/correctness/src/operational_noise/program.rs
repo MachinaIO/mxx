@@ -54,6 +54,15 @@ pub enum SelectionSelector {
     Program(ProgramSelector),
 }
 
+impl SelectionSelector {
+    pub(crate) const fn output_range(self) -> Option<TrustedIndexRange> {
+        match self {
+            Self::Closed(_) => None,
+            Self::Program(selector) => Some(selector.output_range),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FamilyRecord {
     domain: FamilyDomain,

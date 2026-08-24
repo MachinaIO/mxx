@@ -7569,7 +7569,7 @@ pub(crate) mod tests {
     fn parallel_zip_output_uses_one_extracted_coefficient_axis_as_a_leaf() {
         let protocol = parallel_range_protocol();
         let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("parallel plan");
-        let (job, _, trace) = ProductionAdapter::new_with_feasibility(
+        let (job, roots, trace) = ProductionAdapter::new_with_feasibility(
             &protocol,
             &plan,
             BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
@@ -7577,6 +7577,22 @@ pub(crate) mod tests {
         .expect("opt-in adapter")
         .lower_with_feasibility()
         .expect("opt-in lowering");
+        let residual = match &roots.residual {
+            ProductionRoot::Closed(root) => {
+                let ResolvedValueType::Matrix(matrix) =
+                    job.expressions().value_type(root.expression()).unwrap()
+                else {
+                    panic!("parallel residual must be a matrix")
+                };
+                super::super::simulation::CertificateResidualRoot::Closed {
+                    root: *root,
+                    matrix: matrix.clone(),
+                }
+            }
+            ProductionRoot::Family(_) => panic!("parallel residual must be closed"),
+        };
+        let closure = super::super::simulation::collect_residual_closure(&job, &residual)
+            .expect("actual residual closure");
         let extracted_plans = trace
             .index_use_plans()
             .filter(|plan| {
@@ -7601,10 +7617,14 @@ pub(crate) mod tests {
                 panic!("coefficient selector must have one matrix input")
             };
             let input_operator = &job.expressions().node(*matrix_input).unwrap().operator;
-            assert!(
-                matches!(input_operator, ValueOperator::ProgramCall { .. }),
-                "coefficient input={input_operator:?}"
-            );
+            let ValueOperator::ProgramCall { program } = input_operator else {
+                panic!("coefficient input={input_operator:?}")
+            };
+            let callee_root = job.programs().program(*program).unwrap().root;
+            assert!(closure.expressions.contains(expression));
+            assert!(closure.expressions.contains(matrix_input));
+            assert!(closure.programs.contains(program));
+            assert!(closure.expressions.contains(&callee_root));
         }
         let lut = super::super::g0::enumerate_index_lut_evidence(
             job.expressions(),

@@ -1153,29 +1153,50 @@ fn validate_residual_plan(
 ) -> Result<(), G0Error> {
     refs.expression(plan.index)?;
     if !closure.expressions.contains(&plan.index) {
-        return Err(G0Error::CanonicalMissingDependency);
+        return Err(canonical_missing(
+            "index_use",
+            CanonicalReference::Expr(plan.index),
+            CanonicalDependencyField::DagDependency { position: 0 },
+            CanonicalReference::Expr(plan.index),
+        ));
     }
-    for expression in plan
+    for (position, expression) in plan
         .result
         .into_iter()
         .chain(plan.consumed)
         .chain(plan.frontier.iter().map(IndexFrontierAxis::expression))
+        .enumerate()
     {
         if !closure.expressions.contains(&expression) {
-            return Err(G0Error::CanonicalMissingDependency);
+            return Err(canonical_missing(
+                "index_use",
+                CanonicalReference::Expr(plan.index),
+                CanonicalDependencyField::DagDependency { position: position as u64 + 1 },
+                CanonicalReference::Expr(expression),
+            ));
         }
         refs.expression(expression)?;
     }
     for family in plan.result_family.into_iter().chain(plan.consumed_family) {
         if !closure.families.contains(&family) {
-            return Err(G0Error::CanonicalMissingDependency);
+            return Err(canonical_missing(
+                "index_use",
+                CanonicalReference::Expr(plan.index),
+                CanonicalDependencyField::FamilyProgram,
+                CanonicalReference::Family(family),
+            ));
         }
         refs.family(family)?;
     }
     if let Some(group) = &plan.slice_group {
         for member in &group.members {
             if !closure.expressions.contains(&member.expression) {
-                return Err(G0Error::CanonicalMissingDependency);
+                return Err(canonical_missing(
+                    "index_use",
+                    CanonicalReference::Expr(plan.index),
+                    CanonicalDependencyField::DagDependency { position: member.role as u64 },
+                    CanonicalReference::Expr(member.expression),
+                ));
             }
             refs.expression(member.expression)?;
         }
@@ -4485,12 +4506,12 @@ impl CanonicalEventRows {
     }
 
     pub(crate) fn event(&self, event: SampleEventId) -> Result<StableEventRef, G0Error> {
-        self.refs.get(&event).copied().ok_or(G0Error::CanonicalMissingDependency)
+        self.refs.get(&event).copied().ok_or(G0Error::MissingEventObservation)
     }
 
     fn kind(&self, event: SampleEventId) -> Result<&CanonicalEventKind, G0Error> {
         let row = self.event(event)?.row as usize;
-        self.rows.get(row).map(|row| &row.kind).ok_or(G0Error::CanonicalMissingDependency)
+        self.rows.get(row).map(|row| &row.kind).ok_or(G0Error::MissingEventObservation)
     }
 
     pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, G0Error> {
@@ -4582,23 +4603,108 @@ pub(crate) enum G0Error {
     },
     #[error("G0 descriptor encoding failed: {0}")]
     Encoding(String),
-    #[error("canonical DAG node references a missing dependency")]
-    CanonicalMissingDependency,
+    #[error(
+        "canonical {row_kind} reference {referencing:?} is missing {field:?} dependency {missing:?}"
+    )]
+    CanonicalMissingDependency {
+        row_kind: String,
+        referencing: CanonicalReference,
+        field: CanonicalDependencyField,
+        missing: CanonicalReference,
+    },
     #[error("canonical DAG key is ambiguous without authoritative aliasing")]
     AmbiguousCanonicalKey,
     #[error("canonical DAG contains a dependency cycle")]
     CanonicalDependencyCycle,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CanonicalReference {
+    Expr(ExprId),
+    Program(super::arena::ValueProgramId),
+    Family(super::program::FamilyValueId),
+    Source(SourceHandle),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CanonicalDependencyField {
+    FamilyProgram,
+    SourceObservation,
+    Input { position: u64 },
+    ProgramCallTarget,
+    ProgramRoot,
+    DagDependency { position: u64 },
+}
+
+fn canonical_missing(
+    row_kind: impl Into<String>,
+    referencing: CanonicalReference,
+    field: CanonicalDependencyField,
+    missing: CanonicalReference,
+) -> G0Error {
+    G0Error::CanonicalMissingDependency { row_kind: row_kind.into(), referencing, field, missing }
+}
+
+fn require_family_program(
+    closure: &CertificateClosure,
+    family: super::program::FamilyValueId,
+) -> Result<(), G0Error> {
+    let program = family.program();
+    if closure.programs.contains(&program) {
+        Ok(())
+    } else {
+        Err(canonical_missing(
+            "family",
+            CanonicalReference::Family(family),
+            CanonicalDependencyField::FamilyProgram,
+            CanonicalReference::Program(program),
+        ))
+    }
+}
+
+fn require_program_call_target(
+    closure: &CertificateClosure,
+    expression: ExprId,
+    program: super::arena::ValueProgramId,
+) -> Result<(), G0Error> {
+    if closure.programs.contains(&program) {
+        Ok(())
+    } else {
+        Err(canonical_missing(
+            "expression",
+            CanonicalReference::Expr(expression),
+            CanonicalDependencyField::ProgramCallTarget,
+            CanonicalReference::Program(program),
+        ))
+    }
+}
+
+fn require_program_root(
+    closure: &CertificateClosure,
+    program: super::arena::ValueProgramId,
+    root: ExprId,
+) -> Result<(), G0Error> {
+    if closure.expressions.contains(&root) {
+        Ok(())
+    } else {
+        Err(canonical_missing(
+            "program",
+            CanonicalReference::Program(program),
+            CanonicalDependencyField::ProgramRoot,
+            CanonicalReference::Expr(root),
+        ))
+    }
+}
+
 /// A typed, handle-local DAG input for canonical residual row assignment. The handle is used
 /// only for lookup; row ordering and serialized identity are derived from the typed kind,
 /// descriptor, and ordered dependency row references.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CanonicalDagNode<H> {
-    pub handle: H,
+pub(crate) struct CanonicalDagNode {
+    pub handle: CanonicalHandle,
     pub row_kind: String,
     pub descriptor: Vec<u8>,
-    pub dependencies: Vec<H>,
+    pub dependencies: Vec<CanonicalHandle>,
     pub authoritative_alias: bool,
 }
 
@@ -4606,6 +4712,15 @@ pub(crate) struct CanonicalDagNode<H> {
 pub(crate) enum CanonicalHandle {
     Expression(ExprId),
     Program(super::arena::ValueProgramId),
+}
+
+impl CanonicalHandle {
+    fn reference(self) -> CanonicalReference {
+        match self {
+            Self::Expression(expression) => CanonicalReference::Expr(expression),
+            Self::Program(program) => CanonicalReference::Program(program),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -4664,17 +4779,25 @@ impl CanonicalResidualRefs {
     }
 
     pub(crate) fn expression(&self, expression: ExprId) -> Result<u64, G0Error> {
-        self.handles
-            .get(&CanonicalHandle::Expression(expression))
-            .copied()
-            .ok_or(G0Error::CanonicalMissingDependency)
+        self.handles.get(&CanonicalHandle::Expression(expression)).copied().ok_or_else(|| {
+            canonical_missing(
+                "canonical_ref",
+                CanonicalReference::Expr(expression),
+                CanonicalDependencyField::DagDependency { position: 0 },
+                CanonicalReference::Expr(expression),
+            )
+        })
     }
 
     pub(crate) fn program(&self, program: super::arena::ValueProgramId) -> Result<u64, G0Error> {
-        self.handles
-            .get(&CanonicalHandle::Program(program))
-            .copied()
-            .ok_or(G0Error::CanonicalMissingDependency)
+        self.handles.get(&CanonicalHandle::Program(program)).copied().ok_or_else(|| {
+            canonical_missing(
+                "canonical_ref",
+                CanonicalReference::Program(program),
+                CanonicalDependencyField::DagDependency { position: 0 },
+                CanonicalReference::Program(program),
+            )
+        })
     }
 
     pub(crate) fn family(&self, family: super::program::FamilyValueId) -> Result<u64, G0Error> {
@@ -4721,7 +4844,7 @@ impl CanonicalResidualRefs {
             (Some(expression), None) => self.stable_expression(expression).map(Some),
             (None, Some(family)) => self.stable_family(family).map(Some),
             (None, None) => Ok(None),
-            (Some(_), Some(_)) => Err(G0Error::CanonicalMissingDependency),
+            (Some(_), Some(_)) => Err(G0Error::ConflictingIndexUsePlan),
         }
     }
 
@@ -4756,9 +4879,9 @@ struct CanonicalDagKey {
 }
 
 /// Assign deterministic dependency-first rows without using opaque handles as tie-breakers.
-pub(crate) fn canonical_dependency_rows<H: Clone + Ord>(
-    nodes: impl IntoIterator<Item = CanonicalDagNode<H>>,
-) -> Result<BTreeMap<H, u64>, G0Error> {
+pub(crate) fn canonical_dependency_rows(
+    nodes: impl IntoIterator<Item = CanonicalDagNode>,
+) -> Result<BTreeMap<CanonicalHandle, u64>, G0Error> {
     let nodes = nodes.into_iter().collect::<Vec<_>>();
     let mut positions = BTreeMap::new();
     for (position, node) in nodes.iter().enumerate() {
@@ -4769,9 +4892,14 @@ pub(crate) fn canonical_dependency_rows<H: Clone + Ord>(
     let mut indegree = vec![0_usize; nodes.len()];
     let mut dependents = vec![Vec::<usize>::new(); nodes.len()];
     for (position, node) in nodes.iter().enumerate() {
-        for dependency in &node.dependencies {
+        for (dependency_index, dependency) in node.dependencies.iter().enumerate() {
             let Some(&dependency_position) = positions.get(dependency) else {
-                return Err(G0Error::CanonicalMissingDependency);
+                return Err(canonical_missing(
+                    node.row_kind.clone(),
+                    node.handle.reference(),
+                    CanonicalDependencyField::DagDependency { position: dependency_index as u64 },
+                    dependency.reference(),
+                ));
             };
             indegree[position] += 1;
             dependents[dependency_position].push(position);
@@ -4789,8 +4917,23 @@ pub(crate) fn canonical_dependency_rows<H: Clone + Ord>(
         let mut keyed = Vec::with_capacity(ready.len());
         for &position in &ready {
             let node = &nodes[position];
-            let dependencies =
-                node.dependencies.iter().map(|dependency| rows[dependency]).collect::<Vec<_>>();
+            let dependencies = node
+                .dependencies
+                .iter()
+                .enumerate()
+                .map(|(dependency_index, dependency)| {
+                    rows.get(dependency).copied().ok_or_else(|| {
+                        canonical_missing(
+                            node.row_kind.clone(),
+                            node.handle.reference(),
+                            CanonicalDependencyField::DagDependency {
+                                position: dependency_index as u64,
+                            },
+                            dependency.reference(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             keyed.push((
                 CanonicalDagKey {
                     row_kind: node.row_kind.clone(),
@@ -5021,7 +5164,7 @@ fn stable_observed_identity(
                     .sample_event
                     .map(|event| {
                         events
-                            .ok_or(G0Error::CanonicalMissingDependency)
+                            .ok_or(G0Error::MissingEventObservation)
                             .and_then(|events| events.event(event))
                     })
                     .transpose()?,
@@ -5509,10 +5652,7 @@ pub(crate) fn canonical_residual_refs(
 ) -> Result<CanonicalResidualRefs, G0Error> {
     let event_rows = derive_canonical_event_rows(closure, trace)?;
     for &family in &closure.families {
-        let program = family.program();
-        if !closure.programs.contains(&program) {
-            return Err(G0Error::CanonicalMissingDependency);
-        }
+        require_family_program(closure, family)?;
         job.programs().project_family(family)?;
     }
     let mut nodes = Vec::new();
@@ -5520,10 +5660,16 @@ pub(crate) fn canonical_residual_refs(
         let node = job.expressions().node(expression)?;
         let source = match &node.operator {
             ValueOperator::Source(_) => Some(stable_observed_source(
-                trace
-                    .source_observations()
-                    .get(&SourceHandle::Expression(expression))
-                    .ok_or(G0Error::CanonicalMissingDependency)?,
+                trace.source_observations().get(&SourceHandle::Expression(expression)).ok_or_else(
+                    || {
+                        canonical_missing(
+                            "expression",
+                            CanonicalReference::Expr(expression),
+                            CanonicalDependencyField::SourceObservation,
+                            CanonicalReference::Source(SourceHandle::Expression(expression)),
+                        )
+                    },
+                )?,
                 Some(&event_rows),
             )?),
             _ => None,
@@ -5535,16 +5681,19 @@ pub(crate) fn canonical_residual_refs(
         })
         .map_err(|error| G0Error::Encoding(error.to_string()))?;
         let mut dependencies = Vec::new();
-        for &input in &node.inputs {
+        for (position, &input) in node.inputs.iter().enumerate() {
             if !closure.expressions.contains(&input) {
-                return Err(G0Error::CanonicalMissingDependency);
+                return Err(canonical_missing(
+                    "expression",
+                    CanonicalReference::Expr(expression),
+                    CanonicalDependencyField::Input { position: position as u64 },
+                    CanonicalReference::Expr(input),
+                ));
             }
             dependencies.push(CanonicalHandle::Expression(input));
         }
         if let ValueOperator::ProgramCall { program } = node.operator {
-            if !closure.programs.contains(&program) {
-                return Err(G0Error::CanonicalMissingDependency);
-            }
+            require_program_call_target(closure, expression, program)?;
             dependencies.push(CanonicalHandle::Program(program));
         }
         nodes.push(CanonicalDagNode {
@@ -5557,9 +5706,7 @@ pub(crate) fn canonical_residual_refs(
     }
     for &program in &closure.programs {
         let projection = job.programs().project_program(program)?;
-        if !closure.expressions.contains(&projection.root) {
-            return Err(G0Error::CanonicalMissingDependency);
-        }
+        require_program_root(closure, program, projection.root)?;
         let descriptor = serde_json::to_vec(&canonical_program_descriptor(&projection))
             .map_err(|error| G0Error::Encoding(error.to_string()))?;
         nodes.push(CanonicalDagNode {
@@ -5581,7 +5728,16 @@ pub(crate) fn canonical_residual_refs(
                         trace
                             .source_observations()
                             .get(&SourceHandle::Expression(*expression))
-                            .ok_or(G0Error::CanonicalMissingDependency)?,
+                            .ok_or_else(|| {
+                                canonical_missing(
+                                    "expression",
+                                    CanonicalReference::Expr(*expression),
+                                    CanonicalDependencyField::SourceObservation,
+                                    CanonicalReference::Source(SourceHandle::Expression(
+                                        *expression,
+                                    )),
+                                )
+                            })?,
                         Some(&event_rows),
                     )?),
                     _ => None,
@@ -5592,20 +5748,39 @@ pub(crate) fn canonical_residual_refs(
                     source,
                 })
                 .map_err(|error| G0Error::Encoding(error.to_string()))?;
-                (
-                    "expression".to_owned(),
-                    descriptor,
-                    node.inputs
-                        .iter()
-                        .map(|input| handles[&CanonicalHandle::Expression(*input)])
-                        .chain(match node.operator {
-                            ValueOperator::ProgramCall { program } => {
-                                Some(handles[&CanonicalHandle::Program(program)])
-                            }
-                            _ => None,
-                        })
-                        .collect(),
-                )
+                let mut dependencies = Vec::with_capacity(
+                    node.inputs.len() +
+                        usize::from(matches!(node.operator, ValueOperator::ProgramCall { .. })),
+                );
+                for (position, input) in node.inputs.iter().enumerate() {
+                    dependencies.push(
+                        handles.get(&CanonicalHandle::Expression(*input)).copied().ok_or_else(
+                            || {
+                                canonical_missing(
+                                    "expression",
+                                    CanonicalReference::Expr(*expression),
+                                    CanonicalDependencyField::Input { position: position as u64 },
+                                    CanonicalReference::Expr(*input),
+                                )
+                            },
+                        )?,
+                    );
+                }
+                if let ValueOperator::ProgramCall { program } = node.operator {
+                    dependencies.push(
+                        handles.get(&CanonicalHandle::Program(program)).copied().ok_or_else(
+                            || {
+                                canonical_missing(
+                                    "expression",
+                                    CanonicalReference::Expr(*expression),
+                                    CanonicalDependencyField::ProgramCallTarget,
+                                    CanonicalReference::Program(program),
+                                )
+                            },
+                        )?,
+                    );
+                }
+                ("expression".to_owned(), descriptor, dependencies)
             }
             CanonicalHandle::Program(program) => {
                 let projection = job.programs().project_program(*program)?;
@@ -5613,14 +5788,29 @@ pub(crate) fn canonical_residual_refs(
                     "program".to_owned(),
                     serde_json::to_vec(&canonical_program_descriptor(&projection))
                         .map_err(|error| G0Error::Encoding(error.to_string()))?,
-                    vec![handles[&CanonicalHandle::Expression(projection.root)]],
+                    vec![
+                        handles
+                            .get(&CanonicalHandle::Expression(projection.root))
+                            .copied()
+                            .ok_or_else(|| {
+                                canonical_missing(
+                                    "program",
+                                    CanonicalReference::Program(*program),
+                                    CanonicalDependencyField::ProgramRoot,
+                                    CanonicalReference::Expr(projection.root),
+                                )
+                            })?,
+                    ],
                 )
             }
         };
         rows[*row as usize] = Some(CanonicalResidualRow { kind, descriptor, dependencies });
     }
     Ok(CanonicalResidualRefs {
-        rows: rows.into_iter().map(Option::unwrap).collect(),
+        rows: rows
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(G0Error::CanonicalDependencyCycle)?,
         handles,
         event_rows,
     })
@@ -6001,14 +6191,22 @@ mod tests {
         descriptor: &str,
         dependencies: &[u8],
         authoritative_alias: bool,
-    ) -> CanonicalDagNode<u8> {
+    ) -> CanonicalDagNode {
         CanonicalDagNode {
-            handle,
+            handle: dag_handle(handle),
             row_kind: kind.to_owned(),
             descriptor: descriptor.as_bytes().to_vec(),
-            dependencies: dependencies.to_vec(),
+            dependencies: dependencies.iter().copied().map(dag_handle).collect(),
             authoritative_alias,
         }
+    }
+
+    fn dag_handle(slot: u8) -> CanonicalHandle {
+        CanonicalHandle::Expression(dag_expression(slot))
+    }
+
+    fn dag_expression(slot: u8) -> ExprId {
+        ExprId::new(super::super::arena::ArenaToken(200), u32::from(slot))
     }
 
     #[test]
@@ -6027,9 +6225,9 @@ mod tests {
         .unwrap();
         assert_eq!(forward.values().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
         assert_eq!(reverse.values().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
-        assert_eq!(forward[&1], reverse[&10]);
-        assert_eq!(forward[&2], reverse[&20]);
-        assert_eq!(forward[&3], reverse[&30]);
+        assert_eq!(forward[&dag_handle(1)], reverse[&dag_handle(10)]);
+        assert_eq!(forward[&dag_handle(2)], reverse[&dag_handle(20)]);
+        assert_eq!(forward[&dag_handle(3)], reverse[&dag_handle(30)]);
     }
 
     #[test]
@@ -7349,14 +7547,14 @@ mod tests {
             dag_node(4, "ordered", "c", &[2, 1], false),
         ])
         .unwrap();
-        assert_ne!(ordered[&3], ordered[&4]);
+        assert_ne!(ordered[&dag_handle(3)], ordered[&dag_handle(4)]);
 
         let aliases = canonical_dependency_rows([
             dag_node(1, "leaf", "a", &[], true),
             dag_node(2, "leaf", "a", &[], true),
         ])
         .unwrap();
-        assert_eq!(aliases[&1], aliases[&2]);
+        assert_eq!(aliases[&dag_handle(1)], aliases[&dag_handle(2)]);
         assert_eq!(
             canonical_dependency_rows([
                 dag_node(1, "leaf", "a", &[], false),
@@ -7370,7 +7568,12 @@ mod tests {
     fn canonical_dag_rows_reject_missing_dependencies_and_cycles() {
         assert_eq!(
             canonical_dependency_rows([dag_node(1, "node", "a", &[9], false)]),
-            Err(G0Error::CanonicalMissingDependency)
+            Err(canonical_missing(
+                "node",
+                CanonicalReference::Expr(dag_expression(1)),
+                CanonicalDependencyField::DagDependency { position: 0 },
+                CanonicalReference::Expr(dag_expression(9)),
+            ))
         );
         assert_eq!(
             canonical_dependency_rows([
@@ -7378,6 +7581,89 @@ mod tests {
                 dag_node(2, "node", "b", &[1], false),
             ]),
             Err(G0Error::CanonicalDependencyCycle)
+        );
+    }
+
+    fn diagnostic_closure(expressions: impl IntoIterator<Item = ExprId>) -> CertificateClosure {
+        CertificateClosure {
+            expressions: expressions.into_iter().collect(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn canonical_missing_dependencies_report_typed_input_source_program_and_family_context() {
+        let mut job = CheckerJob::new();
+        let child = job
+            .expressions_mut()
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let root = job
+            .expressions_mut()
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::Add), &[child, child])
+            .unwrap();
+        assert_eq!(
+            canonical_residual_refs(
+                &job,
+                &diagnostic_closure([root]),
+                &FeasibilityTrace::default(),
+            ),
+            Err(canonical_missing(
+                "expression",
+                CanonicalReference::Expr(root),
+                CanonicalDependencyField::Input { position: 0 },
+                CanonicalReference::Expr(child),
+            ))
+        );
+
+        let source = matrix_source(job.expressions_mut(), 1, 1);
+        assert_eq!(
+            canonical_residual_refs(
+                &job,
+                &diagnostic_closure([source]),
+                &FeasibilityTrace::default(),
+            ),
+            Err(canonical_missing(
+                "expression",
+                CanonicalReference::Expr(source),
+                CanonicalDependencyField::SourceObservation,
+                CanonicalReference::Source(SourceHandle::Expression(source)),
+            ))
+        );
+
+        let program = ValueProgramId::new(super::super::arena::ArenaToken(201), 4);
+        assert_eq!(
+            require_program_call_target(&diagnostic_closure([]), root, program),
+            Err(canonical_missing(
+                "expression",
+                CanonicalReference::Expr(root),
+                CanonicalDependencyField::ProgramCallTarget,
+                CanonicalReference::Program(program),
+            ))
+        );
+        assert_eq!(
+            require_program_root(&diagnostic_closure([]), program, child),
+            Err(canonical_missing(
+                "program",
+                CanonicalReference::Program(program),
+                CanonicalDependencyField::ProgramRoot,
+                CanonicalReference::Expr(child),
+            ))
+        );
+        let family = super::super::program::FamilyValueId::from_program(program);
+        assert_eq!(
+            require_family_program(&diagnostic_closure([]), family),
+            Err(canonical_missing(
+                "family",
+                CanonicalReference::Family(family),
+                CanonicalDependencyField::FamilyProgram,
+                CanonicalReference::Program(program),
+            ))
         );
     }
 
@@ -7571,7 +7857,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             missing.canonical_source_observation_bytes(),
-            Err(G0Error::CanonicalMissingDependency)
+            Err(G0Error::MissingEventObservation)
         );
     }
 

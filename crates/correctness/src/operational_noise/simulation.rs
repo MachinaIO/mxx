@@ -7,12 +7,14 @@ use super::{
     OperationalSimulationDiagnostics, OperationalSimulationReport,
     arena::{
         ArenaError, ClosedExprId, ExprId, FamilyDomain, MatrixLayout, MatrixOperation,
-        ResolvedMatrixType, ResolvedValueType, ValueOperator,
+        ResolvedMatrixType, ResolvedValueType, ScalarOperation, TrapdoorOperation, ValueOperator,
+        ValueTransformOperation,
     },
     error::{OperationalSimulationError, TargetError},
     g0::{
         AppliedRelationRule, BoundAuthority, BoundProjection, BoundRule, BoundScale, BoundValueRef,
-        CanonicalResidualRefs, FeasibilityTrace, G0Error, MonomialFactorEvidence, NormalizerEvent,
+        CanonicalEventKind, CanonicalResidualRefs, FeasibilityTrace, G0Error,
+        MonomialFactorEvidence, NormalizerEvent, StableSamplerOperation,
     },
     lower::{ProductionAdapter, ProductionRoot},
     program::{FamilyValueId, ValueProgramId},
@@ -367,10 +369,151 @@ pub(crate) struct OperationalProofPayload {
     pub events: Vec<ProofPayloadEvent>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservedScalarKind {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    Negate,
+    Equal,
+    Less,
+    LessEqual,
+    BoolToInt,
+    IntToReal,
+    RealAdd,
+    RealSubtract,
+    RealMultiply,
+    RealDivide,
+    RealSqrt,
+    ThresholdDecode,
+    Bit,
+    Slice,
+    Hash,
+    ExtractCoefficient,
+    LiftConstantPolynomial,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservedMatrixKind {
+    Add,
+    Subtract,
+    Multiply,
+    Negate,
+    Scale,
+    Transpose,
+    Slice,
+    IndexedSlice,
+    View,
+    Concat,
+    Tensor,
+    CrtRecompose,
+    ExtractCoefficient,
+    LiftConstantPolynomial,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservedTrapdoorKind {
+    Generate,
+    Transform,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservedOperatorKind {
+    Argument,
+    Constant,
+    Source,
+    DeterministicHash,
+    OpaqueFamilyElement,
+    IndexMap,
+    ExplicitElement,
+    ProgramCall,
+    ExtractCoefficient,
+    Scalar(ObservedScalarKind),
+    Matrix(ObservedMatrixKind),
+    Trapdoor(ObservedTrapdoorKind),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservedTransformKind {
+    GadgetDecompose,
+    PackPolynomialCoefficients,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservedSamplerKind {
+    Sample,
+    UniformResidue,
+    UniformInterval,
+    Gaussian,
+    Hash,
+    Trapdoor,
+    Preimage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservedRelationKind {
+    Universal,
+    Gadget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservedBoundKind {
+    Authority,
+    Identity,
+    Sum,
+    Maximum,
+    Scale,
+    MonomialProduct,
+    WeightedSum,
+    Product,
+    Tensor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case", tag = "domain", content = "kind")]
+pub(crate) enum ObservedCoverageKind {
+    Operator(ObservedOperatorKind),
+    Transform(ObservedTransformKind),
+    Sampler(ObservedSamplerKind),
+    Relation(ObservedRelationKind),
+    Bound(ObservedBoundKind),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case", tag = "site")]
+pub(crate) enum ObservedCoverageSite {
+    ExpressionRow { row: u64 },
+    SamplerEventRow { row: u64 },
+    TraceEvent { index: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ObservedCoverageRow {
+    pub kind: ObservedCoverageKind,
+    pub count: u64,
+    pub sites: Vec<ObservedCoverageSite>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ObservedCoverage {
+    pub rows: Vec<ObservedCoverageRow>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProofPayloadProjection {
     payload: OperationalProofPayload,
     generator_peak_retained_logical_items: u64,
+    observed_coverage: ObservedCoverage,
 }
 
 /// Errors from the canonical proof-payload boundary.  The payload itself is already projected
@@ -1549,7 +1692,199 @@ fn derive_proof_payload_projection(
         projector.closed_root_expression,
     )
     .map_err(generator_retention_error)?;
-    projector.project(&run.trace, retained_support_items)
+    projector.project(&run.trace, closure, retained_support_items)
+}
+
+fn observed_scalar_kind(operation: &ScalarOperation) -> ObservedScalarKind {
+    match operation {
+        ScalarOperation::Add => ObservedScalarKind::Add,
+        ScalarOperation::Subtract => ObservedScalarKind::Subtract,
+        ScalarOperation::Multiply => ObservedScalarKind::Multiply,
+        ScalarOperation::Divide => ObservedScalarKind::Divide,
+        ScalarOperation::Remainder => ObservedScalarKind::Remainder,
+        ScalarOperation::Negate => ObservedScalarKind::Negate,
+        ScalarOperation::Equal => ObservedScalarKind::Equal,
+        ScalarOperation::Less => ObservedScalarKind::Less,
+        ScalarOperation::LessEqual => ObservedScalarKind::LessEqual,
+        ScalarOperation::BoolToInt => ObservedScalarKind::BoolToInt,
+        ScalarOperation::IntToReal => ObservedScalarKind::IntToReal,
+        ScalarOperation::RealAdd => ObservedScalarKind::RealAdd,
+        ScalarOperation::RealSubtract => ObservedScalarKind::RealSubtract,
+        ScalarOperation::RealMultiply => ObservedScalarKind::RealMultiply,
+        ScalarOperation::RealDivide => ObservedScalarKind::RealDivide,
+        ScalarOperation::RealSqrt => ObservedScalarKind::RealSqrt,
+        ScalarOperation::ThresholdDecode { .. } => ObservedScalarKind::ThresholdDecode,
+        ScalarOperation::Bit { .. } => ObservedScalarKind::Bit,
+        ScalarOperation::Slice { .. } => ObservedScalarKind::Slice,
+        ScalarOperation::Hash { .. } => ObservedScalarKind::Hash,
+        ScalarOperation::ExtractCoefficient { .. } => ObservedScalarKind::ExtractCoefficient,
+        ScalarOperation::LiftConstantPolynomial { .. } => {
+            ObservedScalarKind::LiftConstantPolynomial
+        }
+    }
+}
+
+fn observed_matrix_kind(operation: &MatrixOperation) -> ObservedMatrixKind {
+    match operation {
+        MatrixOperation::Add => ObservedMatrixKind::Add,
+        MatrixOperation::Subtract => ObservedMatrixKind::Subtract,
+        MatrixOperation::Multiply => ObservedMatrixKind::Multiply,
+        MatrixOperation::Negate => ObservedMatrixKind::Negate,
+        MatrixOperation::Scale => ObservedMatrixKind::Scale,
+        MatrixOperation::Transpose => ObservedMatrixKind::Transpose,
+        MatrixOperation::Slice { .. } => ObservedMatrixKind::Slice,
+        MatrixOperation::IndexedSlice { .. } => ObservedMatrixKind::IndexedSlice,
+        MatrixOperation::View { .. } => ObservedMatrixKind::View,
+        MatrixOperation::Concat { .. } => ObservedMatrixKind::Concat,
+        MatrixOperation::Tensor { .. } => ObservedMatrixKind::Tensor,
+        MatrixOperation::CrtRecompose { .. } => ObservedMatrixKind::CrtRecompose,
+        MatrixOperation::ExtractCoefficient { .. } => ObservedMatrixKind::ExtractCoefficient,
+        MatrixOperation::LiftConstantPolynomial { .. } => {
+            ObservedMatrixKind::LiftConstantPolynomial
+        }
+    }
+}
+
+fn observed_operator_kind(operator: &ValueOperator) -> Option<ObservedOperatorKind> {
+    Some(match operator {
+        ValueOperator::Argument { .. } => ObservedOperatorKind::Argument,
+        ValueOperator::Constant(_) => ObservedOperatorKind::Constant,
+        ValueOperator::Source(_) => ObservedOperatorKind::Source,
+        ValueOperator::Sample { .. } |
+        ValueOperator::Sampler { .. } |
+        ValueOperator::Transform(_) => return None,
+        ValueOperator::DeterministicHash(_) => ObservedOperatorKind::DeterministicHash,
+        ValueOperator::OpaqueFamilyElement { .. } => ObservedOperatorKind::OpaqueFamilyElement,
+        ValueOperator::IndexMap { .. } => ObservedOperatorKind::IndexMap,
+        ValueOperator::ExplicitElement { .. } => ObservedOperatorKind::ExplicitElement,
+        ValueOperator::ProgramCall { .. } => ObservedOperatorKind::ProgramCall,
+        ValueOperator::ExtractCoefficient { .. } => ObservedOperatorKind::ExtractCoefficient,
+        ValueOperator::Scalar(operation) => {
+            ObservedOperatorKind::Scalar(observed_scalar_kind(operation))
+        }
+        ValueOperator::Matrix(operation) => {
+            ObservedOperatorKind::Matrix(observed_matrix_kind(operation))
+        }
+        ValueOperator::Trapdoor(operation) => ObservedOperatorKind::Trapdoor(match operation {
+            TrapdoorOperation::Generate { .. } => ObservedTrapdoorKind::Generate,
+            TrapdoorOperation::Transform { .. } => ObservedTrapdoorKind::Transform,
+        }),
+    })
+}
+
+fn observed_transform_kind(operator: &ValueOperator) -> Option<ObservedTransformKind> {
+    match operator {
+        ValueOperator::Transform(ValueTransformOperation::GadgetDecompose { .. }) => {
+            Some(ObservedTransformKind::GadgetDecompose)
+        }
+        ValueOperator::Transform(ValueTransformOperation::PackPolynomialCoefficients {
+            ..
+        }) => Some(ObservedTransformKind::PackPolynomialCoefficients),
+        _ => None,
+    }
+}
+
+fn observed_sampler_kind(kind: &CanonicalEventKind) -> ObservedSamplerKind {
+    match kind {
+        CanonicalEventKind::Sample { .. } => ObservedSamplerKind::Sample,
+        CanonicalEventKind::Sampler { operation } => match operation {
+            StableSamplerOperation::UniformResidue { .. } => ObservedSamplerKind::UniformResidue,
+            StableSamplerOperation::UniformInterval { .. } => ObservedSamplerKind::UniformInterval,
+            StableSamplerOperation::Gaussian { .. } => ObservedSamplerKind::Gaussian,
+            StableSamplerOperation::Hash { .. } => ObservedSamplerKind::Hash,
+            StableSamplerOperation::Trapdoor { .. } => ObservedSamplerKind::Trapdoor,
+            StableSamplerOperation::Preimage { .. } => ObservedSamplerKind::Preimage,
+        },
+    }
+}
+
+fn observed_relation_kind(rule: &ProofPayloadRelationRule) -> ObservedRelationKind {
+    match rule {
+        ProofPayloadRelationRule::Universal { .. } => ObservedRelationKind::Universal,
+        ProofPayloadRelationRule::Gadget { .. } => ObservedRelationKind::Gadget,
+    }
+}
+
+fn observed_bound_kind(rule: &ProofPayloadRule) -> ObservedBoundKind {
+    match rule {
+        ProofPayloadRule::Authority(_) => ObservedBoundKind::Authority,
+        ProofPayloadRule::Identity { .. } => ObservedBoundKind::Identity,
+        ProofPayloadRule::Sum { .. } => ObservedBoundKind::Sum,
+        ProofPayloadRule::Maximum { .. } => ObservedBoundKind::Maximum,
+        ProofPayloadRule::Scale { .. } => ObservedBoundKind::Scale,
+        ProofPayloadRule::MonomialProduct { .. } => ObservedBoundKind::MonomialProduct,
+        ProofPayloadRule::WeightedSum { .. } => ObservedBoundKind::WeightedSum,
+        ProofPayloadRule::Product { .. } => ObservedBoundKind::Product,
+        ProofPayloadRule::Tensor { .. } => ObservedBoundKind::Tensor,
+    }
+}
+
+fn derive_observed_coverage(
+    job: &super::job::CheckerJob,
+    closure: &CertificateClosure,
+    refs: &CanonicalResidualRefs,
+    events: &[ProofPayloadEvent],
+) -> Result<ObservedCoverage, CertificateProjectionError> {
+    let mut sites = BTreeMap::<ObservedCoverageKind, BTreeSet<ObservedCoverageSite>>::new();
+    let mut observe = |kind, site| {
+        sites.entry(kind).or_default().insert(site);
+    };
+    for &expression in &closure.expressions {
+        let node = job
+            .expressions()
+            .node(expression)
+            .map_err(|error| proof_payload_error(G0Error::Arena(error)))?;
+        let site = ObservedCoverageSite::ExpressionRow {
+            row: refs.expression(expression).map_err(proof_payload_error)?,
+        };
+        if let Some(kind) = observed_operator_kind(&node.operator) {
+            observe(ObservedCoverageKind::Operator(kind), site);
+        }
+        if let Some(kind) = observed_transform_kind(&node.operator) {
+            observe(ObservedCoverageKind::Transform(kind), site);
+        }
+    }
+    for (row, event) in refs.event_rows().rows().iter().enumerate() {
+        observe(
+            ObservedCoverageKind::Sampler(observed_sampler_kind(&event.kind)),
+            ObservedCoverageSite::SamplerEventRow {
+                row: u64::try_from(row).map_err(|_| {
+                    generator_retention_error(CanonicalPayloadError::LengthOverflow)
+                })?,
+            },
+        );
+    }
+    for (index, event) in events.iter().enumerate() {
+        let site = ObservedCoverageSite::TraceEvent {
+            index: u64::try_from(index)
+                .map_err(|_| generator_retention_error(CanonicalPayloadError::LengthOverflow))?,
+        };
+        match event {
+            ProofPayloadEvent::AppliedRelation { rule, .. } => {
+                observe(ObservedCoverageKind::Relation(observed_relation_kind(rule)), site)
+            }
+            ProofPayloadEvent::BoundTransfer { rule, .. } => {
+                observe(ObservedCoverageKind::Bound(observed_bound_kind(rule)), site)
+            }
+            _ => {}
+        }
+    }
+    finalize_observed_coverage(sites)
+}
+
+fn finalize_observed_coverage(
+    sites: BTreeMap<ObservedCoverageKind, BTreeSet<ObservedCoverageSite>>,
+) -> Result<ObservedCoverage, CertificateProjectionError> {
+    let rows = sites
+        .into_iter()
+        .map(|(kind, sites)| {
+            let sites = sites.into_iter().collect::<Vec<_>>();
+            let count = u64::try_from(sites.len())
+                .map_err(|_| generator_retention_error(CanonicalPayloadError::LengthOverflow))?;
+            Ok::<_, CertificateProjectionError>(ObservedCoverageRow { kind, count, sites })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ObservedCoverage { rows })
 }
 
 fn generator_support_logical_items(
@@ -1688,6 +2023,7 @@ impl<'a> ProofPayloadProjector<'a> {
     fn project(
         self,
         trace: &FeasibilityTrace,
+        closure: &CertificateClosure,
         retained_support_items: u64,
     ) -> Result<ProofPayloadProjection, CertificateProjectionError> {
         let event_count = trace.events.len();
@@ -1706,9 +2042,11 @@ impl<'a> ProofPayloadProjector<'a> {
                 generator_peak_retained_logical_items.max(current_retained_logical_items);
             events.push(projected);
         }
+        let observed_coverage = derive_observed_coverage(self.job, closure, self.refs, &events)?;
         Ok(ProofPayloadProjection {
             payload: OperationalProofPayload { events },
             generator_peak_retained_logical_items,
+            observed_coverage,
         })
     }
 
@@ -3351,6 +3689,439 @@ mod tests {
     use mxx_dsl::{Bool, DslContext, IdealSpec, Int, Ring, SemanticAnchor};
     use mxx_ir_core::{IntExpr, node::ConstantMatrix};
 
+    #[test]
+    fn observed_coverage_classifiers_cover_all_typed_discriminants() {
+        let matrix = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).expect("matrix type");
+        let layout = MatrixLayout::row_major(1, 1);
+        let scalar_cases = vec![
+            (ScalarOperation::Add, ObservedScalarKind::Add),
+            (ScalarOperation::Subtract, ObservedScalarKind::Subtract),
+            (ScalarOperation::Multiply, ObservedScalarKind::Multiply),
+            (ScalarOperation::Divide, ObservedScalarKind::Divide),
+            (ScalarOperation::Remainder, ObservedScalarKind::Remainder),
+            (ScalarOperation::Negate, ObservedScalarKind::Negate),
+            (ScalarOperation::Equal, ObservedScalarKind::Equal),
+            (ScalarOperation::Less, ObservedScalarKind::Less),
+            (ScalarOperation::LessEqual, ObservedScalarKind::LessEqual),
+            (ScalarOperation::BoolToInt, ObservedScalarKind::BoolToInt),
+            (ScalarOperation::IntToReal, ObservedScalarKind::IntToReal),
+            (ScalarOperation::RealAdd, ObservedScalarKind::RealAdd),
+            (ScalarOperation::RealSubtract, ObservedScalarKind::RealSubtract),
+            (ScalarOperation::RealMultiply, ObservedScalarKind::RealMultiply),
+            (ScalarOperation::RealDivide, ObservedScalarKind::RealDivide),
+            (ScalarOperation::RealSqrt, ObservedScalarKind::RealSqrt),
+            (
+                ScalarOperation::ThresholdDecode {
+                    plaintext_modulus: 2_u8.into(),
+                    length: 1,
+                    output_bool: false,
+                },
+                ObservedScalarKind::ThresholdDecode,
+            ),
+            (ScalarOperation::Bit { position: 3 }, ObservedScalarKind::Bit),
+            (ScalarOperation::Slice { start: 2, end_exclusive: 5 }, ObservedScalarKind::Slice),
+            (
+                ScalarOperation::Hash { tag: "tag".to_owned(), dynamic_tags: Box::new([7]) },
+                ObservedScalarKind::Hash,
+            ),
+            (
+                ScalarOperation::ExtractCoefficient { row: 1, column: 2 },
+                ObservedScalarKind::ExtractCoefficient,
+            ),
+            (
+                ScalarOperation::LiftConstantPolynomial {
+                    output: matrix.clone(),
+                    coefficient_bits: 8,
+                },
+                ObservedScalarKind::LiftConstantPolynomial,
+            ),
+        ];
+        for (operation, expected) in scalar_cases {
+            assert_eq!(observed_scalar_kind(&operation), expected);
+        }
+
+        let matrix_cases = vec![
+            (MatrixOperation::Add, ObservedMatrixKind::Add),
+            (MatrixOperation::Subtract, ObservedMatrixKind::Subtract),
+            (MatrixOperation::Multiply, ObservedMatrixKind::Multiply),
+            (MatrixOperation::Negate, ObservedMatrixKind::Negate),
+            (MatrixOperation::Scale, ObservedMatrixKind::Scale),
+            (MatrixOperation::Transpose, ObservedMatrixKind::Transpose),
+            (
+                MatrixOperation::Slice {
+                    row_start: 0,
+                    row_end_exclusive: 1,
+                    column_start: 0,
+                    column_end_exclusive: 1,
+                    layout: layout.clone(),
+                },
+                ObservedMatrixKind::Slice,
+            ),
+            (
+                MatrixOperation::IndexedSlice { output: matrix.clone(), layout: layout.clone() },
+                ObservedMatrixKind::IndexedSlice,
+            ),
+            (
+                MatrixOperation::View { output: matrix.clone(), layout: layout.clone() },
+                ObservedMatrixKind::View,
+            ),
+            (
+                MatrixOperation::Concat { axis: 0, output: matrix.clone(), layout: layout.clone() },
+                ObservedMatrixKind::Concat,
+            ),
+            (
+                MatrixOperation::Tensor {
+                    output: matrix.clone(),
+                    left_layout: layout.clone(),
+                    right_layout: layout.clone(),
+                    output_layout: layout.clone(),
+                },
+                ObservedMatrixKind::Tensor,
+            ),
+            (
+                MatrixOperation::CrtRecompose {
+                    plaintext_moduli: Box::new([2_u8.into()]),
+                    reconstruction_coefficients: Box::new([1_u8.into()]),
+                    output: matrix.clone(),
+                },
+                ObservedMatrixKind::CrtRecompose,
+            ),
+            (
+                MatrixOperation::ExtractCoefficient { row: 0, column: 0 },
+                ObservedMatrixKind::ExtractCoefficient,
+            ),
+            (
+                MatrixOperation::LiftConstantPolynomial {
+                    output: matrix.clone(),
+                    coefficient_bits: 8,
+                },
+                ObservedMatrixKind::LiftConstantPolynomial,
+            ),
+        ];
+        for (operation, expected) in matrix_cases {
+            assert_eq!(observed_matrix_kind(&operation), expected);
+        }
+
+        let output = super::super::g0::StableValueType::Matrix {
+            modulus: "17".to_owned(),
+            ring_dimension: 1,
+            rows: 1,
+            columns: 1,
+        };
+        let sampler_cases = vec![
+            (
+                CanonicalEventKind::Sample {
+                    descriptor: super::super::g0::StableSampleDescriptor {
+                        definition: "sample".to_owned(),
+                        parameters: vec![],
+                        output_type: output.clone(),
+                        gadget_base: None,
+                        digit_count: None,
+                        decomposition: None,
+                    },
+                },
+                ObservedSamplerKind::Sample,
+            ),
+            (
+                CanonicalEventKind::Sampler {
+                    operation: StableSamplerOperation::UniformResidue { output: output.clone() },
+                },
+                ObservedSamplerKind::UniformResidue,
+            ),
+            (
+                CanonicalEventKind::Sampler {
+                    operation: StableSamplerOperation::UniformInterval {
+                        output: output.clone(),
+                        minimum: "0".to_owned(),
+                        maximum: "1".to_owned(),
+                    },
+                },
+                ObservedSamplerKind::UniformInterval,
+            ),
+            (
+                CanonicalEventKind::Sampler {
+                    operation: StableSamplerOperation::Gaussian {
+                        output: output.clone(),
+                        sigma: "1".to_owned(),
+                        max_coefficient_bound: "2".to_owned(),
+                    },
+                },
+                ObservedSamplerKind::Gaussian,
+            ),
+            (
+                CanonicalEventKind::Sampler {
+                    operation: StableSamplerOperation::Hash {
+                        output: output.clone(),
+                        variant: super::super::g0::StableHashVariant::Plain,
+                        tag_prefix: vec![],
+                        tag_expressions: vec![],
+                        tag_decimal_expressions: vec![],
+                        tag_u64_le_expressions: vec![],
+                        base: None,
+                        digit_count: None,
+                    },
+                },
+                ObservedSamplerKind::Hash,
+            ),
+            (
+                CanonicalEventKind::Sampler {
+                    operation: StableSamplerOperation::Trapdoor {
+                        output: output.clone(),
+                        sigma: "1".to_owned(),
+                        gadget_base: 2,
+                        digit_count: 1,
+                        preimage_max_coefficient_bound: "2".to_owned(),
+                    },
+                },
+                ObservedSamplerKind::Trapdoor,
+            ),
+            (
+                CanonicalEventKind::Sampler {
+                    operation: StableSamplerOperation::Preimage {
+                        output,
+                        max_coefficient_bound: "2".to_owned(),
+                    },
+                },
+                ObservedSamplerKind::Preimage,
+            ),
+        ];
+        for (kind, expected) in sampler_cases {
+            assert_eq!(observed_sampler_kind(&kind), expected);
+        }
+
+        let value = ProofPayloadValueRef::Transfer(0);
+        let monomial =
+            ProofPayloadMonomial { central_factors: Vec::new(), ordered_factors: Vec::new() };
+        let bound_cases = vec![
+            (
+                ProofPayloadRule::Authority(ProofPayloadAuthority::Operator),
+                ObservedBoundKind::Authority,
+            ),
+            (ProofPayloadRule::Identity { input: value.clone() }, ObservedBoundKind::Identity),
+            (ProofPayloadRule::Sum { inputs: vec![value.clone()] }, ObservedBoundKind::Sum),
+            (ProofPayloadRule::Maximum { inputs: vec![value.clone()] }, ObservedBoundKind::Maximum),
+            (
+                ProofPayloadRule::Scale {
+                    value: value.clone(),
+                    scale: ProofPayloadScale::Magnitude(2_u8.into()),
+                },
+                ObservedBoundKind::Scale,
+            ),
+            (
+                ProofPayloadRule::MonomialProduct {
+                    monomial: monomial.clone(),
+                    factors: Vec::new(),
+                },
+                ObservedBoundKind::MonomialProduct,
+            ),
+            (
+                ProofPayloadRule::WeightedSum { inputs: vec![value.clone()] },
+                ObservedBoundKind::WeightedSum,
+            ),
+            (
+                ProofPayloadRule::Product {
+                    left: value.clone(),
+                    right: value.clone(),
+                    facts: super::super::bound::MatrixProductFacts::default(),
+                },
+                ObservedBoundKind::Product,
+            ),
+            (
+                ProofPayloadRule::Tensor {
+                    left: value.clone(),
+                    right: value,
+                    left_is_constant_polynomial: false,
+                    right_is_constant_polynomial: true,
+                },
+                ObservedBoundKind::Tensor,
+            ),
+        ];
+        for (rule, expected) in bound_cases {
+            assert_eq!(observed_bound_kind(&rule), expected);
+        }
+        assert_eq!(
+            observed_relation_kind(&ProofPayloadRelationRule::Universal {
+                computed: 0,
+                lhs: monomial.clone(),
+                lhs_layout: None,
+                rhs_result: 0,
+            }),
+            ObservedRelationKind::Universal,
+        );
+        assert_eq!(
+            observed_relation_kind(&ProofPayloadRelationRule::Gadget {
+                gadget: ProofPayloadOwner {
+                    scope: ProofPayloadScope::Closed { root_expression_row: 0 },
+                    expression_row: 0,
+                },
+                decomposition: ProofPayloadOwner {
+                    scope: ProofPayloadScope::Closed { root_expression_row: 0 },
+                    expression_row: 1,
+                },
+                input: 0,
+                input_result: 0,
+            }),
+            ObservedRelationKind::Gadget,
+        );
+
+        assert_eq!(
+            observed_transform_kind(&ValueOperator::Transform(
+                ValueTransformOperation::GadgetDecompose {
+                    output: matrix.clone(),
+                    base: 2,
+                    small: true,
+                    digit_count: 1,
+                }
+            )),
+            Some(ObservedTransformKind::GadgetDecompose),
+        );
+        assert_eq!(
+            observed_transform_kind(&ValueOperator::Transform(
+                ValueTransformOperation::PackPolynomialCoefficients {
+                    output: matrix,
+                    coefficient_bits: 8,
+                }
+            )),
+            Some(ObservedTransformKind::PackPolynomialCoefficients),
+        );
+        assert_eq!(
+            observed_operator_kind(&ValueOperator::Transform(
+                ValueTransformOperation::PackPolynomialCoefficients {
+                    output: ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap(),
+                    coefficient_bits: 8,
+                }
+            )),
+            None,
+        );
+
+        let source = super::super::arena::SemanticSourceIdentity {
+            stable_definition: "source".to_owned(),
+            invocation: "invocation".to_owned(),
+            sample_event: None,
+            output_role: "output".to_owned(),
+            sampler: None,
+            artifact: None,
+            value_type: ResolvedValueType::Int,
+            coordinates: Box::new([]),
+            matrix_constant: None,
+        };
+        let family_source = super::super::arena::SemanticFamilySourceIdentity {
+            stable_definition: "family".to_owned(),
+            invocation: "invocation".to_owned(),
+            element_type: ResolvedValueType::Int,
+            domain: FamilyDomain::new(0, 1).unwrap(),
+            artifact: None,
+        };
+        let operator_cases = vec![
+            (
+                ValueOperator::Argument { position: 0, value_type: ResolvedValueType::Int },
+                ObservedOperatorKind::Argument,
+            ),
+            (
+                ValueOperator::Constant(super::super::arena::TypedConstant::int(1)),
+                ObservedOperatorKind::Constant,
+            ),
+            (ValueOperator::Source(source), ObservedOperatorKind::Source),
+            (
+                ValueOperator::DeterministicHash(
+                    super::super::arena::DeterministicHashDescriptor {
+                        definition:
+                            super::super::arena::DeterministicHashDefinition::MxxPolynomialHash,
+                        version: 1,
+                        key_byte_length: 32,
+                        output: ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap(),
+                        tag_prefix: Box::new([]),
+                        binary_tag_count: 0,
+                        decimal_tag_count: 0,
+                        u64_le_tag_count: 0,
+                        dynamic_tag_count: 0,
+                    },
+                ),
+                ObservedOperatorKind::DeterministicHash,
+            ),
+            (
+                ValueOperator::OpaqueFamilyElement { source: family_source },
+                ObservedOperatorKind::OpaqueFamilyElement,
+            ),
+            (
+                ValueOperator::IndexMap {
+                    definition: super::super::arena::IndexFunctionDefinitionId(3),
+                    parameters: Box::new([5]),
+                },
+                ObservedOperatorKind::IndexMap,
+            ),
+            (
+                ValueOperator::ExplicitElement {
+                    domain: FamilyDomain::new(0, 1).unwrap(),
+                    element_type: ResolvedValueType::Int,
+                },
+                ObservedOperatorKind::ExplicitElement,
+            ),
+            (
+                ValueOperator::ProgramCall {
+                    program: ValueProgramId::new(super::super::arena::ArenaToken::fresh(), 0),
+                },
+                ObservedOperatorKind::ProgramCall,
+            ),
+            (
+                ValueOperator::ExtractCoefficient {
+                    position: 0,
+                    canonical_input_exclusive_upper: Some(17_u8.into()),
+                },
+                ObservedOperatorKind::ExtractCoefficient,
+            ),
+            (
+                ValueOperator::Scalar(ScalarOperation::Bit { position: 1 }),
+                ObservedOperatorKind::Scalar(ObservedScalarKind::Bit),
+            ),
+            (
+                ValueOperator::Matrix(MatrixOperation::Scale),
+                ObservedOperatorKind::Matrix(ObservedMatrixKind::Scale),
+            ),
+            (
+                ValueOperator::Trapdoor(TrapdoorOperation::Generate {
+                    descriptor: "generate".to_owned(),
+                    parameters: Box::new([]),
+                    paired_public_event: super::super::arena::SampleEventId(1),
+                    paired_public_output_role: "public".to_owned(),
+                }),
+                ObservedOperatorKind::Trapdoor(ObservedTrapdoorKind::Generate),
+            ),
+            (
+                ValueOperator::Trapdoor(TrapdoorOperation::Transform {
+                    descriptor: "transform".to_owned(),
+                    output: ResolvedValueType::Trapdoor,
+                    parameters: Box::new([]),
+                }),
+                ObservedOperatorKind::Trapdoor(ObservedTrapdoorKind::Transform),
+            ),
+        ];
+        for (operator, expected) in operator_cases {
+            assert_eq!(observed_operator_kind(&operator), Some(expected));
+        }
+
+        let mut repeated_parameter_sites = BTreeMap::new();
+        for (row, position) in [(4, 1), (9, 7)] {
+            let kind =
+                observed_operator_kind(&ValueOperator::Scalar(ScalarOperation::Bit { position }))
+                    .unwrap();
+            repeated_parameter_sites
+                .entry(ObservedCoverageKind::Operator(kind))
+                .or_insert_with(BTreeSet::new)
+                .insert(ObservedCoverageSite::ExpressionRow { row });
+        }
+        let coverage = finalize_observed_coverage(repeated_parameter_sites).unwrap();
+        assert_eq!(coverage.rows.len(), 1);
+        assert_eq!(coverage.rows[0].count, 2);
+        assert_eq!(
+            coverage.rows[0].sites,
+            vec![
+                ObservedCoverageSite::ExpressionRow { row: 4 },
+                ObservedCoverageSite::ExpressionRow { row: 9 },
+            ]
+        );
+    }
+
     fn payload_rule_mentions_transfer(rule: &ProofPayloadRule, event: usize) -> bool {
         let value = |value: &ProofPayloadValueRef| matches!(value, ProofPayloadValueRef::Transfer(candidate) if *candidate as usize == event);
         match rule {
@@ -4827,6 +5598,11 @@ mod tests {
             first_projection.generator_peak_retained_logical_items,
             second_projection.generator_peak_retained_logical_items,
         );
+        assert_eq!(first_projection.observed_coverage, second_projection.observed_coverage);
+        for row in &first_projection.observed_coverage.rows {
+            assert_eq!(row.count, u64::try_from(row.sites.len()).unwrap());
+            assert!(row.sites.windows(2).all(|sites| sites[0] < sites[1]));
+        }
         let (manual_support, _, _, _, _) = manual_projection_support_items(&first_run);
         let payload_items = first_payload.logical_items().expect("logical item count");
         assert_eq!(
@@ -4869,6 +5645,67 @@ mod tests {
         assert_eq!(
             projection.generator_peak_retained_logical_items,
             manual_support + payload_items,
+        );
+        let mut expected_trace_sites = BTreeMap::new();
+        for (index, event) in projection.payload.events.iter().enumerate() {
+            let kind = match event {
+                ProofPayloadEvent::AppliedRelation { rule, .. } => {
+                    Some(ObservedCoverageKind::Relation(observed_relation_kind(rule)))
+                }
+                ProofPayloadEvent::BoundTransfer { rule, .. } => {
+                    Some(ObservedCoverageKind::Bound(observed_bound_kind(rule)))
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                expected_trace_sites
+                    .entry(kind)
+                    .or_insert_with(BTreeSet::new)
+                    .insert(ObservedCoverageSite::TraceEvent { index: index as u64 });
+            }
+        }
+        let actual_trace_sites = projection
+            .observed_coverage
+            .rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    ObservedCoverageKind::Relation(_) | ObservedCoverageKind::Bound(_)
+                )
+            })
+            .map(|row| (row.kind, row.sites.iter().copied().collect::<BTreeSet<_>>()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(actual_trace_sites, expected_trace_sites);
+        assert!(
+            projection
+                .payload
+                .events
+                .iter()
+                .any(|event| { matches!(event, ProofPayloadEvent::SpecializationCacheHit { .. }) })
+        );
+        assert!(projection.observed_coverage.rows.iter().any(|row| {
+            row.kind == ObservedCoverageKind::Relation(ObservedRelationKind::Universal) &&
+                row.count > 1
+        }));
+        let canonical_refs = super::super::g0::canonical_residual_refs(
+            &run.job,
+            &run.projection.closure,
+            &run.trace,
+        )
+        .expect("canonical refs");
+        let sampler_sites = projection
+            .observed_coverage
+            .rows
+            .iter()
+            .filter(|row| matches!(row.kind, ObservedCoverageKind::Sampler(_)))
+            .flat_map(|row| row.sites.iter().copied())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(sampler_sites.len(), canonical_refs.event_rows().rows().len());
+        assert!(
+            projection.observed_coverage.rows.iter().any(|row| {
+                matches!(row.kind, ObservedCoverageKind::Operator(_)) && row.count > 1
+            })
         );
         assert_payload_event_refs_are_local(&projection.payload);
     }

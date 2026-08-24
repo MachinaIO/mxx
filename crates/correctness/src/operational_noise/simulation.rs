@@ -367,6 +367,12 @@ pub(crate) struct OperationalProofPayload {
     pub events: Vec<ProofPayloadEvent>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProofPayloadProjection {
+    payload: OperationalProofPayload,
+    projection_peak_retained_logical_items: u64,
+}
+
 /// Errors from the canonical proof-payload boundary.  The payload itself is already projected
 /// into owned values; this error only protects length/count arithmetic while encoding it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,6 +392,23 @@ impl<T: LogicalItems + ?Sized> LogicalItems for &T {
 
 fn checked_add(left: u64, right: u64) -> Result<u64, CanonicalPayloadError> {
     left.checked_add(right).ok_or(CanonicalPayloadError::LengthOverflow)
+}
+
+fn checked_mul(left: u64, right: u64) -> Result<u64, CanonicalPayloadError> {
+    left.checked_mul(right).ok_or(CanonicalPayloadError::LengthOverflow)
+}
+
+fn logical_uniform_collection(
+    len: usize,
+    items_per_entry: u64,
+) -> Result<u64, CanonicalPayloadError> {
+    checked_add(
+        1,
+        checked_mul(
+            u64::try_from(len).map_err(|_| CanonicalPayloadError::LengthOverflow)?,
+            checked_add(1, items_per_entry)?,
+        )?,
+    )
 }
 
 fn checked_sum<I>(items: I) -> Result<u64, CanonicalPayloadError>
@@ -1454,6 +1477,12 @@ pub(crate) fn project_operational_certificate(
 pub(crate) fn derive_proof_payload(
     run: &OperationalCertificateRun,
 ) -> Result<OperationalProofPayload, CertificateProjectionError> {
+    Ok(derive_proof_payload_projection(run)?.payload)
+}
+
+fn derive_proof_payload_projection(
+    run: &OperationalCertificateRun,
+) -> Result<ProofPayloadProjection, CertificateProjectionError> {
     let closure = &run.projection.closure;
     let closed_root_expression = match &run.projection.residual {
         CertificateResidualRoot::Closed { root, .. } => Some(root.expression()),
@@ -1512,7 +1541,52 @@ pub(crate) fn derive_proof_payload(
             .transpose()
             .map_err(proof_payload_error)?,
     };
-    projector.project(&run.trace)
+    let retained_support_items = projection_support_logical_items(
+        closure,
+        &projector.monomial_arenas,
+        &projector.rhs_events,
+        projector.closed_program,
+        projector.closed_root_expression,
+    )
+    .map_err(proof_payload_retention_error)?;
+    projector.project(&run.trace, retained_support_items)
+}
+
+fn projection_support_logical_items(
+    closure: &CertificateClosure,
+    monomial_arenas: &HashMap<super::arena::ArenaToken, &super::monomial::MonomialArena>,
+    rhs_events: &HashMap<
+        (
+            super::relation::RuntimeSpecializationKey,
+            super::g0::EventRange,
+            super::relation::CanonicalRhsId,
+        ),
+        (u64, u64),
+    >,
+    closed_program: Option<ValueProgramId>,
+    closed_root_expression: Option<u64>,
+) -> Result<u64, CanonicalPayloadError> {
+    let canonical_handle_entries = closure
+        .expressions
+        .len()
+        .checked_add(closure.programs.len())
+        .ok_or(CanonicalPayloadError::LengthOverflow)?;
+    // Canonical descriptor rows belong to the already-built G0 boundary and are not duplicated
+    // into this payload. Projection retention counts only its handle and event-ref lookups.
+    let canonical_refs = checked_add(
+        logical_uniform_collection(canonical_handle_entries, 2)?,
+        logical_uniform_collection(closure.event_ids.len(), 2)?,
+    )?;
+    checked_sum([
+        Ok(canonical_refs),
+        logical_uniform_collection(monomial_arenas.len(), 2),
+        // One RHS lookup key contains three typed references (specialization, range, RHS); its
+        // value contains the Computed and Result event references.
+        logical_uniform_collection(rhs_events.len(), 5),
+        checked_add(1, u64::from(closed_program.is_some())),
+        checked_add(1, u64::from(closed_root_expression.is_some())),
+        OperationalProofPayload { events: Vec::new() }.logical_items(),
+    ])
 }
 
 /// Add trace-owned scopes and relation dependencies to the same residual closure before any
@@ -1599,6 +1673,12 @@ fn proof_payload_error(error: G0Error) -> CertificateProjectionError {
     CertificateProjectionError::ProofPayload { detail: error.to_string() }
 }
 
+fn proof_payload_retention_error(_: CanonicalPayloadError) -> CertificateProjectionError {
+    CertificateProjectionError::ProofPayload {
+        detail: "proof payload projection retention overflow".to_owned(),
+    }
+}
+
 struct ProofPayloadProjector<'a> {
     job: &'a super::job::CheckerJob,
     refs: &'a CanonicalResidualRefs,
@@ -1619,13 +1699,28 @@ impl<'a> ProofPayloadProjector<'a> {
     fn project(
         self,
         trace: &FeasibilityTrace,
-    ) -> Result<OperationalProofPayload, CertificateProjectionError> {
+        retained_support_items: u64,
+    ) -> Result<ProofPayloadProjection, CertificateProjectionError> {
         let event_count = trace.events.len();
         let mut events = Vec::with_capacity(event_count);
+        let mut current_retained_logical_items = retained_support_items;
+        let mut projection_peak_retained_logical_items = retained_support_items;
         for (index, event) in trace.events.iter().enumerate() {
-            events.push(self.event(trace, index, event).map_err(proof_payload_error)?);
+            let projected = self.event(trace, index, event).map_err(proof_payload_error)?;
+            current_retained_logical_items = checked_add(
+                current_retained_logical_items,
+                checked_add(1, projected.logical_items().map_err(proof_payload_retention_error)?)
+                    .map_err(proof_payload_retention_error)?,
+            )
+            .map_err(proof_payload_retention_error)?;
+            projection_peak_retained_logical_items =
+                projection_peak_retained_logical_items.max(current_retained_logical_items);
+            events.push(projected);
         }
-        Ok(OperationalProofPayload { events })
+        Ok(ProofPayloadProjection {
+            payload: OperationalProofPayload { events },
+            projection_peak_retained_logical_items,
+        })
     }
 
     fn owner(&self, owner: super::arena::ScopedExprId) -> Result<ProofPayloadOwner, G0Error> {
@@ -3353,6 +3448,72 @@ mod tests {
         (outer, immediate)
     }
 
+    fn manual_projection_support_items(run: &OperationalCertificateRun) -> (u64, usize, usize) {
+        let closure = &run.projection.closure;
+        let handles = closure.expressions.len() + closure.programs.len();
+        let event_refs = closure.event_ids.len();
+        let mut arena_tokens = BTreeSet::new();
+        for program in &closure.programs {
+            if let Some(arena) = run.job.monomials().get(*program) {
+                arena_tokens.insert(arena.token());
+            }
+        }
+        for event in &run.trace.events {
+            let program = match event {
+                NormalizerEvent::InvocationStart { root } |
+                NormalizerEvent::Result { owner: root, .. } |
+                NormalizerEvent::InvocationEnd { root, .. } |
+                NormalizerEvent::SpecializationComputed { owner: root, .. } |
+                NormalizerEvent::SpecializationCacheHit { owner: root, .. } |
+                NormalizerEvent::BoundTransfer { owner: root, .. } => Some(root.program()),
+                NormalizerEvent::CoefficientMerge(observation) => Some(observation.owner.program()),
+                NormalizerEvent::Predecessor { consumer, .. } => Some(consumer.program()),
+                NormalizerEvent::AppliedRelation(observation) => Some(observation.owner.program()),
+                NormalizerEvent::SurvivorFold(observation) => {
+                    match run.trace.events.get(observation.bound.0 as usize) {
+                        Some(NormalizerEvent::BoundTransfer { owner, .. }) => Some(owner.program()),
+                        _ => None,
+                    }
+                }
+                NormalizerEvent::PreFoldPolynomial(_) => None,
+            };
+            if let Some(arena) = program.and_then(|program| run.job.monomials().get(program)) {
+                arena_tokens.insert(arena.token());
+            }
+        }
+        let rhs_lookups = run
+            .trace
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                NormalizerEvent::SpecializationComputed { replay, .. } => {
+                    Some(replay.rhs_results.len())
+                }
+                _ => None,
+            })
+            .sum::<usize>();
+        let closed_root = match &run.projection.residual {
+            CertificateResidualRoot::Closed { root, .. } => Some(root.expression()),
+            CertificateResidualRoot::Family { .. } => None,
+        };
+        let closed_program = closed_root.is_some_and(|root| {
+            run.trace.events.iter().any(|event| {
+                matches!(event, NormalizerEvent::InvocationStart { root: owner } if owner.expression() == root)
+            })
+        });
+        let handles = handles as u64;
+        let event_refs = event_refs as u64;
+        let arenas = arena_tokens.len() as u64;
+        let rhs = rhs_lookups as u64;
+        let support = (1 + 3 * handles) +
+            (1 + 3 * event_refs) +
+            (1 + 3 * arenas) +
+            (1 + 6 * rhs) +
+            (1 + u64::from(closed_program)) +
+            (1 + u64::from(closed_root.is_some()));
+        (support, arena_tokens.len(), rhs_lookups)
+    }
+
     fn repeat_certificate_normalization(run: &mut OperationalCertificateRun) {
         let plaintext_modulus = match &run.accepted_report.acceptance {
             super::super::OperationalAcceptanceReport::Threshold { plaintext_modulus, .. } => {
@@ -4655,14 +4816,31 @@ mod tests {
         let second_run =
             prepare_operational_certificate(&threshold_certificate_protocol(), &request)
                 .expect("independently allocated accepted run");
+        let first_projection =
+            derive_proof_payload_projection(&first_run).expect("first retained projection");
+        let second_projection =
+            derive_proof_payload_projection(&second_run).expect("second retained projection");
         let first_payload = derive_proof_payload(&first_run).expect("first proof payload");
         let second_payload = derive_proof_payload(&second_run).expect("second proof payload");
+        assert_eq!(first_projection.payload, first_payload);
+        assert_eq!(second_projection.payload, second_payload);
         let first_canonical_payload_bytes =
             first_payload.encode_canonical().expect("first canonical payload");
         let second_canonical_payload_bytes =
             second_payload.encode_canonical().expect("second canonical payload");
         assert_eq!(first_canonical_payload_bytes, second_canonical_payload_bytes);
         assert_eq!(first_payload.logical_items(), second_payload.logical_items());
+        assert_eq!(
+            first_projection.projection_peak_retained_logical_items,
+            second_projection.projection_peak_retained_logical_items,
+        );
+        let (manual_support, _, _) = manual_projection_support_items(&first_run);
+        let payload_items = first_payload.logical_items().expect("logical item count");
+        assert_eq!(
+            first_projection.projection_peak_retained_logical_items,
+            manual_support + payload_items,
+        );
+        assert!(first_projection.projection_peak_retained_logical_items >= payload_items);
         assert!(first_payload.logical_items().expect("logical item count") > 0);
 
         // The empty vector contributes its length field and nothing else; this is a small
@@ -4670,6 +4848,34 @@ mod tests {
         let empty = OperationalProofPayload { events: Vec::new() };
         assert_eq!(empty.logical_items(), Ok(1));
         assert!(empty.encode_canonical().expect("empty canonical payload").len() > 0);
+    }
+
+    #[test]
+    fn proof_payload_projection_peak_counts_nested_rhs_lifecycle_once() {
+        let protocol = super::super::lower::tests::singleton_preimage_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "singleton-preimage".to_owned(),
+        };
+        let mut run = prepare_operational_certificate(&protocol, &request)
+            .expect("singleton universal certificate run");
+        repeat_certificate_normalization(&mut run);
+        let projection =
+            derive_proof_payload_projection(&run).expect("retained universal projection");
+        let (frames, immediate) = payload_frame_data(&projection.payload);
+        assert!(frames.iter().any(|(start, end, _)| {
+            (*start..=*end).any(|index| immediate[index].is_some_and(|parent| parent != *start))
+        }));
+        let (manual_support, arena_count, rhs_count) = manual_projection_support_items(&run);
+        assert!(arena_count > 0);
+        assert!(rhs_count > 0);
+        let payload_items = projection.payload.logical_items().expect("payload logical items");
+        assert_eq!(
+            projection.projection_peak_retained_logical_items,
+            manual_support + payload_items,
+        );
+        assert_payload_event_refs_are_local(&projection.payload);
     }
 
     #[test]

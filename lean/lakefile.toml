@@ -3,6 +3,7 @@ version = "0.1.0"
 defaultTargets = [
   "Mxx.Certificate.OperationalNoise.Fixtures",
   "Mxx.Certificate.OperationalNoise.G2Fixtures",
+  "Mxx.Certificate.OperationalNoise.SchemaV1Fixtures",
 ]
 
 [[lean_lib]]

@@ -765,7 +765,7 @@ impl GpuNodeMeasurementBackend {
                 sigma,
                 gadget_base,
                 digit_count,
-                preimage_max_coefficient_bound,
+                preimage_max_coefficient_bound: _,
             }) = node.concrete_argument_types.get(1)
             else {
                 return Err(GpuMeasurementError(
@@ -785,7 +785,11 @@ impl GpuNodeMeasurementBackend {
                 sigma,
                 gadget_base.clone(),
                 *digit_count,
-                preimage_max_coefficient_bound.clone(),
+                // Benchmark one production sampler draw instead of including a random number of
+                // rejection retries. Centered coefficients are at most q / 2, so using the ring
+                // modulus as the cutoff preserves the ordinary bound-check path while accepting
+                // the first draw deterministically.
+                matrix.modulus.clone(),
             ))
         } else {
             None

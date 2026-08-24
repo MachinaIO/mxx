@@ -3981,6 +3981,15 @@ impl FeasibilityTrace {
         self.next_slice_group_id = next;
     }
 
+    /// Freeze the LUT plans selected by the semantic residual closure before proof-only
+    /// expressions are added to that same closure.
+    pub(crate) fn retain_residual_index_use_plans(&mut self, closure: &CertificateClosure) {
+        self.index_use_plans.retain(|plan| plan.is_residual_relevant(closure));
+        self.lowering_retained_items = self
+            .recompute_lowering_items()
+            .expect("residual plan filtering cannot overflow the retained lowering subset");
+    }
+
     /// Keep only source observations whose typed lowering handle belongs to the residual closure.
     pub(crate) fn retain_residual(&mut self, closure: &CertificateClosure) {
         self.source_observations.retain(|handle, _| match handle {

@@ -1754,9 +1754,18 @@ pub(crate) enum CertificateClosureError {
 ///
 /// Callers pass the already projected residual root; this API cannot accept a decoder root and
 /// never enumerates family lanes or selectors.
+#[cfg(test)]
 pub(crate) fn collect_residual_closure(
     job: &super::job::CheckerJob,
     root: &CertificateResidualRoot,
+) -> Result<CertificateClosure, CertificateClosureError> {
+    collect_residual_closure_with_plans(job, root, &[])
+}
+
+fn collect_residual_closure_with_plans(
+    job: &super::job::CheckerJob,
+    root: &CertificateResidualRoot,
+    index_plans: &[&super::g0::IndexUsePlan],
 ) -> Result<CertificateClosure, CertificateClosureError> {
     let mut closure = CertificateClosure {
         expressions: BTreeSet::new(),
@@ -1776,7 +1785,7 @@ pub(crate) fn collect_residual_closure(
             work.push(CertificateWork::Family(*family))
         }
     }
-    walk_certificate_closure(job, &mut closure, work, &[])?;
+    walk_certificate_closure(job, &mut closure, work, index_plans)?;
     Ok(closure)
 }
 
@@ -3898,7 +3907,10 @@ pub(crate) fn prepare_operational_certificate(
             .lower_with_feasibility()
             .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?;
     let residual = project_residual_root(&job, &roots.residual, &target)?;
-    let mut closure = collect_residual_closure(&job, &residual)?;
+    let available_index_plans = trace.index_use_plans().collect::<Vec<_>>();
+    let mut closure = collect_residual_closure_with_plans(&job, &residual, &available_index_plans)?;
+    // Freeze the genuine LUT fixed point before proof-only expressions expand this same closure.
+    trace.retain_residual_index_use_plans(&closure);
     let mut job = job;
     let accepted_report = analyze_roots_with_sink(
         &mut job,
@@ -7232,6 +7244,202 @@ mod tests {
         assert_eq!(closure.constant_expressions.len(), 2);
         assert!(closure.programs.is_empty());
         assert!(closure.families.is_empty());
+    }
+
+    #[test]
+    fn lut_plans_freeze_before_proof_only_closure_expansion() {
+        use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};
+
+        let matrix = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
+        let raw_event = super::super::arena::SampleEventId(91);
+        let mut job = super::super::job::CheckerJob::new();
+        let (
+            residual_root,
+            residual,
+            first_index,
+            second_index,
+            proof_program,
+            proof_gadget,
+            raw_gadget,
+            raw_source,
+            raw_identity,
+        ) = job
+            .with_arena_stores(|expressions, programs, _| {
+                let zero = expressions.intern(
+                    ValueOperator::Constant(super::super::arena::TypedConstant::int(0)),
+                    Box::new([]),
+                )?;
+                let residual = expressions.intern(
+                    ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
+                        output: matrix.clone(),
+                        coefficient_bits: 1,
+                    }),
+                    Box::new([zero]),
+                )?;
+                let first_index = expressions.intern(
+                    ValueOperator::Constant(super::super::arena::TypedConstant::int(1)),
+                    Box::new([]),
+                )?;
+                let second_index = expressions.intern(
+                    ValueOperator::Constant(super::super::arena::TypedConstant::int(2)),
+                    Box::new([]),
+                )?;
+                let proof_gadget = expressions.intern(
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                        output: ResolvedMatrixType::new(17_u8.into(), 1, 2, 1)?,
+                        base: 4,
+                        small: false,
+                        digit_count: 2,
+                    }),
+                    Box::new([residual]),
+                )?;
+                let proof_program = programs.finalize(
+                    expressions,
+                    super::super::arena::ProgramSignature {
+                        inputs: Box::new([]),
+                        output: ResolvedValueType::Matrix(ResolvedMatrixType::new(
+                            17_u8.into(),
+                            1,
+                            2,
+                            1,
+                        )?),
+                    },
+                    proof_gadget,
+                )?;
+                let raw_identity = super::super::arena::SemanticSourceIdentity {
+                    stable_definition: "proof-only-plan-source".to_owned(),
+                    invocation: "proof-only-plan-source".to_owned(),
+                    sample_event: Some(raw_event),
+                    output_role: "matrix".to_owned(),
+                    sampler: Some(super::super::arena::SampleDescriptor::new(
+                        "proof-only-plan-event",
+                        ResolvedValueType::Matrix(matrix.clone()),
+                    )),
+                    artifact: None,
+                    value_type: ResolvedValueType::Matrix(matrix.clone()),
+                    coordinates: Box::new([]),
+                    matrix_constant: None,
+                };
+                let raw_source = expressions
+                    .intern(ValueOperator::Source(raw_identity.clone()), Box::new([]))?;
+                let raw_gadget = expressions.intern(
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                        output: ResolvedMatrixType::new(17_u8.into(), 1, 2, 1)?,
+                        base: 8,
+                        small: false,
+                        digit_count: 2,
+                    }),
+                    Box::new([raw_source]),
+                )?;
+                Ok::<_, super::super::arena::ArenaError>((
+                    expressions.close(residual)?,
+                    residual,
+                    first_index,
+                    second_index,
+                    proof_program,
+                    proof_gadget,
+                    raw_gadget,
+                    raw_source,
+                    raw_identity,
+                ))
+            })
+            .unwrap();
+        let owner = |path| super::super::protocol::PlannedWire {
+            stage: StageId("closure-phase".to_owned()),
+            occurrence: super::super::protocol::ProgramOccurrence {
+                definition: FrozenGraphScopeId::Root,
+                path,
+            },
+            wire: WireRef { node: NodeId(path), port: Port(0) },
+        };
+        let plan = |path, result, consumed, index| super::super::g0::IndexUsePlan {
+            kind: super::super::g0::IndexUseKind::IntegerExpression,
+            owner: owner(path),
+            result: Some(result),
+            result_family: None,
+            consumed,
+            consumed_family: None,
+            index,
+            frontier: Box::new([]),
+            output_type: ResolvedValueType::Int,
+            output_range: None,
+            slice_group: None,
+        };
+        let mut trace = FeasibilityTrace::default();
+        trace.record_index_use(plan(1, residual, None, first_index)).unwrap();
+        trace.record_index_use(plan(2, first_index, None, second_index)).unwrap();
+        trace.record_index_use(plan(3, proof_gadget, Some(raw_gadget), second_index)).unwrap();
+        trace
+            .record_source(
+                super::super::g0::SourceHandle::Expression(raw_source),
+                super::super::g0::SourceClass::UnboundOccurrenceInput {
+                    owner: owner(4),
+                    identity: super::super::g0::InputSourceIdentity::Expression(raw_identity),
+                },
+            )
+            .unwrap();
+        trace
+            .record_event(super::super::g0::EventObservation {
+                event: raw_event,
+                owner: owner(5),
+                kind: super::super::g0::EventKind::Sample {
+                    descriptor: super::super::arena::SampleDescriptor::new(
+                        "proof-only-plan-event",
+                        ResolvedValueType::Matrix(matrix.clone()),
+                    ),
+                },
+            })
+            .unwrap();
+
+        let projected =
+            CertificateResidualRoot::Closed { root: residual_root, matrix: matrix.clone() };
+        let available = trace.index_use_plans().collect::<Vec<_>>();
+        let mut closure =
+            collect_residual_closure_with_plans(&job, &projected, &available).unwrap();
+        assert!(closure.expressions.contains(&first_index));
+        assert!(closure.expressions.contains(&second_index));
+        assert!(!closure.expressions.contains(&proof_gadget));
+        assert!(!closure.expressions.contains(&raw_gadget));
+        trace.retain_residual_index_use_plans(&closure);
+        assert_eq!(trace.index_use_plans().count(), 2);
+        assert_eq!(trace.source_observations().len(), 1);
+        assert_eq!(trace.event_observations().len(), 1);
+
+        let frozen = trace.index_use_plans().collect::<Vec<_>>();
+        walk_certificate_closure(
+            &job,
+            &mut closure,
+            vec![CertificateWork::Program(proof_program)],
+            &frozen,
+        )
+        .unwrap();
+        assert!(closure.programs.contains(&proof_program));
+        assert!(closure.expressions.contains(&proof_gadget));
+        assert!(!closure.expressions.contains(&raw_gadget));
+        assert!(!closure.expressions.contains(&raw_source));
+        assert!(!closure.event_ids.contains(&raw_event));
+        trace.retain_residual(&closure);
+        assert_eq!(trace.index_use_plans().count(), 2);
+        assert!(trace.source_observations().is_empty());
+        assert!(trace.event_observations().is_empty());
+
+        let rows = super::super::g0::derive_certificate_statement_rows(
+            &job,
+            &closure,
+            &trace,
+            Some(residual),
+        )
+        .unwrap();
+        let proof_row = rows.expression(proof_gadget).unwrap() as usize;
+        assert!(matches!(
+            rows.expressions()[proof_row].descriptor,
+            super::super::g0::CanonicalExpressionDescriptor::Event {
+                operator: super::super::g0::CanonicalEventOperator::GadgetDecompose { .. }
+            }
+        ));
+        assert_eq!(rows.events().len(), 1);
+        let n = exact_retained_n(&rows).unwrap();
+        assert_eq!(n.total_rows, n.expression_rows + n.program_rows + n.source_rows + n.event_rows);
     }
 
     #[test]

@@ -283,11 +283,27 @@ pub enum NormalizeError {
     Arena(ArenaError),
     Facts(FactError),
     Monomial(MonomialError),
-    InvalidScope { expected: ValueProgramId, actual: ValueProgramId },
-    MissingCachedValue { expression: ExprId },
-    SharedRootCacheValue { expression: ExprId },
-    UnsupportedOperator { operator: String },
-    InvalidExactPlan { reason: &'static str },
+    InvalidScope {
+        expected: ValueProgramId,
+        actual: ValueProgramId,
+    },
+    MissingCachedValue {
+        expression: ExprId,
+    },
+    SharedRootCacheValue {
+        expression: ExprId,
+    },
+    UnsupportedNonmatrixBound {
+        owner: ScopedExprId,
+        expression: ExprId,
+        operator: Box<ValueOperator>,
+    },
+    UnsupportedOperator {
+        operator: String,
+    },
+    InvalidExactPlan {
+        reason: &'static str,
+    },
     ArithmeticOverflow,
     Relation(RelationRegistryError),
     Feasibility(super::g0::G0Error),
@@ -5948,7 +5964,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         };
         if S::ENABLED {
             if bound.is_missing() {
-                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                return Err(NormalizeError::UnsupportedNonmatrixBound {
+                    owner,
+                    expression,
+                    operator: Box::new(node.operator.clone()),
+                });
             }
             let rule = match &node.operator {
                 ValueOperator::Constant(constant)
@@ -14010,7 +14030,14 @@ mod tests {
         .unwrap()
         .normalize(semantic)
         .unwrap_err();
-        assert!(matches!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer)));
+        assert_eq!(
+            error,
+            NormalizeError::UnsupportedNonmatrixBound {
+                owner: semantic,
+                expression: source,
+                operator: Box::new(expressions.node(source).unwrap().operator.clone()),
+            }
+        );
 
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -14032,7 +14059,57 @@ mod tests {
         .unwrap()
         .normalize(semantic)
         .unwrap_err();
-        assert!(matches!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer)));
+        assert_eq!(
+            error,
+            NormalizeError::UnsupportedNonmatrixBound {
+                owner: semantic,
+                expression: argument,
+                operator: Box::new(ValueOperator::Argument {
+                    position: 0,
+                    value_type: ResolvedValueType::Int,
+                }),
+            }
+        );
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let numerator = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(8)), Box::new([]))
+            .unwrap();
+        let denominator = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .unwrap();
+        let divide = expressions
+            .intern(
+                ValueOperator::Scalar(ScalarOperation::Divide),
+                Box::new([numerator, denominator]),
+            )
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, divide);
+        let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        assert_eq!(ordinary.coefficient_bound, NumericContract::Missing);
+        let mut trace = FeasibilityTrace::default();
+        let error = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(semantic)
+        .unwrap_err();
+        assert_eq!(
+            error,
+            NormalizeError::UnsupportedNonmatrixBound {
+                owner: semantic,
+                expression: divide,
+                operator: Box::new(ValueOperator::Scalar(ScalarOperation::Divide)),
+            }
+        );
     }
 
     #[test]

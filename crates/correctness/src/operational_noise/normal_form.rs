@@ -9932,6 +9932,7 @@ mod tests {
                     &mut trace,
                 )
                 .unwrap();
+                normalizer.monomial_gc_allocation_threshold_bytes = 0;
                 let value = normalizer.normalize(semantic).unwrap();
                 (value, normalizer.counters())
             };
@@ -9975,6 +9976,10 @@ mod tests {
             } else {
                 assert_eq!(output_nf.exact_terms.get(&merge.output), Some(&BigInt::from(2_u8)));
             }
+            assert!(monomials.descriptor(merge.output).is_ok());
+            assert!(
+                inputs.iter().all(|reference| monomials.descriptor(reference.monomial).is_ok())
+            );
         }
     }
 

@@ -1981,6 +1981,10 @@ impl FeasibilitySink for FeasibilityTrace {
         };
         let index = current;
         self.events.push(NormalizerEvent::CoefficientMerge(observation));
+        Self::retain_event_monomials(
+            &self.events[self.events.len() - 1],
+            &mut self.retained_monomial_roots,
+        );
         Ok(index)
     }
 

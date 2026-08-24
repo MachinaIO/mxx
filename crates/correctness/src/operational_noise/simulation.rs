@@ -2869,7 +2869,7 @@ mod tests {
                         source_term_ordinal,
                     } = &observation.source
                     {
-                        Some((index, *application, *source_term_ordinal))
+                        Some((index, *application, *source_term_ordinal, observation))
                     } else {
                         None
                     }
@@ -2878,16 +2878,40 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(!relation_merges.is_empty(), "universal RHS terms carry relation provenance");
-        assert!(relation_merges.iter().all(|(index, application, _)| {
-            *application < *index as u64 &&
-                matches!(
-                    payload.events.get(*application as usize),
-                    Some(ProofPayloadEvent::AppliedRelation {
-                        rule: ProofPayloadRelationRule::Universal { .. },
-                        ..
-                    })
-                )
-        }));
+        for (index, application, source_term_ordinal, merge) in &relation_merges {
+            assert!(*application < *index as u64);
+            let ProofPayloadEvent::AppliedRelation {
+                owner: applied_owner,
+                source_monomial,
+                outer_coefficient,
+                ordered_start,
+                ordered_end_exclusive,
+                rule: ProofPayloadRelationRule::Universal { rhs_result, .. },
+            } = payload.events[*application as usize].clone()
+            else {
+                panic!("relation merge must follow a universal application")
+            };
+            assert_eq!(merge.owner, applied_owner);
+            let ProofPayloadEvent::InvocationEnd {
+                result: ProofPayloadValue::Exact { terms, .. },
+                ..
+            } = &payload.events[rhs_result as usize]
+            else {
+                panic!("relation source must be an exact RHS invocation result")
+            };
+            let source_term = &terms[*source_term_ordinal as usize];
+            let mut expected_central = source_monomial.central_factors.clone();
+            expected_central.extend(source_term.monomial.central_factors.clone());
+            expected_central.sort();
+            let start = ordered_start as usize;
+            let end = ordered_end_exclusive as usize;
+            let mut expected_ordered = source_monomial.ordered_factors[..start].to_vec();
+            expected_ordered.extend(source_term.monomial.ordered_factors.clone());
+            expected_ordered.extend_from_slice(&source_monomial.ordered_factors[end..]);
+            assert_eq!(merge.output.central_factors, expected_central);
+            assert_eq!(merge.output.ordered_factors, expected_ordered);
+            assert_eq!(merge.signed_contribution, outer_coefficient * &source_term.coefficient);
+        }
         let mut frame_stack = Vec::new();
         let mut frame_at = vec![None; payload.events.len()];
         for (index, event) in payload.events.iter().enumerate() {

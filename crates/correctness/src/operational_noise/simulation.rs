@@ -2420,6 +2420,31 @@ mod tests {
         }
     }
 
+    fn payload_frame_data(
+        payload: &OperationalProofPayload,
+    ) -> (Vec<(usize, usize, ProofPayloadOwner)>, Vec<Option<usize>>) {
+        let mut stack = Vec::new();
+        let mut outer = Vec::new();
+        let mut immediate = vec![None; payload.events.len()];
+        for (index, event) in payload.events.iter().enumerate() {
+            if let ProofPayloadEvent::InvocationStart { root } = event {
+                immediate[index] = stack.last().map(|(start, _)| *start);
+                stack.push((index, *root));
+            } else {
+                immediate[index] = stack.last().map(|(start, _)| *start);
+            }
+            if let ProofPayloadEvent::InvocationEnd { root, .. } = event {
+                let (start, started_root) = stack.pop().expect("balanced invocation frames");
+                assert_eq!(&started_root, root);
+                if stack.is_empty() {
+                    outer.push((start, index, *root));
+                }
+            }
+        }
+        assert!(stack.is_empty(), "payload invocation frames must be balanced");
+        (outer, immediate)
+    }
+
     fn repeat_certificate_normalization(run: &mut OperationalCertificateRun) {
         let plaintext_modulus = match &run.accepted_report.acceptance {
             super::super::OperationalAcceptanceReport::Threshold { plaintext_modulus, .. } => {
@@ -2759,6 +2784,44 @@ mod tests {
         // row.  There are no user programs in this closed residual fixture.
         assert!(projection.closure.programs.is_empty());
         assert!(projection.closure.families.is_empty());
+    }
+
+    #[test]
+    fn certificate_report_matches_ordinary_analysis() {
+        let protocol = threshold_certificate_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "certificate-threshold".to_owned(),
+        };
+        let run = prepare_operational_certificate(&protocol, &request)
+            .expect("valid threshold certificate run");
+        let plan = ProtocolPlan::build(&protocol, &request.target_id).expect("protocol plan");
+        let (mut ordinary_job, ordinary_roots) =
+            ProductionAdapter::new(&protocol, &plan, BTreeMap::new())
+                .expect("ordinary production adapter")
+                .lower()
+                .expect("ordinary production lowering");
+        let plaintext_modulus = match &run.accepted_report.acceptance {
+            super::super::OperationalAcceptanceReport::Threshold { plaintext_modulus, .. } => {
+                plaintext_modulus.clone()
+            }
+            super::super::OperationalAcceptanceReport::BooleanInterval { .. } => {
+                panic!("threshold fixture must use threshold acceptance")
+            }
+        };
+        let ordinary_report = analyze_roots(
+            &mut ordinary_job,
+            &ordinary_roots,
+            &ReportTarget {
+                target_id: request.target_id,
+                plaintext_modulus,
+                ciphertext_modulus: run.accepted_report.ciphertext_modulus.clone(),
+                boolean_interval: false,
+            },
+        )
+        .expect("ordinary report");
+        assert_eq!(ordinary_report, run.accepted_report);
     }
 
     #[test]
@@ -3108,6 +3171,125 @@ mod tests {
         assert_eq!(hit.1.scope, computed.1.scope);
         assert_eq!(hit.2, computed.3);
         assert!(hit.2.end <= hit.0 as u64);
+        assert!(matches!(
+            payload.events.get(hit.2.end as usize - 1),
+            Some(ProofPayloadEvent::InvocationEnd { .. })
+        ));
+        let computed_snapshots = payload.events[computed.3.start as usize..computed.3.end as usize]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, event)| {
+                matches!(event, ProofPayloadEvent::PreFoldPolynomial(_))
+                    .then_some(computed.3.start as usize + offset)
+            })
+            .collect::<Vec<_>>();
+        let computed_nested_ends = payload.events
+            [computed.3.start as usize..computed.3.end as usize]
+            .iter()
+            .filter(|event| matches!(event, ProofPayloadEvent::InvocationEnd { .. }))
+            .count();
+        assert!(!computed_snapshots.is_empty());
+        assert_eq!(computed_snapshots.len(), computed_nested_ends);
+        for snapshot in computed_snapshots {
+            assert!(snapshot < computed.3.end as usize);
+            assert!(
+                payload.events[snapshot + 1..computed.3.end as usize]
+                    .iter()
+                    .any(|event| matches!(event, ProofPayloadEvent::InvocationEnd { .. }))
+            );
+        }
+        let computed_nested_starts = payload.events
+            [computed.3.start as usize..computed.3.end as usize]
+            .iter()
+            .filter(|event| matches!(event, ProofPayloadEvent::InvocationStart { .. }))
+            .count();
+        let hit_nested_starts = payload.events[hit.2.start as usize..hit.2.end as usize]
+            .iter()
+            .filter(|event| matches!(event, ProofPayloadEvent::InvocationStart { .. }))
+            .count();
+        assert_eq!(computed_nested_starts, hit_nested_starts);
+        assert!(!matches!(payload.events[hit.0], ProofPayloadEvent::InvocationStart { .. }));
+
+        let (outer_frames, immediate_frames) = payload_frame_data(&payload);
+        assert_eq!(outer_frames.len(), 2, "the repeated run must have two outer invocations");
+        let mut outer_snapshots = Vec::new();
+        for (outer_start, outer_end, outer_root) in &outer_frames {
+            let snapshots = payload.events[*outer_start..=*outer_end]
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, event)| match event {
+                    ProofPayloadEvent::PreFoldPolynomial(snapshot) => {
+                        let index = *outer_start + offset;
+                        (immediate_frames[index] == Some(*outer_start)).then_some((index, snapshot))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(snapshots.len(), 1, "each outer invocation has one fresh snapshot");
+            let (snapshot_index, snapshot) = snapshots[0];
+            assert!(*outer_start < snapshot_index && snapshot_index < *outer_end);
+            if let Some(evidence) = &snapshot.summary_evidence {
+                let event = match evidence {
+                    ProofPayloadValueRef::Result { event, .. } |
+                    ProofPayloadValueRef::Transfer(event) => *event as usize,
+                    ProofPayloadValueRef::Predecessor { .. } => {
+                        unreachable!("pre-fold summaries cannot use predecessor evidence")
+                    }
+                };
+                assert!(*outer_start <= event && event < snapshot_index);
+            }
+            for (index, event) in payload.events[*outer_start..=*outer_end].iter().enumerate() {
+                let index = *outer_start + index;
+                if matches!(event, ProofPayloadEvent::AppliedRelation { .. }) ||
+                    matches!(
+                        event,
+                        ProofPayloadEvent::CoefficientMerge(ProofPayloadCoefficientMerge {
+                            source: ProofPayloadCoefficientMergeSource::Relation { .. },
+                            ..
+                        })
+                    )
+                {
+                    assert!(index < snapshot_index);
+                }
+                if let ProofPayloadEvent::SurvivorFold(fold) = event {
+                    assert!(snapshot_index < index && index < *outer_end);
+                    assert!(*outer_start <= fold.bound as usize && (fold.bound as usize) < index);
+                    assert_eq!(immediate_frames[index], immediate_frames[fold.bound as usize]);
+                }
+            }
+            let root_result = payload.events[*outer_start..snapshot_index]
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, event)| {
+                    matches!(event, ProofPayloadEvent::Result { owner, .. } if owner == outer_root)
+                        .then_some(outer_start + offset)
+                })
+                .last()
+                .expect("outer root result before its snapshot");
+            assert!(root_result < snapshot_index);
+            assert!(matches!(
+                payload.events[*outer_end],
+                ProofPayloadEvent::InvocationEnd { root, .. } if root == *outer_root
+            ));
+            assert!(snapshot_index < *outer_end);
+            outer_snapshots.push(snapshot_index);
+        }
+        assert_ne!(outer_snapshots[0], outer_snapshots[1]);
+
+        for (index, event) in payload.events.iter().enumerate() {
+            let ProofPayloadEvent::AppliedRelation { rule, .. } = event else { continue };
+            let ProofPayloadRelationRule::Universal { computed, rhs_result, .. } = rule else {
+                continue
+            };
+            let Some(ProofPayloadEvent::SpecializationComputed { source, .. }) =
+                payload.events.get(*computed as usize)
+            else {
+                panic!("universal application must cite its computed specialization")
+            };
+            assert!(*rhs_result as usize >= source.start as usize);
+            assert!((*rhs_result as usize) < source.end as usize);
+            assert_ne!(immediate_frames[index], immediate_frames[*rhs_result as usize]);
+        }
         let second = prepare_operational_certificate(&protocol, &request)
             .and_then(|run| derive_proof_payload(&run))
             .expect("stable singleton universal payload");

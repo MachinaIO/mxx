@@ -6772,6 +6772,38 @@ mod tests {
         assert!(value.exact_nf.as_ref().is_some_and(|normal_form| {
             normal_form.exact_terms.keys().all(|monomial| monomials.descriptor(*monomial).is_ok())
         }));
+        let result_index = trace
+            .normalization_events()
+            .iter()
+            .position(|event| matches!(event, NormalizerEvent::Result { owner, .. } if owner.expression() == semantic.expression()))
+            .expect("root result");
+        let snapshot_indices = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event, NormalizerEvent::PreFoldPolynomial(_)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(snapshot_indices.len(), 1);
+        let snapshot_index = snapshot_indices[0];
+        let end_index = trace
+            .normalization_events()
+            .iter()
+            .position(|event| matches!(event, NormalizerEvent::InvocationEnd { root, .. } if *root == semantic))
+            .expect("root invocation end");
+        assert!(result_index < snapshot_index && snapshot_index < end_index);
+        let NormalizerEvent::PreFoldPolynomial(snapshot) =
+            &trace.normalization_events()[snapshot_index]
+        else {
+            unreachable!("snapshot index must point to PreFoldPolynomial")
+        };
+        for monomial in snapshot.polynomial.exact_terms.keys() {
+            assert!(
+                monomials.descriptor(*monomial).is_ok(),
+                "forced GC must retain every snapshot monomial descriptor"
+            );
+        }
         assert!(trace.normalization_events().iter().any(|event| {
             matches!(
                 event,
@@ -14550,7 +14582,7 @@ mod tests {
             .unwrap();
         let abort_semantic =
             programs.scoped(&expressions, abort_family.program(), abort_root).unwrap();
-        let abort_facts = FactStore::new(&expressions);
+        let mut abort_facts = FactStore::new(&expressions);
         let mut abort_monomials =
             MonomialArena::new(&expressions, &programs, abort_family.program()).unwrap();
         let mut abort_cache = NormalizationCache::new();
@@ -14576,20 +14608,76 @@ mod tests {
         let first_fingerprint = abort_cache.canonical_state_fingerprint();
         assert!(first_rhs > baseline_rhs);
         assert!(abort_trace.normalization_events().is_empty());
-        let mut abort_normalizer = Normalizer::new_with_sink(
+
+        insert_matrix_bound(&mut abort_facts, &expressions, missing, 1);
+        let mut recovery_trace = FeasibilityTrace::default();
+        let mut recovery_normalizer = Normalizer::new_with_sink(
             &mut expressions,
             &programs,
             &abort_facts,
             &mut abort_monomials,
-            &mut abort_trace,
+            &mut recovery_trace,
         )
         .unwrap()
         .with_relations(&relations, &mut abort_cache);
-        assert_eq!(abort_normalizer.normalize(abort_semantic).unwrap_err(), expected);
-        drop(abort_normalizer);
-        assert_eq!(abort_cache.runtime_entry_count(), baseline_runtime);
+        let recovered = recovery_normalizer.normalize(abort_semantic).unwrap();
+        let recovered_events =
+            recovery_normalizer.sink.as_deref().unwrap().normalization_events().to_vec();
+        drop(recovery_normalizer);
+        assert_eq!(abort_cache.runtime_entry_count(), baseline_runtime + 1);
         assert_eq!(abort_cache.canonical_rhs_count(), first_rhs);
         assert_eq!(abort_cache.canonical_state_fingerprint(), first_fingerprint);
+        assert!(
+            recovered_events
+                .iter()
+                .any(|event| { matches!(event, NormalizerEvent::SpecializationComputed { .. }) })
+        );
+        assert!(
+            !recovered_events
+                .iter()
+                .any(|event| { matches!(event, NormalizerEvent::SpecializationCacheHit { .. }) })
+        );
+
+        let mut recovery_normalizer = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &abort_facts,
+            &mut abort_monomials,
+            &mut recovery_trace,
+        )
+        .unwrap()
+        .with_relations(&relations, &mut abort_cache);
+        let recovered_again = recovery_normalizer.normalize(abort_semantic).unwrap();
+        let recovered_again_events =
+            recovery_normalizer.sink.as_deref().unwrap().normalization_events().to_vec();
+        drop(recovery_normalizer);
+        assert_eq!(recovered.semantic, recovered_again.semantic);
+        assert_eq!(recovered.exact_nf, recovered_again.exact_nf);
+        assert_eq!(recovered.coefficient_bound, recovered_again.coefficient_bound);
+        assert_eq!(abort_cache.runtime_entry_count(), baseline_runtime + 1);
+        assert_eq!(abort_cache.canonical_rhs_count(), first_rhs);
+        assert_eq!(abort_cache.canonical_state_fingerprint(), first_fingerprint);
+        let computed_source = recovered_events
+            .iter()
+            .find_map(|event| match event {
+                NormalizerEvent::SpecializationComputed { replay, .. } => Some(replay.range),
+                _ => None,
+            })
+            .expect("recovery computation");
+        let hit_source = recovered_again_events
+            .iter()
+            .find_map(|event| match event {
+                NormalizerEvent::SpecializationCacheHit { source, .. } => Some(*source),
+                _ => None,
+            })
+            .expect("recovery cache hit");
+        assert_eq!(computed_source, hit_source);
+        recovery_trace
+            .validate_normalization_observations_with_monomials(&abort_monomials)
+            .unwrap();
+        recovery_trace
+            .validate_normalization_observations_with_state(&abort_monomials, &abort_cache)
+            .unwrap();
         assert!(abort_trace.normalization_events().is_empty());
     }
 

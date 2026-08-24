@@ -442,14 +442,6 @@ theorem relationReplacement_singleton (context : MonomialContext) (outerCoeffici
       [{ coefficient := outerCoefficient * term.coefficient, key := context.plug term.key }] := by
   rfl
 
-theorem coefficient_add_replay (key : MonomialKey) (left right : Polynomial) :
-    coefficient key (add left right) = coefficient key left + coefficient key right :=
-  coefficient_add key left right
-
-theorem coefficient_subtract_replay (key : MonomialKey) (left right : Polynomial) :
-    coefficient key (subtract left right) = coefficient key left - coefficient key right :=
-  coefficient_subtract key left right
-
 def productMerge_contribution (left right : ExactTerm) : ExactTerm :=
   { coefficient := left.coefficient * right.coefficient
     key := MonomialKey.product left.key right.key }
@@ -492,12 +484,12 @@ theorem survivorFold_sound {contributions bounds : List Nat}
     contributions.sum ≤ bounds.sum := by
   exact List.sum_le_sum_forall₂ hbound
 
-theorem preFold_to_invocationEnd {preFoldSummary postFoldSummary : Nat}
+theorem preFold_to_invocationEnd {summaryActual summaryBound : Nat}
     {survivorContributions survivorBounds : List Nat}
-    (summaryBound : preFoldSummary ≤ postFoldSummary)
+    (summaryBoundProof : summaryActual ≤ summaryBound)
     (transferBounds : List.Forall₂ (fun value bound => value ≤ bound)
       survivorContributions survivorBounds) :
-    preFoldSummary + survivorContributions.sum ≤ postFoldSummary + survivorBounds.sum := by
-  exact Nat.add_le_add summaryBound (survivorFold_sound transferBounds)
+    summaryActual + survivorContributions.sum ≤ summaryBound + survivorBounds.sum := by
+  exact Nat.add_le_add summaryBoundProof (survivorFold_sound transferBounds)
 
 end Mxx.Certificate.OperationalNoise.EventReplay

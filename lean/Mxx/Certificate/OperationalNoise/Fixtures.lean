@@ -220,31 +220,37 @@ open Mxx.Certificate.OperationalNoise
 def toyContext : MonomialContext :=
   { exteriorCentral := [1], prefixFactors := [10], suffixFactors := [20] }
 
-def toyLhs : MonomialKey := { centralFactors := [2], orderedFactors := [30] }
-def toySource : MonomialKey := toyContext.plug toyLhs
 def toyRhsKeyA : MonomialKey := { centralFactors := [3], orderedFactors := [40] }
 def toyRhsKeyB : MonomialKey := { centralFactors := [4], orderedFactors := [50] }
-
 def toyRhs : Polynomial :=
   [ { coefficient := 3, key := toyRhsKeyA }, { coefficient := -1, key := toyRhsKeyB } ]
 
+def toyContextualA : MonomialKey := toyContext.plug toyRhsKeyA
+def toyContextualB : MonomialKey := toyContext.plug toyRhsKeyB
 def toyReplacement : Polynomial := relationReplacement toyContext 2 toyRhs
 
-def toyPositive : Polynomial := [{ coefficient := 5, key := toyLhs }]
-def toyNegative : Polynomial := [{ coefficient := -2, key := toyLhs }]
-def toyCancelPositive : Polynomial := [{ coefficient := 5, key := toyLhs }]
-def toyCancelNegative : Polynomial := [{ coefficient := -5, key := toyLhs }]
-def toyProductLeft : ExactTerm := { coefficient := -2, key := toyLhs }
-def toyProductRight : ExactTerm := { coefficient := 3, key := toyRhsKeyA }
-def toyProduct : ExactTerm := productMerge_contribution toyProductLeft toyProductRight
+def toyProductLeft : ExactTerm :=
+  { coefficient := -2, key := { centralFactors := [], orderedFactors := [10] } }
+def toyProductRight : ExactTerm :=
+  { coefficient := 3, key := { centralFactors := [1, 3], orderedFactors := [40, 20] } }
+def toyCancellation : Polynomial := [productMerge_contribution toyProductLeft toyProductRight]
+def toyFolded : Polynomial := add toyReplacement toyCancellation
+def toySubtracted : Polynomial := subtract toyReplacement toyCancellation
 
-def toyContributions : List Nat := [3, 1]
-def toyResolvedBounds : List Nat := [5, 2]
-def toyPreFoldSummary : Nat := 7
-def toyPostFoldSummary : Nat := 9
-def toyFinalSummary : Nat := toyPostFoldSummary + toyResolvedBounds.sum
+def toySurvivorMonomialActual : Nat := 4
+def toySurvivorMonomialBound : Nat := 5
+def toySurvivorCoefficient : Nat := (coefficient toyContextualB toyFolded).natAbs
+def toyResolvedActual : Nat := toySurvivorCoefficient * toySurvivorMonomialActual
+def toyResolvedBound : Nat := toySurvivorCoefficient * toySurvivorMonomialBound
+def toyResolvedContributions : List Nat := [toyResolvedActual]
+def toyResolvedBounds : List Nat := [toyResolvedBound]
+def toySummaryActual : Nat := 7
+def toySummaryBound : Nat := 9
 
-theorem toy_context_source : toySource = toyContext.plug toyLhs := by rfl
+theorem toy_contextual_sources :
+    toyContextualA = toyContext.plug toyRhsKeyA ∧
+      toyContextualB = toyContext.plug toyRhsKeyB := by
+  exact ⟨rfl, rfl⟩
 
 theorem toy_replacement_shape :
     toyReplacement =
@@ -254,57 +260,74 @@ theorem toy_replacement_shape :
           key := { centralFactors := [1, 4], orderedFactors := [10, 50, 20] } } ] := by
   decide
 
-theorem toy_add_value : coefficient toyLhs (add toyPositive toyNegative) = 3 := by decide
+theorem toy_product_cancellation :
+    productMerge_contribution toyProductLeft toyProductRight =
+      { coefficient := -6, key := toyContextualA } := by
+  decide
 
-theorem toy_sub_value : coefficient toyLhs (subtract toyPositive toyNegative) = 7 := by decide
+theorem toy_add_cancellation : coefficient toyContextualA toyFolded = 0 := by decide
 
-theorem toy_exact_cancellation :
-    coefficient toyLhs (add toyCancelPositive toyCancelNegative) = 0 := by decide
+theorem toy_add_survivor : coefficient toyContextualB toyFolded = -2 := by decide
 
-theorem toy_product_value :
-    toyProduct.coefficient = -6 ∧ toyProduct.key.orderedFactors = [30, 40] := by decide
+theorem toy_sub_contribution : coefficient toyContextualA toySubtracted = 12 := by decide
 
-theorem toy_survivor_transfer :
-    List.Forall₂ (fun value bound => value ≤ bound) toyContributions toyResolvedBounds := by
+theorem toy_survivor_magnitude : toySurvivorCoefficient = 2 := by
+  unfold toySurvivorCoefficient
+  rw [show coefficient toyContextualB toyFolded = -2 from toy_add_survivor]
+  decide
+
+theorem toy_monomial_bound : toySurvivorMonomialActual ≤ toySurvivorMonomialBound := by decide
+
+theorem toy_resolved_transfer : toyResolvedActual ≤ toyResolvedBound := by
+  unfold toyResolvedActual toyResolvedBound
+  exact boundTransfer_scale toy_monomial_bound
+
+theorem toy_resolved_transfer_values :
+    toyResolvedActual = 8 ∧ toyResolvedBound = 10 := by
+  unfold toyResolvedActual toyResolvedBound toySurvivorCoefficient
+  rw [toy_add_survivor]
+  decide
+
+theorem toy_resolved_transfer_list :
+    List.Forall₂ (fun value bound => value ≤ bound)
+      toyResolvedContributions toyResolvedBounds := by
   constructor
-  · decide
-  · constructor
-    · decide
-    · exact List.Forall₂.nil
+  · exact toy_resolved_transfer
+  · exact List.Forall₂.nil
 
-theorem toy_survivor_fold_exact :
-    toyContributions.sum = 4 ∧ toyResolvedBounds.sum = 7 := by decide
+theorem toy_summary_bound : toySummaryActual ≤ toySummaryBound := by decide
 
-theorem toy_bound_transfer_chain :
-    3 + 1 ≤ 5 + 2 ∧ 2 * 3 ≤ 2 * 5 ∧ 3 * 1 ≤ 5 * 2 := by
-  exact ⟨boundTransfer_sum (by decide) (by decide),
-    boundTransfer_scale (by decide), boundTransfer_product (by decide) (by decide)⟩
-
-theorem toy_prefold_invocation_end :
-    toyPreFoldSummary + toyContributions.sum ≤ toyPostFoldSummary + toyResolvedBounds.sum := by
-  exact preFold_to_invocationEnd (by decide) toy_survivor_transfer
+theorem toy_prefold_invocation_end : 7 + 8 ≤ 9 + 10 := by
+  have hfinal := preFold_to_invocationEnd
+    (summaryActual := toySummaryActual) (summaryBound := toySummaryBound)
+    (survivorContributions := toyResolvedContributions)
+    (survivorBounds := toyResolvedBounds) toy_summary_bound toy_resolved_transfer_list
+  change toySummaryActual + toyResolvedContributions.sum ≤ toySummaryBound + toyResolvedBounds.sum
+  exact hfinal
 
 theorem toy_event_replay :
-    toySource = toyContext.plug toyLhs ∧
+    toyContextualA = toyContext.plug toyRhsKeyA ∧
+      toyContextualB = toyContext.plug toyRhsKeyB ∧
       toyReplacement =
         [ { coefficient := 6,
             key := { centralFactors := [1, 3], orderedFactors := [10, 40, 20] } },
           { coefficient := -2,
             key := { centralFactors := [1, 4], orderedFactors := [10, 50, 20] } } ] ∧
-      coefficient toyLhs (add toyPositive toyNegative) = 3 ∧
-      coefficient toyLhs (subtract toyPositive toyNegative) = 7 ∧
-      coefficient toyLhs (add toyCancelPositive toyCancelNegative) = 0 ∧
-      (3 + 1 ≤ 5 + 2 ∧ 2 * 3 ≤ 2 * 5 ∧ 3 * 1 ≤ 5 * 2) ∧
-      toyProduct.coefficient = -6 ∧
-      toyContributions.sum = 4 ∧
-      toyResolvedBounds.sum = 7 ∧
-      toyFinalSummary = 16 ∧
-      toyPreFoldSummary + toyContributions.sum ≤
-        toyPostFoldSummary + toyResolvedBounds.sum := by
-  exact ⟨toy_context_source, toy_replacement_shape, toy_add_value, toy_sub_value,
-    toy_exact_cancellation, toy_bound_transfer_chain, toy_product_value.1,
-    toy_survivor_fold_exact.1,
-    toy_survivor_fold_exact.2, by decide, toy_prefold_invocation_end⟩
+      productMerge_contribution toyProductLeft toyProductRight =
+        { coefficient := -6, key := toyContextualA } ∧
+      coefficient toyContextualA toyFolded = 0 ∧
+      coefficient toyContextualB toyFolded = -2 ∧
+      coefficient toyContextualA toySubtracted = 12 ∧
+      toySurvivorCoefficient = 2 ∧
+      toySurvivorMonomialActual ≤ toySurvivorMonomialBound ∧
+      (toyResolvedActual = 8 ∧ toyResolvedBound = 10) ∧
+      toyResolvedActual ≤ toyResolvedBound ∧
+      toySummaryActual ≤ toySummaryBound ∧
+      7 + 8 ≤ 9 + 10 := by
+  exact ⟨toy_contextual_sources.1, toy_contextual_sources.2, toy_replacement_shape,
+    toy_product_cancellation, toy_add_cancellation, toy_add_survivor, toy_sub_contribution,
+    toy_survivor_magnitude, toy_monomial_bound, toy_resolved_transfer_values,
+    toy_resolved_transfer, toy_summary_bound, toy_prefold_invocation_end⟩
 
 #print axioms toy_event_replay
 #print axioms survivorFold_sound

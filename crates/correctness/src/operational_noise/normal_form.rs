@@ -1346,8 +1346,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
 
     fn observe_survivor_fold(
         &mut self,
-        owner: ScopedExprId,
-        monomial: MonomialId,
         coefficient: &BigInt,
         bound: BoundValueRef,
     ) -> Result<(), NormalizeError> {
@@ -1361,8 +1359,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             .as_deref_mut()
             .ok_or(super::g0::G0Error::RelationTraceInvariant)?
             .record_survivor_fold(super::g0::SurvivorFold {
-                owner,
-                monomial,
                 coefficient: coefficient.clone(),
                 bound,
             })?;
@@ -4254,7 +4250,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 if S::ENABLED {
                     let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
                     let transfer = self.observe_finite_monomial(owner, monomial, &coefficient)?;
-                    self.observe_survivor_fold(owner, monomial, &coefficient, transfer)?;
+                    self.observe_survivor_fold(&coefficient, transfer)?;
                 }
                 Ok(())
             }
@@ -4277,7 +4273,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 if S::ENABLED {
                     let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
                     let transfer = self.observe_finite_monomial(owner, monomial, &coefficient)?;
-                    self.observe_survivor_fold(owner, monomial, &coefficient, transfer.clone())?;
+                    self.observe_survivor_fold(&coefficient, transfer.clone())?;
                     self.append_summary_evidence(owner, evidence, transfer)?;
                 }
                 *noise = add_noise_summaries(noise, &NumericContract::Known(bound));
@@ -4891,7 +4887,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
                         let transfer =
                             self.observe_finite_monomial(owner, monomial, &coefficient)?;
-                        self.observe_survivor_fold(owner, monomial, &coefficient, transfer)?;
+                        self.observe_survivor_fold(&coefficient, transfer)?;
                     }
                 }
                 NumericContract::Known(bound @ CoefficientBound::Finite(_)) => {
@@ -4906,12 +4902,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
                         let transfer =
                             self.observe_finite_monomial(owner, monomial, &coefficient)?;
-                        self.observe_survivor_fold(
-                            owner,
-                            monomial,
-                            &coefficient,
-                            transfer.clone(),
-                        )?;
+                        self.observe_survivor_fold(&coefficient, transfer.clone())?;
                         self.append_summary_evidence(owner, evidence, transfer)?;
                     }
                 }
@@ -13123,24 +13114,12 @@ mod tests {
             _ => panic!("factor evidence must use a prior result"),
         };
         assert!(factor_result.0 < monomial_index as u64);
-        let folded_monomial = match &trace.normalization_events()[monomial_index] {
-            NormalizerEvent::BoundTransfer {
-                rule: BoundRule::MonomialProduct { monomial, .. },
-                ..
-            } => *monomial,
-            _ => unreachable!("monomial evidence index"),
-        };
         let fold_index = trace
             .normalization_events()
             .iter()
             .enumerate()
-            .find_map(|(index, event)| match event {
-                NormalizerEvent::SurvivorFold(observation)
-                    if observation.monomial == folded_monomial =>
-                {
-                    Some(index)
-                }
-                _ => None,
+            .find_map(|(index, event)| {
+                matches!(event, NormalizerEvent::SurvivorFold(_)).then_some(index)
             })
             .expect("finite fold observation");
         assert!(fold_index > monomial_index);

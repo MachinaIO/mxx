@@ -239,8 +239,6 @@ pub(crate) struct ProofPayloadCoefficientMerge {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProofPayloadSurvivorFold {
-    pub owner: ProofPayloadOwner,
-    pub monomial: ProofPayloadMonomial,
     pub coefficient: BigInt,
     pub bound: u64,
 }
@@ -561,13 +559,16 @@ pub(crate) fn derive_proof_payload(
             NormalizerEvent::InvocationEnd { root, .. } |
             NormalizerEvent::SpecializationComputed { owner: root, .. } |
             NormalizerEvent::SpecializationCacheHit { owner: root, .. } |
-            NormalizerEvent::BoundTransfer { owner: root, .. } |
-            NormalizerEvent::SurvivorFold(super::g0::SurvivorFold { owner: root, .. }) => {
-                root.program()
-            }
+            NormalizerEvent::BoundTransfer { owner: root, .. } => root.program(),
             NormalizerEvent::CoefficientMerge(observation) => observation.owner.program(),
             NormalizerEvent::Predecessor { consumer, .. } => consumer.program(),
             NormalizerEvent::AppliedRelation(observation) => observation.owner.program(),
+            NormalizerEvent::SurvivorFold(observation) => {
+                match run.trace.events.get(observation.bound.0 as usize) {
+                    Some(NormalizerEvent::BoundTransfer { owner, .. }) => owner.program(),
+                    _ => return Err(proof_payload_error(G0Error::RelationTraceInvariant)),
+                }
+            }
         };
         if let Some(arena) = run.job.monomials().get(scope) {
             monomial_arenas.insert(arena.token(), arena);
@@ -640,11 +641,8 @@ fn extend_certificate_closure(
                     }
                 }
             }
+            NormalizerEvent::SurvivorFold(_) => {}
             NormalizerEvent::CoefficientMerge(observation) => {
-                work.push(CertificateWork::Program(observation.owner.program()));
-                work.push(CertificateWork::Expression(observation.owner.expression()));
-            }
-            NormalizerEvent::SurvivorFold(observation) => {
                 work.push(CertificateWork::Program(observation.owner.program()));
                 work.push(CertificateWork::Expression(observation.owner.expression()));
             }
@@ -1236,9 +1234,13 @@ impl<'a> ProofPayloadProjector<'a> {
             },
             NormalizerEvent::SurvivorFold(observation) => {
                 self.prior_event(observation.bound, current)?;
+                let (owner, monomial, magnitude) =
+                    trace.resolve_survivor_bound(observation.bound)?;
+                if *observation.coefficient.magnitude() != magnitude {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
+                let _ = (self.owner(owner)?, self.monomial(monomial)?);
                 ProofPayloadEvent::SurvivorFold(ProofPayloadSurvivorFold {
-                    owner: self.owner(observation.owner)?,
-                    monomial: self.monomial(observation.monomial)?,
                     coefficient: observation.coefficient.clone(),
                     bound: observation.bound.0,
                 })
@@ -2315,6 +2317,7 @@ mod tests {
         },
     };
     use mxx_dsl::{Bool, DslContext, IdealSpec, Int, Ring, SemanticAnchor};
+    use mxx_ir_core::{IntExpr, node::ConstantMatrix};
 
     fn payload_rule_mentions_transfer(rule: &ProofPayloadRule, event: usize) -> bool {
         let value = |value: &ProofPayloadValueRef| matches!(value, ProofPayloadValueRef::Transfer(candidate) if *candidate as usize == event);
@@ -2379,7 +2382,11 @@ mod tests {
         let left_outer = left_scalar * matrix.clone();
         let right_outer = right_scalar * matrix;
         let product = left_outer * right_outer;
-        let residual = (product.clone() - product)
+        let finite = ring.constant(
+            (2, 2),
+            ConstantMatrix::Polynomial { coefficients: vec![IntExpr::constant(3)] },
+        );
+        let residual = (product.clone() - product + finite)
             .semantic_anchor("certificate.residual")
             .expect("residual anchor");
         let decoded = residual
@@ -2703,6 +2710,56 @@ mod tests {
             )
             .expect("threshold product state validates");
         let payload = derive_proof_payload(&run).expect("canonical proof payload");
+        let survivor_folds = payload
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                ProofPayloadEvent::SurvivorFold(observation) => Some((index, observation)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!survivor_folds.is_empty(), "accepted payload must contain a survivor fold");
+        assert!(survivor_folds.iter().all(|(index, fold)| fold.bound < *index as u64));
+        for (_, fold) in &survivor_folds {
+            let Some(NormalizerEvent::BoundTransfer { owner, rule }) =
+                run.trace.events.get(fold.bound as usize)
+            else {
+                panic!("survivor fold must point to a bound transfer")
+            };
+            match rule {
+                BoundRule::MonomialProduct { monomial, .. } => {
+                    assert_eq!(fold.coefficient.magnitude(), &BigUint::from(1_u8));
+                    run.job
+                        .monomials()
+                        .get(owner.program())
+                        .expect("fold owner monomial arena")
+                        .descriptor(*monomial)
+                        .expect("fold monomial remains live");
+                }
+                BoundRule::Scale {
+                    value: BoundValueRef::Transfer(previous),
+                    scale: BoundScale::Magnitude(magnitude),
+                } => {
+                    assert_eq!(fold.coefficient.magnitude(), magnitude);
+                    let Some(NormalizerEvent::BoundTransfer {
+                        owner: previous_owner,
+                        rule: BoundRule::MonomialProduct { monomial, .. },
+                    }) = run.trace.events.get(previous.0 as usize)
+                    else {
+                        panic!("scale must consume its monomial product")
+                    };
+                    assert_eq!(owner, previous_owner);
+                    run.job
+                        .monomials()
+                        .get(owner.program())
+                        .expect("scaled fold owner monomial arena")
+                        .descriptor(*monomial)
+                        .expect("scaled fold monomial remains live");
+                }
+                _ => panic!("survivor fold must resolve to monomial product or scale"),
+            }
+        }
         let second = prepare_operational_certificate(&protocol, &request)
             .expect("equivalent threshold certificate run");
         let second_payload = derive_proof_payload(&second).expect("canonical second payload");
@@ -2815,7 +2872,7 @@ mod tests {
             ProofPayloadEvent::AppliedRelation { owner, .. } |
             ProofPayloadEvent::BoundTransfer { owner, .. } => Some(owner.scope),
             ProofPayloadEvent::CoefficientMerge(observation) => Some(observation.owner.scope),
-            ProofPayloadEvent::SurvivorFold(observation) => Some(observation.owner.scope),
+            ProofPayloadEvent::SurvivorFold(_) => None,
             ProofPayloadEvent::Predecessor { consumer, .. } => Some(consumer.scope),
         };
         let scopes = payload.events.iter().filter_map(owner_scope).collect::<Vec<_>>();

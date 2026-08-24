@@ -238,6 +238,14 @@ pub(crate) struct ProofPayloadCoefficientMerge {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProofPayloadSurvivorFold {
+    pub owner: ProofPayloadOwner,
+    pub monomial: ProofPayloadMonomial,
+    pub coefficient: BigInt,
+    pub bound: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProofPayloadFactorEvidence {
     pub bound: ProofPayloadValueRef,
     pub is_constant_polynomial: bool,
@@ -345,6 +353,7 @@ pub(crate) enum ProofPayloadEvent {
         rule: ProofPayloadRule,
     },
     CoefficientMerge(ProofPayloadCoefficientMerge),
+    SurvivorFold(ProofPayloadSurvivorFold),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -552,7 +561,10 @@ pub(crate) fn derive_proof_payload(
             NormalizerEvent::InvocationEnd { root, .. } |
             NormalizerEvent::SpecializationComputed { owner: root, .. } |
             NormalizerEvent::SpecializationCacheHit { owner: root, .. } |
-            NormalizerEvent::BoundTransfer { owner: root, .. } => root.program(),
+            NormalizerEvent::BoundTransfer { owner: root, .. } |
+            NormalizerEvent::SurvivorFold(super::g0::SurvivorFold { owner: root, .. }) => {
+                root.program()
+            }
             NormalizerEvent::CoefficientMerge(observation) => observation.owner.program(),
             NormalizerEvent::Predecessor { consumer, .. } => consumer.program(),
             NormalizerEvent::AppliedRelation(observation) => observation.owner.program(),
@@ -629,6 +641,10 @@ fn extend_certificate_closure(
                 }
             }
             NormalizerEvent::CoefficientMerge(observation) => {
+                work.push(CertificateWork::Program(observation.owner.program()));
+                work.push(CertificateWork::Expression(observation.owner.expression()));
+            }
+            NormalizerEvent::SurvivorFold(observation) => {
                 work.push(CertificateWork::Program(observation.owner.program()));
                 work.push(CertificateWork::Expression(observation.owner.expression()));
             }
@@ -1218,6 +1234,15 @@ impl<'a> ProofPayloadProjector<'a> {
                 owner: self.owner(*owner)?,
                 rule: self.rule(rule, current)?,
             },
+            NormalizerEvent::SurvivorFold(observation) => {
+                self.prior_event(observation.bound, current)?;
+                ProofPayloadEvent::SurvivorFold(ProofPayloadSurvivorFold {
+                    owner: self.owner(observation.owner)?,
+                    monomial: self.monomial(observation.monomial)?,
+                    coefficient: observation.coefficient.clone(),
+                    bound: observation.bound.0,
+                })
+            }
             NormalizerEvent::CoefficientMerge(observation) => ProofPayloadEvent::CoefficientMerge(
                 self.coefficient_merge(trace, observation, current)?,
             ),
@@ -2790,6 +2815,7 @@ mod tests {
             ProofPayloadEvent::AppliedRelation { owner, .. } |
             ProofPayloadEvent::BoundTransfer { owner, .. } => Some(owner.scope),
             ProofPayloadEvent::CoefficientMerge(observation) => Some(observation.owner.scope),
+            ProofPayloadEvent::SurvivorFold(observation) => Some(observation.owner.scope),
             ProofPayloadEvent::Predecessor { consumer, .. } => Some(consumer.scope),
         };
         let scopes = payload.events.iter().filter_map(owner_scope).collect::<Vec<_>>();

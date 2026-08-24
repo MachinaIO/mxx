@@ -117,6 +117,11 @@ pub(crate) trait FeasibilitySink: Default {
         observation: CoefficientMerge,
     ) -> Result<EventIndex, G0Error>;
 
+    fn record_survivor_fold(&mut self, observation: SurvivorFold) -> Result<(), G0Error> {
+        let _ = observation;
+        Ok(())
+    }
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error>;
 
     fn retained_monomial_roots(
@@ -258,6 +263,14 @@ pub(crate) struct CoefficientMerge {
     pub signed_contribution: BigInt,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct SurvivorFold {
+    pub owner: super::arena::ScopedExprId,
+    pub monomial: super::monomial::MonomialId,
+    pub coefficient: BigInt,
+    pub bound: EventIndex,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum NormalizerEvent {
     InvocationStart {
@@ -294,6 +307,7 @@ pub(crate) enum NormalizerEvent {
         rule: BoundRule,
     },
     CoefficientMerge(CoefficientMerge),
+    SurvivorFold(SurvivorFold),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1988,6 +2002,23 @@ impl FeasibilitySink for FeasibilityTrace {
         Ok(index)
     }
 
+    fn record_survivor_fold(&mut self, observation: SurvivorFold) -> Result<(), G0Error> {
+        let frame = self.frames.last().ok_or(G0Error::RelationTraceInvariant)?;
+        if frame.root.program() != observation.owner.program() ||
+            observation.bound.0 < frame.range.start.0 ||
+            observation.bound.0 >= self.events.len() as u64 ||
+            !matches!(
+                self.events.get(observation.bound.0 as usize),
+                Some(NormalizerEvent::BoundTransfer { owner, .. }) if *owner == observation.owner
+            )
+        {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        self.retained_monomial_roots.insert(observation.monomial);
+        self.events.push(NormalizerEvent::SurvivorFold(observation));
+        Ok(())
+    }
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error> {
         if !self.frames.is_empty() {
             return Err(G0Error::MissingNormalizationResult);
@@ -2355,6 +2386,12 @@ impl FeasibilitySink for FeasibilityTrace {
                         entry.0 += &observation.signed_contribution;
                     }
                 }
+                NormalizerEvent::SurvivorFold(observation) => {
+                    if observation.bound.0 >= current.0 {
+                        return Err(G0Error::RelationTraceInvariant);
+                    }
+                    self.validate_survivor_fold_shape(observation)?;
+                }
             }
         }
         if !stack.is_empty() {
@@ -2505,8 +2542,43 @@ impl FeasibilityTrace {
                     }
                 }
             }
+            NormalizerEvent::SurvivorFold(observation) => {
+                roots.insert(observation.monomial);
+            }
             _ => {}
         }
+    }
+
+    fn validate_survivor_fold_shape(&self, observation: &SurvivorFold) -> Result<(), G0Error> {
+        let Some(NormalizerEvent::BoundTransfer { owner, rule }) =
+            self.events.get(observation.bound.0 as usize)
+        else {
+            return Err(G0Error::RelationTraceInvariant);
+        };
+        if *owner != observation.owner {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        match rule {
+            BoundRule::MonomialProduct { .. }
+                if *observation.coefficient.magnitude() == BigUint::from(1_u8) => {}
+            BoundRule::Scale {
+                value: BoundValueRef::Transfer(previous),
+                scale: BoundScale::Magnitude(magnitude),
+            } if *observation.coefficient.magnitude() == *magnitude => {
+                let Some(NormalizerEvent::BoundTransfer {
+                    owner: previous_owner,
+                    rule: BoundRule::MonomialProduct { .. },
+                }) = self.events.get(previous.0 as usize)
+                else {
+                    return Err(G0Error::RelationTraceInvariant);
+                };
+                if *previous_owner != observation.owner {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
+            }
+            _ => return Err(G0Error::RelationTraceInvariant),
+        }
+        Ok(())
     }
 
     fn rebuild_retained_monomial_roots(&mut self) {
@@ -2521,6 +2593,33 @@ impl FeasibilityTrace {
         monomials: &super::monomial::MonomialArena,
     ) -> Result<(), G0Error> {
         self.validate_normalization_observations()?;
+        for event in &self.events {
+            let NormalizerEvent::SurvivorFold(observation) = event else { continue };
+            monomials
+                .descriptor(observation.monomial)
+                .map_err(|_| G0Error::UnsupportedBoundTransfer)?;
+            let Some(NormalizerEvent::BoundTransfer { rule, .. }) =
+                self.events.get(observation.bound.0 as usize)
+            else {
+                return Err(G0Error::UnsupportedBoundTransfer);
+            };
+            let bound_monomial = match rule {
+                BoundRule::MonomialProduct { monomial, .. } => Some(*monomial),
+                BoundRule::Scale { value: BoundValueRef::Transfer(previous), .. } => {
+                    match self.events.get(previous.0 as usize) {
+                        Some(NormalizerEvent::BoundTransfer {
+                            rule: BoundRule::MonomialProduct { monomial, .. },
+                            ..
+                        }) => Some(*monomial),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if bound_monomial != Some(observation.monomial) {
+                return Err(G0Error::UnsupportedBoundTransfer);
+            }
+        }
         for event in &self.events {
             let NormalizerEvent::BoundTransfer {
                 rule: BoundRule::MonomialProduct { monomial, factors },

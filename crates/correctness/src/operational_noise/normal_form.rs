@@ -1344,6 +1344,31 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(super::g0::EventIndex(0))
     }
 
+    fn observe_survivor_fold(
+        &mut self,
+        owner: ScopedExprId,
+        monomial: MonomialId,
+        coefficient: &BigInt,
+        bound: BoundValueRef,
+    ) -> Result<(), NormalizeError> {
+        if !S::ENABLED {
+            return Ok(());
+        }
+        let BoundValueRef::Transfer(bound) = bound else {
+            return Err(super::g0::G0Error::RelationTraceInvariant.into());
+        };
+        self.sink
+            .as_deref_mut()
+            .ok_or(super::g0::G0Error::RelationTraceInvariant)?
+            .record_survivor_fold(super::g0::SurvivorFold {
+                owner,
+                monomial,
+                coefficient: coefficient.clone(),
+                bound,
+            })?;
+        Ok(())
+    }
+
     fn append_summary_evidence(
         &mut self,
         owner: ScopedExprId,
@@ -4225,7 +4250,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         evidence: &mut Option<BoundValueRef>,
     ) -> Result<(), NormalizeError> {
         match bound {
-            NumericContract::Known(CoefficientBound::ExactZero) => Ok(()),
+            NumericContract::Known(CoefficientBound::ExactZero) => {
+                if S::ENABLED {
+                    let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                    let transfer = self.observe_finite_monomial(owner, monomial, &coefficient)?;
+                    self.observe_survivor_fold(owner, monomial, &coefficient, transfer)?;
+                }
+                Ok(())
+            }
             NumericContract::Known(bound @ CoefficientBound::Finite(_)) => {
                 if self.is_retained_bounded_monomial(monomial)? {
                     if S::ENABLED {
@@ -4245,6 +4277,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 if S::ENABLED {
                     let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
                     let transfer = self.observe_finite_monomial(owner, monomial, &coefficient)?;
+                    self.observe_survivor_fold(owner, monomial, &coefficient, transfer.clone())?;
                     self.append_summary_evidence(owner, evidence, transfer)?;
                 }
                 *noise = add_noise_summaries(noise, &NumericContract::Known(bound));
@@ -4853,7 +4886,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 continue;
             }
             match self.bound_monomial(monomial, &coefficient)? {
-                NumericContract::Known(CoefficientBound::ExactZero) => {}
+                NumericContract::Known(CoefficientBound::ExactZero) => {
+                    if S::ENABLED {
+                        let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                        let transfer =
+                            self.observe_finite_monomial(owner, monomial, &coefficient)?;
+                        self.observe_survivor_fold(owner, monomial, &coefficient, transfer)?;
+                    }
+                }
                 NumericContract::Known(bound @ CoefficientBound::Finite(_)) => {
                     if preserve_relation_endpoints && self.is_retained_bounded_monomial(monomial)? {
                         retained.insert(monomial, coefficient);
@@ -4866,6 +4906,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
                         let transfer =
                             self.observe_finite_monomial(owner, monomial, &coefficient)?;
+                        self.observe_survivor_fold(
+                            owner,
+                            monomial,
+                            &coefficient,
+                            transfer.clone(),
+                        )?;
                         self.append_summary_evidence(owner, evidence, transfer)?;
                     }
                 }
@@ -13077,6 +13123,27 @@ mod tests {
             _ => panic!("factor evidence must use a prior result"),
         };
         assert!(factor_result.0 < monomial_index as u64);
+        let folded_monomial = match &trace.normalization_events()[monomial_index] {
+            NormalizerEvent::BoundTransfer {
+                rule: BoundRule::MonomialProduct { monomial, .. },
+                ..
+            } => *monomial,
+            _ => unreachable!("monomial evidence index"),
+        };
+        let fold_index = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::SurvivorFold(observation)
+                    if observation.monomial == folded_monomial =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .expect("finite fold observation");
+        assert!(fold_index > monomial_index);
 
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -13147,6 +13214,20 @@ mod tests {
             })
             .expect("non-unit coefficient scale");
         assert!(scale_index > monomial_index);
+        let fold_index = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| {
+                matches!(
+                    event,
+                    NormalizerEvent::SurvivorFold(observation)
+                        if observation.bound == EventIndex(scale_index as u64)
+                )
+                .then_some(index)
+            })
+            .expect("scaled finite fold observation");
+        assert!(fold_index > scale_index);
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let factor = gaussian_factor(&mut expressions, matrix_type(), 99_007, 2);
@@ -13428,6 +13509,67 @@ mod tests {
     }
 
     #[test]
+    fn exact_zero_folds_record_transfer_without_summary_or_counter() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let factor = gaussian_factor(&mut expressions, matrix_type(), 99_020, 3);
+        let zero_scalar = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let zero = expressions
+            .intern_matrix_transform(
+                MatrixOperation::LiftConstantPolynomial {
+                    output: matrix_type(),
+                    coefficient_bits: 1,
+                },
+                &[zero_scalar],
+            )
+            .unwrap();
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[factor, zero]).unwrap();
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut metadata = MatrixMetadata::new(MatrixLayout::row_major(1, 1));
+        metadata.is_constant_polynomial = true;
+        let mut zero_facts = MatrixFacts::new(matrix_type(), metadata);
+        zero_facts.coefficient_bound = NumericContract::Known(CoefficientBound::ExactZero);
+        zero_facts.polynomial = NumericContract::Known(PolynomialFacts::new(1, 4).unwrap());
+        facts.insert(&expressions, factor, ValueFacts::Matrix(zero_facts)).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let value = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            assert_eq!(normalizer.counters().bounded_fold_count, 0);
+            value
+        };
+        assert!(value.exact_nf.as_ref().is_some_and(|normal_form| normal_form.is_zero()));
+        let fold = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::SurvivorFold(observation) => Some((index, observation)),
+                _ => None,
+            })
+            .expect("exact-zero survivor fold");
+        assert!(matches!(
+            trace.normalization_events()[fold.1.bound.0 as usize],
+            NormalizerEvent::BoundTransfer { .. }
+        ));
+        assert!(trace.normalization_events()[fold.0 + 1..].iter().all(|event| !matches!(
+            event,
+            NormalizerEvent::BoundTransfer { rule: BoundRule::Sum { .. }, .. }
+        )));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+    }
+
+    #[test]
     fn root_final_fold_is_after_result_and_before_invocation_end() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -13475,8 +13617,14 @@ mod tests {
             .iter()
             .position(|event| matches!(event, NormalizerEvent::InvocationEnd { root, .. } if *root == semantic))
             .expect("invocation end");
+        let survivor_index = trace
+            .normalization_events()
+            .iter()
+            .position(|event| matches!(event, NormalizerEvent::SurvivorFold(_)))
+            .expect("final survivor fold");
         assert!(result_index < fold_index);
-        assert!(fold_index < end_index);
+        assert!(fold_index < survivor_index);
+        assert!(survivor_index < end_index);
         assert!(
             value.exact_nf.as_ref().is_some_and(|normal_form| normal_form.exact_terms.is_empty())
         );

@@ -5,6 +5,7 @@
 // The production adapter consumes real plans directly. Legacy identity, family, scalar, and
 // egg-era normal-form authorities are intentionally not compiled.
 pub(crate) mod arena;
+mod certificate_schema;
 pub(crate) mod facts;
 pub(crate) mod g0;
 #[cfg(test)]

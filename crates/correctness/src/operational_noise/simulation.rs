@@ -627,6 +627,11 @@ pub(crate) struct ProofPayloadProjection {
     pub(crate) observed_coverage: ObservedCoverage,
 }
 
+pub(crate) struct ProjectedCertificateDocuments {
+    pub(crate) cert: super::certificate_schema::CertificateDocumentV1,
+    pub(crate) proof: ProofPayloadProjection,
+}
+
 /// Errors from the canonical proof-payload boundary.  The payload itself is already projected
 /// into owned values; this error only protects length/count arithmetic while encoding it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2061,6 +2066,26 @@ pub(crate) fn derive_proof_payload(
 pub(crate) fn derive_proof_payload_projection(
     run: &OperationalCertificateRun,
 ) -> Result<ProofPayloadProjection, CertificateProjectionError> {
+    let refs = super::g0::canonical_residual_refs(&run.job, &run.projection.closure, &run.trace)
+        .map_err(proof_payload_error)?;
+    derive_proof_payload_projection_with_refs(run, &refs)
+}
+
+pub(crate) fn derive_certificate_documents(
+    run: &OperationalCertificateRun,
+) -> Result<ProjectedCertificateDocuments, CertificateProjectionError> {
+    let refs = super::g0::canonical_residual_refs(&run.job, &run.projection.closure, &run.trace)
+        .map_err(proof_payload_error)?;
+    let proof = derive_proof_payload_projection_with_refs(run, &refs)?;
+    let cert = super::certificate_schema::project_certificate_document(run, &refs, &proof.payload)
+        .map_err(|error| CertificateProjectionError::ProofPayload { detail: error.to_string() })?;
+    Ok(ProjectedCertificateDocuments { cert, proof })
+}
+
+fn derive_proof_payload_projection_with_refs(
+    run: &OperationalCertificateRun,
+    refs: &CanonicalResidualRefs,
+) -> Result<ProofPayloadProjection, CertificateProjectionError> {
     validate_raw_event_coverage(&run.trace)?;
     let closure = &run.projection.closure;
     let closed_root_expression = match &run.projection.residual {
@@ -2068,8 +2093,6 @@ pub(crate) fn derive_proof_payload_projection(
         CertificateResidualRoot::Family { .. } => None,
     };
     let closed_program = closed_wrapper_program(&run.trace, closed_root_expression);
-    let refs = super::g0::canonical_residual_refs(&run.job, closure, &run.trace)
-        .map_err(proof_payload_error)?;
     let mut monomial_arenas = HashMap::new();
     for scope in closure.programs.iter().copied() {
         if let Some(arena) = run.job.monomials().get(scope) {
@@ -2121,7 +2144,7 @@ pub(crate) fn derive_proof_payload_projection(
     }
     let projector = ProofPayloadProjector {
         job: &run.job,
-        refs: &refs,
+        refs,
         monomial_arenas,
         rhs_events,
         closed_program,
@@ -6880,6 +6903,219 @@ mod tests {
                 .iter()
                 .any(|event| { matches!(event, ProofPayloadEvent::SpecializationComputed { .. }) })
         );
+    }
+
+    #[test]
+    fn certificate_schema_v1_shares_canonical_refs_with_chronological_proof() {
+        let protocol = super::super::lower::tests::singleton_preimage_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "singleton-preimage".to_owned(),
+        };
+        let run = prepare_operational_certificate(&protocol, &request)
+            .expect("singleton certificate run");
+        let ordinary_report = run.accepted_report.clone();
+        let trace_events = run.trace.events.clone();
+        let prior_proof =
+            derive_proof_payload_projection(&run).expect("prior proof projection").payload;
+        let documents = derive_certificate_documents(&run).expect("typed certificate documents");
+        assert_eq!(run.accepted_report, ordinary_report);
+        assert_eq!(run.trace.events, trace_events);
+        assert_eq!(
+            prior_proof.encode_canonical().expect("prior proof bytes"),
+            documents.proof.payload.encode_canonical().expect("shared proof bytes")
+        );
+        assert_eq!(
+            documents.cert.schema_id,
+            super::super::certificate_schema::CERTIFICATE_SCHEMA_ID
+        );
+        assert_eq!(documents.cert.schema_version, 1);
+        assert!(!documents.cert.dependency_rows.is_empty());
+        assert_certificate_references_are_dense(&documents);
+        assert_payload_event_refs_are_local(&documents.proof.payload);
+        let encoded = documents.cert.encode_canonical().expect("certificate bytes");
+        let text = std::str::from_utf8(&encoded).expect("certificate JSON");
+        for forbidden in [
+            "decoder",
+            "target_id",
+            "accepted_report",
+            "proof_payload",
+            "coverage",
+            "metrics",
+            "descriptor_bytes",
+            "descriptor_hash",
+            "opaque_descriptor",
+        ] {
+            assert!(!text.contains(forbidden), "unexpected certificate field {forbidden}");
+        }
+    }
+
+    fn assert_certificate_references_are_dense(documents: &ProjectedCertificateDocuments) {
+        use super::super::certificate_schema::{CertificateDependencyRow, CertificateScope};
+
+        let rows = &documents.cert.dependency_rows;
+        for (row, dependency_row) in rows.iter().enumerate() {
+            let dependencies = match dependency_row {
+                CertificateDependencyRow::Expression(expression) => &expression.dependencies,
+                CertificateDependencyRow::Program(program) => std::slice::from_ref(&program.root),
+            };
+            assert!(dependencies.iter().all(|dependency| (*dependency as usize) < row));
+        }
+        let assert_owner = |owner: ProofPayloadOwner| {
+            assert!((owner.expression_row as usize) < rows.len());
+            assert!(matches!(
+                rows[owner.expression_row as usize],
+                CertificateDependencyRow::Expression(_)
+            ));
+            match owner.scope {
+                ProofPayloadScope::Closed { root_expression_row } => {
+                    assert!((root_expression_row as usize) < rows.len());
+                    assert!(matches!(
+                        documents.cert.residual_root,
+                        super::super::certificate_schema::CertificateResidualRootV1::Closed {
+                            expression,
+                            ..
+                        } if expression == root_expression_row
+                    ));
+                    CertificateScope::Closed { root_expression: root_expression_row }
+                }
+                ProofPayloadScope::Program { program_row } => {
+                    assert!((program_row as usize) < rows.len());
+                    assert!(matches!(
+                        rows[program_row as usize],
+                        CertificateDependencyRow::Program(_)
+                    ));
+                    CertificateScope::Program { program: program_row }
+                }
+            }
+        };
+        let assert_monomial = |monomial: &ProofPayloadMonomial| {
+            for owner in monomial.central_factors.iter().chain(&monomial.ordered_factors) {
+                assert_owner(*owner);
+            }
+        };
+        for event in &documents.proof.payload.events {
+            match event {
+                ProofPayloadEvent::InvocationStart { root } |
+                ProofPayloadEvent::InvocationEnd { root, .. } => {
+                    assert_owner(*root);
+                }
+                ProofPayloadEvent::Predecessor { consumer, .. } |
+                ProofPayloadEvent::Result { owner: consumer, .. } |
+                ProofPayloadEvent::SpecializationComputed { owner: consumer, .. } |
+                ProofPayloadEvent::SpecializationCacheHit { owner: consumer, .. } |
+                ProofPayloadEvent::BoundTransfer { owner: consumer, .. } => {
+                    assert_owner(*consumer);
+                }
+                ProofPayloadEvent::AppliedRelation { owner, source_monomial, rule, .. } => {
+                    assert_owner(*owner);
+                    assert_monomial(source_monomial);
+                    match rule {
+                        ProofPayloadRelationRule::Universal { lhs, .. } => assert_monomial(lhs),
+                        ProofPayloadRelationRule::Gadget { gadget, decomposition, .. } => {
+                            assert_owner(*gadget);
+                            assert_owner(*decomposition);
+                        }
+                    }
+                }
+                ProofPayloadEvent::CoefficientMerge(merge) => {
+                    assert_owner(merge.owner);
+                    assert_monomial(&merge.output);
+                }
+                ProofPayloadEvent::PreFoldPolynomial(polynomial) => {
+                    for term in &polynomial.terms {
+                        assert_monomial(&term.monomial);
+                    }
+                }
+                ProofPayloadEvent::SurvivorFold(_) => {}
+            }
+        }
+        for fact in &documents.cert.facts {
+            let event = &documents.proof.payload.events[fact.event as usize];
+            let owner = match event {
+                ProofPayloadEvent::Result { owner, .. } => *owner,
+                ProofPayloadEvent::InvocationEnd { root, .. } => *root,
+                _ => panic!("fact row must reference a result event"),
+            };
+            assert_eq!(fact.owner.expression, owner.expression_row);
+            assert_owner(owner);
+        }
+    }
+
+    #[test]
+    fn certificate_schema_v1_is_deterministic_for_independent_runs() {
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "singleton-preimage".to_owned(),
+        };
+        let first = prepare_operational_certificate(
+            &super::super::lower::tests::singleton_preimage_protocol(),
+            &request,
+        )
+        .expect("first certificate run");
+        let second = prepare_operational_certificate(
+            &super::super::lower::tests::singleton_preimage_protocol(),
+            &request,
+        )
+        .expect("second certificate run");
+        let first = derive_certificate_documents(&first).expect("first certificate documents");
+        let second = derive_certificate_documents(&second).expect("second certificate documents");
+        assert_eq!(
+            first.cert.encode_canonical().expect("first certificate bytes"),
+            second.cert.encode_canonical().expect("second certificate bytes")
+        );
+        assert_eq!(
+            first.proof.payload.encode_canonical().expect("first proof bytes"),
+            second.proof.payload.encode_canonical().expect("second proof bytes")
+        );
+    }
+
+    #[test]
+    fn certificate_schema_v1_matches_test_golden() {
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "singleton-preimage".to_owned(),
+        };
+        let run = prepare_operational_certificate(
+            &super::super::lower::tests::singleton_preimage_protocol(),
+            &request,
+        )
+        .expect("golden certificate run");
+        let bytes = derive_certificate_documents(&run)
+            .expect("golden certificate documents")
+            .cert
+            .encode_canonical()
+            .expect("golden certificate bytes");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/operational-noise-certificate-v1.json");
+        if std::env::var_os("MXX_REGENERATE_CORRECTNESS").as_deref() ==
+            Some(std::ffi::OsStr::new("1"))
+        {
+            std::fs::create_dir_all(path.parent().expect("golden parent"))
+                .expect("create certificate testdata");
+            std::fs::write(&path, &bytes).expect("write certificate test golden");
+        }
+        let golden = std::fs::read(&path).expect("read certificate test golden");
+        assert_eq!(bytes, golden);
+    }
+
+    #[test]
+    fn certificate_schema_v1_projects_indexed_residual_tables() {
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "indexed-certificate-threshold".to_owned(),
+        };
+        let run =
+            prepare_operational_certificate(&indexed_threshold_certificate_protocol(), &request)
+                .expect("indexed certificate run");
+        let documents = derive_certificate_documents(&run).expect("indexed certificate documents");
+        assert!(!documents.cert.index_uses.is_empty() || !documents.cert.slice_groups.is_empty());
+        assert_certificate_references_are_dense(&documents);
+        assert_payload_event_refs_are_local(&documents.proof.payload);
     }
 
     #[test]

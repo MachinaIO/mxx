@@ -1318,12 +1318,21 @@ pub(crate) fn derive_lut_evidence(
 ) -> Result<G0LutEvidence, G0Error> {
     let mut residual = trace.clone();
     residual.retain_residual(closure);
-    let plans = residual.index_use_plans().collect::<Vec<_>>();
     let refs = canonical_residual_refs(job, closure, &residual)?;
+    derive_lut_evidence_with_refs(job, closure, &residual, &refs)
+}
+
+pub(crate) fn derive_lut_evidence_with_refs(
+    job: &CheckerJob,
+    closure: &CertificateClosure,
+    trace: &FeasibilityTrace,
+    refs: &CanonicalResidualRefs,
+) -> Result<G0LutEvidence, G0Error> {
+    let plans = trace.index_use_plans().collect::<Vec<_>>();
     for plan in &plans {
-        validate_residual_plan(plan, closure, &refs)?;
+        validate_residual_plan(plan, closure, refs)?;
     }
-    enumerate_lut_evidence_with_refs(job.expressions(), plans, &refs)
+    enumerate_lut_evidence_with_refs(job.expressions(), plans, refs)
 }
 
 /// Enumerate ordinary plans and synchronized slice groups into one deterministic G0 payload.
@@ -4102,7 +4111,7 @@ pub(crate) enum StableScope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-struct StableObservedIdentity {
+pub(crate) struct StableObservedIdentity {
     definition: String,
     sample_event: Option<StableEventRef>,
     output_role: String,
@@ -4113,7 +4122,7 @@ struct StableObservedIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-struct StableObservedFamilyIdentity {
+pub(crate) struct StableObservedFamilyIdentity {
     definition: String,
     element_type: StableValueType,
     domain: (u64, u64),
@@ -4122,14 +4131,14 @@ struct StableObservedFamilyIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
-enum StableObservedIdentityKind {
+pub(crate) enum StableObservedIdentityKind {
     Expression { identity: StableObservedIdentity },
     Family { identity: StableObservedFamilyIdentity },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "source_kind")]
-enum StableObservedSource {
+pub(crate) enum StableObservedSource {
     ScalarConstant {
         value: StableConstant,
     },
@@ -4152,7 +4161,7 @@ enum StableObservedSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-struct StableObservedProducer {
+pub(crate) struct StableObservedProducer {
     consumer: StableObservedWire,
     consumer_input: String,
     producer_stage: String,
@@ -4606,9 +4615,10 @@ fn logical_canonical_event_row(row: &CanonicalEventRow) -> Result<u64, G0Error> 
 }
 
 fn logical_canonical_residual_row(row: &CanonicalResidualRow) -> Result<u64, G0Error> {
+    let descriptor_len = row.descriptor.encode_canonical()?.len();
     logical_sum([
         1,
-        logical_uniform_sequence(row.descriptor.len(), 1)?,
+        logical_uniform_sequence(descriptor_len, 1)?,
         logical_uniform_sequence(row.dependencies.len(), 1)?,
     ])
 }
@@ -4854,8 +4864,23 @@ impl CanonicalHandle {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct CanonicalResidualRow {
     pub kind: String,
-    pub descriptor: Vec<u8>,
+    pub descriptor: CanonicalResidualDescriptor,
     pub dependencies: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum CanonicalResidualDescriptor {
+    Expression(CanonicalExpressionDescriptor),
+    Program(CanonicalProgramDescriptor),
+}
+
+impl CanonicalResidualDescriptor {
+    fn encode_canonical(&self) -> Result<Vec<u8>, G0Error> {
+        let value =
+            serde_json::to_value(self).map_err(|error| G0Error::Encoding(error.to_string()))?;
+        serde_json::to_vec(&value).map_err(|error| G0Error::Encoding(error.to_string()))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5130,7 +5155,10 @@ pub(crate) fn derive_inventory(
     let mut operators = Vec::new();
     for expression in &closure.expressions {
         let node = job.expressions().node(*expression)?;
-        operators.push(canonical_expression_operator(&node.operator, &event_rows)?);
+        operators.push(
+            serde_json::to_value(canonical_expression_operator(&node.operator, &event_rows)?)
+                .map_err(|error| G0Error::Encoding(error.to_string()))?,
+        );
     }
     operators.sort_by_key(|operator| operator.to_string());
     operators.dedup();
@@ -5156,7 +5184,7 @@ pub(crate) fn derive_inventory(
     })
 }
 
-fn stable_value_type(value: &ResolvedValueType) -> StableValueType {
+pub(crate) fn stable_value_type(value: &ResolvedValueType) -> StableValueType {
     match value {
         ResolvedValueType::Bool => StableValueType::Bool,
         ResolvedValueType::Int => StableValueType::Int,
@@ -5172,7 +5200,7 @@ fn stable_value_type(value: &ResolvedValueType) -> StableValueType {
     }
 }
 
-fn stable_matrix(value: &ResolvedMatrixType) -> StableValueType {
+pub(crate) fn stable_matrix(value: &ResolvedMatrixType) -> StableValueType {
     stable_value_type(&ResolvedValueType::Matrix(value.clone()))
 }
 
@@ -5220,7 +5248,7 @@ fn stable_source_without_event(value: &SemanticSourceIdentity) -> StableSourceId
     }
 }
 
-fn stable_source(
+pub(crate) fn stable_source(
     value: &SemanticSourceIdentity,
     events: &CanonicalEventRows,
 ) -> Result<StableSourceIdentity, G0Error> {
@@ -5229,7 +5257,9 @@ fn stable_source(
     Ok(source)
 }
 
-fn stable_family_source(value: &SemanticFamilySourceIdentity) -> StableFamilySourceIdentity {
+pub(crate) fn stable_family_source(
+    value: &SemanticFamilySourceIdentity,
+) -> StableFamilySourceIdentity {
     StableFamilySourceIdentity {
         definition: value.stable_definition.clone(),
         invocation: value.invocation.clone(),
@@ -5665,19 +5695,19 @@ fn derive_canonical_event_rows_for_ids(
     Ok(CanonicalEventRows { rows, refs })
 }
 
-#[derive(Serialize)]
-struct CanonicalProgramDescriptor {
-    signature: Vec<(StableValueType, Option<(u64, u64)>)>,
-    output: StableValueType,
-    family: Option<CanonicalFamilyDescriptor>,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CanonicalProgramDescriptor {
+    pub signature: Vec<(StableValueType, Option<(u64, u64)>)>,
+    pub output: StableValueType,
+    pub family: Option<CanonicalFamilyDescriptor>,
 }
 
-#[derive(Serialize)]
-struct CanonicalFamilyDescriptor {
-    domain: (u64, u64),
-    element_type: StableValueType,
-    reducible: bool,
-    artifact: Option<StableArtifact>,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CanonicalFamilyDescriptor {
+    pub domain: (u64, u64),
+    pub element_type: StableValueType,
+    pub reducible: bool,
+    pub artifact: Option<StableArtifact>,
 }
 
 fn canonical_program_descriptor(
@@ -5705,37 +5735,49 @@ fn canonical_program_descriptor(
     }
 }
 
-#[derive(Serialize)]
-struct CanonicalExpressionDescriptor {
-    operator: serde_json::Value,
-    value_type: StableValueType,
-    source: Option<StableObservedSource>,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CanonicalExpressionDescriptor {
+    pub operator: CanonicalExpressionOperator,
+    pub value_type: StableValueType,
+    pub source: Option<StableObservedSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum CanonicalExpressionOperator {
+    Stable(StableOperator),
+    Event(CanonicalEventOperator),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum CanonicalEventOperator {
+    Sample { event: StableEventRef },
+    Sampler { event: StableEventRef },
 }
 
 fn canonical_expression_operator(
     value: &ValueOperator,
     events: &CanonicalEventRows,
-) -> Result<serde_json::Value, G0Error> {
-    let mut operator = serde_json::to_value(stable_operator(value))
-        .map_err(|error| G0Error::Encoding(error.to_string()))?;
-    let event_ref = |event: SampleEventId| -> Result<serde_json::Value, G0Error> {
-        serde_json::to_value(events.event(event)?)
-            .map_err(|error| G0Error::Encoding(error.to_string()))
-    };
+) -> Result<CanonicalExpressionOperator, G0Error> {
     match value {
         ValueOperator::Sample { event, descriptor } => {
             let row = events.kind(*event)?;
             if row != &(CanonicalEventKind::Sample { descriptor: stable_sample(descriptor) }) {
                 return Err(G0Error::ConflictingEventDescriptor { event: event.0 });
             }
-            operator = serde_json::json!({ "kind": "sample", "event": event_ref(*event)? });
+            Ok(CanonicalExpressionOperator::Event(CanonicalEventOperator::Sample {
+                event: events.event(*event)?,
+            }))
         }
         ValueOperator::Sampler { event, operation } => {
             let row = events.kind(*event)?;
             if row != &(CanonicalEventKind::Sampler { operation: stable_sampler(operation) }) {
                 return Err(G0Error::ConflictingEventDescriptor { event: event.0 });
             }
-            operator = serde_json::json!({ "kind": "sampler", "event": event_ref(*event)? });
+            Ok(CanonicalExpressionOperator::Event(CanonicalEventOperator::Sampler {
+                event: events.event(*event)?,
+            }))
         }
         ValueOperator::Source(source) => {
             if let Some(event) = source.sample_event {
@@ -5752,25 +5794,28 @@ fn canonical_expression_operator(
                     return Err(G0Error::ConflictingEventDescriptor { event: event.0 });
                 }
             }
-            operator = serde_json::to_value(StableOperator::Source {
+            Ok(CanonicalExpressionOperator::Stable(StableOperator::Source {
                 identity: stable_source(source, events)?,
-            })
-            .map_err(|error| G0Error::Encoding(error.to_string()))?;
+            }))
         }
-        ValueOperator::Trapdoor(TrapdoorOperation::Generate { paired_public_event, .. }) => {
-            if !matches!(events.kind(*paired_public_event)?, CanonicalEventKind::Sampler { .. }) {
-                return Err(G0Error::ConflictingEventDescriptor { event: paired_public_event.0 });
+        ValueOperator::Trapdoor(TrapdoorOperation::Generate {
+            paired_public_event: raw_event,
+            ..
+        }) => {
+            if !matches!(events.kind(*raw_event)?, CanonicalEventKind::Sampler { .. }) {
+                return Err(G0Error::ConflictingEventDescriptor { event: raw_event.0 });
             }
-            if let Some(operation) = operator.get_mut("operation") {
-                if let serde_json::Value::Object(operation) = operation {
-                    operation
-                        .insert("paired_public_event".to_owned(), event_ref(*paired_public_event)?);
-                }
+            let mut operator = stable_operator(value);
+            if let StableOperator::Trapdoor {
+                operation: StableTrapdoorOperation::Generate { paired_public_event, .. },
+            } = &mut operator
+            {
+                *paired_public_event = Some(events.event(*raw_event)?);
             }
+            Ok(CanonicalExpressionOperator::Stable(operator))
         }
-        _ => {}
+        _ => Ok(CanonicalExpressionOperator::Stable(stable_operator(value))),
     }
-    Ok(operator)
 }
 
 pub(crate) fn canonical_residual_refs(
@@ -5802,12 +5847,12 @@ pub(crate) fn canonical_residual_refs(
             )?),
             _ => None,
         };
-        let descriptor = serde_json::to_vec(&CanonicalExpressionDescriptor {
+        let descriptor = CanonicalResidualDescriptor::Expression(CanonicalExpressionDescriptor {
             operator: canonical_expression_operator(&node.operator, &event_rows)?,
             value_type: stable_value_type(job.expressions().value_type(expression)?),
             source,
         })
-        .map_err(|error| G0Error::Encoding(error.to_string()))?;
+        .encode_canonical()?;
         let mut dependencies = Vec::new();
         for (position, &input) in node.inputs.iter().enumerate() {
             if !closure.expressions.contains(&input) {
@@ -5835,8 +5880,9 @@ pub(crate) fn canonical_residual_refs(
     for &program in &closure.programs {
         let projection = job.programs().project_program(program)?;
         require_program_root(closure, program, projection.root)?;
-        let descriptor = serde_json::to_vec(&canonical_program_descriptor(&projection))
-            .map_err(|error| G0Error::Encoding(error.to_string()))?;
+        let descriptor =
+            CanonicalResidualDescriptor::Program(canonical_program_descriptor(&projection))
+                .encode_canonical()?;
         nodes.push(CanonicalDagNode {
             handle: CanonicalHandle::Program(program),
             row_kind: "program".to_owned(),
@@ -5870,12 +5916,11 @@ pub(crate) fn canonical_residual_refs(
                     )?),
                     _ => None,
                 };
-                let descriptor = serde_json::to_vec(&CanonicalExpressionDescriptor {
+                let descriptor = CanonicalExpressionDescriptor {
                     operator: canonical_expression_operator(&node.operator, &event_rows)?,
                     value_type: stable_value_type(job.expressions().value_type(*expression)?),
                     source,
-                })
-                .map_err(|error| G0Error::Encoding(error.to_string()))?;
+                };
                 let mut dependencies = Vec::with_capacity(
                     node.inputs.len() +
                         usize::from(matches!(node.operator, ValueOperator::ProgramCall { .. })),
@@ -5908,14 +5953,17 @@ pub(crate) fn canonical_residual_refs(
                         )?,
                     );
                 }
-                ("expression".to_owned(), descriptor, dependencies)
+                (
+                    "expression".to_owned(),
+                    CanonicalResidualDescriptor::Expression(descriptor),
+                    dependencies,
+                )
             }
             CanonicalHandle::Program(program) => {
                 let projection = job.programs().project_program(*program)?;
                 (
                     "program".to_owned(),
-                    serde_json::to_vec(&canonical_program_descriptor(&projection))
-                        .map_err(|error| G0Error::Encoding(error.to_string()))?,
+                    CanonicalResidualDescriptor::Program(canonical_program_descriptor(&projection)),
                     vec![
                         handles
                             .get(&CanonicalHandle::Expression(projection.root))
@@ -6389,7 +6437,20 @@ mod tests {
 
     #[test]
     fn canonical_residual_retention_counts_descriptor_and_dependency_sequences() {
-        let retained = |descriptor: Vec<u8>, dependencies: Vec<u64>| {
+        let descriptor = |value: &str| {
+            CanonicalResidualDescriptor::Expression(CanonicalExpressionDescriptor {
+                operator: CanonicalExpressionOperator::Stable(StableOperator::Constant {
+                    value: StableConstant {
+                        value_type: StableValueType::Int,
+                        value: StableConstantValue::Int { value: value.to_owned() },
+                    },
+                }),
+                value_type: StableValueType::Int,
+                source: None,
+            })
+        };
+        let retained = |descriptor: CanonicalResidualDescriptor, dependencies: Vec<u64>| {
+            let descriptor_len = descriptor.encode_canonical().unwrap().len() as u64;
             CanonicalResidualRefs {
                 rows: vec![CanonicalResidualRow {
                     kind: "expression".to_owned(),
@@ -6400,15 +6461,14 @@ mod tests {
                 event_rows: CanonicalEventRows { rows: Vec::new(), refs: BTreeMap::new() },
             }
             .retained_logical_items()
+            .map(|retained| (retained, descriptor_len))
             .expect("retained canonical refs")
         };
-        // Row = kind 1 + descriptor (1 + 2 length + 2 bytes) + dependencies
-        // (1 + 1 length + 1 ref) = 9. The row sequence is 1 + 1 + 9, followed by
-        // one empty handle map and the two empty event-row collections: 11 + 1 + 2 = 14.
-        let baseline = retained(vec![4, 5], vec![0]);
-        assert_eq!(baseline, 14);
-        assert_eq!(retained(vec![4, 5, 6], vec![0]), baseline + 2);
-        assert_eq!(retained(vec![4, 5], vec![0, 1]), baseline + 2);
+        let (baseline, descriptor_len) = retained(descriptor("4"), vec![0]);
+        // One row wrapper, one kind, the length-prefixed descriptor bytes, one dependency,
+        // and the empty handle/event support collections.
+        assert_eq!(baseline, 10 + 2 * descriptor_len);
+        assert_eq!(retained(descriptor("4"), vec![0, 1]).0, baseline + 2);
     }
 
     #[test]
@@ -7658,7 +7718,10 @@ mod tests {
             second.event_rows().encode_canonical().unwrap()
         );
         assert_eq!(first.rows()[0], second.rows()[0]);
-        let encoded = String::from_utf8(first.rows()[0].descriptor.clone()).unwrap();
+        let encoded = String::from_utf8(
+            first.rows()[0].descriptor.encode_canonical().expect("typed descriptor encoding"),
+        )
+        .unwrap();
         assert!(encoded.contains("event"));
         assert!(encoded.contains("row"));
         assert!(!encoded.contains("uniform"));

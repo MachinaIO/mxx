@@ -4111,6 +4111,14 @@ pub(crate) enum StableScope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case", tag = "source_kind")]
+pub(crate) enum StableObservedSourceAccess {
+    DeclaredProtocolInput { owner: StableObservedWire, input: String },
+    UnboundOccurrenceInput { owner: StableObservedWire },
+    ProducerArtifact { producer: StableObservedProducer },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub(crate) struct StableObservedIdentity {
     definition: String,
     sample_event: Option<StableEventRef>,
@@ -4661,6 +4669,8 @@ pub(crate) enum G0Error {
         "conflicting source classes for typed lowering handle {handle:?}: existing {existing:?}, observed {observed:?}"
     )]
     ConflictingSourceClass { handle: SourceHandle, existing: SourceClass, observed: SourceClass },
+    #[error("lowering source identity does not match the expression source identity")]
+    SourceIdentityMismatch,
     #[error("event {event} has conflicting typed descriptors")]
     ConflictingEventDescriptor { event: u64 },
     #[error("event has conflicting typed owner or descriptor")]
@@ -4856,6 +4866,7 @@ impl CanonicalHandle {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum CanonicalExpressionDescriptor {
     Source { source: CanonicalExpressionSource },
+    Event { operator: CanonicalEventOperator },
     Operation { operator: CanonicalExpressionOperator, value_type: StableValueType },
 }
 
@@ -4870,7 +4881,7 @@ pub(crate) enum CanonicalExpressionSource {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum CanonicalSourceRow {
     Constant { value: StableConstant },
-    Direct { identity: StableSourceIdentity, contract: Option<StableObservedSource> },
+    Direct { identity: StableSourceIdentity, access: Option<StableObservedSourceAccess> },
     Family { identity: StableFamilySourceIdentity },
 }
 
@@ -4882,14 +4893,6 @@ pub(crate) enum CanonicalStatementScope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub(crate) enum CanonicalCoefficientContract {
-    ExactZero,
-    Finite { maximum_absolute_coefficient: String },
-    Large,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum CanonicalStatementEventRow {
     Sample {
@@ -4908,7 +4911,6 @@ pub(crate) enum CanonicalStatementEventRow {
         small: bool,
         digit_count: u32,
         input: u64,
-        output_contract: Option<CanonicalCoefficientContract>,
     },
 }
 
@@ -5418,6 +5420,48 @@ fn stable_scope(value: &mxx_ir_core::FrozenGraphScopeId) -> StableScope {
     }
 }
 
+fn stable_observed_source_access(
+    class: &SourceClass,
+    identity: &super::arena::SemanticSourceIdentity,
+    events: &CanonicalEventRows,
+) -> Result<Option<StableObservedSourceAccess>, G0Error> {
+    match class {
+        SourceClass::ScalarConstant { .. } | SourceClass::MatrixConstant { .. } => Ok(None),
+        SourceClass::DeclaredProtocolInput { owner, input, identity: observed } => {
+            if !matches!(observed, InputSourceIdentity::Expression(observed)
+                if stable_source(observed, events)? == stable_source(identity, events)?)
+            {
+                return Err(G0Error::SourceIdentityMismatch);
+            }
+            Ok(Some(StableObservedSourceAccess::DeclaredProtocolInput {
+                owner: stable_observed_wire(owner),
+                input: input.0.clone(),
+            }))
+        }
+        SourceClass::UnboundOccurrenceInput { owner, identity: observed } => {
+            if !matches!(observed, InputSourceIdentity::Expression(observed)
+                if stable_source(observed, events)? == stable_source(identity, events)?)
+            {
+                return Err(G0Error::SourceIdentityMismatch);
+            }
+            Ok(Some(StableObservedSourceAccess::UnboundOccurrenceInput {
+                owner: stable_observed_wire(owner),
+            }))
+        }
+        SourceClass::ProducerArtifact { producer } => {
+            Ok(Some(StableObservedSourceAccess::ProducerArtifact {
+                producer: StableObservedProducer {
+                    consumer: stable_observed_wire(&producer.consumer),
+                    consumer_input: producer.binding.consumer_input.0.clone(),
+                    producer_stage: producer.binding.producer_stage.0.clone(),
+                    producer_output: producer.binding.producer_output.0.clone(),
+                    producer: stable_observed_wire(&producer.producer),
+                },
+            }))
+        }
+    }
+}
+
 fn stable_observed_identity(
     value: &InputSourceIdentity,
     events: Option<&CanonicalEventRows>,
@@ -5855,6 +5899,28 @@ pub(crate) enum CanonicalExpressionOperator {
 pub(crate) enum CanonicalEventOperator {
     Sample { event: StableEventRef },
     Sampler { event: StableEventRef },
+    GadgetDecompose { event: StableEventRef },
+}
+
+fn dense_namespace_refs<T: Copy + Ord>(
+    rows: impl IntoIterator<Item = (T, u64)>,
+) -> Result<BTreeMap<T, u64>, G0Error> {
+    let rows = rows.into_iter().collect::<Vec<_>>();
+    let combined = rows.iter().map(|(_, row)| *row).collect::<BTreeSet<_>>();
+    let dense_by_combined = combined
+        .into_iter()
+        .enumerate()
+        .map(|(dense, combined)| {
+            u64::try_from(dense).map(|dense| (combined, dense)).map_err(|_| G0Error::TraceOverflow)
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let mut refs = BTreeMap::new();
+    for (handle, combined) in rows {
+        let dense =
+            dense_by_combined.get(&combined).copied().ok_or(G0Error::CanonicalDependencyCycle)?;
+        refs.insert(handle, dense);
+    }
+    Ok(refs)
 }
 
 fn canonical_expression_operator(
@@ -5937,11 +6003,12 @@ pub(crate) fn derive_certificate_statement_rows(
             }
             ValueOperator::Source(identity) => Some(CanonicalSourceRow::Direct {
                 identity: stable_source(identity, &event_rows)?,
-                contract: trace
+                access: trace
                     .source_observations()
                     .get(&SourceHandle::Expression(expression))
-                    .map(|source| stable_observed_source(source, Some(&event_rows)))
-                    .transpose()?,
+                    .map(|source| stable_observed_source_access(source, identity, &event_rows))
+                    .transpose()?
+                    .flatten(),
             }),
             ValueOperator::OpaqueFamilyElement { source } => {
                 Some(CanonicalSourceRow::Family { identity: stable_family_source(source) })
@@ -6048,21 +6115,20 @@ pub(crate) fn derive_certificate_statement_rows(
         });
     }
     let combined_rows = canonical_dependency_rows(nodes)?;
-    let mut ordered_handles = combined_rows.iter().collect::<Vec<_>>();
-    ordered_handles.sort_by_key(|(_, row)| **row);
-    let mut expression_refs = BTreeMap::new();
-    let mut program_refs = BTreeMap::new();
-    for (handle, _) in ordered_handles {
-        match handle {
-            CanonicalHandle::Expression(expression) => {
-                expression_refs.insert(*expression, expression_refs.len() as u64);
-            }
-            CanonicalHandle::Program(program) => {
-                program_refs.insert(*program, program_refs.len() as u64);
-            }
-        }
-    }
-    let mut expressions = vec![None; expression_refs.len()];
+    let expression_refs =
+        dense_namespace_refs(combined_rows.iter().filter_map(|(handle, row)| match handle {
+            CanonicalHandle::Expression(expression) => Some((*expression, *row)),
+            CanonicalHandle::Program(_) => None,
+        }))?;
+    let program_refs =
+        dense_namespace_refs(combined_rows.iter().filter_map(|(handle, row)| match handle {
+            CanonicalHandle::Expression(_) => None,
+            CanonicalHandle::Program(program) => Some((*program, *row)),
+        }))?;
+    let derived_events =
+        derive_statement_events(job, trace, &expression_refs, &program_refs, &event_rows)?;
+    let expression_count = expression_refs.values().copied().max().map_or(0, |row| row + 1);
+    let mut expressions = vec![None; expression_count as usize];
     for (expression, row) in &expression_refs {
         let node = job.expressions().node(*expression)?;
         let descriptor = match &node.operator {
@@ -6096,6 +6162,17 @@ pub(crate) fn derive_certificate_statement_rows(
                                 requested: CanonicalReference::Expr(*selector),
                             }
                         })?,
+                    },
+                }
+            }
+            ValueOperator::Transform(ValueTransformOperation::GadgetDecompose { .. }) => {
+                CanonicalExpressionDescriptor::Event {
+                    operator: CanonicalEventOperator::GadgetDecompose {
+                        event: *derived_events.gadget_refs.get(expression).ok_or(
+                            G0Error::MissingCanonicalHandle {
+                                requested: CanonicalReference::Expr(*expression),
+                            },
+                        )?,
                     },
                 }
             }
@@ -6135,9 +6212,15 @@ pub(crate) fn derive_certificate_statement_rows(
             }
             _ => None,
         };
-        expressions[*row as usize] = Some(CanonicalExpressionRow { descriptor, inputs, program });
+        let projected = CanonicalExpressionRow { descriptor, inputs, program };
+        match &mut expressions[*row as usize] {
+            Some(existing) if existing != &projected => return Err(G0Error::AmbiguousCanonicalKey),
+            Some(_) => {}
+            slot @ None => *slot = Some(projected),
+        }
     }
-    let mut programs = vec![None; program_refs.len()];
+    let program_count = program_refs.values().copied().max().map_or(0, |row| row + 1);
+    let mut programs = vec![None; program_count as usize];
     for (program, row) in &program_refs {
         let projection = job.programs().project_program(*program)?;
         let root = expression_refs.get(&projection.root).copied().ok_or_else(|| {
@@ -6148,13 +6231,14 @@ pub(crate) fn derive_certificate_statement_rows(
                 CanonicalReference::Expr(projection.root),
             )
         })?;
-        programs[*row as usize] = Some(CanonicalProgramRow {
-            descriptor: canonical_program_descriptor(&projection),
-            root,
-        });
+        let projected =
+            CanonicalProgramRow { descriptor: canonical_program_descriptor(&projection), root };
+        match &mut programs[*row as usize] {
+            Some(existing) if existing != &projected => return Err(G0Error::AmbiguousCanonicalKey),
+            Some(_) => {}
+            slot @ None => *slot = Some(projected),
+        }
     }
-    let statement_events =
-        derive_statement_events(job, trace, &expression_refs, &program_refs, &event_rows)?;
     Ok(CanonicalStatementRows {
         expressions: expressions
             .into_iter()
@@ -6170,8 +6254,13 @@ pub(crate) fn derive_certificate_statement_rows(
         expression_sources,
         family_sources,
         event_rows,
-        statement_events,
+        statement_events: derived_events.rows,
     })
+}
+
+struct DerivedStatementEvents {
+    rows: Vec<CanonicalStatementEventRow>,
+    gadget_refs: BTreeMap<ExprId, StableEventRef>,
 }
 
 fn derive_statement_events(
@@ -6180,7 +6269,7 @@ fn derive_statement_events(
     expression_refs: &BTreeMap<ExprId, u64>,
     program_refs: &BTreeMap<super::arena::ValueProgramId, u64>,
     raw_events: &CanonicalEventRows,
-) -> Result<Vec<CanonicalStatementEventRow>, G0Error> {
+) -> Result<DerivedStatementEvents, G0Error> {
     let mut events = raw_events
         .rows()
         .iter()
@@ -6229,6 +6318,7 @@ fn derive_statement_events(
         }
     }
     let mut seen = BTreeSet::new();
+    let mut gadgets = BTreeMap::<CanonicalStatementEventRow, BTreeSet<ExprId>>::new();
     for (scope, root) in roots {
         let mut work = vec![root];
         while let Some(expression) = work.pop() {
@@ -6249,23 +6339,7 @@ fn derive_statement_events(
                     let [input] = node.inputs.as_ref() else {
                         return Err(G0Error::UnsupportedBoundTransfer);
                     };
-                    let output_contract = match job.facts().coefficient_bound(expression) {
-                        Ok(NumericContract::Known(CoefficientBound::ExactZero)) => {
-                            Some(CanonicalCoefficientContract::ExactZero)
-                        }
-                        Ok(NumericContract::Known(CoefficientBound::Finite(bound))) => {
-                            Some(CanonicalCoefficientContract::Finite {
-                                maximum_absolute_coefficient: bound
-                                    .maximum_absolute_coefficient
-                                    .to_string(),
-                            })
-                        }
-                        Ok(NumericContract::Known(CoefficientBound::Large)) => {
-                            Some(CanonicalCoefficientContract::Large)
-                        }
-                        Ok(NumericContract::Missing) | Err(_) => None,
-                    };
-                    events.push(CanonicalStatementEventRow::GadgetDecompose {
+                    let event = CanonicalStatementEventRow::GadgetDecompose {
                         scope,
                         expression: row,
                         output: stable_matrix(output),
@@ -6277,8 +6351,8 @@ fn derive_statement_events(
                                 requested: CanonicalReference::Expr(*input),
                             }
                         })?,
-                        output_contract,
-                    });
+                    };
+                    gadgets.entry(event).or_default().insert(expression);
                 }
                 ValueOperator::Transform(ValueTransformOperation::PackPolynomialCoefficients {
                     ..
@@ -6288,7 +6362,18 @@ fn derive_statement_events(
             work.extend(node.inputs.iter().copied());
         }
     }
-    Ok(events)
+    let mut gadget_refs = BTreeMap::new();
+    for (event, expressions) in gadgets {
+        let row = u64::try_from(events.len()).map_err(|_| G0Error::TraceOverflow)?;
+        let event_ref = StableEventRef { row };
+        for expression in expressions {
+            if gadget_refs.insert(expression, event_ref).is_some() {
+                return Err(G0Error::AmbiguousCanonicalKey);
+            }
+        }
+        events.push(event);
+    }
+    Ok(DerivedStatementEvents { rows: events, gadget_refs })
 }
 
 fn stable_hash(value: &DeterministicHashDescriptor) -> StableOperator {
@@ -6798,10 +6883,41 @@ mod tests {
                 base: 4,
                 small: false,
                 digit_count: 2,
-                output_contract: None,
                 ..
             }]
         ));
+        let gadget_row = rows.expression(gadget).unwrap() as usize;
+        assert!(matches!(
+            &rows.expressions()[gadget_row].descriptor,
+            CanonicalExpressionDescriptor::Event {
+                operator: CanonicalEventOperator::GadgetDecompose {
+                    event: StableEventRef { row: 0 }
+                }
+            }
+        ));
+        let expression_json =
+            serde_json::to_value(&rows.expressions()[gadget_row].descriptor).unwrap();
+        let operator = expression_json.get("operator").unwrap();
+        assert_eq!(
+            operator.get("kind").and_then(serde_json::Value::as_str),
+            Some("gadget_decompose")
+        );
+        assert!(operator.get("base").is_none());
+        assert!(operator.get("digit_count").is_none());
+        assert!(operator.get("output").is_none());
+    }
+
+    #[test]
+    fn dense_namespace_refs_preserve_authorized_canonical_aliases() {
+        let first = dag_expression(1);
+        let alias = dag_expression(2);
+        let later = dag_expression(3);
+        let refs = dense_namespace_refs([(later, 8), (alias, 3), (first, 3)]).unwrap();
+        let reverse = dense_namespace_refs([(first, 3), (alias, 3), (later, 8)]).unwrap();
+        assert_eq!(refs, reverse);
+        assert_eq!(refs[&first], refs[&alias]);
+        assert_ne!(refs[&first], refs[&later]);
+        assert_eq!(refs.values().copied().collect::<BTreeSet<_>>(), [0, 1].into());
     }
 
     #[test]
@@ -8103,6 +8219,77 @@ mod tests {
     }
 
     #[test]
+    fn statement_source_keeps_identity_once_and_checks_lowering_access() {
+        use crate::StageId;
+        use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};
+
+        let identity = SemanticSourceIdentity {
+            stable_definition: "input".to_owned(),
+            invocation: "arena-invocation".to_owned(),
+            sample_event: None,
+            output_role: "value".to_owned(),
+            sampler: None,
+            artifact: None,
+            value_type: ResolvedValueType::Int,
+            coordinates: Box::new([]),
+            matrix_constant: None,
+        };
+        let mut job = CheckerJob::new();
+        let expression = job
+            .expressions_mut()
+            .intern(ValueOperator::Source(identity.clone()), Box::new([]))
+            .unwrap();
+        let owner = PlannedWire {
+            stage: StageId("source-row".to_owned()),
+            occurrence: ProgramOccurrence { definition: FrozenGraphScopeId::Root, path: 0 },
+            wire: WireRef { node: NodeId(1), port: Port(0) },
+        };
+        let closure = CertificateClosure {
+            expressions: [expression].into_iter().collect(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: [identity.clone()].into_iter().collect(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: BTreeSet::new(),
+        };
+        let mut trace = FeasibilityTrace::default();
+        let mut observed = identity.clone();
+        observed.invocation = "lowering-invocation".to_owned();
+        trace
+            .record_source(
+                SourceHandle::Expression(expression),
+                SourceClass::DeclaredProtocolInput {
+                    owner: owner.clone(),
+                    input: ProtocolInputId::from("value"),
+                    identity: InputSourceIdentity::Expression(observed),
+                },
+            )
+            .unwrap();
+        let rows = derive_certificate_statement_rows(&job, &closure, &trace).unwrap();
+        let source = serde_json::to_value(&rows.sources()[0]).unwrap();
+        assert!(source.get("identity").is_some());
+        assert!(source.get("access").and_then(|value| value.get("identity")).is_none());
+
+        let mut mismatched = FeasibilityTrace::default();
+        let mut observed = identity;
+        observed.output_role = "other".to_owned();
+        mismatched
+            .record_source(
+                SourceHandle::Expression(expression),
+                SourceClass::UnboundOccurrenceInput {
+                    owner,
+                    identity: InputSourceIdentity::Expression(observed),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            derive_certificate_statement_rows(&job, &closure, &mismatched),
+            Err(G0Error::SourceIdentityMismatch)
+        );
+    }
+
+    #[test]
     fn canonical_dag_rows_preserve_child_order_and_alias_authority() {
         let ordered = canonical_dependency_rows([
             dag_node(1, "leaf", "a", &[], false),
@@ -8192,10 +8379,7 @@ mod tests {
             &FeasibilityTrace::default(),
         )
         .expect("source identity remains authoritative when its optional raw contract is absent");
-        assert!(matches!(
-            source_rows.sources(),
-            [CanonicalSourceRow::Direct { contract: None, .. }]
-        ));
+        assert!(matches!(source_rows.sources(), [CanonicalSourceRow::Direct { access: None, .. }]));
 
         let program = ValueProgramId::new(super::super::arena::ArenaToken(201), 4);
         assert_eq!(
@@ -8355,12 +8539,7 @@ mod tests {
                             coefficients: vec!["-1".to_owned(), "2".to_owned()],
                         }),
                     },
-                    contract: Some(StableObservedSource::ScalarConstant {
-                        value: StableConstant {
-                            value_type: StableValueType::Int,
-                            value: StableConstantValue::Int { value: "0".to_owned() },
-                        },
-                    }),
+                    access: None,
                 },
                 CanonicalSourceRow::Family {
                     identity: StableFamilySourceIdentity {

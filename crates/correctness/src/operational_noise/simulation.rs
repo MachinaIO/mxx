@@ -6966,6 +6966,7 @@ mod tests {
                     assert!((*source as usize) < documents.cert.sources.len());
                     assert!((*selector as usize) < row);
                 }
+                super::super::g0::CanonicalExpressionDescriptor::Event { .. } |
                 super::super::g0::CanonicalExpressionDescriptor::Operation { .. } => {}
             }
         }

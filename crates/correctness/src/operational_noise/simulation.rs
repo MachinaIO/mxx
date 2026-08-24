@@ -2000,6 +2000,38 @@ fn payload_projection<T>(result: Result<T, G0Error>) -> Result<T, CertificatePro
     result.map_err(proof_payload_error)
 }
 
+fn exact_scalar_tensor_contract(
+    operation: &MatrixOperation,
+    left: &ResolvedMatrixType,
+    right: &ResolvedMatrixType,
+) -> bool {
+    let MatrixOperation::Tensor { output, left_layout, right_layout, output_layout } = operation
+    else {
+        return false;
+    };
+    let left_scalar = left.rows == 1 && left.columns == 1;
+    let right_scalar = right.rows == 1 && right.columns == 1;
+    let expected = if left_scalar && right_scalar {
+        left
+    } else if left_scalar {
+        right
+    } else if right_scalar {
+        left
+    } else {
+        return false;
+    };
+    *left_layout == MatrixLayout::row_major(left.rows, left.columns) &&
+        *right_layout == MatrixLayout::row_major(right.rows, right.columns) &&
+        *output_layout == MatrixLayout::row_major(output.rows, output.columns) &&
+        output.modulus == left.modulus &&
+        output.modulus == right.modulus &&
+        output.ring_dimension == left.ring_dimension &&
+        output.ring_dimension == right.ring_dimension &&
+        left.rows.checked_mul(right.rows) == Some(output.rows) &&
+        left.columns.checked_mul(right.columns) == Some(output.columns) &&
+        output == expected
+}
+
 /// Re-runs target resolution and production lowering only when certificate emission is explicitly
 /// requested. Normal simulation entry points never call this function.
 pub(crate) fn project_operational_certificate(
@@ -2825,6 +2857,66 @@ struct ProofPayloadProjector<'a> {
 }
 
 impl<'a> ProofPayloadProjector<'a> {
+    fn scalar_product_monomial(
+        mut left: ProofPayloadMonomial,
+        mut right: ProofPayloadMonomial,
+        left_scalar: bool,
+        right_scalar: bool,
+    ) -> ProofPayloadMonomial {
+        if left_scalar && !right_scalar {
+            left.central_factors.extend(left.ordered_factors);
+            left.central_factors.extend(right.central_factors);
+            left.central_factors.sort();
+            ProofPayloadMonomial {
+                central_factors: left.central_factors,
+                ordered_factors: right.ordered_factors,
+            }
+        } else if right_scalar && !left_scalar {
+            right.central_factors.extend(right.ordered_factors);
+            right.central_factors.extend(left.central_factors);
+            right.central_factors.sort();
+            ProofPayloadMonomial {
+                central_factors: right.central_factors,
+                ordered_factors: left.ordered_factors,
+            }
+        } else {
+            left.central_factors.extend(right.central_factors);
+            left.central_factors.sort();
+            left.ordered_factors.extend(right.ordered_factors);
+            ProofPayloadMonomial {
+                central_factors: left.central_factors,
+                ordered_factors: left.ordered_factors,
+            }
+        }
+    }
+
+    fn scalar_tensor_types(
+        &self,
+        node: &super::arena::ExprNode,
+        operation: &MatrixOperation,
+    ) -> Result<Option<(ResolvedMatrixType, ResolvedMatrixType)>, G0Error> {
+        if !matches!(operation, MatrixOperation::Tensor { .. }) {
+            return Ok(None);
+        }
+        let [left_expression, right_expression] = node.inputs.as_ref() else {
+            return Ok(None);
+        };
+        let ResolvedValueType::Matrix(left) =
+            self.job.expressions().value_type(*left_expression)?
+        else {
+            return Ok(None);
+        };
+        let ResolvedValueType::Matrix(right) =
+            self.job.expressions().value_type(*right_expression)?
+        else {
+            return Ok(None);
+        };
+        if !exact_scalar_tensor_contract(operation, left, right) {
+            return Ok(None);
+        }
+        Ok(Some((left.clone(), right.clone())))
+    }
+
     fn project(
         self,
         trace: &FeasibilityTrace,
@@ -3184,6 +3276,12 @@ impl<'a> ProofPayloadProjector<'a> {
                     ValueOperator::Matrix(operation @ MatrixOperation::Multiply) => {
                         operation.clone()
                     }
+                    ValueOperator::Matrix(operation @ MatrixOperation::Tensor { .. })
+                        if payload_projection(self.scalar_tensor_types(node, operation))?
+                            .is_some() =>
+                    {
+                        operation.clone()
+                    }
                     _ => {
                         return Err(proof_invariant(
                             current,
@@ -3217,7 +3315,7 @@ impl<'a> ProofPayloadProjector<'a> {
                 let expected = match operation {
                     MatrixOperation::Add => right.clone(),
                     MatrixOperation::Subtract => -right.clone(),
-                    MatrixOperation::Multiply => {
+                    MatrixOperation::Multiply | MatrixOperation::Tensor { .. } => {
                         let left = match trace.events.get(inputs[0].value_event.0 as usize) {
                             Some(NormalizerEvent::Result { value, .. }) |
                             Some(NormalizerEvent::InvocationEnd { result: value, .. }) => {
@@ -3271,7 +3369,7 @@ impl<'a> ProofPayloadProjector<'a> {
                             }
                         }
                     }
-                    MatrixOperation::Multiply => {
+                    MatrixOperation::Multiply | MatrixOperation::Tensor { .. } => {
                         let left = payload_projection(self.monomial(inputs[0].monomial))?;
                         let right = payload_projection(self.monomial(inputs[1].monomial))?;
                         let left_type = payload_projection(
@@ -3294,36 +3392,16 @@ impl<'a> ProofPayloadProjector<'a> {
                             right_type,
                             ResolvedValueType::Matrix(matrix) if matrix.rows == 1 && matrix.columns == 1
                         );
-                        let (central_factors, ordered_factors) = if left_scalar && !right_scalar {
-                            let mut central_factors = left.central_factors;
-                            central_factors.extend(left.ordered_factors);
-                            central_factors.extend(right.central_factors);
-                            central_factors.sort();
-                            (central_factors, right.ordered_factors)
-                        } else if right_scalar && !left_scalar {
-                            let mut central_factors = right.central_factors;
-                            central_factors.extend(right.ordered_factors);
-                            central_factors.extend(left.central_factors);
-                            central_factors.sort();
-                            (central_factors, left.ordered_factors)
-                        } else {
-                            let mut central_factors = left.central_factors;
-                            central_factors.extend(right.central_factors);
-                            central_factors.sort();
-                            let mut ordered_factors = left.ordered_factors;
-                            ordered_factors.extend(right.ordered_factors);
-                            (central_factors, ordered_factors)
-                        };
-                        if output.central_factors != central_factors ||
-                            output.ordered_factors != ordered_factors
-                        {
+                        let expected =
+                            Self::scalar_product_monomial(left, right, left_scalar, right_scalar);
+                        if output != expected {
                             return Err(proof_invariant(
                                 current,
                                 Some(observation.owner),
                                 evidence,
                                 ProofInvariantMismatch::SpliceOutput {
-                                    expected_central: central_factors,
-                                    expected_ordered: ordered_factors,
+                                    expected_central: expected.central_factors,
+                                    expected_ordered: expected.ordered_factors,
                                     actual_central: output.central_factors.clone(),
                                     actual_ordered: output.ordered_factors.clone(),
                                 },
@@ -8002,5 +8080,97 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn scalar_tensor_contract_and_monomial_reconstruction_are_exact() {
+        let matrix = |rows, columns| ResolvedMatrixType {
+            modulus: 257_u16.into(),
+            ring_dimension: 8,
+            rows,
+            columns,
+        };
+        let tensor =
+            |left: &ResolvedMatrixType, right: &ResolvedMatrixType, output: ResolvedMatrixType| {
+                MatrixOperation::Tensor {
+                    left_layout: MatrixLayout::row_major(left.rows, left.columns),
+                    right_layout: MatrixLayout::row_major(right.rows, right.columns),
+                    output_layout: MatrixLayout::row_major(output.rows, output.columns),
+                    output,
+                }
+            };
+        let scalar = matrix(1, 1);
+        let vector = matrix(1, 14);
+        assert!(exact_scalar_tensor_contract(
+            &tensor(&scalar, &vector, vector.clone()),
+            &scalar,
+            &vector,
+        ));
+        assert!(exact_scalar_tensor_contract(
+            &tensor(&vector, &scalar, vector.clone()),
+            &vector,
+            &scalar,
+        ));
+        assert!(exact_scalar_tensor_contract(
+            &tensor(&scalar, &scalar, scalar.clone()),
+            &scalar,
+            &scalar,
+        ));
+        let left_non_scalar = matrix(1, 2);
+        let right_non_scalar = matrix(1, 7);
+        assert!(!exact_scalar_tensor_contract(
+            &tensor(&left_non_scalar, &right_non_scalar, matrix(1, 14)),
+            &left_non_scalar,
+            &right_non_scalar,
+        ));
+        let mut non_row_major = tensor(&scalar, &vector, vector.clone());
+        if let MatrixOperation::Tensor { left_layout, .. } = &mut non_row_major {
+            left_layout.name = "opaque-layout".to_owned();
+        }
+        assert!(!exact_scalar_tensor_contract(&non_row_major, &scalar, &vector));
+
+        let owner = |row| ProofPayloadOwner {
+            scope: ProofPayloadScope::Closed { root_expression_row: 0 },
+            expression_row: row,
+        };
+        let left = ProofPayloadMonomial {
+            central_factors: vec![owner(3)],
+            ordered_factors: vec![owner(2)],
+        };
+        let right = ProofPayloadMonomial {
+            central_factors: vec![owner(4)],
+            ordered_factors: vec![owner(5)],
+        };
+        assert_eq!(
+            ProofPayloadProjector::scalar_product_monomial(
+                left.clone(),
+                right.clone(),
+                true,
+                false,
+            ),
+            ProofPayloadMonomial {
+                central_factors: vec![owner(2), owner(3), owner(4)],
+                ordered_factors: vec![owner(5)],
+            }
+        );
+        assert_eq!(
+            ProofPayloadProjector::scalar_product_monomial(
+                left.clone(),
+                right.clone(),
+                false,
+                true,
+            ),
+            ProofPayloadMonomial {
+                central_factors: vec![owner(3), owner(4), owner(5)],
+                ordered_factors: vec![owner(2)],
+            }
+        );
+        assert_eq!(
+            ProofPayloadProjector::scalar_product_monomial(left, right, true, true),
+            ProofPayloadMonomial {
+                central_factors: vec![owner(3), owner(4)],
+                ordered_factors: vec![owner(2), owner(5)],
+            }
+        );
     }
 }

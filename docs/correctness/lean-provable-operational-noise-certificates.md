@@ -489,6 +489,14 @@ excluded because they are operational observations rather than checker semantics
 for source construction and feasibility only. It is not a G3 certificate artifact and cannot be
 used as `Source.json` or as an acceptance artifact.
 
+The evidence uses two exhaustive, statically constructed Tall profiles in this order. The
+security-0 profile fixes one multiplication, CRT depth 7, `log2(n) = 5`, 28-bit CRT moduli, an
+automatically selected 6-bit nested-RNS p basis, 14-bit gadget base, two unreduced
+multiplications, scale 64, error sigma 4, and trapdoor sigma 4.578. The security-128 profile fixes
+the same values except for CRT depth 20 and `log2(n) = 15`; its reviewed static security lower
+bound is 177 bits. These profiles do not read environment variables, run a parameter search, or
+invoke an estimator. The file contains pre-gate CPU observations, not a Tall execution result.
+
 The committed artifacts are:
 
 - `Source.json`: the complete output of the single canonical frozen-bundle serializer, exact

@@ -22,7 +22,7 @@ use mxx_correctness::{
     operational_noise::{
         OperationalAcceptanceReport, OperationalCheckRequest, OperationalGadgetLayout,
         OperationalSimulationError, OperationalSimulationReport, ProgressEventKind,
-        check_operational_noise_candidate_with_progress,
+        check_operational_noise_candidate_with_progress, prepare_g0_cpu_evidence_bytes,
     },
     operational_protocol_from_graphs,
 };
@@ -94,6 +94,15 @@ const TALL_OPERATIONAL_RESIDUAL: &str = "operational_residual";
 const TALL_OPERATIONAL_DECODED: &str = "operational_decoded";
 const TALL_DECODER_RESIDUAL_ANCHOR: &str = "tall.decoder.residual";
 const TALL_DECODER_RESULT_ANCHOR: &str = "tall.decoder.result";
+const TALL_G0_REVIEW_SCHEMA_ID: &str = "mxx.operational-noise.tall-g0-review-evidence";
+const TALL_G0_REVIEW_SCHEMA_VERSION: u32 = 1;
+const G0_CPU_OBSERVATION_SCHEMA_ID: &str = "mxx.operational-noise.g0-cpu-evidence";
+const G0_CPU_OBSERVATION_SCHEMA_VERSION: u32 = 3;
+const G0_CPU_OBSERVATION_STATUS: &str = "CpuObservationOnlyNotG0HardGateOrTallEvidence";
+const TALL_G0_GOLDEN_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/correctness/tall-operational-noise-certificate-g0.json"
+);
 
 fn log_graph_phase(phase: &'static str, state: &'static str, started: Option<&Instant>) {
     let (vm_rss_kib, vm_hwm_kib) = process_memory_kib();
@@ -154,6 +163,151 @@ struct TestConfig {
     release_fence_interval: usize,
     checkpoint_root: PathBuf,
     reuse_checkpoint: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+enum TallG0Profile {
+    Security0,
+    Security128,
+}
+
+impl TallG0Profile {
+    const ALL: [Self; 2] = [Self::Security0, Self::Security128];
+
+    fn fixed(self) -> FixedTallG0Profile {
+        match self {
+            Self::Security0 => FixedTallG0Profile {
+                profile: self,
+                multiplication_count: 1,
+                crt_depth: 7,
+                log_ring_dimension: 5,
+                required_security_bits: 0,
+                reviewed_security_lower_bound_bits: 0,
+                crt_modulus_bits: 28,
+                requested_p_moduli_bits: None,
+                gadget_base_bits: 14,
+                max_unreduced_multiplications: 2,
+                scale: 64,
+                error_sigma: 4.0,
+                trapdoor_sigma: 4.578,
+            },
+            Self::Security128 => FixedTallG0Profile {
+                profile: self,
+                multiplication_count: 1,
+                crt_depth: 20,
+                log_ring_dimension: 15,
+                required_security_bits: 128,
+                reviewed_security_lower_bound_bits: 177,
+                crt_modulus_bits: 28,
+                requested_p_moduli_bits: None,
+                gadget_base_bits: 14,
+                max_unreduced_multiplications: 2,
+                scale: 64,
+                error_sigma: 4.0,
+                trapdoor_sigma: 4.578,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+struct FixedTallG0Profile {
+    profile: TallG0Profile,
+    multiplication_count: usize,
+    crt_depth: usize,
+    log_ring_dimension: usize,
+    required_security_bits: u64,
+    reviewed_security_lower_bound_bits: u64,
+    crt_modulus_bits: usize,
+    requested_p_moduli_bits: Option<usize>,
+    gadget_base_bits: usize,
+    max_unreduced_multiplications: usize,
+    scale: u64,
+    error_sigma: f64,
+    trapdoor_sigma: f64,
+}
+
+impl FixedTallG0Profile {
+    fn parameters(self) -> DCRTPolyParams {
+        let ring_dimension = 1u32
+            .checked_shl(u32::try_from(self.log_ring_dimension).expect("fixed log ring dimension"))
+            .expect("fixed ring dimension");
+        DCRTPolyParams::new(
+            ring_dimension,
+            self.crt_depth,
+            self.crt_modulus_bits,
+            u32::try_from(self.gadget_base_bits).expect("fixed gadget base bits"),
+        )
+    }
+
+    fn test_config(self) -> TestConfig {
+        TestConfig {
+            mul_count: self.multiplication_count,
+            min_crt_depth: self.crt_depth,
+            max_crt_depth: self.crt_depth,
+            min_log_ring_dimension: self.log_ring_dimension,
+            max_log_ring_dimension: self.log_ring_dimension,
+            selected_parameters: Some((self.crt_depth, self.log_ring_dimension)),
+            security_bits: self.required_security_bits,
+            crt_modulus_bits: self.crt_modulus_bits,
+            p_moduli_bits: self.requested_p_moduli_bits,
+            gadget_base_bits: self.gadget_base_bits,
+            max_unreduced_muls: self.max_unreduced_multiplications,
+            scale: self.scale,
+            error_sigma: self.error_sigma,
+            trapdoor_sigma: self.trapdoor_sigma,
+            benchmark_warmups: 1,
+            benchmark_iterations: 1,
+            run_mode: TallRunMode::Graph,
+            parameter_simulation_parallelism: 1,
+            preimage_progress_interval: 1,
+            max_parallel_instances: 1,
+            preprocessing_parallel_instances: 1,
+            release_fence_interval: 1,
+            checkpoint_root: PathBuf::from("test_data/tall_nested_rns_g0_cpu"),
+            reuse_checkpoint: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+enum TallG0ReviewStatus {
+    CpuObservationOnlyNotG0HardGateOrTallEvidence,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TallG0ConstructorTuple {
+    multiplication_count: usize,
+    crt_depth: usize,
+    log_ring_dimension: usize,
+    ring_dimension: u32,
+    required_security_bits: u64,
+    reviewed_security_lower_bound_bits: u64,
+    crt_modulus_bits: usize,
+    resolved_p_moduli_bits: usize,
+    gadget_base_bits: usize,
+    max_unreduced_multiplications: usize,
+    scale: u64,
+    error_sigma: f64,
+    trapdoor_sigma: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TallG0SourceObservation {
+    profile: TallG0Profile,
+    constructor: TallG0ConstructorTuple,
+    observation: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TallG0ReviewEvidence {
+    schema_id: &'static str,
+    schema_version: u32,
+    status: TallG0ReviewStatus,
+    sources: Vec<TallG0SourceObservation>,
 }
 
 impl TestConfig {
@@ -276,6 +430,83 @@ impl TestConfig {
             self.selected_parameters,
         )
     }
+}
+
+fn fixed_tall_g0_profile_observation(
+    profile: TallG0Profile,
+) -> Result<TallG0SourceObservation, String> {
+    let fixed = profile.fixed();
+    let parameters = fixed.parameters();
+    let (q_moduli, _, _) = parameters.to_crt();
+    let resolved_p_moduli_bits = fixed.requested_p_moduli_bits.map_or_else(
+        || {
+            minimum_p_moduli_bits(
+                *q_moduli.iter().max().expect("fixed CRT basis is nonempty"),
+                fixed.max_unreduced_multiplications,
+            )
+            .ok_or_else(|| "fixed Tall G0 profile has no supporting p basis".to_owned())
+        },
+        Ok,
+    )?;
+    let config = fixed.test_config();
+    let selected = prepare_candidate(
+        parameters,
+        &config,
+        fixed.reviewed_security_lower_bound_bits,
+        CandidatePreparation::RuntimeOnly,
+    )?;
+    let (protocol, request) = build_tall_operational_source(
+        &selected.preprocessing,
+        &selected.encoding_graph,
+        &selected.parameters,
+        &selected.nested,
+    )?;
+    let observation_bytes = prepare_g0_cpu_evidence_bytes(&protocol, &request)?;
+    let observation: serde_json::Value =
+        serde_json::from_slice(&observation_bytes).map_err(|error| error.to_string())?;
+    if observation.get("schema_id").and_then(serde_json::Value::as_str) !=
+        Some(G0_CPU_OBSERVATION_SCHEMA_ID) ||
+        observation.get("schema_version").and_then(serde_json::Value::as_u64) !=
+            Some(u64::from(G0_CPU_OBSERVATION_SCHEMA_VERSION)) ||
+        observation.get("status").and_then(serde_json::Value::as_str) !=
+            Some(G0_CPU_OBSERVATION_STATUS)
+    {
+        return Err("fixed Tall G0 profile produced an unexpected CPU observation schema".to_owned());
+    }
+    Ok(TallG0SourceObservation {
+        profile,
+        constructor: TallG0ConstructorTuple {
+            multiplication_count: fixed.multiplication_count,
+            crt_depth: fixed.crt_depth,
+            log_ring_dimension: fixed.log_ring_dimension,
+            ring_dimension: selected.parameters.ring_dimension(),
+            required_security_bits: fixed.required_security_bits,
+            reviewed_security_lower_bound_bits: fixed.reviewed_security_lower_bound_bits,
+            crt_modulus_bits: fixed.crt_modulus_bits,
+            resolved_p_moduli_bits,
+            gadget_base_bits: fixed.gadget_base_bits,
+            max_unreduced_multiplications: fixed.max_unreduced_multiplications,
+            scale: fixed.scale,
+            error_sigma: fixed.error_sigma,
+            trapdoor_sigma: fixed.trapdoor_sigma,
+        },
+        observation,
+    })
+}
+
+fn build_tall_g0_review_evidence(profiles: &[TallG0Profile]) -> Result<Vec<u8>, String> {
+    let sources = profiles
+        .iter()
+        .copied()
+        .map(fixed_tall_g0_profile_observation)
+        .collect::<Result<Vec<_>, _>>()?;
+    serde_json::to_vec(&TallG0ReviewEvidence {
+        schema_id: TALL_G0_REVIEW_SCHEMA_ID,
+        schema_version: TALL_G0_REVIEW_SCHEMA_VERSION,
+        status: TallG0ReviewStatus::CpuObservationOnlyNotG0HardGateOrTallEvidence,
+        sources,
+    })
+    .map_err(|error| error.to_string())
 }
 
 fn candidate_dimensions(
@@ -1982,6 +2213,110 @@ fn runtime_verification(
 #[test]
 fn selected_parameters_produce_exactly_one_candidate() {
     assert_eq!(candidate_dimensions(1, 16, 3, 8, Some((7, 5))), vec![(7, 5)]);
+}
+
+#[test]
+fn fixed_tall_g0_profiles_are_exact() {
+    let security0 = TallG0Profile::Security0.fixed();
+    assert_eq!(security0.multiplication_count, 1);
+    assert_eq!((security0.crt_depth, security0.log_ring_dimension), (7, 5));
+    assert_eq!(security0.required_security_bits, 0);
+    assert_eq!(security0.reviewed_security_lower_bound_bits, 0);
+    assert_eq!(security0.crt_modulus_bits, 28);
+    assert_eq!(security0.requested_p_moduli_bits, None);
+    assert_eq!(security0.gadget_base_bits, 14);
+    assert_eq!(security0.max_unreduced_multiplications, 2);
+    assert_eq!(security0.scale, 64);
+    assert_eq!(security0.error_sigma, 4.0);
+    assert_eq!(security0.trapdoor_sigma, 4.578);
+
+    let security128 = TallG0Profile::Security128.fixed();
+    assert_eq!(security128.multiplication_count, 1);
+    assert_eq!((security128.crt_depth, security128.log_ring_dimension), (20, 15));
+    assert_eq!(security128.required_security_bits, 128);
+    assert_eq!(security128.reviewed_security_lower_bound_bits, 177);
+    assert_eq!(security128.crt_modulus_bits, 28);
+    assert_eq!(security128.requested_p_moduli_bits, None);
+    assert_eq!(security128.gadget_base_bits, 14);
+    assert_eq!(security128.max_unreduced_multiplications, 2);
+    assert_eq!(security128.scale, 64);
+    assert_eq!(security128.error_sigma, 4.0);
+    assert_eq!(security128.trapdoor_sigma, 4.578);
+
+    for fixed in [security0, security128] {
+        let parameters = fixed.parameters();
+        assert_eq!(parameters.to_crt().2, fixed.crt_depth);
+        assert_eq!(parameters.ring_dimension(), 1u32 << fixed.log_ring_dimension);
+        let (q_moduli, _, _) = parameters.to_crt();
+        assert_eq!(
+            minimum_p_moduli_bits(
+                *q_moduli.iter().max().expect("fixed CRT basis"),
+                fixed.max_unreduced_multiplications,
+            ),
+            Some(6)
+        );
+        let config = fixed.test_config();
+        assert_eq!(config.selected_parameters, Some((fixed.crt_depth, fixed.log_ring_dimension)));
+        assert_eq!(config.run_mode, TallRunMode::Graph);
+    }
+}
+
+fn assert_fixed_tall_g0_observation(bytes: &[u8], expected_profile: TallG0Profile) {
+    let evidence: serde_json::Value = serde_json::from_slice(bytes).expect("Tall G0 review JSON");
+    assert_eq!(evidence["schemaId"], TALL_G0_REVIEW_SCHEMA_ID);
+    assert_eq!(evidence["schemaVersion"], TALL_G0_REVIEW_SCHEMA_VERSION);
+    assert_eq!(evidence["status"], G0_CPU_OBSERVATION_STATUS);
+    let profiles = evidence["sources"].as_array().expect("profile observations");
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(
+        profiles[0]["profile"],
+        serde_json::to_value(expected_profile).expect("profile name")
+    );
+    assert_eq!(profiles[0]["constructor"]["resolvedPModuliBits"], 6);
+    assert_eq!(profiles[0]["constructor"]["scale"], 64);
+    assert_eq!(profiles[0]["observation"]["schema_id"], G0_CPU_OBSERVATION_SCHEMA_ID);
+    assert_eq!(profiles[0]["observation"]["schema_version"], G0_CPU_OBSERVATION_SCHEMA_VERSION);
+    assert_eq!(profiles[0]["observation"]["status"], G0_CPU_OBSERVATION_STATUS);
+}
+
+#[test]
+#[ignore = "CPU-only fixed security-0 Tall G0 review evidence; performs no backend execution"]
+fn fixed_tall_g0_security0_evidence_is_deterministic() {
+    let first = build_tall_g0_review_evidence(&[TallG0Profile::Security0])
+        .expect("first fixed security-0 observation");
+    let second = build_tall_g0_review_evidence(&[TallG0Profile::Security0])
+        .expect("independent fixed security-0 observation");
+    assert_eq!(first, second);
+    assert_fixed_tall_g0_observation(&first, TallG0Profile::Security0);
+}
+
+#[test]
+#[ignore = "CPU-only fixed security-128 Tall G0 review evidence; performs no backend execution"]
+fn fixed_tall_g0_security128_evidence_is_deterministic() {
+    let first = build_tall_g0_review_evidence(&[TallG0Profile::Security128])
+        .expect("first fixed security-128 observation");
+    let second = build_tall_g0_review_evidence(&[TallG0Profile::Security128])
+        .expect("independent fixed security-128 observation");
+    assert_eq!(first, second);
+    assert_fixed_tall_g0_observation(&first, TallG0Profile::Security128);
+}
+
+#[test]
+#[ignore = "CPU-only fixed Tall G0 golden evidence; performs no backend execution"]
+fn fixed_tall_g0_combined_evidence_matches_committed_golden() {
+    let bytes =
+        build_tall_g0_review_evidence(&TallG0Profile::ALL).expect("fixed Tall G0 review evidence");
+    assert_eq!(bytes, fs::read(TALL_G0_GOLDEN_PATH).expect("committed Tall G0 golden"));
+    let evidence: serde_json::Value = serde_json::from_slice(&bytes).expect("Tall G0 review JSON");
+    let profiles = evidence["sources"].as_array().expect("profile observations");
+    assert_eq!(profiles.len(), 2);
+    assert_eq!(profiles[0]["profile"], "Security0");
+    assert_eq!(profiles[1]["profile"], "Security128");
+    for profile in profiles {
+        assert_eq!(profile["observation"]["schema_id"], G0_CPU_OBSERVATION_SCHEMA_ID);
+        assert_eq!(profile["observation"]["schema_version"], G0_CPU_OBSERVATION_SCHEMA_VERSION);
+        assert_eq!(profile["observation"]["status"], G0_CPU_OBSERVATION_STATUS);
+    }
 }
 
 #[test]

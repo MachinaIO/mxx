@@ -728,6 +728,14 @@ elapsed time、RSS/GPU 観測値、recorder 専用 metric は checker の意味�
 だけを確認する決定的な G0 review evidence である。これは G3 certificate artifact ではなく、
 `Source.json` や acceptance artifact として使用してはならない。
 
+evidence は、網羅的な静的 constructor で作る二つの Tall profile をこの順序で使用する。
+security-0 profile は、乗算 1 回、CRT depth 7、`log2(n) = 5`、28-bit CRT modulus、自動選択される
+6-bit nested-RNS p basis、14-bit gadget base、未 reduction 乗算 2 回、scale 64、error sigma 4、
+trapdoor sigma 4.578 に固定する。security-128 profile は CRT depth 20 と `log2(n) = 15` だけが
+異なり、review 済みの静的 security lower bound は 177 bit である。これらの profile は環境変数を
+読み込まず、parameter search や estimator を実行しない。このファイルは gate 前の CPU 観測で
+あり、Tall の実行結果ではない。
+
 G3 で canonical frozen-bundle serializer が完成した後は、その完全な出力である `Source.json`
 だけから clean-room regeneration を実行できなければならない。`Source.json` は canonical な
 frozen bundle、正確な request、pinned version identity だけを持ち、target や environment の

@@ -327,7 +327,10 @@ theorem g2c_contract_replay :
       regularGadgetContract 3 = some (.finite ⟨1, by decide⟩) ∧
       regularGadgetContract 4 = some g2aFinite2 ∧
       (recordedFiniteContract 2).Interprets (-2 : Int).natAbs ∧
-      (recordedFiniteContract 5).Interprets 3 := by
+      resolveRelationPreimageSource (some .large) (some g2aFinite2) 1 = .large ∧
+      resolveRelationPreimageSource none (some g2aFinite2) 1 = g2aFinite2 ∧
+      resolveRelationPreimageSource none none 5 = g2aFinite5 ∧
+      (resolveRelationPreimageSource none none 5).Interprets 3 := by
   have gaussianZero : (recordedFiniteContract 0).Interprets 0 :=
     gaussianCutoff_sound (by decide)
   have preimageFour : (recordedFiniteContract 5).Interprets 4 :=
@@ -339,8 +342,11 @@ theorem g2c_contract_replay :
     programFamilyFactAuthority_sound (contract := some (recordedFiniteContract 5))
       rfl preimageFour,
     by decide, by decide, by decide, by decide, by decide, by decide,
-    gadgetDigit,
-    relationPreimageSourceAuthority_sound (sourceCutoff := some 5) rfl (by decide)⟩
+    gadgetDigit, by decide, by decide, by decide,
+    resolveRelationPreimageSource_sound
+      (durableExpression := none) (factStore := none) (cutoff := 5) (actual := 3)
+      (by intro bound impossible; cases impossible)
+      (by intro _ bound impossible; cases impossible) (by decide)⟩
 
 #print axioms g2_four_role_product_kernel
 #print axioms operatorProductContribution_natAbs_le
@@ -370,7 +376,7 @@ theorem g2c_contract_replay :
 #print axioms regularGadgetContract_sound
 #print axioms factStoreAuthority_sound
 #print axioms programFamilyFactAuthority_sound
-#print axioms relationPreimageSourceAuthority_sound
+#print axioms resolveRelationPreimageSource_sound
 #print axioms g2c_contract_replay
 
 end Mxx.Certificate.OperationalNoise.EventReplay

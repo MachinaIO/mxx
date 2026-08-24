@@ -125,11 +125,30 @@ theorem programFamilyFactAuthority_sound {contract : Option CoeffClass}
   cases contractPresent
   exact recordedSound
 
-/-- A relation-preimage authority consumes the matched source's explicit cutoff contract. -/
-theorem relationPreimageSourceAuthority_sound {sourceCutoff : Option Nat} {cutoff actual : Nat}
-    (cutoffPresent : sourceCutoff = some cutoff) (actualWithinSourceCutoff : actual ≤ cutoff) :
-    (recordedFiniteContract cutoff).Interprets actual := by
-  cases cutoffPresent
-  exact preimageCutoff_sound actualWithinSourceCutoff
+/-- Resolve the exact Rust authority precedence for a matched relation-preimage source. -/
+def resolveRelationPreimageSource (durableExpression factStore : Option CoeffClass)
+    (cutoff : Nat) : CoeffClass :=
+  match durableExpression with
+  | some bound => bound
+  | none => match factStore with
+    | some bound => bound
+    | none => recordedFiniteContract cutoff
+
+theorem resolveRelationPreimageSource_sound
+    {durableExpression factStore : Option CoeffClass} {cutoff actual : Nat}
+    (durableSound : ∀ bound, durableExpression = some bound → bound.Interprets actual)
+    (factStoreSound : durableExpression = none →
+      ∀ bound, factStore = some bound → bound.Interprets actual)
+    (cutoffSound : durableExpression = none → factStore = none → actual ≤ cutoff) :
+    (resolveRelationPreimageSource durableExpression factStore cutoff).Interprets actual := by
+  cases durableExpression with
+  | some bound =>
+      exact durableSound bound rfl
+  | none =>
+      cases factStore with
+      | some bound =>
+          exact factStoreSound rfl bound rfl
+      | none =>
+          exact preimageCutoff_sound (cutoffSound rfl rfl)
 
 end Mxx.Certificate.OperationalNoise.EventReplay

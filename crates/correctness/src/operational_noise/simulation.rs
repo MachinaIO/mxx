@@ -13,8 +13,9 @@ use super::{
     error::{OperationalSimulationError, TargetError},
     g0::{
         AppliedRelationRule, BoundAuthority, BoundProjection, BoundRule, BoundScale, BoundValueRef,
-        CanonicalEventKind, CanonicalResidualRefs, EventKind, FeasibilityTrace, G0Error,
-        MonomialFactorEvidence, NormalizerEvent, StableHashVariant, StableSamplerOperation,
+        CanonicalEventKind, CanonicalProjectionRole, CanonicalResidualRefs, EventKind,
+        FeasibilitySink, FeasibilityTrace, G0Error, MonomialFactorEvidence, NormalizerEvent,
+        StableHashVariant, StableSamplerOperation,
     },
     lower::{ProductionAdapter, ProductionRoot},
     program::{FamilyValueId, ValueProgramId},
@@ -1727,6 +1728,14 @@ pub(crate) enum CertificateClosureError {
         family_body: ExprId,
         program_root: ExprId,
     },
+    #[error("certificate closure has no monomial arena for retained root {monomial:?}")]
+    MissingMonomialArena { monomial: super::monomial::MonomialId },
+    #[error("certificate closure cannot read retained monomial {monomial:?}: {source}")]
+    InvalidMonomial {
+        monomial: super::monomial::MonomialId,
+        #[source]
+        source: super::monomial::MonomialError,
+    },
 }
 
 /// Collect the transitive dependency closure of exactly one production root.
@@ -2592,10 +2601,19 @@ fn extend_certificate_closure(
         match event {
             NormalizerEvent::InvocationStart { root } |
             NormalizerEvent::Result { owner: root, .. } |
-            NormalizerEvent::InvocationEnd { root, .. } |
-            NormalizerEvent::BoundTransfer { owner: root, .. } => {
+            NormalizerEvent::InvocationEnd { root, .. } => {
                 work.push(CertificateWork::Program(root.program()));
                 work.push(CertificateWork::Expression(root.expression()));
+            }
+            NormalizerEvent::BoundTransfer { owner, rule } => {
+                work.push(CertificateWork::Program(owner.program()));
+                work.push(CertificateWork::Expression(owner.expression()));
+                if let BoundRule::Authority(BoundAuthority::RelationPreimageSource { source }) =
+                    rule
+                {
+                    work.push(CertificateWork::Program(owner.program()));
+                    work.push(CertificateWork::Expression(*source));
+                }
             }
             NormalizerEvent::SpecializationComputed { owner, key, .. } |
             NormalizerEvent::SpecializationCacheHit { owner, key, .. } => {
@@ -2632,7 +2650,34 @@ fn extend_certificate_closure(
             }
         }
     }
-    walk_certificate_closure(job, closure, work, &index_plans)
+    walk_certificate_closure(job, closure, work, &index_plans)?;
+
+    // Normalization retains the monomial IDs used by the proof trace. Their descriptors can
+    // refer to scoped factors detached from the residual expression DAG, so feed those exact
+    // program/expression identities into the same closure walker before canonicalization.
+    let monomial_arenas = closure
+        .programs
+        .iter()
+        .filter_map(|&program| job.monomials().get(program))
+        .map(|arena| (arena.token(), arena))
+        .collect::<HashMap<_, _>>();
+    let mut factor_work = Vec::new();
+    if let Some(monomials) = trace.retained_monomial_roots() {
+        for &monomial in monomials {
+            let arena = monomial_arenas
+                .get(&monomial.arena())
+                .ok_or(CertificateClosureError::MissingMonomialArena { monomial })?;
+            let descriptor = arena
+                .descriptor(monomial)
+                .map_err(|source| CertificateClosureError::InvalidMonomial { monomial, source })?;
+            for factor in descriptor.central_factors.iter().chain(descriptor.ordered_factors.iter())
+            {
+                factor_work.push(CertificateWork::Program(factor.program()));
+                factor_work.push(CertificateWork::Expression(factor.expression()));
+            }
+        }
+    }
+    walk_certificate_closure(job, closure, factor_work, &index_plans)
 }
 
 fn push_universal_dependencies(
@@ -2754,7 +2799,14 @@ impl<'a> ProofPayloadProjector<'a> {
             BoundAuthority::Operator => ProofPayloadAuthority::Operator,
             BoundAuthority::Unavailable => ProofPayloadAuthority::Unavailable,
             BoundAuthority::RelationPreimageSource { source } => {
-                ProofPayloadAuthority::RelationPreimageSource { source: self.expression(*source)? }
+                ProofPayloadAuthority::RelationPreimageSource {
+                    source: self.expression(*source).map_err(|source| {
+                        G0Error::CanonicalProjectionReference {
+                            role: CanonicalProjectionRole::RelationPreimageSource,
+                            source: Box::new(source),
+                        }
+                    })?,
+                }
             }
         })
     }
@@ -2771,7 +2823,16 @@ impl<'a> ProofPayloadProjector<'a> {
             .central_factors
             .iter()
             .copied()
-            .map(|factor| self.owner(factor))
+            .enumerate()
+            .map(|(ordinal, factor)| {
+                self.owner(factor).map_err(|source| G0Error::CanonicalProjectionReference {
+                    role: CanonicalProjectionRole::MonomialCentralFactor {
+                        monomial,
+                        ordinal: ordinal as u64,
+                    },
+                    source: Box::new(source),
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         central_factors.sort();
         Ok(ProofPayloadMonomial {
@@ -2780,7 +2841,16 @@ impl<'a> ProofPayloadProjector<'a> {
                 .ordered_factors
                 .iter()
                 .copied()
-                .map(|factor| self.owner(factor))
+                .enumerate()
+                .map(|(ordinal, factor)| {
+                    self.owner(factor).map_err(|source| G0Error::CanonicalProjectionReference {
+                        role: CanonicalProjectionRole::MonomialOrderedFactor {
+                            monomial,
+                            ordinal: ordinal as u64,
+                        },
+                        source: Box::new(source),
+                    })
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         })
     }
@@ -5993,6 +6063,99 @@ mod tests {
         let payload = derive_proof_payload(&run).expect("singleton universal payload");
         assert_payload_event_refs_are_local(&payload);
         assert_eq!(run.projection.closure.families.len(), 1);
+        let relation_sources = run
+            .trace
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                NormalizerEvent::BoundTransfer {
+                    rule: BoundRule::Authority(BoundAuthority::RelationPreimageSource { source }),
+                    ..
+                } => Some(*source),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(!relation_sources.is_empty(), "fixture must exercise relation source authority");
+        assert!(
+            relation_sources.iter().all(|source| run
+                .projection
+                .closure
+                .expressions
+                .contains(source))
+        );
+        let relation_source_rows = payload
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ProofPayloadEvent::BoundTransfer {
+                    rule:
+                        ProofPayloadRule::Authority(ProofPayloadAuthority::RelationPreimageSource {
+                            source,
+                        }),
+                    ..
+                } => Some(*source),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let refs = super::super::g0::canonical_residual_refs(
+            &run.job,
+            &run.projection.closure,
+            &run.trace,
+        )
+        .expect("canonical relation source rows");
+        assert!(refs.rows().iter().enumerate().all(|(row, descriptor)| {
+            descriptor.dependencies.iter().all(|dependency| *dependency < row as u64)
+        }));
+        let expected_relation_source_rows = relation_sources
+            .iter()
+            .map(|source| refs.expression(*source).expect("retained relation source"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            relation_source_rows.iter().copied().collect::<BTreeSet<_>>(),
+            expected_relation_source_rows
+        );
+
+        let retained_monomials =
+            run.trace.retained_monomial_roots().expect("enabled trace retains monomial roots");
+        let closed_root = match &run.projection.residual {
+            CertificateResidualRoot::Closed { root, .. } => Some(root.expression()),
+            CertificateResidualRoot::Family { .. } => None,
+        };
+        let wrapper = closed_wrapper_program(&run.trace, closed_root);
+        let mut retained_factor_count = 0_usize;
+        for &monomial in retained_monomials {
+            let Some(arena) =
+                run.projection.closure.programs.iter().copied().chain(wrapper).find_map(
+                    |program| {
+                        run.job
+                            .monomials()
+                            .get(program)
+                            .filter(|arena| arena.token() == monomial.arena())
+                    },
+                )
+            else {
+                continue;
+            };
+            let descriptor = arena.descriptor(monomial).expect("retained descriptor");
+            for factor in descriptor.central_factors.iter().chain(descriptor.ordered_factors.iter())
+            {
+                retained_factor_count += 1;
+                assert!(
+                    run.projection.closure.programs.contains(&factor.program()) ||
+                        wrapper == Some(factor.program())
+                );
+                assert!(run.projection.closure.expressions.contains(&factor.expression()));
+                let node = run.job.expressions().node(factor.expression()).expect("factor node");
+                assert!(
+                    node.inputs.iter().all(|input| run
+                        .projection
+                        .closure
+                        .expressions
+                        .contains(input))
+                );
+            }
+        }
+        assert!(retained_factor_count > 0, "fixture must retain relation monomial factors");
         let computed = payload
             .events
             .iter()

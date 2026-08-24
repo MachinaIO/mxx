@@ -4612,6 +4612,14 @@ pub(crate) enum G0Error {
         field: CanonicalDependencyField,
         missing: CanonicalReference,
     },
+    #[error("canonical handle is missing for {requested:?}")]
+    MissingCanonicalHandle { requested: CanonicalReference },
+    #[error("canonical projection reference {role:?} failed: {source}")]
+    CanonicalProjectionReference {
+        role: CanonicalProjectionRole,
+        #[source]
+        source: Box<G0Error>,
+    },
     #[error("canonical DAG key is ambiguous without authoritative aliasing")]
     AmbiguousCanonicalKey,
     #[error("canonical DAG contains a dependency cycle")]
@@ -4624,6 +4632,13 @@ pub(crate) enum CanonicalReference {
     Program(super::arena::ValueProgramId),
     Family(super::program::FamilyValueId),
     Source(SourceHandle),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CanonicalProjectionRole {
+    RelationPreimageSource,
+    MonomialCentralFactor { monomial: super::monomial::MonomialId, ordinal: u64 },
+    MonomialOrderedFactor { monomial: super::monomial::MonomialId, ordinal: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4779,25 +4794,15 @@ impl CanonicalResidualRefs {
     }
 
     pub(crate) fn expression(&self, expression: ExprId) -> Result<u64, G0Error> {
-        self.handles.get(&CanonicalHandle::Expression(expression)).copied().ok_or_else(|| {
-            canonical_missing(
-                "canonical_ref",
-                CanonicalReference::Expr(expression),
-                CanonicalDependencyField::DagDependency { position: 0 },
-                CanonicalReference::Expr(expression),
-            )
-        })
+        self.handles.get(&CanonicalHandle::Expression(expression)).copied().ok_or(
+            G0Error::MissingCanonicalHandle { requested: CanonicalReference::Expr(expression) },
+        )
     }
 
     pub(crate) fn program(&self, program: super::arena::ValueProgramId) -> Result<u64, G0Error> {
-        self.handles.get(&CanonicalHandle::Program(program)).copied().ok_or_else(|| {
-            canonical_missing(
-                "canonical_ref",
-                CanonicalReference::Program(program),
-                CanonicalDependencyField::DagDependency { position: 0 },
-                CanonicalReference::Program(program),
-            )
-        })
+        self.handles.get(&CanonicalHandle::Program(program)).copied().ok_or(
+            G0Error::MissingCanonicalHandle { requested: CanonicalReference::Program(program) },
+        )
     }
 
     pub(crate) fn family(&self, family: super::program::FamilyValueId) -> Result<u64, G0Error> {
@@ -7664,6 +7669,22 @@ mod tests {
                 CanonicalDependencyField::FamilyProgram,
                 CanonicalReference::Program(program),
             ))
+        );
+
+        let empty_refs = CanonicalResidualRefs {
+            rows: Vec::new(),
+            handles: BTreeMap::new(),
+            event_rows: CanonicalEventRows { rows: Vec::new(), refs: BTreeMap::new() },
+        };
+        assert_eq!(
+            empty_refs.expression(child),
+            Err(G0Error::MissingCanonicalHandle { requested: CanonicalReference::Expr(child) })
+        );
+        assert_eq!(
+            empty_refs.program(program),
+            Err(G0Error::MissingCanonicalHandle {
+                requested: CanonicalReference::Program(program),
+            })
         );
     }
 

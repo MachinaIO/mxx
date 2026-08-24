@@ -1616,8 +1616,9 @@ fn benchmark_estimation(
     };
     let encoding_parallel_instances = config.max_parallel_instances;
     let preprocessing_parallel_instances = config.preprocessing_parallel_instances;
-    let measurement_parallel_instances =
-        encoding_parallel_instances.max(preprocessing_parallel_instances);
+    let encoding_column_wave_size = encoding_parallel_instances.div_ceil(device_ids.len());
+    let preprocessing_column_wave_size =
+        preprocessing_parallel_instances.div_ceil(device_ids.len());
     let estimator_config =
         EstimateConfig { device_pool_size: encoding_parallel_instances, per_instance_occupancy: 1 };
     let preprocessing_estimator_config = EstimateConfig {
@@ -1626,22 +1627,28 @@ fn benchmark_estimation(
     };
     info!(
         gpu_count = device_ids.len(),
-        measurement_parallel_instances,
+        measurement_workers = device_ids.len(),
+        encoding_column_wave_size,
+        preprocessing_column_wave_size,
         encoding_parallel_instances,
         preprocessing_parallel_instances,
         "effective benchmark estimator parallelism"
     );
-    let backends = (0..measurement_parallel_instances)
-        .map(|instance| {
-            let device_id = device_ids[instance % device_ids.len()];
-            (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id)
-        })
+    let backends = device_ids
+        .iter()
+        .copied()
+        .map(|device_id| (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id))
         .collect();
-    let mut backend =
-        GpuNodeMeasurementBackend::new(backends, harness, selected.parameters.to_crt().2);
+    let mut backend = GpuNodeMeasurementBackend::new(
+        backends,
+        harness,
+        selected.parameters.to_crt().2,
+        preprocessing_column_wave_size,
+    );
     info!("collecting unique GPU measurement shapes");
     estimate(&preprocessing_graph, &mut backend, &preprocessing_estimator_config)
         .map_err(|error| error.to_string())?;
+    backend.set_column_wave_size(encoding_column_wave_size);
     estimate(&encoding_graph, &mut backend, &estimator_config)
         .map_err(|error| error.to_string())?;
     let measurement_started = Instant::now();
@@ -1653,6 +1660,7 @@ fn benchmark_estimation(
     );
     let preprocessing_started = Instant::now();
     info!(subgraph = "preprocessing", "benchmark subgraph estimation begin");
+    backend.set_column_wave_size(preprocessing_column_wave_size);
     let preprocessing_report =
         estimate(&preprocessing_graph, &mut backend, &preprocessing_estimator_config)
             .map_err(|error| error.to_string())?;
@@ -1665,6 +1673,7 @@ fn benchmark_estimation(
     log_cost_report("TallBggPreprocessing", &preprocessing_report);
     let encoding_started = Instant::now();
     info!(subgraph = "encoding", "benchmark subgraph estimation begin");
+    backend.set_column_wave_size(encoding_column_wave_size);
     let encoding_report = estimate(&encoding_graph, &mut backend, &estimator_config)
         .map_err(|error| error.to_string())?;
     info!(subgraph = "encoding", elapsed = ?encoding_started.elapsed(), "benchmark subgraph estimation complete");

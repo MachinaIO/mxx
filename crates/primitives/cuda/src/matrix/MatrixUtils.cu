@@ -544,6 +544,37 @@ __device__ __forceinline__ uint64_t mul_mod_u64(uint64_t a, uint64_t b, uint64_t
     return static_cast<uint64_t>(prod % mod);
 }
 
+// Returns floor(2^64 / modulus), which fits in uint64_t for modulus > 1. This
+// reciprocal is used only by the narrow-matrix multiplication fast path. Keep
+// the general 64-bit modular multiplication above for CRT moduli wider than 32
+// bits and for callers that do not guarantee canonical inputs.
+bool matrix_barrett_u32_reciprocal(uint64_t modulus, uint64_t *out_reciprocal)
+{
+    if (!out_reciprocal || modulus <= 1 || modulus > UINT32_MAX)
+    {
+        return false;
+    }
+    const unsigned __int128 two_to_64 = static_cast<unsigned __int128>(1) << 64U;
+    *out_reciprocal = static_cast<uint64_t>(two_to_64 / modulus);
+    return true;
+}
+
+// Preconditions: 1 < modulus <= UINT32_MAX, a < modulus, b < modulus, and
+// reciprocal = floor(2^64 / modulus). Then product = a*b fits in uint64_t.
+// The reciprocal quotient underestimates floor(product/modulus) by at most one,
+// so a single conditional subtraction produces the canonical residue.
+__device__ __forceinline__ uint64_t mul_mod_barrett_u32(
+    uint64_t a,
+    uint64_t b,
+    uint64_t modulus,
+    uint64_t reciprocal)
+{
+    const uint64_t product = a * b;
+    const uint64_t quotient = __umul64hi(product, reciprocal);
+    const uint64_t remainder = product - quotient * modulus;
+    return remainder >= modulus ? remainder - modulus : remainder;
+}
+
 __device__ __forceinline__ uint32_t add_mod_u32(uint32_t a, uint32_t b, uint32_t mod)
 {
     uint64_t sum = static_cast<uint64_t>(a) + static_cast<uint64_t>(b);

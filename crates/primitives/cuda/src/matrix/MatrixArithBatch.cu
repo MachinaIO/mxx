@@ -199,6 +199,82 @@ namespace
         }
     }
 
+    __global__ void matrix_thin_row_matmul_batch_kernel(
+        const uint8_t *const *left,
+        const uint8_t *const *right,
+        uint8_t *const *outputs,
+        const size_t *strides,
+        const uint8_t *coefficient_bytes,
+        const uint64_t *moduli,
+        const uint64_t *reciprocals,
+        size_t limb_count,
+        size_t inner,
+        size_t columns,
+        size_t n,
+        size_t coefficient_groups)
+    {
+        const size_t matrix_limb = static_cast<size_t>(blockIdx.z) / coefficient_groups;
+        const size_t first_coefficient = static_cast<size_t>(blockIdx.z) % coefficient_groups;
+        const size_t limb = matrix_limb % limb_count;
+        const size_t column =
+            static_cast<size_t>(blockIdx.x) * kThinMatmulColumnsPerBlock + threadIdx.y;
+        if (column >= columns)
+        {
+            return;
+        }
+
+        const int lane = static_cast<int>(threadIdx.x);
+        const uint8_t *left_base = left[matrix_limb];
+        const uint8_t *right_base = right[matrix_limb];
+        uint8_t *output_base = outputs[matrix_limb];
+        const size_t stride = strides[limb];
+        const uint8_t bytes = coefficient_bytes[limb];
+        const uint64_t modulus = moduli[limb];
+        const uint64_t reciprocal = reciprocals[limb];
+        for (size_t coefficient_idx = first_coefficient;
+             coefficient_idx < n;
+             coefficient_idx += coefficient_groups)
+        {
+            uint64_t accumulator = 0;
+            for (size_t k = static_cast<size_t>(lane); k < inner; k += kThinMatmulWarpSize)
+            {
+                const uint64_t lhs = matrix_load_limb_u64(
+                    left_base,
+                    k,
+                    coefficient_idx,
+                    stride,
+                    bytes);
+                const uint64_t rhs = matrix_load_limb_u64(
+                    right_base,
+                    k * columns + column,
+                    coefficient_idx,
+                    stride,
+                    bytes);
+                accumulator = add_mod_u64(
+                    accumulator,
+                    mul_mod_barrett_u32(lhs, rhs, modulus, reciprocal),
+                    modulus);
+            }
+            for (int offset = kThinMatmulWarpSize / 2; offset > 0; offset /= 2)
+            {
+                accumulator = add_mod_u64(
+                    accumulator,
+                    __shfl_down_sync(0xffffffffu, accumulator, offset),
+                    modulus);
+            }
+            if (lane == 0)
+            {
+                matrix_store_limb_u64(
+                    output_base,
+                    column,
+                    coefficient_idx,
+                    stride,
+                    bytes,
+                    accumulator);
+            }
+        }
+    }
+
     struct MatrixBatchMetadata
     {
         GpuContext *context = nullptr;
@@ -639,7 +715,22 @@ extern "C" int gpu_matrix_mul_batch(
     size_t *d_strides = nullptr;
     uint8_t *d_bytes = nullptr;
     uint64_t *d_moduli = nullptr;
+    uint64_t *d_reciprocals = nullptr;
+    std::vector<uint64_t> reciprocals(metadata.limb_count);
+    bool use_thin_row_kernel = metadata.rows == 1;
+    if (use_thin_row_kernel)
+    {
+        for (size_t limb = 0; limb < metadata.limb_count; ++limb)
+        {
+            if (!matrix_barrett_u32_reciprocal(metadata.moduli[limb], &reciprocals[limb]))
+            {
+                use_thin_row_kernel = false;
+                break;
+            }
+        }
+    }
     auto release = [&]() {
+        if (d_reciprocals) cudaFreeAsync(d_reciprocals, metadata.stream);
         if (d_moduli) cudaFreeAsync(d_moduli, metadata.stream);
         if (d_bytes) cudaFreeAsync(d_bytes, metadata.stream);
         if (d_strides) cudaFreeAsync(d_strides, metadata.stream);
@@ -653,25 +744,44 @@ extern "C" int gpu_matrix_mul_batch(
     if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_strides), metadata.limb_count * sizeof(size_t), metadata.stream);
     if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_bytes), metadata.limb_count, metadata.stream);
     if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_moduli), metadata.limb_count * sizeof(uint64_t), metadata.stream);
+    if (error == cudaSuccess && use_thin_row_kernel) error = cudaMallocAsync(reinterpret_cast<void **>(&d_reciprocals), metadata.limb_count * sizeof(uint64_t), metadata.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(d_left, metadata.left.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(d_right, metadata.right.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(d_outputs, metadata.outputs.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(d_strides, metadata.strides.data(), metadata.limb_count * sizeof(size_t), cudaMemcpyHostToDevice, metadata.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(d_bytes, metadata.coefficient_bytes.data(), metadata.limb_count, cudaMemcpyHostToDevice, metadata.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(d_moduli, metadata.moduli.data(), metadata.limb_count * sizeof(uint64_t), cudaMemcpyHostToDevice, metadata.stream);
+    if (error == cudaSuccess && use_thin_row_kernel) error = cudaMemcpyAsync(d_reciprocals, reciprocals.data(), metadata.limb_count * sizeof(uint64_t), cudaMemcpyHostToDevice, metadata.stream);
     if (error != cudaSuccess)
     {
         release();
         return set_error(error);
     }
-    const dim3 block(kMatmulTileN, kMatmulTileM, 1);
-    const dim3 grid(
-        static_cast<unsigned int>((metadata.columns + kMatmulTileN - 1) / kMatmulTileN),
-        static_cast<unsigned int>((metadata.rows + kMatmulTileM - 1) / kMatmulTileM),
-        static_cast<unsigned int>(pointer_count * coefficient_groups));
-    matrix_matmul_batch_kernel<<<grid, block, 0, metadata.stream>>>(
-        d_left, d_right, d_outputs, d_strides, d_bytes, d_moduli, metadata.limb_count,
-        metadata.rows, metadata.inner, metadata.columns, metadata.n, coefficient_groups);
+    if (use_thin_row_kernel)
+    {
+        const dim3 block(kThinMatmulWarpSize, kThinMatmulColumnsPerBlock, 1);
+        const dim3 grid(
+            static_cast<unsigned int>(
+                (metadata.columns + kThinMatmulColumnsPerBlock - 1) /
+                kThinMatmulColumnsPerBlock),
+            1,
+            static_cast<unsigned int>(pointer_count * coefficient_groups));
+        matrix_thin_row_matmul_batch_kernel<<<grid, block, 0, metadata.stream>>>(
+            d_left, d_right, d_outputs, d_strides, d_bytes, d_moduli, d_reciprocals,
+            metadata.limb_count, metadata.inner, metadata.columns, metadata.n,
+            coefficient_groups);
+    }
+    else
+    {
+        const dim3 block(kMatmulTileN, kMatmulTileM, 1);
+        const dim3 grid(
+            static_cast<unsigned int>((metadata.columns + kMatmulTileN - 1) / kMatmulTileN),
+            static_cast<unsigned int>((metadata.rows + kMatmulTileM - 1) / kMatmulTileM),
+            static_cast<unsigned int>(pointer_count * coefficient_groups));
+        matrix_matmul_batch_kernel<<<grid, block, 0, metadata.stream>>>(
+            d_left, d_right, d_outputs, d_strides, d_bytes, d_moduli, metadata.limb_count,
+            metadata.rows, metadata.inner, metadata.columns, metadata.n, coefficient_groups);
+    }
     error = cudaGetLastError();
     if (error != cudaSuccess)
     {

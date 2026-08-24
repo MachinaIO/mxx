@@ -2708,6 +2708,29 @@ mod tests {
         GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
     }
 
+    fn random_cpu_matrix(
+        params: &DCRTPolyParams,
+        rows: usize,
+        columns: usize,
+        random: &mut impl Rng,
+    ) -> DCRTPolyMatrix {
+        DCRTPolyMatrix::from_poly_vec(
+            params,
+            (0..rows)
+                .map(|_| {
+                    (0..columns)
+                        .map(|_| {
+                            let coefficients = (0..params.ring_dimension())
+                                .map(|_| BigUint::from(random.random_range(0..(1u64 << 55))))
+                                .collect::<Vec<_>>();
+                            DCRTPoly::from_biguints(params, &coefficients)
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+
     #[test]
     #[sequential]
     fn test_gpu_batch_coefficient_bound_matches_full_crt_cpu_check() {
@@ -2910,6 +2933,54 @@ mod tests {
         let scalar = mixed_contexts.iter().map(PolyMatrix::to_compact_bytes).collect::<Vec<_>>();
         let references = mixed_contexts.iter().collect::<Vec<_>>();
         assert_eq!(GpuDCRTPolyMatrix::compact_bytes_batch_borrowed(&references), scalar);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_thin_row_matrix_multiply_matches_cpu() {
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(32, 2, 28, 8);
+        let gpu_params = gpu_params_from_cpu(&cpu_params);
+        let mut random = rng();
+        let left_cpu = random_cpu_matrix(&cpu_params, 1, 80, &mut random);
+        let right_cpu = random_cpu_matrix(&cpu_params, 80, 4, &mut random);
+        let expected = &left_cpu * &right_cpu;
+        let left = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &left_cpu);
+        let right = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &right_cpu);
+
+        let actual = left.multiply_out_of_place(&right);
+
+        assert_eq!(actual.size(), (1, 4));
+        assert_eq!(actual.to_cpu_matrix(), expected);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_thin_row_matrix_multiply_batch_matches_cpu_with_inner_tail() {
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(32, 2, 28, 8);
+        let gpu_params = gpu_params_from_cpu(&cpu_params);
+        let mut random = rng();
+        let mut expected = Vec::new();
+        let mut inputs = Vec::new();
+        for _ in 0..3 {
+            let left_cpu = random_cpu_matrix(&cpu_params, 1, 82, &mut random);
+            let right_cpu = random_cpu_matrix(&cpu_params, 82, 5, &mut random);
+            expected.push(&left_cpu * &right_cpu);
+            inputs.push((
+                Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &left_cpu)),
+                Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &right_cpu)),
+            ));
+        }
+
+        let actual = GpuDCRTPolyMatrix::multiply_batch_out_of_place(inputs);
+
+        assert_eq!(actual.len(), 3);
+        assert!(actual.iter().all(|matrix| matrix.size() == (1, 5)));
+        assert_eq!(
+            actual.iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]

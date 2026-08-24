@@ -20,6 +20,8 @@ namespace
     constexpr int kMatmulTileM = GPU_MATMUL_TILE_M;
     constexpr int kMatmulTileN = GPU_MATMUL_TILE_N;
     constexpr int kMatmulTileK = GPU_MATMUL_TILE_K;
+    constexpr int kThinMatmulWarpSize = 32;
+    constexpr int kThinMatmulColumnsPerBlock = 4;
     constexpr size_t kMatmulMaxGridZ = 65535;
     static_assert(kMatmulTileM > 0 && kMatmulTileN > 0 && kMatmulTileK > 0, "invalid matmul tile size");
     static_assert(kMatmulTileM * kMatmulTileN <= 1024, "matmul tile thread count exceeds CUDA limit");
@@ -286,6 +288,74 @@ namespace
         }
     }
 
+    __global__ void block_thin_row_matmul_kernel(
+        const uint8_t *lhs_base,
+        const uint8_t *rhs_base,
+        uint8_t *out_base,
+        size_t inner,
+        size_t cols,
+        size_t n,
+        size_t lhs_stride_bytes,
+        size_t rhs_stride_bytes,
+        size_t out_stride_bytes,
+        uint8_t lhs_coeff_bytes,
+        uint8_t rhs_coeff_bytes,
+        uint8_t out_coeff_bytes,
+        uint64_t modulus,
+        uint64_t reciprocal)
+    {
+        const size_t col =
+            static_cast<size_t>(blockIdx.x) * kThinMatmulColumnsPerBlock + threadIdx.y;
+        if (col >= cols)
+        {
+            return;
+        }
+
+        const int lane = static_cast<int>(threadIdx.x);
+        for (size_t coeff_idx = static_cast<size_t>(blockIdx.z);
+             coeff_idx < n;
+             coeff_idx += static_cast<size_t>(gridDim.z))
+        {
+            uint64_t acc = 0;
+            for (size_t k = static_cast<size_t>(lane); k < inner; k += kThinMatmulWarpSize)
+            {
+                const uint64_t lhs = matrix_load_limb_u64(
+                    lhs_base,
+                    k,
+                    coeff_idx,
+                    lhs_stride_bytes,
+                    lhs_coeff_bytes);
+                const uint64_t rhs = matrix_load_limb_u64(
+                    rhs_base,
+                    k * cols + col,
+                    coeff_idx,
+                    rhs_stride_bytes,
+                    rhs_coeff_bytes);
+                acc = add_mod_u64(
+                    acc,
+                    mul_mod_barrett_u32(lhs, rhs, modulus, reciprocal),
+                    modulus);
+            }
+            for (int offset = kThinMatmulWarpSize / 2; offset > 0; offset /= 2)
+            {
+                acc = add_mod_u64(
+                    acc,
+                    __shfl_down_sync(0xffffffffu, acc, offset),
+                    modulus);
+            }
+            if (lane == 0)
+            {
+                matrix_store_limb_u64(
+                    out_base,
+                    col,
+                    coeff_idx,
+                    out_stride_bytes,
+                    out_coeff_bytes,
+                    acc);
+            }
+        }
+    }
+
     size_t align_up_size(size_t value, size_t alignment)
     {
         if (alignment == 0)
@@ -436,28 +506,56 @@ namespace
             return 0;
         }
 
-        const dim3 threads(kMatmulTileN, kMatmulTileM);
         const size_t grid_z = n < kMatmulMaxGridZ ? n : kMatmulMaxGridZ;
-        const dim3 blocks(
-            static_cast<unsigned int>((cols + kMatmulTileN - 1) / kMatmulTileN),
-            static_cast<unsigned int>((rows + kMatmulTileM - 1) / kMatmulTileM),
-            static_cast<unsigned int>(grid_z));
-
-        block_matmul_kernel<<<blocks, threads, 0, stream>>>(
-            lhs_base,
-            rhs_base,
-            out_base,
-            rows,
-            inner,
-            cols,
-            n,
-            lhs_stride_bytes,
-            rhs_stride_bytes,
-            out_stride_bytes,
-            lhs_coeff_bytes,
-            rhs_coeff_bytes,
-            out_coeff_bytes,
-            modulus);
+        uint64_t reciprocal = 0;
+        if (rows == 1 && matrix_barrett_u32_reciprocal(modulus, &reciprocal))
+        {
+            const dim3 threads(kThinMatmulWarpSize, kThinMatmulColumnsPerBlock);
+            const dim3 blocks(
+                static_cast<unsigned int>(
+                    (cols + kThinMatmulColumnsPerBlock - 1) /
+                    kThinMatmulColumnsPerBlock),
+                1,
+                static_cast<unsigned int>(grid_z));
+            block_thin_row_matmul_kernel<<<blocks, threads, 0, stream>>>(
+                lhs_base,
+                rhs_base,
+                out_base,
+                inner,
+                cols,
+                n,
+                lhs_stride_bytes,
+                rhs_stride_bytes,
+                out_stride_bytes,
+                lhs_coeff_bytes,
+                rhs_coeff_bytes,
+                out_coeff_bytes,
+                modulus,
+                reciprocal);
+        }
+        else
+        {
+            const dim3 threads(kMatmulTileN, kMatmulTileM);
+            const dim3 blocks(
+                static_cast<unsigned int>((cols + kMatmulTileN - 1) / kMatmulTileN),
+                static_cast<unsigned int>((rows + kMatmulTileM - 1) / kMatmulTileM),
+                static_cast<unsigned int>(grid_z));
+            block_matmul_kernel<<<blocks, threads, 0, stream>>>(
+                lhs_base,
+                rhs_base,
+                out_base,
+                rows,
+                inner,
+                cols,
+                n,
+                lhs_stride_bytes,
+                rhs_stride_bytes,
+                out_stride_bytes,
+                lhs_coeff_bytes,
+                rhs_coeff_bytes,
+                out_coeff_bytes,
+                modulus);
+        }
 
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)

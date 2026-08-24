@@ -1340,7 +1340,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         applied_event: super::g0::EventIndex,
         coefficient: &BigInt,
         relation_bound: &NumericContract<CoefficientBound>,
-        relation_expression: Option<ExprId>,
+        relation_type: Option<ResolvedMatrixType>,
         left_context: Option<MonomialId>,
         suffix_context: Option<MonomialId>,
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
@@ -1374,19 +1374,17 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             }
             return Ok(relation_bound.clone());
         }
-        let Some(relation_expression) = relation_expression else {
-            return Ok(relation_bound.clone());
-        };
-        let ResolvedValueType::Matrix(relation_type) =
-            self.expressions.value_type(relation_expression)?
-        else {
+        let Some(relation_type) = relation_type else {
+            if S::ENABLED {
+                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+            }
             return Ok(NumericContract::Missing);
         };
         let NumericContract::Known(relation_value) = relation_bound else {
             return Ok(relation_bound.clone());
         };
         let mut current_typed = CanonicalMatrixBound {
-            matrix_type: concrete_type(relation_type),
+            matrix_type: concrete_type(&relation_type),
             coefficient_class: canonical_class(relation_value),
         };
         let mut current_bound = relation_bound.clone();
@@ -4052,13 +4050,17 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 }
             };
             if nonzero_summary {
+                let relation_type = match self.expressions.value_type(input)? {
+                    ResolvedValueType::Matrix(matrix) => Some(matrix.clone()),
+                    _ => None,
+                };
                 let contextual_bound = self.append_contextual_relation_evidence(
                     owner,
                     evidence,
                     applied_event.unwrap_or(super::g0::EventIndex(0)),
                     &coefficient,
                     &summary_noise,
-                    Some(input),
+                    relation_type,
                     left,
                     suffix,
                 )?;
@@ -4154,13 +4156,17 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 }
             };
             if nonzero_summary {
+                let relation_type = match self.expressions.value_type(input)? {
+                    ResolvedValueType::Matrix(matrix) => Some(matrix.clone()),
+                    _ => None,
+                };
                 let contextual_bound = self.append_contextual_relation_evidence(
                     Some(owner),
                     evidence,
                     applied_event.unwrap_or(super::g0::EventIndex(0)),
                     coefficient,
                     &relation_bound,
-                    Some(input),
+                    relation_type,
                     left,
                     suffix,
                 )?;
@@ -4318,18 +4324,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 &rhs.bounded_summary.coefficient_bound(),
                 coefficient.magnitude(),
             );
-            let has_left_context =
-                !(relation_match.remaining_central.is_empty() && relation_match.prefix.is_empty());
-            let has_suffix_context = !relation_match.suffix.is_empty();
-            if rhs_noise != NumericContract::Known(CoefficientBound::ExactZero) {
-                // A summary has no multiplicative identity. It may be preserved only when the
-                // relation replaces the complete monomial without an exact prefix or suffix.
-                if has_left_context || has_suffix_context {
-                    return Err(NormalizeError::Relation(
-                        RelationRegistryError::InvalidCanonicalRhs,
-                    ));
-                }
-            }
             changed = true;
             self.counters.relation_candidates = self.counters.relation_candidates.saturating_add(1);
             self.counters.relation_applied = self.counters.relation_applied.saturating_add(1);
@@ -4355,49 +4349,57 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     &relation_match.suffix,
                 )?)
             };
-            if S::ENABLED {
-                let key = relation_match
-                    .key
-                    .clone()
-                    .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
-                let source = relation_match
-                    .source
-                    .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
-                let lhs = relation_match
-                    .lhs
-                    .clone()
-                    .ok_or(NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs))?;
-                let applied_event = self.observe_applied_relation(super::g0::AppliedRelation {
-                    owner,
-                    source_monomial: monomial,
-                    outer_coefficient: coefficient.clone(),
-                    ordered_start: relation_match.ordered_start,
-                    ordered_end_exclusive: relation_match.ordered_end_exclusive,
-                    rule: super::g0::AppliedRelationRule::Universal {
-                        key,
-                        source,
-                        lhs,
-                        rhs: relation_match.rhs,
-                    },
-                })?;
-                if rhs_noise != NumericContract::Known(CoefficientBound::ExactZero) {
-                    let NumericContract::Known(CoefficientBound::Finite(_)) = rhs_noise else {
-                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
-                    };
-                    self.append_contextual_relation_evidence(
-                        Some(owner),
-                        evidence,
-                        applied_event,
-                        &coefficient,
-                        &rhs_noise,
-                        None,
-                        None,
-                        None,
-                    )?;
-                }
-            }
+            let applied_event =
+                if S::ENABLED {
+                    let key = relation_match.key.clone().ok_or(NormalizeError::Relation(
+                        RelationRegistryError::InvalidCanonicalRhs,
+                    ))?;
+                    let source = relation_match.source.ok_or(NormalizeError::Relation(
+                        RelationRegistryError::InvalidCanonicalRhs,
+                    ))?;
+                    let lhs = relation_match.lhs.clone().ok_or(NormalizeError::Relation(
+                        RelationRegistryError::InvalidCanonicalRhs,
+                    ))?;
+                    Some(self.observe_applied_relation(super::g0::AppliedRelation {
+                        owner,
+                        source_monomial: monomial,
+                        outer_coefficient: coefficient.clone(),
+                        ordered_start: relation_match.ordered_start,
+                        ordered_end_exclusive: relation_match.ordered_end_exclusive,
+                        rule: super::g0::AppliedRelationRule::Universal {
+                            key,
+                            source,
+                            lhs,
+                            rhs: relation_match.rhs,
+                        },
+                    })?)
+                } else {
+                    None
+                };
             if rhs_noise != NumericContract::Known(CoefficientBound::ExactZero) {
-                relation_noise = add_noise_summaries(&relation_noise, &rhs_noise);
+                if matches!(
+                    rhs_noise,
+                    NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing
+                ) && S::ENABLED
+                {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                }
+                let relation_type = rhs
+                    .exact_terms
+                    .keys()
+                    .next()
+                    .and_then(|monomial| self.monomial_matrix_type(*monomial));
+                let contextual_bound = self.append_contextual_relation_evidence(
+                    Some(owner),
+                    evidence,
+                    applied_event.unwrap_or(super::g0::EventIndex(0)),
+                    &coefficient,
+                    &rhs_noise,
+                    relation_type,
+                    left,
+                    suffix,
+                )?;
+                relation_noise = add_noise_summaries(&relation_noise, &contextual_bound);
             }
             let mut recombined = Vec::with_capacity(rhs.exact_terms.len());
             for (rhs_monomial, rhs_coefficient) in &rhs.exact_terms {
@@ -4984,6 +4986,27 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             return Ok(NumericContract::Missing);
         };
         Ok(NumericContract::Known(product))
+    }
+
+    fn monomial_matrix_type(&self, monomial: MonomialId) -> Option<ResolvedMatrixType> {
+        let descriptor = self.monomials.descriptor(monomial).ok()?;
+        let mut factors =
+            descriptor.central_factors.iter().chain(descriptor.ordered_factors.iter());
+        let first = factors.next()?.expression();
+        let ResolvedValueType::Matrix(mut matrix_type) =
+            self.expressions.value_type(first).ok()?.clone()
+        else {
+            return None;
+        };
+        for factor in factors {
+            let ResolvedValueType::Matrix(right) =
+                self.expressions.value_type(factor.expression()).ok()?.clone()
+            else {
+                return None;
+            };
+            matrix_type = checked_matrix_product_output(&matrix_type, &right)?;
+        }
+        Some(matrix_type)
     }
 
     /// Resolve the compact value-level transfer for one exact factor.  A released child may no
@@ -13245,7 +13268,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_contextual_specialization_rolls_back_runtime_entry_for_retry() {
+    fn contextual_specialization_replays_with_prefix_context() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let matrix = matrix_type();
@@ -13342,14 +13365,21 @@ mod tests {
         relations.register_universal(registration).unwrap();
         relations.freeze();
 
-        // The extra prefix is an intentional semantic context: the finite RHS summary cannot
-        // be spliced into it, so specialization succeeds before the normalizer rejects it.
+        // The extra prefix is an intentional semantic context.  The Universal relation now
+        // preserves it through the shared contextual evidence helper.
         let prefix = gaussian_factor(&mut expressions, matrix.clone(), 99_927, 2);
-        let root = product(&mut expressions, &[prefix, public_call, preimage_call]);
+        let suffix = gaussian_factor(&mut expressions, matrix.clone(), 99_928, 2);
+        let root = product(&mut expressions, &[prefix, public_call, preimage_call, suffix]);
         let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut ordinary_cache = NormalizationCache::new();
+        let mut ordinary_normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                .unwrap()
+                .with_relations(&relations, &mut ordinary_cache);
+        let ordinary = ordinary_normalizer.normalize(semantic).unwrap();
+        let ordinary_counters = ordinary_normalizer.counters();
+        drop(ordinary_normalizer);
         let mut cache = NormalizationCache::new();
-        let baseline_rhs = cache.canonical_rhs_count();
-        let baseline_runtime = cache.runtime_entry_count();
         let mut trace = FeasibilityTrace::default();
         let mut normalizer = Normalizer::new_with_sink(
             &mut expressions,
@@ -13360,29 +13390,80 @@ mod tests {
         )
         .unwrap()
         .with_relations(&relations, &mut cache);
-        let expected = NormalizeError::Relation(RelationRegistryError::InvalidCanonicalRhs);
-        assert!(matches!(normalizer.normalize(semantic), Err(error) if error == expected));
+        let first = normalizer.normalize(semantic).unwrap();
+        let first_events = normalizer.sink.as_deref().unwrap().normalization_events().to_vec();
+        let first_counters = normalizer.counters();
+        let second = normalizer.normalize(semantic).unwrap();
+        let second_counters = normalizer.counters();
+        let all_events = normalizer.sink.as_deref().unwrap().normalization_events().to_vec();
         drop(normalizer);
-        assert_eq!(cache.runtime_entry_count(), baseline_runtime);
-        let first_rhs_count = cache.canonical_rhs_count();
-        let first_rhs_fingerprint = cache.canonical_state_fingerprint();
-        assert!(first_rhs_count > baseline_rhs);
-        assert!(trace.normalization_events().is_empty());
-        let mut normalizer = Normalizer::new_with_sink(
-            &mut expressions,
-            &programs,
-            &facts,
-            &mut monomials,
-            &mut trace,
-        )
-        .unwrap()
-        .with_relations(&relations, &mut cache);
-        assert!(matches!(normalizer.normalize(semantic), Err(error) if error == expected));
-        drop(normalizer);
-        assert_eq!(cache.runtime_entry_count(), baseline_runtime);
-        assert_eq!(cache.canonical_rhs_count(), first_rhs_count);
-        assert_eq!(cache.canonical_state_fingerprint(), first_rhs_fingerprint);
-        assert!(trace.normalization_events().is_empty());
+        assert_eq!(first.semantic, second.semantic);
+        assert_eq!(first.exact_nf, second.exact_nf);
+        assert_eq!(first.coefficient_bound, second.coefficient_bound);
+        assert_eq!(first_counters, second_counters);
+        assert_eq!(first.semantic, ordinary.semantic);
+        assert_eq!(first.exact_nf, ordinary.exact_nf);
+        assert_eq!(first.coefficient_bound, ordinary.coefficient_bound);
+        assert_eq!(first_counters, ordinary_counters);
+        assert!(
+            first_events
+                .iter()
+                .any(|event| { matches!(event, NormalizerEvent::SpecializationComputed { .. }) })
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|event| { matches!(event, NormalizerEvent::SpecializationCacheHit { .. }) })
+        );
+        let applied = all_events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::AppliedRelation(observation)
+                    if matches!(observation.rule, AppliedRelationRule::Universal { .. }) =>
+                {
+                    Some(EventIndex(index as u64))
+                }
+                _ => None,
+            })
+            .expect("contextual universal relation application");
+        let contextual_products = all_events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: rule @ BoundRule::Product { .. },
+                } if bound_rule_has_transfer(rule, applied) => {
+                    Some((EventIndex(index as u64), *owner))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contextual_products.len(), 1);
+        let left_product = contextual_products[0].0;
+        let relation_result =
+            all_events.iter().enumerate().find_map(|(index, event)| match event {
+                NormalizerEvent::Result { owner, .. }
+                    if *owner == contextual_products[0].1 && index > left_product.0 as usize =>
+                {
+                    Some(EventIndex(index as u64))
+                }
+                _ => None,
+            });
+        let relation_result = relation_result.expect("contextual relation result");
+        assert!(all_events.iter().enumerate().any(|(index, event)| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer {
+                    rule: BoundRule::Product { left, .. },
+                    ..
+                } if index > relation_result.0 as usize &&
+                    matches!(left, BoundValueRef::Result { event, projection: BoundProjection::Summary } if *event == relation_result)
+            )
+        }));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        trace.validate_normalization_observations_with_state(&monomials, &cache).unwrap();
     }
 
     fn bound_rule_has_transfer(rule: &BoundRule, event: EventIndex) -> bool {

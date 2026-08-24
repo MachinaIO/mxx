@@ -4,6 +4,7 @@ defaultTargets = [
   "Mxx.Certificate.OperationalNoise.Fixtures",
   "Mxx.Certificate.OperationalNoise.BoundReplay",
   "Mxx.Certificate.OperationalNoise.OperatorReplay",
+  "Mxx.Certificate.OperationalNoise.ContractReplay",
   "Mxx.Certificate.OperationalNoise.G2Fixtures",
   "Mxx.Certificate.OperationalNoise.SchemaV1Fixtures",
 ]

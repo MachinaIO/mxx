@@ -1,4 +1,4 @@
-import Mxx.Certificate.OperationalNoise.OperatorReplay
+import Mxx.Certificate.OperationalNoise.ContractReplay
 
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
@@ -310,6 +310,38 @@ theorem g2b_operator_replay :
     by decide, productBound, tensorBound,
     routesCoefficients_bound routeInputBound g2b_route_exact⟩
 
+theorem g2c_contract_replay :
+    recordedFiniteContract 0 = .exactZero ∧
+      recordedFiniteContract 5 = g2aFinite5 ∧
+      uniformIntervalMaximum (-1) 1 = 1 ∧
+      uniformIntervalMaximum 0 1 = 1 ∧
+      uniformIntervalContract 17 (-1) 1 = some (.finite ⟨1, by decide⟩) ∧
+      uniformIntervalContract 2 (-1) 1 = some .large ∧
+      uniformIntervalContract 17 1 (-1) = none ∧
+      (recordedFiniteContract 0).Interprets 0 ∧
+      (recordedFiniteContract 5).Interprets 4 ∧
+      trapdoorSamplerContract = .large ∧
+      trapdoorSamplerContract ≠ recordedFiniteContract 5 ∧
+      regularGadgetContract 1 = none ∧
+      regularGadgetContract 2 = some (.finite ⟨1, by decide⟩) ∧
+      regularGadgetContract 3 = some (.finite ⟨1, by decide⟩) ∧
+      regularGadgetContract 4 = some g2aFinite2 ∧
+      (recordedFiniteContract 2).Interprets (-2 : Int).natAbs ∧
+      (recordedFiniteContract 5).Interprets 3 := by
+  have gaussianZero : (recordedFiniteContract 0).Interprets 0 :=
+    gaussianCutoff_sound (by decide)
+  have preimageFour : (recordedFiniteContract 5).Interprets 4 :=
+    preimageCutoff_sound (by decide)
+  have gadgetDigit : (recordedFiniteContract 2).Interprets (-2 : Int).natAbs :=
+    (regularGadgetContract_sound (base := 4) (digit := -2) (by decide) (by decide)).2
+  exact ⟨by decide, by decide, by decide, by decide, by decide, by decide, by decide,
+    factStoreAuthority_sound (contract := some (recordedFiniteContract 0)) rfl gaussianZero,
+    programFamilyFactAuthority_sound (contract := some (recordedFiniteContract 5))
+      rfl preimageFour,
+    by decide, by decide, by decide, by decide, by decide, by decide,
+    gadgetDigit,
+    relationPreimageSourceAuthority_sound (sourceCutoff := some 5) rfl (by decide)⟩
+
 #print axioms g2_four_role_product_kernel
 #print axioms operatorProductContribution_natAbs_le
 #print axioms g2_replay_composition
@@ -330,5 +362,15 @@ theorem g2b_operator_replay :
 #print axioms scaleCoefficient_bound
 #print axioms routesCoefficients_bound
 #print axioms g2b_operator_replay
+#print axioms recordedFiniteContract_sound
+#print axioms uniformIntervalContract_sound
+#print axioms gaussianCutoff_sound
+#print axioms preimageCutoff_sound
+#print axioms trapdoorSamplerContract_sound
+#print axioms regularGadgetContract_sound
+#print axioms factStoreAuthority_sound
+#print axioms programFamilyFactAuthority_sound
+#print axioms relationPreimageSourceAuthority_sound
+#print axioms g2c_contract_replay
 
 end Mxx.Certificate.OperationalNoise.EventReplay

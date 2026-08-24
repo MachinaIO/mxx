@@ -188,7 +188,6 @@ struct ProductGadgetSplice {
     input_nf: Arc<PolynomialNF>,
     next_after: Option<MonomialId>,
     coefficient: BigInt,
-    summary_pending: bool,
 }
 
 enum ProductWorkItem {
@@ -3703,12 +3702,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         while let Some(item) = worklist.pop_front() {
             let ProductWorkItem::Term(monomial, coefficient) = item else {
                 let ProductWorkItem::GadgetSplice(mut splice) = item else { unreachable!() };
-                if S::ENABLED &&
-                    splice.summary_pending &&
-                    !splice.input_nf.bounded_summary.is_zero()
-                {
-                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
-                }
                 let lower = splice
                     .next_after
                     .map(std::ops::Bound::Excluded)
@@ -3720,17 +3713,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     .take(self.gadget_splice_batch_terms.max(1))
                     .map(|(&monomial, coefficient)| (monomial, coefficient.clone()))
                     .collect::<Vec<_>>();
-                let has_more = input_terms.next().is_some();
                 if batch.is_empty() {
-                    if splice.summary_pending {
-                        *noise = add_noise_summaries(
-                            noise,
-                            &scale_noise_summary(
-                                &splice.input_nf.bounded_summary.coefficient_bound(),
-                                splice.coefficient.magnitude(),
-                            ),
-                        );
-                    }
                     continue;
                 }
                 let input_monomials =
@@ -3747,17 +3730,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     });
                 }
                 let outer_coefficient = splice.coefficient.clone();
-                if has_more {
+                if input_terms.next().is_some() {
                     splice.next_after = batch.last().map(|(monomial, _)| *monomial);
                     worklist.push_front(ProductWorkItem::GadgetSplice(splice));
-                } else if splice.summary_pending {
-                    *noise = add_noise_summaries(
-                        noise,
-                        &scale_noise_summary(
-                            &splice.input_nf.bounded_summary.coefficient_bound(),
-                            splice.coefficient.magnitude(),
-                        ),
-                    );
                 }
                 for ((_, input_coefficient), replacement) in
                     batch.into_iter().zip(replacements).rev()
@@ -3772,7 +3747,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             if coefficient.is_zero() {
                 continue;
             }
-            let Some(splice) = self.product_gadget_splice(monomial, coefficient.clone())? else {
+            let Some(splice) =
+                self.product_gadget_splice(owner, monomial, coefficient.clone(), noise, evidence)?
+            else {
                 self.merge_product_result_early(
                     owner,
                     monomial,
@@ -3891,8 +3868,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
 
     fn product_gadget_splice(
         &mut self,
+        owner: Option<ScopedExprId>,
         monomial: MonomialId,
         coefficient: BigInt,
+        noise: &mut NumericContract<CoefficientBound>,
+        evidence: &mut Option<BoundValueRef>,
     ) -> Result<Option<ProductGadgetSplice>, NormalizeError> {
         let (central_factors, ordered_factors) = {
             let descriptor = self.monomials.descriptor(monomial)?;
@@ -3907,6 +3887,18 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
             let has_left_context = !central_factors.is_empty() || index != 0;
             let has_suffix_context = index + 2 != ordered_factors.len();
+            let summary_noise = scale_noise_summary(
+                &input_nf.bounded_summary.coefficient_bound(),
+                coefficient.magnitude(),
+            );
+            if S::ENABLED &&
+                matches!(
+                    summary_noise,
+                    NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing
+                )
+            {
+                return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+            }
             if !input_nf.bounded_summary.is_zero() && (has_left_context || has_suffix_context) {
                 return Err(NormalizeError::InvalidExactPlan {
                     reason: "gadget input noise summary cannot be recombined with an exact prefix or suffix",
@@ -3933,8 +3925,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 )?)
             };
             if S::ENABLED {
+                let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
                 let input_result = self.relation_input_result(input)?;
-                self.observe_applied_relation(super::g0::AppliedRelation {
+                let applied_event = self.observe_applied_relation(super::g0::AppliedRelation {
                     owner: ordered_factors[index + 1],
                     source_monomial: monomial,
                     outer_coefficient: coefficient.clone(),
@@ -3955,14 +3948,37 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         input_result,
                     },
                 })?;
+                let nonzero_summary = match &summary_noise {
+                    NumericContract::Known(CoefficientBound::ExactZero) => false,
+                    NumericContract::Known(CoefficientBound::Finite(value)) => {
+                        !value.maximum_absolute_coefficient.is_zero()
+                    }
+                    NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into())
+                    }
+                };
+                if nonzero_summary {
+                    let mut relation_evidence = BoundValueRef::Transfer(applied_event);
+                    if coefficient.magnitude() != &BigUint::from(1_u8) {
+                        let scale_event = self.observe_bound_transfer(
+                            owner,
+                            BoundRule::Scale {
+                                value: relation_evidence,
+                                scale: BoundScale::Magnitude(coefficient.magnitude().clone()),
+                            },
+                        )?;
+                        relation_evidence = BoundValueRef::Transfer(scale_event);
+                    }
+                    self.append_summary_evidence(owner, evidence, relation_evidence)?;
+                }
             }
+            *noise = add_noise_summaries(noise, &summary_noise);
             return Ok(Some(ProductGadgetSplice {
                 left,
                 suffix,
                 input_nf,
                 next_after: None,
                 coefficient,
-                summary_pending: true,
             }));
         }
         Ok(None)
@@ -3975,6 +3991,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         &mut self,
         monomial: MonomialId,
         outer_coefficient: Option<&BigInt>,
+        evidence: &mut Option<BoundValueRef>,
     ) -> Result<Option<PolynomialNF>, NormalizeError> {
         let (central_factors, ordered_factors) = {
             let descriptor = self.monomials.descriptor(monomial)?;
@@ -3987,30 +4004,25 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             let Some(input) = self.authorized_gadget_pair_input(gadget, decomposition)? else {
                 continue;
             };
-            let Some(normal_form) =
-                self.splice_gadget_decomposition(&central_factors, &ordered_factors, index, input)?
+            let coefficient = outer_coefficient.ok_or(NormalizeError::InvalidExactPlan {
+                reason: "missing gadget relation coefficient",
+            })?;
+            let Some(normal_form) = self.splice_gadget_decomposition(
+                &central_factors,
+                &ordered_factors,
+                index,
+                input,
+                coefficient,
+            )?
             else {
                 return Ok(None);
             };
             if S::ENABLED {
-                let summary_factor = outer_coefficient
-                    .map_or(BigUint::from(1_u8), |coefficient| coefficient.magnitude().clone());
-                let summary_noise = scale_noise_summary(
-                    &normal_form.bounded_summary.coefficient_bound(),
-                    &summary_factor,
-                );
-                if summary_noise != NumericContract::Known(CoefficientBound::ExactZero) {
-                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
-                }
                 let input_result = self.relation_input_result(input)?;
-                self.observe_applied_relation(super::g0::AppliedRelation {
+                let applied_event = self.observe_applied_relation(super::g0::AppliedRelation {
                     owner: decomposition,
                     source_monomial: monomial,
-                    outer_coefficient: outer_coefficient.cloned().ok_or(
-                        NormalizeError::InvalidExactPlan {
-                            reason: "missing gadget relation coefficient",
-                        },
-                    )?,
+                    outer_coefficient: coefficient.clone(),
                     ordered_start: u32::try_from(index).map_err(|_| {
                         NormalizeError::InvalidExactPlan {
                             reason: "gadget relation index overflow",
@@ -4028,6 +4040,29 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         input_result,
                     },
                 })?;
+                let nonzero_summary = match normal_form.bounded_summary.coefficient_bound() {
+                    NumericContract::Known(CoefficientBound::ExactZero) => false,
+                    NumericContract::Known(CoefficientBound::Finite(value)) => {
+                        !value.maximum_absolute_coefficient.is_zero()
+                    }
+                    NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into())
+                    }
+                };
+                if nonzero_summary {
+                    let mut relation_evidence = BoundValueRef::Transfer(applied_event);
+                    if coefficient.magnitude() != &BigUint::from(1_u8) {
+                        let scale_event = self.observe_bound_transfer(
+                            decomposition,
+                            BoundRule::Scale {
+                                value: relation_evidence,
+                                scale: BoundScale::Magnitude(coefficient.magnitude().clone()),
+                            },
+                        )?;
+                        relation_evidence = BoundValueRef::Transfer(scale_event);
+                    }
+                    self.append_summary_evidence(decomposition, evidence, relation_evidence)?;
+                }
             }
             return Ok(Some(normal_form));
         }
@@ -4043,6 +4078,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         ordered_factors: &[ScopedExprId],
         index: usize,
         input: ExprId,
+        coefficient: &BigInt,
     ) -> Result<Option<PolynomialNF>, NormalizeError> {
         // `D(A)` itself is an atom in the child NF, but the identity exposes the already
         // normalized polynomial NF of `A`, not the raw input expression. The use-count hold
@@ -4098,7 +4134,10 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
         Ok(Some(PolynomialNF {
             exact_terms: terms,
-            bounded_summary: input_nf.bounded_summary.clone(),
+            bounded_summary: BoundedSummary::from_contract(scale_noise_summary(
+                &input_nf.bounded_summary.coefficient_bound(),
+                coefficient.magnitude(),
+            ))?,
         }))
     }
 
@@ -4144,15 +4183,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             }
             // Relation RHS splices can create a new gadget/decomposition adjacency, so ordinary
             // gadget closure must run on every item returned to this worklist.
-            if let Some(rewritten) =
-                self.rewrite_gadget_decomposition(monomial, S::ENABLED.then_some(&coefficient))?
-            {
+            if let Some(rewritten) = self.rewrite_gadget_decomposition(
+                monomial,
+                S::ENABLED.then_some(&coefficient),
+                evidence,
+            )? {
                 changed = true;
-                let rewritten_noise = scale_noise_summary(
+                relation_noise = add_noise_summaries(
+                    &relation_noise,
                     &rewritten.bounded_summary.coefficient_bound(),
-                    coefficient.magnitude(),
                 );
-                relation_noise = add_noise_summaries(&relation_noise, &rewritten_noise);
                 for (rewritten_monomial, rewritten_coefficient) in
                     rewritten.exact_terms.into_iter().rev()
                 {
@@ -7380,78 +7420,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_gadget_summary_rejects_before_destination_mutation() {
-        let mut expressions = ExprArena::new();
-        let mut programs = ProgramArena::new();
-        let root = source_with(&mut expressions, matrix_type(), 96_005);
-        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
-        let input_nf = PolynomialNF {
-            exact_terms: BTreeMap::new(),
-            bounded_summary: BoundedSummary::finite(BoundExpression::new(BigUint::from(3_u8))),
-        };
-        let splice = || {
-            ProductWorkItem::GadgetSplice(ProductGadgetSplice {
-                left: None,
-                suffix: None,
-                input_nf: Arc::new(input_nf.clone()),
-                next_after: None,
-                coefficient: BigInt::from(1_u8),
-                summary_pending: true,
-            })
-        };
-
-        let (ordinary_terms, ordinary_noise) = {
-            let mut normalizer =
-                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
-            let mut terms = BTreeMap::new();
-            let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
-            let mut evidence = None;
-            let mut worklist = VecDeque::from([splice()]);
-            normalizer
-                .drain_product_worklist(None, &mut terms, &mut noise, &mut evidence, &mut worklist)
-                .unwrap();
-            (terms, noise)
-        };
-        assert!(ordinary_terms.is_empty());
-        assert_eq!(ordinary_noise, NumericContract::Known(CoefficientBound::finite(3_u8)));
-
-        let mut trace = FeasibilityTrace::default();
-        let before_len = monomials.len();
-        let before_occupied = monomials.occupied_len();
-        let error = {
-            let mut normalizer = Normalizer::new_with_sink(
-                &mut expressions,
-                &programs,
-                &facts,
-                &mut monomials,
-                &mut trace,
-            )
-            .unwrap();
-            let mut terms = BTreeMap::new();
-            let mut noise = NumericContract::Known(CoefficientBound::ExactZero);
-            let mut evidence = None;
-            let mut worklist = VecDeque::from([splice()]);
-            let error = normalizer
-                .drain_product_worklist(
-                    Some(semantic),
-                    &mut terms,
-                    &mut noise,
-                    &mut evidence,
-                    &mut worklist,
-                )
-                .unwrap_err();
-            assert!(terms.is_empty());
-            assert_eq!(noise, NumericContract::Known(CoefficientBound::ExactZero));
-            assert!(evidence.is_none());
-            assert_eq!(normalizer.monomials.len(), before_len);
-            assert_eq!(normalizer.monomials.occupied_len(), before_occupied);
-            error
-        };
-        assert_eq!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer));
-    }
-
-    #[test]
-    fn actual_gadget_pair_summary_rejects_before_destination_mutation() {
+    fn actual_gadget_pair_summary_records_transfer_without_context() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let modulus = BigUint::from(17_u8);
@@ -7470,7 +7439,7 @@ mod tests {
         let root = expressions
             .intern_matrix_transform(MatrixOperation::Multiply, &[gadget, decomposition])
             .unwrap();
-        let (mut facts, mut monomials, _semantic) = setup(&mut expressions, &mut programs, root);
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
         for (expression, bound) in [(gadget, 2), (decomposition, 3), (input, 4)] {
             insert_matrix_bound(&mut facts, &expressions, expression, bound);
         }
@@ -7509,8 +7478,9 @@ mod tests {
                     .unwrap()
                     .with_gadget_recompositions(&registry);
             normalizer.insert_gadget_hold(input, input_nf.clone());
+            let mut evidence = None;
             let output = normalizer
-                .rewrite_gadget_decomposition(pair_monomial, Some(&coefficient))
+                .rewrite_gadget_decomposition(pair_monomial, Some(&coefficient), &mut evidence)
                 .unwrap()
                 .expect("typed gadget pair reaches the actual splice helper");
             assert_eq!(normalizer.monomials.len(), before_len);
@@ -7521,7 +7491,14 @@ mod tests {
         assert_eq!(ordinary_output.bounded_summary, input_nf.bounded_summary);
 
         let mut trace = FeasibilityTrace::default();
-        let error = {
+        trace.record_invocation_start(semantic).unwrap();
+        let input_value = AnalyzedValue {
+            semantic: scoped_input,
+            exact_nf: Some(input_nf.clone()),
+            coefficient_bound: input_nf.bounded_summary.coefficient_bound(),
+        };
+        trace.record_normalization_result(scoped_input, &input_value).unwrap();
+        let enabled_output = {
             let mut normalizer = Normalizer::new_with_sink(
                 &mut expressions,
                 &programs,
@@ -7531,17 +7508,26 @@ mod tests {
             )
             .unwrap()
             .with_gadget_recompositions(&registry);
-            normalizer.insert_gadget_hold(input, input_nf);
-            let error = normalizer
-                .rewrite_gadget_decomposition(pair_monomial, Some(&coefficient))
-                .unwrap_err();
+            normalizer.insert_gadget_hold(input, input_nf.clone());
+            let mut evidence = None;
+            let output = normalizer
+                .rewrite_gadget_decomposition(pair_monomial, Some(&coefficient), &mut evidence)
+                .unwrap()
+                .expect("typed gadget pair reaches the actual splice helper");
             assert_eq!(normalizer.counters(), ordinary_counters);
             assert_eq!(normalizer.monomials.len(), before_len);
             assert_eq!(normalizer.monomials.occupied_len(), before_occupied);
-            error
+            assert!(matches!(evidence, Some(BoundValueRef::Transfer(_))));
+            output
         };
-        assert_eq!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer));
-        assert!(trace.normalization_events().is_empty());
+        assert_eq!(enabled_output.exact_terms, input_nf.exact_terms);
+        assert_eq!(enabled_output.bounded_summary, input_nf.bounded_summary);
+        assert!(
+            trace.normalization_events().iter().any(|event| matches!(
+                event,
+                super::super::g0::NormalizerEvent::AppliedRelation(_)
+            ))
+        );
         assert_eq!(destination_before.exact_terms.len(), 1);
         assert!(destination_before.bounded_summary.is_zero());
     }

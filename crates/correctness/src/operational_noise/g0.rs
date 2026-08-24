@@ -2248,6 +2248,28 @@ impl FeasibilityTrace {
         for (index, event) in self.events.iter().enumerate() {
             let NormalizerEvent::AppliedRelation(observation) = event else { continue };
             let AppliedRelationRule::Universal { key, lhs, rhs, .. } = &observation.rule else {
+                let AppliedRelationRule::Gadget { input_result, .. } = &observation.rule else {
+                    continue;
+                };
+                let summary = match self.events.get(input_result.0 as usize) {
+                    Some(NormalizerEvent::Result {
+                        value: RecordedValue { exact_nf: Some(normal_form), .. },
+                        ..
+                    }) => normal_form.bounded_summary.coefficient_bound(),
+                    _ => return Err(G0Error::RelationTraceInvariant),
+                };
+                let requires_transfer = match summary {
+                    NumericContract::Known(CoefficientBound::ExactZero) => false,
+                    NumericContract::Known(CoefficientBound::Finite(value)) => {
+                        !value.maximum_absolute_coefficient.is_zero()
+                    }
+                    NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
+                        return Err(G0Error::RelationTraceInvariant)
+                    }
+                };
+                if requires_transfer && !consumed_by.contains(&(index as u64, observation.owner)) {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
                 continue;
             };
             let Some(entries) = normalization.runtime_get(key) else {

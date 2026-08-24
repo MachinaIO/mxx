@@ -195,6 +195,15 @@ source から certificate への canonical projection は監査対象の trusted
 Lean kernel の検査だけでは、選択された source が実際に運用した artifact と同一であること
 までは証明できない。
 
+certificate path は、正常な generator が生成した honest run の証明 artifact を対象とする。
+検証範囲は、(1) 通常の generator 出力の正当性、(2) Lean theorem が使う各事実について、記録した
+LHS、RHS、owner invocation、event が実際の Rust 計算と意味的に一致すること、(3) honest run に
+おける cache と frame の lifecycle が完全であること、(4) 不正な参照や dangling reference が
+panic を起こす前に拒否されるための最小限の構造検査、の四つに限定する。これは一般的な悪意ある
+certificate parser や、あらゆる偽造に対する網羅的な防御機構ではない。専用の mutation test や、
+witness の入れ替え・偽造を網羅的に拒否する検査はこの範囲に含めない。出力を無効にした場合は、
+既存 Rust checker の通常経路と性能を変えない。benchmark estimate はこの仕様の成果物に含めない。
+
 ### 6.2 Source artifact
 
 canonical source artifact は、certificate 用に追加する単一の canonical frozen-bundle serializer

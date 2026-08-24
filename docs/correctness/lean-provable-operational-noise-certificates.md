@@ -85,6 +85,16 @@ Statement-bearing certificate rows can change the theorem subject. The source-se
 source-to-certificate projection boundary is therefore audited trusted code; kernel checking alone
 does not prove that the selected source is the deployment intended by an operator.
 
+The certificate path is an honest-run proof artifact. Its validation scope is intentionally limited
+to four obligations: the correctness of output produced by the normal generator; the semantic
+correspondence, for every fact used by the Lean theorem, of the recorded LHS, RHS, owner invocation,
+and event with the actual Rust computation; complete cache and frame lifecycle for an honest run; and
+the structural checks needed to reject malformed or dangling references before they can cause a
+panic. This path is not a general adversarial certificate parser or an exhaustive anti-forgery
+mechanism. Dedicated mutation tests and exhaustive witness-swap or witness-forgery rejection are
+outside this scope. With emission disabled, the ordinary Rust checker path and its performance are
+unchanged. Benchmark estimates are not a deliverable of this specification.
+
 ### 4.2 Protocol-dependent audited data
 
 The canonical source artifact contains exactly the complete output of the single canonical

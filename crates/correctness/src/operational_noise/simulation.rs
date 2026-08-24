@@ -843,9 +843,7 @@ impl<'a> ProofPayloadProjector<'a> {
             ValueOperator::Matrix(
                 operation @ (MatrixOperation::Add | MatrixOperation::Subtract),
             ) |
-            ValueOperator::Matrix(
-                operation @ (MatrixOperation::Multiply | MatrixOperation::Tensor { .. }),
-            ) => operation.clone(),
+            ValueOperator::Matrix(operation @ MatrixOperation::Multiply) => operation.clone(),
             _ => return Err(G0Error::RelationTraceInvariant),
         };
         if observation.sources.len() != 2 {
@@ -864,7 +862,7 @@ impl<'a> ProofPayloadProjector<'a> {
         let expected = match operation {
             MatrixOperation::Add => right.clone(),
             MatrixOperation::Subtract => -right.clone(),
-            MatrixOperation::Multiply | MatrixOperation::Tensor { .. } => {
+            MatrixOperation::Multiply => {
                 let left = match trace.events.get(observation.sources[0].value_event.0 as usize) {
                     Some(NormalizerEvent::Result { value, .. }) |
                     Some(NormalizerEvent::InvocationEnd { result: value, .. }) => {
@@ -891,7 +889,7 @@ impl<'a> ProofPayloadProjector<'a> {
                     return Err(G0Error::RelationTraceInvariant);
                 }
             }
-            MatrixOperation::Multiply | MatrixOperation::Tensor { .. } => {
+            MatrixOperation::Multiply => {
                 let left = self.monomial(observation.sources[0].monomial)?;
                 let right = self.monomial(observation.sources[1].monomial)?;
                 let mut central_factors = left.central_factors;

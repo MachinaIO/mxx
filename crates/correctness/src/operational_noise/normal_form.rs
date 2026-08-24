@@ -192,7 +192,6 @@ struct ProductGadgetSplice {
 
 enum ProductWorkItem {
     Term(MonomialId, BigInt),
-    ObservedTerm(MonomialId, BigInt, [RecordedTermRef; 2]),
     GadgetSplice(ProductGadgetSplice),
 }
 
@@ -3810,9 +3809,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         )?;
         let mut evidence = None;
         let source_events = if S::ENABLED {
-            self.relation_input_result(left_expression)
-                .ok()
-                .zip(self.relation_input_result(right_expression).ok())
+            if owner.is_some() {
+                Some((
+                    self.relation_input_result(left_expression)?,
+                    self.relation_input_result(right_expression)?,
+                ))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -3853,25 +3857,28 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     continue;
                 }
                 let product = self.product_monomials(*left_id, *right_id)?;
-                if let Some((left_event, right_event)) = source_events {
-                    worklist.push_back(ProductWorkItem::ObservedTerm(
-                        product,
-                        coefficient,
-                        [
-                            RecordedTermRef { value_event: left_event, monomial: *left_id },
-                            RecordedTermRef { value_event: right_event, monomial: *right_id },
-                        ],
-                    ));
-                } else {
-                    worklist.push_back(ProductWorkItem::Term(product, coefficient));
-                }
+                worklist.push_back(ProductWorkItem::Term(product, coefficient));
+                let mut source_refs = source_events.map(|(left_event, right_event)| {
+                    [
+                        RecordedTermRef { value_event: left_event, monomial: *left_id },
+                        RecordedTermRef { value_event: right_event, monomial: *right_id },
+                    ]
+                });
                 // Drain each completed Cartesian pair before generating the next one. The same
                 // rewrite queue remains authoritative, but its live size follows one pair's
                 // recursive splice instead of the full product cardinality.
-                self.drain_product_worklist(owner, terms, noise, evidence, &mut worklist)?;
+                self.drain_product_worklist(
+                    owner,
+                    terms,
+                    noise,
+                    evidence,
+                    &mut source_refs,
+                    &mut worklist,
+                )?;
             }
         }
-        self.drain_product_worklist(owner, terms, noise, evidence, &mut worklist)
+        let mut no_sources = None;
+        self.drain_product_worklist(owner, terms, noise, evidence, &mut no_sources, &mut worklist)
     }
 
     fn drain_product_worklist<A: ExactTermAccumulator>(
@@ -3880,14 +3887,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
+        source_refs: &mut Option<[RecordedTermRef; 2]>,
         worklist: &mut VecDeque<ProductWorkItem>,
     ) -> Result<(), NormalizeError> {
         while let Some(item) = worklist.pop_front() {
-            let (monomial, coefficient, source_refs) = match item {
-                ProductWorkItem::Term(monomial, coefficient) => (monomial, coefficient, None),
-                ProductWorkItem::ObservedTerm(monomial, coefficient, sources) => {
-                    (monomial, coefficient, Some(sources))
-                }
+            let (monomial, coefficient) = match item {
+                ProductWorkItem::Term(monomial, coefficient) => (monomial, coefficient),
                 ProductWorkItem::GadgetSplice(mut splice) => {
                     let lower = splice
                         .next_after
@@ -3932,6 +3937,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     continue;
                 }
             };
+            let term_sources = source_refs.take();
             if coefficient.is_zero() {
                 continue;
             }
@@ -3942,7 +3948,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     owner,
                     monomial,
                     coefficient,
-                    source_refs,
+                    term_sources,
                     terms,
                     noise,
                     evidence,

@@ -18,6 +18,7 @@ pub(crate) mod program;
 pub(crate) mod protocol;
 pub(crate) mod relation;
 pub(crate) mod report;
+mod toy_e2e;
 
 pub mod bound;
 pub mod error;
@@ -38,6 +39,7 @@ pub use simulation::{
     check_operational_noise_candidate_with_progress, prepare_base_feasibility_summary,
     prepare_g0_cpu_evidence_bytes, serialize_base_feasibility_summary,
 };
+pub use toy_e2e::check_toy_operational_slice_source;
 
 /// A concrete value supplied for one named protocol parameter.
 #[derive(Clone, Debug, Eq, PartialEq)]

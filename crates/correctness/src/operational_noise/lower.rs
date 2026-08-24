@@ -4601,6 +4601,107 @@ fn real_descriptor(value: &RealExpr) -> Result<String, ProductionAdapterError> {
     })
 }
 
+/// Builds the singleton-preimage protocol, optionally adding the fixed-sigma Gaussian residual
+/// used by the opt-in toy certificate slice.
+pub(crate) fn singleton_preimage_protocol(
+    gaussian_max_coefficient_bound: Option<BigUint>,
+) -> crate::ProtocolDecl {
+    use crate::{
+        ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
+        EndpointSemanticBinding, EndpointSpecId, OperationalDecoderKind, OperationalDecoderTarget,
+        OutputRef, StageId, operational_protocol_from_graphs,
+    };
+    use mxx_dsl::{Bool, DslContext, IdealSpec, Ring, SemanticAnchor};
+    use mxx_ir_core::{IntExpr, RealExpr};
+
+    let ring = Ring::new(257, 1);
+    let trapdoor = ring.sample_trapdoor(1, 3, 4, 2, 8);
+    let public = trapdoor.public_matrix();
+    let target = ring.uniform_residue((1, 1));
+    let preimage = trapdoor.sample_preimage(target.clone(), (4, 1)).as_mat();
+    let relation_residual = public * preimage - target;
+    let (target_id, residual) = match gaussian_max_coefficient_bound {
+        Some(cutoff) => (
+            "singleton-preimage-gaussian",
+            relation_residual +
+                ring.gaussian(
+                    (1, 1),
+                    RealExpr::from_integer(1),
+                    IntExpr::constant(BigInt::from(cutoff)),
+                ),
+        ),
+        None => ("singleton-preimage", relation_residual),
+    };
+    let decoded = residual
+        .clone()
+        .threshold_decode_bools(2, 1)
+        .into_iter()
+        .next()
+        .expect("decoder output")
+        .semantic_anchor("singleton-preimage.decoder")
+        .expect("decoder anchor");
+    let consumer = DslContext::new("singleton-preimage-consumer")
+        .private_output("operational-residual", residual)
+        .expect("residual output")
+        .bool_output("decoded", decoded)
+        .expect("decoder output")
+        .build()
+        .expect("consumer graph");
+    let decoder_node = consumer.graph.outputs()["decoded"].value.node;
+    let endpoint = EndpointSpecId::ToyThresholdDecode;
+    let decoder_stage = StageId("consumer".to_owned());
+    operational_protocol_from_graphs(
+        vec![("consumer".to_owned(), &consumer)],
+        "consumer",
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        |bundle| {
+            bundle.ideal = IdealSpec::new(
+                DslContext::new("singleton-preimage-ideal")
+                    .bool_output("decoded", Bool::constant(false))
+                    .expect("ideal decoder output")
+                    .build()
+                    .expect("ideal graph"),
+            )
+            .expect("ideal spec");
+            bundle.comparator = ComparatorSpec::Equality {
+                endpoints: vec![ComparatorEndpointBinding {
+                    endpoint,
+                    actual_input: "decoded".to_owned(),
+                    ideal_input: "decoded".to_owned(),
+                    result_output: "failure".to_owned(),
+                    failure_value: true,
+                }],
+            };
+            bundle.endpoints = EndpointAnchors {
+                entries: vec![EndpointAnchor {
+                    spec: endpoint,
+                    stage: decoder_stage.clone(),
+                    semantic_anchor: "singleton-preimage.decoder".to_owned(),
+                    semantics: EndpointSemanticBinding::ThresholdDecode,
+                    workflow_output: OutputRef {
+                        stage: decoder_stage.clone(),
+                        output: "decoded".to_owned(),
+                    },
+                    ideal_output: "decoded".to_owned(),
+                }],
+            };
+            bundle.operational_decoder_targets = vec![OperationalDecoderTarget {
+                target_id: target_id.to_owned(),
+                residual_stage: decoder_stage.clone(),
+                residual_output: "operational-residual".to_owned(),
+                decoder_stage,
+                decoder_node,
+                kind: OperationalDecoderKind::ThresholdDecode {
+                    plaintext_modulus: IntExpr::constant(2),
+                },
+            }];
+            bundle.endpoint_specs = vec![endpoint];
+        },
+    )
+    .expect("singleton preimage operational protocol")
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -5220,88 +5321,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn singleton_preimage_protocol() -> crate::ProtocolDecl {
-        use crate::{
-            ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
-            EndpointSemanticBinding, EndpointSpecId, OperationalDecoderKind,
-            OperationalDecoderTarget, OutputRef, StageId, operational_protocol_from_graphs,
-        };
-        use mxx_dsl::{Bool, DslContext, IdealSpec, Ring, SemanticAnchor};
-        use mxx_ir_core::IntExpr;
-
-        let ring = Ring::new(257, 1);
-        let trapdoor = ring.sample_trapdoor(1, 3, 4, 2, 8);
-        let public = trapdoor.public_matrix();
-        let target = ring.uniform_residue((1, 1));
-        let preimage = trapdoor.sample_preimage(target.clone(), (4, 1)).as_mat();
-        let residual = public * preimage - target;
-        let decoded = residual
-            .clone()
-            .threshold_decode_bools(2, 1)
-            .into_iter()
-            .next()
-            .expect("decoder output")
-            .semantic_anchor("singleton-preimage.decoder")
-            .expect("decoder anchor");
-        let consumer = DslContext::new("singleton-preimage-consumer")
-            .private_output("operational-residual", residual)
-            .expect("residual output")
-            .bool_output("decoded", decoded)
-            .expect("decoder output")
-            .build()
-            .expect("consumer graph");
-        let decoder_node = consumer.graph.outputs()["decoded"].value.node;
-        let endpoint = EndpointSpecId::ToyThresholdDecode;
-        let decoder_stage = StageId("consumer".to_owned());
-        operational_protocol_from_graphs(
-            vec![("consumer".to_owned(), &consumer)],
-            "consumer",
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            |bundle| {
-                bundle.ideal = IdealSpec::new(
-                    DslContext::new("singleton-preimage-ideal")
-                        .bool_output("decoded", Bool::constant(false))
-                        .expect("ideal decoder output")
-                        .build()
-                        .expect("ideal graph"),
-                )
-                .expect("ideal spec");
-                bundle.comparator = ComparatorSpec::Equality {
-                    endpoints: vec![ComparatorEndpointBinding {
-                        endpoint,
-                        actual_input: "decoded".to_owned(),
-                        ideal_input: "decoded".to_owned(),
-                        result_output: "failure".to_owned(),
-                        failure_value: true,
-                    }],
-                };
-                bundle.endpoints = EndpointAnchors {
-                    entries: vec![EndpointAnchor {
-                        spec: endpoint,
-                        stage: decoder_stage.clone(),
-                        semantic_anchor: "singleton-preimage.decoder".to_owned(),
-                        semantics: EndpointSemanticBinding::ThresholdDecode,
-                        workflow_output: OutputRef {
-                            stage: decoder_stage.clone(),
-                            output: "decoded".to_owned(),
-                        },
-                        ideal_output: "decoded".to_owned(),
-                    }],
-                };
-                bundle.operational_decoder_targets = vec![OperationalDecoderTarget {
-                    target_id: "singleton-preimage".to_owned(),
-                    residual_stage: decoder_stage.clone(),
-                    residual_output: "operational-residual".to_owned(),
-                    decoder_stage,
-                    decoder_node,
-                    kind: OperationalDecoderKind::ThresholdDecode {
-                        plaintext_modulus: IntExpr::constant(2),
-                    },
-                }];
-                bundle.endpoint_specs = vec![endpoint];
-            },
-        )
-        .expect("singleton preimage operational protocol")
+        super::singleton_preimage_protocol(None)
     }
 
     #[test]

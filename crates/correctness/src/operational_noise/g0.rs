@@ -6288,15 +6288,21 @@ fn derive_statement_events(
     let mut scope_by_program = BTreeMap::new();
     for event in &trace.events {
         if let NormalizerEvent::InvocationStart { root } = event {
-            let scope = match program_refs.get(&root.program()) {
-                Some(&program) => CanonicalStatementScope::Program { program },
+            let (scope, traversal_root) = match program_refs.get(&root.program()) {
+                Some(&program) => (
+                    CanonicalStatementScope::Program { program },
+                    job.programs().project_program(root.program())?.root,
+                ),
                 None => match expression_refs.get(&root.expression()) {
-                    Some(&root) => CanonicalStatementScope::Closed { root },
+                    Some(&expression_row) => (
+                        CanonicalStatementScope::Closed { root: expression_row },
+                        root.expression(),
+                    ),
                     None => continue,
                 },
             };
             scope_by_program.insert(root.program(), scope);
-            roots.insert((scope, root.expression()));
+            roots.insert((scope, traversal_root));
         }
     }
     for event in &trace.events {
@@ -6308,6 +6314,9 @@ fn derive_statement_events(
             let Some(scope) = scope_by_program.get(&decomposition.program()).copied() else {
                 continue;
             };
+            if !expression_refs.contains_key(&decomposition.expression()) {
+                continue;
+            }
             roots.insert((scope, decomposition.expression()));
         }
     }
@@ -6996,43 +7005,39 @@ mod tests {
     }
 
     #[test]
-    fn statement_events_ignore_honest_invocations_outside_the_closure() {
+    fn program_statement_events_walk_the_canonical_root_not_the_invocation_root() {
         use crate::operational_noise::{
             arena::ArenaToken, facts::NumericContract, monomial::MonomialId,
             normal_form::AnalyzedValue, program::FamilyDomain,
         };
 
         let mut job = CheckerJob::new();
-        let retained = job
+        let retained_scalar = job
             .expressions_mut()
             .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
             .unwrap();
-        let outside_scalar = job
-            .expressions_mut()
-            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
-            .unwrap();
         let input_type = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
-        let outside_input = job
+        let retained_input = job
             .expressions_mut()
             .intern(
                 ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
-                    output: input_type,
-                    coefficient_bits: 2,
+                    output: input_type.clone(),
+                    coefficient_bits: 1,
                 }),
-                Box::new([outside_scalar]),
+                Box::new([retained_scalar]),
             )
             .unwrap();
         let output = ResolvedMatrixType::new(17_u8.into(), 1, 2, 1).unwrap();
-        let outside_gadget = job
+        let retained_gadget = job
             .expressions_mut()
             .intern(
                 ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
-                    output,
+                    output: output.clone(),
                     base: 4,
                     small: false,
                     digit_count: 2,
                 }),
-                Box::new([outside_input]),
+                Box::new([retained_input]),
             )
             .unwrap();
         let family = job
@@ -7040,15 +7045,38 @@ mod tests {
                 programs.generated_family_from_body(
                     expressions,
                     FamilyDomain::new(0, 1).unwrap(),
-                    outside_gadget,
+                    retained_gadget,
                 )
             })
             .unwrap();
-        let owner =
-            job.programs().scoped(job.expressions(), family.program(), outside_gadget).unwrap();
+        let projection = job.programs().project_program(family.program()).unwrap();
+        assert_eq!(projection.root, retained_gadget);
+        let (input_owner, owner) = job
+            .with_arena_stores(|expressions, programs, _| {
+                let mut proof = programs.scope_proof(expressions, family.program())?;
+                let retained_input = expressions.scoped_from_proof(&proof, retained_input)?;
+                let outside_input = expressions.intern_scoped_transform(
+                    &mut proof,
+                    ValueOperator::Matrix(MatrixOperation::Negate),
+                    &[retained_input],
+                )?;
+                let outside_gadget = expressions.intern_scoped_transform(
+                    &mut proof,
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                        output,
+                        base: 4,
+                        small: false,
+                        digit_count: 2,
+                    }),
+                    &[outside_input],
+                )?;
+                Ok((outside_input, outside_gadget))
+            })
+            .unwrap();
+        let outside_input = input_owner.expression();
+        let outside_gadget = owner.expression();
         let mut trace = FeasibilityTrace::default();
         trace.record_invocation_start(owner).unwrap();
-        let input_owner = owner.with_expression(outside_input);
         let input_result = trace
             .record_normalization_result(
                 input_owner,
@@ -7075,20 +7103,34 @@ mod tests {
             })
             .unwrap();
         let closure = CertificateClosure {
-            expressions: [retained].into_iter().collect(),
-            programs: BTreeSet::new(),
-            families: BTreeSet::new(),
+            expressions: [retained_scalar, retained_input, retained_gadget].into_iter().collect(),
+            programs: [family.program()].into_iter().collect(),
+            families: [family].into_iter().collect(),
             source_ids: BTreeSet::new(),
             family_source_ids: BTreeSet::new(),
             event_ids: BTreeSet::new(),
-            constant_expressions: [retained].into_iter().collect(),
+            constant_expressions: [retained_scalar].into_iter().collect(),
         };
-        let baseline =
-            derive_certificate_statement_rows(&job, &closure, &FeasibilityTrace::default())
-                .unwrap();
         let rows = derive_certificate_statement_rows(&job, &closure, &trace).unwrap();
-        assert_eq!(rows, baseline);
-        assert!(rows.events().is_empty());
+        assert!(matches!(
+            rows.events(),
+            [CanonicalStatementEventRow::GadgetDecompose {
+                scope: CanonicalStatementScope::Program { program: 0 },
+                expression,
+                base: 4,
+                small: false,
+                digit_count: 2,
+                ..
+            }] if *expression == rows.expression(retained_gadget).unwrap()
+        ));
+        let gadget_row = rows.expression(retained_gadget).unwrap() as usize;
+        assert!(matches!(
+            &rows.expressions()[gadget_row].descriptor,
+            CanonicalExpressionDescriptor::Event {
+                operator: CanonicalEventOperator::GadgetDecompose { events }
+            } if events.as_slice() == [StableEventRef { row: 0 }]
+        ));
+        assert!(rows.expression_refs.get(&outside_gadget).is_none());
     }
 
     #[test]

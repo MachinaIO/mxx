@@ -298,6 +298,11 @@ pub enum NormalizeError {
         expression: ExprId,
         operator: Box<ValueOperator>,
     },
+    UnsupportedMatrixBound {
+        owner: ScopedExprId,
+        expression: ExprId,
+        operator: Box<ValueOperator>,
+    },
     UnsupportedOperator {
         operator: String,
     },
@@ -5675,7 +5680,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 ValueOperator::Source(_) |
                 ValueOperator::Sample { .. } |
                 ValueOperator::Transform(_) => {
-                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    return Err(NormalizeError::UnsupportedMatrixBound {
+                        owner,
+                        expression,
+                        operator: Box::new(node.operator.clone()),
+                    });
                 }
                 _ if bound.is_missing() => {
                     return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
@@ -12531,7 +12540,18 @@ mod tests {
                 .unwrap();
                 normalizer.normalize(semantic).unwrap_err()
             };
-            assert_eq!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer));
+            if large {
+                assert_eq!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer));
+            } else {
+                assert_eq!(
+                    error,
+                    NormalizeError::UnsupportedMatrixBound {
+                        owner: programs.scoped(&expressions, semantic.program(), source).unwrap(),
+                        expression: source,
+                        operator: Box::new(expressions.node(source).unwrap().operator.clone()),
+                    }
+                );
+            }
             assert_eq!(monomials.len(), before_len);
             assert_eq!(monomials.occupied_len(), before_occupied);
             assert!(!trace.normalization_events().iter().any(|event| {
@@ -15661,6 +15681,13 @@ mod tests {
         .unwrap()
         .normalize(semantic)
         .unwrap_err();
-        assert_eq!(error, NormalizeError::Feasibility(G0Error::UnsupportedBoundTransfer));
+        assert_eq!(
+            error,
+            NormalizeError::UnsupportedMatrixBound {
+                owner: programs.scoped(&expressions, semantic.program(), left).unwrap(),
+                expression: left,
+                operator: Box::new(expressions.node(left).unwrap().operator.clone()),
+            }
+        );
     }
 }

@@ -6281,6 +6281,16 @@ struct DerivedStatementEvents {
     gadget_refs: BTreeMap<ExprId, Vec<StableEventRef>>,
 }
 
+fn universal_statement_roots(
+    key: &super::relation::RuntimeSpecializationKey,
+) -> [super::arena::ScopedExprId; 3] {
+    [
+        key.index,
+        key.index.with_expression(key.dispatch.preimage_source.expression),
+        key.index.with_expression(key.dispatch.trapdoor_source.expression),
+    ]
+}
+
 fn derive_statement_events(
     job: &CheckerJob,
     trace: &FeasibilityTrace,
@@ -6360,19 +6370,17 @@ fn derive_statement_events(
                 NormalizerEvent::SpecializationComputed { owner, key, .. } |
                 NormalizerEvent::SpecializationCacheHit { owner, key, .. } => {
                     retain_scoped(*owner);
-                    retain_scoped(key.index);
+                    for root in universal_statement_roots(key) {
+                        retain_scoped(root);
+                    }
                 }
                 NormalizerEvent::AppliedRelation(observation) => {
                     retain_scoped(observation.owner);
                     match &observation.rule {
                         AppliedRelationRule::Universal { key, .. } => {
-                            retain_scoped(key.index);
-                            retain_scoped(
-                                key.index.with_expression(key.dispatch.preimage_source.expression),
-                            );
-                            retain_scoped(
-                                key.index.with_expression(key.dispatch.trapdoor_source.expression),
-                            );
+                            for root in universal_statement_roots(key) {
+                                retain_scoped(root);
+                            }
                         }
                         AppliedRelationRule::Gadget { gadget, decomposition, .. } => {
                             retain_scoped(*gadget);
@@ -7134,23 +7142,7 @@ mod tests {
         };
         let mut normalization = NormalizationCache::new();
         let rhs = normalization.intern(PolynomialNF::zero()).unwrap();
-        let mut trace = FeasibilityTrace::default();
-        trace.events.push(NormalizerEvent::AppliedRelation(AppliedRelation {
-            owner,
-            source_monomial: MonomialId::new(ArenaToken::fresh(), 0),
-            outer_coefficient: BigInt::from(1_u8),
-            ordered_start: 0,
-            ordered_end_exclusive: 0,
-            rule: AppliedRelationRule::Universal {
-                key,
-                source: EventRange { start: EventIndex(0), end: EventIndex(0) },
-                lhs: CanonicalLhsKey {
-                    layout: None,
-                    monomial: MonomialId::new(ArenaToken::fresh(), 0),
-                },
-                rhs,
-            },
-        }));
+        let range = EventRange { start: EventIndex(0), end: EventIndex(0) };
         let closure = CertificateClosure {
             expressions: [
                 index,
@@ -7170,32 +7162,60 @@ mod tests {
             event_ids: BTreeSet::new(),
             constant_expressions: [index, preimage_scalar, trapdoor_scalar].into_iter().collect(),
         };
-        let rows = derive_certificate_statement_rows(&job, &closure, &trace, None).unwrap();
-        assert_eq!(rows.events().len(), 2);
-        for (gadget, input, base) in
-            [(preimage_gadget, preimage_input, 4), (trapdoor_gadget, trapdoor_input, 8)]
-        {
-            let gadget_row = rows.expression(gadget).unwrap() as usize;
-            let CanonicalExpressionDescriptor::Event {
-                operator: CanonicalEventOperator::GadgetDecompose { events },
-            } = &rows.expressions()[gadget_row].descriptor
-            else {
-                panic!("selector gadget must reference its statement event");
-            };
-            assert_eq!(events.len(), 1);
-            assert!(matches!(
-                &rows.events()[events[0].row as usize],
-                CanonicalStatementEventRow::GadgetDecompose {
-                    scope: CanonicalStatementScope::Program { program: event_program },
-                    expression,
-                    base: event_base,
-                    input: event_input,
-                    ..
-                } if *event_program == rows.program(program).unwrap()
-                    && *expression == gadget_row as u64
-                    && *event_base == base
-                    && *event_input == rows.expression(input).unwrap()
-            ));
+        let events = [
+            NormalizerEvent::AppliedRelation(AppliedRelation {
+                owner,
+                source_monomial: MonomialId::new(ArenaToken::fresh(), 0),
+                outer_coefficient: BigInt::from(1_u8),
+                ordered_start: 0,
+                ordered_end_exclusive: 0,
+                rule: AppliedRelationRule::Universal {
+                    key: key.clone(),
+                    source: range,
+                    lhs: CanonicalLhsKey {
+                        layout: None,
+                        monomial: MonomialId::new(ArenaToken::fresh(), 0),
+                    },
+                    rhs,
+                },
+            }),
+            NormalizerEvent::SpecializationComputed {
+                owner,
+                key: key.clone(),
+                replay: SpecializationReplay { range, rhs_results: Box::new([]) },
+            },
+            NormalizerEvent::SpecializationCacheHit { owner, key, source: range },
+        ];
+        for event in events {
+            let mut trace = FeasibilityTrace::default();
+            trace.events.push(event);
+            let rows = derive_certificate_statement_rows(&job, &closure, &trace, None).unwrap();
+            assert_eq!(rows.events().len(), 2);
+            for (gadget, input, base) in
+                [(preimage_gadget, preimage_input, 4), (trapdoor_gadget, trapdoor_input, 8)]
+            {
+                let gadget_row = rows.expression(gadget).unwrap() as usize;
+                let CanonicalExpressionDescriptor::Event {
+                    operator: CanonicalEventOperator::GadgetDecompose { events },
+                } = &rows.expressions()[gadget_row].descriptor
+                else {
+                    panic!("selector gadget must reference its statement event");
+                };
+                assert_eq!(events.len(), 1);
+                assert!(matches!(
+                    &rows.events()[events[0].row as usize],
+                    CanonicalStatementEventRow::GadgetDecompose {
+                        scope: CanonicalStatementScope::Program { program: event_program },
+                        expression,
+                        base: event_base,
+                        input: event_input,
+                        ..
+                    } if *event_program == rows.program(program).unwrap()
+                        && *expression == gadget_row as u64
+                        && *event_base == base
+                        && *event_input == rows.expression(input).unwrap()
+                ));
+            }
         }
     }
 

@@ -511,7 +511,7 @@ pub(crate) fn derive_proof_payload(
     let closure = &run.projection.closure;
     let refs = super::g0::canonical_residual_refs(&run.job, closure, &run.trace)
         .map_err(proof_payload_error)?;
-    let mut monomial_arenas = BTreeMap::new();
+    let mut monomial_arenas = HashMap::new();
     for scope in closure.programs.iter().copied() {
         if let Some(arena) = run.job.monomials().get(scope) {
             monomial_arenas.insert(arena.token(), arena);
@@ -606,7 +606,7 @@ fn proof_payload_error(error: G0Error) -> CertificateProjectionError {
 struct ProofPayloadProjector<'a> {
     job: &'a super::job::CheckerJob,
     refs: &'a CanonicalResidualRefs,
-    monomial_arenas: BTreeMap<super::arena::ArenaToken, &'a super::monomial::MonomialArena>,
+    monomial_arenas: HashMap<super::arena::ArenaToken, &'a super::monomial::MonomialArena>,
     rhs_events: HashMap<
         (super::relation::RuntimeSpecializationKey, super::relation::CanonicalRhsId),
         (u64, u64),
@@ -2293,6 +2293,23 @@ mod tests {
                 .iter()
                 .any(|event| { matches!(event, ProofPayloadEvent::Result { .. }) })
         );
+        let has_closed_scope = payload.events.iter().any(|event| match event {
+            ProofPayloadEvent::InvocationStart { root } |
+            ProofPayloadEvent::InvocationEnd { root, .. } => {
+                matches!(root.scope, ProofPayloadScope::Closed { .. })
+            }
+            ProofPayloadEvent::Result { owner, .. } |
+            ProofPayloadEvent::SpecializationComputed { owner, .. } |
+            ProofPayloadEvent::SpecializationCacheHit { owner, .. } |
+            ProofPayloadEvent::AppliedRelation { owner, .. } |
+            ProofPayloadEvent::BoundTransfer { owner, .. } => {
+                matches!(owner.scope, ProofPayloadScope::Closed { .. })
+            }
+            ProofPayloadEvent::Predecessor { consumer, .. } => {
+                matches!(consumer.scope, ProofPayloadScope::Closed { .. })
+            }
+        });
+        assert!(has_closed_scope, "synthetic residual scope must be Closed");
     }
 
     #[test]
@@ -2510,6 +2527,72 @@ mod tests {
                 .operators
                 .iter()
                 .all(|operator| !operator.to_string().contains("decoder-only"))
+        );
+    }
+
+    #[test]
+    fn residual_closure_collects_sampler_and_trapdoor_pair_events() {
+        let matrix = super::super::arena::ResolvedMatrixType::new(17_u8.into(), 1, 1, 1)
+            .expect("matrix type");
+        let mut job = super::super::job::CheckerJob::new();
+        let (sampler_root, trapdoor_root) = job
+            .with_arena_stores(|expressions, _, _| {
+                let sampler_left = expressions.intern(
+                    ValueOperator::Sampler {
+                        event: super::super::arena::SampleEventId(51),
+                        operation: super::super::arena::SamplerOperation::UniformResidue {
+                            output: matrix.clone(),
+                        },
+                    },
+                    Box::new([]),
+                )?;
+                let sampler_right = expressions.intern(
+                    ValueOperator::Sampler {
+                        event: super::super::arena::SampleEventId(52),
+                        operation: super::super::arena::SamplerOperation::UniformResidue {
+                            output: matrix.clone(),
+                        },
+                    },
+                    Box::new([]),
+                )?;
+                let sampler_root = expressions.intern_matrix_transform(
+                    super::super::arena::MatrixOperation::Add,
+                    &[sampler_left, sampler_right],
+                )?;
+                let trapdoor_root = expressions.intern(
+                    ValueOperator::Trapdoor(super::super::arena::TrapdoorOperation::Generate {
+                        descriptor: "closure-paired-trapdoor".to_owned(),
+                        parameters: Box::new([]),
+                        paired_public_event: super::super::arena::SampleEventId(53),
+                        paired_public_output_role: "value".to_owned(),
+                    }),
+                    Box::new([]),
+                )?;
+                Ok::<_, super::super::arena::ArenaError>((
+                    expressions.close(sampler_root)?,
+                    expressions.close(trapdoor_root)?,
+                ))
+            })
+            .expect("sampler and trapdoor roots");
+        let sampler_closure = collect_residual_closure(
+            &job,
+            &CertificateResidualRoot::Closed { root: sampler_root, matrix: matrix.clone() },
+        )
+        .expect("sampler closure");
+        assert_eq!(
+            sampler_closure.event_ids,
+            [super::super::arena::SampleEventId(51), super::super::arena::SampleEventId(52)]
+                .into_iter()
+                .collect()
+        );
+        let trapdoor_closure = collect_residual_closure(
+            &job,
+            &CertificateResidualRoot::Closed { root: trapdoor_root, matrix },
+        )
+        .expect("trapdoor closure");
+        assert_eq!(
+            trapdoor_closure.event_ids,
+            [super::super::arena::SampleEventId(53)].into_iter().collect()
         );
     }
 

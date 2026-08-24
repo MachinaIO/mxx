@@ -1,4 +1,5 @@
 import Mxx.Certificate.OperationalNoise.Core
+import Mxx.Certificate.OperationalNoise.Replay
 
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
@@ -212,3 +213,277 @@ theorem malformed_certs_not_valid :
 #print axioms family_operational_proof
 
 end Mxx.Certificate.OperationalNoise
+
+namespace Mxx.Certificate.OperationalNoise.EventReplay
+
+open Mxx.Certificate.OperationalNoise
+
+/-! The event-replay lane keeps only the finite algebra needed by the G0 proof.
+    Central factors are canonicalized as an ordered multiset; ordered factors retain
+    their concatenation order. -/
+
+def insertCentral (factor : Nat) : List Nat → List Nat
+  | [] => [factor]
+  | head :: tail =>
+      if factor ≤ head then factor :: head :: tail else head :: insertCentral factor tail
+
+def canonicalCentral : List Nat → List Nat
+  | [] => []
+  | head :: tail => insertCentral head (canonicalCentral tail)
+
+theorem canonicalCentral_nil : canonicalCentral [] = [] := by rfl
+
+theorem insertCentral_mem (factor : Nat) (factors : List Nat) :
+    factor ∈ insertCentral factor factors := by
+  induction factors with
+  | nil => simp [insertCentral]
+  | cons head tail ih =>
+      by_cases h : factor ≤ head
+      · simp [insertCentral, h]
+      · simp [insertCentral, h, ih]
+
+theorem canonicalCentral_mem (factor : Nat) (factors : List Nat) :
+    factor ∈ canonicalCentral (factor :: factors) := by
+  simp [canonicalCentral, insertCentral_mem]
+
+def MonomialKey.product (left right : MonomialKey) : MonomialKey :=
+  { centralFactors := canonicalCentral (left.centralFactors ++ right.centralFactors)
+    orderedFactors := left.orderedFactors ++ right.orderedFactors }
+
+theorem product_central (left right : MonomialKey) :
+    (MonomialKey.product left right).centralFactors =
+      canonicalCentral (left.centralFactors ++ right.centralFactors) := by rfl
+
+theorem product_ordered (left right : MonomialKey) :
+    (MonomialKey.product left right).orderedFactors =
+      left.orderedFactors ++ right.orderedFactors := by rfl
+
+structure MonomialContext where
+  exteriorCentral : List Nat
+  prefixFactors : List Nat
+  suffixFactors : List Nat
+deriving DecidableEq, Repr
+
+def MonomialContext.plug (context : MonomialContext) (key : MonomialKey) : MonomialKey :=
+  { centralFactors := canonicalCentral (context.exteriorCentral ++ key.centralFactors)
+    orderedFactors := context.prefixFactors ++ key.orderedFactors ++ context.suffixFactors }
+
+theorem context_plug_central (context : MonomialContext) (key : MonomialKey) :
+    (context.plug key).centralFactors =
+      canonicalCentral (context.exteriorCentral ++ key.centralFactors) := by
+  rfl
+
+theorem context_plug_ordered (context : MonomialContext) (key : MonomialKey) :
+    (context.plug key).orderedFactors =
+      context.prefixFactors ++ key.orderedFactors ++ context.suffixFactors := by
+  rfl
+
+def scalePolynomial (scalar : Int) (polynomial : Polynomial) : Polynomial :=
+  polynomial.map (fun term => { term with coefficient := scalar * term.coefficient })
+
+def contextualize (context : MonomialContext) (polynomial : Polynomial) : Polynomial :=
+  polynomial.map (fun term => { term with key := context.plug term.key })
+
+def relationReplacement (context : MonomialContext) (outerCoefficient : Int)
+    (rhs : Polynomial) : Polynomial :=
+  scalePolynomial outerCoefficient (contextualize context rhs)
+
+theorem relationReplacement_coefficient (context : MonomialContext) (outerCoefficient : Int)
+    (rhs : Polynomial) (key : MonomialKey) :
+    coefficient key (relationReplacement context outerCoefficient rhs) =
+      coefficient key (scalePolynomial outerCoefficient (contextualize context rhs)) := by
+  rfl
+
+theorem coefficient_add_replay (key : MonomialKey) (left right : Polynomial) :
+    coefficient key (add left right) = coefficient key left + coefficient key right :=
+  coefficient_add key left right
+
+theorem coefficient_subtract_replay (key : MonomialKey) (left right : Polynomial) :
+    coefficient key (subtract left right) = coefficient key left - coefficient key right :=
+  coefficient_subtract key left right
+
+def productMerge_contribution (left right : ExactTerm) : ExactTerm :=
+  { coefficient := left.coefficient * right.coefficient
+    key := MonomialKey.product left.key right.key }
+
+theorem productMerge_contribution_coefficient (left right : ExactTerm) :
+    (productMerge_contribution left right).coefficient = left.coefficient * right.coefficient := by
+  rfl
+
+theorem productMerge_contribution_key (left right : ExactTerm) :
+    (productMerge_contribution left right).key = MonomialKey.product left.key right.key := by
+  rfl
+
+def sumBound (left right : Nat) : Nat := left + right
+def scaleBound (scalar bound : Nat) : Nat := scalar * bound
+def productBound (left right : Nat) : Nat := left * right
+
+structure BoundTransfer where
+  source : Nat
+  target : Nat
+  proof : source ≤ target
+deriving Repr
+
+def BoundTransfer.sum (left right : Nat) : BoundTransfer :=
+  { source := sumBound left right, target := sumBound left right, proof := Nat.le_refl _ }
+
+def BoundTransfer.scale (scalar bound : Nat) : BoundTransfer :=
+  { source := scaleBound scalar bound, target := scaleBound scalar bound, proof := Nat.le_refl _ }
+
+def BoundTransfer.product (left right : Nat) : BoundTransfer :=
+  { source := productBound left right, target := productBound left right, proof := Nat.le_refl _ }
+
+theorem boundTransfer_sum (left right : Nat) :
+    (BoundTransfer.sum left right).source = left + right := by rfl
+
+theorem boundTransfer_scale (scalar bound : Nat) :
+    (BoundTransfer.scale scalar bound).source = scalar * bound := by rfl
+
+theorem boundTransfer_product (left right : Nat) :
+    (BoundTransfer.product left right).source = left * right := by rfl
+
+theorem boundTransfer_zero_product (bound : Nat) :
+    productBound 0 bound = 0 := by simp [productBound]
+
+theorem boundTransfer_product_zero (bound : Nat) :
+    productBound bound 0 = 0 := by simp [productBound]
+
+structure SurvivorFold where
+  coefficient : Int
+  bound : Nat
+deriving DecidableEq, Repr
+
+def survivorContribution (fold : SurvivorFold) : Nat := fold.coefficient.natAbs
+
+def survivorFold : List SurvivorFold → Nat
+  | [] => 0
+  | fold :: folds => survivorContribution fold + survivorFold folds
+
+def survivorBounds : List SurvivorFold → List Nat
+  | [] => []
+  | fold :: folds => fold.bound :: survivorBounds folds
+
+def listSum : List Nat → Nat
+  | [] => 0
+  | value :: values => value + listSum values
+
+theorem survivorBounds_length (folds : List SurvivorFold) :
+    (survivorBounds folds).length = folds.length := by
+  induction folds with
+  | nil => rfl
+  | cons fold folds ih => simp [survivorBounds, ih]
+
+inductive Forall₂ {α β : Type} (relation : α → β → Prop) : List α → List β → Prop
+  | nil : Forall₂ relation [] []
+  | cons {head tail bound bounds} :
+      relation head bound → Forall₂ relation tail bounds →
+        Forall₂ relation (head :: tail) (bound :: bounds)
+
+theorem survivorFold_sound {folds : List SurvivorFold}
+    (hbound : Forall₂ (fun fold bound => survivorContribution fold ≤ bound) folds
+      (survivorBounds folds)) :
+    survivorFold folds ≤ listSum (survivorBounds folds) := by
+  induction folds with
+  | nil => simp [survivorFold, survivorBounds, listSum]
+  | cons fold folds ih =>
+      cases hbound with
+      | cons head tail =>
+          simp only [survivorFold, survivorBounds, listSum]
+          exact Nat.add_le_add head (ih tail)
+
+structure PreFoldPolynomial where
+  polynomial : Polynomial
+  bound : Nat
+deriving Repr
+
+structure InvocationEnd where
+  polynomial : Polynomial
+  bound : Nat
+deriving Repr
+
+def preFold_to_invocationEnd (preFold : PreFoldPolynomial) : InvocationEnd :=
+  { polynomial := preFold.polynomial, bound := preFold.bound }
+
+theorem preFold_to_invocationEnd_polynomial (preFold : PreFoldPolynomial) :
+    (preFold_to_invocationEnd preFold).polynomial = preFold.polynomial := by rfl
+
+theorem preFold_to_invocationEnd_bound (preFold : PreFoldPolynomial) :
+    (preFold_to_invocationEnd preFold).bound = preFold.bound := by rfl
+
+def toyContext : MonomialContext :=
+  { exteriorCentral := [], prefixFactors := [10], suffixFactors := [20] }
+
+def toyLhs : MonomialKey := { centralFactors := [], orderedFactors := [2] }
+def toyRhsKeyA : MonomialKey := { centralFactors := [], orderedFactors := [3] }
+def toyRhsKeyB : MonomialKey := { centralFactors := [], orderedFactors := [4] }
+
+def toyRhs : Polynomial :=
+  [ { coefficient := 3, key := toyRhsKeyA }, { coefficient := -1, key := toyRhsKeyB } ]
+
+def toyReplacement : Polynomial := relationReplacement toyContext 2 toyRhs
+
+def toyPositive : Polynomial := [{ coefficient := 5, key := toyLhs }]
+def toyNegative : Polynomial := [{ coefficient := -2, key := toyLhs }]
+def toyProductLeft : ExactTerm := { coefficient := -2, key := toyLhs }
+def toyProductRight : ExactTerm := { coefficient := 3, key := toyRhsKeyA }
+def toyProduct : ExactTerm := productMerge_contribution toyProductLeft toyProductRight
+
+def toyFolds : List SurvivorFold :=
+  [ { coefficient := 3, bound := 3 }, { coefficient := -1, bound := 1 } ]
+
+def toyPreFold : PreFoldPolynomial := { polynomial := toyRhs, bound := 4 }
+
+theorem toy_replacement_shape :
+    toyReplacement =
+      [ { coefficient := 6, key := { centralFactors := [], orderedFactors := [10, 3, 20] } },
+        { coefficient := -2,
+          key := { centralFactors := [], orderedFactors := [10, 4, 20] } } ] := by
+  decide
+
+theorem toy_add_value : coefficient toyLhs (add toyPositive toyNegative) = 3 := by decide
+
+theorem toy_sub_value : coefficient toyLhs (subtract toyPositive toyNegative) = 7 := by decide
+
+theorem toy_product_value :
+    toyProduct.coefficient = -6 ∧ toyProduct.key.orderedFactors = [2, 3] := by decide
+
+theorem toy_survivor_fold_value : survivorFold toyFolds = 4 := by decide
+
+theorem toy_survivor_bound :
+    Forall₂ (fun fold bound => survivorContribution fold ≤ bound) toyFolds
+      (survivorBounds toyFolds) := by
+  constructor
+  · decide
+  · constructor
+    · decide
+    · exact Forall₂.nil
+
+theorem toy_survivor_fold_exact :
+    survivorFold toyFolds = listSum (survivorBounds toyFolds) := by
+  have hbound := survivorFold_sound (folds := toyFolds) toy_survivor_bound
+  decide
+
+theorem toy_prefold_invocation_end :
+    (preFold_to_invocationEnd toyPreFold).polynomial = toyRhs ∧
+      (preFold_to_invocationEnd toyPreFold).bound = 4 := by
+  decide
+
+theorem toy_event_replay :
+    toyReplacement =
+        [ { coefficient := 6, key := { centralFactors := [], orderedFactors := [10, 3, 20] } },
+          { coefficient := -2,
+            key := { centralFactors := [], orderedFactors := [10, 4, 20] } } ] ∧
+      coefficient toyLhs (add toyPositive toyNegative) = 3 ∧
+      coefficient toyLhs (subtract toyPositive toyNegative) = 7 ∧
+      toyProduct.coefficient = -6 ∧
+      survivorFold toyFolds = 4 ∧
+      survivorFold toyFolds = listSum (survivorBounds toyFolds) ∧
+      (preFold_to_invocationEnd toyPreFold).polynomial = toyRhs := by
+  exact ⟨toy_replacement_shape, toy_add_value, toy_sub_value, toy_product_value.1,
+    toy_survivor_fold_value, toy_survivor_fold_exact, toy_prefold_invocation_end.1⟩
+
+#print axioms toy_event_replay
+#print axioms survivorFold_sound
+#print axioms preFold_to_invocationEnd
+
+end Mxx.Certificate.OperationalNoise.EventReplay

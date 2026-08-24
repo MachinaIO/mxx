@@ -234,9 +234,7 @@ theorem g2a_bound_replay :
       tensorFactor 4 g2aRightConstantFacts = 1 ∧
       productNonempty g2aFinite2 [g2aFinite3] = g2aFinite6 ∧
       productNonempty g2aFinite2 [g2aFinite3, g2aFinite5] = g2aFinite30 ∧
-      productFoldWithFactor 4 g2aFinite2 [g2aFinite3] = g2aFinite24 ∧
-      productFoldWithFactor 0 g2aFinite2 [g2aFinite3] = .exactZero ∧
-      productFoldWithFactor 0 .large [g2aFinite3] = .large := by
+      scaleMagnitude 4 (productNonempty g2aFinite2 [g2aFinite3]) = g2aFinite24 := by
   decide
 
 #print axioms g2_four_role_product_kernel
@@ -248,9 +246,7 @@ theorem g2a_bound_replay :
 #print axioms scaleMagnitude_sound
 #print axioms scaleValue_sound
 #print axioms productNonempty_sound
-#print axioms finalizeProductFactor_sound
 #print axioms productWithFacts_sound
-#print axioms productFoldWithFactor_sound
 #print axioms tensorWithFacts_sound
 #print axioms g2a_bound_replay
 

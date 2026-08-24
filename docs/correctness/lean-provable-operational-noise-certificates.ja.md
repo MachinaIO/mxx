@@ -700,6 +700,11 @@ Lean の bound lemma は、受理された実行で Rust が使った rule を�
 安全側であっても不要に大きい bound へ置き換えない。bound が大きくなると Rust が受理した
 parameter を Lean が拒否し、同じ判定を証明したことにならないためである。
 
+certificate の `MonomialProduct` theorem API は、各段の product factor を 1 とする
+nonempty fold である。相殺後に残る 0 ではない coefficient magnitude は、直後の独立した
+`Scale` event で適用する。Rust 内部の product helper が持つ任意 factor は certificate API
+には含めず、G0 が受理する `MonomialProduct` call site の factor はすべて 1 とする。
+
 G0 では、正確な residual proof closure の各 `ObservedCoverage` row から、private な residual
 coverage row を一対一で作る。この変換は意味論の検索に使わず、通常の checker 経路も変更しない。
 各 row は kind、正確な count、sort 済みで重複のない site をそのまま保持し、repository-relative

@@ -463,6 +463,11 @@ operator-specific transfers in `bound.rs` and `normal_form.rs`. A looser replace
 accepted merely because it is conservative; it can change parameter acceptance and is unnecessary
 noise overestimation.
 
+The certificate theorem API for `MonomialProduct` is a nonempty fold whose per-step product factor
+is one. A surviving nonzero coefficient magnitude is applied by a separate following `Scale`
+event. The unrestricted factor of the internal Rust product helper is not part of the certificate
+API; every accepted G0 `MonomialProduct` call site uses factor one.
+
 At G0, the generator derives one private residual coverage row from every `ObservedCoverage` row
 in the exact residual proof closure. It neither performs semantic lookup nor changes the ordinary
 checker path. Each row preserves the kind, exact count, and sorted unique sites; adds a stable,

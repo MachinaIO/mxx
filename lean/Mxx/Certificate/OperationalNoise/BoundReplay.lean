@@ -66,22 +66,6 @@ def productNonempty : CoeffClass → List CoeffClass → CoeffClass
   | head, [] => head
   | head, next :: tail => productWithFactor 1 head (productNonempty next tail)
 
-/-- Apply the trailing factor of Rust `product_bounds_with_factor`. Unlike ordinary scaling,
-    `Large` remains `Large` even when this trailing factor is zero. -/
-def finalizeProductFactor (factor : Nat) : CoeffClass → CoeffClass
-  | .exactZero => .exactZero
-  | .finite bound =>
-      if hfactor : factor = 0 then .exactZero
-      else
-        .finite
-          ⟨bound.val * factor,
-            Nat.mul_pos bound.property (Nat.pos_of_ne_zero hfactor)⟩
-  | .large => .large
-
-def productFoldWithFactor (factor : Nat) (head : CoeffClass) (tail : List CoeffClass) :
-    CoeffClass :=
-  finalizeProductFactor factor (productNonempty head tail)
-
 theorem addKnown_sound {leftActual rightActual : Nat}
     {leftClass rightClass : CoeffClass}
     (leftSound : leftClass.Interprets leftActual)
@@ -146,26 +130,6 @@ theorem productNonempty_sound {headActual : Nat} {tailActual : List Nat}
       have tailProductSound := ih nextSound
       simpa [Nat.mul_assoc] using
         productWithFactor_sound (factor := 1) headSound tailProductSound
-
-theorem finalizeProductFactor_sound {factor actual : Nat} {bound : CoeffClass}
-    (sound : bound.Interprets actual) :
-    (finalizeProductFactor factor bound).Interprets (factor * actual) := by
-  cases bound with
-  | exactZero => simp_all [finalizeProductFactor, CoeffClass.Interprets]
-  | large => simp [finalizeProductFactor, CoeffClass.Interprets]
-  | finite maximum =>
-      simp only [finalizeProductFactor]
-      split
-      · simp_all [CoeffClass.Interprets]
-      · change factor * actual ≤ maximum.val * factor
-        simpa [Nat.mul_comm] using Nat.mul_le_mul_right factor sound
-
-theorem productFoldWithFactor_sound {factor headActual : Nat} {tailActual : List Nat}
-    {head : CoeffClass} {tail : List CoeffClass} (headSound : head.Interprets headActual)
-    (tailSound : List.Forall₂ (fun bound actual => bound.Interprets actual) tail tailActual) :
-    (productFoldWithFactor factor head tail).Interprets
-      (factor * (headActual * tailActual.prod)) := by
-  exact finalizeProductFactor_sound (productNonempty_sound headSound tailSound)
 
 structure ProductFacts where
   leftConstantPolynomial : Bool

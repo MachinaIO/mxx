@@ -25,7 +25,7 @@ use super::{
         RecordedTermRef,
     },
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
-    program::{ArenaError, ProgramArena, ValueProgramId},
+    program::{ArenaError, FamilyValueId, ProgramArena, ValueProgramId},
     relation::{
         CanonicalLhsKey, CanonicalRhsId, GadgetRecompositionRegistry, NormalizationCache,
         RelationRegistry, RelationRegistryError, RuntimeSpecializationKey,
@@ -300,6 +300,31 @@ pub struct UnsupportedProgramCallBound {
     pub root_coefficient_bound: Option<NumericContract<CoefficientBound>>,
     pub root_trusted_range: Option<TrustedIndexRange>,
     pub root_scoped_trusted_range: Option<TrustedIndexRange>,
+    pub explicit_scalar_summary: Option<ExplicitScalarSummaryDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExplicitScalarSummaryDiagnostic {
+    Rejected(ExplicitScalarSummaryRejection),
+    SummaryNotRetained,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExplicitScalarSummaryRejection {
+    pub position: usize,
+    pub expression: ExprId,
+    pub operator: Box<ValueOperator>,
+    pub scalar_fact: Option<super::facts::ScalarFacts>,
+    pub trusted_range: Option<TrustedIndexRange>,
+    pub scoped_trusted_range: Option<TrustedIndexRange>,
+    pub program_call: Option<ExplicitScalarProgramCall>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExplicitScalarProgramCall {
+    pub program: ValueProgramId,
+    pub family: Option<FamilyValueId>,
+    pub callee_scalar_fact: Option<super::facts::ScalarFacts>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6074,6 +6099,76 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     Err(selector_error) => {
                         let projection = self.programs.project_program(*program)?;
                         let root_node = self.expressions.node(projection.root)?.clone();
+                        let explicit_scalar_summary = if projection
+                            .family
+                            .as_ref()
+                            .is_some_and(|family| family.element_type == ResolvedValueType::Int) &&
+                            matches!(
+                                &root_node.operator,
+                                ValueOperator::ExplicitElement {
+                                    element_type: ResolvedValueType::Int,
+                                    ..
+                                }
+                            ) {
+                            let mut diagnostic =
+                                ExplicitScalarSummaryDiagnostic::SummaryNotRetained;
+                            for (position, branch) in
+                                root_node.inputs.iter().copied().skip(1).enumerate()
+                            {
+                                if self
+                                    .programs
+                                    .explicit_scalar_branch_bound(
+                                        self.expressions,
+                                        self.facts,
+                                        branch,
+                                    )?
+                                    .is_some()
+                                {
+                                    continue;
+                                }
+                                let branch_node = self.expressions.node(branch)?;
+                                let scalar_fact = match self.facts.facts(branch) {
+                                    Ok(ValueFacts::Scalar(fact)) => Some(fact.clone()),
+                                    _ => None,
+                                };
+                                let program_call = match &branch_node.operator {
+                                    ValueOperator::ProgramCall { program: callee } => {
+                                        let family = self.programs.family_for_program(*callee);
+                                        Some(ExplicitScalarProgramCall {
+                                            program: *callee,
+                                            family,
+                                            callee_scalar_fact: family
+                                                .and_then(|family| {
+                                                    self.programs
+                                                        .family_scalar_facts(family)
+                                                        .ok()
+                                                        .flatten()
+                                                })
+                                                .cloned(),
+                                        })
+                                    }
+                                    _ => None,
+                                };
+                                diagnostic = ExplicitScalarSummaryDiagnostic::Rejected(
+                                    ExplicitScalarSummaryRejection {
+                                        position,
+                                        expression: branch,
+                                        operator: Box::new(branch_node.operator.clone()),
+                                        scalar_fact,
+                                        trusted_range: self.facts.trusted_index_range(branch).ok(),
+                                        scoped_trusted_range: self
+                                            .facts
+                                            .trusted_scoped_index_range(*program, branch)
+                                            .ok(),
+                                        program_call,
+                                    },
+                                );
+                                break;
+                            }
+                            Some(diagnostic)
+                        } else {
+                            None
+                        };
                         return Err(NormalizeError::UnsupportedProgramCallBound(Box::new(
                             UnsupportedProgramCallBound {
                                 owner,
@@ -6104,6 +6199,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                                     .facts
                                     .trusted_scoped_index_range(*program, projection.root)
                                     .ok(),
+                                explicit_scalar_summary,
                             },
                         )));
                     }
@@ -14540,18 +14636,179 @@ mod tests {
         );
         let mut monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
         let mut trace = FeasibilityTrace::default();
-        assert!(matches!(
-            Normalizer::new_with_sink(
+        let error = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(owner)
+        .unwrap_err();
+        let NormalizeError::UnsupportedProgramCallBound(context) = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        let Some(ExplicitScalarSummaryDiagnostic::Rejected(rejection)) =
+            context.explicit_scalar_summary
+        else {
+            panic!("missing explicit scalar rejection: {context:?}");
+        };
+        assert_eq!(rejection.position, 1);
+        assert_eq!(rejection.expression, unsupported);
+        assert_eq!(rejection.operator, Box::new(ValueOperator::Scalar(ScalarOperation::Add)));
+        assert_eq!(rejection.scalar_fact, None);
+        assert_eq!(rejection.trusted_range, None);
+        assert_eq!(rejection.scoped_trusted_range, None);
+        assert_eq!(rejection.program_call, None);
+    }
+
+    #[test]
+    fn explicit_scalar_failure_diagnostic_distinguishes_retention_and_program_calls() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let facts = FactStore::new(&expressions);
+        let zero = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let explicit = programs
+            .explicit_family(
                 &mut expressions,
-                &programs,
                 &facts,
-                &mut monomials,
-                &mut trace,
+                super::super::arena::FamilyDomain::new(0, 2).unwrap(),
+                Box::new([zero, one]),
+            )
+            .unwrap();
+        let call = programs
+            .call_family_in_range(
+                &mut expressions,
+                explicit,
+                zero,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        let caller = programs
+            .opaque_generated_family_from_body(
+                &mut expressions,
+                super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                call,
             )
             .unwrap()
-            .normalize(owner),
-            Err(NormalizeError::UnsupportedProgramCallBound(_))
-        ));
+            .program();
+        let owner = programs.scoped(&expressions, caller, call).unwrap();
+        let mut ordinary_monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
+        assert_eq!(
+            Normalizer::new(&mut expressions, &programs, &facts, &mut ordinary_monomials)
+                .unwrap()
+                .normalize(owner)
+                .unwrap()
+                .coefficient_bound,
+            NumericContract::Missing
+        );
+        let mut monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let error = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(owner)
+        .unwrap_err();
+        let NormalizeError::UnsupportedProgramCallBound(context) = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(
+            context.explicit_scalar_summary,
+            Some(ExplicitScalarSummaryDiagnostic::SummaryNotRetained)
+        );
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let facts = FactStore::new(&expressions);
+        let zero = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let unsupported = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), Box::new([zero, one]))
+            .unwrap();
+        let inner = programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &facts,
+                super::super::arena::FamilyDomain::new(0, 2).unwrap(),
+                Box::new([zero, unsupported]),
+                true,
+            )
+            .unwrap();
+        let inner_call = programs
+            .call_family_in_range(
+                &mut expressions,
+                inner,
+                zero,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        let outer = programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &facts,
+                super::super::arena::FamilyDomain::new(0, 2).unwrap(),
+                Box::new([zero, inner_call]),
+                true,
+            )
+            .unwrap();
+        let outer_call = programs
+            .call_family_in_range(
+                &mut expressions,
+                outer,
+                zero,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        let caller = programs
+            .opaque_generated_family_from_body(
+                &mut expressions,
+                super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                outer_call,
+            )
+            .unwrap()
+            .program();
+        let owner = programs.scoped(&expressions, caller, outer_call).unwrap();
+        let mut monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let error = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(owner)
+        .unwrap_err();
+        let NormalizeError::UnsupportedProgramCallBound(context) = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        let Some(ExplicitScalarSummaryDiagnostic::Rejected(rejection)) =
+            context.explicit_scalar_summary
+        else {
+            panic!("missing nested rejection: {context:?}");
+        };
+        assert_eq!(rejection.position, 1);
+        assert_eq!(rejection.expression, inner_call);
+        let nested = rejection.program_call.expect("nested program-call context");
+        assert_eq!(nested.program, inner.program());
+        assert_eq!(nested.family, Some(inner));
+        assert_eq!(nested.callee_scalar_fact, None);
     }
 
     #[test]

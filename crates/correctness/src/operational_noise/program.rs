@@ -728,24 +728,11 @@ impl ProgramArena {
             ResolvedValueType::Int if summarize_scalar => {
                 let mut maximum = CoefficientBound::ExactZero;
                 for value in values {
-                    let bound = match facts.facts(*value) {
-                        Ok(ValueFacts::Scalar(summary))
-                            if summary.value_type == ResolvedValueType::Int &&
-                                !summary.coefficient_bound.is_missing() =>
-                        {
-                            summary.coefficient_bound.clone()
-                        }
-                        _ => match &expressions.node(*value)?.operator {
-                            ValueOperator::Constant(super::arena::TypedConstant {
-                                value: super::arena::ConstantValue::Int(value),
-                                ..
-                            }) => NumericContract::Known(CoefficientBound::finite(
-                                value.magnitude().clone(),
-                            )),
-                            _ => return Ok(None),
-                        },
+                    let Some(bound) =
+                        self.explicit_scalar_branch_bound(expressions, facts, *value)?
+                    else {
+                        return Ok(None);
                     };
-                    let NumericContract::Known(bound) = bound else { return Ok(None) };
                     maximum = maximum.max(bound);
                 }
                 let mut summary = ScalarFacts::new(ResolvedValueType::Int)
@@ -755,6 +742,27 @@ impl ProgramArena {
             }
             _ => Ok(None),
         }
+    }
+
+    pub(crate) fn explicit_scalar_branch_bound(
+        &self,
+        expressions: &ExprArena,
+        facts: &FactStore,
+        value: ExprId,
+    ) -> Result<Option<CoefficientBound>, ArenaError> {
+        if let Ok(ValueFacts::Scalar(summary)) = facts.facts(value) &&
+            summary.value_type == ResolvedValueType::Int &&
+            let NumericContract::Known(bound) = &summary.coefficient_bound
+        {
+            return Ok(Some(bound.clone()));
+        }
+        Ok(match &expressions.node(value)?.operator {
+            ValueOperator::Constant(super::arena::TypedConstant {
+                value: super::arena::ConstantValue::Int(value),
+                ..
+            }) => Some(CoefficientBound::finite(value.magnitude().clone())),
+            _ => None,
+        })
     }
 
     /// Summarize explicit matrix branches without enumerating a family domain.  Missing branch

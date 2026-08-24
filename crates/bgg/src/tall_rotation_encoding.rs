@@ -193,6 +193,17 @@ fn collect_tall_rotation_encodings<P: Poly>(
 }
 
 impl TallRotationEncodingCompiler {
+    /// Computes the one `S * G` family shared by every rotation offset and direction.
+    pub fn secret_gadget_rows(
+        &self,
+        secret_rows: Family<Mat>,
+    ) -> Result<Family<Mat>, TallCompileError> {
+        self.validate_secret_rows(&secret_rows)?;
+        let gadget =
+            self.ring().gadget(self.secret_size, self.gadget_base.clone(), self.digit_count);
+        Ok(secret_rows.parallel_map(move |_, secret| secret * gadget.clone())?)
+    }
+
     /// Builds the public matrices for all directly requested nonidentity rotation pairs.
     pub fn preprocess(
         &self,
@@ -227,25 +238,27 @@ impl TallRotationEncodingCompiler {
         &self,
         public: &TallRotationPublicWires,
         secret_rows: Family<Mat>,
+        secret_gadget_rows: Family<Mat>,
     ) -> Result<TallRotationEncodingWires, TallCompileError> {
-        self.validate_online_layout(public, &secret_rows)?;
+        self.validate_online_layout(public, &secret_rows, &secret_gadget_rows)?;
         let ring = self.ring();
-        let gadget = ring.gadget(self.secret_size, self.gadget_base.clone(), self.digit_count);
         let forward_offset = usize::try_from(public.key.offset)
             .map_err(|_| TallCompileError::InvalidRotationLayout)?;
         let backward_offset =
             usize::try_from((public.key.num_slots - public.key.offset) % public.key.num_slots)
                 .map_err(|_| TallCompileError::InvalidRotationLayout)?;
-        let shifted_forward = rotate_family(&secret_rows, forward_offset, self.slot_count)?;
-        let shifted_backward = rotate_family(&secret_rows, backward_offset, self.slot_count)?;
+        // `(P_r S) G = P_r (S G)`: rotate the shared product rather than
+        // recomputing it for every offset and direction.
+        let shifted_forward = rotate_family(&secret_gadget_rows, forward_offset, self.slot_count)?;
+        let shifted_backward =
+            rotate_family(&secret_gadget_rows, backward_offset, self.slot_count)?;
         let c_forward = secret_rows.clone().parallel_zip(shifted_forward, {
             let ring = ring.clone();
             let a_forward = public.a_forward.clone();
-            let gadget = gadget.clone();
             let sigma = self.error_sigma.clone();
             let columns = self.gadget_columns();
-            move |_, current, shifted| {
-                current * a_forward.clone() - shifted * gadget.clone() +
+            move |_, current, shifted_gadget| {
+                current * a_forward.clone() - shifted_gadget +
                     ring.gaussian(
                         (1, columns),
                         sigma.clone(),
@@ -256,11 +269,10 @@ impl TallRotationEncodingCompiler {
         let c_backward = secret_rows.parallel_zip(shifted_backward, {
             let ring = ring.clone();
             let a_backward = public.a_backward.clone();
-            let gadget = gadget.clone();
             let sigma = self.error_sigma.clone();
             let columns = self.gadget_columns();
-            move |_, current, shifted| {
-                current * a_backward.clone() - shifted * gadget.clone() +
+            move |_, current, shifted_gadget| {
+                current * a_backward.clone() - shifted_gadget +
                     ring.gaussian(
                         (1, columns),
                         sigma.clone(),
@@ -336,15 +348,16 @@ impl TallRotationEncodingCompiler {
         &self,
         public: &TallRotationPublicWires,
         secret_rows: &Family<Mat>,
+        secret_gadget_rows: &Family<Mat>,
     ) -> Result<(), TallCompileError> {
-        self.validate_public_layout()?;
+        self.validate_secret_rows(secret_rows)?;
         if public.key.num_slots !=
             u32::try_from(self.slot_count)
                 .map_err(|_| TallCompileError::InvalidRotationLayout)? ||
-            secret_rows.count() != &IntExpr::constant(self.slot_count) ||
+            secret_gadget_rows.count() != &IntExpr::constant(self.slot_count) ||
             !same_matrix_type(
-                secret_rows.element_type(),
-                &self.ring().matrix_type((1, self.secret_size)),
+                secret_gadget_rows.element_type(),
+                &self.ring().matrix_type((1, self.gadget_columns())),
             ) ||
             !same_matrix_type(
                 public.a_forward.matrix_type(),
@@ -353,6 +366,19 @@ impl TallRotationEncodingCompiler {
             !same_matrix_type(
                 public.a_backward.matrix_type(),
                 &self.ring().matrix_type((self.secret_size, self.gadget_columns())),
+            )
+        {
+            return Err(TallCompileError::InvalidLayout);
+        }
+        Ok(())
+    }
+
+    fn validate_secret_rows(&self, secret_rows: &Family<Mat>) -> Result<(), TallCompileError> {
+        self.validate_public_layout()?;
+        if secret_rows.count() != &IntExpr::constant(self.slot_count) ||
+            !same_matrix_type(
+                secret_rows.element_type(),
+                &self.ring().matrix_type((1, self.secret_size)),
             )
         {
             return Err(TallCompileError::InvalidLayout);

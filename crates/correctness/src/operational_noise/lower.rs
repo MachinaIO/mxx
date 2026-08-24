@@ -248,6 +248,7 @@ fn classify_node_kind(kind: &NodeKind) -> NodeKindClass {
         NodeKind::RealBinary(_) |
         NodeKind::RealSqrt |
         NodeKind::MatrixBinary(_) |
+        NodeKind::MatrixMulAccumulate { .. } |
         NodeKind::MatrixNegate |
         NodeKind::MatrixScale { .. } |
         NodeKind::Transpose |
@@ -2327,6 +2328,56 @@ impl<'a> ProductionAdapter<'a> {
             }
             NodeKind::MatrixBinary(operation) => {
                 expr(self, ValueOperator::Matrix(matrix_binary(*operation)), inputs)?
+            }
+            NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
+                let values = inputs
+                    .iter()
+                    .map(|value| match value {
+                        Value::Expr(id) => Ok(*id),
+                        Value::Family(_) => Err(ProductionAdapterError::UnsupportedNode {
+                            kind: "family multi-row GEMM input".to_owned(),
+                            wire: wire.clone(),
+                        }),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut terms = Vec::with_capacity(coefficients.len());
+                for (product, coefficient) in coefficients.iter().enumerate() {
+                    let multiplied = self.intern_node_operator(
+                        wire,
+                        output,
+                        ValueOperator::Matrix(MatrixOperation::Multiply),
+                        vec![values[2 * product], values[2 * product + 1]].into_boxed_slice(),
+                        true,
+                    )?;
+                    let coefficient = self.intern_int_expression(coefficient, wire)?;
+                    terms.push(self.intern_node_operator(
+                        wire,
+                        output,
+                        ValueOperator::Matrix(MatrixOperation::Scale),
+                        vec![multiplied, coefficient].into_boxed_slice(),
+                        true,
+                    )?);
+                }
+                let mut accumulated = terms[0];
+                for term in terms.into_iter().skip(1) {
+                    accumulated = self.intern_node_operator(
+                        wire,
+                        output,
+                        ValueOperator::Matrix(MatrixOperation::Add),
+                        vec![accumulated, term].into_boxed_slice(),
+                        true,
+                    )?;
+                }
+                if *has_bias {
+                    accumulated = self.intern_node_operator(
+                        wire,
+                        output,
+                        ValueOperator::Matrix(MatrixOperation::Add),
+                        vec![accumulated, values[2 * coefficients.len()]].into_boxed_slice(),
+                        true,
+                    )?;
+                }
+                Value::Expr(accumulated)
             }
             NodeKind::MatrixNegate => {
                 expr(self, ValueOperator::Matrix(MatrixOperation::Negate), inputs)?

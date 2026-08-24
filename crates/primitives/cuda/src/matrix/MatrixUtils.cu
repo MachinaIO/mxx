@@ -559,6 +559,28 @@ bool matrix_barrett_u32_reciprocal(uint64_t modulus, uint64_t *out_reciprocal)
     return true;
 }
 
+bool matrix_lazy_dot_u64(size_t inner, uint64_t modulus)
+{
+    if (modulus <= 1 || modulus > UINT32_MAX)
+    {
+        return false;
+    }
+    const unsigned __int128 maximum = static_cast<unsigned __int128>(modulus - 1) *
+                                      static_cast<unsigned __int128>(modulus - 1) *
+                                      static_cast<unsigned __int128>(inner);
+    return maximum <= UINT64_MAX;
+}
+
+__device__ __forceinline__ uint64_t reduce_barrett_u32(
+    uint64_t value,
+    uint64_t modulus,
+    uint64_t reciprocal)
+{
+    const uint64_t quotient = __umul64hi(value, reciprocal);
+    const uint64_t remainder = value - quotient * modulus;
+    return remainder >= modulus ? remainder - modulus : remainder;
+}
+
 // Preconditions: 1 < modulus <= UINT32_MAX, a < modulus, b < modulus, and
 // reciprocal = floor(2^64 / modulus). Then product = a*b fits in uint64_t.
 // The reciprocal quotient underestimates floor(product/modulus) by at most one,

@@ -1,4 +1,4 @@
-use super::{Backend, IndexRange, PreimageRequest, SampleRange};
+use super::{Backend, IndexRange, MatrixMulAccumulateRequest, PreimageRequest, SampleRange};
 use mxx_ir_core::{
     ParamEnv,
     node::{ConcatAxis, ConstantMatrix, HashVariant},
@@ -567,6 +567,38 @@ where
 
     fn multiply_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
         Ok(M::multiply_batch_out_of_place(inputs))
+    }
+
+    fn matrix_mul_accumulate_batch(
+        &mut self,
+        requests: Vec<MatrixMulAccumulateRequest<M>>,
+    ) -> Result<Vec<M>, Self::Error> {
+        let requests = requests
+            .into_iter()
+            .map(|request| {
+                let parameters = request
+                    .products
+                    .first()
+                    .expect("validated multi-row GEMM has a product")
+                    .1
+                    .params()
+                    .clone();
+                let products = request
+                    .products
+                    .into_iter()
+                    .map(|(coefficient, left, right)| {
+                        let coefficient = if coefficient.is_one() {
+                            None
+                        } else {
+                            Some(Self::ring_integer(&parameters, &coefficient)?)
+                        };
+                        Ok((coefficient, left, right))
+                    })
+                    .collect::<Result<Vec<_>, PolyBackendError>>()?;
+                Ok((products, request.bias))
+            })
+            .collect::<Result<Vec<_>, PolyBackendError>>()?;
+        Ok(M::multiply_accumulate_batch_out_of_place(requests))
     }
 
     fn negate(&mut self, value: &M) -> Result<M, Self::Error> {

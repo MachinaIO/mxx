@@ -12,7 +12,7 @@ use std::{
 };
 use thiserror::Error;
 
-pub const IR_VERSION: u32 = 6;
+pub const IR_VERSION: u32 = 7;
 
 #[derive(Debug, Error)]
 pub enum EncodingError {
@@ -220,8 +220,8 @@ mod tests {
     fn tiny_graph_canonical_json_and_spec_hash_match_the_pre_streaming_golden() {
         const CANONICAL_JSON: &[u8] = br#"{"effect_roots":[],"name":"tiny-golden","outputs":{"result":{"confidentiality":null,"value":{"node":0,"port":0}}},"parameters":[],"real_constants":{},"scopes":[{"id":{"tag":"Root"},"scope":{"inputs":[],"nodes":[{"arguments":[],"id":0,"kind":{"tag":"ConstantInt","value":"7"},"output_types":[{"tag":"ConstantInt"}]}],"outputs":[{"node":0,"port":0}]}}]}"#;
         const SPEC_HASH: [u8; 32] = [
-            24, 72, 37, 192, 104, 64, 194, 126, 166, 191, 26, 87, 198, 189, 210, 255, 215, 166, 10,
-            219, 206, 151, 214, 116, 206, 162, 61, 64, 205, 21, 162, 229,
+            69, 241, 203, 179, 144, 86, 249, 189, 185, 138, 126, 30, 98, 38, 175, 230, 79, 42, 77,
+            71, 17, 7, 190, 41, 62, 149, 232, 73, 39, 5, 100, 217,
         ];
         let graph = tiny_graph();
 

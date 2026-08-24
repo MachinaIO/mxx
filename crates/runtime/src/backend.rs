@@ -22,6 +22,12 @@ pub struct PreimageRequest<M, T> {
     pub target: Arc<M>,
 }
 
+#[derive(Clone, Debug)]
+pub struct MatrixMulAccumulateRequest<M> {
+    pub products: Vec<(BigInt, Arc<M>, Arc<M>)>,
+    pub bias: Option<Arc<M>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexRange {
     pub start: usize,
@@ -149,6 +155,31 @@ pub trait Backend {
         inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(left, right)| self.multiply(&left, &right)).collect()
+    }
+    fn matrix_mul_accumulate(
+        &mut self,
+        request: MatrixMulAccumulateRequest<Self::Matrix>,
+    ) -> Result<Self::Matrix, Self::Error> {
+        let mut products = request.products.into_iter();
+        let (coefficient, left, right) =
+            products.next().expect("validated multi-row GEMM has a product");
+        let product = self.multiply(&left, &right)?;
+        let mut output = self.scale_integer(&product, &coefficient)?;
+        for (coefficient, left, right) in products {
+            let product = self.multiply(&left, &right)?;
+            let product = self.scale_integer(&product, &coefficient)?;
+            output = self.add(&output, &product)?;
+        }
+        if let Some(bias) = request.bias {
+            output = self.add(&output, &bias)?;
+        }
+        Ok(output)
+    }
+    fn matrix_mul_accumulate_batch(
+        &mut self,
+        requests: Vec<MatrixMulAccumulateRequest<Self::Matrix>>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        requests.into_iter().map(|request| self.matrix_mul_accumulate(request)).collect()
     }
     fn negate(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error>;
     fn negate_batch(

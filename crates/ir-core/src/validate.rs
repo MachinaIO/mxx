@@ -626,6 +626,34 @@ fn validate_node(
             };
             vec![ConcreteWireType::Matrix(output)]
         }
+        NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
+            if coefficients.is_empty() {
+                return Err(ValidationError::Node {
+                    scope: scope.to_owned(),
+                    node: node.id,
+                    message: "multi-row GEMM requires at least one product".to_owned(),
+                });
+            }
+            require_arity(scope, node, coefficients.len() * 2 + usize::from(*has_bias))?;
+            let mut output = None;
+            for (product, coefficient) in coefficients.iter().enumerate() {
+                coefficient.evaluate(env)?;
+                let left = matrix_argument(scope, values, node, 2 * product)?;
+                let right = matrix_argument(scope, values, node, 2 * product + 1)?;
+                let product_type = multiplication_type(&left, &right)?;
+                if let Some(expected) = &output {
+                    check_add_shape(expected, &product_type)?;
+                } else {
+                    output = Some(product_type);
+                }
+            }
+            let output = output.expect("nonempty coefficients");
+            if *has_bias {
+                let bias = matrix_argument(scope, values, node, coefficients.len() * 2)?;
+                check_add_shape(&output, &bias)?;
+            }
+            vec![ConcreteWireType::Matrix(output)]
+        }
         NodeKind::MatrixNegate | NodeKind::MatrixScale { .. } => {
             require_arity(scope, node, 1)?;
             if let NodeKind::MatrixScale { scalar } = node.kind {

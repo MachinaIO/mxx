@@ -19,14 +19,15 @@ use crate::{
                 gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_small_gadget,
                 gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all, gpu_matrix_intt_batch,
                 gpu_matrix_intt_out_of_place_batch, gpu_matrix_load_compact_bytes,
-                gpu_matrix_load_rns_batch, gpu_matrix_mul, gpu_matrix_mul_batch,
-                gpu_matrix_mul_scalar, gpu_matrix_mul_scalar_batch, gpu_matrix_mul_vertical_pair,
-                gpu_matrix_negate_batch, gpu_matrix_ntt_all, gpu_matrix_ntt_batch,
-                gpu_matrix_preimage_add_correction, gpu_matrix_preimage_residual,
-                gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_columns,
-                gpu_matrix_sample_p1_full_cached, gpu_matrix_store_compact_bytes,
-                gpu_matrix_store_compact_bytes_batch, gpu_matrix_store_const_coeff_batch,
-                gpu_matrix_store_rns_batch, gpu_matrix_sub, gpu_matrix_wait,
+                gpu_matrix_load_rns_batch, gpu_matrix_mul, gpu_matrix_mul_accumulate_batch,
+                gpu_matrix_mul_batch, gpu_matrix_mul_scalar, gpu_matrix_mul_scalar_batch,
+                gpu_matrix_mul_vertical_pair, gpu_matrix_negate_batch, gpu_matrix_ntt_all,
+                gpu_matrix_ntt_batch, gpu_matrix_preimage_add_correction,
+                gpu_matrix_preimage_residual, gpu_matrix_sample_distribution,
+                gpu_matrix_sample_distribution_columns, gpu_matrix_sample_p1_full_cached,
+                gpu_matrix_store_compact_bytes, gpu_matrix_store_compact_bytes_batch,
+                gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
+                gpu_matrix_wait,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -1477,61 +1478,158 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                 .map(|(_, left, right)| (left.clone(), right.clone()))
                 .collect::<Vec<_>>();
             let (left_shape, right_shape) = (homogeneous[0].0.size(), homogeneous[0].1.size());
-            let computed =
-                if homogeneous.len() == 1 || left_shape == (1, 1) || right_shape == (1, 1) {
-                    homogeneous
-                        .into_par_iter()
-                        .map(|(left, right)| {
-                            if left.size() == (1, 1) {
-                                right.multiply_poly_out_of_place(&left.entry(0, 0))
-                            } else if right.size() == (1, 1) {
-                                left.multiply_poly_out_of_place(&right.entry(0, 0))
-                            } else {
-                                left.multiply_out_of_place(&right)
-                            }
-                        })
-                        .collect()
-                } else {
-                    let outputs = homogeneous
+            let computed = if left_shape == (1, 1) || right_shape == (1, 1) {
+                homogeneous
+                    .into_par_iter()
+                    .map(|(left, right)| {
+                        if left.size() == (1, 1) {
+                            right.multiply_poly_out_of_place(&left.entry(0, 0))
+                        } else if right.size() == (1, 1) {
+                            left.multiply_poly_out_of_place(&right.entry(0, 0))
+                        } else {
+                            left.multiply_out_of_place(&right)
+                        }
+                    })
+                    .collect()
+            } else {
+                let outputs = homogeneous
+                    .iter()
+                    .map(|(left, right)| {
+                        Self::new_empty_with_state(
+                            &left.params,
+                            left.nrow,
+                            right.ncol,
+                            left.level,
+                            true,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if outputs.iter().any(|output| output.nrow != 0 && output.ncol != 0) {
+                    let output_pointers =
+                        outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
+                    let left_pointers = homogeneous
                         .iter()
-                        .map(|(left, right)| {
-                            Self::new_empty_with_state(
-                                &left.params,
-                                left.nrow,
-                                right.ncol,
-                                left.level,
-                                true,
-                            )
-                        })
+                        .map(|(left, _)| left.raw.cast_const())
                         .collect::<Vec<_>>();
-                    if outputs.iter().any(|output| output.nrow != 0 && output.ncol != 0) {
-                        let output_pointers =
-                            outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
-                        let left_pointers = homogeneous
-                            .iter()
-                            .map(|(left, _)| left.raw.cast_const())
-                            .collect::<Vec<_>>();
-                        let right_pointers = homogeneous
-                            .iter()
-                            .map(|(_, right)| right.raw.cast_const())
-                            .collect::<Vec<_>>();
-                        let status = unsafe {
-                            gpu_matrix_mul_batch(
-                                output_pointers.as_ptr(),
-                                left_pointers.as_ptr(),
-                                right_pointers.as_ptr(),
-                                outputs.len(),
-                            )
-                        };
-                        check_status(status, "gpu_matrix_mul_batch");
-                    }
-                    outputs
-                };
+                    let right_pointers = homogeneous
+                        .iter()
+                        .map(|(_, right)| right.raw.cast_const())
+                        .collect::<Vec<_>>();
+                    let status = unsafe {
+                        gpu_matrix_mul_batch(
+                            output_pointers.as_ptr(),
+                            left_pointers.as_ptr(),
+                            right_pointers.as_ptr(),
+                            outputs.len(),
+                        )
+                    };
+                    check_status(status, "gpu_matrix_mul_batch");
+                }
+                outputs
+            };
             for ((index, _, _), output) in group.into_iter().zip(computed) {
                 ordered[index] = Some(output);
             }
         }
         ordered.into_iter().map(Option::unwrap).collect()
+    }
+
+    fn multiply_accumulate_batch_out_of_place(
+        mut requests: Vec<(Vec<(Option<Self::P>, Arc<Self>, Arc<Self>)>, Option<Arc<Self>>)>,
+    ) -> Vec<Self> {
+        let Some(product_count) = requests.first().map(|(products, _)| products.len()) else {
+            return Vec::new();
+        };
+        let can_fuse = product_count != 0 &&
+            requests.iter().all(|(products, bias)| {
+                products.len() == product_count &&
+                    products
+                        .iter()
+                        .all(|(_, left, right)| left.nrow == 1 && left.ncol == right.nrow) &&
+                    bias.as_ref().map_or(true, |bias| bias.nrow == 1)
+            });
+        if can_fuse {
+            for (products, _) in &mut requests {
+                for (coefficient, _, _) in products {
+                    if let Some(coefficient) = coefficient {
+                        coefficient.ntt_in_place();
+                    }
+                }
+            }
+            let first = &requests[0].0[0].1;
+            let columns = requests[0].0[0].2.ncol;
+            let outputs = requests
+                .iter()
+                .map(|_| Self::new_empty_with_state(&first.params, 1, columns, first.level, true))
+                .collect::<Vec<_>>();
+            let output_pointers = outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
+            let mut left_pointers = Vec::with_capacity(requests.len() * product_count);
+            let mut right_pointers = Vec::with_capacity(requests.len() * product_count);
+            let mut coefficient_pointers = Vec::with_capacity(requests.len() * product_count);
+            let mut inner_dimensions = Vec::with_capacity(requests.len() * product_count);
+            let mut bias_pointers = Vec::with_capacity(requests.len());
+            for (products, bias) in &requests {
+                for (coefficient, left, right) in products {
+                    left_pointers.push(left.raw.cast_const());
+                    right_pointers.push(right.raw.cast_const());
+                    coefficient_pointers.push(
+                        coefficient
+                            .as_ref()
+                            .map_or(ptr::null(), |value| value.inner().raw.cast_const()),
+                    );
+                    inner_dimensions.push(left.ncol);
+                }
+                bias_pointers
+                    .push(bias.as_ref().map_or(ptr::null(), |value| value.raw.cast_const()));
+            }
+            let status = unsafe {
+                gpu_matrix_mul_accumulate_batch(
+                    output_pointers.as_ptr(),
+                    left_pointers.as_ptr(),
+                    right_pointers.as_ptr(),
+                    coefficient_pointers.as_ptr(),
+                    bias_pointers.as_ptr(),
+                    inner_dimensions.as_ptr(),
+                    outputs.len(),
+                    product_count,
+                )
+            };
+            check_status(status, "gpu_matrix_mul_accumulate_batch");
+            return outputs;
+        }
+        let product_counts =
+            requests.iter().map(|(products, _)| products.len()).collect::<Vec<_>>();
+        let mut multiplications = Vec::new();
+        let mut coefficients = Vec::new();
+        let mut biases = Vec::with_capacity(requests.len());
+        for (products, bias) in requests {
+            biases.push(bias);
+            for (coefficient, left, right) in products {
+                coefficients.push(coefficient);
+                multiplications.push((left, right));
+            }
+        }
+        let mut products = Self::multiply_batch_out_of_place(multiplications).into_iter();
+        let mut coefficients = coefficients.into_iter();
+        let mut outputs = Vec::with_capacity(product_counts.len());
+        for (count, bias) in product_counts.into_iter().zip(biases) {
+            let mut output = products.next().expect("multiply-accumulate product");
+            if let Some(coefficient) = coefficients.next().expect("product coefficient") {
+                output = output.multiply_poly_out_of_place(&coefficient);
+            }
+            for _ in 1..count {
+                let mut product = products.next().expect("multiply-accumulate product");
+                if let Some(coefficient) = coefficients.next().expect("product coefficient") {
+                    product = product.multiply_poly_out_of_place(&coefficient);
+                }
+                output.add_in_place(&product);
+            }
+            if let Some(bias) = bias {
+                output.add_in_place(&bias);
+            }
+            outputs.push(output);
+        }
+        outputs
     }
 
     fn negate_out_of_place(&self) -> Self {
@@ -2890,6 +2988,41 @@ mod tests {
         assert_eq!(
             GpuDCRTPolyMatrix::multiply_batch_out_of_place(multiplications),
             expected_multiplications
+        );
+
+        let multiply_accumulate = (0..3)
+            .map(|index| {
+                let coefficient = GpuDCRTPoly::from_usize_to_constant(&gpu_params, 3 + index);
+                let first_left = Arc::new(constant_matrix(1, 5, 61 + index));
+                let first_right = Arc::new(constant_matrix(5, 4, 71 + index));
+                let second_left = Arc::new(constant_matrix(1, 3, 83 + index));
+                let second_right = Arc::new(constant_matrix(3, 4, 97 + index));
+                let bias = Arc::new(constant_matrix(1, 4, 109 + index));
+                (
+                    vec![
+                        (None, first_left, first_right),
+                        (Some(coefficient), second_left, second_right),
+                    ],
+                    Some(bias),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_accumulated = multiply_accumulate
+            .iter()
+            .map(|(products, bias)| {
+                let mut output = products[0].1.multiply_out_of_place(&products[0].2);
+                let product =
+                    products[1].1.multiply_out_of_place(&products[1].2).multiply_poly_out_of_place(
+                        products[1].0.as_ref().expect("second coefficient"),
+                    );
+                output.add_in_place(&product);
+                output.add_in_place(bias.as_ref().expect("bias"));
+                output
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            GpuDCRTPolyMatrix::multiply_accumulate_batch_out_of_place(multiply_accumulate),
+            expected_accumulated
         );
 
         let heterogeneous = vec![

@@ -41,6 +41,13 @@ pub enum NodeKind {
     RealBinary(RealBinaryOp),
     RealSqrt,
     MatrixBinary(MatrixBinaryOp),
+    /// Computes `bias + sum(coefficients[t] * left[t] * right[t])`.
+    /// This is an execution fusion; its semantics are ordinary multiply,
+    /// integer scale, and add operations.
+    MatrixMulAccumulate {
+        coefficients: Vec<IntExpr>,
+        has_bias: bool,
+    },
     MatrixNegate,
     MatrixScale {
         scalar: IntExpr,

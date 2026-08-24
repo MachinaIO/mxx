@@ -19,7 +19,10 @@ use mxx_primitives::{
 };
 use mxx_runtime::{
     Backend,
-    backend::{IndexRange, PreimageRequest, SampleRange, poly::gpu::GpuDcrtBackend},
+    backend::{
+        IndexRange, MatrixMulAccumulateRequest, PreimageRequest, SampleRange,
+        poly::gpu::GpuDcrtBackend,
+    },
 };
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive};
@@ -596,6 +599,48 @@ impl GpuNodeMeasurementBackend {
                     }
                 }
             }
+            NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
+                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
+                    ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                        Some(matrix)
+                    }
+                    _ => None,
+                }) else {
+                    return (kind, argument_types, output_types, scale);
+                };
+                if let Some((representative_columns, column_scale)) = capped_columns(output) {
+                    for product in 0..coefficients.len() {
+                        let Some(rhs) =
+                            argument_types.get_mut(2 * product + 1).and_then(|wire_type| {
+                                match wire_type {
+                                    ConcreteWireType::Matrix(matrix) |
+                                    ConcreteWireType::Preimage(matrix) => Some(matrix),
+                                    _ => None,
+                                }
+                            })
+                        else {
+                            return (kind, argument_types, output_types, scale);
+                        };
+                        rhs.columns = representative_columns;
+                    }
+                    if *has_bias {
+                        let Some(bias) =
+                            argument_types.get_mut(2 * coefficients.len()).and_then(|wire_type| {
+                                match wire_type {
+                                    ConcreteWireType::Matrix(matrix) |
+                                    ConcreteWireType::Preimage(matrix) => Some(matrix),
+                                    _ => None,
+                                }
+                            })
+                        else {
+                            return (kind, argument_types, output_types, scale);
+                        };
+                        bias.columns = representative_columns;
+                    }
+                    output.columns = representative_columns;
+                    scale = column_scale;
+                }
+            }
             NodeKind::PreimageSample { matrix_type, .. } => {
                 let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
                     ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
@@ -885,6 +930,25 @@ impl GpuNodeMeasurementBackend {
                     MatrixBinaryOp::Multiply => backend.multiply_batch(inputs),
                 }
                 .map_err(backend_error)
+            }
+            NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
+                let mut requests = Vec::with_capacity(batch_size);
+                for _ in 0..batch_size {
+                    let mut products = Vec::with_capacity(coefficients.len());
+                    for (product, coefficient) in coefficients.iter().enumerate() {
+                        products.push((
+                            coefficient
+                                .evaluate(bindings)
+                                .map_err(|error| GpuMeasurementError(error.to_string()))?,
+                            matrix_arc(2 * product)?,
+                            matrix_arc(2 * product + 1)?,
+                        ));
+                    }
+                    let bias =
+                        if *has_bias { Some(matrix_arc(2 * coefficients.len())?) } else { None };
+                    requests.push(MatrixMulAccumulateRequest { products, bias });
+                }
+                backend.matrix_mul_accumulate_batch(requests).map_err(backend_error)
             }
             NodeKind::MatrixNegate => backend
                 .negate_batch(

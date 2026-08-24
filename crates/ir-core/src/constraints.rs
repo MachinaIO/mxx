@@ -189,6 +189,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::RealBinary(_) |
                 NodeKind::RealSqrt |
                 NodeKind::MatrixBinary(_) |
+                NodeKind::MatrixMulAccumulate { .. } |
                 NodeKind::MatrixNegate |
                 NodeKind::MatrixScale { .. } |
                 NodeKind::Transpose |

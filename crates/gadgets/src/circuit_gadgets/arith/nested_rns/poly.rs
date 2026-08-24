@@ -445,22 +445,10 @@ impl<P: Poly> NestedRnsPoly<P> {
     pub(crate) fn repack_window(&self, target: CrtWindow, circuit: &mut PolyCircuit<P>) -> Self {
         let target = CrtWindow::new(target.offset, target.depth, self.ctx.q_moduli_depth);
         let operand = self.lazy_reduce_if_unreduced(circuit);
-        let identity_mapping = target == operand.window;
-        let inner = if identity_mapping {
-            operand
-                .inner
-                .gate_ids()
-                .map(|gate| {
-                    circuit
-                        .slot_identity_repeated_lanes_gate(
-                            gate,
-                            operand.num_coefficient_slots,
-                            vec![None; target.depth],
-                        )
-                        .as_single_wire()
-                })
-                .collect::<Vec<_>>()
-        } else {
+        if target == operand.window {
+            return operand;
+        }
+        let inner = {
             let plan = (0..operand.num_coefficient_slots)
                 .flat_map(|coefficient| {
                     (0..target.depth).map(move |target_local| {
@@ -3030,12 +3018,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(repack_specs.len(), repack_context.p_moduli.len());
-        assert!(repack_specs.iter().all(|(blocks, scalars)| {
-            *blocks == 1 << 12 &&
-                scalars.len() == repack_window.depth &&
-                scalars.iter().all(Option::is_none)
-        }));
+        assert!(repack_specs.is_empty());
 
         let mut irregular_circuit = PolyCircuit::<DCRTPoly>::new();
         let (_, irregular_context) = create_context(&mut irregular_circuit, Some(2));

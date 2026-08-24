@@ -756,6 +756,36 @@ impl Mat {
         Self { value: node.output(0).expect("matrix output"), matrix_type, pending }
     }
 
+    /// Fuses a sum of coefficient-weighted matrix products for execution.
+    /// Semantic consumers expand this to ordinary multiply, scale, and add.
+    #[track_caller]
+    pub fn multi_row_gemm_accumulate<C: Into<IntExpr>>(
+        products: Vec<(C, Mat, Mat)>,
+        bias: Option<Mat>,
+    ) -> Self {
+        assert!(!products.is_empty(), "multi-row GEMM requires at least one product");
+        let output_type = MatrixType {
+            columns: products[0].2.matrix_type.columns.clone(),
+            ..products[0].1.matrix_type.clone()
+        };
+        let has_bias = bias.is_some();
+        let mut coefficients = Vec::with_capacity(products.len());
+        let mut arguments = Vec::with_capacity(products.len() * 2 + usize::from(has_bias));
+        for (coefficient, left, right) in products {
+            coefficients.push(coefficient.into());
+            arguments.push(left);
+            arguments.push(right);
+        }
+        if let Some(bias) = bias {
+            arguments.push(bias);
+        }
+        Self::from_node(
+            NodeKind::MatrixMulAccumulate { coefficients, has_bias },
+            arguments,
+            output_type,
+        )
+    }
+
     pub fn matrix_type(&self) -> &MatrixType {
         &self.matrix_type
     }

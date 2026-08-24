@@ -204,6 +204,16 @@ unsafe extern "C" {
         right: *const *const GpuMatrixOpaque,
         matrix_count: usize,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_mul_accumulate_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        left: *const *const GpuMatrixOpaque,
+        right: *const *const GpuMatrixOpaque,
+        coefficients: *const *const GpuMatrixOpaque,
+        biases: *const *const GpuMatrixOpaque,
+        inner_dimensions: *const usize,
+        matrix_count: usize,
+        product_count: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_mul_scalar_batch(
         outputs: *const *mut GpuMatrixOpaque,
         matrices: *const *const GpuMatrixOpaque,

@@ -302,7 +302,8 @@ namespace
         uint8_t rhs_coeff_bytes,
         uint8_t out_coeff_bytes,
         uint64_t modulus,
-        uint64_t reciprocal)
+        uint64_t reciprocal,
+        bool lazy_reduction)
     {
         const size_t col =
             static_cast<size_t>(blockIdx.x) * kThinMatmulColumnsPerBlock + threadIdx.y;
@@ -311,13 +312,13 @@ namespace
             return;
         }
 
-        const int lane = static_cast<int>(threadIdx.x);
-        for (size_t coeff_idx = static_cast<size_t>(blockIdx.z);
+        const size_t coefficient_group = static_cast<size_t>(blockIdx.z);
+        for (size_t coeff_idx = coefficient_group * kThinMatmulWarpSize + threadIdx.x;
              coeff_idx < n;
-             coeff_idx += static_cast<size_t>(gridDim.z))
+             coeff_idx += static_cast<size_t>(gridDim.z) * kThinMatmulWarpSize)
         {
             uint64_t acc = 0;
-            for (size_t k = static_cast<size_t>(lane); k < inner; k += kThinMatmulWarpSize)
+            for (size_t k = 0; k < inner; ++k)
             {
                 const uint64_t lhs = matrix_load_limb_u64(
                     lhs_base,
@@ -331,28 +332,26 @@ namespace
                     coeff_idx,
                     rhs_stride_bytes,
                     rhs_coeff_bytes);
-                acc = add_mod_u64(
-                    acc,
-                    mul_mod_barrett_u32(lhs, rhs, modulus, reciprocal),
-                    modulus);
+                if (lazy_reduction)
+                {
+                    acc += lhs * rhs;
+                }
+                else
+                {
+                    acc = add_mod_u64(
+                        acc,
+                        mul_mod_barrett_u32(lhs, rhs, modulus, reciprocal),
+                        modulus);
+                }
             }
-            for (int offset = kThinMatmulWarpSize / 2; offset > 0; offset /= 2)
-            {
-                acc = add_mod_u64(
-                    acc,
-                    __shfl_down_sync(0xffffffffu, acc, offset),
-                    modulus);
-            }
-            if (lane == 0)
-            {
-                matrix_store_limb_u64(
-                    out_base,
-                    col,
-                    coeff_idx,
-                    out_stride_bytes,
-                    out_coeff_bytes,
-                    acc);
-            }
+            acc = lazy_reduction ? reduce_barrett_u32(acc, modulus, reciprocal) : acc;
+            matrix_store_limb_u64(
+                out_base,
+                col,
+                coeff_idx,
+                out_stride_bytes,
+                out_coeff_bytes,
+                acc);
         }
     }
 
@@ -506,9 +505,17 @@ namespace
             return 0;
         }
 
-        const size_t grid_z = n < kMatmulMaxGridZ ? n : kMatmulMaxGridZ;
         uint64_t reciprocal = 0;
-        if (rows == 1 && matrix_barrett_u32_reciprocal(modulus, &reciprocal))
+        const bool use_thin_row_kernel =
+            rows == 1 && matrix_barrett_u32_reciprocal(modulus, &reciprocal);
+        const size_t coefficient_groups = use_thin_row_kernel
+                                              ? (n + kThinMatmulWarpSize - 1) /
+                                                    kThinMatmulWarpSize
+                                              : n;
+        const size_t grid_z = coefficient_groups < kMatmulMaxGridZ
+                                  ? coefficient_groups
+                                  : kMatmulMaxGridZ;
+        if (use_thin_row_kernel)
         {
             const dim3 threads(kThinMatmulWarpSize, kThinMatmulColumnsPerBlock);
             const dim3 blocks(
@@ -531,7 +538,8 @@ namespace
                 rhs_coeff_bytes,
                 out_coeff_bytes,
                 modulus,
-                reciprocal);
+                reciprocal,
+                matrix_lazy_dot_u64(inner, modulus));
         }
         else
         {

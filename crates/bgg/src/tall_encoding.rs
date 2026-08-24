@@ -1312,9 +1312,11 @@ mod tests {
             (0..slots).map(|slot| ring.input(format!("secret-{slot}"), (1, secret_size))).collect(),
         )
         .unwrap();
+        let secret_gadget_rows = compiler.secret_gadget_rows(secret_rows.clone()).unwrap();
         for offset in [1, 3] {
             let public = compiler.import_artifacts(&artifacts, offset).unwrap().unwrap();
-            let rotation = compiler.encode(&public, secret_rows.clone()).unwrap();
+            let rotation =
+                compiler.encode(&public, secret_rows.clone(), secret_gadget_rows.clone()).unwrap();
             context = context
                 .output(format!("a-forward-{offset}"), rotation.a_forward)
                 .unwrap()

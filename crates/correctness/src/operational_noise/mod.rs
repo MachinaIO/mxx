@@ -7,6 +7,8 @@
 pub(crate) mod arena;
 pub(crate) mod facts;
 pub(crate) mod g0;
+#[cfg(test)]
+mod g0_kernel_spikes;
 pub(crate) mod job;
 pub(crate) mod lower;
 pub(crate) mod monomial;

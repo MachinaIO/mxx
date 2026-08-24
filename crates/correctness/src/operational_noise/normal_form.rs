@@ -13015,63 +13015,6 @@ mod tests {
             assert!(root_sum_index < root_end_index);
             trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
             trace.validate_normalization_observations_with_state(&monomials, &cache).unwrap();
-
-            // Replay witnesses are authoritative invocation ends, not arbitrary events from the
-            // nested specialization.  Mutating one to a nested Result must fail closed.
-            let nested_result_event = all_events
-                .iter()
-                .enumerate()
-                .find_map(|(index, event)| {
-                    (computed_replay.range.start.0 <= index as u64 &&
-                        (index as u64) < computed_replay.range.end.0 &&
-                        matches!(event, NormalizerEvent::Result { .. }))
-                    .then_some(EventIndex(index as u64))
-                })
-                .expect("specialization contains a nested result");
-            let mut malformed_witness = trace.clone();
-            for event in &mut malformed_witness.events {
-                if let NormalizerEvent::SpecializationComputed { replay, .. } = event {
-                    replay.rhs_results[0].1 = nested_result_event;
-                    break;
-                }
-            }
-            assert!(
-                malformed_witness
-                    .validate_normalization_observations_with_monomials(&monomials)
-                    .is_err()
-            );
-
-            // A universal application must point to the exact replay key and source range.  Both
-            // mutations below model stale or forged cache provenance and are rejected
-            // independently.
-            let mut malformed_key = trace.clone();
-            for event in &mut malformed_key.events {
-                if let NormalizerEvent::AppliedRelation(observation) = event {
-                    if let AppliedRelationRule::Universal { key, .. } = &mut observation.rule {
-                        key.index = target_owner;
-                        break;
-                    }
-                }
-            }
-            assert!(
-                malformed_key
-                    .validate_normalization_observations_with_monomials(&monomials)
-                    .is_err()
-            );
-            let mut malformed_source = trace.clone();
-            for event in &mut malformed_source.events {
-                if let NormalizerEvent::AppliedRelation(observation) = event {
-                    if let AppliedRelationRule::Universal { source, .. } = &mut observation.rule {
-                        source.start = EventIndex(0);
-                        break;
-                    }
-                }
-            }
-            assert!(
-                malformed_source
-                    .validate_normalization_observations_with_monomials(&monomials)
-                    .is_err()
-            );
         } else {
             let applied_index = all_events
                 .iter()

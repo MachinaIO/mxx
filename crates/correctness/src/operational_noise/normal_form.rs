@@ -7466,7 +7466,7 @@ mod tests {
         };
         let before_len = monomials.len();
         let before_occupied = monomials.occupied_len();
-        let coefficient = BigInt::from(1_u8);
+        let coefficient = BigInt::from(2_u8);
 
         let (ordinary_output, ordinary_counters) = {
             let mut normalizer =
@@ -7484,7 +7484,10 @@ mod tests {
             (output, normalizer.counters())
         };
         assert_eq!(ordinary_output.exact_terms, input_nf.exact_terms);
-        assert_eq!(ordinary_output.bounded_summary, input_nf.bounded_summary);
+        assert_eq!(
+            ordinary_output.bounded_summary,
+            BoundedSummary::finite(BoundExpression::new(BigUint::from(6_u8)))
+        );
 
         let mut trace = FeasibilityTrace::default();
         trace.record_invocation_start(semantic).unwrap();
@@ -7517,7 +7520,10 @@ mod tests {
             (output, normalizer.counters(), evidence)
         };
         assert_eq!(enabled_output.exact_terms, input_nf.exact_terms);
-        assert_eq!(enabled_output.bounded_summary, input_nf.bounded_summary);
+        assert_eq!(
+            enabled_output.bounded_summary,
+            BoundedSummary::finite(BoundExpression::new(BigUint::from(6_u8)))
+        );
         assert!(
             trace.normalization_events().iter().any(|event| matches!(
                 event,
@@ -7525,6 +7531,56 @@ mod tests {
             ))
         );
         let evidence = enabled_evidence.expect("nonzero gadget summary evidence");
+        let applied_event = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| {
+                matches!(event, super::super::g0::NormalizerEvent::AppliedRelation(_))
+                    .then_some(super::super::g0::EventIndex(index as u64))
+            })
+            .expect("gadget application event");
+        assert_eq!(
+            trace
+                .normalization_events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    super::super::g0::NormalizerEvent::AppliedRelation(_)
+                ))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            trace.normalization_events().get(applied_event.0 as usize),
+            Some(super::super::g0::NormalizerEvent::AppliedRelation(relation))
+                if relation.owner == semantic && relation.outer_coefficient == coefficient
+        ));
+        let scale_event = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule:
+                        BoundRule::Scale {
+                            value: BoundValueRef::Transfer(source),
+                            scale: BoundScale::Magnitude(magnitude),
+                        },
+                } if *owner == semantic &&
+                    *source == applied_event &&
+                    magnitude == &BigUint::from(2_u8) =>
+                {
+                    Some(super::super::g0::EventIndex(index as u64))
+                }
+                _ => None,
+            })
+            .expect("one nonunit scale follows the gadget application");
+        assert!(matches!(
+            evidence,
+            BoundValueRef::Transfer(event) if event == scale_event
+        ));
         trace.record_bound_transfer(semantic, BoundRule::Identity { input: evidence }).unwrap();
         let root_value = AnalyzedValue {
             semantic,
@@ -7534,6 +7590,9 @@ mod tests {
         trace.record_normalization_result(semantic, &root_value).unwrap();
         trace.record_invocation_end(semantic, &root_value, &enabled_counters).unwrap();
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        trace
+            .validate_normalization_observations_with_state(&monomials, &NormalizationCache::new())
+            .unwrap();
         assert_eq!(destination_before.exact_terms.len(), 1);
         assert!(destination_before.bounded_summary.is_zero());
     }

@@ -2306,6 +2306,14 @@ fn fixed_tall_g0_security128_evidence_is_deterministic() {
 fn fixed_tall_g0_combined_evidence_matches_committed_golden() {
     let bytes =
         build_tall_g0_review_evidence(&TallG0Profile::ALL).expect("fixed Tall G0 review evidence");
+    match env::var("MXX_REGENERATE_CORRECTNESS") {
+        Ok(value) if value == "1" => {
+            fs::write(TALL_G0_GOLDEN_PATH, &bytes).expect("write regenerated Tall G0 golden");
+        }
+        Ok(value) => panic!("MXX_REGENERATE_CORRECTNESS must be 1, got {value:?}"),
+        Err(env::VarError::NotPresent) => {}
+        Err(error) => panic!("read MXX_REGENERATE_CORRECTNESS: {error}"),
+    }
     assert_eq!(bytes, fs::read(TALL_G0_GOLDEN_PATH).expect("committed Tall G0 golden"));
     let evidence: serde_json::Value = serde_json::from_slice(&bytes).expect("Tall G0 review JSON");
     let profiles = evidence["sources"].as_array().expect("profile observations");

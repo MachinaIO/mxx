@@ -474,7 +474,7 @@ decomposed, and small-decomposed hash sampling, have distinct rows.
 
 `ThresholdDecode`, `BoundAuthority::Unavailable`, and raw `EventKind::Trapdoor` are rejected before
 matrix generation or canonical event projection. Decoder-only expressions are not part of the
-residual closure. A reject-tagged row therefore cannot occur in emitted schema-version-3 CPU
+residual closure. A reject-tagged row therefore cannot occur in emitted schema-version-4 CPU
 evidence.
 
 An unsupported reachable operator, missing relation lemma, surviving `Large`, missing bound, or

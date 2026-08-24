@@ -1315,10 +1315,11 @@ pub(crate) fn derive_lut_evidence(
     job: &CheckerJob,
     closure: &CertificateClosure,
     trace: &FeasibilityTrace,
+    closed_residual_root: Option<ExprId>,
 ) -> Result<G0LutEvidence, G0Error> {
     let mut residual = trace.clone();
     residual.retain_residual(closure);
-    let refs = derive_certificate_statement_rows(job, closure, &residual)?;
+    let refs = derive_certificate_statement_rows(job, closure, &residual, closed_residual_root)?;
     derive_lut_evidence_with_refs(job, closure, &residual, &refs)
 }
 
@@ -5289,8 +5290,9 @@ pub(crate) fn derive_inventory(
     job: &CheckerJob,
     closure: &CertificateClosure,
     trace: &FeasibilityTrace,
+    closed_residual_root: Option<ExprId>,
 ) -> Result<StableG0Inventory, G0Error> {
-    let rows = derive_certificate_statement_rows(job, closure, trace)?;
+    let rows = derive_certificate_statement_rows(job, closure, trace, closed_residual_root)?;
     Ok(inventory_from_statement_rows(&rows))
 }
 
@@ -5989,6 +5991,7 @@ pub(crate) fn derive_certificate_statement_rows(
     job: &CheckerJob,
     closure: &CertificateClosure,
     trace: &FeasibilityTrace,
+    closed_residual_root: Option<ExprId>,
 ) -> Result<CanonicalStatementRows, G0Error> {
     let event_rows = derive_canonical_event_rows(closure, trace)?;
     let mut source_candidates = BTreeMap::<
@@ -6125,8 +6128,14 @@ pub(crate) fn derive_certificate_statement_rows(
             CanonicalHandle::Expression(_) => None,
             CanonicalHandle::Program(program) => Some((*program, *row)),
         }))?;
-    let derived_events =
-        derive_statement_events(job, trace, &expression_refs, &program_refs, &event_rows)?;
+    let derived_events = derive_statement_events(
+        job,
+        trace,
+        &expression_refs,
+        &program_refs,
+        &event_rows,
+        closed_residual_root,
+    )?;
     let expression_count = expression_refs.values().copied().max().map_or(0, |row| row + 1);
     let mut expressions = vec![None; expression_count as usize];
     for (expression, row) in &expression_refs {
@@ -6269,6 +6278,7 @@ fn derive_statement_events(
     expression_refs: &BTreeMap<ExprId, u64>,
     program_refs: &BTreeMap<super::arena::ValueProgramId, u64>,
     raw_events: &CanonicalEventRows,
+    closed_residual_root: Option<ExprId>,
 ) -> Result<DerivedStatementEvents, G0Error> {
     let mut events = raw_events
         .rows()
@@ -6285,25 +6295,25 @@ fn derive_statement_events(
         })
         .collect::<Vec<_>>();
     let mut roots = BTreeSet::new();
-    let mut scope_by_program = BTreeMap::new();
-    for event in &trace.events {
-        if let NormalizerEvent::InvocationStart { root } = event {
-            let (scope, traversal_root) = match program_refs.get(&root.program()) {
-                Some(&program) => (
-                    CanonicalStatementScope::Program { program },
-                    job.programs().project_program(root.program())?.root,
-                ),
-                None => match expression_refs.get(&root.expression()) {
-                    Some(&expression_row) => (
-                        CanonicalStatementScope::Closed { root: expression_row },
-                        root.expression(),
-                    ),
-                    None => continue,
-                },
-            };
-            scope_by_program.insert(root.program(), scope);
-            roots.insert((scope, traversal_root));
-        }
+    let mut program_scopes = BTreeMap::new();
+    for (&program, &row) in program_refs {
+        let scope = CanonicalStatementScope::Program { program: row };
+        program_scopes.insert(program, scope);
+        roots.insert((scope, job.programs().project_program(program)?.root));
+    }
+    let closed_scope = closed_residual_root
+        .map(|root| {
+            expression_refs
+                .get(&root)
+                .copied()
+                .map(|row| (CanonicalStatementScope::Closed { root: row }, root))
+                .ok_or(G0Error::MissingCanonicalHandle {
+                    requested: CanonicalReference::Expr(root),
+                })
+        })
+        .transpose()?;
+    if let Some(seed) = closed_scope {
+        roots.insert(seed);
     }
     for event in &trace.events {
         if let NormalizerEvent::AppliedRelation(AppliedRelation {
@@ -6311,12 +6321,16 @@ fn derive_statement_events(
             ..
         }) = event
         {
-            let Some(scope) = scope_by_program.get(&decomposition.program()).copied() else {
-                continue;
-            };
             if !expression_refs.contains_key(&decomposition.expression()) {
                 continue;
             }
+            let scope = match program_scopes.get(&decomposition.program()).copied() {
+                Some(scope) => scope,
+                None => match closed_scope {
+                    Some((scope, _)) => scope,
+                    None => continue,
+                },
+            };
             roots.insert((scope, decomposition.expression()));
         }
     }
@@ -6454,6 +6468,36 @@ mod tests {
 
     fn matrix() -> ResolvedMatrixType {
         ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).expect("matrix type")
+    }
+
+    fn statement_gadget(job: &mut CheckerJob) -> (ExprId, ExprId, ExprId) {
+        let scalar = job
+            .expressions_mut()
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let input = job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
+                    output: ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap(),
+                    coefficient_bits: 1,
+                }),
+                Box::new([scalar]),
+            )
+            .unwrap();
+        let gadget = job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    output: ResolvedMatrixType::new(17_u8.into(), 1, 2, 1).unwrap(),
+                    base: 4,
+                    small: false,
+                    digit_count: 2,
+                }),
+                Box::new([input]),
+            )
+            .unwrap();
+        (scalar, input, gadget)
     }
 
     fn oracle_sequence(items: impl IntoIterator<Item = u64>) -> u64 {
@@ -6807,13 +6851,14 @@ mod tests {
             event_ids: BTreeSet::new(),
             constant_expressions: [expression].into_iter().collect(),
         };
-        let refs = derive_certificate_statement_rows(&job, &closure, &FeasibilityTrace::default())
-            .expect("canonical residual refs");
+        let refs =
+            derive_certificate_statement_rows(&job, &closure, &FeasibilityTrace::default(), None)
+                .expect("canonical residual refs");
         assert_eq!(refs.expression(expression), Ok(0));
         assert_eq!(refs.expressions().len(), 1);
         assert!(refs.programs().is_empty());
         assert!(serde_json::to_vec(refs.expressions()).is_ok());
-        let evidence = derive_lut_evidence(&job, &closure, &FeasibilityTrace::default())
+        let evidence = derive_lut_evidence(&job, &closure, &FeasibilityTrace::default(), None)
             .expect("empty residual LUT evidence");
         assert!(evidence.index_uses.is_empty());
         assert!(evidence.slice_groups.is_empty());
@@ -6821,91 +6866,34 @@ mod tests {
     }
 
     #[test]
-    fn statement_rows_derive_reached_gadget_event_from_scoped_expression() {
-        use crate::operational_noise::program::FamilyDomain;
-
+    fn statement_rows_derive_closed_gadget_event_from_explicit_residual_root() {
         let mut job = CheckerJob::new();
-        let scalar = job
-            .expressions_mut()
-            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
-            .unwrap();
-        let input_type = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
-        let input = job
-            .expressions_mut()
-            .intern(
-                ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
-                    output: input_type,
-                    coefficient_bits: 1,
-                }),
-                Box::new([scalar]),
-            )
-            .unwrap();
-        let output = ResolvedMatrixType::new(17_u8.into(), 1, 2, 1).unwrap();
-        let gadget = job
-            .expressions_mut()
-            .intern(
-                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
-                    output: output.clone(),
-                    base: 4,
-                    small: false,
-                    digit_count: 2,
-                }),
-                Box::new([input]),
-            )
-            .unwrap();
-        let family = job
-            .with_arena_stores(|expressions, programs, _| {
-                programs.generated_family_from_body(
-                    expressions,
-                    FamilyDomain::new(0, 1).unwrap(),
-                    gadget,
-                )
-            })
-            .unwrap();
-        let projection = job.programs().project_program(family.program()).unwrap();
-        let scoped = job.programs().scoped(job.expressions(), family.program(), gadget).unwrap();
-        let mut trace = FeasibilityTrace::default();
-        trace.record_invocation_start(scoped).unwrap();
+        let (scalar, input, gadget) = statement_gadget(&mut job);
         let closure = CertificateClosure {
-            expressions: [scalar, input, gadget, projection.root].into_iter().collect(),
-            programs: [family.program()].into_iter().collect(),
-            families: [family].into_iter().collect(),
+            expressions: [scalar, input, gadget].into_iter().collect(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
             source_ids: BTreeSet::new(),
             family_source_ids: BTreeSet::new(),
             event_ids: BTreeSet::new(),
             constant_expressions: [scalar].into_iter().collect(),
         };
-        let rows = derive_certificate_statement_rows(&job, &closure, &trace).unwrap();
+        let rows = derive_certificate_statement_rows(
+            &job,
+            &closure,
+            &FeasibilityTrace::default(),
+            Some(gadget),
+        )
+        .unwrap();
+        let gadget_row = rows.expression(gadget).unwrap();
         assert!(matches!(
             rows.events(),
             [CanonicalStatementEventRow::GadgetDecompose {
-                scope: CanonicalStatementScope::Program { program: 0 },
-                output: StableValueType::Matrix { rows: 2, .. },
-                base: 4,
-                small: false,
-                digit_count: 2,
+                scope: CanonicalStatementScope::Closed { root },
+                expression,
                 ..
-            }]
+            }] if *root == gadget_row && *expression == gadget_row
         ));
-        let gadget_row = rows.expression(gadget).unwrap() as usize;
-        assert!(matches!(
-            &rows.expressions()[gadget_row].descriptor,
-            CanonicalExpressionDescriptor::Event {
-                operator: CanonicalEventOperator::GadgetDecompose {
-                    events
-                }
-            } if events == &[StableEventRef { row: 0 }]
-        ));
-        let expression_json =
-            serde_json::to_value(&rows.expressions()[gadget_row].descriptor).unwrap();
-        let operator = expression_json.get("operator").unwrap();
-        assert_eq!(
-            operator.get("kind").and_then(serde_json::Value::as_str),
-            Some("gadget_decompose")
-        );
-        assert!(operator.get("base").is_none());
-        assert!(operator.get("digit_count").is_none());
-        assert!(operator.get("output").is_none());
     }
 
     #[test]
@@ -6913,34 +6901,7 @@ mod tests {
         use crate::operational_noise::program::FamilyDomain;
 
         let mut job = CheckerJob::new();
-        let scalar = job
-            .expressions_mut()
-            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
-            .unwrap();
-        let input_type = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
-        let input = job
-            .expressions_mut()
-            .intern(
-                ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
-                    output: input_type,
-                    coefficient_bits: 1,
-                }),
-                Box::new([scalar]),
-            )
-            .unwrap();
-        let output = ResolvedMatrixType::new(17_u8.into(), 1, 2, 1).unwrap();
-        let gadget = job
-            .expressions_mut()
-            .intern(
-                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
-                    output,
-                    base: 4,
-                    small: false,
-                    digit_count: 2,
-                }),
-                Box::new([input]),
-            )
-            .unwrap();
+        let (scalar, input, gadget) = statement_gadget(&mut job);
         let (first, second) = job
             .with_arena_stores(|expressions, programs, _| {
                 Ok((
@@ -6960,14 +6921,6 @@ mod tests {
         assert_ne!(first.program(), second.program());
         let first_projection = job.programs().project_program(first.program()).unwrap();
         let second_projection = job.programs().project_program(second.program()).unwrap();
-        let mut trace = FeasibilityTrace::default();
-        for family in [first, second] {
-            trace
-                .record_invocation_start(
-                    job.programs().scoped(job.expressions(), family.program(), gadget).unwrap(),
-                )
-                .unwrap();
-        }
         let closure = CertificateClosure {
             expressions: [scalar, input, gadget, first_projection.root, second_projection.root]
                 .into_iter()
@@ -6979,7 +6932,9 @@ mod tests {
             event_ids: BTreeSet::new(),
             constant_expressions: [scalar].into_iter().collect(),
         };
-        let rows = derive_certificate_statement_rows(&job, &closure, &trace).unwrap();
+        let rows =
+            derive_certificate_statement_rows(&job, &closure, &FeasibilityTrace::default(), None)
+                .unwrap();
         let scopes = rows
             .events()
             .iter()
@@ -7002,44 +6957,130 @@ mod tests {
                 operator: CanonicalEventOperator::GadgetDecompose { events }
             } if events.as_slice() == [StableEventRef { row: 0 }, StableEventRef { row: 1 }]
         ));
+        let expression_json =
+            serde_json::to_value(&rows.expressions()[gadget_row].descriptor).unwrap();
+        let operator = expression_json.get("operator").unwrap();
+        assert!(operator.get("base").is_none());
+        assert!(operator.get("digit_count").is_none());
+        assert!(operator.get("output").is_none());
     }
 
     #[test]
-    fn program_statement_events_walk_the_canonical_root_not_the_invocation_root() {
+    fn program_call_gadget_arguments_keep_caller_scope_and_callee_root_scope() {
+        let mut job = CheckerJob::new();
+        let input_type = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
+        let output_type = ResolvedMatrixType::new(17_u8.into(), 1, 2, 1).unwrap();
+        let callee_output_type = ResolvedMatrixType::new(17_u8.into(), 1, 4, 1).unwrap();
+        let (callee, caller, argument, callee_gadget, scalar, caller_input, caller_gadget, call) =
+            job.with_arena_stores(|expressions, programs, _| {
+                let argument = expressions
+                    .intern_argument(0, ResolvedValueType::Matrix(output_type.clone()))?;
+                let callee_gadget = expressions.intern(
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                        output: callee_output_type.clone(),
+                        base: 4,
+                        small: false,
+                        digit_count: 2,
+                    }),
+                    Box::new([argument]),
+                )?;
+                let callee = programs.finalize(
+                    expressions,
+                    super::super::arena::ProgramSignature {
+                        inputs: Box::new([super::super::arena::ProgramInput {
+                            value_type: ResolvedValueType::Matrix(output_type.clone()),
+                            trusted_index_range: None,
+                        }]),
+                        output: ResolvedValueType::Matrix(callee_output_type.clone()),
+                    },
+                    callee_gadget,
+                )?;
+                let scalar = expressions
+                    .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))?;
+                let caller_input = expressions.intern(
+                    ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
+                        output: input_type,
+                        coefficient_bits: 1,
+                    }),
+                    Box::new([scalar]),
+                )?;
+                let caller_gadget = expressions.intern(
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                        output: output_type.clone(),
+                        base: 4,
+                        small: false,
+                        digit_count: 2,
+                    }),
+                    Box::new([caller_input]),
+                )?;
+                let call = expressions.intern(
+                    ValueOperator::ProgramCall { program: callee },
+                    Box::new([caller_gadget]),
+                )?;
+                let caller = programs.finalize(
+                    expressions,
+                    super::super::arena::ProgramSignature {
+                        inputs: Box::new([]),
+                        output: ResolvedValueType::Matrix(callee_output_type),
+                    },
+                    call,
+                )?;
+                Ok((
+                    callee,
+                    caller,
+                    argument,
+                    callee_gadget,
+                    scalar,
+                    caller_input,
+                    caller_gadget,
+                    call,
+                ))
+            })
+            .unwrap();
+        let closure = CertificateClosure {
+            expressions: [argument, callee_gadget, scalar, caller_input, caller_gadget, call]
+                .into_iter()
+                .collect(),
+            programs: [callee, caller].into_iter().collect(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: [scalar].into_iter().collect(),
+        };
+        let rows =
+            derive_certificate_statement_rows(&job, &closure, &FeasibilityTrace::default(), None)
+                .unwrap();
+        let scopes = rows
+            .events()
+            .iter()
+            .map(|event| match event {
+                CanonicalStatementEventRow::GadgetDecompose { scope, expression, .. } => {
+                    (*expression, *scope)
+                }
+                _ => unreachable!("fixture has only gadget events"),
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            scopes[&rows.expression(callee_gadget).unwrap()],
+            CanonicalStatementScope::Program { program: rows.program(callee).unwrap() }
+        );
+        assert_eq!(
+            scopes[&rows.expression(caller_gadget).unwrap()],
+            CanonicalStatementScope::Program { program: rows.program(caller).unwrap() }
+        );
+    }
+
+    #[test]
+    fn dynamic_gadget_relations_include_retained_and_ignore_nonretained_expressions() {
         use crate::operational_noise::{
             arena::ArenaToken, facts::NumericContract, monomial::MonomialId,
             normal_form::AnalyzedValue, program::FamilyDomain,
         };
 
         let mut job = CheckerJob::new();
-        let retained_scalar = job
-            .expressions_mut()
-            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
-            .unwrap();
-        let input_type = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
-        let retained_input = job
-            .expressions_mut()
-            .intern(
-                ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
-                    output: input_type.clone(),
-                    coefficient_bits: 1,
-                }),
-                Box::new([retained_scalar]),
-            )
-            .unwrap();
+        let (retained_scalar, retained_input, retained_gadget) = statement_gadget(&mut job);
         let output = ResolvedMatrixType::new(17_u8.into(), 1, 2, 1).unwrap();
-        let retained_gadget = job
-            .expressions_mut()
-            .intern(
-                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
-                    output: output.clone(),
-                    base: 4,
-                    small: false,
-                    digit_count: 2,
-                }),
-                Box::new([retained_input]),
-            )
-            .unwrap();
         let family = job
             .with_arena_stores(|expressions, programs, _| {
                 programs.generated_family_from_body(
@@ -7051,7 +7092,7 @@ mod tests {
             .unwrap();
         let projection = job.programs().project_program(family.program()).unwrap();
         assert_eq!(projection.root, retained_gadget);
-        let (input_owner, owner) = job
+        let (input_owner, owner, ignored_input_owner, ignored_owner) = job
             .with_arena_stores(|expressions, programs, _| {
                 let mut proof = programs.scope_proof(expressions, family.program())?;
                 let retained_input = expressions.scoped_from_proof(&proof, retained_input)?;
@@ -7070,11 +7111,28 @@ mod tests {
                     }),
                     &[outside_input],
                 )?;
-                Ok((outside_input, outside_gadget))
+                let ignored_input = expressions.intern_scoped_transform(
+                    &mut proof,
+                    ValueOperator::Matrix(MatrixOperation::Negate),
+                    &[outside_input],
+                )?;
+                let ignored_gadget = expressions.intern_scoped_transform(
+                    &mut proof,
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                        output: ResolvedMatrixType::new(17_u8.into(), 1, 2, 1)?,
+                        base: 4,
+                        small: false,
+                        digit_count: 2,
+                    }),
+                    &[ignored_input],
+                )?;
+                Ok((outside_input, outside_gadget, ignored_input, ignored_gadget))
             })
             .unwrap();
         let outside_input = input_owner.expression();
         let outside_gadget = owner.expression();
+        let ignored_input = ignored_input_owner.expression();
+        let ignored_gadget = ignored_owner.expression();
         let mut trace = FeasibilityTrace::default();
         trace.record_invocation_start(owner).unwrap();
         let input_result = trace
@@ -7082,6 +7140,16 @@ mod tests {
                 input_owner,
                 &AnalyzedValue {
                     semantic: input_owner,
+                    exact_nf: None,
+                    coefficient_bound: NumericContract::Missing,
+                },
+            )
+            .unwrap();
+        let ignored_input_result = trace
+            .record_normalization_result(
+                ignored_input_owner,
+                &AnalyzedValue {
+                    semantic: ignored_input_owner,
                     exact_nf: None,
                     coefficient_bound: NumericContract::Missing,
                 },
@@ -7102,8 +7170,31 @@ mod tests {
                 },
             })
             .unwrap();
+        trace
+            .record_applied_relation(AppliedRelation {
+                owner: ignored_owner,
+                source_monomial: MonomialId::new(ArenaToken(0), 1),
+                outer_coefficient: 1.into(),
+                ordered_start: 0,
+                ordered_end_exclusive: 1,
+                rule: AppliedRelationRule::Gadget {
+                    gadget: ignored_owner,
+                    decomposition: ignored_owner,
+                    input: ignored_input,
+                    input_result: ignored_input_result,
+                },
+            })
+            .unwrap();
         let closure = CertificateClosure {
-            expressions: [retained_scalar, retained_input, retained_gadget].into_iter().collect(),
+            expressions: [
+                retained_scalar,
+                retained_input,
+                retained_gadget,
+                outside_input,
+                outside_gadget,
+            ]
+            .into_iter()
+            .collect(),
             programs: [family.program()].into_iter().collect(),
             families: [family].into_iter().collect(),
             source_ids: BTreeSet::new(),
@@ -7111,26 +7202,26 @@ mod tests {
             event_ids: BTreeSet::new(),
             constant_expressions: [retained_scalar].into_iter().collect(),
         };
-        let rows = derive_certificate_statement_rows(&job, &closure, &trace).unwrap();
-        assert!(matches!(
-            rows.events(),
-            [CanonicalStatementEventRow::GadgetDecompose {
-                scope: CanonicalStatementScope::Program { program: 0 },
-                expression,
-                base: 4,
-                small: false,
-                digit_count: 2,
-                ..
-            }] if *expression == rows.expression(retained_gadget).unwrap()
-        ));
-        let gadget_row = rows.expression(retained_gadget).unwrap() as usize;
-        assert!(matches!(
-            &rows.expressions()[gadget_row].descriptor,
-            CanonicalExpressionDescriptor::Event {
-                operator: CanonicalEventOperator::GadgetDecompose { events }
-            } if events.as_slice() == [StableEventRef { row: 0 }]
-        ));
-        assert!(rows.expression_refs.get(&outside_gadget).is_none());
+        let rows = derive_certificate_statement_rows(&job, &closure, &trace, None).unwrap();
+        let event_expressions = rows
+            .events()
+            .iter()
+            .map(|event| match event {
+                CanonicalStatementEventRow::GadgetDecompose {
+                    scope: CanonicalStatementScope::Program { program: 0 },
+                    expression,
+                    ..
+                } => *expression,
+                _ => unreachable!("fixture has only program-scoped gadget events"),
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            event_expressions,
+            [rows.expression(retained_gadget).unwrap(), rows.expression(outside_gadget).unwrap(),]
+                .into_iter()
+                .collect()
+        );
+        assert!(rows.expression_refs.get(&ignored_gadget).is_none());
     }
 
     #[test]
@@ -8423,9 +8514,11 @@ mod tests {
         let (first_job, first_closure, first_trace, first_expression) = build(7);
         let (second_job, second_closure, second_trace, second_expression) = build(41);
         let first =
-            derive_certificate_statement_rows(&first_job, &first_closure, &first_trace).unwrap();
+            derive_certificate_statement_rows(&first_job, &first_closure, &first_trace, None)
+                .unwrap();
         let second =
-            derive_certificate_statement_rows(&second_job, &second_closure, &second_trace).unwrap();
+            derive_certificate_statement_rows(&second_job, &second_closure, &second_trace, None)
+                .unwrap();
         assert_eq!(
             first.event_rows().encode_canonical().unwrap(),
             second.event_rows().encode_canonical().unwrap()
@@ -8492,7 +8585,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let rows = derive_certificate_statement_rows(&job, &closure, &trace).unwrap();
+        let rows = derive_certificate_statement_rows(&job, &closure, &trace, None).unwrap();
         let source = serde_json::to_value(&rows.sources()[0]).unwrap();
         assert!(source.get("identity").is_some());
         assert!(source.get("access").and_then(|value| value.get("identity")).is_none());
@@ -8510,7 +8603,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            derive_certificate_statement_rows(&job, &closure, &mismatched),
+            derive_certificate_statement_rows(&job, &closure, &mismatched, None),
             Err(G0Error::SourceIdentityMismatch)
         );
     }
@@ -8589,6 +8682,7 @@ mod tests {
                 &job,
                 &diagnostic_closure([root]),
                 &FeasibilityTrace::default(),
+                None,
             ),
             Err(canonical_missing(
                 "expression",
@@ -8603,6 +8697,7 @@ mod tests {
             &job,
             &diagnostic_closure([source]),
             &FeasibilityTrace::default(),
+            None,
         )
         .expect("source identity remains authoritative when its optional raw contract is absent");
         assert!(matches!(source_rows.sources(), [CanonicalSourceRow::Direct { access: None, .. }]));

@@ -2061,21 +2061,36 @@ pub(crate) fn derive_proof_payload(
     Ok(derive_proof_payload_projection(run)?.payload)
 }
 
+fn closed_residual_expression(run: &OperationalCertificateRun) -> Option<ExprId> {
+    match &run.projection.residual {
+        CertificateResidualRoot::Closed { root, .. } => Some(root.expression()),
+        CertificateResidualRoot::Family { .. } => None,
+    }
+}
+
 pub(crate) fn derive_proof_payload_projection(
     run: &OperationalCertificateRun,
 ) -> Result<ProofPayloadProjection, CertificateProjectionError> {
-    let refs =
-        super::g0::derive_certificate_statement_rows(&run.job, &run.projection.closure, &run.trace)
-            .map_err(proof_payload_error)?;
+    let refs = super::g0::derive_certificate_statement_rows(
+        &run.job,
+        &run.projection.closure,
+        &run.trace,
+        closed_residual_expression(run),
+    )
+    .map_err(proof_payload_error)?;
     derive_proof_payload_projection_with_refs(run, &refs)
 }
 
 pub(crate) fn derive_certificate_documents(
     run: &OperationalCertificateRun,
 ) -> Result<ProjectedCertificateDocuments, CertificateProjectionError> {
-    let refs =
-        super::g0::derive_certificate_statement_rows(&run.job, &run.projection.closure, &run.trace)
-            .map_err(proof_payload_error)?;
+    let refs = super::g0::derive_certificate_statement_rows(
+        &run.job,
+        &run.projection.closure,
+        &run.trace,
+        closed_residual_expression(run),
+    )
+    .map_err(proof_payload_error)?;
     let proof = derive_proof_payload_projection_with_refs(run, &refs)?;
     let cert = super::certificate_schema::project_certificate_document(run, &refs)
         .map_err(|error| CertificateProjectionError::ProofPayload { detail: error.to_string() })?;
@@ -3973,8 +3988,13 @@ pub fn prepare_base_feasibility_summary(
     // Build the residual-only Stage-1 inventory from the same owned job and closure.  The base
     // summary does not expose it or claim final artifact completeness, but descriptor conflicts
     // must still fail closed on this opt-in path.
-    let rows = super::g0::derive_certificate_statement_rows(&run.job, closure, &run.trace)
-        .map_err(|error| error.to_string())?;
+    let rows = super::g0::derive_certificate_statement_rows(
+        &run.job,
+        closure,
+        &run.trace,
+        closed_residual_expression(&run),
+    )
+    .map_err(|error| error.to_string())?;
     base_feasibility_summary_from_run(&run, &rows)
 }
 
@@ -4115,9 +4135,13 @@ pub fn prepare_g0_cpu_evidence_bytes(
     let run =
         prepare_operational_certificate(protocol, request).map_err(|error| error.to_string())?;
     let closure = &run.projection.closure;
-    let statement_rows =
-        super::g0::derive_certificate_statement_rows(&run.job, closure, &run.trace)
-            .map_err(|error| error.to_string())?;
+    let statement_rows = super::g0::derive_certificate_statement_rows(
+        &run.job,
+        closure,
+        &run.trace,
+        closed_residual_expression(&run),
+    )
+    .map_err(|error| error.to_string())?;
     let base_feasibility = base_feasibility_summary_from_run(&run, &statement_rows)?;
     let n = exact_retained_n(&statement_rows)?;
 
@@ -5758,9 +5782,13 @@ mod tests {
         run: &OperationalCertificateRun,
     ) -> (u64, usize, usize, u64, u64) {
         let closure = &run.projection.closure;
-        let refs =
-            super::super::g0::derive_certificate_statement_rows(&run.job, closure, &run.trace)
-                .expect("canonical refs for manual pipeline count");
+        let refs = super::super::g0::derive_certificate_statement_rows(
+            &run.job,
+            closure,
+            &run.trace,
+            closed_residual_expression(run),
+        )
+        .expect("canonical refs for manual pipeline count");
         let canonical_refs_items =
             refs.retained_logical_items().expect("canonical refs retained count");
         let shallow_refs_items = (1 + 3 * (closure.expressions.len() + closure.programs.len()))
@@ -6580,6 +6608,7 @@ mod tests {
             &run.job,
             &run.projection.closure,
             &run.trace,
+            closed_residual_expression(&run),
         )
         .expect("canonical relation source rows");
         assert!(refs.expressions().iter().enumerate().all(|(row, descriptor)| {
@@ -7308,7 +7337,7 @@ mod tests {
                 },
             })
             .unwrap();
-        let inventory = super::super::g0::derive_inventory(&job, &closure, &trace)
+        let inventory = super::super::g0::derive_inventory(&job, &closure, &trace, None)
             .expect("residual descriptor inventory");
         assert_eq!(inventory.events.len(), 2);
         assert_eq!(inventory.sources.len(), 1);
@@ -7653,6 +7682,7 @@ mod tests {
             &run.job,
             &run.projection.closure,
             &run.trace,
+            closed_residual_expression(&run),
         )
         .expect("canonical refs");
         let sampler_sites = projection
@@ -8076,9 +8106,13 @@ mod tests {
 
         let run = prepare_operational_certificate(&protocol, &request).expect("comparison run");
         let closure = &run.projection.closure;
-        let statement_rows =
-            super::super::g0::derive_certificate_statement_rows(&run.job, closure, &run.trace)
-                .expect("statement rows");
+        let statement_rows = super::super::g0::derive_certificate_statement_rows(
+            &run.job,
+            closure,
+            &run.trace,
+            closed_residual_expression(&run),
+        )
+        .expect("statement rows");
         let n = exact_retained_n(&statement_rows).expect("exact N");
         assert_eq!(base["n"]["expression_rows"], n.expression_rows);
         assert_eq!(base["n"]["program_rows"], n.program_rows);
@@ -8086,14 +8120,24 @@ mod tests {
         assert_eq!(base["n"]["event_rows"], n.event_rows);
         assert_eq!(base["n"]["total_rows"], n.total_rows);
 
-        let inventory = super::super::g0::derive_inventory(&run.job, closure, &run.trace)
-            .expect("comparison inventory");
+        let inventory = super::super::g0::derive_inventory(
+            &run.job,
+            closure,
+            &run.trace,
+            closed_residual_expression(&run),
+        )
+        .expect("comparison inventory");
         assert_eq!(inventory.sources.len() as u64, n.source_rows);
         assert_eq!(inventory.events.len() as u64, n.event_rows);
         let inventory_bytes = inventory.encode_canonical().unwrap().len() as u64;
         let inventory_retained = inventory.retained_logical_items().unwrap();
-        let lut = super::super::g0::derive_lut_evidence(&run.job, closure, &run.trace)
-            .expect("comparison LUT");
+        let lut = super::super::g0::derive_lut_evidence(
+            &run.job,
+            closure,
+            &run.trace,
+            closed_residual_expression(&run),
+        )
+        .expect("comparison LUT");
         let lut_bytes = lut.encode_canonical().unwrap().len() as u64;
         let lut_retained = lut.retained_logical_items().unwrap();
         let frontier_sum = document["lut"]["index_use_frontier_products"]
@@ -8248,9 +8292,13 @@ mod tests {
         let slice_products = document["lut"]["slice_group_frontier_products"].as_array().unwrap();
         assert!(!index_products.is_empty() || !slice_products.is_empty());
 
-        let lut =
-            super::super::g0::derive_lut_evidence(&run.job, &run.projection.closure, &run.trace)
-                .expect("nonempty LUT");
+        let lut = super::super::g0::derive_lut_evidence(
+            &run.job,
+            &run.projection.closure,
+            &run.trace,
+            closed_residual_expression(&run),
+        )
+        .expect("nonempty LUT");
         assert!(!lut.index_uses.is_empty() || !lut.slice_groups.is_empty());
         for unit in &lut.index_uses {
             assert_eq!(unit.rows.len().to_string(), unit.frontier_product);
@@ -8293,9 +8341,13 @@ mod tests {
         let document: serde_json::Value = serde_json::from_slice(&evidence).unwrap();
 
         let run = prepare_operational_certificate(&protocol, &request).expect("comparison run");
-        let lut =
-            super::super::g0::derive_lut_evidence(&run.job, &run.projection.closure, &run.trace)
-                .expect("shared indexed-slice LUT");
+        let lut = super::super::g0::derive_lut_evidence(
+            &run.job,
+            &run.projection.closure,
+            &run.trace,
+            closed_residual_expression(&run),
+        )
+        .expect("shared indexed-slice LUT");
         assert!(!lut.slice_groups.is_empty());
         assert!(lut.slice_groups.iter().all(|group| {
             group.row_span.is_some() && group.column_span.is_some() && group.members.len() == 4

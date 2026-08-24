@@ -122,6 +122,16 @@ pub(crate) trait FeasibilitySink: Default {
         Ok(())
     }
 
+    fn record_pre_fold_polynomial(
+        &mut self,
+        root: super::arena::ScopedExprId,
+        polynomial: std::sync::Arc<super::normal_form::PolynomialNF>,
+        summary_evidence: Option<BoundValueRef>,
+    ) -> Result<(), G0Error> {
+        let _ = (root, polynomial, summary_evidence);
+        Ok(())
+    }
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error>;
 
     fn retained_monomial_roots(
@@ -270,6 +280,12 @@ pub(crate) struct SurvivorFold {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreFoldPolynomial {
+    pub polynomial: std::sync::Arc<super::normal_form::PolynomialNF>,
+    pub summary_evidence: Option<BoundValueRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum NormalizerEvent {
     InvocationStart {
         root: super::arena::ScopedExprId,
@@ -306,6 +322,7 @@ pub(crate) enum NormalizerEvent {
     },
     CoefficientMerge(CoefficientMerge),
     SurvivorFold(SurvivorFold),
+    PreFoldPolynomial(PreFoldPolynomial),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2016,6 +2033,78 @@ impl FeasibilitySink for FeasibilityTrace {
         Ok(())
     }
 
+    fn record_pre_fold_polynomial(
+        &mut self,
+        root: super::arena::ScopedExprId,
+        polynomial: std::sync::Arc<super::normal_form::PolynomialNF>,
+        summary_evidence: Option<BoundValueRef>,
+    ) -> Result<(), G0Error> {
+        let frame = self.frames.last().ok_or(G0Error::RelationTraceInvariant)?;
+        let current =
+            EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
+        if frame.root != root {
+            // Specialized relation plans are normalized in the caller's frame; their
+            // intermediate snapshot is not an invocation-root event.
+            return Ok(());
+        }
+        let Some(result_index) = frame.results.get(&root.expression()).copied() else {
+            return Err(G0Error::RelationTraceInvariant);
+        };
+        let Some(NormalizerEvent::Result { owner, .. }) = self.events.get(result_index.0 as usize)
+        else {
+            return Err(G0Error::RelationTraceInvariant);
+        };
+        // The root Result is the replay seed. Root relation closure may rewrite its
+        // exact terms before this snapshot, so equality is checked by the validator's
+        // frame-local replay rather than against the seed event here.
+        if *owner != root || result_index.0 >= current.0 {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        let exact_zero = matches!(
+            polynomial.bounded_summary.coefficient_bound(),
+            NumericContract::Known(CoefficientBound::ExactZero)
+        );
+        if exact_zero == summary_evidence.is_some() {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        if let Some(evidence) = &summary_evidence {
+            match evidence {
+                BoundValueRef::Result { event, projection: BoundProjection::Summary } => {
+                    if event.0 < frame.range.start.0 ||
+                        event.0 >= current.0 ||
+                        *event != result_index
+                    {
+                        return Err(G0Error::RelationTraceInvariant);
+                    }
+                }
+                BoundValueRef::Result { projection: BoundProjection::Coefficient, .. } => {
+                    return Err(G0Error::RelationTraceInvariant)
+                }
+                BoundValueRef::Transfer(event) => {
+                    if event.0 < frame.range.start.0 || event.0 >= current.0 {
+                        return Err(G0Error::RelationTraceInvariant);
+                    }
+                    if !matches!(
+                        self.events.get(event.0 as usize),
+                        Some(NormalizerEvent::BoundTransfer { owner, .. }) if *owner == root
+                    ) {
+                        return Err(G0Error::RelationTraceInvariant);
+                    }
+                }
+                BoundValueRef::Predecessor { .. } => return Err(G0Error::RelationTraceInvariant),
+            }
+        }
+        self.events.push(NormalizerEvent::PreFoldPolynomial(PreFoldPolynomial {
+            polynomial,
+            summary_evidence,
+        }));
+        Self::retain_event_monomials(
+            &self.events[self.events.len() - 1],
+            &mut self.retained_monomial_roots,
+        );
+        Ok(())
+    }
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error> {
         if !self.frames.is_empty() {
             return Err(G0Error::MissingNormalizationResult);
@@ -2030,6 +2119,7 @@ impl FeasibilitySink for FeasibilityTrace {
                 super::arena::ScopedExprId,
                 BTreeMap<super::monomial::MonomialId, (BigInt, BigInt)>,
             >,
+            Option<(HashMap<super::monomial::MonomialId, BigInt>, bool)>,
         )>::new();
         let mut frame_starts = vec![None; self.events.len()];
         let mut frame_stack = Vec::new();
@@ -2054,10 +2144,11 @@ impl FeasibilitySink for FeasibilityTrace {
                         BTreeSet::new(),
                         HashMap::new(),
                         BTreeMap::new(),
+                        None,
                     ));
                 }
                 NormalizerEvent::Result { owner, .. } => {
-                    let Some((root, _, results, pending_bounds, _, pending_merges)) =
+                    let Some((root, _, results, pending_bounds, _, pending_merges, scratch)) =
                         stack.last_mut()
                     else {
                         return Err(G0Error::MissingNormalizationResult);
@@ -2087,7 +2178,24 @@ impl FeasibilitySink for FeasibilityTrace {
                             }
                         }
                     }
-                    if *owner != *root {
+                    if *owner == *root {
+                        let NormalizerEvent::Result { value, .. } = event else {
+                            unreachable!("matched result event")
+                        };
+                        if let Some(normal_form) = value.exact_nf.as_ref() {
+                            if scratch.is_some() {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
+                            *scratch = Some((
+                                normal_form
+                                    .exact_terms
+                                    .iter()
+                                    .map(|(monomial, coefficient)| (*monomial, coefficient.clone()))
+                                    .collect(),
+                                false,
+                            ));
+                        }
+                    } else {
                         pending_bounds.remove(owner);
                     }
                 }
@@ -2097,7 +2205,8 @@ impl FeasibilitySink for FeasibilityTrace {
                     predecessor,
                     source_result,
                 } => {
-                    let Some((root, start, results, _, predecessors, _)) = stack.last_mut() else {
+                    let Some((root, start, results, _, predecessors, _, _)) = stack.last_mut()
+                    else {
                         return Err(G0Error::MissingNormalizationResult);
                     };
                     if consumer.program() != root.program() ||
@@ -2115,8 +2224,8 @@ impl FeasibilitySink for FeasibilityTrace {
                         return Err(G0Error::MissingNormalizationResult);
                     }
                 }
-                NormalizerEvent::InvocationEnd { root, .. } => {
-                    let Some((active_root, _, results, pending_bounds, _, pending_merges)) =
+                NormalizerEvent::InvocationEnd { root, result, .. } => {
+                    let Some((active_root, _, results, pending_bounds, _, pending_merges, scratch)) =
                         stack.pop()
                     else {
                         return Err(G0Error::MissingNormalizationResult);
@@ -2136,6 +2245,20 @@ impl FeasibilitySink for FeasibilityTrace {
                         !pending_merges.is_empty()
                     {
                         return Err(G0Error::MissingNormalizationResult);
+                    }
+                    if let Some((expected, seen_pre_fold)) = scratch {
+                        if seen_pre_fold {
+                            let Some(normal_form) = result.exact_nf.as_ref() else {
+                                return Err(G0Error::RelationTraceInvariant);
+                            };
+                            if normal_form.exact_terms.len() != expected.len() ||
+                                normal_form.exact_terms.iter().any(|(monomial, coefficient)| {
+                                    expected.get(monomial) != Some(coefficient)
+                                })
+                            {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
+                        }
                     }
                 }
                 NormalizerEvent::SpecializationComputed { owner, key, replay } => {
@@ -2172,7 +2295,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                 }
                 NormalizerEvent::AppliedRelation(observation) => {
-                    let Some((root, _, _, _, _, _)) = stack.last() else {
+                    let Some((root, _, _, _, _, _, _)) = stack.last() else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
                     if root.program() != observation.owner.program() ||
@@ -2182,14 +2305,14 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                     let input_valid = match &observation.rule {
                         AppliedRelationRule::Gadget { input, input_result, .. } => {
-                            stack.last().is_some_and(|(_, start, results, _, _, _)| {
+                            stack.last().is_some_and(|(_, start, results, _, _, _, _)| {
                                 input_result.0 >= start.0 && input_result.0 < current.0 &&
                                     results.get(input).copied() == Some(*input_result) &&
                                     matches!(self.events.get(input_result.0 as usize), Some(NormalizerEvent::Result { owner, .. }) if owner.expression() == *input)
                             })
                         }
                         AppliedRelationRule::Universal { key, source, rhs, .. } => {
-                            let Some((active_root, _, _, _, _, _)) = stack.last() else {
+                            let Some((active_root, _, _, _, _, _, _)) = stack.last() else {
                                 return Err(G0Error::RelationTraceInvariant);
                             };
                             let Some(replay) = self.specialization_ranges.get(key) else {
@@ -2230,7 +2353,7 @@ impl FeasibilitySink for FeasibilityTrace {
                     {
                         return Err(G0Error::RelationTraceInvariant);
                     }
-                    if let Some((_, _, _, _, _, pending_merges)) = stack.last_mut() {
+                    if let Some((_, _, _, _, _, pending_merges, scratch)) = stack.last_mut() {
                         let remove_owner =
                             pending_merges.get_mut(&observation.owner).is_some_and(|merges| {
                                 merges.remove(&observation.source_monomial);
@@ -2239,10 +2362,19 @@ impl FeasibilitySink for FeasibilityTrace {
                         if remove_owner {
                             pending_merges.remove(&observation.owner);
                         }
+                        if let Some((_, seen_pre_fold)) = scratch {
+                            if *seen_pre_fold {
+                                return Err(G0Error::RelationTraceInvariant);
+                            }
+                        }
+                        if let Some((map, _)) = scratch {
+                            map.remove(&observation.source_monomial);
+                        }
                     }
                 }
                 NormalizerEvent::BoundTransfer { owner, .. } => {
-                    let Some((root, start, _, pending_bounds, predecessors, _)) = stack.last_mut()
+                    let Some((root, start, _, pending_bounds, predecessors, _, _)) =
+                        stack.last_mut()
                     else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
@@ -2262,7 +2394,8 @@ impl FeasibilitySink for FeasibilityTrace {
                     pending_bounds.insert(*owner);
                 }
                 NormalizerEvent::CoefficientMerge(observation) => {
-                    let Some((root, start, _, _, predecessors, pending_merges)) = stack.last_mut()
+                    let Some((root, start, _, _, predecessors, pending_merges, scratch)) =
+                        stack.last_mut()
                     else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
@@ -2382,15 +2515,31 @@ impl FeasibilitySink for FeasibilityTrace {
                             .or_insert_with(|| (BigInt::from(0_u8), pending_left));
                         entry.0 += &observation.signed_contribution;
                     }
+                    if let Some((map, seen_pre_fold)) = scratch {
+                        if *seen_pre_fold {
+                            return Err(G0Error::RelationTraceInvariant);
+                        }
+                        if matches!(observation.source, CoefficientMergeSource::Operator { .. }) {
+                            return Err(G0Error::RelationTraceInvariant);
+                        }
+                        if let CoefficientMergeSource::Relation { .. } = &observation.source {
+                            let entry =
+                                map.entry(observation.output).or_insert_with(|| BigInt::from(0_u8));
+                            *entry += &observation.signed_contribution;
+                            if entry.is_zero() {
+                                map.remove(&observation.output);
+                            }
+                        }
+                    }
                 }
                 NormalizerEvent::SurvivorFold(observation) => {
-                    let Some((root, start, _, _, _, _)) = stack.last() else {
+                    let Some((root, start, _, _, _, _, _)) = stack.last() else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
                     if observation.bound.0 < start.0 || observation.bound.0 >= current.0 {
                         return Err(G0Error::RelationTraceInvariant);
                     }
-                    let (owner, _, magnitude) =
+                    let (owner, monomial, magnitude) =
                         self.resolve_survivor_bound_in_frame(observation.bound, *start)?;
                     if owner.program() != root.program() {
                         return Err(G0Error::RelationTraceInvariant);
@@ -2398,8 +2547,70 @@ impl FeasibilitySink for FeasibilityTrace {
                     if *observation.coefficient.magnitude() != magnitude {
                         return Err(G0Error::RelationTraceInvariant);
                     }
-                    // Association with accumulator removal is deferred to the imminent
-                    // PreFoldPolynomial replay; this event validates only its bound evidence.
+                    if let Some((_, _, _, _, _, _, Some((map, seen_pre_fold)))) = stack.last_mut() {
+                        if !*seen_pre_fold ||
+                            map.remove(&monomial) != Some(observation.coefficient.clone())
+                        {
+                            return Err(G0Error::RelationTraceInvariant);
+                        }
+                        // PreFoldPolynomial replay owns accumulator association; this event
+                        // removes the exact term from the frame-local replay map.
+                    }
+                }
+                NormalizerEvent::PreFoldPolynomial(observation) => {
+                    let Some((root, start, results, _, _, _, scratch)) = stack.last_mut() else {
+                        return Err(G0Error::RelationTraceInvariant);
+                    };
+                    let Some((map, seen_pre_fold)) = scratch else {
+                        return Err(G0Error::RelationTraceInvariant);
+                    };
+                    if *seen_pre_fold ||
+                        map.len() != observation.polynomial.exact_terms.len() ||
+                        observation.polynomial.exact_terms.iter().any(
+                            |(monomial, coefficient)| map.get(monomial) != Some(coefficient),
+                        )
+                    {
+                        return Err(G0Error::RelationTraceInvariant);
+                    }
+                    if observation.summary_evidence.is_none() !=
+                        matches!(
+                            observation.polynomial.bounded_summary.coefficient_bound(),
+                            NumericContract::Known(CoefficientBound::ExactZero)
+                        )
+                    {
+                        return Err(G0Error::RelationTraceInvariant);
+                    }
+                    let Some(result_index) = results.get(&root.expression()).copied() else {
+                        return Err(G0Error::RelationTraceInvariant);
+                    };
+                    if result_index.0 < start.0 || result_index.0 >= current.0 {
+                        return Err(G0Error::RelationTraceInvariant);
+                    }
+                    if let Some(evidence) = &observation.summary_evidence {
+                        match evidence {
+                            BoundValueRef::Result {
+                                event,
+                                projection: BoundProjection::Summary,
+                            } => {
+                                if *event != result_index || event.0 >= current.0 {
+                                    return Err(G0Error::RelationTraceInvariant);
+                                }
+                            }
+                            BoundValueRef::Transfer(event) => {
+                                if event.0 < start.0 ||
+                                    event.0 >= current.0 ||
+                                    !matches!(
+                                        self.events.get(event.0 as usize),
+                                        Some(NormalizerEvent::BoundTransfer { owner, .. }) if *owner == *root
+                                    )
+                                {
+                                    return Err(G0Error::RelationTraceInvariant);
+                                }
+                            }
+                            _ => return Err(G0Error::RelationTraceInvariant),
+                        }
+                    }
+                    *seen_pre_fold = true;
                 }
             }
         }
@@ -2550,6 +2761,9 @@ impl FeasibilityTrace {
                         roots.insert(*source_term);
                     }
                 }
+            }
+            NormalizerEvent::PreFoldPolynomial(observation) => {
+                roots.extend(observation.polynomial.exact_terms.keys().copied());
             }
             _ => {}
         }

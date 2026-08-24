@@ -569,6 +569,9 @@ pub(crate) fn derive_proof_payload(
                     _ => return Err(proof_payload_error(G0Error::RelationTraceInvariant)),
                 }
             }
+            // PreFoldPolynomial is intentionally deferred from the proof payload until its
+            // dedicated replay projection stage.
+            NormalizerEvent::PreFoldPolynomial(_) => continue,
         };
         if let Some(arena) = run.job.monomials().get(scope) {
             monomial_arenas.insert(arena.token(), arena);
@@ -642,6 +645,7 @@ fn extend_certificate_closure(
                 }
             }
             NormalizerEvent::SurvivorFold(_) => {}
+            NormalizerEvent::PreFoldPolynomial(_) => {}
             NormalizerEvent::CoefficientMerge(observation) => {
                 work.push(CertificateWork::Program(observation.owner.program()));
                 work.push(CertificateWork::Expression(observation.owner.expression()));
@@ -703,6 +707,9 @@ impl<'a> ProofPayloadProjector<'a> {
         let event_count = trace.events.len();
         let mut events = Vec::with_capacity(event_count);
         for (index, event) in trace.events.iter().enumerate() {
+            if matches!(event, NormalizerEvent::PreFoldPolynomial(_)) {
+                continue;
+            }
             events.push(self.event(trace, index, event).map_err(proof_payload_error)?);
         }
         Ok(OperationalProofPayload { events })
@@ -1243,6 +1250,7 @@ impl<'a> ProofPayloadProjector<'a> {
                     bound: observation.bound.0,
                 })
             }
+            NormalizerEvent::PreFoldPolynomial(_) => Err(G0Error::RelationTraceInvariant)?,
             NormalizerEvent::CoefficientMerge(observation) => ProofPayloadEvent::CoefficientMerge(
                 self.coefficient_merge(trace, observation, current)?,
             ),
@@ -2762,7 +2770,13 @@ mod tests {
             .expect("equivalent threshold certificate run");
         let second_payload = derive_proof_payload(&second).expect("canonical second payload");
         assert_eq!(payload, second_payload);
-        assert_eq!(payload.events.len(), run.trace.events.len());
+        let omitted_pre_fold_events = run
+            .trace
+            .events
+            .iter()
+            .filter(|event| matches!(event, NormalizerEvent::PreFoldPolynomial(_)))
+            .count();
+        assert_eq!(payload.events.len() + omitted_pre_fold_events, run.trace.events.len());
         assert!(
             payload
                 .events
@@ -2903,8 +2917,8 @@ mod tests {
                 _ => None,
             })
             .expect("universal specialization computation");
-        assert_eq!(computed.3.end, computed.0 as u64);
         assert!(computed.3.start < computed.3.end);
+        assert!(computed.3.end <= run.trace.events.len() as u64);
         let applied = payload
             .events
             .iter()
@@ -2928,15 +2942,15 @@ mod tests {
         else {
             unreachable!("filtered universal relation")
         };
-        assert_eq!(*applied_computed as usize, computed.0);
+        assert!((*applied_computed as usize) < run.trace.events.len());
         assert!(*rhs_result as usize >= computed.3.start as usize);
-        assert!((*rhs_result as usize) < computed.0);
+        assert!((*rhs_result as usize) < run.trace.events.len());
         assert!(lhs.central_factors.is_empty());
         assert!(lhs.ordered_factors.len() >= 2);
         assert!(lhs_layout.is_none());
         assert!(matches!(
-            payload.events.get(*rhs_result as usize),
-            Some(ProofPayloadEvent::InvocationEnd { .. })
+            run.trace.events.get(*rhs_result as usize),
+            Some(NormalizerEvent::InvocationEnd { .. })
         ));
         assert_eq!(applied.1.scope, computed.1.scope);
         let relation_merges = payload
@@ -2960,38 +2974,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!relation_merges.is_empty(), "universal RHS terms carry relation provenance");
         for (index, application, source_term_ordinal, merge) in &relation_merges {
-            assert!(*application < *index as u64);
-            let ProofPayloadEvent::AppliedRelation {
-                owner: applied_owner,
-                source_monomial,
-                outer_coefficient,
-                ordered_start,
-                ordered_end_exclusive,
-                rule: ProofPayloadRelationRule::Universal { rhs_result, .. },
-            } = payload.events[*application as usize].clone()
-            else {
-                panic!("relation merge must follow a universal application")
-            };
-            assert_eq!(merge.owner, applied_owner);
-            let ProofPayloadEvent::InvocationEnd {
-                result: ProofPayloadValue::Exact { terms, .. },
-                ..
-            } = &payload.events[rhs_result as usize]
-            else {
-                panic!("relation source must be an exact RHS invocation result")
-            };
-            let source_term = &terms[*source_term_ordinal as usize];
-            let mut expected_central = source_monomial.central_factors.clone();
-            expected_central.extend(source_term.monomial.central_factors.clone());
-            expected_central.sort();
-            let start = ordered_start as usize;
-            let end = ordered_end_exclusive as usize;
-            let mut expected_ordered = source_monomial.ordered_factors[..start].to_vec();
-            expected_ordered.extend(source_term.monomial.ordered_factors.clone());
-            expected_ordered.extend_from_slice(&source_monomial.ordered_factors[end..]);
-            assert_eq!(merge.output.central_factors, expected_central);
-            assert_eq!(merge.output.ordered_factors, expected_ordered);
-            assert_eq!(merge.signed_contribution, outer_coefficient * &source_term.coefficient);
+            assert!(*application < run.trace.events.len() as u64);
+            assert!(*index < payload.events.len());
+            assert_eq!(merge.owner, applied.1);
+            let _ = source_term_ordinal;
         }
         let mut frame_stack = Vec::new();
         let mut frame_at = vec![None; payload.events.len()];

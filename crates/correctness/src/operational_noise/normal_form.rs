@@ -673,6 +673,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             } else {
                 None
             };
+            let mut pre_fold_observed = false;
             if self.relations.is_some() && self.relation_rewriting_enabled {
                 if let Some(exact_nf) = value.exact_nf.as_mut() {
                     let normal_form = Arc::make_mut(exact_nf);
@@ -687,7 +688,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 if let Some(exact_nf) = value.exact_nf.as_mut() {
                     let normal_form = Arc::make_mut(exact_nf);
                     let rebound = self.bound_normal_form(normal_form)?;
-                    let mut evidence = relation_evidence;
+                    self.observe_pre_fold_polynomial(root, normal_form, relation_evidence.clone())?;
+                    pre_fold_observed = true;
+                    let mut evidence = relation_evidence.clone();
                     self.fold_finite_no_match_terms(Some(root), normal_form, false, &mut evidence)?;
                     value.coefficient_bound = rebound;
                     if normal_form.is_zero() {
@@ -695,6 +698,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                             NumericContract::Known(CoefficientBound::ExactZero);
                         normal_form.bounded_summary = BoundedSummary::zero();
                     }
+                }
+            }
+            if !pre_fold_observed {
+                if let Some(exact_nf) = value.exact_nf.as_ref() {
+                    self.observe_pre_fold_polynomial(root, exact_nf, relation_evidence)?;
                 }
             }
             self.counters.relation_remaining = value
@@ -1362,6 +1370,23 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 coefficient: coefficient.clone(),
                 bound,
             })?;
+        Ok(())
+    }
+
+    fn observe_pre_fold_polynomial(
+        &mut self,
+        root: ScopedExprId,
+        polynomial: &PolynomialNF,
+        summary_evidence: Option<BoundValueRef>,
+    ) -> Result<(), NormalizeError> {
+        if S::ENABLED {
+            let result = self
+                .sink
+                .as_deref_mut()
+                .ok_or(super::g0::G0Error::RelationTraceInvariant)?
+                .record_pre_fold_polynomial(root, Arc::new(polynomial.clone()), summary_evidence);
+            result?;
+        }
         Ok(())
     }
 
@@ -13545,6 +13570,14 @@ mod tests {
             event,
             NormalizerEvent::BoundTransfer { rule: BoundRule::Sum { .. }, .. }
         )));
+        assert_eq!(
+            trace
+                .normalization_events()
+                .iter()
+                .filter(|event| matches!(event, NormalizerEvent::PreFoldPolynomial(_)))
+                .count(),
+            1
+        );
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
     }
 
@@ -13596,6 +13629,11 @@ mod tests {
             .iter()
             .position(|event| matches!(event, NormalizerEvent::InvocationEnd { root, .. } if *root == semantic))
             .expect("invocation end");
+        let pre_fold_index = trace
+            .normalization_events()
+            .iter()
+            .rposition(|event| matches!(event, NormalizerEvent::PreFoldPolynomial(_)))
+            .expect("pre-fold snapshot");
         let survivor_index = trace
             .normalization_events()
             .iter()
@@ -13604,6 +13642,8 @@ mod tests {
         assert!(result_index < fold_index);
         assert!(fold_index < survivor_index);
         assert!(survivor_index < end_index);
+        assert!(result_index < pre_fold_index);
+        assert!(pre_fold_index < end_index);
         assert!(
             value.exact_nf.as_ref().is_some_and(|normal_form| normal_form.exact_terms.is_empty())
         );

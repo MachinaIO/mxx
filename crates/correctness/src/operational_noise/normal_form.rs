@@ -6,9 +6,10 @@
 
 use super::{
     arena::{
-        ExprArena, ExprId, ExprNode, HashVariant, MatrixLayout, MatrixOperation,
-        ResolvedMatrixType, ResolvedValueType, SamplerOperation, ScalarOperation, ScopeProof,
-        ScopedExprId, TypedConstant, ValueOperator, ValueTransformOperation,
+        ExprArena, ExprId, ExprNode, FamilyDomain, HashVariant, MatrixLayout, MatrixOperation,
+        ProgramSignature, ResolvedMatrixType, ResolvedValueType, SamplerOperation, ScalarOperation,
+        ScopeProof, ScopedExprId, TrustedIndexRange, TypedConstant, ValueOperator,
+        ValueTransformOperation,
     },
     bound::{
         BoundClass, MatrixBound as CanonicalMatrixBound, MatrixProductFacts,
@@ -279,6 +280,29 @@ pub struct NormalizationCounters {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnsupportedProgramCallFamily {
+    pub domain: FamilyDomain,
+    pub element_type: ResolvedValueType,
+    pub body: ExprId,
+    pub reducible: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnsupportedProgramCallBound {
+    pub owner: ScopedExprId,
+    pub expression: ExprId,
+    pub program: ValueProgramId,
+    pub selector_error: ArenaError,
+    pub signature: ProgramSignature,
+    pub root: ExprId,
+    pub root_node: ExprNode,
+    pub family: Option<UnsupportedProgramCallFamily>,
+    pub root_coefficient_bound: Option<NumericContract<CoefficientBound>>,
+    pub root_trusted_range: Option<TrustedIndexRange>,
+    pub root_scoped_trusted_range: Option<TrustedIndexRange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NormalizeError {
     Arena(ArenaError),
     Facts(FactError),
@@ -298,6 +322,7 @@ pub enum NormalizeError {
         expression: ExprId,
         operator: Box<ValueOperator>,
     },
+    UnsupportedProgramCallBound(Box<UnsupportedProgramCallBound>),
     UnsupportedMatrixBound {
         owner: ScopedExprId,
         expression: ExprId,
@@ -6028,16 +6053,54 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             }
             if bound.is_missing() &&
                 let ValueOperator::ProgramCall { program } = &node.operator &&
-                self.expressions.value_type(expression)? == &ResolvedValueType::Int &&
-                let Some(range) = self
-                    .programs
-                    .selector(self.expressions, *program)
-                    .ok()
-                    .and_then(|selector| selector.output_range()) &&
-                let Some(maximum) = range.maximum_exclusive.checked_sub(1)
+                self.expressions.value_type(expression)? == &ResolvedValueType::Int
             {
-                bound =
-                    NumericContract::Known(CoefficientBound::finite(range.minimum.max(maximum)));
+                let selector = match self.programs.selector(self.expressions, *program) {
+                    Ok(selector) => selector,
+                    Err(selector_error) => {
+                        let projection = self.programs.project_program(*program)?;
+                        let root_node = self.expressions.node(projection.root)?.clone();
+                        return Err(NormalizeError::UnsupportedProgramCallBound(Box::new(
+                            UnsupportedProgramCallBound {
+                                owner,
+                                expression,
+                                program: *program,
+                                selector_error,
+                                signature: projection.signature,
+                                root: projection.root,
+                                root_node,
+                                family: projection.family.map(|family| {
+                                    UnsupportedProgramCallFamily {
+                                        domain: family.domain,
+                                        element_type: family.element_type,
+                                        body: family.body,
+                                        reducible: family.reducible,
+                                    }
+                                }),
+                                root_coefficient_bound: self
+                                    .facts
+                                    .coefficient_bound(projection.root)
+                                    .ok()
+                                    .cloned(),
+                                root_trusted_range: self
+                                    .facts
+                                    .trusted_index_range(projection.root)
+                                    .ok(),
+                                root_scoped_trusted_range: self
+                                    .facts
+                                    .trusted_scoped_index_range(*program, projection.root)
+                                    .ok(),
+                            },
+                        )));
+                    }
+                };
+                if let Some(range) = selector.output_range() &&
+                    let Some(maximum) = range.maximum_exclusive.checked_sub(1)
+                {
+                    bound = NumericContract::Known(CoefficientBound::finite(
+                        range.minimum.max(maximum),
+                    ));
+                }
             }
             if bound.is_missing() {
                 return Err(NormalizeError::UnsupportedNonmatrixBound {
@@ -14434,25 +14497,41 @@ mod tests {
             programs.generated_family(&mut expressions, signature, call).unwrap().program();
         let owner = programs.scoped(&expressions, caller, call).unwrap();
         let facts = FactStore::new(&expressions);
+        let mut ordinary_monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
+        assert_eq!(
+            Normalizer::new(&mut expressions, &programs, &facts, &mut ordinary_monomials)
+                .unwrap()
+                .normalize(owner)
+                .unwrap()
+                .coefficient_bound,
+            NumericContract::Missing
+        );
         let mut monomials = MonomialArena::new(&expressions, &programs, caller).unwrap();
         let mut trace = FeasibilityTrace::default();
-        assert_eq!(
-            Normalizer::new_with_sink(
-                &mut expressions,
-                &programs,
-                &facts,
-                &mut monomials,
-                &mut trace,
-            )
-            .unwrap()
-            .normalize(owner)
-            .unwrap_err(),
-            NormalizeError::UnsupportedNonmatrixBound {
-                owner,
-                expression: call,
-                operator: Box::new(ValueOperator::ProgramCall { program: callee }),
-            }
-        );
+        let error = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(owner)
+        .unwrap_err();
+        let NormalizeError::UnsupportedProgramCallBound(context) = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(context.owner, owner);
+        assert_eq!(context.expression, call);
+        assert_eq!(context.program, callee);
+        assert_eq!(context.selector_error, ArenaError::ProgramSignatureMismatch);
+        assert_eq!(context.signature.output, ResolvedValueType::Int);
+        assert_eq!(context.root, unsupported_root);
+        assert_eq!(context.root_node, expressions.node(unsupported_root).unwrap().clone());
+        assert_eq!(context.family, None);
+        assert_eq!(context.root_coefficient_bound, None);
+        assert_eq!(context.root_trusted_range, None);
+        assert_eq!(context.root_scoped_trusted_range, None);
     }
 
     #[test]

@@ -1370,8 +1370,53 @@ impl<P: Poly> NestedRnsPoly<P> {
         let mut right = other.clone();
         let predicted_bounds = self.compute_binary_output_bounds(other, &output_bound);
         if self.bounds_exceed_p_full(&predicted_bounds) {
-            left = self.full_reduce(circuit);
-            right = other.full_reduce(circuit);
+            let levels = self.resolve_enable_levels();
+            let context_reduced_bounds =
+                &self.ctx.full_reduce_max_plaintexts[self.window.offset..self.window.end()];
+            let reduced_bounds_for = |bounds: &[BigUint]| {
+                bounds[..levels]
+                    .iter()
+                    .zip(context_reduced_bounds)
+                    .map(
+                        |(bound, reduced)| {
+                            if bound == &BigUint::ZERO { BigUint::ZERO } else { reduced.clone() }
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            };
+            let reduced_left_bounds = reduced_bounds_for(&self.max_plaintexts);
+            let reduced_right_bounds = reduced_bounds_for(&other.max_plaintexts);
+            let bounds_with = |left_bounds: &[BigUint], right_bounds: &[BigUint]| {
+                (0..levels)
+                    .map(|q_idx| {
+                        output_bound(
+                            &left_bounds[q_idx],
+                            &right_bounds[q_idx],
+                            self.ctx.q_moduli[self.window.offset + q_idx],
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let left_reduced_bounds = bounds_with(&reduced_left_bounds, &other.max_plaintexts);
+            let right_reduced_bounds = bounds_with(&self.max_plaintexts, &reduced_right_bounds);
+            let left_reduction_suffices = !self.bounds_exceed_p_full(&left_reduced_bounds);
+            let right_reduction_suffices = !self.bounds_exceed_p_full(&right_reduced_bounds);
+
+            match (left_reduction_suffices, right_reduction_suffices) {
+                (true, false) => left = self.full_reduce(circuit),
+                (false, true) => right = other.full_reduce(circuit),
+                (true, true) => {
+                    if left_reduced_bounds.iter().max() <= right_reduced_bounds.iter().max() {
+                        left = self.full_reduce(circuit);
+                    } else {
+                        right = other.full_reduce(circuit);
+                    }
+                }
+                (false, false) => {
+                    left = self.full_reduce(circuit);
+                    right = other.full_reduce(circuit);
+                }
+            }
         }
         let final_bounds = left.compute_binary_output_bounds(&right, &output_bound);
         left.assert_bounds_within_p_full(
@@ -3295,7 +3340,7 @@ mod tests {
     }
 
     #[test]
-    fn sequential_mul_uses_the_extended_unreduced_multiplication_budget() {
+    fn sequential_mul_reduces_only_the_operand_required_by_the_multiplication_budget() {
         let q_level = Some(1usize);
         let p_moduli_bits = 10usize;
         let max_unreduced_muls = 4usize;
@@ -3338,10 +3383,7 @@ mod tests {
                     product = product.mul(input, &mut circuit);
                 }
                 product = product.full_reduce(&mut circuit);
-                product = product.mul(
-                    &inputs.last().expect("last input").full_reduce(&mut circuit),
-                    &mut circuit,
-                );
+                product = product.mul(inputs.last().expect("last input"), &mut circuit);
             } else {
                 for input in inputs.iter().skip(1) {
                     product = product.mul(input, &mut circuit);

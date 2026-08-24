@@ -3808,24 +3808,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             weight,
         )?;
         let mut evidence = None;
-        let source_events = if S::ENABLED {
-            if owner.is_some() {
-                Some((
-                    self.relation_input_result(left_expression)?,
-                    self.relation_input_result(right_expression)?,
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         self.product_into_body(
             owner,
+            left_expression,
+            right_expression,
             left,
             right,
             weight,
-            source_events,
             terms,
             noise,
             &mut evidence,
@@ -3841,56 +3830,151 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     fn product_into_body<A: ExactTermAccumulator>(
         &mut self,
         owner: Option<ScopedExprId>,
+        left_expression: ExprId,
+        right_expression: ExprId,
         left: &PolynomialNF,
         right: &PolynomialNF,
         weight: &BigInt,
-        source_events: Option<(super::g0::EventIndex, super::g0::EventIndex)>,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
     ) -> Result<(), NormalizeError> {
         let mut worklist = VecDeque::<ProductWorkItem>::new();
-        for (left_ordinal, (left_id, left_coefficient)) in left.exact_terms.iter().enumerate() {
-            for (right_ordinal, (right_id, right_coefficient)) in
-                right.exact_terms.iter().enumerate()
-            {
-                let coefficient = left_coefficient * right_coefficient * weight;
-                if coefficient.is_zero() {
-                    continue;
+        if S::ENABLED {
+            if let Some(owner) = owner {
+                let left_event = self.relation_input_result(left_expression)?;
+                let right_event = self.relation_input_result(right_expression)?;
+                let sink =
+                    self.sink.as_deref().ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                let left_source = sink.result_exact_nf(left_event)?;
+                let right_source = sink.result_exact_nf(right_event)?;
+                if left.exact_terms.len() != left_source.exact_terms.len() ||
+                    right.exact_terms.len() != right_source.exact_terms.len() ||
+                    !left
+                        .exact_terms
+                        .values()
+                        .zip(left_source.exact_terms.values())
+                        .all(|(working, source)| working == source) ||
+                    !right
+                        .exact_terms
+                        .values()
+                        .zip(right_source.exact_terms.values())
+                        .all(|(working, source)| working == source)
+                {
+                    return Err(super::g0::G0Error::RelationTraceInvariant.into());
                 }
-                let product = self.product_monomials(*left_id, *right_id)?;
-                worklist.push_back(ProductWorkItem::Term(product, coefficient));
-                let mut source_refs = if let Some((left_event, right_event)) = source_events {
-                    let sink =
-                        self.sink.as_deref().ok_or(super::g0::G0Error::RelationTraceInvariant)?;
-                    Some([
-                        RecordedTermRef {
-                            value_event: left_event,
-                            monomial: sink.result_monomial(left_event, left_ordinal as u64)?,
-                        },
-                        RecordedTermRef {
-                            value_event: right_event,
-                            monomial: sink.result_monomial(right_event, right_ordinal as u64)?,
-                        },
-                    ])
-                } else {
-                    None
-                };
-                // Drain each completed Cartesian pair before generating the next one. The same
-                // rewrite queue remains authoritative, but its live size follows one pair's
-                // recursive splice instead of the full product cardinality.
-                self.drain_product_worklist(
+                for ((left_id, left_coefficient), (left_source_id, _)) in
+                    left.exact_terms.iter().zip(left_source.exact_terms.iter())
+                {
+                    for ((right_id, right_coefficient), (right_source_id, _)) in
+                        right.exact_terms.iter().zip(right_source.exact_terms.iter())
+                    {
+                        self.product_pair_into_body(
+                            Some(owner),
+                            *left_id,
+                            *right_id,
+                            left_coefficient,
+                            right_coefficient,
+                            weight,
+                            Some([
+                                RecordedTermRef {
+                                    value_event: left_event,
+                                    monomial: *left_source_id,
+                                },
+                                RecordedTermRef {
+                                    value_event: right_event,
+                                    monomial: *right_source_id,
+                                },
+                            ]),
+                            terms,
+                            noise,
+                            evidence,
+                            &mut worklist,
+                        )?;
+                    }
+                }
+            } else {
+                return self.product_into_body_without_sources(
                     owner,
+                    left,
+                    right,
+                    weight,
                     terms,
                     noise,
                     evidence,
-                    &mut source_refs,
                     &mut worklist,
+                );
+            }
+        } else {
+            return self.product_into_body_without_sources(
+                owner,
+                left,
+                right,
+                weight,
+                terms,
+                noise,
+                evidence,
+                &mut worklist,
+            );
+        }
+        Ok(())
+    }
+
+    fn product_into_body_without_sources<A: ExactTermAccumulator>(
+        &mut self,
+        owner: Option<ScopedExprId>,
+        left: &PolynomialNF,
+        right: &PolynomialNF,
+        weight: &BigInt,
+        terms: &mut A,
+        noise: &mut NumericContract<CoefficientBound>,
+        evidence: &mut Option<BoundValueRef>,
+        worklist: &mut VecDeque<ProductWorkItem>,
+    ) -> Result<(), NormalizeError> {
+        for (left_id, left_coefficient) in &left.exact_terms {
+            for (right_id, right_coefficient) in &right.exact_terms {
+                self.product_pair_into_body(
+                    owner,
+                    *left_id,
+                    *right_id,
+                    left_coefficient,
+                    right_coefficient,
+                    weight,
+                    None,
+                    terms,
+                    noise,
+                    evidence,
+                    worklist,
                 )?;
             }
         }
-        let mut no_sources = None;
-        self.drain_product_worklist(owner, terms, noise, evidence, &mut no_sources, &mut worklist)
+        Ok(())
+    }
+
+    fn product_pair_into_body<A: ExactTermAccumulator>(
+        &mut self,
+        owner: Option<ScopedExprId>,
+        left_id: MonomialId,
+        right_id: MonomialId,
+        left_coefficient: &BigInt,
+        right_coefficient: &BigInt,
+        weight: &BigInt,
+        mut source_refs: Option<[RecordedTermRef; 2]>,
+        terms: &mut A,
+        noise: &mut NumericContract<CoefficientBound>,
+        evidence: &mut Option<BoundValueRef>,
+        worklist: &mut VecDeque<ProductWorkItem>,
+    ) -> Result<(), NormalizeError> {
+        let coefficient = left_coefficient * right_coefficient * weight;
+        if coefficient.is_zero() {
+            return Ok(())
+        }
+        let product = self.product_monomials(left_id, right_id)?;
+        worklist.push_back(ProductWorkItem::Term(product, coefficient));
+        // Drain each completed Cartesian pair before generating the next one. The same rewrite
+        // queue remains authoritative, but its live size follows one pair's recursive splice
+        // instead of the full product cardinality.
+        self.drain_product_worklist(owner, terms, noise, evidence, &mut source_refs, worklist)
     }
 
     fn drain_product_worklist<A: ExactTermAccumulator>(
@@ -3990,16 +4074,10 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             return Ok(())
         }
         let initial_bound = self.bound_monomial(monomial, &coefficient)?;
-        let relations_available = if S::ENABLED {
-            self.relations
-                .is_some_and(|relations| matches!(relations.has_universal_relations(), Ok(true)))
-        } else {
-            self.relations.is_some()
-        };
         let needs_relation_closure = matches!(
             initial_bound,
             NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing
-        ) && relations_available &&
+        ) && self.relations.is_some() &&
             self.normalization_depth == 1;
         if !needs_relation_closure {
             return self.merge_product_term(
@@ -4015,14 +4093,18 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
 
         let mut candidate = PolynomialNF {
-            exact_terms: BTreeMap::from([(monomial, coefficient)]),
+            exact_terms: BTreeMap::from([(monomial, coefficient.clone())]),
             bounded_summary: BoundedSummary::zero(),
         };
         let relation_owner = match owner {
             Some(owner) => owner,
             None => self.programs.root(self.expressions, self.scope)?,
         };
-        self.rewrite_relations(relation_owner, &mut candidate, evidence)?;
+        let changed = self.rewrite_relations(relation_owner, &mut candidate, evidence)?;
+        let preserve_source_refs = !changed &&
+            candidate.exact_terms.len() == 1 &&
+            candidate.exact_terms.get(&monomial) == Some(&coefficient);
+        let mut source_refs = source_refs;
         *noise = add_noise_summaries(noise, &candidate.bounded_summary.coefficient_bound());
         for (rewritten, rewritten_coefficient) in candidate.exact_terms {
             let bound = self.bound_monomial(rewritten, &rewritten_coefficient)?;
@@ -4031,7 +4113,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 rewritten,
                 rewritten_coefficient,
                 bound,
-                None,
+                if preserve_source_refs { source_refs.take() } else { None },
                 terms,
                 noise,
                 evidence,

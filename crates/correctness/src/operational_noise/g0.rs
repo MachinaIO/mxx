@@ -94,11 +94,10 @@ pub(crate) trait FeasibilitySink: Default {
 
     fn invocation_end_for(&self, root: super::arena::ScopedExprId) -> Result<EventIndex, G0Error>;
 
-    fn result_monomial(
+    fn result_exact_nf(
         &self,
         event: EventIndex,
-        ordinal: u64,
-    ) -> Result<super::monomial::MonomialId, G0Error>;
+    ) -> Result<std::sync::Arc<super::normal_form::PolynomialNF>, G0Error>;
 
     fn resolve_result(&self, expression: ExprId) -> Result<EventIndex, G0Error>;
 
@@ -1448,11 +1447,10 @@ impl FeasibilitySink for NoFeasibility {
         Ok(EventIndex(0))
     }
 
-    fn result_monomial(
+    fn result_exact_nf(
         &self,
         _event: EventIndex,
-        _ordinal: u64,
-    ) -> Result<super::monomial::MonomialId, G0Error> {
+    ) -> Result<std::sync::Arc<super::normal_form::PolynomialNF>, G0Error> {
         Err(G0Error::RelationTraceInvariant)
     }
 
@@ -1808,21 +1806,16 @@ impl FeasibilitySink for FeasibilityTrace {
         }
     }
 
-    fn result_monomial(
+    fn result_exact_nf(
         &self,
         event: EventIndex,
-        ordinal: u64,
-    ) -> Result<super::monomial::MonomialId, G0Error> {
+    ) -> Result<std::sync::Arc<super::normal_form::PolynomialNF>, G0Error> {
         let value = match self.events.get(event.0 as usize) {
             Some(NormalizerEvent::Result { value, .. }) |
             Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
             _ => return Err(G0Error::RelationTraceInvariant),
         };
-        value
-            .exact_nf
-            .as_ref()
-            .and_then(|normal_form| normal_form.exact_terms.keys().nth(ordinal as usize).copied())
-            .ok_or(G0Error::RelationTraceInvariant)
+        value.exact_nf.clone().ok_or(G0Error::RelationTraceInvariant)
     }
 
     fn resolve_result(&self, expression: ExprId) -> Result<EventIndex, G0Error> {

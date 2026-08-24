@@ -2213,6 +2213,24 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         input.trusted_index_range
     }
 
+    fn scoped_argument_bound(
+        &self,
+        owner: ScopedExprId,
+        position: u32,
+        value_type: &ResolvedValueType,
+    ) -> Option<NumericContract<CoefficientBound>> {
+        let program = self.programs.program(owner.program()).ok()?;
+        let input = program.signature.inputs.get(position as usize)?;
+        if &input.value_type != value_type {
+            return None;
+        }
+        let range = input.trusted_index_range?;
+        if range.minimum >= range.maximum_exclusive {
+            return None;
+        }
+        Some(NumericContract::Known(CoefficientBound::finite(range.maximum_exclusive - 1)))
+    }
+
     /// Exact affine form `a * argument + b` of one binder-open Int expression, with
     /// range-proved remainder elimination: `x mod m` reduces to `x - k*m` only when the
     /// binder's trusted range confines `x` to the single window `[k*m, (k+1)*m)`. Every
@@ -5946,7 +5964,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
         let bounds =
             children.iter().map(|value| value.coefficient_bound.clone()).collect::<Vec<_>>();
-        let bound = match &node.operator {
+        let mut bound = match &node.operator {
             ValueOperator::Constant(constant) => match &constant.value {
                 super::arena::ConstantValue::Int(value) => {
                     NumericContract::Known(CoefficientBound::finite(value.magnitude().clone()))
@@ -5963,6 +5981,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             _ => bounds.first().cloned().unwrap_or(NumericContract::Missing),
         };
         if S::ENABLED {
+            if bound.is_missing() &&
+                let ValueOperator::Argument { position: 0, value_type: ResolvedValueType::Int } =
+                    &node.operator
+            {
+                bound = self
+                    .scoped_argument_bound(owner, 0, &ResolvedValueType::Int)
+                    .unwrap_or(NumericContract::Missing);
+            }
             if bound.is_missing() {
                 return Err(NormalizeError::UnsupportedNonmatrixBound {
                     owner,
@@ -5974,6 +6000,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 ValueOperator::Constant(constant)
                     if matches!(&constant.value, super::arena::ConstantValue::Int(_)) =>
                 {
+                    BoundRule::Authority(BoundAuthority::Operator)
+                }
+                ValueOperator::Argument { position: 0, value_type: ResolvedValueType::Int } => {
                     BoundRule::Authority(BoundAuthority::Operator)
                 }
                 ValueOperator::Scalar(ScalarOperation::Add | ScalarOperation::Subtract) => {
@@ -14042,7 +14071,22 @@ mod tests {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
-        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, argument);
+        let program = programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: None,
+                    }]),
+                    output: ResolvedValueType::Int,
+                },
+                argument,
+            )
+            .unwrap();
+        let facts = FactStore::new(&expressions);
+        let mut monomials = MonomialArena::new(&expressions, &programs, program).unwrap();
+        let semantic = programs.scoped(&expressions, program, argument).unwrap();
         let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
             .unwrap()
             .normalize(semantic)
@@ -14110,6 +14154,76 @@ mod tests {
                 operator: Box::new(ValueOperator::Scalar(ScalarOperation::Divide)),
             }
         );
+    }
+
+    #[test]
+    fn scoped_argument_bounds_are_owner_local_and_leave_ordinary_missing() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let program_for_range = |programs: &mut ProgramArena,
+                                 expressions: &mut ExprArena,
+                                 minimum,
+                                 maximum_exclusive| {
+            programs
+                .finalize(
+                    expressions,
+                    ProgramSignature {
+                        inputs: Box::new([ProgramInput {
+                            value_type: ResolvedValueType::Int,
+                            trusted_index_range: Some(TrustedIndexRange {
+                                minimum,
+                                maximum_exclusive,
+                            }),
+                        }]),
+                        output: ResolvedValueType::Int,
+                    },
+                    argument,
+                )
+                .unwrap()
+        };
+        let first = program_for_range(&mut programs, &mut expressions, 0, 32);
+        let second = program_for_range(&mut programs, &mut expressions, 7, 9);
+        let facts = FactStore::new(&expressions);
+
+        for (program, expected) in [(first, 31_u64), (second, 8_u64)] {
+            let owner = programs.scoped(&expressions, program, argument).unwrap();
+            let mut ordinary_monomials =
+                MonomialArena::new(&expressions, &programs, program).unwrap();
+            let ordinary =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut ordinary_monomials)
+                    .unwrap()
+                    .normalize(owner)
+                    .unwrap();
+            assert_eq!(ordinary.coefficient_bound, NumericContract::Missing);
+
+            let mut traced_monomials =
+                MonomialArena::new(&expressions, &programs, program).unwrap();
+            let mut trace = FeasibilityTrace::default();
+            let traced = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut traced_monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .normalize(owner)
+            .unwrap();
+            assert_eq!(
+                traced.coefficient_bound,
+                NumericContract::Known(CoefficientBound::finite(expected))
+            );
+            assert!(trace.normalization_events().iter().any(|event| {
+                matches!(
+                    event,
+                    NormalizerEvent::BoundTransfer {
+                        owner: observed,
+                        rule: BoundRule::Authority(BoundAuthority::Operator),
+                    } if *observed == owner
+                )
+            }));
+        }
     }
 
     #[test]

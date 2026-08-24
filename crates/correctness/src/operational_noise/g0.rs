@@ -5899,7 +5899,7 @@ pub(crate) enum CanonicalExpressionOperator {
 pub(crate) enum CanonicalEventOperator {
     Sample { event: StableEventRef },
     Sampler { event: StableEventRef },
-    GadgetDecompose { event: StableEventRef },
+    GadgetDecompose { events: Vec<StableEventRef> },
 }
 
 fn dense_namespace_refs<T: Copy + Ord>(
@@ -6168,7 +6168,7 @@ pub(crate) fn derive_certificate_statement_rows(
             ValueOperator::Transform(ValueTransformOperation::GadgetDecompose { .. }) => {
                 CanonicalExpressionDescriptor::Event {
                     operator: CanonicalEventOperator::GadgetDecompose {
-                        event: *derived_events.gadget_refs.get(expression).ok_or(
+                        events: derived_events.gadget_refs.get(expression).cloned().ok_or(
                             G0Error::MissingCanonicalHandle {
                                 requested: CanonicalReference::Expr(*expression),
                             },
@@ -6260,7 +6260,7 @@ pub(crate) fn derive_certificate_statement_rows(
 
 struct DerivedStatementEvents {
     rows: Vec<CanonicalStatementEventRow>,
-    gadget_refs: BTreeMap<ExprId, StableEventRef>,
+    gadget_refs: BTreeMap<ExprId, Vec<StableEventRef>>,
 }
 
 fn derive_statement_events(
@@ -6367,9 +6367,7 @@ fn derive_statement_events(
         let row = u64::try_from(events.len()).map_err(|_| G0Error::TraceOverflow)?;
         let event_ref = StableEventRef { row };
         for expression in expressions {
-            if gadget_refs.insert(expression, event_ref).is_some() {
-                return Err(G0Error::AmbiguousCanonicalKey);
-            }
+            gadget_refs.entry(expression).or_insert_with(Vec::new).push(event_ref);
         }
         events.push(event);
     }
@@ -6891,9 +6889,9 @@ mod tests {
             &rows.expressions()[gadget_row].descriptor,
             CanonicalExpressionDescriptor::Event {
                 operator: CanonicalEventOperator::GadgetDecompose {
-                    event: StableEventRef { row: 0 }
+                    events
                 }
-            }
+            } if events == &[StableEventRef { row: 0 }]
         ));
         let expression_json =
             serde_json::to_value(&rows.expressions()[gadget_row].descriptor).unwrap();
@@ -6905,6 +6903,102 @@ mod tests {
         assert!(operator.get("base").is_none());
         assert!(operator.get("digit_count").is_none());
         assert!(operator.get("output").is_none());
+    }
+
+    #[test]
+    fn shared_gadget_body_keeps_each_program_scope_event_ref() {
+        use crate::operational_noise::program::FamilyDomain;
+
+        let mut job = CheckerJob::new();
+        let scalar = job
+            .expressions_mut()
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let input_type = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
+        let input = job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
+                    output: input_type,
+                    coefficient_bits: 1,
+                }),
+                Box::new([scalar]),
+            )
+            .unwrap();
+        let output = ResolvedMatrixType::new(17_u8.into(), 1, 2, 1).unwrap();
+        let gadget = job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    output,
+                    base: 4,
+                    small: false,
+                    digit_count: 2,
+                }),
+                Box::new([input]),
+            )
+            .unwrap();
+        let (first, second) = job
+            .with_arena_stores(|expressions, programs, _| {
+                Ok((
+                    programs.generated_family_from_body(
+                        expressions,
+                        FamilyDomain::new(0, 1).unwrap(),
+                        gadget,
+                    )?,
+                    programs.generated_family_from_body(
+                        expressions,
+                        FamilyDomain::new(0, 2).unwrap(),
+                        gadget,
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_ne!(first.program(), second.program());
+        let first_projection = job.programs().project_program(first.program()).unwrap();
+        let second_projection = job.programs().project_program(second.program()).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        for family in [first, second] {
+            trace
+                .record_invocation_start(
+                    job.programs().scoped(job.expressions(), family.program(), gadget).unwrap(),
+                )
+                .unwrap();
+        }
+        let closure = CertificateClosure {
+            expressions: [scalar, input, gadget, first_projection.root, second_projection.root]
+                .into_iter()
+                .collect(),
+            programs: [first.program(), second.program()].into_iter().collect(),
+            families: [first, second].into_iter().collect(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: [scalar].into_iter().collect(),
+        };
+        let rows = derive_certificate_statement_rows(&job, &closure, &trace).unwrap();
+        let scopes = rows
+            .events()
+            .iter()
+            .map(|event| match event {
+                CanonicalStatementEventRow::GadgetDecompose { scope, .. } => *scope,
+                _ => unreachable!("fixture has only gadget events"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scopes,
+            vec![
+                CanonicalStatementScope::Program { program: 0 },
+                CanonicalStatementScope::Program { program: 1 },
+            ]
+        );
+        let gadget_row = rows.expression(gadget).unwrap() as usize;
+        assert!(matches!(
+            &rows.expressions()[gadget_row].descriptor,
+            CanonicalExpressionDescriptor::Event {
+                operator: CanonicalEventOperator::GadgetDecompose { events }
+            } if events.as_slice() == [StableEventRef { row: 0 }, StableEventRef { row: 1 }]
+        ));
     }
 
     #[test]

@@ -892,11 +892,36 @@ impl<'a> ProofPayloadProjector<'a> {
             MatrixOperation::Multiply => {
                 let left = self.monomial(observation.sources[0].monomial)?;
                 let right = self.monomial(observation.sources[1].monomial)?;
-                let mut central_factors = left.central_factors;
-                central_factors.extend(right.central_factors);
-                central_factors.sort();
-                let mut ordered_factors = left.ordered_factors;
-                ordered_factors.extend(right.ordered_factors);
+                let left_type = self.job.expressions().value_type(node.inputs[0])?;
+                let right_type = self.job.expressions().value_type(node.inputs[1])?;
+                let left_scalar = matches!(
+                    left_type,
+                    ResolvedValueType::Matrix(matrix) if matrix.rows == 1 && matrix.columns == 1
+                );
+                let right_scalar = matches!(
+                    right_type,
+                    ResolvedValueType::Matrix(matrix) if matrix.rows == 1 && matrix.columns == 1
+                );
+                let (central_factors, ordered_factors) = if left_scalar && !right_scalar {
+                    let mut central_factors = left.central_factors;
+                    central_factors.extend(left.ordered_factors);
+                    central_factors.extend(right.central_factors);
+                    central_factors.sort();
+                    (central_factors, right.ordered_factors)
+                } else if right_scalar && !left_scalar {
+                    let mut central_factors = right.central_factors;
+                    central_factors.extend(right.ordered_factors);
+                    central_factors.extend(left.central_factors);
+                    central_factors.sort();
+                    (central_factors, left.ordered_factors)
+                } else {
+                    let mut central_factors = left.central_factors;
+                    central_factors.extend(right.central_factors);
+                    central_factors.sort();
+                    let mut ordered_factors = left.ordered_factors;
+                    ordered_factors.extend(right.ordered_factors);
+                    (central_factors, ordered_factors)
+                };
                 if output.central_factors != central_factors ||
                     output.ordered_factors != ordered_factors
                 {
@@ -2163,7 +2188,7 @@ fn wire_consumes(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::g0::FeasibilitySink, *};
     use crate::{
         OutputRef, ProtocolDecl, ProtocolStage, StageId,
         bundle::{
@@ -2230,9 +2255,15 @@ mod tests {
     fn threshold_certificate_protocol() -> ProtocolDecl {
         let stage_id = StageId("certificate-stage".to_owned());
         let ring = Ring::new(256, 1);
-        let sampled = ring.uniform_residue((1, 1));
-        let doubled = sampled.clone() + sampled;
-        let residual = (doubled.clone() - doubled)
+        let left_factor = ring.gaussian((1, 1), 1, 2);
+        let right_factor = ring.gaussian((1, 1), 1, 3);
+        let left_scalar = left_factor.clone() + left_factor;
+        let right_scalar = right_factor.clone() + right_factor.clone() + right_factor;
+        let matrix = ring.uniform_residue((2, 2));
+        let left_outer = left_scalar * matrix.clone();
+        let right_outer = right_scalar * matrix;
+        let product = left_outer * right_outer;
+        let residual = (product.clone() - product)
             .semantic_anchor("certificate.residual")
             .expect("residual anchor");
         let decoded = residual
@@ -2535,6 +2566,26 @@ mod tests {
         };
         let run = prepare_operational_certificate(&protocol, &request)
             .expect("valid threshold certificate run");
+        let validation_program = run
+            .trace
+            .events
+            .iter()
+            .find_map(|event| match event {
+                NormalizerEvent::InvocationStart { root } => Some(root.program()),
+                _ => None,
+            })
+            .expect("threshold invocation program");
+        let monomials =
+            run.job.monomials().get(validation_program).expect("threshold monomial arena");
+        run.trace
+            .validate_normalization_observations_with_monomials(monomials)
+            .expect("threshold product trace validates");
+        run.trace
+            .validate_normalization_observations_with_state(
+                monomials,
+                &super::super::relation::NormalizationCache::new(),
+            )
+            .expect("threshold product state validates");
         let payload = derive_proof_payload(&run).expect("canonical proof payload");
         let second = prepare_operational_certificate(&protocol, &request)
             .expect("equivalent threshold certificate run");
@@ -2562,9 +2613,35 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(merges.len(), 2, "the doubled add and cancelling subtract each merge once");
-        assert_eq!(merges[0].1.signed_contribution, BigInt::from(1_u8));
-        assert_eq!(merges[1].1.signed_contribution, BigInt::from(-2_i8));
+        let product_merge = merges
+            .iter()
+            .find(|(_, merge)| merge.signed_contribution == BigInt::from(6_u8))
+            .expect("nonunit production product merge");
+        assert_eq!(product_merge.1.sources.len(), 2);
+        assert_eq!(
+            product_merge.1.sources.iter().map(|source| source.term_ordinal).collect::<Vec<_>>(),
+            vec![0, 0]
+        );
+        assert_eq!(
+            product_merge
+                .1
+                .output
+                .central_factors
+                .iter()
+                .map(|owner| owner.expression_row)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(
+            product_merge
+                .1
+                .output
+                .ordered_factors
+                .iter()
+                .map(|owner| owner.expression_row)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
         for (merge_index, merge) in &merges {
             assert_eq!(merge.sources.len(), 2);
             assert_eq!(merge.sources[0].term_ordinal, merge.sources[1].term_ordinal);

@@ -3850,20 +3850,32 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         evidence: &mut Option<BoundValueRef>,
     ) -> Result<(), NormalizeError> {
         let mut worklist = VecDeque::<ProductWorkItem>::new();
-        for (left_id, left_coefficient) in &left.exact_terms {
-            for (right_id, right_coefficient) in &right.exact_terms {
+        for (left_ordinal, (left_id, left_coefficient)) in left.exact_terms.iter().enumerate() {
+            for (right_ordinal, (right_id, right_coefficient)) in
+                right.exact_terms.iter().enumerate()
+            {
                 let coefficient = left_coefficient * right_coefficient * weight;
                 if coefficient.is_zero() {
                     continue;
                 }
                 let product = self.product_monomials(*left_id, *right_id)?;
                 worklist.push_back(ProductWorkItem::Term(product, coefficient));
-                let mut source_refs = source_events.map(|(left_event, right_event)| {
-                    [
-                        RecordedTermRef { value_event: left_event, monomial: *left_id },
-                        RecordedTermRef { value_event: right_event, monomial: *right_id },
-                    ]
-                });
+                let mut source_refs = if let Some((left_event, right_event)) = source_events {
+                    let sink =
+                        self.sink.as_deref().ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                    Some([
+                        RecordedTermRef {
+                            value_event: left_event,
+                            monomial: sink.result_monomial(left_event, left_ordinal as u64)?,
+                        },
+                        RecordedTermRef {
+                            value_event: right_event,
+                            monomial: sink.result_monomial(right_event, right_ordinal as u64)?,
+                        },
+                    ])
+                } else {
+                    None
+                };
                 // Drain each completed Cartesian pair before generating the next one. The same
                 // rewrite queue remains authoritative, but its live size follows one pair's
                 // recursive splice instead of the full product cardinality.
@@ -3978,10 +3990,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             return Ok(())
         }
         let initial_bound = self.bound_monomial(monomial, &coefficient)?;
+        let relations_available = if S::ENABLED {
+            self.relations
+                .is_some_and(|relations| matches!(relations.has_universal_relations(), Ok(true)))
+        } else {
+            self.relations.is_some()
+        };
         let needs_relation_closure = matches!(
             initial_bound,
             NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing
-        ) && self.relations.is_some() &&
+        ) && relations_available &&
             self.normalization_depth == 1;
         if !needs_relation_closure {
             return self.merge_product_term(

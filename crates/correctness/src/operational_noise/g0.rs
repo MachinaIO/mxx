@@ -94,6 +94,12 @@ pub(crate) trait FeasibilitySink: Default {
 
     fn invocation_end_for(&self, root: super::arena::ScopedExprId) -> Result<EventIndex, G0Error>;
 
+    fn result_monomial(
+        &self,
+        event: EventIndex,
+        ordinal: u64,
+    ) -> Result<super::monomial::MonomialId, G0Error>;
+
     fn resolve_result(&self, expression: ExprId) -> Result<EventIndex, G0Error>;
 
     fn record_applied_relation(
@@ -1442,6 +1448,14 @@ impl FeasibilitySink for NoFeasibility {
         Ok(EventIndex(0))
     }
 
+    fn result_monomial(
+        &self,
+        _event: EventIndex,
+        _ordinal: u64,
+    ) -> Result<super::monomial::MonomialId, G0Error> {
+        Err(G0Error::RelationTraceInvariant)
+    }
+
     fn resolve_result(&self, _expression: ExprId) -> Result<EventIndex, G0Error> {
         Ok(EventIndex(0))
     }
@@ -1792,6 +1806,23 @@ impl FeasibilitySink for FeasibilityTrace {
             }
             _ => Err(G0Error::MissingNormalizationResult),
         }
+    }
+
+    fn result_monomial(
+        &self,
+        event: EventIndex,
+        ordinal: u64,
+    ) -> Result<super::monomial::MonomialId, G0Error> {
+        let value = match self.events.get(event.0 as usize) {
+            Some(NormalizerEvent::Result { value, .. }) |
+            Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
+            _ => return Err(G0Error::RelationTraceInvariant),
+        };
+        value
+            .exact_nf
+            .as_ref()
+            .and_then(|normal_form| normal_form.exact_terms.keys().nth(ordinal as usize).copied())
+            .ok_or(G0Error::RelationTraceInvariant)
     }
 
     fn resolve_result(&self, expression: ExprId) -> Result<EventIndex, G0Error> {
@@ -2194,7 +2225,8 @@ impl FeasibilitySink for FeasibilityTrace {
                     }
                     let right = &coefficients[1];
                     if *right != observation.signed_contribution &&
-                        -right.clone() != observation.signed_contribution
+                        -right.clone() != observation.signed_contribution &&
+                        &coefficients[0] * right != observation.signed_contribution
                     {
                         return Err(G0Error::RelationTraceInvariant);
                     }

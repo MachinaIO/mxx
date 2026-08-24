@@ -8960,6 +8960,17 @@ mod tests {
                 _ => None,
             })
             .expect("gadget application");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    NormalizerEvent::AppliedRelation(observation)
+                        if observation.owner == semantic
+                ))
+                .count(),
+            1
+        );
         assert_eq!(operator.2, applied.1);
         assert_eq!(operator.3, BigInt::from(1_u8));
         assert!(operator.0 < applied.0);
@@ -9159,6 +9170,7 @@ mod tests {
             relations.iter().map(|(_, source, _, _)| *source).collect::<Vec<_>>(),
             expected_sources
         );
+        assert!(relations.iter().all(|(_, source, output, _)| source == output));
         assert!(relations.iter().all(|(_, _, output, _)| *output != operator.2));
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
         trace

@@ -147,7 +147,7 @@ pub struct BaseNBreakdown {
 }
 
 const G0_CPU_EVIDENCE_SCHEMA_ID: &str = "mxx.operational-noise.g0-cpu-evidence";
-const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 3;
+const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 enum G0CpuEvidenceStatus {
@@ -1763,7 +1763,7 @@ fn push_index_plan_dependencies(work: &mut Vec<CertificateWork>, plan: &super::g
     work.push(CertificateWork::Expression(plan.index));
     work.extend(plan.result.into_iter().map(CertificateWork::Expression));
     work.extend(plan.consumed.into_iter().map(CertificateWork::Expression));
-    work.extend(plan.frontier.iter().map(|axis| CertificateWork::Expression(axis.argument)));
+    work.extend(plan.frontier.iter().map(|axis| CertificateWork::Expression(axis.expression())));
     if let Some(group) = &plan.slice_group {
         work.extend(
             group.members.iter().map(|member| CertificateWork::Expression(member.expression)),
@@ -7088,7 +7088,7 @@ mod tests {
         );
         assert_eq!(document["schema_id"], G0_CPU_EVIDENCE_SCHEMA_ID);
         assert_eq!(document["schema_version"], G0_CPU_EVIDENCE_SCHEMA_VERSION);
-        assert_eq!(document["schema_version"], 3);
+        assert_eq!(document["schema_version"], 4);
         assert_eq!(document["status"], "CpuObservationOnlyNotG0HardGateOrTallEvidence");
         let base = &document["base_feasibility"];
         assert_eq!(
@@ -7343,7 +7343,7 @@ mod tests {
                 assert!(run.projection.closure.expressions.contains(&expression));
             }
             for axis in &plan.frontier {
-                assert!(run.projection.closure.expressions.contains(&axis.argument));
+                assert!(run.projection.closure.expressions.contains(&axis.expression()));
             }
             if let Some(group) = &plan.slice_group {
                 for member in &group.members {

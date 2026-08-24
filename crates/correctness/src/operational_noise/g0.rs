@@ -442,11 +442,40 @@ pub(crate) enum BoundRule {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct IndexFrontierAxis {
-    pub owner: ProgramOccurrence,
-    pub argument: ExprId,
-    pub argument_position: u32,
-    pub domain: TrustedIndexRange,
+pub(crate) enum IndexFrontierAxis {
+    Argument {
+        owner: ProgramOccurrence,
+        expression: ExprId,
+        position: u32,
+        domain: TrustedIndexRange,
+    },
+    ExtractedCoefficient {
+        owner: ProgramOccurrence,
+        expression: ExprId,
+        domain: TrustedIndexRange,
+    },
+}
+
+impl IndexFrontierAxis {
+    pub(crate) fn owner(&self) -> &ProgramOccurrence {
+        match self {
+            Self::Argument { owner, .. } | Self::ExtractedCoefficient { owner, .. } => owner,
+        }
+    }
+
+    pub(crate) fn expression(&self) -> ExprId {
+        match self {
+            Self::Argument { expression, .. } | Self::ExtractedCoefficient { expression, .. } => {
+                *expression
+            }
+        }
+    }
+
+    pub(crate) fn domain(&self) -> TrustedIndexRange {
+        match self {
+            Self::Argument { domain, .. } | Self::ExtractedCoefficient { domain, .. } => *domain,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -524,7 +553,10 @@ impl IndexUsePlan {
     }
 
     fn validate(&self) -> Result<(), G0Error> {
-        if self.frontier.iter().any(|axis| axis.domain.minimum > axis.domain.maximum_exclusive) {
+        if self.frontier.iter().any(|axis| {
+            let domain = axis.domain();
+            domain.minimum > domain.maximum_exclusive
+        }) {
             return Err(G0Error::InvalidIndexAxisRange);
         }
         if self.output_range.is_some_and(|range| range.minimum > range.maximum_exclusive) {
@@ -581,7 +613,7 @@ pub(crate) enum IndexValue {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct IndexAxisBinding {
     pub owner: ProgramOccurrence,
-    pub argument: ExprId,
+    pub expression: ExprId,
     pub value: BigInt,
 }
 
@@ -620,32 +652,41 @@ pub(crate) fn evaluate_typed_index(
     frontier: &[IndexFrontierAxis],
     bindings: &[IndexAxisBinding],
 ) -> Result<IndexValue, IndexEvaluationError> {
-    let mut by_argument = BTreeMap::new();
+    let mut by_expression = BTreeMap::new();
     for binding in bindings {
-        if by_argument.insert(binding.argument, binding).is_some() {
+        if by_expression.insert(binding.expression, binding).is_some() {
             return Err(IndexEvaluationError::DuplicateBinding);
         }
-        let Some(axis) = frontier.iter().find(|axis| axis.argument == binding.argument) else {
+        let Some(axis) = frontier.iter().find(|axis| axis.expression() == binding.expression)
+        else {
             return Err(IndexEvaluationError::BindingOwnerMismatch);
         };
-        if axis.owner != binding.owner {
+        if axis.owner() != &binding.owner {
             return Err(IndexEvaluationError::BindingOwnerMismatch);
         }
         let node =
-            arena.node(binding.argument).map_err(|_| IndexEvaluationError::ForeignExpression)?;
-        let ValueOperator::Argument { position, value_type } = &node.operator else {
-            return Err(IndexEvaluationError::BindingPositionMismatch);
-        };
-        if *position != axis.argument_position || *value_type != ResolvedValueType::Int {
-            return Err(IndexEvaluationError::BindingPositionMismatch);
+            arena.node(binding.expression).map_err(|_| IndexEvaluationError::ForeignExpression)?;
+        match (axis, &node.operator) {
+            (
+                IndexFrontierAxis::Argument { position: axis_position, .. },
+                ValueOperator::Argument { position, value_type },
+            ) if position == axis_position && *value_type == ResolvedValueType::Int => {}
+            (
+                IndexFrontierAxis::ExtractedCoefficient { domain, .. },
+                ValueOperator::ExtractCoefficient {
+                    canonical_input_exclusive_upper: Some(upper),
+                    ..
+                },
+            ) if domain.minimum == 0 && upper == &BigUint::from(domain.maximum_exclusive) => {}
+            _ => return Err(IndexEvaluationError::BindingPositionMismatch),
         }
     }
     for axis in frontier {
-        if !by_argument.contains_key(&axis.argument) {
+        if !by_expression.contains_key(&axis.expression()) {
             return Err(IndexEvaluationError::MissingBinding);
         }
     }
-    evaluate_typed_index_node(arena, root, &by_argument)
+    evaluate_typed_index_node(arena, root, &by_expression)
 }
 
 fn evaluate_typed_index_node(
@@ -664,6 +705,10 @@ fn evaluate_typed_index_node(
                 .map(|binding| IndexValue::Int(binding.value.clone()))
                 .ok_or(IndexEvaluationError::MissingBinding)
         }
+        ValueOperator::ExtractCoefficient { .. } => bindings
+            .get(&expression)
+            .map(|binding| IndexValue::Int(binding.value.clone()))
+            .ok_or(IndexEvaluationError::MissingBinding),
         ValueOperator::Constant(TypedConstant { value_type, value }) => {
             if *value_type != ResolvedValueType::Int {
                 return Err(IndexEvaluationError::NonInteger);
@@ -696,7 +741,6 @@ fn evaluate_typed_index_node(
         ValueOperator::IndexMap { .. } |
         ValueOperator::ExplicitElement { .. } |
         ValueOperator::Transform(_) |
-        ValueOperator::ExtractCoefficient { .. } |
         ValueOperator::Matrix(_) |
         ValueOperator::Trapdoor(_) => Err(IndexEvaluationError::UnsupportedOperator {
             expression,
@@ -795,11 +839,19 @@ pub(crate) enum StablePlanRef {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-pub(crate) struct StableFrontierAxis {
-    pub owner: StableObservedOccurrence,
-    pub argument: StablePlanRef,
-    pub argument_position: u32,
-    pub domain: (u64, u64),
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum StableFrontierAxis {
+    Argument {
+        owner: StableObservedOccurrence,
+        expression: StablePlanRef,
+        position: u32,
+        domain: (u64, u64),
+    },
+    ExtractedCoefficient {
+        owner: StableObservedOccurrence,
+        expression: StablePlanRef,
+        domain: (u64, u64),
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -996,12 +1048,25 @@ impl LogicalItems for StableObservedWire {
 
 impl LogicalItems for StableFrontierAxis {
     fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
-        checked_sum([
-            self.owner.logical_items(),
-            self.argument.logical_items(),
-            self.argument_position.logical_items(),
-            logical_range(&self.domain),
-        ])
+        match self {
+            Self::Argument { owner, expression, position, domain } => checked_add(
+                1,
+                checked_sum([
+                    owner.logical_items(),
+                    expression.logical_items(),
+                    position.logical_items(),
+                    logical_range(domain),
+                ])?,
+            ),
+            Self::ExtractedCoefficient { owner, expression, domain } => checked_add(
+                1,
+                checked_sum([
+                    owner.logical_items(),
+                    expression.logical_items(),
+                    logical_range(domain),
+                ])?,
+            ),
+        }
     }
 }
 
@@ -1094,7 +1159,7 @@ fn validate_residual_plan(
         .result
         .into_iter()
         .chain(plan.consumed)
-        .chain(plan.frontier.iter().map(|axis| axis.argument))
+        .chain(plan.frontier.iter().map(IndexFrontierAxis::expression))
     {
         if !closure.expressions.contains(&expression) {
             return Err(G0Error::CanonicalMissingDependency);
@@ -1522,10 +1587,11 @@ fn enumerate_index_use(
 fn frontier_product(frontier: &[IndexFrontierAxis]) -> Result<BigUint, G0Error> {
     let mut product = BigUint::one();
     for axis in frontier {
-        if axis.domain.minimum > axis.domain.maximum_exclusive {
+        let domain = axis.domain();
+        if domain.minimum > domain.maximum_exclusive {
             return Err(G0Error::InvalidIndexAxisRange);
         }
-        product *= BigUint::from(axis.domain.maximum_exclusive - axis.domain.minimum);
+        product *= BigUint::from(domain.maximum_exclusive - domain.minimum);
     }
     Ok(product)
 }
@@ -1548,14 +1614,17 @@ fn enumerate_frontier(
     }
     let widths = frontier
         .iter()
-        .map(|axis| axis.domain.maximum_exclusive - axis.domain.minimum)
+        .map(|axis| {
+            let domain = axis.domain();
+            domain.maximum_exclusive - domain.minimum
+        })
         .collect::<Vec<_>>();
     let mut offsets = vec![0_u64; frontier.len()];
     for row in 0..row_count {
         let tuple = frontier
             .iter()
             .zip(&offsets)
-            .map(|(axis, offset)| BigInt::from(axis.domain.minimum) + BigInt::from(*offset))
+            .map(|(axis, offset)| BigInt::from(axis.domain().minimum) + BigInt::from(*offset))
             .collect::<Vec<_>>();
         visit(&tuple)?;
         if row + 1 == row_count {
@@ -1577,8 +1646,8 @@ fn axis_bindings(frontier: &[IndexFrontierAxis], tuple: &[BigInt]) -> Vec<IndexA
         .iter()
         .zip(tuple)
         .map(|(axis, value)| IndexAxisBinding {
-            owner: axis.owner.clone(),
-            argument: axis.argument,
+            owner: axis.owner().clone(),
+            expression: axis.expression(),
             value: value.clone(),
         })
         .collect()
@@ -4560,7 +4629,7 @@ impl CanonicalResidualRefs {
         let mut programs = BTreeSet::new();
         for plan in plans {
             expressions.insert(plan.index);
-            expressions.extend(plan.frontier.iter().map(|axis| axis.argument));
+            expressions.extend(plan.frontier.iter().map(IndexFrontierAxis::expression));
             expressions.extend(
                 plan.slice_group
                     .iter()
@@ -4624,11 +4693,22 @@ impl CanonicalResidualRefs {
     }
 
     fn axis(&self, axis: &IndexFrontierAxis) -> Result<StableFrontierAxis, G0Error> {
-        Ok(StableFrontierAxis {
-            owner: stable_observed_occurrence(&axis.owner),
-            argument: self.stable_expression(axis.argument)?,
-            argument_position: axis.argument_position,
-            domain: (axis.domain.minimum, axis.domain.maximum_exclusive),
+        Ok(match axis {
+            IndexFrontierAxis::Argument { owner, expression, position, domain } => {
+                StableFrontierAxis::Argument {
+                    owner: stable_observed_occurrence(owner),
+                    expression: self.stable_expression(*expression)?,
+                    position: *position,
+                    domain: (domain.minimum, domain.maximum_exclusive),
+                }
+            }
+            IndexFrontierAxis::ExtractedCoefficient { owner, expression, domain } => {
+                StableFrontierAxis::ExtractedCoefficient {
+                    owner: stable_observed_occurrence(owner),
+                    expression: self.stable_expression(*expression)?,
+                    domain: (domain.minimum, domain.maximum_exclusive),
+                }
+            }
         })
     }
 
@@ -5665,7 +5745,18 @@ mod tests {
     }
 
     fn oracle_lut_frontier(axis: &StableFrontierAxis) -> u64 {
-        oracle_lut_scope(&axis.owner.definition) + 1 + oracle_lut_plan_ref(&axis.argument) + 1 + 2
+        match axis {
+            StableFrontierAxis::Argument { owner, expression, .. } => {
+                1 + oracle_lut_scope(&owner.definition) +
+                    1 +
+                    oracle_lut_plan_ref(expression) +
+                    1 +
+                    2
+            }
+            StableFrontierAxis::ExtractedCoefficient { owner, expression, .. } => {
+                1 + oracle_lut_scope(&owner.definition) + 1 + oracle_lut_plan_ref(expression) + 2
+            }
+        }
     }
 
     fn oracle_index_lut(unit: &IndexLutEvidence) -> u64 {
@@ -7713,10 +7804,10 @@ mod tests {
         owner: ProgramOccurrence,
         position: u32,
     ) -> IndexFrontierAxis {
-        IndexFrontierAxis {
+        IndexFrontierAxis::Argument {
             owner,
-            argument,
-            argument_position: position,
+            expression: argument,
+            position,
             domain: TrustedIndexRange { minimum: 0, maximum_exclusive: 32 },
         }
     }
@@ -7753,10 +7844,140 @@ mod tests {
             .intern_slice(ValueOperator::Scalar(ScalarOperation::Multiply), &[argument, one])
             .unwrap();
         let axis = evaluator_axis(argument, owner.clone(), 0);
-        let binding = IndexAxisBinding { owner, argument, value: BigInt::from(-9_i8) };
+        let binding = IndexAxisBinding { owner, expression: argument, value: BigInt::from(-9_i8) };
         assert_eq!(
             evaluate_typed_index(&arena, nested, &[axis], &[binding]),
             Ok(IndexValue::Int(BigInt::from(-9_i8)))
+        );
+    }
+
+    #[test]
+    fn typed_index_evaluator_binds_extracted_coefficients_as_typed_leaf_axes() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let matrix_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
+        let left =
+            arena.intern_argument(0, ResolvedValueType::Matrix(matrix_type.clone())).unwrap();
+        let right = arena.intern_argument(1, ResolvedValueType::Matrix(matrix_type)).unwrap();
+        let unsupported_matrix_child =
+            arena.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        let extracted = arena
+            .intern_extract_coefficient(unsupported_matrix_child, 0, Some(BigUint::from(4_u8)))
+            .unwrap();
+        let owner =
+            ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path: 7 };
+        let axis = IndexFrontierAxis::ExtractedCoefficient {
+            owner: owner.clone(),
+            expression: extracted,
+            domain: TrustedIndexRange { minimum: 0, maximum_exclusive: 4 },
+        };
+        for value in 0_u8..4 {
+            assert_eq!(
+                evaluate_typed_index(
+                    &arena,
+                    extracted,
+                    &[axis.clone()],
+                    &[IndexAxisBinding {
+                        owner: owner.clone(),
+                        expression: extracted,
+                        value: BigInt::from(value),
+                    }],
+                ),
+                Ok(IndexValue::Int(BigInt::from(value)))
+            );
+        }
+        assert_eq!(
+            evaluate_typed_index(&arena, extracted, &[axis.clone()], &[]),
+            Err(IndexEvaluationError::MissingBinding)
+        );
+        assert_eq!(
+            evaluate_typed_index(
+                &arena,
+                extracted,
+                &[axis.clone()],
+                &[IndexAxisBinding {
+                    owner: ProgramOccurrence {
+                        definition: mxx_ir_core::FrozenGraphScopeId::Root,
+                        path: 8,
+                    },
+                    expression: extracted,
+                    value: BigInt::from(0_u8),
+                }],
+            ),
+            Err(IndexEvaluationError::BindingOwnerMismatch)
+        );
+        assert_eq!(
+            evaluate_typed_index(
+                &arena,
+                extracted,
+                &[IndexFrontierAxis::Argument {
+                    owner: owner.clone(),
+                    expression: extracted,
+                    position: 0,
+                    domain: TrustedIndexRange { minimum: 0, maximum_exclusive: 4 },
+                }],
+                &[IndexAxisBinding {
+                    owner: owner.clone(),
+                    expression: extracted,
+                    value: BigInt::from(0_u8),
+                }],
+            ),
+            Err(IndexEvaluationError::BindingPositionMismatch)
+        );
+        assert_eq!(
+            evaluate_typed_index(
+                &arena,
+                extracted,
+                &[IndexFrontierAxis::ExtractedCoefficient {
+                    owner: owner.clone(),
+                    expression: extracted,
+                    domain: TrustedIndexRange { minimum: 0, maximum_exclusive: 3 },
+                }],
+                &[IndexAxisBinding {
+                    owner: owner.clone(),
+                    expression: extracted,
+                    value: BigInt::from(0_u8),
+                }],
+            ),
+            Err(IndexEvaluationError::BindingPositionMismatch)
+        );
+        let unbounded =
+            arena.intern_extract_coefficient(unsupported_matrix_child, 0, None).unwrap();
+        assert_eq!(
+            evaluate_typed_index(
+                &arena,
+                unbounded,
+                &[IndexFrontierAxis::ExtractedCoefficient {
+                    owner: owner.clone(),
+                    expression: unbounded,
+                    domain: TrustedIndexRange { minimum: 0, maximum_exclusive: 4 },
+                }],
+                &[IndexAxisBinding { owner, expression: unbounded, value: BigInt::from(0_u8) }],
+            ),
+            Err(IndexEvaluationError::BindingPositionMismatch)
+        );
+    }
+
+    #[test]
+    fn extracted_coefficient_axis_has_typed_canonical_shape_and_logical_count() {
+        let owner = StableObservedOccurrence { definition: StableScope::Root, path: 7 };
+        let expression = StablePlanRef::Expression { row: 3 };
+        let extracted = StableFrontierAxis::ExtractedCoefficient {
+            owner: owner.clone(),
+            expression: expression.clone(),
+            domain: (0, 4),
+        };
+        let argument =
+            StableFrontierAxis::Argument { owner, expression, position: 0, domain: (0, 4) };
+        assert_eq!(extracted.logical_items().unwrap(), 7);
+        assert_eq!(argument.logical_items().unwrap(), 8);
+        assert_eq!(
+            serde_json::to_value(&extracted).unwrap(),
+            serde_json::json!({
+                "kind": "extracted_coefficient",
+                "owner": { "definition": { "kind": "root" }, "path": 7 },
+                "expression": { "kind": "expression", "row": 3 },
+                "domain": [0, 4]
+            })
         );
     }
 
@@ -7893,10 +8114,10 @@ mod tests {
         );
 
         let foreign_argument = ExprId::new(super::super::arena::ArenaToken(99_999), 0);
-        let foreign_axis = IndexFrontierAxis {
+        let foreign_axis = IndexFrontierAxis::Argument {
             owner: ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path: 1 },
-            argument: foreign_argument,
-            argument_position: 0,
+            expression: foreign_argument,
+            position: 0,
             domain: TrustedIndexRange { minimum: 0, maximum_exclusive: 1 },
         };
         let plan = index_plan(IndexUseKind::IntegerExpression, branch, vec![foreign_axis]);
@@ -7957,7 +8178,11 @@ mod tests {
                 &arena,
                 argument,
                 &[axis],
-                &[IndexAxisBinding { owner: wrong_owner, argument, value: BigInt::from(1_u8) }],
+                &[IndexAxisBinding {
+                    owner: wrong_owner,
+                    expression: argument,
+                    value: BigInt::from(1_u8),
+                }],
             ),
             Err(IndexEvaluationError::BindingOwnerMismatch)
         );
@@ -7972,7 +8197,11 @@ mod tests {
                 &arena,
                 divide,
                 &[evaluator_axis(argument, owner.clone(), 0)],
-                &[IndexAxisBinding { owner: owner.clone(), argument, value: BigInt::from(4_u8) }],
+                &[IndexAxisBinding {
+                    owner: owner.clone(),
+                    expression: argument,
+                    value: BigInt::from(4_u8),
+                }],
             ),
             Err(IndexEvaluationError::DivisionByZero)
         );
@@ -7998,10 +8227,10 @@ mod tests {
         minimum: u64,
         maximum_exclusive: u64,
     ) -> IndexFrontierAxis {
-        IndexFrontierAxis {
+        IndexFrontierAxis::Argument {
             owner,
-            argument,
-            argument_position: position,
+            expression: argument,
+            position,
             domain: TrustedIndexRange { minimum, maximum_exclusive },
         }
     }
@@ -8438,10 +8667,10 @@ mod tests {
         minimum: u64,
         maximum_exclusive: u64,
     ) -> IndexFrontierAxis {
-        IndexFrontierAxis {
+        IndexFrontierAxis::Argument {
             owner: ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path },
-            argument: expression(argument_position),
-            argument_position,
+            expression: expression(argument_position),
+            position: argument_position,
             domain: TrustedIndexRange { minimum, maximum_exclusive },
         }
     }

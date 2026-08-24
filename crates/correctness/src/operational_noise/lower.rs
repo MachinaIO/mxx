@@ -477,11 +477,34 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
     ) -> Result<Box<[IndexFrontierAxis]>, ProductionAdapterError> {
         let mut reachable = BTreeSet::new();
         let mut pending = indices.to_vec();
+        let mut extracted_axes = BTreeSet::new();
         while let Some(expression) = pending.pop() {
             if !reachable.insert(expression) {
                 continue;
             }
-            pending.extend(self.job.expressions().node(expression)?.inputs.iter().copied());
+            let node = self.job.expressions().node(expression)?;
+            if let ValueOperator::ExtractCoefficient { canonical_input_exclusive_upper, .. } =
+                &node.operator
+            {
+                let Some(maximum_exclusive) = canonical_input_exclusive_upper
+                    .as_ref()
+                    .and_then(num_traits::ToPrimitive::to_u64)
+                    .filter(|upper| *upper != 0)
+                else {
+                    return Err(ProductionAdapterError::Structural {
+                        wire: wire.clone(),
+                        reason: "coefficient index has no finite nonzero u64 canonical domain"
+                            .to_owned(),
+                    });
+                };
+                extracted_axes.insert(IndexFrontierAxis::ExtractedCoefficient {
+                    owner: wire.occurrence.clone(),
+                    expression,
+                    domain: TrustedIndexRange { minimum: 0, maximum_exclusive },
+                });
+                continue;
+            }
+            pending.extend(node.inputs.iter().copied());
         }
         let mut axes = self
             .active_loop_argument_ranges
@@ -497,25 +520,29 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     },
                     Err(_) => None,
                 }?;
-                Some(IndexFrontierAxis {
+                Some(IndexFrontierAxis::Argument {
                     owner: owner.clone(),
-                    argument: *argument,
-                    argument_position: position,
+                    expression: *argument,
+                    position,
                     domain: *domain,
                 })
             })
             .collect::<Vec<_>>();
-        axes.sort_by(|left, right| {
-            left.argument_position
-                .cmp(&right.argument_position)
-                .then_with(|| left.owner.cmp(&right.owner))
-                .then_with(|| left.domain.cmp(&right.domain))
-        });
-        for index in indices {
-            let free_arguments = self.job.expressions().free_arguments(*index)?;
-            if free_arguments
-                .iter()
-                .any(|(position, _)| !axes.iter().any(|axis| axis.argument_position == *position))
+        axes.extend(extracted_axes);
+        axes.sort();
+        for expression in reachable {
+            let node = self.job.expressions().node(expression)?;
+            if let ValueOperator::Argument { position, .. } = node.operator &&
+                !axes.iter().any(|axis| {
+                    matches!(
+                        axis,
+                        IndexFrontierAxis::Argument {
+                            expression: axis_expression,
+                            position: axis_position,
+                            ..
+                        } if *axis_expression == expression && *axis_position == position
+                    )
+                })
             {
                 return Err(ProductionAdapterError::Structural {
                     wire: wire.clone(),
@@ -5492,6 +5519,10 @@ pub(crate) mod tests {
     }
 
     fn parallel_range_protocol() -> crate::ProtocolDecl {
+        parallel_range_protocol_with_selector_upper(4)
+    }
+
+    fn parallel_range_protocol_with_selector_upper(selector_upper: u64) -> crate::ProtocolDecl {
         use crate::{
             InputContractEntry, InputValueContract, ProtocolInputBinding, ProtocolInputDestination,
             ProtocolInputId, StageInputName,
@@ -5502,14 +5533,21 @@ pub(crate) mod tests {
         let right = ring.input_family("right-family", 7, (1, 1));
         let early = left.get_static(0);
         let mapped = left.clone().parallel_map(|_, value| value).unwrap();
-        let zipped = mapped
-            .parallel_zip_offset(right.clone(), 2, |_, first, second| first + second)
-            .unwrap();
+        let zipped = mapped.parallel_zip_offset(right.clone(), 2, |_, first, _| first).unwrap();
+        let extracted_selector =
+            zipped.clone().get_static(0).extract_coefficient_with_canonical_input_exclusive_upper(
+                0,
+                Some(BigUint::from(selector_upper)),
+            );
+        let extracted_selected = left.get(extracted_selector);
         let independent = right.parallel_map(|_, value| value).unwrap();
         let selected = Family::select(Int::constant(0), vec![left.clone()])
             .expect("same-shaped family selection");
-        let residual =
-            early + zipped.get_static(0) + independent.get_static(0) + selected.get_static(0);
+        let residual = early +
+            zipped.get_static(0) +
+            extracted_selected +
+            independent.get_static(0) +
+            selected.get_static(0);
         let encrypt = DslContext::new("parallel-range-encrypt")
             .int_parameter("cutoff")
             .public_output("ciphertext", residual.clone())
@@ -7503,11 +7541,7 @@ pub(crate) mod tests {
             .find(|plan| plan.kind == IndexUseKind::FamilyGetDynamic)
             .expect("dynamic family use");
         assert!(!dynamic.frontier.is_empty());
-        assert!(dynamic.frontier.windows(2).all(|axes| {
-            axes[0].argument_position < axes[1].argument_position ||
-                (axes[0].argument_position == axes[1].argument_position &&
-                    axes[0].owner <= axes[1].owner)
-        }));
+        assert!(dynamic.frontier.windows(2).all(|axes| axes[0] <= axes[1]));
         assert!(
             uses.iter()
                 .any(|plan| { plan.kind == IndexUseKind::Select && plan.frontier.is_empty() })
@@ -7529,6 +7563,80 @@ pub(crate) mod tests {
         };
         retained.retain_residual(&closure);
         assert!(retained.index_use_plans().all(|plan| plan.result == Some(residual_expression)));
+    }
+
+    #[test]
+    fn parallel_zip_output_uses_one_extracted_coefficient_axis_as_a_leaf() {
+        let protocol = parallel_range_protocol();
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("parallel plan");
+        let (job, _, trace) = ProductionAdapter::new_with_feasibility(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("opt-in adapter")
+        .lower_with_feasibility()
+        .expect("opt-in lowering");
+        let extracted_plans = trace
+            .index_use_plans()
+            .filter(|plan| {
+                plan.frontier
+                    .iter()
+                    .any(|axis| matches!(axis, IndexFrontierAxis::ExtractedCoefficient { .. }))
+            })
+            .collect::<Vec<_>>();
+        assert!(!extracted_plans.is_empty());
+        for plan in &extracted_plans {
+            assert_eq!(plan.frontier.len(), 1);
+            let IndexFrontierAxis::ExtractedCoefficient { owner, expression, domain } =
+                &plan.frontier[0]
+            else {
+                panic!("the coefficient selector must be the only frontier axis")
+            };
+            assert_eq!(owner, &plan.owner.occurrence);
+            assert_eq!(*expression, plan.index);
+            assert_eq!(*domain, TrustedIndexRange { minimum: 0, maximum_exclusive: 4 });
+            let coefficient = job.expressions().node(*expression).unwrap();
+            let [matrix_input] = coefficient.inputs.as_ref() else {
+                panic!("coefficient selector must have one matrix input")
+            };
+            let input_operator = &job.expressions().node(*matrix_input).unwrap().operator;
+            assert!(
+                matches!(input_operator, ValueOperator::ProgramCall { .. }),
+                "coefficient input={input_operator:?}"
+            );
+        }
+        let lut = super::super::g0::enumerate_index_lut_evidence(
+            job.expressions(),
+            extracted_plans.iter().copied(),
+        )
+        .expect("extracted coefficient LUT");
+        for unit in &lut.index_uses {
+            assert_eq!(unit.frontier_product, "4");
+            assert_eq!(
+                unit.rows
+                    .iter()
+                    .map(|row| (row.tuple.clone(), row.output.clone()))
+                    .collect::<Vec<_>>(),
+                (0_u8..4)
+                    .map(|value| (vec![value.to_string()], value.to_string()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn extracted_coefficient_axis_rejects_a_narrower_family_consumer() {
+        let protocol = parallel_range_protocol_with_selector_upper(6);
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("parallel plan");
+        let result = ProductionAdapter::new_with_feasibility(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("opt-in adapter")
+        .lower_with_feasibility();
+        assert!(result.is_err(), "a [0, 6) selector cannot index a five-element family");
     }
 
     #[test]

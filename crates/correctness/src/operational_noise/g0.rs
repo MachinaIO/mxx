@@ -6305,12 +6305,9 @@ fn derive_statement_events(
             ..
         }) = event
         {
-            let scope =
-                scope_by_program.get(&decomposition.program()).copied().ok_or_else(|| {
-                    G0Error::MissingCanonicalHandle {
-                        requested: CanonicalReference::Expr(decomposition.expression()),
-                    }
-                })?;
+            let Some(scope) = scope_by_program.get(&decomposition.program()).copied() else {
+                continue;
+            };
             roots.insert((scope, decomposition.expression()));
         }
     }
@@ -7000,31 +6997,82 @@ mod tests {
 
     #[test]
     fn statement_events_ignore_honest_invocations_outside_the_closure() {
-        use crate::operational_noise::program::FamilyDomain;
+        use crate::operational_noise::{
+            arena::ArenaToken, facts::NumericContract, monomial::MonomialId,
+            normal_form::AnalyzedValue, program::FamilyDomain,
+        };
 
         let mut job = CheckerJob::new();
         let retained = job
             .expressions_mut()
             .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
             .unwrap();
-        let outside = job
+        let outside_scalar = job
             .expressions_mut()
             .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .unwrap();
+        let input_type = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
+        let outside_input = job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
+                    output: input_type,
+                    coefficient_bits: 2,
+                }),
+                Box::new([outside_scalar]),
+            )
+            .unwrap();
+        let output = ResolvedMatrixType::new(17_u8.into(), 1, 2, 1).unwrap();
+        let outside_gadget = job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    output,
+                    base: 4,
+                    small: false,
+                    digit_count: 2,
+                }),
+                Box::new([outside_input]),
+            )
             .unwrap();
         let family = job
             .with_arena_stores(|expressions, programs, _| {
                 programs.generated_family_from_body(
                     expressions,
                     FamilyDomain::new(0, 1).unwrap(),
-                    outside,
+                    outside_gadget,
                 )
             })
             .unwrap();
+        let owner =
+            job.programs().scoped(job.expressions(), family.program(), outside_gadget).unwrap();
         let mut trace = FeasibilityTrace::default();
-        trace
-            .record_invocation_start(
-                job.programs().scoped(job.expressions(), family.program(), outside).unwrap(),
+        trace.record_invocation_start(owner).unwrap();
+        let input_owner = owner.with_expression(outside_input);
+        let input_result = trace
+            .record_normalization_result(
+                input_owner,
+                &AnalyzedValue {
+                    semantic: input_owner,
+                    exact_nf: None,
+                    coefficient_bound: NumericContract::Missing,
+                },
             )
+            .unwrap();
+        trace
+            .record_applied_relation(AppliedRelation {
+                owner,
+                source_monomial: MonomialId::new(ArenaToken(0), 0),
+                outer_coefficient: 1.into(),
+                ordered_start: 0,
+                ordered_end_exclusive: 1,
+                rule: AppliedRelationRule::Gadget {
+                    gadget: owner,
+                    decomposition: owner,
+                    input: outside_input,
+                    input_result,
+                },
+            })
             .unwrap();
         let closure = CertificateClosure {
             expressions: [retained].into_iter().collect(),
@@ -7035,8 +7083,11 @@ mod tests {
             event_ids: BTreeSet::new(),
             constant_expressions: [retained].into_iter().collect(),
         };
+        let baseline =
+            derive_certificate_statement_rows(&job, &closure, &FeasibilityTrace::default())
+                .unwrap();
         let rows = derive_certificate_statement_rows(&job, &closure, &trace).unwrap();
-        assert_eq!(rows.expressions().len(), 1);
+        assert_eq!(rows, baseline);
         assert!(rows.events().is_empty());
     }
 

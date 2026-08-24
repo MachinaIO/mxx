@@ -13,7 +13,7 @@ use super::{
     error::{OperationalSimulationError, TargetError},
     g0::{
         AppliedRelationRule, BoundAuthority, BoundProjection, BoundRule, BoundScale, BoundValueRef,
-        CanonicalEventKind, CanonicalProjectionRole, CanonicalResidualRefs, EventKind,
+        CanonicalEventKind, CanonicalProjectionRole, CanonicalStatementRows, EventKind,
         FeasibilitySink, FeasibilityTrace, G0Error, MonomialFactorEvidence, NormalizerEvent,
         StableHashVariant, StableSamplerOperation,
     },
@@ -148,7 +148,7 @@ pub struct BaseNBreakdown {
 }
 
 const G0_CPU_EVIDENCE_SCHEMA_ID: &str = "mxx.operational-noise.g0-cpu-evidence";
-const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 5;
+const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 enum G0CpuEvidenceStatus {
@@ -192,8 +192,6 @@ struct ExactRetainedN {
     expression_rows: u64,
     program_rows: u64,
     source_rows: u64,
-    family_source_rows: u64,
-    constant_rows: u64,
     event_rows: u64,
     total_rows: u64,
 }
@@ -211,7 +209,7 @@ pub(crate) struct OperationalCertificateRun {
 }
 
 /// A stable owner reference used by the proof-payload boundary.  The numbers are rows in
-/// `CanonicalResidualRefs`; they are never arena slots or raw handles.
+/// `CanonicalStatementRows`; they are never arena slots or raw handles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) enum ProofPayloadScope {
     Closed { root_expression_row: u64 },
@@ -2066,25 +2064,27 @@ pub(crate) fn derive_proof_payload(
 pub(crate) fn derive_proof_payload_projection(
     run: &OperationalCertificateRun,
 ) -> Result<ProofPayloadProjection, CertificateProjectionError> {
-    let refs = super::g0::canonical_residual_refs(&run.job, &run.projection.closure, &run.trace)
-        .map_err(proof_payload_error)?;
+    let refs =
+        super::g0::derive_certificate_statement_rows(&run.job, &run.projection.closure, &run.trace)
+            .map_err(proof_payload_error)?;
     derive_proof_payload_projection_with_refs(run, &refs)
 }
 
 pub(crate) fn derive_certificate_documents(
     run: &OperationalCertificateRun,
 ) -> Result<ProjectedCertificateDocuments, CertificateProjectionError> {
-    let refs = super::g0::canonical_residual_refs(&run.job, &run.projection.closure, &run.trace)
-        .map_err(proof_payload_error)?;
+    let refs =
+        super::g0::derive_certificate_statement_rows(&run.job, &run.projection.closure, &run.trace)
+            .map_err(proof_payload_error)?;
     let proof = derive_proof_payload_projection_with_refs(run, &refs)?;
-    let cert = super::certificate_schema::project_certificate_document(run, &refs, &proof.payload)
+    let cert = super::certificate_schema::project_certificate_document(run, &refs)
         .map_err(|error| CertificateProjectionError::ProofPayload { detail: error.to_string() })?;
     Ok(ProjectedCertificateDocuments { cert, proof })
 }
 
 fn derive_proof_payload_projection_with_refs(
     run: &OperationalCertificateRun,
-    refs: &CanonicalResidualRefs,
+    refs: &CanonicalStatementRows,
 ) -> Result<ProofPayloadProjection, CertificateProjectionError> {
     validate_raw_event_coverage(&run.trace)?;
     let closure = &run.projection.closure;
@@ -2347,7 +2347,7 @@ fn observed_bound_kind(rule: &ProofPayloadRule) -> ObservedBoundKind {
 fn derive_observed_coverage(
     job: &super::job::CheckerJob,
     closure: &CertificateClosure,
-    refs: &CanonicalResidualRefs,
+    refs: &CanonicalStatementRows,
     events: &[ProofPayloadEvent],
 ) -> Result<ObservedCoverage, CertificateProjectionError> {
     let mut sites = BTreeMap::<ObservedCoverageKind, BTreeSet<ObservedCoverageSite>>::new();
@@ -2874,7 +2874,7 @@ fn generator_retention_error(_: CanonicalPayloadError) -> CertificateProjectionE
 
 struct ProofPayloadProjector<'a> {
     job: &'a super::job::CheckerJob,
-    refs: &'a CanonicalResidualRefs,
+    refs: &'a CanonicalStatementRows,
     monomial_arenas: HashMap<super::arena::ArenaToken, &'a super::monomial::MonomialArena>,
     rhs_events: HashMap<
         (
@@ -3973,13 +3973,14 @@ pub fn prepare_base_feasibility_summary(
     // Build the residual-only Stage-1 inventory from the same owned job and closure.  The base
     // summary does not expose it or claim final artifact completeness, but descriptor conflicts
     // must still fail closed on this opt-in path.
-    super::g0::derive_inventory(&run.job, closure, &run.trace)
+    let rows = super::g0::derive_certificate_statement_rows(&run.job, closure, &run.trace)
         .map_err(|error| error.to_string())?;
-    base_feasibility_summary_from_run(&run)
+    base_feasibility_summary_from_run(&run, &rows)
 }
 
 fn base_feasibility_summary_from_run(
     run: &OperationalCertificateRun,
+    rows: &CanonicalStatementRows,
 ) -> Result<BaseFeasibilitySummary, String> {
     let (plaintext_modulus, threshold_left, margin) = match &run.accepted_report.acceptance {
         super::OperationalAcceptanceReport::Threshold {
@@ -3992,19 +3993,13 @@ fn base_feasibility_summary_from_run(
         }
     };
     let normalization = run.accepted_report.counters.normalization;
-    let closure = &run.projection.closure;
-    let source_rows = closure
-        .source_ids
+    let source_rows = rows.sources().len();
+    let total_rows = rows
+        .expressions()
         .len()
-        .checked_add(closure.family_source_ids.len())
-        .and_then(|count| count.checked_add(closure.constant_expressions.len()))
-        .ok_or_else(|| "base feasibility source-row count overflow".to_owned())?;
-    let total_rows = closure
-        .expressions
-        .len()
-        .checked_add(closure.programs.len())
+        .checked_add(rows.programs().len())
         .and_then(|total| total.checked_add(source_rows))
-        .and_then(|total| total.checked_add(closure.event_ids.len()))
+        .and_then(|total| total.checked_add(rows.events().len()))
         .ok_or_else(|| "base feasibility N count overflow".to_owned())?;
     Ok(BaseFeasibilitySummary {
         schema_id: BASE_FEASIBILITY_SCHEMA_ID,
@@ -4031,10 +4026,10 @@ fn base_feasibility_summary_from_run(
             residual_trace: ResidualTraceCounters::default(),
         },
         n: BaseNBreakdown {
-            expression_rows: closure.expressions.len(),
-            program_rows: closure.programs.len(),
+            expression_rows: rows.expressions().len(),
+            program_rows: rows.programs().len(),
             source_rows,
-            event_rows: closure.event_ids.len(),
+            event_rows: rows.events().len(),
             total_rows,
         },
     })
@@ -4052,28 +4047,17 @@ fn checked_cardinality(len: usize, label: &str) -> Result<u64, String> {
     u64::try_from(len).map_err(|_| format!("G0 CPU evidence {label} cardinality overflow"))
 }
 
-fn exact_retained_n(closure: &CertificateClosure) -> Result<ExactRetainedN, String> {
-    let expression_rows = checked_cardinality(closure.expressions.len(), "expression")?;
-    let program_rows = checked_cardinality(closure.programs.len(), "program")?;
-    let source_rows = checked_cardinality(closure.source_ids.len(), "source")?;
-    let family_source_rows = checked_cardinality(closure.family_source_ids.len(), "family source")?;
-    let constant_rows = checked_cardinality(closure.constant_expressions.len(), "constant")?;
-    let event_rows = checked_cardinality(closure.event_ids.len(), "event")?;
-    let total_rows =
-        [expression_rows, program_rows, source_rows, family_source_rows, constant_rows, event_rows]
-            .into_iter()
-            .try_fold(0_u64, |total, count| {
-                total.checked_add(count).ok_or_else(|| "G0 CPU evidence N overflow".to_owned())
-            })?;
-    Ok(ExactRetainedN {
-        expression_rows,
-        program_rows,
-        source_rows,
-        family_source_rows,
-        constant_rows,
-        event_rows,
-        total_rows,
-    })
+fn exact_retained_n(rows: &CanonicalStatementRows) -> Result<ExactRetainedN, String> {
+    let expression_rows = checked_cardinality(rows.expressions().len(), "expression")?;
+    let program_rows = checked_cardinality(rows.programs().len(), "program")?;
+    let source_rows = checked_cardinality(rows.sources().len(), "source")?;
+    let event_rows = checked_cardinality(rows.events().len(), "event")?;
+    let total_rows = [expression_rows, program_rows, source_rows, event_rows]
+        .into_iter()
+        .try_fold(0_u64, |total, count| {
+            total.checked_add(count).ok_or_else(|| "G0 CPU evidence N overflow".to_owned())
+        })?;
+    Ok(ExactRetainedN { expression_rows, program_rows, source_rows, event_rows, total_rows })
 }
 
 fn g0_cpu_lut_observation(lut: &super::g0::G0LutEvidence) -> Result<G0CpuLutObservation, String> {
@@ -4130,19 +4114,16 @@ pub fn prepare_g0_cpu_evidence_bytes(
 ) -> Result<Vec<u8>, String> {
     let run =
         prepare_operational_certificate(protocol, request).map_err(|error| error.to_string())?;
-    let base_feasibility = base_feasibility_summary_from_run(&run)?;
     let closure = &run.projection.closure;
-    let n = exact_retained_n(closure)?;
+    let statement_rows =
+        super::g0::derive_certificate_statement_rows(&run.job, closure, &run.trace)
+            .map_err(|error| error.to_string())?;
+    let base_feasibility = base_feasibility_summary_from_run(&run, &statement_rows)?;
+    let n = exact_retained_n(&statement_rows)?;
 
-    let inventory = super::g0::derive_inventory(&run.job, closure, &run.trace)
-        .map_err(|error| error.to_string())?;
+    let inventory = super::g0::inventory_from_statement_rows(&statement_rows);
     if checked_cardinality(inventory.sources.len(), "canonical source row")? != n.source_rows {
         return Err("G0 CPU evidence source-row authority mismatch".to_owned());
-    }
-    if checked_cardinality(inventory.family_sources.len(), "canonical family-source row")? !=
-        n.family_source_rows
-    {
-        return Err("G0 CPU evidence family-source-row authority mismatch".to_owned());
     }
     if checked_cardinality(inventory.events.len(), "canonical event row")? != n.event_rows {
         return Err("G0 CPU evidence event-row authority mismatch".to_owned());
@@ -4155,8 +4136,9 @@ pub fn prepare_g0_cpu_evidence_bytes(
     )?;
     drop(inventory);
 
-    let lut = super::g0::derive_lut_evidence(&run.job, closure, &run.trace)
-        .map_err(|error| error.to_string())?;
+    let lut =
+        super::g0::derive_lut_evidence_with_refs(&run.job, closure, &run.trace, &statement_rows)
+            .map_err(|error| error.to_string())?;
     let lut_observation = g0_cpu_lut_observation(&lut)?;
     let lut_retained_logical_items =
         lut.retained_logical_items().map_err(|error| error.to_string())?;
@@ -4170,7 +4152,8 @@ pub fn prepare_g0_cpu_evidence_bytes(
         payload,
         generator_peak_retained_logical_items: proof_projection_peak_retained_logical_items,
         observed_coverage,
-    } = derive_proof_payload_projection(&run).map_err(|error| error.to_string())?;
+    } = derive_proof_payload_projection_with_refs(&run, &statement_rows)
+        .map_err(|error| error.to_string())?;
     let residual_coverage_matrix =
         derive_residual_coverage_matrix(&observed_coverage).map_err(|error| error.to_string())?;
     let proof_payload_logical_items = payload
@@ -4191,15 +4174,10 @@ pub fn prepare_g0_cpu_evidence_bytes(
     ])
     .map_err(|_| "G0 CPU evidence generator retention overflow".to_owned())?;
 
-    let base_source_rows = n
-        .source_rows
-        .checked_add(n.family_source_rows)
-        .and_then(|rows| rows.checked_add(n.constant_rows))
-        .ok_or_else(|| "G0 CPU evidence base source-row count overflow".to_owned())?;
     if checked_cardinality(base_feasibility.n.expression_rows, "base expression")? !=
         n.expression_rows ||
         checked_cardinality(base_feasibility.n.program_rows, "base program")? != n.program_rows ||
-        checked_cardinality(base_feasibility.n.source_rows, "base source")? != base_source_rows ||
+        checked_cardinality(base_feasibility.n.source_rows, "base source")? != n.source_rows ||
         checked_cardinality(base_feasibility.n.event_rows, "base event")? != n.event_rows ||
         checked_cardinality(base_feasibility.n.total_rows, "base total")? != n.total_rows
     {
@@ -5780,8 +5758,9 @@ mod tests {
         run: &OperationalCertificateRun,
     ) -> (u64, usize, usize, u64, u64) {
         let closure = &run.projection.closure;
-        let refs = super::super::g0::canonical_residual_refs(&run.job, closure, &run.trace)
-            .expect("canonical refs for manual pipeline count");
+        let refs =
+            super::super::g0::derive_certificate_statement_rows(&run.job, closure, &run.trace)
+                .expect("canonical refs for manual pipeline count");
         let canonical_refs_items =
             refs.retained_logical_items().expect("canonical refs retained count");
         let shallow_refs_items = (1 + 3 * (closure.expressions.len() + closure.programs.len()))
@@ -6597,14 +6576,14 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let refs = super::super::g0::canonical_residual_refs(
+        let refs = super::super::g0::derive_certificate_statement_rows(
             &run.job,
             &run.projection.closure,
             &run.trace,
         )
         .expect("canonical relation source rows");
-        assert!(refs.rows().iter().enumerate().all(|(row, descriptor)| {
-            descriptor.dependencies.iter().all(|dependency| *dependency < row as u64)
+        assert!(refs.expressions().iter().enumerate().all(|(row, descriptor)| {
+            descriptor.inputs.iter().all(|dependency| *dependency < row as u64)
         }));
         let expected_relation_source_rows = relation_sources
             .iter()
@@ -6931,11 +6910,31 @@ mod tests {
             super::super::certificate_schema::CERTIFICATE_SCHEMA_ID
         );
         assert_eq!(documents.cert.schema_version, 1);
-        assert!(!documents.cert.dependency_rows.is_empty());
+        assert!(!documents.cert.expressions.is_empty());
         assert_certificate_references_are_dense(&documents);
         assert_payload_event_refs_are_local(&documents.proof.payload);
         let encoded = documents.cert.encode_canonical().expect("certificate bytes");
         let text = std::str::from_utf8(&encoded).expect("certificate JSON");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            value.as_object().unwrap().keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            [
+                "schemaId",
+                "schemaVersion",
+                "plaintextModulus",
+                "ciphertextModulus",
+                "ringDimension",
+                "expressions",
+                "programs",
+                "sources",
+                "events",
+                "indexUses",
+                "sliceGroups",
+                "residualRoot",
+            ]
+            .into_iter()
+            .collect()
+        );
         for forbidden in [
             "decoder",
             "target_id",
@@ -6952,25 +6951,29 @@ mod tests {
     }
 
     fn assert_certificate_references_are_dense(documents: &ProjectedCertificateDocuments) {
-        use super::super::certificate_schema::{CertificateDependencyRow, CertificateScope};
-
-        let rows = &documents.cert.dependency_rows;
-        for (row, dependency_row) in rows.iter().enumerate() {
-            let dependencies = match dependency_row {
-                CertificateDependencyRow::Expression(expression) => &expression.dependencies,
-                CertificateDependencyRow::Program(program) => std::slice::from_ref(&program.root),
-            };
-            assert!(dependencies.iter().all(|dependency| (*dependency as usize) < row));
+        let expressions = &documents.cert.expressions;
+        let programs = &documents.cert.programs;
+        for (row, expression) in expressions.iter().enumerate() {
+            assert!(expression.inputs.iter().all(|dependency| (*dependency as usize) < row));
+            assert!(expression.program.is_none_or(|program| (program as usize) < programs.len()));
+            match &expression.descriptor {
+                super::super::g0::CanonicalExpressionDescriptor::Source {
+                    source: super::super::g0::CanonicalExpressionSource::Direct { source },
+                } => assert!((*source as usize) < documents.cert.sources.len()),
+                super::super::g0::CanonicalExpressionDescriptor::Source {
+                    source: super::super::g0::CanonicalExpressionSource::Family { source, selector },
+                } => {
+                    assert!((*source as usize) < documents.cert.sources.len());
+                    assert!((*selector as usize) < row);
+                }
+                super::super::g0::CanonicalExpressionDescriptor::Operation { .. } => {}
+            }
         }
         let assert_owner = |owner: ProofPayloadOwner| {
-            assert!((owner.expression_row as usize) < rows.len());
-            assert!(matches!(
-                rows[owner.expression_row as usize],
-                CertificateDependencyRow::Expression(_)
-            ));
+            assert!((owner.expression_row as usize) < expressions.len());
             match owner.scope {
                 ProofPayloadScope::Closed { root_expression_row } => {
-                    assert!((root_expression_row as usize) < rows.len());
+                    assert!((root_expression_row as usize) < expressions.len());
                     assert!(matches!(
                         documents.cert.residual_root,
                         super::super::certificate_schema::CertificateResidualRootV1::Closed {
@@ -6978,15 +6981,9 @@ mod tests {
                             ..
                         } if expression == root_expression_row
                     ));
-                    CertificateScope::Closed { root_expression: root_expression_row }
                 }
                 ProofPayloadScope::Program { program_row } => {
-                    assert!((program_row as usize) < rows.len());
-                    assert!(matches!(
-                        rows[program_row as usize],
-                        CertificateDependencyRow::Program(_)
-                    ));
-                    CertificateScope::Program { program: program_row }
+                    assert!((program_row as usize) < programs.len());
                 }
             }
         };
@@ -7030,16 +7027,6 @@ mod tests {
                 }
                 ProofPayloadEvent::SurvivorFold(_) => {}
             }
-        }
-        for fact in &documents.cert.facts {
-            let event = &documents.proof.payload.events[fact.event as usize];
-            let owner = match event {
-                ProofPayloadEvent::Result { owner, .. } => *owner,
-                ProofPayloadEvent::InvocationEnd { root, .. } => *root,
-                _ => panic!("fact row must reference a result event"),
-            };
-            assert_eq!(fact.owner.expression, owner.expression_row);
-            assert_owner(owner);
         }
     }
 
@@ -7328,12 +7315,7 @@ mod tests {
         let second = inventory.encode_canonical().expect("canonical inventory");
         assert_eq!(first, second);
         assert_eq!(inventory.canonical_encoded_size().expect("encoded size"), first.len());
-        assert!(
-            inventory
-                .operators
-                .iter()
-                .all(|operator| !operator.to_string().contains("decoder-only"))
-        );
+        assert!(!String::from_utf8(first).unwrap().contains("decoder-only"));
     }
 
     #[test]
@@ -7666,7 +7648,7 @@ mod tests {
             row.kind == ObservedCoverageKind::Relation(ObservedRelationKind::Universal) &&
                 row.count > 1
         }));
-        let canonical_refs = super::super::g0::canonical_residual_refs(
+        let canonical_refs = super::super::g0::derive_certificate_statement_rows(
             &run.job,
             &run.projection.closure,
             &run.trace,
@@ -7977,7 +7959,7 @@ mod tests {
         );
         assert_eq!(document["schema_id"], G0_CPU_EVIDENCE_SCHEMA_ID);
         assert_eq!(document["schema_version"], G0_CPU_EVIDENCE_SCHEMA_VERSION);
-        assert_eq!(document["schema_version"], 5);
+        assert_eq!(document["schema_version"], 6);
         assert_eq!(document["status"], "CpuObservationOnlyNotG0HardGateOrTallEvidence");
         let base = &document["base_feasibility"];
         assert_eq!(
@@ -8093,20 +8075,19 @@ mod tests {
 
         let run = prepare_operational_certificate(&protocol, &request).expect("comparison run");
         let closure = &run.projection.closure;
-        let n = exact_retained_n(closure).expect("exact N");
+        let statement_rows =
+            super::super::g0::derive_certificate_statement_rows(&run.job, closure, &run.trace)
+                .expect("statement rows");
+        let n = exact_retained_n(&statement_rows).expect("exact N");
         assert_eq!(base["n"]["expression_rows"], n.expression_rows);
         assert_eq!(base["n"]["program_rows"], n.program_rows);
-        assert_eq!(
-            base["n"]["source_rows"],
-            n.source_rows + n.family_source_rows + n.constant_rows
-        );
+        assert_eq!(base["n"]["source_rows"], n.source_rows);
         assert_eq!(base["n"]["event_rows"], n.event_rows);
         assert_eq!(base["n"]["total_rows"], n.total_rows);
 
         let inventory = super::super::g0::derive_inventory(&run.job, closure, &run.trace)
             .expect("comparison inventory");
         assert_eq!(inventory.sources.len() as u64, n.source_rows);
-        assert_eq!(inventory.family_sources.len() as u64, n.family_source_rows);
         assert_eq!(inventory.events.len() as u64, n.event_rows);
         let inventory_bytes = inventory.encode_canonical().unwrap().len() as u64;
         let inventory_retained = inventory.retained_logical_items().unwrap();

@@ -711,7 +711,7 @@ sampling はそれぞれ別の row にする。
 
 `ThresholdDecode`、`BoundAuthority::Unavailable`、raw `EventKind::Trapdoor` は、matrix 生成または
 canonical event projection より前に拒否する。decoder-only expression は residual closure に含めない。
-したがって schema version 5 の CPU evidence に reject-tagged row が現れることはない。
+したがって schema version 6 の CPU evidence に reject-tagged row が現れることはない。
 
 到達した操作に lemma がない場合、`Large` が残る場合、bound がない場合、side condition を証明
 できない場合は certificate 生成を拒否する。

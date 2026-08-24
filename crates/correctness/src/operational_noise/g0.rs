@@ -6315,24 +6315,106 @@ fn derive_statement_events(
     if let Some(seed) = closed_scope {
         roots.insert(seed);
     }
-    for event in &trace.events {
-        if let NormalizerEvent::AppliedRelation(AppliedRelation {
-            rule: AppliedRelationRule::Gadget { decomposition, .. },
-            ..
-        }) = event
-        {
-            if !expression_refs.contains_key(&decomposition.expression()) {
-                continue;
+
+    let closed_programs = closed_residual_root
+        .map(|root| {
+            trace
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    NormalizerEvent::InvocationStart { root: owner }
+                        if owner.expression() == root =>
+                    {
+                        Some(owner.program())
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut scoped_roots = BTreeSet::new();
+    {
+        let mut retain_scoped = |root: super::arena::ScopedExprId| {
+            if expression_refs.contains_key(&root.expression()) {
+                scoped_roots.insert(root);
             }
-            let scope = match program_scopes.get(&decomposition.program()).copied() {
-                Some(scope) => scope,
-                None => match closed_scope {
-                    Some((scope, _)) => scope,
-                    None => continue,
-                },
-            };
-            roots.insert((scope, decomposition.expression()));
+        };
+        for event in &trace.events {
+            match event {
+                NormalizerEvent::InvocationStart { root } |
+                NormalizerEvent::Result { owner: root, .. } |
+                NormalizerEvent::InvocationEnd { root, .. } => retain_scoped(*root),
+                NormalizerEvent::Predecessor { consumer, predecessor, .. } => {
+                    retain_scoped(*consumer);
+                    retain_scoped(consumer.with_expression(*predecessor));
+                }
+                NormalizerEvent::SpecializationComputed { owner, key, .. } |
+                NormalizerEvent::SpecializationCacheHit { owner, key, .. } => {
+                    retain_scoped(*owner);
+                    retain_scoped(key.index);
+                }
+                NormalizerEvent::AppliedRelation(observation) => {
+                    retain_scoped(observation.owner);
+                    match &observation.rule {
+                        AppliedRelationRule::Universal { key, .. } => retain_scoped(key.index),
+                        AppliedRelationRule::Gadget { gadget, decomposition, .. } => {
+                            retain_scoped(*gadget);
+                            retain_scoped(*decomposition);
+                        }
+                    }
+                }
+                NormalizerEvent::BoundTransfer { owner, rule } => {
+                    retain_scoped(*owner);
+                    if let BoundRule::Authority(BoundAuthority::RelationPreimageSource { source }) =
+                        rule
+                    {
+                        retain_scoped(owner.with_expression(*source));
+                    }
+                }
+                NormalizerEvent::CoefficientMerge(observation) => retain_scoped(observation.owner),
+                NormalizerEvent::SurvivorFold(_) | NormalizerEvent::PreFoldPolynomial(_) => {}
+            }
         }
+    }
+
+    let mut monomial_arenas = BTreeMap::new();
+    for program in program_scopes
+        .keys()
+        .copied()
+        .chain(closed_programs.iter().copied())
+        .chain(scoped_roots.iter().map(|root| root.program()))
+    {
+        if let Some(arena) = job.monomials().get(program) {
+            monomial_arenas.insert(arena.token(), arena);
+        }
+    }
+    for monomial in &trace.retained_monomial_roots {
+        let arena =
+            monomial_arenas.get(&monomial.arena()).ok_or(G0Error::UnsupportedBoundTransfer)?;
+        let descriptor =
+            arena.descriptor(*monomial).map_err(|_| G0Error::UnsupportedBoundTransfer)?;
+        for factor in descriptor.central_factors.iter().chain(descriptor.ordered_factors.iter()) {
+            if expression_refs.contains_key(&factor.expression()) {
+                scoped_roots.insert(*factor);
+            }
+        }
+    }
+
+    for root in scoped_roots {
+        let scope = match program_scopes.get(&root.program()).copied() {
+            Some(scope) => scope,
+            None if closed_programs.contains(&root.program()) => {
+                closed_scope.map(|(scope, _)| scope).ok_or(G0Error::MissingCanonicalHandle {
+                    requested: CanonicalReference::Expr(root.expression()),
+                })?
+            }
+            None => {
+                return Err(G0Error::MissingCanonicalHandle {
+                    requested: CanonicalReference::Expr(root.expression()),
+                });
+            }
+        };
+        roots.insert((scope, root.expression()));
     }
     let mut seen = BTreeSet::new();
     let mut gadgets = BTreeMap::<CanonicalStatementEventRow, BTreeSet<ExprId>>::new();
@@ -6867,8 +6949,66 @@ mod tests {
 
     #[test]
     fn statement_rows_derive_closed_gadget_event_from_explicit_residual_root() {
+        use crate::operational_noise::{facts::NumericContract, normal_form::AnalyzedValue};
+
         let mut job = CheckerJob::new();
         let (scalar, input, gadget) = statement_gadget(&mut job);
+        let (closed_root, closed_gadget, ignored_root, ignored_expression) = job
+            .with_arena_stores(|expressions, programs, _| {
+                let signature = super::super::arena::ProgramSignature {
+                    inputs: Box::new([]),
+                    output: ResolvedValueType::Matrix(ResolvedMatrixType::new(
+                        17_u8.into(),
+                        1,
+                        1,
+                        1,
+                    )?),
+                };
+                let closed_program = programs.finalize(expressions, signature, input)?;
+                let closed_root = programs.scoped(expressions, closed_program, input)?;
+                let mut closed_proof = programs.scope_proof(expressions, closed_program)?;
+                let closed_input = expressions.scoped_from_proof(&closed_proof, input)?;
+                let closed_gadget = expressions.intern_scoped_transform(
+                    &mut closed_proof,
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                        output: ResolvedMatrixType::new(17_u8.into(), 1, 2, 1)?,
+                        base: 4,
+                        small: false,
+                        digit_count: 2,
+                    }),
+                    &[closed_input],
+                )?;
+                assert_eq!(closed_gadget.expression(), gadget);
+                let ignored_expression = expressions
+                    .intern(ValueOperator::Constant(TypedConstant::int(9)), Box::new([]))?;
+                let ignored_program = programs.finalize(
+                    expressions,
+                    super::super::arena::ProgramSignature {
+                        inputs: Box::new([]),
+                        output: ResolvedValueType::Int,
+                    },
+                    ignored_expression,
+                )?;
+                let ignored_root =
+                    programs.scoped(expressions, ignored_program, ignored_expression)?;
+                Ok((closed_root, closed_gadget, ignored_root, ignored_expression))
+            })
+            .unwrap();
+        let value = |semantic| AnalyzedValue {
+            semantic,
+            exact_nf: None,
+            coefficient_bound: NumericContract::Missing,
+        };
+        let mut trace = FeasibilityTrace::default();
+        trace.record_invocation_start(closed_root).unwrap();
+        trace.record_normalization_result(closed_gadget, &value(closed_gadget)).unwrap();
+        trace.record_normalization_result(closed_root, &value(closed_root)).unwrap();
+        trace.record_invocation_end(closed_root, &value(closed_root), &Default::default()).unwrap();
+        trace.record_invocation_start(ignored_root).unwrap();
+        trace.record_normalization_result(ignored_root, &value(ignored_root)).unwrap();
+        trace
+            .record_invocation_end(ignored_root, &value(ignored_root), &Default::default())
+            .unwrap();
         let closure = CertificateClosure {
             expressions: [scalar, input, gadget].into_iter().collect(),
             programs: BTreeSet::new(),
@@ -6878,63 +7018,89 @@ mod tests {
             event_ids: BTreeSet::new(),
             constant_expressions: [scalar].into_iter().collect(),
         };
-        let rows = derive_certificate_statement_rows(
-            &job,
-            &closure,
-            &FeasibilityTrace::default(),
-            Some(gadget),
-        )
-        .unwrap();
+        let rows = derive_certificate_statement_rows(&job, &closure, &trace, Some(input)).unwrap();
         let gadget_row = rows.expression(gadget).unwrap();
+        let root_row = rows.expression(input).unwrap();
         assert!(matches!(
             rows.events(),
             [CanonicalStatementEventRow::GadgetDecompose {
                 scope: CanonicalStatementScope::Closed { root },
                 expression,
                 ..
-            }] if *root == gadget_row && *expression == gadget_row
+            }] if *root == root_row && *expression == gadget_row
         ));
+        assert!(rows.expression_refs.get(&ignored_expression).is_none());
     }
 
     #[test]
     fn shared_gadget_body_keeps_each_program_scope_event_ref() {
-        use crate::operational_noise::program::FamilyDomain;
+        use crate::operational_noise::{facts::NumericContract, normal_form::AnalyzedValue};
 
         let mut job = CheckerJob::new();
-        let (scalar, input, gadget) = statement_gadget(&mut job);
-        let (first, second) = job
+        let (scalar, input, _) = statement_gadget(&mut job);
+        let input_type = ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).unwrap();
+        let output_type = ResolvedMatrixType::new(17_u8.into(), 1, 2, 1).unwrap();
+        let (first, second, second_root, first_gadget, second_gadget) = job
             .with_arena_stores(|expressions, programs, _| {
-                Ok((
-                    programs.generated_family_from_body(
-                        expressions,
-                        FamilyDomain::new(0, 1).unwrap(),
-                        gadget,
-                    )?,
-                    programs.generated_family_from_body(
-                        expressions,
-                        FamilyDomain::new(0, 2).unwrap(),
-                        gadget,
-                    )?,
-                ))
+                let second_root = expressions
+                    .intern(ValueOperator::Matrix(MatrixOperation::Negate), Box::new([input]))?;
+                let signature = super::super::arena::ProgramSignature {
+                    inputs: Box::new([]),
+                    output: ResolvedValueType::Matrix(input_type),
+                };
+                let first = programs.finalize(expressions, signature.clone(), input)?;
+                let second = programs.finalize(expressions, signature, second_root)?;
+                let mut first_proof = programs.scope_proof(expressions, first)?;
+                let first_input = expressions.scoped_from_proof(&first_proof, input)?;
+                let first_gadget = expressions.intern_scoped_transform(
+                    &mut first_proof,
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                        output: output_type.clone(),
+                        base: 4,
+                        small: false,
+                        digit_count: 2,
+                    }),
+                    &[first_input],
+                )?;
+                let mut second_proof = programs.scope_proof(expressions, second)?;
+                let second_input = expressions.scoped_from_proof(&second_proof, input)?;
+                let second_gadget = expressions.intern_scoped_transform(
+                    &mut second_proof,
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                        output: output_type,
+                        base: 4,
+                        small: false,
+                        digit_count: 2,
+                    }),
+                    &[second_input],
+                )?;
+                Ok((first, second, second_root, first_gadget, second_gadget))
             })
             .unwrap();
-        assert_ne!(first.program(), second.program());
-        let first_projection = job.programs().project_program(first.program()).unwrap();
-        let second_projection = job.programs().project_program(second.program()).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first_gadget.expression(), second_gadget.expression());
+        let gadget = first_gadget.expression();
+        let mut trace = FeasibilityTrace::default();
+        for owner in [first_gadget, second_gadget] {
+            let value = AnalyzedValue {
+                semantic: owner,
+                exact_nf: None,
+                coefficient_bound: NumericContract::Missing,
+            };
+            trace.record_invocation_start(owner).unwrap();
+            trace.record_normalization_result(owner, &value).unwrap();
+            trace.record_invocation_end(owner, &value, &Default::default()).unwrap();
+        }
         let closure = CertificateClosure {
-            expressions: [scalar, input, gadget, first_projection.root, second_projection.root]
-                .into_iter()
-                .collect(),
-            programs: [first.program(), second.program()].into_iter().collect(),
-            families: [first, second].into_iter().collect(),
+            expressions: [scalar, input, second_root, gadget].into_iter().collect(),
+            programs: [first, second].into_iter().collect(),
+            families: BTreeSet::new(),
             source_ids: BTreeSet::new(),
             family_source_ids: BTreeSet::new(),
             event_ids: BTreeSet::new(),
             constant_expressions: [scalar].into_iter().collect(),
         };
-        let rows =
-            derive_certificate_statement_rows(&job, &closure, &FeasibilityTrace::default(), None)
-                .unwrap();
+        let rows = derive_certificate_statement_rows(&job, &closure, &trace, None).unwrap();
         let scopes = rows
             .events()
             .iter()
@@ -7074,8 +7240,7 @@ mod tests {
     #[test]
     fn dynamic_gadget_relations_include_retained_and_ignore_nonretained_expressions() {
         use crate::operational_noise::{
-            arena::ArenaToken, facts::NumericContract, monomial::MonomialId,
-            normal_form::AnalyzedValue, program::FamilyDomain,
+            facts::NumericContract, normal_form::AnalyzedValue, program::FamilyDomain,
         };
 
         let mut job = CheckerJob::new();
@@ -7133,6 +7298,10 @@ mod tests {
         let outside_gadget = owner.expression();
         let ignored_input = ignored_input_owner.expression();
         let ignored_gadget = ignored_owner.expression();
+        let retained_monomial =
+            job.intern_monomial(family.program(), &[], &[owner]).expect("retained monomial");
+        let ignored_monomial =
+            job.intern_monomial(family.program(), &[], &[ignored_owner]).expect("ignored monomial");
         let mut trace = FeasibilityTrace::default();
         trace.record_invocation_start(owner).unwrap();
         let input_result = trace
@@ -7158,7 +7327,7 @@ mod tests {
         trace
             .record_applied_relation(AppliedRelation {
                 owner,
-                source_monomial: MonomialId::new(ArenaToken(0), 0),
+                source_monomial: retained_monomial,
                 outer_coefficient: 1.into(),
                 ordered_start: 0,
                 ordered_end_exclusive: 1,
@@ -7173,7 +7342,7 @@ mod tests {
         trace
             .record_applied_relation(AppliedRelation {
                 owner: ignored_owner,
-                source_monomial: MonomialId::new(ArenaToken(0), 1),
+                source_monomial: ignored_monomial,
                 outer_coefficient: 1.into(),
                 ordered_start: 0,
                 ordered_end_exclusive: 1,
@@ -7203,15 +7372,17 @@ mod tests {
             constant_expressions: [retained_scalar].into_iter().collect(),
         };
         let rows = derive_certificate_statement_rows(&job, &closure, &trace, None).unwrap();
+        let expected_scope =
+            CanonicalStatementScope::Program { program: rows.program(family.program()).unwrap() };
         let event_expressions = rows
             .events()
             .iter()
             .map(|event| match event {
-                CanonicalStatementEventRow::GadgetDecompose {
-                    scope: CanonicalStatementScope::Program { program: 0 },
-                    expression,
-                    ..
-                } => *expression,
+                CanonicalStatementEventRow::GadgetDecompose { scope, expression, .. }
+                    if *scope == expected_scope =>
+                {
+                    *expression
+                }
                 _ => unreachable!("fixture has only program-scoped gadget events"),
             })
             .collect::<BTreeSet<_>>();
@@ -7221,6 +7392,14 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+        let descriptor =
+            job.monomials().get(family.program()).unwrap().descriptor(retained_monomial).unwrap();
+        assert_eq!(descriptor.ordered_factors.as_ref(), [owner]);
+        assert!(rows.events().iter().any(|event| matches!(
+            event,
+            CanonicalStatementEventRow::GadgetDecompose { scope, expression, .. }
+                if *scope == expected_scope && *expression == rows.expression(owner.expression()).unwrap()
+        )));
         assert!(rows.expression_refs.get(&ignored_gadget).is_none());
     }
 

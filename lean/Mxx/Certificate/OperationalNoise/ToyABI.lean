@@ -253,7 +253,7 @@ def foldEventsValid (rows : ToyRows) (events : List ToyEvent) : Prop :=
 
 /-- Structural validation checks the external proof event list at each fixed ABI position. -/
 def ToyValid (certificate : ToyCertificate) (rows : ToyRows) (events : List ToyEvent) : Prop :=
-  rowsValid certificate rows ∧ samplerRowsValid certificate rows ∧
+  events.length = 30 ∧ rowsValid certificate rows ∧ samplerRowsValid certificate rows ∧
     frameEventsValid rows events ∧ relationEventsValid rows events ∧
     foldEventsValid rows events
 
@@ -277,11 +277,18 @@ instance (certificate : ToyCertificate) (rows : ToyRows) (events : List ToyEvent
   unfold ToyValid
   infer_instance
 
+/-- Constructive decimal decoder for the only two strings emitted by the fixed toy ABI. -/
+def toyDecimalCutoff? (value : String) : Option Nat :=
+  match value.toByteArray.data.toList with
+  | [49] => some 1
+  | [56] => some 8
+  | _ => none
+
 def noiseCutoff? (certificate : ToyCertificate) (rows : ToyRows) : Option Nat :=
   match listAt? certificate.statementEvents rows.noiseEvent.row with
   | some (.sampler eventOwner (.gaussian output sigma cutoff) (some contract)) =>
       if eventOwner = toyWire rows.noiseExpression.row ∧ output = matrixType ∧ sigma = "1" ∧
-          contract = finiteRawContract cutoff then cutoff.toNat?
+          contract = finiteRawContract cutoff then toyDecimalCutoff? cutoff
       else none
   | _ => none
 
@@ -289,48 +296,55 @@ def preimageCutoff? (certificate : ToyCertificate) (rows : ToyRows) : Option Nat
   match listAt? certificate.statementEvents rows.preimageEvent.row with
   | some (.sampler eventOwner (.preimage output cutoff) (some contract)) =>
       if eventOwner = toyWire rows.preimageExpression.row ∧ output = matrixType ∧
-          contract = finiteRawContract cutoff then cutoff.toNat?
+          contract = finiteRawContract cutoff then toyDecimalCutoff? cutoff
       else none
   | _ => none
 
-def ToySamplerContract (certificate : ToyCertificate) (rows : ToyRows) (actual : Int) : Prop :=
-  ∃ cutoff, noiseCutoff? certificate rows = some cutoff ∧ actual.natAbs ≤ cutoff
+def ToySamplerContract (certificate : ToyCertificate) (rows : ToyRows)
+    (events : List ToyEvent) (actual : Int) : Prop :=
+  ∃ cutoff, noiseCutoff? certificate rows = some cutoff ∧
+    listAt? events 13 = some (.result (owner rows rows.noiseExpression) (noiseValue rows)) ∧
+    actual = (noiseValue rows).coefficient ∧ actual.natAbs ≤ cutoff
 
-def ToyPreimageContract (certificate : ToyCertificate) (rows : ToyRows) (actual : Int) : Prop :=
-  ∃ cutoff, preimageCutoff? certificate rows = some cutoff ∧ actual.natAbs ≤ cutoff
+def ToyPreimageContract (certificate : ToyCertificate) (rows : ToyRows)
+    (events : List ToyEvent) (actual : Int) : Prop :=
+  ∃ cutoff, preimageCutoff? certificate rows = some cutoff ∧
+    listAt? events 5 =
+      some (.result (owner rows rows.preimageExpression) (preimageValue rows)) ∧
+    actual = (preimageValue rows).coefficient ∧ actual.natAbs ≤ cutoff
 
 theorem ToyValid.noiseCutoff {certificate : ToyCertificate} {rows : ToyRows}
     {events : List ToyEvent} (valid : ToyValid certificate rows events) :
     noiseCutoff? certificate rows = some 1 := by
-  rcases valid with ⟨rowsValidProof, samplerValid, _⟩
+  rcases valid with ⟨_, rowsValidProof, samplerValid, _⟩
   rcases rowsValidProof with ⟨rfl, _⟩
   simp [noiseCutoff?, samplerValid.2, noiseStatementRow, finiteRawContract, matrixType,
-    toyWire]
-  simp [String.toNat?, String.Slice.toNat?, String.Slice.isNat]
+    toyWire, toyDecimalCutoff?]
+  rfl
 
 theorem ToyValid.preimageCutoff {certificate : ToyCertificate} {rows : ToyRows}
     {events : List ToyEvent} (valid : ToyValid certificate rows events) :
     preimageCutoff? certificate rows = some 8 := by
-  rcases valid with ⟨rowsValidProof, samplerValid, _⟩
+  rcases valid with ⟨_, rowsValidProof, samplerValid, _⟩
   rcases rowsValidProof with ⟨rfl, _⟩
   simp [preimageCutoff?, samplerValid.1, preimageStatementRow, finiteRawContract, matrixType,
-    toyWire]
-  simp [String.toNat?, String.Slice.toNat?, String.Slice.isNat]
+    toyWire, toyDecimalCutoff?]
+  rfl
 
 theorem ToySamplerContract.sound {certificate : ToyCertificate} {rows : ToyRows}
     {events : List ToyEvent} {actual : Int} (valid : ToyValid certificate rows events)
-    (contract : ToySamplerContract certificate rows actual) :
+    (contract : ToySamplerContract certificate rows events actual) :
     (recordedFiniteContract 1).Interprets actual.natAbs := by
-  rcases contract with ⟨cutoff, cutoffRow, actualBound⟩
+  rcases contract with ⟨cutoff, cutoffRow, _, _, actualBound⟩
   rw [valid.noiseCutoff] at cutoffRow
   cases cutoffRow
   exact gaussianCutoff_sound actualBound
 
 theorem ToyPreimageContract.sound {certificate : ToyCertificate} {rows : ToyRows}
     {events : List ToyEvent} {actual : Int} (valid : ToyValid certificate rows events)
-    (contract : ToyPreimageContract certificate rows actual) :
+    (contract : ToyPreimageContract certificate rows events actual) :
     (recordedFiniteContract 8).Interprets actual.natAbs := by
-  rcases contract with ⟨cutoff, cutoffRow, actualBound⟩
+  rcases contract with ⟨cutoff, cutoffRow, _, _, actualBound⟩
   rw [valid.preimageCutoff] at cutoffRow
   cases cutoffRow
   exact preimageCutoff_sound actualBound
@@ -350,11 +364,39 @@ def ToyUniversalRelation (certificate : ToyCertificate) (rows : ToyRows)
 theorem ToyValid.universalRelation {certificate : ToyCertificate} {rows : ToyRows}
     {events : List ToyEvent} (valid : ToyValid certificate rows events) :
     ToyUniversalRelation certificate rows events 1 1 := by
-  rcases valid with ⟨rowProof, _, frameProof, relationProof, _⟩
+  rcases valid with ⟨_, rowProof, _, frameProof, relationProof, _⟩
   rcases rowProof with ⟨rfl, rowChecks⟩
   exact ⟨⟨rfl, rowChecks⟩, relationProof, frameProof.2.2.1,
     frameProof.2.2.2.2.2.1, frameProof.2.2.2.2.2.2.2.2.2.2.1,
     by decide, by decide, by decide⟩
+
+/-- The six scalar values needed to connect the fixed 1-by-1 replay to its recorded results. -/
+structure ToyExecutionValues where
+  publicCoefficient : Int
+  preimageCoefficient : Int
+  relationLeft : Int
+  relationRight : Int
+  error : Int
+  finalCoefficient : Int
+deriving DecidableEq, Repr
+
+/-- Fixed execution-value association. It reuses structural validators and adds only the numeric
+    equations joining result events, merge contributions, the survivor, and the final result. -/
+def ToyExecutionValues.Valid (rows : ToyRows) (events : List ToyEvent)
+    (values : ToyExecutionValues) : Prop :=
+  frameEventsValid rows events ∧ relationEventsValid rows events ∧
+    foldEventsValid rows events ∧
+    values.publicCoefficient = (publicValue rows).coefficient ∧
+    values.preimageCoefficient = (preimageValue rows).coefficient ∧
+    values.relationLeft = values.publicCoefficient * values.preimageCoefficient ∧
+    values.relationRight = (targetValue rows).coefficient ∧
+    values.error = (noiseValue rows).coefficient ∧
+    (targetCancellation rows).coefficient = -values.relationRight ∧
+    (noiseTerm rows).coefficient = values.error ∧
+    (targetTerm rows).coefficient + (targetCancellation rows).coefficient = 0 ∧
+    values.finalCoefficient = values.relationLeft - values.relationRight + values.error ∧
+    values.finalCoefficient = (rootValue rows).coefficient ∧
+    (rootValue rows).bound = 0 + (noiseValue rows).bound
 
 /-- A modularly exact relation may be removed before centering the remaining error. -/
 theorem centeredCoefficient_add_relation {modulus : Nat} {left right error : Int}
@@ -380,26 +422,35 @@ theorem liftCoefficient_norm (coefficient : Int) :
   simp [liftCoefficient, Matrix.maxCenteredCoefficientNorm, maxNatList]
 
 def ToyOperationalClaim (certificate : ToyCertificate) (rows : ToyRows)
-    (events : List ToyEvent) (residual : Int) : Prop :=
-  ToyValid certificate rows events ∧ 2 * 2 * centeredNorm 257 residual < 257
+    (events : List ToyEvent) (values : ToyExecutionValues) : Prop :=
+  ToyValid certificate rows events ∧ values.Valid rows events ∧
+    centeredCoefficient 257
+        (values.relationLeft - values.relationRight + values.error) =
+      centeredCoefficient 257 values.finalCoefficient ∧
+    2 * 2 * centeredNorm 257 values.finalCoefficient < 257
 
 theorem operationalProof {certificate : ToyCertificate} {rows : ToyRows}
-    {events : List ToyEvent} {left right error : Int}
+    {events : List ToyEvent} {values : ToyExecutionValues}
     (valid : ToyValid certificate rows events)
-    (sampler : ToySamplerContract certificate rows error)
-    (relation : ToyUniversalRelation certificate rows events left right) :
-    ToyOperationalClaim certificate rows events (left - right + error) := by
-  have errorBound : error.natAbs ≤ 1 := sampler.sound valid
-  have errorCases : error = -1 ∨ error = 0 ∨ error = 1 := by omega
-  have centeredErrorBound : centeredNorm 257 error ≤ 1 := by
-    rcases errorCases with h | h | h <;> subst error <;> decide
+    (execution : values.Valid rows events)
+    (sampler : ToySamplerContract certificate rows events values.error)
+    (relation : ToyUniversalRelation certificate rows events values.relationLeft
+      values.relationRight) : ToyOperationalClaim certificate rows events values := by
+  have errorBound : values.error.natAbs ≤ 1 := sampler.sound valid
+  have errorCases : values.error = -1 ∨ values.error = 0 ∨ values.error = 1 := by omega
+  have centeredErrorBound : centeredNorm 257 values.error ≤ 1 := by
+    rcases errorCases with h | h | h <;> rw [h] <;> decide
   have centeredRelation := centeredCoefficient_add_relation (modulus := 257)
-    (left := left) (right := right) (error := error) (by decide) relation.2.2.2.2.2.2.2
-  have centeredNormEquality :
-      centeredNorm 257 (left - right + error) = centeredNorm 257 error := by
+    (left := values.relationLeft) (right := values.relationRight) (error := values.error)
+    (by decide) relation.2.2.2.2.2.2.2
+  have executionProof := execution
+  rcases execution with ⟨_, _, _, _, _, _, _, _, _, _, _, residualIsFinal, _, _⟩
+  have centeredNormEquality : centeredNorm 257 values.finalCoefficient =
+      centeredNorm 257 values.error := by
     unfold centeredNorm
-    rw [centeredRelation]
-  refine ⟨valid, ?_⟩
+    rw [residualIsFinal, centeredRelation]
+  refine ⟨valid, executionProof, ?_, ?_⟩
+  · rw [residualIsFinal]
   rw [centeredNormEquality]
   omega
 

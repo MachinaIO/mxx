@@ -492,6 +492,57 @@ theorem productMerge_right_scalar_coefficient (left right : ExactTerm) :
   simpa using productMerge_contribution_coefficient
     left { right with key := scalarActionKey right.key }
 
+/-- Reproduce the four typed scalar roles of the Rust product projector. Exactly one scalar
+    operand is centralized before product-key construction; two scalars retain their ordered
+    product so relation matching can run first. -/
+def scalarProductKey (left right : MonomialKey) (leftScalar rightScalar : Bool) : MonomialKey :=
+  if leftScalar && !rightScalar then MonomialKey.product (scalarActionKey left) right
+  else if rightScalar && !leftScalar then MonomialKey.product left (scalarActionKey right)
+  else MonomialKey.product left right
+
+/-- One exact operator-product contribution with the same coefficient multiplication and typed
+    scalar-role key construction as the Rust projector. -/
+def operatorProductContribution (left right : ExactTerm) (leftScalar rightScalar : Bool) :
+    ExactTerm :=
+  { productMerge_contribution left right with
+    key := scalarProductKey left.key right.key leftScalar rightScalar }
+
+@[simp]
+theorem operatorProductContribution_coefficient (left right : ExactTerm)
+    (leftScalar rightScalar : Bool) :
+    (operatorProductContribution left right leftScalar rightScalar).coefficient =
+      left.coefficient * right.coefficient := by
+  exact productMerge_contribution_coefficient left right
+
+@[simp]
+theorem operatorProductContribution_key (left right : ExactTerm)
+    (leftScalar rightScalar : Bool) :
+    (operatorProductContribution left right leftScalar rightScalar).key =
+      scalarProductKey left.key right.key leftScalar rightScalar := by
+  rfl
+
+@[simp]
+theorem operatorProductContribution_left_scalar (left right : ExactTerm) :
+    operatorProductContribution left right true false =
+      productMerge_contribution { left with key := scalarActionKey left.key } right := by
+  rfl
+
+@[simp]
+theorem operatorProductContribution_right_scalar (left right : ExactTerm) :
+    operatorProductContribution left right false true =
+      productMerge_contribution left { right with key := scalarActionKey right.key } := by
+  rfl
+
+@[simp]
+theorem operatorProductContribution_both_scalar (left right : ExactTerm) :
+    operatorProductContribution left right true true = productMerge_contribution left right := by
+  rfl
+
+@[simp]
+theorem operatorProductContribution_neither_scalar (left right : ExactTerm) :
+    operatorProductContribution left right false false = productMerge_contribution left right := by
+  rfl
+
 theorem boundTransfer_sum {left right left' right' : Nat}
     (leftBound : left ≤ left') (rightBound : right ≤ right') :
     left + right ≤ left' + right' := by
@@ -505,6 +556,15 @@ theorem boundTransfer_product {left right left' right' : Nat}
     (leftBound : left ≤ left') (rightBound : right ≤ right') :
     left * right ≤ left' * right' := by
   exact Nat.mul_le_mul leftBound rightBound
+
+theorem operatorProductContribution_natAbs_le (left right : ExactTerm)
+    (leftScalar rightScalar : Bool) (leftBound rightBound : Nat)
+    (leftExactBound : left.coefficient.natAbs ≤ leftBound)
+    (rightExactBound : right.coefficient.natAbs ≤ rightBound) :
+    (operatorProductContribution left right leftScalar rightScalar).coefficient.natAbs ≤
+      leftBound * rightBound := by
+  rw [operatorProductContribution_coefficient, Int.natAbs_mul]
+  exact boundTransfer_product leftExactBound rightExactBound
 
 theorem boundTransfer_zero_product (bound : Nat) : 0 * bound = 0 := by simp
 

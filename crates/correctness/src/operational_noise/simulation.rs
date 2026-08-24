@@ -510,10 +510,10 @@ pub(crate) struct ObservedCoverage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ProofPayloadProjection {
-    payload: OperationalProofPayload,
-    generator_peak_retained_logical_items: u64,
-    observed_coverage: ObservedCoverage,
+pub(crate) struct ProofPayloadProjection {
+    pub(crate) payload: OperationalProofPayload,
+    pub(crate) generator_peak_retained_logical_items: u64,
+    pub(crate) observed_coverage: ObservedCoverage,
 }
 
 /// Errors from the canonical proof-payload boundary.  The payload itself is already projected
@@ -530,6 +530,103 @@ pub(crate) trait LogicalItems {
 impl<T: LogicalItems + ?Sized> LogicalItems for &T {
     fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
         (*self).logical_items()
+    }
+}
+
+impl LogicalItems for ObservedScalarKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for ObservedMatrixKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for ObservedTrapdoorKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for ObservedOperatorKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_add(
+            1,
+            match self {
+                Self::Scalar(kind) => kind.logical_items()?,
+                Self::Matrix(kind) => kind.logical_items()?,
+                Self::Trapdoor(kind) => kind.logical_items()?,
+                Self::Argument |
+                Self::Constant |
+                Self::Source |
+                Self::DeterministicHash |
+                Self::OpaqueFamilyElement |
+                Self::IndexMap |
+                Self::ExplicitElement |
+                Self::ProgramCall |
+                Self::ExtractCoefficient => 0,
+            },
+        )
+    }
+}
+
+impl LogicalItems for ObservedTransformKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for ObservedSamplerKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for ObservedRelationKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for ObservedBoundKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for ObservedCoverageKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_add(
+            1,
+            match self {
+                Self::Operator(kind) => kind.logical_items()?,
+                Self::Transform(kind) => kind.logical_items()?,
+                Self::Sampler(kind) => kind.logical_items()?,
+                Self::Relation(kind) => kind.logical_items()?,
+                Self::Bound(kind) => kind.logical_items()?,
+            },
+        )
+    }
+}
+
+impl LogicalItems for ObservedCoverageSite {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(2)
+    }
+}
+
+impl LogicalItems for ObservedCoverageRow {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([self.kind.logical_items(), Ok(1), logical_vec(&self.sites)])
+    }
+}
+
+impl LogicalItems for ObservedCoverage {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        logical_vec(&self.rows)
     }
 }
 
@@ -1623,7 +1720,7 @@ pub(crate) fn derive_proof_payload(
     Ok(derive_proof_payload_projection(run)?.payload)
 }
 
-fn derive_proof_payload_projection(
+pub(crate) fn derive_proof_payload_projection(
     run: &OperationalCertificateRun,
 ) -> Result<ProofPayloadProjection, CertificateProjectionError> {
     let closure = &run.projection.closure;
@@ -2043,6 +2140,13 @@ impl<'a> ProofPayloadProjector<'a> {
             events.push(projected);
         }
         let observed_coverage = derive_observed_coverage(self.job, closure, self.refs, &events)?;
+        current_retained_logical_items = checked_add(
+            current_retained_logical_items,
+            observed_coverage.logical_items().map_err(generator_retention_error)?,
+        )
+        .map_err(generator_retention_error)?;
+        generator_peak_retained_logical_items =
+            generator_peak_retained_logical_items.max(current_retained_logical_items);
         Ok(ProofPayloadProjection {
             payload: OperationalProofPayload { events },
             generator_peak_retained_logical_items,
@@ -4120,6 +4224,10 @@ mod tests {
                 ObservedCoverageSite::ExpressionRow { row: 9 },
             ]
         );
+        // Scalar 1; Operator tag + Scalar 2; domain tag + Operator 3; each site 2;
+        // sites Vec 1 + len 2 + sites 4 = 7; row 3 + count 1 + sites 7 = 11;
+        // rows Vec 1 + len 1 + row 11 = 13.
+        assert_eq!(coverage.logical_items(), Ok(13));
     }
 
     fn payload_rule_mentions_transfer(rule: &ProofPayloadRule, event: usize) -> bool {
@@ -5605,10 +5713,13 @@ mod tests {
         }
         let (manual_support, _, _, _, _) = manual_projection_support_items(&first_run);
         let payload_items = first_payload.logical_items().expect("logical item count");
+        let coverage_items =
+            first_projection.observed_coverage.logical_items().expect("coverage logical items");
         assert_eq!(
             first_projection.generator_peak_retained_logical_items,
-            manual_support + payload_items,
+            manual_support + payload_items + coverage_items,
         );
+        assert!(coverage_items > 0);
         assert!(first_projection.generator_peak_retained_logical_items >= payload_items);
         assert!(first_payload.logical_items().expect("logical item count") > 0);
 
@@ -5642,10 +5753,13 @@ mod tests {
         assert!(rhs_count > 0);
         assert!(canonical_refs_items > shallow_refs_items);
         let payload_items = projection.payload.logical_items().expect("payload logical items");
+        let coverage_items =
+            projection.observed_coverage.logical_items().expect("coverage logical items");
         assert_eq!(
             projection.generator_peak_retained_logical_items,
-            manual_support + payload_items,
+            manual_support + payload_items + coverage_items,
         );
+        assert!(coverage_items > 0);
         let mut expected_trace_sites = BTreeMap::new();
         for (index, event) in projection.payload.events.iter().enumerate() {
             let kind = match event {

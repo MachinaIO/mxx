@@ -2202,6 +2202,16 @@ impl FeasibilitySink for FeasibilityTrace {
                     {
                         return Err(G0Error::RelationTraceInvariant);
                     }
+                    if let Some((_, _, _, _, _, pending_merges)) = stack.last_mut() {
+                        let remove_owner =
+                            pending_merges.get_mut(&observation.owner).is_some_and(|merges| {
+                                merges.remove(&observation.source_monomial);
+                                merges.is_empty()
+                            });
+                        if remove_owner {
+                            pending_merges.remove(&observation.owner);
+                        }
+                    }
                 }
                 NormalizerEvent::BoundTransfer { owner, .. } => {
                     let Some((root, start, _, pending_bounds, predecessors, _)) = stack.last_mut()

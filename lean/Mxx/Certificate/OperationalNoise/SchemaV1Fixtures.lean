@@ -286,62 +286,82 @@ def rustV1Golden : String :=
 def decodedRustV1Golden : Except String Document :=
   Json.parse rustV1Golden >>= decodeSmallDocument
 
-structure GoldenSummary where
-  schemaId : String
-  schemaVersion : Nat
-  plaintextModulus : String
-  ciphertextModulus : String
-  ringDimension : Nat
-  expressionRows : Nat
-  programRows : Nat
-  sourceRows : Nat
-  eventRows : Nat
-  indexUseRows : Nat
-  sliceGroupRows : Nat
-  residualRoot : ResidualRoot
-deriving DecidableEq, Repr
+private def goldenMatrix (rows columns : Nat) : ValueType :=
+  .matrix "257" 1 rows columns
 
-def GoldenSummary.ofDocument (document : Document) : GoldenSummary :=
-  { schemaId := document.schemaId
-    schemaVersion := document.schemaVersion
-    plaintextModulus := document.plaintextModulus
-    ciphertextModulus := document.ciphertextModulus
-    ringDimension := document.ringDimension
-    expressionRows := document.expressions.length
-    programRows := document.programs.length
-    sourceRows := document.sources.length
-    eventRows := document.events.length
-    indexUseRows := document.indexUses.length
-    sliceGroupRows := document.sliceGroups.length
-    residualRoot := document.residualRoot }
+private def goldenOwner (node : Nat) : ObservedWire :=
+  { stage := "consumer", definition := .root, path := 0, node, port := 0 }
 
-def expectedGoldenSummary : GoldenSummary :=
+def expectedDocument : Document :=
   { schemaId := "mxx.operational-noise.certificate"
     schemaVersion := 1
     plaintextModulus := "2"
     ciphertextModulus := "257"
     ringDimension := 1
-    expressionRows := 11
-    programRows := 1
-    sourceRows := 2
-    eventRows := 3
-    indexUseRows := 0
-    sliceGroupRows := 0
+    expressions :=
+      [ { descriptor := .operation (.event (.sampler ⟨0⟩)) (goldenMatrix 1 4)
+          inputs := [], program := none },
+        { descriptor := .operation (.event (.sampler ⟨1⟩)) (goldenMatrix 1 1)
+          inputs := [], program := none },
+        { descriptor := .operation (.event (.sampler ⟨2⟩)) (goldenMatrix 4 1)
+          inputs := [], program := none },
+        { descriptor :=
+            .operation
+              (.stable
+                (.trapdoor
+                  (.generate "trapdoor-sample" [4, 2] (some ⟨0⟩) "value")))
+              .trapdoor
+          inputs := [], program := none },
+        { descriptor := .source (.direct ⟨0⟩), inputs := [], program := none },
+        { descriptor := .source (.direct ⟨1⟩), inputs := [], program := none },
+        { descriptor := .operation (.stable .programCall) (goldenMatrix 4 1)
+          inputs := [⟨4⟩], program := some ⟨0⟩ },
+        { descriptor := .operation (.stable (.matrix .multiply)) (goldenMatrix 1 1)
+          inputs := [⟨0⟩, ⟨6⟩], program := none },
+        { descriptor := .operation (.stable (.matrix .scale)) (goldenMatrix 4 1)
+          inputs := [⟨6⟩, ⟨5⟩], program := none },
+        { descriptor := .operation (.stable (.matrix .multiply)) (goldenMatrix 1 1)
+          inputs := [⟨0⟩, ⟨8⟩], program := none },
+        { descriptor := .operation (.stable (.matrix .subtract)) (goldenMatrix 1 1)
+          inputs := [⟨9⟩, ⟨1⟩], program := none } ]
+    programs :=
+      [ { signature := [ { valueType := .int
+                           trustedIndexRange := some { minimum := 0, maximumExclusive := 1 } } ]
+          output := goldenMatrix 4 1
+          family :=
+            some
+              { domain := { minimum := 0, maximumExclusive := 1 }
+                elementType := goldenMatrix 4 1
+                reducible := false
+                artifact := none }
+          root := ⟨2⟩ } ]
+    sources :=
+      [ .constant { valueType := .int, value := .int "0" },
+        .constant { valueType := .int, value := .int "1" } ]
+    events :=
+      [ .sampler (goldenOwner 0)
+          (.trapdoor (goldenMatrix 1 4)
+            "{\"tag\":\"Rational\",\"value\":{\"numerator\":\"3\",\"denominator\":\"1\"}}"
+            4 2 "8"),
+        .sampler (goldenOwner 1) (.uniformResidue (goldenMatrix 1 1)),
+        .sampler (goldenOwner 2) (.preimage (goldenMatrix 4 1) "8") ]
+    indexUses := []
+    sliceGroups := []
     residualRoot := .closed ⟨10⟩ }
 
 theorem rust_v1_golden_representation_is_typed :
-    expectedGoldenSummary.residualRoot = .closed ⟨10⟩ ∧
-      expectedGoldenSummary.expressionRows = 11 ∧
-      expectedGoldenSummary.eventRows = 3 := by
-  exact ⟨rfl, rfl, rfl⟩
+    expectedDocument.schemaVersion = 1 ∧
+      expectedDocument.expressions.length = 11 ∧
+      expectedDocument.events.length = 3 ∧
+      expectedDocument.residualRoot = .closed ⟨10⟩ := by
+  exact ⟨rfl, rfl, rfl, rfl⟩
 
 run_cmd
   match decodedRustV1Golden with
   | .error message => throwError "Rust v1 golden decode failed: {message}"
   | .ok document =>
-      let actual := GoldenSummary.ofDocument document
-      if actual = expectedGoldenSummary then pure ()
-      else throwError "Rust v1 golden summary mismatch: {repr actual}"
+      if document = expectedDocument then pure ()
+      else throwError "Rust v1 golden document mismatch: {repr document}"
 
 def typedGadgetOperator : ExpressionEventOperator :=
   .gadgetDecompose [⟨2⟩, ⟨5⟩]

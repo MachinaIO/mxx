@@ -10,14 +10,10 @@
 
 use crate::{
     BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout,
-    tall_rotation_encoding::{TallRotationDirection, TallRotationEncodingWires},
+    tall_rotation_encoding::{TallLinearTransformEncodingWires, TallRotationEncodingKey},
 };
 use mxx_dsl::{DslError, Family, Int, Mat, Parallel};
-use mxx_ir_core::{
-    IntExpr, RealExpr,
-    node::{ConcatAxis, IndexRange},
-    types::MatrixType,
-};
+use mxx_ir_core::{IntExpr, RealExpr, node::ConcatAxis, types::MatrixType};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use rayon::prelude::*;
@@ -95,6 +91,12 @@ pub enum TallCompileError {
     /// A directly provisioned rotation pair is unavailable.
     #[error("tall rotation encoding ({num_slots}, {offset}) is unavailable")]
     MissingTallRotationEncoding { num_slots: u32, offset: u32 },
+    /// Anchor reduction does not match the physical slot layout.
+    #[error("tall anchor reduction has an invalid block or lane layout")]
+    InvalidAnchorReduceLayout,
+    /// One graph requested incompatible anchor-reduction matrices.
+    #[error("a Tall graph requires more than one anchor-reduction matrix")]
+    ConflictingAnchorReduceEncoding,
     /// A parameterized rotation is missing or bound to another parameter kind.
     #[error("gate {gate} has an invalid parameterized rotation binding")]
     InvalidRotationParameter { gate: usize },
@@ -194,86 +196,205 @@ impl BggTallEncodingCompiler {
         self.scalar_mul(input, scalar, decomposed, true)
     }
 
-    /// Applies one provisioned cyclic rotation pair in the selected direction.
+    /// Applies one provisioned cyclic rotation through the generic fixed linear transform.
     pub fn rotate(
         &self,
         input: &BggTallEncodingWire,
-        rotation: &TallRotationEncodingWires,
-        direction: TallRotationDirection,
+        key: TallRotationEncodingKey,
+        transform: &TallLinearTransformEncodingWires,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
         let BggTallPlaintext::Diagonal(plaintexts) = &input.plaintext else {
             return Err(TallCompileError::MissingRotationPlaintext);
         };
-        let num_slots = usize::try_from(rotation.key.num_slots)
-            .map_err(|_| TallCompileError::InvalidRotationLayout)?;
+        let num_slots =
+            usize::try_from(key.num_slots).map_err(|_| TallCompileError::InvalidRotationLayout)?;
         if input.rows.count() != &IntExpr::constant(num_slots) ||
             plaintexts.count() != &IntExpr::constant(num_slots) ||
-            rotation.c_forward.count() != &IntExpr::constant(num_slots) ||
-            rotation.c_backward.count() != &IntExpr::constant(num_slots)
+            transform.left_rows.count() != &IntExpr::constant(num_slots) ||
+            transform.right_rows.count() != &IntExpr::constant(num_slots)
         {
             return Err(TallCompileError::InvalidRotationLayout);
         }
-        let forward = usize::try_from(rotation.key.offset)
-            .map_err(|_| TallCompileError::InvalidRotationLayout)?;
-        let (offset, a_left, a_right, c_left, c_right) = match direction {
-            TallRotationDirection::Forward => (
-                forward,
-                rotation.a_forward.clone(),
-                rotation.a_backward.clone(),
-                rotation.c_forward.clone(),
-                rotation.c_backward.clone(),
-            ),
-            TallRotationDirection::Backward => (
-                (num_slots - forward) % num_slots,
-                rotation.a_backward.clone(),
-                rotation.a_forward.clone(),
-                rotation.c_backward.clone(),
-                rotation.c_forward.clone(),
-            ),
-        };
+        let offset =
+            usize::try_from(key.offset).map_err(|_| TallCompileError::InvalidRotationLayout)?;
         let rotated_rows = rotate_family(&input.rows, offset, num_slots)?;
         let rotated_plaintexts = rotate_family(plaintexts, offset, num_slots)?;
-        let rotated_inverse_rows = rotate_family(&c_right, offset, num_slots)?;
+        let rotated_right_rows = rotate_family(&transform.right_rows, offset, num_slots)?;
+        let left_message_times_right_rows = rotated_plaintexts
+            .clone()
+            .parallel_zip(rotated_right_rows, |_, plaintext, right| right * plaintext)?;
+        self.linear_transform(
+            input,
+            transform,
+            transform.left_rows.clone(),
+            rotated_rows,
+            left_message_times_right_rows,
+            rotated_plaintexts.clone(),
+        )
+    }
+
+    /// Reduces every repeated CRT-lane block to one anchor row using one fixed
+    /// sparse-matrix encoding twice.
+    pub fn anchor_reduce(
+        &self,
+        input: &BggTallEncodingWire,
+        num_blocks: u32,
+        lane_scalars: &[BigUint],
+        transform: &TallLinearTransformEncodingWires,
+    ) -> Result<BggTallEncodingWire, TallCompileError> {
+        let BggTallPlaintext::Diagonal(plaintexts) = &input.plaintext else {
+            return Err(TallCompileError::MissingRotationPlaintext);
+        };
+        let blocks =
+            usize::try_from(num_blocks).map_err(|_| TallCompileError::InvalidAnchorReduceLayout)?;
+        let lanes = lane_scalars.len();
+        let slots = blocks.checked_mul(lanes).ok_or(TallCompileError::InvalidAnchorReduceLayout)?;
+        if lanes == 0 ||
+            input.rows.count() != &IntExpr::constant(slots) ||
+            plaintexts.count() != &IntExpr::constant(slots) ||
+            transform.left_rows.count() != &IntExpr::constant(slots) ||
+            transform.right_rows.count() != &IntExpr::constant(slots)
+        {
+            return Err(TallCompileError::InvalidAnchorReduceLayout);
+        }
+        let input_lanes = (0..lanes)
+            .map(|lane| gather_repeated_lane(&input.rows, blocks, lanes, lane))
+            .collect::<Result<Vec<_>, _>>()?;
+        let plaintext_lanes = (0..lanes)
+            .map(|lane| gather_repeated_lane(plaintexts, blocks, lanes, lane))
+            .collect::<Result<Vec<_>, _>>()?;
+        let left_helper_lanes = (0..lanes)
+            .map(|lane| gather_repeated_lane(&transform.left_rows, blocks, lanes, lane))
+            .collect::<Result<Vec<_>, _>>()?;
+        let right_helper_lanes = (0..lanes)
+            .map(|lane| gather_repeated_lane(&transform.right_rows, blocks, lanes, lane))
+            .collect::<Result<Vec<_>, _>>()?;
+        if lanes == 1 {
+            let scalar = self
+                .public_key
+                .ring
+                .polynomial([IntExpr::constant(num_bigint::BigInt::from(lane_scalars[0].clone()))]);
+            return self.large_scalar_mul(
+                &BggTallEncodingWire {
+                    rows: input_lanes[0].clone(),
+                    pubkey: input.pubkey.clone(),
+                    plaintext: BggTallPlaintext::Diagonal(plaintext_lanes[0].clone()),
+                    canonical_input_exclusive_upper: None,
+                },
+                &scalar,
+            );
+        }
+        let mut left_times_input_rows = input_lanes[1].clone();
+        for lane_rows in input_lanes.iter().skip(2) {
+            left_times_input_rows = left_times_input_rows
+                .parallel_zip(lane_rows.clone(), |_, left, right| left + right)?;
+        }
+        let mut left_message_times_right_rows = right_helper_lanes[1]
+            .clone()
+            .parallel_zip(plaintext_lanes[1].clone(), |_, row, plaintext| plaintext.tensor(row))?;
+        for lane in 2..lanes {
+            left_message_times_right_rows = left_message_times_right_rows.parallel_zip3(
+                right_helper_lanes[lane].clone(),
+                plaintext_lanes[lane].clone(),
+                |_, sum, row, plaintext| sum + plaintext.tensor(row),
+            )?;
+        }
+        let ring = self.public_key.ring.clone();
+        let mut helper_plaintexts = plaintext_lanes[1].clone().parallel_map({
+            let scalar = ring
+                .polynomial([IntExpr::constant(num_bigint::BigInt::from(lane_scalars[1].clone()))]);
+            move |_, value| value * scalar.clone()
+        })?;
+        for lane in 2..lanes {
+            let scalar = ring.polynomial([IntExpr::constant(num_bigint::BigInt::from(
+                lane_scalars[lane].clone(),
+            ))]);
+            helper_plaintexts = helper_plaintexts
+                .parallel_zip(plaintext_lanes[lane].clone(), move |_, sum, value| {
+                    sum + value * scalar.clone()
+                })?;
+        }
+        let helper_output = self.linear_transform(
+            input,
+            transform,
+            left_helper_lanes[0].clone(),
+            left_times_input_rows,
+            left_message_times_right_rows,
+            helper_plaintexts,
+        )?;
+        let anchor_input = BggTallEncodingWire {
+            rows: input_lanes[0].clone(),
+            pubkey: input.pubkey.clone(),
+            plaintext: BggTallPlaintext::Diagonal(plaintext_lanes[0].clone()),
+            canonical_input_exclusive_upper: None,
+        };
+        let anchor_scalar =
+            ring.polynomial([IntExpr::constant(num_bigint::BigInt::from(lane_scalars[0].clone()))]);
+        let anchor_term = self.large_scalar_mul(&anchor_input, &anchor_scalar)?;
+        self.add(&anchor_term, &helper_output)
+    }
+
+    fn linear_transform(
+        &self,
+        input: &BggTallEncodingWire,
+        transform: &TallLinearTransformEncodingWires,
+        left_rows: Family<Mat>,
+        left_times_input_rows: Family<Mat>,
+        left_message_times_right_rows: Family<Mat>,
+        output_plaintexts: Family<Mat>,
+    ) -> Result<BggTallEncodingWire, TallCompileError> {
         let decomposed_input = input
             .pubkey
             .matrix
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
             .as_mat();
-        let step1 = c_left.parallel_zip(rotated_rows, move |_, permutation, input| {
-            permutation * decomposed_input.clone() + input
-        })?;
-        let decomposed_inverse = a_right
+        let intermediate = left_rows
+            .parallel_zip(left_times_input_rows, move |_, left, input| {
+                left * decomposed_input.clone() + input
+            })?;
+        let decomposed_right = transform
+            .right_matrix
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
             .as_mat();
-        let rows = step1.parallel_zip3(
-            rotated_plaintexts.clone(),
-            rotated_inverse_rows,
-            move |_, intermediate, plaintext, inverse| {
-                intermediate * decomposed_inverse.clone() + inverse * plaintext
-            },
-        )?;
-        let first_public = a_left *
+        let rows = intermediate
+            .parallel_zip(left_message_times_right_rows, move |_, intermediate, right| {
+                intermediate * decomposed_right.clone() + right
+            })?;
+        Ok(BggTallEncodingWire {
+            rows,
+            pubkey: self.linear_transform_public_key(
+                &input.pubkey,
+                &transform.left_matrix,
+                &transform.right_matrix,
+            ),
+            plaintext: BggTallPlaintext::Diagonal(output_plaintexts),
+            canonical_input_exclusive_upper: None,
+        })
+    }
+
+    /// Applies the public-key part of a fixed Tall transform `L * X * R`.
+    pub fn linear_transform_public_key(
+        &self,
+        input: &BggPublicKeyWire,
+        left_matrix: &Mat,
+        right_matrix: &Mat,
+    ) -> BggPublicKeyWire {
+        let first = left_matrix.clone() *
             input
-                .pubkey
                 .matrix
                 .clone()
                 .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
                 .as_mat();
-        let public_matrix = first_public *
-            a_right
-                .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                .as_mat();
-        Ok(BggTallEncodingWire {
-            rows,
-            pubkey: BggPublicKeyWire {
-                matrix: public_matrix,
-                reveal_plaintext: input.pubkey.reveal_plaintext,
-            },
-            plaintext: BggTallPlaintext::Diagonal(rotated_plaintexts),
-            canonical_input_exclusive_upper: None,
-        })
+        BggPublicKeyWire {
+            matrix: first *
+                right_matrix
+                    .clone()
+                    .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
+                    .as_mat(),
+            reveal_plaintext: input.reveal_plaintext,
+        }
     }
 
     fn binary(
@@ -451,40 +572,58 @@ impl BggTallEncodingSampler {
         let count = public_keys.len();
         let gadget =
             ring.gadget(secret_size, self.layout.gadget_base.clone(), self.layout.digit_count);
+        let secret_gadget_rows =
+            secret_rows.clone().parallel_map(move |_, secret_row| secret_row * gadget.clone())?;
+        let public_matrices =
+            Family::pack(public_keys.iter().map(|key| key.matrix.clone()).collect())?;
         let sigma = self.gaussian_sigma.clone();
         let bound = self.gaussian_max_coefficient_bound.clone();
-        let public_matrices = public_keys.iter().map(|key| key.matrix.clone()).collect::<Vec<_>>();
-        let mut input_families = Vec::with_capacity(count + 1);
-        input_families.push(secret_rows);
-        input_families.push(ones.clone());
-        input_families.extend(plaintexts.iter().cloned());
-        let row_families =
-            Family::<Mat>::parallel_zip_many_values(input_families, move |_, values| {
-                let secret_row = &values[0];
-                let secret_gadget = secret_row.clone() * gadget.clone();
-                let packed_error = match (&sigma, &bound) {
+        let flat_count =
+            IntExpr::Mul(Box::new(slot_count.clone()), Box::new(IntExpr::constant(count)));
+        let work_items = Parallel::range(flat_count).map_values({
+            let ring = ring.clone();
+            move |_| ring.zero((1, 1))
+        })?;
+        let mut broadcasts = Vec::with_capacity(count + 3);
+        broadcasts.push(secret_rows);
+        broadcasts.push(secret_gadget_rows);
+        broadcasts.push(public_matrices);
+        broadcasts.push(ones.clone());
+        broadcasts.extend(plaintexts.iter().cloned());
+        // Flatten `(i, j)` into one bounded parallel domain, with input index
+        // as the fast axis. Each instance owns one ordinary-width GEMM, while
+        // the executor's wave size bounds the number resident in VRAM.
+        let flat_rows = Family::<Mat>::parallel_zip_many_with_broadcast_values(
+            vec![work_items],
+            broadcasts,
+            move |index, _, families| {
+                let flat = index.as_int();
+                let inputs = Int::constant(count);
+                let slot = flat.clone().div(inputs.clone());
+                let input_index = flat.rem(inputs);
+                let secret_row = families[0].get(slot.clone());
+                let secret_gadget = families[1].get(slot.clone());
+                let public_matrix = families[2].get(input_index.clone());
+                let plaintext_family =
+                    Family::select(input_index, families.iter().skip(3).cloned().collect())?;
+                let plaintext = plaintext_family.get(slot);
+                let error = match (&sigma, &bound) {
                     (Some(sigma), Some(bound)) => {
-                        ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
+                        ring.gaussian((1, columns), sigma.clone(), bound.clone())
                     }
-                    (None, None) => ring.zero((1, columns * count)),
+                    (None, None) => ring.zero((1, columns)),
                     _ => unreachable!("validated Gaussian sampler configuration"),
                 };
-                (0..count)
-                    .map(|index| {
-                        let plaintext = if index == 0 { &values[1] } else { &values[index + 1] };
-                        let error = packed_error.clone().slice(
-                            None,
-                            Some(IndexRange {
-                                start: (columns * index).into(),
-                                end: (columns * (index + 1)).into(),
-                            }),
-                        );
-                        secret_row.clone() * public_matrices[index].clone() -
-                            plaintext.clone().tensor(secret_gadget.clone()) +
-                            error
-                    })
-                    .collect::<Vec<_>>()
+                Ok(secret_row * public_matrix - plaintext.tensor(secret_gadget) + error)
+            },
+        )?;
+        let mut row_families = Vec::with_capacity(count);
+        for input_index in 0..count {
+            let indices = Parallel::range(slot_count.clone()).map_values(move |slot| {
+                slot.as_int().mul(Int::constant(count)).add(Int::constant(input_index))
             })?;
+            row_families.push(flat_rows.clone().parallel_gather(indices)?);
+        }
         let encodings = row_families
             .into_iter()
             .enumerate()
@@ -571,6 +710,64 @@ pub(crate) fn rotate_family(
     Ok(rows.clone().parallel_gather(indices)?)
 }
 
+/// Applies the sparse matrix `U` used by anchor reduction to a row family.
+/// `U[0,a]=1` and `U[a,0]=lane_scalars[a]` within every block for `a>0`.
+pub(crate) fn anchor_matrix_rows(
+    rows: &Family<Mat>,
+    num_blocks: usize,
+    lane_scalars: &[BigUint],
+    ring: &mxx_dsl::Ring,
+) -> Result<Family<Mat>, TallCompileError> {
+    let lanes = lane_scalars.len();
+    let slot_count =
+        num_blocks.checked_mul(lanes).ok_or(TallCompileError::InvalidAnchorReduceLayout)?;
+    if num_blocks == 0 || lanes == 0 || rows.count() != &IntExpr::constant(slot_count) {
+        return Err(TallCompileError::InvalidAnchorReduceLayout);
+    }
+    let source = rows.clone();
+    let work = rows.clone();
+    let ring = ring.clone();
+    let scalars = lane_scalars.to_vec();
+    Ok(Family::<Mat>::parallel_zip_many_with_broadcast_values(
+        vec![work],
+        vec![source],
+        move |index, _, families| {
+            let lane_count = Int::constant(lanes);
+            let flat = index.as_int();
+            let block_base = flat.clone().div(lane_count.clone()).mul(lane_count.clone());
+            let lane = flat.rem(lane_count);
+            let source = &families[0];
+            let mut anchor = ring.zero((1, source.element_type().columns.clone()));
+            for source_lane in 1..lanes {
+                anchor = anchor + source.get(block_base.clone().add(Int::constant(source_lane)));
+            }
+            let anchor_source = source.get(block_base);
+            let mut branches = Vec::with_capacity(lanes);
+            branches.push(anchor);
+            branches.extend(scalars.iter().skip(1).map(|scalar| {
+                anchor_source.clone() *
+                    ring.polynomial([IntExpr::constant(num_bigint::BigInt::from(scalar.clone()))])
+            }));
+            Ok(lane.select(branches)?)
+        },
+    )?)
+}
+
+fn gather_repeated_lane(
+    rows: &Family<Mat>,
+    num_blocks: usize,
+    lanes: usize,
+    lane: usize,
+) -> Result<Family<Mat>, TallCompileError> {
+    if lane >= lanes || rows.count() != &IntExpr::constant(num_blocks.saturating_mul(lanes)) {
+        return Err(TallCompileError::InvalidAnchorReduceLayout);
+    }
+    let indices = Parallel::range(num_blocks).map_values(move |block| {
+        block.as_int().mul(Int::constant(lanes)).add(Int::constant(lane))
+    })?;
+    Ok(rows.clone().parallel_gather(indices)?)
+}
+
 pub(crate) fn same_matrix_type(lhs: &MatrixType, rhs: &MatrixType) -> bool {
     lhs.modulus.canonicalize() == rhs.modulus.canonicalize() &&
         lhs.ring_dimension.canonicalize() == rhs.ring_dimension.canonicalize() &&
@@ -583,9 +780,9 @@ mod tests {
     use super::*;
     use crate::{
         BggTallSlotLowering, BggTallSlotPublicKeyLowering, CircuitCompileError,
+        TallLinearTransformEncodingWires, TallLinearTransformPublicWires,
         TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts,
-        TallRotationEncodingCompiler, TallRotationEncodingKey, TallRotationPublicWires,
-        required_tall_rotation_encodings,
+        TallRotationEncodingCompiler, TallRotationEncodingKey, required_tall_rotation_encodings,
         tall_rotation_encoding::tall_rotation_public_key_tag,
         test_utils::{execute_graph, matrix_output, row},
     };
@@ -633,7 +830,8 @@ mod tests {
 
     struct TestTallRotationLowering {
         compiler: BggTallEncodingCompiler,
-        rotation: TallRotationEncodingWires,
+        key: TallRotationEncodingKey,
+        transform: TallLinearTransformEncodingWires,
     }
 
     impl CircuitLoweringTypes for TestTallRotationLowering {
@@ -660,6 +858,16 @@ mod tests {
             Err(CircuitCompileError::Structure("unexpected slot reduction".to_owned()))
         }
 
+        fn slot_anchor_reduce(
+            &mut self,
+            _input: &Self::Wire,
+            _num_blocks: u32,
+            _lane_scalars: &[BigUint],
+            _gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            Err(CircuitCompileError::Structure("unexpected anchor reduction".to_owned()))
+        }
+
         fn slot_rotation(
             &mut self,
             input: &Self::Wire,
@@ -667,8 +875,8 @@ mod tests {
             num_slots: u32,
             _gate: GateInstance<'_>,
         ) -> Result<Self::Wire, Self::Error> {
-            assert_eq!((offset, num_slots), (1, self.rotation.key.num_slots));
-            Ok(self.compiler.rotate(input, &self.rotation, TallRotationDirection::Forward)?)
+            assert_eq!((offset, num_slots), (1, self.key.num_slots));
+            Ok(self.compiler.rotate(input, self.key, &self.transform)?)
         }
     }
 
@@ -854,24 +1062,24 @@ mod tests {
             ),
             canonical_input_exclusive_upper: None,
         };
-        let rotation = TallRotationEncodingWires {
-            key: TallRotationEncodingKey { num_slots: slots as u32, offset: 1 },
-            a_forward: ring.input("a-forward", (secret_size, columns)),
-            a_backward: ring.input("a-backward", (secret_size, columns)),
-            c_forward: Family::pack(
+        let key = TallRotationEncodingKey { num_slots: slots as u32, offset: 1 };
+        let rotation = TallLinearTransformEncodingWires {
+            left_matrix: ring.input("a-forward", (secret_size, columns)),
+            right_matrix: ring.input("a-backward", (secret_size, columns)),
+            left_rows: Family::pack(
                 (0..slots)
                     .map(|slot| ring.input(format!("c-forward-{slot}"), (1, columns)))
                     .collect(),
             )
             .unwrap(),
-            c_backward: Family::pack(
+            right_rows: Family::pack(
                 (0..slots)
                     .map(|slot| ring.input(format!("c-backward-{slot}"), (1, columns)))
                     .collect(),
             )
             .unwrap(),
         };
-        let output = compiler.rotate(&input, &rotation, TallRotationDirection::Forward).unwrap();
+        let output = compiler.rotate(&input, key, &rotation).unwrap();
         let BggTallPlaintext::Diagonal(output_plaintexts) = output.plaintext else {
             panic!("rotation keeps revealed diagonal plaintexts")
         };
@@ -1015,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn tall_sampler_is_blockwise_for_three_keys_and_uses_one_packed_error() {
+    fn tall_sampler_parallelizes_slots_and_inputs_without_wide_rows() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let secret_size = 2;
         let slots = 3;
@@ -1062,32 +1270,87 @@ mod tests {
             .iter()
             .filter(|node| matches!(node.kind(), NodeKind::GaussianSample { .. }))
             .collect::<Vec<_>>();
-        assert_eq!(gaussian_nodes.len(), 1, "all blocks share one packed Gaussian");
+        assert_eq!(gaussian_nodes.len(), 1, "one loop body samples one ordinary-width error");
         let NodeKind::GaussianSample { matrix_type, .. } = gaussian_nodes[0].kind() else {
             unreachable!("filtered Gaussian node")
         };
         assert_eq!(matrix_type.rows.canonicalize(), IntExpr::constant(1));
-        assert_eq!(
-            matrix_type.columns.canonicalize(),
-            IntExpr::constant(columns * public_keys.len())
+        assert_eq!(matrix_type.columns.canonicalize(), IntExpr::constant(columns));
+        assert!(
+            nodes.iter().any(|node| {
+                matches!(
+                    node.kind(),
+                    NodeKind::ParallelLoop(loop_node)
+                        if loop_node.count.canonicalize()
+                            == IntExpr::constant(slots * public_keys.len())
+                )
+            }),
+            "the main sampler loop must flatten the `(j, i)` domain"
         );
-        let packed_error = gaussian_nodes[0].output(0).expect("Gaussian output");
-        let error_slices = nodes
-            .iter()
-            .filter_map(|node| {
-                let NodeKind::Slice { columns: Some(range), rows: None } = node.kind() else {
-                    return None;
-                };
-                (node.arguments().first().map(|argument| argument.node()) ==
-                    Some(packed_error.node()))
-                .then_some(range)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(error_slices.len(), public_keys.len(), "each block slices the shared error");
-        for (index, range) in error_slices.iter().enumerate() {
-            assert_eq!(range.start.canonicalize(), IntExpr::constant(columns * index));
-            assert_eq!(range.end.canonicalize(), IntExpr::constant(columns * (index + 1)));
-        }
+    }
+
+    #[test]
+    fn tall_anchor_reduce_uses_one_helper_for_all_lanes() {
+        let ring = Ring::new(257, 8);
+        let slots = 4;
+        let lane_scalars = vec![BigUint::from(3u8), BigUint::from(5u8)];
+        let helper_compiler = TallRotationEncodingCompiler {
+            modulus: 257.into(),
+            ring_dimension: 8.into(),
+            secret_size: 1,
+            slot_count: slots,
+            gadget_base: 4.into(),
+            digit_count: 2,
+            error_sigma: 0.into(),
+            error_max_coefficient_bound: 0.into(),
+        };
+        let public = helper_compiler
+            .preprocess_anchor_reduce(
+                ring.bytes_input("anchor-hash-key", 32),
+                2,
+                lane_scalars.clone(),
+            )
+            .unwrap();
+        let secret_rows = ring.input_family("anchor-secret", slots, (1, 1));
+        let secret_gadget_rows = helper_compiler.secret_gadget_rows(secret_rows.clone()).unwrap();
+        let helper = helper_compiler
+            .encode_anchor_reduce(&public, 2, &lane_scalars, secret_rows, secret_gadget_rows)
+            .unwrap();
+        let public_compiler =
+            BggPublicKeyCompiler { ring: ring.clone(), base: 4.into(), digit_count: 2.into() };
+        let output = BggTallEncodingCompiler { public_key: public_compiler }
+            .anchor_reduce(
+                &BggTallEncodingWire {
+                    rows: ring.input_family("anchor-input-rows", slots, (1, 2)),
+                    pubkey: BggPublicKeyWire {
+                        matrix: ring.input("anchor-input-public", (1, 2)),
+                        reveal_plaintext: true,
+                    },
+                    plaintext: BggTallPlaintext::Diagonal(ring.input_family(
+                        "anchor-input-plaintexts",
+                        slots,
+                        (1, 1),
+                    )),
+                    canonical_input_exclusive_upper: None,
+                },
+                2,
+                &lane_scalars,
+                &helper,
+            )
+            .unwrap();
+        assert_eq!(output.rows.count(), &IntExpr::constant(2));
+        let BggTallPlaintext::Diagonal(plaintexts) = output.plaintext else {
+            panic!("anchor reduction keeps the revealed anchor plaintexts")
+        };
+        DslContext::new("tall-anchor-reduce")
+            .family_output("rows", output.rows)
+            .unwrap()
+            .family_output("plaintexts", plaintexts)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
     }
 
     #[test]
@@ -1314,24 +1577,25 @@ mod tests {
         .unwrap();
         let secret_gadget_rows = compiler.secret_gadget_rows(secret_rows.clone()).unwrap();
         for offset in [1, 3] {
-            let public = compiler.import_artifacts(&artifacts, offset).unwrap().unwrap();
-            let rotation =
-                compiler.encode(&public, secret_rows.clone(), secret_gadget_rows.clone()).unwrap();
+            let (key, public) = compiler.import_artifacts(&artifacts, offset).unwrap().unwrap();
+            let rotation = compiler
+                .encode_rotation(key, &public, secret_rows.clone(), secret_gadget_rows.clone())
+                .unwrap();
             context = context
-                .output(format!("a-forward-{offset}"), rotation.a_forward)
+                .output(format!("a-forward-{offset}"), rotation.left_matrix)
                 .unwrap()
-                .output(format!("a-backward-{offset}"), rotation.a_backward)
+                .output(format!("a-backward-{offset}"), rotation.right_matrix)
                 .unwrap();
             for slot in 0..slots {
                 context = context
                     .output(
                         format!("c-forward-{offset}-{slot}"),
-                        rotation.c_forward.get_static(slot),
+                        rotation.left_rows.get_static(slot),
                     )
                     .unwrap()
                     .output(
                         format!("c-backward-{offset}-{slot}"),
-                        rotation.c_backward.get_static(slot),
+                        rotation.right_rows.get_static(slot),
                     )
                     .unwrap();
             }
@@ -1425,20 +1689,19 @@ mod tests {
             matrix: ring.input("input-public", (secret_size, columns)),
             reveal_plaintext: true,
         };
-        let rotation = TallRotationEncodingWires {
-            key,
-            a_forward: ring.hash_matrix(
+        let rotation = TallLinearTransformEncodingWires {
+            left_matrix: ring.hash_matrix(
                 hash_key.clone(),
                 tall_rotation_public_key_tag(key, false),
                 (secret_size, columns),
             ),
-            a_backward: ring.hash_matrix(
+            right_matrix: ring.hash_matrix(
                 hash_key.clone(),
                 tall_rotation_public_key_tag(key, true),
                 (secret_size, columns),
             ),
-            c_forward: Family::pack((0..slots).map(|_| ring.zero((1, columns))).collect()).unwrap(),
-            c_backward: Family::pack((0..slots).map(|_| ring.zero((1, columns))).collect())
+            left_rows: Family::pack((0..slots).map(|_| ring.zero((1, columns))).collect()).unwrap(),
+            right_rows: Family::pack((0..slots).map(|_| ring.zero((1, columns))).collect())
                 .unwrap(),
         };
         let tall_input = BggTallEncodingWire {
@@ -1455,12 +1718,12 @@ mod tests {
             configured_slot_count: slots,
             rotations: BTreeMap::from([(
                 key,
-                TallRotationPublicWires {
-                    key,
-                    a_forward: rotation.a_forward.clone(),
-                    a_backward: rotation.a_backward.clone(),
+                TallLinearTransformPublicWires {
+                    left_matrix: rotation.left_matrix.clone(),
+                    right_matrix: rotation.right_matrix.clone(),
                 },
             )]),
+            anchor_reduce: None,
         };
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1);
@@ -1483,7 +1746,8 @@ mod tests {
             .remove(0);
         let mut tall_slots = TestTallRotationLowering {
             compiler: BggTallEncodingCompiler { public_key: public_compiler },
-            rotation,
+            key,
+            transform: rotation,
         };
         let mut no_public_lookup = crate::NoPublicLookup::default();
         let tall_output = circuit_compiler
@@ -1556,6 +1820,7 @@ mod tests {
             diagonal_mask_public_key: diagonal_mask_public_key.clone(),
             configured_slot_count: 2,
             rotations: BTreeMap::new(),
+            anchor_reduce: None,
         };
         let circuit_compiler = crate::PolyCircuitCompiler { public_key: public_compiler.clone() };
         let mut no_lookup = crate::NoPublicLookup::default();
@@ -1597,6 +1862,7 @@ mod tests {
                 gaussian_max_coefficient_bound: None,
             },
             BTreeMap::new(),
+            None,
         );
         let mut no_lookup = crate::NoPublicLookup::default();
         let output = circuit_compiler
@@ -1669,6 +1935,7 @@ mod tests {
                 diagonal_mask_public_key: diagonal_mask_public_key.clone(),
                 configured_slot_count: slot_count,
                 rotations: BTreeMap::new(),
+                anchor_reduce: None,
             };
             let public_output = circuit_compiler
                 .compile_public_keys_with_lowerings(
@@ -1716,6 +1983,7 @@ mod tests {
                     gaussian_max_coefficient_bound: None,
                 },
                 BTreeMap::new(),
+                None,
             );
             let output = circuit_compiler
                 .compile_tall_encodings_with_lowerings(
@@ -1776,6 +2044,7 @@ mod tests {
             },
             configured_slot_count: 2,
             rotations: BTreeMap::new(),
+            anchor_reduce: None,
         };
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input = circuit.input(1).as_single_wire();

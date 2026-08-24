@@ -1156,9 +1156,9 @@ impl<P: Poly> NestedRnsPoly<P> {
     /// The returned wire is intentionally not a full-lane reconstruction: for
     /// coefficient `c`, only slot `c * active_crt_depth` is authoritative.  This
     /// path is for Tall's anchor consumer, which reads exactly those slots.  It
-    /// uses cyclic slot rotations rather than ordinary reconstruction transfers,
-    /// while leaving [`Self::reconstruct`] unchanged for callers that require
-    /// every lane to be valid.
+    /// uses one compact block-wise anchor reduction rather than one rotation per
+    /// active CRT lane, while leaving [`Self::reconstruct`] unchanged for callers
+    /// that require every lane to be valid.
     pub fn reconstruct_q1_anchors(&self, circuit: &mut PolyCircuit<P>) -> Q1AnchorReconstruction {
         let operand = self.prepare_for_reconstruct(circuit);
         let levels = operand.resolve_enable_levels();
@@ -1175,8 +1175,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         x_prime = circuit.sub_gate(x_prime, pv);
 
         let lanes = operand.window.depth;
-        let physical_slots = operand.physical_slots();
-        let mut anchors = circuit.const_zero_gate();
+        let mut reconst_coefficients = Vec::with_capacity(levels);
         for a in 0..levels {
             let q_i_big = BigUint::from(active_moduli[a]);
             let q_over_qi = &active_modulus / &q_i_big;
@@ -1187,14 +1186,14 @@ impl<P: Poly> NestedRnsPoly<P> {
             )
             .expect("CRT modulus must be invertible within the active range");
             let reconst_coeff = (&q_over_qi * BigUint::from(inv)) % &active_modulus;
-            let aligned = if a == 0 {
-                x_prime
-            } else {
-                circuit.slot_rotation_gate(x_prime, physical_slots - a, physical_slots)
-            };
-            let scaled = circuit.large_scalar_mul(aligned, &[reconst_coeff]);
-            anchors = circuit.add_gate(anchors, scaled);
+            reconst_coefficients.push(reconst_coeff);
         }
+        reconst_coefficients.resize(lanes, BigUint::ZERO);
+        let anchors = circuit.slot_anchor_reduce_gate(
+            x_prime,
+            operand.num_coefficient_slots,
+            reconst_coefficients,
+        );
         Q1AnchorReconstruction {
             anchor_wire: anchors.as_single_wire(),
             coefficient_slots: operand.num_coefficient_slots,
@@ -2940,7 +2939,7 @@ mod tests {
     }
 
     #[test]
-    fn q1_anchor_reconstruction_uses_only_cyclic_slot_rotations() {
+    fn q1_anchor_reconstruction_uses_one_compact_anchor_reduction() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (_, context) = create_context(&mut circuit, None);
         let window = CrtWindow::new(1, 2, context.q_moduli_depth);
@@ -2955,14 +2954,14 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            transfers.len(),
-            window.depth - 1,
-            "one cyclic rotation per non-anchor active lane"
-        );
-        assert!(transfers.iter().all(|src_slots| {
-            matches!(src_slots, GateParamSource::Const(SlotTransferSpec::Rotation { .. }))
-        }));
+        assert_eq!(transfers.len(), 1, "one reduction serves every active CRT lane");
+        let GateParamSource::Const(SlotTransferSpec::AnchorReduce { num_blocks, lane_scalars }) =
+            transfers[0]
+        else {
+            panic!("q1 reconstruction must use the compact anchor reduction")
+        };
+        assert_eq!(*num_blocks, 3);
+        assert_eq!(lane_scalars.len(), window.depth);
     }
 
     #[test]

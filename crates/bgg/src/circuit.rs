@@ -131,6 +131,16 @@ where
     ) -> Result<Self::Wire, Self::Error> {
         self.slots.slot_identity_repeated_lanes(input, num_blocks, lane_scalars, gate)
     }
+
+    fn slot_anchor_reduce(
+        &mut self,
+        input: &Self::Wire,
+        num_blocks: u32,
+        lane_scalars: &[BigUint],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        self.slots.slot_anchor_reduce(input, num_blocks, lane_scalars, gate)
+    }
 }
 
 impl<P, A, L, S> PublicLookupLowering<P> for ConfiguredCircuitLowering<'_, A, L, S>
@@ -317,6 +327,16 @@ impl<P: Poly, W: Clone> SlotOperationLowering<P> for NoSlotOperations<W> {
         gate: GateInstance<'_>,
     ) -> Result<Self::Wire, Self::Error> {
         unsupported(gate, "slot reduction")
+    }
+
+    fn slot_anchor_reduce(
+        &mut self,
+        _input: &Self::Wire,
+        _num_blocks: u32,
+        _lane_scalars: &[BigUint],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        unsupported(gate, "anchor reduction")
     }
 }
 
@@ -723,6 +743,16 @@ impl<P: Poly> SlotOperationLowering<P> for NaivePublicKeySlotOperations {
     ) -> Result<Self::Wire, Self::Error> {
         Ok(NaiveBggSlotTransferCompiler.reduce_public_keys(inputs, slot_count)?)
     }
+
+    fn slot_anchor_reduce(
+        &mut self,
+        _input: &Self::Wire,
+        _num_blocks: u32,
+        _lane_scalars: &[BigUint],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        unsupported(gate, "anchor reduction")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -750,6 +780,16 @@ impl<P: Poly> SlotOperationLowering<P> for NaiveEncodingSlotOperations {
         _gate: GateInstance<'_>,
     ) -> Result<Self::Wire, Self::Error> {
         Ok(NaiveBggSlotTransferCompiler.reduce_encodings(inputs, slot_count)?)
+    }
+
+    fn slot_anchor_reduce(
+        &mut self,
+        _input: &Self::Wire,
+        _num_blocks: u32,
+        _lane_scalars: &[BigUint],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        unsupported(gate, "anchor reduction")
     }
 }
 

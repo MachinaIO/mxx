@@ -130,6 +130,14 @@ pub trait SlotOperationLowering<P: Poly>: CircuitLoweringTypes {
         self.slot_transfer(input, &materialized, gate)
     }
 
+    fn slot_anchor_reduce(
+        &mut self,
+        input: &Self::Wire,
+        num_blocks: u32,
+        lane_scalars: &[BigUint],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error>;
+
     fn slot_reduce(
         &mut self,
         inputs: &[Self::Wire],
@@ -586,6 +594,9 @@ where
                                 source,
                             })?
                     }
+                    SlotTransferSpec::AnchorReduce { num_blocks, lane_scalars } => lowering
+                        .slot_anchor_reduce(input, *num_blocks, lane_scalars, gate_instance)
+                        .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?,
                     spec => {
                         let source_slots = materialize_slot_transfer(spec);
                         lowering.slot_transfer(input, &source_slots, gate_instance).map_err(
@@ -835,6 +846,9 @@ where
                                 source,
                             })?
                     }
+                    SlotTransferSpec::AnchorReduce { num_blocks, lane_scalars } => lowering
+                        .slot_anchor_reduce(input, *num_blocks, lane_scalars, gate_instance)
+                        .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?,
                     spec => {
                         let source_slots = materialize_slot_transfer(spec);
                         lowering.slot_transfer(input, &source_slots, gate_instance).map_err(
@@ -1296,6 +1310,17 @@ mod tests {
             self.record(PolyGateKind::SlotReduce, gate);
             Ok(inputs.iter().sum())
         }
+
+        fn slot_anchor_reduce(
+            &mut self,
+            input: &Self::Wire,
+            _num_blocks: u32,
+            _lane_scalars: &[BigUint],
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            self.record(PolyGateKind::SlotTransfer, gate);
+            Ok(*input)
+        }
     }
 
     #[derive(Default)]
@@ -1326,6 +1351,16 @@ mod tests {
             _gate: GateInstance<'_>,
         ) -> Result<Self::Wire, Self::Error> {
             Ok(inputs.iter().sum())
+        }
+
+        fn slot_anchor_reduce(
+            &mut self,
+            input: &Self::Wire,
+            _num_blocks: u32,
+            _lane_scalars: &[BigUint],
+            _gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            Ok(*input)
         }
     }
 

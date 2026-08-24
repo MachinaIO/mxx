@@ -4596,6 +4596,7 @@ mod tests {
                         gaussian_max_coefficient_bound: Some(5.into()),
                     },
                     BTreeMap::new(),
+                    None,
                 );
                 circuit_compiler
                     .compile_tall_encodings_with_lowerings(

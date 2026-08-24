@@ -111,6 +111,16 @@ impl<P: Poly> SlotOperationLowering<P> for LweLookupIdentityCollector {
     ) -> Result<Self::Wire, Self::Error> {
         Ok(())
     }
+
+    fn slot_anchor_reduce(
+        &mut self,
+        _input: &Self::Wire,
+        _num_blocks: u32,
+        _lane_scalars: &[BigUint],
+        _gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        Ok(())
+    }
 }
 
 /// Enumerates every concrete public-lookup invocation after recursively

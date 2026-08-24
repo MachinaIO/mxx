@@ -129,6 +129,16 @@ mod graph_tests {
         ) -> Result<Mat, Infallible> {
             Ok(inputs[0].clone())
         }
+
+        fn slot_anchor_reduce(
+            &mut self,
+            input: &Mat,
+            _num_blocks: u32,
+            _lane_scalars: &[num_bigint::BigUint],
+            _gate: GateInstance<'_>,
+        ) -> Result<Mat, Infallible> {
+            Ok(input.clone())
+        }
     }
 
     impl PublicLookupLowering<DCRTPoly> for MatrixLowering {

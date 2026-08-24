@@ -486,6 +486,19 @@ mod public_key {
             });
             Ok(output)
         }
+
+        fn slot_anchor_reduce(
+            &mut self,
+            _input: &Self::Wire,
+            _num_blocks: u32,
+            _lane_scalars: &[num_bigint::BigUint],
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            Err(CircuitCompileError::Unsupported {
+                gate: gate.local_gate().index(),
+                feature: "anchor reduction in preimage-based slot lowering",
+            })
+        }
     }
 
     pub(crate) fn gate_token(gate: GateInstance<'_>) -> String {
@@ -1874,8 +1887,8 @@ mod tall {
         BggPublicKeyWire, CircuitCompileError,
         tall_encoding::{BggTallEncodingCompiler, BggTallEncodingSampler, BggTallEncodingWire},
         tall_rotation_encoding::{
-            TallRotationDirection, TallRotationEncodingKey, TallRotationEncodingWires,
-            TallRotationPublicWires,
+            TallLinearTransformEncodingWires, TallLinearTransformPublicWires,
+            TallRotationEncodingKey,
         },
     };
     use mxx_dsl::{Family, Int, Mat, Parallel};
@@ -1901,7 +1914,10 @@ mod tall {
         /// Exact physical Tall slot count.
         pub configured_slot_count: usize,
         /// Exact preprocessed public matrices for cyclic rotations.
-        pub rotations: BTreeMap<TallRotationEncodingKey, TallRotationPublicWires>,
+        pub rotations: BTreeMap<TallRotationEncodingKey, TallLinearTransformPublicWires>,
+        /// The sole CRT reconstruction spec and its generic fixed linear transform.
+        pub anchor_reduce:
+            Option<((u32, Vec<num_bigint::BigUint>), TallLinearTransformPublicWires)>,
     }
 
     impl CircuitLoweringTypes for BggTallSlotPublicKeyLowering {
@@ -1938,6 +1954,35 @@ mod tall {
             })
         }
 
+        fn slot_anchor_reduce(
+            &mut self,
+            input: &Self::Wire,
+            num_blocks: u32,
+            lane_scalars: &[num_bigint::BigUint],
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            let (_, transform) = self
+                .anchor_reduce
+                .as_ref()
+                .filter(|((blocks, scalars), _)| {
+                    *blocks == num_blocks && scalars.as_slice() == lane_scalars
+                })
+                .ok_or(CircuitCompileError::Unsupported {
+                    gate: gate.local_gate().index(),
+                    feature: "missing Tall anchor-reduction encoding",
+                })?;
+            let tall = BggTallEncodingCompiler { public_key: self.compiler.clone() };
+            let helper_public = tall.linear_transform_public_key(
+                input,
+                &transform.left_matrix,
+                &transform.right_matrix,
+            );
+            let scalar = self.compiler.ring.polynomial([mxx_ir_core::IntExpr::constant(
+                num_bigint::BigInt::from(lane_scalars[0].clone()),
+            )]);
+            Ok(self.compiler.add(&self.compiler.large_scalar_mul(input, &scalar), &helper_public))
+        }
+
         fn slot_rotation(
             &mut self,
             input: &Self::Wire,
@@ -1961,20 +2006,18 @@ mod tall {
                     gate: gate.local_gate().index(),
                 });
             }
-            let rotation = self.rotations.get(&key).ok_or(
+            let transform = self.rotations.get(&key).ok_or(
                 CircuitCompileError::MissingTallRotationEncoding {
                     num_slots: key.num_slots,
                     offset: key.offset,
                 },
             )?;
-            let base = self.compiler.base.clone();
-            let digits = self.compiler.digit_count.clone();
-            let step1 = rotation.a_forward.clone() *
-                input.matrix.clone().decompose(base.clone(), digits.clone()).as_mat();
-            Ok(BggPublicKeyWire {
-                matrix: step1 * rotation.a_backward.clone().decompose(base, digits).as_mat(),
-                reveal_plaintext: input.reveal_plaintext,
-            })
+            Ok(BggTallEncodingCompiler { public_key: self.compiler.clone() }
+                .linear_transform_public_key(
+                    input,
+                    &transform.left_matrix,
+                    &transform.right_matrix,
+                ))
         }
 
         fn slot_identity_repeated_lanes(
@@ -2017,7 +2060,8 @@ mod tall {
         /// Error configuration for direct diagonal-mask encodings.
         sampler: BggTallEncodingSampler,
         /// Direct tall-rotation encodings keyed by `(num_slots, normalized_offset)`.
-        rotations: BTreeMap<TallRotationEncodingKey, TallRotationEncodingWires>,
+        rotations: BTreeMap<TallRotationEncodingKey, TallLinearTransformEncodingWires>,
+        anchor_reduce: Option<((u32, Vec<num_bigint::BigUint>), TallLinearTransformEncodingWires)>,
         /// Reusable encodings of compact repeated-lane masks, keyed by their canonical scalars.
         ///
         /// The configured slot count fixes the repetition count, so the short lane pattern is a
@@ -2031,7 +2075,11 @@ mod tall {
             diagonal_mask_public_key: BggPublicKeyWire,
             secret_rows: Family<Mat>,
             sampler: BggTallEncodingSampler,
-            rotations: BTreeMap<TallRotationEncodingKey, TallRotationEncodingWires>,
+            rotations: BTreeMap<TallRotationEncodingKey, TallLinearTransformEncodingWires>,
+            anchor_reduce: Option<(
+                (u32, Vec<num_bigint::BigUint>),
+                TallLinearTransformEncodingWires,
+            )>,
         ) -> Self {
             Self {
                 compiler,
@@ -2039,6 +2087,7 @@ mod tall {
                 secret_rows,
                 sampler,
                 rotations,
+                anchor_reduce,
                 repeated_lane_mask_encodings: BTreeMap::new(),
             }
         }
@@ -2140,6 +2189,26 @@ mod tall {
             })
         }
 
+        fn slot_anchor_reduce(
+            &mut self,
+            input: &Self::Wire,
+            num_blocks: u32,
+            lane_scalars: &[num_bigint::BigUint],
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            let ((blocks, scalars), transform) = self
+                .anchor_reduce
+                .as_ref()
+                .filter(|((blocks, scalars), _)| {
+                    *blocks == num_blocks && scalars.as_slice() == lane_scalars
+                })
+                .ok_or(CircuitCompileError::Unsupported {
+                    gate: gate.local_gate().index(),
+                    feature: "missing Tall anchor-reduction encoding",
+                })?;
+            self.compiler.anchor_reduce(input, *blocks, scalars, transform).map_err(Into::into)
+        }
+
         fn slot_rotation(
             &mut self,
             input: &Self::Wire,
@@ -2163,15 +2232,13 @@ mod tall {
             else {
                 return Ok(input.clone());
             };
-            let rotation = self.rotations.get(&key).ok_or(
+            let transform = self.rotations.get(&key).ok_or(
                 CircuitCompileError::MissingTallRotationEncoding {
                     num_slots: key.num_slots,
                     offset: key.offset,
                 },
             )?;
-            self.compiler
-                .rotate(input, rotation, TallRotationDirection::Forward)
-                .map_err(Into::into)
+            self.compiler.rotate(input, key, transform).map_err(Into::into)
         }
 
         fn slot_identity_repeated_lanes(

@@ -11,9 +11,10 @@ use mxx_bgg::{
     BggTallSlotPublicKeyLowering, LweLookupArtifactNames, LweLookupArtifacts, LweLookupCompiler,
     LweLookupIdentity, LweLookupPreprocessingLowering, LweLookupTable,
     LweLookupTallEncodingLowering, NoSlotOperations, PolyCircuitCompiler,
-    TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts, TallRotationEncodingCompiler,
-    TallRotationEncodingKey, bind_lwe_lookup_invocations, collect_lwe_lookup_identities,
-    required_tall_rotation_encodings,
+    TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT, TallRotationEncodingArtifactNames,
+    TallRotationEncodingArtifacts, TallRotationEncodingCompiler, TallRotationEncodingKey,
+    bind_lwe_lookup_invocations, collect_lwe_lookup_identities,
+    required_tall_anchor_reduce_encoding, required_tall_rotation_encodings,
 };
 use mxx_correctness::{
     ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
@@ -375,6 +376,7 @@ struct PreparedCandidate {
     runtime_manifest: RuntimeManifest,
     lookup_compilers: Vec<mxx_bgg::LweLookupCompiler>,
     rotation_offsets: Vec<u32>,
+    anchor_reduce_spec: Option<(u32, Vec<BigUint>)>,
     encoding_graph: BuiltGraph,
     operational_report: Option<OperationalSimulationReport>,
     achieved_security_bits: u64,
@@ -930,6 +932,8 @@ fn prepare_candidate(
     );
     let rotation_keys =
         required_tall_rotation_encodings(&circuit).map_err(|error| error.to_string())?;
+    let anchor_reduce_spec =
+        required_tall_anchor_reduce_encoding(&circuit).map_err(|error| error.to_string())?;
     let rotation_offsets = rotation_keys.iter().map(|key| key.offset).collect::<Vec<_>>();
     let rotation_compiler = TallRotationEncodingCompiler {
         modulus: modulus.clone().into(),
@@ -945,11 +949,19 @@ fn prepare_candidate(
     let rotations = rotation_compiler
         .preprocess(hash_key.clone(), &rotation_offsets)
         .map_err(|error| error.to_string())?;
+    let anchor_reduce = anchor_reduce_spec
+        .as_ref()
+        .map(|(blocks, scalars)| {
+            rotation_compiler.preprocess_anchor_reduce(hash_key.clone(), *blocks, scalars.clone())
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let mut slot_preprocessing = BggTallSlotPublicKeyLowering {
         compiler: public_key_compiler.clone(),
         diagonal_mask_public_key: diagonal_mask_public_key.clone(),
         configured_slot_count: physical_slots,
         rotations: rotations.rotations.clone(),
+        anchor_reduce: anchor_reduce_spec.clone().zip(anchor_reduce.clone()),
     };
     let output_public_key = circuit_compiler
         .compile_public_keys_with_lowerings(
@@ -1009,6 +1021,11 @@ fn prepare_candidate(
     preprocessing_context = rotation_compiler
         .export_preprocessing(preprocessing_context, rotations)
         .map_err(|error| error.to_string())?;
+    if let Some(anchor_reduce) = anchor_reduce {
+        preprocessing_context = rotation_compiler
+            .export_anchor_reduce_preprocessing(preprocessing_context, anchor_reduce)
+            .map_err(|error| error.to_string())?;
+    }
     let preprocessing = preprocessing_context.build().map_err(|error| error.to_string())?;
     let preprocessing_graph_construction = preprocessing_graph_started.elapsed();
     log_graph_phase("preprocessing_construction", "end", Some(&preprocessing_graph_started));
@@ -1036,6 +1053,7 @@ fn prepare_candidate(
         circuit.num_input(),
         &lookup_compilers,
         rotation_keys,
+        anchor_reduce_spec.is_some(),
     )?;
     drop(validated_preprocessing);
     drop(lookup_entries);
@@ -1061,6 +1079,7 @@ fn prepare_candidate(
         production.clone(),
         &lookup_compilers,
         &rotation_offsets,
+        anchor_reduce_spec.clone(),
         physical_slots,
         encoding_crt_depth,
         config.error_sigma,
@@ -1095,6 +1114,7 @@ fn prepare_candidate(
         runtime_manifest,
         lookup_compilers,
         rotation_offsets,
+        anchor_reduce_spec,
         encoding_graph,
         operational_report,
         achieved_security_bits,
@@ -1125,6 +1145,7 @@ fn validate_tall_preprocessing_manifest(
     input_count: usize,
     lookup_compilers: &[mxx_bgg::LweLookupCompiler],
     rotations: impl IntoIterator<Item = TallRotationEncodingKey>,
+    has_anchor_reduce: bool,
 ) -> Result<(), String> {
     let forbidden = [
         "slot_transfer",
@@ -1161,6 +1182,9 @@ fn validate_tall_preprocessing_manifest(
         let names = TallRotationEncodingArtifactNames::for_key(key);
         required.extend([names.a_forward, names.a_backward]);
     }
+    if has_anchor_reduce {
+        required.push(TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT.to_owned());
+    }
     if let Some(name) = required.into_iter().find(|name| !manifest.artifacts.contains_key(name)) {
         return Err(format!("Tall preprocessing manifest omits required public artifact {name}"));
     }
@@ -1182,6 +1206,7 @@ fn build_encoding_graph(
     production: ProductionId,
     lookup_compilers: &[mxx_bgg::LweLookupCompiler],
     rotation_offsets: &[u32],
+    anchor_reduce_spec: Option<(u32, Vec<BigUint>)>,
     physical_slots: usize,
     encoding_crt_depth: usize,
     error_sigma: f64,
@@ -1284,16 +1309,34 @@ fn build_encoding_graph(
         .map_err(|error| error.to_string())?;
     let mut rotations = BTreeMap::new();
     for offset in rotation_offsets {
-        if let Some(public) = rotation_compiler
+        if let Some((key, public)) = rotation_compiler
             .import_artifacts(&rotation_artifacts, *offset)
             .map_err(|error| error.to_string())?
         {
             let rotation = rotation_compiler
-                .encode(&public, secret_rows.clone(), secret_gadget_rows.clone())
+                .encode_rotation(key, &public, secret_rows.clone(), secret_gadget_rows.clone())
                 .map_err(|error| error.to_string())?;
-            rotations.insert(rotation.key, rotation);
+            rotations.insert(key, rotation);
         }
     }
+    let anchor_reduce = anchor_reduce_spec
+        .map(|(blocks, scalars)| {
+            let public = rotation_compiler.import_anchor_reduce_artifact(
+                &rotation_artifacts,
+                blocks,
+                scalars.clone(),
+            )?;
+            let transform = rotation_compiler.encode_anchor_reduce(
+                &public,
+                blocks,
+                &scalars,
+                secret_rows.clone(),
+                secret_gadget_rows.clone(),
+            )?;
+            Ok::<_, mxx_bgg::TallCompileError>(((blocks, scalars), transform))
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let public_key_compiler = BggPublicKeyCompiler {
         ring: ring.clone(),
         base: layout.gadget_base.clone(),
@@ -1326,6 +1369,7 @@ fn build_encoding_graph(
             ),
         },
         rotations,
+        anchor_reduce,
     );
     let outputs = PolyCircuitCompiler { public_key: public_key_compiler }
         .compile_tall_encodings_with_lowerings(
@@ -1357,21 +1401,17 @@ fn build_encoding_graph(
         ));
     }
     let anchor_count = physical_slots / encoding_crt_depth;
-    // Keep the anchor selection as one generated gather family. A packed list of static gets
-    // lowers to an opaque explicit family and prevents the checker from beta-reducing the source
-    // row expression; this generated index map retains one shared mapped-index authority.
+    // The anchor reducer already returns one encoding row per coefficient. Only
+    // the original secret family still needs a generated gather at anchor slots.
     let anchor_index_family = Parallel::range(anchor_count)
         .map_values(|index| index.as_int().mul(Int::constant(encoding_crt_depth)))
         .map_err(|error| error.to_string())?;
-    let encoding_rows = output
-        .rows
-        .clone()
-        .parallel_gather(anchor_index_family.clone())
-        .map_err(|error| error.to_string())?;
-    let output_plaintexts = output_plaintexts
-        .clone()
-        .parallel_gather(anchor_index_family.clone())
-        .map_err(|error| error.to_string())?;
+    if output.rows.count() != &IntExpr::constant(anchor_count) ||
+        output_plaintexts.count() != &IntExpr::constant(anchor_count)
+    {
+        return Err("Tall anchor reduction did not shrink to one row per coefficient".to_owned());
+    }
+    let encoding_rows = output.rows;
     let residual_secret_rows = secret_rows
         .clone()
         .parallel_gather(anchor_index_family)
@@ -2011,6 +2051,7 @@ fn end_to_end_processing(
         selected.production.clone(),
         &selected.lookup_compilers,
         &selected.rotation_offsets,
+        selected.anchor_reduce_spec.clone(),
         selected.physical_slots,
         selected.encoding_crt_depth,
         config.error_sigma,

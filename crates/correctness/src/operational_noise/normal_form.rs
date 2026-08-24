@@ -1333,6 +1333,34 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(())
     }
 
+    fn append_relation_evidence(
+        &mut self,
+        owner: ScopedExprId,
+        evidence: &mut Option<BoundValueRef>,
+        applied_event: super::g0::EventIndex,
+        coefficient: &BigInt,
+    ) -> Result<(), NormalizeError> {
+        if !S::ENABLED {
+            return Ok(())
+        }
+        let mut relation_evidence = BoundValueRef::Transfer(applied_event);
+        if coefficient.magnitude() != &BigUint::from(1_u8) {
+            let scale_event = self.observe_bound_transfer(
+                owner,
+                BoundRule::Scale {
+                    value: relation_evidence,
+                    scale: BoundScale::Magnitude(coefficient.magnitude().clone()),
+                },
+            )?;
+            relation_evidence = BoundValueRef::Transfer(scale_event);
+        } else if evidence.is_none() {
+            let identity_event = self
+                .observe_bound_transfer(owner, BoundRule::Identity { input: relation_evidence })?;
+            relation_evidence = BoundValueRef::Transfer(identity_event);
+        }
+        self.append_summary_evidence(owner, evidence, relation_evidence)
+    }
+
     fn summary_result_ref(
         &mut self,
         expression: ExprId,
@@ -3807,17 +3835,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             Some(owner) => owner,
             None => self.programs.root(self.expressions, self.scope)?,
         };
-        let had_evidence = evidence.is_some();
         self.rewrite_relations(relation_owner, &mut candidate, evidence)?;
-        if S::ENABLED && !had_evidence {
-            if let Some(BoundValueRef::Transfer(applied_event)) = evidence.take() {
-                let identity_event = self.observe_bound_transfer(
-                    relation_owner,
-                    BoundRule::Identity { input: BoundValueRef::Transfer(applied_event) },
-                )?;
-                *evidence = Some(BoundValueRef::Transfer(identity_event));
-            }
-        }
         *noise = add_noise_summaries(noise, &candidate.bounded_summary.coefficient_bound());
         for (rewritten, rewritten_coefficient) in candidate.exact_terms {
             let bound = self.bound_monomial(rewritten, &rewritten_coefficient)?;
@@ -3958,18 +3976,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     }
                 };
                 if nonzero_summary {
-                    let mut relation_evidence = BoundValueRef::Transfer(applied_event);
-                    if coefficient.magnitude() != &BigUint::from(1_u8) {
-                        let scale_event = self.observe_bound_transfer(
-                            owner,
-                            BoundRule::Scale {
-                                value: relation_evidence,
-                                scale: BoundScale::Magnitude(coefficient.magnitude().clone()),
-                            },
-                        )?;
-                        relation_evidence = BoundValueRef::Transfer(scale_event);
-                    }
-                    self.append_summary_evidence(owner, evidence, relation_evidence)?;
+                    self.append_relation_evidence(owner, evidence, applied_event, &coefficient)?;
                 }
             }
             *noise = add_noise_summaries(noise, &summary_noise);
@@ -4048,18 +4055,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     }
                 };
                 if nonzero_summary {
-                    let mut relation_evidence = BoundValueRef::Transfer(applied_event);
-                    if coefficient.magnitude() != &BigUint::from(1_u8) {
-                        let scale_event = self.observe_bound_transfer(
-                            owner,
-                            BoundRule::Scale {
-                                value: relation_evidence,
-                                scale: BoundScale::Magnitude(coefficient.magnitude().clone()),
-                            },
-                        )?;
-                        relation_evidence = BoundValueRef::Transfer(scale_event);
-                    }
-                    self.append_summary_evidence(owner, evidence, relation_evidence)?;
+                    self.append_relation_evidence(owner, evidence, applied_event, coefficient)?;
                 }
             }
             return Ok(Some(normal_form));
@@ -4282,18 +4278,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     let NumericContract::Known(CoefficientBound::Finite(_)) = rhs_noise else {
                         return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
                     };
-                    let mut relation_evidence = BoundValueRef::Transfer(applied_event);
-                    if coefficient.magnitude() != &BigUint::from(1_u8) {
-                        let scale_event = self.observe_bound_transfer(
-                            owner,
-                            BoundRule::Scale {
-                                value: relation_evidence,
-                                scale: BoundScale::Magnitude(coefficient.magnitude().clone()),
-                            },
-                        )?;
-                        relation_evidence = BoundValueRef::Transfer(scale_event);
-                    }
-                    self.append_summary_evidence(owner, evidence, relation_evidence)?;
+                    self.append_relation_evidence(owner, evidence, applied_event, &coefficient)?;
                 }
             }
             if rhs_noise != NumericContract::Known(CoefficientBound::ExactZero) {
@@ -8226,6 +8211,115 @@ mod tests {
         assert_eq!(descriptor.central_factors.len(), 1);
         assert_eq!(descriptor.central_factors[0].expression(), input);
         assert!(descriptor.ordered_factors.is_empty());
+    }
+
+    #[test]
+    fn traced_product_gadget_splice_records_unit_identity_transfer() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 3, 1).unwrap();
+        let gadget_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 3).unwrap();
+        let gadget =
+            matrix_source(&mut expressions, "traced-gadget", gadget_type.clone(), Some((2, false)));
+        let input_source = matrix_source(&mut expressions, "traced-input", scalar.clone(), None);
+        let input_noise = gaussian_factor(&mut expressions, scalar.clone(), 96_101, 3);
+        let input = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[input_source, input_noise])
+            .unwrap();
+        let decomposition = expressions
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    output: decomposition_type.clone(),
+                    base: 2,
+                    small: false,
+                    digit_count: 3,
+                }),
+                Box::new([input]),
+            )
+            .unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[gadget, decomposition])
+            .unwrap();
+        let registry = recomposition_registry(gadget_type, decomposition_type, scalar, false, 3);
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        for expression in [gadget, decomposition, input_source, input] {
+            insert_matrix_bound(&mut facts, &expressions, expression, 3);
+        }
+        let ordinary = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                    .unwrap()
+                    .with_gadget_recompositions(&registry);
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        let mut trace = FeasibilityTrace::default();
+        let traced = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .with_gadget_recompositions(&registry);
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        assert_eq!(ordinary.0.semantic, traced.0.semantic);
+        assert_eq!(ordinary.0.exact_nf, traced.0.exact_nf);
+        assert_eq!(ordinary.0.coefficient_bound, traced.0.coefficient_bound);
+        assert_eq!(ordinary.1, traced.1);
+
+        let events = trace.normalization_events();
+        let applied = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event, super::super::g0::NormalizerEvent::AppliedRelation(_))
+                    .then_some(super::super::g0::EventIndex(index as u64))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(applied.len(), 1);
+        let identity = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    super::super::g0::NormalizerEvent::BoundTransfer {
+                        owner,
+                        rule: BoundRule::Identity {
+                            input: BoundValueRef::Transfer(source),
+                        },
+                    } if *owner == semantic && *source == applied[0]
+                )
+            })
+            .count();
+        assert_eq!(identity, 1);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            super::super::g0::NormalizerEvent::BoundTransfer {
+                rule: BoundRule::Scale {
+                    value: BoundValueRef::Transfer(source), ..
+                },
+                ..
+            } if *source == applied[0]
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            super::super::g0::NormalizerEvent::BoundTransfer {
+                rule: BoundRule::Sum { inputs }, ..
+            } if inputs.iter().any(|input| matches!(
+                input,
+                BoundValueRef::Transfer(source) if *source == applied[0]
+            ))
+        )));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        trace
+            .validate_normalization_observations_with_state(&monomials, &NormalizationCache::new())
+            .unwrap();
     }
 
     #[test]

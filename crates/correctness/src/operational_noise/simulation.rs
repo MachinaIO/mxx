@@ -536,7 +536,7 @@ pub(crate) fn derive_proof_payload(
     for (index, event) in run.trace.events.iter().enumerate() {
         if let NormalizerEvent::SpecializationComputed { key, replay, .. } = event {
             for (rhs, result) in replay.rhs_results.iter() {
-                rhs_events.insert((key.clone(), *rhs), (index as u64, result.0));
+                rhs_events.insert((key.clone(), replay.range, *rhs), (index as u64, result.0));
             }
         }
     }
@@ -608,7 +608,11 @@ struct ProofPayloadProjector<'a> {
     refs: &'a CanonicalResidualRefs,
     monomial_arenas: HashMap<super::arena::ArenaToken, &'a super::monomial::MonomialArena>,
     rhs_events: HashMap<
-        (super::relation::RuntimeSpecializationKey, super::relation::CanonicalRhsId),
+        (
+            super::relation::RuntimeSpecializationKey,
+            super::g0::EventRange,
+            super::relation::CanonicalRhsId,
+        ),
         (u64, u64),
     >,
 }
@@ -815,8 +819,8 @@ impl<'a> ProofPayloadProjector<'a> {
         current: usize,
     ) -> Result<ProofPayloadRelationRule, G0Error> {
         Ok(match rule {
-            AppliedRelationRule::Universal { key, lhs, rhs, .. } => {
-                let (computed, rhs_result) = self.rhs_event(key, *rhs, current)?;
+            AppliedRelationRule::Universal { key, source, lhs, rhs } => {
+                let (computed, rhs_result) = self.rhs_event(key, *source, *rhs, current)?;
                 ProofPayloadRelationRule::Universal {
                     computed,
                     lhs: self.monomial(lhs.monomial)?,
@@ -850,12 +854,13 @@ impl<'a> ProofPayloadProjector<'a> {
     fn rhs_event(
         &self,
         key: &super::relation::RuntimeSpecializationKey,
+        source: super::g0::EventRange,
         rhs: super::relation::CanonicalRhsId,
         current: usize,
     ) -> Result<(u64, u64), G0Error> {
         let (computed, result) = self
             .rhs_events
-            .get(&(key.clone(), rhs))
+            .get(&(key.clone(), source, rhs))
             .copied()
             .ok_or(G0Error::RelationTraceInvariant)?;
         if computed >= current as u64 || result >= current as u64 {

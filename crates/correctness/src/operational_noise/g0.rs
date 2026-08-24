@@ -15,7 +15,10 @@ use super::{
     facts::{CoefficientBound, NumericContract},
     job::CheckerJob,
     protocol::{ArtifactProducer, PlannedWire, ProgramOccurrence},
-    simulation::CertificateClosure,
+    simulation::{
+        CanonicalPayloadError, CertificateClosure, LogicalItems, checked_add, checked_sum,
+        logical_vec,
+    },
 };
 use crate::ProtocolInputId;
 use num_bigint::{BigInt, BigUint};
@@ -893,6 +896,174 @@ impl G0LutEvidence {
 
     pub(crate) fn l_bytes(&self) -> Result<usize, G0Error> {
         self.canonical_encoded_byte_size()
+    }
+}
+
+fn logical_range(range: &(u64, u64)) -> Result<u64, CanonicalPayloadError> {
+    checked_sum([range.0.logical_items(), range.1.logical_items()])
+}
+
+fn logical_optional_range(range: &Option<(u64, u64)>) -> Result<u64, CanonicalPayloadError> {
+    match range {
+        Some(range) => checked_add(1, logical_range(range)?),
+        None => Ok(1),
+    }
+}
+
+impl LogicalItems for IndexUseKind {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for SliceMemberRole {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for StablePlanRef {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Expression { row } | Self::Family { row } => checked_add(1, row.logical_items()?),
+        }
+    }
+}
+
+impl LogicalItems for StableValueType {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Bool | Self::Int | Self::Real | Self::Bytes | Self::Trapdoor => Ok(1),
+            Self::Matrix { modulus, ring_dimension, rows, columns } => checked_add(
+                1,
+                checked_sum([
+                    modulus.logical_items(),
+                    ring_dimension.logical_items(),
+                    rows.logical_items(),
+                    columns.logical_items(),
+                ])?,
+            ),
+        }
+    }
+}
+
+impl LogicalItems for StableScope {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Root => Ok(1),
+            Self::Subgraph { canonical_name } => checked_add(1, canonical_name.logical_items()?),
+            Self::ParallelBody { parent, owner } | Self::SequentialBody { parent, owner } => {
+                checked_add(
+                    1,
+                    checked_sum([parent.as_ref().logical_items(), owner.logical_items()])?,
+                )
+            }
+        }
+    }
+}
+
+impl LogicalItems for StableObservedOccurrence {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([self.definition.logical_items(), self.path.logical_items()])
+    }
+}
+
+impl LogicalItems for StableObservedWire {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.stage.logical_items(),
+            self.definition.logical_items(),
+            self.path.logical_items(),
+            self.node.logical_items(),
+            self.port.logical_items(),
+        ])
+    }
+}
+
+impl LogicalItems for StableFrontierAxis {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.owner.logical_items(),
+            self.argument.logical_items(),
+            self.argument_position.logical_items(),
+            logical_range(&self.domain),
+        ])
+    }
+}
+
+impl LogicalItems for StableSliceMember {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.role.logical_items(),
+            self.expression.logical_items(),
+            logical_range(&self.range),
+        ])
+    }
+}
+
+impl LogicalItems for IndexLutRow {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([logical_vec(&self.tuple), self.output.logical_items()])
+    }
+}
+
+impl LogicalItems for SliceLutRow {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            logical_vec(&self.tuple),
+            self.row_start.logical_items(),
+            self.row_end_exclusive.logical_items(),
+            self.column_start.logical_items(),
+            self.column_end_exclusive.logical_items(),
+        ])
+    }
+}
+
+impl LogicalItems for IndexLutEvidence {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.owner.logical_items(),
+            self.result.logical_items(),
+            self.consumed.logical_items(),
+            self.kind.logical_items(),
+            self.index.logical_items(),
+            logical_optional_range(&self.output_range),
+            self.output_type.logical_items(),
+            logical_vec(&self.frontier),
+            self.frontier_product.logical_items(),
+            logical_vec(&self.rows),
+        ])
+    }
+}
+
+impl LogicalItems for SliceLutEvidence {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.id.logical_items(),
+            self.owner.logical_items(),
+            self.result.logical_items(),
+            self.consumed.logical_items(),
+            self.output_type.logical_items(),
+            logical_vec(&self.frontier),
+            self.row_span.logical_items(),
+            self.column_span.logical_items(),
+            logical_vec(&self.members),
+            self.frontier_product.logical_items(),
+            logical_vec(&self.rows),
+        ])
+    }
+}
+
+impl LogicalItems for G0LutDocument<'_> {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([logical_vec(self.index_uses), logical_vec(self.slice_groups)])
+    }
+}
+
+impl LogicalItems for G0LutEvidence {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        G0LutDocument { index_uses: &self.index_uses, slice_groups: &self.slice_groups }
+            .logical_items()
     }
 }
 
@@ -5411,6 +5582,73 @@ mod tests {
         1 + item.unwrap_or(0)
     }
 
+    fn oracle_lut_scope(scope: &StableScope) -> u64 {
+        match scope {
+            StableScope::Root => 1,
+            StableScope::Subgraph { .. } => 2,
+            StableScope::ParallelBody { parent, .. } |
+            StableScope::SequentialBody { parent, .. } => 2 + oracle_lut_scope(parent),
+        }
+    }
+
+    fn oracle_lut_value_type(value_type: &StableValueType) -> u64 {
+        match value_type {
+            StableValueType::Matrix { .. } => 5,
+            StableValueType::Bool |
+            StableValueType::Int |
+            StableValueType::Real |
+            StableValueType::Bytes |
+            StableValueType::Trapdoor => 1,
+        }
+    }
+
+    fn oracle_lut_wire(owner: &StableObservedWire) -> u64 {
+        4 + oracle_lut_scope(&owner.definition)
+    }
+
+    fn oracle_lut_plan_ref(reference: &StablePlanRef) -> u64 {
+        match reference {
+            StablePlanRef::Expression { .. } | StablePlanRef::Family { .. } => 2,
+        }
+    }
+
+    fn oracle_lut_frontier(axis: &StableFrontierAxis) -> u64 {
+        oracle_lut_scope(&axis.owner.definition) + 1 + oracle_lut_plan_ref(&axis.argument) + 1 + 2
+    }
+
+    fn oracle_index_lut(unit: &IndexLutEvidence) -> u64 {
+        oracle_lut_wire(&unit.owner) +
+            oracle_option(unit.result.as_ref().map(oracle_lut_plan_ref)) +
+            oracle_option(unit.consumed.as_ref().map(oracle_lut_plan_ref)) +
+            1 +
+            oracle_lut_plan_ref(&unit.index) +
+            oracle_option(unit.output_range.map(|_| 2)) +
+            oracle_lut_value_type(&unit.output_type) +
+            oracle_sequence(unit.frontier.iter().map(oracle_lut_frontier)) +
+            1 +
+            oracle_sequence(unit.rows.iter().map(|row| 2 + 2 * row.tuple.len() as u64))
+    }
+
+    fn oracle_slice_lut(unit: &SliceLutEvidence) -> u64 {
+        1 + oracle_lut_wire(&unit.owner) +
+            oracle_option(unit.result.as_ref().map(oracle_lut_plan_ref)) +
+            oracle_option(unit.consumed.as_ref().map(oracle_lut_plan_ref)) +
+            oracle_lut_value_type(&unit.output_type) +
+            oracle_sequence(unit.frontier.iter().map(oracle_lut_frontier)) +
+            oracle_option(unit.row_span.map(|_| 1)) +
+            oracle_option(unit.column_span.map(|_| 1)) +
+            oracle_sequence(
+                unit.members.iter().map(|member| 1 + oracle_lut_plan_ref(&member.expression) + 2),
+            ) +
+            1 +
+            oracle_sequence(unit.rows.iter().map(|row| 5 + 2 * row.tuple.len() as u64))
+    }
+
+    fn oracle_lut_document(evidence: &G0LutEvidence) -> u64 {
+        oracle_sequence(evidence.index_uses.iter().map(oracle_index_lut)) +
+            oracle_sequence(evidence.slice_groups.iter().map(oracle_slice_lut))
+    }
+
     fn oracle_contract(bound: &NumericContract<CoefficientBound>) -> u64 {
         match bound {
             NumericContract::Missing => 1,
@@ -7668,6 +7906,7 @@ mod tests {
         assert_eq!(evidence.slice_groups[0].rows[0].row_start, "0");
         assert_eq!(evidence.slice_groups[0].rows[0].row_end_exclusive, "1");
         assert_eq!(evidence.l_rows, BigUint::from(2_u8));
+        assert_eq!(evidence.logical_items().unwrap(), oracle_lut_document(&evidence));
         let bytes = evidence.encode_canonical().unwrap();
         assert_eq!(bytes, evidence.encode_canonical().unwrap());
         assert_eq!(evidence.l_bytes().unwrap(), bytes.len());
@@ -7675,6 +7914,27 @@ mod tests {
         let json = String::from_utf8(bytes).unwrap();
         assert!(json.contains("\"indexUses\":["));
         assert!(json.contains("\"sliceGroups\":["));
+    }
+
+    #[test]
+    fn lut_rows_have_exact_zero_and_two_axis_logical_items() {
+        let index_zero = IndexLutRow { tuple: Vec::new(), output: "0".to_owned() };
+        let index_two =
+            IndexLutRow { tuple: vec!["0".to_owned(), "1".to_owned()], output: "1".to_owned() };
+        let slice_zero = SliceLutRow {
+            tuple: Vec::new(),
+            row_start: "0".to_owned(),
+            row_end_exclusive: "1".to_owned(),
+            column_start: "0".to_owned(),
+            column_end_exclusive: "1".to_owned(),
+        };
+        let slice_two =
+            SliceLutRow { tuple: vec!["0".to_owned(), "1".to_owned()], ..slice_zero.clone() };
+
+        assert_eq!(index_zero.logical_items().unwrap(), 2);
+        assert_eq!(index_two.logical_items().unwrap(), 6);
+        assert_eq!(slice_zero.logical_items().unwrap(), 5);
+        assert_eq!(slice_two.logical_items().unwrap(), 9);
     }
 
     #[test]

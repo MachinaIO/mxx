@@ -147,7 +147,7 @@ pub struct BaseNBreakdown {
 }
 
 const G0_CPU_EVIDENCE_SCHEMA_ID: &str = "mxx.operational-noise.g0-cpu-evidence";
-const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 enum G0CpuEvidenceStatus {
@@ -157,6 +157,7 @@ enum G0CpuEvidenceStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct G0CpuLutObservation {
     exact_row_count: String,
+    exact_payload_logical_items: u64,
     index_use_frontier_products: Vec<String>,
     slice_group_frontier_products: Vec<String>,
 }
@@ -677,7 +678,7 @@ impl LogicalItems for ObservedCoverage {
     }
 }
 
-fn checked_add(left: u64, right: u64) -> Result<u64, CanonicalPayloadError> {
+pub(crate) fn checked_add(left: u64, right: u64) -> Result<u64, CanonicalPayloadError> {
     left.checked_add(right).ok_or(CanonicalPayloadError::LengthOverflow)
 }
 
@@ -698,7 +699,7 @@ fn logical_uniform_collection(
     )
 }
 
-fn checked_sum<I>(items: I) -> Result<u64, CanonicalPayloadError>
+pub(crate) fn checked_sum<I>(items: I) -> Result<u64, CanonicalPayloadError>
 where
     I: IntoIterator,
     I::Item: LogicalItems,
@@ -706,7 +707,7 @@ where
     items.into_iter().try_fold(0_u64, |total, item| checked_add(total, item.logical_items()?))
 }
 
-fn logical_vec<T: LogicalItems>(items: &[T]) -> Result<u64, CanonicalPayloadError> {
+pub(crate) fn logical_vec<T: LogicalItems>(items: &[T]) -> Result<u64, CanonicalPayloadError> {
     checked_add(
         checked_add(
             1,
@@ -3077,6 +3078,9 @@ fn g0_cpu_lut_observation(lut: &super::g0::G0LutEvidence) -> Result<G0CpuLutObse
     }
     Ok(G0CpuLutObservation {
         exact_row_count: lut.l_rows.to_string(),
+        exact_payload_logical_items: lut
+            .logical_items()
+            .map_err(|_| "G0 CPU evidence LUT logical-item overflow".to_owned())?,
         index_use_frontier_products: lut
             .index_uses
             .iter()
@@ -6455,6 +6459,7 @@ mod tests {
         );
         assert_eq!(document["schema_id"], G0_CPU_EVIDENCE_SCHEMA_ID);
         assert_eq!(document["schema_version"], G0_CPU_EVIDENCE_SCHEMA_VERSION);
+        assert_eq!(document["schema_version"], 2);
         assert_eq!(document["status"], "CpuObservationOnlyNotG0HardGateOrTallEvidence");
         let base = &document["base_feasibility"];
         assert_eq!(
@@ -6522,9 +6527,14 @@ mod tests {
         }
         assert_eq!(
             object_keys(&document["lut"]),
-            ["exact_row_count", "index_use_frontier_products", "slice_group_frontier_products",]
-                .into_iter()
-                .collect()
+            [
+                "exact_row_count",
+                "exact_payload_logical_items",
+                "index_use_frontier_products",
+                "slice_group_frontier_products",
+            ]
+            .into_iter()
+            .collect()
         );
         assert_eq!(
             object_keys(&document["metrics"]),
@@ -6618,6 +6628,41 @@ mod tests {
 
     #[test]
     fn g0_cpu_evidence_observes_nonempty_honest_index_lut() {
+        fn serialized_logical_items(value: &serde_json::Value) -> u64 {
+            match value {
+                serde_json::Value::Array(values) => {
+                    1 + values.len() as u64 +
+                        values.iter().map(serialized_logical_items).sum::<u64>()
+                }
+                serde_json::Value::Object(fields) => {
+                    fields.values().map(serialized_logical_items).sum()
+                }
+                _ => 1,
+            }
+        }
+
+        fn independent_lut_logical_items(lut: &serde_json::Value) -> u64 {
+            let mut optional_payloads = 0_u64;
+            let mut semantic_ranges = 0_u64;
+            for unit in lut["indexUses"].as_array().unwrap() {
+                optional_payloads += ["result", "consumed", "output_range"]
+                    .into_iter()
+                    .filter(|field| !unit[*field].is_null())
+                    .count() as u64;
+                semantic_ranges += u64::from(!unit["output_range"].is_null());
+                semantic_ranges += unit["frontier"].as_array().unwrap().len() as u64;
+            }
+            for unit in lut["sliceGroups"].as_array().unwrap() {
+                optional_payloads += ["result", "consumed", "row_span", "column_span"]
+                    .into_iter()
+                    .filter(|field| !unit[*field].is_null())
+                    .count() as u64;
+                semantic_ranges += unit["frontier"].as_array().unwrap().len() as u64;
+                semantic_ranges += unit["members"].as_array().unwrap().len() as u64;
+            }
+            serialized_logical_items(lut) + optional_payloads - 3 * semantic_ranges
+        }
+
         let protocol = indexed_threshold_certificate_protocol();
         let request = super::super::OperationalCheckRequest {
             environment: Vec::new(),
@@ -6671,6 +6716,11 @@ mod tests {
             .fold(BigUint::ZERO, |sum, rows| sum + rows);
         assert_eq!(summed_rows, lut.l_rows);
         assert_eq!(document["lut"]["exact_row_count"], summed_rows.to_string());
+        let canonical_lut: serde_json::Value =
+            serde_json::from_slice(&lut.encode_canonical().unwrap()).unwrap();
+        let independent_logical_items = independent_lut_logical_items(&canonical_lut);
+        assert!(independent_logical_items > 0);
+        assert_eq!(document["lut"]["exact_payload_logical_items"], independent_logical_items);
         assert_eq!(
             document["metrics"]["lut_canonical_encoded_bytes"],
             lut.encode_canonical().unwrap().len() as u64

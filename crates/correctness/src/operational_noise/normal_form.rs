@@ -5989,6 +5989,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     .scoped_argument_bound(owner, 0, &ResolvedValueType::Int)
                     .unwrap_or(NumericContract::Missing);
             }
+            if bound.is_missing() &&
+                matches!(&node.operator, ValueOperator::Scalar(ScalarOperation::Remainder)) &&
+                let [_, divisor] = node.inputs.as_ref() &&
+                self.integer_constant(*divisor).is_some_and(|value| !value.is_zero())
+            {
+                bound = bounds[1].clone();
+            }
             if bound.is_missing() {
                 return Err(NormalizeError::UnsupportedNonmatrixBound {
                     owner,
@@ -6019,6 +6026,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         1,
                         BoundProjection::Coefficient,
                     )?),
+                },
+                ValueOperator::Scalar(ScalarOperation::Remainder) => BoundRule::Identity {
+                    input: Self::predecessor_ref(1, BoundProjection::Coefficient)?,
                 },
                 ValueOperator::Scalar(
                     ScalarOperation::Negate |
@@ -14224,6 +14234,256 @@ mod tests {
                 )
             }));
         }
+    }
+
+    #[test]
+    fn closed_remainder_uses_the_rhs_bound_and_records_it_in_order() {
+        for (left_value, divisor_value, negate_divisor, expected_bound) in
+            [(-1_i64, 100_i64, false, 100_u64), (7, 3, true, 3), (7, 1, false, 1)]
+        {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let left = expressions
+                .intern(ValueOperator::Constant(TypedConstant::int(left_value)), Box::new([]))
+                .unwrap();
+            let divisor_literal = expressions
+                .intern(ValueOperator::Constant(TypedConstant::int(divisor_value)), Box::new([]))
+                .unwrap();
+            let divisor = if negate_divisor {
+                expressions
+                    .intern(
+                        ValueOperator::Scalar(ScalarOperation::Negate),
+                        Box::new([divisor_literal]),
+                    )
+                    .unwrap()
+            } else {
+                divisor_literal
+            };
+            let remainder = expressions
+                .intern(
+                    ValueOperator::Scalar(ScalarOperation::Remainder),
+                    Box::new([left, divisor]),
+                )
+                .unwrap();
+            let (facts, mut monomials, semantic) =
+                setup(&mut expressions, &mut programs, remainder);
+            let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                .unwrap()
+                .normalize(semantic)
+                .unwrap();
+            assert_eq!(ordinary.coefficient_bound, NumericContract::Missing);
+
+            let mut trace = FeasibilityTrace::default();
+            let traced = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+            assert_eq!(
+                traced.coefficient_bound,
+                NumericContract::Known(CoefficientBound::finite(expected_bound))
+            );
+            trace.validate_normalization_observations().unwrap();
+
+            let predecessor_index = trace
+                .normalization_events()
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        NormalizerEvent::Predecessor {
+                            consumer,
+                            input_position: 1,
+                            predecessor,
+                            ..
+                        } if *consumer == semantic && *predecessor == divisor
+                    )
+                })
+                .expect("remainder RHS predecessor");
+            let transfer_index = trace
+                .normalization_events()
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        NormalizerEvent::BoundTransfer {
+                            owner,
+                            rule: BoundRule::Identity {
+                                input: BoundValueRef::Predecessor {
+                                    input_position: 1,
+                                    projection: BoundProjection::Coefficient,
+                                },
+                            },
+                        } if *owner == semantic
+                    )
+                })
+                .expect("remainder RHS identity");
+            assert!(predecessor_index < transfer_index);
+        }
+    }
+
+    #[test]
+    fn remainder_rejects_zero_and_open_divisors_only_in_enabled_mode() {
+        for open_divisor in [false, true] {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let left = expressions
+                .intern(ValueOperator::Constant(TypedConstant::int(7)), Box::new([]))
+                .unwrap();
+            let divisor = if open_divisor {
+                expressions.intern_argument(0, ResolvedValueType::Int).unwrap()
+            } else {
+                expressions
+                    .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+                    .unwrap()
+            };
+            let remainder = expressions
+                .intern(
+                    ValueOperator::Scalar(ScalarOperation::Remainder),
+                    Box::new([left, divisor]),
+                )
+                .unwrap();
+            let program = programs
+                .finalize(
+                    &mut expressions,
+                    ProgramSignature {
+                        inputs: if open_divisor {
+                            Box::new([ProgramInput {
+                                value_type: ResolvedValueType::Int,
+                                trusted_index_range: Some(TrustedIndexRange {
+                                    minimum: 0,
+                                    maximum_exclusive: 32,
+                                }),
+                            }])
+                        } else {
+                            Box::new([])
+                        },
+                        output: ResolvedValueType::Int,
+                    },
+                    remainder,
+                )
+                .unwrap();
+            let facts = FactStore::new(&expressions);
+            let semantic = programs.scoped(&expressions, program, remainder).unwrap();
+            let mut monomials = MonomialArena::new(&expressions, &programs, program).unwrap();
+            let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                .unwrap()
+                .normalize(semantic)
+                .unwrap();
+            assert_eq!(ordinary.coefficient_bound, NumericContract::Missing);
+
+            let mut trace = FeasibilityTrace::default();
+            let error = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .normalize(semantic)
+            .unwrap_err();
+            assert_eq!(
+                error,
+                NormalizeError::UnsupportedNonmatrixBound {
+                    owner: semantic,
+                    expression: remainder,
+                    operator: Box::new(ValueOperator::Scalar(ScalarOperation::Remainder)),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn tall_shaped_remainder_records_the_scoped_rhs_descriptor() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let offset = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(7)), Box::new([]))
+            .unwrap();
+        let shifted = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), Box::new([argument, offset]))
+            .unwrap();
+        let divisor = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(32)), Box::new([]))
+            .unwrap();
+        let remainder = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Remainder), Box::new([shifted, divisor]))
+            .unwrap();
+        let program = programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: Some(TrustedIndexRange {
+                            minimum: 0,
+                            maximum_exclusive: 32,
+                        }),
+                    }]),
+                    output: ResolvedValueType::Int,
+                },
+                remainder,
+            )
+            .unwrap();
+        let facts = FactStore::new(&expressions);
+        let semantic = programs.scoped(&expressions, program, remainder).unwrap();
+        let divisor_owner = programs.scoped(&expressions, program, divisor).unwrap();
+        let mut monomials = MonomialArena::new(&expressions, &programs, program).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let traced = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(semantic)
+        .unwrap();
+        assert_eq!(
+            traced.coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(32_u8))
+        );
+        trace.validate_normalization_observations().unwrap();
+
+        let source_result = trace
+            .normalization_events()
+            .iter()
+            .find_map(|event| match event {
+                NormalizerEvent::Predecessor {
+                    consumer,
+                    input_position: 1,
+                    predecessor,
+                    source_result,
+                } if *consumer == semantic && *predecessor == divisor => Some(*source_result),
+                _ => None,
+            })
+            .expect("scoped divisor predecessor");
+        assert!(matches!(
+            trace.normalization_events().get(source_result.0 as usize),
+            Some(NormalizerEvent::Result { owner, .. }) if *owner == divisor_owner
+        ));
+        assert!(trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Identity {
+                        input: BoundValueRef::Predecessor {
+                            input_position: 1,
+                            projection: BoundProjection::Coefficient,
+                        },
+                    },
+                } if *owner == semantic
+            )
+        }));
     }
 
     #[test]

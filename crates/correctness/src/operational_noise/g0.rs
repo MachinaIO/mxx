@@ -722,17 +722,15 @@ fn evaluate_typed_scalar(
         }
         ScalarOperation::Divide => {
             let (left, right) = pair()?;
-            if right.is_zero() {
-                return Err(IndexEvaluationError::DivisionByZero);
-            }
-            Ok(IndexValue::Int(left / right))
+            let (quotient, _) = mxx_ir_core::expr::euclidean_div_rem(left, right)
+                .map_err(|_| IndexEvaluationError::DivisionByZero)?;
+            Ok(IndexValue::Int(quotient))
         }
         ScalarOperation::Remainder => {
             let (left, right) = pair()?;
-            if right.is_zero() {
-                return Err(IndexEvaluationError::DivisionByZero);
-            }
-            Ok(IndexValue::Int(left % right))
+            let (_, remainder) = mxx_ir_core::expr::euclidean_div_rem(left, right)
+                .map_err(|_| IndexEvaluationError::DivisionByZero)?;
+            Ok(IndexValue::Int(remainder))
         }
         ScalarOperation::Negate => {
             if values.len() != 1 {
@@ -7709,11 +7707,11 @@ mod tests {
         let frontier = [];
         assert_eq!(
             evaluate_typed_index(&arena, quotient, &frontier, &[]),
-            Ok(IndexValue::Int(BigInt::from(-2_i8)))
+            Ok(IndexValue::Int(BigInt::from(-3_i8)))
         );
         assert_eq!(
             evaluate_typed_index(&arena, remainder, &frontier, &[]),
-            Ok(IndexValue::Int(BigInt::from(-1_i8)))
+            Ok(IndexValue::Int(BigInt::from(2_i8)))
         );
 
         let argument = arena.intern_argument(0, ResolvedValueType::Int).unwrap();

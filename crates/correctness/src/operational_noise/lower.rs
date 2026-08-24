@@ -5561,23 +5561,41 @@ pub(crate) mod tests {
     }
 
     fn generated_gather_protocol(source_count: usize) -> crate::ProtocolDecl {
-        generated_slice_protocol(source_count, GeneratedSliceCase::Unit)
+        generated_slice_protocol(source_count, GeneratedSliceCase::Unit, false)
+    }
+
+    pub(crate) fn generated_indexed_slice_certificate_protocol() -> crate::ProtocolDecl {
+        generated_slice_protocol(7, GeneratedSliceCase::Unit, true)
     }
 
     fn generated_slice_protocol(
         source_count: usize,
         slice_case: GeneratedSliceCase,
+        local_certificate_target: bool,
     ) -> crate::ProtocolDecl {
         use crate::{
-            InputContractEntry, InputValueContract, ProtocolInputBinding, ProtocolInputDestination,
+            InputContractEntry, InputValueContract, OperationalDecoderKind,
+            OperationalDecoderTarget, ProtocolInputBinding, ProtocolInputDestination,
             ProtocolInputId, StageInputName,
         };
-        use mxx_dsl::{DslContext, Int, Parallel, Ring};
+        use mxx_dsl::{DslContext, Int, Parallel, Ring, SemanticAnchor};
         let ring = Ring::new(256, 1);
-        let source = ring.input_family("gather-source", source_count, (1, 1));
+        let declared_source = ring.input_family("gather-source", source_count, (1, 1));
+        let source = if local_certificate_target {
+            Parallel::range(source_count)
+                .map_values(|_| ring.zero((1, 1)))
+                .expect("generated constant gather source")
+        } else {
+            declared_source
+        };
         let slice_source_rows =
             if matches!(slice_case, GeneratedSliceCase::OutOfBounds) { 3 } else { 8 };
-        let slice_source = ring.input("slice-source", (slice_source_rows, 1));
+        let declared_slice_source = ring.input("slice-source", (slice_source_rows, 1));
+        let slice_source = if local_certificate_target {
+            ring.zero((slice_source_rows, 1))
+        } else {
+            declared_slice_source
+        };
         let slices = Parallel::range(4)
             .map_values(|index| {
                 let index_expression = index.expression();
@@ -5609,14 +5627,30 @@ pub(crate) mod tests {
             .expect("generated gather map");
         let gathered = source.parallel_gather(indices).expect("generated gather family");
         let residual = gathered.get_static(0) + slices.get_static(0);
-        let encrypt = DslContext::new("production-generated-gather")
+        let decoded = local_certificate_target.then(|| {
+            residual
+                .clone()
+                .threshold_decode_bools(IntExpr::constant(2), 1)
+                .into_iter()
+                .next()
+                .expect("generated threshold output")
+                .semantic_anchor("generated.indexed.slice.decoded")
+                .expect("generated decoded anchor")
+        });
+        let mut encrypt = DslContext::new("production-generated-gather")
             .int_parameter("cutoff")
             .public_output("ciphertext", residual.clone())
             .expect("ciphertext output")
             .private_output("operational-residual", residual)
-            .expect("residual output")
-            .build()
-            .expect("generated gather graph");
+            .expect("residual output");
+        if let Some(decoded) = decoded {
+            encrypt = encrypt
+                .bool_output("certificate-decoded", decoded)
+                .expect("generated decoded output");
+        }
+        let encrypt = encrypt.build().expect("generated gather graph");
+        let decoder_node = local_certificate_target
+            .then(|| encrypt.graph.outputs()["certificate-decoded"].value.node);
 
         let mut protocol = crate::toy_example::protocol();
         let encrypt_stage = protocol
@@ -5677,6 +5711,36 @@ pub(crate) mod tests {
                 input: StageInputName("slice-source".to_owned()),
             }],
         });
+        if let Some(decoder_node) = decoder_node {
+            protocol
+                .bundle
+                .input_contract
+                .inputs
+                .retain(|entry| !matches!(entry.id.0.as_str(), "gather-source" | "slice-source"));
+            protocol.bundle.input_bindings.retain(|binding| {
+                !matches!(binding.input.0.as_str(), "gather-source" | "slice-source")
+            });
+            let endpoint = &mut protocol.bundle.endpoints.entries[0];
+            endpoint.stage = StageId("encrypt".to_owned());
+            endpoint.semantic_anchor = "generated.indexed.slice.decoded".to_owned();
+            endpoint.workflow_output.stage = StageId("encrypt".to_owned());
+            endpoint.workflow_output.output = "certificate-decoded".to_owned();
+            let crate::ComparatorSpec::Equality { endpoints } = &mut protocol.bundle.comparator
+            else {
+                unreachable!("toy fixture uses direct equality")
+            };
+            endpoints[0].actual_input = "certificate-decoded".to_owned();
+            protocol.bundle.operational_decoder_targets = vec![OperationalDecoderTarget {
+                target_id: "generated-indexed-slice-threshold".to_owned(),
+                residual_stage: StageId("encrypt".to_owned()),
+                residual_output: "operational-residual".to_owned(),
+                decoder_stage: StageId("encrypt".to_owned()),
+                decoder_node,
+                kind: OperationalDecoderKind::ThresholdDecode {
+                    plaintext_modulus: IntExpr::constant(2),
+                },
+            }];
+        }
         crate::ProtocolDecl::new(protocol).unwrap()
     }
 
@@ -6484,7 +6548,7 @@ pub(crate) mod tests {
             "source domain [0,6) must reject reachable mapped index 6"
         );
 
-        let protocol = generated_slice_protocol(7, GeneratedSliceCase::Static);
+        let protocol = generated_slice_protocol(7, GeneratedSliceCase::Static, false);
         let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("static slice plan");
         let adapter = ProductionAdapter::new(
             &protocol,
@@ -6824,7 +6888,7 @@ pub(crate) mod tests {
     #[test]
     fn production_adapter_rejects_invalid_dynamic_slice_geometry() {
         for case in [GeneratedSliceCase::OutOfBounds, GeneratedSliceCase::NonAffine] {
-            let protocol = generated_slice_protocol(7, case);
+            let protocol = generated_slice_protocol(7, case, false);
             let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("slice plan");
             let adapter = ProductionAdapter::new(
                 &protocol,

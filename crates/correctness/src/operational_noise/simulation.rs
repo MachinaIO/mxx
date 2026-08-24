@@ -6626,43 +6626,43 @@ mod tests {
         }
     }
 
+    fn serialized_lut_logical_items(value: &serde_json::Value) -> u64 {
+        match value {
+            serde_json::Value::Array(values) => {
+                1 + values.len() as u64 +
+                    values.iter().map(serialized_lut_logical_items).sum::<u64>()
+            }
+            serde_json::Value::Object(fields) => {
+                fields.values().map(serialized_lut_logical_items).sum()
+            }
+            _ => 1,
+        }
+    }
+
+    fn independent_lut_logical_items(lut: &serde_json::Value) -> u64 {
+        let mut optional_payloads = 0_u64;
+        let mut semantic_ranges = 0_u64;
+        for unit in lut["indexUses"].as_array().unwrap() {
+            optional_payloads += ["result", "consumed", "output_range"]
+                .into_iter()
+                .filter(|field| !unit[*field].is_null())
+                .count() as u64;
+            semantic_ranges += u64::from(!unit["output_range"].is_null());
+            semantic_ranges += unit["frontier"].as_array().unwrap().len() as u64;
+        }
+        for unit in lut["sliceGroups"].as_array().unwrap() {
+            optional_payloads += ["result", "consumed", "row_span", "column_span"]
+                .into_iter()
+                .filter(|field| !unit[*field].is_null())
+                .count() as u64;
+            semantic_ranges += unit["frontier"].as_array().unwrap().len() as u64;
+            semantic_ranges += unit["members"].as_array().unwrap().len() as u64;
+        }
+        serialized_lut_logical_items(lut) + optional_payloads - 3 * semantic_ranges
+    }
+
     #[test]
     fn g0_cpu_evidence_observes_nonempty_honest_index_lut() {
-        fn serialized_logical_items(value: &serde_json::Value) -> u64 {
-            match value {
-                serde_json::Value::Array(values) => {
-                    1 + values.len() as u64 +
-                        values.iter().map(serialized_logical_items).sum::<u64>()
-                }
-                serde_json::Value::Object(fields) => {
-                    fields.values().map(serialized_logical_items).sum()
-                }
-                _ => 1,
-            }
-        }
-
-        fn independent_lut_logical_items(lut: &serde_json::Value) -> u64 {
-            let mut optional_payloads = 0_u64;
-            let mut semantic_ranges = 0_u64;
-            for unit in lut["indexUses"].as_array().unwrap() {
-                optional_payloads += ["result", "consumed", "output_range"]
-                    .into_iter()
-                    .filter(|field| !unit[*field].is_null())
-                    .count() as u64;
-                semantic_ranges += u64::from(!unit["output_range"].is_null());
-                semantic_ranges += unit["frontier"].as_array().unwrap().len() as u64;
-            }
-            for unit in lut["sliceGroups"].as_array().unwrap() {
-                optional_payloads += ["result", "consumed", "row_span", "column_span"]
-                    .into_iter()
-                    .filter(|field| !unit[*field].is_null())
-                    .count() as u64;
-                semantic_ranges += unit["frontier"].as_array().unwrap().len() as u64;
-                semantic_ranges += unit["members"].as_array().unwrap().len() as u64;
-            }
-            serialized_logical_items(lut) + optional_payloads - 3 * semantic_ranges
-        }
-
         let protocol = indexed_threshold_certificate_protocol();
         let request = super::super::OperationalCheckRequest {
             environment: Vec::new(),
@@ -6724,6 +6724,47 @@ mod tests {
         assert_eq!(
             document["metrics"]["lut_canonical_encoded_bytes"],
             lut.encode_canonical().unwrap().len() as u64
+        );
+    }
+
+    #[test]
+    fn g0_cpu_evidence_counts_shared_four_role_slice_lut() {
+        let protocol = super::super::lower::tests::generated_indexed_slice_certificate_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: vec![(
+                "cutoff".to_owned(),
+                super::super::OperationalParameterValue::Integer(8.into()),
+            )],
+            layouts: Vec::new(),
+            target_id: "generated-indexed-slice-threshold".to_owned(),
+        };
+        let evidence = prepare_g0_cpu_evidence_bytes(&protocol, &request)
+            .expect("shared indexed-slice CPU evidence");
+        let document: serde_json::Value = serde_json::from_slice(&evidence).unwrap();
+
+        let run = prepare_operational_certificate(&protocol, &request).expect("comparison run");
+        let lut =
+            super::super::g0::derive_lut_evidence(&run.job, &run.projection.closure, &run.trace)
+                .expect("shared indexed-slice LUT");
+        assert!(!lut.slice_groups.is_empty());
+        assert!(lut.slice_groups.iter().all(|group| {
+            group.row_span.is_some() && group.column_span.is_some() && group.members.len() == 4
+        }));
+
+        let canonical_lut: serde_json::Value =
+            serde_json::from_slice(&lut.encode_canonical().unwrap()).unwrap();
+        let slice_groups = canonical_lut["sliceGroups"].as_array().unwrap();
+        assert!(!slice_groups.is_empty());
+        for group in slice_groups {
+            assert!(!group["row_span"].is_null());
+            assert!(!group["column_span"].is_null());
+            let members = group["members"].as_array().unwrap();
+            assert_eq!(members.len(), 4);
+            assert!(members.iter().all(|member| member["range"].as_array().unwrap().len() == 2));
+        }
+        assert_eq!(
+            document["lut"]["exact_payload_logical_items"],
+            independent_lut_logical_items(&canonical_lut)
         );
     }
 }

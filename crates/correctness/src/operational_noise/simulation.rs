@@ -6,8 +6,8 @@
 use super::{
     OperationalSimulationDiagnostics, OperationalSimulationReport,
     arena::{
-        ArenaError, ClosedExprId, ExprId, FamilyDomain, MatrixLayout, ResolvedMatrixType,
-        ResolvedValueType, ValueOperator,
+        ArenaError, ClosedExprId, ExprId, FamilyDomain, MatrixLayout, MatrixOperation,
+        ResolvedMatrixType, ResolvedValueType, ValueOperator,
     },
     error::{OperationalSimulationError, TargetError},
     g0::{
@@ -220,18 +220,13 @@ pub(crate) enum ProofPayloadRelationRule {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProofPayloadTermRef {
     pub value_event: u64,
-    pub term_ordinal: Option<u64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ProofPayloadCoefficientMergeSource {
-    Value(ProofPayloadTermRef),
+    pub term_ordinal: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProofPayloadCoefficientMerge {
     pub owner: ProofPayloadOwner,
-    pub sources: Box<[ProofPayloadCoefficientMergeSource]>,
+    pub sources: Box<[ProofPayloadTermRef]>,
     pub output: ProofPayloadMonomial,
     pub signed_contribution: BigInt,
 }
@@ -817,44 +812,23 @@ impl<'a> ProofPayloadProjector<'a> {
         reference: super::g0::RecordedTermRef,
         current: usize,
     ) -> Result<ProofPayloadTermRef, G0Error> {
-        self.term_ref_with_missing(trace, reference, current, false)
-    }
-
-    fn term_ref_with_missing(
-        &self,
-        trace: &FeasibilityTrace,
-        reference: super::g0::RecordedTermRef,
-        current: usize,
-        allow_missing: bool,
-    ) -> Result<ProofPayloadTermRef, G0Error> {
         self.prior_event(reference.value_event, current)?;
         let value = match trace.events.get(reference.value_event.0 as usize) {
             Some(NormalizerEvent::Result { value, .. }) |
             Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
             _ => return Err(G0Error::RelationTraceInvariant),
         };
-        let term_ordinal = value.exact_nf.as_ref().and_then(|normal_form| {
-            let mut terms = normal_form
-                .exact_terms
-                .keys()
-                .filter_map(|monomial| self.monomial(*monomial).ok().map(|term| (*monomial, term)))
-                .collect::<Vec<_>>();
-            terms.sort_by(|left, right| left.1.cmp(&right.1));
-            terms
-                .iter()
-                .position(|(monomial, _)| *monomial == reference.monomial)
-                .map(|position| position as u64)
-        });
-        if !allow_missing &&
-            term_ordinal.is_none() &&
-            matches!(
-                trace.events.get(reference.value_event.0 as usize),
-                Some(NormalizerEvent::Result { .. }) | Some(NormalizerEvent::InvocationEnd { .. })
-            ) &&
-            value.exact_nf.is_some()
-        {
-            return Err(G0Error::RelationTraceInvariant);
-        }
+        let normal_form = value.exact_nf.as_ref().ok_or(G0Error::RelationTraceInvariant)?;
+        let mut terms = normal_form
+            .exact_terms
+            .keys()
+            .filter_map(|monomial| self.monomial(*monomial).ok().map(|term| (*monomial, term)))
+            .collect::<Vec<_>>();
+        terms.sort_by(|left, right| left.1.cmp(&right.1));
+        let term_ordinal = terms
+            .iter()
+            .position(|(monomial, _)| *monomial == reference.monomial)
+            .ok_or(G0Error::RelationTraceInvariant)? as u64;
         Ok(ProofPayloadTermRef { value_event: reference.value_event.0, term_ordinal })
     }
 
@@ -864,19 +838,36 @@ impl<'a> ProofPayloadProjector<'a> {
         observation: &super::g0::CoefficientMerge,
         current: usize,
     ) -> Result<ProofPayloadCoefficientMerge, G0Error> {
-        let source = |source: &super::g0::CoefficientMergeSource| match source {
-            super::g0::CoefficientMergeSource::Value(reference) => {
-                Ok(ProofPayloadCoefficientMergeSource::Value(
-                    self.term_ref(trace, *reference, current)?,
-                ))
-            }
+        let node = self.job.expressions().node(observation.owner.expression())?;
+        let subtract = match node.operator {
+            ValueOperator::Matrix(MatrixOperation::Add) => false,
+            ValueOperator::Matrix(MatrixOperation::Subtract) => true,
+            _ => return Err(G0Error::RelationTraceInvariant),
         };
+        if observation.sources.len() != 2 ||
+            observation.sources.iter().any(|reference| reference.monomial != observation.output)
+        {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        let right = match trace.events.get(observation.sources[1].value_event.0 as usize) {
+            Some(NormalizerEvent::Result { value, .. }) |
+            Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value
+                .exact_nf
+                .as_ref()
+                .and_then(|normal_form| normal_form.exact_terms.get(&observation.output)),
+            _ => None,
+        }
+        .ok_or(G0Error::RelationTraceInvariant)?;
+        let expected = if subtract { -right.clone() } else { right.clone() };
+        if observation.signed_contribution != expected {
+            return Err(G0Error::RelationTraceInvariant);
+        }
         Ok(ProofPayloadCoefficientMerge {
             owner: self.owner(observation.owner)?,
             sources: observation
                 .sources
                 .iter()
-                .map(source)
+                .map(|reference| self.term_ref(trace, *reference, current))
                 .collect::<Result<Vec<_>, G0Error>>()?
                 .into_boxed_slice(),
             output: self.monomial(observation.output)?,
@@ -2196,8 +2187,11 @@ mod tests {
     fn threshold_certificate_protocol() -> ProtocolDecl {
         let stage_id = StageId("certificate-stage".to_owned());
         let ring = Ring::new(256, 1);
-        let residual =
-            ring.zero((1, 1)).semantic_anchor("certificate.residual").expect("residual anchor");
+        let sampled = ring.uniform_residue((1, 1));
+        let doubled = sampled.clone() + sampled;
+        let residual = (doubled.clone() - doubled)
+            .semantic_anchor("certificate.residual")
+            .expect("residual anchor");
         let decoded = residual
             .clone()
             .threshold_decode_bools(IntExpr::constant(2), 1)
@@ -2516,6 +2510,63 @@ mod tests {
                 .iter()
                 .any(|event| { matches!(event, ProofPayloadEvent::Result { .. }) })
         );
+        let merges = payload
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                ProofPayloadEvent::CoefficientMerge(observation) => Some((index, observation)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(merges.len(), 2, "the doubled add and cancelling subtract each merge once");
+        assert_eq!(merges[0].1.signed_contribution, BigInt::from(1_u8));
+        assert_eq!(merges[1].1.signed_contribution, BigInt::from(-2_i8));
+        for (merge_index, merge) in &merges {
+            assert_eq!(merge.sources.len(), 2);
+            assert_eq!(merge.sources[0].term_ordinal, merge.sources[1].term_ordinal);
+            for (input_position, source) in merge.sources.iter().enumerate() {
+                let predecessor_result = payload
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        ProofPayloadEvent::Predecessor {
+                            consumer,
+                            input_position: position,
+                            source_result,
+                            ..
+                        } if consumer == &merge.owner && *position == input_position as u32 => {
+                            Some(*source_result)
+                        }
+                        _ => None,
+                    })
+                    .expect("merge source predecessor");
+                assert_eq!(source.value_event, predecessor_result);
+            }
+            let owner_result = payload
+                .events
+                .iter()
+                .enumerate()
+                .find(|(_, event)| {
+                    matches!(event, ProofPayloadEvent::Result { owner, .. } if owner == &merge.owner)
+                })
+                .map(|(index, _)| index)
+                .expect("merge owner result");
+            assert!(*merge_index < owner_result, "merge is recorded before its owner Result");
+        }
+        let final_result = payload
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                ProofPayloadEvent::InvocationEnd { result, .. } => Some(result),
+                _ => None,
+            })
+            .expect("final invocation result");
+        let ProofPayloadValue::Exact { terms, .. } = final_result else {
+            panic!("threshold residual should retain exact polynomial output")
+        };
+        assert!(terms.is_empty(), "the subtract merge cancels the final monomial");
         let owner_scope = |event: &ProofPayloadEvent| match event {
             ProofPayloadEvent::InvocationStart { root } |
             ProofPayloadEvent::InvocationEnd { root, .. } => Some(root.scope),

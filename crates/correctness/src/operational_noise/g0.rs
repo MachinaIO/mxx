@@ -240,14 +240,9 @@ pub(crate) struct RecordedTermRef {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) enum CoefficientMergeSource {
-    Value(RecordedTermRef),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct CoefficientMerge {
     pub owner: super::arena::ScopedExprId,
-    pub sources: Box<[CoefficientMergeSource]>,
+    pub sources: Box<[RecordedTermRef]>,
     pub output: super::monomial::MonomialId,
     pub signed_contribution: BigInt,
 }
@@ -1860,8 +1855,30 @@ impl FeasibilitySink for FeasibilityTrace {
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
         let in_frame = |event: EventIndex| event.0 >= frame.range.start.0 && event.0 < current.0;
         let mut source_coefficients = Vec::new();
-        for source in &observation.sources {
-            let CoefficientMergeSource::Value(reference) = source;
+        if observation.sources.len() != 2 ||
+            observation.sources[0].monomial != observation.output ||
+            observation.sources[1].monomial != observation.output
+        {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        for (input_position, reference) in observation.sources.iter().enumerate() {
+            let expected = self.events[frame.range.start.0 as usize..current.0 as usize]
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    NormalizerEvent::Predecessor {
+                        consumer,
+                        input_position: position,
+                        source_result,
+                        ..
+                    } if *consumer == observation.owner && *position == input_position as u32 => {
+                        Some(*source_result)
+                    }
+                    _ => None,
+                });
+            if expected != Some(reference.value_event) {
+                return Err(G0Error::RelationTraceInvariant);
+            }
             let (event, monomial) = (reference.value_event, reference.monomial);
             if !in_frame(event) {
                 return Err(G0Error::RelationTraceInvariant);
@@ -2125,16 +2142,24 @@ impl FeasibilitySink for FeasibilityTrace {
                     pending_bounds.insert(*owner);
                 }
                 NormalizerEvent::CoefficientMerge(observation) => {
-                    let Some((root, start, _, _, _, pending_merges)) = stack.last_mut() else {
+                    let Some((root, start, _, _, predecessors, pending_merges)) = stack.last_mut()
+                    else {
                         return Err(G0Error::RelationTraceInvariant);
                     };
                     if root.program() != observation.owner.program() {
                         return Err(G0Error::RelationTraceInvariant);
                     }
                     let mut coefficients = Vec::new();
-                    for source in &observation.sources {
-                        let CoefficientMergeSource::Value(reference) = source;
+                    for (input_position, reference) in observation.sources.iter().enumerate() {
                         let event = reference.value_event;
+                        let Some((_, predecessor_event)) =
+                            predecessors.get(&(observation.owner, input_position as u32))
+                        else {
+                            return Err(G0Error::RelationTraceInvariant);
+                        };
+                        if *predecessor_event != event {
+                            return Err(G0Error::RelationTraceInvariant);
+                        }
                         if event.0 < start.0 ||
                             event.0 >= current.0 ||
                             !matches!(

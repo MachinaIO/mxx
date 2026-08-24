@@ -20,8 +20,7 @@ use super::{
     },
     g0::{
         BoundAuthority, BoundProjection, BoundRule, BoundScale, BoundValueRef, CoefficientMerge,
-        CoefficientMergeSource, FeasibilitySink, MonomialFactorEvidence, NoFeasibility,
-        RecordedTermRef,
+        FeasibilitySink, MonomialFactorEvidence, NoFeasibility, RecordedTermRef,
     },
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
     program::{ArenaError, ProgramArena, ValueProgramId},
@@ -1200,14 +1199,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 .record_coefficient_merge(CoefficientMerge {
                     owner,
                     sources: Box::new([
-                        CoefficientMergeSource::Value(RecordedTermRef {
-                            value_event: left_event,
-                            monomial,
-                        }),
-                        CoefficientMergeSource::Value(RecordedTermRef {
-                            value_event: right_event,
-                            monomial,
-                        }),
+                        RecordedTermRef { value_event: left_event, monomial },
+                        RecordedTermRef { value_event: right_event, monomial },
                     ]),
                     output: monomial,
                     signed_contribution,
@@ -9686,13 +9679,9 @@ mod tests {
             let merge = merges[0];
             assert_eq!(merge.owner, semantic);
             assert_eq!(merge.sources.len(), 2);
-            let first_monomial = match &merge.sources[0] {
-                super::super::g0::CoefficientMergeSource::Value(reference) => reference.monomial,
-            };
+            let first_monomial = merge.sources[0].monomial;
             assert_eq!(merge.output, first_monomial);
-            assert!(merge.sources.iter().all(|source| {
-                matches!(source, super::super::g0::CoefficientMergeSource::Value(reference) if reference.monomial == merge.output)
-            }));
+            assert!(merge.sources.iter().all(|reference| reference.monomial == merge.output));
             assert_eq!(merge.signed_contribution, BigInt::from(if subtract { -1 } else { 1 }));
             let output = trace
                 .normalization_events()

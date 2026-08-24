@@ -8751,6 +8751,166 @@ mod tests {
     }
 
     #[test]
+    fn contextual_exact_zero_consumes_applied_with_oriented_product() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let modulus = BigUint::from(17_u8);
+        let input_type = ResolvedMatrixType::new(modulus.clone(), 1, 1, 1).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(modulus.clone(), 1, 3, 1).unwrap();
+        let gadget_type = ResolvedMatrixType::new(modulus, 1, 1, 3).unwrap();
+        let (gadget, decomposition, input) = gadget_product(
+            &mut expressions,
+            false,
+            3,
+            gadget_type.clone(),
+            decomposition_type.clone(),
+            input_type.clone(),
+            Some((2, false)),
+        );
+        let central =
+            matrix_source(&mut expressions, "zero-context-central", input_type.clone(), None);
+        let root = product(&mut expressions, &[gadget, central, decomposition]);
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        for (expression, bound) in [(gadget, 2), (decomposition, 3), (input, 4)] {
+            insert_matrix_bound(&mut facts, &expressions, expression, bound);
+        }
+        let mut metadata = MatrixMetadata::new(MatrixLayout::row_major(1, 1));
+        metadata.is_constant_polynomial = true;
+        let mut zero_facts = MatrixFacts::new(input_type.clone(), metadata);
+        zero_facts.coefficient_bound = NumericContract::Known(CoefficientBound::ExactZero);
+        facts.insert(&expressions, central, ValueFacts::Matrix(zero_facts)).unwrap();
+        let registry =
+            recomposition_registry(gadget_type, decomposition_type, input_type, false, 3);
+        let scope = monomials.scope();
+        let scoped_gadget = programs.scoped(&expressions, scope, gadget).unwrap();
+        let scoped_decomposition = programs.scoped(&expressions, scope, decomposition).unwrap();
+        let scoped_input = programs.scoped(&expressions, scope, input).unwrap();
+        let scoped_central = programs.scoped(&expressions, scope, central).unwrap();
+        let input_monomial =
+            monomials.intern(&expressions, &programs, &[], &[scoped_input]).unwrap();
+        let central_monomial =
+            monomials.intern(&expressions, &programs, &[], &[scoped_central]).unwrap();
+        let source_monomial = monomials
+            .intern(
+                &expressions,
+                &programs,
+                &[scoped_central],
+                &[scoped_gadget, scoped_decomposition],
+            )
+            .unwrap();
+        let input_nf = Arc::new(PolynomialNF {
+            exact_terms: BTreeMap::from([(input_monomial, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::finite(BoundExpression::new(BigUint::from(3_u8))),
+        });
+        let coefficient = BigInt::from(1_u8);
+        let ordinary = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                    .unwrap()
+                    .with_gadget_recompositions(&registry);
+            normalizer.insert_gadget_hold(input, input_nf.clone());
+            let mut evidence = None;
+            let output = normalizer
+                .rewrite_gadget_decomposition(
+                    semantic,
+                    source_monomial,
+                    &coefficient,
+                    &mut evidence,
+                )
+                .unwrap()
+                .expect("zero contextual pair reaches splice");
+            (output, normalizer.counters())
+        };
+        assert_eq!(ordinary.0.bounded_summary, BoundedSummary::zero());
+
+        let central_nf = Arc::new(PolynomialNF {
+            exact_terms: BTreeMap::from([(central_monomial, BigInt::from(1_u8))]),
+            bounded_summary: BoundedSummary::zero(),
+        });
+        let mut trace = FeasibilityTrace::default();
+        trace.record_invocation_start(semantic).unwrap();
+        for (scoped, exact_nf, bound) in [
+            (
+                scoped_input,
+                input_nf.clone(),
+                NumericContract::Known(CoefficientBound::finite(3_u64)),
+            ),
+            (scoped_central, central_nf, NumericContract::Known(CoefficientBound::ExactZero)),
+        ] {
+            let value = AnalyzedValue {
+                semantic: scoped,
+                exact_nf: Some(exact_nf),
+                coefficient_bound: bound,
+            };
+            trace.record_normalization_result(scoped, &value).unwrap();
+        }
+        let (enabled, enabled_counters, evidence) = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .with_gadget_recompositions(&registry);
+            normalizer.insert_gadget_hold(input, input_nf.clone());
+            let mut evidence = None;
+            let output = normalizer
+                .rewrite_gadget_decomposition(
+                    semantic,
+                    source_monomial,
+                    &coefficient,
+                    &mut evidence,
+                )
+                .unwrap()
+                .expect("zero contextual pair reaches splice");
+            (output, normalizer.counters(), evidence)
+        };
+        assert_eq!(enabled.bounded_summary, BoundedSummary::zero());
+        assert_eq!(ordinary.0.exact_terms, enabled.exact_terms);
+        assert_eq!(ordinary.0.bounded_summary, enabled.bounded_summary);
+        assert_eq!(ordinary.1, enabled_counters);
+        assert!(evidence.is_none());
+        let applied = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| {
+                matches!(event, super::super::g0::NormalizerEvent::AppliedRelation(_))
+                    .then_some(super::super::g0::EventIndex(index as u64))
+            })
+            .expect("applied gadget relation");
+        let product = trace
+            .normalization_events()
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                super::super::g0::NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Product { left, right, .. },
+                } if *owner == semantic => {
+                    Some((super::super::g0::EventIndex(index as u64), left.clone(), right.clone()))
+                }
+                _ => None,
+            })
+            .expect("zero context product consumes relation");
+        assert!(matches!(product.1, BoundValueRef::Transfer(_)));
+        assert!(matches!(product.2, BoundValueRef::Transfer(event) if event == applied));
+        let root_value = AnalyzedValue {
+            semantic,
+            exact_nf: Some(Arc::new(enabled.clone())),
+            coefficient_bound: enabled.bounded_summary.coefficient_bound(),
+        };
+        trace.record_normalization_result(semantic, &root_value).unwrap();
+        trace.record_invocation_end(semantic, &root_value, &enabled_counters).unwrap();
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        trace
+            .validate_normalization_observations_with_state(&monomials, &NormalizationCache::new())
+            .unwrap();
+    }
+
+    #[test]
     fn gadget_recomposition_requires_order_and_typed_gadget_source() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();

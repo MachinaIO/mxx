@@ -9084,6 +9084,50 @@ mod tests {
         ));
         assert!(matches!(products[1].2, BoundValueRef::Transfer(_)));
         assert!(matches!(evidence, BoundValueRef::Transfer(event) if event == products[1].0));
+        let relation_merge = trace
+            .normalization_events()
+            .iter()
+            .find_map(|event| match event {
+                NormalizerEvent::CoefficientMerge(observation)
+                    if matches!(
+                        &observation.source,
+                        CoefficientMergeSource::Relation { application, .. }
+                            if *application == applied_event
+                    ) =>
+                {
+                    Some(observation)
+                }
+                _ => None,
+            })
+            .expect("contextual gadget relation merge");
+        let CoefficientMergeSource::Relation { source_term: relation_source_term, .. } =
+            &relation_merge.source
+        else {
+            unreachable!("filtered relation merge")
+        };
+        let relation_source_term = *relation_source_term;
+        let relation_output = relation_merge.output;
+        assert_eq!(relation_source_term, input_monomial);
+        assert_ne!(relation_output, relation_source_term);
+        let retained = trace.retained_monomial_roots().unwrap();
+        assert!(retained.contains(&relation_source_term));
+        assert!(retained.contains(&relation_output));
+        {
+            let mut gc = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            gc.protected_monomial_prefix = 0;
+            gc.normalization_depth = 1;
+            gc.monomial_gc_allocation_threshold_bytes = 0;
+            gc.sweep_monomials_at_node_commit().unwrap();
+        }
+        assert!(monomials.descriptor(relation_source_term).is_ok());
+        assert!(monomials.descriptor(relation_output).is_ok());
         let root_value = AnalyzedValue {
             semantic,
             exact_nf: Some(Arc::new(enabled_output.clone())),

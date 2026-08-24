@@ -2277,7 +2277,7 @@ impl FeasibilitySink for FeasibilityTrace {
                             {
                                 return Err(G0Error::RelationTraceInvariant);
                             }
-                            coefficients[0].clone()
+                            Some(coefficients[0].clone())
                         }
                         CoefficientMergeSource::Relation { application, source_term } => {
                             if application.0 < start.0 || application.0 >= current.0 {
@@ -2329,15 +2329,17 @@ impl FeasibilitySink for FeasibilityTrace {
                             {
                                 return Err(G0Error::RelationTraceInvariant);
                             }
-                            BigInt::from(0_u8)
+                            None
                         }
                     };
-                    let entry = pending_merges
-                        .entry(observation.owner)
-                        .or_default()
-                        .entry(observation.output)
-                        .or_insert_with(|| (BigInt::from(0_u8), pending_left));
-                    entry.0 += &observation.signed_contribution;
+                    if let Some(pending_left) = pending_left {
+                        let entry = pending_merges
+                            .entry(observation.owner)
+                            .or_default()
+                            .entry(observation.output)
+                            .or_insert_with(|| (BigInt::from(0_u8), pending_left));
+                        entry.0 += &observation.signed_contribution;
+                    }
                 }
             }
         }

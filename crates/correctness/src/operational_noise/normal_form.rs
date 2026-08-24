@@ -4364,19 +4364,10 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             let Some(input) = self.authorized_gadget_pair_input(gadget, decomposition)? else {
                 continue;
             };
-            let Some((mut normal_form, left, suffix)) = self.splice_gadget_decomposition(
-                &central_factors,
-                &ordered_factors,
-                index,
-                input,
-                coefficient,
-            )?
-            else {
-                return Ok(None);
-            };
+            let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
             let applied_event = if S::ENABLED {
                 let input_result = self.relation_input_result(input)?;
-                Some(self.observe_applied_relation(super::g0::AppliedRelation {
+                let applied_event = self.observe_applied_relation(super::g0::AppliedRelation {
                     owner,
                     source_monomial: monomial,
                     outer_coefficient: coefficient.clone(),
@@ -4396,9 +4387,22 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         input,
                         input_result,
                     },
-                })?)
+                })?;
+                Some(applied_event)
             } else {
                 None
+            };
+            let Some((mut normal_form, left, suffix)) = self.splice_gadget_decomposition(
+                &central_factors,
+                &ordered_factors,
+                index,
+                coefficient,
+                &input_nf,
+                owner,
+                applied_event,
+            )?
+            else {
+                return Ok(None);
             };
             let relation_bound = normal_form.bounded_summary.coefficient_bound();
             let nonzero_summary = match &relation_bound {
@@ -4443,14 +4447,15 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         central_factors: &[ScopedExprId],
         ordered_factors: &[ScopedExprId],
         index: usize,
-        input: ExprId,
         coefficient: &BigInt,
+        input_nf: &PolynomialNF,
+        owner: ScopedExprId,
+        application: Option<super::g0::EventIndex>,
     ) -> Result<Option<(PolynomialNF, Option<MonomialId>, Option<MonomialId>)>, NormalizeError>
     {
         // `D(A)` itself is an atom in the child NF, but the identity exposes the already
         // normalized polynomial NF of `A`, not the raw input expression. The use-count hold
         // installed during traversal keeps this memo entry alive until this splice.
-        let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
         let left = if central_factors.is_empty() && index == 0 {
             None
         } else {
@@ -4488,7 +4493,19 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 &input_monomials,
                 suffix,
             )?;
-            for ((_, input_coefficient), replacement) in batch.into_iter().zip(replacements) {
+            for ((input_monomial, input_coefficient), replacement) in
+                batch.into_iter().zip(replacements)
+            {
+                let signed_contribution = coefficient * input_coefficient;
+                if S::ENABLED && !signed_contribution.is_zero() {
+                    self.observe_relation_merge(
+                        owner,
+                        application.ok_or(super::g0::G0Error::RelationTraceInvariant)?,
+                        *input_monomial,
+                        replacement,
+                        signed_contribution,
+                    )?;
+                }
                 merge_term(&mut terms, replacement, input_coefficient.clone());
             }
         }
@@ -7957,6 +7974,25 @@ mod tests {
                 .count(),
             1
         );
+        let relation_merges = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                super::super::g0::NormalizerEvent::CoefficientMerge(observation) => {
+                    Some(observation)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(relation_merges.len(), 1);
+        assert!(matches!(
+            &relation_merges[0].source,
+            super::super::g0::CoefficientMergeSource::Relation { application, source_term }
+                if *application == applied_event &&
+                    *source_term == input_monomial &&
+                    relation_merges[0].output == input_monomial &&
+                    relation_merges[0].signed_contribution == coefficient
+        ));
         assert!(matches!(
             trace.normalization_events().get(applied_event.0 as usize),
             Some(super::super::g0::NormalizerEvent::AppliedRelation(relation))

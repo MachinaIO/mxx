@@ -1914,6 +1914,90 @@ pub(crate) enum CertificateProjectionError {
     ReportMismatch { target_id: String, detail: String },
     #[error("proof payload projection failed: {detail}")]
     ProofPayload { detail: String },
+    #[error("proof payload invariant failed: {context:?}")]
+    ProofInvariant { context: Box<ProofInvariantContext> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProofEvidenceKind {
+    Universal,
+    Gadget,
+    OperatorMerge,
+    SurvivorFold,
+    EventReference,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProofInvariantMismatch {
+    EventOrder {
+        referenced: u64,
+    },
+    EventKind {
+        referenced: u64,
+        expected: &'static str,
+    },
+    MissingExactNormalForm {
+        referenced: u64,
+    },
+    MissingTerm {
+        referenced: u64,
+        monomial: super::monomial::MonomialId,
+    },
+    Owner {
+        expected: super::arena::ScopedExprId,
+        actual: Option<super::arena::ScopedExprId>,
+    },
+    Coefficient {
+        expected: BigInt,
+        actual: BigInt,
+    },
+    SpliceRange {
+        start: u64,
+        end_exclusive: u64,
+        ordered_len: u64,
+    },
+    SpliceOutput {
+        expected_central: Vec<ProofPayloadOwner>,
+        expected_ordered: Vec<ProofPayloadOwner>,
+        actual_central: Vec<ProofPayloadOwner>,
+        actual_ordered: Vec<ProofPayloadOwner>,
+    },
+    RhsReplay,
+    MonomialRole {
+        role: &'static str,
+        expected: ProofPayloadMonomial,
+        actual: ProofPayloadMonomial,
+    },
+    SurvivorMagnitude {
+        expected: BigUint,
+        actual: BigUint,
+    },
+    Operator {
+        actual: Box<ValueOperator>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProofInvariantContext {
+    pub event: u64,
+    pub owner: Option<super::arena::ScopedExprId>,
+    pub evidence: ProofEvidenceKind,
+    pub mismatch: ProofInvariantMismatch,
+}
+
+fn proof_invariant(
+    event: usize,
+    owner: Option<super::arena::ScopedExprId>,
+    evidence: ProofEvidenceKind,
+    mismatch: ProofInvariantMismatch,
+) -> CertificateProjectionError {
+    CertificateProjectionError::ProofInvariant {
+        context: Box::new(ProofInvariantContext { event: event as u64, owner, evidence, mismatch }),
+    }
+}
+
+fn payload_projection<T>(result: Result<T, G0Error>) -> Result<T, CertificateProjectionError> {
+    result.map_err(proof_payload_error)
 }
 
 /// Re-runs target resolution and production lowering only when certificate emission is explicitly
@@ -1951,7 +2035,7 @@ pub(crate) fn derive_proof_payload_projection(
             monomial_arenas.insert(arena.token(), arena);
         }
     }
-    for event in &run.trace.events {
+    for (event_index, event) in run.trace.events.iter().enumerate() {
         let scope = match event {
             NormalizerEvent::InvocationStart { root } |
             NormalizerEvent::Result { owner: root, .. } |
@@ -1965,7 +2049,17 @@ pub(crate) fn derive_proof_payload_projection(
             NormalizerEvent::SurvivorFold(observation) => {
                 match run.trace.events.get(observation.bound.0 as usize) {
                     Some(NormalizerEvent::BoundTransfer { owner, .. }) => owner.program(),
-                    _ => return Err(proof_payload_error(G0Error::RelationTraceInvariant)),
+                    _ => {
+                        return Err(proof_invariant(
+                            event_index,
+                            None,
+                            ProofEvidenceKind::SurvivorFold,
+                            ProofInvariantMismatch::EventKind {
+                                referenced: observation.bound.0,
+                                expected: "BoundTransfer",
+                            },
+                        ));
+                    }
                 }
             }
             // PreFoldPolynomial has no owner field; its monomial arenas are already covered by
@@ -2742,7 +2836,7 @@ impl<'a> ProofPayloadProjector<'a> {
         let mut current_retained_logical_items = retained_support_items;
         let mut generator_peak_retained_logical_items = retained_support_items;
         for (index, event) in trace.events.iter().enumerate() {
-            let projected = self.event(trace, index, event).map_err(proof_payload_error)?;
+            let projected = self.event(trace, index, event)?;
             current_retained_logical_items = checked_add(
                 current_retained_logical_items,
                 checked_add(1, projected.logical_items().map_err(generator_retention_error)?)
@@ -2887,9 +2981,9 @@ impl<'a> ProofPayloadProjector<'a> {
         &self,
         observation: &super::g0::PreFoldPolynomial,
         current: usize,
-    ) -> Result<ProofPayloadPreFoldPolynomial, G0Error> {
+    ) -> Result<ProofPayloadPreFoldPolynomial, CertificateProjectionError> {
         Ok(ProofPayloadPreFoldPolynomial {
-            terms: self.terms(&observation.polynomial)?,
+            terms: payload_projection(self.terms(&observation.polynomial))?,
             summary: observation.polynomial.bounded_summary.clone(),
             summary_evidence: observation
                 .summary_evidence
@@ -2914,7 +3008,7 @@ impl<'a> ProofPayloadProjector<'a> {
         &self,
         value: &BoundValueRef,
         current: usize,
-    ) -> Result<ProofPayloadValueRef, G0Error> {
+    ) -> Result<ProofPayloadValueRef, CertificateProjectionError> {
         let event = match value {
             BoundValueRef::Predecessor { input_position, projection } => {
                 return Ok(ProofPayloadValueRef::Predecessor {
@@ -2923,14 +3017,14 @@ impl<'a> ProofPayloadProjector<'a> {
                 });
             }
             BoundValueRef::Result { event, projection } => {
-                self.prior_event(*event, current)?;
+                self.prior_event(*event, current, None, ProofEvidenceKind::EventReference)?;
                 return Ok(ProofPayloadValueRef::Result {
                     event: event.0,
                     projection: projection.clone(),
                 });
             }
             BoundValueRef::Transfer(event) => {
-                self.prior_event(*event, current)?;
+                self.prior_event(*event, current, None, ProofEvidenceKind::EventReference)?;
                 *event
             }
         };
@@ -2942,24 +3036,57 @@ impl<'a> ProofPayloadProjector<'a> {
         trace: &FeasibilityTrace,
         reference: super::g0::RecordedTermRef,
         current: usize,
-    ) -> Result<ProofPayloadTermRef, G0Error> {
-        self.prior_event(reference.value_event, current)?;
+        owner: super::arena::ScopedExprId,
+        evidence: ProofEvidenceKind,
+    ) -> Result<ProofPayloadTermRef, CertificateProjectionError> {
+        self.prior_event(reference.value_event, current, Some(owner), evidence)?;
         let value = match trace.events.get(reference.value_event.0 as usize) {
             Some(NormalizerEvent::Result { value, .. }) |
             Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
-            _ => return Err(G0Error::RelationTraceInvariant),
+            _ => {
+                return Err(proof_invariant(
+                    current,
+                    Some(owner),
+                    evidence,
+                    ProofInvariantMismatch::EventKind {
+                        referenced: reference.value_event.0,
+                        expected: "Result or InvocationEnd",
+                    },
+                ));
+            }
         };
-        let normal_form = value.exact_nf.as_ref().ok_or(G0Error::RelationTraceInvariant)?;
+        let normal_form = value.exact_nf.as_ref().ok_or_else(|| {
+            proof_invariant(
+                current,
+                Some(owner),
+                evidence,
+                ProofInvariantMismatch::MissingExactNormalForm {
+                    referenced: reference.value_event.0,
+                },
+            )
+        })?;
         let mut terms = normal_form
             .exact_terms
             .keys()
-            .filter_map(|monomial| self.monomial(*monomial).ok().map(|term| (*monomial, term)))
-            .collect::<Vec<_>>();
+            .map(|monomial| {
+                payload_projection(self.monomial(*monomial)).map(|term| (*monomial, term))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         terms.sort_by(|left, right| left.1.cmp(&right.1));
         let term_ordinal = terms
             .iter()
             .position(|(monomial, _)| *monomial == reference.monomial)
-            .ok_or(G0Error::RelationTraceInvariant)? as u64;
+            .ok_or_else(|| {
+                proof_invariant(
+                    current,
+                    Some(owner),
+                    evidence,
+                    ProofInvariantMismatch::MissingTerm {
+                        referenced: reference.value_event.0,
+                        monomial: reference.monomial,
+                    },
+                )
+            })? as u64;
         Ok(ProofPayloadTermRef { value_event: reference.value_event.0, term_ordinal })
     }
 
@@ -2968,15 +3095,46 @@ impl<'a> ProofPayloadProjector<'a> {
         applied: &super::g0::AppliedRelation,
         source_term: super::monomial::MonomialId,
         output: &ProofPayloadMonomial,
-    ) -> Result<(), G0Error> {
-        let source = self.monomial(applied.source_monomial)?;
-        let replacement = self.monomial(source_term)?;
-        let start =
-            usize::try_from(applied.ordered_start).map_err(|_| G0Error::RelationTraceInvariant)?;
-        let end = usize::try_from(applied.ordered_end_exclusive)
-            .map_err(|_| G0Error::RelationTraceInvariant)?;
+        current: usize,
+        evidence: ProofEvidenceKind,
+    ) -> Result<(), CertificateProjectionError> {
+        let source = payload_projection(self.monomial(applied.source_monomial))?;
+        let replacement = payload_projection(self.monomial(source_term))?;
+        let start = usize::try_from(applied.ordered_start).map_err(|_| {
+            proof_invariant(
+                current,
+                Some(applied.owner),
+                evidence,
+                ProofInvariantMismatch::SpliceRange {
+                    start: applied.ordered_start as u64,
+                    end_exclusive: applied.ordered_end_exclusive as u64,
+                    ordered_len: source.ordered_factors.len() as u64,
+                },
+            )
+        })?;
+        let end = usize::try_from(applied.ordered_end_exclusive).map_err(|_| {
+            proof_invariant(
+                current,
+                Some(applied.owner),
+                evidence,
+                ProofInvariantMismatch::SpliceRange {
+                    start: applied.ordered_start as u64,
+                    end_exclusive: applied.ordered_end_exclusive as u64,
+                    ordered_len: source.ordered_factors.len() as u64,
+                },
+            )
+        })?;
         if start > end || end > source.ordered_factors.len() {
-            return Err(G0Error::RelationTraceInvariant);
+            return Err(proof_invariant(
+                current,
+                Some(applied.owner),
+                evidence,
+                ProofInvariantMismatch::SpliceRange {
+                    start: applied.ordered_start as u64,
+                    end_exclusive: applied.ordered_end_exclusive as u64,
+                    ordered_len: source.ordered_factors.len() as u64,
+                },
+            ));
         }
         let mut central_factors = source.central_factors;
         central_factors.extend(replacement.central_factors);
@@ -2988,7 +3146,17 @@ impl<'a> ProofPayloadProjector<'a> {
         ordered_factors.extend(replacement.ordered_factors);
         ordered_factors.extend_from_slice(&source.ordered_factors[end..]);
         if output.central_factors != central_factors || output.ordered_factors != ordered_factors {
-            return Err(G0Error::RelationTraceInvariant);
+            return Err(proof_invariant(
+                current,
+                Some(applied.owner),
+                evidence,
+                ProofInvariantMismatch::SpliceOutput {
+                    expected_central: central_factors,
+                    expected_ordered: ordered_factors,
+                    actual_central: output.central_factors.clone(),
+                    actual_ordered: output.ordered_factors.clone(),
+                },
+            ));
         }
         Ok(())
     }
@@ -2998,11 +3166,17 @@ impl<'a> ProofPayloadProjector<'a> {
         trace: &FeasibilityTrace,
         observation: &super::g0::CoefficientMerge,
         current: usize,
-    ) -> Result<ProofPayloadCoefficientMerge, G0Error> {
-        let output = self.monomial(observation.output)?;
+    ) -> Result<ProofPayloadCoefficientMerge, CertificateProjectionError> {
+        let output = payload_projection(self.monomial(observation.output))?;
         let source = match &observation.source {
             super::g0::CoefficientMergeSource::Operator { inputs } => {
-                let node = self.job.expressions().node(observation.owner.expression())?;
+                let evidence = ProofEvidenceKind::OperatorMerge;
+                let node = payload_projection(
+                    self.job
+                        .expressions()
+                        .node(observation.owner.expression())
+                        .map_err(G0Error::from),
+                )?;
                 let operation = match &node.operator {
                     ValueOperator::Matrix(
                         operation @ (MatrixOperation::Add | MatrixOperation::Subtract),
@@ -3010,7 +3184,16 @@ impl<'a> ProofPayloadProjector<'a> {
                     ValueOperator::Matrix(operation @ MatrixOperation::Multiply) => {
                         operation.clone()
                     }
-                    _ => return Err(G0Error::RelationTraceInvariant),
+                    _ => {
+                        return Err(proof_invariant(
+                            current,
+                            Some(observation.owner),
+                            evidence,
+                            ProofInvariantMismatch::Operator {
+                                actual: Box::new(node.operator.clone()),
+                            },
+                        ));
+                    }
                 };
                 let right = match trace.events.get(inputs[1].value_event.0 as usize) {
                     Some(NormalizerEvent::Result { value, .. }) |
@@ -3020,7 +3203,17 @@ impl<'a> ProofPayloadProjector<'a> {
                         .and_then(|normal_form| normal_form.exact_terms.get(&inputs[1].monomial)),
                     _ => None,
                 }
-                .ok_or(G0Error::RelationTraceInvariant)?;
+                .ok_or_else(|| {
+                    proof_invariant(
+                        current,
+                        Some(observation.owner),
+                        evidence,
+                        ProofInvariantMismatch::MissingTerm {
+                            referenced: inputs[1].value_event.0,
+                            monomial: inputs[1].monomial,
+                        },
+                    )
+                })?;
                 let expected = match operation {
                     MatrixOperation::Add => right.clone(),
                     MatrixOperation::Subtract => -right.clone(),
@@ -3034,27 +3227,65 @@ impl<'a> ProofPayloadProjector<'a> {
                             }
                             _ => None,
                         }
-                        .ok_or(G0Error::RelationTraceInvariant)?;
+                        .ok_or_else(|| {
+                            proof_invariant(
+                                current,
+                                Some(observation.owner),
+                                evidence,
+                                ProofInvariantMismatch::MissingTerm {
+                                    referenced: inputs[0].value_event.0,
+                                    monomial: inputs[0].monomial,
+                                },
+                            )
+                        })?;
                         left * right
                     }
                     _ => unreachable!("operator classification is exhaustive"),
                 };
                 if observation.signed_contribution != expected {
-                    return Err(G0Error::RelationTraceInvariant);
+                    return Err(proof_invariant(
+                        current,
+                        Some(observation.owner),
+                        evidence,
+                        ProofInvariantMismatch::Coefficient {
+                            expected,
+                            actual: observation.signed_contribution.clone(),
+                        },
+                    ));
                 }
                 match operation {
                     MatrixOperation::Add | MatrixOperation::Subtract => {
-                        if self.monomial(inputs[0].monomial)? != output ||
-                            self.monomial(inputs[1].monomial)? != output
-                        {
-                            return Err(G0Error::RelationTraceInvariant);
+                        for (role, input) in [("left", inputs[0]), ("right", inputs[1])] {
+                            let actual = payload_projection(self.monomial(input.monomial))?;
+                            if actual != output {
+                                return Err(proof_invariant(
+                                    current,
+                                    Some(observation.owner),
+                                    evidence,
+                                    ProofInvariantMismatch::MonomialRole {
+                                        role,
+                                        expected: output.clone(),
+                                        actual,
+                                    },
+                                ));
+                            }
                         }
                     }
                     MatrixOperation::Multiply => {
-                        let left = self.monomial(inputs[0].monomial)?;
-                        let right = self.monomial(inputs[1].monomial)?;
-                        let left_type = self.job.expressions().value_type(node.inputs[0])?;
-                        let right_type = self.job.expressions().value_type(node.inputs[1])?;
+                        let left = payload_projection(self.monomial(inputs[0].monomial))?;
+                        let right = payload_projection(self.monomial(inputs[1].monomial))?;
+                        let left_type = payload_projection(
+                            self.job
+                                .expressions()
+                                .value_type(node.inputs[0])
+                                .map_err(G0Error::from),
+                        )?;
+                        let right_type = payload_projection(
+                            self.job
+                                .expressions()
+                                .value_type(node.inputs[1])
+                                .map_err(G0Error::from),
+                        )?;
                         let left_scalar = matches!(
                             left_type,
                             ResolvedValueType::Matrix(matrix) if matrix.rows == 1 && matrix.columns == 1
@@ -3086,34 +3317,89 @@ impl<'a> ProofPayloadProjector<'a> {
                         if output.central_factors != central_factors ||
                             output.ordered_factors != ordered_factors
                         {
-                            return Err(G0Error::RelationTraceInvariant);
+                            return Err(proof_invariant(
+                                current,
+                                Some(observation.owner),
+                                evidence,
+                                ProofInvariantMismatch::SpliceOutput {
+                                    expected_central: central_factors,
+                                    expected_ordered: ordered_factors,
+                                    actual_central: output.central_factors.clone(),
+                                    actual_ordered: output.ordered_factors.clone(),
+                                },
+                            ));
                         }
                     }
                     _ => unreachable!("operator classification is exhaustive"),
                 }
                 ProofPayloadCoefficientMergeSource::Operator {
                     inputs: [
-                        self.term_ref(trace, inputs[0], current)?,
-                        self.term_ref(trace, inputs[1], current)?,
+                        self.term_ref(trace, inputs[0], current, observation.owner, evidence)?,
+                        self.term_ref(trace, inputs[1], current, observation.owner, evidence)?,
                     ],
                 }
             }
             super::g0::CoefficientMergeSource::Relation { application, source_term } => {
-                self.prior_event(*application, current)?;
+                let evidence = match trace.events.get(application.0 as usize) {
+                    Some(NormalizerEvent::AppliedRelation(super::g0::AppliedRelation {
+                        rule: AppliedRelationRule::Universal { .. },
+                        ..
+                    })) => ProofEvidenceKind::Universal,
+                    Some(NormalizerEvent::AppliedRelation(super::g0::AppliedRelation {
+                        rule: AppliedRelationRule::Gadget { .. },
+                        ..
+                    })) => ProofEvidenceKind::Gadget,
+                    _ => ProofEvidenceKind::Universal,
+                };
+                self.prior_event(*application, current, Some(observation.owner), evidence)?;
                 let applied = match trace.events.get(application.0 as usize) {
                     Some(NormalizerEvent::AppliedRelation(applied))
                         if applied.owner == observation.owner =>
                     {
                         applied
                     }
-                    _ => return Err(G0Error::RelationTraceInvariant),
+                    Some(NormalizerEvent::AppliedRelation(applied)) => {
+                        return Err(proof_invariant(
+                            current,
+                            Some(observation.owner),
+                            evidence,
+                            ProofInvariantMismatch::Owner {
+                                expected: observation.owner,
+                                actual: Some(applied.owner),
+                            },
+                        ));
+                    }
+                    _ => {
+                        return Err(proof_invariant(
+                            current,
+                            Some(observation.owner),
+                            evidence,
+                            ProofInvariantMismatch::EventKind {
+                                referenced: application.0,
+                                expected: "AppliedRelation",
+                            },
+                        ));
+                    }
                 };
                 let source_event = match &applied.rule {
                     super::g0::AppliedRelationRule::Universal { key, source, rhs, .. } => {
-                        self.rhs_event(key, *source, *rhs, current)?.1
+                        self.rhs_event(
+                            key,
+                            *source,
+                            *rhs,
+                            current,
+                            applied.owner,
+                            ProofEvidenceKind::Universal,
+                        )?
+                        .1
                     }
                     super::g0::AppliedRelationRule::Gadget { input_result, .. } => {
-                        self.prior_event(*input_result, current)?;
+                        self.prior_event(
+                            *input_result,
+                            current,
+                            Some(applied.owner),
+                            ProofEvidenceKind::Gadget,
+                        )?;
                         input_result.0
                     }
                 };
@@ -3121,18 +3407,49 @@ impl<'a> ProofPayloadProjector<'a> {
                 let source_value = match trace.events.get(source_event as usize) {
                     Some(NormalizerEvent::Result { value, .. }) |
                     Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
-                    _ => return Err(G0Error::RelationTraceInvariant),
+                    _ => {
+                        return Err(proof_invariant(
+                            current,
+                            Some(observation.owner),
+                            evidence,
+                            ProofInvariantMismatch::EventKind {
+                                referenced: source_event,
+                                expected: "Result or InvocationEnd",
+                            },
+                        ));
+                    }
                 };
-                let source_nf =
-                    source_value.exact_nf.as_ref().ok_or(G0Error::RelationTraceInvariant)?;
-                let source_coefficient = source_nf
-                    .exact_terms
-                    .get(source_term)
-                    .ok_or(G0Error::RelationTraceInvariant)?;
-                if &applied.outer_coefficient * source_coefficient !=
-                    observation.signed_contribution
-                {
-                    return Err(G0Error::RelationTraceInvariant);
+                let source_nf = source_value.exact_nf.as_ref().ok_or_else(|| {
+                    proof_invariant(
+                        current,
+                        Some(observation.owner),
+                        evidence,
+                        ProofInvariantMismatch::MissingExactNormalForm { referenced: source_event },
+                    )
+                })?;
+                let source_coefficient =
+                    source_nf.exact_terms.get(source_term).ok_or_else(|| {
+                        proof_invariant(
+                            current,
+                            Some(observation.owner),
+                            evidence,
+                            ProofInvariantMismatch::MissingTerm {
+                                referenced: source_event,
+                                monomial: *source_term,
+                            },
+                        )
+                    })?;
+                let expected_coefficient = &applied.outer_coefficient * source_coefficient;
+                if expected_coefficient != observation.signed_contribution {
+                    return Err(proof_invariant(
+                        current,
+                        Some(observation.owner),
+                        evidence,
+                        ProofInvariantMismatch::Coefficient {
+                            expected: expected_coefficient,
+                            actual: observation.signed_contribution.clone(),
+                        },
+                    ));
                 }
                 let source_ordinal = self
                     .term_ref(
@@ -3142,9 +3459,11 @@ impl<'a> ProofPayloadProjector<'a> {
                             monomial: *source_term,
                         },
                         current,
+                        observation.owner,
+                        evidence,
                     )?
                     .term_ordinal;
-                self.validate_relation_output(applied, *source_term, &output)?;
+                self.validate_relation_output(applied, *source_term, &output, current, evidence)?;
                 ProofPayloadCoefficientMergeSource::Relation {
                     application: application.0,
                     source_term_ordinal: source_ordinal,
@@ -3152,25 +3471,40 @@ impl<'a> ProofPayloadProjector<'a> {
             }
         };
         Ok(ProofPayloadCoefficientMerge {
-            owner: self.owner(observation.owner)?,
+            owner: payload_projection(self.owner(observation.owner))?,
             source,
             output,
             signed_contribution: observation.signed_contribution.clone(),
         })
     }
 
-    fn prior_event(&self, event: super::g0::EventIndex, current: usize) -> Result<(), G0Error> {
+    fn prior_event(
+        &self,
+        event: super::g0::EventIndex,
+        current: usize,
+        owner: Option<super::arena::ScopedExprId>,
+        evidence: ProofEvidenceKind,
+    ) -> Result<(), CertificateProjectionError> {
         if event.0 as usize >= current {
-            return Err(G0Error::RelationTraceInvariant);
+            return Err(proof_invariant(
+                current,
+                owner,
+                evidence,
+                ProofInvariantMismatch::EventOrder { referenced: event.0 },
+            ));
         }
         Ok(())
     }
 
-    fn rule(&self, rule: &BoundRule, current: usize) -> Result<ProofPayloadRule, G0Error> {
+    fn rule(
+        &self,
+        rule: &BoundRule,
+        current: usize,
+    ) -> Result<ProofPayloadRule, CertificateProjectionError> {
         let value = |value: &BoundValueRef| self.value_ref(value, current);
         Ok(match rule {
             BoundRule::Authority(authority) => {
-                ProofPayloadRule::Authority(self.authority(authority)?)
+                ProofPayloadRule::Authority(payload_projection(self.authority(authority))?)
             }
             BoundRule::Identity { input } => ProofPayloadRule::Identity { input: value(input)? },
             BoundRule::Sum { inputs } => ProofPayloadRule::Sum {
@@ -3189,7 +3523,7 @@ impl<'a> ProofPayloadProjector<'a> {
                 },
             },
             BoundRule::MonomialProduct { monomial, factors } => ProofPayloadRule::MonomialProduct {
-                monomial: self.monomial(*monomial)?,
+                monomial: payload_projection(self.monomial(*monomial))?,
                 factors: factors
                     .iter()
                     .map(|factor| self.factor(factor, current))
@@ -3221,7 +3555,7 @@ impl<'a> ProofPayloadProjector<'a> {
         &self,
         factor: &MonomialFactorEvidence,
         current: usize,
-    ) -> Result<ProofPayloadFactorEvidence, G0Error> {
+    ) -> Result<ProofPayloadFactorEvidence, CertificateProjectionError> {
         Ok(ProofPayloadFactorEvidence {
             bound: self.value_ref(&factor.bound, current)?,
             is_constant_polynomial: factor.is_constant_polynomial,
@@ -3233,23 +3567,31 @@ impl<'a> ProofPayloadProjector<'a> {
         &self,
         rule: &AppliedRelationRule,
         current: usize,
-    ) -> Result<ProofPayloadRelationRule, G0Error> {
+        owner: super::arena::ScopedExprId,
+    ) -> Result<ProofPayloadRelationRule, CertificateProjectionError> {
         Ok(match rule {
             AppliedRelationRule::Universal { key, source, lhs, rhs } => {
-                let (computed, rhs_result) = self.rhs_event(key, *source, *rhs, current)?;
+                let (computed, rhs_result) = self.rhs_event(
+                    key,
+                    *source,
+                    *rhs,
+                    current,
+                    owner,
+                    ProofEvidenceKind::Universal,
+                )?;
                 ProofPayloadRelationRule::Universal {
                     computed,
-                    lhs: self.monomial(lhs.monomial)?,
+                    lhs: payload_projection(self.monomial(lhs.monomial))?,
                     lhs_layout: lhs.layout.clone(),
                     rhs_result,
                 }
             }
             AppliedRelationRule::Gadget { gadget, decomposition, input, input_result } => {
-                self.prior_event(*input_result, current)?;
+                self.prior_event(*input_result, current, Some(*gadget), ProofEvidenceKind::Gadget)?;
                 ProofPayloadRelationRule::Gadget {
-                    gadget: self.owner(*gadget)?,
-                    decomposition: self.owner(*decomposition)?,
-                    input: self.expression(*input)?,
+                    gadget: payload_projection(self.owner(*gadget))?,
+                    decomposition: payload_projection(self.owner(*decomposition))?,
+                    input: payload_projection(self.expression(*input))?,
                     input_result: input_result.0,
                 }
             }
@@ -3273,14 +3615,20 @@ impl<'a> ProofPayloadProjector<'a> {
         source: super::g0::EventRange,
         rhs: super::relation::CanonicalRhsId,
         current: usize,
-    ) -> Result<(u64, u64), G0Error> {
-        let (computed, result) = self
-            .rhs_events
-            .get(&(key.clone(), source, rhs))
-            .copied()
-            .ok_or(G0Error::RelationTraceInvariant)?;
+        owner: super::arena::ScopedExprId,
+        evidence: ProofEvidenceKind,
+    ) -> Result<(u64, u64), CertificateProjectionError> {
+        let (computed, result) =
+            self.rhs_events.get(&(key.clone(), source, rhs)).copied().ok_or_else(|| {
+                proof_invariant(current, Some(owner), evidence, ProofInvariantMismatch::RhsReplay)
+            })?;
         if computed >= current as u64 || result >= current as u64 {
-            return Err(G0Error::RelationTraceInvariant);
+            return Err(proof_invariant(
+                current,
+                Some(owner),
+                evidence,
+                ProofInvariantMismatch::EventOrder { referenced: computed.max(result) },
+            ));
         }
         Ok((computed, result))
     }
@@ -3290,10 +3638,10 @@ impl<'a> ProofPayloadProjector<'a> {
         trace: &FeasibilityTrace,
         current: usize,
         event: &NormalizerEvent,
-    ) -> Result<ProofPayloadEvent, G0Error> {
+    ) -> Result<ProofPayloadEvent, CertificateProjectionError> {
         Ok(match event {
             NormalizerEvent::InvocationStart { root } => {
-                ProofPayloadEvent::InvocationStart { root: self.owner(*root)? }
+                ProofPayloadEvent::InvocationStart { root: payload_projection(self.owner(*root))? }
             }
             NormalizerEvent::Predecessor {
                 consumer,
@@ -3301,53 +3649,73 @@ impl<'a> ProofPayloadProjector<'a> {
                 predecessor,
                 source_result,
             } => {
-                self.prior_event(*source_result, current)?;
+                self.prior_event(
+                    *source_result,
+                    current,
+                    Some(*consumer),
+                    ProofEvidenceKind::EventReference,
+                )?;
                 ProofPayloadEvent::Predecessor {
-                    consumer: self.owner(*consumer)?,
+                    consumer: payload_projection(self.owner(*consumer))?,
                     input_position: *input_position,
-                    predecessor: self.expression(*predecessor)?,
+                    predecessor: payload_projection(self.expression(*predecessor))?,
                     source_result: source_result.0,
                 }
             }
-            NormalizerEvent::Result { owner, value } => {
-                ProofPayloadEvent::Result { owner: self.owner(*owner)?, value: self.value(value)? }
-            }
+            NormalizerEvent::Result { owner, value } => ProofPayloadEvent::Result {
+                owner: payload_projection(self.owner(*owner))?,
+                value: payload_projection(self.value(value))?,
+            },
             NormalizerEvent::InvocationEnd { root, result, .. } => {
                 ProofPayloadEvent::InvocationEnd {
-                    root: self.owner(*root)?,
-                    result: self.value(result)?,
+                    root: payload_projection(self.owner(*root))?,
+                    result: payload_projection(self.value(result))?,
                 }
             }
             NormalizerEvent::SpecializationComputed { owner, key, replay } => {
                 ProofPayloadEvent::SpecializationComputed {
-                    owner: self.owner(*owner)?,
-                    dispatch: self.specialization_dispatch(key)?,
-                    source: self.range(replay.range, current)?,
+                    owner: payload_projection(self.owner(*owner))?,
+                    dispatch: payload_projection(self.specialization_dispatch(key))?,
+                    source: payload_projection(self.range(replay.range, current))?,
                 }
             }
             NormalizerEvent::SpecializationCacheHit { owner, source, .. } => {
                 ProofPayloadEvent::SpecializationCacheHit {
-                    owner: self.owner(*owner)?,
-                    source: self.range(*source, current)?,
+                    owner: payload_projection(self.owner(*owner))?,
+                    source: payload_projection(self.range(*source, current))?,
                 }
             }
             NormalizerEvent::AppliedRelation(observation) => ProofPayloadEvent::AppliedRelation {
-                owner: self.owner(observation.owner)?,
-                source_monomial: self.monomial(observation.source_monomial)?,
+                owner: payload_projection(self.owner(observation.owner))?,
+                source_monomial: payload_projection(self.monomial(observation.source_monomial))?,
                 outer_coefficient: observation.outer_coefficient.clone(),
                 ordered_start: observation.ordered_start,
                 ordered_end_exclusive: observation.ordered_end_exclusive,
-                rule: self.relation_rule(&observation.rule, current)?,
+                rule: self.relation_rule(&observation.rule, current, observation.owner)?,
             },
             NormalizerEvent::BoundTransfer { owner, rule } => ProofPayloadEvent::BoundTransfer {
-                owner: self.owner(*owner)?,
+                owner: payload_projection(self.owner(*owner))?,
                 rule: self.rule(rule, current)?,
             },
             NormalizerEvent::SurvivorFold(observation) => {
-                self.prior_event(observation.bound, current)?;
-                let (_, _, magnitude) = trace.resolve_survivor_bound(observation.bound)?;
+                self.prior_event(
+                    observation.bound,
+                    current,
+                    None,
+                    ProofEvidenceKind::SurvivorFold,
+                )?;
+                let (_, _, magnitude) =
+                    payload_projection(trace.resolve_survivor_bound(observation.bound))?;
                 if *observation.coefficient.magnitude() != magnitude {
-                    return Err(G0Error::RelationTraceInvariant);
+                    return Err(proof_invariant(
+                        current,
+                        None,
+                        ProofEvidenceKind::SurvivorFold,
+                        ProofInvariantMismatch::SurvivorMagnitude {
+                            expected: magnitude,
+                            actual: observation.coefficient.magnitude().clone(),
+                        },
+                    ));
                 }
                 ProofPayloadEvent::SurvivorFold(ProofPayloadSurvivorFold {
                     coefficient: observation.coefficient.clone(),
@@ -7595,5 +7963,44 @@ mod tests {
             document["lut"]["exact_payload_logical_items"],
             independent_lut_logical_items(&canonical_lut)
         );
+    }
+
+    #[test]
+    fn proof_invariant_context_keeps_major_evidence_branches_typed() {
+        let cases = [
+            (ProofEvidenceKind::Universal, ProofInvariantMismatch::RhsReplay),
+            (
+                ProofEvidenceKind::Gadget,
+                ProofInvariantMismatch::EventKind {
+                    referenced: 3,
+                    expected: "Result or InvocationEnd",
+                },
+            ),
+            (
+                ProofEvidenceKind::OperatorMerge,
+                ProofInvariantMismatch::Coefficient { expected: 2.into(), actual: 3.into() },
+            ),
+            (
+                ProofEvidenceKind::SurvivorFold,
+                ProofInvariantMismatch::SurvivorMagnitude {
+                    expected: 5_u8.into(),
+                    actual: 7_u8.into(),
+                },
+            ),
+        ];
+        for (evidence, mismatch) in cases {
+            let error = proof_invariant(11, None, evidence, mismatch.clone());
+            assert_eq!(
+                error,
+                CertificateProjectionError::ProofInvariant {
+                    context: Box::new(ProofInvariantContext {
+                        event: 11,
+                        owner: None,
+                        evidence,
+                        mismatch,
+                    }),
+                }
+            );
+        }
     }
 }

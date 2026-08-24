@@ -1790,15 +1790,7 @@ fn collect_residual_closure_with_plans(
 }
 
 fn push_index_plan_dependencies(work: &mut Vec<CertificateWork>, plan: &super::g0::IndexUsePlan) {
-    work.push(CertificateWork::Expression(plan.index));
-    work.extend(plan.result.into_iter().map(CertificateWork::Expression));
-    work.extend(plan.consumed.into_iter().map(CertificateWork::Expression));
-    work.extend(plan.frontier.iter().map(|axis| CertificateWork::Expression(axis.expression())));
-    if let Some(group) = &plan.slice_group {
-        work.extend(
-            group.members.iter().map(|member| CertificateWork::Expression(member.expression)),
-        );
-    }
+    work.extend(plan.expression_roots().map(CertificateWork::Expression));
     work.extend(plan.result_family.into_iter().map(CertificateWork::Family));
     work.extend(plan.consumed_family.into_iter().map(CertificateWork::Family));
 }

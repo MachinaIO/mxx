@@ -532,6 +532,19 @@ pub(crate) struct IndexUsePlan {
 }
 
 impl IndexUsePlan {
+    pub(crate) fn expression_roots(&self) -> impl Iterator<Item = super::arena::ExprId> + '_ {
+        self.result
+            .into_iter()
+            .chain(self.consumed)
+            .chain(std::iter::once(self.index))
+            .chain(self.frontier.iter().map(IndexFrontierAxis::expression))
+            .chain(
+                self.slice_group
+                    .iter()
+                    .flat_map(|group| group.members.iter().map(|member| member.expression)),
+            )
+    }
+
     pub(crate) fn is_residual_relevant(&self, closure: &CertificateClosure) -> bool {
         self.result.is_some_and(|expression| closure.expressions.contains(&expression)) ||
             self.result_family.is_some_and(|family| closure.families.contains(&family)) ||
@@ -6334,6 +6347,16 @@ fn derive_statement_events(
     if let Some(seed) = closed_scope {
         roots.insert(seed);
     }
+    let plan_roots = trace
+        .index_use_plans()
+        .flat_map(IndexUsePlan::expression_roots)
+        .filter(|root| expression_refs.contains_key(root))
+        .collect::<BTreeSet<_>>();
+    for root in plan_roots {
+        if job.expressions().close(root).is_ok() {
+            roots.insert((CanonicalStatementScope::Closed { root: expression_refs[&root] }, root));
+        }
+    }
 
     let closed_programs = closed_residual_root
         .map(|root| {
@@ -7097,6 +7120,175 @@ mod tests {
             }] if *root == root_row && *expression == gadget_row
         ));
         assert!(rows.expression_refs.get(&ignored_expression).is_none());
+    }
+
+    #[test]
+    fn statement_rows_seed_closed_retained_plan_result_once() {
+        use crate::operational_noise::arena::FamilyDomain;
+
+        let mut job = CheckerJob::new();
+        let (scalar, input, gadget) = statement_gadget(&mut job);
+        let index = job
+            .expressions_mut()
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let family = job
+            .with_arena_stores(|expressions, programs, _| {
+                programs.generated_family_from_body(expressions, FamilyDomain::new(0, 1)?, index)
+            })
+            .unwrap();
+        let program = family.program();
+        assert!(job.expressions().close(gadget).is_ok());
+        let closure = CertificateClosure {
+            expressions: [scalar, input, gadget, index].into_iter().collect(),
+            programs: [program].into_iter().collect(),
+            families: [family].into_iter().collect(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: [scalar, index].into_iter().collect(),
+        };
+        let plan = |path| IndexUsePlan {
+            kind: IndexUseKind::FamilyGetStatic,
+            owner: planned_owner(path),
+            result: Some(gadget),
+            result_family: None,
+            consumed: None,
+            consumed_family: Some(family),
+            index,
+            frontier: Box::new([]),
+            output_type: ResolvedValueType::Matrix(matrix()),
+            output_range: None,
+            slice_group: None,
+        };
+        let mut forward = FeasibilityTrace::default();
+        forward.record_index_use(plan(1)).unwrap();
+        forward.record_index_use(plan(2)).unwrap();
+        let mut reverse = FeasibilityTrace::default();
+        reverse.record_index_use(plan(2)).unwrap();
+        reverse.record_index_use(plan(1)).unwrap();
+
+        let forward_rows = derive_certificate_statement_rows(&job, &closure, &forward, None)
+            .expect("closed retained plan result");
+        let reverse_rows = derive_certificate_statement_rows(&job, &closure, &reverse, None)
+            .expect("allocation-order independent closed retained plan result");
+        assert_eq!(forward_rows.expressions(), reverse_rows.expressions());
+        assert_eq!(forward_rows.events(), reverse_rows.events());
+        assert_eq!(forward_rows.expressions().len(), 4);
+        assert_eq!(forward_rows.programs().len(), 1);
+        let mut dense_rows = forward_rows.expression_refs.values().copied().collect::<Vec<_>>();
+        dense_rows.sort_unstable();
+        assert_eq!(dense_rows, vec![0, 1, 2, 3]);
+        let gadget_row = forward_rows.expression(gadget).unwrap();
+        assert!(matches!(
+            forward_rows.events(),
+            [CanonicalStatementEventRow::GadgetDecompose {
+                scope: CanonicalStatementScope::Closed { root },
+                expression,
+                ..
+            }] if *root == gadget_row && *expression == gadget_row
+        ));
+    }
+
+    #[test]
+    fn retained_plan_open_gadget_requires_existing_program_scope() {
+        use crate::operational_noise::arena::{ProgramInput, ProgramSignature};
+
+        let mut job = CheckerJob::new();
+        let argument = job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Argument { position: 0, value_type: ResolvedValueType::Int },
+                Box::new([]),
+            )
+            .unwrap();
+        let input = job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
+                    output: matrix(),
+                    coefficient_bits: 1,
+                }),
+                Box::new([argument]),
+            )
+            .unwrap();
+        let gadget = job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    output: ResolvedMatrixType::new(17_u8.into(), 1, 2, 1).unwrap(),
+                    base: 4,
+                    small: false,
+                    digit_count: 2,
+                }),
+                Box::new([input]),
+            )
+            .unwrap();
+        assert!(job.expressions().close(gadget).is_err());
+        let program = job
+            .with_arena_stores(|expressions, programs, _| {
+                programs.finalize(
+                    expressions,
+                    ProgramSignature {
+                        inputs: Box::new([ProgramInput {
+                            value_type: ResolvedValueType::Int,
+                            trusted_index_range: None,
+                        }]),
+                        output: ResolvedValueType::Matrix(ResolvedMatrixType::new(
+                            17_u8.into(),
+                            1,
+                            2,
+                            1,
+                        )?),
+                    },
+                    gadget,
+                )
+            })
+            .unwrap();
+        let plan = IndexUsePlan {
+            kind: IndexUseKind::FamilyGetStatic,
+            owner: planned_owner(1),
+            result: Some(gadget),
+            result_family: None,
+            consumed: None,
+            consumed_family: None,
+            index: argument,
+            frontier: Box::new([]),
+            output_type: ResolvedValueType::Matrix(matrix()),
+            output_range: None,
+            slice_group: None,
+        };
+        let mut trace = FeasibilityTrace::default();
+        trace.record_index_use(plan).unwrap();
+        let expressions = [argument, input, gadget].into_iter().collect::<BTreeSet<_>>();
+        let detached = CertificateClosure {
+            expressions: expressions.clone(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: BTreeSet::new(),
+        };
+        assert!(matches!(
+            derive_certificate_statement_rows(&job, &detached, &trace, None),
+            Err(G0Error::MissingCanonicalHandle {
+                requested: CanonicalReference::Expr(expression)
+            }) if expression == gadget
+        ));
+
+        let scoped = CertificateClosure { programs: [program].into_iter().collect(), ..detached };
+        let rows = derive_certificate_statement_rows(&job, &scoped, &trace, None)
+            .expect("program-reachable open plan result");
+        assert!(matches!(
+            rows.events(),
+            [CanonicalStatementEventRow::GadgetDecompose {
+                scope: CanonicalStatementScope::Program { program: event_program },
+                expression,
+                ..
+            }] if *event_program == rows.program(program).unwrap()
+                && *expression == rows.expression(gadget).unwrap()
+        ));
     }
 
     #[test]
@@ -10666,6 +10858,28 @@ mod tests {
         let mut trace = FeasibilityTrace::default();
         trace.record_index_use(plan).expect("zero-axis use is valid");
         assert_eq!(trace.index_use_plans().count(), 1);
+    }
+
+    #[test]
+    fn index_use_expression_roots_cover_every_expression_component() {
+        let frontier = vec![axis(4, 4, 0, 5)];
+        let mut plan = index_plan(IndexUseKind::IndexedSlice, expression(3), frontier.clone());
+        plan.result = Some(expression(1));
+        plan.consumed = Some(expression(2));
+        plan.slice_group = Some(slice_group(frontier));
+        assert_eq!(
+            plan.expression_roots().collect::<Vec<_>>(),
+            vec![
+                expression(1),
+                expression(2),
+                expression(3),
+                expression(4),
+                expression(10),
+                expression(11),
+                expression(12),
+                expression(13),
+            ]
+        );
     }
 
     #[test]

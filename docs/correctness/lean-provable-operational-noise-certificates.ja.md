@@ -434,16 +434,22 @@ program と family は `Value` に追加せず、expression row から参照す�
 
 `SourceRow` は、定数、宣言済み protocol input、特定 occurrence に属する unbound input、
 producer artifact を、種類を示す tag が付いた一つの datatype で表す。完全な Rust identity、
-owner scope、signature、resolved type を保持する。
+owner scope、signature、resolved type を保持する。direct row と family row は、対応する Rust
+facts から得た optional raw value contract も唯一の場所として保持する。この contract は signed
+half-open range、coefficient class、canonical coefficient exclusive upper、polynomial support
+upper から成る。constant row は literal value から導ける facts を重複して持たない。
 
 family source もこの同じ `SourceRow` に格納し、その owner scope と signature で所有関係を表す。
 family 専用の第二の source ID 空間は作らない。
 
 ### 8.2 EventRow
 
-`EventRow` は uniform、Gaussian、deterministic hash、trapdoor-public、preimage、gadget
+`EventRow` は uniform、Gaussian、sampled hash、trapdoor-public、preimage、gadget
 decomposition event を、同様に種類 tag 付きの一つの datatype で表す。各 row は owner scope、
-signature、output type、種類固有の完全な descriptor を持つ。
+signature、output type、種類固有の完全な descriptor を持つ。optional raw contract に置くのは、
+descriptor とは独立して記録された range、canonical coefficient、support facts だけである。
+sampler cutoff や decomposition bound は descriptor から重複させない。deterministic hash は sampler
+event ではなく、通常の型付き expression operator として表す。
 
 各 descriptor の保存場所は一つだけにする。
 

@@ -282,11 +282,17 @@ expression rows, not runtime `Value` variants.
 `SourceRow` is one tagged sum for constants, declared protocol inputs, unbound occurrence-local
 inputs, and producer artifacts. It stores the complete authoritative Rust identity and resolved
 type. Family ownership is represented by the source's owner scope and signature rather than by a
-second source-ID namespace.
+second source-ID namespace. Direct and family rows also own the optional raw value contract
+projected from the corresponding Rust facts: a signed half-open range, coefficient class,
+canonical-coefficient exclusive upper, and polynomial-support upper. A constant row does not
+repeat facts that follow from its literal value.
 
-`EventRow` is one tagged sum for uniform, Gaussian, deterministic hash, trapdoor-public,
-preimage, and gadget-decomposition events. Every row stores its owner scope, signature, output
-type, and complete kind-specific descriptor.
+`EventRow` is one tagged sum for uniform, Gaussian, sampled hash, trapdoor-public, preimage, and
+gadget-decomposition events. Every row stores its owner scope, signature, output type, and complete
+kind-specific descriptor. Its optional raw contract contains only independently recorded range,
+canonical-coefficient, or support facts. It does not repeat a cutoff or decomposition bound already
+present in the event descriptor. A deterministic hash is an ordinary typed expression operator,
+not a sampler event.
 
 Each descriptor has exactly one canonical certificate location. Constant and external-input
 payloads live only in `SourceRow`; sampler and transform descriptors live only in `EventRow`.

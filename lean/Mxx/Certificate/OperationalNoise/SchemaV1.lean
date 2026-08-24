@@ -120,10 +120,29 @@ inductive ObservedSourceAccess where
   | producerArtifact (producer : ObservedProducer)
 deriving DecidableEq, Repr
 
+structure SignedRange where
+  minimum : String
+  maxExclusive : String
+deriving DecidableEq, Repr
+
+inductive RawCoefficientClass where
+  | exactZero
+  | finite (maximumAbsoluteCoefficient : String)
+  | large
+deriving DecidableEq, Repr
+
+structure RawValueContract where
+  signedRange : Option SignedRange
+  coefficientClass : Option RawCoefficientClass
+  canonicalCoefficientExclusiveUpper : Option String
+  polynomialSupportUpper : Option Nat
+deriving DecidableEq, Repr
+
 inductive SourceRow where
   | constant (value : Constant)
   | direct (identity : SourceIdentity) (access : Option ObservedSourceAccess)
-  | family (identity : FamilySourceIdentity)
+      (contract : Option RawValueContract)
+  | family (identity : FamilySourceIdentity) (contract : Option RawValueContract)
 deriving DecidableEq, Repr
 
 inductive HashVariant where
@@ -155,10 +174,12 @@ deriving DecidableEq, Repr
 
 inductive EventRow where
   | sample (owner : ObservedWire) (descriptor : SampleDescriptor)
+      (contract : Option RawValueContract)
   | sampler (owner : ObservedWire) (operation : SamplerOperation)
+      (contract : Option RawValueContract)
   | gadgetDecompose (scope : StatementScope) (expression : ExpressionRef)
       (output : ValueType) (base : Nat) (small : Bool) (digitCount : Nat)
-      (input : ExpressionRef)
+      (input : ExpressionRef) (contract : Option RawValueContract)
 deriving DecidableEq, Repr
 
 inductive ExpressionSource where

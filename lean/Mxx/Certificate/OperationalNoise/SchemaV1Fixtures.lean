@@ -99,6 +99,28 @@ private def decodeObservedWire (json : Json) : Except String ObservedWire :=
          node := ← natField json "node"
          port := ← natField json "port" }
 
+private def decodeSignedRange (json : Json) : Except String SignedRange :=
+  do
+  pure { minimum := ← stringField json "minimum"
+         maxExclusive := ← stringField json "maxExclusive" }
+
+private def decodeRawCoefficientClass (json : Json) : Except String RawCoefficientClass := do
+  match ← stringField json "kind" with
+  | "exact_zero" => pure .exactZero
+  | "finite" => pure <| .finite (← stringField json "maximumAbsoluteCoefficient")
+  | "large" => pure .large
+  | kind => throw s!"unsupported v1 raw coefficient class {kind}"
+
+private def decodeRawValueContract (json : Json) : Except String RawValueContract :=
+  do
+  pure { signedRange := ← decodeOption decodeSignedRange (← field json "signedRange")
+         coefficientClass :=
+           ← decodeOption decodeRawCoefficientClass (← field json "coefficientClass")
+         canonicalCoefficientExclusiveUpper :=
+           ← decodeOption Json.getStr? (← field json "canonicalCoefficientExclusiveUpper")
+         polynomialSupportUpper :=
+           ← decodeOption Json.getNat? (← field json "polynomialSupportUpper") }
+
 private def decodeSampleDescriptor (json : Json) : Except String SampleDescriptor :=
   do
   pure { definition := ← stringField json "definition"
@@ -153,14 +175,17 @@ private def decodeEventRow (json : Json) : Except String EventRow := do
   | "sample" =>
       pure <| .sample (← decodeObservedWire (← field json "owner"))
         (← decodeSampleDescriptor (← field json "descriptor"))
+        (← decodeOption decodeRawValueContract (← field json "contract"))
   | "sampler" =>
       pure <| .sampler (← decodeObservedWire (← field json "owner"))
         (← decodeSamplerOperation (← field json "operation"))
+        (← decodeOption decodeRawValueContract (← field json "contract"))
   | "gadget_decompose" =>
       pure <| .gadgetDecompose (← decodeStatementScope (← field json "scope"))
         ⟨← natField json "expression"⟩ (← decodeValueType (← field json "output"))
         (← natField json "base") (← boolField json "small") (← natField json "digit_count")
         ⟨← natField json "input"⟩
+        (← decodeOption decodeRawValueContract (← field json "contract"))
   | kind => throw s!"unsupported v1 event row {kind}"
 
 private def decodeSourceRow (json : Json) : Except String SourceRow := do
@@ -286,6 +311,19 @@ def rustV1Golden : String :=
 def decodedRustV1Golden : Except String Document :=
   Json.parse rustV1Golden >>= decodeSmallDocument
 
+def expectedRawContract : RawValueContract :=
+  { signedRange := some { minimum := "-3", maxExclusive := "5" }
+    coefficientClass := some (.finite "7")
+    canonicalCoefficientExclusiveUpper := some "257"
+    polynomialSupportUpper := some 2 }
+
+def decodedRawContract : Except String RawValueContract :=
+  Json.parse
+      "{\"signedRange\":{\"minimum\":\"-3\",\"maxExclusive\":\"5\"},\
+      \"coefficientClass\":{\"kind\":\"finite\",\"maximumAbsoluteCoefficient\":\"7\"},\
+      \"canonicalCoefficientExclusiveUpper\":\"257\",\"polynomialSupportUpper\":2}" >>=
+    decodeRawValueContract
+
 private def goldenMatrix (rows columns : Nat) : ValueType :=
   .matrix "257" 1 rows columns
 
@@ -342,9 +380,9 @@ def expectedDocument : Document :=
       [ .sampler (goldenOwner 0)
           (.trapdoor (goldenMatrix 1 4)
             "{\"tag\":\"Rational\",\"value\":{\"numerator\":\"3\",\"denominator\":\"1\"}}"
-            4 2 "8"),
-        .sampler (goldenOwner 1) (.uniformResidue (goldenMatrix 1 1)),
-        .sampler (goldenOwner 2) (.preimage (goldenMatrix 4 1) "8") ]
+            4 2 "8") none,
+        .sampler (goldenOwner 1) (.uniformResidue (goldenMatrix 1 1)) none,
+        .sampler (goldenOwner 2) (.preimage (goldenMatrix 4 1) "8") none ]
     indexUses := []
     sliceGroups := []
     residualRoot := .closed ⟨10⟩ }
@@ -363,19 +401,35 @@ run_cmd
       if document = expectedDocument then pure ()
       else throwError "Rust v1 golden document mismatch: {repr document}"
 
+run_cmd
+  match decodedRawContract with
+  | .error message => throwError "raw v1 contract decode failed: {message}"
+  | .ok contract =>
+      if contract = expectedRawContract then pure ()
+      else throwError "raw v1 contract mismatch: {repr contract}"
+
 def typedGadgetOperator : ExpressionEventOperator :=
   .gadgetDecompose [⟨2⟩, ⟨5⟩]
 
 def typedGadgetEvent : EventRow :=
-  .gadgetDecompose (.program ⟨3⟩) ⟨7⟩ (.matrix "257" 1 4 1) 4 false 2 ⟨6⟩
+  .gadgetDecompose (.program ⟨3⟩) ⟨7⟩ (.matrix "257" 1 4 1) 4 false 2 ⟨6⟩ none
 
 theorem gadget_refs_and_scope_are_typed :
     typedGadgetOperator = .gadgetDecompose [⟨2⟩, ⟨5⟩] ∧
       typedGadgetEvent =
-        .gadgetDecompose (.program ⟨3⟩) ⟨7⟩ (.matrix "257" 1 4 1) 4 false 2 ⟨6⟩ := by
+        .gadgetDecompose
+          (.program ⟨3⟩) ⟨7⟩ (.matrix "257" 1 4 1) 4 false 2 ⟨6⟩ none := by
   exact ⟨rfl, rfl⟩
+
+theorem raw_contract_fields_are_distinct :
+    expectedRawContract.signedRange = some { minimum := "-3", maxExclusive := "5" } ∧
+      expectedRawContract.coefficientClass = some (.finite "7") ∧
+      expectedRawContract.canonicalCoefficientExclusiveUpper = some "257" ∧
+      expectedRawContract.polynomialSupportUpper = some 2 := by
+  exact ⟨rfl, rfl, rfl, rfl⟩
 
 #print axioms rust_v1_golden_representation_is_typed
 #print axioms gadget_refs_and_scope_are_typed
+#print axioms raw_contract_fields_are_distinct
 
 end Mxx.Certificate.OperationalNoise.SchemaV1

@@ -5097,6 +5097,17 @@ impl CanonicalStatementRows {
         &self.sources
     }
 
+    pub(crate) fn source_for_expression(&self, expression: ExprId) -> Option<u64> {
+        self.expression_sources.get(&expression).copied()
+    }
+
+    pub(crate) fn source_for_family_identity(
+        &self,
+        identity: &super::arena::SemanticFamilySourceIdentity,
+    ) -> Option<u64> {
+        self.family_sources.get(identity).copied()
+    }
+
     pub(crate) fn event_rows(&self) -> &CanonicalEventRows {
         &self.event_rows
     }

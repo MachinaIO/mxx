@@ -1185,52 +1185,35 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(super::g0::EventIndex(0))
     }
 
-    fn collect_add_sub_merges(
+    fn observe_coefficient_merge(
         &mut self,
         owner: ScopedExprId,
-        node: &ExprNode,
-        children: &[Arc<AnalyzedValue>],
-    ) -> Result<Vec<CoefficientMerge>, NormalizeError> {
-        let ValueOperator::Matrix(operation) = &node.operator else { return Ok(Vec::new()) };
-        let subtract = match operation {
-            MatrixOperation::Add => false,
-            MatrixOperation::Subtract => true,
-            _ => return Ok(Vec::new()),
-        };
-        let (Some(left), Some(right)) = (
-            children.first().and_then(|value| value.exact_nf.as_ref()),
-            children.get(1).and_then(|value| value.exact_nf.as_ref()),
-        ) else {
-            return Ok(Vec::new());
-        };
-        let left_event = self.relation_input_result(node.inputs[0])?;
-        let right_event = self.relation_input_result(node.inputs[1])?;
-        let mut merges = Vec::new();
-        for (monomial, coefficient) in &right.exact_terms {
-            if !left.exact_terms.contains_key(monomial) {
-                continue;
-            }
-            let signed_contribution = if subtract { -coefficient } else { coefficient.clone() };
-            merges.push(CoefficientMerge {
-                owner,
-                sources: Box::new([
-                    CoefficientMergeSource::Value(RecordedTermRef {
-                        value_event: left_event,
-                        monomial: *monomial,
-                    }),
-                    CoefficientMergeSource::Value(RecordedTermRef {
-                        value_event: right_event,
-                        monomial: *monomial,
-                    }),
-                ]),
-                output: RecordedTermRef {
-                    value_event: super::g0::EventIndex(0),
-                    monomial: *monomial,
-                },
-                signed_contribution,
-            });
+        left_event: super::g0::EventIndex,
+        right_event: super::g0::EventIndex,
+        monomial: MonomialId,
+        signed_contribution: BigInt,
+    ) -> Result<(), NormalizeError> {
+        if S::ENABLED {
+            self.sink
+                .as_deref_mut()
+                .ok_or(super::g0::G0Error::RelationTraceInvariant)?
+                .record_coefficient_merge(CoefficientMerge {
+                    owner,
+                    sources: Box::new([
+                        CoefficientMergeSource::Value(RecordedTermRef {
+                            value_event: left_event,
+                            monomial,
+                        }),
+                        CoefficientMergeSource::Value(RecordedTermRef {
+                            value_event: right_event,
+                            monomial,
+                        }),
+                    ]),
+                    output: monomial,
+                    signed_contribution,
+                })?;
         }
-        Ok(merges)
+        Ok(())
     }
 
     fn specialization_miss_start(
@@ -1557,11 +1540,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             children.push(self.child_value(*child)?);
             self.observe_predecessor(semantic, input_position as u32, *child)?;
         }
-        let pending_merges = if S::ENABLED {
-            Some(self.collect_add_sub_merges(semantic, node, &children)?)
-        } else {
-            None
-        };
         let output_type = self.expressions.value_type(expression)?.clone();
         let mut value = if matches!(output_type, ResolvedValueType::Matrix(_)) {
             self.evaluate_matrix(scope_proof, semantic, expression, node, &children)?
@@ -1581,16 +1559,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 normal_form.bounded_summary = BoundedSummary::zero();
             }
         }
-        let result_event = self.observe_result(semantic, &value)?;
-        if let Some(merges) = pending_merges {
-            for mut merge in merges {
-                merge.output.value_event = result_event;
-                self.sink
-                    .as_deref_mut()
-                    .ok_or(super::g0::G0Error::RelationTraceInvariant)?
-                    .record_coefficient_merge(merge)?;
-            }
-        }
+        self.observe_result(semantic, &value)?;
         Ok(value)
     }
 
@@ -1725,16 +1694,27 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 let left = children.first().and_then(|value| value.exact_nf.as_ref());
                 let right = children.get(1).and_then(|value| value.exact_nf.as_ref());
                 match (left, right) {
-                    (Some(left), Some(right)) => self.add_nf(
-                        Some(semantic),
-                        Some(node.inputs[0]),
-                        Some(node.inputs[1]),
-                        left,
-                        right,
-                        matches!(operation, MatrixOperation::Subtract),
-                        false,
-                        &mut None,
-                    ),
+                    (Some(left), Some(right)) => {
+                        let merge_sources = if S::ENABLED {
+                            Some((
+                                self.relation_input_result(node.inputs[0])?,
+                                self.relation_input_result(node.inputs[1])?,
+                            ))
+                        } else {
+                            None
+                        };
+                        self.add_nf(
+                            Some(semantic),
+                            Some(node.inputs[0]),
+                            Some(node.inputs[1]),
+                            left,
+                            right,
+                            matches!(operation, MatrixOperation::Subtract),
+                            merge_sources,
+                            false,
+                            &mut None,
+                        )
+                    }
                     _ => Ok(self.atom_nf(scope_proof, semantic)?),
                 }
             }
@@ -1996,6 +1976,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                             &output,
                             &scaled,
                             false,
+                            None,
                             true,
                             &mut output_evidence,
                         )?;
@@ -2013,6 +1994,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                             &output,
                             &scaled,
                             false,
+                            None,
                             true,
                             &mut None,
                         )?;
@@ -3366,6 +3348,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         left: &PolynomialNF,
         right: &PolynomialNF,
         subtract: bool,
+        merge_sources: Option<(super::g0::EventIndex, super::g0::EventIndex)>,
         summary_evidence_supplied: bool,
         evidence: &mut Option<BoundValueRef>,
     ) -> Result<PolynomialNF, NormalizeError> {
@@ -3375,10 +3358,20 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
         for (id, coefficient) in &right.exact_terms {
             let signed = if subtract { -coefficient } else { coefficient.clone() };
-            let entry = terms.entry(*id).or_insert_with(|| BigInt::from(0_u8));
-            *entry += signed;
-            if entry.is_zero() {
+            let collision = terms.contains_key(id);
+            let is_zero = {
+                let entry = terms.entry(*id).or_insert_with(|| BigInt::from(0_u8));
+                *entry += &signed;
+                entry.is_zero()
+            };
+            if is_zero {
                 terms.remove(id);
+            }
+            if collision && S::ENABLED {
+                let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                let (left_event, right_event) =
+                    merge_sources.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
+                self.observe_coefficient_merge(owner, left_event, right_event, *id, signed)?;
             }
         }
         let mut result = PolynomialNF {
@@ -9693,25 +9686,62 @@ mod tests {
             let merge = merges[0];
             assert_eq!(merge.owner, semantic);
             assert_eq!(merge.sources.len(), 2);
+            let first_monomial = match &merge.sources[0] {
+                super::super::g0::CoefficientMergeSource::Value(reference) => reference.monomial,
+            };
+            assert_eq!(merge.output, first_monomial);
             assert!(merge.sources.iter().all(|source| {
-                matches!(source, super::super::g0::CoefficientMergeSource::Value(reference) if reference.monomial == merge.output.monomial)
+                matches!(source, super::super::g0::CoefficientMergeSource::Value(reference) if reference.monomial == merge.output)
             }));
             assert_eq!(merge.signed_contribution, BigInt::from(if subtract { -1 } else { 1 }));
-            let output = &trace.normalization_events()[merge.output.value_event.0 as usize];
+            let output = trace
+                .normalization_events()
+                .iter()
+                .find(|event| {
+                    matches!(event, NormalizerEvent::Result { owner, .. } if *owner == semantic)
+                })
+                .expect("merge output must be followed by the owner Result");
             let NormalizerEvent::Result { owner, value } = output else {
                 panic!("merge output must point to the owner Result")
             };
             assert_eq!(*owner, semantic);
             let output_nf = value.exact_nf.as_ref().unwrap();
             if subtract {
-                assert!(!output_nf.exact_terms.contains_key(&merge.output.monomial));
+                assert!(!output_nf.exact_terms.contains_key(&merge.output));
             } else {
-                assert_eq!(
-                    output_nf.exact_terms.get(&merge.output.monomial),
-                    Some(&BigInt::from(2_u8))
-                );
+                assert_eq!(output_nf.exact_terms.get(&merge.output), Some(&BigInt::from(2_u8)));
             }
         }
+    }
+
+    #[test]
+    fn traced_add_without_a_term_collision_emits_no_merge() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left = source_with(&mut expressions, matrix_type(), 10_907);
+        let right = source_with(&mut expressions, matrix_type(), 10_908);
+        let root =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut trace = FeasibilityTrace::default();
+        let value = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(semantic)
+        .unwrap();
+        assert_eq!(value.exact_nf.as_ref().unwrap().exact_terms.len(), 2);
+        assert!(
+            !trace
+                .normalization_events()
+                .iter()
+                .any(|event| matches!(event, NormalizerEvent::CoefficientMerge(..)))
+        );
+        trace.validate_normalization_observations().unwrap();
     }
 
     #[test]

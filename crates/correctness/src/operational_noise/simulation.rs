@@ -226,14 +226,13 @@ pub(crate) struct ProofPayloadTermRef {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProofPayloadCoefficientMergeSource {
     Value(ProofPayloadTermRef),
-    Applied { event: u64, replacement_term: ProofPayloadTermRef },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProofPayloadCoefficientMerge {
     pub owner: ProofPayloadOwner,
     pub sources: Box<[ProofPayloadCoefficientMergeSource]>,
-    pub output: ProofPayloadTermRef,
+    pub output: ProofPayloadMonomial,
     pub signed_contribution: BigInt,
 }
 
@@ -871,13 +870,6 @@ impl<'a> ProofPayloadProjector<'a> {
                     self.term_ref(trace, *reference, current)?,
                 ))
             }
-            super::g0::CoefficientMergeSource::Applied { event, replacement_term } => {
-                self.prior_event(*event, current)?;
-                Ok(ProofPayloadCoefficientMergeSource::Applied {
-                    event: event.0,
-                    replacement_term: self.term_ref(trace, *replacement_term, current)?,
-                })
-            }
         };
         Ok(ProofPayloadCoefficientMerge {
             owner: self.owner(observation.owner)?,
@@ -887,7 +879,7 @@ impl<'a> ProofPayloadProjector<'a> {
                 .map(source)
                 .collect::<Result<Vec<_>, G0Error>>()?
                 .into_boxed_slice(),
-            output: self.term_ref_with_missing(trace, observation.output, current, true)?,
+            output: self.monomial(observation.output)?,
             signed_contribution: observation.signed_contribution.clone(),
         })
     }

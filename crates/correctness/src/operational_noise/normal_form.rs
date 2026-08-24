@@ -5663,6 +5663,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 }
                 bound
             }
+            ValueOperator::Transform(
+                operation @ ValueTransformOperation::GadgetDecompose { .. },
+            ) if S::ENABLED => transform_bound(operation),
             ValueOperator::Transform(_) => NumericContract::Missing,
             _ => child_bounds.into_iter().next().unwrap_or(NumericContract::Missing),
         };
@@ -5671,6 +5674,19 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 ValueOperator::Sampler { .. } | ValueOperator::DeterministicHash(_) => {
                     if bound.is_missing() {
                         return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    }
+                    self.observe_bound_transfer(
+                        owner,
+                        BoundRule::Authority(BoundAuthority::Operator),
+                    )?;
+                }
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose { .. }) => {
+                    if bound.is_missing() {
+                        return Err(NormalizeError::UnsupportedMatrixBound {
+                            owner,
+                            expression,
+                            operator: Box::new(node.operator.clone()),
+                        });
                     }
                     self.observe_bound_transfer(
                         owner,
@@ -15651,6 +15667,138 @@ mod tests {
     #[test]
     fn tensor_bound_trace_preserves_no_feasibility_result_and_rule() {
         assert_bound_trace_matches_no_feasibility(true);
+    }
+
+    #[test]
+    fn gadget_decompose_bound_is_operator_authority_independent_of_its_child() {
+        for (small, expected) in [(false, 2_u64), (true, 3_u64)] {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            let input_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
+            let output_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 2, 1).unwrap();
+            let input = matrix_source(
+                &mut expressions,
+                if small { "small-decompose-input" } else { "regular-decompose-input" },
+                input_type,
+                None,
+            );
+            let decomposition = expressions
+                .intern(
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                        output: output_type,
+                        base: 4,
+                        small,
+                        digit_count: 2,
+                    }),
+                    Box::new([input]),
+                )
+                .unwrap();
+            let (facts, mut monomials, owner) =
+                setup(&mut expressions, &mut programs, decomposition);
+            let input_owner = programs.scoped(&expressions, owner.program(), input).unwrap();
+            let missing_child = Arc::new(AnalyzedValue {
+                semantic: input_owner,
+                exact_nf: None,
+                coefficient_bound: NumericContract::Missing,
+            });
+            let node = expressions.node(decomposition).unwrap().clone();
+
+            let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                .unwrap()
+                .matrix_bound(owner, decomposition, &node, std::slice::from_ref(&missing_child))
+                .unwrap();
+            assert_eq!(ordinary, NumericContract::Missing);
+
+            let mut trace = FeasibilityTrace::default();
+            trace.record_invocation_start(owner).unwrap();
+            let traced = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .matrix_bound(owner, decomposition, &node, std::slice::from_ref(&missing_child))
+            .unwrap();
+            assert_eq!(traced, NumericContract::Known(CoefficientBound::finite(expected)));
+            assert_eq!(
+                trace
+                    .normalization_events()
+                    .iter()
+                    .filter(|event| matches!(event, NormalizerEvent::BoundTransfer { .. }))
+                    .collect::<Vec<_>>(),
+                vec![&NormalizerEvent::BoundTransfer {
+                    owner,
+                    rule: BoundRule::Authority(BoundAuthority::Operator),
+                }]
+            );
+
+            let value =
+                AnalyzedValue { semantic: owner, exact_nf: None, coefficient_bound: traced };
+            trace.record_normalization_result(owner, &value).unwrap();
+            trace.record_invocation_end(owner, &value, &NormalizationCounters::default()).unwrap();
+            trace.validate_normalization_observations().unwrap();
+        }
+    }
+
+    #[test]
+    fn pack_polynomial_coefficients_remains_typed_unsupported() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let bit = expressions
+            .intern(ValueOperator::Constant(TypedConstant::bool(true)), Box::new([]))
+            .unwrap();
+        let output = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
+        let pack = expressions
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::PackPolynomialCoefficients {
+                    output,
+                    coefficient_bits: 1,
+                }),
+                Box::new([bit]),
+            )
+            .unwrap();
+        let (facts, mut monomials, owner) = setup(&mut expressions, &mut programs, pack);
+        let bit_owner = programs.scoped(&expressions, owner.program(), bit).unwrap();
+        let missing_child = Arc::new(AnalyzedValue {
+            semantic: bit_owner,
+            exact_nf: None,
+            coefficient_bound: NumericContract::Missing,
+        });
+        let node = expressions.node(pack).unwrap().clone();
+        let ordinary = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .matrix_bound(owner, pack, &node, std::slice::from_ref(&missing_child))
+            .unwrap();
+        assert_eq!(ordinary, NumericContract::Missing);
+
+        let mut trace = FeasibilityTrace::default();
+        trace.record_invocation_start(owner).unwrap();
+        let error = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .matrix_bound(owner, pack, &node, std::slice::from_ref(&missing_child))
+        .unwrap_err();
+        assert_eq!(
+            error,
+            NormalizeError::UnsupportedMatrixBound {
+                owner,
+                expression: pack,
+                operator: Box::new(node.operator),
+            }
+        );
+        assert!(
+            !trace
+                .normalization_events()
+                .iter()
+                .any(|event| { matches!(event, NormalizerEvent::BoundTransfer { .. }) })
+        );
     }
 
     #[test]

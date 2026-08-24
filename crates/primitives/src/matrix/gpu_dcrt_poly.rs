@@ -1478,55 +1478,56 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                 .map(|(_, left, right)| (left.clone(), right.clone()))
                 .collect::<Vec<_>>();
             let (left_shape, right_shape) = (homogeneous[0].0.size(), homogeneous[0].1.size());
-            let computed = if left_shape == (1, 1) || right_shape == (1, 1) {
-                homogeneous
-                    .into_par_iter()
-                    .map(|(left, right)| {
-                        if left.size() == (1, 1) {
-                            right.multiply_poly_out_of_place(&left.entry(0, 0))
-                        } else if right.size() == (1, 1) {
-                            left.multiply_poly_out_of_place(&right.entry(0, 0))
-                        } else {
-                            left.multiply_out_of_place(&right)
-                        }
-                    })
-                    .collect()
-            } else {
-                let outputs = homogeneous
-                    .iter()
-                    .map(|(left, right)| {
-                        Self::new_empty_with_state(
-                            &left.params,
-                            left.nrow,
-                            right.ncol,
-                            left.level,
-                            true,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                if outputs.iter().any(|output| output.nrow != 0 && output.ncol != 0) {
-                    let output_pointers =
-                        outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
-                    let left_pointers = homogeneous
+            let computed =
+                if homogeneous.len() == 1 || left_shape == (1, 1) || right_shape == (1, 1) {
+                    homogeneous
+                        .into_par_iter()
+                        .map(|(left, right)| {
+                            if left.size() == (1, 1) {
+                                right.multiply_poly_out_of_place(&left.entry(0, 0))
+                            } else if right.size() == (1, 1) {
+                                left.multiply_poly_out_of_place(&right.entry(0, 0))
+                            } else {
+                                left.multiply_out_of_place(&right)
+                            }
+                        })
+                        .collect()
+                } else {
+                    let outputs = homogeneous
                         .iter()
-                        .map(|(left, _)| left.raw.cast_const())
+                        .map(|(left, right)| {
+                            Self::new_empty_with_state(
+                                &left.params,
+                                left.nrow,
+                                right.ncol,
+                                left.level,
+                                true,
+                            )
+                        })
                         .collect::<Vec<_>>();
-                    let right_pointers = homogeneous
-                        .iter()
-                        .map(|(_, right)| right.raw.cast_const())
-                        .collect::<Vec<_>>();
-                    let status = unsafe {
-                        gpu_matrix_mul_batch(
-                            output_pointers.as_ptr(),
-                            left_pointers.as_ptr(),
-                            right_pointers.as_ptr(),
-                            outputs.len(),
-                        )
-                    };
-                    check_status(status, "gpu_matrix_mul_batch");
-                }
-                outputs
-            };
+                    if outputs.iter().any(|output| output.nrow != 0 && output.ncol != 0) {
+                        let output_pointers =
+                            outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
+                        let left_pointers = homogeneous
+                            .iter()
+                            .map(|(left, _)| left.raw.cast_const())
+                            .collect::<Vec<_>>();
+                        let right_pointers = homogeneous
+                            .iter()
+                            .map(|(_, right)| right.raw.cast_const())
+                            .collect::<Vec<_>>();
+                        let status = unsafe {
+                            gpu_matrix_mul_batch(
+                                output_pointers.as_ptr(),
+                                left_pointers.as_ptr(),
+                                right_pointers.as_ptr(),
+                                outputs.len(),
+                            )
+                        };
+                        check_status(status, "gpu_matrix_mul_batch");
+                    }
+                    outputs
+                };
             for ((index, _, _), output) in group.into_iter().zip(computed) {
                 ordered[index] = Some(output);
             }

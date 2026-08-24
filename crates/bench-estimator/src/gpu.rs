@@ -35,11 +35,6 @@ use std::{
 };
 use tracing::info;
 
-unsafe extern "C" {
-    fn cudaProfilerStart() -> std::ffi::c_int;
-    fn cudaProfilerStop() -> std::ffi::c_int;
-}
-
 // Oversized column-separable operations are measured as bounded multi-column waves. The logical
 // output size remains unchanged in the estimator's persistent-memory model.
 const REPRESENTATIVE_MATRIX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -829,16 +824,6 @@ impl GpuNodeMeasurementBackend {
         let prepared = Self::prepare(&mut worker.backend, &node, &request.bindings)?;
         let probe = GpuMemoryProbe { device_id: worker.device_id };
         let mut operation_error = None;
-        let profile_preimage =
-            request.preimage_sample && std::env::var_os("MXX_PROFILE_GPU_PREIMAGE").is_some();
-        if profile_preimage {
-            let status = unsafe { cudaProfilerStart() };
-            if status != 0 {
-                return Err(GpuMeasurementError(format!(
-                    "cudaProfilerStart failed with status {status}"
-                )));
-            }
-        }
         let measured = measure_batch_operation(harness, &probe, 1, |representative_batch| {
             if operation_error.is_some() {
                 return;
@@ -855,14 +840,6 @@ impl GpuNodeMeasurementBackend {
             }
         })
         .map_err(|error| GpuMeasurementError(error.to_string()))?;
-        if profile_preimage {
-            let status = unsafe { cudaProfilerStop() };
-            if status != 0 {
-                return Err(GpuMeasurementError(format!(
-                    "cudaProfilerStop failed with status {status}"
-                )));
-            }
-        }
         if let Some(error) = operation_error {
             return Err(error);
         }

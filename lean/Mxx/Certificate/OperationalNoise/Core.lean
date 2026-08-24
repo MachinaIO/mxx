@@ -454,6 +454,44 @@ theorem productMerge_contribution_key (left right : ExactTerm) :
     (productMerge_contribution left right).key = MonomialKey.product left.key right.key := by
   rfl
 
+/-- Reclassify every factor of a typed scalar monomial as commutative. -/
+def scalarActionKey (key : MonomialKey) : MonomialKey :=
+  { centralFactors := canonicalCentral (key.centralFactors ++ key.orderedFactors)
+    orderedFactors := [] }
+
+@[simp]
+theorem scalarActionKey_central (key : MonomialKey) :
+    (scalarActionKey key).centralFactors =
+      canonicalCentral (key.centralFactors ++ key.orderedFactors) := by
+  rfl
+
+@[simp]
+theorem scalarActionKey_ordered (key : MonomialKey) :
+    (scalarActionKey key).orderedFactors = [] := by
+  rfl
+
+theorem productMerge_left_scalar_key (left right : ExactTerm) :
+    (productMerge_contribution { left with key := scalarActionKey left.key } right).key =
+      MonomialKey.product (scalarActionKey left.key) right.key := by
+  exact productMerge_contribution_key _ _
+
+theorem productMerge_left_scalar_coefficient (left right : ExactTerm) :
+    (productMerge_contribution { left with key := scalarActionKey left.key } right).coefficient =
+      left.coefficient * right.coefficient := by
+  simpa using productMerge_contribution_coefficient
+    { left with key := scalarActionKey left.key } right
+
+theorem productMerge_right_scalar_key (left right : ExactTerm) :
+    (productMerge_contribution left { right with key := scalarActionKey right.key }).key =
+      MonomialKey.product left.key (scalarActionKey right.key) := by
+  exact productMerge_contribution_key _ _
+
+theorem productMerge_right_scalar_coefficient (left right : ExactTerm) :
+    (productMerge_contribution left { right with key := scalarActionKey right.key }).coefficient =
+      left.coefficient * right.coefficient := by
+  simpa using productMerge_contribution_coefficient
+    left { right with key := scalarActionKey right.key }
+
 theorem boundTransfer_sum {left right left' right' : Nat}
     (leftBound : left ≤ left') (rightBound : right ≤ right') :
     left + right ≤ left' + right' := by

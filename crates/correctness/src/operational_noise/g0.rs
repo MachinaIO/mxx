@@ -6377,25 +6377,59 @@ fn derive_statement_events(
         }
     }
 
-    let mut monomial_arenas = BTreeMap::new();
-    for program in program_scopes
-        .keys()
-        .copied()
-        .chain(closed_programs.iter().copied())
-        .chain(scoped_roots.iter().map(|root| root.program()))
-    {
-        if let Some(arena) = job.monomials().get(program) {
-            monomial_arenas.insert(arena.token(), arena);
+    let mut monomial_owners =
+        BTreeMap::<super::monomial::MonomialId, BTreeSet<super::arena::ScopedExprId>>::new();
+    let mut invocation_roots = Vec::new();
+    let mut event_monomials = std::collections::HashSet::new();
+    for event in &trace.events {
+        if let NormalizerEvent::InvocationStart { root } = event {
+            invocation_roots.push(*root);
+        }
+        let owner = match event {
+            NormalizerEvent::Result { owner, .. } |
+            NormalizerEvent::BoundTransfer { owner, .. } => Some(*owner),
+            NormalizerEvent::InvocationEnd { root, .. } => Some(*root),
+            NormalizerEvent::AppliedRelation(observation) => Some(observation.owner),
+            NormalizerEvent::CoefficientMerge(observation) => Some(observation.owner),
+            NormalizerEvent::PreFoldPolynomial(_) => invocation_roots.last().copied(),
+            NormalizerEvent::InvocationStart { .. } |
+            NormalizerEvent::Predecessor { .. } |
+            NormalizerEvent::SpecializationComputed { .. } |
+            NormalizerEvent::SpecializationCacheHit { .. } |
+            NormalizerEvent::SurvivorFold(_) => None,
+        };
+        if let Some(owner) = owner {
+            event_monomials.clear();
+            FeasibilityTrace::retain_event_monomials(event, &mut event_monomials);
+            for monomial in &event_monomials {
+                if trace.retained_monomial_roots.contains(monomial) {
+                    monomial_owners.entry(*monomial).or_default().insert(owner);
+                }
+            }
+        }
+        if matches!(event, NormalizerEvent::InvocationEnd { .. }) {
+            invocation_roots.pop();
         }
     }
-    for monomial in &trace.retained_monomial_roots {
-        let arena =
-            monomial_arenas.get(&monomial.arena()).ok_or(G0Error::UnsupportedBoundTransfer)?;
-        let descriptor =
-            arena.descriptor(*monomial).map_err(|_| G0Error::UnsupportedBoundTransfer)?;
-        for factor in descriptor.central_factors.iter().chain(descriptor.ordered_factors.iter()) {
-            if expression_refs.contains_key(&factor.expression()) {
-                scoped_roots.insert(*factor);
+    for (monomial, owners) in monomial_owners {
+        for owner in owners {
+            let in_statement_scope = program_scopes.contains_key(&owner.program()) ||
+                closed_programs.contains(&owner.program());
+            if !in_statement_scope || !expression_refs.contains_key(&owner.expression()) {
+                continue;
+            }
+            let arena = job
+                .monomials()
+                .get(owner.program())
+                .filter(|arena| arena.token() == monomial.arena())
+                .ok_or(G0Error::UnsupportedBoundTransfer)?;
+            let descriptor =
+                arena.descriptor(monomial).map_err(|_| G0Error::UnsupportedBoundTransfer)?;
+            for factor in descriptor.central_factors.iter().chain(descriptor.ordered_factors.iter())
+            {
+                if expression_refs.contains_key(&factor.expression()) {
+                    scoped_roots.insert(*factor);
+                }
             }
         }
     }
@@ -7401,6 +7435,98 @@ mod tests {
                 if *scope == expected_scope && *expression == rows.expression(owner.expression()).unwrap()
         )));
         assert!(rows.expression_refs.get(&ignored_gadget).is_none());
+    }
+
+    #[test]
+    fn external_program_monomial_trace_does_not_change_retained_statement_rows() {
+        use crate::operational_noise::{
+            facts::{CoefficientBound, NumericContract},
+            normal_form::{AnalyzedValue, BoundedSummary, PolynomialNF},
+            program::FamilyDomain,
+        };
+
+        let mut job = CheckerJob::new();
+        let (scalar, input, gadget) = statement_gadget(&mut job);
+        let retained = job
+            .with_arena_stores(|expressions, programs, _| {
+                programs.generated_family_from_body(
+                    expressions,
+                    FamilyDomain::new(0, 1).unwrap(),
+                    gadget,
+                )
+            })
+            .unwrap();
+        let (external_program, external_owner) = job
+            .with_arena_stores(|expressions, programs, _| {
+                let external_scalar = expressions
+                    .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))?;
+                let external_input = expressions.intern(
+                    ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial {
+                        output: ResolvedMatrixType::new(17_u8.into(), 1, 1, 1)?,
+                        coefficient_bits: 2,
+                    }),
+                    Box::new([external_scalar]),
+                )?;
+                let external_gadget = expressions.intern(
+                    ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                        output: ResolvedMatrixType::new(17_u8.into(), 1, 2, 1)?,
+                        base: 8,
+                        small: false,
+                        digit_count: 2,
+                    }),
+                    Box::new([external_input]),
+                )?;
+                let external_program = programs.finalize(
+                    expressions,
+                    super::super::arena::ProgramSignature {
+                        inputs: Box::new([]),
+                        output: ResolvedValueType::Matrix(ResolvedMatrixType::new(
+                            17_u8.into(),
+                            1,
+                            2,
+                            1,
+                        )?),
+                    },
+                    external_gadget,
+                )?;
+                let external_owner =
+                    programs.scoped(expressions, external_program, external_gadget)?;
+                Ok((external_program, external_owner))
+            })
+            .unwrap();
+        let external_monomial = job
+            .intern_monomial(external_program, &[], &[external_owner])
+            .expect("external monomial");
+        let external_nf = std::sync::Arc::new(PolynomialNF {
+            exact_terms: [(external_monomial, BigInt::from(1_u8))].into_iter().collect(),
+            bounded_summary: BoundedSummary::finite(BigUint::from(1_u8).into()),
+        });
+        let external_value = AnalyzedValue {
+            semantic: external_owner,
+            exact_nf: Some(external_nf),
+            coefficient_bound: NumericContract::Known(CoefficientBound::finite(1_u8)),
+        };
+        let mut trace = FeasibilityTrace::default();
+        trace.record_invocation_start(external_owner).unwrap();
+        trace.record_normalization_result(external_owner, &external_value).unwrap();
+        trace.record_invocation_end(external_owner, &external_value, &Default::default()).unwrap();
+
+        let projection = job.programs().project_program(retained.program()).unwrap();
+        let closure = CertificateClosure {
+            expressions: [scalar, input, gadget, projection.root].into_iter().collect(),
+            programs: [retained.program()].into_iter().collect(),
+            families: [retained].into_iter().collect(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: [scalar].into_iter().collect(),
+        };
+        let baseline =
+            derive_certificate_statement_rows(&job, &closure, &FeasibilityTrace::default(), None)
+                .unwrap();
+        let with_external =
+            derive_certificate_statement_rows(&job, &closure, &trace, None).unwrap();
+        assert_eq!(with_external, baseline);
     }
 
     #[test]

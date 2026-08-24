@@ -1,4 +1,5 @@
 import Lean.Elab.Tactic.Omega
+import Mxx.Certificate.OperationalNoise.Replay
 
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
@@ -336,3 +337,167 @@ def OperationalClaim (cert : CheckedCert) : Prop :=
                 cert.val.ciphertextModulus
 
 end Mxx.Certificate.OperationalNoise
+
+namespace List
+
+inductive Forall₂ {α β : Type} (relation : α → β → Prop) : List α → List β → Prop
+  | nil : Forall₂ relation [] []
+  | cons {head tail bound bounds} :
+      relation head bound → Forall₂ relation tail bounds →
+        Forall₂ relation (head :: tail) (bound :: bounds)
+
+end List
+
+namespace Mxx.Certificate.OperationalNoise.EventReplay
+
+open Mxx.Certificate.OperationalNoise
+
+/-! Pure finite algebra used by G0 replay. Central factors are canonicalized as an ordered
+    multiset, while ordered factors retain their concatenation order. -/
+
+def insertCentral (factor : Nat) : List Nat → List Nat
+  | [] => [factor]
+  | head :: tail =>
+      if factor ≤ head then factor :: head :: tail else head :: insertCentral factor tail
+
+def canonicalCentral : List Nat → List Nat
+  | [] => []
+  | head :: tail => insertCentral head (canonicalCentral tail)
+
+theorem canonicalCentral_nil : canonicalCentral [] = [] := by rfl
+
+theorem insertCentral_mem (factor : Nat) (factors : List Nat) :
+    factor ∈ insertCentral factor factors := by
+  induction factors with
+  | nil => simp [insertCentral]
+  | cons head tail ih =>
+      by_cases h : factor ≤ head
+      · simp [insertCentral, h]
+      · simp [insertCentral, h, ih]
+
+theorem canonicalCentral_mem (factor : Nat) (factors : List Nat) :
+    factor ∈ canonicalCentral (factor :: factors) := by
+  simp [canonicalCentral, insertCentral_mem]
+
+def MonomialKey.product (left right : MonomialKey) : MonomialKey :=
+  { centralFactors := canonicalCentral (left.centralFactors ++ right.centralFactors)
+    orderedFactors := left.orderedFactors ++ right.orderedFactors }
+
+theorem product_central (left right : MonomialKey) :
+    (MonomialKey.product left right).centralFactors =
+      canonicalCentral (left.centralFactors ++ right.centralFactors) := by rfl
+
+theorem product_ordered (left right : MonomialKey) :
+    (MonomialKey.product left right).orderedFactors =
+      left.orderedFactors ++ right.orderedFactors := by rfl
+
+structure MonomialContext where
+  exteriorCentral : List Nat
+  prefixFactors : List Nat
+  suffixFactors : List Nat
+deriving DecidableEq, Repr
+
+def MonomialContext.plug (context : MonomialContext) (key : MonomialKey) : MonomialKey :=
+  { centralFactors := canonicalCentral (context.exteriorCentral ++ key.centralFactors)
+    orderedFactors := context.prefixFactors ++ key.orderedFactors ++ context.suffixFactors }
+
+theorem context_plug_central (context : MonomialContext) (key : MonomialKey) :
+    (context.plug key).centralFactors =
+      canonicalCentral (context.exteriorCentral ++ key.centralFactors) := by
+  rfl
+
+theorem context_plug_ordered (context : MonomialContext) (key : MonomialKey) :
+    (context.plug key).orderedFactors =
+      context.prefixFactors ++ key.orderedFactors ++ context.suffixFactors := by
+  rfl
+
+def scalePolynomial (scalar : Int) (polynomial : Polynomial) : Polynomial :=
+  polynomial.map (fun term => { term with coefficient := scalar * term.coefficient })
+
+def contextualize (context : MonomialContext) (polynomial : Polynomial) : Polynomial :=
+  polynomial.map (fun term => { term with key := context.plug term.key })
+
+def relationReplacement (context : MonomialContext) (outerCoefficient : Int)
+    (rhs : Polynomial) : Polynomial :=
+  scalePolynomial outerCoefficient (contextualize context rhs)
+
+theorem scalePolynomial_coefficient (scalar : Int) (polynomial : Polynomial) (key : MonomialKey) :
+    coefficient key (scalePolynomial scalar polynomial) = scalar * coefficient key polynomial := by
+  induction polynomial with
+  | nil => simp [scalePolynomial, coefficient]
+  | cons term terms ih =>
+      by_cases h : term.key = key
+      · simp only [scalePolynomial, List.map, coefficient, if_pos h]
+        change scalar * term.coefficient + coefficient key (scalePolynomial scalar terms) =
+          scalar * (term.coefficient + coefficient key terms)
+        rw [ih]
+        exact (Int.mul_add _ _ _).symm
+      · simp only [scalePolynomial, List.map, coefficient, if_neg h]
+        change coefficient key (scalePolynomial scalar terms) = scalar * coefficient key terms
+        exact ih
+
+theorem relationReplacement_singleton (context : MonomialContext) (outerCoefficient : Int)
+    (term : ExactTerm) :
+    relationReplacement context outerCoefficient [term] =
+      [{ coefficient := outerCoefficient * term.coefficient, key := context.plug term.key }] := by
+  rfl
+
+theorem coefficient_add_replay (key : MonomialKey) (left right : Polynomial) :
+    coefficient key (add left right) = coefficient key left + coefficient key right :=
+  coefficient_add key left right
+
+theorem coefficient_subtract_replay (key : MonomialKey) (left right : Polynomial) :
+    coefficient key (subtract left right) = coefficient key left - coefficient key right :=
+  coefficient_subtract key left right
+
+def productMerge_contribution (left right : ExactTerm) : ExactTerm :=
+  { coefficient := left.coefficient * right.coefficient
+    key := MonomialKey.product left.key right.key }
+
+theorem productMerge_contribution_coefficient (left right : ExactTerm) :
+    (productMerge_contribution left right).coefficient = left.coefficient * right.coefficient := by
+  rfl
+
+theorem productMerge_contribution_key (left right : ExactTerm) :
+    (productMerge_contribution left right).key = MonomialKey.product left.key right.key := by
+  rfl
+
+theorem boundTransfer_sum {left right left' right' : Nat}
+    (leftBound : left ≤ left') (rightBound : right ≤ right') :
+    left + right ≤ left' + right' := by
+  exact Nat.add_le_add leftBound rightBound
+
+theorem boundTransfer_scale {scalar bound bound' : Nat} (boundTransfer : bound ≤ bound') :
+    scalar * bound ≤ scalar * bound' := by
+  exact Nat.mul_le_mul_left scalar boundTransfer
+
+theorem boundTransfer_product {left right left' right' : Nat}
+    (leftBound : left ≤ left') (rightBound : right ≤ right') :
+    left * right ≤ left' * right' := by
+  exact Nat.mul_le_mul leftBound rightBound
+
+theorem boundTransfer_zero_product (bound : Nat) : 0 * bound = 0 := by simp
+
+theorem boundTransfer_product_zero (bound : Nat) : bound * 0 = 0 := by simp
+
+theorem List.sum_le_sum_forall₂ {left right : List Nat}
+    (hbound : List.Forall₂ (fun value bound => value ≤ bound) left right) :
+    left.sum ≤ right.sum := by
+  induction hbound with
+  | nil => simp
+  | cons head tail ih => exact Nat.add_le_add head ih
+
+theorem survivorFold_sound {contributions bounds : List Nat}
+    (hbound : List.Forall₂ (fun value bound => value ≤ bound) contributions bounds) :
+    contributions.sum ≤ bounds.sum := by
+  exact List.sum_le_sum_forall₂ hbound
+
+theorem preFold_to_invocationEnd {preFoldSummary postFoldSummary : Nat}
+    {survivorContributions survivorBounds : List Nat}
+    (summaryBound : preFoldSummary ≤ postFoldSummary)
+    (transferBounds : List.Forall₂ (fun value bound => value ≤ bound)
+      survivorContributions survivorBounds) :
+    preFoldSummary + survivorContributions.sum ≤ postFoldSummary + survivorBounds.sum := by
+  exact Nat.add_le_add summaryBound (survivorFold_sound transferBounds)
+
+end Mxx.Certificate.OperationalNoise.EventReplay

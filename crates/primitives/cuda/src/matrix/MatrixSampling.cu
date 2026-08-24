@@ -167,10 +167,11 @@ __device__ __forceinline__ uint64_t signed_mod_i64(int64_t value, uint64_t modul
     }
     if (value >= 0)
     {
-        return static_cast<uint64_t>(value) % modulus;
+        const uint64_t magnitude = static_cast<uint64_t>(value);
+        return magnitude < modulus ? magnitude : magnitude % modulus;
     }
     uint64_t magnitude = static_cast<uint64_t>(-(value + 1)) + 1;
-    uint64_t rem = magnitude % modulus;
+    uint64_t rem = magnitude < modulus ? magnitude : magnitude % modulus;
     return rem == 0 ? 0 : (modulus - rem);
 }
 
@@ -198,20 +199,22 @@ __device__ __forceinline__ uint64_t centered_sample_abs_i64(
     return residue < negative_magnitude ? residue : negative_magnitude;
 }
 
-__device__ __forceinline__ uint64_t sample_uniform_mod(DeviceChaChaRng &rng, uint64_t modulus)
+__device__ __forceinline__ uint64_t sample_uniform_mod(
+    DeviceChaChaRng &rng,
+    uint64_t modulus,
+    uint64_t rejection_threshold)
 {
     if (modulus == 0)
     {
         return 0;
     }
-    constexpr uint64_t kU64Max = ~uint64_t{0};
-    const uint64_t threshold = kU64Max - (kU64Max % modulus);
     for (;;)
     {
-        uint64_t x = rng_next_u64(rng);
-        if (x < threshold)
+        const uint64_t random = rng_next_u64(rng);
+        const uint64_t low = random * modulus;
+        if (low >= rejection_threshold)
         {
-            return x % modulus;
+            return __umul64hi(random, modulus);
         }
     }
 }
@@ -249,82 +252,77 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
     uint64_t coefficient_modulus,
     GpuRngSeed seed)
 {
-    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    size_t total = poly_count * n;
-    if (idx >= total)
+    constexpr size_t kSamplesPerThread = 4;
+    const size_t chunks_per_poly = (n + kSamplesPerThread - 1) / kSamplesPerThread;
+    const size_t chunk_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total_chunks = poly_count * chunks_per_poly;
+    if (chunk_idx >= total_chunks)
     {
         return;
     }
-    const size_t local_poly_idx = idx / n;
-    const size_t coeff_idx = idx - local_poly_idx * n;
+    const size_t local_poly_idx = chunk_idx / chunks_per_poly;
+    const size_t coeff_start =
+        (chunk_idx - local_poly_idx * chunks_per_poly) * kSamplesPerThread;
     const size_t row_idx = local_poly_idx / local_ncol;
     const size_t local_col_idx = local_poly_idx - row_idx * local_ncol;
     const size_t global_poly_idx = row_idx * full_ncol + (col_offset + local_col_idx);
 
-    uint64_t sample = 0;
-    if (dist_type == GPU_MATRIX_DIST_UNIFORM)
-    {
-        DeviceChaChaRng rng;
-        rng_init(
-            rng,
-            seed,
-            static_cast<uint64_t>(global_poly_idx + 1),
-            static_cast<uint64_t>(coeff_idx + 1),
-            static_cast<uint64_t>(limb_idx + 1),
-            0x6f70656e66686531ULL);
-        sample = sample_uniform_mod(rng, modulus);
-    }
-    else if (dist_type == GPU_MATRIX_DIST_GAUSS)
-    {
-        DeviceChaChaRng rng;
-        rng_init(
-            rng,
-            seed,
-            static_cast<uint64_t>(global_poly_idx + 1),
-            static_cast<uint64_t>(coeff_idx + 1),
-            0,
-            0x6f70656e66686532ULL);
-        int64_t z;
-        do
-        {
-            z = sample_integer_karney(rng, 0.0, sigma);
-        } while (centered_sample_abs_i64(z, coefficient_modulus) > max_coefficient_bound);
-        sample = signed_mod_i64(z, modulus);
-    }
-    else if (dist_type == GPU_MATRIX_DIST_BIT)
-    {
-        DeviceChaChaRng rng;
-        rng_init(
-            rng,
-            seed,
-            static_cast<uint64_t>(global_poly_idx + 1),
-            static_cast<uint64_t>(coeff_idx + 1),
-            0,
-            0x6f70656e66686533ULL);
-        sample = (rng_next_u64(rng) & 1ULL) % modulus;
-    }
-    else if (dist_type == GPU_MATRIX_DIST_TERNARY)
-    {
-        DeviceChaChaRng rng;
-        rng_init(
-            rng,
-            seed,
-            static_cast<uint64_t>(global_poly_idx + 1),
-            static_cast<uint64_t>(coeff_idx + 1),
-            0,
-            0x6f70656e66686534ULL);
-        uint64_t pick = rng_next_u64(rng) % 3ULL;
-        int64_t z = pick == 0 ? 0 : (pick == 1 ? 1 : -1);
-        sample = signed_mod_i64(z, modulus);
-    }
+    const uint64_t domain = dist_type == GPU_MATRIX_DIST_UNIFORM ?
+        0x6f70656e66686531ULL :
+        (dist_type == GPU_MATRIX_DIST_GAUSS ? 0x6f70656e66686532ULL :
+         (dist_type == GPU_MATRIX_DIST_BIT ? 0x6f70656e66686533ULL :
+                                            0x6f70656e66686534ULL));
+    const uint64_t limb_domain =
+        dist_type == GPU_MATRIX_DIST_UNIFORM ? static_cast<uint64_t>(limb_idx + 1) : 0;
+    DeviceChaChaRng rng;
+    rng_init(
+        rng,
+        seed,
+        static_cast<uint64_t>(global_poly_idx + 1),
+        static_cast<uint64_t>(coeff_start + 1),
+        limb_domain,
+        domain);
+    const uint64_t uniform_rejection_threshold =
+        dist_type == GPU_MATRIX_DIST_UNIFORM && modulus != 0 ?
+        static_cast<uint64_t>(-modulus) % modulus : 0;
 
-    matrix_store_limb_u64(
-        dst_base,
-        local_poly_idx,
-        coeff_idx,
-        dst_stride_bytes,
-        dst_coeff_bytes,
-        sample);
+    for (size_t lane = 0; lane < kSamplesPerThread; ++lane)
+    {
+        const size_t coeff_idx = coeff_start + lane;
+        if (coeff_idx >= n) break;
+        uint64_t sample = 0;
+        if (dist_type == GPU_MATRIX_DIST_UNIFORM)
+        {
+            sample = sample_uniform_mod(rng, modulus, uniform_rejection_threshold);
+        }
+        else if (dist_type == GPU_MATRIX_DIST_GAUSS)
+        {
+            int64_t z;
+            do
+            {
+                z = sample_integer_karney(rng, 0.0, sigma);
+            } while (centered_sample_abs_i64(z, coefficient_modulus) > max_coefficient_bound);
+            sample = signed_mod_i64(z, modulus);
+        }
+        else if (dist_type == GPU_MATRIX_DIST_BIT)
+        {
+            sample = rng_next_u64(rng) & 1ULL;
+        }
+        else if (dist_type == GPU_MATRIX_DIST_TERNARY)
+        {
+            const uint64_t pick = rng_next_u64(rng) % 3ULL;
+            const int64_t z = pick == 0 ? 0 : (pick == 1 ? 1 : -1);
+            sample = signed_mod_i64(z, modulus);
+        }
+
+        matrix_store_limb_u64(
+            dst_base,
+            local_poly_idx,
+            coeff_idx,
+            dst_stride_bytes,
+            dst_coeff_bytes,
+            sample);
+    }
 }
 
 int launch_sample_distribution_multi_limb_kernel(
@@ -357,8 +355,10 @@ int launch_sample_distribution_multi_limb_kernel(
     }
 
     const int threads = 256;
-    const size_t total = poly_count * n;
-    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    constexpr size_t kSamplesPerThread = 4;
+    const size_t chunks_per_poly = (n + kSamplesPerThread - 1) / kSamplesPerThread;
+    const size_t total_chunks = poly_count * chunks_per_poly;
+    const int blocks = static_cast<int>((total_chunks + threads - 1) / threads);
     matrix_sample_distribution_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
         dst_base,
         poly_count,

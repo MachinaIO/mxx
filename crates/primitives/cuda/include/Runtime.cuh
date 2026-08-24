@@ -64,16 +64,17 @@ struct GpuNttDeviceConstants
 {
     int device;
     size_t limb_count;
-    uint32_t stage_count;
-    uint64_t *limb_wlen_forward; // stage-major layout: [stage][limb]
-    uint64_t *limb_wlen_inverse; // stage-major layout: [stage][limb]
+    uint32_t ring_dimension;
+    uint64_t *twiddle_forward; // limb-major layout: [limb][exponent]
+    uint64_t *twiddle_inverse; // limb-major layout: [limb][exponent]
+    uint64_t *twiddle_shoup_forward;
+    uint64_t *twiddle_shoup_inverse;
 };
 
 #if defined(__CUDACC__)
 extern __constant__ uint64_t gpu_ntt_const_moduli[GPU_RUNTIME_MAX_LIMBS];
-extern __constant__ uint64_t gpu_ntt_const_root[GPU_RUNTIME_MAX_LIMBS];
-extern __constant__ uint64_t gpu_ntt_const_inv_root[GPU_RUNTIME_MAX_LIMBS];
 extern __constant__ uint64_t gpu_ntt_const_n_inv[GPU_RUNTIME_MAX_LIMBS];
+extern __constant__ uint64_t gpu_ntt_const_n_inv_shoup[GPU_RUNTIME_MAX_LIMBS];
 extern __constant__ uint32_t gpu_ntt_const_limb_count;
 #endif
 

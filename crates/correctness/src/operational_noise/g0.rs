@@ -1963,10 +1963,10 @@ impl FeasibilitySink for FeasibilityTrace {
             &mut self.retained_monomial_roots,
         );
         let frame = self.frames.last_mut().ok_or(G0Error::MissingNormalizationResult)?;
+        frame.results.insert(result.expression(), index);
         if pending_removed {
             frame.pending_bounds.remove(&result);
         }
-        frame.results.insert(result.expression(), index);
         Ok(index)
     }
 
@@ -5432,6 +5432,16 @@ mod tests {
             }
     }
 
+    fn oracle_event_observation(observation: &EventObservation) -> u64 {
+        1 + 1 +
+            1 +
+            match observation.kind {
+                EventKind::Sample { .. } |
+                EventKind::Sampler { .. } |
+                EventKind::Trapdoor { .. } => 2,
+            }
+    }
+
     fn oracle_index_plan(plan: &IndexUsePlan) -> u64 {
         let frontier = oracle_sequence(plan.frontier.iter().map(|_| 5));
         let slice = plan.slice_group.as_ref().map(|group| {
@@ -5455,15 +5465,8 @@ mod tests {
     fn oracle_lowering(trace: &FeasibilityTrace) -> u64 {
         oracle_sequence(
             trace.source_observations.iter().map(|(handle, class)| oracle_source(handle, class)),
-        ) + oracle_sequence(trace.event_observations.iter().map(|(_, observation)| {
-            1 + 1 +
-                1 +
-                match observation.kind {
-                    EventKind::Sample { .. } |
-                    EventKind::Sampler { .. } |
-                    EventKind::Trapdoor { .. } => 2,
-                }
-        })) + oracle_sequence(trace.index_use_plans.iter().map(oracle_index_plan))
+        ) + oracle_sequence(trace.event_observations.values().map(oracle_event_observation)) +
+            oracle_sequence(trace.index_use_plans.iter().map(oracle_index_plan))
     }
 
     fn oracle_normalization(trace: &FeasibilityTrace) -> u64 {
@@ -6187,14 +6190,21 @@ mod tests {
 
     #[test]
     fn independent_retention_oracle_covers_every_retained_variant() {
-        use crate::operational_noise::{
-            arena::{ArenaToken, ExprArena, FamilyDomain},
-            monomial::MonomialId,
-            program::ProgramArena,
-            relation::{
-                RelationRegistry, RuntimeSpecializationKey, SamplerSourceContract,
-                TrapdoorSourceContract, UniversalDispatchKey,
+        use crate::{
+            operational_noise::{
+                arena::{
+                    ArenaToken, ArtifactIdentity, ExprArena, FamilyDomain,
+                    SemanticFamilySourceIdentity, SemanticSourceIdentity,
+                },
+                monomial::MonomialId,
+                program::ProgramArena,
+                relation::{
+                    CanonicalLhsKey, NormalizationCache, RelationRegistry,
+                    RuntimeSpecializationKey, SamplerSourceContract, TrapdoorSourceContract,
+                    UniversalDispatchKey,
+                },
             },
+            protocol::{ArtifactBinding, ArtifactName, StageId, StageInputName},
         };
         use std::sync::Arc;
 
@@ -6211,6 +6221,12 @@ mod tests {
             )
             .expect("family");
         let owner = programs.scoped(&expressions, family.program(), expression).expect("owner");
+        let monomial = MonomialId::new(ArenaToken::fresh(), 0);
+        let mut normalization = NormalizationCache::new();
+        let rhs = normalization
+            .intern(super::super::normal_form::PolynomialNF::zero())
+            .expect("canonical rhs");
+        let generation = RelationRegistry::new().freeze();
         let key = RuntimeSpecializationKey {
             dispatch: UniversalDispatchKey {
                 preimage_family: family,
@@ -6219,27 +6235,56 @@ mod tests {
                 trapdoor_source: TrapdoorSourceContract { expression },
             },
             index: owner,
-            generation: RelationRegistry::new().freeze(),
+            generation,
         };
-        let monomial = MonomialId::new(ArenaToken::fresh(), 0);
         let value_ref = BoundValueRef::Transfer(EventIndex(0));
-        let polynomial = Arc::new(super::super::normal_form::PolynomialNF::zero());
+        let polynomial = Arc::new(super::super::normal_form::PolynomialNF {
+            exact_terms: [(monomial, BigInt::from(-2_i8))].into_iter().collect(),
+            bounded_summary: super::super::normal_form::BoundedSummary::finite(
+                BigUint::from(5_u8).into(),
+            ),
+        });
         let value = RecordedValue {
             exact_nf: Some(polynomial.clone()),
             coefficient_bound: NumericContract::Known(CoefficientBound::finite(3_u8)),
         };
         let replay = SpecializationReplay {
             range: EventRange { start: EventIndex(0), end: EventIndex(1) },
-            rhs_results: Box::new([]),
+            rhs_results: vec![(rhs, EventIndex(2))].into_boxed_slice(),
         };
+        let predecessor_ref = BoundValueRef::Predecessor {
+            input_position: 1,
+            projection: BoundProjection::Coefficient,
+        };
+        let result_ref =
+            BoundValueRef::Result { event: EventIndex(2), projection: BoundProjection::Summary };
+        for reference in [&predecessor_ref, &result_ref, &value_ref] {
+            assert_eq!(logical_value_ref(reference), oracle_value_ref(reference));
+        }
+        for contract in [
+            NumericContract::Known(CoefficientBound::ExactZero),
+            NumericContract::Known(CoefficientBound::finite(3_u8)),
+            NumericContract::Known(CoefficientBound::Large),
+            NumericContract::Missing,
+        ] {
+            assert_eq!(logical_numeric_contract(&contract).unwrap(), oracle_contract(&contract));
+        }
         let rules = vec![
+            BoundRule::Authority(BoundAuthority::FactStore),
+            BoundRule::Authority(BoundAuthority::ProgramFamilyFact),
+            BoundRule::Authority(BoundAuthority::Operator),
             BoundRule::Authority(BoundAuthority::RelationPreimageSource { source: expression }),
-            BoundRule::Identity { input: value_ref.clone() },
+            BoundRule::Authority(BoundAuthority::Unavailable),
+            BoundRule::Identity { input: predecessor_ref.clone() },
             BoundRule::Sum { inputs: vec![value_ref.clone()].into_boxed_slice() },
             BoundRule::Maximum { inputs: vec![value_ref.clone()].into_boxed_slice() },
             BoundRule::Scale {
                 value: value_ref.clone(),
                 scale: BoundScale::Magnitude(BigUint::from(2_u8)),
+            },
+            BoundRule::Scale {
+                value: result_ref.clone(),
+                scale: BoundScale::Value(predecessor_ref.clone()),
             },
             BoundRule::MonomialProduct {
                 monomial,
@@ -6269,6 +6314,9 @@ mod tests {
                 right_is_constant_polynomial: false,
             },
         ];
+        for rule in &rules {
+            assert_eq!(logical_bound_rule(rule).unwrap(), oracle_bound_rule(rule));
+        }
         let mut events = vec![
             NormalizerEvent::InvocationStart { root: owner },
             NormalizerEvent::Predecessor {
@@ -6316,6 +6364,19 @@ mod tests {
                     input_result: EventIndex(2),
                 },
             }),
+            NormalizerEvent::AppliedRelation(AppliedRelation {
+                owner,
+                source_monomial: monomial,
+                outer_coefficient: BigInt::from(1_u8),
+                ordered_start: 0,
+                ordered_end_exclusive: 1,
+                rule: AppliedRelationRule::Universal {
+                    key: key.clone(),
+                    source: replay.range,
+                    lhs: CanonicalLhsKey { layout: None, monomial },
+                    rhs,
+                },
+            }),
             NormalizerEvent::CoefficientMerge(CoefficientMerge {
                 owner,
                 source: CoefficientMergeSource::Operator {
@@ -6341,11 +6402,16 @@ mod tests {
                 bound: EventIndex(0),
             }),
             NormalizerEvent::PreFoldPolynomial(PreFoldPolynomial {
-                polynomial,
+                polynomial: polynomial.clone(),
                 summary_evidence: Some(value_ref),
             }),
         ];
         events.extend(rules.into_iter().map(|rule| NormalizerEvent::BoundTransfer { owner, rule }));
+        for event in &events {
+            assert_eq!(logical_event(event).unwrap(), oracle_event(event));
+        }
+        assert_eq!(logical_polynomial(&polynomial).unwrap(), oracle_polynomial(&polynomial));
+        assert_eq!(logical_specialization_replay(&replay).unwrap(), oracle_replay(&replay));
 
         let mut trace = FeasibilityTrace::default();
         trace.events = events;
@@ -6358,12 +6424,131 @@ mod tests {
         });
         trace.specialization_ranges.insert(key, replay);
         trace.retained_monomial_roots.insert(monomial);
+        let artifact = ArtifactIdentity {
+            definition: "oracle-artifact".to_owned(),
+            version: 1,
+            confidentiality: 0,
+            value_type: ResolvedValueType::Int,
+            layout: "scalar".to_owned(),
+            domain: Some(FamilyDomain::new(0, 1).expect("artifact domain")),
+        };
+        let expression_identity = InputSourceIdentity::Expression(SemanticSourceIdentity {
+            stable_definition: "oracle-expression".to_owned(),
+            invocation: "invocation".to_owned(),
+            sample_event: Some(SampleEventId(1)),
+            output_role: "value".to_owned(),
+            sampler: Some(SampleDescriptor::new("source", ResolvedValueType::Int)),
+            artifact: Some(artifact.clone()),
+            value_type: ResolvedValueType::Int,
+            coordinates: vec![0].into_boxed_slice(),
+            matrix_constant: None,
+        });
+        let family_identity = InputSourceIdentity::Family(SemanticFamilySourceIdentity {
+            stable_definition: "oracle-family".to_owned(),
+            invocation: "invocation".to_owned(),
+            element_type: ResolvedValueType::Int,
+            domain: FamilyDomain::new(0, 1).expect("family identity domain"),
+            artifact: Some(artifact),
+        });
+        let expression_identity_without_options =
+            InputSourceIdentity::Expression(SemanticSourceIdentity {
+                stable_definition: "oracle-expression-plain".to_owned(),
+                invocation: "invocation".to_owned(),
+                sample_event: None,
+                output_role: "value".to_owned(),
+                sampler: None,
+                artifact: None,
+                value_type: ResolvedValueType::Int,
+                coordinates: Box::new([]),
+                matrix_constant: None,
+            });
+        let family_identity_without_artifact =
+            InputSourceIdentity::Family(SemanticFamilySourceIdentity {
+                stable_definition: "oracle-family-plain".to_owned(),
+                invocation: "invocation".to_owned(),
+                element_type: ResolvedValueType::Int,
+                domain: FamilyDomain::new(0, 1).expect("plain family identity domain"),
+                artifact: None,
+            });
+        let source_cases = vec![
+            (
+                SourceHandle::Expression(expression),
+                SourceClass::ScalarConstant { value: TypedConstant::int(1) },
+            ),
+            (
+                SourceHandle::Expression(expression),
+                SourceClass::MatrixConstant {
+                    matrix_type: matrix(),
+                    kind: MatrixConstantKind::Identity,
+                },
+            ),
+            (
+                SourceHandle::Expression(expression),
+                SourceClass::DeclaredProtocolInput {
+                    owner: planned_owner(2),
+                    input: ProtocolInputId::from("declared"),
+                    identity: expression_identity.clone(),
+                },
+            ),
+            (
+                SourceHandle::Family(family),
+                SourceClass::DeclaredProtocolInput {
+                    owner: planned_owner(3),
+                    input: ProtocolInputId::from("family"),
+                    identity: family_identity.clone(),
+                },
+            ),
+            (
+                SourceHandle::Expression(expression),
+                SourceClass::UnboundOccurrenceInput {
+                    owner: planned_owner(4),
+                    identity: expression_identity,
+                },
+            ),
+            (
+                SourceHandle::Family(family),
+                SourceClass::UnboundOccurrenceInput {
+                    owner: planned_owner(5),
+                    identity: family_identity,
+                },
+            ),
+            (
+                SourceHandle::Expression(expression),
+                SourceClass::UnboundOccurrenceInput {
+                    owner: planned_owner(5),
+                    identity: expression_identity_without_options,
+                },
+            ),
+            (
+                SourceHandle::Family(family),
+                SourceClass::UnboundOccurrenceInput {
+                    owner: planned_owner(5),
+                    identity: family_identity_without_artifact,
+                },
+            ),
+            (
+                SourceHandle::Expression(expression),
+                SourceClass::ProducerArtifact {
+                    producer: ArtifactProducer {
+                        consumer: planned_owner(6),
+                        binding: ArtifactBinding {
+                            consumer_input: StageInputName("input".to_owned()),
+                            producer_stage: StageId("producer".to_owned()),
+                            producer_output: ArtifactName("output".to_owned()),
+                        },
+                        producer: planned_owner(7),
+                    },
+                },
+            ),
+        ];
+        for (handle, class) in &source_cases {
+            assert_eq!(logical_source(handle, class).unwrap(), oracle_source(handle, class));
+        }
         trace.source_observations.insert(
             SourceHandle::Expression(expression),
             SourceClass::ScalarConstant { value: TypedConstant::int(1) },
         );
-        trace.event_observations.insert(
-            SampleEventId(1),
+        let observation_cases = vec![
             EventObservation {
                 event: SampleEventId(1),
                 owner: planned_owner(1),
@@ -6371,12 +6556,56 @@ mod tests {
                     descriptor: SampleDescriptor::new("oracle-sample", ResolvedValueType::Int),
                 },
             },
-        );
-        trace.index_use_plans.insert(index_plan(
-            IndexUseKind::IntegerExpression,
-            expression,
-            vec![axis(1, 0, 0, 2)],
-        ));
+            EventObservation {
+                event: SampleEventId(2),
+                owner: planned_owner(2),
+                kind: EventKind::Sampler {
+                    operation: SamplerOperation::Trapdoor {
+                        output: matrix(),
+                        sigma: "1.25".to_owned(),
+                        gadget_base: 2,
+                        digit_count: 3,
+                        preimage_max_coefficient_bound: BigInt::from(9_u8),
+                    },
+                },
+            },
+            EventObservation {
+                event: SampleEventId(3),
+                owner: planned_owner(3),
+                kind: EventKind::Trapdoor {
+                    operation: TrapdoorOperation::Generate {
+                        descriptor: "oracle-trapdoor".to_owned(),
+                        parameters: vec![4, 5].into_boxed_slice(),
+                        paired_public_event: SampleEventId(2),
+                        paired_public_output_role: "public".to_owned(),
+                    },
+                },
+            },
+        ];
+        for observation in &observation_cases {
+            assert_eq!(
+                logical_event_observation(&observation.event, observation),
+                oracle_event_observation(observation),
+            );
+        }
+        trace.event_observations.insert(SampleEventId(1), observation_cases[0].clone());
+
+        let basic_plan =
+            index_plan(IndexUseKind::IntegerExpression, expression, vec![axis(1, 0, 0, 2)]);
+        let mut rich_plan =
+            index_plan(IndexUseKind::IndexedSlice, expression, vec![axis(2, 1, 0, 4)]);
+        rich_plan.result_family = Some(family);
+        rich_plan.consumed = Some(expression);
+        rich_plan.consumed_family = Some(family);
+        rich_plan.output_type = ResolvedValueType::Matrix(matrix());
+        rich_plan.slice_group = Some(slice_group(vec![axis(2, 1, 0, 4)]));
+        let mut empty_option_plan = basic_plan.clone();
+        empty_option_plan.result = None;
+        empty_option_plan.output_range = None;
+        for plan in [&empty_option_plan, &basic_plan, &rich_plan] {
+            assert_eq!(logical_index_plan(plan).unwrap(), oracle_index_plan(plan));
+        }
+        trace.index_use_plans.insert(basic_plan);
 
         let production_lowering = trace.recompute_lowering_items().expect("production lowering");
         let production_normalization = logical_sum([

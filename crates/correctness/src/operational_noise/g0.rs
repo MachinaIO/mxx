@@ -2480,6 +2480,17 @@ impl FeasibilityTrace {
             NormalizerEvent::BoundTransfer { rule, .. } => {
                 Self::retain_bound_rule_monomials(rule, roots);
             }
+            NormalizerEvent::CoefficientMerge(observation) => {
+                roots.insert(observation.output);
+                match &observation.source {
+                    CoefficientMergeSource::Operator { inputs } => {
+                        roots.extend(inputs.iter().map(|input| input.monomial));
+                    }
+                    CoefficientMergeSource::Relation { source_term, .. } => {
+                        roots.insert(*source_term);
+                    }
+                }
+            }
             _ => {}
         }
     }

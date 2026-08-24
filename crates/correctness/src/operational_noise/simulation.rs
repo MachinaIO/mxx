@@ -225,7 +225,7 @@ pub(crate) struct ProofPayloadTermRef {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProofPayloadCoefficientMergeSource {
-    Operator { inputs: Box<[ProofPayloadTermRef]> },
+    Operator { inputs: [ProofPayloadTermRef; 2] },
     Relation { application: u64, source_term_ordinal: u64 },
 }
 
@@ -838,6 +838,36 @@ impl<'a> ProofPayloadProjector<'a> {
         Ok(ProofPayloadTermRef { value_event: reference.value_event.0, term_ordinal })
     }
 
+    fn validate_relation_output(
+        &self,
+        applied: &super::g0::AppliedRelation,
+        source_term: super::monomial::MonomialId,
+        output: &ProofPayloadMonomial,
+    ) -> Result<(), G0Error> {
+        let source = self.monomial(applied.source_monomial)?;
+        let replacement = self.monomial(source_term)?;
+        let start =
+            usize::try_from(applied.ordered_start).map_err(|_| G0Error::RelationTraceInvariant)?;
+        let end = usize::try_from(applied.ordered_end_exclusive)
+            .map_err(|_| G0Error::RelationTraceInvariant)?;
+        if start > end || end > source.ordered_factors.len() {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        let mut central_factors = source.central_factors;
+        central_factors.extend(replacement.central_factors);
+        central_factors.sort();
+        let mut ordered_factors = Vec::with_capacity(
+            source.ordered_factors.len() - (end - start) + replacement.ordered_factors.len(),
+        );
+        ordered_factors.extend_from_slice(&source.ordered_factors[..start]);
+        ordered_factors.extend(replacement.ordered_factors);
+        ordered_factors.extend_from_slice(&source.ordered_factors[end..]);
+        if output.central_factors != central_factors || output.ordered_factors != ordered_factors {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        Ok(())
+    }
+
     fn coefficient_merge(
         &self,
         trace: &FeasibilityTrace,
@@ -937,11 +967,10 @@ impl<'a> ProofPayloadProjector<'a> {
                     _ => unreachable!("operator classification is exhaustive"),
                 }
                 ProofPayloadCoefficientMergeSource::Operator {
-                    inputs: inputs
-                        .iter()
-                        .map(|reference| self.term_ref(trace, *reference, current))
-                        .collect::<Result<Vec<_>, G0Error>>()?
-                        .into_boxed_slice(),
+                    inputs: [
+                        self.term_ref(trace, inputs[0], current)?,
+                        self.term_ref(trace, inputs[1], current)?,
+                    ],
                 }
             }
             super::g0::CoefficientMergeSource::Relation { application, source_term } => {
@@ -990,6 +1019,7 @@ impl<'a> ProofPayloadProjector<'a> {
                         current,
                     )?
                     .term_ordinal;
+                self.validate_relation_output(applied, *source_term, &output)?;
                 ProofPayloadCoefficientMergeSource::Relation {
                     application: application.0,
                     source_term_ordinal: source_ordinal,

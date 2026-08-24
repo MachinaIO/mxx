@@ -189,7 +189,6 @@ struct ProductGadgetSplice {
     input_nf: Arc<PolynomialNF>,
     next_after: Option<MonomialId>,
     coefficient: BigInt,
-    application: Option<super::g0::EventIndex>,
 }
 
 enum ProductWorkItem {
@@ -4022,26 +4021,17 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         });
                     }
                     let outer_coefficient = splice.coefficient.clone();
-                    let application = splice.application;
                     if input_terms.next().is_some() {
                         splice.next_after = batch.last().map(|(monomial, _)| *monomial);
                         worklist.push_front(ProductWorkItem::GadgetSplice(splice));
                     }
-                    for ((input_monomial, input_coefficient), replacement) in
+                    for ((_, input_coefficient), replacement) in
                         batch.into_iter().zip(replacements).rev()
                     {
-                        let signed_contribution = &outer_coefficient * &input_coefficient;
-                        if S::ENABLED && !signed_contribution.is_zero() {
-                            self.observe_relation_merge(
-                                owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?,
-                                application.ok_or(super::g0::G0Error::RelationTraceInvariant)?,
-                                input_monomial,
-                                replacement,
-                                signed_contribution.clone(),
-                            )?;
-                        }
-                        worklist
-                            .push_front(ProductWorkItem::Term(replacement, signed_contribution));
+                        worklist.push_front(ProductWorkItem::Term(
+                            replacement,
+                            outer_coefficient.clone() * input_coefficient,
+                        ));
                     }
                     continue;
                 }
@@ -4339,7 +4329,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     input_nf,
                     next_after: None,
                     coefficient,
-                    application: applied_event,
                 }));
             }
             *noise = add_noise_summaries(noise, &summary_noise);
@@ -4349,7 +4338,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 input_nf,
                 next_after: None,
                 coefficient,
-                application: applied_event,
             }));
         }
         Ok(None)

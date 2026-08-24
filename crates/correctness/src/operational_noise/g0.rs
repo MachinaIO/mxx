@@ -3190,7 +3190,11 @@ impl FeasibilitySink for FeasibilityTrace {
 
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error> {
         match self.source_observations.get(&handle) {
-            Some(existing) if existing != &class => Err(G0Error::ConflictingSourceClass),
+            Some(existing) if existing != &class => Err(G0Error::ConflictingSourceClass {
+                handle,
+                existing: existing.clone(),
+                observed: class,
+            }),
             Some(_) => Ok(()),
             None => {
                 self.add_lowering_items(logical_add(1, logical_source(&handle, &class)?)?)?;
@@ -4409,8 +4413,10 @@ pub(crate) enum G0Error {
     Arena(#[from] super::arena::ArenaError),
     #[error("feasibility trace counter overflow")]
     TraceOverflow,
-    #[error("conflicting source classes for one typed lowering handle")]
-    ConflictingSourceClass,
+    #[error(
+        "conflicting source classes for typed lowering handle {handle:?}: existing {existing:?}, observed {observed:?}"
+    )]
+    ConflictingSourceClass { handle: SourceHandle, existing: SourceClass, observed: SourceClass },
     #[error("event {event} has conflicting typed descriptors")]
     ConflictingEventDescriptor { event: u64 },
     #[error("event has conflicting typed owner or descriptor")]
@@ -7635,7 +7641,11 @@ mod tests {
                 scalar,
                 SourceClass::ScalarConstant { value: TypedConstant::int(8) },
             ),
-            Err(G0Error::ConflictingSourceClass)
+            Err(G0Error::ConflictingSourceClass {
+                handle: scalar,
+                existing: SourceClass::ScalarConstant { value: TypedConstant::int(7) },
+                observed: SourceClass::ScalarConstant { value: TypedConstant::int(8) },
+            })
         );
 
         let closure = CertificateClosure {

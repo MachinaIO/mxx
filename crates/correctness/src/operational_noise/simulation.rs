@@ -10,7 +10,10 @@ use super::{
         ValueOperator,
     },
     error::{OperationalSimulationError, TargetError},
-    g0::FeasibilityTrace,
+    g0::{
+        AppliedRelationRule, BoundAuthority, BoundProjection, BoundRule, BoundScale, BoundValueRef,
+        CanonicalResidualRefs, FeasibilityTrace, G0Error, MonomialFactorEvidence, NormalizerEvent,
+    },
     lower::{ProductionAdapter, ProductionRoot},
     program::{FamilyValueId, ValueProgramId},
     protocol::ProtocolPlan,
@@ -149,6 +152,160 @@ pub(crate) struct OperationalCertificateRun {
     pub projection: OperationalCertificateProjection,
     pub accepted_report: super::report::OperationalReport,
     pub trace: FeasibilityTrace,
+}
+
+/// A stable owner reference used by the proof-payload boundary.  The numbers are rows in
+/// `CanonicalResidualRefs`; they are never arena slots or raw handles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct ProofPayloadOwner {
+    pub program_row: u64,
+    pub expression_row: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct ProofPayloadMonomial {
+    pub central_factors: Vec<ProofPayloadOwner>,
+    pub ordered_factors: Vec<ProofPayloadOwner>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct ProofPayloadTerm {
+    pub monomial: ProofPayloadMonomial,
+    pub coefficient: BigInt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProofPayloadPolynomial {
+    pub exact_terms: Vec<ProofPayloadTerm>,
+    pub bounded_summary: Option<super::normal_form::BoundedSummary>,
+    pub coefficient_bound: super::facts::NumericContract<super::facts::CoefficientBound>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct ProofPayloadRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProofPayloadRelationRule {
+    Universal {
+        source: ProofPayloadRange,
+        lhs: ProofPayloadMonomial,
+        rhs: ProofPayloadPolynomial,
+    },
+    Gadget {
+        gadget: ProofPayloadOwner,
+        decomposition: ProofPayloadOwner,
+        input: u64,
+        input_result: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProofPayloadFactorEvidence {
+    pub bound: ProofPayloadValueRef,
+    pub is_constant_polynomial: bool,
+    pub support_upper: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProofPayloadValueRef {
+    Predecessor { input_position: u32, projection: BoundProjection },
+    Result { event: u64, projection: BoundProjection },
+    Transfer(u64),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProofPayloadScale {
+    Value(ProofPayloadValueRef),
+    Magnitude(BigUint),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProofPayloadRule {
+    Authority(BoundAuthority),
+    Identity {
+        input: ProofPayloadValueRef,
+    },
+    Sum {
+        inputs: Vec<ProofPayloadValueRef>,
+    },
+    Maximum {
+        inputs: Vec<ProofPayloadValueRef>,
+    },
+    Scale {
+        value: ProofPayloadValueRef,
+        scale: ProofPayloadScale,
+    },
+    MonomialProduct {
+        monomial: ProofPayloadMonomial,
+        factors: Vec<ProofPayloadFactorEvidence>,
+    },
+    WeightedSum {
+        inputs: Vec<ProofPayloadValueRef>,
+    },
+    Product {
+        left: ProofPayloadValueRef,
+        right: ProofPayloadValueRef,
+        facts: super::bound::MatrixProductFacts,
+    },
+    Tensor {
+        left: ProofPayloadValueRef,
+        right: ProofPayloadValueRef,
+        left_is_constant_polynomial: bool,
+        right_is_constant_polynomial: bool,
+    },
+}
+
+/// One stable chronological observation.  Event positions remain the only local references;
+/// all arena-local expression, monomial, and canonical-RHS handles are projected into values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProofPayloadEvent {
+    InvocationStart {
+        root: ProofPayloadOwner,
+    },
+    Predecessor {
+        consumer: ProofPayloadOwner,
+        input_position: u32,
+        predecessor: u64,
+        source_result: u64,
+    },
+    Result {
+        owner: ProofPayloadOwner,
+        value: ProofPayloadPolynomial,
+    },
+    InvocationEnd {
+        root: ProofPayloadOwner,
+        result: ProofPayloadPolynomial,
+        counters: super::normal_form::NormalizationCounters,
+    },
+    SpecializationComputed {
+        owner: ProofPayloadOwner,
+        source: ProofPayloadRange,
+        rhs_results: Vec<(ProofPayloadPolynomial, u64)>,
+    },
+    SpecializationCacheHit {
+        owner: ProofPayloadOwner,
+        source: ProofPayloadRange,
+    },
+    AppliedRelation {
+        owner: ProofPayloadOwner,
+        source_monomial: ProofPayloadMonomial,
+        outer_coefficient: BigInt,
+        ordered_start: u32,
+        ordered_end_exclusive: u32,
+        rule: ProofPayloadRelationRule,
+    },
+    BoundTransfer {
+        owner: ProofPayloadOwner,
+        rule: ProofPayloadRule,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OperationalProofPayload {
+    pub events: Vec<ProofPayloadEvent>,
 }
 
 /// The typed dependency inventory rooted at one residual production root.
@@ -315,6 +472,8 @@ pub(crate) enum CertificateProjectionError {
     Rejected { target_id: String },
     #[error("operational checker report mismatched certificate target {target_id:?}: {detail}")]
     ReportMismatch { target_id: String, detail: String },
+    #[error("proof payload projection failed: {detail}")]
+    ProofPayload { detail: String },
 }
 
 /// Re-runs target resolution and production lowering only when certificate emission is explicitly
@@ -324,6 +483,363 @@ pub(crate) fn project_operational_certificate(
     request: &super::OperationalCheckRequest,
 ) -> Result<OperationalCertificateProjection, CertificateProjectionError> {
     Ok(prepare_operational_certificate(protocol, request)?.projection)
+}
+
+/// Project the retained Rust trace into one canonical, in-memory proof payload.  This is a
+/// crate-local boundary: it does not serialize, emit Lean, or retain a second dependency graph.
+pub(crate) fn derive_proof_payload(
+    run: &OperationalCertificateRun,
+) -> Result<OperationalProofPayload, CertificateProjectionError> {
+    let closure = collect_residual_closure(&run.job, &run.projection.residual)
+        .map_err(|error| CertificateProjectionError::Closure(error))?;
+    let mut residual = run.trace.clone();
+    residual.retain_residual(&closure);
+    let refs = super::g0::canonical_residual_refs(&run.job, &closure, &residual)
+        .map_err(proof_payload_error)?;
+    let scopes = proof_payload_scopes(&closure, &residual);
+    let projector = ProofPayloadProjector { job: &run.job, refs: &refs, scopes };
+    projector.project(&residual)
+}
+
+fn proof_payload_error(error: G0Error) -> CertificateProjectionError {
+    CertificateProjectionError::ProofPayload { detail: error.to_string() }
+}
+
+fn proof_payload_scopes(
+    closure: &CertificateClosure,
+    trace: &FeasibilityTrace,
+) -> BTreeSet<super::arena::ValueProgramId> {
+    let mut scopes = closure.programs.clone();
+    for event in &trace.events {
+        match event {
+            NormalizerEvent::InvocationStart { root } |
+            NormalizerEvent::Result { owner: root, .. } |
+            NormalizerEvent::InvocationEnd { root, .. } |
+            NormalizerEvent::SpecializationComputed { owner: root, .. } |
+            NormalizerEvent::SpecializationCacheHit { owner: root, .. } |
+            NormalizerEvent::BoundTransfer { owner: root, .. } => {
+                scopes.insert(root.program());
+            }
+            NormalizerEvent::Predecessor { consumer, .. } => {
+                scopes.insert(consumer.program());
+            }
+            NormalizerEvent::AppliedRelation(observation) => {
+                scopes.insert(observation.owner.program());
+                match &observation.rule {
+                    AppliedRelationRule::Universal { key, .. } => {
+                        scopes.insert(key.index.program());
+                    }
+                    AppliedRelationRule::Gadget { gadget, decomposition, .. } => {
+                        scopes.insert(gadget.program());
+                        scopes.insert(decomposition.program());
+                    }
+                }
+            }
+        }
+    }
+    scopes
+}
+
+struct ProofPayloadProjector<'a> {
+    job: &'a super::job::CheckerJob,
+    refs: &'a CanonicalResidualRefs,
+    scopes: BTreeSet<super::arena::ValueProgramId>,
+}
+
+impl<'a> ProofPayloadProjector<'a> {
+    fn project(
+        self,
+        trace: &FeasibilityTrace,
+    ) -> Result<OperationalProofPayload, CertificateProjectionError> {
+        let event_count = trace.events.len();
+        let mut events = Vec::with_capacity(event_count);
+        for (index, event) in trace.events.iter().enumerate() {
+            events.push(self.event(index, event).map_err(proof_payload_error)?);
+        }
+        Ok(OperationalProofPayload { events })
+    }
+
+    fn owner(&self, owner: super::arena::ScopedExprId) -> Result<ProofPayloadOwner, G0Error> {
+        Ok(ProofPayloadOwner {
+            // Closed roots do not have a separate program row in the residual DAG.  In that
+            // case the canonical expression row is the owner-local scope row.
+            program_row: self
+                .refs
+                .program(owner.program())
+                .or_else(|_| self.refs.expression(owner.expression()))?,
+            expression_row: self.refs.expression(owner.expression())?,
+        })
+    }
+
+    fn expression(&self, expression: super::arena::ExprId) -> Result<u64, G0Error> {
+        self.refs.expression(expression)
+    }
+
+    fn monomial(
+        &self,
+        monomial: super::monomial::MonomialId,
+    ) -> Result<ProofPayloadMonomial, G0Error> {
+        for scope in &self.scopes {
+            let Some(arena) = self.job.monomials().get(*scope) else { continue };
+            let Ok(descriptor) = arena.descriptor(monomial) else { continue };
+            return Ok(ProofPayloadMonomial {
+                central_factors: descriptor
+                    .central_factors
+                    .iter()
+                    .copied()
+                    .map(|factor| self.owner(factor))
+                    .collect::<Result<Vec<_>, _>>()?,
+                ordered_factors: descriptor
+                    .ordered_factors
+                    .iter()
+                    .copied()
+                    .map(|factor| self.owner(factor))
+                    .collect::<Result<Vec<_>, _>>()?,
+            });
+        }
+        Err(G0Error::UnsupportedBoundTransfer)
+    }
+
+    fn polynomial(
+        &self,
+        value: &super::g0::RecordedValue,
+    ) -> Result<ProofPayloadPolynomial, G0Error> {
+        let Some(normal_form) = &value.exact_nf else {
+            return Ok(ProofPayloadPolynomial {
+                exact_terms: Vec::new(),
+                bounded_summary: None,
+                coefficient_bound: value.coefficient_bound.clone(),
+            });
+        };
+        self.polynomial_nf(normal_form)
+    }
+
+    fn polynomial_nf(
+        &self,
+        normal_form: &super::normal_form::PolynomialNF,
+    ) -> Result<ProofPayloadPolynomial, G0Error> {
+        let mut exact_terms = normal_form
+            .exact_terms
+            .iter()
+            .map(|(monomial, coefficient)| {
+                Ok(ProofPayloadTerm {
+                    monomial: self.monomial(*monomial)?,
+                    coefficient: coefficient.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, G0Error>>()?;
+        exact_terms.sort_by(|left, right| left.monomial.cmp(&right.monomial));
+        Ok(ProofPayloadPolynomial {
+            exact_terms,
+            bounded_summary: Some(normal_form.bounded_summary.clone()),
+            coefficient_bound: normal_form.bounded_summary.coefficient_bound(),
+        })
+    }
+
+    fn cached_polynomial(
+        &self,
+        rhs: super::relation::CanonicalRhsId,
+    ) -> Result<ProofPayloadPolynomial, G0Error> {
+        let value =
+            self.job.normalization().get_arc(rhs).map_err(|_| G0Error::RelationTraceInvariant)?;
+        self.polynomial_nf(value.as_ref())
+    }
+
+    fn range(
+        &self,
+        range: super::g0::EventRange,
+        current: usize,
+    ) -> Result<ProofPayloadRange, G0Error> {
+        if range.start.0 > range.end.0 || range.end.0 as usize > current {
+            return Err(G0Error::MalformedSpecializationRange);
+        }
+        Ok(ProofPayloadRange { start: range.start.0, end: range.end.0 })
+    }
+
+    fn value_ref(
+        &self,
+        value: &BoundValueRef,
+        current: usize,
+    ) -> Result<ProofPayloadValueRef, G0Error> {
+        let event = match value {
+            BoundValueRef::Predecessor { input_position, projection } => {
+                return Ok(ProofPayloadValueRef::Predecessor {
+                    input_position: *input_position,
+                    projection: projection.clone(),
+                });
+            }
+            BoundValueRef::Result { event, projection } => {
+                self.prior_event(*event, current)?;
+                return Ok(ProofPayloadValueRef::Result {
+                    event: event.0,
+                    projection: projection.clone(),
+                });
+            }
+            BoundValueRef::Transfer(event) => {
+                self.prior_event(*event, current)?;
+                *event
+            }
+        };
+        Ok(ProofPayloadValueRef::Transfer(event.0))
+    }
+
+    fn prior_event(&self, event: super::g0::EventIndex, current: usize) -> Result<(), G0Error> {
+        if event.0 as usize >= current {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        Ok(())
+    }
+
+    fn rule(&self, rule: &BoundRule, current: usize) -> Result<ProofPayloadRule, G0Error> {
+        let value = |value: &BoundValueRef| self.value_ref(value, current);
+        Ok(match rule {
+            BoundRule::Authority(authority) => ProofPayloadRule::Authority(authority.clone()),
+            BoundRule::Identity { input } => ProofPayloadRule::Identity { input: value(input)? },
+            BoundRule::Sum { inputs } => ProofPayloadRule::Sum {
+                inputs: inputs.iter().map(value).collect::<Result<Vec<_>, _>>()?,
+            },
+            BoundRule::Maximum { inputs } => ProofPayloadRule::Maximum {
+                inputs: inputs.iter().map(value).collect::<Result<Vec<_>, _>>()?,
+            },
+            BoundRule::Scale { value: input, scale } => ProofPayloadRule::Scale {
+                value: value(input)?,
+                scale: match scale {
+                    BoundScale::Value(input) => ProofPayloadScale::Value(value(input)?),
+                    BoundScale::Magnitude(magnitude) => {
+                        ProofPayloadScale::Magnitude(magnitude.clone())
+                    }
+                },
+            },
+            BoundRule::MonomialProduct { monomial, factors } => ProofPayloadRule::MonomialProduct {
+                monomial: self.monomial(*monomial)?,
+                factors: factors
+                    .iter()
+                    .map(|factor| self.factor(factor, current))
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+            BoundRule::WeightedSum { inputs } => ProofPayloadRule::WeightedSum {
+                inputs: inputs.iter().map(value).collect::<Result<Vec<_>, _>>()?,
+            },
+            BoundRule::Product { left, right, facts } => ProofPayloadRule::Product {
+                left: value(left)?,
+                right: value(right)?,
+                facts: facts.clone(),
+            },
+            BoundRule::Tensor {
+                left,
+                right,
+                left_is_constant_polynomial,
+                right_is_constant_polynomial,
+            } => ProofPayloadRule::Tensor {
+                left: value(left)?,
+                right: value(right)?,
+                left_is_constant_polynomial: *left_is_constant_polynomial,
+                right_is_constant_polynomial: *right_is_constant_polynomial,
+            },
+        })
+    }
+
+    fn factor(
+        &self,
+        factor: &MonomialFactorEvidence,
+        current: usize,
+    ) -> Result<ProofPayloadFactorEvidence, G0Error> {
+        Ok(ProofPayloadFactorEvidence {
+            bound: self.value_ref(&factor.bound, current)?,
+            is_constant_polynomial: factor.is_constant_polynomial,
+            support_upper: factor.support_upper,
+        })
+    }
+
+    fn relation_rule(
+        &self,
+        rule: &AppliedRelationRule,
+        current: usize,
+    ) -> Result<ProofPayloadRelationRule, G0Error> {
+        Ok(match rule {
+            AppliedRelationRule::Universal { source, lhs, rhs, .. } => {
+                ProofPayloadRelationRule::Universal {
+                    source: self.range(*source, current)?,
+                    lhs: self.monomial(lhs.monomial)?,
+                    rhs: self.cached_polynomial(*rhs)?,
+                }
+            }
+            AppliedRelationRule::Gadget { gadget, decomposition, input, input_result } => {
+                self.prior_event(*input_result, current)?;
+                ProofPayloadRelationRule::Gadget {
+                    gadget: self.owner(*gadget)?,
+                    decomposition: self.owner(*decomposition)?,
+                    input: self.expression(*input)?,
+                    input_result: input_result.0,
+                }
+            }
+        })
+    }
+
+    fn event(&self, current: usize, event: &NormalizerEvent) -> Result<ProofPayloadEvent, G0Error> {
+        Ok(match event {
+            NormalizerEvent::InvocationStart { root } => {
+                ProofPayloadEvent::InvocationStart { root: self.owner(*root)? }
+            }
+            NormalizerEvent::Predecessor {
+                consumer,
+                input_position,
+                predecessor,
+                source_result,
+            } => {
+                self.prior_event(*source_result, current)?;
+                ProofPayloadEvent::Predecessor {
+                    consumer: self.owner(*consumer)?,
+                    input_position: *input_position,
+                    predecessor: self.expression(*predecessor)?,
+                    source_result: source_result.0,
+                }
+            }
+            NormalizerEvent::Result { owner, value } => ProofPayloadEvent::Result {
+                owner: self.owner(*owner)?,
+                value: self.polynomial(value)?,
+            },
+            NormalizerEvent::InvocationEnd { root, result, counters } => {
+                ProofPayloadEvent::InvocationEnd {
+                    root: self.owner(*root)?,
+                    result: self.polynomial(result)?,
+                    counters: counters.clone(),
+                }
+            }
+            NormalizerEvent::SpecializationComputed { owner, replay, .. } => {
+                ProofPayloadEvent::SpecializationComputed {
+                    owner: self.owner(*owner)?,
+                    source: self.range(replay.range, current)?,
+                    rhs_results: replay
+                        .rhs_results
+                        .iter()
+                        .map(|(rhs, result)| {
+                            self.prior_event(*result, current)?;
+                            Ok((self.cached_polynomial(*rhs)?, result.0))
+                        })
+                        .collect::<Result<Vec<_>, G0Error>>()?,
+                }
+            }
+            NormalizerEvent::SpecializationCacheHit { owner, source, .. } => {
+                ProofPayloadEvent::SpecializationCacheHit {
+                    owner: self.owner(*owner)?,
+                    source: self.range(*source, current)?,
+                }
+            }
+            NormalizerEvent::AppliedRelation(observation) => ProofPayloadEvent::AppliedRelation {
+                owner: self.owner(observation.owner)?,
+                source_monomial: self.monomial(observation.source_monomial)?,
+                outer_coefficient: observation.outer_coefficient.clone(),
+                ordered_start: observation.ordered_start,
+                ordered_end_exclusive: observation.ordered_end_exclusive,
+                rule: self.relation_rule(&observation.rule, current)?,
+            },
+            NormalizerEvent::BoundTransfer { owner, rule } => ProofPayloadEvent::BoundTransfer {
+                owner: self.owner(*owner)?,
+                rule: self.rule(rule, current)?,
+            },
+        })
+    }
 }
 
 /// Resolve, lower, report, and retain one accepted opt-in certificate run.
@@ -1666,6 +2182,38 @@ mod tests {
         assert!(!projection.closure.expressions.is_empty());
         assert!(projection.closure.programs.is_empty());
         assert!(projection.closure.families.is_empty());
+    }
+
+    #[test]
+    fn proof_payload_projects_the_accepted_trace_without_arena_handles() {
+        let protocol = threshold_certificate_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "certificate-threshold".to_owned(),
+        };
+        let run = prepare_operational_certificate(&protocol, &request)
+            .expect("valid threshold certificate run");
+        let payload = derive_proof_payload(&run).expect("canonical proof payload");
+        let second = prepare_operational_certificate(&protocol, &request)
+            .expect("equivalent threshold certificate run");
+        let second_payload = derive_proof_payload(&second).expect("canonical second payload");
+        assert_eq!(payload, second_payload);
+        let mut residual = run.trace.clone();
+        residual.retain_residual(&run.projection.closure);
+        assert_eq!(payload.events.len(), residual.events.len());
+        assert!(
+            payload
+                .events
+                .iter()
+                .any(|event| { matches!(event, ProofPayloadEvent::InvocationEnd { .. }) })
+        );
+        assert!(
+            payload
+                .events
+                .iter()
+                .any(|event| { matches!(event, ProofPayloadEvent::Result { .. }) })
+        );
     }
 
     #[test]

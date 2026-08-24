@@ -47,7 +47,6 @@ pub(crate) struct ReplayMetrics {
     pub cancellation_count: usize,
     pub survivor_count: usize,
     pub logical_payload_terms: usize,
-    pub artifact_bytes: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -84,8 +83,6 @@ impl ReplaySink for ReplayTrace {
             self.metrics.survivor_count.saturating_add(event.survivors.len());
         self.metrics.logical_payload_terms =
             self.metrics.logical_payload_terms.saturating_add(event.result.term_count());
-        self.metrics.artifact_bytes =
-            self.metrics.artifact_bytes.saturating_add(std::mem::size_of_val(&event));
         self.events.push(event);
     }
 }

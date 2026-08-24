@@ -152,6 +152,8 @@ pub(crate) struct OperationalCertificateRun {
     pub projection: OperationalCertificateProjection,
     pub accepted_report: super::report::OperationalReport,
     pub trace: FeasibilityTrace,
+    #[cfg(test)]
+    pub roots: super::lower::ProductionRoots,
 }
 
 /// A stable owner reference used by the proof-payload boundary.  The numbers are rows in
@@ -1075,7 +1077,14 @@ pub(crate) fn prepare_operational_certificate(
     if !accepted_report.accepted {
         return Err(CertificateProjectionError::Rejected { target_id: request.target_id.clone() });
     }
-    Ok(OperationalCertificateRun { job, projection, accepted_report, trace })
+    Ok(OperationalCertificateRun {
+        job,
+        projection,
+        accepted_report,
+        trace,
+        #[cfg(test)]
+        roots,
+    })
 }
 
 /// Prepare the typed, non-emitting base summary used by the later G0 feasibility evidence stage.
@@ -2045,6 +2054,39 @@ mod tests {
         }
     }
 
+    fn repeat_certificate_normalization(run: &mut OperationalCertificateRun) {
+        let plaintext_modulus = match &run.accepted_report.acceptance {
+            super::super::OperationalAcceptanceReport::Threshold { plaintext_modulus, .. } => {
+                plaintext_modulus.clone()
+            }
+            super::super::OperationalAcceptanceReport::BooleanInterval { .. } => {
+                panic!("repeated fixture requires threshold acceptance")
+            }
+        };
+        analyze_roots_with_sink(
+            &mut run.job,
+            &run.roots,
+            &ReportTarget {
+                target_id: run.accepted_report.target_id.clone(),
+                plaintext_modulus,
+                ciphertext_modulus: run.accepted_report.ciphertext_modulus.clone(),
+                boolean_interval: false,
+            },
+            &mut run.trace,
+        )
+        .expect("repeat accepted trace normalization");
+        let closed_root_expression = match &run.projection.residual {
+            CertificateResidualRoot::Closed { root, .. } => Some(root.expression()),
+            CertificateResidualRoot::Family { .. } => None,
+        };
+        extend_certificate_closure(&run.job, &mut run.projection.closure, &run.trace)
+            .expect("repeat trace closure");
+        if let Some(wrapper) = closed_wrapper_program(&run.trace, closed_root_expression) {
+            run.projection.closure.programs.remove(&wrapper);
+        }
+        run.trace.retain_residual(&run.projection.closure);
+    }
+
     fn threshold_certificate_protocol() -> ProtocolDecl {
         let stage_id = StageId("certificate-stage".to_owned());
         let ring = Ring::new(256, 1);
@@ -2392,8 +2434,9 @@ mod tests {
             layouts: Vec::new(),
             target_id: "singleton-preimage".to_owned(),
         };
-        let run = prepare_operational_certificate(&protocol, &request)
+        let mut run = prepare_operational_certificate(&protocol, &request)
             .expect("singleton universal certificate run");
+        repeat_certificate_normalization(&mut run);
         let payload = derive_proof_payload(&run).expect("singleton universal payload");
         assert_eq!(run.projection.closure.families.len(), 1);
         let computed = payload
@@ -2409,7 +2452,6 @@ mod tests {
             .expect("universal specialization computation");
         assert_eq!(computed.3.end, computed.0 as u64);
         assert!(computed.3.start < computed.3.end);
-        assert!(computed.2.preimage_family > 0);
         let applied = payload
             .events
             .iter()
@@ -2444,16 +2486,53 @@ mod tests {
             Some(ProofPayloadEvent::InvocationEnd { .. })
         ));
         assert_eq!(applied.1.scope, computed.1.scope);
+        let mut frame_stack = Vec::new();
+        let mut frame_at = vec![None; payload.events.len()];
+        for (index, event) in payload.events.iter().enumerate() {
+            if matches!(event, ProofPayloadEvent::InvocationStart { .. }) {
+                frame_stack.push(index);
+            }
+            frame_at[index] = frame_stack.last().copied();
+            if matches!(event, ProofPayloadEvent::InvocationEnd { .. }) {
+                frame_stack.pop();
+            }
+        }
+        assert_eq!(frame_at[applied.0], frame_at[computed.0]);
         assert!(payload.events.iter().all(|event| match event {
             ProofPayloadEvent::BoundTransfer { owner, rule } => {
                 !payload_rule_mentions_transfer(rule, applied.0) || owner.scope == applied.1.scope
             }
             _ => true,
         }));
+        let hit = payload
+            .events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                ProofPayloadEvent::SpecializationCacheHit { owner, source } => {
+                    Some((index, *owner, *source))
+                }
+                _ => None,
+            })
+            .expect("universal specialization cache hit");
+        assert!(hit.0 > applied.0);
+        assert_eq!(hit.1.scope, computed.1.scope);
+        assert_eq!(hit.2, computed.3);
+        assert!(hit.2.end <= hit.0 as u64);
         let second = prepare_operational_certificate(&protocol, &request)
             .and_then(|run| derive_proof_payload(&run))
             .expect("stable singleton universal payload");
-        assert_eq!(payload, second);
+        assert!(
+            second.events.iter().all(|event| {
+                !matches!(event, ProofPayloadEvent::SpecializationCacheHit { .. })
+            })
+        );
+        assert!(
+            second
+                .events
+                .iter()
+                .any(|event| { matches!(event, ProofPayloadEvent::SpecializationComputed { .. }) })
+        );
     }
 
     #[test]

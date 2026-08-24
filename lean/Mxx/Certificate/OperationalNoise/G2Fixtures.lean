@@ -100,7 +100,82 @@ theorem g2_four_role_product_kernel :
     g2_product_bound, g2_relation_context_preserves_order,
     g2_relation_replacement_preserves_context⟩
 
+/-! A single owner-local algebra chain using the left-scalar product role. The replacement and
+    product contribution meet at one contextualized key, cancel there, and leave one survivor
+    whose resolved transfer is folded into the invocation-end bound. -/
+
+def g2ReplayRightTerm : ExactTerm :=
+  { coefficient := 3
+    key := { centralFactors := [3], orderedFactors := [31, 51, 41] } }
+
+def g2ReplayProduct : ExactTerm :=
+  operatorProductContribution g2LeftTerm g2ReplayRightTerm true false
+
+def g2ReplayContext : MonomialContext :=
+  { exteriorCentral := [7, 11, 12], prefixFactors := [31], suffixFactors := [41] }
+
+def g2ReplaySourceA : MonomialKey :=
+  { centralFactors := [3], orderedFactors := [51] }
+
+def g2ReplaySourceB : MonomialKey :=
+  { centralFactors := [4], orderedFactors := [61] }
+
+def g2ReplayReplacement : Polynomial :=
+  relationReplacement g2ReplayContext 2
+    [ { coefficient := 3, key := g2ReplaySourceA },
+      { coefficient := -1, key := g2ReplaySourceB } ]
+
+def g2ReplayMerged : Polynomial := add g2ReplayReplacement [g2ReplayProduct]
+def g2ReplaySubtracted : Polynomial := subtract g2ReplayReplacement [g2ReplayProduct]
+
+theorem g2_replay_composition :
+    g2ReplayProduct =
+        { coefficient := -6
+          key := { centralFactors := [3, 7, 11, 12], orderedFactors := [31, 51, 41] } } ∧
+      g2ReplayContext.plug g2ReplaySourceA = g2ReplayProduct.key ∧
+      g2ReplayReplacement =
+        [ { coefficient := 6
+            key := { centralFactors := [3, 7, 11, 12], orderedFactors := [31, 51, 41] } },
+          { coefficient := -2
+            key := { centralFactors := [4, 7, 11, 12], orderedFactors := [31, 61, 41] } } ] ∧
+      coefficient (g2ReplayContext.plug g2ReplaySourceA) g2ReplayMerged = 0 ∧
+      coefficient (g2ReplayContext.plug g2ReplaySourceB) g2ReplayMerged = -2 ∧
+      coefficient (g2ReplayContext.plug g2ReplaySourceA) g2ReplaySubtracted = 12 ∧
+      g2ReplayProduct.coefficient.natAbs ≤ 2 * 3 ∧
+      (coefficient (g2ReplayContext.plug g2ReplaySourceB) g2ReplayMerged).natAbs = 2 ∧
+      [2 * 4].sum ≤ [2 * 5].sum ∧
+      7 + [2 * 4].sum ≤ 9 + [2 * 5].sum := by
+  have productBound : g2ReplayProduct.coefficient.natAbs ≤ 2 * 3 := by
+    exact operatorProductContribution_natAbs_le g2LeftTerm g2ReplayRightTerm true false 2 3
+      (by decide) (by decide)
+  have addCancellation :
+      coefficient (g2ReplayContext.plug g2ReplaySourceA) g2ReplayMerged = 0 := by
+    unfold g2ReplayMerged
+    rw [coefficient_add]
+    decide
+  have addSurvivor :
+      coefficient (g2ReplayContext.plug g2ReplaySourceB) g2ReplayMerged = -2 := by
+    unfold g2ReplayMerged
+    rw [coefficient_add]
+    decide
+  have subtractContribution :
+      coefficient (g2ReplayContext.plug g2ReplaySourceA) g2ReplaySubtracted = 12 := by
+    unfold g2ReplaySubtracted
+    rw [coefficient_subtract]
+    decide
+  have survivorTransfer : 2 * 4 ≤ 2 * 5 := boundTransfer_scale (by decide)
+  have survivorTransfers :
+      List.Forall₂ (fun value bound => value ≤ bound) [2 * 4] [2 * 5] :=
+    .cons survivorTransfer .nil
+  have survivorFold : [2 * 4].sum ≤ [2 * 5].sum :=
+    survivorFold_sound survivorTransfers
+  have invocationEnd : 7 + [2 * 4].sum ≤ 9 + [2 * 5].sum :=
+    preFold_to_invocationEnd (by decide) survivorTransfers
+  exact ⟨by decide, by decide, by decide, addCancellation, addSurvivor, subtractContribution,
+    productBound, by rw [addSurvivor]; decide, survivorFold, invocationEnd⟩
+
 #print axioms g2_four_role_product_kernel
 #print axioms operatorProductContribution_natAbs_le
+#print axioms g2_replay_composition
 
 end Mxx.Certificate.OperationalNoise.EventReplay

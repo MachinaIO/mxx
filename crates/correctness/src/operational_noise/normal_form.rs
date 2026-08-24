@@ -12778,9 +12778,6 @@ mod tests {
 
         // The producer facts are intentionally not passed to `setup` or the normalizer.  The
         // public explicit family remains the sole authority for its closed family call.
-        let relation_product = expressions
-            .intern_matrix_transform(MatrixOperation::Multiply, &[public_call, preimage_call])
-            .unwrap();
         let root_scalar = if target_bound == 0 {
             let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
             Some(gaussian_factor(&mut expressions, scalar_type, 99_908, 1))
@@ -12788,13 +12785,16 @@ mod tests {
             None
         };
         let root = if let Some(root_scalar) = root_scalar {
+            let scaled_public = expressions
+                .intern_matrix_transform(MatrixOperation::Multiply, &[root_scalar, public_call])
+                .unwrap();
             expressions
-                .intern_matrix_transform(
-                    MatrixOperation::Multiply,
-                    &[root_scalar, relation_product],
-                )
+                .intern_matrix_transform(MatrixOperation::Multiply, &[scaled_public, preimage_call])
                 .unwrap()
         } else {
+            let relation_product = expressions
+                .intern_matrix_transform(MatrixOperation::Multiply, &[public_call, preimage_call])
+                .unwrap();
             let root_gaussian = gaussian_factor(&mut expressions, matrix.clone(), 99_907, 2);
             expressions
                 .intern_matrix_transform(MatrixOperation::Add, &[relation_product, root_gaussian])
@@ -13025,6 +13025,26 @@ mod tests {
                     .then_some(EventIndex(index as u64))
                 })
                 .expect("zero-summary universal relation application");
+            let expected_scalar = programs
+                .scoped(
+                    &expressions,
+                    semantic.program(),
+                    root_scalar.expect("zero-summary fixture has a scalar context"),
+                )
+                .unwrap();
+            let applied = match &all_events[applied_index.0 as usize] {
+                NormalizerEvent::AppliedRelation(observation) => observation,
+                _ => unreachable!("applied index points to a relation event"),
+            };
+            let source_descriptor = monomials.descriptor(applied.source_monomial).unwrap();
+            assert_eq!(
+                source_descriptor
+                    .central_factors
+                    .iter()
+                    .filter(|factor| **factor == expected_scalar)
+                    .count(),
+                1
+            );
             assert!(!all_events.iter().any(|event| {
                 matches!(event, NormalizerEvent::BoundTransfer { rule, .. }
                     if bound_rule_has_transfer(rule, applied_index))

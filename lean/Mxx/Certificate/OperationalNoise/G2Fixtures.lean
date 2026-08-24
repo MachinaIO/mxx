@@ -1,4 +1,4 @@
-import Mxx.Certificate.OperationalNoise.BoundReplay
+import Mxx.Certificate.OperationalNoise.OperatorReplay
 
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
@@ -237,6 +237,79 @@ theorem g2a_bound_replay :
       scaleMagnitude 4 (productNonempty g2aFinite2 [g2aFinite3]) = g2aFinite24 := by
   decide
 
+def g2bLeft : Coefficients 3 := fun index => [-2, 1, 4].get index
+def g2bRight : Coefficients 3 := fun index => [3, -1, 2].get index
+
+def g2bRouteInput : Coefficients 3 := fun index => [7, -4, 2].get index
+def g2bRouteOutput : Coefficients 4 := fun index => [-4, 0, 7, 2].get index
+
+theorem g2b_route_exact : RoutesCoefficients g2bRouteInput g2bRouteOutput := by
+  unfold RoutesCoefficients g2bRouteInput g2bRouteOutput
+  decide
+
+theorem g2b_operator_replay :
+    addCoefficients (fun _ : Fin 1 => -2) (fun _ : Fin 1 => 3) ⟨0, by decide⟩ = 1 ∧
+      addCoefficients g2bLeft g2bRight ⟨0, by decide⟩ = 1 ∧
+      addCoefficients g2bLeft g2bRight ⟨2, by decide⟩ = 6 ∧
+      subtractCoefficients g2bLeft g2bRight ⟨1, by decide⟩ = 2 ∧
+      (addKnown g2aFinite5 g2aFinite3).Bounds (addCoefficients g2bLeft g2bRight) ∧
+      (addKnown g2aFinite5 g2aFinite3).Bounds (subtractCoefficients g2bLeft g2bRight) ∧
+      scaleValue g2aFinite2 g2aFinite3 = g2aFinite6 ∧
+      (scaleValue g2aFinite2 g2aFinite3).Interprets ((-2 : Int) * 3).natAbs ∧
+      productCoefficient [(g2LeftTerm.coefficient, g2RightTerm.coefficient)] =
+        g2LeftScalarContribution.coefficient ∧
+      productCoefficient [(-2, 3), (1, -1)] = -7 ∧
+      (productWithFactor 2 g2aFinite2 g2aFinite3).Interprets
+        (productCoefficient [(-2, 3), (1, -1)]).natAbs ∧
+      (tensorWithFacts 4 g2aNoProductFacts g2aFinite2 g2aFinite3).Interprets
+        (productCoefficient [(-2, 3), (1, -1)]).natAbs ∧
+      g2aFinite8.Bounds g2bRouteOutput := by
+  have leftBound : g2aFinite5.Bounds g2bLeft := by
+    unfold CoeffClass.Bounds g2aFinite5 g2bLeft CoeffClass.Interprets
+    decide
+  have rightBound : g2aFinite3.Bounds g2bRight := by
+    unfold CoeffClass.Bounds g2aFinite3 g2bRight CoeffClass.Interprets
+    decide
+  have termsBounded : ProductTermsBounded 2 3 [(-2, 3), (1, -1)] := by
+    exact ⟨by decide, by decide, ⟨by decide, by decide, trivial⟩⟩
+  have leftSound : g2aFinite2.Interprets 2 := by
+    unfold g2aFinite2 CoeffClass.Interprets
+    decide
+  have rightSound : g2aFinite3.Interprets 3 := by
+    unfold g2aFinite3 CoeffClass.Interprets
+    decide
+  have productBound :
+      (productWithFactor 2 g2aFinite2 g2aFinite3).Interprets
+        (productCoefficient [(-2, 3), (1, -1)]).natAbs := by
+    exact (productCoefficient_withFacts_bound
+      (leftRows := 2) (leftColumns := 1) (rightRows := 1) (rightColumns := 2)
+      (ringDimension := 2) (facts := g2aNoProductFacts) (factor := 2)
+      (leftClass := g2aFinite2) (rightClass := g2aFinite3)
+      (leftMaximum := 2) (rightMaximum := 3)
+      (terms := [(-2, 3), (1, -1)]) (by decide) (by decide)
+      termsBounded leftSound rightSound).2
+  have tensorBound :
+      (tensorWithFacts 4 g2aNoProductFacts g2aFinite2 g2aFinite3).Interprets
+        (productCoefficient [(-2, 3), (1, -1)]).natAbs := by
+    exact tensorCoefficient_bound (ringDimension := 4) (facts := g2aNoProductFacts)
+      (leftClass := g2aFinite2) (rightClass := g2aFinite3)
+      (leftMaximum := 2) (rightMaximum := 3)
+      (terms := [(-2, 3), (1, -1)]) (by decide)
+      termsBounded leftSound rightSound
+  have routeInputBound : g2aFinite8.Bounds g2bRouteInput := by
+    unfold CoeffClass.Bounds g2aFinite8 g2bRouteInput CoeffClass.Interprets
+    decide
+  have scaleBound :
+      (scaleValue g2aFinite2 g2aFinite3).Interprets ((-2 : Int) * 3).natAbs := by
+    exact scaleCoefficient_bound leftSound rightSound
+  exact ⟨by decide, by decide, by decide, by decide,
+    addCoefficients_bound leftBound rightBound,
+    subtractCoefficients_bound leftBound rightBound,
+    by decide, scaleBound,
+    productCoefficient_singleton_operator g2LeftTerm g2RightTerm true false,
+    by decide, productBound, tensorBound,
+    routesCoefficients_bound routeInputBound g2b_route_exact⟩
+
 #print axioms g2_four_role_product_kernel
 #print axioms operatorProductContribution_natAbs_le
 #print axioms g2_replay_composition
@@ -249,5 +322,13 @@ theorem g2a_bound_replay :
 #print axioms productWithFacts_sound
 #print axioms tensorWithFacts_sound
 #print axioms g2a_bound_replay
+#print axioms addCoefficients_bound
+#print axioms subtractCoefficients_bound
+#print axioms productCoefficient_singleton_operator
+#print axioms productCoefficient_withFacts_bound
+#print axioms tensorCoefficient_bound
+#print axioms scaleCoefficient_bound
+#print axioms routesCoefficients_bound
+#print axioms g2b_operator_replay
 
 end Mxx.Certificate.OperationalNoise.EventReplay

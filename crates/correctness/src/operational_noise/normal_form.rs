@@ -3843,7 +3843,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         evidence: &mut Option<BoundValueRef>,
     ) -> Result<(), NormalizeError> {
         let mut worklist = VecDeque::<ProductWorkItem>::new();
-        let mut pending_relation_applications = VecDeque::<Option<super::g0::EventIndex>>::new();
+        let mut pending_relation_applications =
+            if S::ENABLED { Some(VecDeque::<Option<super::g0::EventIndex>>::new()) } else { None };
         if S::ENABLED {
             if let Some(owner) = owner {
                 let left_event = self.relation_input_result(left_expression)?;
@@ -3936,7 +3937,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
-        pending_relation_applications: &mut VecDeque<Option<super::g0::EventIndex>>,
+        pending_relation_applications: &mut Option<VecDeque<Option<super::g0::EventIndex>>>,
         worklist: &mut VecDeque<ProductWorkItem>,
     ) -> Result<(), NormalizeError> {
         for (left_id, left_coefficient) in &left.exact_terms {
@@ -3972,7 +3973,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
-        pending_relation_applications: &mut VecDeque<Option<super::g0::EventIndex>>,
+        pending_relation_applications: &mut Option<VecDeque<Option<super::g0::EventIndex>>>,
         worklist: &mut VecDeque<ProductWorkItem>,
     ) -> Result<(), NormalizeError> {
         let coefficient = left_coefficient * right_coefficient * weight;
@@ -3981,7 +3982,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
         let product = self.product_monomials(left_id, right_id)?;
         worklist.push_back(ProductWorkItem::Term(product, coefficient));
-        pending_relation_applications.push_back(None);
+        if S::ENABLED {
+            pending_relation_applications
+                .as_mut()
+                .ok_or(super::g0::G0Error::RelationTraceInvariant)?
+                .push_back(None);
+        }
         // Drain each completed Cartesian pair before generating the next one. The same rewrite
         // queue remains authoritative, but its live size follows one pair's recursive splice
         // instead of the full product cardinality.
@@ -4003,11 +4009,19 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
         source_refs: &mut Option<[RecordedTermRef; 2]>,
-        pending_relation_applications: &mut VecDeque<Option<super::g0::EventIndex>>,
+        pending_relation_applications: &mut Option<VecDeque<Option<super::g0::EventIndex>>>,
         worklist: &mut VecDeque<ProductWorkItem>,
     ) -> Result<(), NormalizeError> {
         while let Some(item) = worklist.pop_front() {
-            let pending_application = pending_relation_applications.pop_front().flatten();
+            let pending_application = if S::ENABLED {
+                pending_relation_applications
+                    .as_mut()
+                    .ok_or(super::g0::G0Error::RelationTraceInvariant)?
+                    .pop_front()
+                    .ok_or(super::g0::G0Error::RelationTraceInvariant)?
+            } else {
+                None
+            };
             let (monomial, coefficient) = match item {
                 ProductWorkItem::Term(monomial, coefficient) => (monomial, coefficient),
                 ProductWorkItem::GadgetSplice(mut splice) => {
@@ -4059,7 +4073,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     if input_terms.next().is_some() {
                         splice.next_after = batch.last().map(|(monomial, _)| *monomial);
                         worklist.push_front(ProductWorkItem::GadgetSplice(splice));
-                        pending_relation_applications.push_front(pending_application);
+                        if S::ENABLED {
+                            pending_relation_applications
+                                .as_mut()
+                                .ok_or(super::g0::G0Error::RelationTraceInvariant)?
+                                .push_front(pending_application);
+                        }
                     }
                     for ((_, input_coefficient), replacement) in
                         batch.into_iter().zip(replacements).rev()
@@ -4068,7 +4087,12 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                             replacement,
                             outer_coefficient.clone() * input_coefficient,
                         ));
-                        pending_relation_applications.push_front(None);
+                        if S::ENABLED {
+                            pending_relation_applications
+                                .as_mut()
+                                .ok_or(super::g0::G0Error::RelationTraceInvariant)?
+                                .push_front(None);
+                        }
                     }
                     continue;
                 }
@@ -4098,7 +4122,17 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 continue;
             };
             worklist.push_front(ProductWorkItem::GadgetSplice(splice));
-            pending_relation_applications.push_front(pending_application);
+            if S::ENABLED {
+                pending_relation_applications
+                    .as_mut()
+                    .ok_or(super::g0::G0Error::RelationTraceInvariant)?
+                    .push_front(pending_application);
+            }
+        }
+        if S::ENABLED &&
+            pending_relation_applications.as_ref().is_none_or(|queue| !queue.is_empty())
+        {
+            return Err(super::g0::G0Error::RelationTraceInvariant.into());
         }
         Ok(())
     }
@@ -8950,6 +8984,182 @@ mod tests {
         assert!(applied.0 < relation.0);
         assert_eq!(relation.3, BigInt::from(1_u8));
         assert!(operator.1[0].value_event != operator.1[1].value_event);
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        trace
+            .validate_normalization_observations_with_state(&monomials, &NormalizationCache::new())
+            .unwrap();
+    }
+
+    #[test]
+    fn traced_product_gadget_handoff_preserves_multi_term_batch_order() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 3, 1).unwrap();
+        let gadget_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 3).unwrap();
+        let gadget =
+            matrix_source(&mut expressions, "batch-gadget", gadget_type.clone(), Some((2, false)));
+        let factor_left_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 2).unwrap();
+        let factor_right_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 2, 1).unwrap();
+        let input_left_factor = matrix_source(
+            &mut expressions,
+            "batch-input-left-factor",
+            factor_left_type.clone(),
+            None,
+        );
+        let input_left_partner = matrix_source(
+            &mut expressions,
+            "batch-input-left-partner",
+            factor_right_type.clone(),
+            None,
+        );
+        let input_left = expressions
+            .intern_matrix_transform(
+                MatrixOperation::Multiply,
+                &[input_left_factor, input_left_partner],
+            )
+            .unwrap();
+        let input_right_factor =
+            matrix_source(&mut expressions, "batch-input-right-factor", factor_left_type, None);
+        let input_right_partner =
+            matrix_source(&mut expressions, "batch-input-right-partner", factor_right_type, None);
+        let input_right = expressions
+            .intern_matrix_transform(
+                MatrixOperation::Multiply,
+                &[input_right_factor, input_right_partner],
+            )
+            .unwrap();
+        let input = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[input_left, input_right])
+            .unwrap();
+        let decomposition = expressions
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    output: decomposition_type.clone(),
+                    base: 2,
+                    small: false,
+                    digit_count: 3,
+                }),
+                Box::new([input]),
+            )
+            .unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[gadget, decomposition])
+            .unwrap();
+        let registry = recomposition_registry(gadget_type, decomposition_type, scalar, false, 3);
+        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        for expression in [gadget, decomposition, input] {
+            insert_matrix_bound(&mut facts, &expressions, expression, 3);
+        }
+        for expression in
+            [input_left_factor, input_left_partner, input_right_factor, input_right_partner]
+        {
+            let matrix = match expressions.value_type(expression).unwrap() {
+                ResolvedValueType::Matrix(matrix) => matrix.clone(),
+                _ => unreachable!("matrix fixture factor"),
+            };
+            let mut matrix_facts = MatrixFacts::new(
+                matrix.clone(),
+                MatrixMetadata::new(MatrixLayout::row_major(matrix.rows, matrix.columns)),
+            );
+            matrix_facts.coefficient_bound = NumericContract::Known(CoefficientBound::Large);
+            facts.insert(&expressions, expression, ValueFacts::Matrix(matrix_facts)).unwrap();
+        }
+        let ordinary = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                    .unwrap()
+                    .with_gadget_recompositions(&registry);
+            normalizer.gadget_splice_batch_terms = 1;
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        let mut trace = FeasibilityTrace::default();
+        let traced = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap()
+            .with_gadget_recompositions(&registry);
+            normalizer.gadget_splice_batch_terms = 1;
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        assert_eq!(ordinary.0.exact_nf, traced.0.exact_nf);
+        assert_eq!(ordinary.0.coefficient_bound, traced.0.coefficient_bound);
+        assert_eq!(ordinary.1, traced.1);
+
+        let events = trace.normalization_events();
+        let operator = events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::CoefficientMerge(CoefficientMerge {
+                    owner,
+                    source: CoefficientMergeSource::Operator { inputs },
+                    output,
+                    ..
+                }) if *owner == semantic => Some((EventIndex(index as u64), *inputs, *output)),
+                _ => None,
+            })
+            .expect("product operator merge");
+        let applied = events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                NormalizerEvent::AppliedRelation(observation) if observation.owner == semantic => {
+                    let AppliedRelationRule::Gadget { input_result, .. } = &observation.rule else {
+                        return None;
+                    };
+                    Some((EventIndex(index as u64), observation.source_monomial, *input_result))
+                }
+                _ => None,
+            })
+            .expect("gadget application");
+        assert_eq!(operator.2, applied.1);
+        assert!(operator.0 < applied.0);
+        let relations = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                NormalizerEvent::CoefficientMerge(CoefficientMerge {
+                    owner,
+                    source: CoefficientMergeSource::Relation { application, source_term },
+                    output,
+                    signed_contribution,
+                }) if *owner == semantic && *application == applied.0 => Some((
+                    EventIndex(index as u64),
+                    *source_term,
+                    *output,
+                    signed_contribution.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(relations.len(), 2);
+        assert!(relations[0].0 < relations[1].0);
+        assert_eq!(relations[0].3, BigInt::from(1_u8));
+        assert_eq!(relations[1].3, BigInt::from(1_u8));
+        let expected_sources = match &events[applied.2.0 as usize] {
+            NormalizerEvent::Result { value, .. } => value
+                .exact_nf
+                .as_ref()
+                .expect("input exact NF")
+                .exact_terms
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            _ => unreachable!("gadget input result"),
+        };
+        assert_eq!(
+            relations.iter().map(|(_, source, _, _)| *source).collect::<Vec<_>>(),
+            expected_sources
+        );
+        assert!(relations.iter().all(|(_, _, output, _)| *output != operator.2));
         trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
         trace
             .validate_normalization_observations_with_state(&monomials, &NormalizationCache::new())

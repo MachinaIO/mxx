@@ -3928,7 +3928,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
                 let input_result = self.relation_input_result(input)?;
                 let applied_event = self.observe_applied_relation(super::g0::AppliedRelation {
-                    owner: ordered_factors[index + 1],
+                    owner,
                     source_monomial: monomial,
                     outer_coefficient: coefficient.clone(),
                     ordered_start: u32::try_from(index).map_err(|_| {
@@ -3989,8 +3989,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     /// already present in this ordered word; no same-shaped source search is performed.
     fn rewrite_gadget_decomposition(
         &mut self,
+        owner: ScopedExprId,
         monomial: MonomialId,
-        outer_coefficient: Option<&BigInt>,
+        coefficient: &BigInt,
         evidence: &mut Option<BoundValueRef>,
     ) -> Result<Option<PolynomialNF>, NormalizeError> {
         let (central_factors, ordered_factors) = {
@@ -4004,9 +4005,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             let Some(input) = self.authorized_gadget_pair_input(gadget, decomposition)? else {
                 continue;
             };
-            let coefficient = outer_coefficient.ok_or(NormalizeError::InvalidExactPlan {
-                reason: "missing gadget relation coefficient",
-            })?;
             let Some(normal_form) = self.splice_gadget_decomposition(
                 &central_factors,
                 &ordered_factors,
@@ -4020,7 +4018,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             if S::ENABLED {
                 let input_result = self.relation_input_result(input)?;
                 let applied_event = self.observe_applied_relation(super::g0::AppliedRelation {
-                    owner: decomposition,
+                    owner,
                     source_monomial: monomial,
                     outer_coefficient: coefficient.clone(),
                     ordered_start: u32::try_from(index).map_err(|_| {
@@ -4053,7 +4051,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     let mut relation_evidence = BoundValueRef::Transfer(applied_event);
                     if coefficient.magnitude() != &BigUint::from(1_u8) {
                         let scale_event = self.observe_bound_transfer(
-                            decomposition,
+                            owner,
                             BoundRule::Scale {
                                 value: relation_evidence,
                                 scale: BoundScale::Magnitude(coefficient.magnitude().clone()),
@@ -4061,7 +4059,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         )?;
                         relation_evidence = BoundValueRef::Transfer(scale_event);
                     }
-                    self.append_summary_evidence(decomposition, evidence, relation_evidence)?;
+                    self.append_summary_evidence(owner, evidence, relation_evidence)?;
                 }
             }
             return Ok(Some(normal_form));
@@ -4183,11 +4181,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             }
             // Relation RHS splices can create a new gadget/decomposition adjacency, so ordinary
             // gadget closure must run on every item returned to this worklist.
-            if let Some(rewritten) = self.rewrite_gadget_decomposition(
-                monomial,
-                S::ENABLED.then_some(&coefficient),
-                evidence,
-            )? {
+            if let Some(rewritten) =
+                self.rewrite_gadget_decomposition(owner, monomial, &coefficient, evidence)?
+            {
                 changed = true;
                 relation_noise = add_noise_summaries(
                     &relation_noise,
@@ -7480,7 +7476,7 @@ mod tests {
             normalizer.insert_gadget_hold(input, input_nf.clone());
             let mut evidence = None;
             let output = normalizer
-                .rewrite_gadget_decomposition(pair_monomial, Some(&coefficient), &mut evidence)
+                .rewrite_gadget_decomposition(semantic, pair_monomial, &coefficient, &mut evidence)
                 .unwrap()
                 .expect("typed gadget pair reaches the actual splice helper");
             assert_eq!(normalizer.monomials.len(), before_len);
@@ -7498,7 +7494,7 @@ mod tests {
             coefficient_bound: input_nf.bounded_summary.coefficient_bound(),
         };
         trace.record_normalization_result(scoped_input, &input_value).unwrap();
-        let enabled_output = {
+        let (enabled_output, enabled_counters, enabled_evidence) = {
             let mut normalizer = Normalizer::new_with_sink(
                 &mut expressions,
                 &programs,
@@ -7511,14 +7507,14 @@ mod tests {
             normalizer.insert_gadget_hold(input, input_nf.clone());
             let mut evidence = None;
             let output = normalizer
-                .rewrite_gadget_decomposition(pair_monomial, Some(&coefficient), &mut evidence)
+                .rewrite_gadget_decomposition(semantic, pair_monomial, &coefficient, &mut evidence)
                 .unwrap()
                 .expect("typed gadget pair reaches the actual splice helper");
             assert_eq!(normalizer.counters(), ordinary_counters);
             assert_eq!(normalizer.monomials.len(), before_len);
             assert_eq!(normalizer.monomials.occupied_len(), before_occupied);
             assert!(matches!(evidence, Some(BoundValueRef::Transfer(_))));
-            output
+            (output, normalizer.counters(), evidence)
         };
         assert_eq!(enabled_output.exact_terms, input_nf.exact_terms);
         assert_eq!(enabled_output.bounded_summary, input_nf.bounded_summary);
@@ -7528,6 +7524,16 @@ mod tests {
                 super::super::g0::NormalizerEvent::AppliedRelation(_)
             ))
         );
+        let evidence = enabled_evidence.expect("nonzero gadget summary evidence");
+        trace.record_bound_transfer(semantic, BoundRule::Identity { input: evidence }).unwrap();
+        let root_value = AnalyzedValue {
+            semantic,
+            exact_nf: Some(Arc::new(enabled_output.clone())),
+            coefficient_bound: enabled_output.bounded_summary.coefficient_bound(),
+        };
+        trace.record_normalization_result(semantic, &root_value).unwrap();
+        trace.record_invocation_end(semantic, &root_value, &enabled_counters).unwrap();
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
         assert_eq!(destination_before.exact_terms.len(), 1);
         assert!(destination_before.bounded_summary.is_zero());
     }

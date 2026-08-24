@@ -1784,9 +1784,8 @@ impl FeasibilitySink for FeasibilityTrace {
         {
             return Err(G0Error::RelationTraceInvariant);
         }
-        if let AppliedRelationRule::Gadget { decomposition, input_result, .. } = &observation.rule {
-            if observation.owner != *decomposition ||
-                input_result.0 < frame.range.start.0 ||
+        if let AppliedRelationRule::Gadget { input_result, .. } = &observation.rule {
+            if input_result.0 < frame.range.start.0 ||
                 input_result.0 >=
                     u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?
             {
@@ -1943,12 +1942,7 @@ impl FeasibilitySink for FeasibilityTrace {
                         return Err(G0Error::RelationTraceInvariant);
                     }
                     let input_valid = match &observation.rule {
-                        AppliedRelationRule::Gadget {
-                            decomposition, input, input_result, ..
-                        } => {
-                            if observation.owner != *decomposition {
-                                return Err(G0Error::RelationTraceInvariant);
-                            }
+                        AppliedRelationRule::Gadget { input, input_result, .. } => {
                             stack.last().is_some_and(|(_, start, results, _, _)| {
                                 input_result.0 >= start.0 && input_result.0 < current.0 &&
                                     results.get(input).copied() == Some(*input_result) &&
@@ -2207,6 +2201,59 @@ impl FeasibilityTrace {
                 }
             }
         }
+        for event in &self.events {
+            let NormalizerEvent::BoundTransfer { rule, .. } = event else { continue };
+            let mut validation = Ok(());
+            visit_bound_rule_transfers(rule, |transfer| {
+                if validation.is_err() {
+                    return;
+                }
+                let Some(NormalizerEvent::AppliedRelation(observation)) =
+                    self.events.get(transfer.0 as usize)
+                else {
+                    return;
+                };
+                let AppliedRelationRule::Gadget { gadget, decomposition, input_result, .. } =
+                    &observation.rule
+                else {
+                    return;
+                };
+                let descriptor = match monomials.descriptor(observation.source_monomial) {
+                    Ok(descriptor) => descriptor,
+                    Err(_) => {
+                        validation = Err(G0Error::UnsupportedBoundTransfer);
+                        return;
+                    }
+                };
+                let start = observation.ordered_start as usize;
+                let end = observation.ordered_end_exclusive as usize;
+                if !descriptor.central_factors.is_empty() ||
+                    start != 0 ||
+                    end != descriptor.ordered_factors.len() ||
+                    descriptor.ordered_factors.get(start..end) !=
+                        Some(&[gadget.clone(), decomposition.clone()][..])
+                {
+                    validation = Err(G0Error::UnsupportedBoundTransfer);
+                    return;
+                }
+                let Some(NormalizerEvent::Result {
+                    value: RecordedValue { exact_nf: Some(normal_form), .. },
+                    ..
+                }) = self.events.get(input_result.0 as usize)
+                else {
+                    validation = Err(G0Error::UnsupportedBoundTransfer);
+                    return;
+                };
+                if !matches!(
+                    normal_form.bounded_summary.coefficient_bound(),
+                    NumericContract::Known(CoefficientBound::Finite(value))
+                        if !value.maximum_absolute_coefficient.is_zero()
+                ) {
+                    validation = Err(G0Error::UnsupportedBoundTransfer);
+                }
+            });
+            validation?;
+        }
         Ok(())
     }
 
@@ -2428,32 +2475,50 @@ impl FeasibilityTrace {
                         if observation.owner != owner {
                             return Err(G0Error::UnsupportedBoundTransfer);
                         }
-                        let AppliedRelationRule::Universal { key, source, rhs, .. } =
-                            &observation.rule
-                        else {
-                            return Err(G0Error::UnsupportedBoundTransfer);
-                        };
-                        let Some(replay) = self.specialization_ranges.get(key) else {
-                            return Err(G0Error::UnsupportedBoundTransfer);
-                        };
-                        let Some((_, rhs_event)) =
-                            replay.rhs_results.iter().find(|(candidate, _)| candidate == rhs)
-                        else {
-                            return Err(G0Error::UnsupportedBoundTransfer);
-                        };
-                        if replay.range != *source ||
-                            !matches!(
-                                self.events.get(rhs_event.0 as usize),
-                                Some(NormalizerEvent::InvocationEnd {
-                                    result: RecordedValue { exact_nf: Some(nf), .. },
-                                    ..
-                                }) if matches!(
-                                    nf.bounded_summary.coefficient_bound(),
-                                    NumericContract::Known(CoefficientBound::Finite(_))
-                                )
-                            )
-                        {
-                            return Err(G0Error::UnsupportedBoundTransfer);
+                        match &observation.rule {
+                            AppliedRelationRule::Universal { key, source, rhs, .. } => {
+                                let Some(replay) = self.specialization_ranges.get(key) else {
+                                    return Err(G0Error::UnsupportedBoundTransfer);
+                                };
+                                let Some((_, rhs_event)) = replay
+                                    .rhs_results
+                                    .iter()
+                                    .find(|(candidate, _)| candidate == rhs)
+                                else {
+                                    return Err(G0Error::UnsupportedBoundTransfer);
+                                };
+                                if replay.range != *source ||
+                                    !matches!(
+                                        self.events.get(rhs_event.0 as usize),
+                                        Some(NormalizerEvent::InvocationEnd {
+                                            result: RecordedValue { exact_nf: Some(nf), .. },
+                                            ..
+                                        }) if matches!(
+                                            nf.bounded_summary.coefficient_bound(),
+                                            NumericContract::Known(CoefficientBound::Finite(_))
+                                        )
+                                    )
+                                {
+                                    return Err(G0Error::UnsupportedBoundTransfer);
+                                }
+                            }
+                            AppliedRelationRule::Gadget { input_result, .. } => {
+                                if !same_frame(*input_result) ||
+                                    !matches!(
+                                        self.events.get(input_result.0 as usize),
+                                        Some(NormalizerEvent::Result {
+                                            value: RecordedValue { exact_nf: Some(nf), .. },
+                                            ..
+                                        }) if matches!(
+                                            nf.bounded_summary.coefficient_bound(),
+                                            NumericContract::Known(CoefficientBound::Finite(value))
+                                                if !value.maximum_absolute_coefficient.is_zero()
+                                        )
+                                    )
+                                {
+                                    return Err(G0Error::UnsupportedBoundTransfer);
+                                }
+                            }
                         }
                     }
                     _ => return Err(G0Error::UnsupportedBoundTransfer),

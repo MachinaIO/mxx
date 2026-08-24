@@ -600,6 +600,14 @@ impl GpuNodeMeasurementBackend {
                 }
             }
             NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
+                let representative = coefficients.iter().enumerate().find_map(|(product, _)| {
+                    argument_types.get(2 * product + 1).and_then(|wire_type| match wire_type {
+                        ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                            capped_columns(matrix)
+                        }
+                        _ => None,
+                    })
+                });
                 let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
                     ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
                         Some(matrix)
@@ -608,7 +616,9 @@ impl GpuNodeMeasurementBackend {
                 }) else {
                     return (kind, argument_types, output_types, scale);
                 };
-                if let Some((representative_columns, column_scale)) = capped_columns(output) {
+                if let Some((representative_columns, column_scale)) =
+                    capped_columns(output).or(representative)
+                {
                     for product in 0..coefficients.len() {
                         let Some(rhs) =
                             argument_types.get_mut(2 * product + 1).and_then(|wire_type| {
@@ -1789,6 +1799,41 @@ mod tests {
         assert_eq!((rhs.rows, rhs.columns), (80, 4));
         assert_eq!((product.rows, product.columns), (1, 4));
         assert_eq!(multiply_scale, 20.0);
+
+        let accumulate_kind = NodeKind::MatrixMulAccumulate {
+            coefficients: vec![IntExpr::constant(1), IntExpr::constant(3)],
+            has_bias: true,
+        };
+        let accumulate_node = MeasurementNode {
+            scope: &scope,
+            id: NodeId(3),
+            kind: &accumulate_kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: vec![
+                ConcreteWireType::Matrix(matrix(1, 82)),
+                ConcreteWireType::Matrix(matrix(82, 80)),
+                ConcreteWireType::Matrix(matrix(1, 80)),
+                ConcreteWireType::Matrix(matrix(80, 80)),
+                ConcreteWireType::Matrix(matrix(1, 80)),
+            ],
+            concrete_output_types: vec![ConcreteWireType::Matrix(matrix(1, 80))],
+        };
+        let (_, accumulate_arguments, accumulate_outputs, accumulate_scale) =
+            GpuNodeMeasurementBackend::representative_node(&accumulate_node, 40, 4);
+        for index in [1, 3, 4] {
+            let ConcreteWireType::Matrix(matrix) = &accumulate_arguments[index] else {
+                panic!("multiply-accumulate representative matrix input");
+            };
+            assert_eq!(matrix.columns, 4);
+        }
+        let ConcreteWireType::Matrix(accumulate_output) = &accumulate_outputs[0] else {
+            panic!("multiply-accumulate representative output");
+        };
+        assert_eq!((accumulate_output.rows, accumulate_output.columns), (1, 4));
+        assert_eq!(accumulate_scale, 20.0);
     }
 
     #[test]

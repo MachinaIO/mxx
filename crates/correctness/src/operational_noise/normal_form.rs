@@ -5975,6 +5975,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         node: &ExprNode,
         children: &[Arc<AnalyzedValue>],
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
+        if S::ENABLED &&
+            matches!(self.expressions.value_type(expression)?, ResolvedValueType::Bytes)
+        {
+            return Ok(NumericContract::Missing);
+        }
         if let Some(bound) = self.fact_bound(expression)? {
             if S::ENABLED {
                 if bound.is_missing() {
@@ -14528,7 +14533,20 @@ mod tests {
         let mut programs = ProgramArena::new();
         let output = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
         let key = expressions
-            .intern(ValueOperator::Constant(TypedConstant::bytes(vec![0_u8; 32])), Box::new([]))
+            .intern(
+                ValueOperator::Source(SemanticSourceIdentity {
+                    stable_definition: "protocol-input".to_owned(),
+                    invocation: "deterministic-hash-key".to_owned(),
+                    sample_event: None,
+                    output_role: "value".to_owned(),
+                    sampler: None,
+                    artifact: None,
+                    value_type: ResolvedValueType::Bytes,
+                    coordinates: Box::new([]),
+                    matrix_constant: None,
+                }),
+                Box::new([]),
+            )
             .unwrap();
         let hash = expressions
             .intern(
@@ -14546,25 +14564,69 @@ mod tests {
                 Box::new([key]),
             )
             .unwrap();
-        let (mut facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, hash);
-        let mut key_facts = ScalarFacts::new(ResolvedValueType::Bytes).unwrap();
-        key_facts.coefficient_bound = NumericContract::Known(CoefficientBound::finite(0_u8));
-        facts.insert(&expressions, key, ValueFacts::Scalar(key_facts)).unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, hash);
+        let key_owner = programs.scoped(&expressions, semantic.program(), key).unwrap();
+        let (ordinary, ordinary_counters) = {
+            let mut normalizer =
+                Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
         let mut trace = FeasibilityTrace::default();
-        let mut normalizer = Normalizer::new_with_sink(
-            &mut expressions,
-            &programs,
-            &facts,
-            &mut monomials,
-            &mut trace,
-        )
-        .unwrap();
-        assert_eq!(
-            normalizer.normalize(semantic).unwrap().coefficient_bound,
-            NumericContract::Known(CoefficientBound::Large)
-        );
-        drop(normalizer);
-        trace.validate_normalization_observations().unwrap();
+        let (traced, traced_counters) = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            let value = normalizer.normalize(semantic).unwrap();
+            (value, normalizer.counters())
+        };
+        assert_eq!(ordinary.semantic, traced.semantic);
+        assert_eq!(ordinary.exact_nf, traced.exact_nf);
+        assert_eq!(ordinary.coefficient_bound, traced.coefficient_bound);
+        assert_eq!(ordinary_counters, traced_counters);
+        assert_eq!(traced.coefficient_bound, NumericContract::Known(CoefficientBound::Large));
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+
+        let key_result = trace
+            .normalization_events()
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    NormalizerEvent::Result { owner, value }
+                        if *owner == key_owner && value.coefficient_bound.is_missing()
+                )
+            })
+            .expect("Bytes key Result");
+        assert!(!trace.normalization_events().iter().any(|event| {
+            matches!(event, NormalizerEvent::BoundTransfer { owner, .. } if *owner == key_owner)
+        }));
+        assert!(trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::Predecessor {
+                    consumer,
+                    input_position: 0,
+                    predecessor,
+                    source_result,
+                } if *consumer == semantic &&
+                    *predecessor == key &&
+                    source_result.0 == key_result as u64
+            )
+        }));
+        assert!(trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::Result { owner, value }
+                    if *owner == semantic &&
+                        value.coefficient_bound == NumericContract::Known(CoefficientBound::Large)
+            )
+        }));
         let authorities = trace
             .normalization_events()
             .iter()

@@ -500,6 +500,13 @@ pub(crate) struct IndexUsePlan {
 }
 
 impl IndexUsePlan {
+    pub(crate) fn is_residual_relevant(&self, closure: &CertificateClosure) -> bool {
+        self.result.is_some_and(|expression| closure.expressions.contains(&expression)) ||
+            self.result_family.is_some_and(|family| closure.families.contains(&family)) ||
+            self.consumed.is_some_and(|expression| closure.expressions.contains(&expression)) ||
+            self.consumed_family.is_some_and(|family| closure.families.contains(&family))
+    }
+
     fn same_use_identity(&self, other: &Self) -> bool {
         self.kind == other.kind &&
             self.owner == other.owner &&
@@ -3658,12 +3665,7 @@ impl FeasibilityTrace {
             SourceHandle::Family(family) => closure.families.contains(family),
         });
         self.event_observations.retain(|event, _| closure.event_ids.contains(event));
-        self.index_use_plans.retain(|plan| {
-            plan.result.is_some_and(|expression| closure.expressions.contains(&expression)) ||
-                plan.result_family.is_some_and(|family| closure.families.contains(&family)) ||
-                plan.consumed.is_some_and(|expression| closure.expressions.contains(&expression)) ||
-                plan.consumed_family.is_some_and(|family| closure.families.contains(&family))
-        });
+        self.index_use_plans.retain(|plan| plan.is_residual_relevant(closure));
         // Filtering only removes entries that were already counted successfully. Recomputing the
         // three persistent lowering collections therefore cannot exceed the prior checked total.
         self.lowering_retained_items = self

@@ -1647,20 +1647,61 @@ pub(crate) fn collect_residual_closure(
             work.push(CertificateWork::Family(*family))
         }
     }
-    walk_certificate_closure(job, &mut closure, work)?;
+    walk_certificate_closure(job, &mut closure, work, &[])?;
     Ok(closure)
+}
+
+fn push_index_plan_dependencies(work: &mut Vec<CertificateWork>, plan: &super::g0::IndexUsePlan) {
+    work.push(CertificateWork::Expression(plan.index));
+    work.extend(plan.result.into_iter().map(CertificateWork::Expression));
+    work.extend(plan.consumed.into_iter().map(CertificateWork::Expression));
+    work.extend(plan.frontier.iter().map(|axis| CertificateWork::Expression(axis.argument)));
+    if let Some(group) = &plan.slice_group {
+        work.extend(
+            group.members.iter().map(|member| CertificateWork::Expression(member.expression)),
+        );
+    }
+    work.extend(plan.result_family.into_iter().map(CertificateWork::Family));
+    work.extend(plan.consumed_family.into_iter().map(CertificateWork::Family));
 }
 
 fn walk_certificate_closure(
     job: &super::job::CheckerJob,
     closure: &mut CertificateClosure,
     mut work: Vec<CertificateWork>,
+    index_plans: &[&super::g0::IndexUsePlan],
 ) -> Result<(), CertificateClosureError> {
+    let mut expression_plans = BTreeMap::<ExprId, Vec<usize>>::new();
+    let mut family_plans = BTreeMap::<FamilyValueId, Vec<usize>>::new();
+    for (plan_index, plan) in index_plans.iter().enumerate() {
+        for expression in plan.result.into_iter().chain(plan.consumed) {
+            expression_plans.entry(expression).or_default().push(plan_index);
+        }
+        for family in plan.result_family.into_iter().chain(plan.consumed_family) {
+            family_plans.entry(family).or_default().push(plan_index);
+        }
+    }
+
+    let mut seen_plans = BTreeSet::new();
+    for (plan_index, plan) in index_plans.iter().enumerate() {
+        if plan.is_residual_relevant(closure) && seen_plans.insert(plan_index) {
+            push_index_plan_dependencies(&mut work, plan);
+        }
+    }
+
     while let Some(item) = work.pop() {
         match item {
             CertificateWork::Expression(expression) => {
                 if !closure.expressions.insert(expression) {
                     continue;
+                }
+                if let Some(attached) = expression_plans.get(&expression) {
+                    for &plan_index in attached {
+                        let plan = index_plans[plan_index];
+                        if plan.is_residual_relevant(closure) && seen_plans.insert(plan_index) {
+                            push_index_plan_dependencies(&mut work, plan);
+                        }
+                    }
                 }
                 let node = job.expressions().node(expression)?;
                 match &node.operator {
@@ -1705,6 +1746,14 @@ fn walk_certificate_closure(
             CertificateWork::Family(family) => {
                 if !closure.families.insert(family) {
                     continue;
+                }
+                if let Some(attached) = family_plans.get(&family) {
+                    for &plan_index in attached {
+                        let plan = index_plans[plan_index];
+                        if plan.is_residual_relevant(closure) && seen_plans.insert(plan_index) {
+                            push_index_plan_dependencies(&mut work, plan);
+                        }
+                    }
                 }
                 let program = family.program();
                 let family_body = job.programs().family_body(family)?;
@@ -2065,6 +2114,7 @@ fn extend_certificate_closure(
     closure: &mut CertificateClosure,
     trace: &FeasibilityTrace,
 ) -> Result<(), CertificateClosureError> {
+    let index_plans = trace.index_use_plans().collect::<Vec<_>>();
     let mut work = Vec::new();
     for event in &trace.events {
         match event {
@@ -2110,7 +2160,7 @@ fn extend_certificate_closure(
             }
         }
     }
-    walk_certificate_closure(job, closure, work)
+    walk_certificate_closure(job, closure, work, &index_plans)
 }
 
 fn push_universal_dependencies(
@@ -3054,6 +3104,14 @@ pub fn prepare_g0_cpu_evidence_bytes(
 
     let inventory = super::g0::derive_inventory(&run.job, closure, &run.trace)
         .map_err(|error| error.to_string())?;
+    if checked_cardinality(inventory.sources.len(), "canonical source row")? != n.source_rows {
+        return Err("G0 CPU evidence source-row authority mismatch".to_owned());
+    }
+    if checked_cardinality(inventory.family_sources.len(), "canonical family-source row")? !=
+        n.family_source_rows
+    {
+        return Err("G0 CPU evidence family-source-row authority mismatch".to_owned());
+    }
     if checked_cardinality(inventory.events.len(), "canonical event row")? != n.event_rows {
         return Err("G0 CPU evidence event-row authority mismatch".to_owned());
     }
@@ -3989,7 +4047,7 @@ mod tests {
         },
         operational_noise::facts::{BoundExpression, CoefficientBound, NumericContract},
     };
-    use mxx_dsl::{Bool, DslContext, IdealSpec, Int, Ring, SemanticAnchor};
+    use mxx_dsl::{Bool, DslContext, IdealSpec, Int, Parallel, Ring, SemanticAnchor};
     use mxx_ir_core::{IntExpr, node::ConstantMatrix};
 
     #[test]
@@ -4715,6 +4773,104 @@ mod tests {
             },
         })
         .expect("threshold certificate protocol")
+    }
+
+    fn indexed_threshold_certificate_protocol() -> ProtocolDecl {
+        let stage_id = StageId("indexed-certificate-stage".to_owned());
+        let ring = Ring::new(256, 1);
+        let source_value = ring.constant(
+            (1, 1),
+            ConstantMatrix::Polynomial { coefficients: vec![IntExpr::constant(3)] },
+        );
+        let source =
+            Parallel::range(7).map_values(|_| source_value.clone()).expect("indexed source family");
+        let indices = Parallel::range(4)
+            .map_values(|index| index.as_int().mul(Int::constant(2)))
+            .expect("indexed selector family");
+        let gathered = source.parallel_gather(indices).expect("indexed gathered family");
+        let residual = gathered
+            .get_static(0)
+            .semantic_anchor("indexed.certificate.residual")
+            .expect("indexed residual anchor");
+        let decoded = residual
+            .clone()
+            .threshold_decode_bools(IntExpr::constant(2), 1)
+            .into_iter()
+            .next()
+            .expect("indexed decoded output")
+            .semantic_anchor("indexed.certificate.decoded")
+            .expect("indexed decoded anchor");
+        let stage = DslContext::new("indexed-certificate-stage")
+            .private_output("operational-residual", residual)
+            .expect("indexed residual output")
+            .bool_output("decoded", decoded)
+            .expect("indexed decoded output")
+            .build()
+            .expect("indexed certificate graph");
+        let decoder_node = stage.graph.outputs()["decoded"].value.node;
+        let ideal = IdealSpec::new(
+            DslContext::new("indexed-certificate-ideal")
+                .bool_output("result", Bool::constant(false))
+                .expect("ideal output")
+                .build()
+                .expect("ideal graph"),
+        )
+        .expect("pure ideal");
+        let endpoint = EndpointSpecId::ToyThresholdDecode;
+        ProtocolDecl::new(crate::ProtocolDecl {
+            params: Vec::new(),
+            bundle: ClosedProtocolBundle {
+                workflow: Workflow {
+                    stages: vec![ProtocolStage {
+                        id: stage_id.clone(),
+                        graph: stage.graph,
+                        semantic_anchors: stage.anchors,
+                        derivation_attachments: stage.derivation_attachments,
+                        bindings: Vec::new(),
+                    }],
+                    entrypoint: stage_id.clone(),
+                },
+                ideal,
+                requirements: Vec::new(),
+                comparator: ComparatorSpec::Equality {
+                    endpoints: vec![ComparatorEndpointBinding {
+                        endpoint,
+                        actual_input: "decoded".to_owned(),
+                        ideal_input: "result".to_owned(),
+                        result_output: "failure".to_owned(),
+                        failure_value: true,
+                    }],
+                },
+                endpoints: EndpointAnchors {
+                    entries: vec![EndpointAnchor {
+                        spec: endpoint,
+                        stage: stage_id.clone(),
+                        semantic_anchor: "indexed.certificate.decoded".to_owned(),
+                        semantics: EndpointSemanticBinding::ThresholdDecode,
+                        workflow_output: OutputRef {
+                            stage: stage_id.clone(),
+                            output: "decoded".to_owned(),
+                        },
+                        ideal_output: "result".to_owned(),
+                    }],
+                },
+                operational_decoder_targets: vec![OperationalDecoderTarget {
+                    target_id: "indexed-certificate-threshold".to_owned(),
+                    residual_stage: stage_id.clone(),
+                    residual_output: "operational-residual".to_owned(),
+                    decoder_stage: stage_id,
+                    decoder_node,
+                    kind: OperationalDecoderKind::ThresholdDecode {
+                        plaintext_modulus: IntExpr::constant(2),
+                    },
+                }],
+                endpoint_specs: vec![endpoint],
+                input_contract: InputContract::default(),
+                input_bindings: Vec::new(),
+                precondition_spec: crate::ProtocolPreconditionSpec::default(),
+            },
+        })
+        .expect("indexed threshold certificate protocol")
     }
 
     fn boolean_interval_certificate_protocol() -> ProtocolDecl {
@@ -6398,6 +6554,8 @@ mod tests {
 
         let inventory = super::super::g0::derive_inventory(&run.job, closure, &run.trace)
             .expect("comparison inventory");
+        assert_eq!(inventory.sources.len() as u64, n.source_rows);
+        assert_eq!(inventory.family_sources.len() as u64, n.family_source_rows);
         assert_eq!(inventory.events.len() as u64, n.event_rows);
         let inventory_bytes = inventory.encode_canonical().unwrap().len() as u64;
         let lut = super::super::g0::derive_lut_evidence(&run.job, closure, &run.trace)
@@ -6456,5 +6614,66 @@ mod tests {
         for forbidden in ["l_logical_items", "artifact_bytes", "runtime", "benchmark", "estimate"] {
             assert!(!encoded.contains(forbidden), "forbidden evidence substring {forbidden}");
         }
+    }
+
+    #[test]
+    fn g0_cpu_evidence_observes_nonempty_honest_index_lut() {
+        let protocol = indexed_threshold_certificate_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "indexed-certificate-threshold".to_owned(),
+        };
+        let run = prepare_operational_certificate(&protocol, &request).expect("comparison run");
+        for plan in run.trace.index_use_plans() {
+            assert!(plan.is_residual_relevant(&run.projection.closure));
+            assert!(run.projection.closure.expressions.contains(&plan.index));
+            for expression in plan.result.into_iter().chain(plan.consumed) {
+                assert!(run.projection.closure.expressions.contains(&expression));
+            }
+            for axis in &plan.frontier {
+                assert!(run.projection.closure.expressions.contains(&axis.argument));
+            }
+            if let Some(group) = &plan.slice_group {
+                for member in &group.members {
+                    assert!(run.projection.closure.expressions.contains(&member.expression));
+                }
+            }
+            for family in plan.result_family.into_iter().chain(plan.consumed_family) {
+                assert!(run.projection.closure.families.contains(&family));
+            }
+        }
+        let first = prepare_g0_cpu_evidence_bytes(&protocol, &request)
+            .expect("accepted indexed CPU evidence");
+        let second = prepare_g0_cpu_evidence_bytes(&protocol, &request)
+            .expect("repeat accepted indexed CPU evidence");
+        assert_eq!(first, second);
+        let document: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        let index_products = document["lut"]["index_use_frontier_products"].as_array().unwrap();
+        let slice_products = document["lut"]["slice_group_frontier_products"].as_array().unwrap();
+        assert!(!index_products.is_empty() || !slice_products.is_empty());
+
+        let lut =
+            super::super::g0::derive_lut_evidence(&run.job, &run.projection.closure, &run.trace)
+                .expect("nonempty LUT");
+        assert!(!lut.index_uses.is_empty() || !lut.slice_groups.is_empty());
+        for unit in &lut.index_uses {
+            assert_eq!(unit.rows.len().to_string(), unit.frontier_product);
+        }
+        for unit in &lut.slice_groups {
+            assert_eq!(unit.rows.len().to_string(), unit.frontier_product);
+        }
+        let summed_rows = lut
+            .index_uses
+            .iter()
+            .map(|unit| BigUint::from(unit.rows.len()))
+            .chain(lut.slice_groups.iter().map(|unit| BigUint::from(unit.rows.len())))
+            .fold(BigUint::ZERO, |sum, rows| sum + rows);
+        assert_eq!(summed_rows, lut.l_rows);
+        assert_eq!(document["lut"]["exact_row_count"], summed_rows.to_string());
+        assert_eq!(
+            document["metrics"]["lut_canonical_encoded_bytes"],
+            lut.encode_canonical().unwrap().len() as u64
+        );
     }
 }

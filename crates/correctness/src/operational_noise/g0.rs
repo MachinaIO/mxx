@@ -331,6 +331,14 @@ struct InvocationFrame {
     range: EventRange,
     results: BTreeMap<ExprId, EventIndex>,
     pending_bounds: BTreeSet<super::arena::ScopedExprId>,
+    normalization_items_before_start: u64,
+}
+
+/// Logical items currently retained by the opt-in recorder and the monotone high-water mark.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecorderRetention {
+    pub current_logical_items: u64,
+    pub peak_logical_items: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1536,6 +1544,224 @@ impl FeasibilitySink for NoFeasibility {
     }
 }
 
+fn logical_add(left: u64, right: u64) -> Result<u64, G0Error> {
+    left.checked_add(right).ok_or(G0Error::TraceOverflow)
+}
+
+fn logical_sum(items: impl IntoIterator<Item = u64>) -> Result<u64, G0Error> {
+    items.into_iter().try_fold(0, logical_add)
+}
+
+fn logical_sequence(len: usize, items: impl IntoIterator<Item = u64>) -> Result<u64, G0Error> {
+    logical_add(
+        logical_add(1, u64::try_from(len).map_err(|_| G0Error::TraceOverflow)?)?,
+        logical_sum(items)?,
+    )
+}
+
+fn logical_option(item: Option<u64>) -> Result<u64, G0Error> {
+    logical_add(1, item.unwrap_or(0))
+}
+
+fn logical_coefficient_bound(bound: &CoefficientBound) -> Result<u64, G0Error> {
+    match bound {
+        CoefficientBound::ExactZero | CoefficientBound::Large => Ok(1),
+        CoefficientBound::Finite(_) => Ok(2),
+    }
+}
+
+fn logical_numeric_contract(bound: &NumericContract<CoefficientBound>) -> Result<u64, G0Error> {
+    match bound {
+        NumericContract::Missing => Ok(1),
+        NumericContract::Known(bound) => logical_add(1, logical_coefficient_bound(bound)?),
+    }
+}
+
+fn logical_polynomial(polynomial: &super::normal_form::PolynomialNF) -> Result<u64, G0Error> {
+    let terms =
+        logical_sequence(polynomial.exact_terms.len(), polynomial.exact_terms.iter().map(|_| 2))?;
+    logical_add(terms, logical_numeric_contract(&polynomial.bounded_summary.coefficient_bound())?)
+}
+
+fn logical_recorded_value(value: &RecordedValue) -> Result<u64, G0Error> {
+    logical_sum([
+        logical_option(value.exact_nf.as_deref().map(logical_polynomial).transpose()?)?,
+        logical_numeric_contract(&value.coefficient_bound)?,
+    ])
+}
+
+fn logical_value_ref(value: &BoundValueRef) -> u64 {
+    match value {
+        BoundValueRef::Predecessor { .. } | BoundValueRef::Result { .. } => 3,
+        BoundValueRef::Transfer(_) => 2,
+    }
+}
+
+fn logical_bound_rule(rule: &BoundRule) -> Result<u64, G0Error> {
+    let fields = match rule {
+        BoundRule::Authority(authority) => match authority {
+            BoundAuthority::RelationPreimageSource { .. } => 2,
+            _ => 1,
+        },
+        BoundRule::Identity { input } => logical_value_ref(input),
+        BoundRule::Sum { inputs } |
+        BoundRule::Maximum { inputs } |
+        BoundRule::WeightedSum { inputs } => {
+            logical_sequence(inputs.len(), inputs.iter().map(logical_value_ref))?
+        }
+        BoundRule::Scale { value, scale } => {
+            let scale = match scale {
+                BoundScale::Value(value) => logical_add(1, logical_value_ref(value))?,
+                BoundScale::Magnitude(_) => 2,
+            };
+            logical_add(logical_value_ref(value), scale)?
+        }
+        BoundRule::MonomialProduct { factors, .. } => {
+            let factors = logical_sequence(
+                factors.len(),
+                factors.iter().map(|factor| {
+                    logical_value_ref(&factor.bound) +
+                        1 +
+                        1 +
+                        u64::from(factor.support_upper.is_some())
+                }),
+            )?;
+            logical_add(1, factors)?
+        }
+        BoundRule::Product { left, right, facts } => {
+            let facts = logical_sum([
+                1,
+                1,
+                1 + u64::from(facts.right_known_zero_rows.is_some()),
+                1 + u64::from(facts.left_support_upper.is_some()),
+                1 + u64::from(facts.right_support_upper.is_some()),
+            ])?;
+            logical_sum([logical_value_ref(left), logical_value_ref(right), facts])?
+        }
+        BoundRule::Tensor { left, right, .. } => {
+            logical_sum([logical_value_ref(left), logical_value_ref(right), 1, 1])?
+        }
+    };
+    logical_add(1, fields)
+}
+
+fn logical_specialization_replay(replay: &SpecializationReplay) -> Result<u64, G0Error> {
+    logical_add(
+        2,
+        logical_sequence(replay.rhs_results.len(), replay.rhs_results.iter().map(|_| 2))?,
+    )
+}
+
+fn logical_applied_relation(observation: &AppliedRelation) -> Result<u64, G0Error> {
+    let rule = match &observation.rule {
+        AppliedRelationRule::Universal { .. } => 6,
+        AppliedRelationRule::Gadget { .. } => 5,
+    };
+    logical_sum([1, 1, 1, 1, 1, rule])
+}
+
+fn logical_coefficient_merge(observation: &CoefficientMerge) -> Result<u64, G0Error> {
+    let source = match &observation.source {
+        CoefficientMergeSource::Operator { .. } => 5,
+        CoefficientMergeSource::Relation { .. } => 3,
+    };
+    logical_sum([1, source, 1, 1])
+}
+
+fn logical_event(event: &NormalizerEvent) -> Result<u64, G0Error> {
+    let fields = match event {
+        NormalizerEvent::InvocationStart { .. } => 1,
+        NormalizerEvent::Predecessor { .. } => 4,
+        NormalizerEvent::Result { value, .. } => logical_add(1, logical_recorded_value(value)?)?,
+        NormalizerEvent::InvocationEnd { result, .. } => {
+            logical_add(1, logical_recorded_value(result)?)?
+        }
+        NormalizerEvent::SpecializationComputed { replay, .. } => {
+            logical_add(2, logical_specialization_replay(replay)?)?
+        }
+        NormalizerEvent::SpecializationCacheHit { .. } => 4,
+        NormalizerEvent::AppliedRelation(observation) => logical_applied_relation(observation)?,
+        NormalizerEvent::BoundTransfer { rule, .. } => logical_add(1, logical_bound_rule(rule)?)?,
+        NormalizerEvent::CoefficientMerge(observation) => logical_coefficient_merge(observation)?,
+        NormalizerEvent::SurvivorFold(_) => 2,
+        NormalizerEvent::PreFoldPolynomial(observation) => logical_sum([
+            logical_polynomial(&observation.polynomial)?,
+            logical_option(observation.summary_evidence.as_ref().map(logical_value_ref))?,
+        ])?,
+    };
+    logical_add(1, fields)
+}
+
+fn logical_frame(frame: &InvocationFrame) -> Result<u64, G0Error> {
+    logical_sum([
+        1,
+        2,
+        logical_sequence(frame.results.len(), frame.results.iter().map(|_| 2))?,
+        logical_sequence(frame.pending_bounds.len(), frame.pending_bounds.iter().map(|_| 1))?,
+    ])
+}
+
+fn logical_source(handle: &SourceHandle, class: &SourceClass) -> Result<u64, G0Error> {
+    let handle = match handle {
+        SourceHandle::Expression(_) | SourceHandle::Family(_) => 2,
+    };
+    let class = match class {
+        SourceClass::ScalarConstant { .. } => 2,
+        SourceClass::MatrixConstant { .. } => 3,
+        SourceClass::DeclaredProtocolInput { identity, .. } => {
+            let identity = match identity {
+                InputSourceIdentity::Expression(_) | InputSourceIdentity::Family(_) => 2,
+            };
+            logical_sum([1, 1, 1, identity])?
+        }
+        SourceClass::UnboundOccurrenceInput { identity, .. } => {
+            let identity = match identity {
+                InputSourceIdentity::Expression(_) | InputSourceIdentity::Family(_) => 2,
+            };
+            logical_sum([1, 1, identity])?
+        }
+        SourceClass::ProducerArtifact { .. } => 2,
+    };
+    logical_add(handle, class)
+}
+
+fn logical_event_observation(_: &SampleEventId, observation: &EventObservation) -> u64 {
+    let kind = match observation.kind {
+        EventKind::Sample { .. } | EventKind::Sampler { .. } | EventKind::Trapdoor { .. } => 2,
+    };
+    1 + 1 + 1 + kind
+}
+
+fn logical_index_plan(plan: &IndexUsePlan) -> Result<u64, G0Error> {
+    let frontier = logical_sequence(plan.frontier.len(), plan.frontier.iter().map(|_| 5))?;
+    let slice_group = plan
+        .slice_group
+        .as_ref()
+        .map(|group| {
+            logical_sum([
+                1,
+                logical_sequence(group.frontier.len(), group.frontier.iter().map(|_| 5))?,
+                logical_sequence(group.members.len(), group.members.iter().map(|_| 4))?,
+                1 + u64::from(group.row_span.is_some()),
+                1 + u64::from(group.column_span.is_some()),
+            ])
+        })
+        .transpose()?;
+    logical_sum([
+        1,
+        1,
+        1 + u64::from(plan.result.is_some()),
+        1 + u64::from(plan.result_family.is_some()),
+        1 + u64::from(plan.consumed.is_some()),
+        1 + u64::from(plan.consumed_family.is_some()),
+        1,
+        frontier,
+        1,
+        1 + 2 * u64::from(plan.output_range.is_some()),
+        logical_option(slice_group)?,
+    ])
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FeasibilityTrace {
     pub lowering_complete: u64,
@@ -1548,6 +1774,9 @@ pub(crate) struct FeasibilityTrace {
     index_use_plans: BTreeSet<IndexUsePlan>,
     retained_monomial_roots: std::collections::HashSet<super::monomial::MonomialId>,
     next_slice_group_id: u64,
+    lowering_retained_items: u64,
+    normalization_retained_items: u64,
+    retention_peak_items: u64,
 }
 
 impl Default for FeasibilityTrace {
@@ -1562,6 +1791,9 @@ impl Default for FeasibilityTrace {
             index_use_plans: BTreeSet::new(),
             retained_monomial_roots: std::collections::HashSet::new(),
             next_slice_group_id: 1,
+            lowering_retained_items: 3,
+            normalization_retained_items: 4,
+            retention_peak_items: 7,
         }
     }
 }
@@ -1569,6 +1801,105 @@ impl Default for FeasibilityTrace {
 impl From<NoFeasibility> for FeasibilityTrace {
     fn from(_: NoFeasibility) -> Self {
         Self::default()
+    }
+}
+
+impl FeasibilityTrace {
+    pub(crate) fn recorder_retention(&self) -> RecorderRetention {
+        RecorderRetention {
+            current_logical_items: self.lowering_retained_items + self.normalization_retained_items,
+            peak_logical_items: self.retention_peak_items,
+        }
+    }
+
+    fn commit_retention(&mut self, lowering: u64, normalization: u64) -> Result<(), G0Error> {
+        let current = logical_add(lowering, normalization)?;
+        self.lowering_retained_items = lowering;
+        self.normalization_retained_items = normalization;
+        self.retention_peak_items = self.retention_peak_items.max(current);
+        Ok(())
+    }
+
+    fn add_lowering_items(&mut self, added: u64) -> Result<(), G0Error> {
+        self.commit_retention(
+            logical_add(self.lowering_retained_items, added)?,
+            self.normalization_retained_items,
+        )
+    }
+
+    fn update_normalization_items(&mut self, added: u64, removed: u64) -> Result<(), G0Error> {
+        let normalization = logical_add(self.normalization_retained_items, added)?
+            .checked_sub(removed)
+            .ok_or(G0Error::TraceOverflow)?;
+        self.commit_retention(self.lowering_retained_items, normalization)
+    }
+
+    fn novel_event_root_items(&self, event: &NormalizerEvent) -> Result<u64, G0Error> {
+        let mut roots = HashSet::new();
+        Self::retain_event_monomials(event, &mut roots);
+        let novel =
+            roots.iter().filter(|root| !self.retained_monomial_roots.contains(root)).count();
+        u64::try_from(novel)
+            .map_err(|_| G0Error::TraceOverflow)
+            .and_then(|novel| novel.checked_mul(2).ok_or(G0Error::TraceOverflow))
+    }
+
+    fn add_event_items(&mut self, event: &NormalizerEvent) -> Result<(), G0Error> {
+        let event_items = logical_add(1, logical_event(event)?)?;
+        self.update_normalization_items(
+            logical_add(event_items, self.novel_event_root_items(event)?)?,
+            0,
+        )
+    }
+
+    fn recompute_lowering_items(&self) -> Result<u64, G0Error> {
+        logical_sum([
+            logical_sequence(
+                self.source_observations.len(),
+                self.source_observations
+                    .iter()
+                    .map(|(handle, class)| logical_source(handle, class))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?,
+            logical_sequence(
+                self.event_observations.len(),
+                self.event_observations
+                    .iter()
+                    .map(|(event, observation)| logical_event_observation(event, observation)),
+            )?,
+            logical_sequence(
+                self.index_use_plans.len(),
+                self.index_use_plans
+                    .iter()
+                    .map(logical_index_plan)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?,
+        ])
+    }
+
+    #[cfg(test)]
+    fn recompute_normalization_items(&self) -> Result<u64, G0Error> {
+        logical_sum([
+            logical_sequence(
+                self.events.len(),
+                self.events.iter().map(logical_event).collect::<Result<Vec<_>, _>>()?,
+            )?,
+            logical_sequence(
+                self.frames.len(),
+                self.frames.iter().map(logical_frame).collect::<Result<Vec<_>, _>>()?,
+            )?,
+            logical_sequence(
+                self.specialization_ranges.len(),
+                self.specialization_ranges
+                    .iter()
+                    .map(|(_, replay)| logical_add(1, logical_specialization_replay(replay)?))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?,
+            logical_sequence(
+                self.retained_monomial_roots.len(),
+                self.retained_monomial_roots.iter().map(|_| 1),
+            )?,
+        ])
     }
 }
 
@@ -1584,13 +1915,20 @@ impl FeasibilitySink for FeasibilityTrace {
     fn record_invocation_start(&mut self, root: super::arena::ScopedExprId) -> Result<(), G0Error> {
         let start =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
-        self.events.push(NormalizerEvent::InvocationStart { root });
-        self.frames.push(InvocationFrame {
+        let event = NormalizerEvent::InvocationStart { root };
+        let frame = InvocationFrame {
             root,
             range: EventRange::checked(start, start)?,
             results: BTreeMap::new(),
             pending_bounds: BTreeSet::new(),
-        });
+            normalization_items_before_start: self.normalization_retained_items,
+        };
+        self.update_normalization_items(
+            logical_sum([1, logical_event(&event)?, 1, logical_frame(&frame)?])?,
+            0,
+        )?;
+        self.events.push(event);
+        self.frames.push(frame);
         Ok(())
     }
 
@@ -1603,12 +1941,10 @@ impl FeasibilitySink for FeasibilityTrace {
         let frame = self.frames.last().ok_or(G0Error::MissingNormalizationResult)?;
         let source_result =
             *frame.results.get(&predecessor).ok_or(G0Error::MissingNormalizationResult)?;
-        self.events.push(NormalizerEvent::Predecessor {
-            consumer,
-            input_position,
-            predecessor,
-            source_result,
-        });
+        let event =
+            NormalizerEvent::Predecessor { consumer, input_position, predecessor, source_result };
+        self.add_event_items(&event)?;
+        self.events.push(event);
         Ok(())
     }
 
@@ -1617,29 +1953,35 @@ impl FeasibilitySink for FeasibilityTrace {
         result: super::arena::ScopedExprId,
         value: &super::normal_form::AnalyzedValue,
     ) -> Result<EventIndex, G0Error> {
-        let frame = self.frames.last_mut().ok_or(G0Error::MissingNormalizationResult)?;
+        let frame = self.frames.last().ok_or(G0Error::MissingNormalizationResult)?;
         if result.program() != frame.root.program() {
             return Err(G0Error::MissingNormalizationResult);
         }
         if frame.results.contains_key(&result.expression()) {
             return Err(G0Error::MissingNormalizationResult);
         }
-        if result != frame.root {
-            frame.pending_bounds.remove(&result);
-        }
         let index =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
-        self.events.push(NormalizerEvent::Result {
+        let event = NormalizerEvent::Result {
             owner: result,
             value: RecordedValue {
                 exact_nf: value.exact_nf.clone(),
                 coefficient_bound: value.coefficient_bound.clone(),
             },
-        });
+        };
+        let pending_removed = result != frame.root && frame.pending_bounds.contains(&result);
+        let added =
+            logical_sum([1, logical_event(&event)?, self.novel_event_root_items(&event)?, 3])?;
+        self.update_normalization_items(added, if pending_removed { 2 } else { 0 })?;
+        self.events.push(event);
         Self::retain_event_monomials(
             &self.events[self.events.len() - 1],
             &mut self.retained_monomial_roots,
         );
+        let frame = self.frames.last_mut().ok_or(G0Error::MissingNormalizationResult)?;
+        if pending_removed {
+            frame.pending_bounds.remove(&result);
+        }
         frame.results.insert(result.expression(), index);
         Ok(index)
     }
@@ -1678,11 +2020,14 @@ impl FeasibilitySink for FeasibilityTrace {
             frame.range.start,
             EventIndex(end.0.checked_add(1).ok_or(G0Error::TraceOverflow)?),
         )?;
-        self.events.push(NormalizerEvent::InvocationEnd {
-            root,
-            result: root_result,
-            counters: *counters,
-        });
+        let event =
+            NormalizerEvent::InvocationEnd { root, result: root_result, counters: *counters };
+        let frame_items = logical_frame(frame)?;
+        self.update_normalization_items(
+            logical_sum([1, logical_event(&event)?, self.novel_event_root_items(&event)?])?,
+            logical_add(1, frame_items)?,
+        )?;
+        self.events.push(event);
         Self::retain_event_monomials(
             &self.events[self.events.len() - 1],
             &mut self.retained_monomial_roots,
@@ -1714,9 +2059,11 @@ impl FeasibilitySink for FeasibilityTrace {
             self.events.clear();
             self.specialization_ranges.clear();
             self.retained_monomial_roots.clear();
+            self.normalization_retained_items = 4;
             return discarded.into_boxed_slice();
         }
         let Some(frame) = self.frames.pop() else { return discarded.into_boxed_slice() };
+        let normalization_items_before_start = frame.normalization_items_before_start;
         let truncate = frame.range.start.0 as usize;
         for event in self.events.iter().skip(truncate) {
             if let NormalizerEvent::SpecializationComputed { key, .. } = event {
@@ -1728,6 +2075,7 @@ impl FeasibilitySink for FeasibilityTrace {
         self.events.truncate(truncate);
         self.specialization_ranges.retain(|_, replay| replay.range.end.0 <= truncate as u64);
         self.rebuild_retained_monomial_roots();
+        self.normalization_retained_items = normalization_items_before_start;
         discarded.into_boxed_slice()
     }
 
@@ -1776,8 +2124,23 @@ impl FeasibilitySink for FeasibilityTrace {
             }
         }
         let replay = SpecializationReplay { range, rhs_results };
+        let event = NormalizerEvent::SpecializationComputed {
+            owner,
+            key: key.clone(),
+            replay: replay.clone(),
+        };
+        self.update_normalization_items(
+            logical_sum([
+                1,
+                1,
+                logical_specialization_replay(&replay)?,
+                1,
+                logical_event(&event)?,
+            ])?,
+            0,
+        )?;
         self.specialization_ranges.insert(key.clone(), replay.clone());
-        self.events.push(NormalizerEvent::SpecializationComputed { owner, key, replay });
+        self.events.push(event);
         Ok(())
     }
 
@@ -1800,11 +2163,9 @@ impl FeasibilitySink for FeasibilityTrace {
         if source.range.end.0 >= current.0 {
             return Err(G0Error::SpecializationTraceInvariant);
         }
-        self.events.push(NormalizerEvent::SpecializationCacheHit {
-            owner,
-            key,
-            source: source.range,
-        });
+        let event = NormalizerEvent::SpecializationCacheHit { owner, key, source: source.range };
+        self.add_event_items(&event)?;
+        self.events.push(event);
         Ok(())
     }
 
@@ -1878,10 +2239,12 @@ impl FeasibilitySink for FeasibilityTrace {
                 return Err(G0Error::RelationTraceInvariant);
             }
         }
-        self.retained_monomial_roots.insert(observation.source_monomial);
         let index =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
-        self.events.push(NormalizerEvent::AppliedRelation(observation));
+        let event = NormalizerEvent::AppliedRelation(observation);
+        self.add_event_items(&event)?;
+        Self::retain_event_monomials(&event, &mut self.retained_monomial_roots);
+        self.events.push(event);
         Ok(index)
     }
 
@@ -1890,15 +2253,27 @@ impl FeasibilitySink for FeasibilityTrace {
         owner: super::arena::ScopedExprId,
         rule: BoundRule,
     ) -> Result<EventIndex, G0Error> {
-        let frame = self.frames.last_mut().ok_or(G0Error::UnsupportedBoundTransfer)?;
+        let frame = self.frames.last().ok_or(G0Error::UnsupportedBoundTransfer)?;
         if frame.root.program() != owner.program() {
             return Err(G0Error::UnsupportedBoundTransfer);
         }
         let index =
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
+        let event = NormalizerEvent::BoundTransfer { owner, rule };
+        let pending_added = !frame.pending_bounds.contains(&owner);
+        self.update_normalization_items(
+            logical_sum([
+                1,
+                logical_event(&event)?,
+                self.novel_event_root_items(&event)?,
+                if pending_added { 2 } else { 0 },
+            ])?,
+            0,
+        )?;
+        let frame = self.frames.last_mut().ok_or(G0Error::UnsupportedBoundTransfer)?;
         frame.pending_bounds.insert(owner);
-        Self::retain_bound_rule_monomials(&rule, &mut self.retained_monomial_roots);
-        self.events.push(NormalizerEvent::BoundTransfer { owner, rule });
+        Self::retain_event_monomials(&event, &mut self.retained_monomial_roots);
+        self.events.push(event);
         Ok(index)
     }
 
@@ -2009,7 +2384,9 @@ impl FeasibilitySink for FeasibilityTrace {
             }
         };
         let index = current;
-        self.events.push(NormalizerEvent::CoefficientMerge(observation));
+        let event = NormalizerEvent::CoefficientMerge(observation);
+        self.add_event_items(&event)?;
+        self.events.push(event);
         Self::retain_event_monomials(
             &self.events[self.events.len() - 1],
             &mut self.retained_monomial_roots,
@@ -2029,7 +2406,9 @@ impl FeasibilitySink for FeasibilityTrace {
         if frame.root.program() != owner.program() {
             return Err(G0Error::RelationTraceInvariant);
         }
-        self.events.push(NormalizerEvent::SurvivorFold(observation));
+        let event = NormalizerEvent::SurvivorFold(observation);
+        self.add_event_items(&event)?;
+        self.events.push(event);
         Ok(())
     }
 
@@ -2092,10 +2471,10 @@ impl FeasibilitySink for FeasibilityTrace {
                 BoundValueRef::Predecessor { .. } => return Err(G0Error::RelationTraceInvariant),
             }
         }
-        self.events.push(NormalizerEvent::PreFoldPolynomial(PreFoldPolynomial {
-            polynomial,
-            summary_evidence,
-        }));
+        let event =
+            NormalizerEvent::PreFoldPolynomial(PreFoldPolynomial { polynomial, summary_evidence });
+        self.add_event_items(&event)?;
+        self.events.push(event);
         Self::retain_event_monomials(
             &self.events[self.events.len() - 1],
             &mut self.retained_monomial_roots,
@@ -2652,6 +3031,7 @@ impl FeasibilitySink for FeasibilityTrace {
             Some(existing) if existing != &class => Err(G0Error::ConflictingSourceClass),
             Some(_) => Ok(()),
             None => {
+                self.add_lowering_items(logical_add(1, logical_source(&handle, &class)?)?)?;
                 self.source_observations.insert(handle, class);
                 Ok(())
             }
@@ -2663,6 +3043,10 @@ impl FeasibilitySink for FeasibilityTrace {
             Some(existing) if existing != &observation => Err(G0Error::ConflictingEventObservation),
             Some(_) => Ok(()),
             None => {
+                self.add_lowering_items(logical_add(
+                    1,
+                    logical_event_observation(&observation.event, &observation),
+                )?)?;
                 self.event_observations.insert(observation.event, observation);
                 Ok(())
             }
@@ -2676,7 +3060,10 @@ impl FeasibilitySink for FeasibilityTrace {
         }) {
             return Err(G0Error::ConflictingIndexUsePlan);
         }
-        self.index_use_plans.insert(plan);
+        if !self.index_use_plans.contains(&plan) {
+            self.add_lowering_items(logical_add(1, logical_index_plan(&plan)?)?)?;
+            self.index_use_plans.insert(plan);
+        }
         Ok(())
     }
 
@@ -3293,6 +3680,11 @@ impl FeasibilityTrace {
                 plan.consumed.is_some_and(|expression| closure.expressions.contains(&expression)) ||
                 plan.consumed_family.is_some_and(|family| closure.families.contains(&family))
         });
+        // Filtering only removes entries that were already counted successfully. Recomputing the
+        // three persistent lowering collections therefore cannot exceed the prior checked total.
+        self.lowering_retained_items = self
+            .recompute_lowering_items()
+            .expect("residual filtering cannot overflow the retained lowering subset");
     }
 
     pub(crate) fn source_observations(&self) -> &BTreeMap<SourceHandle, SourceClass> {
@@ -4897,6 +5289,17 @@ mod tests {
         ResolvedMatrixType::new(17_u8.into(), 1, 1, 1).expect("matrix type")
     }
 
+    fn assert_retention_oracle(trace: &FeasibilityTrace) {
+        let expected = logical_add(
+            trace.recompute_lowering_items().expect("lowering logical items"),
+            trace.recompute_normalization_items().expect("normalization logical items"),
+        )
+        .expect("total logical items");
+        let retention = trace.recorder_retention();
+        assert_eq!(retention.current_logical_items, expected);
+        assert!(retention.peak_logical_items >= retention.current_logical_items);
+    }
+
     fn dag_node(
         handle: u8,
         kind: &str,
@@ -5442,6 +5845,160 @@ mod tests {
             malformed.validate_normalization_observations(),
             Err(G0Error::SpecializationTraceInvariant)
         );
+    }
+
+    #[test]
+    fn recorder_retention_tracks_nested_end_abort_and_specialization_rollback() {
+        use crate::operational_noise::{
+            arena::{ArenaToken, ExprArena, FamilyDomain},
+            monomial::MonomialId,
+            program::ProgramArena,
+            relation::{
+                RelationRegistry, RuntimeSpecializationKey, SamplerSourceContract,
+                TrapdoorSourceContract, UniversalDispatchKey,
+            },
+        };
+
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let child_expression = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .expect("child expression");
+        let parent_expression = expressions
+            .intern(ValueOperator::Scalar(ScalarOperation::Negate), Box::new([child_expression]))
+            .expect("parent expression");
+        let family = programs
+            .generated_family_from_body(
+                &mut expressions,
+                FamilyDomain::new(0, 1).expect("domain"),
+                parent_expression,
+            )
+            .expect("family");
+        let parent = programs
+            .scoped(&expressions, family.program(), parent_expression)
+            .expect("parent owner");
+        let child =
+            programs.scoped(&expressions, family.program(), child_expression).expect("child owner");
+        let value = super::super::normal_form::AnalyzedValue {
+            semantic: child,
+            exact_nf: None,
+            coefficient_bound: NumericContract::Missing,
+        };
+
+        let mut trace = FeasibilityTrace::default();
+        assert_eq!(
+            trace.recorder_retention(),
+            RecorderRetention { current_logical_items: 7, peak_logical_items: 7 }
+        );
+        trace
+            .record_source(
+                SourceHandle::Expression(child_expression),
+                SourceClass::ScalarConstant { value: TypedConstant::int(1) },
+            )
+            .expect("lowering source");
+        assert_eq!(trace.recorder_retention().current_logical_items, 12);
+        assert_retention_oracle(&trace);
+
+        trace.record_invocation_start(parent).expect("parent start");
+        assert_eq!(trace.recorder_retention().current_logical_items, 21);
+        assert_retention_oracle(&trace);
+        trace.record_invocation_start(child).expect("child start");
+        assert_eq!(trace.recorder_retention().current_logical_items, 30);
+        assert_retention_oracle(&trace);
+        trace.record_normalization_result(child, &value).expect("child result");
+        assert_eq!(trace.recorder_retention().current_logical_items, 38);
+        assert_retention_oracle(&trace);
+        trace.record_invocation_end(child, &value, &Default::default()).expect("child end");
+        assert_eq!(trace.recorder_retention().current_logical_items, 34);
+        assert_retention_oracle(&trace);
+        let peak_before_abort = trace.recorder_retention().peak_logical_items;
+        assert!(trace.abort_invocation(parent).is_empty());
+        assert_eq!(trace.recorder_retention().current_logical_items, 12);
+        assert_eq!(trace.recorder_retention().peak_logical_items, peak_before_abort);
+        assert_retention_oracle(&trace);
+
+        let dispatch = UniversalDispatchKey {
+            preimage_family: family,
+            preimage_source: SamplerSourceContract { expression: child_expression },
+            matrix_type: matrix(),
+            trapdoor_source: TrapdoorSourceContract { expression: child_expression },
+        };
+        let key = RuntimeSpecializationKey {
+            dispatch,
+            index: parent,
+            generation: RelationRegistry::new().freeze(),
+        };
+        trace.record_invocation_start(parent).expect("specialization start");
+        let monomial = MonomialId::new(ArenaToken::fresh(), 0);
+        trace
+            .record_bound_transfer(
+                parent,
+                BoundRule::MonomialProduct { monomial, factors: Box::new([]) },
+            )
+            .expect("retained root");
+        let replay_start = trace.specialization_miss_start(parent, key.clone()).expect("miss");
+        trace
+            .record_specialization_computed(parent, key.clone(), replay_start, Box::new([]))
+            .expect("computed range");
+        assert!(trace.specialization_ranges.contains_key(&key));
+        assert!(trace.retained_monomial_roots.contains(&monomial));
+        assert_retention_oracle(&trace);
+        let peak_before_computed_abort = trace.recorder_retention().peak_logical_items;
+        assert_eq!(trace.abort_invocation(parent), vec![key].into_boxed_slice());
+        assert!(trace.specialization_ranges.is_empty());
+        assert!(trace.retained_monomial_roots.is_empty());
+        assert_eq!(trace.recorder_retention().current_logical_items, 12);
+        assert_eq!(trace.recorder_retention().peak_logical_items, peak_before_computed_abort);
+        assert_retention_oracle(&trace);
+
+        trace.record_invocation_start(parent).expect("mismatch start");
+        let peak_before_mismatch = trace.recorder_retention().peak_logical_items;
+        assert!(trace.abort_invocation(child).is_empty());
+        assert_eq!(trace.recorder_retention().current_logical_items, 12);
+        assert_eq!(trace.recorder_retention().peak_logical_items, peak_before_mismatch);
+        assert_retention_oracle(&trace);
+    }
+
+    #[test]
+    fn residual_filter_recomputes_current_retention_without_lowering_peak() {
+        let mut job = CheckerJob::new();
+        let first = job
+            .expressions_mut()
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .expect("first expression");
+        let second = job
+            .expressions_mut()
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .expect("second expression");
+        let mut trace = FeasibilityTrace::default();
+        trace
+            .record_source(
+                SourceHandle::Expression(first),
+                SourceClass::ScalarConstant { value: TypedConstant::int(1) },
+            )
+            .expect("first source");
+        trace
+            .record_source(
+                SourceHandle::Expression(second),
+                SourceClass::ScalarConstant { value: TypedConstant::int(2) },
+            )
+            .expect("second source");
+        assert_eq!(trace.recorder_retention().current_logical_items, 17);
+        assert_retention_oracle(&trace);
+        let peak = trace.recorder_retention().peak_logical_items;
+        let closure = CertificateClosure {
+            expressions: [first].into_iter().collect(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: [first].into_iter().collect(),
+        };
+        trace.retain_residual(&closure);
+        assert_eq!(trace.recorder_retention().current_logical_items, 12);
+        assert_eq!(trace.recorder_retention().peak_logical_items, peak);
+        assert_retention_oracle(&trace);
     }
 
     #[test]

@@ -2298,7 +2298,7 @@ fn scalar_coverage_classification(kind: ObservedScalarKind) -> ResidualCoverageC
             "Mxx.Certificate.OperationalNoise.coefficient_subtract",
             "Mxx.Certificate.OperationalNoise.EventReplay.boundTransfer_sum",
         ),
-        ObservedScalarKind::Multiply => checked_lean(
+        ObservedScalarKind::Multiply => g2_obligation(
             NORMALIZE_RUST_ITEM,
             "Mxx.Certificate.OperationalNoise.EventReplay.\
 productMerge_contribution_coefficient",
@@ -5025,10 +5025,22 @@ mod tests {
 
     #[test]
     fn residual_coverage_classification_splits_variants_and_rejects_unsupported_rows() {
-        let checked = residual_coverage_classification(ObservedCoverageKind::Operator(
-            ObservedOperatorKind::Scalar(ObservedScalarKind::Add),
+        for operation in [ObservedScalarKind::Add, ObservedScalarKind::Subtract] {
+            let classification = residual_coverage_classification(ObservedCoverageKind::Operator(
+                ObservedOperatorKind::Scalar(operation),
+            ));
+            assert!(matches!(
+                classification.disposition,
+                ResidualCoverageDisposition::CheckedLean { .. }
+            ));
+        }
+        let multiply = residual_coverage_classification(ObservedCoverageKind::Operator(
+            ObservedOperatorKind::Scalar(ObservedScalarKind::Multiply),
         ));
-        assert!(matches!(checked.disposition, ResidualCoverageDisposition::CheckedLean { .. }));
+        assert!(matches!(
+            multiply.disposition,
+            ResidualCoverageDisposition::G2LeanObligation { .. }
+        ));
         let regular = residual_coverage_classification(ObservedCoverageKind::Transform(
             ObservedTransformKind::GadgetDecompose(ObservedGadgetKind::Regular),
         ));

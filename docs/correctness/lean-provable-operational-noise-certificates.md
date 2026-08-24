@@ -474,7 +474,7 @@ decomposed, and small-decomposed hash sampling, have distinct rows.
 
 `ThresholdDecode`, `BoundAuthority::Unavailable`, and raw `EventKind::Trapdoor` are rejected before
 matrix generation or canonical event projection. Decoder-only expressions are not part of the
-residual closure. A reject-tagged row therefore cannot occur in emitted schema-version-5 CPU
+residual closure. A reject-tagged row therefore cannot occur in emitted schema-version-6 CPU
 evidence.
 
 An unsupported reachable operator, missing relation lemma, surviving `Large`, missing bound, or
@@ -503,6 +503,12 @@ multiplications, scale 64, error sigma 4, and trapdoor sigma 4.578. The security
 the same values except for CRT depth 20 and `log2(n) = 15`; its reviewed static security lower
 bound is 177 bits. These profiles do not read environment variables, run a parameter search, or
 invoke an estimator. The file contains pre-gate CPU observations, not a Tall execution result.
+
+Schema version 6 derives the exact `N` rows and descriptor inventory from the same canonical
+statement-row projection used by the typed certificate schema. In particular, its event rows
+include each reached gadget decomposition in its exact closed or program scope; the expression row
+stores only the corresponding event reference. This keeps the expression, program, source, and
+event counts under one authority without changing runtime acceptance or the ordinary checker path.
 
 The committed artifacts are:
 

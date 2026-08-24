@@ -741,6 +741,12 @@ trapdoor sigma 4.578 に固定する。security-128 profile は CRT depth 20 と
 読み込まず、parameter search や estimator を実行しない。このファイルは gate 前の CPU 観測で
 あり、Tall の実行結果ではない。
 
+schema version 6 では、正確な `N` の row と descriptor inventory を、typed certificate schema と
+共通の canonical statement-row projection から導出する。特に event row は、到達した各 gadget
+decomposition を正確な closed scope または program scope で含み、expression row は対応する event
+reference だけを保持する。これにより expression、program、source、event の count は一つの authority
+に従い、runtime acceptance と通常 checker 経路は変わらない。
+
 G3 で canonical frozen-bundle serializer が完成した後は、その完全な出力である `Source.json`
 だけから clean-room regeneration を実行できなければならない。`Source.json` は canonical な
 frozen bundle、正確な request、pinned version identity だけを持ち、target や environment の

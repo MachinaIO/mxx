@@ -4578,7 +4578,7 @@ fn real_descriptor(value: &RealExpr) -> Result<String, ProductionAdapterError> {
 pub(crate) mod tests {
     use super::*;
     use crate::operational_noise::{
-        g0::G0Error,
+        g0::{BoundAuthority, BoundRule, G0Error, NormalizerEvent},
         program::{ArenaToken, ValueProgramId},
     };
 
@@ -5562,6 +5562,44 @@ pub(crate) mod tests {
                     input: StageInputName(name.to_owned()),
                 }],
             });
+        }
+        crate::ProtocolDecl::new(protocol).unwrap()
+    }
+
+    fn packed_integer_residual_protocol() -> crate::ProtocolDecl {
+        use crate::{ProtocolInputDestination, ProtocolInputId};
+        use mxx_dsl::{DslContext, Family, Int, Ring};
+
+        let ring = Ring::new(256, 1);
+        let packed = Family::<Int>::pack([7_i64, 0, 5].into_iter().map(Int::constant).collect())
+            .expect("integer family");
+        let residual = packed.get_static(0).lift_to_constant_polynomial(ring.matrix_type((1, 1)));
+        let encrypt = DslContext::new("packed-integer-residual")
+            .int_parameter("cutoff")
+            .public_output("ciphertext", residual.clone())
+            .unwrap()
+            .private_output("operational-residual", residual)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut protocol = crate::toy_example::protocol();
+        let encrypt_stage = protocol
+            .bundle
+            .workflow
+            .stages
+            .iter_mut()
+            .find(|stage| stage.id == StageId("encrypt".to_owned()))
+            .unwrap();
+        encrypt_stage.graph = encrypt.graph;
+        encrypt_stage.semantic_anchors = encrypt.anchors;
+        encrypt_stage.derivation_attachments = encrypt.derivation_attachments;
+        for binding in &mut protocol.bundle.input_bindings {
+            if binding.input == ProtocolInputId::from("message") {
+                binding.destinations.retain(|destination| {
+                    matches!(destination, ProtocolInputDestination::Ideal { .. })
+                });
+            }
         }
         crate::ProtocolDecl::new(protocol).unwrap()
     }
@@ -7033,6 +7071,88 @@ pub(crate) mod tests {
             matches!(trace_roots.decoder, ProductionRoot::Closed(_))
         );
         assert_eq!(ordinary_job.relations().is_frozen(), trace_job.relations().is_frozen());
+    }
+
+    #[test]
+    fn packed_integer_constants_retain_add_summary_only_for_opt_in_normalization() {
+        let protocol = packed_integer_residual_protocol();
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("packed plan");
+        let parameters = BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]);
+        let (mut ordinary_job, ordinary_roots) =
+            ProductionAdapter::new(&protocol, &plan, parameters.clone())
+                .expect("ordinary adapter")
+                .lower()
+                .expect("ordinary lowering");
+        let (mut traced_job, traced_roots, mut trace) =
+            ProductionAdapter::new_with_feasibility(&protocol, &plan, parameters)
+                .expect("opt-in adapter")
+                .lower_with_feasibility()
+                .expect("opt-in lowering");
+
+        let explicit_integer_family = |job: &CheckerJob| {
+            job.programs()
+                .family_scopes()
+                .into_iter()
+                .filter_map(|(program, _)| job.programs().family_for_program(program))
+                .find(|family| {
+                    job.programs().family_element_type(*family).ok() ==
+                        Some(ResolvedValueType::Int) &&
+                        job.programs()
+                            .family_body(*family)
+                            .ok()
+                            .and_then(|body| job.expressions().node(body).ok())
+                            .is_some_and(|node| {
+                                matches!(node.operator, ValueOperator::ExplicitElement { .. })
+                            })
+                })
+                .expect("packed integer family")
+        };
+        let ordinary_family = explicit_integer_family(&ordinary_job);
+        assert_eq!(ordinary_job.programs().family_scalar_facts(ordinary_family).unwrap(), None);
+        let traced_family = explicit_integer_family(&traced_job);
+        assert_eq!(
+            traced_job
+                .programs()
+                .family_scalar_facts(traced_family)
+                .unwrap()
+                .unwrap()
+                .coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(7_u8))
+        );
+        let body = traced_job.programs().family_body(traced_family).unwrap();
+        let branches = &traced_job.expressions().node(body).unwrap().inputs[1..];
+        assert_eq!(branches.len(), 3);
+        assert!(branches.iter().all(|branch| {
+            matches!(
+                traced_job.expressions().node(*branch).unwrap().operator,
+                ValueOperator::Scalar(ScalarOperation::Add)
+            )
+        }));
+
+        let ProductionRoot::Closed(ordinary_root) = ordinary_roots.residual else {
+            panic!("ordinary packed residual must be closed");
+        };
+        let ProductionRoot::Closed(traced_root) = traced_roots.residual else {
+            panic!("opt-in packed residual must be closed");
+        };
+        let ordinary = ordinary_job.normalize_closed_root(ordinary_root).unwrap();
+        assert_eq!(ordinary.value.coefficient_bound, NumericContract::Missing);
+        let traced = traced_job.normalize_closed_root_with_sink(traced_root, &mut trace).unwrap();
+        assert_eq!(
+            traced.value.coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(7_u8))
+        );
+        assert!(trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::BoundTransfer {
+                    rule: BoundRule::Authority(BoundAuthority::ProgramFamilyFact),
+                    ..
+                }
+            )
+        }));
+        assert_eq!(ordinary_job.expressions().node_count(), traced_job.expressions().node_count());
+        assert_eq!(ordinary_job.programs().len(), traced_job.programs().len());
     }
 
     #[test]

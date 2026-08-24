@@ -17,7 +17,8 @@ use super::{
     },
     facts::{
         BoundExpression, CoefficientBound, FactError, FactStore, MatrixFacts, NumericContract,
-        ValueFacts,
+        ValueFacts, add_bounds, add_known_bounds, max_bounds, product_bounds,
+        product_bounds_with_factor, scalar_bound, weighted_sum_bounds,
     },
     g0::{
         BoundAuthority, BoundProjection, BoundRule, BoundScale, BoundValueRef, CoefficientMerge,
@@ -2832,7 +2833,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             .collect::<Vec<_>>();
         let mut result = PolynomialNF {
             exact_terms: terms,
-            bounded_summary: BoundedSummary::from_contract(max_bounds(&summaries)?)?,
+            bounded_summary: BoundedSummary::from_contract(max_bounds(&summaries))?,
         };
         let mut evidence = None;
         if S::ENABLED {
@@ -4954,7 +4955,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                             )),
                         ],
                         &BigUint::from(1_u8),
-                    )?;
+                    );
                     match bound {
                         NumericContract::Known(CoefficientBound::Large) => {
                             if let Some(existing) = &relation_type {
@@ -5477,13 +5478,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             }
             return Ok(NumericContract::Missing);
         };
-        product_bounds_with_factor(
+        Ok(product_bounds_with_factor(
             &[
                 NumericContract::Known(coefficient_bound(&product.coefficient_class)),
                 NumericContract::Known(CoefficientBound::finite(coefficient.magnitude().clone())),
             ],
             &BigUint::from(1_u8),
-        )
+        ))
     }
 
     fn canonical_monomial_bound(
@@ -5700,7 +5701,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             // are the complete, same-typed branch set, so their maximum is the exact compact
             // transfer and a missing branch remains fail-closed.
             ValueOperator::ExplicitElement { .. } => {
-                let bound = max_bounds(&child_bounds[1..])?;
+                let bound = max_bounds(&child_bounds[1..]);
                 if S::ENABLED {
                     if bound.is_missing() {
                         return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
@@ -5774,7 +5775,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
         match operation {
             MatrixOperation::Add | MatrixOperation::Subtract => {
-                let bound = add_bounds(bounds)?;
+                let bound = add_bounds(bounds);
                 if S::ENABLED {
                     if bound.is_missing() {
                         return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
@@ -5811,7 +5812,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 Ok(bound)
             }
             MatrixOperation::Scale => {
-                let bound = product_bounds(bounds)?;
+                let bound = product_bounds(bounds);
                 if S::ENABLED {
                     if bound.is_missing() {
                         return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
@@ -5832,7 +5833,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             MatrixOperation::Multiply => self.matrix_product_bound(owner, node, bounds),
             MatrixOperation::Tensor { .. } => self.tensor_bound(owner, node, bounds),
             MatrixOperation::Concat { .. } => {
-                let bound = max_bounds(bounds)?;
+                let bound = max_bounds(bounds);
                 if S::ENABLED {
                     if bound.is_missing() {
                         return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
@@ -5850,7 +5851,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 Ok(bound)
             }
             MatrixOperation::CrtRecompose { reconstruction_coefficients, .. } => {
-                let bound = weighted_sum_bounds(bounds, reconstruction_coefficients)?;
+                let bound = weighted_sum_bounds(bounds, reconstruction_coefficients);
                 if S::ENABLED {
                     if bound.is_missing() {
                         return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
@@ -6474,58 +6475,10 @@ fn transform_bound(operation: &ValueTransformOperation) -> NumericContract<Coeff
     }
 }
 
-fn scalar_bound(
-    operation: &ScalarOperation,
-    bounds: &[NumericContract<CoefficientBound>],
-) -> NumericContract<CoefficientBound> {
-    match operation {
-        ScalarOperation::Add | ScalarOperation::Subtract => {
-            add_bounds(bounds).unwrap_or(NumericContract::Missing)
-        }
-        ScalarOperation::Multiply => product_bounds(bounds).unwrap_or(NumericContract::Missing),
-        ScalarOperation::Negate |
-        ScalarOperation::BoolToInt |
-        ScalarOperation::IntToReal |
-        ScalarOperation::ExtractCoefficient { .. } => {
-            bounds.first().cloned().unwrap_or(NumericContract::Missing)
-        }
-        ScalarOperation::LiftConstantPolynomial { .. } => {
-            bounds.first().cloned().unwrap_or(NumericContract::Missing)
-        }
-        _ => NumericContract::Missing,
-    }
-}
-
-fn add_bounds(
-    bounds: &[NumericContract<CoefficientBound>],
-) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
-    let mut result = CoefficientBound::ExactZero;
-    for bound in bounds {
-        let NumericContract::Known(bound) = bound else {
-            return Ok(NumericContract::Missing);
-        };
-        result = add_known_bounds(&result, bound);
-    }
-    Ok(NumericContract::Known(result))
-}
-
 /// Floor division for a strictly positive divisor, matching `div_euclid` on integers.
 fn floor_div(value: &BigInt, divisor: &BigInt) -> BigInt {
     let quotient = value / divisor;
     if (value - &quotient * divisor) < BigInt::from(0_u8) { quotient - 1 } else { quotient }
-}
-
-fn add_known_bounds(left: &CoefficientBound, right: &CoefficientBound) -> CoefficientBound {
-    match (left, right) {
-        (CoefficientBound::ExactZero, right) => right.clone(),
-        (left, CoefficientBound::ExactZero) => left.clone(),
-        (CoefficientBound::Large, _) | (_, CoefficientBound::Large) => CoefficientBound::Large,
-        (CoefficientBound::Finite(left), CoefficientBound::Finite(right)) => {
-            CoefficientBound::finite(
-                &left.maximum_absolute_coefficient + &right.maximum_absolute_coefficient,
-            )
-        }
-    }
 }
 
 /// Add two identityless noise contributions. Production exact values canonicalize an absent
@@ -6558,92 +6511,6 @@ fn scale_noise_summary(
         )),
         CoefficientBound::Large => NumericContract::Known(CoefficientBound::Large),
     }
-}
-
-fn product_bounds(
-    bounds: &[NumericContract<CoefficientBound>],
-) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
-    product_bounds_with_factor(bounds, &BigUint::from(1_u8))
-}
-
-fn product_bounds_with_factor(
-    bounds: &[NumericContract<CoefficientBound>],
-    factor: &BigUint,
-) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
-    let mut result = CoefficientBound::Finite(BoundExpression::new(BigUint::from(1_u8)));
-    for bound in bounds {
-        let NumericContract::Known(bound) = bound else {
-            return Ok(NumericContract::Missing);
-        };
-        match (&result, bound) {
-            (CoefficientBound::ExactZero, _) | (_, CoefficientBound::ExactZero) => {
-                return Ok(NumericContract::Known(CoefficientBound::ExactZero));
-            }
-            (CoefficientBound::Large, _) | (_, CoefficientBound::Large) => {
-                return Ok(NumericContract::Known(CoefficientBound::Large));
-            }
-            (CoefficientBound::Finite(left), CoefficientBound::Finite(right)) => {
-                result = CoefficientBound::Finite(BoundExpression::new(
-                    &left.maximum_absolute_coefficient * &right.maximum_absolute_coefficient,
-                ));
-            }
-        }
-    }
-    if let CoefficientBound::Finite(value) = &mut result {
-        value.maximum_absolute_coefficient *= factor;
-    }
-    Ok(NumericContract::Known(result))
-}
-
-fn max_bounds(
-    bounds: &[NumericContract<CoefficientBound>],
-) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
-    let mut result = NumericContract::Known(CoefficientBound::ExactZero);
-    for bound in bounds {
-        let NumericContract::Known(bound) = bound else {
-            return Ok(NumericContract::Missing);
-        };
-        result = NumericContract::Known(max_bound(result.as_known().unwrap(), bound));
-    }
-    Ok(result)
-}
-
-fn max_bound(left: &CoefficientBound, right: &CoefficientBound) -> CoefficientBound {
-    match (left, right) {
-        (CoefficientBound::Large, _) | (_, CoefficientBound::Large) => CoefficientBound::Large,
-        (CoefficientBound::ExactZero, right) => right.clone(),
-        (left, CoefficientBound::ExactZero) => left.clone(),
-        (CoefficientBound::Finite(left), CoefficientBound::Finite(right)) => {
-            CoefficientBound::finite(
-                left.maximum_absolute_coefficient
-                    .clone()
-                    .max(right.maximum_absolute_coefficient.clone()),
-            )
-        }
-    }
-}
-
-fn weighted_sum_bounds(
-    bounds: &[NumericContract<CoefficientBound>],
-    weights: &[BigInt],
-) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
-    if bounds.len() != weights.len() {
-        return Ok(NumericContract::Missing);
-    }
-    let mut result = BigUint::from(0_u8);
-    for (bound, weight) in bounds.iter().zip(weights) {
-        // A zero reconstruction coefficient removes the lane semantically. Inspecting its
-        // numeric class first would incorrectly let `0 * Large` poison an otherwise bounded CRT
-        // recomposition.
-        if weight.is_zero() {
-            continue;
-        }
-        let NumericContract::Known(CoefficientBound::Finite(value)) = bound else {
-            return Ok(NumericContract::Missing);
-        };
-        result += value.maximum_absolute_coefficient.clone() * weight.magnitude();
-    }
-    Ok(NumericContract::Known(CoefficientBound::finite(result)))
 }
 
 #[cfg(test)]
@@ -12313,7 +12180,7 @@ mod tests {
             NumericContract::Known(CoefficientBound::finite(BigUint::from(7_u8))),
         ];
         assert_eq!(
-            weighted_sum_bounds(&bounds, &[BigInt::from(0_u8), BigInt::from(3_u8)]).unwrap(),
+            weighted_sum_bounds(&bounds, &[BigInt::from(0_u8), BigInt::from(3_u8)]),
             NumericContract::Known(CoefficientBound::finite(BigUint::from(21_u8)))
         );
     }
@@ -14473,11 +14340,17 @@ mod tests {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let facts = FactStore::new(&expressions);
+        let zero = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
         let branches = [-7_i64, 0, 5]
             .into_iter()
             .map(|value| {
-                expressions
+                let constant = expressions
                     .intern(ValueOperator::Constant(TypedConstant::int(value)), Box::new([]))
+                    .unwrap();
+                expressions
+                    .intern(ValueOperator::Scalar(ScalarOperation::Add), Box::new([constant, zero]))
                     .unwrap()
             })
             .collect::<Vec<_>>();
@@ -14596,7 +14469,7 @@ mod tests {
             .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
             .unwrap();
         let unsupported = expressions
-            .intern(ValueOperator::Scalar(ScalarOperation::Add), Box::new([one, two]))
+            .intern(ValueOperator::Scalar(ScalarOperation::Multiply), Box::new([one, two]))
             .unwrap();
         let explicit = programs
             .explicit_family_with_scalar_summary(
@@ -14656,7 +14529,7 @@ mod tests {
         };
         assert_eq!(rejection.position, 1);
         assert_eq!(rejection.expression, unsupported);
-        assert_eq!(rejection.operator, Box::new(ValueOperator::Scalar(ScalarOperation::Add)));
+        assert_eq!(rejection.operator, Box::new(ValueOperator::Scalar(ScalarOperation::Multiply)));
         assert_eq!(rejection.scalar_fact, None);
         assert_eq!(rejection.trusted_range, None);
         assert_eq!(rejection.scoped_trusted_range, None);
@@ -14738,7 +14611,7 @@ mod tests {
             .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
             .unwrap();
         let unsupported = expressions
-            .intern(ValueOperator::Scalar(ScalarOperation::Add), Box::new([zero, one]))
+            .intern(ValueOperator::Scalar(ScalarOperation::Multiply), Box::new([zero, one]))
             .unwrap();
         let inner = programs
             .explicit_family_with_scalar_summary(

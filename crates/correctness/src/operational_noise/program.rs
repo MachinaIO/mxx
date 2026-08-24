@@ -10,14 +10,14 @@ pub use super::arena::{
     ProgramSignature, ResolvedValueType, SemanticFamilySourceIdentity, TrustedIndexRange,
     ValueOperator, ValueProgram, ValueProgramId,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub use super::arena::ScopedExprId;
 use super::{
     arena::{ArtifactIdentity, ScopeProof},
     facts::{
         CoefficientBound, FactStore, MatrixFacts, NumericContract, PolynomialFacts, ScalarFacts,
-        ValueFacts,
+        ValueFacts, max_bound, scalar_bound,
     },
 };
 
@@ -726,14 +726,19 @@ impl ProgramArena {
                 .explicit_matrix_summary(expressions, facts, values)?
                 .map(ValueFacts::Matrix)),
             ResolvedValueType::Int if summarize_scalar => {
+                let mut memo = HashMap::new();
                 let mut maximum = CoefficientBound::ExactZero;
                 for value in values {
-                    let Some(bound) =
-                        self.explicit_scalar_branch_bound(expressions, facts, *value)?
+                    let Some(bound) = self.explicit_scalar_branch_bound_with_memo(
+                        expressions,
+                        facts,
+                        *value,
+                        &mut memo,
+                    )?
                     else {
                         return Ok(None);
                     };
-                    maximum = maximum.max(bound);
+                    maximum = max_bound(&maximum, &bound);
                 }
                 let mut summary = ScalarFacts::new(ResolvedValueType::Int)
                     .expect("integer explicit-family facts must be scalar facts");
@@ -750,19 +755,77 @@ impl ProgramArena {
         facts: &FactStore,
         value: ExprId,
     ) -> Result<Option<CoefficientBound>, ArenaError> {
-        if let Ok(ValueFacts::Scalar(summary)) = facts.facts(value) &&
-            summary.value_type == ResolvedValueType::Int &&
-            let NumericContract::Known(bound) = &summary.coefficient_bound
-        {
-            return Ok(Some(bound.clone()));
+        self.explicit_scalar_branch_bound_with_memo(expressions, facts, value, &mut HashMap::new())
+    }
+
+    fn explicit_scalar_branch_bound_with_memo(
+        &self,
+        expressions: &ExprArena,
+        facts: &FactStore,
+        value: ExprId,
+        memo: &mut HashMap<ExprId, Option<CoefficientBound>>,
+    ) -> Result<Option<CoefficientBound>, ArenaError> {
+        let mut work = vec![(value, false)];
+        while let Some((expression, finish)) = work.pop() {
+            if memo.contains_key(&expression) {
+                continue;
+            }
+            let node = expressions.node(expression)?;
+            if finish {
+                let [left, right] = node.inputs.as_ref() else {
+                    memo.insert(expression, None);
+                    continue;
+                };
+                let Some(left) = memo.get(left).cloned().flatten() else {
+                    memo.insert(expression, None);
+                    continue;
+                };
+                let Some(right) = memo.get(right).cloned().flatten() else {
+                    memo.insert(expression, None);
+                    continue;
+                };
+                let bound = scalar_bound(
+                    &super::arena::ScalarOperation::Add,
+                    &[NumericContract::Known(left), NumericContract::Known(right)],
+                )
+                .as_known()
+                .cloned();
+                memo.insert(expression, bound);
+                continue;
+            }
+            if let Ok(ValueFacts::Scalar(summary)) = facts.facts(expression) &&
+                summary.value_type == ResolvedValueType::Int &&
+                let NumericContract::Known(bound) = &summary.coefficient_bound
+            {
+                memo.insert(expression, Some(bound.clone()));
+                continue;
+            }
+            match &node.operator {
+                ValueOperator::Constant(super::arena::TypedConstant {
+                    value: super::arena::ConstantValue::Int(value),
+                    ..
+                }) => {
+                    memo.insert(
+                        expression,
+                        Some(CoefficientBound::finite(value.magnitude().clone())),
+                    );
+                }
+                ValueOperator::Scalar(super::arena::ScalarOperation::Add)
+                    if node.inputs.len() == 2 =>
+                {
+                    work.push((expression, true));
+                    for input in node.inputs.iter().rev() {
+                        if !memo.contains_key(input) {
+                            work.push((*input, false));
+                        }
+                    }
+                }
+                _ => {
+                    memo.insert(expression, None);
+                }
+            }
         }
-        Ok(match &expressions.node(value)?.operator {
-            ValueOperator::Constant(super::arena::TypedConstant {
-                value: super::arena::ConstantValue::Int(value),
-                ..
-            }) => Some(CoefficientBound::finite(value.magnitude().clone())),
-            _ => None,
-        })
+        Ok(memo.get(&value).cloned().flatten())
     }
 
     /// Summarize explicit matrix branches without enumerating a family domain.  Missing branch
@@ -1342,6 +1405,16 @@ impl ProgramArena {
         };
         let id = FamilyValueId(program);
         if let Some(existing) = self.family_intern.get(&key).copied() {
+            let existing_record = self
+                .families
+                .get_mut(&existing)
+                .ok_or(ArenaError::UnknownProgram(existing.program()))?;
+            match (&existing_record.explicit_facts, record.explicit_facts) {
+                (_, None) => {}
+                (None, Some(incoming)) => existing_record.explicit_facts = Some(incoming),
+                (Some(current), Some(incoming)) if current == &incoming => {}
+                (Some(_), Some(_)) => return Err(ArenaError::ProgramSignatureMismatch),
+            }
             return Ok(existing);
         }
         self.families.insert(id, record);
@@ -1645,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_explicit_integer_summary_uses_exact_literals_and_fails_closed() {
+    fn enabled_explicit_integer_summary_supports_add_dags_and_fails_closed() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let facts = FactStore::new(&expressions);
@@ -1677,9 +1750,35 @@ mod tests {
         let two = expressions
             .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
             .unwrap();
-        let unsupported = expressions
+        assert!(matches!(
+            expressions.intern(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                Box::new([one]),
+            ),
+            Err(ArenaError::InvalidArity { expected: 2, actual: 1, .. })
+        ));
+        let add = expressions
             .intern(
                 ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                Box::new([one, two]),
+            )
+            .unwrap();
+        let add_family = programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &facts,
+                FamilyDomain::new(0, 2).unwrap(),
+                Box::new([one, add]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            programs.family_scalar_facts(add_family).unwrap().unwrap().coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(3_u64))
+        );
+        let unsupported = expressions
+            .intern(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Multiply),
                 Box::new([one, two]),
             )
             .unwrap();
@@ -1714,6 +1813,181 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ordinary_programs.family_scalar_facts(ordinary).unwrap(), None);
+    }
+
+    #[test]
+    fn explicit_integer_add_summary_uses_branch_max_and_shared_nodes() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let facts = FactStore::new(&expressions);
+        let shared = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .unwrap();
+        let three = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(3)), Box::new([]))
+            .unwrap();
+        let negative_seven = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(-7)), Box::new([]))
+            .unwrap();
+        let first = expressions
+            .intern(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                Box::new([shared, three]),
+            )
+            .unwrap();
+        let second = expressions
+            .intern(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                Box::new([shared, negative_seven]),
+            )
+            .unwrap();
+        let family = programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &facts,
+                FamilyDomain::new(0, 2).unwrap(),
+                Box::new([first, second]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            programs.family_scalar_facts(family).unwrap().unwrap().coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(9_u64))
+        );
+    }
+
+    #[test]
+    fn explicit_integer_add_summary_preserves_contract_classes() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let mut facts = FactStore::new(&expressions);
+        let zero = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let opaque = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let with_bound = |bound| {
+            let mut scalar = ScalarFacts::new(ResolvedValueType::Int).unwrap();
+            scalar.coefficient_bound = NumericContract::Known(bound);
+            ValueFacts::Scalar(scalar)
+        };
+        facts.insert(&expressions, opaque, with_bound(CoefficientBound::Large)).unwrap();
+        let large = programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &facts,
+                FamilyDomain::new(0, 2).unwrap(),
+                Box::new([zero, opaque]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            programs.family_scalar_facts(large).unwrap().unwrap().coefficient_bound,
+            NumericContract::Known(CoefficientBound::Large)
+        );
+
+        let two = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .unwrap();
+        let missing = expressions
+            .intern(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Multiply),
+                Box::new([zero, two]),
+            )
+            .unwrap();
+        let missing_family = programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &facts,
+                FamilyDomain::new(0, 2).unwrap(),
+                Box::new([zero, missing]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(programs.family_scalar_facts(missing_family).unwrap(), None);
+    }
+
+    #[test]
+    fn explicit_integer_add_summary_is_iterative_and_interning_enriches() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let facts = FactStore::new(&expressions);
+        let zero = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let mut chain = one;
+        for _ in 0..4096 {
+            chain = expressions
+                .intern(
+                    ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                    Box::new([chain, zero]),
+                )
+                .unwrap();
+        }
+        let domain = FamilyDomain::new(0, 1).unwrap();
+        let ordinary =
+            programs.explicit_family(&mut expressions, &facts, domain, Box::new([chain])).unwrap();
+        assert_eq!(programs.family_scalar_facts(ordinary).unwrap(), None);
+        let enriched = programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &facts,
+                domain,
+                Box::new([chain]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(ordinary, enriched);
+        assert_eq!(
+            programs.family_scalar_facts(enriched).unwrap().unwrap().coefficient_bound,
+            NumericContract::Known(CoefficientBound::finite(1_u64))
+        );
+        let retained =
+            programs.explicit_family(&mut expressions, &facts, domain, Box::new([chain])).unwrap();
+        assert_eq!(retained, enriched);
+        assert!(programs.family_scalar_facts(retained).unwrap().is_some());
+    }
+
+    #[test]
+    fn explicit_integer_summary_interning_rejects_conflicting_enrichment() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let value = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let scalar_fact = |bound| {
+            let mut scalar = ScalarFacts::new(ResolvedValueType::Int).unwrap();
+            scalar.coefficient_bound = NumericContract::Known(CoefficientBound::finite(bound));
+            ValueFacts::Scalar(scalar)
+        };
+        let mut first_facts = FactStore::new(&expressions);
+        first_facts.insert(&expressions, value, scalar_fact(2_u8)).unwrap();
+        let mut second_facts = FactStore::new(&expressions);
+        second_facts.insert(&expressions, value, scalar_fact(3_u8)).unwrap();
+        let domain = FamilyDomain::new(0, 1).unwrap();
+        programs
+            .explicit_family_with_scalar_summary(
+                &mut expressions,
+                &first_facts,
+                domain,
+                Box::new([value]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            programs.explicit_family_with_scalar_summary(
+                &mut expressions,
+                &second_facts,
+                domain,
+                Box::new([value]),
+                true,
+            ),
+            Err(ArenaError::ProgramSignatureMismatch)
+        );
     }
 
     #[test]

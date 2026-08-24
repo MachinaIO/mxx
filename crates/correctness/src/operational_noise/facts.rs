@@ -6,9 +6,10 @@
 
 use super::arena::{
     ArenaError, ArenaToken, ExprArena, ExprId, MatrixLayout, ResolvedMatrixType, ResolvedValueType,
-    TrustedIndexRange, ValueProgramId,
+    ScalarOperation, TrustedIndexRange, ValueProgramId,
 };
-use num_bigint::BigUint;
+use num_bigint::{BigInt, BigUint};
+use num_traits::Zero;
 use std::{collections::BTreeMap, fmt};
 
 /// A transfer contract is either absent or fully known.  `Missing` is not a
@@ -81,6 +82,139 @@ impl CoefficientBound {
     pub fn is_large(&self) -> bool {
         matches!(self, Self::Large)
     }
+}
+
+pub(crate) fn scalar_bound(
+    operation: &ScalarOperation,
+    bounds: &[NumericContract<CoefficientBound>],
+) -> NumericContract<CoefficientBound> {
+    match operation {
+        ScalarOperation::Add | ScalarOperation::Subtract => add_bounds(bounds),
+        ScalarOperation::Multiply => product_bounds(bounds),
+        ScalarOperation::Negate |
+        ScalarOperation::BoolToInt |
+        ScalarOperation::IntToReal |
+        ScalarOperation::ExtractCoefficient { .. } |
+        ScalarOperation::LiftConstantPolynomial { .. } => {
+            bounds.first().cloned().unwrap_or(NumericContract::Missing)
+        }
+        _ => NumericContract::Missing,
+    }
+}
+
+pub(crate) fn add_bounds(
+    bounds: &[NumericContract<CoefficientBound>],
+) -> NumericContract<CoefficientBound> {
+    let mut result = CoefficientBound::ExactZero;
+    for bound in bounds {
+        let NumericContract::Known(bound) = bound else {
+            return NumericContract::Missing;
+        };
+        result = add_known_bounds(&result, bound);
+    }
+    NumericContract::Known(result)
+}
+
+pub(crate) fn add_known_bounds(
+    left: &CoefficientBound,
+    right: &CoefficientBound,
+) -> CoefficientBound {
+    match (left, right) {
+        (CoefficientBound::ExactZero, right) => right.clone(),
+        (left, CoefficientBound::ExactZero) => left.clone(),
+        (CoefficientBound::Large, _) | (_, CoefficientBound::Large) => CoefficientBound::Large,
+        (CoefficientBound::Finite(left), CoefficientBound::Finite(right)) => {
+            CoefficientBound::finite(
+                &left.maximum_absolute_coefficient + &right.maximum_absolute_coefficient,
+            )
+        }
+    }
+}
+
+pub(crate) fn product_bounds(
+    bounds: &[NumericContract<CoefficientBound>],
+) -> NumericContract<CoefficientBound> {
+    product_bounds_with_factor(bounds, &BigUint::from(1_u8))
+}
+
+pub(crate) fn product_bounds_with_factor(
+    bounds: &[NumericContract<CoefficientBound>],
+    factor: &BigUint,
+) -> NumericContract<CoefficientBound> {
+    let mut result = CoefficientBound::Finite(BoundExpression::new(BigUint::from(1_u8)));
+    for bound in bounds {
+        let NumericContract::Known(bound) = bound else {
+            return NumericContract::Missing;
+        };
+        match (&result, bound) {
+            (CoefficientBound::ExactZero, _) | (_, CoefficientBound::ExactZero) => {
+                return NumericContract::Known(CoefficientBound::ExactZero);
+            }
+            (CoefficientBound::Large, _) | (_, CoefficientBound::Large) => {
+                return NumericContract::Known(CoefficientBound::Large);
+            }
+            (CoefficientBound::Finite(left), CoefficientBound::Finite(right)) => {
+                result = CoefficientBound::Finite(BoundExpression::new(
+                    &left.maximum_absolute_coefficient * &right.maximum_absolute_coefficient,
+                ));
+            }
+        }
+    }
+    if let CoefficientBound::Finite(value) = &mut result {
+        value.maximum_absolute_coefficient *= factor;
+    }
+    NumericContract::Known(result)
+}
+
+pub(crate) fn max_bounds(
+    bounds: &[NumericContract<CoefficientBound>],
+) -> NumericContract<CoefficientBound> {
+    let mut result = NumericContract::Known(CoefficientBound::ExactZero);
+    for bound in bounds {
+        let NumericContract::Known(bound) = bound else {
+            return NumericContract::Missing;
+        };
+        result = NumericContract::Known(max_bound(result.as_known().unwrap(), bound));
+    }
+    result
+}
+
+pub(crate) fn max_bound(left: &CoefficientBound, right: &CoefficientBound) -> CoefficientBound {
+    match (left, right) {
+        (CoefficientBound::Large, _) | (_, CoefficientBound::Large) => CoefficientBound::Large,
+        (CoefficientBound::ExactZero, right) => right.clone(),
+        (left, CoefficientBound::ExactZero) => left.clone(),
+        (CoefficientBound::Finite(left), CoefficientBound::Finite(right)) => {
+            CoefficientBound::finite(
+                left.maximum_absolute_coefficient
+                    .clone()
+                    .max(right.maximum_absolute_coefficient.clone()),
+            )
+        }
+    }
+}
+
+pub(crate) fn weighted_sum_bounds(
+    bounds: &[NumericContract<CoefficientBound>],
+    weights: &[BigInt],
+) -> NumericContract<CoefficientBound> {
+    if bounds.len() != weights.len() {
+        return NumericContract::Missing;
+    }
+    let mut result = BigUint::from(0_u8);
+    for (bound, weight) in bounds.iter().zip(weights) {
+        // A zero reconstruction coefficient removes the lane semantically. Inspecting its
+        // numeric class first would incorrectly let `0 * Large` poison an otherwise bounded CRT
+        // recomposition.
+        if weight.is_zero() {
+            continue;
+        }
+        let NumericContract::Known(CoefficientBound::Finite(value)) = bound else {
+            return NumericContract::Missing;
+        };
+        result += value.maximum_absolute_coefficient.clone() * weight.magnitude();
+    }
+    NumericContract::Known(CoefficientBound::finite(result))
 }
 
 /// Bounds for polynomial support after typed validation.

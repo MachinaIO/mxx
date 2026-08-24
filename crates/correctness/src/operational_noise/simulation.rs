@@ -218,6 +218,26 @@ pub(crate) enum ProofPayloadRelationRule {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProofPayloadTermRef {
+    pub value_event: u64,
+    pub term_ordinal: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProofPayloadCoefficientMergeSource {
+    Value(ProofPayloadTermRef),
+    Applied { event: u64, replacement_term: ProofPayloadTermRef },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProofPayloadCoefficientMerge {
+    pub owner: ProofPayloadOwner,
+    pub sources: Box<[ProofPayloadCoefficientMergeSource]>,
+    pub output: ProofPayloadTermRef,
+    pub signed_contribution: BigInt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProofPayloadFactorEvidence {
     pub bound: ProofPayloadValueRef,
     pub is_constant_polynomial: bool,
@@ -324,6 +344,7 @@ pub(crate) enum ProofPayloadEvent {
         owner: ProofPayloadOwner,
         rule: ProofPayloadRule,
     },
+    CoefficientMerge(ProofPayloadCoefficientMerge),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -532,6 +553,7 @@ pub(crate) fn derive_proof_payload(
             NormalizerEvent::SpecializationComputed { owner: root, .. } |
             NormalizerEvent::SpecializationCacheHit { owner: root, .. } |
             NormalizerEvent::BoundTransfer { owner: root, .. } => root.program(),
+            NormalizerEvent::CoefficientMerge(observation) => observation.owner.program(),
             NormalizerEvent::Predecessor { consumer, .. } => consumer.program(),
             NormalizerEvent::AppliedRelation(observation) => observation.owner.program(),
         };
@@ -606,6 +628,10 @@ fn extend_certificate_closure(
                     }
                 }
             }
+            NormalizerEvent::CoefficientMerge(observation) => {
+                work.push(CertificateWork::Program(observation.owner.program()));
+                work.push(CertificateWork::Expression(observation.owner.expression()));
+            }
         }
     }
     walk_certificate_closure(job, closure, work)
@@ -663,7 +689,7 @@ impl<'a> ProofPayloadProjector<'a> {
         let event_count = trace.events.len();
         let mut events = Vec::with_capacity(event_count);
         for (index, event) in trace.events.iter().enumerate() {
-            events.push(self.event(index, event).map_err(proof_payload_error)?);
+            events.push(self.event(trace, index, event).map_err(proof_payload_error)?);
         }
         Ok(OperationalProofPayload { events })
     }
@@ -784,6 +810,86 @@ impl<'a> ProofPayloadProjector<'a> {
             }
         };
         Ok(ProofPayloadValueRef::Transfer(event.0))
+    }
+
+    fn term_ref(
+        &self,
+        trace: &FeasibilityTrace,
+        reference: super::g0::RecordedTermRef,
+        current: usize,
+    ) -> Result<ProofPayloadTermRef, G0Error> {
+        self.term_ref_with_missing(trace, reference, current, false)
+    }
+
+    fn term_ref_with_missing(
+        &self,
+        trace: &FeasibilityTrace,
+        reference: super::g0::RecordedTermRef,
+        current: usize,
+        allow_missing: bool,
+    ) -> Result<ProofPayloadTermRef, G0Error> {
+        self.prior_event(reference.value_event, current)?;
+        let value = match trace.events.get(reference.value_event.0 as usize) {
+            Some(NormalizerEvent::Result { value, .. }) |
+            Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
+            _ => return Err(G0Error::RelationTraceInvariant),
+        };
+        let term_ordinal = value.exact_nf.as_ref().and_then(|normal_form| {
+            let mut terms = normal_form
+                .exact_terms
+                .keys()
+                .filter_map(|monomial| self.monomial(*monomial).ok().map(|term| (*monomial, term)))
+                .collect::<Vec<_>>();
+            terms.sort_by(|left, right| left.1.cmp(&right.1));
+            terms
+                .iter()
+                .position(|(monomial, _)| *monomial == reference.monomial)
+                .map(|position| position as u64)
+        });
+        if !allow_missing &&
+            term_ordinal.is_none() &&
+            matches!(
+                trace.events.get(reference.value_event.0 as usize),
+                Some(NormalizerEvent::Result { .. }) | Some(NormalizerEvent::InvocationEnd { .. })
+            ) &&
+            value.exact_nf.is_some()
+        {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        Ok(ProofPayloadTermRef { value_event: reference.value_event.0, term_ordinal })
+    }
+
+    fn coefficient_merge(
+        &self,
+        trace: &FeasibilityTrace,
+        observation: &super::g0::CoefficientMerge,
+        current: usize,
+    ) -> Result<ProofPayloadCoefficientMerge, G0Error> {
+        let source = |source: &super::g0::CoefficientMergeSource| match source {
+            super::g0::CoefficientMergeSource::Value(reference) => {
+                Ok(ProofPayloadCoefficientMergeSource::Value(
+                    self.term_ref(trace, *reference, current)?,
+                ))
+            }
+            super::g0::CoefficientMergeSource::Applied { event, replacement_term } => {
+                self.prior_event(*event, current)?;
+                Ok(ProofPayloadCoefficientMergeSource::Applied {
+                    event: event.0,
+                    replacement_term: self.term_ref(trace, *replacement_term, current)?,
+                })
+            }
+        };
+        Ok(ProofPayloadCoefficientMerge {
+            owner: self.owner(observation.owner)?,
+            sources: observation
+                .sources
+                .iter()
+                .map(source)
+                .collect::<Result<Vec<_>, G0Error>>()?
+                .into_boxed_slice(),
+            output: self.term_ref_with_missing(trace, observation.output, current, true)?,
+            signed_contribution: observation.signed_contribution.clone(),
+        })
     }
 
     fn prior_event(&self, event: super::g0::EventIndex, current: usize) -> Result<(), G0Error> {
@@ -912,7 +1018,12 @@ impl<'a> ProofPayloadProjector<'a> {
         Ok((computed, result))
     }
 
-    fn event(&self, current: usize, event: &NormalizerEvent) -> Result<ProofPayloadEvent, G0Error> {
+    fn event(
+        &self,
+        trace: &FeasibilityTrace,
+        current: usize,
+        event: &NormalizerEvent,
+    ) -> Result<ProofPayloadEvent, G0Error> {
         Ok(match event {
             NormalizerEvent::InvocationStart { root } => {
                 ProofPayloadEvent::InvocationStart { root: self.owner(*root)? }
@@ -965,6 +1076,9 @@ impl<'a> ProofPayloadProjector<'a> {
                 owner: self.owner(*owner)?,
                 rule: self.rule(rule, current)?,
             },
+            NormalizerEvent::CoefficientMerge(observation) => ProofPayloadEvent::CoefficientMerge(
+                self.coefficient_merge(trace, observation, current)?,
+            ),
         })
     }
 }
@@ -2418,6 +2532,7 @@ mod tests {
             ProofPayloadEvent::SpecializationCacheHit { owner, .. } |
             ProofPayloadEvent::AppliedRelation { owner, .. } |
             ProofPayloadEvent::BoundTransfer { owner, .. } => Some(owner.scope),
+            ProofPayloadEvent::CoefficientMerge(observation) => Some(observation.owner.scope),
             ProofPayloadEvent::Predecessor { consumer, .. } => Some(consumer.scope),
         };
         let scopes = payload.events.iter().filter_map(owner_scope).collect::<Vec<_>>();

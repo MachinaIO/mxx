@@ -47,7 +47,7 @@ pub(crate) trait FeasibilitySink: Default {
         &mut self,
         result: super::arena::ScopedExprId,
         value: &super::normal_form::AnalyzedValue,
-    ) -> Result<(), G0Error>;
+    ) -> Result<EventIndex, G0Error>;
 
     fn record_invocation_end(
         &mut self,
@@ -105,6 +105,11 @@ pub(crate) trait FeasibilitySink: Default {
         &mut self,
         owner: super::arena::ScopedExprId,
         rule: BoundRule,
+    ) -> Result<EventIndex, G0Error>;
+
+    fn record_coefficient_merge(
+        &mut self,
+        observation: CoefficientMerge,
     ) -> Result<EventIndex, G0Error>;
 
     fn validate_normalization_observations(&self) -> Result<(), G0Error>;
@@ -228,6 +233,26 @@ pub(crate) struct RecordedValue {
     pub coefficient_bound: super::facts::NumericContract<super::facts::CoefficientBound>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct RecordedTermRef {
+    pub value_event: EventIndex,
+    pub monomial: super::monomial::MonomialId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum CoefficientMergeSource {
+    Value(RecordedTermRef),
+    Applied { event: EventIndex, replacement_term: RecordedTermRef },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct CoefficientMerge {
+    pub owner: super::arena::ScopedExprId,
+    pub sources: Box<[CoefficientMergeSource]>,
+    pub output: RecordedTermRef,
+    pub signed_contribution: BigInt,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum NormalizerEvent {
     InvocationStart {
@@ -263,6 +288,7 @@ pub(crate) enum NormalizerEvent {
         owner: super::arena::ScopedExprId,
         rule: BoundRule,
     },
+    CoefficientMerge(CoefficientMerge),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1366,8 +1392,8 @@ impl FeasibilitySink for NoFeasibility {
         &mut self,
         _result: super::arena::ScopedExprId,
         _value: &super::normal_form::AnalyzedValue,
-    ) -> Result<(), G0Error> {
-        Ok(())
+    ) -> Result<EventIndex, G0Error> {
+        Ok(EventIndex(0))
     }
 
     fn abort_invocation(
@@ -1437,6 +1463,13 @@ impl FeasibilitySink for NoFeasibility {
         &mut self,
         _owner: super::arena::ScopedExprId,
         _rule: BoundRule,
+    ) -> Result<EventIndex, G0Error> {
+        Ok(EventIndex(0))
+    }
+
+    fn record_coefficient_merge(
+        &mut self,
+        _observation: CoefficientMerge,
     ) -> Result<EventIndex, G0Error> {
         Ok(EventIndex(0))
     }
@@ -1542,7 +1575,7 @@ impl FeasibilitySink for FeasibilityTrace {
         &mut self,
         result: super::arena::ScopedExprId,
         value: &super::normal_form::AnalyzedValue,
-    ) -> Result<(), G0Error> {
+    ) -> Result<EventIndex, G0Error> {
         let frame = self.frames.last_mut().ok_or(G0Error::MissingNormalizationResult)?;
         if result.program() != frame.root.program() {
             return Err(G0Error::MissingNormalizationResult);
@@ -1567,7 +1600,7 @@ impl FeasibilitySink for FeasibilityTrace {
             &mut self.retained_monomial_roots,
         );
         frame.results.insert(result.expression(), index);
-        Ok(())
+        Ok(index)
     }
 
     fn record_invocation_end(
@@ -1816,6 +1849,81 @@ impl FeasibilitySink for FeasibilityTrace {
         Ok(index)
     }
 
+    fn record_coefficient_merge(
+        &mut self,
+        observation: CoefficientMerge,
+    ) -> Result<EventIndex, G0Error> {
+        let frame = self.frames.last().ok_or(G0Error::RelationTraceInvariant)?;
+        if frame.root.program() != observation.owner.program() {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        let current =
+            EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
+        let in_frame = |event: EventIndex| event.0 >= frame.range.start.0 && event.0 < current.0;
+        if !in_frame(observation.output.value_event) ||
+            !matches!(
+                self.events.get(observation.output.value_event.0 as usize),
+                Some(NormalizerEvent::Result { owner, .. }) if *owner == observation.owner
+            )
+        {
+            return Err(G0Error::RelationTraceInvariant);
+        }
+        let output_value = match self.events.get(observation.output.value_event.0 as usize) {
+            Some(NormalizerEvent::Result { value, .. }) => value,
+            _ => unreachable!("checked result event"),
+        };
+        let mut source_coefficients = Vec::new();
+        for source in &observation.sources {
+            let (event, monomial) = match source {
+                CoefficientMergeSource::Value(reference) => {
+                    (reference.value_event, reference.monomial)
+                }
+                CoefficientMergeSource::Applied { event, replacement_term } => {
+                    (*event, replacement_term.monomial)
+                }
+            };
+            if !in_frame(event) {
+                return Err(G0Error::RelationTraceInvariant);
+            }
+            let value = match self.events.get(event.0 as usize) {
+                Some(NormalizerEvent::Result { value, .. }) |
+                Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
+                _ => return Err(G0Error::RelationTraceInvariant),
+            };
+            let Some(normal_form) = value.exact_nf.as_ref() else {
+                return Err(G0Error::RelationTraceInvariant);
+            };
+            let Some(coefficient) = normal_form.exact_terms.get(&monomial) else {
+                return Err(G0Error::RelationTraceInvariant);
+            };
+            source_coefficients.push(coefficient.clone());
+        }
+        if let Some(right) = source_coefficients.get(1) {
+            if *right != observation.signed_contribution &&
+                -right.clone() != observation.signed_contribution
+            {
+                return Err(G0Error::RelationTraceInvariant);
+            }
+        }
+        let output_coefficient = output_value
+            .exact_nf
+            .as_ref()
+            .and_then(|normal_form| normal_form.exact_terms.get(&observation.output.monomial));
+        if let Some(left) = source_coefficients.first() {
+            let expected = left + &observation.signed_contribution;
+            if expected.is_zero() {
+                if output_coefficient.is_some() {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
+            } else if output_coefficient != Some(&expected) {
+                return Err(G0Error::RelationTraceInvariant);
+            }
+        }
+        let index = current;
+        self.events.push(NormalizerEvent::CoefficientMerge(observation));
+        Ok(index)
+    }
+
     fn validate_normalization_observations(&self) -> Result<(), G0Error> {
         if !self.frames.is_empty() {
             return Err(G0Error::MissingNormalizationResult);
@@ -2011,6 +2119,41 @@ impl FeasibilitySink for FeasibilityTrace {
                         rule,
                     )?;
                     pending_bounds.insert(*owner);
+                }
+                NormalizerEvent::CoefficientMerge(observation) => {
+                    let Some((root, start, _, _, _)) = stack.last() else {
+                        return Err(G0Error::RelationTraceInvariant);
+                    };
+                    if root.program() != observation.owner.program() ||
+                        observation.output.value_event.0 < start.0 ||
+                        observation.output.value_event.0 >= current.0 ||
+                        !matches!(
+                            self.events.get(observation.output.value_event.0 as usize),
+                            Some(NormalizerEvent::Result { owner, .. }) if *owner == observation.owner
+                        )
+                    {
+                        return Err(G0Error::RelationTraceInvariant);
+                    }
+                    for source in &observation.sources {
+                        let (event, _) = match source {
+                            CoefficientMergeSource::Value(reference) => {
+                                (reference.value_event, reference.monomial)
+                            }
+                            CoefficientMergeSource::Applied { event, replacement_term } => {
+                                (*event, replacement_term.monomial)
+                            }
+                        };
+                        if event.0 < start.0 ||
+                            event.0 >= current.0 ||
+                            !matches!(
+                                self.events.get(event.0 as usize),
+                                Some(NormalizerEvent::Result { .. }) |
+                                    Some(NormalizerEvent::InvocationEnd { .. })
+                            )
+                        {
+                            return Err(G0Error::RelationTraceInvariant);
+                        }
+                    }
                 }
             }
         }

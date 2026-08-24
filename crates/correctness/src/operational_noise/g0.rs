@@ -6290,12 +6290,9 @@ fn derive_statement_events(
         if let NormalizerEvent::InvocationStart { root } = event {
             let scope = match program_refs.get(&root.program()) {
                 Some(&program) => CanonicalStatementScope::Program { program },
-                None => CanonicalStatementScope::Closed {
-                    root: *expression_refs.get(&root.expression()).ok_or_else(|| {
-                        G0Error::MissingCanonicalHandle {
-                            requested: CanonicalReference::Expr(root.expression()),
-                        }
-                    })?,
+                None => match expression_refs.get(&root.expression()) {
+                    Some(&root) => CanonicalStatementScope::Closed { root },
+                    None => continue,
                 },
             };
             scope_by_program.insert(root.program(), scope);
@@ -6999,6 +6996,48 @@ mod tests {
                 operator: CanonicalEventOperator::GadgetDecompose { events }
             } if events.as_slice() == [StableEventRef { row: 0 }, StableEventRef { row: 1 }]
         ));
+    }
+
+    #[test]
+    fn statement_events_ignore_honest_invocations_outside_the_closure() {
+        use crate::operational_noise::program::FamilyDomain;
+
+        let mut job = CheckerJob::new();
+        let retained = job
+            .expressions_mut()
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let outside = job
+            .expressions_mut()
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .unwrap();
+        let family = job
+            .with_arena_stores(|expressions, programs, _| {
+                programs.generated_family_from_body(
+                    expressions,
+                    FamilyDomain::new(0, 1).unwrap(),
+                    outside,
+                )
+            })
+            .unwrap();
+        let mut trace = FeasibilityTrace::default();
+        trace
+            .record_invocation_start(
+                job.programs().scoped(job.expressions(), family.program(), outside).unwrap(),
+            )
+            .unwrap();
+        let closure = CertificateClosure {
+            expressions: [retained].into_iter().collect(),
+            programs: BTreeSet::new(),
+            families: BTreeSet::new(),
+            source_ids: BTreeSet::new(),
+            family_source_ids: BTreeSet::new(),
+            event_ids: BTreeSet::new(),
+            constant_expressions: [retained].into_iter().collect(),
+        };
+        let rows = derive_certificate_statement_rows(&job, &closure, &trace).unwrap();
+        assert_eq!(rows.expressions().len(), 1);
+        assert!(rows.events().is_empty());
     }
 
     #[test]

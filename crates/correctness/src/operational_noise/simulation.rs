@@ -509,6 +509,11 @@ pub(crate) fn derive_proof_payload(
     run: &OperationalCertificateRun,
 ) -> Result<OperationalProofPayload, CertificateProjectionError> {
     let closure = &run.projection.closure;
+    let closed_root_expression = match &run.projection.residual {
+        CertificateResidualRoot::Closed { root, .. } => Some(root.expression()),
+        CertificateResidualRoot::Family { .. } => None,
+    };
+    let closed_program = closed_wrapper_program(&run.trace, closed_root_expression);
     let refs = super::g0::canonical_residual_refs(&run.job, closure, &run.trace)
         .map_err(proof_payload_error)?;
     let mut monomial_arenas = HashMap::new();
@@ -540,8 +545,17 @@ pub(crate) fn derive_proof_payload(
             }
         }
     }
-    let projector =
-        ProofPayloadProjector { job: &run.job, refs: &refs, monomial_arenas, rhs_events };
+    let projector = ProofPayloadProjector {
+        job: &run.job,
+        refs: &refs,
+        monomial_arenas,
+        rhs_events,
+        closed_program,
+        closed_root_expression: closed_root_expression
+            .map(|expression| refs.expression(expression))
+            .transpose()
+            .map_err(proof_payload_error)?,
+    };
     projector.project(&run.trace)
 }
 
@@ -559,11 +573,15 @@ fn extend_certificate_closure(
             NormalizerEvent::InvocationStart { root } |
             NormalizerEvent::Result { owner: root, .. } |
             NormalizerEvent::InvocationEnd { root, .. } |
-            NormalizerEvent::SpecializationComputed { owner: root, .. } |
-            NormalizerEvent::SpecializationCacheHit { owner: root, .. } |
             NormalizerEvent::BoundTransfer { owner: root, .. } => {
                 work.push(CertificateWork::Program(root.program()));
                 work.push(CertificateWork::Expression(root.expression()));
+            }
+            NormalizerEvent::SpecializationComputed { owner, key, .. } |
+            NormalizerEvent::SpecializationCacheHit { owner, key, .. } => {
+                work.push(CertificateWork::Program(owner.program()));
+                work.push(CertificateWork::Expression(owner.expression()));
+                push_universal_dependencies(&mut work, key);
             }
             NormalizerEvent::Predecessor { consumer, predecessor, .. } => {
                 work.push(CertificateWork::Program(consumer.program()));
@@ -575,15 +593,7 @@ fn extend_certificate_closure(
                 work.push(CertificateWork::Expression(observation.owner.expression()));
                 match &observation.rule {
                     AppliedRelationRule::Universal { key, .. } => {
-                        work.push(CertificateWork::Family(key.dispatch.preimage_family));
-                        work.push(CertificateWork::Expression(
-                            key.dispatch.preimage_source.expression,
-                        ));
-                        work.push(CertificateWork::Expression(
-                            key.dispatch.trapdoor_source.expression,
-                        ));
-                        work.push(CertificateWork::Expression(key.index.expression()));
-                        work.push(CertificateWork::Program(key.index.program()));
+                        push_universal_dependencies(&mut work, key);
                     }
                     AppliedRelationRule::Gadget { gadget, decomposition, input, .. } => {
                         work.push(CertificateWork::Program(gadget.program()));
@@ -597,6 +607,30 @@ fn extend_certificate_closure(
         }
     }
     walk_certificate_closure(job, closure, work)
+}
+
+fn push_universal_dependencies(
+    work: &mut Vec<CertificateWork>,
+    key: &super::relation::RuntimeSpecializationKey,
+) {
+    work.push(CertificateWork::Family(key.dispatch.preimage_family));
+    work.push(CertificateWork::Expression(key.dispatch.preimage_source.expression));
+    work.push(CertificateWork::Expression(key.dispatch.trapdoor_source.expression));
+    work.push(CertificateWork::Expression(key.index.expression()));
+    work.push(CertificateWork::Program(key.index.program()));
+}
+
+fn closed_wrapper_program(
+    trace: &FeasibilityTrace,
+    root: Option<ExprId>,
+) -> Option<ValueProgramId> {
+    let root = root?;
+    trace.events.iter().find_map(|event| match event {
+        NormalizerEvent::InvocationStart { root: owner } if owner.expression() == root => {
+            Some(owner.program())
+        }
+        _ => None,
+    })
 }
 
 fn proof_payload_error(error: G0Error) -> CertificateProjectionError {
@@ -615,6 +649,8 @@ struct ProofPayloadProjector<'a> {
         ),
         (u64, u64),
     >,
+    closed_program: Option<ValueProgramId>,
+    closed_root_expression: Option<u64>,
 }
 
 impl<'a> ProofPayloadProjector<'a> {
@@ -632,14 +668,19 @@ impl<'a> ProofPayloadProjector<'a> {
 
     fn owner(&self, owner: super::arena::ScopedExprId) -> Result<ProofPayloadOwner, G0Error> {
         let expression_row = self.refs.expression(owner.expression())?;
-        let program = self
-            .job
-            .programs()
-            .project_program(owner.program())
-            .map_err(|_| G0Error::UnsupportedBoundTransfer)?;
-        let scope = if program.root == owner.expression() && program.signature.inputs.is_empty() {
-            ProofPayloadScope::Closed { root_expression_row: expression_row }
+        let scope = if self.closed_program == Some(owner.program()) {
+            ProofPayloadScope::Closed {
+                root_expression_row: self
+                    .closed_root_expression
+                    .ok_or(G0Error::UnsupportedBoundTransfer)?,
+            }
         } else {
+            // Validate that user-owned program scopes are still real finalized programs.  The
+            // synthetic closed wrapper is handled above and deliberately has no Program row.
+            self.job
+                .programs()
+                .project_program(owner.program())
+                .map_err(|_| G0Error::UnsupportedBoundTransfer)?;
             ProofPayloadScope::Program { program_row: self.refs.program(owner.program())? }
         };
         Ok(ProofPayloadOwner { scope, expression_row })
@@ -1014,6 +1055,15 @@ pub(crate) fn prepare_operational_certificate(
     }
     extend_certificate_closure(&job, &mut closure, &trace)
         .map_err(CertificateProjectionError::Closure)?;
+    let closed_root_expression = match &residual {
+        CertificateResidualRoot::Closed { root, .. } => Some(root.expression()),
+        CertificateResidualRoot::Family { .. } => None,
+    };
+    if let Some(wrapper) = closed_wrapper_program(&trace, closed_root_expression) {
+        // The zero-argument wrapper exists only to authorize a closed root.  Its expressions
+        // remain in the closure, but it is not a user-visible Program row.
+        closure.programs.remove(&wrapper);
+    }
     trace.retain_residual(&closure);
     let projection = OperationalCertificateProjection {
         target_id,
@@ -1976,6 +2026,25 @@ mod tests {
     };
     use mxx_dsl::{Bool, DslContext, IdealSpec, Int, Ring, SemanticAnchor};
 
+    fn payload_rule_mentions_transfer(rule: &ProofPayloadRule, event: usize) -> bool {
+        let value = |value: &ProofPayloadValueRef| matches!(value, ProofPayloadValueRef::Transfer(candidate) if *candidate as usize == event);
+        match rule {
+            ProofPayloadRule::Authority(_) => false,
+            ProofPayloadRule::Identity { input } => value(input),
+            ProofPayloadRule::Sum { inputs } |
+            ProofPayloadRule::Maximum { inputs } |
+            ProofPayloadRule::WeightedSum { inputs } => inputs.iter().any(value),
+            ProofPayloadRule::Scale { value: input, scale } => {
+                value(input) || matches!(scale, ProofPayloadScale::Value(input) if value(input))
+            }
+            ProofPayloadRule::MonomialProduct { factors, .. } => {
+                factors.iter().any(|factor| value(&factor.bound))
+            }
+            ProofPayloadRule::Product { left, right, .. } |
+            ProofPayloadRule::Tensor { left, right, .. } => value(left) || value(right),
+        }
+    }
+
     fn threshold_certificate_protocol() -> ProtocolDecl {
         let stage_id = StageId("certificate-stage".to_owned());
         let ring = Ring::new(256, 1);
@@ -2265,8 +2334,9 @@ mod tests {
         assert_eq!(matrix.modulus, 256_u16.into());
         assert_eq!(matrix.ring_dimension, 1);
         assert!(!projection.closure.expressions.is_empty());
-        // The final closure is extended with trace-owned synthetic scopes after normalization.
-        assert!(!projection.closure.programs.is_empty());
+        // The synthetic zero-argument wrapper is a Closed scope, never a user-visible Program
+        // row.  There are no user programs in this closed residual fixture.
+        assert!(projection.closure.programs.is_empty());
         assert!(projection.closure.families.is_empty());
     }
 
@@ -2298,23 +2368,92 @@ mod tests {
                 .iter()
                 .any(|event| { matches!(event, ProofPayloadEvent::Result { .. }) })
         );
-        let has_closed_scope = payload.events.iter().any(|event| match event {
+        let owner_scope = |event: &ProofPayloadEvent| match event {
             ProofPayloadEvent::InvocationStart { root } |
-            ProofPayloadEvent::InvocationEnd { root, .. } => {
-                matches!(root.scope, ProofPayloadScope::Closed { .. })
-            }
+            ProofPayloadEvent::InvocationEnd { root, .. } => Some(root.scope),
             ProofPayloadEvent::Result { owner, .. } |
             ProofPayloadEvent::SpecializationComputed { owner, .. } |
             ProofPayloadEvent::SpecializationCacheHit { owner, .. } |
             ProofPayloadEvent::AppliedRelation { owner, .. } |
-            ProofPayloadEvent::BoundTransfer { owner, .. } => {
-                matches!(owner.scope, ProofPayloadScope::Closed { .. })
+            ProofPayloadEvent::BoundTransfer { owner, .. } => Some(owner.scope),
+            ProofPayloadEvent::Predecessor { consumer, .. } => Some(consumer.scope),
+        };
+        let scopes = payload.events.iter().filter_map(owner_scope).collect::<Vec<_>>();
+        let expected_scope = scopes.first().copied().expect("payload owner scope");
+        assert!(matches!(expected_scope, ProofPayloadScope::Closed { .. }));
+        assert!(scopes.iter().all(|scope| *scope == expected_scope));
+    }
+
+    #[test]
+    fn proof_payload_projects_singleton_universal_relation_trace() {
+        let protocol = super::super::lower::tests::singleton_preimage_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "singleton-preimage".to_owned(),
+        };
+        let run = prepare_operational_certificate(&protocol, &request)
+            .expect("singleton universal certificate run");
+        let payload = derive_proof_payload(&run).expect("singleton universal payload");
+        assert_eq!(run.projection.closure.families.len(), 1);
+        let computed = payload
+            .events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                ProofPayloadEvent::SpecializationComputed { owner, dispatch, source } => {
+                    Some((index, *owner, dispatch, *source))
+                }
+                _ => None,
+            })
+            .expect("universal specialization computation");
+        assert_eq!(computed.3.end, computed.0 as u64);
+        assert!(computed.3.start < computed.3.end);
+        assert!(computed.2.preimage_family > 0);
+        let applied = payload
+            .events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                ProofPayloadEvent::AppliedRelation { owner, rule, .. }
+                    if matches!(rule, ProofPayloadRelationRule::Universal { .. }) =>
+                {
+                    Some((index, *owner, rule))
+                }
+                _ => None,
+            })
+            .expect("universal relation application");
+        assert!(applied.0 > computed.0);
+        let ProofPayloadRelationRule::Universal {
+            computed: applied_computed,
+            lhs,
+            lhs_layout,
+            rhs_result,
+        } = applied.2
+        else {
+            unreachable!("filtered universal relation")
+        };
+        assert_eq!(*applied_computed as usize, computed.0);
+        assert!(*rhs_result as usize >= computed.3.start as usize);
+        assert!((*rhs_result as usize) < computed.0);
+        assert!(lhs.central_factors.is_empty());
+        assert!(lhs.ordered_factors.len() >= 2);
+        assert!(lhs_layout.is_none());
+        assert!(matches!(
+            payload.events.get(*rhs_result as usize),
+            Some(ProofPayloadEvent::InvocationEnd { .. })
+        ));
+        assert_eq!(applied.1.scope, computed.1.scope);
+        assert!(payload.events.iter().all(|event| match event {
+            ProofPayloadEvent::BoundTransfer { owner, rule } => {
+                !payload_rule_mentions_transfer(rule, applied.0) || owner.scope == applied.1.scope
             }
-            ProofPayloadEvent::Predecessor { consumer, .. } => {
-                matches!(consumer.scope, ProofPayloadScope::Closed { .. })
-            }
-        });
-        assert!(has_closed_scope, "synthetic residual scope must be Closed");
+            _ => true,
+        }));
+        let second = prepare_operational_certificate(&protocol, &request)
+            .and_then(|run| derive_proof_payload(&run))
+            .expect("stable singleton universal payload");
+        assert_eq!(payload, second);
     }
 
     #[test]

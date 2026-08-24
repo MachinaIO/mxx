@@ -4569,7 +4569,7 @@ fn real_descriptor(value: &RealExpr) -> Result<String, ProductionAdapterError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn repeated_named_parallel_artifact_protocol() -> crate::ProtocolDecl {
@@ -5178,7 +5178,7 @@ mod tests {
         .expect("compact Tall operational protocol")
     }
 
-    fn singleton_preimage_protocol() -> crate::ProtocolDecl {
+    pub(crate) fn singleton_preimage_protocol() -> crate::ProtocolDecl {
         use crate::{
             ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
             EndpointSemanticBinding, EndpointSpecId, OperationalDecoderKind,

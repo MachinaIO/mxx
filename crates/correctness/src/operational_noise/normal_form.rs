@@ -1349,46 +1349,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         } else {
             None
         };
-        let mut context_bounds = Vec::new();
-        for context in [left_context, suffix_context].into_iter().flatten() {
-            let typed = self.canonical_monomial_bound(context)?;
-            let bound = match &typed {
-                NumericContract::Known(value) => {
-                    NumericContract::Known(coefficient_bound(&value.coefficient_class))
-                }
-                NumericContract::Missing => NumericContract::Missing,
-            };
-            match &bound {
-                NumericContract::Known(CoefficientBound::ExactZero) => {
-                    if let Some(owner) = trace_owner {
-                        let relation_evidence = if evidence.is_none() {
-                            let identity_event = self.observe_bound_transfer(
-                                owner,
-                                BoundRule::Identity {
-                                    input: BoundValueRef::Transfer(applied_event),
-                                },
-                            )?;
-                            BoundValueRef::Transfer(identity_event)
-                        } else {
-                            BoundValueRef::Transfer(applied_event)
-                        };
-                        self.append_summary_evidence(owner, evidence, relation_evidence)?;
-                    }
-                    return Ok(NumericContract::Known(CoefficientBound::ExactZero));
-                }
-                NumericContract::Known(CoefficientBound::Finite(_)) => {}
-                NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
-                    if S::ENABLED {
-                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
-                    }
-                    return Ok(relation_bound.clone());
-                }
-            }
-            let NumericContract::Known(typed) = typed else {
-                return Ok(relation_bound.clone());
-            };
-            context_bounds.push((bound, typed));
-        }
         let mut relation_evidence = None;
         if let Some(owner) = trace_owner {
             let mut next = BoundValueRef::Transfer(applied_event);
@@ -1408,15 +1368,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             }
             relation_evidence = Some((owner, next));
         }
-        let Some(relation_expression) =
-            relation_expression.filter(|_| left_context.is_some() || suffix_context.is_some())
-        else {
-            if left_context.is_none() && suffix_context.is_none() {
-                if let Some((owner, relation_evidence)) = relation_evidence {
-                    self.append_summary_evidence(owner, evidence, relation_evidence)?;
-                }
-                return Ok(relation_bound.clone());
+        if left_context.is_none() && suffix_context.is_none() {
+            if let Some((owner, relation_evidence)) = relation_evidence {
+                self.append_summary_evidence(owner, evidence, relation_evidence)?;
             }
+            return Ok(relation_bound.clone());
+        }
+        let Some(relation_expression) = relation_expression else {
             return Ok(relation_bound.clone());
         };
         let ResolvedValueType::Matrix(relation_type) =
@@ -1432,48 +1390,23 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             coefficient_class: canonical_class(relation_value),
         };
         let mut current_bound = relation_bound.clone();
-        for (context, context_data, left) in [
-            (left_context, context_bounds.first(), true),
-            (suffix_context, context_bounds.last(), false),
-        ] {
+        for (context, left) in [(left_context, true), (suffix_context, false)] {
             let Some(context) = context else { continue };
-            let Some((_context_bound, context_typed)) = context_data else { continue };
-            let facts = if left {
-                MatrixProductFacts {
-                    left_is_constant_polynomial: self.monomial_is_constant_polynomial(context),
-                    right_is_constant_polynomial: self
-                        .matrix_value_facts(relation_expression)
-                        .is_some_and(|facts| facts.metadata.is_constant_polynomial),
-                    right_support_upper: self.matrix_value_facts(relation_expression).and_then(
-                        |facts| match &facts.polynomial {
-                            NumericContract::Known(polynomial) => Some(polynomial.support_upper),
-                            NumericContract::Missing => None,
-                        },
-                    ),
-                    ..MatrixProductFacts::default()
+            let NumericContract::Known(context_typed) = self.canonical_monomial_bound(context)?
+            else {
+                if S::ENABLED {
+                    return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
                 }
-            } else {
-                MatrixProductFacts {
-                    left_is_constant_polynomial: self
-                        .matrix_value_facts(relation_expression)
-                        .is_some_and(|facts| facts.metadata.is_constant_polynomial),
-                    left_support_upper: self.matrix_value_facts(relation_expression).and_then(
-                        |facts| match &facts.polynomial {
-                            NumericContract::Known(polynomial) => Some(polynomial.support_upper),
-                            NumericContract::Missing => None,
-                        },
-                    ),
-                    right_is_constant_polynomial: self.monomial_is_constant_polynomial(context),
-                    ..MatrixProductFacts::default()
-                }
+                return Ok(NumericContract::Missing);
             };
             let (left_typed, right_typed) = if left {
-                (context_typed, &current_typed)
+                (&context_typed, &current_typed)
             } else {
-                (&current_typed, context_typed)
+                (&current_typed, &context_typed)
             };
-            let product_typed = product_bound_with_facts(left_typed, right_typed, &facts)
-                .map_err(|_| NormalizeError::ArithmeticOverflow)?;
+            let product_typed =
+                product_bound_with_facts(left_typed, right_typed, &MatrixProductFacts::default())
+                    .map_err(|_| NormalizeError::ArithmeticOverflow)?;
             current_bound =
                 NumericContract::Known(coefficient_bound(&product_typed.coefficient_class));
             current_typed = product_typed;
@@ -1495,25 +1428,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 )?;
                 relation_evidence = Some((owner, BoundValueRef::Transfer(product_event)));
             }
+            if matches!(current_bound, NumericContract::Known(CoefficientBound::ExactZero)) {
+                return Ok(current_bound);
+            }
         }
         if let Some((owner, relation_evidence)) = relation_evidence {
             self.append_summary_evidence(owner, evidence, relation_evidence)?;
         }
         Ok(current_bound)
-    }
-
-    fn monomial_is_constant_polynomial(&self, monomial: MonomialId) -> bool {
-        self.monomials
-            .descriptor(monomial)
-            .map(|descriptor| {
-                descriptor.central_factors.iter().chain(descriptor.ordered_factors.iter()).all(
-                    |factor| {
-                        self.matrix_value_facts(factor.expression())
-                            .is_some_and(|facts| facts.metadata.is_constant_polynomial)
-                    },
-                )
-            })
-            .unwrap_or(false)
     }
 
     fn summary_result_ref(

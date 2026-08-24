@@ -24,7 +24,7 @@ use mxx_ir_core::{
     FrozenGraphScopeId, Graph, IntExpr, ParamEnv, Port, WireRef, WireType,
     node::{IntBinaryOp, IntCompareOp, NodeKind},
 };
-use num_bigint::{BigInt, BigUint};
+use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::Zero;
 use serde::Serialize;
 use std::{
@@ -365,6 +365,914 @@ pub(crate) enum ProofPayloadEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OperationalProofPayload {
     pub events: Vec<ProofPayloadEvent>,
+}
+
+/// Errors from the canonical proof-payload boundary.  The payload itself is already projected
+/// into owned values; this error only protects length/count arithmetic while encoding it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanonicalPayloadError {
+    LengthOverflow,
+}
+
+pub(crate) trait LogicalItems {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError>;
+}
+
+impl<T: LogicalItems + ?Sized> LogicalItems for &T {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        (*self).logical_items()
+    }
+}
+
+fn checked_add(left: u64, right: u64) -> Result<u64, CanonicalPayloadError> {
+    left.checked_add(right).ok_or(CanonicalPayloadError::LengthOverflow)
+}
+
+fn checked_sum<I>(items: I) -> Result<u64, CanonicalPayloadError>
+where
+    I: IntoIterator,
+    I::Item: LogicalItems,
+{
+    items.into_iter().try_fold(0_u64, |total, item| checked_add(total, item.logical_items()?))
+}
+
+fn logical_vec<T: LogicalItems>(items: &[T]) -> Result<u64, CanonicalPayloadError> {
+    checked_add(
+        checked_add(
+            1,
+            u64::try_from(items.len()).map_err(|_| CanonicalPayloadError::LengthOverflow)?,
+        )?,
+        checked_sum(items)?,
+    )
+}
+
+impl LogicalItems for bool {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for u32 {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for u64 {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for usize {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for BigInt {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for BigUint {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for String {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for Result<u64, CanonicalPayloadError> {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        *self
+    }
+}
+
+impl<T: LogicalItems> LogicalItems for Option<T> {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Some(value) => checked_add(1, value.logical_items()?),
+            None => Ok(1),
+        }
+    }
+}
+
+impl<T: LogicalItems> LogicalItems for Vec<T> {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        logical_vec(self)
+    }
+}
+
+impl<T: LogicalItems> LogicalItems for Box<[T]> {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        logical_vec(self)
+    }
+}
+
+impl<T: LogicalItems, const N: usize> LogicalItems for [T; N] {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum(self)
+    }
+}
+
+impl LogicalItems for MatrixLayout {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.name.logical_items(),
+            self.row_stride.logical_items(),
+            self.column_stride.logical_items(),
+        ])
+    }
+}
+
+impl LogicalItems for BoundProjection {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        Ok(1)
+    }
+}
+
+impl LogicalItems for super::facts::CoefficientBound {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::ExactZero | Self::Large => Ok(1),
+            Self::Finite(bound) => {
+                checked_add(1, bound.maximum_absolute_coefficient.logical_items()?)
+            }
+        }
+    }
+}
+
+impl LogicalItems for super::facts::NumericContract<super::facts::CoefficientBound> {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Missing => Ok(1),
+            Self::Known(value) => checked_add(1, value.logical_items()?),
+        }
+    }
+}
+
+impl LogicalItems for super::normal_form::BoundedSummary {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        self.coefficient_bound().logical_items()
+    }
+}
+
+impl LogicalItems for super::bound::MatrixProductFacts {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.left_is_constant_polynomial.logical_items(),
+            self.right_is_constant_polynomial.logical_items(),
+            self.right_known_zero_rows.logical_items(),
+            self.left_support_upper.logical_items(),
+            self.right_support_upper.logical_items(),
+        ])
+    }
+}
+
+impl LogicalItems for ProofPayloadScope {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Closed { root_expression_row } => {
+                checked_add(1, root_expression_row.logical_items()?)
+            }
+            Self::Program { program_row } => checked_add(1, program_row.logical_items()?),
+        }
+    }
+}
+
+impl LogicalItems for ProofPayloadOwner {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([self.scope.logical_items(), self.expression_row.logical_items()])
+    }
+}
+
+impl LogicalItems for ProofPayloadMonomial {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([self.central_factors.logical_items(), self.ordered_factors.logical_items()])
+    }
+}
+
+impl LogicalItems for ProofPayloadTerm {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([self.monomial.logical_items(), self.coefficient.logical_items()])
+    }
+}
+
+impl LogicalItems for ProofPayloadValue {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Exact { terms, summary } => {
+                checked_add(1, checked_sum([terms.logical_items(), summary.logical_items()])?)
+            }
+            Self::Coefficient { bound } => checked_add(1, bound.logical_items()?),
+        }
+    }
+}
+
+impl LogicalItems for ProofPayloadUniversalDispatch {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.preimage_family.logical_items(),
+            self.preimage_source.logical_items(),
+            self.trapdoor_source.logical_items(),
+        ])
+    }
+}
+
+impl LogicalItems for ProofPayloadRange {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([self.start.logical_items(), self.end.logical_items()])
+    }
+}
+
+impl LogicalItems for ProofPayloadRelationRule {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Universal { computed, lhs, lhs_layout, rhs_result } => checked_add(
+                1,
+                checked_sum([
+                    computed.logical_items(),
+                    lhs.logical_items(),
+                    lhs_layout.logical_items(),
+                    rhs_result.logical_items(),
+                ])?,
+            ),
+            Self::Gadget { gadget, decomposition, input, input_result } => checked_add(
+                1,
+                checked_sum([
+                    gadget.logical_items(),
+                    decomposition.logical_items(),
+                    input.logical_items(),
+                    input_result.logical_items(),
+                ])?,
+            ),
+        }
+    }
+}
+
+impl LogicalItems for ProofPayloadTermRef {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([self.value_event.logical_items(), self.term_ordinal.logical_items()])
+    }
+}
+
+impl LogicalItems for ProofPayloadCoefficientMergeSource {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Operator { inputs } => checked_add(1, inputs.logical_items()?),
+            Self::Relation { application, source_term_ordinal } => checked_add(
+                1,
+                checked_sum([application.logical_items(), source_term_ordinal.logical_items()])?,
+            ),
+        }
+    }
+}
+
+impl LogicalItems for ProofPayloadCoefficientMerge {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.owner.logical_items(),
+            self.source.logical_items(),
+            self.output.logical_items(),
+            self.signed_contribution.logical_items(),
+        ])
+    }
+}
+
+impl LogicalItems for ProofPayloadSurvivorFold {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([self.coefficient.logical_items(), self.bound.logical_items()])
+    }
+}
+
+impl LogicalItems for ProofPayloadValueRef {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Predecessor { input_position, projection } => checked_add(
+                1,
+                checked_sum([input_position.logical_items(), projection.logical_items()])?,
+            ),
+            Self::Result { event, projection } => {
+                checked_add(1, checked_sum([event.logical_items(), projection.logical_items()])?)
+            }
+            Self::Transfer(event) => checked_add(1, event.logical_items()?),
+        }
+    }
+}
+
+impl LogicalItems for ProofPayloadPreFoldPolynomial {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.terms.logical_items(),
+            self.summary.logical_items(),
+            self.summary_evidence.logical_items(),
+        ])
+    }
+}
+
+impl LogicalItems for ProofPayloadFactorEvidence {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        checked_sum([
+            self.bound.logical_items(),
+            self.is_constant_polynomial.logical_items(),
+            self.support_upper.logical_items(),
+        ])
+    }
+}
+
+impl LogicalItems for ProofPayloadScale {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Value(value) => checked_add(1, value.logical_items()?),
+            Self::Magnitude(value) => checked_add(1, value.logical_items()?),
+        }
+    }
+}
+
+impl LogicalItems for ProofPayloadAuthority {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::FactStore | Self::ProgramFamilyFact | Self::Operator | Self::Unavailable => Ok(1),
+            Self::RelationPreimageSource { source } => checked_add(1, source.logical_items()?),
+        }
+    }
+}
+
+impl LogicalItems for ProofPayloadRule {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::Authority(authority) => checked_add(1, authority.logical_items()?),
+            Self::Identity { input } => checked_add(1, input.logical_items()?),
+            Self::Sum { inputs } | Self::Maximum { inputs } | Self::WeightedSum { inputs } => {
+                checked_add(1, inputs.logical_items()?)
+            }
+            Self::Scale { value, scale } => {
+                checked_add(1, checked_sum([value.logical_items(), scale.logical_items()])?)
+            }
+            Self::MonomialProduct { monomial, factors } => {
+                checked_add(1, checked_sum([monomial.logical_items(), factors.logical_items()])?)
+            }
+            Self::Product { left, right, facts } => checked_add(
+                1,
+                checked_sum([left.logical_items(), right.logical_items(), facts.logical_items()])?,
+            ),
+            Self::Tensor {
+                left,
+                right,
+                left_is_constant_polynomial,
+                right_is_constant_polynomial,
+            } => checked_add(
+                1,
+                checked_sum([
+                    left.logical_items(),
+                    right.logical_items(),
+                    left_is_constant_polynomial.logical_items(),
+                    right_is_constant_polynomial.logical_items(),
+                ])?,
+            ),
+        }
+    }
+}
+
+impl LogicalItems for ProofPayloadEvent {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        match self {
+            Self::InvocationStart { root } => checked_add(1, root.logical_items()?),
+            Self::Predecessor { consumer, input_position, predecessor, source_result } => {
+                checked_add(
+                    1,
+                    checked_sum([
+                        consumer.logical_items(),
+                        input_position.logical_items(),
+                        predecessor.logical_items(),
+                        source_result.logical_items(),
+                    ])?,
+                )
+            }
+            Self::Result { owner, value } => {
+                checked_add(1, checked_sum([owner.logical_items(), value.logical_items()])?)
+            }
+            Self::InvocationEnd { root, result } => {
+                checked_add(1, checked_sum([root.logical_items(), result.logical_items()])?)
+            }
+            Self::SpecializationComputed { owner, dispatch, source } => checked_add(
+                1,
+                checked_sum([
+                    owner.logical_items(),
+                    dispatch.logical_items(),
+                    source.logical_items(),
+                ])?,
+            ),
+            Self::SpecializationCacheHit { owner, source } => {
+                checked_add(1, checked_sum([owner.logical_items(), source.logical_items()])?)
+            }
+            Self::AppliedRelation {
+                owner,
+                source_monomial,
+                outer_coefficient,
+                ordered_start,
+                ordered_end_exclusive,
+                rule,
+            } => checked_add(
+                1,
+                checked_sum([
+                    owner.logical_items(),
+                    source_monomial.logical_items(),
+                    outer_coefficient.logical_items(),
+                    ordered_start.logical_items(),
+                    ordered_end_exclusive.logical_items(),
+                    rule.logical_items(),
+                ])?,
+            ),
+            Self::BoundTransfer { owner, rule } => {
+                checked_add(1, checked_sum([owner.logical_items(), rule.logical_items()])?)
+            }
+            Self::CoefficientMerge(merge) => checked_add(1, merge.logical_items()?),
+            Self::PreFoldPolynomial(polynomial) => checked_add(1, polynomial.logical_items()?),
+            Self::SurvivorFold(fold) => checked_add(1, fold.logical_items()?),
+        }
+    }
+}
+
+impl LogicalItems for OperationalProofPayload {
+    fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        self.events.logical_items()
+    }
+}
+
+struct CanonicalPayloadWriter {
+    bytes: Vec<u8>,
+}
+
+impl CanonicalPayloadWriter {
+    fn new() -> Self {
+        let mut writer = Self { bytes: Vec::new() };
+        writer.bytes.extend_from_slice(b"mxx-operational-proof-payload\0");
+        writer.u8(1);
+        writer
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn usize(&mut self, value: usize) -> Result<(), CanonicalPayloadError> {
+        self.u64(u64::try_from(value).map_err(|_| CanonicalPayloadError::LengthOverflow)?);
+        Ok(())
+    }
+
+    fn bytes(&mut self, value: &[u8]) -> Result<(), CanonicalPayloadError> {
+        self.usize(value.len())?;
+        self.bytes.extend_from_slice(value);
+        Ok(())
+    }
+
+    fn string(&mut self, value: &str) -> Result<(), CanonicalPayloadError> {
+        self.bytes(value.as_bytes())
+    }
+
+    fn bigint(&mut self, value: &BigInt) -> Result<(), CanonicalPayloadError> {
+        let (sign, magnitude) = value.to_bytes_be();
+        self.u8(match sign {
+            Sign::NoSign => 0,
+            Sign::Plus => 1,
+            Sign::Minus => 2,
+        });
+        self.bytes(&magnitude)
+    }
+
+    fn biguint(&mut self, value: &BigUint) -> Result<(), CanonicalPayloadError> {
+        self.bytes(&value.to_bytes_be())
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    fn option<T>(
+        &mut self,
+        value: &Option<T>,
+        write: impl FnOnce(&mut Self, &T) -> Result<(), CanonicalPayloadError>,
+    ) -> Result<(), CanonicalPayloadError> {
+        match value {
+            None => self.u8(0),
+            Some(value) => {
+                self.u8(1);
+                write(self, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn vec<T>(
+        &mut self,
+        values: &[T],
+        mut write: impl FnMut(&mut Self, &T) -> Result<(), CanonicalPayloadError>,
+    ) -> Result<(), CanonicalPayloadError> {
+        self.usize(values.len())?;
+        for value in values {
+            write(self, value)?;
+        }
+        Ok(())
+    }
+
+    fn owner(&mut self, owner: &ProofPayloadOwner) -> Result<(), CanonicalPayloadError> {
+        self.scope(&owner.scope)?;
+        self.u64(owner.expression_row);
+        Ok(())
+    }
+
+    fn scope(&mut self, scope: &ProofPayloadScope) -> Result<(), CanonicalPayloadError> {
+        match scope {
+            ProofPayloadScope::Closed { root_expression_row } => {
+                self.u8(0);
+                self.u64(*root_expression_row);
+            }
+            ProofPayloadScope::Program { program_row } => {
+                self.u8(1);
+                self.u64(*program_row);
+            }
+        }
+        Ok(())
+    }
+
+    fn monomial(&mut self, monomial: &ProofPayloadMonomial) -> Result<(), CanonicalPayloadError> {
+        self.vec(&monomial.central_factors, |writer, owner| writer.owner(owner))?;
+        self.vec(&monomial.ordered_factors, |writer, owner| writer.owner(owner))
+    }
+
+    fn term(&mut self, term: &ProofPayloadTerm) -> Result<(), CanonicalPayloadError> {
+        self.monomial(&term.monomial)?;
+        self.bigint(&term.coefficient)
+    }
+
+    fn summary(
+        &mut self,
+        summary: &super::normal_form::BoundedSummary,
+    ) -> Result<(), CanonicalPayloadError> {
+        self.numeric_contract(&summary.coefficient_bound())
+    }
+
+    fn numeric_contract(
+        &mut self,
+        contract: &super::facts::NumericContract<super::facts::CoefficientBound>,
+    ) -> Result<(), CanonicalPayloadError> {
+        match contract {
+            super::facts::NumericContract::Missing => self.u8(0),
+            super::facts::NumericContract::Known(bound) => {
+                self.u8(1);
+                self.coefficient_bound(bound)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn coefficient_bound(
+        &mut self,
+        bound: &super::facts::CoefficientBound,
+    ) -> Result<(), CanonicalPayloadError> {
+        match bound {
+            super::facts::CoefficientBound::ExactZero => self.u8(0),
+            super::facts::CoefficientBound::Finite(value) => {
+                self.u8(1);
+                self.biguint(&value.maximum_absolute_coefficient)?;
+            }
+            super::facts::CoefficientBound::Large => self.u8(2),
+        }
+        Ok(())
+    }
+
+    fn value(&mut self, value: &ProofPayloadValue) -> Result<(), CanonicalPayloadError> {
+        match value {
+            ProofPayloadValue::Exact { terms, summary } => {
+                self.u8(0);
+                self.vec(terms, |writer, term| writer.term(term))?;
+                self.summary(summary)
+            }
+            ProofPayloadValue::Coefficient { bound } => {
+                self.u8(1);
+                self.numeric_contract(bound)
+            }
+        }
+    }
+
+    fn dispatch(&mut self, dispatch: &ProofPayloadUniversalDispatch) {
+        self.u64(dispatch.preimage_family);
+        self.u64(dispatch.preimage_source);
+        self.u64(dispatch.trapdoor_source);
+    }
+
+    fn range(&mut self, range: &ProofPayloadRange) {
+        self.u64(range.start);
+        self.u64(range.end);
+    }
+
+    fn layout(&mut self, layout: &Option<MatrixLayout>) -> Result<(), CanonicalPayloadError> {
+        self.option(layout, |writer, layout| {
+            writer.string(&layout.name)?;
+            writer.usize(layout.row_stride)?;
+            writer.usize(layout.column_stride)
+        })
+    }
+
+    fn relation_rule(
+        &mut self,
+        rule: &ProofPayloadRelationRule,
+    ) -> Result<(), CanonicalPayloadError> {
+        match rule {
+            ProofPayloadRelationRule::Universal { computed, lhs, lhs_layout, rhs_result } => {
+                self.u8(0);
+                self.u64(*computed);
+                self.monomial(lhs)?;
+                self.layout(lhs_layout)?;
+                self.u64(*rhs_result);
+            }
+            ProofPayloadRelationRule::Gadget { gadget, decomposition, input, input_result } => {
+                self.u8(1);
+                self.owner(gadget)?;
+                self.owner(decomposition)?;
+                self.u64(*input);
+                self.u64(*input_result);
+            }
+        }
+        Ok(())
+    }
+
+    fn term_ref(&mut self, reference: &ProofPayloadTermRef) {
+        self.u64(reference.value_event);
+        self.u64(reference.term_ordinal);
+    }
+
+    fn merge_source(
+        &mut self,
+        source: &ProofPayloadCoefficientMergeSource,
+    ) -> Result<(), CanonicalPayloadError> {
+        match source {
+            ProofPayloadCoefficientMergeSource::Operator { inputs } => {
+                self.u8(0);
+                self.term_ref(&inputs[0]);
+                self.term_ref(&inputs[1]);
+            }
+            ProofPayloadCoefficientMergeSource::Relation { application, source_term_ordinal } => {
+                self.u8(1);
+                self.u64(*application);
+                self.u64(*source_term_ordinal);
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, merge: &ProofPayloadCoefficientMerge) -> Result<(), CanonicalPayloadError> {
+        self.owner(&merge.owner)?;
+        self.merge_source(&merge.source)?;
+        self.monomial(&merge.output)?;
+        self.bigint(&merge.signed_contribution)
+    }
+
+    fn value_ref(&mut self, reference: &ProofPayloadValueRef) {
+        match reference {
+            ProofPayloadValueRef::Predecessor { input_position, projection } => {
+                self.u8(0);
+                self.u32(*input_position);
+                self.projection(projection);
+            }
+            ProofPayloadValueRef::Result { event, projection } => {
+                self.u8(1);
+                self.u64(*event);
+                self.projection(projection);
+            }
+            ProofPayloadValueRef::Transfer(event) => {
+                self.u8(2);
+                self.u64(*event);
+            }
+        }
+    }
+
+    fn projection(&mut self, projection: &BoundProjection) {
+        self.u8(match projection {
+            BoundProjection::Coefficient => 0,
+            BoundProjection::Summary => 1,
+        });
+    }
+
+    fn scale(&mut self, scale: &ProofPayloadScale) -> Result<(), CanonicalPayloadError> {
+        match scale {
+            ProofPayloadScale::Value(value) => {
+                self.u8(0);
+                self.value_ref(value);
+            }
+            ProofPayloadScale::Magnitude(value) => {
+                self.u8(1);
+                self.biguint(value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn authority(&mut self, authority: &ProofPayloadAuthority) {
+        match authority {
+            ProofPayloadAuthority::FactStore => self.u8(0),
+            ProofPayloadAuthority::ProgramFamilyFact => self.u8(1),
+            ProofPayloadAuthority::Operator => self.u8(2),
+            ProofPayloadAuthority::RelationPreimageSource { source } => {
+                self.u8(3);
+                self.u64(*source);
+            }
+            ProofPayloadAuthority::Unavailable => self.u8(4),
+        }
+    }
+
+    fn factor_evidence(
+        &mut self,
+        factor: &ProofPayloadFactorEvidence,
+    ) -> Result<(), CanonicalPayloadError> {
+        self.value_ref(&factor.bound);
+        self.bool(factor.is_constant_polynomial);
+        self.option(&factor.support_upper, |writer, value| writer.usize(*value))
+    }
+
+    fn rule(&mut self, rule: &ProofPayloadRule) -> Result<(), CanonicalPayloadError> {
+        match rule {
+            ProofPayloadRule::Authority(authority) => {
+                self.u8(0);
+                self.authority(authority);
+            }
+            ProofPayloadRule::Identity { input } => {
+                self.u8(1);
+                self.value_ref(input);
+            }
+            ProofPayloadRule::Sum { inputs } => {
+                self.u8(2);
+                self.vec(inputs, |writer, input| {
+                    writer.value_ref(input);
+                    Ok(())
+                })?;
+            }
+            ProofPayloadRule::Maximum { inputs } => {
+                self.u8(3);
+                self.vec(inputs, |writer, input| {
+                    writer.value_ref(input);
+                    Ok(())
+                })?;
+            }
+            ProofPayloadRule::Scale { value, scale } => {
+                self.u8(4);
+                self.value_ref(value);
+                self.scale(scale)?;
+            }
+            ProofPayloadRule::MonomialProduct { monomial, factors } => {
+                self.u8(5);
+                self.monomial(monomial)?;
+                self.vec(factors, |writer, factor| writer.factor_evidence(factor))?;
+            }
+            ProofPayloadRule::WeightedSum { inputs } => {
+                self.u8(6);
+                self.vec(inputs, |writer, input| {
+                    writer.value_ref(input);
+                    Ok(())
+                })?;
+            }
+            ProofPayloadRule::Product { left, right, facts } => {
+                self.u8(7);
+                self.value_ref(left);
+                self.value_ref(right);
+                self.product_facts(facts)?;
+            }
+            ProofPayloadRule::Tensor {
+                left,
+                right,
+                left_is_constant_polynomial,
+                right_is_constant_polynomial,
+            } => {
+                self.u8(8);
+                self.value_ref(left);
+                self.value_ref(right);
+                self.bool(*left_is_constant_polynomial);
+                self.bool(*right_is_constant_polynomial);
+            }
+        }
+        Ok(())
+    }
+
+    fn product_facts(
+        &mut self,
+        facts: &super::bound::MatrixProductFacts,
+    ) -> Result<(), CanonicalPayloadError> {
+        self.bool(facts.left_is_constant_polynomial);
+        self.bool(facts.right_is_constant_polynomial);
+        self.option(&facts.right_known_zero_rows, |writer, value| writer.biguint(value))?;
+        self.option(&facts.left_support_upper, |writer, value| writer.usize(*value))?;
+        self.option(&facts.right_support_upper, |writer, value| writer.usize(*value))
+    }
+
+    fn event(&mut self, event: &ProofPayloadEvent) -> Result<(), CanonicalPayloadError> {
+        match event {
+            ProofPayloadEvent::InvocationStart { root } => {
+                self.u8(0);
+                self.owner(root)?;
+            }
+            ProofPayloadEvent::Predecessor {
+                consumer,
+                input_position,
+                predecessor,
+                source_result,
+            } => {
+                self.u8(1);
+                self.owner(consumer)?;
+                self.u32(*input_position);
+                self.u64(*predecessor);
+                self.u64(*source_result);
+            }
+            ProofPayloadEvent::Result { owner, value } => {
+                self.u8(2);
+                self.owner(owner)?;
+                self.value(value)?;
+            }
+            ProofPayloadEvent::InvocationEnd { root, result } => {
+                self.u8(3);
+                self.owner(root)?;
+                self.value(result)?;
+            }
+            ProofPayloadEvent::SpecializationComputed { owner, dispatch, source } => {
+                self.u8(4);
+                self.owner(owner)?;
+                self.dispatch(dispatch);
+                self.range(source);
+            }
+            ProofPayloadEvent::SpecializationCacheHit { owner, source } => {
+                self.u8(5);
+                self.owner(owner)?;
+                self.range(source);
+            }
+            ProofPayloadEvent::AppliedRelation {
+                owner,
+                source_monomial,
+                outer_coefficient,
+                ordered_start,
+                ordered_end_exclusive,
+                rule,
+            } => {
+                self.u8(6);
+                self.owner(owner)?;
+                self.monomial(source_monomial)?;
+                self.bigint(outer_coefficient)?;
+                self.u32(*ordered_start);
+                self.u32(*ordered_end_exclusive);
+                self.relation_rule(rule)?;
+            }
+            ProofPayloadEvent::BoundTransfer { owner, rule } => {
+                self.u8(7);
+                self.owner(owner)?;
+                self.rule(rule)?;
+            }
+            ProofPayloadEvent::CoefficientMerge(merge) => {
+                self.u8(8);
+                self.merge(merge)?;
+            }
+            ProofPayloadEvent::PreFoldPolynomial(polynomial) => {
+                self.u8(9);
+                self.vec(&polynomial.terms, |writer, term| writer.term(term))?;
+                self.summary(&polynomial.summary)?;
+                self.option(&polynomial.summary_evidence, |writer, value| {
+                    writer.value_ref(value);
+                    Ok(())
+                })?;
+            }
+            ProofPayloadEvent::SurvivorFold(fold) => {
+                self.u8(10);
+                self.bigint(&fold.coefficient)?;
+                self.u64(fold.bound);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl OperationalProofPayload {
+    /// Encode exactly this projected payload in a versioned, tagged deterministic format.
+    pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, CanonicalPayloadError> {
+        let mut writer = CanonicalPayloadWriter::new();
+        writer.vec(&self.events, |writer, event| writer.event(event))?;
+        Ok(writer.bytes)
+    }
+
+    pub(crate) fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
+        LogicalItems::logical_items(self)
+    }
 }
 
 /// The typed dependency inventory rooted at one residual production root.
@@ -3732,6 +4640,64 @@ mod tests {
                 super::super::arena::ArenaError::ForeignExpression { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn proof_payload_encoding_and_logical_items_are_allocation_independent() {
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "certificate-threshold".to_owned(),
+        };
+        let first_run =
+            prepare_operational_certificate(&threshold_certificate_protocol(), &request)
+                .expect("first accepted run");
+        let second_run =
+            prepare_operational_certificate(&threshold_certificate_protocol(), &request)
+                .expect("independently allocated accepted run");
+        let first_payload = derive_proof_payload(&first_run).expect("first proof payload");
+        let second_payload = derive_proof_payload(&second_run).expect("second proof payload");
+        let first_canonical_payload_bytes =
+            first_payload.encode_canonical().expect("first canonical payload");
+        let second_canonical_payload_bytes =
+            second_payload.encode_canonical().expect("second canonical payload");
+        assert_eq!(first_canonical_payload_bytes, second_canonical_payload_bytes);
+        assert_eq!(first_payload.logical_items(), second_payload.logical_items());
+        assert!(first_payload.logical_items().expect("logical item count") > 0);
+
+        // The empty vector contributes its length field and nothing else; this is a small
+        // independent audit of the recursive structural count.
+        let empty = OperationalProofPayload { events: Vec::new() };
+        assert_eq!(empty.logical_items(), Ok(1));
+        assert!(empty.encode_canonical().expect("empty canonical payload").len() > 0);
+    }
+
+    #[test]
+    fn honest_protocol_difference_changes_payload_encoding_and_logical_items() {
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "singleton-preimage".to_owned(),
+        };
+        let threshold_request = super::super::OperationalCheckRequest {
+            target_id: "certificate-threshold".to_owned(),
+            ..request.clone()
+        };
+        let singleton_run = prepare_operational_certificate(
+            &super::super::lower::tests::singleton_preimage_protocol(),
+            &request,
+        )
+        .expect("honest singleton run");
+        let threshold_run =
+            prepare_operational_certificate(&threshold_certificate_protocol(), &threshold_request)
+                .expect("honest threshold run");
+        let singleton_payload = derive_proof_payload(&singleton_run).expect("singleton payload");
+        let threshold_payload = derive_proof_payload(&threshold_run).expect("threshold payload");
+        assert_ne!(
+            singleton_payload.encode_canonical().expect("singleton canonical payload"),
+            threshold_payload.encode_canonical().expect("threshold canonical payload")
+        );
+        assert_ne!(singleton_payload.logical_items(), threshold_payload.logical_items());
     }
 
     #[test]

@@ -839,28 +839,73 @@ impl<'a> ProofPayloadProjector<'a> {
         current: usize,
     ) -> Result<ProofPayloadCoefficientMerge, G0Error> {
         let node = self.job.expressions().node(observation.owner.expression())?;
-        let subtract = match node.operator {
-            ValueOperator::Matrix(MatrixOperation::Add) => false,
-            ValueOperator::Matrix(MatrixOperation::Subtract) => true,
+        let operation = match &node.operator {
+            ValueOperator::Matrix(
+                operation @ (MatrixOperation::Add | MatrixOperation::Subtract),
+            ) |
+            ValueOperator::Matrix(
+                operation @ (MatrixOperation::Multiply | MatrixOperation::Tensor { .. }),
+            ) => operation.clone(),
             _ => return Err(G0Error::RelationTraceInvariant),
         };
-        if observation.sources.len() != 2 ||
-            observation.sources.iter().any(|reference| reference.monomial != observation.output)
-        {
+        if observation.sources.len() != 2 {
             return Err(G0Error::RelationTraceInvariant);
         }
         let right = match trace.events.get(observation.sources[1].value_event.0 as usize) {
             Some(NormalizerEvent::Result { value, .. }) |
-            Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value
-                .exact_nf
-                .as_ref()
-                .and_then(|normal_form| normal_form.exact_terms.get(&observation.output)),
+            Some(NormalizerEvent::InvocationEnd { result: value, .. }) => {
+                value.exact_nf.as_ref().and_then(|normal_form| {
+                    normal_form.exact_terms.get(&observation.sources[1].monomial)
+                })
+            }
             _ => None,
         }
         .ok_or(G0Error::RelationTraceInvariant)?;
-        let expected = if subtract { -right.clone() } else { right.clone() };
+        let expected = match operation {
+            MatrixOperation::Add => right.clone(),
+            MatrixOperation::Subtract => -right.clone(),
+            MatrixOperation::Multiply | MatrixOperation::Tensor { .. } => {
+                let left = match trace.events.get(observation.sources[0].value_event.0 as usize) {
+                    Some(NormalizerEvent::Result { value, .. }) |
+                    Some(NormalizerEvent::InvocationEnd { result: value, .. }) => {
+                        value.exact_nf.as_ref().and_then(|normal_form| {
+                            normal_form.exact_terms.get(&observation.sources[0].monomial)
+                        })
+                    }
+                    _ => None,
+                }
+                .ok_or(G0Error::RelationTraceInvariant)?;
+                left * right
+            }
+            _ => unreachable!("operator classification is exhaustive"),
+        };
         if observation.signed_contribution != expected {
             return Err(G0Error::RelationTraceInvariant);
+        }
+        let output = self.monomial(observation.output)?;
+        match operation {
+            MatrixOperation::Add | MatrixOperation::Subtract => {
+                if self.monomial(observation.sources[0].monomial)? != output ||
+                    self.monomial(observation.sources[1].monomial)? != output
+                {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
+            }
+            MatrixOperation::Multiply | MatrixOperation::Tensor { .. } => {
+                let left = self.monomial(observation.sources[0].monomial)?;
+                let right = self.monomial(observation.sources[1].monomial)?;
+                let mut central_factors = left.central_factors;
+                central_factors.extend(right.central_factors);
+                central_factors.sort();
+                let mut ordered_factors = left.ordered_factors;
+                ordered_factors.extend(right.ordered_factors);
+                if output.central_factors != central_factors ||
+                    output.ordered_factors != ordered_factors
+                {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
+            }
+            _ => unreachable!("operator classification is exhaustive"),
         }
         Ok(ProofPayloadCoefficientMerge {
             owner: self.owner(observation.owner)?,
@@ -870,7 +915,7 @@ impl<'a> ProofPayloadProjector<'a> {
                 .map(|reference| self.term_ref(trace, *reference, current))
                 .collect::<Result<Vec<_>, G0Error>>()?
                 .into_boxed_slice(),
-            output: self.monomial(observation.output)?,
+            output,
             signed_contribution: observation.signed_contribution.clone(),
         })
     }

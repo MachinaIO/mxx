@@ -1855,10 +1855,7 @@ impl FeasibilitySink for FeasibilityTrace {
             EventIndex(u64::try_from(self.events.len()).map_err(|_| G0Error::TraceOverflow)?);
         let in_frame = |event: EventIndex| event.0 >= frame.range.start.0 && event.0 < current.0;
         let mut source_coefficients = Vec::new();
-        if observation.sources.len() != 2 ||
-            observation.sources[0].monomial != observation.output ||
-            observation.sources[1].monomial != observation.output
-        {
+        if observation.sources.len() != 2 {
             return Err(G0Error::RelationTraceInvariant);
         }
         for (input_position, reference) in observation.sources.iter().enumerate() {
@@ -1886,7 +1883,9 @@ impl FeasibilitySink for FeasibilityTrace {
             let value = match self.events.get(event.0 as usize) {
                 Some(NormalizerEvent::Result { value, .. }) |
                 Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
-                _ => return Err(G0Error::RelationTraceInvariant),
+                _ => {
+                    return Err(G0Error::RelationTraceInvariant);
+                }
             };
             let Some(normal_form) = value.exact_nf.as_ref() else {
                 return Err(G0Error::RelationTraceInvariant);
@@ -1900,8 +1899,10 @@ impl FeasibilitySink for FeasibilityTrace {
             return Err(G0Error::RelationTraceInvariant);
         }
         let right = &source_coefficients[1];
+        let product = &source_coefficients[0] * right;
         if *right != observation.signed_contribution &&
-            -right.clone() != observation.signed_contribution
+            -right.clone() != observation.signed_contribution &&
+            product != observation.signed_contribution
         {
             return Err(G0Error::RelationTraceInvariant);
         }
@@ -1920,7 +1921,10 @@ impl FeasibilitySink for FeasibilityTrace {
             BTreeMap<ExprId, EventIndex>,
             BTreeSet<super::arena::ScopedExprId>,
             HashMap<(super::arena::ScopedExprId, u32), (ExprId, EventIndex)>,
-            BTreeMap<super::arena::ScopedExprId, BTreeMap<super::monomial::MonomialId, BigInt>>,
+            BTreeMap<
+                super::arena::ScopedExprId,
+                BTreeMap<super::monomial::MonomialId, (BigInt, BigInt)>,
+            >,
         )>::new();
         let mut frame_starts = vec![None; self.events.len()];
         let mut frame_stack = Vec::new();
@@ -1966,13 +1970,14 @@ impl FeasibilitySink for FeasibilityTrace {
                         let Some(normal_form) = value.exact_nf.as_ref() else {
                             return Err(G0Error::RelationTraceInvariant);
                         };
-                        for (monomial, coefficient) in expected {
+                        for (monomial, (sum, left)) in expected {
                             let actual = normal_form.exact_terms.get(&monomial);
-                            if coefficient.is_zero() {
-                                if actual.is_some() {
+                            let additive = &left + &sum;
+                            if actual.is_none() {
+                                if !sum.is_zero() && !additive.is_zero() {
                                     return Err(G0Error::RelationTraceInvariant);
                                 }
-                            } else if actual != Some(&coefficient) {
+                            } else if actual != Some(&sum) && actual != Some(&additive) {
                                 return Err(G0Error::RelationTraceInvariant);
                             }
                         }
@@ -2193,15 +2198,12 @@ impl FeasibilitySink for FeasibilityTrace {
                     {
                         return Err(G0Error::RelationTraceInvariant);
                     }
-                    let expected = &coefficients[0] + &observation.signed_contribution;
-                    if pending_merges
+                    let entry = pending_merges
                         .entry(observation.owner)
                         .or_default()
-                        .insert(observation.output, expected)
-                        .is_some()
-                    {
-                        return Err(G0Error::RelationTraceInvariant);
-                    }
+                        .entry(observation.output)
+                        .or_insert_with(|| (BigInt::from(0_u8), coefficients[0].clone()));
+                    entry.0 += &observation.signed_contribution;
                 }
             }
         }

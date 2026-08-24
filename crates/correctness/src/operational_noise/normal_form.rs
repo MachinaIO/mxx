@@ -192,6 +192,7 @@ struct ProductGadgetSplice {
 
 enum ProductWorkItem {
     Term(MonomialId, BigInt),
+    ObservedTerm(MonomialId, BigInt, [RecordedTermRef; 2]),
     GadgetSplice(ProductGadgetSplice),
 }
 
@@ -3808,7 +3809,23 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             weight,
         )?;
         let mut evidence = None;
-        self.product_into_body(owner, left, right, weight, terms, noise, &mut evidence)?;
+        let source_events = if S::ENABLED {
+            self.relation_input_result(left_expression)
+                .ok()
+                .zip(self.relation_input_result(right_expression).ok())
+        } else {
+            None
+        };
+        self.product_into_body(
+            owner,
+            left,
+            right,
+            weight,
+            source_events,
+            terms,
+            noise,
+            &mut evidence,
+        )?;
         if let Some(summary_evidence) = summary_evidence {
             let owner = owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?;
             self.append_summary_evidence(owner, &mut evidence, summary_evidence)?;
@@ -3823,6 +3840,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         left: &PolynomialNF,
         right: &PolynomialNF,
         weight: &BigInt,
+        source_events: Option<(super::g0::EventIndex, super::g0::EventIndex)>,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
@@ -3835,7 +3853,18 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     continue;
                 }
                 let product = self.product_monomials(*left_id, *right_id)?;
-                worklist.push_back(ProductWorkItem::Term(product, coefficient));
+                if let Some((left_event, right_event)) = source_events {
+                    worklist.push_back(ProductWorkItem::ObservedTerm(
+                        product,
+                        coefficient,
+                        [
+                            RecordedTermRef { value_event: left_event, monomial: *left_id },
+                            RecordedTermRef { value_event: right_event, monomial: *right_id },
+                        ],
+                    ));
+                } else {
+                    worklist.push_back(ProductWorkItem::Term(product, coefficient));
+                }
                 // Drain each completed Cartesian pair before generating the next one. The same
                 // rewrite queue remains authoritative, but its live size follows one pair's
                 // recursive splice instead of the full product cardinality.
@@ -3854,49 +3883,54 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         worklist: &mut VecDeque<ProductWorkItem>,
     ) -> Result<(), NormalizeError> {
         while let Some(item) = worklist.pop_front() {
-            let ProductWorkItem::Term(monomial, coefficient) = item else {
-                let ProductWorkItem::GadgetSplice(mut splice) = item else { unreachable!() };
-                let lower = splice
-                    .next_after
-                    .map(std::ops::Bound::Excluded)
-                    .unwrap_or(std::ops::Bound::Unbounded);
-                let mut input_terms =
-                    splice.input_nf.exact_terms.range((lower, std::ops::Bound::Unbounded));
-                let batch = input_terms
-                    .by_ref()
-                    .take(self.gadget_splice_batch_terms.max(1))
-                    .map(|(&monomial, coefficient)| (monomial, coefficient.clone()))
-                    .collect::<Vec<_>>();
-                if batch.is_empty() {
+            let (monomial, coefficient, source_refs) = match item {
+                ProductWorkItem::Term(monomial, coefficient) => (monomial, coefficient, None),
+                ProductWorkItem::ObservedTerm(monomial, coefficient, sources) => {
+                    (monomial, coefficient, Some(sources))
+                }
+                ProductWorkItem::GadgetSplice(mut splice) => {
+                    let lower = splice
+                        .next_after
+                        .map(std::ops::Bound::Excluded)
+                        .unwrap_or(std::ops::Bound::Unbounded);
+                    let mut input_terms =
+                        splice.input_nf.exact_terms.range((lower, std::ops::Bound::Unbounded));
+                    let batch = input_terms
+                        .by_ref()
+                        .take(self.gadget_splice_batch_terms.max(1))
+                        .map(|(&monomial, coefficient)| (monomial, coefficient.clone()))
+                        .collect::<Vec<_>>();
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    let input_monomials =
+                        batch.iter().map(|(monomial, _)| *monomial).collect::<Vec<_>>();
+                    let replacements = self.monomials.combine_interned_wrapped_batch(
+                        self.scope,
+                        splice.left,
+                        &input_monomials,
+                        splice.suffix,
+                    )?;
+                    if replacements.len() != batch.len() {
+                        return Err(NormalizeError::InvalidExactPlan {
+                            reason: "streamed gadget splice batch length mismatch",
+                        });
+                    }
+                    let outer_coefficient = splice.coefficient.clone();
+                    if input_terms.next().is_some() {
+                        splice.next_after = batch.last().map(|(monomial, _)| *monomial);
+                        worklist.push_front(ProductWorkItem::GadgetSplice(splice));
+                    }
+                    for ((_, input_coefficient), replacement) in
+                        batch.into_iter().zip(replacements).rev()
+                    {
+                        worklist.push_front(ProductWorkItem::Term(
+                            replacement,
+                            outer_coefficient.clone() * input_coefficient,
+                        ));
+                    }
                     continue;
                 }
-                let input_monomials =
-                    batch.iter().map(|(monomial, _)| *monomial).collect::<Vec<_>>();
-                let replacements = self.monomials.combine_interned_wrapped_batch(
-                    self.scope,
-                    splice.left,
-                    &input_monomials,
-                    splice.suffix,
-                )?;
-                if replacements.len() != batch.len() {
-                    return Err(NormalizeError::InvalidExactPlan {
-                        reason: "streamed gadget splice batch length mismatch",
-                    });
-                }
-                let outer_coefficient = splice.coefficient.clone();
-                if input_terms.next().is_some() {
-                    splice.next_after = batch.last().map(|(monomial, _)| *monomial);
-                    worklist.push_front(ProductWorkItem::GadgetSplice(splice));
-                }
-                for ((_, input_coefficient), replacement) in
-                    batch.into_iter().zip(replacements).rev()
-                {
-                    worklist.push_front(ProductWorkItem::Term(
-                        replacement,
-                        outer_coefficient.clone() * input_coefficient,
-                    ));
-                }
-                continue;
             };
             if coefficient.is_zero() {
                 continue;
@@ -3908,6 +3942,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     owner,
                     monomial,
                     coefficient,
+                    source_refs,
                     terms,
                     noise,
                     evidence,
@@ -3928,6 +3963,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         owner: Option<ScopedExprId>,
         monomial: MonomialId,
         coefficient: BigInt,
+        source_refs: Option<[RecordedTermRef; 2]>,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
@@ -3947,6 +3983,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 monomial,
                 coefficient,
                 initial_bound,
+                source_refs,
                 terms,
                 noise,
                 evidence,
@@ -3970,6 +4007,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 rewritten,
                 rewritten_coefficient,
                 bound,
+                None,
                 terms,
                 noise,
                 evidence,
@@ -3984,6 +4022,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         monomial: MonomialId,
         coefficient: BigInt,
         bound: NumericContract<CoefficientBound>,
+        source_refs: Option<[RecordedTermRef; 2]>,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
@@ -3992,6 +4031,16 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             NumericContract::Known(CoefficientBound::ExactZero) => Ok(()),
             NumericContract::Known(bound @ CoefficientBound::Finite(_)) => {
                 if self.is_retained_bounded_monomial(monomial)? {
+                    if S::ENABLED {
+                        if let Some(sources) = source_refs {
+                            self.observe_product_merge(
+                                owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?,
+                                sources,
+                                monomial,
+                                coefficient.clone(),
+                            )?;
+                        }
+                    }
                     return terms.merge(monomial, coefficient);
                 }
                 self.counters.bounded_fold_count =
@@ -4005,9 +4054,38 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 Ok(())
             }
             NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing => {
+                if S::ENABLED {
+                    if let Some(sources) = source_refs {
+                        self.observe_product_merge(
+                            owner.ok_or(super::g0::G0Error::RelationTraceInvariant)?,
+                            sources,
+                            monomial,
+                            coefficient.clone(),
+                        )?;
+                    }
+                }
                 terms.merge(monomial, coefficient)
             }
         }
+    }
+
+    fn observe_product_merge(
+        &mut self,
+        owner: ScopedExprId,
+        sources: [RecordedTermRef; 2],
+        output: MonomialId,
+        signed_contribution: BigInt,
+    ) -> Result<(), NormalizeError> {
+        self.sink
+            .as_deref_mut()
+            .ok_or(super::g0::G0Error::RelationTraceInvariant)?
+            .record_coefficient_merge(CoefficientMerge {
+                owner,
+                sources: Box::new(sources),
+                output,
+                signed_contribution,
+            })?;
+        Ok(())
     }
 
     fn product_gadget_splice(
@@ -7837,6 +7915,22 @@ mod tests {
         assert!(products.iter().any(|(left, right)| {
             matches!(left, BoundValueRef::Result { projection: BoundProjection::Summary, .. }) &&
                 matches!(right, BoundValueRef::Transfer(_))
+        }));
+        let merges = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                NormalizerEvent::CoefficientMerge(observation) => Some(observation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!merges.is_empty(), "retained product terms must carry merge provenance");
+        assert!(merges.iter().all(|merge| {
+            merge.sources.len() == 2 &&
+                !merge.signed_contribution.is_zero() &&
+                merge.sources.iter().all(|source| {
+                    source.value_event.0 < trace.normalization_events().len() as u64
+                })
         }));
         assert!(!trace.normalization_events().iter().any(|event| {
             matches!(

@@ -3198,20 +3198,27 @@ mod tests {
                     .any(|event| matches!(event, ProofPayloadEvent::InvocationEnd { .. }))
             );
         }
-        let computed_nested_starts = payload.events
-            [computed.3.start as usize..computed.3.end as usize]
-            .iter()
-            .filter(|event| matches!(event, ProofPayloadEvent::InvocationStart { .. }))
-            .count();
-        let hit_nested_starts = payload.events[hit.2.start as usize..hit.2.end as usize]
-            .iter()
-            .filter(|event| matches!(event, ProofPayloadEvent::InvocationStart { .. }))
-            .count();
-        assert_eq!(computed_nested_starts, hit_nested_starts);
         assert!(!matches!(payload.events[hit.0], ProofPayloadEvent::InvocationStart { .. }));
 
         let (outer_frames, immediate_frames) = payload_frame_data(&payload);
         assert_eq!(outer_frames.len(), 2, "the repeated run must have two outer invocations");
+        let first_outer = outer_frames[0];
+        let second_outer = outer_frames[1];
+        assert!(first_outer.0 <= computed.0 && computed.0 <= first_outer.1);
+        assert!(second_outer.0 <= hit.0 && hit.0 <= second_outer.1);
+        let direct_child_starts =
+            |(outer_start, outer_end, _): (usize, usize, ProofPayloadOwner)| {
+                payload.events[outer_start..=outer_end]
+                    .iter()
+                    .enumerate()
+                    .filter(|(offset, event)| {
+                        matches!(event, ProofPayloadEvent::InvocationStart { .. }) &&
+                            immediate_frames[outer_start + offset] == Some(outer_start)
+                    })
+                    .count()
+            };
+        assert!(direct_child_starts(first_outer) > 0);
+        assert_eq!(direct_child_starts(second_outer), 0);
         let mut outer_snapshots = Vec::new();
         for (outer_start, outer_end, outer_root) in &outer_frames {
             let snapshots = payload.events[*outer_start..=*outer_end]

@@ -13381,17 +13381,21 @@ mod tests {
         central_facts.coefficient_bound = NumericContract::Known(CoefficientBound::finite(2_u8));
         facts.insert(&expressions, central, ValueFacts::Matrix(central_facts)).unwrap();
         let mut trace = FeasibilityTrace::default();
-        let mut normalizer = Normalizer::new_with_sink(
-            &mut expressions,
-            &programs,
-            &facts,
-            &mut monomials,
-            &mut trace,
-        )
-        .unwrap();
-        normalizer.normalize(semantic).unwrap();
-        drop(normalizer);
-        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
+        trace.record_invocation_start(semantic).unwrap();
+        let (value, counters) = {
+            let mut normalizer = Normalizer::new_with_sink(
+                &mut expressions,
+                &programs,
+                &facts,
+                &mut monomials,
+                &mut trace,
+            )
+            .unwrap();
+            normalizer.normalization_depth = 1;
+            normalizer.monomial_gc_allocation_threshold_bytes = u64::MAX;
+            let value = normalizer.normalize_inner(semantic, None).unwrap();
+            (value, normalizer.counters())
+        };
         let (event_index, monomial, factors) = trace
             .normalization_events()
             .iter()
@@ -13409,6 +13413,7 @@ mod tests {
             .central_factors
             .iter()
             .chain(descriptor.ordered_factors.iter())
+            .copied()
             .collect::<Vec<_>>();
         assert_eq!(expected.len(), 2);
         for (factor, evidence) in expected.iter().zip(&factors) {
@@ -13419,9 +13424,61 @@ mod tests {
             assert!(event.0 < event_index as u64);
             assert!(matches!(
                 trace.normalization_events()[event.0 as usize],
-                NormalizerEvent::Result { owner, .. } if owner == **factor
+                NormalizerEvent::Result { owner, .. } if owner == *factor
             ));
         }
+        trace.record_invocation_end(semantic, &value, &counters).unwrap();
+        trace.record_invocation_start(semantic).unwrap();
+        record_root_result_and_snapshot(&mut trace, semantic, &value);
+        let snapshot_terms = trace
+            .normalization_events()
+            .iter()
+            .filter_map(|event| match event {
+                NormalizerEvent::PreFoldPolynomial(snapshot) => {
+                    Some(snapshot.polynomial.exact_terms.keys().copied().collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .last()
+            .expect("root pre-fold snapshot");
+        let relation_source = factors
+            .iter()
+            .map(|factor| match &factor.bound {
+                BoundValueRef::Result { event, .. } => *event,
+                _ => panic!("mixed factor evidence must use Result"),
+            })
+            .collect::<Vec<_>>();
+        let relation_output = monomial;
+        let mut sweeper = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap();
+        sweeper.normalization_depth = 1;
+        sweeper.protected_monomial_prefix = 0;
+        sweeper.monomial_gc_allocation_threshold_bytes = 1;
+        let dead = sweeper
+            .monomials
+            .intern(&*sweeper.expressions, sweeper.programs, &[], &[semantic, semantic])
+            .unwrap();
+        sweeper.sweep_monomials_at_node_commit().unwrap();
+        assert!(matches!(
+            sweeper.monomials.descriptor(dead),
+            Err(MonomialError::CollectedMonomialId { .. })
+        ));
+        for snapshot_monomial in &snapshot_terms {
+            assert!(sweeper.monomials.descriptor(*snapshot_monomial).is_ok());
+        }
+        assert!(sweeper.monomials.descriptor(relation_output).is_ok());
+        for source in relation_source {
+            assert!(source.0 < event_index as u64);
+        }
+        drop(sweeper);
+        trace.record_invocation_end(semantic, &value, &counters).unwrap();
+        trace.validate_normalization_observations_with_monomials(&monomials).unwrap();
 
         let mut swapped = trace.clone();
         if let Some(NormalizerEvent::BoundTransfer {
@@ -13483,7 +13540,7 @@ mod tests {
             programs.scoped(&expressions, foreign_family.program(), ordered).unwrap();
         let mut foreign_program = trace.clone();
         let ordered_result = foreign_program.events.iter_mut().find_map(|event| match event {
-            NormalizerEvent::Result { owner, .. } if *owner == *expected[1] => Some(owner),
+            NormalizerEvent::Result { owner, .. } if *owner == expected[1] => Some(owner),
             _ => None,
         });
         *ordered_result.expect("ordered result") = foreign_ordered;
@@ -13505,12 +13562,6 @@ mod tests {
         }
         assert_eq!(
             foreign.validate_normalization_observations_with_monomials(&monomials),
-            Err(G0Error::UnsupportedBoundTransfer)
-        );
-
-        monomials.sweep(0, []).unwrap();
-        assert_eq!(
-            trace.validate_normalization_observations_with_monomials(&monomials),
             Err(G0Error::UnsupportedBoundTransfer)
         );
     }

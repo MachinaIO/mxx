@@ -30,7 +30,7 @@ use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::Zero;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -1671,8 +1671,8 @@ fn walk_certificate_closure(
     mut work: Vec<CertificateWork>,
     index_plans: &[&super::g0::IndexUsePlan],
 ) -> Result<(), CertificateClosureError> {
-    let mut expression_plans = BTreeMap::<ExprId, Vec<usize>>::new();
-    let mut family_plans = BTreeMap::<FamilyValueId, Vec<usize>>::new();
+    let mut expression_plans = HashMap::<ExprId, Vec<usize>>::new();
+    let mut family_plans = HashMap::<FamilyValueId, Vec<usize>>::new();
     for (plan_index, plan) in index_plans.iter().enumerate() {
         for expression in plan.result.into_iter().chain(plan.consumed) {
             expression_plans.entry(expression).or_default().push(plan_index);
@@ -1682,7 +1682,7 @@ fn walk_certificate_closure(
         }
     }
 
-    let mut seen_plans = BTreeSet::new();
+    let mut seen_plans = HashSet::new();
     for (plan_index, plan) in index_plans.iter().enumerate() {
         if plan.is_residual_relevant(closure) && seen_plans.insert(plan_index) {
             push_index_plan_dependencies(&mut work, plan);

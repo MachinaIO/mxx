@@ -9,7 +9,7 @@ use super::{
         ExprArena, ExprId, HashVariant, MatrixConstantKind, MatrixLayout, MatrixOperation,
         ResolvedMatrixType, ResolvedValueType, SampleDescriptor, SampleEventId, SamplerOperation,
         ScalarOperation, SemanticFamilySourceIdentity, SemanticSourceIdentity, TrapdoorOperation,
-        TrustedIndexRange, TypedConstant, ValueOperator, ValueTransformOperation,
+        TrustedIndexRange, TypedConstant, ValueOperator, ValueProgramId, ValueTransformOperation,
     },
     bound::MatrixProductFacts,
     facts::{CoefficientBound, NumericContract},
@@ -601,10 +601,10 @@ pub(crate) enum IndexEvaluationError {
     NonInteger,
     #[error("index scalar operand types do not match")]
     TypeMismatch,
-    #[error("index operator is unsupported")]
-    UnsupportedOperator,
-    #[error("index program call has no typed program scope")]
-    ProgramCallUnsupported,
+    #[error("index operator is unsupported at {expression:?}: {operator:?}")]
+    UnsupportedOperator { expression: ExprId, operator: Box<ValueOperator>, inputs: Box<[ExprId]> },
+    #[error("index program call {program:?} is unsupported at {expression:?}")]
+    ProgramCallUnsupported { expression: ExprId, program: ValueProgramId, inputs: Box<[ExprId]> },
     #[error("index division or remainder has a zero divisor")]
     DivisionByZero,
 }
@@ -679,9 +679,15 @@ fn evaluate_typed_index_node(
                 .iter()
                 .map(|input| evaluate_typed_index_node(arena, *input, bindings))
                 .collect::<Result<Vec<_>, _>>()?;
-            evaluate_typed_scalar(operation, &values)
+            evaluate_typed_scalar(expression, operation, &node.inputs, &values)
         }
-        ValueOperator::ProgramCall { .. } => Err(IndexEvaluationError::ProgramCallUnsupported),
+        ValueOperator::ProgramCall { program } => {
+            Err(IndexEvaluationError::ProgramCallUnsupported {
+                expression,
+                program: *program,
+                inputs: node.inputs.clone(),
+            })
+        }
         ValueOperator::Source(_) |
         ValueOperator::Sample { .. } |
         ValueOperator::Sampler { .. } |
@@ -692,12 +698,18 @@ fn evaluate_typed_index_node(
         ValueOperator::Transform(_) |
         ValueOperator::ExtractCoefficient { .. } |
         ValueOperator::Matrix(_) |
-        ValueOperator::Trapdoor(_) => Err(IndexEvaluationError::UnsupportedOperator),
+        ValueOperator::Trapdoor(_) => Err(IndexEvaluationError::UnsupportedOperator {
+            expression,
+            operator: Box::new(node.operator.clone()),
+            inputs: node.inputs.clone(),
+        }),
     }
 }
 
 fn evaluate_typed_scalar(
+    expression: ExprId,
     operation: &ScalarOperation,
+    inputs: &[ExprId],
     values: &[IndexValue],
 ) -> Result<IndexValue, IndexEvaluationError> {
     let pair = || {
@@ -754,7 +766,11 @@ fn evaluate_typed_scalar(
         ScalarOperation::Hash { .. } |
         ScalarOperation::ExtractCoefficient { .. } |
         ScalarOperation::LiftConstantPolynomial { .. } => {
-            Err(IndexEvaluationError::UnsupportedOperator)
+            Err(IndexEvaluationError::UnsupportedOperator {
+                expression,
+                operator: Box::new(ValueOperator::Scalar(operation.clone())),
+                inputs: inputs.into(),
+            })
         }
     }
 }
@@ -1375,12 +1391,15 @@ fn enumerate_slice_group(
         let bindings = axis_bindings(&group.frontier, tuple);
         let mut values = BTreeMap::new();
         for member in &group.members {
-            let value = evaluated_integer(evaluate_typed_index(
-                arena,
-                member.expression,
-                &group.frontier,
-                &bindings,
-            )?)?;
+            let value = evaluated_integer(
+                evaluate_typed_index(arena, member.expression, &group.frontier, &bindings)
+                    .map_err(|source| G0Error::IndexEvaluation {
+                        owner: first.owner.clone(),
+                        root: member.expression,
+                        member: Some(member.role),
+                        source: Box::new(source),
+                    })?,
+            )?;
             verify_output_range(&value, member.range)?;
             values.insert(member.role, value);
         }
@@ -1470,7 +1489,14 @@ fn enumerate_index_use(
     rows.try_reserve_exact(row_count).map_err(|_| G0Error::InfeasibleIndexRows)?;
     enumerate_frontier(&plan.frontier, row_count, |tuple| {
         let bindings = axis_bindings(&plan.frontier, tuple);
-        let output = evaluate_typed_index(arena, plan.index, &plan.frontier, &bindings)?;
+        let output = evaluate_typed_index(arena, plan.index, &plan.frontier, &bindings).map_err(
+            |source| G0Error::IndexEvaluation {
+                owner: plan.owner.clone(),
+                root: plan.index,
+                member: None,
+                source: Box::new(source),
+            },
+        )?;
         let output = evaluated_integer(output)?;
         verify_output_range(&output, output_range)?;
         rows.push(IndexLutRow {
@@ -4477,8 +4503,14 @@ pub(crate) enum G0Error {
     IndexOutputOutOfRange,
     #[error("indexed-slice endpoint escapes the consumed matrix extent")]
     SliceBoundsEscape,
-    #[error("typed index evaluator rejected the expression: {0}")]
-    IndexEvaluation(#[from] IndexEvaluationError),
+    #[error("typed index evaluator rejected {root:?} for {owner:?} member {member:?}: {source}")]
+    IndexEvaluation {
+        owner: PlannedWire,
+        root: ExprId,
+        member: Option<SliceMemberRole>,
+        #[source]
+        source: Box<IndexEvaluationError>,
+    },
     #[error("G0 descriptor encoding failed: {0}")]
     Encoding(String),
     #[error("canonical DAG node references a missing dependency")]
@@ -7743,11 +7775,167 @@ mod tests {
             .unwrap();
         assert_eq!(
             evaluate_typed_index(&arena, less, &[], &[]),
-            Err(IndexEvaluationError::UnsupportedOperator)
+            Err(IndexEvaluationError::UnsupportedOperator {
+                expression: less,
+                operator: Box::new(ValueOperator::Scalar(ScalarOperation::Less)),
+                inputs: Box::new([three, five]),
+            })
         );
         assert_eq!(
             evaluate_typed_index(&arena, bit, &[], &[]),
-            Err(IndexEvaluationError::UnsupportedOperator)
+            Err(IndexEvaluationError::UnsupportedOperator {
+                expression: bit,
+                operator: Box::new(ValueOperator::Scalar(ScalarOperation::Bit { position: 2 })),
+                inputs: Box::new([five]),
+            })
+        );
+    }
+
+    #[test]
+    fn typed_index_evaluator_reports_exact_unsupported_descendant_and_program_call() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let one = constant_int(&mut arena, 1);
+        let two = constant_int(&mut arena, 2);
+        let three = constant_int(&mut arena, 3);
+        let add =
+            arena.intern_slice(ValueOperator::Scalar(ScalarOperation::Add), &[one, two]).unwrap();
+        let less_equal = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::LessEqual), &[add, three])
+            .unwrap();
+        let root = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::BoolToInt), &[less_equal])
+            .unwrap();
+        assert_eq!(
+            evaluate_typed_index(&arena, root, &[], &[]),
+            Err(IndexEvaluationError::UnsupportedOperator {
+                expression: less_equal,
+                operator: Box::new(ValueOperator::Scalar(ScalarOperation::LessEqual)),
+                inputs: Box::new([add, three]),
+            })
+        );
+
+        let mut programs = super::super::program::ProgramArena::new();
+        let callee = programs
+            .finalize(
+                &mut arena,
+                super::super::arena::ProgramSignature {
+                    inputs: Box::new([]),
+                    output: ResolvedValueType::Int,
+                },
+                one,
+            )
+            .unwrap();
+        let call =
+            arena.intern(ValueOperator::ProgramCall { program: callee }, Box::new([])).unwrap();
+        assert_eq!(
+            evaluate_typed_index(&arena, call, &[], &[]),
+            Err(IndexEvaluationError::ProgramCallUnsupported {
+                expression: call,
+                program: callee,
+                inputs: Box::new([]),
+            })
+        );
+    }
+
+    #[test]
+    fn ordinary_lut_wraps_root_and_descendant_evaluation_context() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let selector = constant_int(&mut arena, 0);
+        let branch = constant_int(&mut arena, 1);
+        let domain = super::super::arena::FamilyDomain::new(0, 1).unwrap();
+        let explicit = arena
+            .intern(
+                ValueOperator::ExplicitElement { domain, element_type: ResolvedValueType::Int },
+                Box::new([selector, branch]),
+            )
+            .unwrap();
+        let plan = index_plan(IndexUseKind::IntegerExpression, explicit, Vec::new());
+        assert_eq!(
+            enumerate_index_lut_evidence(&arena, [&plan]),
+            Err(G0Error::IndexEvaluation {
+                owner: plan.owner.clone(),
+                root: explicit,
+                member: None,
+                source: Box::new(IndexEvaluationError::UnsupportedOperator {
+                    expression: explicit,
+                    operator: Box::new(ValueOperator::ExplicitElement {
+                        domain,
+                        element_type: ResolvedValueType::Int,
+                    }),
+                    inputs: Box::new([selector, branch]),
+                }),
+            })
+        );
+
+        let one = constant_int(&mut arena, 1);
+        let two = constant_int(&mut arena, 2);
+        let add =
+            arena.intern_slice(ValueOperator::Scalar(ScalarOperation::Add), &[one, two]).unwrap();
+        let less_equal = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::LessEqual), &[add, branch])
+            .unwrap();
+        let nested = arena
+            .intern_slice(ValueOperator::Scalar(ScalarOperation::BoolToInt), &[less_equal])
+            .unwrap();
+        let plan = index_plan(IndexUseKind::IntegerExpression, nested, Vec::new());
+        assert_eq!(
+            enumerate_index_lut_evidence(&arena, [&plan]),
+            Err(G0Error::IndexEvaluation {
+                owner: plan.owner.clone(),
+                root: nested,
+                member: None,
+                source: Box::new(IndexEvaluationError::UnsupportedOperator {
+                    expression: less_equal,
+                    operator: Box::new(ValueOperator::Scalar(ScalarOperation::LessEqual)),
+                    inputs: Box::new([add, branch]),
+                }),
+            })
+        );
+
+        let foreign_argument = ExprId::new(super::super::arena::ArenaToken(99_999), 0);
+        let foreign_axis = IndexFrontierAxis {
+            owner: ProgramOccurrence { definition: mxx_ir_core::FrozenGraphScopeId::Root, path: 1 },
+            argument: foreign_argument,
+            argument_position: 0,
+            domain: TrustedIndexRange { minimum: 0, maximum_exclusive: 1 },
+        };
+        let plan = index_plan(IndexUseKind::IntegerExpression, branch, vec![foreign_axis]);
+        assert_eq!(
+            enumerate_index_lut_evidence(&arena, [&plan]),
+            Err(G0Error::IndexEvaluation {
+                owner: plan.owner.clone(),
+                root: branch,
+                member: None,
+                source: Box::new(IndexEvaluationError::ForeignExpression),
+            })
+        );
+
+        let mut programs = super::super::program::ProgramArena::new();
+        let callee = programs
+            .finalize(
+                &mut arena,
+                super::super::arena::ProgramSignature {
+                    inputs: Box::new([]),
+                    output: ResolvedValueType::Int,
+                },
+                branch,
+            )
+            .unwrap();
+        let call =
+            arena.intern(ValueOperator::ProgramCall { program: callee }, Box::new([])).unwrap();
+        let plan = index_plan(IndexUseKind::IntegerExpression, call, Vec::new());
+        assert_eq!(
+            enumerate_index_lut_evidence(&arena, [&plan]),
+            Err(G0Error::IndexEvaluation {
+                owner: plan.owner.clone(),
+                root: call,
+                member: None,
+                source: Box::new(IndexEvaluationError::ProgramCallUnsupported {
+                    expression: call,
+                    program: callee,
+                    inputs: Box::new([]),
+                }),
+            })
         );
     }
 
@@ -7938,6 +8126,43 @@ mod tests {
         let json = String::from_utf8(bytes).unwrap();
         assert!(json.contains("\"indexUses\":["));
         assert!(json.contains("\"sliceGroups\":["));
+    }
+
+    #[test]
+    fn synchronized_slice_lut_reports_the_failing_member_role() {
+        let mut arena = super::super::arena::ExprArena::new();
+        let selector = constant_int(&mut arena, 0);
+        let branch = constant_int(&mut arena, 1);
+        let domain = super::super::arena::FamilyDomain::new(0, 1).unwrap();
+        let unsupported = arena
+            .intern(
+                ValueOperator::ExplicitElement { domain, element_type: ResolvedValueType::Int },
+                Box::new([selector, branch]),
+            )
+            .unwrap();
+        let mut plans = slice_plans(&mut arena, 2, 2, 1, 1, [0, 1, 0, 1], 91);
+        let mut group = plans[0].slice_group.clone().unwrap();
+        group.members[1].expression = unsupported;
+        plans[1].index = unsupported;
+        for plan in &mut plans {
+            plan.slice_group = Some(group.clone());
+        }
+        assert_eq!(
+            enumerate_lut_evidence(&arena, plans.iter()),
+            Err(G0Error::IndexEvaluation {
+                owner: planned_owner(91),
+                root: unsupported,
+                member: Some(SliceMemberRole::RowEndExclusive),
+                source: Box::new(IndexEvaluationError::UnsupportedOperator {
+                    expression: unsupported,
+                    operator: Box::new(ValueOperator::ExplicitElement {
+                        domain,
+                        element_type: ResolvedValueType::Int,
+                    }),
+                    inputs: Box::new([selector, branch]),
+                }),
+            })
+        );
     }
 
     #[test]

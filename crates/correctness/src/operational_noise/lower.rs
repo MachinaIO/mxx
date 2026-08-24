@@ -4571,8 +4571,12 @@ fn real_descriptor(value: &RealExpr) -> Result<String, ProductionAdapterError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::operational_noise::{
+        g0::G0Error,
+        program::{ArenaToken, ValueProgramId},
+    };
 
-    fn repeated_named_parallel_artifact_protocol() -> crate::ProtocolDecl {
+    fn repeated_named_parallel_artifact_protocol(shared_producer: bool) -> crate::ProtocolDecl {
         use crate::{
             ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
             EndpointSemanticBinding, EndpointSpecId, OperationalDecoderKind,
@@ -4589,7 +4593,11 @@ pub(crate) mod tests {
         let ring = Ring::new(257, 1);
         let count = IntExpr::constant(2);
         let artifact_a_source = ring.input_family("artifact-a-source", count.clone(), (1, 1));
-        let artifact_b_source = ring.input_family("artifact-b-source", count.clone(), (1, 1));
+        let artifact_b_source = if shared_producer {
+            artifact_a_source.clone()
+        } else {
+            ring.input_family("artifact-b-source", count.clone(), (1, 1))
+        };
         let producer = DslContext::new("named-parallel-artifact-producer")
             .public_family_output("artifact-a", artifact_a_source)
             .expect("artifact A output")
@@ -4718,7 +4726,7 @@ pub(crate) mod tests {
         use crate::{ArtifactName, ProtocolInputId, StageInputName};
         use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef, node::NodeKind};
 
-        let protocol = repeated_named_parallel_artifact_protocol();
+        let protocol = repeated_named_parallel_artifact_protocol(false);
         let plan =
             ProtocolPlan::build(&protocol, "named-parallel-artifact").expect("protocol plan");
         let consumer_stage = protocol
@@ -7101,7 +7109,7 @@ pub(crate) mod tests {
 
     #[test]
     fn opt_in_declared_inputs_keep_repeated_occurrences_distinct() {
-        let protocol = repeated_named_parallel_artifact_protocol();
+        let protocol = repeated_named_parallel_artifact_protocol(false);
         let plan = ProtocolPlan::build(&protocol, "named-parallel-artifact")
             .expect("repeated artifact plan");
         let (_, _, trace) =
@@ -7122,7 +7130,7 @@ pub(crate) mod tests {
 
     #[test]
     fn opt_in_artifact_sources_preserve_typed_producers_and_deduplicate_aliases() {
-        let protocol = repeated_named_parallel_artifact_protocol();
+        let protocol = repeated_named_parallel_artifact_protocol(false);
         let plan = ProtocolPlan::build(&protocol, "named-parallel-artifact")
             .expect("repeated artifact plan");
         let (_, _, mut trace) =
@@ -7168,6 +7176,86 @@ pub(crate) mod tests {
         trace.retain_residual(&closure);
         assert_eq!(trace.source_observations().len(), 1);
         assert!(trace.source_observations().contains_key(&retained_handle));
+    }
+
+    #[test]
+    fn producer_artifact_fanout_retains_the_lexicographically_first_observed_edge() {
+        let protocol = repeated_named_parallel_artifact_protocol(true);
+        let plan = ProtocolPlan::build(&protocol, "named-parallel-artifact")
+            .expect("fan-out artifact plan");
+        let producers = plan.artifact_producers().iter().cloned().collect::<Vec<_>>();
+        assert_eq!(producers.len(), 2);
+        assert_eq!(producers[0].producer, producers[1].producer);
+        assert_ne!(producers[0], producers[1]);
+
+        let handle = SourceHandle::Family(FamilyValueId::from_program(ValueProgramId::new(
+            ArenaToken(97),
+            0,
+        )));
+        let first = SourceClass::ProducerArtifact { producer: producers[0].clone() };
+        let second = SourceClass::ProducerArtifact { producer: producers[1].clone() };
+        let expected = std::cmp::min(first.clone(), second.clone());
+
+        let mut forward = FeasibilityTrace::default();
+        forward.record_source(handle, first.clone()).unwrap();
+        forward.record_source(handle, second.clone()).unwrap();
+        let mut reverse = FeasibilityTrace::default();
+        reverse.record_source(handle, second).unwrap();
+        reverse.record_source(handle, first).unwrap();
+        assert_eq!(forward.source_observations().get(&handle), Some(&expected));
+        assert_eq!(reverse.source_observations().get(&handle), Some(&expected));
+
+        let mut different = producers[1].clone();
+        different.producer.wire.node = NodeId(different.producer.wire.node.0 + 1);
+        let observed = SourceClass::ProducerArtifact { producer: different };
+        assert_eq!(
+            forward.record_source(handle, observed.clone()),
+            Err(G0Error::ConflictingSourceClass { handle, existing: expected, observed })
+        );
+    }
+
+    #[test]
+    fn opt_in_artifact_fanout_preserves_ordinary_lowering_shape() {
+        let protocol = repeated_named_parallel_artifact_protocol(true);
+        let plan = ProtocolPlan::build(&protocol, "named-parallel-artifact")
+            .expect("fan-out artifact plan");
+        let (ordinary_job, ordinary_roots) =
+            ProductionAdapter::new(&protocol, &plan, BTreeMap::new())
+                .expect("ordinary adapter")
+                .lower()
+                .expect("ordinary fan-out lowering");
+        let (enabled_job, enabled_roots, trace) =
+            ProductionAdapter::new_with_feasibility(&protocol, &plan, BTreeMap::new())
+                .expect("enabled adapter")
+                .lower_with_feasibility()
+                .expect("enabled fan-out lowering");
+
+        assert_eq!(ordinary_job.expressions().node_count(), enabled_job.expressions().node_count());
+        assert_eq!(ordinary_job.programs().len(), enabled_job.programs().len());
+        assert_eq!(ordinary_roots.occurrences, enabled_roots.occurrences);
+        assert_eq!(ordinary_roots.samples, enabled_roots.samples);
+        assert_eq!(ordinary_job.relations().is_frozen(), enabled_job.relations().is_frozen());
+        assert_eq!(
+            matches!(ordinary_roots.residual, ProductionRoot::Closed(_)),
+            matches!(enabled_roots.residual, ProductionRoot::Closed(_))
+        );
+        assert_eq!(
+            matches!(ordinary_roots.decoder, ProductionRoot::Closed(_)),
+            matches!(enabled_roots.decoder, ProductionRoot::Closed(_))
+        );
+        let retained = trace
+            .source_observations()
+            .values()
+            .filter_map(|class| match class {
+                SourceClass::ProducerArtifact { producer } => Some(producer),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[0],
+            plan.artifact_producers().iter().min().expect("first fan-out edge")
+        );
     }
 
     #[test]

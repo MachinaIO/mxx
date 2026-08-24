@@ -3189,13 +3189,29 @@ impl FeasibilitySink for FeasibilityTrace {
     }
 
     fn record_source(&mut self, handle: SourceHandle, class: SourceClass) -> Result<(), G0Error> {
-        match self.source_observations.get(&handle) {
-            Some(existing) if existing != &class => Err(G0Error::ConflictingSourceClass {
-                handle,
-                existing: existing.clone(),
-                observed: class,
-            }),
-            Some(_) => Ok(()),
+        match self.source_observations.get_mut(&handle) {
+            Some(existing) if existing == &class => Ok(()),
+            Some(existing) => {
+                let same_producer_wire = matches!(
+                    (&*existing, &class),
+                    (
+                        SourceClass::ProducerArtifact { producer: first },
+                        SourceClass::ProducerArtifact { producer: second },
+                    ) if first.producer == second.producer
+                );
+                if same_producer_wire {
+                    if class < *existing {
+                        *existing = class;
+                    }
+                    Ok(())
+                } else {
+                    Err(G0Error::ConflictingSourceClass {
+                        handle,
+                        existing: existing.clone(),
+                        observed: class,
+                    })
+                }
+            }
             None => {
                 self.add_lowering_items(logical_add(1, logical_source(&handle, &class)?)?)?;
                 self.source_observations.insert(handle, class);

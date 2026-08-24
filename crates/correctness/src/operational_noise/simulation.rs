@@ -146,6 +146,53 @@ pub struct BaseNBreakdown {
     pub total_rows: usize,
 }
 
+const G0_CPU_EVIDENCE_SCHEMA_ID: &str = "mxx.operational-noise.g0-cpu-evidence";
+const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+enum G0CpuEvidenceStatus {
+    CpuObservationOnlyNotG0HardGateOrTallEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct G0CpuLutObservation {
+    exact_row_count: String,
+    index_use_frontier_products: Vec<String>,
+    slice_group_frontier_products: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct G0CpuMetrics {
+    descriptor_inventory_canonical_encoded_bytes: u64,
+    proof_payload_logical_items: u64,
+    proof_payload_canonical_encoded_bytes: u64,
+    lut_canonical_encoded_bytes: u64,
+    recorder_peak_retained_logical_items: u64,
+    proof_projection_peak_retained_logical_items: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct G0CpuEvidence {
+    schema_id: &'static str,
+    schema_version: u32,
+    status: G0CpuEvidenceStatus,
+    base_feasibility: BaseFeasibilitySummary,
+    observed_coverage: ObservedCoverage,
+    lut: G0CpuLutObservation,
+    metrics: G0CpuMetrics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactRetainedN {
+    expression_rows: u64,
+    program_rows: u64,
+    source_rows: u64,
+    family_source_rows: u64,
+    constant_rows: u64,
+    event_rows: u64,
+    total_rows: u64,
+}
+
 /// The owned job, certificate projection, and ordinary accepted report from one opt-in run.
 /// Arena handles remain tied to this job; callers cannot accidentally pair a projection with a
 /// report or job from another lowering.
@@ -2852,6 +2899,18 @@ pub fn prepare_base_feasibility_summary(
 ) -> Result<BaseFeasibilitySummary, String> {
     let run =
         prepare_operational_certificate(protocol, request).map_err(|error| error.to_string())?;
+    let closure = &run.projection.closure;
+    // Build the residual-only Stage-1 inventory from the same owned job and closure.  The base
+    // summary does not expose it or claim final artifact completeness, but descriptor conflicts
+    // must still fail closed on this opt-in path.
+    super::g0::derive_inventory(&run.job, closure, &run.trace)
+        .map_err(|error| error.to_string())?;
+    base_feasibility_summary_from_run(&run)
+}
+
+fn base_feasibility_summary_from_run(
+    run: &OperationalCertificateRun,
+) -> Result<BaseFeasibilitySummary, String> {
     let (plaintext_modulus, threshold_left, margin) = match &run.accepted_report.acceptance {
         super::OperationalAcceptanceReport::Threshold {
             plaintext_modulus,
@@ -2864,11 +2923,6 @@ pub fn prepare_base_feasibility_summary(
     };
     let normalization = run.accepted_report.counters.normalization;
     let closure = &run.projection.closure;
-    // Build the residual-only Stage-1 inventory from the same owned job and closure.  The base
-    // summary does not expose it or claim final artifact completeness, but descriptor conflicts
-    // must still fail closed on this opt-in path.
-    super::g0::derive_inventory(&run.job, closure, &run.trace)
-        .map_err(|error| error.to_string())?;
     let source_rows = closure
         .source_ids
         .len()
@@ -2885,7 +2939,7 @@ pub fn prepare_base_feasibility_summary(
     Ok(BaseFeasibilitySummary {
         schema_id: BASE_FEASIBILITY_SCHEMA_ID,
         schema_version: BASE_FEASIBILITY_SCHEMA_VERSION,
-        target_id: run.accepted_report.target_id,
+        target_id: run.accepted_report.target_id.clone(),
         plaintext_modulus: plaintext_modulus.to_string(),
         ciphertext_modulus: run.accepted_report.ciphertext_modulus.to_string(),
         accepted: run.accepted_report.accepted,
@@ -2922,6 +2976,151 @@ pub fn serialize_base_feasibility_summary(
     summary: &BaseFeasibilitySummary,
 ) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(summary)
+}
+
+fn checked_cardinality(len: usize, label: &str) -> Result<u64, String> {
+    u64::try_from(len).map_err(|_| format!("G0 CPU evidence {label} cardinality overflow"))
+}
+
+fn exact_retained_n(closure: &CertificateClosure) -> Result<ExactRetainedN, String> {
+    let expression_rows = checked_cardinality(closure.expressions.len(), "expression")?;
+    let program_rows = checked_cardinality(closure.programs.len(), "program")?;
+    let source_rows = checked_cardinality(closure.source_ids.len(), "source")?;
+    let family_source_rows = checked_cardinality(closure.family_source_ids.len(), "family source")?;
+    let constant_rows = checked_cardinality(closure.constant_expressions.len(), "constant")?;
+    let event_rows = checked_cardinality(closure.event_ids.len(), "event")?;
+    let total_rows =
+        [expression_rows, program_rows, source_rows, family_source_rows, constant_rows, event_rows]
+            .into_iter()
+            .try_fold(0_u64, |total, count| {
+                total.checked_add(count).ok_or_else(|| "G0 CPU evidence N overflow".to_owned())
+            })?;
+    Ok(ExactRetainedN {
+        expression_rows,
+        program_rows,
+        source_rows,
+        family_source_rows,
+        constant_rows,
+        event_rows,
+        total_rows,
+    })
+}
+
+fn g0_cpu_lut_observation(lut: &super::g0::G0LutEvidence) -> Result<G0CpuLutObservation, String> {
+    let mut observed_rows = BigUint::ZERO;
+    for unit in &lut.index_uses {
+        let rows = BigUint::from(unit.rows.len());
+        if rows.to_string() != unit.frontier_product {
+            return Err("G0 CPU evidence index LUT frontier product mismatch".to_owned());
+        }
+        observed_rows += rows;
+    }
+    for unit in &lut.slice_groups {
+        let rows = BigUint::from(unit.rows.len());
+        if rows.to_string() != unit.frontier_product {
+            return Err("G0 CPU evidence slice LUT frontier product mismatch".to_owned());
+        }
+        observed_rows += rows;
+    }
+    if observed_rows != lut.l_rows {
+        return Err("G0 CPU evidence LUT row total mismatch".to_owned());
+    }
+    Ok(G0CpuLutObservation {
+        exact_row_count: lut.l_rows.to_string(),
+        index_use_frontier_products: lut
+            .index_uses
+            .iter()
+            .map(|unit| unit.frontier_product.clone())
+            .collect(),
+        slice_group_frontier_products: lut
+            .slice_groups
+            .iter()
+            .map(|unit| unit.frontier_product.clone())
+            .collect(),
+    })
+}
+
+/// Produce deterministic CPU-observation evidence bytes without emitting a file or claiming a
+/// G0 hard gate, Tall execution, or GPU evidence.
+pub fn prepare_g0_cpu_evidence_bytes(
+    protocol: &ProtocolDecl,
+    request: &super::OperationalCheckRequest,
+) -> Result<Vec<u8>, String> {
+    let run =
+        prepare_operational_certificate(protocol, request).map_err(|error| error.to_string())?;
+    let base_feasibility = base_feasibility_summary_from_run(&run)?;
+    let closure = &run.projection.closure;
+    let n = exact_retained_n(closure)?;
+
+    let inventory = super::g0::derive_inventory(&run.job, closure, &run.trace)
+        .map_err(|error| error.to_string())?;
+    if checked_cardinality(inventory.events.len(), "canonical event row")? != n.event_rows {
+        return Err("G0 CPU evidence event-row authority mismatch".to_owned());
+    }
+    let descriptor_inventory_canonical_encoded_bytes = checked_cardinality(
+        inventory.encode_canonical().map_err(|error| error.to_string())?.len(),
+        "descriptor inventory byte",
+    )?;
+    drop(inventory);
+
+    let lut = super::g0::derive_lut_evidence(&run.job, closure, &run.trace)
+        .map_err(|error| error.to_string())?;
+    let lut_observation = g0_cpu_lut_observation(&lut)?;
+    let lut_canonical_encoded_bytes = checked_cardinality(
+        lut.encode_canonical().map_err(|error| error.to_string())?.len(),
+        "LUT byte",
+    )?;
+    drop(lut);
+
+    let ProofPayloadProjection {
+        payload,
+        generator_peak_retained_logical_items,
+        observed_coverage,
+    } = derive_proof_payload_projection(&run).map_err(|error| error.to_string())?;
+    let proof_payload_logical_items = payload
+        .logical_items()
+        .map_err(|_| "G0 CPU evidence proof payload logical-item overflow".to_owned())?;
+    let proof_payload_canonical_encoded_bytes = checked_cardinality(
+        payload
+            .encode_canonical()
+            .map_err(|_| "G0 CPU evidence proof payload encoding overflow".to_owned())?
+            .len(),
+        "proof payload byte",
+    )?;
+    let retention = run.trace.recorder_retention();
+
+    let base_source_rows = n
+        .source_rows
+        .checked_add(n.family_source_rows)
+        .and_then(|rows| rows.checked_add(n.constant_rows))
+        .ok_or_else(|| "G0 CPU evidence base source-row count overflow".to_owned())?;
+    if checked_cardinality(base_feasibility.n.expression_rows, "base expression")? !=
+        n.expression_rows ||
+        checked_cardinality(base_feasibility.n.program_rows, "base program")? != n.program_rows ||
+        checked_cardinality(base_feasibility.n.source_rows, "base source")? != base_source_rows ||
+        checked_cardinality(base_feasibility.n.event_rows, "base event")? != n.event_rows ||
+        checked_cardinality(base_feasibility.n.total_rows, "base total")? != n.total_rows
+    {
+        return Err("G0 CPU evidence N authority mismatch".to_owned());
+    }
+
+    let evidence = G0CpuEvidence {
+        schema_id: G0_CPU_EVIDENCE_SCHEMA_ID,
+        schema_version: G0_CPU_EVIDENCE_SCHEMA_VERSION,
+        status: G0CpuEvidenceStatus::CpuObservationOnlyNotG0HardGateOrTallEvidence,
+        base_feasibility,
+        observed_coverage,
+        lut: lut_observation,
+        metrics: G0CpuMetrics {
+            descriptor_inventory_canonical_encoded_bytes,
+            proof_payload_logical_items,
+            proof_payload_canonical_encoded_bytes,
+            lut_canonical_encoded_bytes,
+            recorder_peak_retained_logical_items: retention.peak_logical_items,
+            proof_projection_peak_retained_logical_items: generator_peak_retained_logical_items,
+        },
+    };
+    serde_json::to_vec(&evidence).map_err(|error| error.to_string())
 }
 
 fn project_residual_root(
@@ -6049,5 +6248,213 @@ mod tests {
         let json = String::from_utf8(first_bytes).expect("UTF-8 JSON");
         assert!(!json.contains("milliseconds"));
         assert!(!json.contains("artifact_emission"));
+    }
+
+    #[test]
+    fn g0_cpu_evidence_is_deterministic_exact_and_explicitly_pre_gate() {
+        fn object_keys(value: &serde_json::Value) -> BTreeSet<&str> {
+            value.as_object().expect("JSON object").keys().map(String::as_str).collect()
+        }
+        fn collect_keys<'a>(value: &'a serde_json::Value, keys: &mut BTreeSet<&'a str>) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, value) in object {
+                        keys.insert(key);
+                        collect_keys(value, keys);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        collect_keys(value, keys);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let protocol = super::super::lower::tests::singleton_preimage_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "singleton-preimage".to_owned(),
+        };
+        let first = prepare_g0_cpu_evidence_bytes(&protocol, &request).expect("CPU evidence");
+        let second =
+            prepare_g0_cpu_evidence_bytes(&protocol, &request).expect("repeat CPU evidence");
+        assert_eq!(first, second);
+        let document: serde_json::Value = serde_json::from_slice(&first).expect("evidence JSON");
+        assert_eq!(
+            object_keys(&document),
+            [
+                "schema_id",
+                "schema_version",
+                "status",
+                "base_feasibility",
+                "observed_coverage",
+                "lut",
+                "metrics",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(document["schema_id"], G0_CPU_EVIDENCE_SCHEMA_ID);
+        assert_eq!(document["schema_version"], G0_CPU_EVIDENCE_SCHEMA_VERSION);
+        assert_eq!(document["status"], "CpuObservationOnlyNotG0HardGateOrTallEvidence");
+        let base = &document["base_feasibility"];
+        assert_eq!(
+            object_keys(base),
+            [
+                "schema_id",
+                "schema_version",
+                "target_id",
+                "plaintext_modulus",
+                "ciphertext_modulus",
+                "accepted",
+                "noise_bound",
+                "threshold_left",
+                "margin",
+                "counters",
+                "n",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            object_keys(&base["counters"]),
+            ["ordinary_baseline", "residual_trace"].into_iter().collect()
+        );
+        assert_eq!(
+            object_keys(&base["counters"]["ordinary_baseline"]),
+            [
+                "occurrences",
+                "samples",
+                "normalization_nodes_processed",
+                "normalization_nodes_total",
+                "normalization_exact_term_count",
+                "normalization_relation_candidates",
+                "normalization_relation_applied",
+                "normalization_relation_remaining",
+                "normalization_bounded_fold_count",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(object_keys(&base["counters"]["residual_trace"]).is_empty());
+        assert_eq!(
+            object_keys(&base["n"]),
+            ["expression_rows", "program_rows", "source_rows", "event_rows", "total_rows"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(object_keys(&document["observed_coverage"]), ["rows"].into_iter().collect());
+        for row in document["observed_coverage"]["rows"].as_array().expect("coverage rows") {
+            assert_eq!(object_keys(row), ["kind", "count", "sites"].into_iter().collect());
+            assert_eq!(object_keys(&row["kind"]), ["domain", "kind"].into_iter().collect());
+            if let Some(nested_kind) = row["kind"]["kind"].as_object() {
+                assert_eq!(nested_kind.len(), 1);
+                assert!(
+                    nested_kind
+                        .keys()
+                        .all(|key| { matches!(key.as_str(), "scalar" | "matrix" | "trapdoor") })
+                );
+            }
+            for site in row["sites"].as_array().expect("coverage sites") {
+                let expected =
+                    if site["site"] == "trace_event" { ["site", "index"] } else { ["site", "row"] };
+                assert_eq!(object_keys(site), expected.into_iter().collect());
+            }
+        }
+        assert_eq!(
+            object_keys(&document["lut"]),
+            ["exact_row_count", "index_use_frontier_products", "slice_group_frontier_products",]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            object_keys(&document["metrics"]),
+            [
+                "descriptor_inventory_canonical_encoded_bytes",
+                "proof_payload_logical_items",
+                "proof_payload_canonical_encoded_bytes",
+                "lut_canonical_encoded_bytes",
+                "recorder_peak_retained_logical_items",
+                "proof_projection_peak_retained_logical_items",
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let run = prepare_operational_certificate(&protocol, &request).expect("comparison run");
+        let closure = &run.projection.closure;
+        let n = exact_retained_n(closure).expect("exact N");
+        assert_eq!(base["n"]["expression_rows"], n.expression_rows);
+        assert_eq!(base["n"]["program_rows"], n.program_rows);
+        assert_eq!(
+            base["n"]["source_rows"],
+            n.source_rows + n.family_source_rows + n.constant_rows
+        );
+        assert_eq!(base["n"]["event_rows"], n.event_rows);
+        assert_eq!(base["n"]["total_rows"], n.total_rows);
+
+        let inventory = super::super::g0::derive_inventory(&run.job, closure, &run.trace)
+            .expect("comparison inventory");
+        assert_eq!(inventory.events.len() as u64, n.event_rows);
+        let inventory_bytes = inventory.encode_canonical().unwrap().len() as u64;
+        let lut = super::super::g0::derive_lut_evidence(&run.job, closure, &run.trace)
+            .expect("comparison LUT");
+        let lut_bytes = lut.encode_canonical().unwrap().len() as u64;
+        let frontier_sum = document["lut"]["index_use_frontier_products"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(document["lut"]["slice_group_frontier_products"].as_array().unwrap())
+            .map(|value| value.as_str().unwrap().parse::<BigUint>().unwrap())
+            .fold(BigUint::ZERO, |sum, value| sum + value);
+        assert_eq!(document["lut"]["exact_row_count"], frontier_sum.to_string());
+        assert_eq!(frontier_sum, lut.l_rows);
+
+        let projection = derive_proof_payload_projection(&run).expect("comparison projection");
+        let payload_t = projection.payload.logical_items().unwrap();
+        let payload_bytes = projection.payload.encode_canonical().unwrap().len() as u64;
+        let retention = run.trace.recorder_retention();
+        let metrics = &document["metrics"];
+        assert_eq!(metrics["descriptor_inventory_canonical_encoded_bytes"], inventory_bytes);
+        assert_eq!(metrics["proof_payload_logical_items"], payload_t);
+        assert_eq!(metrics["proof_payload_canonical_encoded_bytes"], payload_bytes);
+        assert_eq!(metrics["lut_canonical_encoded_bytes"], lut_bytes);
+        assert_eq!(metrics["recorder_peak_retained_logical_items"], retention.peak_logical_items);
+        assert_eq!(
+            metrics["proof_projection_peak_retained_logical_items"],
+            projection.generator_peak_retained_logical_items
+        );
+        assert_eq!(
+            document["observed_coverage"],
+            serde_json::to_value(&projection.observed_coverage).unwrap()
+        );
+
+        let mut all_keys = BTreeSet::new();
+        collect_keys(&document, &mut all_keys);
+        for forbidden in [
+            "l",
+            "l_logical_items",
+            "artifact",
+            "current",
+            "size",
+            "rss",
+            "time",
+            "runtime",
+            "gpu",
+            "benchmark",
+            "estimate",
+            "dispositions",
+            "generation",
+            "acceptance",
+        ] {
+            assert!(!all_keys.contains(forbidden), "forbidden evidence key {forbidden}");
+        }
+        let encoded = std::str::from_utf8(&first).unwrap();
+        for forbidden in ["l_logical_items", "artifact_bytes", "runtime", "benchmark", "estimate"] {
+            assert!(!encoded.contains(forbidden), "forbidden evidence substring {forbidden}");
+        }
     }
 }

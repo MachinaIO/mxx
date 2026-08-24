@@ -33,7 +33,7 @@ pub use simulation::{
     BaseFeasibilitySummary, BaseNBreakdown, OrdinaryBaselineCounters, ProgressEvent,
     ProgressEventKind, ResidualTraceCounters, check_operational_noise_candidate,
     check_operational_noise_candidate_with_progress, prepare_base_feasibility_summary,
-    serialize_base_feasibility_summary,
+    prepare_g0_cpu_evidence_bytes, serialize_base_feasibility_summary,
 };
 
 /// A concrete value supplied for one named protocol parameter.

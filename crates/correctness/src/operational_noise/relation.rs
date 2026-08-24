@@ -22,17 +22,17 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct SamplerSourceContract {
     pub expression: super::arena::ExprId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct TrapdoorSourceContract {
     pub expression: super::arena::ExprId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct UniversalDispatchKey {
     pub preimage_family: FamilyValueId,
     pub preimage_source: SamplerSourceContract,
@@ -330,7 +330,7 @@ pub struct CanonicalRhsId {
     slot: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct RuntimeSpecializationKey {
     pub dispatch: UniversalDispatchKey,
     pub index: ScopedExprId,
@@ -460,7 +460,7 @@ impl NormalizationCache {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FrozenGeneration(u64);
 
 #[derive(Clone, Debug, Eq, PartialEq)]

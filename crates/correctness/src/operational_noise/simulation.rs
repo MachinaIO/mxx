@@ -28,7 +28,7 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -187,12 +187,10 @@ pub(crate) enum ProofPayloadValue {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProofPayloadSpecializationKey {
+pub(crate) struct ProofPayloadUniversalDispatch {
     pub preimage_family: u64,
     pub preimage_source: u64,
-    pub matrix_type: ResolvedMatrixType,
     pub trapdoor_source: u64,
-    pub index: ProofPayloadOwner,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -204,7 +202,7 @@ pub(crate) struct ProofPayloadRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProofPayloadRelationRule {
     Universal {
-        source: ProofPayloadRange,
+        computed: u64,
         lhs: ProofPayloadMonomial,
         lhs_layout: Option<MatrixLayout>,
         rhs_result: u64,
@@ -305,13 +303,11 @@ pub(crate) enum ProofPayloadEvent {
     },
     SpecializationComputed {
         owner: ProofPayloadOwner,
-        key: ProofPayloadSpecializationKey,
+        dispatch: ProofPayloadUniversalDispatch,
         source: ProofPayloadRange,
-        rhs_results: Vec<u64>,
     },
     SpecializationCacheHit {
         owner: ProofPayloadOwner,
-        key: ProofPayloadSpecializationKey,
         source: ProofPayloadRange,
     },
     AppliedRelation {
@@ -348,6 +344,12 @@ pub(crate) struct CertificateClosure {
     pub constant_expressions: BTreeSet<ExprId>,
 }
 
+enum CertificateWork {
+    Expression(ExprId),
+    Program(ValueProgramId),
+    Family(FamilyValueId),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub(crate) enum CertificateClosureError {
     #[error("certificate closure arena reference is invalid: {0}")]
@@ -371,86 +373,86 @@ pub(crate) fn collect_residual_closure(
     job: &super::job::CheckerJob,
     root: &CertificateResidualRoot,
 ) -> Result<CertificateClosure, CertificateClosureError> {
-    enum Work {
-        Expression(ExprId),
-        Program(ValueProgramId),
-        Family(FamilyValueId),
-    }
-
-    let mut expressions = BTreeSet::new();
-    let mut programs = BTreeSet::new();
-    let mut families = BTreeSet::new();
-    let mut source_ids = BTreeSet::new();
-    let mut family_source_ids = BTreeSet::new();
-    let mut event_ids = BTreeSet::new();
-    let mut constant_expressions = BTreeSet::new();
+    let mut closure = CertificateClosure {
+        expressions: BTreeSet::new(),
+        programs: BTreeSet::new(),
+        families: BTreeSet::new(),
+        source_ids: BTreeSet::new(),
+        family_source_ids: BTreeSet::new(),
+        event_ids: BTreeSet::new(),
+        constant_expressions: BTreeSet::new(),
+    };
     let mut work = Vec::new();
     match root {
         CertificateResidualRoot::Closed { root, .. } => {
-            work.push(Work::Expression(root.expression()))
+            work.push(CertificateWork::Expression(root.expression()))
         }
-        CertificateResidualRoot::Family { family, .. } => work.push(Work::Family(*family)),
+        CertificateResidualRoot::Family { family, .. } => {
+            work.push(CertificateWork::Family(*family))
+        }
     }
+    walk_certificate_closure(job, &mut closure, work)?;
+    Ok(closure)
+}
 
+fn walk_certificate_closure(
+    job: &super::job::CheckerJob,
+    closure: &mut CertificateClosure,
+    mut work: Vec<CertificateWork>,
+) -> Result<(), CertificateClosureError> {
     while let Some(item) = work.pop() {
         match item {
-            Work::Expression(expression) => {
-                if !expressions.insert(expression) {
+            CertificateWork::Expression(expression) => {
+                if !closure.expressions.insert(expression) {
                     continue;
                 }
                 let node = job.expressions().node(expression)?;
-                let inputs = node.inputs.clone();
                 match &node.operator {
                     ValueOperator::Constant(_) => {
-                        constant_expressions.insert(expression);
+                        closure.constant_expressions.insert(expression);
                     }
                     ValueOperator::Source(source) => {
-                        source_ids.insert(source.clone());
+                        closure.source_ids.insert(source.clone());
                         if let Some(event) = source.sample_event {
-                            event_ids.insert(event);
+                            closure.event_ids.insert(event);
                         }
                     }
                     ValueOperator::OpaqueFamilyElement { source } => {
-                        family_source_ids.insert(source.clone());
+                        closure.family_source_ids.insert(source.clone());
                     }
                     ValueOperator::Sample { event, .. } | ValueOperator::Sampler { event, .. } => {
-                        event_ids.insert(*event);
+                        closure.event_ids.insert(*event);
                     }
                     ValueOperator::Trapdoor(super::arena::TrapdoorOperation::Generate {
                         paired_public_event,
                         ..
                     }) => {
-                        event_ids.insert(*paired_public_event);
+                        closure.event_ids.insert(*paired_public_event);
                     }
                     _ => {}
                 }
-                let program = match &node.operator {
-                    ValueOperator::ProgramCall { program } => Some(*program),
-                    _ => None,
-                };
-                work.extend(inputs.into_iter().map(Work::Expression));
-                if let Some(program) = program {
-                    work.push(Work::Program(program));
+                work.extend(node.inputs.iter().copied().map(CertificateWork::Expression));
+                if let ValueOperator::ProgramCall { program } = node.operator {
+                    work.push(CertificateWork::Program(program));
                 }
             }
-            Work::Program(program) => {
-                if !programs.insert(program) {
+            CertificateWork::Program(program) => {
+                if !closure.programs.insert(program) {
                     continue;
                 }
                 let record = job.programs().program(program)?;
-                let root = record.root;
+                work.push(CertificateWork::Expression(record.root));
                 if let Some(family) = job.programs().family_for_program(program) {
-                    work.push(Work::Family(family));
+                    work.push(CertificateWork::Family(family));
                 }
-                work.push(Work::Expression(root));
             }
-            Work::Family(family) => {
-                if !families.insert(family) {
+            CertificateWork::Family(family) => {
+                if !closure.families.insert(family) {
                     continue;
                 }
                 let program = family.program();
-                let program_root = job.programs().program(program)?.root;
                 let family_body = job.programs().family_body(family)?;
+                let program_root = job.programs().program(program)?.root;
                 if family_body != program_root {
                     return Err(CertificateClosureError::FamilyProgramMismatch {
                         family,
@@ -459,20 +461,11 @@ pub(crate) fn collect_residual_closure(
                         program_root,
                     });
                 }
-                work.push(Work::Program(program));
+                work.push(CertificateWork::Program(program));
             }
         }
     }
-
-    Ok(CertificateClosure {
-        expressions,
-        programs,
-        families,
-        source_ids,
-        family_source_ids,
-        event_ids,
-        constant_expressions,
-    })
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -515,12 +508,8 @@ pub(crate) fn project_operational_certificate(
 pub(crate) fn derive_proof_payload(
     run: &OperationalCertificateRun,
 ) -> Result<OperationalProofPayload, CertificateProjectionError> {
-    let mut closure = run.projection.closure.clone();
-    extend_certificate_closure(&run.job, &mut closure, &run.trace)
-        .map_err(CertificateProjectionError::Closure)?;
-    let mut residual = run.trace.clone();
-    residual.retain_residual(&closure);
-    let refs = super::g0::canonical_residual_refs(&run.job, &closure, &residual)
+    let closure = &run.projection.closure;
+    let refs = super::g0::canonical_residual_refs(&run.job, closure, &run.trace)
         .map_err(proof_payload_error)?;
     let mut monomial_arenas = BTreeMap::new();
     for scope in closure.programs.iter().copied() {
@@ -528,7 +517,7 @@ pub(crate) fn derive_proof_payload(
             monomial_arenas.insert(arena.token(), arena);
         }
     }
-    for event in &residual.events {
+    for event in &run.trace.events {
         let scope = match event {
             NormalizerEvent::InvocationStart { root } |
             NormalizerEvent::Result { owner: root, .. } |
@@ -543,8 +532,17 @@ pub(crate) fn derive_proof_payload(
             monomial_arenas.insert(arena.token(), arena);
         }
     }
-    let projector = ProofPayloadProjector { refs: &refs, monomial_arenas, trace: &residual };
-    projector.project(&residual)
+    let mut rhs_events = HashMap::new();
+    for (index, event) in run.trace.events.iter().enumerate() {
+        if let NormalizerEvent::SpecializationComputed { key, replay, .. } = event {
+            for (rhs, result) in replay.rhs_results.iter() {
+                rhs_events.insert((key.clone(), *rhs), (index as u64, result.0));
+            }
+        }
+    }
+    let projector =
+        ProofPayloadProjector { job: &run.job, refs: &refs, monomial_arenas, rhs_events };
+    projector.project(&run.trace)
 }
 
 /// Add trace-owned scopes and relation dependencies to the same residual closure before any
@@ -555,11 +553,6 @@ fn extend_certificate_closure(
     closure: &mut CertificateClosure,
     trace: &FeasibilityTrace,
 ) -> Result<(), CertificateClosureError> {
-    enum Work {
-        Expression(ExprId),
-        Program(ValueProgramId),
-        Family(FamilyValueId),
-    }
     let mut work = Vec::new();
     for event in &trace.events {
         match event {
@@ -569,90 +562,41 @@ fn extend_certificate_closure(
             NormalizerEvent::SpecializationComputed { owner: root, .. } |
             NormalizerEvent::SpecializationCacheHit { owner: root, .. } |
             NormalizerEvent::BoundTransfer { owner: root, .. } => {
-                work.push(Work::Program(root.program()));
-                work.push(Work::Expression(root.expression()));
+                work.push(CertificateWork::Program(root.program()));
+                work.push(CertificateWork::Expression(root.expression()));
             }
             NormalizerEvent::Predecessor { consumer, predecessor, .. } => {
-                work.push(Work::Program(consumer.program()));
-                work.push(Work::Expression(consumer.expression()));
-                work.push(Work::Expression(*predecessor));
+                work.push(CertificateWork::Program(consumer.program()));
+                work.push(CertificateWork::Expression(consumer.expression()));
+                work.push(CertificateWork::Expression(*predecessor));
             }
             NormalizerEvent::AppliedRelation(observation) => {
-                work.push(Work::Program(observation.owner.program()));
-                work.push(Work::Expression(observation.owner.expression()));
+                work.push(CertificateWork::Program(observation.owner.program()));
+                work.push(CertificateWork::Expression(observation.owner.expression()));
                 match &observation.rule {
                     AppliedRelationRule::Universal { key, .. } => {
-                        work.push(Work::Family(key.dispatch.preimage_family));
-                        work.push(Work::Expression(key.dispatch.preimage_source.expression));
-                        work.push(Work::Expression(key.dispatch.trapdoor_source.expression));
-                        work.push(Work::Expression(key.index.expression()));
-                        work.push(Work::Program(key.index.program()));
+                        work.push(CertificateWork::Family(key.dispatch.preimage_family));
+                        work.push(CertificateWork::Expression(
+                            key.dispatch.preimage_source.expression,
+                        ));
+                        work.push(CertificateWork::Expression(
+                            key.dispatch.trapdoor_source.expression,
+                        ));
+                        work.push(CertificateWork::Expression(key.index.expression()));
+                        work.push(CertificateWork::Program(key.index.program()));
                     }
                     AppliedRelationRule::Gadget { gadget, decomposition, input, .. } => {
-                        work.push(Work::Program(gadget.program()));
-                        work.push(Work::Program(decomposition.program()));
-                        work.push(Work::Expression(gadget.expression()));
-                        work.push(Work::Expression(decomposition.expression()));
-                        work.push(Work::Expression(*input));
+                        work.push(CertificateWork::Program(gadget.program()));
+                        work.push(CertificateWork::Program(decomposition.program()));
+                        work.push(CertificateWork::Expression(gadget.expression()));
+                        work.push(CertificateWork::Expression(decomposition.expression()));
+                        work.push(CertificateWork::Expression(*input));
                     }
                 }
             }
         }
     }
-    while let Some(item) = work.pop() {
-        match item {
-            Work::Expression(expression) => {
-                if !closure.expressions.insert(expression) {
-                    continue;
-                }
-                let node = job.expressions().node(expression)?;
-                if let ValueOperator::Source(source) = &node.operator {
-                    closure.source_ids.insert(source.clone());
-                    if let Some(event) = source.sample_event {
-                        closure.event_ids.insert(event);
-                    }
-                }
-                if let ValueOperator::OpaqueFamilyElement { source } = &node.operator {
-                    closure.family_source_ids.insert(source.clone());
-                }
-                if let ValueOperator::Constant(_) = &node.operator {
-                    closure.constant_expressions.insert(expression);
-                }
-                work.extend(node.inputs.iter().copied().map(Work::Expression));
-                if let ValueOperator::ProgramCall { program } = node.operator {
-                    work.push(Work::Program(program));
-                }
-            }
-            Work::Program(program) => {
-                if !closure.programs.insert(program) {
-                    continue;
-                }
-                let record = job.programs().program(program)?;
-                work.push(Work::Expression(record.root));
-                if let Some(family) = job.programs().family_for_program(program) {
-                    work.push(Work::Family(family));
-                }
-            }
-            Work::Family(family) => {
-                if !closure.families.insert(family) {
-                    continue;
-                }
-                let program = family.program();
-                let family_body = job.programs().family_body(family)?;
-                let program_root = job.programs().program(program)?.root;
-                if family_body != program_root {
-                    return Err(CertificateClosureError::FamilyProgramMismatch {
-                        family,
-                        program,
-                        family_body,
-                        program_root,
-                    });
-                }
-                work.push(Work::Program(program));
-            }
-        }
-    }
-    Ok(())
+    walk_certificate_closure(job, closure, work)
 }
 
 fn proof_payload_error(error: G0Error) -> CertificateProjectionError {
@@ -660,9 +604,13 @@ fn proof_payload_error(error: G0Error) -> CertificateProjectionError {
 }
 
 struct ProofPayloadProjector<'a> {
+    job: &'a super::job::CheckerJob,
     refs: &'a CanonicalResidualRefs,
     monomial_arenas: BTreeMap<super::arena::ArenaToken, &'a super::monomial::MonomialArena>,
-    trace: &'a FeasibilityTrace,
+    rhs_events: HashMap<
+        (super::relation::RuntimeSpecializationKey, super::relation::CanonicalRhsId),
+        (u64, u64),
+    >,
 }
 
 impl<'a> ProofPayloadProjector<'a> {
@@ -680,9 +628,15 @@ impl<'a> ProofPayloadProjector<'a> {
 
     fn owner(&self, owner: super::arena::ScopedExprId) -> Result<ProofPayloadOwner, G0Error> {
         let expression_row = self.refs.expression(owner.expression())?;
-        let scope = match self.refs.program(owner.program()) {
-            Ok(program_row) => ProofPayloadScope::Program { program_row },
-            Err(_) => ProofPayloadScope::Closed { root_expression_row: expression_row },
+        let program = self
+            .job
+            .programs()
+            .project_program(owner.program())
+            .map_err(|_| G0Error::UnsupportedBoundTransfer)?;
+        let scope = if program.root == owner.expression() && program.signature.inputs.is_empty() {
+            ProofPayloadScope::Closed { root_expression_row: expression_row }
+        } else {
+            ProofPayloadScope::Program { program_row: self.refs.program(owner.program())? }
         };
         Ok(ProofPayloadOwner { scope, expression_row })
     }
@@ -861,10 +815,10 @@ impl<'a> ProofPayloadProjector<'a> {
         current: usize,
     ) -> Result<ProofPayloadRelationRule, G0Error> {
         Ok(match rule {
-            AppliedRelationRule::Universal { key, source, lhs, rhs } => {
-                let rhs_result = self.rhs_event(key, *rhs, current)?;
+            AppliedRelationRule::Universal { key, lhs, rhs, .. } => {
+                let (computed, rhs_result) = self.rhs_event(key, *rhs, current)?;
                 ProofPayloadRelationRule::Universal {
-                    source: self.range(*source, current)?,
+                    computed,
                     lhs: self.monomial(lhs.monomial)?,
                     lhs_layout: lhs.layout.clone(),
                     rhs_result,
@@ -882,16 +836,14 @@ impl<'a> ProofPayloadProjector<'a> {
         })
     }
 
-    fn specialization_key(
+    fn specialization_dispatch(
         &self,
         key: &super::relation::RuntimeSpecializationKey,
-    ) -> Result<ProofPayloadSpecializationKey, G0Error> {
-        Ok(ProofPayloadSpecializationKey {
+    ) -> Result<ProofPayloadUniversalDispatch, G0Error> {
+        Ok(ProofPayloadUniversalDispatch {
             preimage_family: self.refs.family(key.dispatch.preimage_family)?,
             preimage_source: self.refs.expression(key.dispatch.preimage_source.expression)?,
-            matrix_type: key.dispatch.matrix_type.clone(),
             trapdoor_source: self.refs.expression(key.dispatch.trapdoor_source.expression)?,
-            index: self.owner(key.index)?,
         })
     }
 
@@ -900,20 +852,16 @@ impl<'a> ProofPayloadProjector<'a> {
         key: &super::relation::RuntimeSpecializationKey,
         rhs: super::relation::CanonicalRhsId,
         current: usize,
-    ) -> Result<u64, G0Error> {
-        for event in self.trace.events[..current].iter().rev() {
-            if let NormalizerEvent::SpecializationComputed { key: candidate, replay, .. } = event {
-                if candidate == key {
-                    if let Some((_, result)) =
-                        replay.rhs_results.iter().find(|(candidate, _)| *candidate == rhs)
-                    {
-                        self.prior_event(*result, current)?;
-                        return Ok(result.0);
-                    }
-                }
-            }
+    ) -> Result<(u64, u64), G0Error> {
+        let (computed, result) = self
+            .rhs_events
+            .get(&(key.clone(), rhs))
+            .copied()
+            .ok_or(G0Error::RelationTraceInvariant)?;
+        if computed >= current as u64 || result >= current as u64 {
+            return Err(G0Error::RelationTraceInvariant);
         }
-        Err(G0Error::RelationTraceInvariant)
+        Ok((computed, result))
     }
 
     fn event(&self, current: usize, event: &NormalizerEvent) -> Result<ProofPayloadEvent, G0Error> {
@@ -947,22 +895,13 @@ impl<'a> ProofPayloadProjector<'a> {
             NormalizerEvent::SpecializationComputed { owner, key, replay } => {
                 ProofPayloadEvent::SpecializationComputed {
                     owner: self.owner(*owner)?,
-                    key: self.specialization_key(key)?,
+                    dispatch: self.specialization_dispatch(key)?,
                     source: self.range(replay.range, current)?,
-                    rhs_results: replay
-                        .rhs_results
-                        .iter()
-                        .map(|(_, result)| {
-                            self.prior_event(*result, current)?;
-                            Ok(result.0)
-                        })
-                        .collect::<Result<Vec<_>, G0Error>>()?,
                 }
             }
-            NormalizerEvent::SpecializationCacheHit { owner, key, source } => {
+            NormalizerEvent::SpecializationCacheHit { owner, source, .. } => {
                 ProofPayloadEvent::SpecializationCacheHit {
                     owner: self.owner(*owner)?,
-                    key: self.specialization_key(key)?,
                     source: self.range(*source, current)?,
                 }
             }
@@ -1023,15 +962,7 @@ pub(crate) fn prepare_operational_certificate(
             .lower_with_feasibility()
             .map_err(|error| CertificateProjectionError::Lowering { detail: error.to_string() })?;
     let residual = project_residual_root(&job, &roots.residual, &target)?;
-    let closure = collect_residual_closure(&job, &residual)?;
-    trace.retain_residual(&closure);
-    let projection = OperationalCertificateProjection {
-        target_id,
-        plaintext_modulus: plaintext_modulus.clone(),
-        ciphertext_modulus: target.ciphertext_modulus.clone(),
-        residual,
-        closure,
-    };
+    let mut closure = collect_residual_closure(&job, &residual)?;
     let mut job = job;
     let accepted_report = analyze_roots_with_sink(
         &mut job,
@@ -1061,9 +992,8 @@ pub(crate) fn prepare_operational_certificate(
         }
     };
     if accepted_report.target_id != request.target_id ||
-        accepted_report.target_id != projection.target_id ||
-        accepted_report.ciphertext_modulus != projection.ciphertext_modulus ||
-        report_plaintext_modulus != &projection.plaintext_modulus
+        accepted_report.ciphertext_modulus != target.ciphertext_modulus ||
+        report_plaintext_modulus != &plaintext_modulus
     {
         return Err(CertificateProjectionError::ReportMismatch {
             target_id: request.target_id.clone(),
@@ -1072,11 +1002,21 @@ pub(crate) fn prepare_operational_certificate(
                 accepted_report.target_id,
                 report_plaintext_modulus,
                 accepted_report.ciphertext_modulus,
-                projection.plaintext_modulus,
-                projection.ciphertext_modulus,
+                plaintext_modulus,
+                target.ciphertext_modulus,
             ),
         });
     }
+    extend_certificate_closure(&job, &mut closure, &trace)
+        .map_err(CertificateProjectionError::Closure)?;
+    trace.retain_residual(&closure);
+    let projection = OperationalCertificateProjection {
+        target_id,
+        plaintext_modulus,
+        ciphertext_modulus: target.ciphertext_modulus.clone(),
+        residual,
+        closure,
+    };
     if !accepted_report.accepted {
         return Err(CertificateProjectionError::Rejected { target_id: request.target_id.clone() });
     }
@@ -2320,7 +2260,8 @@ mod tests {
         assert_eq!(matrix.modulus, 256_u16.into());
         assert_eq!(matrix.ring_dimension, 1);
         assert!(!projection.closure.expressions.is_empty());
-        assert!(projection.closure.programs.is_empty());
+        // The final closure is extended with trace-owned synthetic scopes after normalization.
+        assert!(!projection.closure.programs.is_empty());
         assert!(projection.closure.families.is_empty());
     }
 
@@ -2339,9 +2280,7 @@ mod tests {
             .expect("equivalent threshold certificate run");
         let second_payload = derive_proof_payload(&second).expect("canonical second payload");
         assert_eq!(payload, second_payload);
-        let mut residual = run.trace.clone();
-        residual.retain_residual(&run.projection.closure);
-        assert_eq!(payload.events.len(), residual.events.len());
+        assert_eq!(payload.events.len(), run.trace.events.len());
         assert!(
             payload
                 .events

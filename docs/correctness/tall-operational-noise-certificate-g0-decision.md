@@ -80,8 +80,7 @@ cd lean
 lake build Mxx.Certificate.OperationalNoise.Fixtures
 ```
 
-Result: PASS. The reported axiom dependencies were limited to `propext` and `Quot.sound`; the
-source scan found no forbidden proof placeholders or custom axiom declarations.
+Result: PASS. The reported axiom dependencies were limited to `propext` and `Quot.sound`.
 
 ## Independent review
 

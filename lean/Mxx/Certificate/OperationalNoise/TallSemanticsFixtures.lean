@@ -263,5 +263,8 @@ theorem canonical_relation_fixture :
 #print axioms generic_value_claim_fixture
 #print axioms statement_domain_fixture
 #print axioms constructive_raw_bound_fixture
+#print axioms TallSemantics.ValueDerived.interprets
+#print axioms source_atom_interprets
+#print axioms sampler_atom_interprets
 
 end Mxx.Certificate.OperationalNoise.TallSemanticsFixtures

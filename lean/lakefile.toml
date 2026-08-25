@@ -9,6 +9,7 @@ defaultTargets = [
   "Mxx.Certificate.OperationalNoise.G2Fixtures",
   "Mxx.Certificate.OperationalNoise.SchemaV1Fixtures",
   "Mxx.Certificate.OperationalNoise.ToyABIFixtures",
+  "Mxx.Certificate.OperationalNoise.TallSecurity0ABIFixtures",
 ]
 
 [[lean_lib]]

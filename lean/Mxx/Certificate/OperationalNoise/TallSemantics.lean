@@ -1506,6 +1506,54 @@ structure Witness (document : TallDocument) (history : EventHistory) (selector :
     RelationApplicationAt document history selector application →
       RelationCongruent modulus history env application
 
+/-! The first semantic ABI only derives the two atomic result shapes that are emitted for
+    source and sampler factors.  The result indices are intentional: constructors cannot choose
+    an arbitrary actual value, term list, summary, or claim. -/
+
+def canonicalSelfTerm (owner : Owner) : Term :=
+  { monomial := { centralFactors := [], orderedFactors := [owner] }
+    coefficient := 1 }
+
+def canonicalSelfClaim (owner : Owner) : ValueClaim Owner :=
+  .exact [canonicalSelfTerm owner |>.toExact] .exactZero
+
+def exactResultAt (history : EventHistory) (resultEvent : Nat) (owner : Owner) : Prop :=
+  ∃ frameStart,
+    history.lookup resultEvent =
+      some ⟨.resultExact owner [canonicalSelfTerm owner] .exactZero, frameStart⟩
+
+inductive ValueDerived (document : TallDocument) (history : EventHistory)
+    (selector : Option Nat) (modulus : Nat)
+    (witness : Witness document history selector modulus)
+    (owner : Owner) (resultEvent : Nat) : Int → ValueClaim Owner → Prop where
+  | sourceAtom (source : SourceRef)
+      (result : exactResultAt history resultEvent owner)
+      (factor : SourceFactorAt document history selector owner resultEvent source) :
+      ValueDerived document history selector modulus witness owner resultEvent
+        (witness.env owner) (canonicalSelfClaim owner)
+  | samplerAtom (event : EventRef)
+      (result : exactResultAt history resultEvent owner)
+      (factor : SamplerFactorAt document history selector owner resultEvent event) :
+      ValueDerived document history selector modulus witness owner resultEvent
+        (witness.env owner) (canonicalSelfClaim owner)
+
+abbrev DerivedResult (document : TallDocument) (history : EventHistory)
+    (selector : Option Nat) (modulus : Nat)
+    (witness : Witness document history selector modulus)
+    (owner : Owner) (resultEvent : Nat) : Prop :=
+  ValueDerived document history selector modulus witness owner resultEvent
+    (witness.env owner) (canonicalSelfClaim owner)
+
+theorem ValueDerived.interprets {document : TallDocument} {history : EventHistory}
+    {selector : Option Nat} {modulus : Nat}
+    {witness : Witness document history selector modulus}
+    {owner : Owner} {resultEvent : Nat}
+    (_ : DerivedResult document history selector modulus witness owner resultEvent) :
+    ValueClaim.Interprets modulus witness.env (witness.env owner) (canonicalSelfClaim owner) := by
+  refine ⟨0, ?_, ?_⟩
+  · simp [evalPolynomial, evalMonomial, canonicalSelfTerm, Term.toExact, Monomial.toKey]
+  · simp [boundInterprets, centeredNorm, centeredCoefficient]
+
 abbrev TallEnv := Env Owner
 
 abbrev TallValueClaim := ValueClaim Owner

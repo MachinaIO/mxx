@@ -1,4 +1,5 @@
 import Mxx.Certificate.OperationalNoise.TallSemantics
+import Mxx.Certificate.OperationalNoise.TallSecurity0ABIFixtures
 
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
@@ -9,6 +10,125 @@ open Mxx.Certificate.OperationalNoise
 open SchemaV1
 open TallSecurity0ABI
 open TallSemantics
+
+def atomType : ValueType := .matrix "257" 1 1 1
+
+def atomContract : RawValueContract :=
+  { signedRange := none
+    coefficientClass := some (.finite "5")
+    canonicalCoefficientExclusiveUpper := none
+    polynomialSupportUpper := none }
+
+def atomSourceIdentity : SourceIdentity :=
+  { definition := "toy-source"
+    sampleEvent := none
+    outputRole := "value"
+    artifact := none
+    valueType := atomType
+    coordinates := []
+    matrixConstant := none }
+
+def sourceAtomOwner : Owner := closedOwner 0
+
+def sourceAtomDocument : TallDocument where
+  schemaId := "mxx-operational-noise-certificate"
+  schemaVersion := 1
+  plaintextModulus := "2"
+  ciphertextModulus := "257"
+  ringDimension := 1
+  expressions := .node 0
+    { descriptor := .source (.direct ⟨0⟩)
+      inputs := emptyExpressionInputs
+      program := none } .empty .empty
+  programs := .empty
+  sources := .node 0 (.direct atomSourceIdentity none (some atomContract)) .empty .empty
+  events := .empty
+  indexUses := .empty
+  sliceGroups := .empty
+  residualRoot := .closed ⟨0⟩
+
+def sourceAtomHistory : EventHistory :=
+  smallHistory #[annotated
+    (.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner] .exactZero) 0]
+
+def samplerAtomOwner : Owner := closedOwner 0
+
+def samplerAtomDocument : TallDocument where
+  schemaId := "mxx-operational-noise-certificate"
+  schemaVersion := 1
+  plaintextModulus := "2"
+  ciphertextModulus := "257"
+  ringDimension := 1
+  expressions := .node 0
+    { descriptor := .event (.sampler ⟨0⟩)
+      inputs := emptyExpressionInputs
+      program := none } .empty .empty
+  programs := .empty
+  sources := .empty
+  events := .node 0 (.sampler fixtureWire (.preimage atomType "5") (some atomContract)) .empty .empty
+  indexUses := .empty
+  sliceGroups := .empty
+  residualRoot := .closed ⟨0⟩
+
+def samplerAtomHistory : EventHistory :=
+  smallHistory #[annotated
+    (.resultExact samplerAtomOwner [canonicalSelfTerm samplerAtomOwner] .exactZero) 0]
+
+theorem source_atom_fixture
+    (witness : Witness sourceAtomDocument sourceAtomHistory none 257) :
+  DerivedResult sourceAtomDocument sourceAtomHistory none 257 witness
+      sourceAtomOwner 0 := by
+  apply ValueDerived.sourceAtom ⟨0⟩
+  · refine ⟨0, ?_⟩
+    rfl
+  · refine ⟨?_, ?_, ?_⟩
+    · refine ⟨⟨.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner] .exactZero, 0⟩,
+        ?_, ?_⟩
+      · rfl
+      · exact ⟨canonicalSelfTerm sourceAtomOwner,
+          by simp [canonicalSelfTerm, termContains, monomialContains]⟩
+    · rfl
+    · refine ⟨⟨.source (.direct ⟨0⟩), emptyExpressionInputs, none⟩,
+        ⟨.direct atomSourceIdentity none (some atomContract), ?_⟩⟩
+      constructor
+      · rfl
+      constructor
+      · rfl
+      · rfl
+
+theorem source_atom_interprets
+    (witness : Witness sourceAtomDocument sourceAtomHistory none 257) :
+    ValueClaim.Interprets 257 witness.env (witness.env sourceAtomOwner)
+      (canonicalSelfClaim sourceAtomOwner) := by
+  exact ValueDerived.interprets (source_atom_fixture witness)
+
+theorem sampler_atom_fixture
+    (witness : Witness samplerAtomDocument samplerAtomHistory none 257) :
+  DerivedResult samplerAtomDocument samplerAtomHistory none 257 witness
+      samplerAtomOwner 0 := by
+  apply ValueDerived.samplerAtom ⟨0⟩
+  · refine ⟨0, ?_⟩
+    rfl
+  · refine ⟨?_, ?_, ?_⟩
+    · refine ⟨⟨.resultExact samplerAtomOwner [canonicalSelfTerm samplerAtomOwner] .exactZero, 0⟩,
+        ?_, ?_⟩
+      · rfl
+      · exact ⟨canonicalSelfTerm samplerAtomOwner,
+          by simp [canonicalSelfTerm, termContains, monomialContains]⟩
+    · rfl
+    · refine ⟨⟨.event (.sampler ⟨0⟩), emptyExpressionInputs, none⟩,
+        ⟨EventRow.sampler fixtureWire (.preimage atomType "5") (some atomContract), ?_⟩⟩
+      constructor
+      · rfl
+      constructor
+      · exact List.mem_cons_self
+      · rfl
+
+theorem sampler_atom_interprets
+    (witness : Witness samplerAtomDocument samplerAtomHistory none 257) :
+    ValueClaim.Interprets 257 witness.env (witness.env samplerAtomOwner)
+      (canonicalSelfClaim samplerAtomOwner) := by
+  exact ValueDerived.interprets (sampler_atom_fixture witness)
 
 def factorA : Owner := ⟨.program ⟨0⟩, ⟨10⟩⟩
 def factorB : Owner := ⟨.program ⟨0⟩, ⟨11⟩⟩

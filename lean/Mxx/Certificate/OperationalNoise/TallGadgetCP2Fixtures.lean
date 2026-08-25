@@ -278,6 +278,63 @@ def frameRelationTerms : List Term :=
   | some ⟨.resultExact _ terms _, _⟩ => terms
   | _ => []
 
+def frameBaseTerms : List Term :=
+  match frameLookup relationBaseResult with
+  | some ⟨.resultExact _ terms _, _⟩ => terms
+  | _ => []
+
+def frameTransferTerms : List Term :=
+  match frameLookup relationTransferResult with
+  | some ⟨.resultExact _ terms _, _⟩ => terms
+  | _ => []
+
+def frameRelationOwner : Owner :=
+  match frameLookup relationEvent with
+  | some ⟨.appliedRelation owner _ _ _ _ _, _⟩ => owner
+  | _ => p214 0
+
+def frameRelationSource : Monomial :=
+  match frameLookup relationEvent with
+  | some ⟨.appliedRelation _ source _ _ _ _, _⟩ => source
+  | _ => { centralFactors := [], orderedFactors := [] }
+
+def frameRelationOuter : Int :=
+  match frameLookup relationEvent with
+  | some ⟨.appliedRelation _ _ outer _ _ _, _⟩ => outer
+  | _ => 0
+
+def frameRelationStart : Nat :=
+  match frameLookup relationEvent with
+  | some ⟨.appliedRelation _ _ _ start _ _, _⟩ => start
+  | _ => 0
+
+def frameRelationEnd : Nat :=
+  match frameLookup relationEvent with
+  | some ⟨.appliedRelation _ _ _ _ finish _, _⟩ => finish
+  | _ => 0
+
+def frameRelationGadget : Owner :=
+  match frameLookup relationEvent with
+  | some ⟨.appliedRelation _ _ _ _ _ (.gadget gadget _ _ _), _⟩ => gadget
+  | _ => p214 0
+
+def frameRelationDecomposition : Owner :=
+  match frameLookup relationEvent with
+  | some ⟨.appliedRelation _ _ _ _ _ (.gadget _ decomposition _ _), _⟩ => decomposition
+  | _ => p214 0
+
+def frameRelationInput : Nat :=
+  match frameLookup relationEvent with
+  | some ⟨.appliedRelation _ _ _ _ _ (.gadget _ _ input _), _⟩ => input.row
+  | _ => 0
+
+def frameRelationInputResult : Nat :=
+  match frameLookup relationEvent with
+  | some ⟨.appliedRelation _ _ _ _ _ (.gadget _ _ _ inputResult), _⟩ => inputResult
+  | _ => 0
+
+def frameRelationSourceKey : MonomialKey Owner := frameRelationSource.toKey
+
 def frameRootTerms : List Term :=
   match frameLookup rootResult with
   | some ⟨.resultExact _ terms _, _⟩ => terms
@@ -304,6 +361,10 @@ def frameEndSummary : Bound :=
   | _ => .missing
 
 theorem frameRecords_source_faithful :
+    frameLookup relationBaseResult =
+        some ⟨.resultExact (p214 13465) baseResultTerms .exactZero, frameStart⟩ ∧
+      frameLookup relationTransferResult =
+        some ⟨.resultExact (p214 25778) transferResultTerms .exactZero, frameStart⟩ ∧
     frameLookup relationEvent =
         some ⟨.appliedRelation relationOwner sourceMonomial (-1) 0 2
           (.gadget relationGadget relationDecomposition ⟨23424⟩ relationInputResult),
@@ -417,7 +478,16 @@ theorem frame_relation_product_prefold_end (env : Env Owner)
         (evalPolynomial env baseResult * evalPolynomial env transferResult))
       (.exact finalResult .exactZero) := by
   rcases frameRecords_source_faithful with
-    ⟨relationLookup, relationResultLookup, rootLookup, preFoldLookup, endLookup⟩
+    ⟨baseLookup, transferLookup, relationLookup, relationResultLookup, rootLookup,
+      preFoldLookup, endLookup⟩
+  have baseTermsExact : termPolynomial frameBaseTerms = baseResult := by
+    dsimp [frameBaseTerms]
+    rw [baseLookup]
+    rfl
+  have transferTermsExact : termPolynomial frameTransferTerms = transferResult := by
+    dsimp [frameTransferTerms]
+    rw [transferLookup]
+    rfl
   have relationTermsExact : termPolynomial frameRelationTerms = relationOutput := by
     dsimp [frameRelationTerms]
     rw [relationResultLookup]
@@ -440,11 +510,76 @@ theorem frame_relation_product_prefold_end (env : Env Owner)
   have endSummaryExact : frameEndSummary = .exactZero := by
     dsimp [frameEndSummary]
     rw [endLookup]
+  have extractedProductAgreement :
+      CoefficientAgreement productResult
+        (productPoly (termPolynomial frameBaseTerms)
+          (termPolynomial frameTransferTerms) false false) := by
+    rw [baseTermsExact, transferTermsExact]
+    intro term h
+    rfl
+  have productSoundExtracted :
+      evalPolynomial env productResult =
+        evalPolynomial env (termPolynomial frameBaseTerms) *
+          evalPolynomial env (termPolynomial frameTransferTerms) := by
+    exact productResultSound env (termPolynomial frameBaseTerms)
+      (termPolynomial frameTransferTerms) productResult false false
+      extractedProductAgreement
+  have productSound :
+      evalPolynomial env productResult =
+        evalPolynomial env baseResult * evalPolynomial env transferResult := by
+    rw [baseTermsExact, transferTermsExact] at productSoundExtracted
+    exact productSoundExtracted
+  have relationOwnerExact : frameRelationOwner = relationOwner := by
+    dsimp [frameRelationOwner]
+    rw [relationLookup]
+  have relationSourceExact : frameRelationSourceKey = sourceKey := by
+    dsimp [frameRelationSourceKey, frameRelationSource]
+    rw [relationLookup]
+    rfl
+  have relationOuterExact : frameRelationOuter = -1 := by
+    dsimp [frameRelationOuter]
+    rw [relationLookup]
+  have relationStartExact : frameRelationStart = 0 := by
+    dsimp [frameRelationStart]
+    rw [relationLookup]
+  have relationEndExact : frameRelationEnd = 2 := by
+    dsimp [frameRelationEnd]
+    rw [relationLookup]
+  have relationGadgetExact : frameRelationGadget = relationGadget := by
+    dsimp [frameRelationGadget]
+    rw [relationLookup]
+  have relationDecompositionExact :
+      frameRelationDecomposition = relationDecomposition := by
+    dsimp [frameRelationDecomposition]
+    rw [relationLookup]
+  have relationInputExact : frameRelationInput = 23424 := by
+    dsimp [frameRelationInput]
+    rw [relationLookup]
+  have relationInputResultExact : frameRelationInputResult = relationInputResult := by
+    dsimp [frameRelationInputResult]
+    rw [relationLookup]
+  have extractedSourceContext :
+      KeyEquivalent frameRelationSourceKey
+        ((relationContext frameRelationSourceKey frameRelationSourceKey.centralFactors
+          frameRelationStart frameRelationEnd).plug lhsKey) := by
+    rw [relationSourceExact, relationStartExact, relationEndExact]
+    exact relation_source_context
+  have extractedRelationAgreement :
+      CoefficientAgreement (termPolynomial frameRelationTerms)
+        (relationPoly productResult frameRelationSourceKey
+          (relationContext frameRelationSourceKey frameRelationSourceKey.centralFactors
+            frameRelationStart frameRelationEnd)
+          frameRelationOuter relationRhs) := by
+    rw [relationTermsExact, relationSourceExact, relationStartExact, relationEndExact,
+      relationOuterExact]
+    exact relation_agreement
   have preFoldToRoot : termPolynomial framePreFoldTerms = termPolynomial frameRootTerms :=
     preFoldTermsExact.trans rootTermsExact.symm
-  have productSound := product_result_sound env
   rw [← productSound]
-  have relationSoundRaw := relation_result_sound env baseRelation
+  have relationSoundRaw := relationResultSound 257 env productResult frameRelationSourceKey lhsKey
+    frameRelationSourceKey.centralFactors frameRelationStart frameRelationEnd frameRelationOuter
+    relationRhs (termPolynomial frameRelationTerms) extractedSourceContext baseRelation
+    extractedRelationAgreement
   have relationSound :
       evalPolynomial env (termPolynomial frameRelationTerms) % 257 =
         evalPolynomial env productResult % 257 := by

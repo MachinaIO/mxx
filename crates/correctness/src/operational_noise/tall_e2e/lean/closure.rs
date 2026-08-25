@@ -729,12 +729,16 @@ mod tests {
     }
 
     fn exact() -> ProofPayloadValue {
+        let summary = BoundedSummary::zero();
         ProofPayloadValue::Exact {
             terms: vec![ProofPayloadTerm {
                 monomial: ProofPayloadMonomial { central_factors: vec![], ordered_factors: vec![] },
                 coefficient: BigInt::from(1),
             }],
-            summary: BoundedSummary::zero(),
+            coefficient_bound: summary.coefficient_bound(),
+            coefficient_producer: 0,
+            summary,
+            summary_producer: None,
         }
     }
 

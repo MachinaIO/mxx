@@ -412,7 +412,7 @@ pub(crate) fn measure_owner_claims(
 
 fn claim_key(value: &ProofPayloadValue) -> ClaimKey {
     match value {
-        ProofPayloadValue::Exact { terms, summary } => {
+        ProofPayloadValue::Exact { terms, summary, .. } => {
             ClaimKey::Exact { coefficients: normalize_terms(terms), summary: summary_key(summary) }
         }
         ProofPayloadValue::Coefficient { bound } => ClaimKey::Coefficient(match bound {
@@ -576,6 +576,20 @@ mod tests {
         BoundedSummary::finite(crate::operational_noise::facts::BoundExpression::new(4_u8.into()))
     }
 
+    fn test_exact(terms: Vec<ProofPayloadTerm>, summary: BoundedSummary) -> ProofPayloadValue {
+        let coefficient_bound = summary.coefficient_bound();
+        let summary_producer =
+            (!matches!(coefficient_bound, NumericContract::Known(CoefficientBound::ExactZero)))
+                .then_some(0);
+        ProofPayloadValue::Exact {
+            terms,
+            coefficient_bound,
+            coefficient_producer: 0,
+            summary,
+            summary_producer,
+        }
+    }
+
     #[test]
     fn owner_claim_statistics_normalize_terms_and_classify_fold_shapes() {
         let root = owner(0);
@@ -595,17 +609,11 @@ mod tests {
                 },
                 ProofPayloadEvent::Result {
                     owner: value_owner,
-                    value: ProofPayloadValue::Exact {
-                        terms: vec![term(9, 1)],
-                        summary: zero.clone(),
-                    },
+                    value: test_exact(vec![term(9, 1)], zero.clone()),
                 },
                 ProofPayloadEvent::Result {
                     owner: value_owner,
-                    value: ProofPayloadValue::Exact {
-                        terms: vec![term(9, 2), term(9, -1)],
-                        summary: zero.clone(),
-                    },
+                    value: test_exact(vec![term(9, 2), term(9, -1)], zero.clone()),
                 },
                 ProofPayloadEvent::BoundTransfer {
                     owner: value_owner,
@@ -620,7 +628,7 @@ mod tests {
                 }),
                 ProofPayloadEvent::Result {
                     owner: value_owner,
-                    value: ProofPayloadValue::Exact { terms: vec![], summary: finite.clone() },
+                    value: test_exact(vec![], finite.clone()),
                 },
                 ProofPayloadEvent::CoefficientMerge(ProofPayloadCoefficientMerge {
                     owner: value_owner,
@@ -659,7 +667,7 @@ mod tests {
                 }),
                 ProofPayloadEvent::InvocationEnd {
                     root,
-                    result: ProofPayloadValue::Exact { terms: vec![term(14, 1)], summary: finite },
+                    result: test_exact(vec![term(14, 1)], finite),
                     pre_fold_event: 9,
                 },
             ],
@@ -718,10 +726,7 @@ mod tests {
                 },
                 ProofPayloadEvent::Result {
                     owner: exact_owner,
-                    value: ProofPayloadValue::Exact {
-                        terms: vec![term(9, 1)],
-                        summary: finite.clone(),
-                    },
+                    value: test_exact(vec![term(9, 1)], finite.clone()),
                 },
                 ProofPayloadEvent::PreFoldPolynomial(ProofPayloadPreFoldPolynomial {
                     result_event: 2,
@@ -731,7 +736,7 @@ mod tests {
                 }),
                 ProofPayloadEvent::InvocationEnd {
                     root,
-                    result: ProofPayloadValue::Exact { terms: vec![], summary: finite },
+                    result: test_exact(vec![], finite),
                     pre_fold_event: 3,
                 },
             ],
@@ -757,11 +762,11 @@ mod tests {
                 ProofPayloadEvent::InvocationStart { root },
                 ProofPayloadEvent::Result {
                     owner: value_owner,
-                    value: ProofPayloadValue::Exact { terms: vec![term(9, 1)], summary: zero },
+                    value: test_exact(vec![term(9, 1)], zero),
                 },
                 ProofPayloadEvent::Result {
                     owner: value_owner,
-                    value: ProofPayloadValue::Exact { terms: vec![], summary: finite.clone() },
+                    value: test_exact(vec![], finite.clone()),
                 },
                 ProofPayloadEvent::PreFoldPolynomial(ProofPayloadPreFoldPolynomial {
                     result_event: 2,
@@ -771,7 +776,7 @@ mod tests {
                 }),
                 ProofPayloadEvent::InvocationEnd {
                     root,
-                    result: ProofPayloadValue::Exact { terms: vec![], summary: finite },
+                    result: test_exact(vec![], finite),
                     pre_fold_event: 3,
                 },
             ],
@@ -793,17 +798,11 @@ mod tests {
                 ProofPayloadEvent::InvocationStart { root },
                 ProofPayloadEvent::Result {
                     owner: value_owner,
-                    value: ProofPayloadValue::Exact {
-                        terms: vec![term(9, 1)],
-                        summary: zero.clone(),
-                    },
+                    value: test_exact(vec![term(9, 1)], zero.clone()),
                 },
                 ProofPayloadEvent::Result {
                     owner: value_owner,
-                    value: ProofPayloadValue::Exact {
-                        terms: vec![term(9, 2)],
-                        summary: zero.clone(),
-                    },
+                    value: test_exact(vec![term(9, 2)], zero.clone()),
                 },
                 ProofPayloadEvent::PreFoldPolynomial(ProofPayloadPreFoldPolynomial {
                     result_event: 2,
@@ -813,7 +812,7 @@ mod tests {
                 }),
                 ProofPayloadEvent::InvocationEnd {
                     root,
-                    result: ProofPayloadValue::Exact { terms: vec![], summary: zero },
+                    result: test_exact(vec![], zero),
                     pre_fold_event: 3,
                 },
             ],
@@ -838,7 +837,7 @@ mod tests {
                 ProofPayloadEvent::InvocationStart { root },
                 ProofPayloadEvent::Result {
                     owner: value_owner,
-                    value: ProofPayloadValue::Exact { terms: vec![term(9, 1)], summary: zero },
+                    value: test_exact(vec![term(9, 1)], zero),
                 },
                 ProofPayloadEvent::BoundTransfer {
                     owner: value_owner,
@@ -853,7 +852,7 @@ mod tests {
                 }),
                 ProofPayloadEvent::Result {
                     owner: value_owner,
-                    value: ProofPayloadValue::Exact { terms: vec![], summary: finite.clone() },
+                    value: test_exact(vec![], finite.clone()),
                 },
                 ProofPayloadEvent::PreFoldPolynomial(ProofPayloadPreFoldPolynomial {
                     result_event: 4,
@@ -863,7 +862,7 @@ mod tests {
                 }),
                 ProofPayloadEvent::InvocationEnd {
                     root,
-                    result: ProofPayloadValue::Exact { terms: vec![], summary: finite },
+                    result: test_exact(vec![], finite),
                     pre_fold_event: 5,
                 },
             ],

@@ -446,7 +446,7 @@ fn audit_summary(summary: &super::normal_form::BoundedSummary) -> ToyAuditBound 
 
 fn audit_value(value: &ProofPayloadValue) -> ToyAuditValue {
     match value {
-        ProofPayloadValue::Exact { terms, summary } => ToyAuditValue::Exact {
+        ProofPayloadValue::Exact { terms, summary, .. } => ToyAuditValue::Exact {
             terms: terms.iter().map(audit_term).collect(),
             summary: audit_summary(summary),
         },

@@ -10,6 +10,7 @@ use super::{
         ResolvedMatrixType, ResolvedValueType, ScalarOperation, TrapdoorOperation, ValueOperator,
         ValueTransformOperation,
     },
+    bound::{BoundClass, MatrixBound, product_bound_with_facts, tensor_bound_with_facts},
     error::{OperationalSimulationError, TargetError},
     g0::{
         AppliedRelationRule, BoundAuthority, BoundProjection, BoundRule, BoundScale, BoundValueRef,
@@ -236,8 +237,16 @@ pub(crate) struct ProofPayloadTerm {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProofPayloadValue {
-    Exact { terms: Vec<ProofPayloadTerm>, summary: super::normal_form::BoundedSummary },
-    Coefficient { bound: super::facts::NumericContract<super::facts::CoefficientBound> },
+    Exact {
+        terms: Vec<ProofPayloadTerm>,
+        coefficient_bound: super::facts::NumericContract<super::facts::CoefficientBound>,
+        coefficient_producer: u64,
+        summary: super::normal_form::BoundedSummary,
+        summary_producer: Option<u64>,
+    },
+    Coefficient {
+        bound: super::facts::NumericContract<super::facts::CoefficientBound>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1000,9 +1009,22 @@ impl LogicalItems for ProofPayloadTerm {
 impl LogicalItems for ProofPayloadValue {
     fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
         match self {
-            Self::Exact { terms, summary } => {
-                checked_add(1, checked_sum([terms.logical_items(), summary.logical_items()])?)
-            }
+            Self::Exact {
+                terms,
+                coefficient_bound,
+                coefficient_producer,
+                summary,
+                summary_producer,
+            } => checked_add(
+                1,
+                checked_sum([
+                    terms.logical_items(),
+                    coefficient_bound.logical_items(),
+                    coefficient_producer.logical_items(),
+                    summary.logical_items(),
+                    summary_producer.logical_items(),
+                ])?,
+            ),
             Self::Coefficient { bound } => checked_add(1, bound.logical_items()?),
         }
     }
@@ -1401,10 +1423,22 @@ impl CanonicalPayloadWriter {
 
     fn value(&mut self, value: &ProofPayloadValue) -> Result<(), CanonicalPayloadError> {
         match value {
-            ProofPayloadValue::Exact { terms, summary } => {
+            ProofPayloadValue::Exact {
+                terms,
+                coefficient_bound,
+                coefficient_producer,
+                summary,
+                summary_producer,
+            } => {
                 self.u8(0);
                 self.vec(terms, |writer, term| writer.term(term))?;
-                self.summary(summary)
+                self.numeric_contract(coefficient_bound)?;
+                self.u64(*coefficient_producer);
+                self.summary(summary)?;
+                self.option(summary_producer, |writer, event| {
+                    writer.u64(*event);
+                    Ok(())
+                })
             }
             ProofPayloadValue::Coefficient { bound } => {
                 self.u8(1);
@@ -2923,6 +2957,7 @@ struct ProofPayloadProjector<'a> {
 
 struct ProofProjectionFrame {
     root: super::arena::ScopedExprId,
+    start: usize,
     predecessor_bindings: HashMap<(super::arena::ScopedExprId, u32), u64>,
     last_exact_result: Option<u64>,
     last_pre_fold: Option<u64>,
@@ -2936,6 +2971,99 @@ fn active_predecessor_binding(
     frames
         .last()
         .and_then(|frame| frame.predecessor_bindings.get(&(owner, input_position)).copied())
+}
+
+fn reached_exact_coefficient_root(rule: &BoundRule) -> bool {
+    match rule {
+        BoundRule::Sum { inputs } => {
+            !inputs.is_empty() &&
+                inputs.iter().all(|input| {
+                    matches!(
+                        input,
+                        BoundValueRef::Predecessor { projection: BoundProjection::Coefficient, .. }
+                    )
+                })
+        }
+        BoundRule::Product { left, right, .. } => [left, right].into_iter().all(|input| {
+            matches!(
+                input,
+                BoundValueRef::Predecessor { projection: BoundProjection::Coefficient, .. }
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn select_reached_exact_producers(
+    candidates: &[(usize, &BoundRule)],
+    summary: &super::facts::NumericContract<super::facts::CoefficientBound>,
+) -> Result<(usize, Option<usize>), G0Error> {
+    match summary {
+        super::facts::NumericContract::Known(super::facts::CoefficientBound::ExactZero) => {
+            let [(producer, _)] = candidates else {
+                return Err(G0Error::UnsupportedBoundTransfer);
+            };
+            Ok((*producer, None))
+        }
+        super::facts::NumericContract::Known(super::facts::CoefficientBound::Finite(_)) => {
+            if let [(producer, rule)] = candidates {
+                if reached_exact_coefficient_root(rule) {
+                    return Ok((*producer, None));
+                }
+            }
+            let roots = candidates
+                .iter()
+                .filter(|(_, rule)| reached_exact_coefficient_root(rule))
+                .collect::<Vec<_>>();
+            let [root] = roots.as_slice() else {
+                return Err(G0Error::UnsupportedBoundTransfer);
+            };
+            let Some((first, _)) = candidates.first() else {
+                return Err(G0Error::UnsupportedBoundTransfer);
+            };
+            let Some((last, _)) = candidates.last() else {
+                return Err(G0Error::UnsupportedBoundTransfer);
+            };
+            if root.0 != *first {
+                return Err(G0Error::UnsupportedBoundTransfer);
+            }
+            Ok((*first, Some(*last)))
+        }
+        _ => Err(G0Error::UnsupportedBoundTransfer),
+    }
+}
+
+fn coefficient_bound_is_within(
+    recorded: &super::facts::NumericContract<super::facts::CoefficientBound>,
+    replayed: &super::facts::NumericContract<super::facts::CoefficientBound>,
+) -> bool {
+    use super::facts::{CoefficientBound, NumericContract};
+    match (recorded, replayed) {
+        (NumericContract::Known(CoefficientBound::ExactZero), NumericContract::Known(_)) |
+        (
+            NumericContract::Known(CoefficientBound::Finite(_)),
+            NumericContract::Known(CoefficientBound::Large),
+        ) |
+        (
+            NumericContract::Known(CoefficientBound::Large),
+            NumericContract::Known(CoefficientBound::Large),
+        ) => true,
+        (
+            NumericContract::Known(CoefficientBound::Finite(recorded)),
+            NumericContract::Known(CoefficientBound::Finite(replayed)),
+        ) => recorded.maximum_absolute_coefficient <= replayed.maximum_absolute_coefficient,
+        _ => false,
+    }
+}
+
+fn reached_deferred_finite_summary_allowed(
+    replayed_coefficient: &super::facts::NumericContract<super::facts::CoefficientBound>,
+    has_owner_merge: bool,
+) -> bool {
+    matches!(
+        replayed_coefficient,
+        super::facts::NumericContract::Known(super::facts::CoefficientBound::Large)
+    ) && has_owner_merge
 }
 
 impl<'a> ProofPayloadProjector<'a> {
@@ -3024,6 +3152,7 @@ impl<'a> ProofPayloadProjector<'a> {
                 NormalizerEvent::InvocationStart { root } => {
                     self.frames.push(ProofProjectionFrame {
                         root: *root,
+                        start: index,
                         predecessor_bindings: HashMap::new(),
                         last_exact_result: None,
                         last_pre_fold: None,
@@ -3175,14 +3304,343 @@ impl<'a> ProofPayloadProjector<'a> {
         })
     }
 
-    fn value(&self, value: &super::g0::RecordedValue) -> Result<ProofPayloadValue, G0Error> {
-        let Some(normal_form) = &value.exact_nf else {
-            return Ok(ProofPayloadValue::Coefficient { bound: value.coefficient_bound.clone() });
+    fn recorded_value_bound(
+        value: &super::g0::RecordedValue,
+        projection: &BoundProjection,
+    ) -> Result<super::facts::NumericContract<super::facts::CoefficientBound>, G0Error> {
+        match projection {
+            BoundProjection::Coefficient => Ok(value.coefficient_bound.clone()),
+            BoundProjection::Summary => value
+                .exact_nf
+                .as_ref()
+                .map(|normal_form| normal_form.bounded_summary.coefficient_bound())
+                .ok_or(G0Error::UnsupportedBoundTransfer),
+        }
+    }
+
+    fn recorded_reference_bound(
+        &self,
+        trace: &FeasibilityTrace,
+        current: usize,
+        owner: super::arena::ScopedExprId,
+        reference: &BoundValueRef,
+        visiting: &mut BTreeSet<u64>,
+    ) -> Result<super::facts::NumericContract<super::facts::CoefficientBound>, G0Error> {
+        let value_at = |event: super::g0::EventIndex, projection: &BoundProjection| {
+            let value = match trace.events.get(event.0 as usize) {
+                Some(NormalizerEvent::Result { value, .. }) |
+                Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
+                _ => return Err(G0Error::UnsupportedBoundTransfer),
+            };
+            Self::recorded_value_bound(value, projection)
         };
+        match reference {
+            BoundValueRef::Predecessor { input_position, projection } => {
+                let frame = self.frames.last().ok_or(G0Error::UnsupportedBoundTransfer)?;
+                let (binding_event, source_result) = trace.events[frame.start..current]
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(offset, event)| match event {
+                        NormalizerEvent::Predecessor {
+                            consumer,
+                            input_position: position,
+                            source_result,
+                            ..
+                        } if *consumer == owner && position == input_position => {
+                            Some((frame.start + offset, *source_result))
+                        }
+                        _ => None,
+                    })
+                    .ok_or(G0Error::UnsupportedBoundTransfer)?;
+                if source_result.0 as usize >= binding_event {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                value_at(source_result, projection)
+            }
+            BoundValueRef::Result { event, projection } => {
+                if event.0 as usize >= current {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                value_at(*event, projection)
+            }
+            BoundValueRef::Transfer(event) => {
+                self.replay_transfer_bound(trace, *event, owner, visiting)
+            }
+        }
+    }
+
+    fn replay_matrix_transfer(
+        &self,
+        owner: super::arena::ScopedExprId,
+        left: super::facts::NumericContract<super::facts::CoefficientBound>,
+        right: super::facts::NumericContract<super::facts::CoefficientBound>,
+        facts: &super::bound::MatrixProductFacts,
+        tensor: bool,
+    ) -> Result<super::facts::NumericContract<super::facts::CoefficientBound>, G0Error> {
+        let (
+            super::facts::NumericContract::Known(left_bound),
+            super::facts::NumericContract::Known(right_bound),
+        ) = (left, right)
+        else {
+            return Ok(super::facts::NumericContract::Missing);
+        };
+        let node = self.job.expressions().node(owner.expression())?;
+        let [left_expression, right_expression] = node.inputs.as_ref() else {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        };
+        let ResolvedValueType::Matrix(left_type) =
+            self.job.expressions().value_type(*left_expression)?
+        else {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        };
+        let ResolvedValueType::Matrix(right_type) =
+            self.job.expressions().value_type(*right_expression)?
+        else {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        };
+        let matrix_bound =
+            |matrix: &ResolvedMatrixType, bound: &super::facts::CoefficientBound| MatrixBound {
+                matrix_type: mxx_ir_core::types::ConcreteMatrixType {
+                    modulus: matrix.modulus.clone().into(),
+                    ring_dimension: matrix.ring_dimension,
+                    rows: matrix.rows,
+                    columns: matrix.columns,
+                },
+                coefficient_class: match bound {
+                    super::facts::CoefficientBound::ExactZero => BoundClass::ExactZero,
+                    super::facts::CoefficientBound::Finite(value) => {
+                        BoundClass::bounded(value.maximum_absolute_coefficient.clone())
+                    }
+                    super::facts::CoefficientBound::Large => BoundClass::Large,
+                },
+            };
+        let left = matrix_bound(left_type, &left_bound);
+        let right = matrix_bound(right_type, &right_bound);
+        let output = if tensor {
+            tensor_bound_with_facts(&left, &right, facts)
+        } else {
+            product_bound_with_facts(&left, &right, facts)
+        }
+        .map_err(|_| G0Error::UnsupportedBoundTransfer)?;
+        Ok(super::facts::NumericContract::Known(match output.coefficient_class {
+            BoundClass::ExactZero => super::facts::CoefficientBound::ExactZero,
+            BoundClass::Bounded { maximum_absolute_coefficient } => {
+                super::facts::CoefficientBound::finite(maximum_absolute_coefficient)
+            }
+            BoundClass::Large => super::facts::CoefficientBound::Large,
+        }))
+    }
+
+    fn replay_transfer_bound(
+        &self,
+        trace: &FeasibilityTrace,
+        event: super::g0::EventIndex,
+        owner: super::arena::ScopedExprId,
+        visiting: &mut BTreeSet<u64>,
+    ) -> Result<super::facts::NumericContract<super::facts::CoefficientBound>, G0Error> {
+        if !visiting.insert(event.0) {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        }
+        let Some(NormalizerEvent::BoundTransfer { owner: actual_owner, rule }) =
+            trace.events.get(event.0 as usize)
+        else {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        };
+        if *actual_owner != owner {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        }
+        let reference = |value: &BoundValueRef, visiting: &mut BTreeSet<u64>| {
+            self.recorded_reference_bound(trace, event.0 as usize, owner, value, visiting)
+        };
+        let output = match rule {
+            BoundRule::Authority(_) => return Err(G0Error::UnsupportedBoundTransfer),
+            BoundRule::Identity { input } => reference(input, visiting)?,
+            BoundRule::Sum { inputs } => super::facts::add_bounds(
+                &inputs
+                    .iter()
+                    .map(|input| reference(input, visiting))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            BoundRule::Scale { value, scale } => {
+                let value = reference(value, visiting)?;
+                match scale {
+                    BoundScale::Magnitude(magnitude) => {
+                        super::facts::product_bounds_with_factor(&[value], magnitude)
+                    }
+                    BoundScale::Value(scale) => {
+                        super::facts::product_bounds(&[value, reference(scale, visiting)?])
+                    }
+                }
+            }
+            BoundRule::MonomialProduct { factors, .. } => super::facts::product_bounds(
+                &factors.iter().map(|factor| reference(&factor.bound, visiting)).collect::<Result<
+                    Vec<_>,
+                    _,
+                >>(
+                )?,
+            ),
+            BoundRule::Product { left, right, facts } => self.replay_matrix_transfer(
+                owner,
+                reference(left, visiting)?,
+                reference(right, visiting)?,
+                facts,
+                false,
+            )?,
+            BoundRule::Tensor {
+                left,
+                right,
+                left_is_constant_polynomial,
+                right_is_constant_polynomial,
+            } => self.replay_matrix_transfer(
+                owner,
+                reference(left, visiting)?,
+                reference(right, visiting)?,
+                &super::bound::MatrixProductFacts {
+                    left_is_constant_polynomial: *left_is_constant_polynomial,
+                    right_is_constant_polynomial: *right_is_constant_polynomial,
+                    ..Default::default()
+                },
+                true,
+            )?,
+            BoundRule::Maximum { .. } | BoundRule::WeightedSum { .. } => {
+                return Err(G0Error::UnsupportedBoundTransfer)
+            }
+        };
+        visiting.remove(&event.0);
+        Ok(output)
+    }
+
+    fn exact_value_producers(
+        &self,
+        trace: &FeasibilityTrace,
+        current: usize,
+        owner: super::arena::ScopedExprId,
+        value: &super::g0::RecordedValue,
+    ) -> Result<(u64, Option<u64>), CertificateProjectionError> {
+        let frame = self
+            .frames
+            .last()
+            .filter(|frame| frame.root.program() == owner.program())
+            .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?;
+        let boundary = trace.events[frame.start..current]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(offset, event)| match event {
+                NormalizerEvent::Result { owner: prior_owner, .. } if *prior_owner == owner => {
+                    Some(frame.start + offset + 1)
+                }
+                NormalizerEvent::Predecessor { consumer, .. } if *consumer == owner => {
+                    Some(frame.start + offset + 1)
+                }
+                _ => None,
+            })
+            .unwrap_or(frame.start);
+        let candidates = trace.events[boundary..current]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, event)| match event {
+                NormalizerEvent::BoundTransfer { owner: transfer_owner, rule }
+                    if *transfer_owner == owner =>
+                {
+                    Some((boundary + offset, rule))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let summary = value
+            .exact_nf
+            .as_ref()
+            .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?
+            .bounded_summary
+            .coefficient_bound();
+        let (coefficient_producer, summary_producer) =
+            select_reached_exact_producers(&candidates, &summary).map_err(proof_payload_error)?;
+        let coefficient_rule = match trace.events.get(coefficient_producer) {
+            Some(NormalizerEvent::BoundTransfer { rule, .. }) => rule,
+            _ => return Err(proof_payload_error(G0Error::UnsupportedBoundTransfer)),
+        };
+        if !matches!(coefficient_rule, BoundRule::Authority(_)) {
+            let replayed_coefficient = self
+                .replay_transfer_bound(
+                    trace,
+                    super::g0::EventIndex(coefficient_producer as u64),
+                    owner,
+                    &mut BTreeSet::new(),
+                )
+                .map_err(proof_payload_error)?;
+            if !coefficient_bound_is_within(&value.coefficient_bound, &replayed_coefficient) {
+                return Err(proof_payload_error(G0Error::UnsupportedBoundTransfer));
+            }
+            if summary_producer.is_none() &&
+                matches!(
+                    summary,
+                    super::facts::NumericContract::Known(super::facts::CoefficientBound::Finite(_))
+                )
+            {
+                let has_owner_merge =
+                    trace.events[coefficient_producer + 1..current].iter().any(|event| {
+                        matches!(
+                            event,
+                            NormalizerEvent::CoefficientMerge(merge) if merge.owner == owner
+                        )
+                    });
+                if !reached_deferred_finite_summary_allowed(&replayed_coefficient, has_owner_merge)
+                {
+                    return Err(proof_payload_error(G0Error::UnsupportedBoundTransfer));
+                }
+            }
+        }
+        if let Some(summary_producer) = summary_producer {
+            let replayed_summary = self
+                .replay_transfer_bound(
+                    trace,
+                    super::g0::EventIndex(summary_producer as u64),
+                    owner,
+                    &mut BTreeSet::new(),
+                )
+                .map_err(proof_payload_error)?;
+            if replayed_summary != summary {
+                return Err(proof_payload_error(G0Error::UnsupportedBoundTransfer));
+            }
+        }
+        Ok((coefficient_producer as u64, summary_producer.map(|event| event as u64)))
+    }
+
+    fn exact_value(
+        &self,
+        trace: &FeasibilityTrace,
+        current: usize,
+        owner: super::arena::ScopedExprId,
+        value: &super::g0::RecordedValue,
+    ) -> Result<ProofPayloadValue, CertificateProjectionError> {
+        let Some(normal_form) = &value.exact_nf else {
+            return Err(proof_payload_error(G0Error::RelationTraceInvariant));
+        };
+        let (coefficient_producer, summary_producer) =
+            self.exact_value_producers(trace, current, owner, value)?;
         Ok(ProofPayloadValue::Exact {
-            terms: self.terms(normal_form)?,
+            terms: payload_projection(self.terms(normal_form))?,
+            coefficient_bound: value.coefficient_bound.clone(),
+            coefficient_producer,
             summary: normal_form.bounded_summary.clone(),
+            summary_producer,
         })
+    }
+
+    fn value(
+        &self,
+        trace: &FeasibilityTrace,
+        current: usize,
+        owner: super::arena::ScopedExprId,
+        value: &super::g0::RecordedValue,
+    ) -> Result<ProofPayloadValue, CertificateProjectionError> {
+        if value.exact_nf.is_some() {
+            self.exact_value(trace, current, owner, value)
+        } else {
+            Ok(ProofPayloadValue::Coefficient { bound: value.coefficient_bound.clone() })
+        }
     }
 
     fn terms(
@@ -3902,7 +4360,7 @@ impl<'a> ProofPayloadProjector<'a> {
             }
             NormalizerEvent::Result { owner, value } => ProofPayloadEvent::Result {
                 owner: payload_projection(self.owner(*owner))?,
-                value: payload_projection(self.value(value))?,
+                value: self.value(trace, current, *owner, value)?,
             },
             NormalizerEvent::InvocationEnd { root, result, .. } => {
                 let pre_fold_event = self
@@ -3911,9 +4369,22 @@ impl<'a> ProofPayloadProjector<'a> {
                     .filter(|frame| frame.root == *root)
                     .and_then(|frame| frame.last_pre_fold)
                     .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?;
+                let result_event = self
+                    .frames
+                    .last()
+                    .filter(|frame| frame.root == *root)
+                    .and_then(|frame| frame.last_exact_result)
+                    .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?;
+                let result_value = match trace.events.get(result_event as usize) {
+                    Some(NormalizerEvent::Result { owner, value }) if *owner == *root => value,
+                    _ => return Err(proof_payload_error(G0Error::RelationTraceInvariant)),
+                };
+                if result_value.exact_nf.is_none() || result_value.exact_nf != result.exact_nf {
+                    return Err(proof_payload_error(G0Error::RelationTraceInvariant));
+                }
                 ProofPayloadEvent::InvocationEnd {
                     root: payload_projection(self.owner(*root))?,
-                    result: payload_projection(self.value(result))?,
+                    result: self.value(trace, result_event as usize, *root, result_value)?,
                     pre_fold_event,
                 }
             }
@@ -5221,6 +5692,93 @@ mod tests {
     };
     use mxx_dsl::{Bool, DslContext, IdealSpec, Int, Parallel, Ring, SemanticAnchor};
     use mxx_ir_core::{IntExpr, node::ConstantMatrix};
+
+    fn predecessor_coefficient(input_position: u32) -> BoundValueRef {
+        BoundValueRef::Predecessor { input_position, projection: BoundProjection::Coefficient }
+    }
+
+    fn finite_coefficient_bound(value: u64) -> NumericContract<CoefficientBound> {
+        NumericContract::Known(CoefficientBound::finite(value))
+    }
+
+    #[test]
+    fn reached_exact_producer_resolver_leaves_shared_finite_summary_for_semantic_fold() {
+        let rule = BoundRule::Sum {
+            inputs: vec![predecessor_coefficient(0), predecessor_coefficient(1)].into_boxed_slice(),
+        };
+        let candidates = [(107_405, &rule)];
+
+        assert_eq!(
+            select_reached_exact_producers(&candidates, &finite_coefficient_bound(4)),
+            Ok((107_405, None))
+        );
+    }
+
+    #[test]
+    fn reached_exact_producer_resolver_uses_endpoints_not_repeated_rule_classes() {
+        let coefficient = BoundRule::Product {
+            left: predecessor_coefficient(0),
+            right: predecessor_coefficient(1),
+            facts: Default::default(),
+        };
+        let internal_one = BoundRule::Sum {
+            inputs: vec![BoundValueRef::Transfer(super::super::g0::EventIndex(11))]
+                .into_boxed_slice(),
+        };
+        let internal_two = BoundRule::Sum {
+            inputs: vec![BoundValueRef::Transfer(super::super::g0::EventIndex(12))]
+                .into_boxed_slice(),
+        };
+        let summary = BoundRule::Sum {
+            inputs: vec![BoundValueRef::Transfer(super::super::g0::EventIndex(13))]
+                .into_boxed_slice(),
+        };
+        let candidates =
+            [(10, &coefficient), (11, &internal_one), (12, &internal_two), (13, &summary)];
+
+        assert_eq!(
+            select_reached_exact_producers(&candidates, &finite_coefficient_bound(8)),
+            Ok((10, Some(13)))
+        );
+    }
+
+    #[test]
+    fn reached_exact_producer_resolver_rejects_multiple_coefficient_roots() {
+        let first = BoundRule::Sum {
+            inputs: vec![predecessor_coefficient(0), predecessor_coefficient(1)].into_boxed_slice(),
+        };
+        let second = BoundRule::Product {
+            left: predecessor_coefficient(0),
+            right: predecessor_coefficient(1),
+            facts: Default::default(),
+        };
+        let candidates = [(20, &first), (21, &second)];
+
+        assert!(matches!(
+            select_reached_exact_producers(&candidates, &finite_coefficient_bound(16)),
+            Err(G0Error::UnsupportedBoundTransfer)
+        ));
+    }
+
+    #[test]
+    fn reached_exact_coefficient_allows_post_merge_cancellation() {
+        assert!(coefficient_bound_is_within(
+            &NumericContract::Known(CoefficientBound::ExactZero),
+            &finite_coefficient_bound(2),
+        ));
+        assert!(!coefficient_bound_is_within(
+            &finite_coefficient_bound(3),
+            &finite_coefficient_bound(2),
+        ));
+    }
+
+    #[test]
+    fn reached_exact_deferred_finite_summary_requires_large_transfer_and_merge() {
+        let large = NumericContract::Known(CoefficientBound::Large);
+        assert!(reached_deferred_finite_summary_allowed(&large, true));
+        assert!(!reached_deferred_finite_summary_allowed(&large, false));
+        assert!(!reached_deferred_finite_summary_allowed(&finite_coefficient_bound(4), true));
+    }
 
     #[test]
     fn observed_coverage_classifiers_cover_all_typed_discriminants() {
@@ -8096,14 +8654,19 @@ mod tests {
         // monomial = 5 + 9 = 14; term = monomial 14 + coefficient 1 = 15.
         let term =
             ProofPayloadTerm { monomial: monomial.clone(), coefficient: BigInt::from(-7_i32) };
+        let exact_summary = super::super::normal_form::BoundedSummary::finite(
+            BoundExpression::new(BigUint::from(2_u8)),
+        );
         let exact = ProofPayloadValue::Exact {
             terms: vec![term.clone()],
-            summary: super::super::normal_form::BoundedSummary::finite(BoundExpression::new(
-                BigUint::from(2_u8),
-            )),
+            coefficient_bound: exact_summary.coefficient_bound(),
+            coefficient_producer: 1,
+            summary: exact_summary,
+            summary_producer: Some(1),
         };
         // finite summary = Known tag 1 + (Finite tag 1 + BigUint 1) = 3;
-        // Exact value = enum tag 1 + terms Vec (1 + length 1 + term 15) + summary 3 = 21.
+        // Exact value = enum tag 1 + terms Vec 17 + coefficient bound 3 + producer 1 +
+        // summary 3 + optional summary producer 2 = 27.
         let product_facts = super::super::bound::MatrixProductFacts {
             left_is_constant_polynomial: true,
             right_is_constant_polynomial: false,
@@ -8161,7 +8724,7 @@ mod tests {
         let payload = OperationalProofPayload {
             events: vec![
                 ProofPayloadEvent::InvocationStart { root: owner }, // 1 + 3 = 4
-                ProofPayloadEvent::Result { owner, value: exact },  // 1 + 3 + 21 = 25
+                ProofPayloadEvent::Result { owner, value: exact },  // 1 + 3 + 27 = 31
                 ProofPayloadEvent::BoundTransfer { owner, rule: product_rule }, // 17
                 ProofPayloadEvent::CoefficientMerge(operator_merge), // 24
                 ProofPayloadEvent::CoefficientMerge(relation_merge), // 22
@@ -8173,8 +8736,8 @@ mod tests {
             ],
         };
         // OperationalProofPayload is the events Vec: 1 + length 7 +
-        // (4 + 25 + 17 + 24 + 22 + 26 + 3) = 8 + 121 = 129.
-        assert_eq!(payload.logical_items(), Ok(129));
+        // (4 + 31 + 17 + 24 + 22 + 26 + 3) = 8 + 127 = 135.
+        assert_eq!(payload.logical_items(), Ok(135));
         let canonical_payload_bytes = payload.encode_canonical().expect("representative payload");
 
         // Scalar changes are semantically represented bytes but remain one logical item.
@@ -8190,7 +8753,7 @@ mod tests {
             canonical_payload_bytes,
             scalar_changed.encode_canonical().expect("scalar-changed payload")
         );
-        assert_eq!(scalar_changed.logical_items(), Ok(129));
+        assert_eq!(scalar_changed.logical_items(), Ok(135));
 
         // Removing one Some option changes the structural count by exactly one.
         let mut product_changed = payload.clone();
@@ -8207,7 +8770,7 @@ mod tests {
             canonical_payload_bytes,
             product_changed.encode_canonical().expect("product-changed payload")
         );
-        assert_eq!(product_changed.logical_items(), Ok(130));
+        assert_eq!(product_changed.logical_items(), Ok(136));
 
         let mut evidence_removed = payload.clone();
         if let ProofPayloadEvent::PreFoldPolynomial(polynomial) = &mut evidence_removed.events[5] {
@@ -8219,7 +8782,7 @@ mod tests {
             canonical_payload_bytes,
             evidence_removed.encode_canonical().expect("evidence-removed payload")
         );
-        assert_eq!(evidence_removed.logical_items(), Ok(126));
+        assert_eq!(evidence_removed.logical_items(), Ok(132));
 
         let mut survivor_changed = payload.clone();
         if let ProofPayloadEvent::SurvivorFold(fold) = &mut survivor_changed.events[6] {
@@ -8231,7 +8794,7 @@ mod tests {
             canonical_payload_bytes,
             survivor_changed.encode_canonical().expect("survivor-changed payload")
         );
-        assert_eq!(survivor_changed.logical_items(), Ok(129));
+        assert_eq!(survivor_changed.logical_items(), Ok(135));
     }
 
     #[test]

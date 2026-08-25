@@ -97,11 +97,19 @@ fn event_text(event: &ProofPayloadEvent) -> Result<String, String> {
             )
         }
         ProofPayloadEvent::Result { owner: result_owner, value } => match value {
-            ProofPayloadValue::Exact { terms, summary } => format!(
-                ".resultExact ({}) {} {}",
+            ProofPayloadValue::Exact {
+                terms,
+                coefficient_bound: coefficient,
+                coefficient_producer,
+                summary,
+                summary_producer,
+            } => format!(
+                ".resultExact ({}) {} {} {coefficient_producer} {} ({})",
                 owner(result_owner),
                 terms_text(terms)?,
+                coefficient_bound(coefficient)?,
                 summary_text(summary)?,
+                option(summary_producer.as_ref(), |event| Ok(event.to_string()))?,
             ),
             ProofPayloadValue::Coefficient { bound } => format!(
                 ".resultCoefficient ({}) {}",
@@ -110,11 +118,19 @@ fn event_text(event: &ProofPayloadEvent) -> Result<String, String> {
             ),
         },
         ProofPayloadEvent::InvocationEnd { root, result, pre_fold_event } => match result {
-            ProofPayloadValue::Exact { terms, summary } => format!(
-                ".invocationEndExact ({}) {pre_fold_event} {} {}",
+            ProofPayloadValue::Exact {
+                terms,
+                coefficient_bound: coefficient,
+                coefficient_producer,
+                summary,
+                summary_producer,
+            } => format!(
+                ".invocationEndExact ({}) {pre_fold_event} {} {} {coefficient_producer} {} ({})",
                 owner(root),
                 terms_text(terms)?,
-                summary_text(summary)?
+                coefficient_bound(coefficient)?,
+                summary_text(summary)?,
+                option(summary_producer.as_ref(), |event| Ok(event.to_string()))?,
             ),
             ProofPayloadValue::Coefficient { .. } => {
                 return Err("unsupported coefficient InvocationEnd in Security0 renderer".to_owned());
@@ -701,21 +717,33 @@ mod tests {
 
         let result_exact = ProofPayloadEvent::Result {
             owner: owner(3),
-            value: ProofPayloadValue::Exact { terms: vec![], summary: finite.clone() },
+            value: ProofPayloadValue::Exact {
+                terms: vec![],
+                coefficient_bound: finite.coefficient_bound(),
+                coefficient_producer: 7,
+                summary: finite.clone(),
+                summary_producer: Some(8),
+            },
         };
         assert_eq!(
             event_text(&result_exact).expect("finite exact result"),
-            ".resultExact (⟨.program ⟨0⟩, ⟨3⟩⟩) [] (.finite 7)"
+            ".resultExact (⟨.program ⟨0⟩, ⟨3⟩⟩) [] (.finite 7) 7 (.finite 7) (some (8))"
         );
 
         let invocation_end = ProofPayloadEvent::InvocationEnd {
             root: owner(3),
-            result: ProofPayloadValue::Exact { terms: vec![], summary: finite },
+            result: ProofPayloadValue::Exact {
+                terms: vec![],
+                coefficient_bound: finite.coefficient_bound(),
+                coefficient_producer: 7,
+                summary: finite,
+                summary_producer: Some(8),
+            },
             pre_fold_event: 11,
         };
         assert_eq!(
             event_text(&invocation_end).expect("finite invocation end"),
-            ".invocationEndExact (⟨.program ⟨0⟩, ⟨3⟩⟩) 11 [] (.finite 7)"
+            ".invocationEndExact (⟨.program ⟨0⟩, ⟨3⟩⟩) 11 [] (.finite 7) 7 (.finite 7) (some (8))"
         );
     }
 

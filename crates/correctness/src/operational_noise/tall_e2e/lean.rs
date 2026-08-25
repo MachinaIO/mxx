@@ -1,3 +1,4 @@
+mod closure;
 mod proof;
 mod semantic;
 mod statement;
@@ -18,12 +19,17 @@ pub(super) fn render(
     proof: &OperationalProofPayload,
     owner_claim_report_bytes: &[u8],
 ) -> Result<Vec<TallSecurity0GeneratedFile>, String> {
+    let dependency_closure = closure::collect_security0_final_closure(proof)?;
     let mut files = statement::render(statement)?;
     files.extend(proof::render(statement, proof)?);
     files.extend(semantic::render(statement, proof)?);
     files.push(TallSecurity0GeneratedFile {
         relative_path: "SemanticOwnerStatistics.json".to_owned(),
         bytes: owner_claim_report_bytes.to_vec(),
+    });
+    files.push(TallSecurity0GeneratedFile {
+        relative_path: "SemanticDependencyClosure.json".to_owned(),
+        bytes: dependency_closure.report_bytes()?,
     });
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(files)

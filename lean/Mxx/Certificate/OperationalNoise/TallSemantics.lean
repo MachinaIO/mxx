@@ -1365,6 +1365,61 @@ theorem exactValueClaim_of_remainder {Factor : Type} (modulus : Nat) (env : Env 
     ValueClaim.Interprets modulus env actual (.exact terms (.finite maximum)) := by
   exact ⟨remainder, congruence, remainderBound⟩
 
+theorem centeredNorm_eq_zero_mod {modulus : Nat} {value : Int}
+    (modulusPositive : 0 < modulus) (normZero : centeredNorm modulus value = 0) :
+    value % Int.ofNat modulus = 0 := by
+  unfold centeredNorm centeredCoefficient at normZero
+  simp only [Int.natAbs_eq_zero] at normZero
+  split at normZero
+  · omega
+  · split at normZero
+    · have remainderNonnegative := Int.emod_nonneg value
+        (Int.ofNat_ne_zero.mpr (Nat.ne_of_gt modulusPositive))
+      have remainderLess := Int.emod_lt value
+        (Int.ofNat_ne_zero.mpr (Nat.ne_of_gt modulusPositive))
+      change value % Int.ofNat modulus < Int.ofNat modulus at remainderLess
+      omega
+    · have remainderNonnegative := Int.emod_nonneg value
+        (Int.ofNat_ne_zero.mpr (Nat.ne_of_gt modulusPositive))
+      have modulusNonnegative : (0 : Int) ≤ Int.ofNat modulus := by omega
+      have remainderLess := Int.emod_lt value
+        (Int.ofNat_ne_zero.mpr (Nat.ne_of_gt modulusPositive))
+      change value % Int.ofNat modulus < Int.ofNat modulus at remainderLess
+      omega
+
+theorem exactClaim_mod_zero {Factor : Type} (modulus : Nat) (env : Env Factor)
+    (actual : Int) (terms : Polynomial Factor)
+    (claim : ValueClaim.Interprets modulus env actual (.exact terms .exactZero))
+    (modulusPositive : 0 < modulus) :
+    (actual - evalPolynomial env terms) % Int.ofNat modulus = 0 := by
+  rcases claim with ⟨remainder, congruence, remainderBound⟩
+  rw [congruence, centeredNorm_eq_zero_mod modulusPositive remainderBound]
+
+theorem exactValueClaim_sub_of_mod_zero {Factor : Type} (modulus : Nat) (env : Env Factor)
+    (leftActual rightActual : Int) (leftTerms rightTerms output : Polynomial Factor)
+    (maximum : Nat)
+    (leftClaim : ValueClaim.Interprets modulus env leftActual (.exact leftTerms (.finite maximum)))
+    (rightModZero : (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus = 0)
+    (outputEval : evalPolynomial env output = evalPolynomial env leftTerms - evalPolynomial env rightTerms) :
+    ValueClaim.Interprets modulus env (leftActual - rightActual)
+      (.exact output (.finite maximum)) := by
+  rcases leftClaim with ⟨remainder, leftCongruence, leftBound⟩
+  refine ⟨remainder, ?_, leftBound⟩
+  rw [outputEval]
+  calc
+    (leftActual - rightActual - (evalPolynomial env leftTerms - evalPolynomial env rightTerms)) %
+        Int.ofNat modulus =
+        ((leftActual - evalPolynomial env leftTerms) -
+          (rightActual - evalPolynomial env rightTerms)) % Int.ofNat modulus := by
+            congr 1 <;> omega
+    _ = ((leftActual - evalPolynomial env leftTerms) % Int.ofNat modulus -
+      (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus) % Int.ofNat modulus := by
+        rw [Int.sub_emod]
+    _ = (leftActual - evalPolynomial env leftTerms) % Int.ofNat modulus := by
+      rw [rightModZero]
+      simp
+    _ = remainder % Int.ofNat modulus := by simpa [boundInterprets] using leftCongruence
+
 theorem invocationEndSound (modulus : Nat) (env : Env Owner) (actual : Int)
     (prefoldTerms endTerms : Polynomial Owner)
     (prefoldSummary endSummary : Bound)

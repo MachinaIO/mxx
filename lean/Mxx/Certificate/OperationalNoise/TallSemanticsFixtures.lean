@@ -148,6 +148,18 @@ theorem generic_value_claim_fixture :
   · decide
   · simp [centeredNorm, centeredCoefficient]
 
+theorem exact_zero_right_preserves_bound_fixture :
+    ValueClaim.Interprets 257 fixtureEnv (-14 - 0)
+      (.exact fixturePolynomial (.finite 1)) := by
+  have rightClaim : ValueClaim.Interprets 257 fixtureEnv 0 (.exact [] .exactZero) := by
+    refine ⟨0, ?_, ?_⟩
+    · decide
+    · simp [boundInterprets, centeredNorm, centeredCoefficient]
+  apply exactValueClaim_sub_of_mod_zero 257 fixtureEnv (-14) 0
+    fixturePolynomial [] fixturePolynomial 1 generic_value_claim_fixture
+  · exact exactClaim_mod_zero 257 fixtureEnv 0 [] rightClaim (by decide)
+  · rfl
+
 def familyRoot : SchemaV1.ResidualRoot := .family ⟨0⟩ ⟨2, 5⟩
 
 theorem statement_domain_fixture :

@@ -1333,7 +1333,11 @@ fn build_probes(
             owner_text(outer_result.owner)
         )
     })?;
-    let outer_op = if typed_operator_eligibility(index, &outer_result, outer_kind)? {
+    let outer_semantic_rule = typed_operation_rule(index, &outer_result, outer_kind)?.is_some();
+    let outer_eligible = typed_operator_eligibility(index, &outer_result, outer_kind)? ||
+        (matches!(outer_kind, OperationKind::Add | OperationKind::Subtract) &&
+            outer_semantic_rule);
+    let outer_op = if outer_eligible {
         op_probe(statement, index, &outer_result, outer_kind)?
     } else {
         OperationProbe {

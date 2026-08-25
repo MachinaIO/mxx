@@ -1,6 +1,6 @@
 use super::{NAMESPACE, generated_file};
 use crate::operational_noise::{
-    certificate_schema::CertificateDocumentV1,
+    certificate_schema::{CertificateDocumentV1, CertificateResidualRootV1},
     g0::{
         BoundProjection, CanonicalExpressionDescriptor, CanonicalExpressionOperator,
         StableMatrixOperation, StableOperator,
@@ -245,6 +245,23 @@ struct SemanticShard {
     bounds: Vec<BoundProbe>,
     raw_semantic_count: u64,
     raw_family_counts: [u64; 6],
+}
+
+#[derive(Clone)]
+enum RightRootNodeKind {
+    Operation(OperationProbe),
+    Terminal {
+        producer_event: u64,
+        frame_start: u64,
+        rule: ProofPayloadRule,
+        term: ProofPayloadTerm,
+    },
+}
+
+#[derive(Clone)]
+struct RightRootNode {
+    result: ResultRecord,
+    kind: RightRootNodeKind,
 }
 
 impl SemanticShard {
@@ -1643,10 +1660,10 @@ pub(super) fn render(
         "SemanticProbeStatistics.json",
         String::from_utf8(report_bytes).expect("JSON is UTF-8"),
     )];
-    files.push(generated_file(
-        "Semantic/SemanticRightRoot.lean",
-        render_right_root(statement, &index, &modulus)?,
-    ));
+    let (right_root_index, right_root_shards) =
+        render_right_root(statement, &index, &relation_probes, &modulus)?;
+    files.push(generated_file("Semantic/SemanticRightRoot.lean", right_root_index));
+    files.extend(right_root_shards);
 
     let specs = [
         ("Semantic/Semantic000.lean", "Semantic000", "long-monomial-merge"),
@@ -2812,48 +2829,339 @@ fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection], modulus: &
     source
 }
 
+fn reached_terminal_rule(rule: &ProofPayloadRule) -> bool {
+    use crate::operational_noise::simulation::ProofPayloadAuthority;
+    matches!(
+        rule,
+        ProofPayloadRule::Authority(
+            ProofPayloadAuthority::FactStore |
+                ProofPayloadAuthority::ProgramFamilyFact |
+                ProofPayloadAuthority::Operator
+        ) | ProofPayloadRule::Identity { .. } |
+            ProofPayloadRule::Scale { .. }
+    )
+}
+
+fn right_root_nodes(
+    statement: &CertificateDocumentV1,
+    index: &PayloadIndex,
+    relation_probes: &[RelationProbe],
+) -> Result<Vec<RightRootNode>, String> {
+    const RIGHT_ROOT_EVENT: u64 = 6275;
+    let CertificateResidualRootV1::Family { program, .. } = statement.residual_root else {
+        return Err("Security0 right-root semantics requires a family residual root".to_owned());
+    };
+    let mut pending = vec![RIGHT_ROOT_EVENT];
+    let mut nodes = BTreeMap::<u64, RightRootNode>::new();
+    while let Some(event) = pending.pop() {
+        if nodes.contains_key(&event) {
+            continue;
+        }
+        let result = index.by_event.get(&event).ok_or_else(|| {
+            format!("Security0 right-root dependency {event} is not an exact Result")
+        })?;
+        if !matches!(
+            result.summary.coefficient_bound(),
+            crate::operational_noise::facts::NumericContract::Known(
+                crate::operational_noise::facts::CoefficientBound::ExactZero
+            )
+        ) {
+            return Err(format!("Security0 right-root dependency Result {event} is not exact-zero"));
+        }
+        if !matches!(
+            result.owner.scope,
+            crate::operational_noise::simulation::ProofPayloadScope::Program { program_row }
+                if program_row == program
+        ) {
+            return Err(format!(
+                "Security0 right-root dependency Result {event} is outside residual program {program}"
+            ));
+        }
+        let kind = match expression_kind(statement, result.owner)? {
+            Some(operation_kind) if operation_kind != OperationKind::Direct => {
+                let operation = op_probe(statement, index, result, operation_kind)?;
+                let result_frame = index.immediate_frames
+                    [usize::try_from(event).map_err(|_| "semantic event index overflow")?];
+                let matching_relations = relation_probes
+                    .iter()
+                    .filter(|relation| {
+                        relation.owner == result.owner &&
+                            relation.event > operation.rule_event &&
+                            relation.event < operation.output_event &&
+                            relation.frame_start == result_frame.unwrap_or(u64::MAX) &&
+                            relation.frame_end >= relation.event
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let operation = attach_composite_relations(operation, &matching_relations)?;
+                pending.extend(operation.input_events);
+                RightRootNodeKind::Operation(operation)
+            }
+            _ => {
+                let producer_event = event.checked_sub(1).ok_or_else(|| {
+                    format!("terminal Result {event} has no preceding producer event")
+                })?;
+                let ProofPayloadEvent::BoundTransfer { owner, rule } =
+                    index.event(producer_event)?
+                else {
+                    return Err(format!(
+                        "terminal Result {event} is not adjacent to a BoundTransfer producer"
+                    ));
+                };
+                if *owner != result.owner || !reached_terminal_rule(rule) {
+                    return Err(format!(
+                        "terminal Result {event} has unsupported producer {rule:?}"
+                    ));
+                }
+                let producer_frame = index.immediate_frames[usize::try_from(producer_event)
+                    .map_err(|_| "semantic event index overflow")?];
+                let result_frame = index.immediate_frames
+                    [usize::try_from(event).map_err(|_| "semantic event index overflow")?];
+                if producer_frame != result_frame {
+                    return Err(format!(
+                        "terminal Result {event} and producer {producer_event} have different frames"
+                    ));
+                }
+                let [term] = result.terms.as_slice() else {
+                    return Err(format!(
+                        "terminal Result {event} is not a singleton exact polynomial"
+                    ));
+                };
+                RightRootNodeKind::Terminal {
+                    producer_event,
+                    frame_start: result_frame.ok_or_else(|| {
+                        format!("terminal Result {event} is outside an invocation frame")
+                    })?,
+                    rule: rule.clone(),
+                    term: term.clone(),
+                }
+            }
+        };
+        nodes.insert(event, RightRootNode { result: result.clone(), kind });
+    }
+    let nodes = nodes.into_values().collect::<Vec<_>>();
+    for node in &nodes {
+        if let RightRootNodeKind::Operation(operation) = &node.kind {
+            for input in operation.input_events {
+                if input >= node.result.event ||
+                    !nodes.iter().any(|node| node.result.event == input)
+                {
+                    return Err(format!(
+                        "right-root Result {} has non-topological input Result {input}",
+                        node.result.event
+                    ));
+                }
+            }
+        }
+    }
+    Ok(nodes)
+}
+
+fn reached_terminal_constructor(rule: &ProofPayloadRule) -> Result<String, String> {
+    use crate::operational_noise::simulation::ProofPayloadAuthority;
+    Ok(match rule {
+        ProofPayloadRule::Authority(ProofPayloadAuthority::FactStore) => {
+            ".authorityFactStore".to_owned()
+        }
+        ProofPayloadRule::Authority(ProofPayloadAuthority::ProgramFamilyFact) => {
+            ".authorityProgramFamilyFact".to_owned()
+        }
+        ProofPayloadRule::Authority(ProofPayloadAuthority::Operator) => {
+            ".authorityOperator".to_owned()
+        }
+        ProofPayloadRule::Identity { input } => {
+            format!(".identity ({})", value_ref_text(input))
+        }
+        ProofPayloadRule::Scale { value, scale } => {
+            format!(".scale ({}) ({})", value_ref_text(value), terminal_scale_text(scale))
+        }
+        _ => return Err("unsupported reached terminal rule".to_owned()),
+    })
+}
+
+fn terminal_scale_text(scale: &crate::operational_noise::simulation::ProofPayloadScale) -> String {
+    match scale {
+        crate::operational_noise::simulation::ProofPayloadScale::Value(value) => {
+            format!(".value ({})", value_ref_text(value))
+        }
+        crate::operational_noise::simulation::ProofPayloadScale::Magnitude(value) => {
+            format!(".magnitude {value}")
+        }
+    }
+}
+
+fn reached_terminal_rule_text(rule: &ProofPayloadRule) -> Result<String, String> {
+    use crate::operational_noise::simulation::ProofPayloadAuthority;
+    Ok(match rule {
+        ProofPayloadRule::Authority(ProofPayloadAuthority::FactStore) => {
+            ".authority (.factStore)".to_owned()
+        }
+        ProofPayloadRule::Authority(ProofPayloadAuthority::ProgramFamilyFact) => {
+            ".authority (.programFamilyFact)".to_owned()
+        }
+        ProofPayloadRule::Authority(ProofPayloadAuthority::Operator) => {
+            ".authority (.operator)".to_owned()
+        }
+        ProofPayloadRule::Identity { input } => {
+            format!(".identity ({})", value_ref_text(input))
+        }
+        ProofPayloadRule::Scale { value, scale } => {
+            format!(".scale ({}) ({})", value_ref_text(value), terminal_scale_text(scale))
+        }
+        _ => return Err("unsupported reached terminal rule".to_owned()),
+    })
+}
+
+fn render_right_root_node(
+    source: &mut String,
+    node: &RightRootNode,
+    modulus: &str,
+) -> Result<(), String> {
+    let event = node.result.event;
+    writeln!(source, "namespace SemanticRightRootResult{event}\n").expect("String write");
+    match &node.kind {
+        RightRootNodeKind::Terminal { producer_event, frame_start, rule, term } => {
+            writeln!(source, "def owner : Owner := {}", owner_text(node.result.owner))
+                .expect("String write");
+            writeln!(source, "def term : Term := {}", raw_term_text(term)).expect("String write");
+            writeln!(source, "def producerEvent : Nat := {producer_event}").expect("String write");
+            writeln!(source, "def resultEvent : Nat := {event}").expect("String write");
+            writeln!(
+                source,
+                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  witness.terminalActual resultEvent"
+            )
+            .expect("String write");
+            writeln!(
+                source,
+                "theorem terminalAt (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32) :\n    TerminalExactAt document history (some selector) producerEvent resultEvent owner term := by\n  refine ⟨by decide, rightRootOwnerAtSelector214 selector selectorLower selectorUpper _, ?_⟩\n  refine ⟨{}, {frame_start}, {}, ?_, ?_⟩\n  · rfl\n  · rfl",
+                reached_terminal_rule_text(rule)?,
+                reached_terminal_constructor(rule)?,
+            )
+            .expect("String write");
+            writeln!(
+                source,
+                "theorem claimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact [term.toExact] .exactZero) := by\n  exact terminalExactClaim witness\n    (terminalAt selector selectorLower selectorUpper)"
+            )
+            .expect("String write");
+        }
+        RightRootNodeKind::Operation(operation) => {
+            if !operation.composite_relations.is_empty() {
+                return Err(format!(
+                    "right-root Result {event} unexpectedly requires {} relation rewrites",
+                    operation.composite_relations.len()
+                ));
+            }
+            for input in &operation.inputs {
+                if !matches!(
+                    input.summary.coefficient_bound(),
+                    crate::operational_noise::facts::NumericContract::Known(
+                        crate::operational_noise::facts::CoefficientBound::ExactZero
+                    )
+                ) {
+                    return Err(format!(
+                        "right-root operation Result {event} input {} is not exact-zero",
+                        input.event
+                    ));
+                }
+            }
+            writeln!(source, "def selectedOwner : Owner := {}", owner_text(node.result.owner))
+                .expect("String write");
+            render_operation(source, operation, modulus);
+            render_operation_bindings(source, operation);
+            let left_event = operation.input_events[0];
+            let right_event = operation.input_events[1];
+            let operator = match operation.kind {
+                OperationKind::Add => "+",
+                OperationKind::Subtract => "-",
+                OperationKind::Multiply | OperationKind::Tensor => "*",
+                OperationKind::Direct => {
+                    return Err(format!("right-root Result {event} is a direct operation"));
+                }
+            };
+            writeln!(
+                source,
+                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  SemanticRightRootResult{left_event}.actual selector witness {operator}\n    SemanticRightRootResult{right_event}.actual selector witness"
+            )
+            .expect("String write");
+            let theorem = match operation.kind {
+                OperationKind::Add => "exactValueClaim_add_of_mod_zero",
+                OperationKind::Subtract => "exactValueClaim_sub_exactZero_of_mod_zero",
+                OperationKind::Multiply | OperationKind::Tensor => {
+                    "exactValueClaim_product_of_mod_zero"
+                }
+                OperationKind::Direct => unreachable!(),
+            };
+            writeln!(
+                source,
+                "theorem claimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact output .exactZero) := by\n  exact {theorem} {modulus} witness.env\n    (SemanticRightRootResult{left_event}.actual selector witness)\n    (SemanticRightRootResult{right_event}.actual selector witness) left right output\n    (SemanticRightRootResult{left_event}.claimSound selector selectorLower selectorUpper witness)\n    (SemanticRightRootResult{right_event}.claimSound selector selectorLower selectorUpper witness)\n    (resultSound witness.env) (by decide)"
+            )
+            .expect("String write");
+        }
+    }
+    writeln!(source, "\nend SemanticRightRootResult{event}\n").expect("String write");
+    Ok(())
+}
+
 fn render_right_root(
     statement: &CertificateDocumentV1,
     index: &PayloadIndex,
+    relation_probes: &[RelationProbe],
     modulus: &str,
-) -> Result<String, String> {
-    const RIGHT_ROOT_EVENT: u64 = 6275;
-    let result = index.by_event.get(&RIGHT_ROOT_EVENT).ok_or_else(|| {
-        format!("Security0 right exact-zero root Result {RIGHT_ROOT_EVENT} is missing")
-    })?;
-    let operation = op_probe(statement, index, result, OperationKind::Subtract)?;
-    if operation.output_event != RIGHT_ROOT_EVENT {
+) -> Result<(String, Vec<super::super::TallSecurity0GeneratedFile>), String> {
+    const CHUNK_SIZE: usize = 16;
+    let nodes = right_root_nodes(statement, index, relation_probes)?;
+    if nodes.len() != 571 {
         return Err(format!(
-            "right exact-zero root probe selected Result {}, expected {RIGHT_ROOT_EVENT}",
-            operation.output_event
+            "Security0 right-root closure has {} Results, expected 571",
+            nodes.len()
         ));
     }
-    if !matches!(
-        result.summary.coefficient_bound(),
-        crate::operational_noise::facts::NumericContract::Known(
-            crate::operational_noise::facts::CoefficientBound::ExactZero
-        )
-    ) {
-        return Err(format!("right exact-zero root Result {RIGHT_ROOT_EVENT} is not exact-zero"));
+    let terminal_count =
+        nodes.iter().filter(|node| matches!(node.kind, RightRootNodeKind::Terminal { .. })).count();
+    if terminal_count != 221 {
+        return Err(format!(
+            "Security0 right-root closure has {terminal_count} terminals, expected 221"
+        ));
     }
+    let mut files = Vec::new();
+    for (shard_index, shard) in nodes.chunks(CHUNK_SIZE).enumerate() {
+        let module = format!("SemanticRightRootShard{shard_index:03}");
+        let previous = shard_index
+            .checked_sub(1)
+            .map(|index| format!("import {NAMESPACE}.Semantic.SemanticRightRootShard{index:03}\n"));
+        let mut source = previous.unwrap_or_else(|| {
+            format!(
+                "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n"
+            )
+        });
+        source
+            .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
+        writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
+        source.push_str(
+            "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+        );
+        if shard_index == 0 {
+            source.push_str(
+                "theorem rightRootOwnerAtSelector214 (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32) (expression : SchemaV1.ExpressionRef) :\n    ownerAtSelector document (some selector) ⟨.program ⟨214⟩, expression⟩ := by\n  simp [ownerAtSelector, document, selectorLower, selectorUpper]\n\n",
+            );
+        }
+        for node in shard {
+            render_right_root_node(&mut source, node, modulus)?;
+        }
+        writeln!(source, "end {NAMESPACE}.Semantic").expect("String write");
+        files.push(generated_file(format!("Semantic/{module}.lean"), source));
+    }
+    let last_shard = nodes.len().div_ceil(CHUNK_SIZE) - 1;
     let mut source = format!(
-        "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.SemanticRightRoot\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n"
-    );
-    writeln!(source, "def selectedEvent : Nat := {RIGHT_ROOT_EVENT}").expect("String write");
-    writeln!(source, "def selectedOwner : Owner := {}", owner_text(result.owner))
-        .expect("String write");
-    render_operation(&mut source, &operation, modulus);
-    render_operation_bindings(&mut source, &operation);
-    source.push_str(
-        "\n/-- The generated theorem application for the reached right exact-zero root. -/\n",
+        "import {NAMESPACE}.Semantic.SemanticRightRootShard{last_shard:03}\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.SemanticRightRoot\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n"
     );
     writeln!(
         source,
-        "theorem rightRootClaimSound (env : Env Owner) (leftActual rightActual : Int)\n    (leftClaim : ValueClaim.Interprets {modulus} env leftActual (.exact left leftSummary))\n    (rightClaim : ValueClaim.Interprets {modulus} env rightActual (.exact right rightSummary)) :\n    ValueClaim.Interprets {modulus} env (leftActual - rightActual) (.exact output outputSummary) := by\n  exact exactValueClaim_sub_exactZero_of_mod_zero {modulus} env leftActual rightActual\n    left right output\n    (by simpa [leftSummary] using leftClaim)\n    (by simpa [rightSummary] using rightClaim)\n    (resultSound env)\n    (by decide)"
+        "/-- The generated theorem application for the reached right exact-zero root. -/\ntheorem rightRootClaimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env\n      (SemanticRightRootResult6275.actual selector witness)\n      (.exact SemanticRightRootResult6275.output .exactZero) := by\n  exact SemanticRightRootResult6275.claimSound selector selectorLower selectorUpper witness"
     )
     .expect("String write");
     source.push_str(&format!("\n\nend {NAMESPACE}.Semantic.SemanticRightRoot\n"));
-    Ok(source)
+    Ok((source, files))
 }
 
 #[cfg(test)]
@@ -2874,6 +3182,26 @@ mod tests {
             scope: ProofPayloadScope::Closed { root_expression_row: row },
             expression_row: row,
         }
+    }
+
+    #[test]
+    fn reached_terminal_rules_match_the_fixed_security0_boundary() {
+        use crate::operational_noise::simulation::{ProofPayloadAuthority, ProofPayloadScale};
+
+        let value =
+            ProofPayloadValueRef::Result { event: 3, projection: BoundProjection::Coefficient };
+        let accepted = [
+            ProofPayloadRule::Authority(ProofPayloadAuthority::FactStore),
+            ProofPayloadRule::Authority(ProofPayloadAuthority::ProgramFamilyFact),
+            ProofPayloadRule::Authority(ProofPayloadAuthority::Operator),
+            ProofPayloadRule::Identity { input: value.clone() },
+            ProofPayloadRule::Scale {
+                value: value.clone(),
+                scale: ProofPayloadScale::Magnitude(BigUint::from(2_u8)),
+            },
+        ];
+        assert!(accepted.iter().all(reached_terminal_rule));
+        assert!(!reached_terminal_rule(&ProofPayloadRule::Sum { inputs: vec![value] }));
     }
 
     #[test]

@@ -23,11 +23,13 @@ def honestEnv (gaussian : Int) : ToyEnv := fun owner =>
 theorem honestUniversal (gaussian : Int) :
     (m [0, 7]).eval (honestEnv gaussian) % Int.ofNat 257 =
       (m [1]).eval (honestEnv gaussian) % Int.ofNat 257 := by
-  simp [m, ToyMonomial.eval, honestEnv, o]
+  simp [m, ToyMonomial.eval, ToyMonomial.toSemanticKey, TallSemantics.evalMonomial,
+    honestEnv, o]
 
 theorem honestUniversal_not_exact (gaussian : Int) :
     (m [0, 7]).eval (honestEnv gaussian) ≠ (m [1]).eval (honestEnv gaussian) := by
-  simp [m, ToyMonomial.eval, honestEnv, o]
+  simp [m, ToyMonomial.eval, ToyMonomial.toSemanticKey, TallSemantics.evalMonomial,
+    honestEnv, o]
 
 def honestWitness (gaussian : Int) (bound : centeredNorm 257 gaussian ≤ 1) :
     ToyReplayWitness fixtureEvents where

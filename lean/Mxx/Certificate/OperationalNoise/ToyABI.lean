@@ -1,5 +1,6 @@
 import Mxx.Certificate.OperationalNoise.RelationReplay
 import Mxx.Certificate.OperationalNoise.SchemaV1
+import Mxx.Certificate.OperationalNoise.TallSemantics
 
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
@@ -9,6 +10,7 @@ namespace Mxx.Certificate.OperationalNoise.ToyABI
 open Mxx.Certificate.OperationalNoise
 open EventReplay
 open SchemaV1
+open TallSemantics
 
 /-! The fixed Lean ABI for the Rust `singleton-preimage-gaussian-v1` audit slice. -/
 
@@ -186,24 +188,36 @@ inductive ToyEvent where
   | survivorFold (coefficient : Int) (bound : Nat)
 deriving DecidableEq, Repr
 
-abbrev ToyEnv := ToyOwner -> Int
+abbrev ToyEnv := TallSemantics.Env ToyOwner
+
+def ToyMonomial.toSemanticKey (value : ToyMonomial) : MonomialKey ToyOwner :=
+  { centralFactors := value.centralFactors
+    orderedFactors := value.orderedFactors }
+
+def ToyTerm.toSemanticExact (value : ToyTerm) : ExactTerm ToyOwner :=
+  { coefficient := value.coefficient
+    key := value.monomial.toSemanticKey }
+
+def ToySummary.toSemanticBound : ToySummary → TallSecurity0ABI.Bound
+  | .exactZero => .exactZero
+  | .finite maximum => .finite maximum
+
+def ToyValue.toSemanticClaim : ToyValue → TallSemantics.ValueClaim ToyOwner
+  | .exact terms summary =>
+      .exact (terms.map ToyTerm.toSemanticExact) summary.toSemanticBound
+  | .coefficient summary => .coefficient summary.toSemanticBound
 
 def ToyMonomial.eval (env : ToyEnv) (value : ToyMonomial) : Int :=
-  (value.centralFactors.map env).prod * (value.orderedFactors.map env).prod
+  TallSemantics.evalMonomial env value.toSemanticKey
 
 def ToyTerms.eval (env : ToyEnv) (terms : List ToyTerm) : Int :=
-  (terms.map (fun term => term.coefficient * term.monomial.eval env)).sum
+  TallSemantics.evalPolynomial env (terms.map ToyTerm.toSemanticExact)
 
 def ToySummary.Interprets (modulus : Nat) (summary : ToySummary) (value : Int) : Prop :=
-  match summary with
-  | .exactZero => centeredNorm modulus value = 0
-  | .finite maximum => centeredNorm modulus value <= maximum
+  TallSemantics.boundInterprets modulus summary.toSemanticBound value
 
 def ToyValue.Interprets (modulus : Nat) (env : ToyEnv) (actual : Int) : ToyValue -> Prop
-  | .exact terms summary =>
-      ∃ remainder, (actual - ToyTerms.eval env terms) % Int.ofNat modulus = remainder %
-        Int.ofNat modulus ∧ summary.Interprets modulus remainder
-  | .coefficient summary => summary.Interprets modulus actual
+  | value => TallSemantics.ValueClaim.Interprets modulus env actual value.toSemanticClaim
 
 def ToyOwner.toKeyFactor (owner : ToyOwner) : Nat := owner.expressionRow
 
@@ -420,7 +434,8 @@ theorem fixed_relation_replay {events : List ToyEvent} (witness : ToyReplayWitne
   · intro key
     simp [universalContext, MonomialContext.plug, toyValuation]
   · simpa [evaluatePolynomial, ToyTerm.toCore, ToyMonomial.toCore, ToyOwner.toKeyFactor,
-      toyValuation, t, m, ToyMonomial.eval, o] using witness.universalRelation
+      toyValuation, t, m, ToyMonomial.eval, ToyMonomial.toSemanticKey,
+      TallSemantics.evalMonomial, o] using witness.universalRelation
 
 theorem fixed_merge_cancels :
     coefficient (t 1 [1]).toCore.key [(t 1 [1]).toCore, (t (-1) [1]).toCore] = 0 := by
@@ -475,7 +490,8 @@ theorem fixed_bound_replay {events : List ToyEvent} (witness : ToyReplayWitness 
         (m [1]).eval witness.env % Int.ofNat 257 := by
     simpa [evaluatePolynomial, relationReplacement, universalContext, contextualize,
       scalePolynomial, MonomialContext.plug, toyValuation, ToyTerm.toCore, ToyMonomial.toCore,
-      ToyOwner.toKeyFactor, t, m, o, ToyMonomial.eval] using relationReplay
+      ToyOwner.toKeyFactor, t, m, o, ToyMonomial.eval, ToyMonomial.toSemanticKey,
+      TallSemantics.evalMonomial] using relationReplay
   have residualRemainder : ToyResidual events witness.env % Int.ofNat 257 =
       witness.env (o 3) % Int.ofNat 257 := by
     unfold ToyResidual
@@ -503,9 +519,12 @@ theorem replay_sound {source : ToySource} {document : Document} {rows : ToyRows}
   rw [finalEvent]
   change ∃ remainder, _ = _ ∧ centeredNorm 257 remainder ≤ 1
   refine ⟨witness.env (o 3), ?_, witness.gaussianBound⟩
-  simp only [ToyTerms.eval, List.map_nil, List.sum_nil, Int.sub_zero]
+  simp [TallSemantics.evalPolynomial]
   unfold ToyResidual
-  rw [Int.add_emod, Int.sub_emod, witness.universalRelation]
+  have relationModular :
+      (m [0, 7]).eval witness.env % 257 = (m [1]).eval witness.env % 257 := by
+    simpa using witness.universalRelation
+  rw [Int.add_emod, Int.sub_emod, relationModular]
   simp
 
 def ToyOperationalClaim (events : List ToyEvent) (witness : ToyReplayWitness events) : Prop :=

@@ -48,9 +48,11 @@ pub struct TallSecurity0ReachedProjection {
     pub inventory_bytes: Vec<u8>,
     pub projection_bytes: Vec<u8>,
     pub recorded_report: OperationalSimulationReport,
+    pub owner_claim_statistics: TallSecurity0OwnerClaimStatistics,
+    pub owner_claim_report_bytes: Vec<u8>,
 }
 
-/// One deterministic generated Lean module, relative to
+/// One deterministic generated artifact, relative to
 /// `Mxx/Certificate/OperationalNoise/TallSecurity0Generated`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TallSecurity0GeneratedFile {
@@ -63,6 +65,27 @@ pub struct TallSecurity0GeneratedFile {
 pub struct TallSecurity0LeanManifest {
     pub files: Vec<TallSecurity0GeneratedFile>,
     pub recorded_report: OperationalSimulationReport,
+    pub owner_claim_statistics: TallSecurity0OwnerClaimStatistics,
+    pub owner_claim_report_bytes: Vec<u8>,
+}
+
+/// Deterministic semantic-claim counts observed while rendering the opt-in Security0 proof.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TallSecurity0OwnerClaimStatistics {
+    pub result_events: u64,
+    pub owners: u64,
+    pub multi_payload_owners: u64,
+    pub exact_zero_occurrences: u64,
+    pub finite_occurrences: u64,
+    pub factor_occurrences: u64,
+    pub distinct_factor_owners: u64,
+    pub factor_present_multi_payload_owners: u64,
+    pub direct_fold_occurrences: u64,
+    pub sum_fold_occurrences: u64,
+    pub exact_zero_consistent_owners: u64,
+    pub h2_owners: u64,
+    pub unknown_owners: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -185,6 +208,8 @@ pub fn prepare_tall_security0_reached_projection(
         .iter()
         .map(reached_event_kind)
         .collect::<Result<Vec<_>, _>>()?;
+    let (owner_claim_statistics, owner_claim_report_bytes) =
+        lean::measure_owner_claims(&documents.proof.payload).map_err(|error| error.to_string())?;
     let inventory_bytes = encode_inventory(&run.projection.closure, &documents.cert, &event_kinds)?;
     let projection =
         ReachedProjection { statement: documents.cert, proof: documents.proof.payload };
@@ -196,7 +221,13 @@ pub fn prepare_tall_security0_reached_projection(
         return Err("Security0 reached projection encoding is not deterministic".to_owned());
     }
     let recorded_report = run.accepted_report.clone().into_simulation_report();
-    Ok(TallSecurity0ReachedProjection { inventory_bytes, projection_bytes, recorded_report })
+    Ok(TallSecurity0ReachedProjection {
+        inventory_bytes,
+        projection_bytes,
+        recorded_report,
+        owner_claim_statistics,
+        owner_claim_report_bytes,
+    })
 }
 
 /// Run the fixed Security0 authority once and render its exact reached statement and proof.
@@ -209,9 +240,17 @@ pub fn prepare_tall_security0_lean_manifest(
     let run =
         prepare_operational_certificate(protocol, request).map_err(|error| error.to_string())?;
     let documents = derive_certificate_documents(&run).map_err(|error| error.to_string())?;
-    let rendered = lean::render(&documents.cert, &documents.proof.payload)?;
+    let (owner_claim_statistics, owner_claim_report_bytes) =
+        lean::measure_owner_claims(&documents.proof.payload).map_err(|error| error.to_string())?;
+    let rendered =
+        lean::render(&documents.cert, &documents.proof.payload, &owner_claim_report_bytes)?;
     let recorded_report = run.accepted_report.into_simulation_report();
-    Ok(TallSecurity0LeanManifest { files: rendered, recorded_report })
+    Ok(TallSecurity0LeanManifest {
+        files: rendered,
+        recorded_report,
+        owner_claim_statistics,
+        owner_claim_report_bytes,
+    })
 }
 
 fn validate_identity(

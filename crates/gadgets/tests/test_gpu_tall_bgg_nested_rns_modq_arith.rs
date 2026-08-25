@@ -22,9 +22,10 @@ use mxx_correctness::{
     operational_noise::{
         OperationalAcceptanceReport, OperationalCheckRequest, OperationalGadgetLayout,
         OperationalSimulationError, OperationalSimulationReport, ProgressEventKind,
-        TallSecurity0ProfileIdentity, check_operational_noise_candidate,
-        check_operational_noise_candidate_with_progress, prepare_g0_cpu_evidence_bytes,
-        prepare_tall_security0_lean_manifest, prepare_tall_security0_reached_projection,
+        TallSecurity0OwnerClaimStatistics, TallSecurity0ProfileIdentity,
+        check_operational_noise_candidate, check_operational_noise_candidate_with_progress,
+        prepare_g0_cpu_evidence_bytes, prepare_tall_security0_lean_manifest,
+        prepare_tall_security0_reached_projection,
     },
     operational_protocol_from_graphs,
 };
@@ -2473,6 +2474,10 @@ fn fixed_tall_security0_source_projection_matches_ordinary_semantics() {
         check_operational_noise_candidate(&reconstructed.protocol, &reconstructed.request)
             .expect("ordinary fixed Security0 report");
     assert_eq!(ordinary, reconstructed_projection.recorded_report);
+    assert_security0_owner_claim_statistics(
+        &reconstructed_projection.owner_claim_statistics,
+        &reconstructed_projection.owner_claim_report_bytes,
+    );
     let inventory: serde_json::Value =
         serde_json::from_slice(&reconstructed_projection.inventory_bytes)
             .expect("Security0 reached inventory JSON");
@@ -2510,6 +2515,18 @@ fn emit_fixed_tall_security0_lean(output: &Path, revision: &str) -> Result<usize
         &source.profile_identity(),
     )
     .map_err(|error| format!("Security0 Lean generation failed: {error}"))?;
+    assert_security0_owner_claim_statistics(
+        &manifest.owner_claim_statistics,
+        &manifest.owner_claim_report_bytes,
+    );
+    assert_eq!(
+        manifest
+            .files
+            .iter()
+            .find(|file| file.relative_path == "SemanticOwnerStatistics.json")
+            .map(|file| file.bytes.as_slice()),
+        Some(manifest.owner_claim_report_bytes.as_slice())
+    );
     for file in &manifest.files {
         let path = output.join(&file.relative_path);
         fs::create_dir_all(path.parent().ok_or("generated file has no parent")?)
@@ -2517,6 +2534,31 @@ fn emit_fixed_tall_security0_lean(output: &Path, revision: &str) -> Result<usize
         fs::write(path, &file.bytes).map_err(|error| error.to_string())?;
     }
     Ok(manifest.files.len())
+}
+
+fn assert_security0_owner_claim_statistics(
+    statistics: &TallSecurity0OwnerClaimStatistics,
+    report_bytes: &[u8],
+) {
+    assert_eq!(statistics.result_events, 26_377);
+    assert_eq!(statistics.owners, 9_735);
+    assert_eq!(statistics.multi_payload_owners, 245);
+    assert_eq!(statistics.exact_zero_occurrences, 868);
+    assert_eq!(statistics.finite_occurrences, 623);
+    assert_eq!(statistics.factor_occurrences, 125_521);
+    assert_eq!(statistics.distinct_factor_owners, 2_036);
+    assert_eq!(statistics.factor_present_multi_payload_owners, 0);
+    assert_eq!(statistics.direct_fold_occurrences, 504);
+    assert_eq!(statistics.sum_fold_occurrences, 119);
+    assert_eq!(statistics.exact_zero_consistent_owners, 245);
+    assert_eq!(statistics.h2_owners, 0);
+    assert_eq!(statistics.unknown_owners, 0);
+    let report: serde_json::Value =
+        serde_json::from_slice(report_bytes).expect("Security0 owner-claim report JSON");
+    assert_eq!(report["schemaId"], "mxx.operational-noise.semantic-owner-statistics");
+    assert_eq!(report["schemaVersion"], 1);
+    assert_eq!(report["statistics"]["resultEvents"], 26_377);
+    assert_eq!(report["owners"].as_array().map(Vec::len), Some(9_735));
 }
 
 #[test]

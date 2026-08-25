@@ -328,6 +328,25 @@ nodes, `ProgramCall`, and `IndexUse` without recursively unfolding descendants. 
 emits adjacent-fuel child haves. `Cert.Valid` proves the fallbacks unreachable for
 contract-satisfying assignments.
 
+### 7.1 Semantic owner claims and the CP0/CP1 trust split
+
+Within one replay, an `Owner` is the typed pair of scope and expression row. An owner used as a
+central or ordered monomial factor must denote one value in that replay and, for a program scope,
+for every selector in the program domain. The opt-in Rust generator enforces CP0 before emitting
+Lean: coefficient-normalized exact-zero claims for a factor owner must agree, and an owner with
+multiple distinct result payloads must not occur as a factor. A nonfactor owner may have repeated
+consistent exact claims or an empty finite claim obtained by the recognized direct-survivor or
+sum-after-survivor fold chain. The deterministic semantic-owner statistics file records the
+event-level claims, frame starts, summaries, and frame-root predecessor bindings used by this
+check.
+
+CP1 keeps these roles separate. `Env` is queried only for factor owners, `ValueClaim` remains an
+event-level statement, and `Witness` bounds only factor atoms. The generated Lean theorem is an
+unconditional kernel-checked validity theorem for the emitted document; it does not assume CP0 as
+a proposition. CP0 is instead a trusted-generator correspondence assertion that the owner keys
+used by that document model the values in the honest Rust replay. This split does not add work to
+the ordinary checker path.
+
 Production constructs `Cert.Valid` from row-local `RowTable.AllFrom` witnesses. The Boolean
 `Cert.wellFormed` remains for small fixtures and is connected by fixed reflection theorems. The
 shared validation obligations include at least:

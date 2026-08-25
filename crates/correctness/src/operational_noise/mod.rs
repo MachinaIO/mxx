@@ -41,9 +41,9 @@ pub use simulation::{
     prepare_g0_cpu_evidence_bytes, serialize_base_feasibility_summary,
 };
 pub use tall_e2e::{
-    TallSecurity0GeneratedFile, TallSecurity0LeanManifest, TallSecurity0ProfileIdentity,
-    TallSecurity0ReachedProjection, prepare_tall_security0_lean_manifest,
-    prepare_tall_security0_reached_projection,
+    TallSecurity0GeneratedFile, TallSecurity0LeanManifest, TallSecurity0OwnerClaimStatistics,
+    TallSecurity0ProfileIdentity, TallSecurity0ReachedProjection,
+    prepare_tall_security0_lean_manifest, prepare_tall_security0_reached_projection,
 };
 pub use toy_e2e::{
     ToyGeneratedLean, check_toy_operational_slice_source, generate_toy_operational_slice_lean,

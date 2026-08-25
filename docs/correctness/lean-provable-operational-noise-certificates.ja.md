@@ -309,6 +309,25 @@ code review と Rust–Lean differential test で担保する。
 
 ## 7. Lean で証明する固定の主張
 
+### 7.1 semantic owner claim と CP0/CP1 の trust split
+
+一回の replay における `Owner` は、scope と expression row の型付き pair である。central または
+ordered monomial factor として使う owner は、その replay 内で一つの値を表し、program scope の
+場合は program domain 内の各 selector について一つの値を表さなければならない。opt-in Rust
+generator は Lean を出力する前に CP0 を検査する。factor owner の coefficient-normalized
+exact-zero claim は一致しなければならず、異なる複数の result payload を持つ owner は factor に
+現れてはならない。nonfactor owner については、一致する exact claim の反復、または
+direct-survivor / sum-after-survivor として認識した fold chain から得た空の finite claim を許す。
+決定的な semantic-owner statistics file は、この検査に使った event 単位の claim、frame start、
+summary、frame-root predecessor binding を記録する。
+
+CP1 では役割を分離する。`Env` を参照するのは factor owner だけであり、`ValueClaim` は event
+単位の statement のまま、`Witness` が bound するのも factor atom だけである。生成される Lean
+theorem は、出力 document に対する無条件の kernel-checked validity theorem であり、CP0 を命題の
+仮定として受け取らない。CP0 は代わりに、その document が使う owner key と honest Rust replay
+の値との対応を検査する trusted-generator assertion である。この分離によって通常 checker 経路に
+処理は追加されない。
+
 `InputAssignment` は source access ごとの実際の入力値、`SamplerAssignment` は event ごとの
 実際の sampler 値である。`InputContract` と `SamplerContract` は、それらの値が型・範囲・
 sampler 条件を満たすことを表す。root の引数は実行者から受け取らず、certificate に記録された

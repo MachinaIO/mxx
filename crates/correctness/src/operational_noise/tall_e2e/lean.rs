@@ -1,5 +1,8 @@
 mod proof;
 mod statement;
+mod statistics;
+
+pub(super) use statistics::measure_owner_claims;
 
 use super::TallSecurity0GeneratedFile;
 use crate::operational_noise::{
@@ -12,9 +15,14 @@ const MODULE_ROOT: &str = "Mxx.Certificate.OperationalNoise.TallSecurity0Generat
 pub(super) fn render(
     statement: &CertificateDocumentV1,
     proof: &OperationalProofPayload,
+    owner_claim_report_bytes: &[u8],
 ) -> Result<Vec<TallSecurity0GeneratedFile>, String> {
     let mut files = statement::render(statement)?;
     files.extend(proof::render(statement, proof)?);
+    files.push(TallSecurity0GeneratedFile {
+        relative_path: "SemanticOwnerStatistics.json".to_owned(),
+        bytes: owner_claim_report_bytes.to_vec(),
+    });
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(files)
 }

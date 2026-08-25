@@ -2417,6 +2417,41 @@ fn fixed_tall_security0_certificate_source_is_exact() {
 }
 
 #[test]
+#[ignore = "CPU-only fixed Security0 source reconstruction; performs no backend execution"]
+fn fixed_tall_security0_source_reconstructs_direct_semantics() {
+    let source: TallCertificateSourceV1 = serde_json::from_slice(
+        &fs::read(TALL_SECURITY0_SOURCE_PATH).expect("fixed Security0 Source.json"),
+    )
+    .expect("strict fixed Security0 source");
+    let direct = prepare_fixed_tall_operational_source(TallG0Profile::Security0.fixed())
+        .expect("direct fixed Security0 source");
+    let reconstructed = build_fixed_tall_certificate_source(&source)
+        .expect("Source.json-driven fixed Security0 source");
+
+    assert_eq!(direct.fixed, reconstructed.fixed);
+    assert_eq!(direct.selected.parameters.to_crt(), reconstructed.selected.parameters.to_crt());
+    assert_eq!(
+        direct.selected.parameters.ring_dimension(),
+        reconstructed.selected.parameters.ring_dimension()
+    );
+    assert_eq!(direct.request, reconstructed.request);
+
+    let direct_evidence = prepare_g0_cpu_evidence_bytes(&direct.protocol, &direct.request)
+        .expect("direct fixed Security0 semantic evidence");
+    let reconstructed_evidence =
+        prepare_g0_cpu_evidence_bytes(&reconstructed.protocol, &reconstructed.request)
+            .expect("Source.json-driven fixed Security0 semantic evidence");
+    assert_eq!(direct_evidence, reconstructed_evidence);
+
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&reconstructed_evidence).expect("Security0 CPU evidence JSON");
+    assert_eq!(evidence["schema_id"], G0_CPU_OBSERVATION_SCHEMA_ID);
+    assert_eq!(evidence["schema_version"], G0_CPU_OBSERVATION_SCHEMA_VERSION);
+    assert_eq!(evidence["status"], G0_CPU_OBSERVATION_STATUS);
+    assert!(evidence["base_feasibility"]["accepted"].as_bool().expect("accepted report"));
+}
+
+#[test]
 #[ignore = "CPU-only fixed Security0 reached projection; performs no backend execution"]
 fn fixed_tall_security0_source_projection_matches_ordinary_semantics() {
     let source: TallCertificateSourceV1 = serde_json::from_slice(

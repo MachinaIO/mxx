@@ -1,0 +1,1781 @@
+{
+  "statement": {
+    "schemaId": "mxx.operational-noise.certificate",
+    "schemaVersion": 1,
+    "plaintextModulus": "2",
+    "ciphertextModulus": "257",
+    "ringDimension": 1,
+    "expressions": [
+      {
+        "descriptor": {
+          "kind": "operation",
+          "operator": {
+            "kind": "sampler",
+            "event": {
+              "row": 0
+            }
+          },
+          "value_type": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 1,
+            "columns": 4
+          }
+        },
+        "inputs": [],
+        "program": null
+      },
+      {
+        "descriptor": {
+          "kind": "operation",
+          "operator": {
+            "kind": "sampler",
+            "event": {
+              "row": 1
+            }
+          },
+          "value_type": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 1,
+            "columns": 1
+          }
+        },
+        "inputs": [],
+        "program": null
+      },
+      {
+        "descriptor": {
+          "kind": "operation",
+          "operator": {
+            "kind": "sampler",
+            "event": {
+              "row": 2
+            }
+          },
+          "value_type": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 4,
+            "columns": 1
+          }
+        },
+        "inputs": [],
+        "program": null
+      },
+      {
+        "descriptor": {
+          "kind": "operation",
+          "operator": {
+            "kind": "sampler",
+            "event": {
+              "row": 3
+            }
+          },
+          "value_type": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 1,
+            "columns": 1
+          }
+        },
+        "inputs": [],
+        "program": null
+      },
+      {
+        "descriptor": {
+          "kind": "operation",
+          "operator": {
+            "kind": "trapdoor",
+            "operation": {
+              "kind": "generate",
+              "descriptor": "trapdoor-sample",
+              "parameters": [
+                4,
+                2
+              ],
+              "paired_public_event": {
+                "row": 0
+              },
+              "paired_public_output_role": "value"
+            }
+          },
+          "value_type": {
+            "kind": "trapdoor"
+          }
+        },
+        "inputs": [],
+        "program": null
+      },
+      {
+        "descriptor": {
+          "kind": "source",
+          "source": {
+            "kind": "direct",
+            "source": 0
+          }
+        },
+        "inputs": [],
+        "program": null
+      },
+      {
+        "descriptor": {
+          "kind": "source",
+          "source": {
+            "kind": "direct",
+            "source": 1
+          }
+        },
+        "inputs": [],
+        "program": null
+      },
+      {
+        "descriptor": {
+          "kind": "operation",
+          "operator": {
+            "kind": "program_call"
+          },
+          "value_type": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 4,
+            "columns": 1
+          }
+        },
+        "inputs": [
+          5
+        ],
+        "program": 0
+      },
+      {
+        "descriptor": {
+          "kind": "operation",
+          "operator": {
+            "kind": "matrix",
+            "operation": {
+              "kind": "multiply"
+            }
+          },
+          "value_type": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 1,
+            "columns": 1
+          }
+        },
+        "inputs": [
+          0,
+          7
+        ],
+        "program": null
+      },
+      {
+        "descriptor": {
+          "kind": "operation",
+          "operator": {
+            "kind": "matrix",
+            "operation": {
+              "kind": "scale"
+            }
+          },
+          "value_type": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 4,
+            "columns": 1
+          }
+        },
+        "inputs": [
+          7,
+          6
+        ],
+        "program": null
+      },
+      {
+        "descriptor": {
+          "kind": "operation",
+          "operator": {
+            "kind": "matrix",
+            "operation": {
+              "kind": "multiply"
+            }
+          },
+          "value_type": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 1,
+            "columns": 1
+          }
+        },
+        "inputs": [
+          0,
+          9
+        ],
+        "program": null
+      },
+      {
+        "descriptor": {
+          "kind": "operation",
+          "operator": {
+            "kind": "matrix",
+            "operation": {
+              "kind": "subtract"
+            }
+          },
+          "value_type": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 1,
+            "columns": 1
+          }
+        },
+        "inputs": [
+          10,
+          1
+        ],
+        "program": null
+      },
+      {
+        "descriptor": {
+          "kind": "operation",
+          "operator": {
+            "kind": "matrix",
+            "operation": {
+              "kind": "add"
+            }
+          },
+          "value_type": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 1,
+            "columns": 1
+          }
+        },
+        "inputs": [
+          11,
+          3
+        ],
+        "program": null
+      }
+    ],
+    "programs": [
+      {
+        "signature": [
+          {
+            "value_type": {
+              "kind": "int"
+            },
+            "trusted_index_range": {
+              "minimum": 0,
+              "maximum_exclusive": 1
+            }
+          }
+        ],
+        "output": {
+          "kind": "matrix",
+          "modulus": "257",
+          "ring_dimension": 1,
+          "rows": 4,
+          "columns": 1
+        },
+        "family": {
+          "domain": {
+            "minimum": 0,
+            "maximum_exclusive": 1
+          },
+          "element_type": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 4,
+            "columns": 1
+          },
+          "reducible": false,
+          "artifact": null
+        },
+        "root": 2
+      }
+    ],
+    "sources": [
+      {
+        "kind": "constant",
+        "value": {
+          "value_type": {
+            "kind": "int"
+          },
+          "value": {
+            "kind": "int",
+            "value": "0"
+          }
+        }
+      },
+      {
+        "kind": "constant",
+        "value": {
+          "value_type": {
+            "kind": "int"
+          },
+          "value": {
+            "kind": "int",
+            "value": "1"
+          }
+        }
+      }
+    ],
+    "events": [
+      {
+        "kind": "sampler",
+        "owner": {
+          "stage": "consumer",
+          "definition": {
+            "kind": "root"
+          },
+          "path": 0,
+          "node": 0,
+          "port": 0
+        },
+        "operation": {
+          "kind": "trapdoor",
+          "output": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 1,
+            "columns": 4
+          },
+          "sigma": "{\"tag\":\"Rational\",\"value\":{\"numerator\":\"3\",\"denominator\":\"1\"}}",
+          "gadget_base": 4,
+          "digit_count": 2,
+          "preimage_max_coefficient_bound": "8"
+        },
+        "contract": null
+      },
+      {
+        "kind": "sampler",
+        "owner": {
+          "stage": "consumer",
+          "definition": {
+            "kind": "root"
+          },
+          "path": 0,
+          "node": 1,
+          "port": 0
+        },
+        "operation": {
+          "kind": "uniform_residue",
+          "output": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 1,
+            "columns": 1
+          }
+        },
+        "contract": null
+      },
+      {
+        "kind": "sampler",
+        "owner": {
+          "stage": "consumer",
+          "definition": {
+            "kind": "root"
+          },
+          "path": 0,
+          "node": 2,
+          "port": 0
+        },
+        "operation": {
+          "kind": "preimage",
+          "output": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 4,
+            "columns": 1
+          },
+          "max_coefficient_bound": "8"
+        },
+        "contract": null
+      },
+      {
+        "kind": "sampler",
+        "owner": {
+          "stage": "consumer",
+          "definition": {
+            "kind": "root"
+          },
+          "path": 0,
+          "node": 6,
+          "port": 0
+        },
+        "operation": {
+          "kind": "gaussian",
+          "output": {
+            "kind": "matrix",
+            "modulus": "257",
+            "ring_dimension": 1,
+            "rows": 1,
+            "columns": 1
+          },
+          "sigma": "{\"tag\":\"Rational\",\"value\":{\"numerator\":\"1\",\"denominator\":\"1\"}}",
+          "max_coefficient_bound": "1"
+        },
+        "contract": null
+      }
+    ],
+    "indexUses": [],
+    "sliceGroups": [],
+    "residualRoot": {
+      "kind": "closed",
+      "expression": 12
+    }
+  },
+  "events": [
+    {
+      "kind": "invocation_start",
+      "root": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 12
+      }
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 3
+      },
+      "rule": {
+        "kind": "authority",
+        "authority": {
+          "kind": "operator"
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 3
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 3
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 1
+      },
+      "rule": {
+        "kind": "authority",
+        "authority": {
+          "kind": "operator"
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 1
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 1
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 6
+      },
+      "rule": {
+        "kind": "authority",
+        "authority": {
+          "kind": "operator"
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 6
+      },
+      "value": {
+        "kind": "coefficient",
+        "bound": {
+          "kind": "finite",
+          "maximumAbsoluteCoefficient": "1"
+        }
+      }
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 5
+      },
+      "rule": {
+        "kind": "authority",
+        "authority": {
+          "kind": "operator"
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 5
+      },
+      "value": {
+        "kind": "coefficient",
+        "bound": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 7
+      },
+      "inputPosition": 0,
+      "predecessor": 5,
+      "sourceResult": 8
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 7
+      },
+      "rule": {
+        "kind": "authority",
+        "authority": {
+          "kind": "relation_preimage_source",
+          "source": 2
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 7
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 7
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 9
+      },
+      "inputPosition": 0,
+      "predecessor": 7,
+      "sourceResult": 11
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 9
+      },
+      "inputPosition": 1,
+      "predecessor": 6,
+      "sourceResult": 6
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 9
+      },
+      "rule": {
+        "kind": "scale",
+        "value": {
+          "kind": "predecessor",
+          "inputPosition": 0,
+          "projection": "coefficient"
+        },
+        "scale": {
+          "kind": "value",
+          "value": {
+            "kind": "predecessor",
+            "inputPosition": 1,
+            "projection": "coefficient"
+          }
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 9
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 7
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 0
+      },
+      "rule": {
+        "kind": "authority",
+        "authority": {
+          "kind": "operator"
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 0
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 0
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 10
+      },
+      "inputPosition": 0,
+      "predecessor": 0,
+      "sourceResult": 17
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 10
+      },
+      "inputPosition": 1,
+      "predecessor": 9,
+      "sourceResult": 15
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 10
+      },
+      "rule": {
+        "kind": "product",
+        "left": {
+          "kind": "predecessor",
+          "inputPosition": 0,
+          "projection": "coefficient"
+        },
+        "right": {
+          "kind": "predecessor",
+          "inputPosition": 1,
+          "projection": "coefficient"
+        },
+        "facts": {
+          "leftIsConstantPolynomial": false,
+          "rightIsConstantPolynomial": false,
+          "rightKnownZeroRows": null,
+          "leftSupportUpper": null,
+          "rightSupportUpper": null
+        }
+      }
+    },
+    {
+      "kind": "coefficient_merge",
+      "merge": {
+        "owner": {
+          "scope": {
+            "kind": "closed",
+            "rootExpressionRow": 12
+          },
+          "expressionRow": 10
+        },
+        "source": {
+          "kind": "operator",
+          "inputs": [
+            {
+              "valueEvent": 17,
+              "termOrdinal": 0
+            },
+            {
+              "valueEvent": 15,
+              "termOrdinal": 0
+            }
+          ]
+        },
+        "output": {
+          "centralFactors": [],
+          "orderedFactors": [
+            {
+              "scope": {
+                "kind": "closed",
+                "rootExpressionRow": 12
+              },
+              "expressionRow": 0
+            },
+            {
+              "scope": {
+                "kind": "closed",
+                "rootExpressionRow": 12
+              },
+              "expressionRow": 7
+            }
+          ]
+        },
+        "signedContribution": "1"
+      }
+    },
+    {
+      "kind": "invocation_start",
+      "root": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 8
+      }
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 5
+      },
+      "rule": {
+        "kind": "authority",
+        "authority": {
+          "kind": "operator"
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 5
+      },
+      "value": {
+        "kind": "coefficient",
+        "bound": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 7
+      },
+      "inputPosition": 0,
+      "predecessor": 5,
+      "sourceResult": 24
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 7
+      },
+      "rule": {
+        "kind": "authority",
+        "authority": {
+          "kind": "relation_preimage_source",
+          "source": 2
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 7
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 7
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 0
+      },
+      "rule": {
+        "kind": "authority",
+        "authority": {
+          "kind": "operator"
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 0
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 0
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 8
+      },
+      "inputPosition": 0,
+      "predecessor": 0,
+      "sourceResult": 29
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 8
+      },
+      "inputPosition": 1,
+      "predecessor": 7,
+      "sourceResult": 27
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 8
+      },
+      "rule": {
+        "kind": "product",
+        "left": {
+          "kind": "predecessor",
+          "inputPosition": 0,
+          "projection": "coefficient"
+        },
+        "right": {
+          "kind": "predecessor",
+          "inputPosition": 1,
+          "projection": "coefficient"
+        },
+        "facts": {
+          "leftIsConstantPolynomial": false,
+          "rightIsConstantPolynomial": false,
+          "rightKnownZeroRows": null,
+          "leftSupportUpper": null,
+          "rightSupportUpper": null
+        }
+      }
+    },
+    {
+      "kind": "coefficient_merge",
+      "merge": {
+        "owner": {
+          "scope": {
+            "kind": "closed",
+            "rootExpressionRow": 12
+          },
+          "expressionRow": 8
+        },
+        "source": {
+          "kind": "operator",
+          "inputs": [
+            {
+              "valueEvent": 29,
+              "termOrdinal": 0
+            },
+            {
+              "valueEvent": 27,
+              "termOrdinal": 0
+            }
+          ]
+        },
+        "output": {
+          "centralFactors": [],
+          "orderedFactors": [
+            {
+              "scope": {
+                "kind": "closed",
+                "rootExpressionRow": 12
+              },
+              "expressionRow": 0
+            },
+            {
+              "scope": {
+                "kind": "closed",
+                "rootExpressionRow": 12
+              },
+              "expressionRow": 7
+            }
+          ]
+        },
+        "signedContribution": "1"
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 8
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 0
+                },
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 7
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "pre_fold_polynomial",
+      "terms": [
+        {
+          "monomial": {
+            "centralFactors": [],
+            "orderedFactors": [
+              {
+                "scope": {
+                  "kind": "closed",
+                  "rootExpressionRow": 12
+                },
+                "expressionRow": 0
+              },
+              {
+                "scope": {
+                  "kind": "closed",
+                  "rootExpressionRow": 12
+                },
+                "expressionRow": 7
+              }
+            ]
+          },
+          "coefficient": "1"
+        }
+      ],
+      "summary": {
+        "kind": "exact_zero"
+      },
+      "summaryEvidence": null
+    },
+    {
+      "kind": "invocation_end",
+      "root": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 8
+      },
+      "result": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 0
+                },
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 7
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "invocation_start",
+      "root": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 1
+      }
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 1
+      },
+      "rule": {
+        "kind": "authority",
+        "authority": {
+          "kind": "operator"
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 1
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 1
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "pre_fold_polynomial",
+      "terms": [
+        {
+          "monomial": {
+            "centralFactors": [],
+            "orderedFactors": [
+              {
+                "scope": {
+                  "kind": "closed",
+                  "rootExpressionRow": 12
+                },
+                "expressionRow": 1
+              }
+            ]
+          },
+          "coefficient": "1"
+        }
+      ],
+      "summary": {
+        "kind": "exact_zero"
+      },
+      "summaryEvidence": null
+    },
+    {
+      "kind": "invocation_end",
+      "root": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 1
+      },
+      "result": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 1
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "specialization_computed",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 5
+      },
+      "dispatch": {
+        "preimageFamily": 0,
+        "preimageSource": 2,
+        "trapdoorSource": 4
+      },
+      "source": {
+        "start": 22,
+        "end": 42
+      }
+    },
+    {
+      "kind": "applied_universal",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 10
+      },
+      "sourceMonomial": {
+        "centralFactors": [],
+        "orderedFactors": [
+          {
+            "scope": {
+              "kind": "closed",
+              "rootExpressionRow": 12
+            },
+            "expressionRow": 0
+          },
+          {
+            "scope": {
+              "kind": "closed",
+              "rootExpressionRow": 12
+            },
+            "expressionRow": 7
+          }
+        ]
+      },
+      "outerCoefficient": "1",
+      "orderedStart": 0,
+      "orderedEndExclusive": 2,
+      "computed": 42,
+      "lhs": {
+        "centralFactors": [],
+        "orderedFactors": [
+          {
+            "scope": {
+              "kind": "closed",
+              "rootExpressionRow": 12
+            },
+            "expressionRow": 0
+          },
+          {
+            "scope": {
+              "kind": "closed",
+              "rootExpressionRow": 12
+            },
+            "expressionRow": 7
+          }
+        ]
+      },
+      "lhsLayout": null,
+      "rhsResult": 41
+    },
+    {
+      "kind": "coefficient_merge",
+      "merge": {
+        "owner": {
+          "scope": {
+            "kind": "closed",
+            "rootExpressionRow": 12
+          },
+          "expressionRow": 10
+        },
+        "source": {
+          "kind": "relation",
+          "application": 43,
+          "sourceTermOrdinal": 0
+        },
+        "output": {
+          "centralFactors": [],
+          "orderedFactors": [
+            {
+              "scope": {
+                "kind": "closed",
+                "rootExpressionRow": 12
+              },
+              "expressionRow": 1
+            }
+          ]
+        },
+        "signedContribution": "1"
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 10
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [
+          {
+            "monomial": {
+              "centralFactors": [],
+              "orderedFactors": [
+                {
+                  "scope": {
+                    "kind": "closed",
+                    "rootExpressionRow": 12
+                  },
+                  "expressionRow": 1
+                }
+              ]
+            },
+            "coefficient": "1"
+          }
+        ],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 11
+      },
+      "inputPosition": 0,
+      "predecessor": 10,
+      "sourceResult": 45
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 11
+      },
+      "inputPosition": 1,
+      "predecessor": 1,
+      "sourceResult": 4
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 11
+      },
+      "rule": {
+        "kind": "sum",
+        "inputs": [
+          {
+            "kind": "predecessor",
+            "inputPosition": 0,
+            "projection": "coefficient"
+          },
+          {
+            "kind": "predecessor",
+            "inputPosition": 1,
+            "projection": "coefficient"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "coefficient_merge",
+      "merge": {
+        "owner": {
+          "scope": {
+            "kind": "closed",
+            "rootExpressionRow": 12
+          },
+          "expressionRow": 11
+        },
+        "source": {
+          "kind": "operator",
+          "inputs": [
+            {
+              "valueEvent": 45,
+              "termOrdinal": 0
+            },
+            {
+              "valueEvent": 4,
+              "termOrdinal": 0
+            }
+          ]
+        },
+        "output": {
+          "centralFactors": [],
+          "orderedFactors": [
+            {
+              "scope": {
+                "kind": "closed",
+                "rootExpressionRow": 12
+              },
+              "expressionRow": 1
+            }
+          ]
+        },
+        "signedContribution": "-1"
+      }
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 11
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [],
+        "summary": {
+          "kind": "exact_zero"
+        }
+      }
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 12
+      },
+      "inputPosition": 0,
+      "predecessor": 11,
+      "sourceResult": 50
+    },
+    {
+      "kind": "predecessor",
+      "consumer": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 12
+      },
+      "inputPosition": 1,
+      "predecessor": 3,
+      "sourceResult": 2
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 12
+      },
+      "rule": {
+        "kind": "sum",
+        "inputs": [
+          {
+            "kind": "predecessor",
+            "inputPosition": 0,
+            "projection": "coefficient"
+          },
+          {
+            "kind": "predecessor",
+            "inputPosition": 1,
+            "projection": "coefficient"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "bound_transfer",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 12
+      },
+      "rule": {
+        "kind": "monomial_product",
+        "monomial": {
+          "centralFactors": [],
+          "orderedFactors": [
+            {
+              "scope": {
+                "kind": "closed",
+                "rootExpressionRow": 12
+              },
+              "expressionRow": 3
+            }
+          ]
+        },
+        "factors": [
+          {
+            "bound": {
+              "kind": "result",
+              "event": 2,
+              "projection": "coefficient"
+            },
+            "isConstantPolynomial": false,
+            "supportUpper": null
+          }
+        ]
+      }
+    },
+    {
+      "kind": "survivor_fold",
+      "coefficient": "1",
+      "bound": 54
+    },
+    {
+      "kind": "result",
+      "owner": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 12
+      },
+      "value": {
+        "kind": "exact",
+        "terms": [],
+        "summary": {
+          "kind": "finite",
+          "maximumAbsoluteCoefficient": "1"
+        }
+      }
+    },
+    {
+      "kind": "pre_fold_polynomial",
+      "terms": [],
+      "summary": {
+        "kind": "finite",
+        "maximumAbsoluteCoefficient": "1"
+      },
+      "summaryEvidence": {
+        "kind": "result",
+        "event": 56,
+        "projection": "summary"
+      }
+    },
+    {
+      "kind": "invocation_end",
+      "root": {
+        "scope": {
+          "kind": "closed",
+          "rootExpressionRow": 12
+        },
+        "expressionRow": 12
+      },
+      "result": {
+        "kind": "exact",
+        "terms": [],
+        "summary": {
+          "kind": "finite",
+          "maximumAbsoluteCoefficient": "1"
+        }
+      }
+    }
+  ]
+}

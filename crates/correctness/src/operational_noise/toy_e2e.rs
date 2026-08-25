@@ -1,7 +1,8 @@
 //! Fixed Rust input and in-memory adapter for the singleton-preimage Gaussian toy slice.
 //!
-//! The adapter intentionally has no serializer or generic proof language.  It retains exactly the
-//! variants reached by this one honest certificate run and rejects any other projected variant.
+//! The adapter intentionally has no Lean renderer or generic proof language.  Its deterministic
+//! serialization is test/audit output only; the fixed source remains the sole generator input.
+//! It retains exactly the variants reached by this one honest run and rejects any other variant.
 
 use super::{
     OperationalCheckRequest,
@@ -15,7 +16,7 @@ use super::{
         ProofPayloadValueRef, derive_certificate_documents, prepare_operational_certificate,
     },
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 const TOY_SOURCE_SCHEMA_ID: &str = "mxx.operational-noise.toy-source";
 const TOY_SOURCE_SCHEMA_VERSION: u32 = 1;
@@ -175,6 +176,465 @@ enum ToyEventV1 {
     SurvivorFold(ProofPayloadSurvivorFold),
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToyAuditSlice<'a> {
+    statement: &'a CertificateDocumentV1,
+    events: Vec<ToyAuditEvent>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase", tag = "kind")]
+enum ToyAuditScope {
+    Closed { root_expression_row: u64 },
+    Program { program_row: u64 },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToyAuditOwner {
+    scope: ToyAuditScope,
+    expression_row: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToyAuditMonomial {
+    central_factors: Vec<ToyAuditOwner>,
+    ordered_factors: Vec<ToyAuditOwner>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToyAuditTerm {
+    monomial: ToyAuditMonomial,
+    coefficient: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase", tag = "kind")]
+enum ToyAuditBound {
+    ExactZero,
+    Finite { maximum_absolute_coefficient: String },
+    Large,
+    Missing,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase", tag = "kind")]
+enum ToyAuditValue {
+    Exact { terms: Vec<ToyAuditTerm>, summary: ToyAuditBound },
+    Coefficient { bound: ToyAuditBound },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ToyAuditProjection {
+    Coefficient,
+    Summary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase", tag = "kind")]
+enum ToyAuditValueRef {
+    Predecessor { input_position: u32, projection: ToyAuditProjection },
+    Result { event: u64, projection: ToyAuditProjection },
+    Transfer { event: u64 },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase", tag = "kind")]
+enum ToyAuditScale {
+    Value { value: ToyAuditValueRef },
+    Magnitude { magnitude: String },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToyAuditFactorEvidence {
+    bound: ToyAuditValueRef,
+    is_constant_polynomial: bool,
+    support_upper: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToyAuditProductFacts {
+    left_is_constant_polynomial: bool,
+    right_is_constant_polynomial: bool,
+    right_known_zero_rows: Option<String>,
+    left_support_upper: Option<usize>,
+    right_support_upper: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase", tag = "kind")]
+enum ToyAuditAuthority {
+    Operator,
+    RelationPreimageSource { source: u64 },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase", tag = "kind")]
+enum ToyAuditRule {
+    Authority { authority: ToyAuditAuthority },
+    Sum { inputs: Vec<ToyAuditValueRef> },
+    Scale { value: ToyAuditValueRef, scale: ToyAuditScale },
+    MonomialProduct { monomial: ToyAuditMonomial, factors: Vec<ToyAuditFactorEvidence> },
+    Product { left: ToyAuditValueRef, right: ToyAuditValueRef, facts: ToyAuditProductFacts },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToyAuditDispatch {
+    preimage_family: u64,
+    preimage_source: u64,
+    trapdoor_source: u64,
+}
+
+#[derive(Serialize)]
+struct ToyAuditRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToyAuditLayout {
+    name: String,
+    row_stride: usize,
+    column_stride: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToyAuditTermRef {
+    value_event: u64,
+    term_ordinal: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase", tag = "kind")]
+enum ToyAuditMergeSource {
+    Operator { inputs: [ToyAuditTermRef; 2] },
+    Relation { application: u64, source_term_ordinal: u64 },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToyAuditMerge {
+    owner: ToyAuditOwner,
+    source: ToyAuditMergeSource,
+    output: ToyAuditMonomial,
+    signed_contribution: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase", tag = "kind")]
+enum ToyAuditEvent {
+    InvocationStart {
+        root: ToyAuditOwner,
+    },
+    Predecessor {
+        consumer: ToyAuditOwner,
+        input_position: u32,
+        predecessor: u64,
+        source_result: u64,
+    },
+    Result {
+        owner: ToyAuditOwner,
+        value: ToyAuditValue,
+    },
+    InvocationEnd {
+        root: ToyAuditOwner,
+        result: ToyAuditValue,
+    },
+    SpecializationComputed {
+        owner: ToyAuditOwner,
+        dispatch: ToyAuditDispatch,
+        source: ToyAuditRange,
+    },
+    AppliedUniversal {
+        owner: ToyAuditOwner,
+        source_monomial: ToyAuditMonomial,
+        outer_coefficient: String,
+        ordered_start: u32,
+        ordered_end_exclusive: u32,
+        computed: u64,
+        lhs: ToyAuditMonomial,
+        lhs_layout: Option<ToyAuditLayout>,
+        rhs_result: u64,
+    },
+    BoundTransfer {
+        owner: ToyAuditOwner,
+        rule: ToyAuditRule,
+    },
+    CoefficientMerge {
+        merge: ToyAuditMerge,
+    },
+    PreFoldPolynomial {
+        terms: Vec<ToyAuditTerm>,
+        summary: ToyAuditBound,
+        summary_evidence: Option<ToyAuditValueRef>,
+    },
+    SurvivorFold {
+        coefficient: String,
+        bound: u64,
+    },
+}
+
+fn audit_owner(owner: &ProofPayloadOwner) -> ToyAuditOwner {
+    let scope = match owner.scope {
+        super::simulation::ProofPayloadScope::Closed { root_expression_row } => {
+            ToyAuditScope::Closed { root_expression_row }
+        }
+        super::simulation::ProofPayloadScope::Program { program_row } => {
+            ToyAuditScope::Program { program_row }
+        }
+    };
+    ToyAuditOwner { scope, expression_row: owner.expression_row }
+}
+
+fn audit_monomial(monomial: &ProofPayloadMonomial) -> ToyAuditMonomial {
+    ToyAuditMonomial {
+        central_factors: monomial.central_factors.iter().map(audit_owner).collect(),
+        ordered_factors: monomial.ordered_factors.iter().map(audit_owner).collect(),
+    }
+}
+
+fn audit_term(term: &super::simulation::ProofPayloadTerm) -> ToyAuditTerm {
+    ToyAuditTerm {
+        monomial: audit_monomial(&term.monomial),
+        coefficient: term.coefficient.to_string(),
+    }
+}
+
+fn audit_coefficient_bound(
+    bound: &super::facts::NumericContract<super::facts::CoefficientBound>,
+) -> ToyAuditBound {
+    match bound {
+        super::facts::NumericContract::Missing => ToyAuditBound::Missing,
+        super::facts::NumericContract::Known(super::facts::CoefficientBound::ExactZero) => {
+            ToyAuditBound::ExactZero
+        }
+        super::facts::NumericContract::Known(super::facts::CoefficientBound::Finite(bound)) => {
+            ToyAuditBound::Finite {
+                maximum_absolute_coefficient: bound.maximum_absolute_coefficient.to_string(),
+            }
+        }
+        super::facts::NumericContract::Known(super::facts::CoefficientBound::Large) => {
+            ToyAuditBound::Large
+        }
+    }
+}
+
+fn audit_summary(summary: &super::normal_form::BoundedSummary) -> ToyAuditBound {
+    audit_coefficient_bound(&summary.coefficient_bound())
+}
+
+fn audit_value(value: &ProofPayloadValue) -> ToyAuditValue {
+    match value {
+        ProofPayloadValue::Exact { terms, summary } => ToyAuditValue::Exact {
+            terms: terms.iter().map(audit_term).collect(),
+            summary: audit_summary(summary),
+        },
+        ProofPayloadValue::Coefficient { bound } => {
+            ToyAuditValue::Coefficient { bound: audit_coefficient_bound(bound) }
+        }
+    }
+}
+
+fn audit_projection(projection: &super::g0::BoundProjection) -> ToyAuditProjection {
+    match projection {
+        super::g0::BoundProjection::Coefficient => ToyAuditProjection::Coefficient,
+        super::g0::BoundProjection::Summary => ToyAuditProjection::Summary,
+    }
+}
+
+fn audit_value_ref(value: &ProofPayloadValueRef) -> ToyAuditValueRef {
+    match value {
+        ProofPayloadValueRef::Predecessor { input_position, projection } => {
+            ToyAuditValueRef::Predecessor {
+                input_position: *input_position,
+                projection: audit_projection(projection),
+            }
+        }
+        ProofPayloadValueRef::Result { event, projection } => {
+            ToyAuditValueRef::Result { event: *event, projection: audit_projection(projection) }
+        }
+        ProofPayloadValueRef::Transfer(event) => ToyAuditValueRef::Transfer { event: *event },
+    }
+}
+
+fn audit_scale(scale: &ProofPayloadScale) -> ToyAuditScale {
+    match scale {
+        ProofPayloadScale::Value(value) => ToyAuditScale::Value { value: audit_value_ref(value) },
+        ProofPayloadScale::Magnitude(magnitude) => {
+            ToyAuditScale::Magnitude { magnitude: magnitude.to_string() }
+        }
+    }
+}
+
+fn audit_rule(rule: &ToyRuleV1) -> ToyAuditRule {
+    match rule {
+        ToyRuleV1::Authority(authority) => ToyAuditRule::Authority {
+            authority: match authority {
+                ToyAuthorityV1::Operator => ToyAuditAuthority::Operator,
+                ToyAuthorityV1::RelationPreimageSource { source } => {
+                    ToyAuditAuthority::RelationPreimageSource { source: *source }
+                }
+            },
+        },
+        ToyRuleV1::Sum { inputs } => {
+            ToyAuditRule::Sum { inputs: inputs.iter().map(audit_value_ref).collect() }
+        }
+        ToyRuleV1::Scale { value, scale } => {
+            ToyAuditRule::Scale { value: audit_value_ref(value), scale: audit_scale(scale) }
+        }
+        ToyRuleV1::MonomialProduct { monomial, factors } => ToyAuditRule::MonomialProduct {
+            monomial: audit_monomial(monomial),
+            factors: factors
+                .iter()
+                .map(|factor| ToyAuditFactorEvidence {
+                    bound: audit_value_ref(&factor.bound),
+                    is_constant_polynomial: factor.is_constant_polynomial,
+                    support_upper: factor.support_upper,
+                })
+                .collect(),
+        },
+        ToyRuleV1::Product { left, right, facts } => ToyAuditRule::Product {
+            left: audit_value_ref(left),
+            right: audit_value_ref(right),
+            facts: ToyAuditProductFacts {
+                left_is_constant_polynomial: facts.left_is_constant_polynomial,
+                right_is_constant_polynomial: facts.right_is_constant_polynomial,
+                right_known_zero_rows: facts
+                    .right_known_zero_rows
+                    .as_ref()
+                    .map(ToString::to_string),
+                left_support_upper: facts.left_support_upper,
+                right_support_upper: facts.right_support_upper,
+            },
+        },
+    }
+}
+
+fn audit_merge(merge: &ToyMergeV1) -> ToyAuditMerge {
+    let source = match &merge.source {
+        ToyMergeSourceV1::Operator { inputs } => ToyAuditMergeSource::Operator {
+            inputs: inputs.each_ref().map(|input| ToyAuditTermRef {
+                value_event: input.value_event,
+                term_ordinal: input.term_ordinal,
+            }),
+        },
+        ToyMergeSourceV1::Relation { application, source_term_ordinal } => {
+            ToyAuditMergeSource::Relation {
+                application: *application,
+                source_term_ordinal: *source_term_ordinal,
+            }
+        }
+    };
+    ToyAuditMerge {
+        owner: audit_owner(&merge.owner),
+        source,
+        output: audit_monomial(&merge.output),
+        signed_contribution: merge.signed_contribution.to_string(),
+    }
+}
+
+fn audit_event(event: &ToyEventV1) -> ToyAuditEvent {
+    match event {
+        ToyEventV1::InvocationStart { root } => {
+            ToyAuditEvent::InvocationStart { root: audit_owner(root) }
+        }
+        ToyEventV1::Predecessor { consumer, input_position, predecessor, source_result } => {
+            ToyAuditEvent::Predecessor {
+                consumer: audit_owner(consumer),
+                input_position: *input_position,
+                predecessor: *predecessor,
+                source_result: *source_result,
+            }
+        }
+        ToyEventV1::Result { owner, value } => {
+            ToyAuditEvent::Result { owner: audit_owner(owner), value: audit_value(value) }
+        }
+        ToyEventV1::InvocationEnd { root, result } => {
+            ToyAuditEvent::InvocationEnd { root: audit_owner(root), result: audit_value(result) }
+        }
+        ToyEventV1::SpecializationComputed { owner, dispatch, source } => {
+            ToyAuditEvent::SpecializationComputed {
+                owner: audit_owner(owner),
+                dispatch: ToyAuditDispatch {
+                    preimage_family: dispatch.preimage_family,
+                    preimage_source: dispatch.preimage_source,
+                    trapdoor_source: dispatch.trapdoor_source,
+                },
+                source: ToyAuditRange { start: source.start, end: source.end },
+            }
+        }
+        ToyEventV1::AppliedUniversal {
+            owner,
+            source_monomial,
+            outer_coefficient,
+            ordered_start,
+            ordered_end_exclusive,
+            computed,
+            lhs,
+            lhs_layout,
+            rhs_result,
+        } => ToyAuditEvent::AppliedUniversal {
+            owner: audit_owner(owner),
+            source_monomial: audit_monomial(source_monomial),
+            outer_coefficient: outer_coefficient.to_string(),
+            ordered_start: *ordered_start,
+            ordered_end_exclusive: *ordered_end_exclusive,
+            computed: *computed,
+            lhs: audit_monomial(lhs),
+            lhs_layout: lhs_layout.as_ref().map(|layout| ToyAuditLayout {
+                name: layout.name.clone(),
+                row_stride: layout.row_stride,
+                column_stride: layout.column_stride,
+            }),
+            rhs_result: *rhs_result,
+        },
+        ToyEventV1::BoundTransfer { owner, rule } => {
+            ToyAuditEvent::BoundTransfer { owner: audit_owner(owner), rule: audit_rule(rule) }
+        }
+        ToyEventV1::CoefficientMerge(merge) => {
+            ToyAuditEvent::CoefficientMerge { merge: audit_merge(merge) }
+        }
+        ToyEventV1::PreFoldPolynomial(value) => ToyAuditEvent::PreFoldPolynomial {
+            terms: value.terms.iter().map(audit_term).collect(),
+            summary: audit_summary(&value.summary),
+            summary_evidence: value.summary_evidence.as_ref().map(audit_value_ref),
+        },
+        ToyEventV1::SurvivorFold(value) => ToyAuditEvent::SurvivorFold {
+            coefficient: value.coefficient.to_string(),
+            bound: value.bound,
+        },
+    }
+}
+
+impl Serialize for ToySliceV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ToyAuditSlice {
+            statement: &self.statement,
+            events: self.events.iter().map(audit_event).collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl ToySliceV1 {
+    fn encode_audit_pretty(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("toy projected-slice encoding failed: {error}"))
+    }
+}
+
 fn toy_rule(rule: ProofPayloadRule) -> Result<ToyRuleV1, &'static str> {
     Ok(match rule {
         ProofPayloadRule::Authority(ProofPayloadAuthority::Operator) => {
@@ -279,7 +739,7 @@ fn prepare_toy_slice(source: ToySourceV1) -> Result<ToySliceV1, String> {
 /// Runs the fixed opt-in Rust authority and verifies that it projects into the narrow toy slice.
 /// Rendering and filesystem output are deliberately deferred to a later checkpoint.
 pub fn check_toy_operational_slice_source(source_json: &[u8]) -> Result<(), String> {
-    prepare_toy_slice(ToySourceV1::parse(source_json)?).map(|_| ())
+    prepare_toy_slice(ToySourceV1::parse(source_json)?)?.encode_audit_pretty().map(|_| ())
 }
 
 #[cfg(test)]
@@ -314,6 +774,73 @@ mod tests {
         let mut mismatch = source;
         mismatch.parameters.gaussian_maximum_absolute_coefficient = "2".into();
         assert!(ToySourceV1::parse(&serde_json::to_vec(&mismatch).unwrap()).is_err());
+    }
+
+    #[test]
+    fn projected_slice_audit_is_complete_deterministic_and_matches_golden() {
+        let first = slice().encode_audit_pretty().expect("first projected slice");
+        let second = slice().encode_audit_pretty().expect("second projected slice");
+        assert_eq!(first, second);
+
+        let document: serde_json::Value = serde_json::from_slice(&first).expect("audit JSON");
+        let top = document.as_object().expect("audit document");
+        assert_eq!(
+            top.keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+            ["statement", "events"].into_iter().collect()
+        );
+        let events = document["events"].as_array().expect("audit events");
+        assert_eq!(events.len(), 59);
+        for event in events {
+            let event = event.as_object().expect("typed audit event");
+            let kind = event["kind"].as_str().expect("event kind");
+            let expected: &[&str] = match kind {
+                "invocation_start" => &["kind", "root"],
+                "predecessor" => {
+                    &["kind", "consumer", "inputPosition", "predecessor", "sourceResult"]
+                }
+                "result" => &["kind", "owner", "value"],
+                "invocation_end" => &["kind", "root", "result"],
+                "specialization_computed" => &["kind", "owner", "dispatch", "source"],
+                "applied_universal" => &[
+                    "kind",
+                    "owner",
+                    "sourceMonomial",
+                    "outerCoefficient",
+                    "orderedStart",
+                    "orderedEndExclusive",
+                    "computed",
+                    "lhs",
+                    "lhsLayout",
+                    "rhsResult",
+                ],
+                "bound_transfer" => &["kind", "owner", "rule"],
+                "coefficient_merge" => &["kind", "merge"],
+                "pre_fold_polynomial" => &["kind", "terms", "summary", "summaryEvidence"],
+                "survivor_fold" => &["kind", "coefficient", "bound"],
+                other => panic!("unexpected reached event {other}"),
+            };
+            let actual =
+                event.keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>();
+            let expected = expected.iter().copied().collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(actual, expected, "complete fields for {kind}");
+        }
+        let text = std::str::from_utf8(&first).expect("UTF-8 audit JSON");
+        for forbidden in
+            ["arena", "cache", "coverage", "metric", "canonicalPayload", "generatorPeak"]
+        {
+            assert!(!text.contains(forbidden), "audit output contains {forbidden}");
+        }
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/operational-noise-toy-v1/projected-slice.json");
+        if std::env::var_os("MXX_REGENERATE_CORRECTNESS").as_deref() ==
+            Some(std::ffi::OsStr::new("1"))
+        {
+            std::fs::create_dir_all(path.parent().expect("golden parent"))
+                .expect("create toy audit testdata");
+            std::fs::write(&path, &first).expect("write toy projected-slice golden");
+        }
+        assert_eq!(first, std::fs::read(path).expect("read toy projected-slice golden"));
     }
 
     #[test]

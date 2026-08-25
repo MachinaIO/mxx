@@ -212,6 +212,8 @@ private def partitionBy (representative : MonomialKey Owner) :
 def aggregateCoeff (representative : MonomialKey Owner) (terms : Polynomial Owner) : Int :=
   ((partitionBy representative terms).1.map ExactTerm.coefficient).sum
 
+/-! Coefficient support is derived from `left ++ right`; callers provide no representative,
+    support list, or completeness artifact. -/
 def CoefficientAgreement (left right : Polynomial Owner) : Prop :=
   ∀ term, term ∈ left ++ right →
     aggregateCoeff term.key left = aggregateCoeff term.key right

@@ -166,6 +166,64 @@ def singletonMonomial (expression : Nat) : Monomial := ⟨[], [closedOwner expre
 
 def singletonTerm (expression : Nat) : Term := ⟨singletonMonomial expression, 1⟩
 
+def ownerProductLeft : Monomial :=
+  ⟨[closedOwner 10], [closedOwner 11, closedOwner 12]⟩
+
+def ownerProductRight : Monomial :=
+  ⟨[closedOwner 20], [closedOwner 21]⟩
+
+def ownerProductOutput : Monomial :=
+  ⟨[closedOwner 20, closedOwner 10], [closedOwner 11, closedOwner 12, closedOwner 21]⟩
+
+def wrongOwnerProductOutput : Monomial :=
+  ⟨[closedOwner 30, closedOwner 10], [closedOwner 11, closedOwner 12, closedOwner 21]⟩
+
+def reversedOwnerProductOutput : Monomial :=
+  ⟨[closedOwner 20, closedOwner 10], [closedOwner 21, closedOwner 12, closedOwner 11]⟩
+
+theorem owner_product_key_fixture :
+    ProductKey ownerProductLeft.toKey ownerProductRight.toKey ownerProductOutput.toKey := by
+  constructor
+  · exact .swap _ _ []
+  · rfl
+
+theorem owner_product_key_rejections :
+    ¬ ProductKey ownerProductLeft.toKey ownerProductRight.toKey wrongOwnerProductOutput.toKey ∧
+      ¬ ProductKey ownerProductLeft.toKey ownerProductRight.toKey
+        reversedOwnerProductOutput.toKey := by
+  constructor
+  · intro valid
+    have present : closedOwner 30 ∈
+        ownerProductLeft.toKey.centralFactors ++ ownerProductRight.toKey.centralFactors :=
+      valid.1.mem_iff.mp (by simp [wrongOwnerProductOutput, Monomial.toKey])
+    simp [ownerProductLeft, ownerProductRight, Monomial.toKey, closedOwner] at present
+  · intro valid
+    have ordered := valid.2
+    simp [ownerProductLeft, ownerProductRight, reversedOwnerProductOutput,
+      Monomial.toKey, closedOwner] at ordered
+
+def universalSourceMonomial : Monomial :=
+  ⟨[closedOwner 30], [closedOwner 10, closedOwner 11, closedOwner 12]⟩
+
+def universalReplacementMonomial : Monomial :=
+  ⟨[closedOwner 31], [closedOwner 20, closedOwner 21]⟩
+
+def universalContextOutput : Monomial :=
+  ⟨[closedOwner 31, closedOwner 30],
+    [closedOwner 10, closedOwner 20, closedOwner 21, closedOwner 12]⟩
+
+theorem universal_context_key_fixture :
+    ContextKey universalSourceMonomial.toKey universalReplacementMonomial.toKey
+      universalContextOutput.toKey 1 2 := by
+  constructor
+  · exact .swap _ _ []
+  · rfl
+
+theorem owner_term_bridge_fixture :
+    (singletonTerm 7).toExact =
+      { coefficient := 1, key := { centralFactors := [], orderedFactors := [closedOwner 7] } } := by
+  rfl
+
 def largeTerms : List Term :=
   List.replicate 39 (singletonTerm 1) ++ [singletonTerm 2, singletonTerm 1]
 
@@ -490,6 +548,10 @@ theorem tall_security0_abi_fixture :
 
 #print axioms tall_security0_abi_fixture
 #print axioms term_exists_fixture
+#print axioms owner_product_key_fixture
+#print axioms owner_product_key_rejections
+#print axioms universal_context_key_fixture
+#print axioms owner_term_bridge_fixture
 #print axioms fixture_replay
 #print axioms fixture_four_mixed_lifecycle_and_prior_refs
 #print axioms fixture_four_crosses_leaf_boundary

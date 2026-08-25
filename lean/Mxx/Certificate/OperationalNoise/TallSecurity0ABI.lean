@@ -97,6 +97,14 @@ structure Term where
   coefficient : Int
 deriving DecidableEq, Repr
 
+def Monomial.toKey (monomial : Monomial) : MonomialKey Owner :=
+  { centralFactors := monomial.centralFactors
+    orderedFactors := monomial.orderedFactors }
+
+def Term.toExact (term : Term) : ExactTerm Owner :=
+  { coefficient := term.coefficient
+    key := term.monomial.toKey }
+
 inductive Bound where
   | exactZero
   | finite (maximumAbsoluteCoefficient : Nat)

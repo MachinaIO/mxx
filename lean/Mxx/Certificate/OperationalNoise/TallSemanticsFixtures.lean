@@ -103,17 +103,6 @@ theorem source_atom_interprets
       (canonicalSelfClaim sourceAtomOwner) := by
   exact ValueDerived.interprets (source_atom_fixture witness)
 
-theorem generic_factor_atom_fixture
-    (witness : Witness sourceAtomDocument sourceAtomHistory none 257) :
-    DerivedResult sourceAtomDocument sourceAtomHistory none 257 witness
-      sourceAtomOwner 0 := by
-  apply ValueDerived.factorAtom
-  · exact ⟨0, rfl⟩
-  · refine ⟨⟨.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner] .exactZero, 0⟩,
-      rfl, ?_⟩
-    exact ⟨canonicalSelfTerm sourceAtomOwner,
-      by simp [canonicalSelfTerm, termContains, monomialContains]⟩
-
 theorem sampler_atom_fixture
     (witness : Witness samplerAtomDocument samplerAtomHistory none 257) :
   DerivedResult samplerAtomDocument samplerAtomHistory none 257 witness
@@ -324,7 +313,6 @@ theorem canonical_relation_fixture :
 #print axioms statement_domain_fixture
 #print axioms constructive_raw_bound_fixture
 #print axioms TallSemantics.ValueDerived.interprets
-#print axioms generic_factor_atom_fixture
 #print axioms source_atom_interprets
 #print axioms sampler_atom_interprets
 

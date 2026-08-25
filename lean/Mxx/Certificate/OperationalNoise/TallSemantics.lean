@@ -1721,9 +1721,9 @@ structure Witness (document : TallDocument) (history : EventHistory) (selector :
     RelationApplicationAt document history selector application →
       RelationCongruent modulus history env application
 
-/-! Atomic derivations are tied to a canonical exact result and an actual factor occurrence.
-    The result indices are intentional: constructors cannot choose an arbitrary actual value,
-    term list, summary, or claim. -/
+/-! Atomic derivations require validated source or sampler provenance.  The result indices are
+    intentional: constructors cannot choose an arbitrary actual value, term list, summary, or
+    claim. -/
 
 def canonicalSelfTerm (owner : Owner) : Term :=
   { monomial := { centralFactors := [], orderedFactors := [owner] }
@@ -1741,11 +1741,6 @@ inductive ValueDerived (document : TallDocument) (history : EventHistory)
     (selector : Option Nat) (modulus : Nat)
     (witness : Witness document history selector modulus)
     (owner : Owner) (resultEvent : Nat) : Int → ValueClaim Owner → Prop where
-  | factorAtom
-      (result : exactResultAt history resultEvent owner)
-      (factor : FactorAtomAt history resultEvent owner) :
-      ValueDerived document history selector modulus witness owner resultEvent
-        (witness.env owner) (canonicalSelfClaim owner)
   | sourceAtom (source : SourceRef)
       (result : exactResultAt history resultEvent owner)
       (factor : SourceFactorAt document history selector owner resultEvent source) :

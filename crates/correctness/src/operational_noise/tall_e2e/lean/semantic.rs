@@ -264,6 +264,18 @@ struct RightRootNode {
     kind: RightRootNodeKind,
 }
 
+struct LeftRootBoundNode<'a> {
+    event: u64,
+    owner: ProofPayloadOwner,
+    rule: &'a ProofPayloadRule,
+}
+
+struct LeftRootRenderData<'a> {
+    event_ids: Vec<u64>,
+    bounds: Vec<LeftRootBoundNode<'a>>,
+    relation_events: Vec<u64>,
+}
+
 impl SemanticShard {
     fn canonical_work(&self) -> u64 {
         self.operations
@@ -1647,7 +1659,8 @@ pub(super) fn render(
     let modulus = ciphertext_modulus_text(statement)?;
     let (mut report, _selections, _long_monomial) = measure(proof)?;
     let index = PayloadIndex::new(proof)?;
-    let _left_root_closure = validate_left_root_closure(proof, &index)?;
+    let left_root = collect_left_root_render_data(proof, &index)?;
+    let _ = (left_root.event_ids.len(), left_root.bounds.len(), left_root.relation_events.len());
     let probes = build_probes(statement, proof, &index)?;
     let ranges = frame_ranges(proof)?;
     let relation_probes = relation_candidates(&index, &ranges)?;
@@ -1748,10 +1761,10 @@ fn reached_left_bound_rule(rule: &ProofPayloadRule) -> bool {
     )
 }
 
-fn validate_left_root_closure(
+fn collect_left_root_render_data<'a>(
     proof: &OperationalProofPayload,
-    index: &PayloadIndex,
-) -> Result<Vec<u64>, String> {
+    index: &'a PayloadIndex,
+) -> Result<LeftRootRenderData<'a>, String> {
     const LEFT_ROOT_EVENT: u64 = 107_402;
     const REACHED_RELATION_COUNT: usize = 1_905;
     let root = index.result(LEFT_ROOT_EVENT)?;
@@ -1764,12 +1777,13 @@ fn validate_left_root_closure(
         return Err(format!("Security0 left-root Result {LEFT_ROOT_EVENT} is not finite"));
     }
     let event_ids = super::closure::collect_security0_event_closure(proof, LEFT_ROOT_EVENT)?;
-    let mut relations = 0_usize;
+    let mut relation_events = Vec::new();
+    let mut bounds = Vec::new();
     let mut reached_rules = BTreeSet::new();
     for event in &event_ids {
         match index.event(*event)? {
-            ProofPayloadEvent::AppliedRelation { .. } => relations += 1,
-            ProofPayloadEvent::BoundTransfer { rule, .. } => {
+            ProofPayloadEvent::AppliedRelation { .. } => relation_events.push(*event),
+            ProofPayloadEvent::BoundTransfer { owner, rule } => {
                 if !reached_left_bound_rule(rule) {
                     return Err(format!(
                         "Security0 left-root closure reaches unsupported bound rule {rule:?} at event {event}"
@@ -1789,13 +1803,15 @@ fn validate_left_root_closure(
                     ProofPayloadRule::MonomialProduct { .. } => 7,
                     _ => unreachable!(),
                 });
+                bounds.push(LeftRootBoundNode { event: *event, owner: *owner, rule });
             }
             _ => {}
         }
     }
-    if relations != REACHED_RELATION_COUNT {
+    if relation_events.len() != REACHED_RELATION_COUNT {
         return Err(format!(
-            "Security0 left-root closure reaches {relations} relations, expected {REACHED_RELATION_COUNT}"
+            "Security0 left-root closure reaches {} relations, expected {REACHED_RELATION_COUNT}",
+            relation_events.len()
         ));
     }
     if reached_rules != BTreeSet::from_iter(0_u8..8) {
@@ -1803,7 +1819,20 @@ fn validate_left_root_closure(
             "Security0 left-root closure does not reach exactly the eight supported bound-rule families: {reached_rules:?}"
         ));
     }
-    Ok(event_ids)
+    if bounds.len() != 9_234 ||
+        bounds.iter().any(|bound| {
+            !event_ids.binary_search(&bound.event).is_ok() ||
+                !reached_left_bound_rule(bound.rule) ||
+                !matches!(
+                    index.event(bound.event),
+                    Ok(ProofPayloadEvent::BoundTransfer { owner, rule })
+                        if *owner == bound.owner && rule == bound.rule
+                )
+        })
+    {
+        return Err("Security0 left-root typed bound collection is inconsistent".to_owned());
+    }
+    Ok(LeftRootRenderData { event_ids, bounds, relation_events })
 }
 
 fn ciphertext_modulus_text(statement: &CertificateDocumentV1) -> Result<String, String> {

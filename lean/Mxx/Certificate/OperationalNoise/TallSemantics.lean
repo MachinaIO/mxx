@@ -1534,4 +1534,13 @@ def Security0Accepted (document : TallDocument) (history : EventHistory)
           2 * plaintextModulus * centeredNorm ciphertextModulus
             (residual selector witness.env) < ciphertextModulus
 
+theorem forall₂_append {α β : Type} {r : α → β → Prop}
+    {left left' right right' : List _} :
+    List.Forall₂ r left left' → List.Forall₂ r right right' →
+      List.Forall₂ r (left ++ right) (left' ++ right') := by
+  intro first second
+  induction first generalizing right right' with
+  | nil => simpa using second
+  | cons head tail ih => exact List.Forall₂.cons head (ih second)
+
 end Mxx.Certificate.OperationalNoise.TallSemantics

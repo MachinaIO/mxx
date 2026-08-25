@@ -124,6 +124,7 @@ theorem canonical_relation_fixture :
   decide
 
 #print axioms canonicalPolynomial_eval
+#print axioms Mxx.Certificate.OperationalNoise.TallSemantics.forall₂_append
 #print axioms canonicalAgreement_eval
 #print axioms addCanonicalResultSound
 #print axioms subCanonicalResultSound

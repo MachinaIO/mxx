@@ -87,6 +87,19 @@ struct SemanticShardReport {
     raw_family_counts: [u64; 6],
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SemanticShardAggregateReport {
+    schema_id: &'static str,
+    schema_version: u32,
+    shard_count: u64,
+    theorem_count: u64,
+    canonical_work_total: u64,
+    canonical_work_max: u64,
+    canonical_work_max_event: u64,
+    shards: Vec<SemanticShardReport>,
+}
+
 #[derive(Clone)]
 struct Frame {
     root: ProofPayloadOwner,
@@ -482,24 +495,18 @@ fn typed_operation_rule(
                 (inputs.len() == 2)
                     .then(|| (*event, [inputs[0].clone(), inputs[1].clone()], (false, false)))
             }
-            (OperationKind::Multiply, ProofPayloadRule::Product { left, right, facts }) => Some((
-                *event,
-                [left.clone(), right.clone()],
-                (facts.left_is_constant_polynomial, facts.right_is_constant_polynomial),
-            )),
+            (OperationKind::Multiply, ProofPayloadRule::Product { left, right, facts: _ }) => {
+                Some((*event, [left.clone(), right.clone()], (false, false)))
+            }
             (
                 OperationKind::Tensor,
                 ProofPayloadRule::Tensor {
                     left,
                     right,
-                    left_is_constant_polynomial,
-                    right_is_constant_polynomial,
+                    left_is_constant_polynomial: _,
+                    right_is_constant_polynomial: _,
                 },
-            ) => Some((
-                *event,
-                [left.clone(), right.clone()],
-                (*left_is_constant_polynomial, *right_is_constant_polynomial),
-            )),
+            ) => Some((*event, [left.clone(), right.clone()], (false, false))),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -519,13 +526,135 @@ fn typed_operation_rule(
     Ok(Some((event, refs, flags)))
 }
 
+fn scalar_action_key(key: &ProofPayloadMonomial) -> ProofPayloadMonomial {
+    ProofPayloadMonomial {
+        central_factors: key
+            .central_factors
+            .iter()
+            .chain(key.ordered_factors.iter())
+            .copied()
+            .collect(),
+        ordered_factors: Vec::new(),
+    }
+}
+
+fn product_key_for_scalar_flags(
+    left: &ProofPayloadMonomial,
+    right: &ProofPayloadMonomial,
+    left_scalar: bool,
+    right_scalar: bool,
+) -> ProofPayloadMonomial {
+    let (left, right) = if left_scalar && !right_scalar {
+        (scalar_action_key(left), right.clone())
+    } else if right_scalar && !left_scalar {
+        (left.clone(), scalar_action_key(right))
+    } else {
+        (left.clone(), right.clone())
+    };
+    ProofPayloadMonomial {
+        central_factors: left
+            .central_factors
+            .iter()
+            .chain(right.central_factors.iter())
+            .copied()
+            .collect(),
+        ordered_factors: left
+            .ordered_factors
+            .iter()
+            .chain(right.ordered_factors.iter())
+            .copied()
+            .collect(),
+    }
+}
+
+fn canonical_monomial(mut key: ProofPayloadMonomial) -> ProofPayloadMonomial {
+    key.central_factors.sort();
+    key
+}
+
+fn monomial_equivalent(left: &ProofPayloadMonomial, right: &ProofPayloadMonomial) -> bool {
+    canonical_monomial(left.clone()) == canonical_monomial(right.clone())
+}
+
+fn matching_scalar_flags_from_merges(
+    merges: &[(ProofPayloadMonomial, ProofPayloadMonomial, ProofPayloadMonomial)],
+) -> Vec<(bool, bool)> {
+    let mut candidates = vec![(false, false), (true, false), (false, true), (true, true)];
+    for (left, right, output) in merges {
+        candidates.retain(|(left_scalar, right_scalar)| {
+            monomial_equivalent(
+                &product_key_for_scalar_flags(left, right, *left_scalar, *right_scalar),
+                output,
+            )
+        });
+    }
+    candidates.sort();
+    candidates
+}
+
+fn product_terms_for_scalar_flags(
+    left: &[ProofPayloadTerm],
+    right: &[ProofPayloadTerm],
+    left_scalar: bool,
+    right_scalar: bool,
+) -> Vec<ProofPayloadTerm> {
+    let mut terms = BTreeMap::<ProofPayloadMonomial, num_bigint::BigInt>::new();
+    for left_term in left {
+        for right_term in right {
+            let key = product_key_for_scalar_flags(
+                &left_term.monomial,
+                &right_term.monomial,
+                left_scalar,
+                right_scalar,
+            );
+            let coefficient = &left_term.coefficient * &right_term.coefficient;
+            *terms.entry(canonical_monomial(key)).or_default() += coefficient;
+        }
+    }
+    terms
+        .into_iter()
+        .filter(|(_, coefficient)| !coefficient.is_zero())
+        .map(|(monomial, coefficient)| ProofPayloadTerm { monomial, coefficient })
+        .collect()
+}
+
+fn resolve_scalar_flags(
+    candidates: &[(bool, bool)],
+    inputs: &[ResultRecord],
+) -> Result<(bool, bool), String> {
+    if candidates.is_empty() {
+        return Err("typed operator merges have no matching scalar flag placement".to_owned());
+    }
+    if candidates.len() == 1 {
+        return Ok(candidates[0]);
+    }
+    let expected = candidates
+        .iter()
+        .map(|(left_scalar, right_scalar)| {
+            product_terms_for_scalar_flags(
+                &inputs[0].terms,
+                &inputs[1].terms,
+                *left_scalar,
+                *right_scalar,
+            )
+        })
+        .collect::<Vec<_>>();
+    if expected.windows(2).all(|pair| pair[0] == pair[1]) {
+        Ok(candidates[0])
+    } else {
+        Err(format!(
+            "typed operator merges have ambiguous scalar flag placements {candidates:?} with distinct expected product polynomials"
+        ))
+    }
+}
+
 fn op_probe(
     statement: &CertificateDocumentV1,
     index: &PayloadIndex,
     result: &ResultRecord,
     kind: OperationKind,
 ) -> Result<OperationProbe, String> {
-    let Some((rule_event, input_refs, flags)) = typed_operation_rule(index, result, kind)? else {
+    let Some((rule_event, input_refs, _flags)) = typed_operation_rule(index, result, kind)? else {
         return Err(format!(
             "operator Result {} owner {} has no preceding typed {:?} rule",
             result.event,
@@ -590,6 +719,68 @@ fn op_probe(
             }
         }
     }
+    let scalar_flags = match kind {
+        OperationKind::Multiply | OperationKind::Tensor => {
+            if operator_merges.is_empty() {
+                return Err(format!(
+                    "operator Result {} rule {} has no typed operator coefficient merges for scalar inference",
+                    result.event, rule_event
+                ));
+            }
+            let mut merge_events = Vec::new();
+            let mut merge_terms = Vec::new();
+            for (merge_event, merge) in &operator_merges {
+                let ProofPayloadCoefficientMergeSource::Operator { inputs: refs } = &merge.source
+                else {
+                    unreachable!()
+                };
+                let left = index.result(refs[0].value_event)?;
+                let right = index.result(refs[1].value_event)?;
+                let left_term = left
+                    .terms
+                    .get(usize::try_from(refs[0].term_ordinal).map_err(|_| {
+                        format!(
+                            "operator Result {} merge {} left term ordinal overflows usize",
+                            result.event, merge_event
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        format!(
+                            "operator Result {} merge {} left term ordinal is out of range",
+                            result.event, merge_event
+                        )
+                    })?;
+                let right_term = right
+                    .terms
+                    .get(usize::try_from(refs[1].term_ordinal).map_err(|_| {
+                        format!(
+                            "operator Result {} merge {} right term ordinal overflows usize",
+                            result.event, merge_event
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        format!(
+                            "operator Result {} merge {} right term ordinal is out of range",
+                            result.event, merge_event
+                        )
+                    })?;
+                merge_events.push(*merge_event);
+                merge_terms.push((
+                    left_term.monomial.clone(),
+                    right_term.monomial.clone(),
+                    merge.output.clone(),
+                ));
+            }
+            let candidates = matching_scalar_flags_from_merges(&merge_terms);
+            resolve_scalar_flags(&candidates, &inputs).map_err(|error| {
+                format!(
+                    "operator Result {} rule {} typed merges {:?}: {error}",
+                    result.event, rule_event, merge_events
+                )
+            })?
+        }
+        OperationKind::Add | OperationKind::Subtract | OperationKind::Direct => (false, false),
+    };
     let raw_work = (inputs[0].terms.len() as u64).saturating_mul(inputs[1].terms.len() as u64);
     let _ = statement;
     Ok(OperationProbe {
@@ -599,8 +790,8 @@ fn op_probe(
         output_event: result.event,
         inputs,
         output: result.clone(),
-        scalar_left: flags.0,
-        scalar_right: flags.1,
+        scalar_left: scalar_flags.0,
+        scalar_right: scalar_flags.1,
         raw_work,
         composite_relations: Vec::new(),
     })
@@ -620,17 +811,6 @@ fn attach_composite_relations(
         .cloned()
         .collect::<Vec<_>>();
     attached.sort_by_key(|relation| relation.event);
-    if attached.len() > 1 {
-        return Err(format!(
-            "operator Result {} has multiple attached relation applications: {}",
-            operation.output.event,
-            attached
-                .iter()
-                .map(|relation| relation.event.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
     operation.composite_relations = attached;
     Ok(operation)
 }
@@ -1277,51 +1457,37 @@ fn build_probes(
 const SEMANTIC_SHARD_CHUNK_SIZE: u64 =
     crate::operational_noise::tall_e2e::SECURITY0_EVENT_CHUNK_SIZE as u64;
 
-fn raw_semantic_shard(index: &PayloadIndex) -> Result<(u64, u64, u64, [u64; 6]), String> {
+fn raw_semantic_shard_counts(index: &PayloadIndex, start: u64, end: u64) -> [u64; 6] {
+    let mut counts = [0_u64; 6];
+    for event in start..end {
+        match &index.events[usize::try_from(event).expect("indexed semantic event")] {
+            ProofPayloadEvent::BoundTransfer { .. } => counts[0] += 1,
+            ProofPayloadEvent::Result { .. } => counts[1] += 1,
+            ProofPayloadEvent::AppliedRelation { .. } => counts[2] += 1,
+            ProofPayloadEvent::SurvivorFold(_) => counts[3] += 1,
+            ProofPayloadEvent::PreFoldPolynomial(_) => counts[4] += 1,
+            ProofPayloadEvent::InvocationEnd { .. } => counts[5] += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn raw_semantic_shards(index: &PayloadIndex) -> Result<Vec<(u64, u64, u64, [u64; 6])>, String> {
     let event_count =
         u64::try_from(index.events.len()).map_err(|_| "semantic event count overflow")?;
     let shard_count = event_count.div_ceil(SEMANTIC_SHARD_CHUNK_SIZE);
-    (0..shard_count)
-        .filter_map(|shard_index| {
+    Ok((0..shard_count)
+        .map(|shard_index| {
             let start = shard_index * SEMANTIC_SHARD_CHUNK_SIZE;
             let end = (start + SEMANTIC_SHARD_CHUNK_SIZE).min(event_count);
-            let mut counts = [0_u64; 6];
-            for event in start..end {
-                match &index.events[usize::try_from(event).expect("indexed semantic event")] {
-                    ProofPayloadEvent::BoundTransfer { .. } => counts[0] += 1,
-                    ProofPayloadEvent::Result { .. } => counts[1] += 1,
-                    ProofPayloadEvent::AppliedRelation { .. } => counts[2] += 1,
-                    ProofPayloadEvent::SurvivorFold(_) => counts[3] += 1,
-                    ProofPayloadEvent::PreFoldPolynomial(_) => counts[4] += 1,
-                    ProofPayloadEvent::InvocationEnd { .. } => counts[5] += 1,
-                    _ => {}
-                }
-            }
-            let has_algebraic_operation = index.operations.iter().any(|(_, rule, event)| {
-                *event >= start &&
-                    *event < end &&
-                    matches!(rule, ProofPayloadRule::Sum { inputs } if inputs.len() == 2) ||
-                    (*event >= start &&
-                        *event < end &&
-                        matches!(
-                            rule,
-                            ProofPayloadRule::Product { .. } | ProofPayloadRule::Tensor { .. }
-                        ))
-            });
-            (has_algebraic_operation && counts[2] != 0 && counts[5] != 0).then_some((
-                shard_index,
-                start,
-                end,
-                counts,
-            ))
+            (shard_index, start, end, raw_semantic_shard_counts(index, start, end))
         })
-        .max_by_key(|(shard_index, _, _, counts)| {
-            (counts.iter().sum::<u64>(), std::cmp::Reverse(*shard_index))
-        })
-        .ok_or_else(|| {
-            "Security0 semantic raw shard has no algebraic operation, relation, and InvocationEnd"
-                .to_owned()
-        })
+        .collect())
+}
+
+fn shard_module_name(index: u64) -> String {
+    format!("SemanticShard{index:03}")
 }
 
 fn semantic_shard_candidates(
@@ -1330,61 +1496,65 @@ fn semantic_shard_candidates(
     _ranges: &[(u64, u64, ProofPayloadOwner, u64)],
     relation_probes: &[RelationProbe],
     bound_probes: &[(u64, u64, BoundProbe)],
-) -> Result<SemanticShard, String> {
-    let (shard_index, start, end, raw_family_counts) = raw_semantic_shard(index)?;
-    let mut operations = Vec::new();
-    for result in &index.results {
-        if result.event < start || result.event >= end {
-            continue;
+) -> Result<Vec<SemanticShard>, String> {
+    let mut shards = Vec::new();
+    for (shard_index, start, end, raw_family_counts) in raw_semantic_shards(index)? {
+        let mut operations = Vec::new();
+        for result in &index.results {
+            if result.event < start || result.event >= end {
+                continue;
+            }
+            let kind = match expression_kind(statement, result.owner)? {
+                Some(kind) if kind != OperationKind::Direct => kind,
+                _ => continue,
+            };
+            if !typed_operator_eligibility(index, result, kind)? {
+                continue;
+            }
+            let operation = op_probe(statement, index, result, kind)?;
+            let result_frame = index.immediate_frames
+                [usize::try_from(result.event).expect("indexed result event")];
+            let matching_relations = relation_probes
+                .iter()
+                .filter(|relation| {
+                    relation.owner == result.owner &&
+                        relation.event > operation.rule_event &&
+                        relation.event < operation.output_event &&
+                        relation.frame_start == result_frame.unwrap_or(u64::MAX) &&
+                        relation.frame_end >= relation.event
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            operations.push(attach_composite_relations(operation, &matching_relations)?);
         }
-        let kind = match expression_kind(statement, result.owner)? {
-            Some(kind) if kind != OperationKind::Direct => kind,
-            _ => continue,
-        };
-        if !typed_operator_eligibility(index, result, kind)? {
-            continue;
-        }
-        let operation = op_probe(statement, index, result, kind)?;
-        let result_frame =
-            index.immediate_frames[usize::try_from(result.event).expect("indexed result event")];
-        let matching_relations = relation_probes
+        let relations = relation_probes
             .iter()
-            .filter(|relation| {
-                relation.owner == result.owner &&
-                    relation.event > operation.rule_event &&
-                    relation.event < operation.output_event &&
-                    relation.frame_start == result_frame.unwrap_or(u64::MAX) &&
-                    relation.frame_end >= relation.event
-            })
+            .filter(|relation| relation.event >= start && relation.event < end)
             .cloned()
             .collect::<Vec<_>>();
-        operations.push(attach_composite_relations(operation, &matching_relations)?);
+        let bounds = bound_probes
+            .iter()
+            .filter(|(_, frame_end, _)| *frame_end >= start && *frame_end < end)
+            .map(|(_, _, bound)| bound.clone())
+            .collect::<Vec<_>>();
+        if operations.is_empty() && relations.is_empty() && bounds.is_empty() {
+            continue;
+        }
+        shards.push(SemanticShard {
+            index: shard_index,
+            start,
+            end,
+            operations,
+            relations,
+            bounds,
+            raw_semantic_count: raw_family_counts.iter().sum(),
+            raw_family_counts,
+        });
     }
-    let relations = relation_probes
-        .iter()
-        .filter(|relation| relation.event >= start && relation.event < end)
-        .cloned()
-        .collect::<Vec<_>>();
-    let bounds = bound_probes
-        .iter()
-        .filter(|(_, frame_end, _)| *frame_end >= start && *frame_end < end)
-        .map(|(_, _, bound)| bound.clone())
-        .collect::<Vec<_>>();
-    if operations.is_empty() || relations.is_empty() || bounds.is_empty() {
-        return Err(format!(
-            "raw Security0 shard {shard_index} lacks required operation/relation/InvocationEnd mapping"
-        ));
+    if shards.is_empty() {
+        return Err("Security0 semantic shards have no supported reached obligations".to_owned());
     }
-    Ok(SemanticShard {
-        index: shard_index,
-        start,
-        end,
-        operations,
-        relations,
-        bounds,
-        raw_semantic_count: raw_family_counts.iter().sum(),
-        raw_family_counts,
-    })
+    Ok(shards)
 }
 
 struct PayloadIndex {
@@ -1419,7 +1589,7 @@ pub(super) fn render(
     let ranges = frame_ranges(proof)?;
     let relation_probes = relation_candidates(&index, &ranges)?;
     let all_bound_probes = bound_candidates(&index, &ranges)?;
-    let shard =
+    let shards =
         semantic_shard_candidates(statement, &index, &ranges, &relation_probes, &all_bound_probes)?;
     report.probes = probes.iter().map(ProbeStat::from_probe).collect();
     let report_bytes = serde_json::to_vec(&report)
@@ -1440,31 +1610,56 @@ pub(super) fn render(
     for (path, module, probe) in specs {
         files.push(generated_file(path, render_probe(module, probe, &probes)));
     }
-    let (shard_source, emitted_theorem_count) = render_semantic_shard("SemanticShard000", &shard);
-    files.push(generated_file("Semantic/SemanticShard000.lean", shard_source));
-    let shard_report = SemanticShardReport {
+    let mut shard_reports = Vec::with_capacity(shards.len());
+    let mut theorem_count = 0_u64;
+    let mut canonical_work_total = 0_u64;
+    for shard in &shards {
+        let module = shard_module_name(shard.index);
+        let (shard_source, emitted_theorem_count) = render_semantic_shard(&module, shard);
+        files.push(generated_file(format!("Semantic/{module}.lean"), shard_source));
+        theorem_count += emitted_theorem_count;
+        canonical_work_total += shard.canonical_work();
+        shard_reports.push(SemanticShardReport {
+            schema_id: SCHEMA_ID,
+            schema_version: SCHEMA_VERSION,
+            shard_index: shard.index,
+            start_event: shard.start,
+            end_event: shard.end,
+            theorem_count: emitted_theorem_count,
+            canonical_work: shard.canonical_work(),
+            operation_count: shard.operations.len() as u64,
+            relation_count: shard.relations.len() as u64,
+            bound_count: shard.bounds.len() as u64,
+            raw_semantic_count: shard.raw_semantic_count,
+            raw_family_counts: shard.raw_family_counts,
+        });
+    }
+    let max_shard = shards
+        .iter()
+        .max_by_key(|shard| (shard.canonical_work(), std::cmp::Reverse(shard.index)))
+        .expect("nonempty semantic shards");
+    let aggregate_report = SemanticShardAggregateReport {
         schema_id: SCHEMA_ID,
         schema_version: SCHEMA_VERSION,
-        shard_index: shard.index,
-        start_event: shard.start,
-        end_event: shard.end,
-        theorem_count: emitted_theorem_count,
-        canonical_work: shard.canonical_work(),
-        operation_count: shard.operations.len() as u64,
-        relation_count: shard.relations.len() as u64,
-        bound_count: shard.bounds.len() as u64,
-        raw_semantic_count: shard.raw_semantic_count,
-        raw_family_counts: shard.raw_family_counts,
+        shard_count: shards.len() as u64,
+        theorem_count,
+        canonical_work_total,
+        canonical_work_max: max_shard.canonical_work(),
+        canonical_work_max_event: max_shard.start,
+        shards: shard_reports,
     };
     files.push(generated_file(
         "Semantic/SemanticShardStatistics.json",
-        serde_json::to_string(&shard_report).expect("JSON is UTF-8"),
+        serde_json::to_string(&aggregate_report).expect("JSON is UTF-8"),
     ));
     let mut index = String::new();
     for (_, module, _) in specs {
         writeln!(index, "import {NAMESPACE}.Semantic.{module}").expect("String write");
     }
-    writeln!(index, "import {NAMESPACE}.Semantic.SemanticShard000").expect("String write");
+    for shard in &shards {
+        writeln!(index, "import {NAMESPACE}.Semantic.{}", shard_module_name(shard.index))
+            .expect("String write");
+    }
     files.push(generated_file("Semantic/Semantic.lean", index));
     Ok(files)
 }
@@ -1826,7 +2021,7 @@ fn render_operation(source: &mut String, operation: &OperationProbe) {
         .expect("String write");
     writeln!(source, "def selectedResultEvent : Nat := {}", operation.output_event)
         .expect("String write");
-    if let Some(relation) = operation.composite_relations.last() {
+    if !operation.composite_relations.is_empty() {
         source.push_str("open EventReplay\n");
         writeln!(
             source,
@@ -1840,61 +2035,61 @@ fn render_operation(source: &mut String, operation: &OperationProbe) {
             if operation.scalar_right { "true" } else { "false" }
         )
         .expect("String write");
-        writeln!(
-            source,
-            "def productOutput : Polynomial Owner := {}",
-            "productPoly left right leftScalar rightScalar"
-        )
-        .expect("String write");
-        writeln!(
-            source,
-            "def relationOutput : Polynomial Owner := {}",
-            terms_text(&operation.output.terms)
-        )
-        .expect("String write");
-        writeln!(
-            source,
-            "def sourceKey : MonomialKey Owner := {}",
-            monomial_text(&relation.source)
-        )
-        .expect("String write");
-        writeln!(source, "def lhsKey : MonomialKey Owner := {}", monomial_text(&relation.lhs))
+        source.push_str(
+            "def expected0 : Polynomial Owner := productPoly left right leftScalar rightScalar\n",
+        );
+        for (ordinal, relation) in operation.composite_relations.iter().enumerate() {
+            writeln!(
+                source,
+                "def sourceKey{ordinal} : MonomialKey Owner := {}",
+                monomial_text(&relation.source)
+            )
             .expect("String write");
-        writeln!(
-            source,
-            "def relationRhs : Polynomial Owner := {}",
-            terms_text(&relation.rhs.terms)
-        )
-        .expect("String write");
-        writeln!(
-            source,
-            "def relationContext0 : MonomialContext Owner := relationContext sourceKey sourceKey.centralFactors {} {}",
-            relation.start,
-            relation.end
-        )
-        .expect("String write");
-        source.push_str(
-            "\ntheorem productAgreement : CanonicalAgreement productOutput (productPoly left right leftScalar rightScalar) := by\n  decide +kernel\n\n",
-        );
-        source.push_str(
-            "theorem relationAgreement : CanonicalAgreement relationOutput (relationPoly productOutput sourceKey relationContext0 ",
-        );
-        writeln!(source, "({}) relationRhs) := by decide +kernel", relation.outer)
+            writeln!(
+                source,
+                "def lhsKey{ordinal} : MonomialKey Owner := {}",
+                monomial_text(&relation.lhs)
+            )
             .expect("String write");
-        source.push_str(
-            "\ntheorem resultSound (env : Env Owner)\n    (baseRelation : evalMonomial env lhsKey % Int.ofNat 257 =\n      evalPolynomial env relationRhs % Int.ofNat 257) :\n    evalPolynomial env relationOutput % Int.ofNat 257 =\n      (evalPolynomial env left * evalPolynomial env right) % Int.ofNat 257 := by\n  have productSound := productCanonicalResultSound env left right productOutput leftScalar rightScalar productAgreement\n  have relationSound := relationCanonicalResultSound 257 env productOutput sourceKey lhsKey\n    sourceKey.centralFactors ",
-        );
-        writeln!(
-            source,
-            "{} {} ({}) relationRhs relationOutput\n    (by decide +kernel) baseRelation relationAgreement",
-            relation.start,
-            relation.end,
-            relation.outer
-        )
-        .expect("String write");
-        source.push_str(
-            "  calc\n    evalPolynomial env relationOutput % Int.ofNat 257 = evalPolynomial env productOutput % Int.ofNat 257 := relationSound\n    _ = (evalPolynomial env left * evalPolynomial env right) % Int.ofNat 257 := by rw [productSound]\n\n",
-        );
+            writeln!(
+                source,
+                "def relationRhs{ordinal} : Polynomial Owner := {}",
+                terms_text(&relation.rhs.terms)
+            )
+            .expect("String write");
+            writeln!(source, "def relationContext{ordinal} : MonomialContext Owner := relationContext sourceKey{ordinal} sourceKey{ordinal}.centralFactors {} {}", relation.start, relation.end)
+                .expect("String write");
+            writeln!(source, "def expected{} : Polynomial Owner := relationPoly expected{} sourceKey{} relationContext{} ({}) relationRhs{}", ordinal + 1, ordinal, ordinal, ordinal, relation.outer, ordinal)
+                .expect("String write");
+        }
+        let final_expected = operation.composite_relations.len();
+        source.push_str("\ntheorem productAgreement : CanonicalAgreement expected0 (productPoly left right leftScalar rightScalar) := by\n  decide +kernel\n");
+        writeln!(source, "\ntheorem resultAgreement : CanonicalAgreement output expected{} := by\n  decide +kernel", final_expected)
+            .expect("String write");
+        source.push_str("\ntheorem resultSound (env : Env Owner)\n");
+        for ordinal in 0..final_expected {
+            writeln!(source, "    (baseRelation{ordinal} : evalMonomial env lhsKey{ordinal} % Int.ofNat 257 = evalPolynomial env relationRhs{ordinal} % Int.ofNat 257)")
+                .expect("String write");
+        }
+        source.push_str("    : evalPolynomial env output % Int.ofNat 257 =\n      (evalPolynomial env left * evalPolynomial env right) % Int.ofNat 257 := by\n  have productSound := productCanonicalResultSound env left right expected0 leftScalar rightScalar productAgreement\n");
+        for (ordinal, relation) in operation.composite_relations.iter().enumerate() {
+            writeln!(source, "  have relationSound{ordinal} := relationCanonicalResultSound 257 env expected{ordinal} sourceKey{ordinal} lhsKey{ordinal} sourceKey{ordinal}.centralFactors {} {} ({}) relationRhs{ordinal} expected{} (by decide +kernel) baseRelation{ordinal} (by decide +kernel)", relation.start, relation.end, relation.outer, ordinal + 1)
+                .expect("String write");
+        }
+        source.push_str("  have outputSound := canonicalAgreement_eval env output expected");
+        writeln!(source, "{} resultAgreement", final_expected).expect("String write");
+        source.push_str("  calc\n");
+        writeln!(source, "    evalPolynomial env output % Int.ofNat 257 = evalPolynomial env expected{} % Int.ofNat 257 := by rw [outputSound]", final_expected)
+            .expect("String write");
+        for ordinal in (0..final_expected).rev() {
+            writeln!(
+                source,
+                "    _ = evalPolynomial env expected{} % Int.ofNat 257 := relationSound{ordinal}",
+                ordinal
+            )
+            .expect("String write");
+        }
+        source.push_str("    _ = (evalPolynomial env left * evalPolynomial env right) % Int.ofNat 257 := by rw [productSound]\n\n");
         return;
     }
     match operation.kind {
@@ -2017,30 +2212,86 @@ fn render_bound(source: &mut String, bound: &BoundProbe) {
         summary_bound_nat_text(&bound.prefold_summary)
     )
     .expect("String write");
-    writeln!(
-        source,
-        "def survivorContributions : List Nat := [{}]",
-        bound.survivor_contributions.join(", ")
-    )
-    .expect("String write");
-    writeln!(source, "def survivorBounds : List Nat := [{}]", bound.survivor_bounds.join(", "))
-        .expect("String write");
-    let mut survivors_proof = String::from("by\n");
-    if bound.survivor_contributions.is_empty() {
-        survivors_proof.push_str("  exact List.Forall₂.nil\n");
-    } else {
-        for depth in 0..bound.survivor_contributions.len() {
-            let indent = "  ".repeat(depth + 1);
-            survivors_proof.push_str(&format!("{indent}constructor\n"));
-            survivors_proof.push_str(&format!("{indent}· decide +kernel\n"));
-            survivors_proof.push_str(&format!("{indent}·\n"));
-        }
-        let indent = "  ".repeat(bound.survivor_contributions.len() + 1);
-        survivors_proof.push_str(&format!("{indent}exact List.Forall₂.nil\n"));
-    }
+    render_survivor_witness(source, bound);
     source.push_str("\ntheorem prefoldResult : prefoldTerms = rootTerms := by rfl\n\ntheorem prefoldBoundSound : rootBound ≤ prefoldBound := by decide +kernel\n\n");
-    writeln!(source, "theorem survivorBoundsSound : List.Forall₂ (fun actual bound => actual ≤ bound) survivorContributions survivorBounds :=\n{survivors_proof}").expect("String write");
     source.push_str("\ntheorem prefoldSound :\n  preFoldBound rootBound prefoldBound survivorContributions survivorBounds := by\n  exact (preFoldSound rootTerms prefoldTerms prefoldResult prefoldBoundSound survivorBoundsSound).2\n\ntheorem endResult : endTerms = prefoldTerms := by rfl\n\ntheorem endSummaryResult : endSummary = prefoldSummary := by rfl\n\ntheorem endSound :\n  endTerms = prefoldTerms ∧ endSummary = prefoldSummary := by\n  exact ⟨endResult, endSummaryResult⟩\n\n");
+}
+
+fn render_survivor_witness(source: &mut String, bound: &BoundProbe) {
+    const CHUNK_SIZE: usize = 16;
+    if bound.survivor_contributions.is_empty() {
+        source.push_str(
+            "def survivorContributions : List Nat := []\ndef survivorBounds : List Nat := []\n",
+        );
+        source.push_str("theorem survivorBoundsSound : List.Forall₂ (fun actual bound => actual ≤ bound) survivorContributions survivorBounds := by\n  exact List.Forall₂.nil\n");
+        return;
+    }
+    let mut nodes = Vec::new();
+    for (chunk, (contributions, bounds)) in bound
+        .survivor_contributions
+        .chunks(CHUNK_SIZE)
+        .zip(bound.survivor_bounds.chunks(CHUNK_SIZE))
+        .enumerate()
+    {
+        let contribution_name = format!("survivorContributionsChunk{chunk}");
+        let bounds_name = format!("survivorBoundsChunk{chunk}");
+        let theorem_name = format!("survivorBoundsSoundChunk{chunk}");
+        writeln!(source, "def {contribution_name} : List Nat := [{}]", contributions.join(", "))
+            .expect("String write");
+        writeln!(source, "def {bounds_name} : List Nat := [{}]", bounds.join(", "))
+            .expect("String write");
+        let mut proof = String::from("by\n");
+        for depth in 0..contributions.len() {
+            let indent = "  ".repeat(depth + 1);
+            proof.push_str(&format!("{indent}constructor\n"));
+            proof.push_str(&format!("{indent}· omega\n"));
+            proof.push_str(&format!("{indent}·\n"));
+        }
+        let indent = "  ".repeat(contributions.len() + 1);
+        proof.push_str(&format!("{indent}exact List.Forall₂.nil\n"));
+        writeln!(source, "theorem {theorem_name} : List.Forall₂ (fun actual bound => actual ≤ bound) {contribution_name} {bounds_name} :=\n{proof}")
+            .expect("String write");
+        nodes.push((contribution_name, bounds_name, theorem_name));
+    }
+    let mut level = 0;
+    while nodes.len() > 1 {
+        let mut next = Vec::new();
+        for (pair, children) in nodes.chunks(2).enumerate() {
+            if children.len() == 1 {
+                next.push(children[0].clone());
+                continue;
+            }
+            let left = &children[0];
+            let right = &children[1];
+            let contribution_name = format!("survivorContributionsTree{level}_{pair}");
+            let bounds_name = format!("survivorBoundsTree{level}_{pair}");
+            let theorem_name = format!("survivorBoundsSoundTree{level}_{pair}");
+            writeln!(
+                source,
+                "def {contribution_name} : List Nat := {left_name} ++ {right_name}",
+                left_name = left.0,
+                right_name = right.0
+            )
+            .expect("String write");
+            writeln!(
+                source,
+                "def {bounds_name} : List Nat := {left_name} ++ {right_name}",
+                left_name = left.1,
+                right_name = right.1
+            )
+            .expect("String write");
+            writeln!(source, "theorem {theorem_name} : List.Forall₂ (fun actual bound => actual ≤ bound) {contribution_name} {bounds_name} := by\n  exact forall₂_append {left_theorem} {right_theorem}", left_theorem = left.2, right_theorem = right.2)
+                .expect("String write");
+            next.push((contribution_name, bounds_name, theorem_name));
+        }
+        nodes = next;
+        level += 1;
+    }
+    let root = &nodes[0];
+    writeln!(source, "def survivorContributions : List Nat := {}", root.0).expect("String write");
+    writeln!(source, "def survivorBounds : List Nat := {}", root.1).expect("String write");
+    writeln!(source, "theorem survivorBoundsSound : List.Forall₂ (fun actual bound => actual ≤ bound) survivorContributions survivorBounds := by\n  exact {}", root.2)
+        .expect("String write");
 }
 
 fn render_semantic_shard(module: &str, shard: &SemanticShard) -> (String, u64) {
@@ -2336,7 +2587,7 @@ mod tests {
             root_result_event: 1,
             prefold_event: 2,
             end_event: 3,
-            survivor_events: vec![4, 5],
+            survivor_events: (0..64).map(|event| event + 4).collect(),
             root: ResultRecord {
                 event: 1,
                 owner: root,
@@ -2351,14 +2602,18 @@ mod tests {
                 terms: vec![],
                 summary: BoundedSummary::zero(),
             },
-            survivor_contributions: vec!["1".to_owned(), "2".to_owned()],
-            survivor_bounds: vec!["1".to_owned(), "3".to_owned()],
+            survivor_contributions: (1..=64).map(|value| value.to_string()).collect(),
+            survivor_bounds: (1..=64).map(|value| (value + 1).to_string()).collect(),
         };
         let mut bound_source = String::new();
         render_bound(&mut bound_source, &bound);
         assert!(bound_source.contains("theorem survivorBoundsSound"));
         assert!(bound_source.contains("List.Forall₂"));
-        assert!(bound_source.contains("· decide +kernel"));
+        assert!(bound_source.contains("constructor"));
+        assert!(bound_source.contains("· omega"));
+        assert!(bound_source.contains("survivorContributionsChunk3"));
+        assert!(bound_source.contains("survivorContributionsTree"));
+        assert!(bound_source.contains("forall₂_append"));
     }
 
     #[test]
@@ -2692,16 +2947,30 @@ mod tests {
     #[test]
     fn composite_operation_renders_product_then_relation_chain() {
         let root = owner(7);
-        let output = add_result(root, 5327, 1);
-        let operation = add_operation(output);
-        let relation = relation_probe(RelationRuleKind::Gadget, 5326);
-        let operation = attach_composite_relations(operation, &[relation]).expect("one relation");
+        let output = add_result(root, 20, 1);
+        let mut operation = add_operation(output);
+        operation.rule_event = 10;
+        operation.output_event = 20;
+        let relations = [
+            relation_probe(RelationRuleKind::Gadget, 11),
+            relation_probe(RelationRuleKind::Gadget, 12),
+        ];
+        let operation = attach_composite_relations(operation, &relations).expect("two relations");
         let mut source = String::new();
         render_operation(&mut source, &operation);
-        assert!(source.contains("relationPoly productOutput sourceKey relationContext0"));
+        assert!(source.contains("def expected1 : Polynomial Owner := relationPoly expected0"));
+        assert!(source.contains("def expected2 : Polynomial Owner := relationPoly expected1"));
+        assert!(source.contains("relationSound1"));
+        assert!(source.contains(
+            "have outputSound := canonicalAgreement_eval env output expected2 resultAgreement"
+        ));
+        assert!(source.contains(":= by rw [outputSound]"));
+        assert!(
+            source.contains("_ = evalPolynomial env expected0 % Int.ofNat 257 := relationSound0")
+        );
         assert!(source.contains("productCanonicalResultSound"));
         assert!(source.contains("relationCanonicalResultSound"));
-        assert!(source.contains("evalPolynomial env relationOutput % Int.ofNat 257"));
+        assert!(source.contains("evalPolynomial env output % Int.ofNat 257"));
     }
 
     fn relation_probe(kind: RelationRuleKind, event: u64) -> RelationProbe {
@@ -2768,5 +3037,75 @@ mod tests {
         };
         let error = expression_kind(&statement, owner(91)).expect_err("missing row must fail");
         assert!(error.contains("missing expression row 91"));
+    }
+
+    #[test]
+    fn product_merge_scalar_inference_uses_typed_output_key() {
+        let left =
+            ProofPayloadMonomial { central_factors: vec![], ordered_factors: vec![owner(5506)] };
+        let right =
+            ProofPayloadMonomial { central_factors: vec![], ordered_factors: vec![owner(6544)] };
+        let output = ProofPayloadMonomial {
+            central_factors: vec![owner(5506)],
+            ordered_factors: vec![owner(6544)],
+        };
+        let merge = [(left.clone(), right.clone(), output.clone())];
+        let candidates = matching_scalar_flags_from_merges(&merge);
+        assert_eq!(candidates, vec![(true, false)]);
+        let inputs = vec![
+            ResultRecord {
+                event: 1,
+                owner: owner(5506),
+                terms: vec![ProofPayloadTerm { monomial: left, coefficient: BigInt::from(1) }],
+                summary: BoundedSummary::zero(),
+            },
+            ResultRecord {
+                event: 2,
+                owner: owner(6544),
+                terms: vec![ProofPayloadTerm { monomial: right, coefficient: BigInt::from(1) }],
+                summary: BoundedSummary::zero(),
+            },
+        ];
+        assert_eq!(resolve_scalar_flags(&candidates, &inputs), Ok((true, false)));
+
+        let central_left =
+            ProofPayloadMonomial { central_factors: vec![owner(5506)], ordered_factors: vec![] };
+        let central_right =
+            ProofPayloadMonomial { central_factors: vec![owner(6544)], ordered_factors: vec![] };
+        let central_output = ProofPayloadMonomial {
+            central_factors: vec![owner(5506), owner(6544)],
+            ordered_factors: vec![],
+        };
+        let central_merge = [(central_left, central_right, central_output)];
+        let central_candidates = matching_scalar_flags_from_merges(&central_merge);
+        assert_eq!(central_candidates.len(), 4);
+        let central_inputs = vec![
+            ResultRecord {
+                event: 3,
+                owner: owner(5506),
+                terms: vec![ProofPayloadTerm {
+                    monomial: central_merge[0].0.clone(),
+                    coefficient: BigInt::from(1),
+                }],
+                summary: BoundedSummary::zero(),
+            },
+            ResultRecord {
+                event: 4,
+                owner: owner(6544),
+                terms: vec![ProofPayloadTerm {
+                    monomial: central_merge[0].1.clone(),
+                    coefficient: BigInt::from(1),
+                }],
+                summary: BoundedSummary::zero(),
+            },
+        ];
+        assert_eq!(resolve_scalar_flags(&central_candidates, &central_inputs), Ok((false, false)));
+    }
+
+    #[test]
+    fn semantic_shard_module_names_are_deterministic() {
+        assert_eq!(shard_module_name(0), "SemanticShard000");
+        assert_eq!(shard_module_name(59), "SemanticShard059");
+        assert_eq!(shard_module_name(1001), "SemanticShard1001");
     }
 }

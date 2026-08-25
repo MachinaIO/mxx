@@ -292,6 +292,7 @@ pub(crate) fn measure_owner_claims(
             })
             .collect::<BTreeSet<_>>();
         let exact_zero_consistent = exact_zero_maps.len() <= 1;
+        let has_exact_zero = !exact_zero_maps.is_empty();
         let factor_present = factor_owners.contains(&owner);
         if factor_present && !exact_zero_consistent {
             return Err(OwnerClaimInvariantError::ContradictoryExactZero { owner });
@@ -308,7 +309,9 @@ pub(crate) fn measure_owner_claims(
                     ClaimKey::Exact { summary: SummaryKey::ExactZero, .. } => {
                         statistics.exact_zero_occurrences += 1;
                     }
-                    ClaimKey::Exact { coefficients, summary: SummaryKey::Finite(_) } => {
+                    ClaimKey::Exact { coefficients, summary: SummaryKey::Finite(_) }
+                        if has_exact_zero =>
+                    {
                         statistics.finite_occurrences += 1;
                         if !coefficients.is_empty() {
                             return Err(OwnerClaimInvariantError::UnrecognizedFiniteFold {
@@ -333,7 +336,7 @@ pub(crate) fn measure_owner_claims(
                             }
                         }
                     }
-                    ClaimKey::Coefficient(CoefficientKey::Finite(_)) => {
+                    ClaimKey::Coefficient(CoefficientKey::Finite(_)) if has_exact_zero => {
                         return Err(OwnerClaimInvariantError::UnrecognizedFiniteFold {
                             owner,
                             event: value.event,
@@ -342,7 +345,7 @@ pub(crate) fn measure_owner_claims(
                     _ => {}
                 }
             }
-            if exact_zero_consistent {
+            if has_exact_zero && exact_zero_consistent {
                 statistics.exact_zero_consistent_owners += 1;
             }
             if factor_present {
@@ -569,6 +572,10 @@ mod tests {
         ProofPayloadTerm { monomial: monomial(expression_row), coefficient: coefficient.into() }
     }
 
+    fn finite_summary() -> BoundedSummary {
+        BoundedSummary::finite(crate::operational_noise::facts::BoundExpression::new(4_u8.into()))
+    }
+
     #[test]
     fn owner_claim_statistics_normalize_terms_and_classify_fold_shapes() {
         let root = owner(0);
@@ -689,6 +696,90 @@ mod tests {
         assert_ne!(
             report["owners"][0]["claims"][0]["claimIdentity"],
             report["owners"][0]["claims"][2]["claimIdentity"]
+        );
+    }
+
+    #[test]
+    fn singleton_finite_claims_remain_event_level_obligations() {
+        let root = owner(0);
+        let coefficient_owner = owner(1);
+        let exact_owner = owner(2);
+        let finite = finite_summary();
+        let proof = OperationalProofPayload {
+            events: vec![
+                ProofPayloadEvent::InvocationStart { root },
+                ProofPayloadEvent::Result {
+                    owner: coefficient_owner,
+                    value: ProofPayloadValue::Coefficient {
+                        bound: NumericContract::Known(CoefficientBound::Finite(
+                            crate::operational_noise::facts::BoundExpression::new(4_u8.into()),
+                        )),
+                    },
+                },
+                ProofPayloadEvent::Result {
+                    owner: exact_owner,
+                    value: ProofPayloadValue::Exact {
+                        terms: vec![term(9, 1)],
+                        summary: finite.clone(),
+                    },
+                },
+                ProofPayloadEvent::PreFoldPolynomial(ProofPayloadPreFoldPolynomial {
+                    result_event: 2,
+                    terms: vec![],
+                    summary: finite.clone(),
+                    summary_evidence: None,
+                }),
+                ProofPayloadEvent::InvocationEnd {
+                    root,
+                    result: ProofPayloadValue::Exact { terms: vec![], summary: finite },
+                    pre_fold_event: 3,
+                },
+            ],
+        };
+
+        let (statistics, _) = measure_owner_claims(&proof).expect("measure singleton claims");
+        assert_eq!(statistics.result_events, 2);
+        assert_eq!(statistics.owners, 2);
+        assert_eq!(statistics.multi_payload_owners, 0);
+        assert_eq!(statistics.finite_occurrences, 0);
+        assert_eq!(statistics.direct_fold_occurrences, 0);
+        assert_eq!(statistics.sum_fold_occurrences, 0);
+    }
+
+    #[test]
+    fn unrecognized_alternate_finite_claim_is_rejected() {
+        let root = owner(0);
+        let value_owner = owner(1);
+        let zero = BoundedSummary::zero();
+        let finite = finite_summary();
+        let proof = OperationalProofPayload {
+            events: vec![
+                ProofPayloadEvent::InvocationStart { root },
+                ProofPayloadEvent::Result {
+                    owner: value_owner,
+                    value: ProofPayloadValue::Exact { terms: vec![term(9, 1)], summary: zero },
+                },
+                ProofPayloadEvent::Result {
+                    owner: value_owner,
+                    value: ProofPayloadValue::Exact { terms: vec![], summary: finite.clone() },
+                },
+                ProofPayloadEvent::PreFoldPolynomial(ProofPayloadPreFoldPolynomial {
+                    result_event: 2,
+                    terms: vec![],
+                    summary: finite.clone(),
+                    summary_evidence: None,
+                }),
+                ProofPayloadEvent::InvocationEnd {
+                    root,
+                    result: ProofPayloadValue::Exact { terms: vec![], summary: finite },
+                    pre_fold_event: 3,
+                },
+            ],
+        };
+
+        assert_eq!(
+            measure_owner_claims(&proof),
+            Err(OwnerClaimInvariantError::UnrecognizedFiniteFold { owner: value_owner, event: 2 })
         );
     }
 

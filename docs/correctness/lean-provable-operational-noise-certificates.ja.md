@@ -316,10 +316,14 @@ ordered monomial factor として使う owner は、その replay 内で一つ�
 場合は program domain 内の各 selector について一つの値を表さなければならない。opt-in Rust
 generator は Lean を出力する前に CP0 を検査する。factor owner の coefficient-normalized
 exact-zero claim は一致しなければならず、異なる複数の result payload を持つ owner は factor に
-現れてはならない。nonfactor owner については、一致する exact claim の反復、または
-direct-survivor / sum-after-survivor として認識した fold chain から得た空の finite claim を許す。
-決定的な semantic-owner statistics file は、この検査に使った event 単位の claim、frame start、
-summary、frame-root predecessor binding を記録する。
+現れてはならない。nonfactor owner に対する CP0 の検査対象は、複数の payload の中で exact-zero
+claim と別の finite claim が共存する場合だけである。このとき、別の finite claim はすべて、
+direct-survivor / sum-after-survivor として認識した fold chain から得た空の exact result でなければ
+ならない。それ以外の nonfactor multiplicity は、proof reference が event 単位の claim を指定する
+ため theorem-load-bearing ではない。特に singleton coefficient-finite claim と nonempty
+exact-finite claim は CP2 の semantic `Result` / `Transfer` proof の obligation として残す。決定的な
+semantic-owner statistics file は、この検査に使った event 単位の claim、frame start、summary、
+frame-root predecessor binding を記録する。
 
 CP1 では役割を分離する。`Env` を参照するのは factor owner だけであり、`ValueClaim` は event
 単位の statement のまま、`Witness` が bound するのも factor atom だけである。生成される Lean

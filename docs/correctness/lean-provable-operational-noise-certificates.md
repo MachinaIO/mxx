@@ -334,10 +334,14 @@ Within one replay, an `Owner` is the typed pair of scope and expression row. An 
 central or ordered monomial factor must denote one value in that replay and, for a program scope,
 for every selector in the program domain. The opt-in Rust generator enforces CP0 before emitting
 Lean: coefficient-normalized exact-zero claims for a factor owner must agree, and an owner with
-multiple distinct result payloads must not occur as a factor. A nonfactor owner may have repeated
-consistent exact claims or an empty finite claim obtained by the recognized direct-survivor or
-sum-after-survivor fold chain. The deterministic semantic-owner statistics file records the
-event-level claims, frame starts, summaries, and frame-root predecessor bindings used by this
+multiple distinct normalized result payloads must not occur as a factor. For a nonfactor owner,
+CP0 checks only the multi-payload case where exact-zero claims coexist with alternate finite
+claims: every alternate finite claim must be an empty exact result obtained by the recognized
+direct-survivor or sum-after-survivor fold chain. Other nonfactor multiplicity is not
+theorem-load-bearing because proof references identify event-level claims. In particular,
+singleton coefficient-finite and nonempty exact-finite claims remain obligations for the CP2
+semantic `Result` and `Transfer` proof. The deterministic semantic-owner statistics file records
+the event-level claims, frame starts, summaries, and frame-root predecessor bindings used by this
 check.
 
 CP1 keeps these roles separate. `Env` is queried only for factor owners, `ValueClaim` remains an

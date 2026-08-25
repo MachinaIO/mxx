@@ -7,6 +7,7 @@ set_option relaxedAutoImplicit false
 namespace Mxx.Certificate.OperationalNoise.TallSemanticsFixtures
 
 open Mxx.Certificate.OperationalNoise
+open EventReplay
 open SchemaV1
 open TallSecurity0ABI
 open TallSemantics
@@ -102,6 +103,17 @@ theorem source_atom_interprets
       (canonicalSelfClaim sourceAtomOwner) := by
   exact ValueDerived.interprets (source_atom_fixture witness)
 
+theorem generic_factor_atom_fixture
+    (witness : Witness sourceAtomDocument sourceAtomHistory none 257) :
+    DerivedResult sourceAtomDocument sourceAtomHistory none 257 witness
+      sourceAtomOwner 0 := by
+  apply ValueDerived.factorAtom
+  · exact ⟨0, rfl⟩
+  · refine ⟨⟨.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner] .exactZero, 0⟩,
+      rfl, ?_⟩
+    exact ⟨canonicalSelfTerm sourceAtomOwner,
+      by simp [canonicalSelfTerm, termContains, monomialContains]⟩
+
 theorem sampler_atom_fixture
     (witness : Witness samplerAtomDocument samplerAtomHistory none 257) :
   DerivedResult samplerAtomDocument samplerAtomHistory none 257 witness
@@ -147,6 +159,21 @@ theorem generic_value_claim_fixture :
   apply exactValueClaim_of_remainder 257 fixtureEnv (-14) fixturePolynomial 1 1
   · decide
   · simp [centeredNorm, centeredCoefficient]
+
+def finiteOneClass : CoeffClass := .finite ⟨1, by decide⟩
+
+theorem reached_sum_class_fixture :
+    (addKnownList [.exactZero, finiteOneClass]).Interprets ([0, 1] : List Nat).sum := by
+  apply addKnownList_sound
+  exact List.Forall₂.cons (by rfl)
+    (List.Forall₂.cons (by simp [finiteOneClass, CoeffClass.Interprets]) List.Forall₂.nil)
+
+theorem reached_finite_exact_claim_fixture :
+    ValueClaim.Interprets 257 fixtureEnv (-14)
+      (.exact fixturePolynomial (coeffClassToTallBound finiteOneClass)) := by
+  apply exactValueClaim_of_coeffClass 257 fixtureEnv (-14) fixturePolynomial finiteOneClass 1
+  · decide
+  · simp [finiteOneClass, CoeffClass.Interprets, centeredNorm, centeredCoefficient]
 
 theorem exact_zero_right_preserves_bound_fixture :
     ValueClaim.Interprets 257 fixtureEnv (-14 - 0)
@@ -284,6 +311,11 @@ theorem canonical_relation_fixture :
 
 #print axioms generic_evaluation_fixture
 #print axioms generic_value_claim_fixture
+#print axioms TallSemantics.coeffClassInterprets_to_boundInterprets
+#print axioms TallSemantics.addKnownList_sound
+#print axioms TallSemantics.exactValueClaim_of_coeffClass
+#print axioms reached_sum_class_fixture
+#print axioms reached_finite_exact_claim_fixture
 #print axioms TallSemantics.centeredNorm_eq_of_emod_eq
 #print axioms TallSemantics.centeredNorm_le_of_empty_finite_claim
 #print axioms TallSemantics.finalStrictBound_of_empty_finite_claim
@@ -292,6 +324,7 @@ theorem canonical_relation_fixture :
 #print axioms statement_domain_fixture
 #print axioms constructive_raw_bound_fixture
 #print axioms TallSemantics.ValueDerived.interprets
+#print axioms generic_factor_atom_fixture
 #print axioms source_atom_interprets
 #print axioms sampler_atom_interprets
 

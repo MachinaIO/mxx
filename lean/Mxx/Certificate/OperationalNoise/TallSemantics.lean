@@ -1342,6 +1342,31 @@ def boundInterprets (modulus : Nat) (bound : Bound) (value : Int) : Prop :=
   | .large => True
   | .missing => False
 
+def coeffClassToTallBound : CoeffClass → Bound
+  | .exactZero => .exactZero
+  | .finite maximum => .finite maximum.val
+  | .large => .large
+
+theorem coeffClassInterprets_to_boundInterprets {modulus : Nat} {value : Int}
+    {bound : CoeffClass} (sound : bound.Interprets (centeredNorm modulus value)) :
+    boundInterprets modulus (coeffClassToTallBound bound) value := by
+  cases bound with
+  | exactZero => exact sound
+  | finite maximum => exact sound
+  | large => trivial
+
+def addKnownList : List CoeffClass → CoeffClass
+  | [] => .exactZero
+  | bound :: bounds => addKnown bound (addKnownList bounds)
+
+theorem addKnownList_sound {bounds : List CoeffClass} {actuals : List Nat}
+    (sound : List.Forall₂ (fun bound actual => bound.Interprets actual) bounds actuals) :
+    (addKnownList bounds).Interprets actuals.sum := by
+  induction sound with
+  | nil => simp [addKnownList, CoeffClass.Interprets]
+  | cons head tail ih =>
+      simpa [addKnownList] using addKnown_sound head ih
+
 /-- An event-level claim; coefficient results do not create entries in `Env`. -/
 inductive ValueClaim (Factor : Type) where
   | exact (terms : Polynomial Factor) (summary : Bound)
@@ -1364,6 +1389,14 @@ theorem exactValueClaim_of_remainder {Factor : Type} (modulus : Nat) (env : Env 
     (remainderBound : centeredNorm modulus remainder ≤ maximum) :
     ValueClaim.Interprets modulus env actual (.exact terms (.finite maximum)) := by
   exact ⟨remainder, congruence, remainderBound⟩
+
+theorem exactValueClaim_of_coeffClass {Factor : Type} (modulus : Nat) (env : Env Factor)
+    (actual : Int) (terms : Polynomial Factor) (bound : CoeffClass) (remainder : Int)
+    (congruence :
+      (actual - evalPolynomial env terms) % Int.ofNat modulus = remainder % Int.ofNat modulus)
+    (remainderSound : bound.Interprets (centeredNorm modulus remainder)) :
+    ValueClaim.Interprets modulus env actual (.exact terms (coeffClassToTallBound bound)) := by
+  exact ⟨remainder, congruence, coeffClassInterprets_to_boundInterprets remainderSound⟩
 
 theorem centeredNorm_eq_zero_mod {modulus : Nat} {value : Int}
     (modulusPositive : 0 < modulus) (normZero : centeredNorm modulus value = 0) :
@@ -1688,9 +1721,9 @@ structure Witness (document : TallDocument) (history : EventHistory) (selector :
     RelationApplicationAt document history selector application →
       RelationCongruent modulus history env application
 
-/-! The first semantic ABI only derives the two atomic result shapes that are emitted for
-    source and sampler factors.  The result indices are intentional: constructors cannot choose
-    an arbitrary actual value, term list, summary, or claim. -/
+/-! Atomic derivations are tied to a canonical exact result and an actual factor occurrence.
+    The result indices are intentional: constructors cannot choose an arbitrary actual value,
+    term list, summary, or claim. -/
 
 def canonicalSelfTerm (owner : Owner) : Term :=
   { monomial := { centralFactors := [], orderedFactors := [owner] }
@@ -1708,6 +1741,11 @@ inductive ValueDerived (document : TallDocument) (history : EventHistory)
     (selector : Option Nat) (modulus : Nat)
     (witness : Witness document history selector modulus)
     (owner : Owner) (resultEvent : Nat) : Int → ValueClaim Owner → Prop where
+  | factorAtom
+      (result : exactResultAt history resultEvent owner)
+      (factor : FactorAtomAt history resultEvent owner) :
+      ValueDerived document history selector modulus witness owner resultEvent
+        (witness.env owner) (canonicalSelfClaim owner)
   | sourceAtom (source : SourceRef)
       (result : exactResultAt history resultEvent owner)
       (factor : SourceFactorAt document history selector owner resultEvent source) :

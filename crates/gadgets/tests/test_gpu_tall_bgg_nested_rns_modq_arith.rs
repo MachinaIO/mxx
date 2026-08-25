@@ -69,7 +69,7 @@ use mxx_runtime::{
     transcript::SamplingMode,
 };
 use num_bigint::{BigInt, BigUint};
-use num_traits::{FromPrimitive, Zero};
+use num_traits::{FromPrimitive, ToPrimitive, Zero};
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,7 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
     process::Command,
+    str::FromStr,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -106,6 +107,7 @@ const TALL_G0_GOLDEN_PATH: &str = concat!(
 const TALL_SECURITY0_SOURCE_PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/operational-noise-security0-v1/Source.json");
 const TALL_CERTIFICATE_SOURCE_SCHEMA_ID: &str = "mxx.operational-noise.tall-certificate-source";
+const TALL_CERTIFICATE_SOURCE_SCHEMA_VERSION: u32 = 1;
 const TALL_CERTIFICATE_SOURCE_REVISION: &str = "tall-nested-rns-security0-v1";
 const TALL_CERTIFICATE_EVALUATOR_VERSION: &str = "tall-runtime-only-v1";
 const TALL_CERTIFICATE_RUST_PROJECTION_VERSION: &str = "operational-noise-certificate-v1";
@@ -266,39 +268,67 @@ struct TallCertificateParametersV1 {
 }
 
 impl TallCertificateSourceV1 {
-    fn security0() -> Self {
-        Self {
-            schema_id: TALL_CERTIFICATE_SOURCE_SCHEMA_ID.to_owned(),
-            schema_version: 1,
-            profile: TallG0Profile::Security0,
-            source_revision: TALL_CERTIFICATE_SOURCE_REVISION.to_owned(),
-            evaluator_version: TALL_CERTIFICATE_EVALUATOR_VERSION.to_owned(),
-            rust_projection_version: TALL_CERTIFICATE_RUST_PROJECTION_VERSION.to_owned(),
-            lean_abi_version: TALL_CERTIFICATE_LEAN_ABI_VERSION.to_owned(),
-            request_target_id: TALL_OPERATIONAL_TARGET_ID.to_owned(),
-            parameters: TallCertificateParametersV1 {
-                multiplication_count: 1,
-                crt_depth: 7,
-                log_ring_dimension: 5,
-                required_security_bits: 0,
-                reviewed_security_lower_bound_bits: 0,
-                crt_modulus_bits: 28,
-                requested_p_moduli_bits: None,
-                gadget_base_bits: 14,
-                max_unreduced_multiplications: 2,
-                scale: "64".to_owned(),
-                error_sigma: "4".to_owned(),
-                trapdoor_sigma: "4.578".to_owned(),
-            },
-        }
-    }
-
     fn fixed_profile(&self) -> Result<FixedTallG0Profile, String> {
-        if self != &Self::security0() {
-            return Err("Tall certificate source is not the fixed Security0 source".to_owned());
+        if self.schema_id != TALL_CERTIFICATE_SOURCE_SCHEMA_ID ||
+            self.schema_version != TALL_CERTIFICATE_SOURCE_SCHEMA_VERSION ||
+            self.profile != TallG0Profile::Security0 ||
+            self.source_revision != TALL_CERTIFICATE_SOURCE_REVISION ||
+            self.evaluator_version != TALL_CERTIFICATE_EVALUATOR_VERSION ||
+            self.rust_projection_version != TALL_CERTIFICATE_RUST_PROJECTION_VERSION ||
+            self.lean_abi_version != TALL_CERTIFICATE_LEAN_ABI_VERSION ||
+            self.request_target_id != TALL_OPERATIONAL_TARGET_ID
+        {
+            return Err(
+                "Tall certificate source identity is not the fixed Security0 identity".to_owned()
+            );
         }
-        Ok(TallG0Profile::Security0.fixed())
+
+        let scale = parse_canonical_u64("scale", &self.parameters.scale)?;
+        let error_sigma = parse_canonical_f64("errorSigma", &self.parameters.error_sigma)?;
+        let trapdoor_sigma = parse_canonical_f64("trapdoorSigma", &self.parameters.trapdoor_sigma)?;
+        let fixed = FixedTallG0Profile {
+            profile: self.profile,
+            multiplication_count: self.parameters.multiplication_count,
+            crt_depth: self.parameters.crt_depth,
+            log_ring_dimension: self.parameters.log_ring_dimension,
+            required_security_bits: self.parameters.required_security_bits,
+            reviewed_security_lower_bound_bits: self.parameters.reviewed_security_lower_bound_bits,
+            crt_modulus_bits: self.parameters.crt_modulus_bits,
+            requested_p_moduli_bits: self.parameters.requested_p_moduli_bits,
+            gadget_base_bits: self.parameters.gadget_base_bits,
+            max_unreduced_multiplications: self.parameters.max_unreduced_multiplications,
+            scale,
+            error_sigma,
+            trapdoor_sigma,
+        };
+        if fixed != TallG0Profile::Security0.fixed() {
+            return Err(
+                "Tall certificate source parameters are not the fixed Security0 profile".to_owned()
+            );
+        }
+        Ok(fixed)
     }
+}
+
+fn parse_canonical_u64(field: &str, value: &str) -> Result<u64, String> {
+    let parsed =
+        value.parse::<u64>().map_err(|error| format!("invalid {field} decimal: {error}"))?;
+    if parsed.to_string() != value {
+        return Err(format!("{field} is not a canonical decimal"));
+    }
+    Ok(parsed)
+}
+
+fn parse_canonical_f64(field: &str, value: &str) -> Result<f64, String> {
+    let decimal =
+        BigDecimal::from_str(value).map_err(|error| format!("invalid {field} decimal: {error}"))?;
+    if decimal.normalized().to_string() != value {
+        return Err(format!("{field} is not a canonical decimal"));
+    }
+    decimal
+        .to_f64()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| format!("{field} decimal is not finite"))
 }
 
 impl FixedTallG0Profile {
@@ -2360,11 +2390,11 @@ fn fixed_tall_security0_certificate_source_is_exact() {
     let bytes = fs::read(TALL_SECURITY0_SOURCE_PATH).expect("fixed Security0 Source.json");
     let source: TallCertificateSourceV1 =
         serde_json::from_slice(&bytes).expect("strict fixed Security0 source");
-    assert_eq!(source, TallCertificateSourceV1::security0());
-    assert_eq!(
-        source.fixed_profile().expect("fixed Security0 profile"),
-        TallG0Profile::Security0.fixed()
-    );
+    let fixed = source.fixed_profile().expect("fixed Security0 profile");
+    assert_eq!(fixed, TallG0Profile::Security0.fixed());
+    assert_eq!(fixed.scale, source.parameters.scale.parse::<u64>().expect("source scale"));
+    assert_eq!(fixed.error_sigma, 4.0);
+    assert_eq!(fixed.trapdoor_sigma, 4.578);
 }
 
 #[test]

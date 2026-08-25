@@ -450,6 +450,9 @@ def boundProducerValid (history : EventHistory) (state : ReplayState) (owner : O
 def summaryProducerValid (history : EventHistory) (state : ReplayState) (owner : Owner) :
     Bound → Option Nat → Bool
   | .exactZero, none => true
+  -- `none` records that no single transfer is the summary endpoint. Semantic replay must
+  -- establish any nonzero summary separately; structural validity grants no such theorem.
+  | .finite _, none | .large, none => true
   | .finite _, some producer | .large, some producer =>
       boundProducerValid history state owner producer
   | _, _ => false

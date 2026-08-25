@@ -320,6 +320,17 @@ theorem dangling_survivor_rejected :
     stepAt fixtureDocument (smallHistory #[⟨.survivorFold 1 0, 0⟩]) initialState = none := by
   decide
 
+def finiteWithoutSummaryProducerHistory : EventHistory :=
+  smallHistory #[
+    annotated (.invocationStart (closedOwner 0)) 0,
+    annotated (.boundTransfer (closedOwner 0) (.authority .operator)) 0,
+    annotated (.resultExact (closedOwner 0) [] .exactZero 1 (.finite 1) none) 0]
+
+theorem finite_without_summary_producer_structurally_accepted :
+    replayRange fixtureDocument finiteWithoutSummaryProducerHistory 3 initialState =
+      some ⟨3, [⟨closedOwner 0, 0⟩]⟩ := by
+  rfl
+
 theorem end_without_prefold_rejected :
     replay fixtureDocument (smallHistory
       [ ⟨.invocationStart (closedOwner 0), 0⟩,
@@ -567,6 +578,7 @@ theorem tall_security0_abi_fixture :
 #print axioms fixture_replay
 #print axioms fixture_four_mixed_lifecycle_and_prior_refs
 #print axioms fixture_four_crosses_leaf_boundary
+#print axioms finite_without_summary_producer_structurally_accepted
 #print axioms repeated_invocation_rejects_stale_references
 #print axioms in_range_nonfinal_rhs_accepted
 #print axioms nested_invocation_range_fixture

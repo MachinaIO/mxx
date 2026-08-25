@@ -26,7 +26,10 @@ use rayon::prelude::*;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ButterflyStagePlan {
     alpha_slot_transfer: Vec<(u32, Option<Vec<u64>>)>,
-    beta_slot_transfer: Vec<(u32, Option<Vec<u64>>)>,
+    beta_lower_rotation: Vec<(u32, Option<Vec<u64>>)>,
+    beta_lower_mask: Vec<(u32, Option<Vec<u64>>)>,
+    beta_upper_rotation: Vec<(u32, Option<Vec<u64>>)>,
+    beta_upper_mask: Vec<(u32, Option<Vec<u64>>)>,
 }
 
 fn validate_num_slots<P: Poly>(params: &P::Params, num_slots: usize) {
@@ -162,6 +165,65 @@ fn attach_slot_residues(
         .collect()
 }
 
+fn split_partner_transfer(
+    num_slots: usize,
+    group_len: usize,
+    half_group_len: usize,
+    beta_residues_by_q: &[Vec<u64>],
+) -> (
+    Vec<(u32, Option<Vec<u64>>)>,
+    Vec<(u32, Option<Vec<u64>>)>,
+    Vec<(u32, Option<Vec<u64>>)>,
+    Vec<(u32, Option<Vec<u64>>)>,
+) {
+    let identity_sources = (0..num_slots)
+        .into_par_iter()
+        .map(|slot| u32::try_from(slot).expect("stage identity slot exceeds u32"))
+        .collect::<Vec<_>>();
+    let lower_rotation = (0..num_slots)
+        .into_par_iter()
+        .map(|slot| {
+            u32::try_from((slot + half_group_len) % num_slots)
+                .expect("stage rotation source exceeds u32")
+        })
+        .map(|source| (source, None))
+        .collect::<Vec<_>>();
+    let upper_rotation = (0..num_slots)
+        .into_par_iter()
+        .map(|slot| {
+            u32::try_from((slot + num_slots - half_group_len) % num_slots)
+                .expect("stage rotation source exceeds u32")
+        })
+        .map(|source| (source, None))
+        .collect::<Vec<_>>();
+    let lower_residues_by_q = beta_residues_by_q
+        .par_iter()
+        .map(|residues| {
+            residues
+                .par_iter()
+                .enumerate()
+                .map(|(slot, &residue)| if slot % group_len < half_group_len { residue } else { 0 })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let upper_residues_by_q = beta_residues_by_q
+        .par_iter()
+        .map(|residues| {
+            residues
+                .par_iter()
+                .enumerate()
+                .map(|(slot, &residue)| if slot % group_len < half_group_len { 0 } else { residue })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    (
+        lower_rotation,
+        attach_slot_residues(identity_sources.clone(), &lower_residues_by_q),
+        upper_rotation,
+        attach_slot_residues(identity_sources, &upper_residues_by_q),
+    )
+}
+
 fn resolved_active_levels<P: Poly>(poly: &NestedRnsPoly<P>) -> usize {
     poly.window.depth
 }
@@ -266,14 +328,6 @@ fn build_forward_stage_plan(
     let m = 1usize << stage_index;
     let t = num_slots >> (stage_index + 1);
     let group_len = t << 1;
-    let partner_sources = (0..num_slots)
-        .into_par_iter()
-        .map(|slot| {
-            let offset = slot % group_len;
-            let partner = if offset < t { slot + t } else { slot - t };
-            u32::try_from(partner).expect("stage permutation exceeds u32")
-        })
-        .collect::<Vec<_>>();
     let (alpha_residues_by_q, beta_residues_by_q): (Vec<_>, Vec<_>) = q_moduli
         .par_iter()
         .zip(root_tables_by_q.par_iter())
@@ -305,9 +359,16 @@ fn build_forward_stage_plan(
             .collect(),
         &alpha_residues_by_q,
     );
-    let beta_slot_transfer = attach_slot_residues(partner_sources, &beta_residues_by_q);
+    let (beta_lower_rotation, beta_lower_mask, beta_upper_rotation, beta_upper_mask) =
+        split_partner_transfer(num_slots, group_len, t, &beta_residues_by_q);
 
-    ButterflyStagePlan { alpha_slot_transfer, beta_slot_transfer }
+    ButterflyStagePlan {
+        alpha_slot_transfer,
+        beta_lower_rotation,
+        beta_lower_mask,
+        beta_upper_rotation,
+        beta_upper_mask,
+    }
 }
 
 fn build_inverse_stage_plan(
@@ -319,14 +380,6 @@ fn build_inverse_stage_plan(
     let m = num_slots >> (stage_index + 1);
     let t = 1usize << stage_index;
     let group_len = t << 1;
-    let partner_sources = (0..num_slots)
-        .into_par_iter()
-        .map(|slot| {
-            let offset = slot % group_len;
-            let partner = if offset < t { slot + t } else { slot - t };
-            u32::try_from(partner).expect("stage permutation exceeds u32")
-        })
-        .collect::<Vec<_>>();
     let (alpha_residues_by_q, beta_residues_by_q): (Vec<_>, Vec<_>) = q_moduli
         .par_iter()
         .zip(inverse_root_tables_by_q.par_iter())
@@ -358,9 +411,16 @@ fn build_inverse_stage_plan(
             .collect(),
         &alpha_residues_by_q,
     );
-    let beta_slot_transfer = attach_slot_residues(partner_sources, &beta_residues_by_q);
+    let (beta_lower_rotation, beta_lower_mask, beta_upper_rotation, beta_upper_mask) =
+        split_partner_transfer(num_slots, group_len, t, &beta_residues_by_q);
 
-    ButterflyStagePlan { alpha_slot_transfer, beta_slot_transfer }
+    ButterflyStagePlan {
+        alpha_slot_transfer,
+        beta_lower_rotation,
+        beta_lower_mask,
+        beta_upper_rotation,
+        beta_upper_mask,
+    }
 }
 
 fn apply_stage<P: Poly>(
@@ -369,7 +429,13 @@ fn apply_stage<P: Poly>(
     plan: &ButterflyStagePlan,
 ) -> NestedRnsPoly<P> {
     let alpha_current = current.slot_transfer(&plan.alpha_slot_transfer, circuit);
-    let beta_partner = current.slot_transfer(&plan.beta_slot_transfer, circuit);
+    let beta_lower = current
+        .slot_transfer(&plan.beta_lower_rotation, circuit)
+        .slot_transfer(&plan.beta_lower_mask, circuit);
+    let beta_upper = current
+        .slot_transfer(&plan.beta_upper_rotation, circuit)
+        .slot_transfer(&plan.beta_upper_mask, circuit);
+    let beta_partner = beta_lower.add(&beta_upper, circuit);
     alpha_current.add(&beta_partner, circuit)
 }
 

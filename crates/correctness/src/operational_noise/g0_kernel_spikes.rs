@@ -11,6 +11,10 @@ const BALANCED_ROW_COUNT: usize = 5_000;
 const FUEL_HAVE_COUNT: usize = 1_000;
 const FUEL_HAVE_GROUP_MAX: usize = 64;
 const INLINE_TREE_DEPTH: usize = 7;
+const SECURITY0_STATEMENT_ROW_COUNT: usize = 35_975;
+const SECURITY0_EVENT_COUNT: usize = 107_567;
+const SECURITY0_EVENT_CHUNK_SIZE: usize = 256;
+const SECURITY0_EVENT_LEAF_SIZE: usize = 16;
 const ALLOWED_AXIOMS: [&str; 2] = ["propext", "Quot.sound"];
 
 #[derive(Debug)]
@@ -188,6 +192,284 @@ fn render_balanced_rows_module(row: &BalancedRow) -> String {
          #print axioms rows_allFrom\n\
          \n\
          end Mxx.Certificate.OperationalNoise.G0BalancedSpike\n"
+    )
+}
+
+fn render_security0_statement_row(index: usize) -> String {
+    let inputs = if index == 0 { "[⟨1⟩]" } else { "[]" };
+    format!(
+        "{{ descriptor := .operation (.stable (.argument {index} statementType)) statementType, \
+         inputs := {inputs}, program := none }}"
+    )
+}
+
+fn render_security0_event(index: usize, event_count: usize) -> String {
+    let final_result = event_count - 3;
+    let final_pre_fold = event_count - 2;
+    let final_end = event_count - 1;
+    let event = match index {
+        0 => ".invocationStart outerOwner".to_owned(),
+        1 => ".resultCoefficient sourceOwner (.finite 1)".to_owned(),
+        2 => ".predecessor outerOwner 0 ⟨1⟩ 1".to_owned(),
+        10 => ".invocationStart nestedOwner".to_owned(),
+        11 => ".resultExact nestedOwner [] .exactZero".to_owned(),
+        12 => ".preFoldPolynomial [] .exactZero none".to_owned(),
+        13 => ".invocationEndExact nestedOwner [] .exactZero".to_owned(),
+        14 => ".specializationComputed outerOwner dispatch ⟨10, 14⟩".to_owned(),
+        index if index == final_result => ".resultExact outerOwner [] .exactZero".to_owned(),
+        index if index == final_pre_fold => ".preFoldPolynomial [] .exactZero none".to_owned(),
+        index if index == final_end => ".invocationEndExact outerOwner [] .exactZero".to_owned(),
+        index if index % SECURITY0_EVENT_LEAF_SIZE == 0 => {
+            format!(".boundTransfer outerOwner (.identity (.result {} .coefficient))", index - 1,)
+        }
+        index if index > 1 && index % SECURITY0_EVENT_LEAF_SIZE == 1 => {
+            ".boundTransfer outerOwner (.identity (.result 1 .coefficient))".to_owned()
+        }
+        _ => ".resultCoefficient sourceOwner (.finite 1)".to_owned(),
+    };
+    let frame_start = if (10..=13).contains(&index) { 10 } else { 0 };
+    format!("{{ event := {event}, frameStart := {frame_start} }}")
+}
+
+fn render_security0_events(
+    event_count: usize,
+    chunk_size: usize,
+) -> (String, String, Vec<usize>, Vec<usize>, usize) {
+    assert!(event_count > 17, "Security0 structural trace must include fixed lifecycle events");
+    assert!(chunk_size > 15, "first shard must contain the nested frame range");
+    assert_eq!(
+        chunk_size % SECURITY0_EVENT_LEAF_SIZE,
+        0,
+        "logical shards must contain whole event leaves",
+    );
+    let mut definitions = String::new();
+    let mut names = Vec::new();
+    let leaf_count = event_count.div_ceil(SECURITY0_EVENT_LEAF_SIZE);
+    for leaf in 0..leaf_count {
+        let start = leaf * SECURITY0_EVENT_LEAF_SIZE;
+        let end = (start + SECURITY0_EVENT_LEAF_SIZE).min(event_count);
+        let events = (start..end)
+            .map(|index| render_security0_event(index, event_count))
+            .collect::<Vec<_>>()
+            .join(",\n  ");
+        let chunk = start / chunk_size;
+        let local = (start % chunk_size) / SECURITY0_EVENT_LEAF_SIZE;
+        let name = format!("eventShard{chunk}Leaf{local}");
+        writeln!(definitions, "def {name} : Array AnnotatedEvent := #[\n  {events}\n]")
+            .expect("writing to String cannot fail");
+        names.push(name);
+    }
+    let leaf_rows = BalancedRow::median_range(0, leaf_count).expect("nonempty event leaf table");
+    assert_exact_tree(&leaf_rows, leaf_count);
+    let root = render_named_rows(
+        Some(&leaf_rows),
+        "eventLeafRow",
+        "(Array AnnotatedEvent)",
+        &|leaf| names[leaf].clone(),
+        &mut definitions,
+    );
+    let leaf_ends = (SECURITY0_EVENT_LEAF_SIZE..event_count)
+        .step_by(SECURITY0_EVENT_LEAF_SIZE)
+        .chain(std::iter::once(event_count))
+        .collect::<Vec<_>>();
+    assert_eq!(leaf_ends.len(), leaf_count);
+    let shard_ends = (chunk_size..event_count)
+        .step_by(chunk_size)
+        .chain(std::iter::once(event_count))
+        .collect::<Vec<_>>();
+    assert_eq!(shard_ends.len(), event_count.div_ceil(chunk_size));
+    (definitions, root, leaf_ends, shard_ends, leaf_count)
+}
+
+fn render_balanced_replay_chain(prefix: &str, start: usize, end: usize) -> String {
+    if end - start == 1 {
+        return format!("{prefix}{start}");
+    }
+    let middle = (start + end) / 2;
+    format!(
+        "(.trans {} {})",
+        render_balanced_replay_chain(prefix, start, middle),
+        render_balanced_replay_chain(prefix, middle, end),
+    )
+}
+
+fn render_security0_replay_chain(
+    leaf_ends: &[usize],
+    shard_ends: &[usize],
+    event_count: usize,
+    chunk_size: usize,
+) -> String {
+    let mut output = "def replayState0 : ReplayState := initialState\n\n".to_owned();
+    for (leaf, end) in leaf_ends.iter().copied().enumerate() {
+        let next = leaf + 1;
+        let frames = if end == event_count {
+            "[]"
+        } else {
+            "[⟨outerOwner, 0, #[some ⟨⟨1⟩, 1⟩], none, false⟩]"
+        };
+        writeln!(
+            output,
+            "def replayState{next} : ReplayState := ⟨{end}, {frames}⟩\n\n\
+             theorem replayLeaf{leaf} : ReplayChain document history replayState{leaf} \
+             replayState{next} :=\n  .chunk {end} (by rfl)\n"
+        )
+        .expect("writing to String cannot fail");
+    }
+    let leaves_per_shard = chunk_size / SECURITY0_EVENT_LEAF_SIZE;
+    for (shard, end) in shard_ends.iter().copied().enumerate() {
+        let start_leaf = shard * leaves_per_shard;
+        let end_leaf = (start_leaf + leaves_per_shard).min(leaf_ends.len());
+        let proof = render_balanced_replay_chain("replayLeaf", start_leaf, end_leaf);
+        writeln!(
+            output,
+            "theorem replayShard{shard} : ReplayChain document history replayState{start_leaf} \
+             replayState{end_leaf} :=\n  {proof}\n"
+        )
+        .expect("writing to String cannot fail");
+        assert_eq!(leaf_ends[end_leaf - 1], end, "shard boundary does not match leaf boundary");
+    }
+    let proof = render_balanced_replay_chain("replayShard", 0, shard_ends.len());
+    writeln!(
+        output,
+        "theorem replayChain : ReplayChain document history replayState0 \
+         replayState{} := by\n  exact {proof}\n",
+        leaf_ends.len(),
+    )
+    .expect("writing to String cannot fail");
+    output
+}
+
+fn render_security0_structure_module(
+    row: &BalancedRow,
+    statement_row_count: usize,
+    event_count: usize,
+    event_chunk_size: usize,
+) -> String {
+    let mut row_definitions = String::new();
+    let row_root = render_named_rows(
+        Some(row),
+        "statementRow",
+        "ExpressionRow",
+        &render_security0_statement_row,
+        &mut row_definitions,
+    );
+    let (event_definitions, event_root, leaf_ends, shard_ends, event_leaf_count) =
+        render_security0_events(event_count, event_chunk_size);
+    let replay_chain =
+        render_security0_replay_chain(&leaf_ends, &shard_ends, event_count, event_chunk_size);
+    let middle = statement_row_count / 2;
+    let last = statement_row_count - 1;
+    let middle_event = event_count / 2;
+    let last_event = event_count - 1;
+    let final_leaf_size = event_count - (event_leaf_count - 1) * SECURITY0_EVENT_LEAF_SIZE;
+    let final_state = leaf_ends.len();
+    format!(
+        "import Mxx.Certificate.OperationalNoise.TallSecurity0ABI\n\
+         \n\
+         set_option autoImplicit false\n\
+         set_option relaxedAutoImplicit false\n\
+         \n\
+         namespace Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike\n\
+         \n\
+         open SchemaV1 TallSecurity0ABI\n\
+         \n\
+         def statementType : ValueType := .matrix \"257\" 1 1 1\n\
+         \n\
+         {row_definitions}\n\
+         def expressionRows : RowTable ExpressionRow := {row_root}\n\
+         \n\
+         def programRow : SchemaV1.ProgramRow :=\n\
+           {{ signature := [], output := statementType, family := none, root := ⟨2⟩ }}\n\
+         \n\
+         def document : TallDocument :=\n\
+         \x20 {{ schemaId := \"mxx-operational-noise-certificate\"\n\
+         \x20   schemaVersion := 1\n\
+         \x20   plaintextModulus := \"2\"\n\
+         \x20   ciphertextModulus := \"257\"\n\
+         \x20   ringDimension := 1\n\
+         \x20   expressions := expressionRows\n\
+         \x20   programs := .node 0 programRow .empty .empty\n\
+         \x20   sources := .empty\n\
+         \x20   events := .empty\n\
+         \x20   indexUses := .empty\n\
+         \x20   sliceGroups := .empty\n\
+         \x20   residualRoot := .closed ⟨0⟩ }}\n\
+         \n\
+         def closedOwner (expression : Nat) : Owner := ⟨.closed ⟨0⟩, ⟨expression⟩⟩\n\
+         def outerOwner : Owner := closedOwner 0\n\
+         def sourceOwner : Owner := closedOwner 1\n\
+         def nestedOwner : Owner := closedOwner 2\n\
+         def dispatch : UniversalDispatch := ⟨⟨0⟩, ⟨3⟩, ⟨4⟩⟩\n\
+         \n\
+         {event_definitions}\n\
+         def historyLeaves : RowTable (Array AnnotatedEvent) := {event_root}\n\
+         def history : EventHistory := {{ leaves := historyLeaves, size := {event_count} }}\n\
+         \n\
+         {replay_chain}\n\
+         theorem firstRowLookup :\n\
+             expressionRows.lookup 0 = some ({}) := by\n\
+         \x20 rfl\n\
+         \n\
+         theorem middleRowLookup :\n\
+             expressionRows.lookup {middle} = some ({}) := by\n\
+         \x20 rfl\n\
+         \n\
+         theorem lastRowLookup :\n\
+             expressionRows.lookup {last} = some ({}) := by\n\
+         \x20 rfl\n\
+         \n\
+         theorem historyHasExactSize : history.size = {event_count} := by\n\
+         \x20 decide\n\
+         \n\
+         theorem historyHasExactLeafCount : history.leafCount = {event_leaf_count} := by\n\
+         \x20 decide\n\
+         \n\
+         theorem historyNodeCount : rowTableNodeCount history.leaves = {event_leaf_count} := by\n\
+         \x20 decide\n\
+         \n\
+         theorem firstEventLookup : history.lookup 0 = some ({}) := by\n\
+         \x20 rfl\n\
+         \n\
+         theorem middleEventLookup : history.lookup {middle_event} = some ({}) := by\n\
+         \x20 rfl\n\
+         \n\
+         theorem lastEventLookup : history.lookup {last_event} = some ({}) := by\n\
+         \x20 rfl\n\
+         \n\
+         theorem finalLeafHasExactSize :\n\
+             (history.leaves.lookup {}).map Array.size = some {final_leaf_size} := by\n\
+         \x20 rfl\n\
+         \n\
+         theorem historyIsWellFormed : history.wellFormed = true := by\n\
+         \x20 decide\n\
+         \n\
+         theorem replayCloses :\n\
+             replayState{final_state}.cursor = {event_count} ∧\n\
+               replayState{final_state}.frames = [] := by\n\
+         \x20 exact ⟨rfl, rfl⟩\n\
+         \n\
+         #print axioms firstRowLookup\n\
+         #print axioms middleRowLookup\n\
+         #print axioms lastRowLookup\n\
+         #print axioms historyHasExactSize\n\
+         #print axioms historyHasExactLeafCount\n\
+         #print axioms historyNodeCount\n\
+         #print axioms firstEventLookup\n\
+         #print axioms middleEventLookup\n\
+         #print axioms lastEventLookup\n\
+         #print axioms finalLeafHasExactSize\n\
+         #print axioms historyIsWellFormed\n\
+         #print axioms replayChain\n\
+         #print axioms replayCloses\n\
+         \n\
+         end Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike\n",
+        render_security0_statement_row(0),
+        render_security0_statement_row(middle),
+        render_security0_statement_row(last),
+        render_security0_event(0, event_count),
+        render_security0_event(middle_event, event_count),
+        render_security0_event(last_event, event_count),
+        event_leaf_count - 1,
     )
 }
 
@@ -505,4 +787,104 @@ fn g0_kernel_spikes_compile_exact_sizes() {
     println!("balanced_rows={BALANCED_ROW_COUNT}");
     println!("fuel_haves={FUEL_HAVE_COUNT}");
     println!("PASS");
+}
+
+#[test]
+#[ignore = "actual-cardinality Security0 Lean structural compile-feasibility gate"]
+fn g0_kernel_spike_compiles_security0_actual_structure() {
+    let statement_rows = BalancedRow::median_range(0, SECURITY0_STATEMENT_ROW_COUNT)
+        .expect("nonempty Security0 statement table");
+    assert_exact_tree(&statement_rows, SECURITY0_STATEMENT_ROW_COUNT);
+    let source = render_security0_structure_module(
+        &statement_rows,
+        SECURITY0_STATEMENT_ROW_COUNT,
+        SECURITY0_EVENT_COUNT,
+        SECURITY0_EVENT_CHUNK_SIZE,
+    );
+    assert_generated_source(&source);
+
+    let repository_root = repository_root();
+    let lean_root = repository_root.join("lean");
+    let mut manifest_guard = LakeManifestGuard::capture(lean_root.join("lake-manifest.json"))
+        .expect("manifest snapshot");
+    let temporary = tempfile::Builder::new()
+        .prefix("mxx-g0-security0-structural-spike-")
+        .tempdir()
+        .expect("temporary Security0 structural-spike directory");
+    let path = temporary.path().join("Security0ActualStructure.lean");
+    write_new(&path, &source).expect("new Security0 structural-spike Lean module");
+
+    compile_lean_module(
+        &lean_root,
+        &path,
+        &[
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.firstRowLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.middleRowLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.lastRowLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyHasExactSize",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyHasExactLeafCount",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyNodeCount",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.firstEventLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.middleEventLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.lastEventLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.finalLeafHasExactSize",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyIsWellFormed",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.replayChain",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.replayCloses",
+        ],
+    );
+    manifest_guard.restore().expect("restore lake manifest");
+    println!("statement_rows={SECURITY0_STATEMENT_ROW_COUNT}");
+    println!("events={SECURITY0_EVENT_COUNT}");
+    println!("event_chunks={}", SECURITY0_EVENT_COUNT.div_ceil(SECURITY0_EVENT_CHUNK_SIZE),);
+    println!("PASS");
+}
+
+#[test]
+#[ignore = "small generated Lean syntax gate for the Security0 structural spike renderer"]
+fn g0_kernel_spike_renderer_compiles_tiny_structure() {
+    const TINY_ROW_COUNT: usize = 5;
+    const TINY_EVENT_COUNT: usize = 32;
+    const TINY_CHUNK_SIZE: usize = 16;
+    let statement_rows =
+        BalancedRow::median_range(0, TINY_ROW_COUNT).expect("nonempty tiny statement table");
+    assert_exact_tree(&statement_rows, TINY_ROW_COUNT);
+    let source = render_security0_structure_module(
+        &statement_rows,
+        TINY_ROW_COUNT,
+        TINY_EVENT_COUNT,
+        TINY_CHUNK_SIZE,
+    );
+    assert_generated_source(&source);
+
+    let repository_root = repository_root();
+    let lean_root = repository_root.join("lean");
+    let mut manifest_guard = LakeManifestGuard::capture(lean_root.join("lake-manifest.json"))
+        .expect("manifest snapshot");
+    let temporary = tempfile::Builder::new()
+        .prefix("mxx-g0-security0-structural-renderer-")
+        .tempdir()
+        .expect("temporary tiny structural-renderer directory");
+    let path = temporary.path().join("Security0TinyStructure.lean");
+    write_new(&path, &source).expect("new tiny Security0 structural Lean module");
+    compile_lean_module(
+        &lean_root,
+        &path,
+        &[
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.firstRowLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.middleRowLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.lastRowLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyHasExactSize",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyHasExactLeafCount",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyNodeCount",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.firstEventLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.middleEventLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.lastEventLookup",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.finalLeafHasExactSize",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyIsWellFormed",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.replayChain",
+            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.replayCloses",
+        ],
+    );
+    manifest_guard.restore().expect("restore lake manifest");
 }

@@ -9,19 +9,43 @@ open SchemaV1
 
 def fixtureType : ValueType := .matrix "257" 1 1 1
 
+def emptyExpressionInputs : ExpressionInputs := ⟨.empty, 0⟩
+
+def repeatedInputLeaf : Array ExpressionRef :=
+  Array.replicate expressionInputLeafSize ⟨2⟩
+
+def longExpressionInputs : ExpressionInputs where
+  leaves := .node 0 repeatedInputLeaf .empty
+    (.node 1 #[⟨2⟩, ⟨2⟩] .empty .empty)
+  size := 18
+
+def twoFullExpressionInputs : ExpressionInputs where
+  leaves := .node 0 repeatedInputLeaf .empty
+    (.node 1 repeatedInputLeaf .empty .empty)
+  size := 32
+
+def singletonExpressionInputs (input : Nat) : ExpressionInputs where
+  leaves := .node 0 #[⟨input⟩] .empty .empty
+  size := 1
+
 def fixtureExpression (position : Nat) : ExpressionRow where
   descriptor := .operation (.stable (.argument position fixtureType)) fixtureType
-  inputs := []
+  inputs := emptyExpressionInputs
   program := none
 
 def fixtureRootExpression : ExpressionRow where
   descriptor := .operation (.stable (.argument 0 fixtureType)) fixtureType
-  inputs := [⟨2⟩]
+  inputs := longExpressionInputs
+  program := none
+
+def fixtureConsumerExpression (position input : Nat) : ExpressionRow where
+  descriptor := .operation (.stable (.argument position fixtureType)) fixtureType
+  inputs := singletonExpressionInputs input
   program := none
 
 def fixturePreimageExpression : ExpressionRow where
   descriptor := .operation (.event (.sampler ⟨0⟩)) fixtureType
-  inputs := []
+  inputs := emptyExpressionInputs
   program := none
 
 def fixtureWire : ObservedWire where
@@ -40,7 +64,7 @@ def fixtureDocument : TallDocument where
   expressions := .node 1 (fixtureExpression 1)
     (.node 0 fixtureRootExpression .empty .empty)
     (.node 2 fixturePreimageExpression .empty
-      (.node 3 (fixtureExpression 3) .empty .empty))
+      (.node 3 (fixtureConsumerExpression 3 2) .empty .empty))
   programs := .node 0
     { signature := [], output := fixtureType, family := none, root := ⟨1⟩ } .empty .empty
   sources := .empty
@@ -48,6 +72,43 @@ def fixtureDocument : TallDocument where
   indexUses := .empty
   sliceGroups := .empty
   residualRoot := .closed ⟨0⟩
+
+def gappedExpressionInputs : ExpressionInputs where
+  leaves := .node 0 repeatedInputLeaf .empty
+    (.node 2 #[⟨2⟩] .empty .empty)
+  size := 17
+
+def shortNonfinalExpressionInputs : ExpressionInputs where
+  leaves := .node 0 (Array.replicate 15 ⟨2⟩) .empty
+    (.node 1 #[⟨2⟩] .empty .empty)
+  size := 17
+
+def wrongFinalExpressionInputs : ExpressionInputs where
+  leaves := .node 0 repeatedInputLeaf .empty
+    (.node 1 #[⟨2⟩, ⟨2⟩, ⟨2⟩] .empty .empty)
+  size := 17
+
+theorem expression_inputs_fixture :
+    emptyExpressionInputs.Valid ∧ longExpressionInputs.Valid ∧
+      twoFullExpressionInputs.Valid ∧
+      longExpressionInputs.get? 0 = some ⟨2⟩ ∧
+      longExpressionInputs.get? 8 = some ⟨2⟩ ∧
+      longExpressionInputs.get? 15 = some ⟨2⟩ ∧
+      longExpressionInputs.get? 16 = some ⟨2⟩ ∧
+      longExpressionInputs.get? 17 = some ⟨2⟩ ∧
+      longExpressionInputs.get? 18 = none ∧
+      longExpressionInputs.get? 0 = longExpressionInputs.get? 15 := by
+  simp [ExpressionInputs.Valid, ExpressionInputs.wellFormed, ExpressionInputs.leafCount,
+    ExpressionInputs.expectedLeafSize, ExpressionInputs.get?, emptyExpressionInputs,
+    longExpressionInputs, twoFullExpressionInputs, repeatedInputLeaf, expressionInputLeafSize,
+    rowTableNodeCount, RowTable.wellFormed, RowTable.orderedFrom, RowTable.balanced,
+    RowTable.height, RowTable.allBool, RowTable.lookup]
+
+theorem malformed_expression_inputs_rejected :
+    gappedExpressionInputs.wellFormed = false ∧
+      shortNonfinalExpressionInputs.wellFormed = false ∧
+      wrongFinalExpressionInputs.wellFormed = false := by
+  decide
 
 def closedOwner (expression : Nat) : Owner := ⟨.closed ⟨0⟩, ⟨expression⟩⟩
 
@@ -61,8 +122,8 @@ def fixtureEvents : List Event :=
   [ .invocationStart (closedOwner 0),
     .invocationStart (closedOwner 1),
     .resultExact (closedOwner 1) [singletonTerm 1] .exactZero,
-    .preFoldPolynomial [singletonTerm 1] .exactZero none,
-    .invocationEndExact (closedOwner 1) [singletonTerm 1] .exactZero,
+    .preFoldPolynomial 2 [singletonTerm 1] .exactZero none,
+    .invocationEndExact (closedOwner 1) 3 [singletonTerm 1] .exactZero,
     .specializationComputed (closedOwner 0) fixtureDispatch ⟨1, 5⟩,
     .appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
       (.universal 5 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 4),
@@ -70,14 +131,18 @@ def fixtureEvents : List Event :=
       ⟨closedOwner 0, .relation 6 0, singletonMonomial 1, 1⟩,
     .resultExact (closedOwner 2) [singletonTerm 2] (.finite 1),
     .predecessor (closedOwner 0) 0 ⟨2⟩ 8,
-    .boundTransfer (closedOwner 0) (.identity (.predecessor 0 .coefficient)),
+    .boundTransfer (closedOwner 0) (.identity (.predecessor 0 9 .coefficient)),
+    .predecessor (closedOwner 3) 0 ⟨2⟩ 8,
+    .boundTransfer (closedOwner 3) (.identity (.predecessor 0 11 .coefficient)),
+    .predecessor (closedOwner 0) 17 ⟨2⟩ 8,
+    .boundTransfer (closedOwner 0) (.identity (.predecessor 17 13 .coefficient)),
     .coefficientMerge
       ⟨closedOwner 0, .operator (⟨8, 0⟩, ⟨8, 0⟩), singletonMonomial 2, 1⟩,
     .boundTransfer (closedOwner 0) (.authority (.relationPreimageSource ⟨2⟩)),
-    .survivorFold 1 12,
+    .survivorFold 1 16,
     .resultExact (closedOwner 0) [] (.finite 1),
-    .preFoldPolynomial [] (.finite 1) (some (.result 14 .summary)),
-    .invocationEndExact (closedOwner 0) [] (.finite 1) ]
+    .preFoldPolynomial 18 [] (.finite 1) (some (.result 18 .summary)),
+    .invocationEndExact (closedOwner 0) 19 [] (.finite 1) ]
 
 def annotateEvents (events : List Event) (frameStarts : List Nat) : Array AnnotatedEvent :=
   (List.zipWith (fun event frameStart => ⟨event, frameStart⟩) events frameStarts).toArray
@@ -94,7 +159,7 @@ def annotated (event : Event) (frameStart : Nat) : AnnotatedEvent :=
   ⟨event, frameStart⟩
 
 def fixtureFrameStarts : List Nat := [0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0]
+  0, 0, 0, 0, 0, 0]
 
 def fixtureHistory : EventHistory :=
   smallHistory (annotateEvents fixtureEvents fixtureFrameStarts)
@@ -117,18 +182,18 @@ theorem end_without_prefold_rejected :
     replay fixtureDocument (smallHistory
       [ ⟨.invocationStart (closedOwner 0), 0⟩,
         ⟨.resultExact (closedOwner 0) [] .exactZero, 0⟩,
-        ⟨.invocationEndExact (closedOwner 0) [] .exactZero, 0⟩ ].toArray) = none := by
+        ⟨.invocationEndExact (closedOwner 0) 1 [] .exactZero, 0⟩ ].toArray) = none := by
   decide
 
 def repeatedStart : List AnnotatedEvent :=
   (annotateEvents fixtureEvents fixtureFrameStarts).toList ++
-    [⟨.invocationStart (closedOwner 0), 17⟩]
+    [⟨.invocationStart (closedOwner 0), 21⟩]
 
 theorem stale_relation_rhs_rejected :
     replay fixtureDocument (smallHistory
       (repeatedStart ++
         [annotated (.appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩
-          1 0 2 (.universal 5 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 4)) 17]).toArray) =
+          1 0 2 (.universal 5 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 4)) 21]).toArray) =
       none := by
   decide
 
@@ -136,42 +201,43 @@ theorem stale_relation_merge_rejected :
     replay fixtureDocument (smallHistory
       (repeatedStart ++
         [annotated (.coefficientMerge
-          ⟨closedOwner 0, .relation 6 0, singletonMonomial 1, 1⟩) 17]).toArray) = none := by
+          ⟨closedOwner 0, .relation 6 0, singletonMonomial 1, 1⟩) 21]).toArray) = none := by
   decide
 
 theorem stale_summary_evidence_rejected :
     replay fixtureDocument (smallHistory
       (repeatedStart ++
-        [annotated (.resultExact (closedOwner 0) [] (.finite 1)) 17,
-          annotated (.preFoldPolynomial [] (.finite 1) (some (.result 14 .summary))) 17]).toArray) =
+        [annotated (.resultExact (closedOwner 0) [] (.finite 1)) 21,
+          annotated
+            (.preFoldPolynomial 21 [] (.finite 1) (some (.result 18 .summary))) 21]).toArray) =
       none := by
   decide
 
 theorem stale_survivor_transfer_rejected :
     replay fixtureDocument
       (smallHistory (repeatedStart ++
-        [annotated (.survivorFold 1 12) 17]).toArray) = none := by
+        [annotated (.survivorFold 1 16) 21]).toArray) = none := by
   decide
 
 theorem repeated_invocation_rejects_stale_references :
     replay fixtureDocument (smallHistory
         (repeatedStart ++
           [annotated (.appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩
-            1 0 2 (.universal 5 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 4)) 17]).toArray) =
+            1 0 2 (.universal 5 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 4)) 21]).toArray) =
         none ∧
       replay fixtureDocument (smallHistory
         (repeatedStart ++
           [annotated (.coefficientMerge
-            ⟨closedOwner 0, .relation 6 0, singletonMonomial 1, 1⟩) 17]).toArray) = none ∧
+            ⟨closedOwner 0, .relation 6 0, singletonMonomial 1, 1⟩) 21]).toArray) = none ∧
       replay fixtureDocument (smallHistory
         (repeatedStart ++
-          [annotated (.resultExact (closedOwner 0) [] (.finite 1)) 17,
+          [annotated (.resultExact (closedOwner 0) [] (.finite 1)) 21,
             annotated
-              (.preFoldPolynomial [] (.finite 1) (some (.result 14 .summary))) 17]).toArray) =
+              (.preFoldPolynomial 21 [] (.finite 1) (some (.result 18 .summary))) 21]).toArray) =
         none ∧
       replay fixtureDocument
         (smallHistory (repeatedStart ++
-          [annotated (.survivorFold 1 12) 17]).toArray) = none :=
+          [annotated (.survivorFold 1 16) 21]).toArray) = none :=
   ⟨stale_relation_rhs_rejected, stale_relation_merge_rejected,
     stale_summary_evidence_rejected, stale_survivor_transfer_rejected⟩
 
@@ -180,19 +246,19 @@ def multipleRhsEvents : List Event :=
     .invocationStart (closedOwner 1),
     .invocationStart (closedOwner 2),
     .resultExact (closedOwner 2) [singletonTerm 2] .exactZero,
-    .preFoldPolynomial [singletonTerm 2] .exactZero none,
-    .invocationEndExact (closedOwner 2) [singletonTerm 2] .exactZero,
+    .preFoldPolynomial 3 [singletonTerm 2] .exactZero none,
+    .invocationEndExact (closedOwner 2) 4 [singletonTerm 2] .exactZero,
     .resultExact (closedOwner 1) [singletonTerm 1] .exactZero,
-    .preFoldPolynomial [singletonTerm 1] .exactZero none,
-    .invocationEndExact (closedOwner 1) [singletonTerm 1] .exactZero,
+    .preFoldPolynomial 6 [singletonTerm 1] .exactZero none,
+    .invocationEndExact (closedOwner 1) 7 [singletonTerm 1] .exactZero,
     .specializationComputed (closedOwner 0) fixtureDispatch ⟨1, 9⟩,
     .appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
       (.universal 9 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 5),
     .coefficientMerge
       ⟨closedOwner 0, .relation 10 0, singletonMonomial 1, 1⟩,
     .resultExact (closedOwner 0) [] .exactZero,
-    .preFoldPolynomial [] .exactZero none,
-    .invocationEndExact (closedOwner 0) [] .exactZero ]
+    .preFoldPolynomial 12 [] .exactZero none,
+    .invocationEndExact (closedOwner 0) 13 [] .exactZero ]
 
 def multipleRhsFrameStarts : List Nat := [0, 1, 2, 2, 2, 2, 1, 1, 1, 0, 0, 0, 0, 0,
   0]
@@ -209,27 +275,34 @@ theorem in_range_nonfinal_rhs_accepted :
   decide
 
 def multipleRhsBeforeComputed : ReplayState :=
-  ⟨9, [⟨closedOwner 0, 0, #[none], none, false⟩]⟩
+  ⟨9, [⟨closedOwner 0, 0⟩]⟩
 
 theorem nested_endpoint_equivalence :
     exactFrameRange multipleRhsHistory multipleRhsBeforeComputed ⟨1, 9⟩ = true := by
-  decide
-
-def duplicatePredecessorEvents : List Event :=
-  [ .invocationStart (closedOwner 0),
-    .resultExact (closedOwner 2) [singletonTerm 2] (.finite 1),
-    .predecessor (closedOwner 0) 0 ⟨2⟩ 1,
-    .predecessor (closedOwner 0) 0 ⟨2⟩ 1 ]
-
-theorem duplicate_predecessor_rejected :
-    replay fixtureDocument
-      (smallHistory (annotateEvents duplicatePredecessorEvents [0, 0, 0, 0])) = none := by
   decide
 
 theorem wrong_nested_annotation_rejected :
     replay fixtureDocument
       (smallHistory #[⟨.invocationStart (closedOwner 0), 0⟩,
         ⟨.invocationStart (closedOwner 1), 0⟩]) = none := by
+  decide
+
+def nestedLinkPrefix : List Event :=
+  [ .invocationStart (closedOwner 0),
+    .invocationStart (closedOwner 1),
+    .resultExact (closedOwner 1) [singletonTerm 1] .exactZero,
+    .preFoldPolynomial 2 [singletonTerm 1] .exactZero none,
+    .invocationEndExact (closedOwner 1) 3 [singletonTerm 1] .exactZero ]
+
+theorem nested_frame_links_are_isolated :
+    replay fixtureDocument
+        (smallHistory (annotateEvents
+          (nestedLinkPrefix ++ [.preFoldPolynomial 2 [] .exactZero none])
+          [0, 1, 1, 1, 1, 0])) = none ∧
+      replay fixtureDocument
+        (smallHistory (annotateEvents
+          (nestedLinkPrefix ++ [.invocationEndExact (closedOwner 0) 3 [] .exactZero])
+          [0, 1, 1, 1, 1, 0])) = none := by
   decide
 
 def repeatedCoefficient : AnnotatedEvent :=
@@ -244,10 +317,10 @@ def crossBoundaryHistory : EventHistory where
   size := 65
 
 def beforeBoundary : ReplayState :=
-  ⟨64, [⟨closedOwner 0, 0, #[none], none, false⟩]⟩
+  ⟨64, [⟨closedOwner 0, 0⟩]⟩
 
 def afterBoundary : ReplayState :=
-  ⟨65, [⟨closedOwner 0, 0, #[none], none, false⟩]⟩
+  ⟨65, [⟨closedOwner 0, 0⟩]⟩
 
 theorem replay_chunk_crosses_64_boundary :
     replayRange fixtureDocument crossBoundaryHistory 65 beforeBoundary = some afterBoundary := by
@@ -271,10 +344,12 @@ theorem tall_security0_abi_fixture :
 #print axioms fixture_replay
 #print axioms repeated_invocation_rejects_stale_references
 #print axioms in_range_nonfinal_rhs_accepted
-#print axioms duplicate_predecessor_rejected
 #print axioms nested_endpoint_equivalence
 #print axioms wrong_nested_annotation_rejected
+#print axioms nested_frame_links_are_isolated
 #print axioms replay_chunk_crosses_64_boundary
 #print axioms malformed_history_rejected
+#print axioms expression_inputs_fixture
+#print axioms malformed_expression_inputs_rejected
 
 end Mxx.Certificate.OperationalNoise.TallSecurity0ABI

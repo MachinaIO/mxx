@@ -716,6 +716,7 @@
         "kind": "scale",
         "value": {
           "kind": "predecessor",
+          "bindingEvent": 12,
           "inputPosition": 0,
           "projection": "coefficient"
         },
@@ -723,6 +724,7 @@
           "kind": "value",
           "value": {
             "kind": "predecessor",
+            "bindingEvent": 13,
             "inputPosition": 1,
             "projection": "coefficient"
           }
@@ -850,11 +852,13 @@
         "kind": "product",
         "left": {
           "kind": "predecessor",
+          "bindingEvent": 18,
           "inputPosition": 0,
           "projection": "coefficient"
         },
         "right": {
           "kind": "predecessor",
+          "bindingEvent": 19,
           "inputPosition": 1,
           "projection": "coefficient"
         },
@@ -1105,11 +1109,13 @@
         "kind": "product",
         "left": {
           "kind": "predecessor",
+          "bindingEvent": 30,
           "inputPosition": 0,
           "projection": "coefficient"
         },
         "right": {
           "kind": "predecessor",
+          "bindingEvent": 31,
           "inputPosition": 1,
           "projection": "coefficient"
         },
@@ -1209,6 +1215,7 @@
     },
     {
       "kind": "pre_fold_polynomial",
+      "resultEvent": 34,
       "terms": [
         {
           "monomial": {
@@ -1276,7 +1283,8 @@
         "summary": {
           "kind": "exact_zero"
         }
-      }
+      },
+      "preFoldEvent": 35
     },
     {
       "kind": "invocation_start",
@@ -1339,6 +1347,7 @@
     },
     {
       "kind": "pre_fold_polynomial",
+      "resultEvent": 39,
       "terms": [
         {
           "monomial": {
@@ -1392,7 +1401,8 @@
         "summary": {
           "kind": "exact_zero"
         }
-      }
+      },
+      "preFoldEvent": 40
     },
     {
       "kind": "specialization_computed",
@@ -1570,11 +1580,13 @@
         "inputs": [
           {
             "kind": "predecessor",
+            "bindingEvent": 46,
             "inputPosition": 0,
             "projection": "coefficient"
           },
           {
             "kind": "predecessor",
+            "bindingEvent": 47,
             "inputPosition": 1,
             "projection": "coefficient"
           }
@@ -1676,11 +1688,13 @@
         "inputs": [
           {
             "kind": "predecessor",
+            "bindingEvent": 51,
             "inputPosition": 0,
             "projection": "coefficient"
           },
           {
             "kind": "predecessor",
+            "bindingEvent": 52,
             "inputPosition": 1,
             "projection": "coefficient"
           }
@@ -1748,6 +1762,7 @@
     },
     {
       "kind": "pre_fold_polynomial",
+      "resultEvent": 56,
       "terms": [],
       "summary": {
         "kind": "finite",
@@ -1775,7 +1790,8 @@
           "kind": "finite",
           "maximumAbsoluteCoefficient": "1"
         }
-      }
+      },
+      "preFoldEvent": 57
     }
   ]
 }

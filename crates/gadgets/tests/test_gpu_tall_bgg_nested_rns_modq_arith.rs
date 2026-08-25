@@ -24,7 +24,7 @@ use mxx_correctness::{
         OperationalSimulationError, OperationalSimulationReport, ProgressEventKind,
         TallSecurity0ProfileIdentity, check_operational_noise_candidate,
         check_operational_noise_candidate_with_progress, prepare_g0_cpu_evidence_bytes,
-        prepare_tall_security0_reached_projection,
+        prepare_tall_security0_lean_manifest, prepare_tall_security0_reached_projection,
     },
     operational_protocol_from_graphs,
 };
@@ -79,7 +79,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     env, fs,
     num::NonZeroUsize,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     str::FromStr,
     sync::Arc,
@@ -2492,6 +2492,83 @@ fn fixed_tall_security0_source_projection_matches_ordinary_semantics() {
         std::str::from_utf8(&reconstructed_projection.inventory_bytes)
             .expect("Security0 reached inventory UTF-8")
     );
+}
+
+fn emit_fixed_tall_security0_lean(output: &Path, revision: &str) -> Result<usize, String> {
+    if revision != TALL_CERTIFICATE_SOURCE_REVISION {
+        return Err("Security0 emitter revision does not match Source.json".to_owned());
+    }
+    let source: TallCertificateSourceV1 = serde_json::from_slice(
+        &fs::read(TALL_SECURITY0_SOURCE_PATH).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let reconstructed = build_fixed_tall_certificate_source(&source)
+        .map_err(|error| format!("Source.json-driven fixed Security0 source failed: {error}"))?;
+    let manifest = prepare_tall_security0_lean_manifest(
+        &reconstructed.protocol,
+        &reconstructed.request,
+        &source.profile_identity(),
+    )
+    .map_err(|error| format!("Security0 Lean generation failed: {error}"))?;
+    for file in &manifest.files {
+        let path = output.join(&file.relative_path);
+        fs::create_dir_all(path.parent().ok_or("generated file has no parent")?)
+            .map_err(|error| error.to_string())?;
+        fs::write(path, &file.bytes).map_err(|error| error.to_string())?;
+    }
+    Ok(manifest.files.len())
+}
+
+#[test]
+#[ignore = "CPU-only fixed Security0 actual maximum-expression-input renderer gate"]
+fn fixed_tall_security0_emits_actual_maximum_expression_input_module() {
+    let output = env::var_os("MXX_SECURITY0_EXPRESSION_PROBE_OUTPUT")
+        .map(PathBuf::from)
+        .expect("set MXX_SECURITY0_EXPRESSION_PROBE_OUTPUT to an explicit empty output directory");
+    assert!(!output.exists(), "Security0 expression probe directory must not already exist");
+    let source: TallCertificateSourceV1 = serde_json::from_slice(
+        &fs::read(TALL_SECURITY0_SOURCE_PATH).expect("fixed Security0 Source.json"),
+    )
+    .expect("strict fixed Security0 source");
+    let reconstructed = build_fixed_tall_certificate_source(&source)
+        .expect("Source.json-driven fixed Security0 source");
+    let manifest = prepare_tall_security0_lean_manifest(
+        &reconstructed.protocol,
+        &reconstructed.request,
+        &source.profile_identity(),
+    )
+    .expect("derive fixed Security0 maximum expression input module");
+    let module = manifest
+        .files
+        .iter()
+        .find(|file| file.relative_path == "Cert/Expression036.lean")
+        .expect("actual Security0 expression package 36");
+    let path = output.join(&module.relative_path);
+    fs::create_dir_all(path.parent().expect("expression probe parent"))
+        .expect("create expression probe parent");
+    fs::write(&path, &module.bytes).expect("write expression probe module");
+    let text = std::str::from_utf8(&module.bytes).expect("generated expression UTF-8");
+    assert!(text.contains("def ExpressionInputs9307 : ExpressionInputs :="));
+    assert!(text.contains(", 1154⟩"));
+    assert_eq!(text.matches("def ExpressionInputLeaf9307_").count(), 73);
+    assert!(text.contains("ExpressionInputLeaf9307_72 : Array ExpressionRef := #[⟨1725⟩, ⟨1747⟩]"));
+    println!("generatedExpressionProbe={}", path.display());
+}
+
+#[test]
+#[ignore = "CPU-only fixed Security0 Lean emitter; performs no backend execution"]
+fn fixed_tall_security0_emits_reached_lean() {
+    let output = env::var_os("MXX_SECURITY0_LEAN_OUTPUT")
+        .map(PathBuf::from)
+        .expect("set MXX_SECURITY0_LEAN_OUTPUT to an explicit empty output directory");
+    let revision = env::var("MXX_SECURITY0_SOURCE_REVISION")
+        .expect("set MXX_SECURITY0_SOURCE_REVISION to the pinned Source.json revision");
+    assert!(!output.exists(), "Security0 Lean output directory must not already exist");
+    fs::create_dir_all(&output).expect("create Security0 Lean output directory");
+    let count = emit_fixed_tall_security0_lean(&output, &revision)
+        .expect("emit fixed Security0 reached Lean modules");
+    assert!(count > 400, "Security0 renderer must emit the reached module set");
+    println!("generatedFiles={count} output={}", output.display());
 }
 
 fn assert_fixed_tall_g0_observation(bytes: &[u8], expected_profile: TallG0Profile) {

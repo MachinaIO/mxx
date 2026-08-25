@@ -4,6 +4,8 @@
 //! built protocol and request, runs the existing certificate authority once, and retains the
 //! exact typed statement and proof payload without introducing a second proof language.
 
+mod lean;
+
 use super::{
     OperationalCheckRequest, OperationalSimulationReport,
     certificate_schema::CertificateDocumentV1,
@@ -45,6 +47,21 @@ pub struct TallSecurity0ProfileIdentity {
 pub struct TallSecurity0ReachedProjection {
     pub inventory_bytes: Vec<u8>,
     pub projection_bytes: Vec<u8>,
+    pub recorded_report: OperationalSimulationReport,
+}
+
+/// One deterministic generated Lean module, relative to
+/// `Mxx/Certificate/OperationalNoise/TallSecurity0Generated`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TallSecurity0GeneratedFile {
+    pub relative_path: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Filesystem-free output of one fixed Security0 certificate run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TallSecurity0LeanManifest {
+    pub files: Vec<TallSecurity0GeneratedFile>,
     pub recorded_report: OperationalSimulationReport,
 }
 
@@ -180,6 +197,21 @@ pub fn prepare_tall_security0_reached_projection(
     }
     let recorded_report = run.accepted_report.clone().into_simulation_report();
     Ok(TallSecurity0ReachedProjection { inventory_bytes, projection_bytes, recorded_report })
+}
+
+/// Run the fixed Security0 authority once and render its exact reached statement and proof.
+pub fn prepare_tall_security0_lean_manifest(
+    protocol: &ProtocolDecl,
+    request: &OperationalCheckRequest,
+    identity: &TallSecurity0ProfileIdentity,
+) -> Result<TallSecurity0LeanManifest, String> {
+    validate_identity(identity, request)?;
+    let run =
+        prepare_operational_certificate(protocol, request).map_err(|error| error.to_string())?;
+    let documents = derive_certificate_documents(&run).map_err(|error| error.to_string())?;
+    let rendered = lean::render(&documents.cert, &documents.proof.payload)?;
+    let recorded_report = run.accepted_report.into_simulation_report();
+    Ok(TallSecurity0LeanManifest { files: rendered, recorded_report })
 }
 
 fn validate_identity(

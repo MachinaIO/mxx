@@ -4117,11 +4117,11 @@ pub(crate) struct StableFamilySourceIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub(crate) struct StableObservedWire {
-    stage: String,
-    definition: StableScope,
-    path: u64,
-    node: u64,
-    port: u32,
+    pub(crate) stage: String,
+    pub(crate) definition: StableScope,
+    pub(crate) path: u64,
+    pub(crate) node: u64,
+    pub(crate) port: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -4193,11 +4193,11 @@ pub(crate) enum StableObservedSource {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub(crate) struct StableObservedProducer {
-    consumer: StableObservedWire,
-    consumer_input: String,
-    producer_stage: String,
-    producer_output: String,
-    producer: StableObservedWire,
+    pub(crate) consumer: StableObservedWire,
+    pub(crate) consumer_input: String,
+    pub(crate) producer_stage: String,
+    pub(crate) producer_output: String,
+    pub(crate) producer: StableObservedWire,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]

@@ -358,7 +358,7 @@ fn projection(value: &ToyAuditProjection) -> &'static str {
 
 fn value_ref(value: &ToyAuditValueRef) -> String {
     match value {
-        ToyAuditValueRef::Predecessor { input_position, projection: selected } => {
+        ToyAuditValueRef::Predecessor { input_position, projection: selected, .. } => {
             format!(".predecessor {input_position} {}", projection(selected))
         }
         ToyAuditValueRef::Result { event, projection: selected } => {
@@ -447,7 +447,7 @@ fn event(item: &ToyAuditEvent) -> Result<String, String> {
         ToyAuditEvent::Result { owner: result_owner, value: result } => {
             format!(".result ({}) ({})", owner(result_owner), value(result)?)
         }
-        ToyAuditEvent::InvocationEnd { root, result } => {
+        ToyAuditEvent::InvocationEnd { root, result, .. } => {
             format!(".invocationEnd ({}) ({})", owner(root), value(result)?)
         }
         ToyAuditEvent::SpecializationComputed { owner: event_owner, dispatch, source } => format!(
@@ -495,7 +495,12 @@ fn event(item: &ToyAuditEvent) -> Result<String, String> {
         ToyAuditEvent::CoefficientMerge { merge: coefficient_merge } => {
             format!(".coefficientMerge ({})", merge(coefficient_merge))
         }
-        ToyAuditEvent::PreFoldPolynomial { terms, summary: bound, summary_evidence } => format!(
+        ToyAuditEvent::PreFoldPolynomial {
+            result_event: _,
+            terms,
+            summary: bound,
+            summary_evidence,
+        } => format!(
             ".preFoldPolynomial {} {} {}",
             list(terms, |item| Ok(term(item)))?,
             summary(bound)?,

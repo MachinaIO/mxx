@@ -159,6 +159,7 @@ enum ToyEventV1 {
     InvocationEnd {
         root: ProofPayloadOwner,
         result: ProofPayloadValue,
+        pre_fold_event: u64,
     },
     SpecializationComputed {
         owner: ProofPayloadOwner,
@@ -246,7 +247,7 @@ enum ToyAuditProjection {
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case", rename_all_fields = "camelCase", tag = "kind")]
 enum ToyAuditValueRef {
-    Predecessor { input_position: u32, projection: ToyAuditProjection },
+    Predecessor { binding_event: u64, input_position: u32, projection: ToyAuditProjection },
     Result { event: u64, projection: ToyAuditProjection },
     Transfer { event: u64 },
 }
@@ -357,6 +358,7 @@ enum ToyAuditEvent {
     InvocationEnd {
         root: ToyAuditOwner,
         result: ToyAuditValue,
+        pre_fold_event: u64,
     },
     SpecializationComputed {
         owner: ToyAuditOwner,
@@ -382,6 +384,7 @@ enum ToyAuditEvent {
         merge: ToyAuditMerge,
     },
     PreFoldPolynomial {
+        result_event: u64,
         terms: Vec<ToyAuditTerm>,
         summary: ToyAuditBound,
         summary_evidence: Option<ToyAuditValueRef>,
@@ -462,8 +465,9 @@ fn audit_projection(projection: &super::g0::BoundProjection) -> ToyAuditProjecti
 
 fn audit_value_ref(value: &ProofPayloadValueRef) -> ToyAuditValueRef {
     match value {
-        ProofPayloadValueRef::Predecessor { input_position, projection } => {
+        ProofPayloadValueRef::Predecessor { binding_event, input_position, projection } => {
             ToyAuditValueRef::Predecessor {
+                binding_event: *binding_event,
                 input_position: *input_position,
                 projection: audit_projection(projection),
             }
@@ -567,8 +571,12 @@ fn audit_event(event: &ToyEventV1) -> ToyAuditEvent {
         ToyEventV1::Result { owner, value } => {
             ToyAuditEvent::Result { owner: audit_owner(owner), value: audit_value(value) }
         }
-        ToyEventV1::InvocationEnd { root, result } => {
-            ToyAuditEvent::InvocationEnd { root: audit_owner(root), result: audit_value(result) }
+        ToyEventV1::InvocationEnd { root, result, pre_fold_event } => {
+            ToyAuditEvent::InvocationEnd {
+                root: audit_owner(root),
+                result: audit_value(result),
+                pre_fold_event: *pre_fold_event,
+            }
         }
         ToyEventV1::SpecializationComputed { owner, dispatch, source } => {
             ToyAuditEvent::SpecializationComputed {
@@ -613,6 +621,7 @@ fn audit_event(event: &ToyEventV1) -> ToyAuditEvent {
             ToyAuditEvent::CoefficientMerge { merge: audit_merge(merge) }
         }
         ToyEventV1::PreFoldPolynomial(value) => ToyAuditEvent::PreFoldPolynomial {
+            result_event: value.result_event,
             terms: value.terms.iter().map(audit_term).collect(),
             summary: audit_summary(&value.summary),
             summary_evidence: value.summary_evidence.as_ref().map(audit_value_ref),
@@ -688,8 +697,8 @@ fn toy_event(event: ProofPayloadEvent) -> Result<ToyEventV1, &'static str> {
             ToyEventV1::Predecessor { consumer, input_position, predecessor, source_result }
         }
         ProofPayloadEvent::Result { owner, value } => ToyEventV1::Result { owner, value },
-        ProofPayloadEvent::InvocationEnd { root, result } => {
-            ToyEventV1::InvocationEnd { root, result }
+        ProofPayloadEvent::InvocationEnd { root, result, pre_fold_event } => {
+            ToyEventV1::InvocationEnd { root, result, pre_fold_event }
         }
         ProofPayloadEvent::SpecializationComputed { owner, dispatch, source } => {
             ToyEventV1::SpecializationComputed { owner, dispatch, source }
@@ -814,7 +823,7 @@ mod tests {
                     &["kind", "consumer", "inputPosition", "predecessor", "sourceResult"]
                 }
                 "result" => &["kind", "owner", "value"],
-                "invocation_end" => &["kind", "root", "result"],
+                "invocation_end" => &["kind", "root", "result", "preFoldEvent"],
                 "specialization_computed" => &["kind", "owner", "dispatch", "source"],
                 "applied_universal" => &[
                     "kind",
@@ -830,7 +839,9 @@ mod tests {
                 ],
                 "bound_transfer" => &["kind", "owner", "rule"],
                 "coefficient_merge" => &["kind", "merge"],
-                "pre_fold_polynomial" => &["kind", "terms", "summary", "summaryEvidence"],
+                "pre_fold_polynomial" => {
+                    &["kind", "resultEvent", "terms", "summary", "summaryEvidence"]
+                }
                 "survivor_fold" => &["kind", "coefficient", "bound"],
                 other => panic!("unexpected reached event {other}"),
             };

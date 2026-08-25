@@ -297,6 +297,7 @@ pub(crate) struct ProofPayloadSurvivorFold {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProofPayloadPreFoldPolynomial {
+    pub result_event: u64,
     pub terms: Vec<ProofPayloadTerm>,
     pub summary: super::normal_form::BoundedSummary,
     pub summary_evidence: Option<ProofPayloadValueRef>,
@@ -311,7 +312,7 @@ pub(crate) struct ProofPayloadFactorEvidence {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProofPayloadValueRef {
-    Predecessor { input_position: u32, projection: BoundProjection },
+    Predecessor { binding_event: u64, input_position: u32, projection: BoundProjection },
     Result { event: u64, projection: BoundProjection },
     Transfer(u64),
 }
@@ -387,6 +388,7 @@ pub(crate) enum ProofPayloadEvent {
     InvocationEnd {
         root: ProofPayloadOwner,
         result: ProofPayloadValue,
+        pre_fold_event: u64,
     },
     SpecializationComputed {
         owner: ProofPayloadOwner,
@@ -1085,9 +1087,13 @@ impl LogicalItems for ProofPayloadSurvivorFold {
 impl LogicalItems for ProofPayloadValueRef {
     fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
         match self {
-            Self::Predecessor { input_position, projection } => checked_add(
+            Self::Predecessor { binding_event, input_position, projection } => checked_add(
                 1,
-                checked_sum([input_position.logical_items(), projection.logical_items()])?,
+                checked_sum([
+                    binding_event.logical_items(),
+                    input_position.logical_items(),
+                    projection.logical_items(),
+                ])?,
             ),
             Self::Result { event, projection } => {
                 checked_add(1, checked_sum([event.logical_items(), projection.logical_items()])?)
@@ -1100,6 +1106,7 @@ impl LogicalItems for ProofPayloadValueRef {
 impl LogicalItems for ProofPayloadPreFoldPolynomial {
     fn logical_items(&self) -> Result<u64, CanonicalPayloadError> {
         checked_sum([
+            self.result_event.logical_items(),
             self.terms.logical_items(),
             self.summary.logical_items(),
             self.summary_evidence.logical_items(),
@@ -1189,9 +1196,14 @@ impl LogicalItems for ProofPayloadEvent {
             Self::Result { owner, value } => {
                 checked_add(1, checked_sum([owner.logical_items(), value.logical_items()])?)
             }
-            Self::InvocationEnd { root, result } => {
-                checked_add(1, checked_sum([root.logical_items(), result.logical_items()])?)
-            }
+            Self::InvocationEnd { root, result, pre_fold_event } => checked_add(
+                1,
+                checked_sum([
+                    root.logical_items(),
+                    result.logical_items(),
+                    pre_fold_event.logical_items(),
+                ])?,
+            ),
             Self::SpecializationComputed { owner, dispatch, source } => checked_add(
                 1,
                 checked_sum([
@@ -1476,8 +1488,9 @@ impl CanonicalPayloadWriter {
 
     fn value_ref(&mut self, reference: &ProofPayloadValueRef) {
         match reference {
-            ProofPayloadValueRef::Predecessor { input_position, projection } => {
+            ProofPayloadValueRef::Predecessor { binding_event, input_position, projection } => {
                 self.u8(0);
+                self.u64(*binding_event);
                 self.u32(*input_position);
                 self.projection(projection);
             }
@@ -1633,10 +1646,11 @@ impl CanonicalPayloadWriter {
                 self.owner(owner)?;
                 self.value(value)?;
             }
-            ProofPayloadEvent::InvocationEnd { root, result } => {
+            ProofPayloadEvent::InvocationEnd { root, result, pre_fold_event } => {
                 self.u8(3);
                 self.owner(root)?;
                 self.value(result)?;
+                self.u64(*pre_fold_event);
             }
             ProofPayloadEvent::SpecializationComputed { owner, dispatch, source } => {
                 self.u8(4);
@@ -1676,6 +1690,7 @@ impl CanonicalPayloadWriter {
             }
             ProofPayloadEvent::PreFoldPolynomial(polynomial) => {
                 self.u8(9);
+                self.u64(polynomial.result_event);
                 self.vec(&polynomial.terms, |writer, term| writer.term(term))?;
                 self.summary(&polynomial.summary)?;
                 self.option(&polynomial.summary_evidence, |writer, value| {
@@ -2168,6 +2183,7 @@ fn derive_proof_payload_projection_with_refs(
             .map(|expression| refs.expression(expression))
             .transpose()
             .map_err(proof_payload_error)?,
+        frames: Vec::new(),
     };
     let retained_support_items = generator_support_logical_items(
         refs.retained_logical_items().map_err(proof_payload_error)?,
@@ -2902,6 +2918,24 @@ struct ProofPayloadProjector<'a> {
     >,
     closed_program: Option<ValueProgramId>,
     closed_root_expression: Option<u64>,
+    frames: Vec<ProofProjectionFrame>,
+}
+
+struct ProofProjectionFrame {
+    root: super::arena::ScopedExprId,
+    predecessor_bindings: HashMap<(super::arena::ScopedExprId, u32), u64>,
+    last_exact_result: Option<u64>,
+    last_pre_fold: Option<u64>,
+}
+
+fn active_predecessor_binding(
+    frames: &[ProofProjectionFrame],
+    owner: super::arena::ScopedExprId,
+    input_position: u32,
+) -> Option<u64> {
+    frames
+        .last()
+        .and_then(|frame| frame.predecessor_bindings.get(&(owner, input_position)).copied())
 }
 
 impl<'a> ProofPayloadProjector<'a> {
@@ -2966,7 +3000,7 @@ impl<'a> ProofPayloadProjector<'a> {
     }
 
     fn project(
-        self,
+        mut self,
         trace: &FeasibilityTrace,
         closure: &CertificateClosure,
         retained_support_items: u64,
@@ -2986,6 +3020,58 @@ impl<'a> ProofPayloadProjector<'a> {
             generator_peak_retained_logical_items =
                 generator_peak_retained_logical_items.max(current_retained_logical_items);
             events.push(projected);
+            match event {
+                NormalizerEvent::InvocationStart { root } => {
+                    self.frames.push(ProofProjectionFrame {
+                        root: *root,
+                        predecessor_bindings: HashMap::new(),
+                        last_exact_result: None,
+                        last_pre_fold: None,
+                    });
+                }
+                NormalizerEvent::Predecessor { consumer, input_position, .. } => {
+                    let frame = self.frames.last_mut().ok_or_else(|| {
+                        proof_invariant(
+                            index,
+                            Some(*consumer),
+                            ProofEvidenceKind::EventReference,
+                            ProofInvariantMismatch::EventKind {
+                                referenced: index as u64,
+                                expected: "active invocation frame",
+                            },
+                        )
+                    })?;
+                    frame.predecessor_bindings.insert((*consumer, *input_position), index as u64);
+                }
+                NormalizerEvent::Result { owner, value } if value.exact_nf.is_some() => {
+                    let frame = self
+                        .frames
+                        .last_mut()
+                        .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?;
+                    if frame.root == *owner {
+                        frame.last_exact_result = Some(index as u64);
+                    }
+                }
+                NormalizerEvent::PreFoldPolynomial(_) => {
+                    self.frames
+                        .last_mut()
+                        .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?
+                        .last_pre_fold = Some(index as u64);
+                }
+                NormalizerEvent::InvocationEnd { root, .. } => {
+                    let frame = self
+                        .frames
+                        .pop()
+                        .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?;
+                    if frame.root != *root {
+                        return Err(proof_payload_error(G0Error::RelationTraceInvariant));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !self.frames.is_empty() {
+            return Err(proof_payload_error(G0Error::RelationTraceInvariant));
         }
         let observed_coverage = derive_observed_coverage(self.job, closure, self.refs, &events)?;
         current_retained_logical_items = checked_add(
@@ -3122,13 +3208,21 @@ impl<'a> ProofPayloadProjector<'a> {
         observation: &super::g0::PreFoldPolynomial,
         current: usize,
     ) -> Result<ProofPayloadPreFoldPolynomial, CertificateProjectionError> {
+        let frame = self
+            .frames
+            .last()
+            .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?;
+        let result_event = frame
+            .last_exact_result
+            .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?;
         Ok(ProofPayloadPreFoldPolynomial {
+            result_event,
             terms: payload_projection(self.terms(&observation.polynomial))?,
             summary: observation.polynomial.bounded_summary.clone(),
             summary_evidence: observation
                 .summary_evidence
                 .as_ref()
-                .map(|evidence| self.value_ref(evidence, current))
+                .map(|evidence| self.value_ref(evidence, current, frame.root))
                 .transpose()?,
         })
     }
@@ -3148,10 +3242,26 @@ impl<'a> ProofPayloadProjector<'a> {
         &self,
         value: &BoundValueRef,
         current: usize,
+        owner: super::arena::ScopedExprId,
     ) -> Result<ProofPayloadValueRef, CertificateProjectionError> {
         let event = match value {
             BoundValueRef::Predecessor { input_position, projection } => {
+                let binding_event =
+                    active_predecessor_binding(&self.frames, owner, *input_position).ok_or_else(
+                        || {
+                            proof_invariant(
+                                current,
+                                Some(owner),
+                                ProofEvidenceKind::EventReference,
+                                ProofInvariantMismatch::EventKind {
+                                    referenced: current as u64,
+                                    expected: "prior predecessor binding",
+                                },
+                            )
+                        },
+                    )?;
                 return Ok(ProofPayloadValueRef::Predecessor {
+                    binding_event,
                     input_position: *input_position,
                     projection: projection.clone(),
                 });
@@ -3626,8 +3736,9 @@ impl<'a> ProofPayloadProjector<'a> {
         &self,
         rule: &BoundRule,
         current: usize,
+        owner: super::arena::ScopedExprId,
     ) -> Result<ProofPayloadRule, CertificateProjectionError> {
-        let value = |value: &BoundValueRef| self.value_ref(value, current);
+        let value = |value: &BoundValueRef| self.value_ref(value, current, owner);
         Ok(match rule {
             BoundRule::Authority(authority) => {
                 ProofPayloadRule::Authority(payload_projection(self.authority(authority))?)
@@ -3652,7 +3763,7 @@ impl<'a> ProofPayloadProjector<'a> {
                 monomial: payload_projection(self.monomial(*monomial))?,
                 factors: factors
                     .iter()
-                    .map(|factor| self.factor(factor, current))
+                    .map(|factor| self.factor(factor, current, owner))
                     .collect::<Result<Vec<_>, _>>()?,
             },
             BoundRule::WeightedSum { inputs } => ProofPayloadRule::WeightedSum {
@@ -3681,9 +3792,10 @@ impl<'a> ProofPayloadProjector<'a> {
         &self,
         factor: &MonomialFactorEvidence,
         current: usize,
+        owner: super::arena::ScopedExprId,
     ) -> Result<ProofPayloadFactorEvidence, CertificateProjectionError> {
         Ok(ProofPayloadFactorEvidence {
-            bound: self.value_ref(&factor.bound, current)?,
+            bound: self.value_ref(&factor.bound, current, owner)?,
             is_constant_polynomial: factor.is_constant_polynomial,
             support_upper: factor.support_upper,
         })
@@ -3793,9 +3905,16 @@ impl<'a> ProofPayloadProjector<'a> {
                 value: payload_projection(self.value(value))?,
             },
             NormalizerEvent::InvocationEnd { root, result, .. } => {
+                let pre_fold_event = self
+                    .frames
+                    .last()
+                    .filter(|frame| frame.root == *root)
+                    .and_then(|frame| frame.last_pre_fold)
+                    .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?;
                 ProofPayloadEvent::InvocationEnd {
                     root: payload_projection(self.owner(*root))?,
                     result: payload_projection(self.value(result))?,
+                    pre_fold_event,
                 }
             }
             NormalizerEvent::SpecializationComputed { owner, key, replay } => {
@@ -3821,7 +3940,7 @@ impl<'a> ProofPayloadProjector<'a> {
             },
             NormalizerEvent::BoundTransfer { owner, rule } => ProofPayloadEvent::BoundTransfer {
                 owner: payload_projection(self.owner(*owner))?,
-                rule: self.rule(rule, current)?,
+                rule: self.rule(rule, current, *owner)?,
             },
             NormalizerEvent::SurvivorFold(observation) => {
                 self.prior_event(
@@ -5716,6 +5835,39 @@ mod tests {
     }
 
     fn assert_payload_event_refs_are_local(payload: &OperationalProofPayload) {
+        fn value_ref_before(reference: &ProofPayloadValueRef, before: &impl Fn(u64)) {
+            match reference {
+                ProofPayloadValueRef::Predecessor { binding_event, .. } => before(*binding_event),
+                ProofPayloadValueRef::Result { event, .. } |
+                ProofPayloadValueRef::Transfer(event) => before(*event),
+            }
+        }
+
+        fn rule_refs_before(rule: &ProofPayloadRule, before: &impl Fn(u64)) {
+            let value = |reference: &ProofPayloadValueRef| value_ref_before(reference, before);
+            match rule {
+                ProofPayloadRule::Authority(_) => {}
+                ProofPayloadRule::Identity { input } => value(input),
+                ProofPayloadRule::Sum { inputs } |
+                ProofPayloadRule::Maximum { inputs } |
+                ProofPayloadRule::WeightedSum { inputs } => inputs.iter().for_each(value),
+                ProofPayloadRule::Scale { value: input, scale } => {
+                    value(input);
+                    if let ProofPayloadScale::Value(reference) = scale {
+                        value(reference);
+                    }
+                }
+                ProofPayloadRule::MonomialProduct { factors, .. } => {
+                    factors.iter().for_each(|factor| value(&factor.bound));
+                }
+                ProofPayloadRule::Product { left, right, .. } |
+                ProofPayloadRule::Tensor { left, right, .. } => {
+                    value(left);
+                    value(right);
+                }
+            }
+        }
+
         for (index, event) in payload.events.iter().enumerate() {
             let before = |reference: u64| assert!((reference as usize) < index);
             match event {
@@ -5743,15 +5895,14 @@ mod tests {
                     }
                 },
                 ProofPayloadEvent::PreFoldPolynomial(snapshot) => {
-                    if let Some(
-                        ProofPayloadValueRef::Result { event, .. } |
-                        ProofPayloadValueRef::Transfer(event),
-                    ) = &snapshot.summary_evidence
-                    {
-                        before(*event);
+                    before(snapshot.result_event);
+                    if let Some(reference) = &snapshot.summary_evidence {
+                        value_ref_before(reference, &before);
                     }
                 }
+                ProofPayloadEvent::BoundTransfer { rule, .. } => rule_refs_before(rule, &before),
                 ProofPayloadEvent::SurvivorFold(observation) => before(observation.bound),
+                ProofPayloadEvent::InvocationEnd { pre_fold_event, .. } => before(*pre_fold_event),
                 _ => {}
             }
         }
@@ -7994,6 +8145,7 @@ mod tests {
         // Relation source = tag 1 + application 1 + ordinal 1 = 3;
         // relation merge = 3 + 3 + 14 + 1 = 21; event = 1 + 21 = 22.
         let pre_fold = ProofPayloadPreFoldPolynomial {
+            result_event: 1,
             terms: vec![term],
             summary: super::super::normal_form::BoundedSummary::finite(BoundExpression::new(
                 BigUint::from(2_u8),
@@ -8003,8 +8155,9 @@ mod tests {
                 projection: BoundProjection::Coefficient,
             }),
         };
-        // PreFold = terms Vec 17 + summary 3 + Some(ref (1 + 1 + 1) = 4) = 24;
-        // event = tag 1 + 24 = 25. SurvivorFold = event tag 1 + (integer 1 + bound 1) = 3.
+        // PreFold = result event 1 + terms Vec 17 + summary 3
+        //   + Some(ref (1 + 1 + 1) = 4) = 25;
+        // event = tag 1 + 25 = 26. SurvivorFold = event tag 1 + (integer 1 + bound 1) = 3.
         let payload = OperationalProofPayload {
             events: vec![
                 ProofPayloadEvent::InvocationStart { root: owner }, // 1 + 3 = 4
@@ -8012,7 +8165,7 @@ mod tests {
                 ProofPayloadEvent::BoundTransfer { owner, rule: product_rule }, // 17
                 ProofPayloadEvent::CoefficientMerge(operator_merge), // 24
                 ProofPayloadEvent::CoefficientMerge(relation_merge), // 22
-                ProofPayloadEvent::PreFoldPolynomial(pre_fold),     // 25
+                ProofPayloadEvent::PreFoldPolynomial(pre_fold),     // 26
                 ProofPayloadEvent::SurvivorFold(ProofPayloadSurvivorFold {
                     coefficient: BigInt::from(-2_i32),
                     bound: 5,
@@ -8020,8 +8173,8 @@ mod tests {
             ],
         };
         // OperationalProofPayload is the events Vec: 1 + length 7 +
-        // (4 + 25 + 17 + 24 + 22 + 25 + 3) = 8 + 120 = 128.
-        assert_eq!(payload.logical_items(), Ok(128));
+        // (4 + 25 + 17 + 24 + 22 + 26 + 3) = 8 + 121 = 129.
+        assert_eq!(payload.logical_items(), Ok(129));
         let canonical_payload_bytes = payload.encode_canonical().expect("representative payload");
 
         // Scalar changes are semantically represented bytes but remain one logical item.
@@ -8037,7 +8190,7 @@ mod tests {
             canonical_payload_bytes,
             scalar_changed.encode_canonical().expect("scalar-changed payload")
         );
-        assert_eq!(scalar_changed.logical_items(), Ok(128));
+        assert_eq!(scalar_changed.logical_items(), Ok(129));
 
         // Removing one Some option changes the structural count by exactly one.
         let mut product_changed = payload.clone();
@@ -8054,7 +8207,7 @@ mod tests {
             canonical_payload_bytes,
             product_changed.encode_canonical().expect("product-changed payload")
         );
-        assert_eq!(product_changed.logical_items(), Ok(129));
+        assert_eq!(product_changed.logical_items(), Ok(130));
 
         let mut evidence_removed = payload.clone();
         if let ProofPayloadEvent::PreFoldPolynomial(polynomial) = &mut evidence_removed.events[5] {
@@ -8066,7 +8219,7 @@ mod tests {
             canonical_payload_bytes,
             evidence_removed.encode_canonical().expect("evidence-removed payload")
         );
-        assert_eq!(evidence_removed.logical_items(), Ok(125));
+        assert_eq!(evidence_removed.logical_items(), Ok(126));
 
         let mut survivor_changed = payload.clone();
         if let ProofPayloadEvent::SurvivorFold(fold) = &mut survivor_changed.events[6] {
@@ -8078,7 +8231,7 @@ mod tests {
             canonical_payload_bytes,
             survivor_changed.encode_canonical().expect("survivor-changed payload")
         );
-        assert_eq!(survivor_changed.logical_items(), Ok(128));
+        assert_eq!(survivor_changed.logical_items(), Ok(129));
     }
 
     #[test]

@@ -11,13 +11,52 @@ open SchemaV1
 
 /-! Reached-only chronological ABI for the fixed Tall Security0 proof payload. -/
 
+def rowTableNodeCount {α : Type} : RowTable α → Nat
+  | .empty => 0
+  | .node _ _ left right => rowTableNodeCount left + rowTableNodeCount right + 1
+
+def expressionInputLeafSize : Nat := 16
+
+structure ExpressionInputs where
+  leaves : RowTable (Array ExpressionRef)
+  size : Nat
+deriving Repr
+
+def ExpressionInputs.leafCount (inputs : ExpressionInputs) : Nat :=
+  (inputs.size + expressionInputLeafSize - 1) / expressionInputLeafSize
+
+def ExpressionInputs.expectedLeafSize (inputs : ExpressionInputs) (leaf : Nat) : Nat :=
+  Nat.min expressionInputLeafSize (inputs.size - leaf * expressionInputLeafSize)
+
+def ExpressionInputs.wellFormed (inputs : ExpressionInputs) : Bool :=
+  inputs.leaves.wellFormed &&
+    decide (rowTableNodeCount inputs.leaves = inputs.leafCount) &&
+    inputs.leaves.allBool fun leaf values =>
+      decide (leaf < inputs.leafCount) &&
+        decide (values.size = inputs.expectedLeafSize leaf)
+
+def ExpressionInputs.get? (inputs : ExpressionInputs) (position : Nat) : Option ExpressionRef :=
+  if position < inputs.size then
+    (inputs.leaves.lookup (position / expressionInputLeafSize)).bind fun leaf =>
+      leaf[position % expressionInputLeafSize]?
+  else none
+
+def ExpressionInputs.Valid (inputs : ExpressionInputs) : Prop :=
+  inputs.wellFormed = true
+
+structure ExpressionRow where
+  descriptor : SchemaV1.ExpressionDescriptor
+  inputs : ExpressionInputs
+  program : Option ProgramRef
+deriving Repr
+
 structure TallDocument where
   schemaId : String
   schemaVersion : Nat
   plaintextModulus : String
   ciphertextModulus : String
   ringDimension : Nat
-  expressions : RowTable SchemaV1.ExpressionRow
+  expressions : RowTable ExpressionRow
   programs : RowTable SchemaV1.ProgramRow
   sources : RowTable SchemaV1.SourceRow
   events : RowTable SchemaV1.EventRow
@@ -52,7 +91,7 @@ inductive Projection where | coefficient | summary
 deriving DecidableEq, Repr
 
 inductive ValueRef where
-  | predecessor (inputPosition : Nat) (projection : Projection)
+  | predecessor (inputPosition bindingEvent : Nat) (projection : Projection)
   | result (event : Nat) (projection : Projection)
   | transfer (event : Nat)
 deriving DecidableEq, Repr
@@ -133,28 +172,20 @@ inductive Event where
       (sourceResult : Nat)
   | resultExact (owner : Owner) (terms : List Term) (summary : Bound)
   | resultCoefficient (owner : Owner) (bound : Bound)
-  | invocationEndExact (root : Owner) (terms : List Term) (summary : Bound)
+  | invocationEndExact (root : Owner) (preFoldEvent : Nat) (terms : List Term) (summary : Bound)
   | specializationComputed (owner : Owner) (dispatch : UniversalDispatch) (source : EventRange)
   | appliedRelation (owner : Owner) (sourceMonomial : Monomial) (outerCoefficient : Int)
       (orderedStart orderedEndExclusive : Nat) (rule : RelationRule)
   | boundTransfer (owner : Owner) (rule : BoundRule)
   | coefficientMerge (merge : Merge)
-  | preFoldPolynomial (terms : List Term) (summary : Bound)
+  | preFoldPolynomial (resultEvent : Nat) (terms : List Term) (summary : Bound)
       (summaryEvidence : Option ValueRef)
   | survivorFold (coefficient : Int) (bound : Nat)
 deriving DecidableEq, Repr, Inhabited
 
-structure PredecessorBinding where
-  predecessor : ExpressionRef
-  sourceResult : Nat
-deriving DecidableEq, Repr
-
 structure Frame where
   root : Owner
   start : Nat
-  predecessors : Array (Option PredecessorBinding)
-  lastExact : Option (List Term × Bound)
-  preFolded : Bool
 deriving DecidableEq, Repr
 
 structure AnnotatedEvent where
@@ -168,10 +199,6 @@ structure EventHistory where
   leaves : RowTable (Array AnnotatedEvent)
   size : Nat
 deriving Repr
-
-def rowTableNodeCount {α : Type} : RowTable α → Nat
-  | .empty => 0
-  | .node _ _ left right => rowTableNodeCount left + rowTableNodeCount right + 1
 
 def EventHistory.leafCount (history : EventHistory) : Nat :=
   (history.size + eventLeafSize - 1) / eventLeafSize
@@ -200,10 +227,11 @@ deriving DecidableEq, Repr
 def initialState : ReplayState := ⟨0, []⟩
 
 def ownerValid (document : TallDocument) (owner : Owner) : Bool :=
-  (document.expressions.lookup owner.expression.row).isSome &&
-    match owner.scope with
-    | .closed root => decide (document.residualRoot = .closed root)
-    | .program program => (document.programs.lookup program.row).isSome
+  match document.expressions.lookup owner.expression.row with
+  | some expression => expression.inputs.wellFormed && match owner.scope with
+      | .closed root => decide (document.residualRoot = .closed root)
+      | .program program => (document.programs.lookup program.row).isSome
+  | none => false
 
 def monomialValid (document : TallDocument) (monomial : Monomial) : Bool :=
   (monomial.centralFactors ++ monomial.orderedFactors).all (ownerValid document)
@@ -233,7 +261,7 @@ def exactFrameRange (history : EventHistory) (state : ReplayState)
         decide (active.start < range.start) && decide (first.frameStart = range.start) &&
           decide (last.frameStart = range.start) &&
           (match first.event, last.event with
-          | .invocationStart root, .invocationEndExact ended _ _ =>
+          | .invocationStart root, .invocationEndExact ended _ _ _ =>
               decide (root = ended)
           | _, _ => false)
     | _, _, _ => false
@@ -260,7 +288,7 @@ def projectionAvailable : Event → Projection → Bool
 def exactTermExists (history : EventHistory) (state : ReplayState)
     (event ordinal : Nat) : Bool :=
   prior state event && match eventAt? history event with
-    | some (.resultExact _ terms _) | some (.invocationEndExact _ terms _) =>
+    | some (.resultExact _ terms _) | some (.invocationEndExact _ _ terms _) =>
         decide (ordinal < terms.length)
     | _ => false
 
@@ -284,17 +312,18 @@ def relationSourceValid (history : EventHistory) (state : ReplayState) (owner : 
 
 def valueRefValid (history : EventHistory) (state : ReplayState) (owner : Owner) :
     ValueRef → Bool
-  | .predecessor position projection => match state.frames.head? with
-      | some frame => decide (frame.root = owner) && match frame.predecessors[position]? with
-          | some (some binding) => sameFrame history state owner binding.sourceResult &&
-              match eventAt? history binding.sourceResult with
+  | .predecessor position bindingEvent projection =>
+      sameFrame history state owner bindingEvent &&
+        match eventAt? history bindingEvent with
+        | some (.predecessor consumer inputPosition predecessor sourceResult) =>
+            decide (consumer = owner) && decide (inputPosition = position) &&
+              sameFrame history state owner sourceResult &&
+              match eventAt? history sourceResult with
               | some source =>
-                  decide
-                    (resultOwner? source = some ⟨owner.scope, binding.predecessor⟩) &&
+                  decide (resultOwner? source = some ⟨owner.scope, predecessor⟩) &&
                     projectionAvailable source projection
               | none => false
-          | _ => false
-      | none => false
+        | _ => false
   | .result event projection => sameFrame history state owner event &&
       match eventAt? history event with
       | some source => projectionAvailable source projection && match resultOwner? source with
@@ -383,43 +412,37 @@ def stepAt (document : TallDocument) (history : EventHistory) (state : ReplaySta
   match event with
   | .invocationStart root =>
       if ownerValid document root then match document.expressions.lookup root.expression.row with
-        | some expression =>
-            accept (⟨root, state.cursor, Array.replicate expression.inputs.length none,
-              none, false⟩ :: state.frames)
+        | some _ => accept (⟨root, state.cursor⟩ :: state.frames)
         | none => none
       else none
   | .predecessor consumer inputPosition predecessor sourceResult =>
       if currentScope state consumer && ownerValid document consumer &&
+          (match document.expressions.lookup consumer.expression.row with
+          | some expression => expression.inputs.get? inputPosition = some predecessor
+          | none => false) &&
           sameFrame history state consumer sourceResult &&
           (match eventAt? history sourceResult with
           | some source =>
               decide (resultOwner? source = some ⟨consumer.scope, predecessor⟩)
           | none => false)
       then
-        match state.frames with
-        | frame :: frames => match frame.predecessors[inputPosition]? with
-            | some none =>
-                let updated := frame.predecessors.setIfInBounds inputPosition
-                  (some ⟨predecessor, sourceResult⟩)
-                accept ({ frame with predecessors := updated } :: frames)
-            | _ => none
-        | [] => none
+        accept state.frames
       else none
-  | .resultExact owner terms summary =>
+  | .resultExact owner terms _ =>
       if currentScope state owner && ownerValid document owner &&
           terms.all (fun term => monomialValid document term.monomial) then
-        match state.frames with
-        | [] => none
-        | frame :: frames => accept ({ frame with lastExact := some (terms, summary) } :: frames)
+        accept state.frames
       else none
   | .resultCoefficient owner _ =>
       if currentScope state owner && ownerValid document owner then accept state.frames else none
-  | .invocationEndExact root terms summary =>
+  | .invocationEndExact root preFoldEvent _ _ =>
       match state.frames with
       | [] => none
       | frame :: frames =>
-          if decide (frame.root = root) && decide (frame.lastExact = some (terms, summary)) &&
-              frame.preFolded then
+          if decide (frame.root = root) && sameFrame history state root preFoldEvent &&
+              (match eventAt? history preFoldEvent with
+              | some (.preFoldPolynomial ..) => true
+              | _ => false) then
             accept frames
           else none
   | .specializationComputed owner dispatch source =>
@@ -429,7 +452,7 @@ def stepAt (document : TallDocument) (history : EventHistory) (state : ReplaySta
           (document.expressions.lookup dispatch.trapdoorSource.row).isSome &&
           exactFrameRange history state source && decide (source.end = state.cursor) &&
           (match eventAt? history source.start, eventAt? history (source.end - 1) with
-          | some (.invocationStart root), some (.invocationEndExact ended _ _) =>
+          | some (.invocationStart root), some (.invocationEndExact ended _ _ _) =>
               decide (root.scope = owner.scope) && decide (ended.scope = owner.scope)
           | _, _ => false) then accept state.frames else none
   | .appliedRelation owner sourceMonomial _ orderedStart orderedEnd rule =>
@@ -442,7 +465,7 @@ def stepAt (document : TallDocument) (history : EventHistory) (state : ReplaySta
                     decide (source.start ≤ rhsResult) && decide (rhsResult < source.end) &&
                     exactFrameRange history state source &&
                     (match eventAt? history rhsResult with
-                    | some (.invocationEndExact rhsOwner _ _) =>
+                    | some (.invocationEndExact rhsOwner _ _ _) =>
                         decide (rhsOwner.scope = owner.scope)
                     | _ => false)
               | _ => false)
@@ -473,14 +496,16 @@ def stepAt (document : TallDocument) (history : EventHistory) (state : ReplaySta
             relationSourceValid history state merge.owner application ordinal
       if currentScope state merge.owner && ownerValid document merge.owner &&
           monomialValid document merge.output && sourceOk then accept state.frames else none
-  | .preFoldPolynomial terms summary evidence =>
+  | .preFoldPolynomial resultEvent terms _ evidence =>
       match state.frames with
       | [] => none
-      | frame :: frames =>
-          if decide (frame.lastExact = some (terms, summary)) &&
-              summaryEvidenceValid history state frame evidence then
-            accept ({ frame with preFolded := true } :: frames)
-          else none
+      | frame :: _ =>
+          if terms.all (fun term => monomialValid document term.monomial) &&
+              sameFrame history state frame.root resultEvent &&
+              (match eventAt? history resultEvent with
+              | some (.resultExact owner _ _) => decide (owner = frame.root)
+              | _ => false) && summaryEvidenceValid history state frame evidence
+          then accept state.frames else none
   | .survivorFold _ bound =>
       if prior state bound then
         match eventAt? history bound with

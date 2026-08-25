@@ -41,7 +41,8 @@ pub use simulation::{
     prepare_g0_cpu_evidence_bytes, serialize_base_feasibility_summary,
 };
 pub use tall_e2e::{
-    TallSecurity0ProfileIdentity, TallSecurity0ReachedProjection,
+    TallSecurity0GeneratedFile, TallSecurity0LeanManifest, TallSecurity0ProfileIdentity,
+    TallSecurity0ReachedProjection, prepare_tall_security0_lean_manifest,
     prepare_tall_security0_reached_projection,
 };
 pub use toy_e2e::{

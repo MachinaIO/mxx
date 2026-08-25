@@ -1705,6 +1705,26 @@ def RelationCongruent (modulus : Nat) (history : EventHistory) (env : Env Owner)
             evalPolynomial env (inputTerms.map Term.toExact) % Int.ofNat modulus
   | _ => False
 
+def canonicalSelfTerm (owner : Owner) : Term :=
+  { monomial := { centralFactors := [], orderedFactors := [owner] }
+    coefficient := 1 }
+
+inductive ReachedTerminalRule : BoundRule → Prop where
+  | authorityFactStore : ReachedTerminalRule (.authority .factStore)
+  | authorityProgramFamilyFact : ReachedTerminalRule (.authority .programFamilyFact)
+  | authorityOperator : ReachedTerminalRule (.authority .operator)
+  | identity (input : ValueRef) : ReachedTerminalRule (.identity input)
+  | scale (value : ValueRef) (factor : Scale) : ReachedTerminalRule (.scale value factor)
+
+def TerminalExactAt (document : TallDocument) (history : EventHistory)
+    (selector : Option Nat) (producer resultEvent : Nat) (owner : Owner) (term : Term) : Prop :=
+  producer + 1 = resultEvent ∧ ownerAtSelector document selector owner ∧
+    ∃ rule frameStart,
+      ReachedTerminalRule rule ∧
+        history.lookup producer = some ⟨.boundTransfer owner rule, frameStart⟩ ∧
+        history.lookup resultEvent = some
+          ⟨.resultExact owner [term] .exactZero, frameStart⟩
+
 /-- Honest primitive contracts and all reached relation congruences for one selector. -/
 structure Witness (document : TallDocument) (history : EventHistory) (selector : Option Nat)
     (modulus : Nat) where
@@ -1720,14 +1740,15 @@ structure Witness (document : TallDocument) (history : EventHistory) (selector :
   relationCongruence : ∀ application,
     RelationApplicationAt document history selector application →
       RelationCongruent modulus history env application
+  terminalActual : Nat → Int
+  terminalCongruence : ∀ producer resultEvent owner term,
+    TerminalExactAt document history selector producer resultEvent owner term →
+      (terminalActual resultEvent - evalPolynomial env [term.toExact]) %
+        Int.ofNat modulus = 0
 
 /-! Atomic derivations require validated source or sampler provenance.  The result indices are
     intentional: constructors cannot choose an arbitrary actual value, term list, summary, or
     claim. -/
-
-def canonicalSelfTerm (owner : Owner) : Term :=
-  { monomial := { centralFactors := [], orderedFactors := [owner] }
-    coefficient := 1 }
 
 def canonicalSelfClaim (owner : Owner) : ValueClaim Owner :=
   .exact [canonicalSelfTerm owner |>.toExact] .exactZero
@@ -1736,6 +1757,17 @@ def exactResultAt (history : EventHistory) (resultEvent : Nat) (owner : Owner) :
   ∃ frameStart,
     history.lookup resultEvent =
       some ⟨.resultExact owner [canonicalSelfTerm owner] .exactZero, frameStart⟩
+
+theorem terminalExactClaim {document : TallDocument} {history : EventHistory}
+    {selector : Option Nat} {modulus producer resultEvent : Nat} {owner : Owner} {term : Term}
+    (witness : Witness document history selector modulus)
+    (terminal : TerminalExactAt document history selector producer resultEvent owner term) :
+    ValueClaim.Interprets modulus witness.env (witness.terminalActual resultEvent)
+      (.exact [term.toExact] .exactZero) := by
+  refine ⟨0, ?_, ?_⟩
+  · simpa using
+      witness.terminalCongruence producer resultEvent owner term terminal
+  · simp [boundInterprets, centeredNorm, centeredCoefficient]
 
 inductive ValueDerived (document : TallDocument) (history : EventHistory)
     (selector : Option Nat) (modulus : Nat)

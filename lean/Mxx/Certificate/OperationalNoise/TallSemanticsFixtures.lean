@@ -75,6 +75,24 @@ def samplerAtomHistory : EventHistory :=
   smallHistory #[annotated
     (.resultExact samplerAtomOwner [canonicalSelfTerm samplerAtomOwner] .exactZero) 0]
 
+def terminalAtomHistory : EventHistory :=
+  smallHistory #[annotated
+    (.boundTransfer sourceAtomOwner (.authority .factStore)) 0,
+    annotated
+      (.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner] .exactZero) 0]
+
+theorem terminal_atom_at :
+    TerminalExactAt sourceAtomDocument terminalAtomHistory none 0 1 sourceAtomOwner
+      (canonicalSelfTerm sourceAtomOwner) := by
+  refine ⟨rfl, rfl, .authority .factStore, 0, ?_, rfl, rfl⟩
+  exact ReachedTerminalRule.authorityFactStore
+
+theorem terminal_exact_claim_fixture
+    (witness : Witness sourceAtomDocument terminalAtomHistory none 257) :
+    ValueClaim.Interprets 257 witness.env (witness.terminalActual 1)
+      (canonicalSelfClaim sourceAtomOwner) := by
+  exact terminalExactClaim witness terminal_atom_at
+
 theorem source_atom_fixture
     (witness : Witness sourceAtomDocument sourceAtomHistory none 257) :
   DerivedResult sourceAtomDocument sourceAtomHistory none 257 witness
@@ -313,6 +331,9 @@ theorem canonical_relation_fixture :
 #print axioms statement_domain_fixture
 #print axioms constructive_raw_bound_fixture
 #print axioms TallSemantics.ValueDerived.interprets
+#print axioms TallSemantics.terminalExactClaim
+#print axioms terminal_atom_at
+#print axioms terminal_exact_claim_fixture
 #print axioms source_atom_interprets
 #print axioms sampler_atom_interprets
 

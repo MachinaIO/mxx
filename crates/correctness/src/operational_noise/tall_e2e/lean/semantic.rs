@@ -2494,7 +2494,7 @@ fn relation_expected_terms(relation: &RelationProbe) -> Vec<ProofPayloadTerm> {
     terms
 }
 
-fn render_bound(source: &mut String, bound: &BoundProbe) {
+fn render_bound(source: &mut String, bound: &BoundProbe, modulus: &str) {
     writeln!(source, "def rootRaw : List Term := {}", raw_terms_text(&bound.root.terms))
         .expect("String write");
     writeln!(source, "def prefoldRaw : List Term := {}", raw_terms_text(&bound.prefold_terms))
@@ -2524,6 +2524,11 @@ fn render_bound(source: &mut String, bound: &BoundProbe) {
     render_survivor_witness(source, bound);
     source.push_str("\ntheorem prefoldResult : prefoldTerms = rootTerms := by rfl\n\ntheorem prefoldBoundSound : rootBound ≤ prefoldBound := by decide +kernel\n\n");
     source.push_str("\ntheorem prefoldSound :\n  preFoldBound rootBound prefoldBound survivorContributions survivorBounds := by\n  exact (preFoldSound rootTerms prefoldTerms prefoldResult prefoldBoundSound survivorBoundsSound).2\n\ntheorem endResult : endTerms = prefoldTerms := by rfl\n\ntheorem endSummaryResult : endSummary = prefoldSummary := by rfl\n\ntheorem endSound :\n  endTerms = prefoldTerms ∧ endSummary = prefoldSummary := by\n  exact ⟨endResult, endSummaryResult⟩\n\n");
+    writeln!(
+        source,
+        "theorem invocationEndClaimSound (env : Env Owner) (actual : Int)\n    (claim : ValueClaim.Interprets {modulus} env actual (.exact rootTerms rootSummary)) :\n    ValueClaim.Interprets {modulus} env actual (.exact endTerms endSummary) := by\n  exact invocationEndSound {modulus} env actual rootTerms endTerms rootSummary endSummary\n    claim endResult endSummaryResult\n"
+    )
+    .expect("String write");
 }
 
 fn render_bound_bindings(source: &mut String, bound: &BoundProbe) {
@@ -2693,7 +2698,7 @@ fn render_semantic_shard(module: &str, shard: &SemanticShard, modulus: &str) -> 
             bound.survivor_events.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
         )
         .expect("String write");
-        render_bound(&mut source, bound);
+        render_bound(&mut source, bound, modulus);
         render_bound_bindings(&mut source, bound);
         writeln!(source, "end Bound{ordinal}").expect("String write");
     }
@@ -2773,7 +2778,11 @@ fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection], modulus: &
         }
         "bound-fold-result" => {
             if let Some(selection) = selected {
-                render_bound(&mut source, selection.bound.as_ref().expect("bound probe"));
+                render_bound(
+                    &mut source,
+                    selection.bound.as_ref().expect("bound probe"),
+                    modulus,
+                );
                 render_bound_bindings(&mut source, selection.bound.as_ref().expect("bound probe"));
             }
         }
@@ -2970,7 +2979,7 @@ mod tests {
             survivor_bounds: (1..=64).map(|value| (value + 1).to_string()).collect(),
         };
         let mut bound_source = String::new();
-        render_bound(&mut bound_source, &bound);
+        render_bound(&mut bound_source, &bound, "257");
         assert!(bound_source.contains("theorem survivorBoundsSound"));
         assert!(bound_source.contains("List.Forall₂"));
         assert!(bound_source.contains("constructor"));

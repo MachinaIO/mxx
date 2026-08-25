@@ -10,37 +10,147 @@ open Mxx.Certificate.OperationalNoise
 open EventReplay
 open SchemaV1
 
-/-! A fixed, hand-authored ABI for the singleton-preimage plus Gaussian G2 fixture. It is not a
-    decoder or a general certificate language. Every proof reference is a chronological `Nat`. -/
+/-! The fixed Lean ABI for the Rust `singleton-preimage-gaussian-v1` audit slice. -/
+
+structure ToyRequest where
+  targetId : String
+  environment : List Unit
+  layouts : List Unit
+deriving DecidableEq, Repr
+
+structure ToyParameters where
+  plaintextModulus : String
+  ciphertextModulus : String
+  ringDimension : Nat
+  trapdoorRows : String
+  trapdoorSigma : String
+  gadgetBase : String
+  digitCount : String
+  preimageMaximumAbsoluteCoefficient : String
+  gaussianSigma : String
+  gaussianMaximumAbsoluteCoefficient : String
+deriving DecidableEq, Repr
+
+structure ToySource where
+  schemaId : String
+  schemaVersion : Nat
+  abi : String
+  rustProjectionVersion : String
+  leanAbiVersion : String
+  request : ToyRequest
+  parameters : ToyParameters
+deriving DecidableEq, Repr
+
+def expectedSource : ToySource where
+  schemaId := "mxx.operational-noise.toy-source"
+  schemaVersion := 1
+  abi := "singleton-preimage-gaussian-v1"
+  rustProjectionVersion := "operational-noise-certificate-v1"
+  leanAbiVersion := "toy-replay-v1"
+  request := ⟨"singleton-preimage-gaussian", [], []⟩
+  parameters := ⟨"2", "257", 1, "1", "3", "4", "2", "8", "1", "1"⟩
 
 structure ToyRows where
+  expressions : List ExpressionRef
+  program : ProgramRef
+  sources : List SourceRef
+  events : List EventRef
   root : ExpressionRef
-  publicExpression : ExpressionRef
-  preimageExpression : ExpressionRef
-  targetExpression : ExpressionRef
-  noiseExpression : ExpressionRef
-  preimageEvent : EventRef
-  noiseEvent : EventRef
+deriving DecidableEq, Repr
+
+def expectedRows : ToyRows where
+  expressions := (List.range 13).map ExpressionRef.mk
+  program := ⟨0⟩
+  sources := [⟨0⟩, ⟨1⟩]
+  events := [⟨0⟩, ⟨1⟩, ⟨2⟩, ⟨3⟩]
+  root := ⟨12⟩
+
+inductive ToyScope where
+  | closed (rootExpressionRow : Nat)
+  | program (programRow : Nat)
 deriving DecidableEq, Repr
 
 structure ToyOwner where
-  scope : StatementScope
-  expression : ExpressionRef
+  scope : ToyScope
+  expressionRow : Nat
 deriving DecidableEq, Repr
 
 structure ToyMonomial where
-  ordered : List ToyOwner
+  centralFactors : List ToyOwner
+  orderedFactors : List ToyOwner
 deriving DecidableEq, Repr
 
 structure ToyTerm where
-  coefficient : Int
   monomial : ToyMonomial
+  coefficient : Int
 deriving DecidableEq, Repr
 
-structure ToyValue where
-  coefficient : Int
-  terms : List ToyTerm
-  bound : Nat
+inductive ToySummary where
+  | exactZero
+  | finite (maximumAbsoluteCoefficient : Nat)
+deriving DecidableEq, Repr
+
+inductive ToyValue where
+  | exact (terms : List ToyTerm) (summary : ToySummary)
+  | coefficient (bound : ToySummary)
+deriving DecidableEq, Repr
+
+inductive ToyProjection where | coefficient | summary
+deriving DecidableEq, Repr
+
+inductive ToyValueRef where
+  | predecessor (inputPosition : Nat) (projection : ToyProjection)
+  | result (event : Nat) (projection : ToyProjection)
+  | transfer (event : Nat)
+deriving DecidableEq, Repr
+
+inductive ToyScale where
+  | value (value : ToyValueRef)
+  | magnitude (magnitude : Nat)
+deriving DecidableEq, Repr
+
+structure ToyFactorEvidence where
+  bound : ToyValueRef
+  isConstantPolynomial : Bool
+  supportUpper : Option Nat
+deriving DecidableEq, Repr
+
+structure ToyProductFacts where
+  leftIsConstantPolynomial : Bool
+  rightIsConstantPolynomial : Bool
+  rightKnownZeroRows : Option Nat
+  leftSupportUpper : Option Nat
+  rightSupportUpper : Option Nat
+deriving DecidableEq, Repr
+
+inductive ToyAuthority where
+  | operator
+  | relationPreimageSource (source : Nat)
+deriving DecidableEq, Repr
+
+inductive ToyBoundRule where
+  | authority (authority : ToyAuthority)
+  | sum (inputs : List ToyValueRef)
+  | scale (value : ToyValueRef) (scale : ToyScale)
+  | monomialProduct (monomial : ToyMonomial) (factors : List ToyFactorEvidence)
+  | product (left right : ToyValueRef) (facts : ToyProductFacts)
+deriving DecidableEq, Repr
+
+structure ToyDispatch where
+  preimageFamily : Nat
+  preimageSource : Nat
+  trapdoorSource : Nat
+deriving DecidableEq, Repr
+
+structure ToyRange where
+  start : Nat
+  «end» : Nat
+deriving DecidableEq, Repr
+
+structure ToyLayout where
+  name : String
+  rowStride : Nat
+  columnStride : Nat
 deriving DecidableEq, Repr
 
 structure ToyTermRef where
@@ -48,410 +158,352 @@ structure ToyTermRef where
   termOrdinal : Nat
 deriving DecidableEq, Repr
 
-inductive ToyBoundRule where
-  | authorityRelationPreimageSource (source : EventRef)
-  | authorityNoiseOperator (source : EventRef)
-  | sum (inputs : List Nat)
-  | monomialProduct (factors : List Nat)
-  | product (left right : Nat)
+inductive ToyMergeSource where
+  | operator (inputs : ToyTermRef × ToyTermRef)
+  | relation (application sourceTermOrdinal : Nat)
 deriving DecidableEq, Repr
 
-inductive ToyCoefficientMerge where
-  | operator (left right : ToyTermRef) (contribution : ToyTerm)
-  | relation (appliedEvent ordinal : Nat) (contribution : ToyTerm)
+structure ToyMerge where
+  owner : ToyOwner
+  source : ToyMergeSource
+  output : ToyMonomial
+  signedContribution : Int
 deriving DecidableEq, Repr
 
 inductive ToyEvent where
-  | invocationStart (owner : ToyOwner)
-  | predecessor (owner : ToyOwner) (inputPosition : Nat) (expression : ExpressionRef)
-      (resultEvent : Nat)
+  | invocationStart (root : ToyOwner)
+  | predecessor (consumer : ToyOwner) (inputPosition predecessor sourceResult : Nat)
   | result (owner : ToyOwner) (value : ToyValue)
-  | invocationEnd (owner : ToyOwner) (result : ToyValue)
-  | specializationComputed (owner : ToyOwner) (sourceStart sourceEnd selector : Nat)
-      (rhsResult rhsNestedEnd : Nat)
-  | appliedUniversal (owner : ToyOwner) (specialization : Nat) (source : EventRef)
-      (sourceMonomial : ToyMonomial) (outerCoefficient : Int)
-      (orderedStart orderedEndExclusive : Nat) (left right : ToyTerm)
-      (rhsResult rhsTermOrdinal : Nat)
-  | boundTransfer (owner : ToyOwner) (rule : ToyBoundRule) (bound : Nat)
-  | coefficientMerge (owner : ToyOwner) (merge : ToyCoefficientMerge)
-  | preFold (owner : ToyOwner) (accumulator : List ToyTerm) (summaryBound : Nat)
-  | survivorFold (coefficient : Int) (transferEvent : Nat)
+  | invocationEnd (root : ToyOwner) (result : ToyValue)
+  | specializationComputed (owner : ToyOwner) (dispatch : ToyDispatch) (source : ToyRange)
+  | appliedUniversal (owner : ToyOwner) (sourceMonomial : ToyMonomial)
+      (outerCoefficient : Int) (orderedStart orderedEndExclusive computed : Nat)
+      (lhs : ToyMonomial) (lhsLayout : Option ToyLayout) (rhsResult : Nat)
+  | boundTransfer (owner : ToyOwner) (rule : ToyBoundRule)
+  | coefficientMerge (merge : ToyMerge)
+  | preFoldPolynomial (terms : List ToyTerm) (summary : ToySummary)
+      (summaryEvidence : Option ToyValueRef)
+  | survivorFold (coefficient : Int) (bound : Nat)
 deriving DecidableEq, Repr
 
-/-- Statement rows are separate from the proof-row map and chronological proof events. -/
-structure ToyCertificate where
-  expressions : List ExpressionRow
-  statementEvents : List SchemaV1.EventRow
-deriving DecidableEq, Repr
+abbrev ToyEnv := ToyOwner -> Int
 
-def listAt? {α : Type} : List α → Nat → Option α
-  | [], _ => none
-  | value :: _, 0 => some value
-  | _ :: values, index + 1 => listAt? values index
+def ToyMonomial.eval (env : ToyEnv) (value : ToyMonomial) : Int :=
+  (value.centralFactors.map env).prod * (value.orderedFactors.map env).prod
 
-def matrixType : ValueType := .matrix "257" 1 1 1
+def ToyTerms.eval (env : ToyEnv) (terms : List ToyTerm) : Int :=
+  (terms.map (fun term => term.coefficient * term.monomial.eval env)).sum
 
-def finiteRawContract (maximum : String) : RawValueContract where
-  signedRange := none
-  coefficientClass := some (.finite maximum)
-  canonicalCoefficientExclusiveUpper := none
-  polynomialSupportUpper := some 1
+def ToySummary.Interprets (modulus : Nat) (summary : ToySummary) (value : Int) : Prop :=
+  match summary with
+  | .exactZero => centeredNorm modulus value = 0
+  | .finite maximum => centeredNorm modulus value <= maximum
 
-def toyWire (node : Nat) : ObservedWire where
-  stage := "toy"
-  definition := .root
-  path := 0
-  node := node
-  port := 0
+def ToyValue.Interprets (modulus : Nat) (env : ToyEnv) (actual : Int) : ToyValue -> Prop
+  | .exact terms summary =>
+      ∃ remainder, (actual - ToyTerms.eval env terms) % Int.ofNat modulus = remainder %
+        Int.ofNat modulus ∧ summary.Interprets modulus remainder
+  | .coefficient summary => summary.Interprets modulus actual
 
-def toyRows : ToyRows where
-  root := ⟨4⟩
-  publicExpression := ⟨0⟩
-  preimageExpression := ⟨1⟩
-  targetExpression := ⟨2⟩
-  noiseExpression := ⟨3⟩
-  preimageEvent := ⟨0⟩
-  noiseEvent := ⟨1⟩
+def ToyOwner.toKeyFactor (owner : ToyOwner) : Nat := owner.expressionRow
 
-def publicIdentity : SourceIdentity where
-  definition := "toy-public"
-  sampleEvent := none
-  outputRole := "public"
+def ToyMonomial.toCore (value : ToyMonomial) : MonomialKey :=
+  { centralFactors := value.centralFactors.map ToyOwner.toKeyFactor
+    orderedFactors := value.orderedFactors.map ToyOwner.toKeyFactor }
+
+def ToyTerm.toCore (value : ToyTerm) : ExactTerm :=
+  { coefficient := value.coefficient
+    key := value.monomial.toCore }
+
+def toyMatrix (rows columns : Nat) : ValueType := .matrix "257" 1 rows columns
+
+def toyWire (node : Nat) : ObservedWire :=
+  { stage := "consumer"
+    definition := .root
+    path := 0
+    node
+    port := 0 }
+
+def toyProgramInput : ProgramInput where
+  valueType := .int
+  trustedIndexRange := some ⟨0, 1⟩
+
+def toyFamily : Family where
+  domain := ⟨0, 1⟩
+  elementType := toyMatrix 4 1
+  reducible := false
   artifact := none
-  valueType := matrixType
-  coordinates := []
-  matrixConstant := none
 
-def publicRow : ExpressionRow :=
-  { descriptor := .operation (.stable (.source publicIdentity)) matrixType
-    inputs := []
-    program := none }
+def toyProgram : SchemaV1.ProgramRow where
+  signature := [toyProgramInput]
+  output := toyMatrix 4 1
+  family := some toyFamily
+  root := ⟨2⟩
 
-def preimageRow (rows : ToyRows) : ExpressionRow :=
-  { descriptor := .event (.sampler rows.preimageEvent)
-    inputs := []
-    program := none }
+def zeroConstant : Constant where
+  valueType := .int
+  value := .int "0"
 
-def targetRow (rows : ToyRows) : ExpressionRow :=
-  { descriptor := .operation (.stable (.matrix .multiply)) matrixType
-    inputs := [rows.publicExpression, rows.preimageExpression]
-    program := none }
+def oneConstant : Constant where
+  valueType := .int
+  value := .int "1"
 
-def noiseRow (rows : ToyRows) : ExpressionRow :=
-  { descriptor := .event (.sampler rows.noiseEvent)
-    inputs := []
-    program := none }
+def zeroSource : SchemaV1.SourceRow := .constant zeroConstant
+def oneSource : SchemaV1.SourceRow := .constant oneConstant
 
-def rootRow (rows : ToyRows) : ExpressionRow :=
-  { descriptor := .operation (.stable (.matrix .add)) matrixType
-    inputs := [rows.targetExpression, rows.noiseExpression]
-    program := none }
+def expectedDocument : Document :=
+  { schemaId := "mxx.operational-noise.certificate"
+    schemaVersion := 1
+    plaintextModulus := "2"
+    ciphertextModulus := "257"
+    ringDimension := 1
+    expressions :=
+      [ { descriptor := .operation (.event (.sampler ⟨0⟩)) (toyMatrix 1 4)
+          inputs := []
+          program := none },
+        { descriptor := .operation (.event (.sampler ⟨1⟩)) (toyMatrix 1 1)
+          inputs := []
+          program := none },
+        { descriptor := .operation (.event (.sampler ⟨2⟩)) (toyMatrix 4 1)
+          inputs := []
+          program := none },
+        { descriptor := .operation (.event (.sampler ⟨3⟩)) (toyMatrix 1 1)
+          inputs := []
+          program := none },
+        { descriptor := .operation (.stable (.trapdoor (.generate "trapdoor-sample" [4, 2]
+            (some ⟨0⟩) "value"))) .trapdoor
+          inputs := []
+          program := none },
+        { descriptor := .source (.direct ⟨0⟩)
+          inputs := []
+          program := none },
+        { descriptor := .source (.direct ⟨1⟩)
+          inputs := []
+          program := none },
+        { descriptor := .operation (.stable .programCall) (toyMatrix 4 1)
+          inputs := [⟨5⟩]
+          program := some ⟨0⟩ },
+        { descriptor := .operation (.stable (.matrix .multiply)) (toyMatrix 1 1)
+          inputs := [⟨0⟩, ⟨7⟩]
+          program := none },
+        { descriptor := .operation (.stable (.matrix .scale)) (toyMatrix 4 1)
+          inputs := [⟨7⟩, ⟨6⟩]
+          program := none },
+        { descriptor := .operation (.stable (.matrix .multiply)) (toyMatrix 1 1)
+          inputs := [⟨0⟩, ⟨9⟩]
+          program := none },
+        { descriptor := .operation (.stable (.matrix .subtract)) (toyMatrix 1 1)
+          inputs := [⟨10⟩, ⟨1⟩]
+          program := none },
+        { descriptor := .operation (.stable (.matrix .add)) (toyMatrix 1 1)
+          inputs := [⟨11⟩, ⟨3⟩]
+          program := none } ]
+    programs := [toyProgram]
+    sources := [zeroSource, oneSource]
+    events :=
+      [ .sampler (toyWire 0) (.trapdoor (toyMatrix 1 4)
+          "{\"tag\":\"Rational\",\"value\":{\"numerator\":\"3\",\"denominator\":\"1\"}}"
+          4 2 "8") none,
+        .sampler (toyWire 1) (.uniformResidue (toyMatrix 1 1)) none,
+        .sampler (toyWire 2) (.preimage (toyMatrix 4 1) "8") none,
+        .sampler (toyWire 6) (.gaussian (toyMatrix 1 1)
+          "{\"tag\":\"Rational\",\"value\":{\"numerator\":\"1\",\"denominator\":\"1\"}}"
+          "1") none ]
+    indexUses := []
+    sliceGroups := []
+    residualRoot := .closed ⟨12⟩ }
 
-def preimageStatementRow (rows : ToyRows) : SchemaV1.EventRow :=
-  .sampler (toyWire rows.preimageExpression.row) (.preimage matrixType "8")
-    (some (finiteRawContract "8"))
+def ToyDocumentValid (document : Document) : Prop := document = expectedDocument
 
-def noiseStatementRow (rows : ToyRows) : SchemaV1.EventRow :=
-  .sampler (toyWire rows.noiseExpression.row) (.gaussian matrixType "1" "1")
-    (some (finiteRawContract "1"))
+def o (row : Nat) : ToyOwner := ⟨.closed 12, row⟩
+def m (rows : List Nat) : ToyMonomial := ⟨[], rows.map o⟩
+def t (coefficient : Int) (rows : List Nat) : ToyTerm := ⟨m rows, coefficient⟩
+def ez (rows : List Nat) : ToyValue := .exact [t 1 rows] .exactZero
+def c0 : ToyValue := .coefficient .exactZero
+def c1 : ToyValue := .coefficient (.finite 1)
+def empty0 : ToyValue := .exact [] .exactZero
+def empty1 : ToyValue := .exact [] (.finite 1)
+def predC (position : Nat) : ToyValueRef := .predecessor position .coefficient
+def noFacts : ToyProductFacts := ⟨false, false, none, none, none⟩
 
-def owner (rows : ToyRows) (expression : ExpressionRef) : ToyOwner :=
-  ⟨.closed rows.root, expression⟩
+def expectedEvents : List ToyEvent :=
+  [ .invocationStart (o 12),
+    .boundTransfer (o 3) (.authority .operator), .result (o 3) (ez [3]),
+    .boundTransfer (o 1) (.authority .operator), .result (o 1) (ez [1]),
+    .boundTransfer (o 6) (.authority .operator), .result (o 6) c1,
+    .boundTransfer (o 5) (.authority .operator), .result (o 5) c0,
+    .predecessor (o 7) 0 5 8,
+    .boundTransfer (o 7) (.authority (.relationPreimageSource 2)),
+    .result (o 7) (ez [7]),
+    .predecessor (o 9) 0 7 11, .predecessor (o 9) 1 6 6,
+    .boundTransfer (o 9) (.scale (predC 0) (.value (predC 1))),
+    .result (o 9) (ez [7]),
+    .boundTransfer (o 0) (.authority .operator), .result (o 0) (ez [0]),
+    .predecessor (o 10) 0 0 17, .predecessor (o 10) 1 9 15,
+    .boundTransfer (o 10) (.product (predC 0) (predC 1) noFacts),
+    .coefficientMerge ⟨o 10, .operator (⟨17, 0⟩, ⟨15, 0⟩), m [0, 7], 1⟩,
+    .invocationStart (o 8),
+    .boundTransfer (o 5) (.authority .operator), .result (o 5) c0,
+    .predecessor (o 7) 0 5 24,
+    .boundTransfer (o 7) (.authority (.relationPreimageSource 2)),
+    .result (o 7) (ez [7]),
+    .boundTransfer (o 0) (.authority .operator), .result (o 0) (ez [0]),
+    .predecessor (o 8) 0 0 29, .predecessor (o 8) 1 7 27,
+    .boundTransfer (o 8) (.product (predC 0) (predC 1) noFacts),
+    .coefficientMerge ⟨o 8, .operator (⟨29, 0⟩, ⟨27, 0⟩), m [0, 7], 1⟩,
+    .result (o 8) (ez [0, 7]),
+    .preFoldPolynomial [t 1 [0, 7]] .exactZero none,
+    .invocationEnd (o 8) (ez [0, 7]),
+    .invocationStart (o 1),
+    .boundTransfer (o 1) (.authority .operator), .result (o 1) (ez [1]),
+    .preFoldPolynomial [t 1 [1]] .exactZero none,
+    .invocationEnd (o 1) (ez [1]),
+    .specializationComputed (o 5) ⟨0, 2, 4⟩ ⟨22, 42⟩,
+    .appliedUniversal (o 10) (m [0, 7]) 1 0 2 42 (m [0, 7]) none 41,
+    .coefficientMerge ⟨o 10, .relation 43 0, m [1], 1⟩,
+    .result (o 10) (ez [1]),
+    .predecessor (o 11) 0 10 45, .predecessor (o 11) 1 1 4,
+    .boundTransfer (o 11) (.sum [predC 0, predC 1]),
+    .coefficientMerge ⟨o 11, .operator (⟨45, 0⟩, ⟨4, 0⟩), m [1], -1⟩,
+    .result (o 11) empty0,
+    .predecessor (o 12) 0 11 50, .predecessor (o 12) 1 3 2,
+    .boundTransfer (o 12) (.sum [predC 0, predC 1]),
+    .boundTransfer (o 12) (.monomialProduct (m [3])
+      [⟨.result 2 .coefficient, false, none⟩]),
+    .survivorFold 1 54,
+    .result (o 12) empty1,
+    .preFoldPolynomial [] (.finite 1) (some (.result 56 .summary)),
+    .invocationEnd (o 12) empty1 ]
 
-def monomial (rows : ToyRows) (ordered : List ExpressionRef) : ToyMonomial :=
-  ⟨ordered.map (owner rows)⟩
+def eventAt? (events : List ToyEvent) (index : Nat) : Option ToyEvent := events[index]?
 
-def term (rows : ToyRows) (coefficient : Int) (ordered : List ExpressionRef) : ToyTerm :=
-  ⟨coefficient, monomial rows ordered⟩
+def ToyEventsValid (events : List ToyEvent) : Prop :=
+  events.length = 59 ∧
+    ∀ index, index < 59 → eventAt? events index = eventAt? expectedEvents index
 
-def publicTerm (rows : ToyRows) : ToyTerm := term rows 1 [rows.publicExpression]
-def preimageTerm (rows : ToyRows) : ToyTerm := term rows 1 [rows.preimageExpression]
-def relationLeftTerm (rows : ToyRows) : ToyTerm :=
-  term rows 1 [rows.publicExpression, rows.preimageExpression]
-def targetTerm (rows : ToyRows) : ToyTerm := term rows 1 [rows.targetExpression]
-def targetCancellation (rows : ToyRows) : ToyTerm := term rows (-1) [rows.targetExpression]
-def noiseTerm (rows : ToyRows) : ToyTerm := term rows 1 [rows.noiseExpression]
+def ToyValid (source : ToySource) (document : Document) (rows : ToyRows)
+    (events : List ToyEvent) : Prop :=
+  source = expectedSource ∧ document = expectedDocument ∧ rows = expectedRows ∧
+    ToyEventsValid events
 
-def publicValue (rows : ToyRows) : ToyValue := ⟨1, [publicTerm rows], 1⟩
-def preimageValue (rows : ToyRows) : ToyValue := ⟨1, [preimageTerm rows], 8⟩
-def targetValue (rows : ToyRows) : ToyValue := ⟨1, [targetTerm rows], 8⟩
-def noiseValue (rows : ToyRows) : ToyValue := ⟨1, [noiseTerm rows], 1⟩
-def rootValue (rows : ToyRows) : ToyValue := ⟨1, [noiseTerm rows], 1⟩
-
-/-- The only ordinal in the fixed relation replacement. A later generator must reproduce it. -/
-def relationContributionOrdinal : Nat := 0
-
-def rowsValid (certificate : ToyCertificate) (rows : ToyRows) : Prop :=
-  rows = toyRows ∧
-    listAt? certificate.expressions rows.publicExpression.row = some publicRow ∧
-    listAt? certificate.expressions rows.preimageExpression.row = some (preimageRow rows) ∧
-    listAt? certificate.expressions rows.targetExpression.row = some (targetRow rows) ∧
-    listAt? certificate.expressions rows.noiseExpression.row = some (noiseRow rows) ∧
-    listAt? certificate.expressions rows.root.row = some (rootRow rows)
-
-def samplerRowsValid (certificate : ToyCertificate) (rows : ToyRows) : Prop :=
-  listAt? certificate.statementEvents rows.preimageEvent.row =
-      some (preimageStatementRow rows) ∧
-    listAt? certificate.statementEvents rows.noiseEvent.row = some (noiseStatementRow rows)
-
-def frameEventsValid (rows : ToyRows) (events : List ToyEvent) : Prop :=
-  listAt? events 0 = some (.invocationStart (owner rows rows.root)) ∧
-    listAt? events 1 = some (.invocationStart (owner rows rows.publicExpression)) ∧
-    listAt? events 2 = some (.result (owner rows rows.publicExpression) (publicValue rows)) ∧
-    listAt? events 3 =
-      some (.invocationEnd (owner rows rows.publicExpression) (publicValue rows)) ∧
-    listAt? events 4 = some (.invocationStart (owner rows rows.preimageExpression)) ∧
-    listAt? events 5 =
-      some (.result (owner rows rows.preimageExpression) (preimageValue rows)) ∧
-    listAt? events 6 =
-      some (.invocationEnd (owner rows rows.preimageExpression) (preimageValue rows)) ∧
-    listAt? events 7 = some (.invocationStart (owner rows rows.targetExpression)) ∧
-    listAt? events 8 = some (.predecessor (owner rows rows.targetExpression) 0
-      rows.publicExpression 2) ∧
-    listAt? events 9 = some (.predecessor (owner rows rows.targetExpression) 1
-      rows.preimageExpression 5) ∧
-    listAt? events 10 = some (.result (owner rows rows.targetExpression) (targetValue rows)) ∧
-    listAt? events 11 =
-      some (.invocationEnd (owner rows rows.targetExpression) (targetValue rows)) ∧
-    listAt? events 12 = some (.invocationStart (owner rows rows.noiseExpression)) ∧
-    listAt? events 13 = some (.result (owner rows rows.noiseExpression) (noiseValue rows)) ∧
-    listAt? events 14 =
-      some (.invocationEnd (owner rows rows.noiseExpression) (noiseValue rows)) ∧
-    listAt? events 15 = some (.predecessor (owner rows rows.root) 0 rows.targetExpression 10) ∧
-    listAt? events 16 = some (.predecessor (owner rows rows.root) 1 rows.noiseExpression 13)
-
-def relationEventsValid (rows : ToyRows) (events : List ToyEvent) : Prop :=
-  listAt? events 17 =
-      some (.specializationComputed (owner rows rows.root) 7 12 0 10 11) ∧
-    listAt? events 18 = some (.appliedUniversal (owner rows rows.root) 17
-      rows.preimageEvent (relationLeftTerm rows).monomial (-1) 0 2
-      (relationLeftTerm rows) (targetTerm rows) 10 0) ∧
-    listAt? events 19 = some (.boundTransfer (owner rows rows.root)
-      (.authorityRelationPreimageSource rows.preimageEvent) 8) ∧
-    listAt? events 20 = some (.boundTransfer (owner rows rows.root)
-      (.authorityNoiseOperator rows.noiseEvent) 1) ∧
-    listAt? events 21 = some (.boundTransfer (owner rows rows.root)
-      (.monomialProduct [19]) 8) ∧
-    listAt? events 22 =
-      some (.boundTransfer (owner rows rows.root) (.product 19 20) 8) ∧
-    listAt? events 23 = some (.boundTransfer (owner rows rows.root) (.sum [19, 20]) 9) ∧
-    listAt? events 24 = some (.coefficientMerge (owner rows rows.root)
-      (.relation 18 relationContributionOrdinal (targetCancellation rows))) ∧
-    listAt? events 25 = some (.coefficientMerge (owner rows rows.root)
-      (.operator ⟨10, 0⟩ ⟨13, 0⟩ (noiseTerm rows))) ∧
-    7 < 11 ∧ 11 < 12 ∧ 12 ≤ 17 ∧ rows.targetExpression ≠ rows.root ∧
-    18 < 24 ∧ 10 < 25 ∧ 13 < 25
-
-def foldEventsValid (rows : ToyRows) (events : List ToyEvent) : Prop :=
-  listAt? events 26 = some (.preFold (owner rows rows.root)
-      [targetTerm rows, targetCancellation rows] 0) ∧
-    listAt? events 27 = some (.survivorFold 1 20) ∧
-    listAt? events 28 = some (.result (owner rows rows.root) (rootValue rows)) ∧
-    listAt? events 29 = some (.invocationEnd (owner rows rows.root) (rootValue rows)) ∧
-    (rootValue rows).bound = 0 + (noiseValue rows).bound ∧ 20 < 27
-
-/-- Structural validation checks the external proof event list at each fixed ABI position. -/
-def ToyValid (certificate : ToyCertificate) (rows : ToyRows) (events : List ToyEvent) : Prop :=
-  events.length = 30 ∧ rowsValid certificate rows ∧ samplerRowsValid certificate rows ∧
-    frameEventsValid rows events ∧ relationEventsValid rows events ∧
-    foldEventsValid rows events
-
-instance (certificate : ToyCertificate) (rows : ToyRows) (events : List ToyEvent) :
-    Decidable (ToyValid certificate rows events) := by
-  letI : Decidable (rowsValid certificate rows) := by
-    unfold rowsValid
-    infer_instance
-  letI : Decidable (samplerRowsValid certificate rows) := by
-    unfold samplerRowsValid
-    infer_instance
-  letI : Decidable (frameEventsValid rows events) := by
-    unfold frameEventsValid
-    infer_instance
-  letI : Decidable (relationEventsValid rows events) := by
-    unfold relationEventsValid
-    infer_instance
-  letI : Decidable (foldEventsValid rows events) := by
-    unfold foldEventsValid
-    infer_instance
-  unfold ToyValid
+instance (source : ToySource) (document : Document) (rows : ToyRows)
+    (events : List ToyEvent) : Decidable (ToyValid source document rows events) := by
+  unfold ToyValid ToyEventsValid
   infer_instance
 
-/-- Constructive decimal decoder for the only two strings emitted by the fixed toy ABI. -/
-def toyDecimalCutoff? (value : String) : Option Nat :=
-  match value.toByteArray.data.toList with
-  | [49] => some 1
-  | [56] => some 8
-  | _ => none
+def finalValue (events : List ToyEvent) : ToyValue :=
+  match eventAt? events 58 with | some (.invocationEnd _ value) => value | _ => empty0
 
-def noiseCutoff? (certificate : ToyCertificate) (rows : ToyRows) : Option Nat :=
-  match listAt? certificate.statementEvents rows.noiseEvent.row with
-  | some (.sampler eventOwner (.gaussian output sigma cutoff) (some contract)) =>
-      if eventOwner = toyWire rows.noiseExpression.row ∧ output = matrixType ∧ sigma = "1" ∧
-          contract = finiteRawContract cutoff then toyDecimalCutoff? cutoff
-      else none
-  | _ => none
+def ToyResidual (_events : List ToyEvent) (env : ToyEnv) : Int :=
+  (m [0, 7]).eval env - (m [1]).eval env + env (o 3)
 
-def preimageCutoff? (certificate : ToyCertificate) (rows : ToyRows) : Option Nat :=
-  match listAt? certificate.statementEvents rows.preimageEvent.row with
-  | some (.sampler eventOwner (.preimage output cutoff) (some contract)) =>
-      if eventOwner = toyWire rows.preimageExpression.row ∧ output = matrixType ∧
-          contract = finiteRawContract cutoff then toyDecimalCutoff? cutoff
-      else none
-  | _ => none
+structure ToyReplayWitness (events : List ToyEvent) where
+  env : ToyEnv
+  gaussianEvent : eventAt? events 2 = some (.result (o 3) (ez [3]))
+  gaussianBound : centeredNorm 257 (env (o 3)) ≤ 1
+  universalEvent : eventAt? events 43 = some (.appliedUniversal (o 10) (m [0, 7])
+    1 0 2 42 (m [0, 7]) none 41)
+  universalRelation : (m [0, 7]).eval env = (m [1]).eval env
 
-def ToySamplerContract (certificate : ToyCertificate) (rows : ToyRows)
-    (events : List ToyEvent) (actual : Int) : Prop :=
-  ∃ cutoff, noiseCutoff? certificate rows = some cutoff ∧
-    listAt? events 13 = some (.result (owner rows rows.noiseExpression) (noiseValue rows)) ∧
-    actual = (noiseValue rows).coefficient ∧ actual.natAbs ≤ cutoff
+def toyValuation (env : ToyEnv) (key : MonomialKey) : Int :=
+  (key.orderedFactors.map (fun row => env (o row))).prod
 
-def ToyPreimageContract (certificate : ToyCertificate) (rows : ToyRows)
-    (events : List ToyEvent) (actual : Int) : Prop :=
-  ∃ cutoff, preimageCutoff? certificate rows = some cutoff ∧
-    listAt? events 5 =
-      some (.result (owner rows rows.preimageExpression) (preimageValue rows)) ∧
-    actual = (preimageValue rows).coefficient ∧ actual.natAbs ≤ cutoff
+def universalContext : MonomialContext := ⟨[], [], []⟩
 
-theorem ToyValid.noiseCutoff {certificate : ToyCertificate} {rows : ToyRows}
-    {events : List ToyEvent} (valid : ToyValid certificate rows events) :
-    noiseCutoff? certificate rows = some 1 := by
-  rcases valid with ⟨_, rowsValidProof, samplerValid, _⟩
-  rcases rowsValidProof with ⟨rfl, _⟩
-  simp [noiseCutoff?, samplerValid.2, noiseStatementRow, finiteRawContract, matrixType,
-    toyWire, toyDecimalCutoff?]
-  rfl
+theorem fixed_relation_replay {events : List ToyEvent} (witness : ToyReplayWitness events) :
+    evaluatePolynomial (toyValuation witness.env)
+        (relationReplacement universalContext 1 [(t 1 [0, 7]).toCore]) =
+      evaluatePolynomial (toyValuation witness.env)
+        (relationReplacement universalContext 1 [(t 1 [1]).toCore]) := by
+  apply relationReplacement_congruent (contextMultiplier := 1)
+  · intro key
+    simp [universalContext, MonomialContext.plug, toyValuation]
+  · simpa [evaluatePolynomial, ToyTerm.toCore, ToyMonomial.toCore, ToyOwner.toKeyFactor,
+      toyValuation, t, m, ToyMonomial.eval, o] using witness.universalRelation
 
-theorem ToyValid.preimageCutoff {certificate : ToyCertificate} {rows : ToyRows}
-    {events : List ToyEvent} (valid : ToyValid certificate rows events) :
-    preimageCutoff? certificate rows = some 8 := by
-  rcases valid with ⟨_, rowsValidProof, samplerValid, _⟩
-  rcases rowsValidProof with ⟨rfl, _⟩
-  simp [preimageCutoff?, samplerValid.1, preimageStatementRow, finiteRawContract, matrixType,
-    toyWire, toyDecimalCutoff?]
-  rfl
+theorem fixed_merge_cancels :
+    coefficient (t 1 [1]).toCore.key [(t 1 [1]).toCore, (t (-1) [1]).toCore] = 0 := by
+  decide
 
-theorem ToySamplerContract.sound {certificate : ToyCertificate} {rows : ToyRows}
-    {events : List ToyEvent} {actual : Int} (valid : ToyValid certificate rows events)
-    (contract : ToySamplerContract certificate rows events actual) :
-    (recordedFiniteContract 1).Interprets actual.natAbs := by
-  rcases contract with ⟨cutoff, cutoffRow, _, _, actualBound⟩
-  rw [valid.noiseCutoff] at cutoffRow
-  cases cutoffRow
-  exact gaussianCutoff_sound actualBound
+theorem fixed_product_merge :
+    operatorProductContribution (t 1 [0]).toCore (t 1 [7]).toCore false false =
+      (t 1 [0, 7]).toCore := by
+  decide
 
-theorem ToyPreimageContract.sound {certificate : ToyCertificate} {rows : ToyRows}
-    {events : List ToyEvent} {actual : Int} (valid : ToyValid certificate rows events)
-    (contract : ToyPreimageContract certificate rows events actual) :
-    (recordedFiniteContract 8).Interprets actual.natAbs := by
-  rcases contract with ⟨cutoff, cutoffRow, _, _, actualBound⟩
-  rw [valid.preimageCutoff] at cutoffRow
-  cases cutoffRow
-  exact preimageCutoff_sound actualBound
+def finiteOne : CoeffClass := .finite ⟨1, by decide⟩
 
-/-- Numeric equality is attached to the exact B/K source, target result, source authority, and
-    specialization event; it cannot be reused with another row map or proof event list. -/
-def ToyUniversalRelation (certificate : ToyCertificate) (rows : ToyRows)
-    (events : List ToyEvent) (left right : Int) : Prop :=
-  rowsValid certificate rows ∧ relationEventsValid rows events ∧
-    listAt? events 2 = some (.result (owner rows rows.publicExpression) (publicValue rows)) ∧
-    listAt? events 5 = some (.result (owner rows rows.preimageExpression) (preimageValue rows)) ∧
-    listAt? events 10 = some (.result (owner rows rows.targetExpression) (targetValue rows)) ∧
-    left = (publicValue rows).coefficient * (preimageValue rows).coefficient ∧
-    right = (targetValue rows).coefficient ∧
-    (left - right) % (257 : Int) = 0
+theorem fixed_bound_replay {events : List ToyEvent} (witness : ToyReplayWitness events) :
+    centeredNorm 257 (ToyResidual events witness.env) ≤ 1 := by
+  have relationReplay := fixed_relation_replay witness
+  have mergeReplay := fixed_merge_cancels
+  have productReplay := operatorProductContribution_natAbs_le
+    (t 1 [0]).toCore (t 1 [7]).toCore false false 1 1 (by decide) (by decide)
+  rw [fixed_product_merge] at productReplay
+  have cancellationMagnitude :
+      (coefficient (t 1 [1]).toCore.key
+        [(t 1 [1]).toCore, (t (-1) [1]).toCore]).natAbs = 0 := by
+    rw [mergeReplay]
+    decide
+  have scaleReplay :
+      (coefficient (t 1 [1]).toCore.key
+          [(t 1 [1]).toCore, (t (-1) [1]).toCore]).natAbs * (1 * 1) ≤
+        (coefficient (t 1 [1]).toCore.key
+          [(t 1 [1]).toCore, (t (-1) [1]).toCore]).natAbs * (1 * 1) :=
+    boundTransfer_scale productReplay
+  rw [cancellationMagnitude] at scaleReplay
+  have cancelledReplay : 0 ≤ 0 := by exact scaleReplay
+  have sumReplay : 0 + centeredNorm 257 (witness.env (o 3)) ≤ 0 + 1 :=
+    boundTransfer_sum cancelledReplay witness.gaussianBound
+  have gaussianReplay : centeredNorm 257 (witness.env (o 3)) ≤ 1 := by
+    simpa using sumReplay
+  have gaussianClass : finiteOne.Interprets (centeredNorm 257 (witness.env (o 3))) := by
+    simpa [finiteOne, CoeffClass.Interprets] using gaussianReplay
+  have monomialReplay : (productNonempty finiteOne []).Interprets
+      (centeredNorm 257 (witness.env (o 3))) := by
+    simpa using productNonempty_sound gaussianClass (.nil : List.Forall₂ _ [] [])
+  have gaussianProductReplay : centeredNorm 257 (witness.env (o 3)) ≤ 1 := by
+    simpa [productNonempty, finiteOne, CoeffClass.Interprets] using monomialReplay
+  have survivorReplay : [centeredNorm 257 (witness.env (o 3))].sum ≤ [1].sum :=
+    survivorFold_sound (.cons gaussianProductReplay .nil)
+  have finalReplay : 0 + [centeredNorm 257 (witness.env (o 3))].sum ≤ 0 + [1].sum :=
+    Nat.add_le_add cancelledReplay survivorReplay
+  have invocationReplay : 0 + [1].sum ≤ 0 + [1].sum :=
+    preFold_to_invocationEnd cancelledReplay (.cons (Nat.le_refl 1) .nil)
+  have relationExact : (m [0, 7]).eval witness.env = (m [1]).eval witness.env := by
+    simpa [evaluatePolynomial, relationReplacement, universalContext, contextualize,
+      scalePolynomial, MonomialContext.plug, toyValuation, ToyTerm.toCore, ToyMonomial.toCore,
+      ToyOwner.toKeyFactor, t, m, o, ToyMonomial.eval] using relationReplay
+  rw [ToyResidual, relationExact]
+  simp
+  exact Nat.le_trans (by simpa using finalReplay) (by exact invocationReplay)
 
-theorem ToyValid.universalRelation {certificate : ToyCertificate} {rows : ToyRows}
-    {events : List ToyEvent} (valid : ToyValid certificate rows events) :
-    ToyUniversalRelation certificate rows events 1 1 := by
-  rcases valid with ⟨_, rowProof, _, frameProof, relationProof, _⟩
-  rcases rowProof with ⟨rfl, rowChecks⟩
-  exact ⟨⟨rfl, rowChecks⟩, relationProof, frameProof.2.2.1,
-    frameProof.2.2.2.2.2.1, frameProof.2.2.2.2.2.2.2.2.2.2.1,
-    by decide, by decide, by decide⟩
+theorem replay_sound {source : ToySource} {document : Document} {rows : ToyRows}
+    {events : List ToyEvent} (valid : ToyValid source document rows events)
+    (witness : ToyReplayWitness events) :
+    (finalValue events).Interprets 257 witness.env (ToyResidual events witness.env) := by
+  rcases valid with ⟨_, _, _, _, positions⟩
+  have finalEvent := positions 58 (by decide)
+  simp [expectedEvents, eventAt?] at finalEvent
+  unfold finalValue
+  change (match events[58]? with
+    | some (ToyEvent.invocationEnd _ value) => value
+    | _ => empty0).Interprets 257 witness.env (ToyResidual events witness.env)
+  rw [finalEvent]
+  change ∃ remainder, _ = _ ∧ centeredNorm 257 remainder ≤ 1
+  exact ⟨ToyResidual events witness.env, by simp [ToyTerms.eval], fixed_bound_replay witness⟩
 
-/-- The six scalar values needed to connect the fixed 1-by-1 replay to its recorded results. -/
-structure ToyExecutionValues where
-  publicCoefficient : Int
-  preimageCoefficient : Int
-  relationLeft : Int
-  relationRight : Int
-  error : Int
-  finalCoefficient : Int
-deriving DecidableEq, Repr
+def ToyOperationalClaim (events : List ToyEvent) (witness : ToyReplayWitness events) : Prop :=
+  (finalValue events).Interprets 257 witness.env (ToyResidual events witness.env) ∧
+    2 * 2 * centeredNorm 257 (ToyResidual events witness.env) < 257
 
-/-- Fixed execution-value association. It reuses structural validators and adds only the numeric
-    equations joining result events, merge contributions, the survivor, and the final result. -/
-def ToyExecutionValues.Valid (rows : ToyRows) (events : List ToyEvent)
-    (values : ToyExecutionValues) : Prop :=
-  frameEventsValid rows events ∧ relationEventsValid rows events ∧
-    foldEventsValid rows events ∧
-    values.publicCoefficient = (publicValue rows).coefficient ∧
-    values.preimageCoefficient = (preimageValue rows).coefficient ∧
-    values.relationLeft = values.publicCoefficient * values.preimageCoefficient ∧
-    values.relationRight = (targetValue rows).coefficient ∧
-    values.error = (noiseValue rows).coefficient ∧
-    (targetCancellation rows).coefficient = -values.relationRight ∧
-    (noiseTerm rows).coefficient = values.error ∧
-    (targetTerm rows).coefficient + (targetCancellation rows).coefficient = 0 ∧
-    values.finalCoefficient = values.relationLeft - values.relationRight + values.error ∧
-    values.finalCoefficient = (rootValue rows).coefficient ∧
-    (rootValue rows).bound = 0 + (noiseValue rows).bound
-
-/-- A modularly exact relation may be removed before centering the remaining error. -/
-theorem centeredCoefficient_add_relation {modulus : Nat} {left right error : Int}
-    (modulusPositive : 0 < modulus)
-    (relationExact : (left - right) % Int.ofNat modulus = 0) :
-    centeredCoefficient modulus (left - right + error) = centeredCoefficient modulus error := by
-  have modulusNonzero : modulus ≠ 0 := Nat.ne_of_gt modulusPositive
-  have remainderEquality :
-      (left - right + error) % Int.ofNat modulus = error % Int.ofNat modulus := by
-    rw [Int.add_emod, relationExact]
-    simp
-  simp only [centeredCoefficient, modulusNonzero, ↓reduceIte]
-  rw [remainderEquality]
-
-def liftCoefficient (coefficient : Int) : Matrix where
-  shape := ⟨257, 1, 1, 1⟩
-  coefficients := [coefficient]
-
-@[simp]
-theorem liftCoefficient_norm (coefficient : Int) :
-    (liftCoefficient coefficient).maxCenteredCoefficientNorm 257 =
-      centeredNorm 257 coefficient := by
-  simp [liftCoefficient, Matrix.maxCenteredCoefficientNorm, maxNatList]
-
-def ToyOperationalClaim (certificate : ToyCertificate) (rows : ToyRows)
-    (events : List ToyEvent) (values : ToyExecutionValues) : Prop :=
-  ToyValid certificate rows events ∧ values.Valid rows events ∧
-    centeredCoefficient 257
-        (values.relationLeft - values.relationRight + values.error) =
-      centeredCoefficient 257 values.finalCoefficient ∧
-    2 * 2 * centeredNorm 257 values.finalCoefficient < 257
-
-theorem operationalProof {certificate : ToyCertificate} {rows : ToyRows}
-    {events : List ToyEvent} {values : ToyExecutionValues}
-    (valid : ToyValid certificate rows events)
-    (execution : values.Valid rows events)
-    (sampler : ToySamplerContract certificate rows events values.error)
-    (relation : ToyUniversalRelation certificate rows events values.relationLeft
-      values.relationRight) : ToyOperationalClaim certificate rows events values := by
-  have errorBound : values.error.natAbs ≤ 1 := sampler.sound valid
-  have errorCases : values.error = -1 ∨ values.error = 0 ∨ values.error = 1 := by omega
-  have centeredErrorBound : centeredNorm 257 values.error ≤ 1 := by
-    rcases errorCases with h | h | h <;> rw [h] <;> decide
-  have centeredRelation := centeredCoefficient_add_relation (modulus := 257)
-    (left := values.relationLeft) (right := values.relationRight) (error := values.error)
-    (by decide) relation.2.2.2.2.2.2.2
-  have executionProof := execution
-  rcases execution with ⟨_, _, _, _, _, _, _, _, _, _, _, residualIsFinal, _, _⟩
-  have centeredNormEquality : centeredNorm 257 values.finalCoefficient =
-      centeredNorm 257 values.error := by
-    unfold centeredNorm
-    rw [residualIsFinal, centeredRelation]
-  refine ⟨valid, executionProof, ?_, ?_⟩
-  · rw [residualIsFinal]
-  rw [centeredNormEquality]
-  omega
+theorem operationalProof {source : ToySource} {document : Document} {rows : ToyRows}
+    {events : List ToyEvent} (valid : ToyValid source document rows events) :
+    ∀ witness : ToyReplayWitness events, ToyOperationalClaim events witness := by
+  intro witness
+  refine ⟨replay_sound valid witness, ?_⟩
+  have replayBound := fixed_bound_replay witness
+  calc
+    2 * 2 * centeredNorm 257 (ToyResidual events witness.env) ≤ 2 * 2 * 1 := by omega
+    _ < 257 := by decide
 
 end Mxx.Certificate.OperationalNoise.ToyABI

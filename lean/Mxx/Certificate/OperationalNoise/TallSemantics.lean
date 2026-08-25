@@ -1347,6 +1347,17 @@ def coeffClassToTallBound : CoeffClass → Bound
   | .finite maximum => .finite maximum.val
   | .large => .large
 
+/-- The recorded row bound may be tighter than the conservative bound replayed from its
+    producer. This relation validates that modeling refinement; coefficient soundness always
+    comes from the producer bound. -/
+def RecordedBoundRefines : Bound → CoeffClass → Prop
+  | .exactZero, _ => True
+  | .finite recorded, .exactZero => recorded = 0
+  | .finite recorded, .finite produced => recorded ≤ produced.val
+  | .finite _, .large => True
+  | .large, .large => True
+  | _, _ => False
+
 theorem coeffClassInterprets_to_boundInterprets {modulus : Nat} {value : Int}
     {bound : CoeffClass} (sound : bound.Interprets (centeredNorm modulus value)) :
     boundInterprets modulus (coeffClassToTallBound bound) value := by
@@ -1415,13 +1426,16 @@ mutual
     | resultExactCoefficient {resultEvent : Nat} {owner : Owner} {terms : List Term}
         {coefficientProducer frameStart : Nat}
         {summary : Bound} {summaryProducer : Option Nat} {rule : BoundRule}
-        {bound : CoeffClass} {actualMagnitude : Nat}
+        {recordedCoefficientBound : Bound} {producerBound : CoeffClass}
+        {actualMagnitude : Nat}
         (row : history.lookup resultEvent = some
-          ⟨.resultExact owner terms (coeffClassToTallBound bound) coefficientProducer
+          ⟨.resultExact owner terms recordedCoefficientBound coefficientProducer
             summary summaryProducer, frameStart⟩)
+        (refines : RecordedBoundRefines recordedCoefficientBound producerBound)
         (derived : BoundDerivedAt history coefficientProducer frameStart owner rule
-          bound actualMagnitude) :
-        ProjectedBoundAt history resultEvent owner (some terms) .coefficient bound actualMagnitude
+          producerBound actualMagnitude) :
+        ProjectedBoundAt history resultEvent owner (some terms) .coefficient producerBound
+          actualMagnitude
 
   inductive BoundInputAt (history : EventHistory) :
       Owner → ValueRef → CoeffClass → Nat → Prop where
@@ -1612,15 +1626,18 @@ theorem boundTransfer_to_resultCoefficient
 theorem boundTransfer_to_resultExactCoefficient
     {history : EventHistory} {resultEvent coefficientProducer frameStart : Nat}
     {owner : Owner} {terms : List Term} {summary : Bound}
-    {summaryProducer : Option Nat} {rule : BoundRule} {bound : CoeffClass}
+    {summaryProducer : Option Nat} {rule : BoundRule}
+    {recordedCoefficientBound : Bound} {producerBound : CoeffClass}
     {actualMagnitude : Nat}
     (row : history.lookup resultEvent = some
-      ⟨.resultExact owner terms (coeffClassToTallBound bound) coefficientProducer summary
+      ⟨.resultExact owner terms recordedCoefficientBound coefficientProducer summary
         summaryProducer, frameStart⟩)
-    (derived : BoundDerivedAt history coefficientProducer frameStart owner rule bound
+    (refines : RecordedBoundRefines recordedCoefficientBound producerBound)
+    (derived : BoundDerivedAt history coefficientProducer frameStart owner rule producerBound
       actualMagnitude) :
-    ProjectedBoundAt history resultEvent owner (some terms) .coefficient bound actualMagnitude :=
-  .resultExactCoefficient row derived
+    ProjectedBoundAt history resultEvent owner (some terms) .coefficient producerBound
+      actualMagnitude :=
+  .resultExactCoefficient row refines derived
 
 theorem centeredNorm_eq_zero_mod {modulus : Nat} {value : Int}
     (modulusPositive : 0 < modulus) (normZero : centeredNorm modulus value = 0) :

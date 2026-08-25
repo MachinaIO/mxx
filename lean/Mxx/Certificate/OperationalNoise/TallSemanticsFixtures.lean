@@ -103,12 +103,16 @@ theorem bound_identity_fixture :
   apply BoundDerivedAt.identity
   · rfl
   · exact .result rfl (.resultExactCoefficient (rule := .sum []) (by rfl)
-      (.sum (by rfl) .nil))
+      (by simp [RecordedBoundRefines]) (.sum (by rfl) .nil))
 
 theorem bound_identity_projection_fixture :
     ProjectedBoundAt boundFixtureHistory 3 boundFixtureOwner none .coefficient
       .exactZero 0 := by
   exact .resultCoefficient rfl (by rfl) bound_identity_fixture
+
+theorem exact_zero_recording_refines_finite_two_fixture :
+    RecordedBoundRefines .exactZero (.finite ⟨2, by decide⟩) := by
+  trivial
 
 def exactBoundFixtureTerms : List Term := [canonicalSelfTerm boundFixtureOwner]
 
@@ -368,6 +372,7 @@ theorem canonical_relation_fixture :
 #print axioms generic_value_claim_fixture
 #print axioms bound_identity_fixture
 #print axioms bound_identity_projection_fixture
+#print axioms exact_zero_recording_refines_finite_two_fixture
 #print axioms TallSemantics.boundTransfer_to_resultCoefficient
 #print axioms TallSemantics.ProjectedBoundAt.sound
 #print axioms TallSemantics.BoundDerivedAt.sound

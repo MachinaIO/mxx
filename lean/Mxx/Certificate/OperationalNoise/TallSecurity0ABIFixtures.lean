@@ -91,6 +91,50 @@ theorem end_without_prefold_rejected :
         .invocationEndExact (closedOwner 0) [] .exactZero] = none := by
   decide
 
+def repeatedStart : List Event := fixtureEvents ++ [.invocationStart (closedOwner 0)]
+
+theorem stale_relation_rhs_rejected :
+    replay fixtureDocument
+      (repeatedStart ++
+        [.appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
+          (.universal 5 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 4)]) = none := by
+  decide
+
+theorem stale_relation_merge_rejected :
+    replay fixtureDocument
+      (repeatedStart ++
+        [.coefficientMerge
+          ⟨closedOwner 0, .relation 6 0, singletonMonomial 1, 1⟩]) = none := by
+  decide
+
+theorem stale_summary_evidence_rejected :
+    replay fixtureDocument
+      (repeatedStart ++
+        [.resultExact (closedOwner 0) [] (.finite 1),
+          .preFoldPolynomial [] (.finite 1) (some (.result 14 .summary))]) = none := by
+  decide
+
+theorem stale_survivor_transfer_rejected :
+    replay fixtureDocument (repeatedStart ++ [.survivorFold 1 12]) = none := by
+  decide
+
+theorem repeated_invocation_rejects_stale_references :
+    replay fixtureDocument
+        (repeatedStart ++
+          [.appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
+            (.universal 5 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 4)]) = none ∧
+      replay fixtureDocument
+        (repeatedStart ++
+          [.coefficientMerge
+            ⟨closedOwner 0, .relation 6 0, singletonMonomial 1, 1⟩]) = none ∧
+      replay fixtureDocument
+        (repeatedStart ++
+          [.resultExact (closedOwner 0) [] (.finite 1),
+            .preFoldPolynomial [] (.finite 1) (some (.result 14 .summary))]) = none ∧
+      replay fixtureDocument (repeatedStart ++ [.survivorFold 1 12]) = none :=
+  ⟨stale_relation_rhs_rejected, stale_relation_merge_rejected,
+    stale_summary_evidence_rejected, stale_survivor_transfer_rejected⟩
+
 theorem tall_security0_abi_fixture :
     Valid fixtureDocument fixtureEvents ∧
       step fixtureDocument initialState (.survivorFold 1 0) = none :=
@@ -98,5 +142,6 @@ theorem tall_security0_abi_fixture :
 
 #print axioms tall_security0_abi_fixture
 #print axioms fixture_replay
+#print axioms repeated_invocation_rejects_stale_references
 
 end Mxx.Certificate.OperationalNoise.TallSecurity0ABI

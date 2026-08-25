@@ -199,11 +199,18 @@ def exactTermExists (state : ReplayState) (event ordinal : Nat) : Bool :=
     | _ => false
 
 def relationSourceValid (state : ReplayState) (owner : Owner) (application ordinal : Nat) : Bool :=
-  prior state application && match state.history[application]! with
+  sameFrame state owner application && match state.history[application]! with
     | .appliedRelation relationOwner _ _ _ _ rule =>
         decide (relationOwner = owner) && match rule with
-          | .universal _ _ _ rhsResult => exactTermExists state rhsResult ordinal
-          | .gadget _ _ _ inputResult => exactTermExists state inputResult ordinal
+          | .universal computed _ _ rhsResult =>
+              match state.history[computed]? with
+              | some (.specializationComputed computedOwner _ source) =>
+                  decide (computedOwner = owner) && decide (source.end = computed) &&
+                    decide (rhsResult + 1 = source.end) && exactFrameRange state source &&
+                    exactTermExists state rhsResult ordinal
+              | _ => false
+          | .gadget _ _ _ inputResult =>
+              sameFrame state owner inputResult && exactTermExists state inputResult ordinal
     | _ => false
 
 def valueRefValid (state : ReplayState) (owner : Owner) : ValueRef → Bool
@@ -263,11 +270,14 @@ def termRefOwnerLocal (state : ReplayState) (owner : Owner) (reference : TermRef
     | some sourceOwner => decide (sourceOwner.scope = owner.scope)
     | none => false
 
-def summaryEvidenceValid (state : ReplayState) : Option ValueRef → Bool
+def summaryEvidenceValid (state : ReplayState) (frame : Frame) : Option ValueRef → Bool
   | none => true
-  | some (.result event .summary) => prior state event &&
+  | some (.result event .summary) => sameFrame state frame.root event &&
       match state.history[event]! with | .resultExact .. => true | _ => false
-  | some (.transfer event) => prior state event
+  | some (.transfer event) => sameFrame state frame.root event &&
+      match transferOwner? state.history[event]! with
+      | some owner => decide (owner.scope = frame.root.scope)
+      | none => false
   | _ => false
 
 def append (state : ReplayState) (event : Event) (frames : List Frame) : ReplayState :=
@@ -322,16 +332,22 @@ def step (document : Document) (state : ReplayState) (event : Event) : Option Re
   | .appliedRelation owner sourceMonomial _ orderedStart orderedEnd rule =>
       let ruleOk := match rule with
         | .universal computed lhs _ rhsResult =>
-            prior state computed && prior state rhsResult && monomialValid document lhs &&
-              (match state.history[computed]!, state.history[rhsResult]! with
-              | .specializationComputed computedOwner _ _, .invocationEndExact rhsOwner _ _ =>
-                  decide (computedOwner = owner) && decide (rhsOwner.scope = owner.scope)
-              | _, _ => false)
+            sameFrame state owner computed && monomialValid document lhs &&
+              (match state.history[computed]! with
+              | .specializationComputed computedOwner _ source =>
+                  decide (computedOwner = owner) && decide (source.end = computed) &&
+                    decide (rhsResult + 1 = source.end) && exactFrameRange state source &&
+                    (match state.history[rhsResult]? with
+                    | some (.invocationEndExact rhsOwner _ _) =>
+                        decide (rhsOwner.scope = owner.scope)
+                    | _ => false)
+              | _ => false)
         | .gadget gadget decomposition input inputResult =>
             ownerValid document gadget && ownerValid document decomposition &&
               decide (gadget.scope = owner.scope) &&
               decide (decomposition.scope = owner.scope) &&
-              (rowAt? document.expressions input.row).isSome && prior state inputResult &&
+              (rowAt? document.expressions input.row).isSome &&
+              sameFrame state owner inputResult &&
               decide (resultOwner? state.history[inputResult]! = some ⟨owner.scope, input⟩)
       if currentScope state owner && ownerValid document owner &&
           monomialValid document sourceMonomial && decide (orderedStart ≤ orderedEnd) &&
@@ -356,14 +372,14 @@ def step (document : Document) (state : ReplayState) (event : Event) : Option Re
       | [] => none
       | frame :: frames =>
           if decide (frame.lastExact = some (terms, summary)) &&
-              summaryEvidenceValid state evidence then
+              summaryEvidenceValid state frame evidence then
             accept ({ frame with preFolded := true } :: frames)
           else none
   | .survivorFold _ bound =>
       if prior state bound then
         match transferOwner? state.history[bound]! with
         | some owner =>
-            if currentScope state owner then accept state.frames else none
+            if sameFrame state owner bound then accept state.frames else none
         | none => none
       else none
 

@@ -65,6 +65,33 @@ theorem evaluate_relationReplacement (valuation : MonomialKey → Int)
     evaluate_contextualize_factor valuation context contextMultiplier polynomial contextSound]
   simp [Int.mul_assoc]
 
+/-- Context and its outer coefficient preserve a modular base relation. -/
+theorem relationReplacement_modular (modulus : Nat) (valuation : MonomialKey → Int)
+    (context : MonomialContext) (contextMultiplier outerCoefficient : Int)
+    (left right : Polynomial)
+    (contextSound : ∀ key, valuation (context.plug key) = contextMultiplier * valuation key)
+    (baseRelation : evaluatePolynomial valuation left % Int.ofNat modulus =
+      evaluatePolynomial valuation right % Int.ofNat modulus) :
+    evaluatePolynomial valuation (relationReplacement context outerCoefficient left) %
+        Int.ofNat modulus =
+      evaluatePolynomial valuation (relationReplacement context outerCoefficient right) %
+        Int.ofNat modulus := by
+  rw [evaluate_relationReplacement valuation context contextMultiplier outerCoefficient left
+      contextSound,
+    evaluate_relationReplacement valuation context contextMultiplier outerCoefficient right
+      contextSound]
+  calc
+    (outerCoefficient * contextMultiplier * evaluatePolynomial valuation left) %
+        Int.ofNat modulus =
+      ((outerCoefficient * contextMultiplier) % Int.ofNat modulus *
+        (evaluatePolynomial valuation left % Int.ofNat modulus)) % Int.ofNat modulus :=
+      Int.mul_emod _ _ _
+    _ = ((outerCoefficient * contextMultiplier) % Int.ofNat modulus *
+        (evaluatePolynomial valuation right % Int.ofNat modulus)) % Int.ofNat modulus := by
+      rw [baseRelation]
+    _ = (outerCoefficient * contextMultiplier * evaluatePolynomial valuation right) %
+        Int.ofNat modulus := (Int.mul_emod _ _ _).symm
+
 /-- Contextual replay is congruent for every exact base relation. Terms may merge or cancel after
     canonical context insertion; no per-key equality or collision-free premise is required. -/
 theorem relationReplacement_congruent (valuation : MonomialKey → Int)

@@ -11,11 +11,81 @@ const BALANCED_ROW_COUNT: usize = 5_000;
 const FUEL_HAVE_COUNT: usize = 1_000;
 const FUEL_HAVE_GROUP_MAX: usize = 64;
 const INLINE_TREE_DEPTH: usize = 7;
+const SECURITY0_EXPRESSION_ROW_COUNT: usize = 30_330;
+const SECURITY0_PROGRAM_ROW_COUNT: usize = 269;
+const SECURITY0_SOURCE_ROW_COUNT: usize = 3_850;
+const SECURITY0_STATEMENT_EVENT_ROW_COUNT: usize = 1_526;
 const SECURITY0_STATEMENT_ROW_COUNT: usize = 35_975;
+const SECURITY0_INDEX_USE_ROW_COUNT: usize = 199;
+const SECURITY0_SLICE_GROUP_ROW_COUNT: usize = 1;
 const SECURITY0_EVENT_COUNT: usize = 107_567;
 const SECURITY0_EVENT_CHUNK_SIZE: usize = 256;
 const SECURITY0_EVENT_LEAF_SIZE: usize = 16;
 const ALLOWED_AXIOMS: [&str; 2] = ["propext", "Quot.sound"];
+const SECURITY0_SPIKE_AXIOM_DECLARATIONS: &[&str] = &[
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.expressionRowsFirstLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.expressionRowsMiddleLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.expressionRowsLastLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.expressionRowsWellFormed",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.programRowsFirstLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.programRowsMiddleLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.programRowsLastLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.programRowsWellFormed",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.sourceRowsFirstLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.sourceRowsMiddleLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.sourceRowsLastLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.sourceRowsWellFormed",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.statementEventRowsFirstLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.statementEventRowsMiddleLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.statementEventRowsLastLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.statementEventRowsWellFormed",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.indexUseRowsFirstLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.indexUseRowsMiddleLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.indexUseRowsLastLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.indexUseRowsWellFormed",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.sliceGroupRowsFirstLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.sliceGroupRowsMiddleLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.sliceGroupRowsLastLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.sliceGroupRowsWellFormed",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.statementRowsHaveExactAggregate",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.indexUseRowsHaveExactCount",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.sliceGroupRowsHaveExactCount",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyHasExactSize",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyHasExactLeafCount",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyNodeCount",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.firstEventLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.middleEventLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.lastEventLookup",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.finalLeafHasExactSize",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyIsWellFormed",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.replayChain",
+    "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.replayCloses",
+];
+
+#[derive(Clone, Copy)]
+struct StatementCardinalities {
+    expressions: usize,
+    programs: usize,
+    sources: usize,
+    events: usize,
+    index_uses: usize,
+    slice_groups: usize,
+}
+
+impl StatementCardinalities {
+    fn statement_rows(self) -> usize {
+        self.expressions + self.programs + self.sources + self.events
+    }
+}
+
+const SECURITY0_STATEMENT_CARDINALITIES: StatementCardinalities = StatementCardinalities {
+    expressions: SECURITY0_EXPRESSION_ROW_COUNT,
+    programs: SECURITY0_PROGRAM_ROW_COUNT,
+    sources: SECURITY0_SOURCE_ROW_COUNT,
+    events: SECURITY0_STATEMENT_EVENT_ROW_COUNT,
+    index_uses: SECURITY0_INDEX_USE_ROW_COUNT,
+    slice_groups: SECURITY0_SLICE_GROUP_ROW_COUNT,
+};
 
 #[derive(Debug)]
 struct BalancedRow {
@@ -203,6 +273,44 @@ fn render_security0_statement_row(index: usize) -> String {
     )
 }
 
+fn render_security0_program_row(_: usize) -> String {
+    "{ signature := [], output := statementType, family := none, root := ⟨0⟩ }".to_owned()
+}
+
+fn render_security0_source_row(index: usize) -> String {
+    format!("(.constant ⟨.int, .int \"{index}\"⟩)")
+}
+
+fn render_security0_statement_event_row(_: usize) -> String {
+    "(.sampler statementWire (.uniformResidue statementType) none)".to_owned()
+}
+
+fn render_security0_index_use_row(_: usize) -> String {
+    "{ owner := statementWire, result := none, consumed := none, \
+     kind := .integerExpression, index := .expression ⟨0⟩, outputRange := none, \
+     outputType := statementType, frontier := [], rows := [] }"
+        .to_owned()
+}
+
+fn render_security0_slice_group_row(_: usize) -> String {
+    "{ owner := statementWire, result := none, consumed := none, \
+     outputType := statementType, frontier := [], rowSpan := none, columnSpan := none, \
+     members := [], rows := [] }"
+        .to_owned()
+}
+
+fn render_statement_table(
+    count: usize,
+    prefix: &str,
+    row_type: &str,
+    value: &dyn Fn(usize) -> String,
+    output: &mut String,
+) -> String {
+    let rows = BalancedRow::median_range(0, count).expect("nonempty statement table");
+    assert_exact_tree(&rows, count);
+    render_named_rows(Some(&rows), prefix, row_type, value, output)
+}
+
 fn render_security0_event(index: usize, event_count: usize) -> String {
     let final_result = event_count - 3;
     let final_pre_fold = event_count - 2;
@@ -339,30 +447,133 @@ fn render_security0_replay_chain(
     output
 }
 
+fn render_statement_table_gates(
+    label: &str,
+    table: &str,
+    count: usize,
+    value: &dyn Fn(usize) -> String,
+) -> (String, String) {
+    assert!(count != 0, "statement gate requires a nonempty table");
+    let middle = count / 2;
+    let last = count - 1;
+    let first_name = format!("{label}FirstLookup");
+    let middle_name = format!("{label}MiddleLookup");
+    let last_name = format!("{label}LastLookup");
+    let well_formed_name = format!("{label}WellFormed");
+    let theorems = format!(
+        "theorem {first_name} : {table}.lookup 0 = some ({}) := by\n  rfl\n\n\
+         theorem {middle_name} : {table}.lookup {middle} = some ({}) := by\n  rfl\n\n\
+         theorem {last_name} : {table}.lookup {last} = some ({}) := by\n  rfl\n\n\
+         theorem {well_formed_name} : {table}.wellFormed = true := by\n  rfl\n",
+        value(0),
+        value(middle),
+        value(last),
+    );
+    let prints = format!(
+        "#print axioms {first_name}\n#print axioms {middle_name}\n\
+         #print axioms {last_name}\n#print axioms {well_formed_name}\n"
+    );
+    (theorems, prints)
+}
+
 fn render_security0_structure_module(
-    row: &BalancedRow,
-    statement_row_count: usize,
+    statement: StatementCardinalities,
     event_count: usize,
     event_chunk_size: usize,
 ) -> String {
-    let mut row_definitions = String::new();
-    let row_root = render_named_rows(
-        Some(row),
+    let mut statement_definitions = String::new();
+    let expression_root = render_statement_table(
+        statement.expressions,
         "statementRow",
         "ExpressionRow",
         &render_security0_statement_row,
-        &mut row_definitions,
+        &mut statement_definitions,
+    );
+    let program_root = render_statement_table(
+        statement.programs,
+        "programRow",
+        "SchemaV1.ProgramRow",
+        &render_security0_program_row,
+        &mut statement_definitions,
+    );
+    let source_root = render_statement_table(
+        statement.sources,
+        "sourceRow",
+        "SchemaV1.SourceRow",
+        &render_security0_source_row,
+        &mut statement_definitions,
+    );
+    let statement_event_root = render_statement_table(
+        statement.events,
+        "statementEventRow",
+        "SchemaV1.EventRow",
+        &render_security0_statement_event_row,
+        &mut statement_definitions,
+    );
+    let index_use_root = render_statement_table(
+        statement.index_uses,
+        "indexUseRow",
+        "SchemaV1.IndexUseRow",
+        &render_security0_index_use_row,
+        &mut statement_definitions,
+    );
+    let slice_group_root = render_statement_table(
+        statement.slice_groups,
+        "sliceGroupRow",
+        "SchemaV1.SliceGroupRow",
+        &render_security0_slice_group_row,
+        &mut statement_definitions,
     );
     let (event_definitions, event_root, leaf_ends, shard_ends, event_leaf_count) =
         render_security0_events(event_count, event_chunk_size);
     let replay_chain =
         render_security0_replay_chain(&leaf_ends, &shard_ends, event_count, event_chunk_size);
-    let middle = statement_row_count / 2;
-    let last = statement_row_count - 1;
     let middle_event = event_count / 2;
     let last_event = event_count - 1;
     let final_leaf_size = event_count - (event_leaf_count - 1) * SECURITY0_EVENT_LEAF_SIZE;
     let final_state = leaf_ends.len();
+    let statement_gates = [
+        render_statement_table_gates(
+            "expressionRows",
+            "expressionRows",
+            statement.expressions,
+            &render_security0_statement_row,
+        ),
+        render_statement_table_gates(
+            "programRows",
+            "programRows",
+            statement.programs,
+            &render_security0_program_row,
+        ),
+        render_statement_table_gates(
+            "sourceRows",
+            "sourceRows",
+            statement.sources,
+            &render_security0_source_row,
+        ),
+        render_statement_table_gates(
+            "statementEventRows",
+            "statementEventRows",
+            statement.events,
+            &render_security0_statement_event_row,
+        ),
+        render_statement_table_gates(
+            "indexUseRows",
+            "indexUseRows",
+            statement.index_uses,
+            &render_security0_index_use_row,
+        ),
+        render_statement_table_gates(
+            "sliceGroupRows",
+            "sliceGroupRows",
+            statement.slice_groups,
+            &render_security0_slice_group_row,
+        ),
+    ];
+    let statement_theorems = statement_gates.iter().map(|gate| gate.0.as_str()).collect::<String>();
+    let statement_axiom_prints =
+        statement_gates.iter().map(|gate| gate.1.as_str()).collect::<String>();
+    let statement_row_count = statement.statement_rows();
     format!(
         "import Mxx.Certificate.OperationalNoise.TallSecurity0ABI\n\
          \n\
@@ -375,11 +586,16 @@ fn render_security0_structure_module(
          \n\
          def statementType : ValueType := .matrix \"257\" 1 1 1\n\
          \n\
-         {row_definitions}\n\
-         def expressionRows : RowTable ExpressionRow := {row_root}\n\
+         def statementWire : ObservedWire :=\n\
+         \x20 {{ stage := \"security0-spike\", definition := .root, path := 0, node := 0, port := 0 }}\n\
          \n\
-         def programRow : SchemaV1.ProgramRow :=\n\
-           {{ signature := [], output := statementType, family := none, root := ⟨2⟩ }}\n\
+         {statement_definitions}\n\
+         def expressionRows : RowTable ExpressionRow := {expression_root}\n\
+         def programRows : RowTable SchemaV1.ProgramRow := {program_root}\n\
+         def sourceRows : RowTable SchemaV1.SourceRow := {source_root}\n\
+         def statementEventRows : RowTable SchemaV1.EventRow := {statement_event_root}\n\
+         def indexUseRows : RowTable SchemaV1.IndexUseRow := {index_use_root}\n\
+         def sliceGroupRows : RowTable SchemaV1.SliceGroupRow := {slice_group_root}\n\
          \n\
          def document : TallDocument :=\n\
          \x20 {{ schemaId := \"mxx-operational-noise-certificate\"\n\
@@ -388,11 +604,11 @@ fn render_security0_structure_module(
          \x20   ciphertextModulus := \"257\"\n\
          \x20   ringDimension := 1\n\
          \x20   expressions := expressionRows\n\
-         \x20   programs := .node 0 programRow .empty .empty\n\
-         \x20   sources := .empty\n\
-         \x20   events := .empty\n\
-         \x20   indexUses := .empty\n\
-         \x20   sliceGroups := .empty\n\
+         \x20   programs := programRows\n\
+         \x20   sources := sourceRows\n\
+         \x20   events := statementEventRows\n\
+         \x20   indexUses := indexUseRows\n\
+         \x20   sliceGroups := sliceGroupRows\n\
          \x20   residualRoot := .closed ⟨0⟩ }}\n\
          \n\
          def closedOwner (expression : Nat) : Owner := ⟨.closed ⟨0⟩, ⟨expression⟩⟩\n\
@@ -406,17 +622,20 @@ fn render_security0_structure_module(
          def history : EventHistory := {{ leaves := historyLeaves, size := {event_count} }}\n\
          \n\
          {replay_chain}\n\
-         theorem firstRowLookup :\n\
-             expressionRows.lookup 0 = some ({}) := by\n\
-         \x20 rfl\n\
+         {statement_theorems}\n\
+         theorem statementRowsHaveExactAggregate :\n\
+             rowTableNodeCount expressionRows + rowTableNodeCount programRows +\n\
+               rowTableNodeCount sourceRows + rowTableNodeCount statementEventRows =\n\
+               {statement_row_count} := by\n\
+         \x20 decide\n\
          \n\
-         theorem middleRowLookup :\n\
-             expressionRows.lookup {middle} = some ({}) := by\n\
-         \x20 rfl\n\
+         theorem indexUseRowsHaveExactCount :\n\
+             rowTableNodeCount indexUseRows = {} := by\n\
+         \x20 decide\n\
          \n\
-         theorem lastRowLookup :\n\
-             expressionRows.lookup {last} = some ({}) := by\n\
-         \x20 rfl\n\
+         theorem sliceGroupRowsHaveExactCount :\n\
+             rowTableNodeCount sliceGroupRows = {} := by\n\
+         \x20 decide\n\
          \n\
          theorem historyHasExactSize : history.size = {event_count} := by\n\
          \x20 decide\n\
@@ -448,9 +667,10 @@ fn render_security0_structure_module(
                replayState{final_state}.frames = [] := by\n\
          \x20 exact ⟨rfl, rfl⟩\n\
          \n\
-         #print axioms firstRowLookup\n\
-         #print axioms middleRowLookup\n\
-         #print axioms lastRowLookup\n\
+         {statement_axiom_prints}\n\
+         #print axioms statementRowsHaveExactAggregate\n\
+         #print axioms indexUseRowsHaveExactCount\n\
+         #print axioms sliceGroupRowsHaveExactCount\n\
          #print axioms historyHasExactSize\n\
          #print axioms historyHasExactLeafCount\n\
          #print axioms historyNodeCount\n\
@@ -463,9 +683,8 @@ fn render_security0_structure_module(
          #print axioms replayCloses\n\
          \n\
          end Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike\n",
-        render_security0_statement_row(0),
-        render_security0_statement_row(middle),
-        render_security0_statement_row(last),
+        statement.index_uses,
+        statement.slice_groups,
         render_security0_event(0, event_count),
         render_security0_event(middle_event, event_count),
         render_security0_event(last_event, event_count),
@@ -792,12 +1011,9 @@ fn g0_kernel_spikes_compile_exact_sizes() {
 #[test]
 #[ignore = "actual-cardinality Security0 Lean structural compile-feasibility gate"]
 fn g0_kernel_spike_compiles_security0_actual_structure() {
-    let statement_rows = BalancedRow::median_range(0, SECURITY0_STATEMENT_ROW_COUNT)
-        .expect("nonempty Security0 statement table");
-    assert_exact_tree(&statement_rows, SECURITY0_STATEMENT_ROW_COUNT);
+    assert_eq!(SECURITY0_STATEMENT_CARDINALITIES.statement_rows(), SECURITY0_STATEMENT_ROW_COUNT,);
     let source = render_security0_structure_module(
-        &statement_rows,
-        SECURITY0_STATEMENT_ROW_COUNT,
+        SECURITY0_STATEMENT_CARDINALITIES,
         SECURITY0_EVENT_COUNT,
         SECURITY0_EVENT_CHUNK_SIZE,
     );
@@ -814,27 +1030,15 @@ fn g0_kernel_spike_compiles_security0_actual_structure() {
     let path = temporary.path().join("Security0ActualStructure.lean");
     write_new(&path, &source).expect("new Security0 structural-spike Lean module");
 
-    compile_lean_module(
-        &lean_root,
-        &path,
-        &[
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.firstRowLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.middleRowLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.lastRowLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyHasExactSize",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyHasExactLeafCount",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyNodeCount",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.firstEventLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.middleEventLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.lastEventLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.finalLeafHasExactSize",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyIsWellFormed",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.replayChain",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.replayCloses",
-        ],
-    );
+    compile_lean_module(&lean_root, &path, SECURITY0_SPIKE_AXIOM_DECLARATIONS);
     manifest_guard.restore().expect("restore lake manifest");
     println!("statement_rows={SECURITY0_STATEMENT_ROW_COUNT}");
+    println!("expression_rows={SECURITY0_EXPRESSION_ROW_COUNT}");
+    println!("program_rows={SECURITY0_PROGRAM_ROW_COUNT}");
+    println!("source_rows={SECURITY0_SOURCE_ROW_COUNT}");
+    println!("statement_event_rows={SECURITY0_STATEMENT_EVENT_ROW_COUNT}");
+    println!("index_use_rows={SECURITY0_INDEX_USE_ROW_COUNT}");
+    println!("slice_group_rows={SECURITY0_SLICE_GROUP_ROW_COUNT}");
     println!("events={SECURITY0_EVENT_COUNT}");
     println!("event_chunks={}", SECURITY0_EVENT_COUNT.div_ceil(SECURITY0_EVENT_CHUNK_SIZE),);
     println!("PASS");
@@ -843,18 +1047,18 @@ fn g0_kernel_spike_compiles_security0_actual_structure() {
 #[test]
 #[ignore = "small generated Lean syntax gate for the Security0 structural spike renderer"]
 fn g0_kernel_spike_renderer_compiles_tiny_structure() {
-    const TINY_ROW_COUNT: usize = 5;
+    const TINY_STATEMENT: StatementCardinalities = StatementCardinalities {
+        expressions: 5,
+        programs: 2,
+        sources: 3,
+        events: 4,
+        index_uses: 3,
+        slice_groups: 1,
+    };
     const TINY_EVENT_COUNT: usize = 32;
     const TINY_CHUNK_SIZE: usize = 16;
-    let statement_rows =
-        BalancedRow::median_range(0, TINY_ROW_COUNT).expect("nonempty tiny statement table");
-    assert_exact_tree(&statement_rows, TINY_ROW_COUNT);
-    let source = render_security0_structure_module(
-        &statement_rows,
-        TINY_ROW_COUNT,
-        TINY_EVENT_COUNT,
-        TINY_CHUNK_SIZE,
-    );
+    let source =
+        render_security0_structure_module(TINY_STATEMENT, TINY_EVENT_COUNT, TINY_CHUNK_SIZE);
     assert_generated_source(&source);
 
     let repository_root = repository_root();
@@ -867,24 +1071,6 @@ fn g0_kernel_spike_renderer_compiles_tiny_structure() {
         .expect("temporary tiny structural-renderer directory");
     let path = temporary.path().join("Security0TinyStructure.lean");
     write_new(&path, &source).expect("new tiny Security0 structural Lean module");
-    compile_lean_module(
-        &lean_root,
-        &path,
-        &[
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.firstRowLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.middleRowLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.lastRowLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyHasExactSize",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyHasExactLeafCount",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyNodeCount",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.firstEventLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.middleEventLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.lastEventLookup",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.finalLeafHasExactSize",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.historyIsWellFormed",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.replayChain",
-            "Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike.replayCloses",
-        ],
-    );
+    compile_lean_module(&lean_root, &path, SECURITY0_SPIKE_AXIOM_DECLARATIONS);
     manifest_guard.restore().expect("restore lake manifest");
 }

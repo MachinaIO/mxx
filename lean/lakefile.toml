@@ -12,6 +12,7 @@ defaultTargets = [
   "Mxx.Certificate.OperationalNoise.TallSecurity0ABIFixtures",
   "Mxx.Certificate.OperationalNoise.TallSemantics",
   "Mxx.Certificate.OperationalNoise.TallSemanticsFixtures",
+  "Mxx.Certificate.OperationalNoise.TallGadgetCP2Fixtures",
 ]
 
 [[lean_lib]]

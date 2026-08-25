@@ -6,6 +6,7 @@ set_option relaxedAutoImplicit false
 namespace Mxx.Certificate.OperationalNoise.TallSemantics
 
 open Mxx.Certificate.OperationalNoise
+open EventReplay
 open SchemaV1
 open TallSecurity0ABI
 
@@ -14,11 +15,749 @@ open TallSecurity0ABI
 /-- A semantic environment assigns values only to factors that occur in monomial keys. -/
 abbrev Env (Factor : Type) := Factor → Int
 
+/-! Tall factors are not assigned an artificial numeric order. Their central representation is
+    the source order; semantic equalities use `List.Perm` below. -/
+instance ownerCentralNormalizer : CentralNormalizer Owner where
+  normalize := id
+
 def evalMonomial {Factor : Type} (env : Env Factor) (key : MonomialKey Factor) : Int :=
   (key.centralFactors.map env).prod * (key.orderedFactors.map env).prod
 
-def evalPolynomial {Factor : Type} (env : Env Factor) (terms : Polynomial Factor) : Int :=
-  (terms.map (fun term ↦ term.coefficient * evalMonomial env term.key)).sum
+def evalPolynomial {Factor : Type} (env : Env Factor) : Polynomial Factor → Int
+  | [] => 0
+  | term :: terms =>
+      term.coefficient * evalMonomial env term.key + evalPolynomial env terms
+
+def termPolynomial (terms : List Term) : Polynomial Owner := terms.map Term.toExact
+
+def relationContext (source : MonomialKey Owner)
+    (exteriorCentral : List Owner)
+    (orderedStart orderedEndExclusive : Nat) :
+  MonomialContext Owner :=
+  { exteriorCentral := exteriorCentral
+    prefixFactors := source.orderedFactors.take orderedStart
+    suffixFactors := source.orderedFactors.drop orderedEndExclusive }
+
+private def extractFirst (x : Owner) : List Owner → Option (List Owner)
+  | [] => none
+  | y :: ys =>
+      if x = y then some ys
+      else
+        match extractFirst x ys with
+        | none => none
+        | some rest => some (y :: rest)
+
+private theorem extractFirst_sound {x : Owner} {ys rest : List Owner}
+    (h : extractFirst x ys = some rest) : ys.Perm (x :: rest) := by
+  induction ys generalizing rest with
+  | nil => simp [extractFirst] at h
+  | cons y ys ih =>
+      by_cases eq : x = y
+      · simp [extractFirst, eq] at h
+        cases eq
+        cases h
+        exact List.Perm.refl _
+      · simp only [extractFirst, eq, ↓reduceIte] at h
+        cases found : extractFirst x ys with
+        | none => simp [found] at h
+        | some tail =>
+            simp only [found, Option.some.injEq] at h
+            subst rest
+            have tailPerm : ys.Perm (x :: tail) := ih found
+            exact (List.Perm.cons y tailPerm).trans (List.Perm.swap x y tail)
+
+private theorem extractFirst_exists {x : Owner} {ys : List Owner}
+    (h : x ∈ ys) : ∃ rest, extractFirst x ys = some rest := by
+  induction ys with
+  | nil => simp at h
+  | cons y ys ih =>
+      by_cases eq : x = y
+      · subst y
+        exact ⟨ys, by simp [extractFirst]⟩
+      · simp only [List.mem_cons, eq, false_or] at h
+        rcases ih h with ⟨rest, found⟩
+        exact ⟨y :: rest, by simp [extractFirst, eq, found]⟩
+
+private theorem extractFirst_complete {x : Owner} {ys rest : List Owner}
+    (h : ys.Perm (x :: rest)) :
+    ∃ extracted, extractFirst x ys = some extracted ∧ extracted.Perm rest := by
+  have present : x ∈ ys := h.mem_iff.mpr (by simp)
+  rcases extractFirst_exists present with ⟨extracted, found⟩
+  refine ⟨extracted, found, ?_⟩
+  exact (List.Perm.cons_inv (h.symm.trans (extractFirst_sound found))).symm
+
+private def permCheck : List Owner → List Owner → Bool
+  | [], ys => ys == []
+  | x :: xs, ys =>
+      match extractFirst x ys with
+      | none => false
+      | some rest => permCheck xs rest
+
+private theorem permCheck_iff {left right : List Owner} :
+    permCheck left right = true ↔ left.Perm right := by
+  induction left generalizing right with
+  | nil =>
+      cases right with
+      | nil => simp [permCheck]
+      | cons head tail =>
+          constructor
+          · simp [permCheck]
+          · intro h
+            exact False.elim (by
+              have impossible := h.symm.eq_nil
+              cases impossible)
+  | cons head tail ih =>
+      cases right with
+      | nil =>
+          constructor
+          · simp [permCheck, extractFirst]
+          · intro h
+            exact False.elim (by
+              have impossible := h.eq_nil
+              cases impossible)
+      | cons rightHead rightTail =>
+          cases found : extractFirst head (rightHead :: rightTail) with
+          | none =>
+              constructor
+              · simp [permCheck, found]
+              · intro h
+                exact False.elim (by
+                  rcases extractFirst_complete h.symm with ⟨rest, found', _⟩
+                  rw [found] at found'
+                  cases found')
+          | some extracted =>
+              constructor
+              · intro checked
+                simp only [permCheck, found] at checked
+                have tailPerm : tail.Perm extracted := (ih (right := extracted)).mp checked
+                have extractedPerm : (rightHead :: rightTail).Perm (head :: extracted) :=
+                  extractFirst_sound found
+                exact (List.Perm.cons head tailPerm).trans extractedPerm.symm
+              · intro permutation
+                simp only [permCheck, found]
+                have extractedPerm : (rightHead :: rightTail).Perm (head :: extracted) :=
+                  extractFirst_sound found
+                have tailPerm : tail.Perm extracted :=
+                  List.Perm.cons_inv (permutation.trans extractedPerm)
+                exact (ih (right := extracted)).mpr tailPerm
+
+def KeyEquivalent (left right : MonomialKey Owner) : Prop :=
+  left.centralFactors.Perm right.centralFactors ∧
+    left.orderedFactors = right.orderedFactors
+
+instance keyEquivalentDecidable (left right : MonomialKey Owner) :
+    Decidable (KeyEquivalent left right) := by
+  apply decidable_of_iff
+    ((permCheck left.centralFactors right.centralFactors = true) ∧
+      left.orderedFactors = right.orderedFactors)
+  constructor
+  · intro h
+    exact ⟨permCheck_iff.mp h.1, h.2⟩
+  · intro h
+    exact ⟨permCheck_iff.mpr h.1, h.2⟩
+
+theorem list_prod_perm {Factor : Type} (env : Env Factor) {left right : List Factor}
+    (h : left.Perm right) : (left.map env).prod = (right.map env).prod := by
+  induction h with
+  | nil => rfl
+  | cons a h ih => simp [ih]
+  | swap a b l => simp [Int.mul_left_comm]
+  | trans h₁ h₂ ih₁ ih₂ => exact ih₁.trans ih₂
+
+theorem evalMonomial_of_key {Factor : Type} (env : Env Factor)
+    {left right : MonomialKey Factor}
+    (central : left.centralFactors.Perm right.centralFactors)
+    (ordered : left.orderedFactors = right.orderedFactors) :
+    evalMonomial env left = evalMonomial env right := by
+  rw [evalMonomial, evalMonomial, ordered, list_prod_perm env central]
+
+theorem evalMonomial_of_productKey (env : Env Owner)
+    {left right output : MonomialKey Owner}
+    (key : ProductKey left right output) :
+    evalMonomial env output = evalMonomial env left * evalMonomial env right := by
+  rw [evalMonomial, evalMonomial, evalMonomial]
+  rw [list_prod_perm env key.1, key.2]
+  simp [List.map_append, List.prod_append, Int.mul_assoc, Int.mul_left_comm]
+
+theorem evalMonomial_of_contextKey (env : Env Owner)
+    {source replacement output : MonomialKey Owner}
+    {exteriorCentral : List Owner}
+    {orderedStart orderedEndExclusive : Nat}
+    (key : ContextKey
+      { centralFactors := exteriorCentral, orderedFactors := source.orderedFactors }
+      replacement output orderedStart orderedEndExclusive) :
+    evalMonomial env output =
+      evalMonomial env
+        ((relationContext source exteriorCentral orderedStart orderedEndExclusive).plug
+          replacement) := by
+  apply evalMonomial_of_key env
+  · change output.centralFactors.Perm (exteriorCentral ++ replacement.centralFactors)
+    exact key.1
+  · change output.orderedFactors =
+      source.orderedFactors.take orderedStart ++ replacement.orderedFactors ++
+        source.orderedFactors.drop orderedEndExclusive
+    exact key.2
+
+private def partitionBy (representative : MonomialKey Owner) :
+    Polynomial Owner → Polynomial Owner × Polynomial Owner
+  | [] => ([], [])
+  | term :: terms =>
+      if KeyEquivalent term.key representative then
+        let partitioned := partitionBy representative terms
+        (term :: partitioned.1, partitioned.2)
+      else
+        let partitioned := partitionBy representative terms
+        (partitioned.1, term :: partitioned.2)
+
+def aggregateCoeff (representative : MonomialKey Owner) (terms : Polynomial Owner) : Int :=
+  ((partitionBy representative terms).1.map ExactTerm.coefficient).sum
+
+def CoefficientAgreement (left right : Polynomial Owner) : Prop :=
+  ∀ term, term ∈ left ++ right →
+    aggregateCoeff term.key left = aggregateCoeff term.key right
+
+private theorem keyEquivalent_symm {left right : MonomialKey Owner}
+    (h : KeyEquivalent left right) : KeyEquivalent right left := by
+  exact ⟨h.1.symm, h.2.symm⟩
+
+private theorem keyEquivalent_trans {left middle right : MonomialKey Owner}
+    (h₁ : KeyEquivalent left middle) (h₂ : KeyEquivalent middle right) :
+    KeyEquivalent left right := by
+  exact ⟨h₁.1.trans h₂.1, h₁.2.trans h₂.2⟩
+
+private theorem partitionBy_fst_mem (representative : MonomialKey Owner)
+    {term : ExactTerm Owner} {terms : Polynomial Owner}
+    (h : term ∈ (partitionBy representative terms).1) : term ∈ terms := by
+  induction terms with
+  | nil => simp [partitionBy] at h
+  | cons head terms ih =>
+      by_cases equivalent : KeyEquivalent head.key representative
+      · simp only [partitionBy, equivalent, ↓reduceIte] at h
+        simp only [List.mem_cons] at h
+        rcases h with rfl | h
+        · exact List.mem_cons_self
+        · exact List.mem_cons_of_mem _ (ih h)
+      · simp only [partitionBy, equivalent, ↓reduceIte] at h
+        change term ∈ (partitionBy representative terms).1 at h
+        exact List.mem_cons_of_mem _ (ih h)
+
+private theorem partitionBy_snd_mem (representative : MonomialKey Owner)
+    {term : ExactTerm Owner} {terms : Polynomial Owner}
+    (h : term ∈ (partitionBy representative terms).2) : term ∈ terms := by
+  induction terms with
+  | nil => simp [partitionBy] at h
+  | cons head terms ih =>
+      by_cases equivalent : KeyEquivalent head.key representative
+      · simp only [partitionBy, equivalent, ↓reduceIte] at h
+        change term ∈ (partitionBy representative terms).2 at h
+        exact List.mem_cons_of_mem _ (ih h)
+      · simp only [partitionBy, equivalent, ↓reduceIte] at h
+        simp only [List.mem_cons] at h
+        rcases h with rfl | h
+        · exact List.mem_cons_self
+        · exact List.mem_cons_of_mem _ (ih h)
+
+private theorem partitionBy_snd_not_equivalent (representative : MonomialKey Owner)
+    {term : ExactTerm Owner} {terms : Polynomial Owner}
+    (h : term ∈ (partitionBy representative terms).2) :
+    ¬ KeyEquivalent term.key representative := by
+  induction terms with
+  | nil => simp [partitionBy] at h
+  | cons head terms ih =>
+      by_cases equivalent : KeyEquivalent head.key representative
+      · simp only [partitionBy, equivalent, ↓reduceIte] at h
+        change term ∈ (partitionBy representative terms).2 at h
+        exact ih h
+      · simp only [partitionBy, equivalent, ↓reduceIte] at h
+        simp only [List.mem_cons] at h
+        rcases h with h | h
+        · simpa [h] using equivalent
+        · exact ih h
+
+private theorem partitionBy_snd_partitionBy_fst
+    (representative key : MonomialKey Owner) (terms : Polynomial Owner)
+    (notEquivalent : ¬ KeyEquivalent key representative) :
+    (partitionBy key (partitionBy representative terms).2).1 =
+      (partitionBy key terms).1 := by
+  induction terms with
+  | nil => simp [partitionBy]
+  | cons head terms ih =>
+      by_cases equivalent : KeyEquivalent head.key representative
+      · have headNotEquivalent : ¬ KeyEquivalent key head.key := by
+          intro keyHead
+          exact notEquivalent (keyEquivalent_trans keyHead equivalent)
+        have headKeyNotEquivalent : ¬ KeyEquivalent head.key key := by
+          intro keyHead
+          exact headNotEquivalent (keyEquivalent_symm keyHead)
+        simp [partitionBy, equivalent, headKeyNotEquivalent, ih]
+      · by_cases keyHead : KeyEquivalent head.key key
+        · simp [partitionBy, equivalent, keyHead, ih]
+        · simp [partitionBy, equivalent, keyHead, ih]
+
+private theorem partitionBy_snd_partitionBy_fst_of_equivalent
+    (representative key : MonomialKey Owner) (terms : Polynomial Owner)
+    (equivalent : KeyEquivalent key representative) :
+    (partitionBy key (partitionBy representative terms).2).1 = [] := by
+  induction terms with
+  | nil => simp [partitionBy]
+  | cons head terms ih =>
+      by_cases headEquivalent : KeyEquivalent head.key representative
+      · simp [partitionBy, headEquivalent, ih]
+      · have headKeyNotEquivalent : ¬ KeyEquivalent head.key key := by
+          intro headKey
+          exact headEquivalent (keyEquivalent_trans headKey equivalent)
+        simp [partitionBy, headEquivalent, headKeyNotEquivalent, ih]
+
+private theorem aggregateCoeff_snd_of_not_equivalent
+    (representative key : MonomialKey Owner) (terms : Polynomial Owner)
+    (notEquivalent : ¬ KeyEquivalent key representative) :
+    aggregateCoeff key (partitionBy representative terms).2 =
+      aggregateCoeff key terms := by
+  rw [aggregateCoeff, partitionBy_snd_partitionBy_fst representative key terms notEquivalent,
+    aggregateCoeff]
+
+private theorem aggregateCoeff_snd_of_equivalent
+    (representative key : MonomialKey Owner) (terms : Polynomial Owner)
+    (equivalent : KeyEquivalent key representative) :
+    aggregateCoeff key (partitionBy representative terms).2 = 0 := by
+  rw [aggregateCoeff, partitionBy_snd_partitionBy_fst_of_equivalent representative key terms
+    equivalent]
+  rfl
+
+private theorem coefficientAgreement_snd (representative : MonomialKey Owner)
+    {left right : Polynomial Owner} (agreement : CoefficientAgreement left right) :
+    CoefficientAgreement (partitionBy representative left).2
+      (partitionBy representative right).2 := by
+  intro term h
+  rcases List.mem_append.mp h with hleft | hright
+  · have sourceMembership : term ∈ left ++ right :=
+      List.mem_append.mpr (Or.inl (partitionBy_snd_mem representative hleft))
+    have rawAgreement := agreement term sourceMembership
+    have notEquivalent := partitionBy_snd_not_equivalent representative hleft
+    rw [aggregateCoeff_snd_of_not_equivalent representative term.key left notEquivalent,
+      aggregateCoeff_snd_of_not_equivalent representative term.key right notEquivalent]
+    exact rawAgreement
+
+  · have sourceMembership : term ∈ left ++ right :=
+      List.mem_append.mpr (Or.inr (partitionBy_snd_mem representative hright))
+    have rawAgreement := agreement term sourceMembership
+    have notEquivalent := partitionBy_snd_not_equivalent representative hright
+    rw [aggregateCoeff_snd_of_not_equivalent representative term.key left notEquivalent,
+      aggregateCoeff_snd_of_not_equivalent representative term.key right notEquivalent]
+    exact rawAgreement
+
+private theorem evalPolynomial_partition (env : Env Owner)
+    (representative : MonomialKey Owner) (terms : Polynomial Owner) :
+    evalPolynomial env terms =
+      evalPolynomial env (partitionBy representative terms).1 +
+        evalPolynomial env (partitionBy representative terms).2 := by
+  induction terms with
+  | nil => rfl
+  | cons term terms ih =>
+      simp only [partitionBy]
+      split
+      · simp only [evalPolynomial]
+        rw [ih]
+        simp [Int.add_assoc]
+      · simp only [evalPolynomial]
+        rw [ih]
+        simp [Int.add_left_comm]
+
+private theorem evalPolynomial_partition_matches (env : Env Owner)
+    (representative : MonomialKey Owner) (terms : Polynomial Owner) :
+    evalPolynomial env (partitionBy representative terms).1 =
+      aggregateCoeff representative terms * evalMonomial env representative := by
+  induction terms with
+  | nil => simp [aggregateCoeff, partitionBy, evalPolynomial]
+  | cons term terms ih =>
+      by_cases h : KeyEquivalent term.key representative
+      · simp [partitionBy, h, aggregateCoeff, evalPolynomial, ih,
+          evalMonomial_of_key env h.1 h.2, Int.add_mul]
+      · simp [partitionBy, h, aggregateCoeff, ih]
+
+private theorem partitionBy_snd_length_le (representative : MonomialKey Owner)
+    (terms : Polynomial Owner) : (partitionBy representative terms).2.length ≤ terms.length := by
+  induction terms with
+  | nil => exact Nat.zero_le _
+  | cons term terms ih =>
+      by_cases equivalent : KeyEquivalent term.key representative
+      · simp only [partitionBy, if_pos equivalent]
+        change (partitionBy representative terms).2.length ≤ terms.length + 1
+        exact Nat.le_trans ih (Nat.le_succ _)
+      · simp only [partitionBy, if_neg equivalent]
+        change (term :: (partitionBy representative terms).2).length ≤ terms.length + 1
+        exact Nat.succ_le_succ ih
+
+private theorem partitionBy_snd_length_lt_of_equivalent
+    (representative : MonomialKey Owner) (term : ExactTerm Owner)
+    (terms : Polynomial Owner) (equivalent : KeyEquivalent term.key representative) :
+    (partitionBy representative (term :: terms)).2.length < (term :: terms).length := by
+  simp only [partitionBy, equivalent, ↓reduceIte]
+  dsimp
+  have bound := partitionBy_snd_length_le representative terms
+  exact Nat.lt_succ_of_le bound
+
+private theorem keyEquivalent_refl (key : MonomialKey Owner) : KeyEquivalent key key :=
+  ⟨List.Perm.refl _, rfl⟩
+
+private theorem coefficientAgreement_partitionBy_snd
+    (representative : MonomialKey Owner) (left right : Polynomial Owner)
+    (agreement : CoefficientAgreement left right) :
+    CoefficientAgreement (partitionBy representative left).2
+      (partitionBy representative right).2 := by
+  intro term termMem
+  rcases List.mem_append.mp termMem with termMem | termMem
+  · have original := partitionBy_snd_mem representative termMem
+    have notEquivalent := partitionBy_snd_not_equivalent representative termMem
+    rw [aggregateCoeff_snd_of_not_equivalent representative term.key left notEquivalent,
+      aggregateCoeff_snd_of_not_equivalent representative term.key right notEquivalent]
+    exact agreement term (List.mem_append_left _ original)
+  · have original := partitionBy_snd_mem representative termMem
+    have notEquivalent := partitionBy_snd_not_equivalent representative termMem
+    rw [aggregateCoeff_snd_of_not_equivalent representative term.key left notEquivalent,
+      aggregateCoeff_snd_of_not_equivalent representative term.key right notEquivalent]
+    exact agreement term (List.mem_append_right _ original)
+
+theorem coefficientAgreement_eval (env : Env Owner) (left right : Polynomial Owner)
+    (agreement : CoefficientAgreement left right) :
+    evalPolynomial env left = evalPolynomial env right := by
+  let motive : Nat → Prop := fun total =>
+    ∀ (left right : Polynomial Owner), left.length + right.length = total →
+      CoefficientAgreement left right → evalPolynomial env left = evalPolynomial env right
+  refine Nat.strongRecOn (motive := motive) (left.length + right.length) ?_ left right rfl agreement
+  intro total inductionHypothesis left right totalEq agreement
+  cases left with
+  | nil =>
+      cases right with
+      | nil => rfl
+      | cons term terms =>
+          let representative := term.key
+          have representativeAgreement := agreement term (by simp)
+          have aggregateRightZero : aggregateCoeff representative (term :: terms) = 0 := by
+            simpa [aggregateCoeff, partitionBy] using representativeAgreement.symm
+          have residualAgreement := coefficientAgreement_partitionBy_snd representative
+            [] (term :: terms) agreement
+          have residualLength :
+              (partitionBy representative []).2.length +
+                (partitionBy representative (term :: terms)).2.length < total := by
+            have bound := partitionBy_snd_length_lt_of_equivalent representative term terms
+              (keyEquivalent_refl term.key)
+            have emptyLength : (partitionBy representative []).2.length = 0 := by
+              simp [partitionBy]
+            rw [emptyLength]
+            simp only [representative] at bound
+            have termEq : (term :: terms).length = total := by simpa using totalEq
+            have termLe : (term :: terms).length ≤ total := Nat.le_of_eq termEq
+            exact Nat.lt_of_lt_of_le (by simpa using bound) termLe
+          have recursive := inductionHypothesis _ residualLength _ _ rfl residualAgreement
+          calc
+            evalPolynomial env [] =
+                evalPolynomial env (partitionBy representative []).1 +
+                  evalPolynomial env (partitionBy representative []).2 :=
+              evalPolynomial_partition env representative []
+            _ = evalPolynomial env (partitionBy representative (term :: terms)).1 +
+                  evalPolynomial env (partitionBy representative []).2 := by
+              rw [show evalPolynomial env (partitionBy representative (term :: terms)).1 =
+                aggregateCoeff representative (term :: terms) *
+                  evalMonomial env representative by
+                exact evalPolynomial_partition_matches env representative (term :: terms)]
+              rw [aggregateRightZero]
+              simp [partitionBy, evalPolynomial]
+            _ = evalPolynomial env (partitionBy representative (term :: terms)).1 +
+                  evalPolynomial env (partitionBy representative (term :: terms)).2 := by
+              rw [recursive]
+            _ = evalPolynomial env (term :: terms) := by
+              symm
+              exact evalPolynomial_partition env representative (term :: terms)
+  | cons term terms =>
+      let representative := term.key
+      have representativeAgreement := agreement term (by simp)
+      have residualAgreement := coefficientAgreement_partitionBy_snd representative
+        (term :: terms) right agreement
+      have residualLength :
+          (partitionBy representative (term :: terms)).2.length +
+            (partitionBy representative right).2.length < total := by
+        have leftBound := partitionBy_snd_length_lt_of_equivalent representative term terms
+          (keyEquivalent_refl term.key)
+        have rightBound := partitionBy_snd_length_le representative right
+        simp only [representative] at leftBound rightBound ⊢
+        exact Nat.lt_of_lt_of_eq
+          (Nat.add_lt_add_of_lt_of_le leftBound rightBound) totalEq
+      have recursive := inductionHypothesis _ residualLength _ _ rfl residualAgreement
+      calc
+        evalPolynomial env (term :: terms) =
+            evalPolynomial env (partitionBy representative (term :: terms)).1 +
+              evalPolynomial env (partitionBy representative (term :: terms)).2 :=
+          evalPolynomial_partition env representative _
+        _ = aggregateCoeff representative (term :: terms) * evalMonomial env representative +
+              evalPolynomial env (partitionBy representative (term :: terms)).2 := by
+          rw [evalPolynomial_partition_matches]
+        _ = aggregateCoeff representative right * evalMonomial env representative +
+              evalPolynomial env (partitionBy representative (term :: terms)).2 := by
+          rw [representativeAgreement]
+        _ = evalPolynomial env (partitionBy representative right).1 +
+              evalPolynomial env (partitionBy representative (term :: terms)).2 := by
+          rw [evalPolynomial_partition_matches]
+        _ = evalPolynomial env (partitionBy representative right).1 +
+              evalPolynomial env (partitionBy representative right).2 := by
+          rw [recursive]
+        _ = evalPolynomial env right := by
+          symm
+          exact evalPolynomial_partition env representative right
+
+private theorem evalPolynomial_append (env : Env Owner)
+    (left right : Polynomial Owner) :
+    evalPolynomial env (left ++ right) = evalPolynomial env left + evalPolynomial env right := by
+  induction left with
+  | nil => simp [evalPolynomial]
+  | cons term left ih =>
+      simp only [List.cons_append, evalPolynomial]
+      rw [ih]
+      simp [Int.add_assoc]
+
+private theorem evalPolynomial_negate (env : Env Owner) (terms : Polynomial Owner) :
+    evalPolynomial env (negate terms) = -evalPolynomial env terms := by
+  induction terms with
+  | nil => rfl
+  | cons term terms ih =>
+      simp only [negate, evalPolynomial]
+      rw [ih]
+      simp [Int.neg_mul, Int.neg_add]
+
+theorem addResultSound (env : Env Owner) (left right output : Polynomial Owner)
+    (agreement : CoefficientAgreement output (add left right)) :
+    evalPolynomial env output = evalPolynomial env left + evalPolynomial env right := by
+  rw [coefficientAgreement_eval env output (add left right) agreement,
+    show add left right = left ++ right by rfl,
+    evalPolynomial_append env left right]
+
+theorem subResultSound (env : Env Owner) (left right output : Polynomial Owner)
+    (agreement : CoefficientAgreement output (subtract left right)) :
+    evalPolynomial env output = evalPolynomial env left - evalPolynomial env right := by
+  rw [coefficientAgreement_eval env output (subtract left right) agreement,
+    show subtract left right = left ++ negate right by rfl,
+    evalPolynomial_append, evalPolynomial_negate]
+  rfl
+
+def productPoly (left right : Polynomial Owner) (leftScalar rightScalar : Bool) :
+    Polynomial Owner :=
+  left.flatMap (fun leftTerm =>
+    right.map (fun rightTerm =>
+      operatorProductContribution leftTerm rightTerm leftScalar rightScalar))
+
+private theorem evalMonomial_of_scalarAction (env : Env Owner) (key : MonomialKey Owner) :
+    evalMonomial env (scalarActionKey key) = evalMonomial env key := by
+  rw [evalMonomial, evalMonomial]
+  rw [scalarActionKey_central, scalarActionKey_ordered]
+  rw [show CentralNormalizer.normalize (key.centralFactors ++ key.orderedFactors) =
+    key.centralFactors ++ key.orderedFactors by rfl]
+  simp [List.map_append, List.prod_append]
+
+private theorem productKey_product (left right : MonomialKey Owner) :
+    ProductKey left right (MonomialKey.product left right) := by
+  constructor
+  · rw [product_central]
+    change (left.centralFactors ++ right.centralFactors).Perm _
+    exact List.Perm.refl _
+  · exact product_ordered left right
+
+private theorem evalMonomial_of_scalarProductKey (env : Env Owner)
+    (left right : MonomialKey Owner) (leftScalar rightScalar : Bool) :
+    evalMonomial env (scalarProductKey left right leftScalar rightScalar) =
+      evalMonomial env left * evalMonomial env right := by
+  cases leftScalar <;> cases rightScalar <;> simp [scalarProductKey]
+  all_goals
+    rw [evalMonomial_of_productKey env (productKey_product _ _)] <;>
+      simp [evalMonomial_of_scalarAction]
+
+private theorem evalOperatorProductContribution (env : Env Owner)
+    (left right : ExactTerm Owner) (leftScalar rightScalar : Bool) :
+    (operatorProductContribution left right leftScalar rightScalar).coefficient *
+        evalMonomial env (operatorProductContribution left right leftScalar rightScalar).key =
+      (left.coefficient * evalMonomial env left.key) *
+        (right.coefficient * evalMonomial env right.key) := by
+  rw [operatorProductContribution_coefficient, operatorProductContribution_key,
+    evalMonomial_of_scalarProductKey]
+  simp [Int.mul_assoc, Int.mul_left_comm]
+
+private theorem evalPolynomial_productMap (env : Env Owner)
+    (leftTerm : ExactTerm Owner) (right : Polynomial Owner)
+    (leftScalar rightScalar : Bool) :
+    evalPolynomial env
+        (right.map (fun rightTerm =>
+          operatorProductContribution leftTerm rightTerm leftScalar rightScalar)) =
+      (leftTerm.coefficient * evalMonomial env leftTerm.key) *
+        evalPolynomial env right := by
+  induction right with
+  | nil => simp [evalPolynomial]
+  | cons rightTerm rightTail ih =>
+      simp only [List.map, evalPolynomial]
+      rw [ih]
+      rw [evalOperatorProductContribution]
+      simp [Int.mul_assoc, Int.mul_left_comm, Int.mul_add]
+
+private theorem evalPolynomial_productPoly (env : Env Owner)
+    (left right : Polynomial Owner) (leftScalar rightScalar : Bool) :
+    evalPolynomial env (productPoly left right leftScalar rightScalar) =
+      evalPolynomial env left * evalPolynomial env right := by
+  induction left with
+  | nil => simp [productPoly, evalPolynomial]
+  | cons leftTerm leftTail ih =>
+      change evalPolynomial env
+          (right.map (fun rightTerm =>
+            operatorProductContribution leftTerm rightTerm leftScalar rightScalar) ++
+            productPoly leftTail right leftScalar rightScalar) = _
+      rw [evalPolynomial_append, evalPolynomial_productMap, ih]
+      simp only [evalPolynomial]
+      simp [Int.mul_assoc, Int.mul_comm, Int.mul_add]
+
+theorem productResultSound (env : Env Owner) (left right output : Polynomial Owner)
+    (leftScalar rightScalar : Bool)
+    (agreement : CoefficientAgreement output (productPoly left right leftScalar rightScalar)) :
+    evalPolynomial env output = evalPolynomial env left * evalPolynomial env right := by
+  rw [coefficientAgreement_eval env output
+      (productPoly left right leftScalar rightScalar) agreement,
+    evalPolynomial_productPoly]
+
+def relationPoly (accumulator : Polynomial Owner) (sourceKey : MonomialKey Owner)
+    (context : MonomialContext Owner) (outerCoefficient : Int)
+    (rhs : Polynomial Owner) : Polynomial Owner :=
+  add (subtract accumulator
+      [{ coefficient := outerCoefficient, key := sourceKey }])
+    (relationReplacement context outerCoefficient rhs)
+
+def contextMultiplier (env : Env Owner) (context : MonomialContext Owner) : Int :=
+  (context.exteriorCentral.map env).prod *
+    (context.prefixFactors.map env).prod * (context.suffixFactors.map env).prod
+
+private theorem evalMonomial_contextPlug (env : Env Owner)
+    (context : MonomialContext Owner) (key : MonomialKey Owner) :
+    evalMonomial env (context.plug key) =
+      contextMultiplier env context * evalMonomial env key := by
+  rw [evalMonomial, contextMultiplier, context_plug_central, context_plug_ordered]
+  rw [show CentralNormalizer.normalize (context.exteriorCentral ++ key.centralFactors) =
+    context.exteriorCentral ++ key.centralFactors by rfl]
+  simp [evalMonomial, List.map_append, List.prod_append, Int.mul_assoc,
+    Int.mul_left_comm, Int.mul_comm]
+
+private theorem evalPolynomial_eventReplay (env : Env Owner) (terms : Polynomial Owner) :
+    EventReplay.evaluatePolynomial (fun key => evalMonomial env key) terms =
+      evalPolynomial env terms := by
+  induction terms with
+  | nil => rfl
+  | cons term terms ih => simp [EventReplay.evaluatePolynomial, evalPolynomial, ih]
+
+theorem relationResultSound (modulus : Nat) (env : Env Owner)
+    (accumulator : Polynomial Owner) (sourceKey lhsKey : MonomialKey Owner)
+    (exteriorCentral : List Owner) (orderedStart orderedEndExclusive : Nat)
+    (outerCoefficient : Int) (rhs output : Polynomial Owner)
+    (sourceKeyEquivalent :
+      KeyEquivalent sourceKey
+        ((relationContext sourceKey exteriorCentral orderedStart orderedEndExclusive).plug lhsKey))
+    (baseRelation :
+      evalMonomial env lhsKey % Int.ofNat modulus =
+        evalPolynomial env rhs % Int.ofNat modulus)
+    (agreement : CoefficientAgreement output
+      (relationPoly accumulator sourceKey
+        (relationContext sourceKey exteriorCentral orderedStart orderedEndExclusive)
+        outerCoefficient rhs)) :
+    evalPolynomial env output % Int.ofNat modulus =
+      evalPolynomial env accumulator % Int.ofNat modulus := by
+  let context := relationContext sourceKey exteriorCentral orderedStart orderedEndExclusive
+  have contextSound : ∀ key,
+      (fun key => evalMonomial env key) (context.plug key) =
+        contextMultiplier env context * (fun key => evalMonomial env key) key := by
+    intro key
+    exact evalMonomial_contextPlug env context key
+  let lhsPolynomial : Polynomial Owner :=
+    [{ coefficient := 1, key := lhsKey }]
+  have baseRelation' :
+      EventReplay.evaluatePolynomial (fun key => evalMonomial env key) lhsPolynomial %
+          Int.ofNat modulus =
+        EventReplay.evaluatePolynomial (fun key => evalMonomial env key) rhs %
+          Int.ofNat modulus := by
+    calc
+      EventReplay.evaluatePolynomial (fun key => evalMonomial env key) lhsPolynomial %
+            Int.ofNat modulus = evalMonomial env lhsKey % Int.ofNat modulus := by
+        simp [lhsPolynomial, EventReplay.evaluatePolynomial]
+      _ = evalPolynomial env rhs % Int.ofNat modulus := baseRelation
+      _ = EventReplay.evaluatePolynomial (fun key => evalMonomial env key) rhs %
+            Int.ofNat modulus := by
+        rw [evalPolynomial_eventReplay]
+  have replacementCongruence := EventReplay.relationReplacement_modular modulus
+    (fun key => evalMonomial env key) context (contextMultiplier env context) outerCoefficient
+    lhsPolynomial rhs contextSound baseRelation'
+  rw [evalPolynomial_eventReplay, evalPolynomial_eventReplay] at replacementCongruence
+  have lhsReplacement :
+      evalPolynomial env (relationReplacement context outerCoefficient lhsPolynomial) =
+        outerCoefficient * evalMonomial env sourceKey := by
+    simp [lhsPolynomial, relationReplacement, scalePolynomial, contextualize, evalPolynomial]
+    rw [evalMonomial_of_key env sourceKeyEquivalent.1 sourceKeyEquivalent.2]
+  have outputEval := coefficientAgreement_eval env output
+    (relationPoly accumulator sourceKey context outerCoefficient rhs) agreement
+  have relationEvalModular :
+      evalPolynomial env (relationPoly accumulator sourceKey context outerCoefficient rhs) %
+          Int.ofNat modulus = evalPolynomial env accumulator % Int.ofNat modulus := by
+    rw [relationPoly]
+    simp only [add, subtract]
+    rw [evalPolynomial_append env
+        (accumulator ++ negate [{ coefficient := outerCoefficient, key := sourceKey }])
+        (relationReplacement context outerCoefficient rhs),
+      evalPolynomial_append env accumulator
+        (negate [{ coefficient := outerCoefficient, key := sourceKey }]),
+      evalPolynomial_negate]
+    simp only [evalPolynomial]
+    simp only [Int.add_zero]
+    have replacementDifference :
+        (evalPolynomial env (relationReplacement context outerCoefficient rhs) -
+            outerCoefficient * evalMonomial env sourceKey) %
+          Int.ofNat modulus = 0 := by
+      have difference :=
+        Int.emod_eq_emod_iff_emod_sub_eq_zero.mp replacementCongruence.symm
+      rw [lhsReplacement] at difference
+      exact difference
+    calc
+      (evalPolynomial env accumulator +
+          -(outerCoefficient * evalMonomial env sourceKey) +
+          evalPolynomial env (relationReplacement context outerCoefficient rhs)) %
+            Int.ofNat modulus =
+          (evalPolynomial env accumulator +
+            (evalPolynomial env (relationReplacement context outerCoefficient rhs) -
+              outerCoefficient * evalMonomial env sourceKey)) %
+            Int.ofNat modulus := by
+        congr 1
+        simp [Int.sub_eq_add_neg, Int.add_assoc, Int.add_left_comm, Int.add_comm]
+      _ = (evalPolynomial env accumulator % Int.ofNat modulus +
+          (evalPolynomial env (relationReplacement context outerCoefficient rhs) -
+            outerCoefficient * evalMonomial env sourceKey) % Int.ofNat modulus) %
+            Int.ofNat modulus := by
+        rw [Int.add_emod]
+      _ = evalPolynomial env accumulator % Int.ofNat modulus := by
+        rw [replacementDifference]
+        simp
+  rw [outputEval, relationEvalModular]
+
+/- The coefficient-transfer primitives are intentionally kept in `EventReplay`.  Tall generated
+   proofs use those soundness lemmas directly, so this layer does not add same-shaped aliases. -/
+
+def preFoldBound (summaryActual summaryBound : Nat)
+    (survivorContributions survivorBounds : List Nat) : Prop :=
+  summaryActual + survivorContributions.sum ≤ summaryBound + survivorBounds.sum
+
+theorem preFoldSound (rootTerms terms : Polynomial Owner)
+    (termsExact : terms = rootTerms)
+    {summaryActual summaryBound : Nat}
+    (rootRemainderBound : summaryActual ≤ summaryBound)
+    {survivorContributions survivorBounds : List Nat}
+    (survivors : List.Forall₂ (fun actual bound => actual ≤ bound)
+      survivorContributions survivorBounds) :
+    terms = rootTerms ∧ preFoldBound summaryActual summaryBound
+      survivorContributions survivorBounds := by
+  have survivorSum : survivorContributions.sum ≤ survivorBounds.sum := by
+    induction survivors with
+    | nil => exact Nat.zero_le _
+    | cons head tail ih => exact Nat.add_le_add head ih
+  exact ⟨termsExact, Nat.add_le_add rootRemainderBound survivorSum⟩
 
 def boundInterprets (modulus : Nat) (bound : Bound) (value : Int) : Prop :=
   match bound with
@@ -39,6 +778,15 @@ def ValueClaim.Interprets {Factor : Type} (modulus : Nat) (env : Env Factor)
         (actual - evalPolynomial env terms) % Int.ofNat modulus = remainder % Int.ofNat modulus ∧
           boundInterprets modulus summary remainder
   | .coefficient bound => boundInterprets modulus bound actual
+
+theorem invocationEndSound (modulus : Nat) (env : Env Owner) (actual : Int)
+    (prefoldTerms endTerms : Polynomial Owner)
+    (prefoldSummary endSummary : Bound)
+    (claim : ValueClaim.Interprets modulus env actual (.exact prefoldTerms prefoldSummary))
+    (termsExact : endTerms = prefoldTerms)
+    (summaryExact : endSummary = prefoldSummary) :
+    ValueClaim.Interprets modulus env actual (.exact endTerms endSummary) := by
+  simpa [termsExact, summaryExact] using claim
 
 /-- A finite raw bound is supplied constructively; no decimal parser belongs to this layer. -/
 def rawCoefficientClassInterprets (modulus : Nat) (value : Int) :

@@ -8,13 +8,14 @@ namespace Mxx.Certificate.OperationalNoise.EventReplay
 open Mxx.Certificate.OperationalNoise
 
 /-- Evaluate a signed polynomial under one semantic value for each monomial key. -/
-def evaluatePolynomial (valuation : MonomialKey → Int) : Polynomial → Int
+def evaluatePolynomial {Factor : Type} (valuation : MonomialKey Factor → Int) :
+    Polynomial Factor → Int
   | [] => 0
   | term :: terms =>
       term.coefficient * valuation term.key + evaluatePolynomial valuation terms
 
-theorem evaluate_scalePolynomial (valuation : MonomialKey → Int) (scalar : Int)
-    (polynomial : Polynomial) :
+theorem evaluate_scalePolynomial {Factor : Type} (valuation : MonomialKey Factor → Int)
+    (scalar : Int) (polynomial : Polynomial Factor) :
     evaluatePolynomial valuation (scalePolynomial scalar polynomial) =
       scalar * evaluatePolynomial valuation polynomial := by
   induction polynomial with
@@ -28,8 +29,9 @@ theorem evaluate_scalePolynomial (valuation : MonomialKey → Int) (scalar : Int
       rw [ih]
       simp [Int.mul_add, Int.mul_assoc]
 
-theorem evaluate_contextualize (valuation : MonomialKey → Int) (context : MonomialContext)
-    (polynomial : Polynomial) :
+theorem evaluate_contextualize {Factor : Type} [CentralNormalizer Factor]
+    (valuation : MonomialKey Factor → Int) (context : MonomialContext Factor)
+    (polynomial : Polynomial Factor) :
     evaluatePolynomial valuation (contextualize context polynomial) =
       evaluatePolynomial (fun key => valuation (context.plug key)) polynomial := by
   induction polynomial with
@@ -42,8 +44,9 @@ theorem evaluate_contextualize (valuation : MonomialKey → Int) (context : Mono
           evaluatePolynomial (fun key => valuation (context.plug key)) terms
       rw [ih]
 
-theorem evaluate_contextualize_factor (valuation : MonomialKey → Int)
-    (context : MonomialContext) (contextMultiplier : Int) (polynomial : Polynomial)
+theorem evaluate_contextualize_factor {Factor : Type} [CentralNormalizer Factor]
+    (valuation : MonomialKey Factor → Int) (context : MonomialContext Factor)
+    (contextMultiplier : Int) (polynomial : Polynomial Factor)
     (contextSound : ∀ key, valuation (context.plug key) = contextMultiplier * valuation key) :
     evaluatePolynomial valuation (contextualize context polynomial) =
       contextMultiplier * evaluatePolynomial valuation polynomial := by
@@ -55,9 +58,9 @@ theorem evaluate_contextualize_factor (valuation : MonomialKey → Int)
       rw [contextSound, ih]
       simp [Int.mul_add, Int.mul_left_comm]
 
-theorem evaluate_relationReplacement (valuation : MonomialKey → Int)
-    (context : MonomialContext) (contextMultiplier outerCoefficient : Int)
-    (polynomial : Polynomial)
+theorem evaluate_relationReplacement {Factor : Type} [CentralNormalizer Factor]
+    (valuation : MonomialKey Factor → Int) (context : MonomialContext Factor)
+    (contextMultiplier outerCoefficient : Int) (polynomial : Polynomial Factor)
     (contextSound : ∀ key, valuation (context.plug key) = contextMultiplier * valuation key) :
     evaluatePolynomial valuation (relationReplacement context outerCoefficient polynomial) =
       outerCoefficient * contextMultiplier * evaluatePolynomial valuation polynomial := by
@@ -66,9 +69,9 @@ theorem evaluate_relationReplacement (valuation : MonomialKey → Int)
   simp [Int.mul_assoc]
 
 /-- Context and its outer coefficient preserve a modular base relation. -/
-theorem relationReplacement_modular (modulus : Nat) (valuation : MonomialKey → Int)
-    (context : MonomialContext) (contextMultiplier outerCoefficient : Int)
-    (left right : Polynomial)
+theorem relationReplacement_modular {Factor : Type} [CentralNormalizer Factor]
+    (modulus : Nat) (valuation : MonomialKey Factor → Int) (context : MonomialContext Factor)
+    (contextMultiplier outerCoefficient : Int) (left right : Polynomial Factor)
     (contextSound : ∀ key, valuation (context.plug key) = contextMultiplier * valuation key)
     (baseRelation : evaluatePolynomial valuation left % Int.ofNat modulus =
       evaluatePolynomial valuation right % Int.ofNat modulus) :
@@ -94,9 +97,9 @@ theorem relationReplacement_modular (modulus : Nat) (valuation : MonomialKey →
 
 /-- Contextual replay is congruent for every exact base relation. Terms may merge or cancel after
     canonical context insertion; no per-key equality or collision-free premise is required. -/
-theorem relationReplacement_congruent (valuation : MonomialKey → Int)
-    (context : MonomialContext) (contextMultiplier outerCoefficient : Int)
-    (left right : Polynomial)
+theorem relationReplacement_congruent {Factor : Type} [CentralNormalizer Factor]
+    (valuation : MonomialKey Factor → Int) (context : MonomialContext Factor)
+    (contextMultiplier outerCoefficient : Int) (left right : Polynomial Factor)
     (contextSound : ∀ key, valuation (context.plug key) = contextMultiplier * valuation key)
     (baseRelation : evaluatePolynomial valuation left = evaluatePolynomial valuation right) :
     evaluatePolynomial valuation (relationReplacement context outerCoefficient left) =

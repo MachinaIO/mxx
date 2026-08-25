@@ -364,6 +364,15 @@ def canonicalCentral : List Nat → List Nat
   | [] => []
   | head :: tail => insertCentral head (canonicalCentral tail)
 
+/-! A representation policy for central factors. The Nat instance preserves the original
+    canonicalization used by structural replay; semantic factor types may choose direct
+    concatenation instead of introducing an artificial order. -/
+class CentralNormalizer (Factor : Type) where
+  normalize : List Factor → List Factor
+
+instance : CentralNormalizer Nat where
+  normalize := canonicalCentral
+
 theorem canonicalCentral_nil : canonicalCentral [] = [] := by rfl
 
 theorem insertCentral_mem (factor : Nat) (factors : List Nat) :
@@ -379,49 +388,64 @@ theorem canonicalCentral_mem (factor : Nat) (factors : List Nat) :
     factor ∈ canonicalCentral (factor :: factors) := by
   simp [canonicalCentral, insertCentral_mem]
 
-def MonomialKey.product (left right : MonomialKey) : MonomialKey :=
-  { centralFactors := canonicalCentral (left.centralFactors ++ right.centralFactors)
+def MonomialKey.product {Factor : Type} [CentralNormalizer Factor]
+    (left right : MonomialKey Factor) :
+    MonomialKey Factor :=
+  { centralFactors := CentralNormalizer.normalize (left.centralFactors ++ right.centralFactors)
     orderedFactors := left.orderedFactors ++ right.orderedFactors }
 
-theorem product_central (left right : MonomialKey) :
+theorem product_central {Factor : Type} [CentralNormalizer Factor]
+    (left right : MonomialKey Factor) :
     (MonomialKey.product left right).centralFactors =
-      canonicalCentral (left.centralFactors ++ right.centralFactors) := by rfl
+      CentralNormalizer.normalize (left.centralFactors ++ right.centralFactors) := by rfl
 
-theorem product_ordered (left right : MonomialKey) :
+theorem product_ordered {Factor : Type} [CentralNormalizer Factor]
+    (left right : MonomialKey Factor) :
     (MonomialKey.product left right).orderedFactors =
       left.orderedFactors ++ right.orderedFactors := by rfl
 
-structure MonomialContext where
-  exteriorCentral : List Nat
-  prefixFactors : List Nat
-  suffixFactors : List Nat
+structure MonomialContext (Factor : Type := Nat) where
+  exteriorCentral : List Factor
+  prefixFactors : List Factor
+  suffixFactors : List Factor
 deriving DecidableEq, Repr
 
-def MonomialContext.plug (context : MonomialContext) (key : MonomialKey) : MonomialKey :=
-  { centralFactors := canonicalCentral (context.exteriorCentral ++ key.centralFactors)
+def MonomialContext.plug {Factor : Type} [CentralNormalizer Factor]
+    (context : MonomialContext Factor)
+    (key : MonomialKey Factor) : MonomialKey Factor :=
+  { centralFactors := CentralNormalizer.normalize (context.exteriorCentral ++ key.centralFactors)
     orderedFactors := context.prefixFactors ++ key.orderedFactors ++ context.suffixFactors }
 
-theorem context_plug_central (context : MonomialContext) (key : MonomialKey) :
+theorem context_plug_central {Factor : Type} [CentralNormalizer Factor]
+    (context : MonomialContext Factor)
+    (key : MonomialKey Factor) :
     (context.plug key).centralFactors =
-      canonicalCentral (context.exteriorCentral ++ key.centralFactors) := by
+      CentralNormalizer.normalize (context.exteriorCentral ++ key.centralFactors) := by
   rfl
 
-theorem context_plug_ordered (context : MonomialContext) (key : MonomialKey) :
+theorem context_plug_ordered {Factor : Type} [CentralNormalizer Factor]
+    (context : MonomialContext Factor)
+    (key : MonomialKey Factor) :
     (context.plug key).orderedFactors =
       context.prefixFactors ++ key.orderedFactors ++ context.suffixFactors := by
   rfl
 
-def scalePolynomial (scalar : Int) (polynomial : Polynomial) : Polynomial :=
+def scalePolynomial {Factor : Type} (scalar : Int) (polynomial : Polynomial Factor) :
+    Polynomial Factor :=
   polynomial.map (fun term => { term with coefficient := scalar * term.coefficient })
 
-def contextualize (context : MonomialContext) (polynomial : Polynomial) : Polynomial :=
+def contextualize {Factor : Type} [CentralNormalizer Factor] (context : MonomialContext Factor)
+    (polynomial : Polynomial Factor) : Polynomial Factor :=
   polynomial.map (fun term => { term with key := context.plug term.key })
 
-def relationReplacement (context : MonomialContext) (outerCoefficient : Int)
-    (rhs : Polynomial) : Polynomial :=
+def relationReplacement {Factor : Type} [CentralNormalizer Factor]
+    (context : MonomialContext Factor)
+    (outerCoefficient : Int) (rhs : Polynomial Factor) : Polynomial Factor :=
   scalePolynomial outerCoefficient (contextualize context rhs)
 
-theorem scalePolynomial_coefficient (scalar : Int) (polynomial : Polynomial) (key : MonomialKey) :
+theorem scalePolynomial_coefficient {Factor : Type} [DecidableEq Factor]
+    (scalar : Int) (polynomial : Polynomial Factor)
+    (key : MonomialKey Factor) :
     coefficient key (scalePolynomial scalar polynomial) = scalar * coefficient key polynomial := by
   induction polynomial with
   | nil => simp [scalePolynomial, coefficient]
@@ -436,57 +460,68 @@ theorem scalePolynomial_coefficient (scalar : Int) (polynomial : Polynomial) (ke
         change coefficient key (scalePolynomial scalar terms) = scalar * coefficient key terms
         exact ih
 
-theorem relationReplacement_singleton (context : MonomialContext) (outerCoefficient : Int)
-    (term : ExactTerm) :
+theorem relationReplacement_singleton {Factor : Type} [CentralNormalizer Factor]
+    (context : MonomialContext Factor) (outerCoefficient : Int) (term : ExactTerm Factor) :
     relationReplacement context outerCoefficient [term] =
       [{ coefficient := outerCoefficient * term.coefficient, key := context.plug term.key }] := by
   rfl
 
-def productMerge_contribution (left right : ExactTerm) : ExactTerm :=
+def productMerge_contribution {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor) :
+    ExactTerm Factor :=
   { coefficient := left.coefficient * right.coefficient
     key := MonomialKey.product left.key right.key }
 
-theorem productMerge_contribution_coefficient (left right : ExactTerm) :
+theorem productMerge_contribution_coefficient {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor) :
     (productMerge_contribution left right).coefficient = left.coefficient * right.coefficient := by
   rfl
 
-theorem productMerge_contribution_key (left right : ExactTerm) :
+theorem productMerge_contribution_key {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor) :
     (productMerge_contribution left right).key = MonomialKey.product left.key right.key := by
   rfl
 
 /-- Reclassify every factor of a typed scalar monomial as commutative. -/
-def scalarActionKey (key : MonomialKey) : MonomialKey :=
-  { centralFactors := canonicalCentral (key.centralFactors ++ key.orderedFactors)
+def scalarActionKey {Factor : Type} [CentralNormalizer Factor]
+    (key : MonomialKey Factor) : MonomialKey Factor :=
+  { centralFactors := CentralNormalizer.normalize (key.centralFactors ++ key.orderedFactors)
     orderedFactors := [] }
 
 @[simp]
-theorem scalarActionKey_central (key : MonomialKey) :
+theorem scalarActionKey_central {Factor : Type} [CentralNormalizer Factor]
+    (key : MonomialKey Factor) :
     (scalarActionKey key).centralFactors =
-      canonicalCentral (key.centralFactors ++ key.orderedFactors) := by
+      CentralNormalizer.normalize (key.centralFactors ++ key.orderedFactors) := by
   rfl
 
 @[simp]
-theorem scalarActionKey_ordered (key : MonomialKey) :
+theorem scalarActionKey_ordered {Factor : Type} [CentralNormalizer Factor]
+    (key : MonomialKey Factor) :
     (scalarActionKey key).orderedFactors = [] := by
   rfl
 
-theorem productMerge_left_scalar_key (left right : ExactTerm) :
+theorem productMerge_left_scalar_key {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor) :
     (productMerge_contribution { left with key := scalarActionKey left.key } right).key =
       MonomialKey.product (scalarActionKey left.key) right.key := by
   exact productMerge_contribution_key _ _
 
-theorem productMerge_left_scalar_coefficient (left right : ExactTerm) :
+theorem productMerge_left_scalar_coefficient {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor) :
     (productMerge_contribution { left with key := scalarActionKey left.key } right).coefficient =
       left.coefficient * right.coefficient := by
   simpa using productMerge_contribution_coefficient
     { left with key := scalarActionKey left.key } right
 
-theorem productMerge_right_scalar_key (left right : ExactTerm) :
+theorem productMerge_right_scalar_key {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor) :
     (productMerge_contribution left { right with key := scalarActionKey right.key }).key =
       MonomialKey.product left.key (scalarActionKey right.key) := by
   exact productMerge_contribution_key _ _
 
-theorem productMerge_right_scalar_coefficient (left right : ExactTerm) :
+theorem productMerge_right_scalar_coefficient {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor) :
     (productMerge_contribution left { right with key := scalarActionKey right.key }).coefficient =
       left.coefficient * right.coefficient := by
   simpa using productMerge_contribution_coefficient
@@ -495,51 +530,60 @@ theorem productMerge_right_scalar_coefficient (left right : ExactTerm) :
 /-- Reproduce the four typed scalar roles of the Rust product projector. Exactly one scalar
     operand is centralized before product-key construction; two scalars retain their ordered
     product so relation matching can run first. -/
-def scalarProductKey (left right : MonomialKey) (leftScalar rightScalar : Bool) : MonomialKey :=
+def scalarProductKey {Factor : Type} [CentralNormalizer Factor]
+    (left right : MonomialKey Factor)
+    (leftScalar rightScalar : Bool) : MonomialKey Factor :=
   if leftScalar && !rightScalar then MonomialKey.product (scalarActionKey left) right
   else if rightScalar && !leftScalar then MonomialKey.product left (scalarActionKey right)
   else MonomialKey.product left right
 
 /-- One exact operator-product contribution with the same coefficient multiplication and typed
     scalar-role key construction as the Rust projector. -/
-def operatorProductContribution (left right : ExactTerm) (leftScalar rightScalar : Bool) :
-    ExactTerm :=
+def operatorProductContribution {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor)
+    (leftScalar rightScalar : Bool) : ExactTerm Factor :=
   { productMerge_contribution left right with
     key := scalarProductKey left.key right.key leftScalar rightScalar }
 
 @[simp]
-theorem operatorProductContribution_coefficient (left right : ExactTerm)
+theorem operatorProductContribution_coefficient {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor)
     (leftScalar rightScalar : Bool) :
     (operatorProductContribution left right leftScalar rightScalar).coefficient =
       left.coefficient * right.coefficient := by
   exact productMerge_contribution_coefficient left right
 
 @[simp]
-theorem operatorProductContribution_key (left right : ExactTerm)
+theorem operatorProductContribution_key {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor)
     (leftScalar rightScalar : Bool) :
     (operatorProductContribution left right leftScalar rightScalar).key =
       scalarProductKey left.key right.key leftScalar rightScalar := by
   rfl
 
 @[simp]
-theorem operatorProductContribution_left_scalar (left right : ExactTerm) :
+theorem operatorProductContribution_left_scalar {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor) :
     operatorProductContribution left right true false =
       productMerge_contribution { left with key := scalarActionKey left.key } right := by
   rfl
 
 @[simp]
-theorem operatorProductContribution_right_scalar (left right : ExactTerm) :
+theorem operatorProductContribution_right_scalar {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor) :
     operatorProductContribution left right false true =
       productMerge_contribution left { right with key := scalarActionKey right.key } := by
   rfl
 
 @[simp]
-theorem operatorProductContribution_both_scalar (left right : ExactTerm) :
+theorem operatorProductContribution_both_scalar {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor) :
     operatorProductContribution left right true true = productMerge_contribution left right := by
   rfl
 
 @[simp]
-theorem operatorProductContribution_neither_scalar (left right : ExactTerm) :
+theorem operatorProductContribution_neither_scalar {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor) :
     operatorProductContribution left right false false = productMerge_contribution left right := by
   rfl
 
@@ -557,7 +601,8 @@ theorem boundTransfer_product {left right left' right' : Nat}
     left * right ≤ left' * right' := by
   exact Nat.mul_le_mul leftBound rightBound
 
-theorem operatorProductContribution_natAbs_le (left right : ExactTerm)
+theorem operatorProductContribution_natAbs_le {Factor : Type} [CentralNormalizer Factor]
+    (left right : ExactTerm Factor)
     (leftScalar rightScalar : Bool) (leftBound rightBound : Nat)
     (leftExactBound : left.coefficient.natAbs ≤ leftBound)
     (rightExactBound : right.coefficient.natAbs ≤ rightBound) :

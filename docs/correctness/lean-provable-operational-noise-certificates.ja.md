@@ -256,12 +256,13 @@ certificate は `InputContract` や `SamplerContract` を満たす値が無条�
 狭義不等式、family selector の domain、modulus と ring の整合性、certificate validity は
 証明済みであり、仮定として残らない。residual root の引数についての仮定もない。
 
-accepted operational theorem を具体的な assignment に適用するとき、Lean 内に残る仮定は正確に次の
-二つである。
+accepted operational theorem を実際の一回の実行に適用するとき、次の contract と modeling の
+仮定が残る。
 
 ```text
 InputContract checkedCert inputs
 SamplerContract checkedCert inputs samplers
+HonestTerminalCongruence checkedCert run
 ```
 
 実際の一回の実行へ結び付けるには、さらに Lean claim の外で次の三命題を確認する。
@@ -278,6 +279,10 @@ InputsInstantiate(run, inputs)
 SamplersInstantiate(run, samplers)
   := residual proof closure 内のすべての event occurrence e と owner invocation o について、
      samplers(e, o) = run が (e, o) で実際に生成した値
+
+HonestTerminalValuesInstantiate(run, witness)
+  := 到達したすべての terminal Result event e について、
+     witness.honestTerminalActual(e) = run が e で実際に生成した値
 ```
 
 たとえば input coefficient bound が 8 の場合、`InputsInstantiate` は「証明中の input 値が実行時
@@ -288,8 +293,18 @@ sampler event `e` の cutoff が 12 の場合、`SamplersInstantiate` は「証�
 event occurrence の出力そのもの」と保証し、`SamplerContract` は「その同じ sample が cutoff
 12、型、support、relation を満たす」と保証する。
 
-具体的な `inputs` と `samplers` を示して二つの contract を証明できなければ、Lean の含意は論理
-的には真でも、実際の実行を一つも保証していない可能性がある。
+具体的な `inputs` と `samplers` を示して二つの contract と terminal bridge を証明できなければ、
+Lean の含意は論理的には真でも、実際の実行を一つも保証していない可能性がある。
+
+terminal Result とは、到達した基底 transfer の直後に記録された exact Result である。今回到達する
+基底 transfer は fact-store authority、program-family-fact authority、operator authority、identity、
+scale の五種類だけである。各 terminal event について、`Witness.honestTerminalCongruence` は、
+event 番号で引いた `honestTerminalActual` と、同じ history row に記録された exact polynomial の
+評価が `q` を法として一致することを表す。Lean kernel が証明するのは、この field を仮定した条件
+付きの定理である。生成器はどの row が terminal かは証明できるが、この field を証明したり作り
+出したりはできない。呼び出し側が honest Rust execution の実値を `honestTerminalActual` に入れ、
+congruence を示す必要がある。したがって、これは生成 proof が compile しただけでは得られない、
+定理の statement と実行を結ぶ modeling assumption である。
 
 さらに Lean compile は、次の二つを trusted code の監査事項として信頼する。
 
@@ -326,11 +341,19 @@ semantic-owner statistics file は、この検査に使った event 単位の cl
 frame-root predecessor binding を記録する。
 
 CP1 では役割を分離する。`Env` を参照するのは factor owner だけであり、`ValueClaim` は event
-単位の statement のまま、`Witness` が bound するのも factor atom だけである。生成される Lean
-theorem は、出力 document に対する無条件の kernel-checked validity theorem であり、CP0 を命題の
-仮定として受け取らない。CP0 は代わりに、その document が使う owner key と honest Rust replay
-の値との対応を検査する trusted-generator assertion である。この分離によって通常 checker 経路に
-処理は追加されない。
+単位の statement のままである。`ExactClaimAt` は、その claim と、それが解釈する正確な owner、
+raw terms、summary、`Result` history index を一組にする。このため、算術 proof が別 event の claim
+へ黙って差し替わることはない。`Witness` は factor atom を bound するほか、§6.4 の reached-only
+modeling bridge を持つ。`honestTerminalActual` は terminal Result event で引き、
+`honestTerminalCongruence` はその値を同じ history row の polynomial に結び付ける。許される terminal
+transfer は fact-store authority、program-family-fact authority、operator authority、identity、scale
+の五種類である。生成器は row lookup を証明して通常の算術 theorem を適用するが、honest execution
+との congruence 自体は構成できない。
+
+生成される Lean theorem は、これらの明示的な premise を満たすすべての witness に対して kernel が
+検査する条件付き定理である。Lean compile は、honest Rust execution がその witness を供給すること
+までは証明しない。CP0 は別途、その document が使う owner key と honest Rust replay の値との対応を
+検査する trusted-generator assertion である。この分離によって通常 checker 経路に処理は追加されない。
 
 `InputAssignment` は source access ごとの実際の入力値、`SamplerAssignment` は event ごとの
 実際の sampler 値である。`InputContract` と `SamplerContract` は、それらの値が型・範囲・

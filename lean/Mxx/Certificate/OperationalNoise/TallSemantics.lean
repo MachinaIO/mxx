@@ -1716,14 +1716,24 @@ inductive ReachedTerminalRule : BoundRule → Prop where
   | identity (input : ValueRef) : ReachedTerminalRule (.identity input)
   | scale (value : ValueRef) (factor : Scale) : ReachedTerminalRule (.scale value factor)
 
+/-- An interpreted exact claim tied to the precise `Result` row at one history index. -/
+structure ExactClaimAt (history : EventHistory) (modulus : Nat) (env : Env Owner)
+    (event : Nat) (owner : Owner) (actual : Int) (rawTerms : List Term)
+    (summary : Bound) : Prop where
+  row : (history.lookup event).map AnnotatedEvent.event =
+    some (.resultExact owner rawTerms summary)
+  claim : ValueClaim.Interprets modulus env actual
+    (.exact (rawTerms.map Term.toExact) summary)
+
 def TerminalExactAt (document : TallDocument) (history : EventHistory)
-    (selector : Option Nat) (producer resultEvent : Nat) (owner : Owner) (term : Term) : Prop :=
+    (selector : Option Nat) (producer resultEvent : Nat) (owner : Owner)
+    (rawTerms : List Term) : Prop :=
   producer + 1 = resultEvent ∧ ownerAtSelector document selector owner ∧
     ∃ rule frameStart,
       ReachedTerminalRule rule ∧
         history.lookup producer = some ⟨.boundTransfer owner rule, frameStart⟩ ∧
         history.lookup resultEvent = some
-          ⟨.resultExact owner [term] .exactZero, frameStart⟩
+          ⟨.resultExact owner rawTerms .exactZero, frameStart⟩
 
 /-- Honest primitive contracts and all reached relation congruences for one selector. -/
 structure Witness (document : TallDocument) (history : EventHistory) (selector : Option Nat)
@@ -1740,10 +1750,10 @@ structure Witness (document : TallDocument) (history : EventHistory) (selector :
   relationCongruence : ∀ application,
     RelationApplicationAt document history selector application →
       RelationCongruent modulus history env application
-  terminalActual : Nat → Int
-  terminalCongruence : ∀ producer resultEvent owner term,
-    TerminalExactAt document history selector producer resultEvent owner term →
-      (terminalActual resultEvent - evalPolynomial env [term.toExact]) %
+  honestTerminalActual : Nat → Int
+  honestTerminalCongruence : ∀ producer resultEvent owner rawTerms,
+    TerminalExactAt document history selector producer resultEvent owner rawTerms →
+      (honestTerminalActual resultEvent - evalPolynomial env (rawTerms.map Term.toExact)) %
         Int.ofNat modulus = 0
 
 /-! Atomic derivations require validated source or sampler provenance.  The result indices are
@@ -1758,15 +1768,19 @@ def exactResultAt (history : EventHistory) (resultEvent : Nat) (owner : Owner) :
     history.lookup resultEvent =
       some ⟨.resultExact owner [canonicalSelfTerm owner] .exactZero, frameStart⟩
 
-theorem terminalExactClaim {document : TallDocument} {history : EventHistory}
-    {selector : Option Nat} {modulus producer resultEvent : Nat} {owner : Owner} {term : Term}
+theorem terminalExactClaimAt {document : TallDocument} {history : EventHistory}
+    {selector : Option Nat} {modulus producer resultEvent : Nat} {owner : Owner}
+    {rawTerms : List Term}
     (witness : Witness document history selector modulus)
-    (terminal : TerminalExactAt document history selector producer resultEvent owner term) :
-    ValueClaim.Interprets modulus witness.env (witness.terminalActual resultEvent)
-      (.exact [term.toExact] .exactZero) := by
-  refine ⟨0, ?_, ?_⟩
+    (terminal : TerminalExactAt document history selector producer resultEvent owner rawTerms) :
+    ExactClaimAt history modulus witness.env resultEvent owner
+      (witness.honestTerminalActual resultEvent) rawTerms .exactZero := by
+  refine ⟨?_, 0, ?_, ?_⟩
+  · rcases terminal with ⟨_, _, rule, frameStart, _, _, resultAt⟩
+    rw [resultAt]
+    rfl
   · simpa using
-      witness.terminalCongruence producer resultEvent owner term terminal
+      witness.honestTerminalCongruence producer resultEvent owner rawTerms terminal
   · simp [boundInterprets, centeredNorm, centeredCoefficient]
 
 inductive ValueDerived (document : TallDocument) (history : EventHistory)

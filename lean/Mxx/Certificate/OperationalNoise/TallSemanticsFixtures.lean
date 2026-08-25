@@ -83,15 +83,15 @@ def terminalAtomHistory : EventHistory :=
 
 theorem terminal_atom_at :
     TerminalExactAt sourceAtomDocument terminalAtomHistory none 0 1 sourceAtomOwner
-      (canonicalSelfTerm sourceAtomOwner) := by
+      [canonicalSelfTerm sourceAtomOwner] := by
   refine ⟨rfl, rfl, .authority .factStore, 0, ?_, rfl, rfl⟩
   exact ReachedTerminalRule.authorityFactStore
 
 theorem terminal_exact_claim_fixture
     (witness : Witness sourceAtomDocument terminalAtomHistory none 257) :
-    ValueClaim.Interprets 257 witness.env (witness.terminalActual 1)
-      (canonicalSelfClaim sourceAtomOwner) := by
-  exact terminalExactClaim witness terminal_atom_at
+    ExactClaimAt terminalAtomHistory 257 witness.env 1 sourceAtomOwner
+      (witness.honestTerminalActual 1) [canonicalSelfTerm sourceAtomOwner] .exactZero := by
+  exact terminalExactClaimAt witness terminal_atom_at
 
 theorem source_atom_fixture
     (witness : Witness sourceAtomDocument sourceAtomHistory none 257) :
@@ -331,7 +331,7 @@ theorem canonical_relation_fixture :
 #print axioms statement_domain_fixture
 #print axioms constructive_raw_bound_fixture
 #print axioms TallSemantics.ValueDerived.interprets
-#print axioms TallSemantics.terminalExactClaim
+#print axioms TallSemantics.terminalExactClaimAt
 #print axioms terminal_atom_at
 #print axioms terminal_exact_claim_fixture
 #print axioms source_atom_interprets

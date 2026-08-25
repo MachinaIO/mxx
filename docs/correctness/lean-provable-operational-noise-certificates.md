@@ -145,12 +145,13 @@ Once the fixed acceptance module has checked the generated proof of
 agreement, and certificate validity are proved facts, not remaining assumptions. There is also no
 residual-root argument premise.
 
-Applying the accepted operational theorem to concrete assignments leaves exactly these Lean
-premises:
+Applying the accepted operational theorem to a concrete run leaves the following contract and
+modeling premises:
 
 ```text
 InputContract checkedCert inputs
 SamplerContract checkedCert inputs samplers
+HonestTerminalCongruence checkedCert run
 ```
 
 For a real execution, the operator must additionally establish the following bridge outside the
@@ -168,12 +169,27 @@ InputsInstantiate(run, inputs)
 SamplersInstantiate(run, samplers)
   := for every event occurrence e and owner invocation o in the residual proof closure,
        samplers(e, o) = the value actually produced by run at (e, o)
+
+HonestTerminalValuesInstantiate(run, witness)
+  := for every reached terminal Result event e,
+       witness.honestTerminalActual(e) = the value actually produced by run at e
 ```
 
 `InputContract` then proves the recorded type, range, coefficient, and support facts about those
 equal input values. `SamplerContract` proves the recorded type, cutoff, support, and exact
 relations about those equal event values. If no concrete assignments satisfying both contracts
-can be exhibited, the implication may be logically true but certifies no real execution.
+and the terminal bridge can be exhibited, the implication may be logically true but certifies no
+real execution.
+
+A terminal Result is an exact Result introduced immediately after one of the five reached base
+transfers: fact-store authority, program-family-fact authority, operator authority, identity, or
+scale. For each such event, `Witness.honestTerminalCongruence` states that the event-indexed
+`honestTerminalActual` agrees modulo `q` with evaluation of the exact polynomial recorded in that
+same history row. The Lean kernel proves the final theorem conditionally on this field. The
+generated proof producer can prove which row is terminal, but it cannot prove or manufacture the
+field: the caller must instantiate `honestTerminalActual` from the honest Rust execution and
+establish the congruence. This is a modeling assumption connecting the theorem statement to the
+execution, not a fact obtained merely by compiling the generated proof.
 
 Lean compilation also remains relative to two audited trusted-code propositions: the fixed Lean
 value/matrix/interpreter semantics match the pinned Rust operational-noise semantics, and the
@@ -344,12 +360,21 @@ semantic `Result` and `Transfer` proof. The deterministic semantic-owner statist
 the event-level claims, frame starts, summaries, and frame-root predecessor bindings used by this
 check.
 
-CP1 keeps these roles separate. `Env` is queried only for factor owners, `ValueClaim` remains an
-event-level statement, and `Witness` bounds only factor atoms. The generated Lean theorem is an
-unconditional kernel-checked validity theorem for the emitted document; it does not assume CP0 as
-a proposition. CP0 is instead a trusted-generator correspondence assertion that the owner keys
-used by that document model the values in the honest Rust replay. This split does not add work to
-the ordinary checker path.
+CP1 keeps these roles separate. `Env` is queried only for factor owners, and `ValueClaim` remains
+an event-level statement. `ExactClaimAt` pairs such a claim with the exact owner, raw terms,
+summary, and `Result` history index that it interprets, so an arithmetic proof cannot silently
+substitute another event's claim. `Witness` bounds factor atoms and also carries the reached-only
+modeling bridge described in Section 4.4: `honestTerminalActual` is indexed by the terminal Result
+event, and `honestTerminalCongruence` relates that value to the polynomial in the same history row.
+The five admitted terminal transfer forms are fact-store authority, program-family-fact authority,
+operator authority, identity, and scale. The generated producer proves the row lookup and then
+uses ordinary arithmetic theorems; it cannot construct the honest-execution congruence.
+
+The generated Lean theorem is kernel-checked for every witness satisfying these explicit
+premises; Lean compilation does not prove that an honest Rust execution supplies such a witness.
+CP0 is separately a trusted-generator correspondence assertion that the owner keys used by that
+document model the values in the honest Rust replay. This split does not add work to the ordinary
+checker path.
 
 Production constructs `Cert.Valid` from row-local `RowTable.AllFrom` witnesses. The Boolean
 `Cert.wellFormed` remains for small fixtures and is connected by fixed reflection theorems. The

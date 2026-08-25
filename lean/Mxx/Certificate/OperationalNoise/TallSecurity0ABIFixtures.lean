@@ -135,6 +135,34 @@ theorem repeated_invocation_rejects_stale_references :
   ⟨stale_relation_rhs_rejected, stale_relation_merge_rejected,
     stale_summary_evidence_rejected, stale_survivor_transfer_rejected⟩
 
+def multipleRhsEvents : List Event :=
+  [ .invocationStart (closedOwner 0),
+    .invocationStart (closedOwner 1),
+    .resultExact (closedOwner 1) [singletonTerm 1] .exactZero,
+    .preFoldPolynomial [singletonTerm 1] .exactZero none,
+    .invocationEndExact (closedOwner 1) [singletonTerm 1] .exactZero,
+    .invocationStart (closedOwner 2),
+    .resultExact (closedOwner 2) [singletonTerm 2] .exactZero,
+    .preFoldPolynomial [singletonTerm 2] .exactZero none,
+    .invocationEndExact (closedOwner 2) [singletonTerm 2] .exactZero,
+    .specializationComputed (closedOwner 0) fixtureDispatch ⟨1, 9⟩,
+    .appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
+      (.universal 9 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 4),
+    .coefficientMerge
+      ⟨closedOwner 0, .relation 10 0, singletonMonomial 1, 1⟩,
+    .resultExact (closedOwner 0) [] .exactZero,
+    .preFoldPolynomial [] .exactZero none,
+    .invocationEndExact (closedOwner 0) [] .exactZero ]
+
+def multipleRhsFrameStarts : List Nat := [0, 1, 1, 1, 1, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0]
+
+def multipleRhsFinalState : ReplayState :=
+  ⟨multipleRhsEvents, multipleRhsFrameStarts, []⟩
+
+theorem in_range_nonfinal_rhs_accepted :
+    replay fixtureDocument multipleRhsEvents = some multipleRhsFinalState := by
+  decide
+
 theorem tall_security0_abi_fixture :
     Valid fixtureDocument fixtureEvents ∧
       step fixtureDocument initialState (.survivorFold 1 0) = none :=
@@ -143,5 +171,6 @@ theorem tall_security0_abi_fixture :
 #print axioms tall_security0_abi_fixture
 #print axioms fixture_replay
 #print axioms repeated_invocation_rejects_stale_references
+#print axioms in_range_nonfinal_rhs_accepted
 
 end Mxx.Certificate.OperationalNoise.TallSecurity0ABI

@@ -170,8 +170,12 @@ def sameFrame (state : ReplayState) (owner : Owner) (event : Nat) : Bool :=
 
 def exactFrameRange (state : ReplayState) (range : EventRange) : Bool :=
   decide (range.start < range.end) && decide (range.end ≤ state.history.length) &&
-    ((state.frameStarts.drop range.start).take (range.end - range.start)).all
-      (fun start => decide (start = range.start))
+    match state.frames.head? with
+    | some active =>
+        decide (active.start < range.start) &&
+          ((state.frameStarts.drop range.start).take (range.end - range.start)).all
+            (fun start => decide (range.start ≤ start))
+    | none => false
 
 def resultOwner? : Event → Option Owner
   | .resultExact owner _ _ | .resultCoefficient owner _ => some owner
@@ -206,7 +210,8 @@ def relationSourceValid (state : ReplayState) (owner : Owner) (application ordin
               match state.history[computed]? with
               | some (.specializationComputed computedOwner _ source) =>
                   decide (computedOwner = owner) && decide (source.end = computed) &&
-                    decide (rhsResult + 1 = source.end) && exactFrameRange state source &&
+                    decide (source.start ≤ rhsResult) && decide (rhsResult < source.end) &&
+                    exactFrameRange state source &&
                     exactTermExists state rhsResult ordinal
               | _ => false
           | .gadget _ _ _ inputResult =>
@@ -327,7 +332,7 @@ def step (document : Document) (state : ReplayState) (event : Event) : Option Re
           exactFrameRange state source && decide (source.end = state.history.length) &&
           (match state.history[source.start]?, state.history[source.end - 1]? with
           | some (.invocationStart root), some (.invocationEndExact ended _ _) =>
-              decide (root = ended) && decide (root.scope = owner.scope)
+              decide (root.scope = owner.scope) && decide (ended.scope = owner.scope)
           | _, _ => false) then accept state.frames else none
   | .appliedRelation owner sourceMonomial _ orderedStart orderedEnd rule =>
       let ruleOk := match rule with
@@ -336,7 +341,8 @@ def step (document : Document) (state : ReplayState) (event : Event) : Option Re
               (match state.history[computed]! with
               | .specializationComputed computedOwner _ source =>
                   decide (computedOwner = owner) && decide (source.end = computed) &&
-                    decide (rhsResult + 1 = source.end) && exactFrameRange state source &&
+                    decide (source.start ≤ rhsResult) && decide (rhsResult < source.end) &&
+                    exactFrameRange state source &&
                     (match state.history[rhsResult]? with
                     | some (.invocationEndExact rhsOwner _ _) =>
                         decide (rhsOwner.scope = owner.scope)

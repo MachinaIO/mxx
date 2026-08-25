@@ -199,7 +199,9 @@ inductive Event where
       (coefficientBound : Bound) (coefficientProducer : Nat)
       (summary : Bound) (summaryProducer : Option Nat)
   | resultCoefficient (owner : Owner) (bound : Bound)
-  | invocationEndExact (root : Owner) (preFoldEvent : Nat) (terms : List Term) (summary : Bound)
+  | invocationEndExact (root : Owner) (preFoldEvent : Nat) (terms : List Term)
+      (coefficientBound : Bound) (coefficientProducer : Nat)
+      (summary : Bound) (summaryProducer : Option Nat)
   | specializationComputed (owner : Owner) (dispatch : UniversalDispatch) (source : EventRange)
   | appliedRelation (owner : Owner) (sourceMonomial : Monomial) (outerCoefficient : Int)
       (orderedStart orderedEndExclusive : Nat) (rule : RelationRule)
@@ -297,7 +299,7 @@ def completedInvocationInRange (history : EventHistory) (range : EventRange)
     (result : Nat) : Option Owner :=
   if range.start ≤ result && result < range.end then
     match history.lookup result with
-    | some { event := .invocationEndExact ended _ _ _, frameStart := childStart } =>
+    | some { event := .invocationEndExact ended _ _ _ _ _ _, frameStart := childStart } =>
         if range.start ≤ childStart && childStart ≤ result && childStart < range.end then
           match history.lookup childStart with
           | some { event := .invocationStart started, frameStart := annotatedStart } =>
@@ -333,7 +335,7 @@ def termExists (terms : List Term) (ordinal : Nat) : Bool :=
 def exactTermExists (history : EventHistory) (state : ReplayState)
     (event ordinal : Nat) : Bool :=
   prior state event && match eventAt? history event with
-    | some (.resultExact _ terms _ _ _ _) | some (.invocationEndExact _ _ terms _) =>
+    | some (.resultExact _ terms _ _ _ _) | some (.invocationEndExact _ _ terms _ _ _ _) =>
         termExists terms ordinal
     | _ => false
 
@@ -500,14 +502,28 @@ def stepAt (document : TallDocument) (history : EventHistory) (state : ReplaySta
       else none
   | .resultCoefficient owner _ =>
       if currentScope state owner && ownerValid document owner then accept state.frames else none
-  | .invocationEndExact root preFoldEvent _ _ =>
+  | .invocationEndExact root preFoldEvent terms coefficientBound coefficientProducer summary
+      summaryProducer =>
       match state.frames with
       | [] => none
       | frame :: frames =>
           if decide (frame.root = root) && sameFrame history state root preFoldEvent &&
               (match eventAt? history preFoldEvent with
-              | some (.preFoldPolynomial ..) => true
-              | _ => false) then
+              | some (.preFoldPolynomial resultEvent preFoldTerms preFoldSummary _) =>
+                  decide (preFoldTerms = terms) && decide (preFoldSummary = summary) &&
+                    sameFrame history state root resultEvent &&
+                    (match eventAt? history resultEvent with
+                    | some (.resultExact resultOwner resultTerms resultCoefficientBound
+                        resultCoefficientProducer resultSummary resultSummaryProducer) =>
+                        decide (resultOwner = root) && decide (resultTerms = terms) &&
+                          decide (resultCoefficientBound = coefficientBound) &&
+                          decide (resultCoefficientProducer = coefficientProducer) &&
+                          decide (resultSummary = summary) &&
+                          decide (resultSummaryProducer = summaryProducer)
+                    | _ => false)
+              | _ => false) &&
+              boundProducerValid history state root coefficientProducer &&
+              summaryProducerValid history state root summary summaryProducer then
             accept frames
           else none
   | .specializationComputed owner dispatch source =>

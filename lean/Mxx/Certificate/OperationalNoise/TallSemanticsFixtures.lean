@@ -90,12 +90,19 @@ def boundFixtureOwner : Owner := closedOwner 0
 
 def boundFixtureReference : ValueRef := .result 1 .coefficient
 
+def productFixtureReference : ValueRef := .result 3 .coefficient
+
+def productFixtureFacts : TallSecurity0ABI.ProductFacts :=
+  ⟨false, false, none, none, none⟩
+
 def boundFixtureHistory : EventHistory :=
     smallHistory #[
     annotated (.boundTransfer boundFixtureOwner (.sum [])) 7,
     annotated (.resultExact boundFixtureOwner [] .exactZero 0 .exactZero none) 7,
     annotated (.boundTransfer boundFixtureOwner (.identity boundFixtureReference)) 7,
-    annotated (.resultCoefficient boundFixtureOwner .exactZero) 7]
+    annotated (.resultCoefficient boundFixtureOwner .exactZero) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.product productFixtureReference productFixtureReference productFixtureFacts)) 7]
 
 theorem bound_identity_fixture :
     BoundDerivedAt boundFixtureHistory 2 7 boundFixtureOwner
@@ -109,6 +116,19 @@ theorem bound_identity_projection_fixture :
     ProjectedBoundAt boundFixtureHistory 3 boundFixtureOwner none .coefficient
       .exactZero 0 := by
   exact .resultCoefficient rfl (by rfl) bound_identity_fixture
+
+theorem bound_product_fixture :
+    BoundDerivedAt boundFixtureHistory 4 7 boundFixtureOwner
+      (.product productFixtureReference productFixtureReference productFixtureFacts)
+      .exactZero 0 := by
+  apply BoundDerivedAt.product (leftRows := 1) (leftColumns := 1) (rightRows := 1)
+    (rightColumns := 1) (ringDimension := 1) (factor := 1)
+    (leftBound := .exactZero) (rightBound := .exactZero)
+    (leftActual := 0) (rightActual := 0)
+  · rfl
+  · rfl
+  · exact .result rfl bound_identity_projection_fixture
+  · exact .result rfl bound_identity_projection_fixture
 
 theorem exact_zero_recording_refines_finite_two_fixture :
     RecordedBoundRefines .exactZero (.finite ⟨2, by decide⟩) := by
@@ -372,6 +392,7 @@ theorem canonical_relation_fixture :
 #print axioms generic_value_claim_fixture
 #print axioms bound_identity_fixture
 #print axioms bound_identity_projection_fixture
+#print axioms bound_product_fixture
 #print axioms exact_zero_recording_refines_finite_two_fixture
 #print axioms TallSemantics.boundTransfer_to_resultCoefficient
 #print axioms TallSemantics.ProjectedBoundAt.sound

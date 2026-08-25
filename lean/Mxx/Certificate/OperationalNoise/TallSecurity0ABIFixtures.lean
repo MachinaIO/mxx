@@ -245,7 +245,7 @@ def fixtureEvents : List Event :=
     .boundTransfer (closedOwner 1) (.authority .operator),
     .resultExact (closedOwner 1) [singletonTerm 1] .exactZero 2 .exactZero none,
     .preFoldPolynomial 3 [singletonTerm 1] .exactZero none,
-    .invocationEndExact (closedOwner 1) 4 [singletonTerm 1] .exactZero,
+    .invocationEndExact (closedOwner 1) 4 [singletonTerm 1] .exactZero 2 .exactZero none,
     .specializationComputed (closedOwner 0) fixtureDispatch ⟨1, 6⟩,
     .appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
       (.universal 6 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 5),
@@ -265,7 +265,7 @@ def fixtureEvents : List Event :=
     .survivorFold 1 18,
     .resultExact (closedOwner 0) [] (.finite 1) 18 (.finite 1) (some 18),
     .preFoldPolynomial 20 [] (.finite 1) (some (.result 20 .summary)),
-    .invocationEndExact (closedOwner 0) 21 [] (.finite 1) ]
+    .invocationEndExact (closedOwner 0) 21 [] (.finite 1) 18 (.finite 1) (some 18) ]
 
 def annotateEvents (events : List Event) (frameStarts : List Nat) : Array AnnotatedEvent :=
   (List.zipWith (fun event frameStart => ⟨event, frameStart⟩) events frameStarts).toArray
@@ -335,7 +335,8 @@ theorem end_without_prefold_rejected :
     replay fixtureDocument (smallHistory
       [ ⟨.invocationStart (closedOwner 0), 0⟩,
         ⟨.resultExact (closedOwner 0) [] .exactZero 0 .exactZero none, 0⟩,
-        ⟨.invocationEndExact (closedOwner 0) 1 [] .exactZero, 0⟩ ].toArray) = none := by
+        ⟨.invocationEndExact (closedOwner 0) 1 [] .exactZero 0 .exactZero none, 0⟩ ].toArray) =
+      none := by
   decide
 
 def repeatedStart : List AnnotatedEvent :=
@@ -397,11 +398,11 @@ def multipleRhsEvents : List Event :=
     .boundTransfer (closedOwner 2) (.authority .operator),
     .resultExact (closedOwner 2) [singletonTerm 2] .exactZero 3 .exactZero none,
     .preFoldPolynomial 4 [singletonTerm 2] .exactZero none,
-    .invocationEndExact (closedOwner 2) 5 [singletonTerm 2] .exactZero,
+    .invocationEndExact (closedOwner 2) 5 [singletonTerm 2] .exactZero 3 .exactZero none,
     .boundTransfer (closedOwner 1) (.authority .operator),
     .resultExact (closedOwner 1) [singletonTerm 1] .exactZero 7 .exactZero none,
     .preFoldPolynomial 8 [singletonTerm 1] .exactZero none,
-    .invocationEndExact (closedOwner 1) 9 [singletonTerm 1] .exactZero,
+    .invocationEndExact (closedOwner 1) 9 [singletonTerm 1] .exactZero 7 .exactZero none,
     .specializationComputed (closedOwner 3) fixtureDispatch ⟨1, 11⟩,
     .appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
       (.universal 11 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 6),
@@ -410,7 +411,7 @@ def multipleRhsEvents : List Event :=
     .boundTransfer (closedOwner 0) (.authority .operator),
     .resultExact (closedOwner 0) [] .exactZero 14 .exactZero none,
     .preFoldPolynomial 15 [] .exactZero none,
-    .invocationEndExact (closedOwner 0) 16 [] .exactZero ]
+    .invocationEndExact (closedOwner 0) 16 [] .exactZero 14 .exactZero none ]
 
 def multipleRhsFrameStarts : List Nat := [0, 1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0,
   0, 0, 0, 0]
@@ -441,19 +442,19 @@ def siblingEvents : List Event :=
     .boundTransfer (closedOwner 1) (.authority .operator),
     .resultExact (closedOwner 1) [singletonTerm 1] .exactZero 2 .exactZero none,
     .preFoldPolynomial 3 [singletonTerm 1] .exactZero none,
-    .invocationEndExact (closedOwner 1) 4 [singletonTerm 1] .exactZero,
+    .invocationEndExact (closedOwner 1) 4 [singletonTerm 1] .exactZero 2 .exactZero none,
     .invocationStart (closedOwner 2),
     .boundTransfer (closedOwner 2) (.authority .operator),
     .resultExact (closedOwner 2) [singletonTerm 2] .exactZero 7 .exactZero none,
     .preFoldPolynomial 8 [singletonTerm 2] .exactZero none,
-    .invocationEndExact (closedOwner 2) 9 [singletonTerm 2] .exactZero,
+    .invocationEndExact (closedOwner 2) 9 [singletonTerm 2] .exactZero 7 .exactZero none,
     .specializationComputed (closedOwner 3) fixtureDispatch ⟨1, 11⟩,
     .appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
       (.universal 11 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 10),
     .boundTransfer (closedOwner 0) (.authority .operator),
     .resultExact (closedOwner 0) [] .exactZero 13 .exactZero none,
     .preFoldPolynomial 14 [] .exactZero none,
-    .invocationEndExact (closedOwner 0) 15 [] .exactZero ]
+    .invocationEndExact (closedOwner 0) 15 [] .exactZero 13 .exactZero none ]
 
 def siblingFrameStarts : List Nat := [0, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 0, 0, 0,
   0, 0, 0]
@@ -475,7 +476,7 @@ def mismatchedInvocationHistory : EventHistory :=
       .invocationStart (closedOwner 1),
       .resultExact (closedOwner 1) [] .exactZero 0 .exactZero none,
       .preFoldPolynomial 2 [] .exactZero none,
-      .invocationEndExact (closedOwner 2) 3 [] .exactZero ]
+      .invocationEndExact (closedOwner 2) 3 [] .exactZero 0 .exactZero none ]
     [0, 1, 1, 1, 1])
 
 def largeSparseRangeHistory : EventHistory where
@@ -518,7 +519,7 @@ def nestedLinkPrefix : List Event :=
     .invocationStart (closedOwner 1),
     .resultExact (closedOwner 1) [singletonTerm 1] .exactZero 0 .exactZero none,
     .preFoldPolynomial 2 [singletonTerm 1] .exactZero none,
-    .invocationEndExact (closedOwner 1) 3 [singletonTerm 1] .exactZero ]
+    .invocationEndExact (closedOwner 1) 3 [singletonTerm 1] .exactZero 0 .exactZero none ]
 
 def nestedLinkState : ReplayState :=
   ⟨5, [⟨closedOwner 0, 0⟩]⟩
@@ -528,7 +529,8 @@ theorem nested_frame_links_are_isolated :
       (nestedLinkPrefix ++ [.preFoldPolynomial 2 [] .exactZero none])
       [0, 1, 1, 1, 1, 0])
     let endHistory := smallHistory (annotateEvents
-      (nestedLinkPrefix ++ [.invocationEndExact (closedOwner 0) 3 [] .exactZero])
+      (nestedLinkPrefix ++
+        [.invocationEndExact (closedOwner 0) 3 [] .exactZero 0 .exactZero none])
       [0, 1, 1, 1, 1, 0])
     replayRange fixtureDocument preFoldHistory preFoldHistory.size nestedLinkState = none ∧
       replayRange fixtureDocument endHistory endHistory.size nestedLinkState = none := by

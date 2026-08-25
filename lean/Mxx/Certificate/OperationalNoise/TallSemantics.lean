@@ -30,6 +30,13 @@ def evalPolynomial {Factor : Type} (env : Env Factor) : Polynomial Factor → In
 
 def termPolynomial (terms : List Term) : Polynomial Owner := terms.map Term.toExact
 
+def replayProductFacts (facts : TallSecurity0ABI.ProductFacts) : EventReplay.ProductFacts :=
+  { leftConstantPolynomial := facts.leftIsConstantPolynomial
+    rightConstantPolynomial := facts.rightIsConstantPolynomial
+    rightKnownZeroRows := facts.rightKnownZeroRows
+    leftSupportUpper := facts.leftSupportUpper
+    rightSupportUpper := facts.rightSupportUpper }
+
 def relationContext (source : MonomialKey Owner)
     (exteriorCentral : List Owner)
     (orderedStart orderedEndExclusive : Nat) :
@@ -1523,6 +1530,19 @@ mutual
         BoundDerivedAt history transferEvent transferFrame owner
           (.monomialProduct monomial (headFactor :: tailFactors))
           (productNonempty headBound tailBounds) (headActual * tailActuals.prod)
+    | product {transferEvent transferFrame : Nat} {owner : Owner}
+        {left right : ValueRef} {facts : TallSecurity0ABI.ProductFacts}
+        {leftRows leftColumns rightRows rightColumns ringDimension factor : Nat}
+        {leftBound rightBound : CoeffClass} {leftActual rightActual : Nat}
+        (transferRow : history.lookup transferEvent = some
+          ⟨.boundTransfer owner (.product left right facts), transferFrame⟩)
+        (factorExact : EventReplay.productFactor leftRows leftColumns rightRows rightColumns
+          ringDimension (replayProductFacts facts) = some factor)
+        (leftChild : BoundInputAt history owner left leftBound leftActual)
+        (rightChild : BoundInputAt history owner right rightBound rightActual) :
+        BoundDerivedAt history transferEvent transferFrame owner (.product left right facts)
+          (productWithFactor factor leftBound rightBound)
+          (factor * leftActual * rightActual)
 end
 
 theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {owner : Owner}
@@ -1541,7 +1561,7 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
   · intros
     assumption
   · intros
@@ -1568,6 +1588,8 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
     assumption
   · intros
     apply productNonempty_sound <;> assumption
+  · intros
+    exact (productWithFacts_sound (by assumption) (by assumption) (by assumption)).2
 
 theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFrame : Nat}
     {owner : Owner} {rule : BoundRule} {bound : CoeffClass} {actualMagnitude : Nat}
@@ -1584,7 +1606,7 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
   · intros
     assumption
   · intros
@@ -1611,6 +1633,8 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
     assumption
   · intros
     apply productNonempty_sound <;> assumption
+  · intros
+    exact (productWithFacts_sound (by assumption) (by assumption) (by assumption)).2
 
 theorem boundTransfer_to_resultCoefficient
     {history : EventHistory} {producerEvent resultEvent frameStart : Nat} {owner : Owner}
@@ -1884,7 +1908,7 @@ def termContains (term : Term) (owner : Owner) : Prop := monomialContains term.m
 
 def eventContainsFactor (event : Event) (owner : Owner) : Prop :=
   match event with
-  | .resultExact _ terms _ _ _ _ | .invocationEndExact _ _ terms _ |
+  | .resultExact _ terms _ _ _ _ | .invocationEndExact _ _ terms _ _ _ _ |
       .preFoldPolynomial _ terms _ _ => ∃ term ∈ terms, termContains term owner
   | .appliedRelation _ sourceMonomial _ _ _ rule =>
       monomialContains sourceMonomial owner ∨ match rule with
@@ -1924,7 +1948,8 @@ def RelationApplicationAt (document : TallDocument) (history : EventHistory)
 
 def exactTermsAt? (history : EventHistory) (event : Nat) : Option (List Term) :=
   match TallSecurity0ABI.eventAt? history event with
-  | some (.resultExact _ terms _ _ _ _) | some (.invocationEndExact _ _ terms _) => some terms
+  | some (.resultExact _ terms _ _ _ _) |
+      some (.invocationEndExact _ _ terms _ _ _ _) => some terms
   | _ => none
 
 def RelationCongruent (modulus : Nat) (history : EventHistory) (env : Env Owner)
@@ -2101,7 +2126,9 @@ def rootMatchesOwner (root : SchemaV1.ResidualRoot) (owner : Owner) : Prop :=
 /-- The fixed Security0 statement; later checkpoints construct, rather than assume, its proof. -/
 def Security0Accepted (document : TallDocument) (history : EventHistory)
     (plaintextModulus ciphertextModulus ringDimension finalEvent preFoldEvent finalBound : Nat)
-    (finalOwner : Owner) (finalTerms : List Term) (finalSummary : Bound)
+    (finalOwner : Owner) (finalTerms : List Term) (finalCoefficientBound : Bound)
+    (finalCoefficientProducer : Nat) (finalSummary : Bound)
+    (finalSummaryProducer : Option Nat)
     (residual : Option Nat → Env Owner → Int) : Prop :=
   TallSecurity0ABI.Valid document history ∧
     document.plaintextModulus = toString plaintextModulus ∧
@@ -2111,7 +2138,8 @@ def Security0Accepted (document : TallDocument) (history : EventHistory)
     finalSummary = .finite finalBound ∧
     (∃ frameStart,
       history.lookup finalEvent = some
-        ⟨.invocationEndExact finalOwner preFoldEvent finalTerms finalSummary, frameStart⟩) ∧
+        ⟨.invocationEndExact finalOwner preFoldEvent finalTerms finalCoefficientBound
+          finalCoefficientProducer finalSummary finalSummaryProducer, frameStart⟩) ∧
     ForStatement document.residualRoot fun selector ↦
       ∀ witness : Witness document history selector ciphertextModulus,
         ValueClaim.Interprets ciphertextModulus witness.env (residual selector witness.env)

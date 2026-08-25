@@ -273,7 +273,7 @@ def frameRecords : List (Nat × AnnotatedEvent) :=
    (preFoldEvent,
     ⟨.preFoldPolynomial rootResult finalResultTerms .exactZero none, frameStart⟩),
    (invocationEndEvent,
-    ⟨.invocationEndExact frameOwner preFoldEvent finalResultTerms .exactZero,
+    ⟨.invocationEndExact frameOwner preFoldEvent finalResultTerms .exactZero 0 .exactZero none,
       frameStart⟩)]
 
 def frameLookup (event : Nat) : Option AnnotatedEvent :=
@@ -358,12 +358,12 @@ def framePreFoldSummary : Bound :=
 
 def frameEndTerms : List Term :=
   match frameLookup invocationEndEvent with
-  | some ⟨.invocationEndExact _ _ terms _, _⟩ => terms
+  | some ⟨.invocationEndExact _ _ terms _ _ _ _, _⟩ => terms
   | _ => []
 
 def frameEndSummary : Bound :=
   match frameLookup invocationEndEvent with
-  | some ⟨.invocationEndExact _ _ _ summary, _⟩ => summary
+  | some ⟨.invocationEndExact _ _ _ _ _ summary _, _⟩ => summary
   | _ => .missing
 
 theorem frameRecords_source_faithful :
@@ -386,7 +386,8 @@ theorem frameRecords_source_faithful :
       frameLookup preFoldEvent =
         some ⟨.preFoldPolynomial rootResult finalResultTerms .exactZero none, frameStart⟩ ∧
       frameLookup invocationEndEvent =
-        some ⟨.invocationEndExact frameOwner preFoldEvent finalResultTerms .exactZero,
+        some ⟨.invocationEndExact frameOwner preFoldEvent finalResultTerms .exactZero 0
+          .exactZero none,
           frameStart⟩ := by
   repeat' apply And.intro
   all_goals

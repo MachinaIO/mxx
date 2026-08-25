@@ -15,39 +15,56 @@ def rowTableNodeCount {α : Type} : RowTable α → Nat
   | .empty => 0
   | .node _ _ left right => rowTableNodeCount left + rowTableNodeCount right + 1
 
-def expressionInputLeafSize : Nat := 16
+def orderedLeafSize : Nat := 16
 
-structure ExpressionInputs where
-  leaves : RowTable (Array ExpressionRef)
+structure OrderedLeaves (α : Type) where
+  leaves : RowTable (Array α)
   size : Nat
 deriving Repr
 
-def ExpressionInputs.leafCount (inputs : ExpressionInputs) : Nat :=
-  (inputs.size + expressionInputLeafSize - 1) / expressionInputLeafSize
+def OrderedLeaves.leafCount {α : Type} (rows : OrderedLeaves α) : Nat :=
+  (rows.size + orderedLeafSize - 1) / orderedLeafSize
 
-def ExpressionInputs.expectedLeafSize (inputs : ExpressionInputs) (leaf : Nat) : Nat :=
-  Nat.min expressionInputLeafSize (inputs.size - leaf * expressionInputLeafSize)
+def OrderedLeaves.expectedLeafSize {α : Type} (rows : OrderedLeaves α) (leaf : Nat) : Nat :=
+  Nat.min orderedLeafSize (rows.size - leaf * orderedLeafSize)
 
-def ExpressionInputs.wellFormed (inputs : ExpressionInputs) : Bool :=
-  inputs.leaves.wellFormed &&
-    decide (rowTableNodeCount inputs.leaves = inputs.leafCount) &&
-    inputs.leaves.allBool fun leaf values =>
-      decide (leaf < inputs.leafCount) &&
-        decide (values.size = inputs.expectedLeafSize leaf)
+def OrderedLeaves.wellFormed {α : Type} (rows : OrderedLeaves α) : Bool :=
+  rows.leaves.wellFormed &&
+    decide (rowTableNodeCount rows.leaves = rows.leafCount) &&
+    rows.leaves.allBool fun leaf values =>
+      decide (leaf < rows.leafCount) &&
+        decide (values.size = rows.expectedLeafSize leaf)
 
-def ExpressionInputs.get? (inputs : ExpressionInputs) (position : Nat) : Option ExpressionRef :=
-  if position < inputs.size then
-    (inputs.leaves.lookup (position / expressionInputLeafSize)).bind fun leaf =>
-      leaf[position % expressionInputLeafSize]?
+def OrderedLeaves.get? {α : Type} (rows : OrderedLeaves α) (position : Nat) : Option α :=
+  if position < rows.size then
+    (rows.leaves.lookup (position / orderedLeafSize)).bind fun leaf =>
+      leaf[position % orderedLeafSize]?
   else none
 
-def ExpressionInputs.Valid (inputs : ExpressionInputs) : Prop :=
-  inputs.wellFormed = true
+def OrderedLeaves.Valid {α : Type} (rows : OrderedLeaves α) : Prop :=
+  rows.wellFormed = true
+
+abbrev ExpressionInputs := OrderedLeaves ExpressionRef
+
+abbrev IndexLutRows := OrderedLeaves SchemaV1.IndexLutRow
 
 structure ExpressionRow where
   descriptor : SchemaV1.ExpressionDescriptor
   inputs : ExpressionInputs
   program : Option ProgramRef
+deriving Repr
+
+structure IndexUseRow where
+  owner : SchemaV1.ObservedWire
+  result : Option SchemaV1.PlanRef
+  consumed : Option SchemaV1.PlanRef
+  kind : SchemaV1.IndexUseKind
+  index : SchemaV1.PlanRef
+  outputRange : Option SchemaV1.Range
+  outputType : SchemaV1.ValueType
+  frontier : List SchemaV1.FrontierAxis
+  rows : IndexLutRows
+  rowsValid : rows.Valid
 deriving Repr
 
 structure TallDocument where
@@ -60,7 +77,7 @@ structure TallDocument where
   programs : RowTable SchemaV1.ProgramRow
   sources : RowTable SchemaV1.SourceRow
   events : RowTable SchemaV1.EventRow
-  indexUses : RowTable SchemaV1.IndexUseRow
+  indexUses : RowTable IndexUseRow
   sliceGroups : RowTable SchemaV1.SliceGroupRow
   residualRoot : SchemaV1.ResidualRoot
 deriving Repr
@@ -285,11 +302,14 @@ def projectionAvailable : Event → Projection → Bool
   | .resultCoefficient _ bound, .coefficient => decide (bound ≠ .missing)
   | _, _ => false
 
+def termExists (terms : List Term) (ordinal : Nat) : Bool :=
+  (List.get?Internal terms ordinal).isSome
+
 def exactTermExists (history : EventHistory) (state : ReplayState)
     (event ordinal : Nat) : Bool :=
   prior state event && match eventAt? history event with
     | some (.resultExact _ terms _) | some (.invocationEndExact _ _ terms _) =>
-        decide (ordinal < terms.length)
+        termExists terms ordinal
     | _ => false
 
 def relationSourceValid (history : EventHistory) (state : ReplayState) (owner : Owner)
@@ -370,7 +390,7 @@ def termRefValid (history : EventHistory) (state : ReplayState)
     (reference : TermRef) : Bool :=
   prior state reference.valueEvent &&
     match eventAt? history reference.valueEvent with
-    | some (.resultExact _ terms _) => reference.termOrdinal < terms.length
+    | some (.resultExact _ terms _) => termExists terms reference.termOrdinal
     | _ => false
 
 def termRefOwnerLocal (history : EventHistory) (state : ReplayState) (owner : Owner)
@@ -518,7 +538,7 @@ def stepAt (document : TallDocument) (history : EventHistory) (state : ReplaySta
 
 def replayBlock (document : TallDocument) (history : EventHistory) (endExclusive : Nat)
     (state : ReplayState) : Option ReplayState :=
-  let steps := Nat.min (endExclusive - state.cursor) 8
+  let steps := Nat.min (endExclusive - state.cursor) 4
   let rec run : Nat → ReplayState → Option ReplayState
     | 0, current => some current
     | remaining + 1, current => do
@@ -526,26 +546,12 @@ def replayBlock (document : TallDocument) (history : EventHistory) (endExclusive
         run remaining next
   run steps state
 
-def replayEightBlocks (document : TallDocument) (history : EventHistory) (endExclusive : Nat)
-    (state : ReplayState) : Option ReplayState := do
-  let first ← replayBlock document history endExclusive state
-  let second ← replayBlock document history endExclusive first
-  let third ← replayBlock document history endExclusive second
-  let fourth ← replayBlock document history endExclusive third
-  let fifth ← replayBlock document history endExclusive fourth
-  let sixth ← replayBlock document history endExclusive fifth
-  let seventh ← replayBlock document history endExclusive sixth
-  replayBlock document history endExclusive seventh
-
 def replayRange (document : TallDocument) (history : EventHistory) (endExclusive : Nat)
     (state : ReplayState) : Option ReplayState := do
   let steps := endExclusive - state.cursor
-  if state.cursor ≤ endExclusive && endExclusive ≤ history.size && steps ≤ 256 then
-    let first ← replayEightBlocks document history endExclusive state
-    let second ← replayEightBlocks document history endExclusive first
-    let third ← replayEightBlocks document history endExclusive second
-    let fourth ← replayEightBlocks document history endExclusive third
-    if fourth.cursor = endExclusive then some fourth else none
+  if state.cursor ≤ endExclusive && endExclusive ≤ history.size && steps ≤ 4 then
+    let finish ← replayBlock document history endExclusive state
+    if finish.cursor = endExclusive then some finish else none
   else none
 
 def replay (document : TallDocument) (history : EventHistory) : Option ReplayState :=

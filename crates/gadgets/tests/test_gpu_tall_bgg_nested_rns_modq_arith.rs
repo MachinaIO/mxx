@@ -2556,6 +2556,156 @@ fn fixed_tall_security0_emits_actual_maximum_expression_input_module() {
 }
 
 #[test]
+#[ignore = "CPU-only fixed Security0 actual maximum-index-LUT renderer gate"]
+fn fixed_tall_security0_emits_actual_maximum_index_lut_module() {
+    let output = env::var_os("MXX_SECURITY0_INDEX_USE_PROBE_OUTPUT")
+        .map(PathBuf::from)
+        .expect("set MXX_SECURITY0_INDEX_USE_PROBE_OUTPUT to an explicit empty output directory");
+    assert!(!output.exists(), "Security0 index-use probe directory must not already exist");
+    let source: TallCertificateSourceV1 = serde_json::from_slice(
+        &fs::read(TALL_SECURITY0_SOURCE_PATH).expect("fixed Security0 Source.json"),
+    )
+    .expect("strict fixed Security0 source");
+    let reconstructed = build_fixed_tall_certificate_source(&source)
+        .expect("Source.json-driven fixed Security0 source");
+    let manifest = prepare_tall_security0_lean_manifest(
+        &reconstructed.protocol,
+        &reconstructed.request,
+        &source.profile_identity(),
+    )
+    .expect("derive fixed Security0 maximum index LUT module");
+    let module = manifest
+        .files
+        .iter()
+        .find(|file| file.relative_path == "Cert/IndexUse000.lean")
+        .expect("actual Security0 index-use package");
+    let path = output.join(&module.relative_path);
+    fs::create_dir_all(path.parent().expect("index-use probe parent"))
+        .expect("create index-use probe parent");
+    fs::write(&path, &module.bytes).expect("write index-use probe module");
+    let text = std::str::from_utf8(&module.bytes).expect("generated index-use UTF-8");
+    assert_eq!(text.matches("def IndexUseRow").count(), 199);
+    assert!(text.contains("def IndexLutRows33 : IndexLutRows :="));
+    assert!(text.contains(", 3601⟩"));
+    assert_eq!(text.matches("def IndexLutRowLeaf33_").count(), 226);
+    assert!(text.contains(
+        "IndexLutRowLeaf33_225 : Array SchemaV1.IndexLutRow := #[⟨[\"3600\"], \"3600\"⟩]"
+    ));
+    assert!(text.contains("def IndexUseRow33 : TallSecurity0ABI.IndexUseRow :="));
+    println!("generatedIndexUseProbe={}", path.display());
+}
+
+#[test]
+#[ignore = "CPU-only fixed Security0 first proof-event renderer gate"]
+fn fixed_tall_security0_emits_first_proof_event_module() {
+    let output = env::var_os("MXX_SECURITY0_PROOF_EVENT_PROBE_OUTPUT")
+        .map(PathBuf::from)
+        .expect("set MXX_SECURITY0_PROOF_EVENT_PROBE_OUTPUT to an explicit empty output directory");
+    assert!(!output.exists(), "Security0 proof-event probe directory must not already exist");
+    let source: TallCertificateSourceV1 = serde_json::from_slice(
+        &fs::read(TALL_SECURITY0_SOURCE_PATH).expect("fixed Security0 Source.json"),
+    )
+    .expect("strict fixed Security0 source");
+    let reconstructed = build_fixed_tall_certificate_source(&source)
+        .expect("Source.json-driven fixed Security0 source");
+    let manifest = prepare_tall_security0_lean_manifest(
+        &reconstructed.protocol,
+        &reconstructed.request,
+        &source.profile_identity(),
+    )
+    .expect("derive fixed Security0 first proof event module");
+    let module = manifest
+        .files
+        .iter()
+        .find(|file| file.relative_path == "Proof/Events000.lean")
+        .expect("actual Security0 first proof event package");
+    let path = output.join(&module.relative_path);
+    fs::create_dir_all(path.parent().expect("proof-event probe parent"))
+        .expect("create proof-event probe parent");
+    fs::write(&path, &module.bytes).expect("write proof-event probe module");
+    let text = std::str::from_utf8(&module.bytes).expect("generated proof-event UTF-8");
+    assert!(text.contains(".resultCoefficient"));
+    assert!(text.contains("(.finite 1)"));
+    assert!(!text.contains(") .finite "));
+    println!("generatedProofEventProbe={}", path.display());
+}
+
+#[test]
+#[ignore = "CPU-only fixed Security0 final proof-event renderer gate"]
+fn fixed_tall_security0_emits_final_proof_event_module() {
+    let output = env::var_os("MXX_SECURITY0_FINAL_PROOF_EVENT_PROBE_OUTPUT")
+        .map(PathBuf::from)
+        .expect(
+            "set MXX_SECURITY0_FINAL_PROOF_EVENT_PROBE_OUTPUT to an explicit empty output directory",
+        );
+    assert!(!output.exists(), "Security0 final proof-event probe directory must not exist");
+    let source: TallCertificateSourceV1 = serde_json::from_slice(
+        &fs::read(TALL_SECURITY0_SOURCE_PATH).expect("fixed Security0 Source.json"),
+    )
+    .expect("strict fixed Security0 source");
+    let reconstructed = build_fixed_tall_certificate_source(&source)
+        .expect("Source.json-driven fixed Security0 source");
+    let manifest = prepare_tall_security0_lean_manifest(
+        &reconstructed.protocol,
+        &reconstructed.request,
+        &source.profile_identity(),
+    )
+    .expect("derive fixed Security0 final proof event module");
+    let module = manifest
+        .files
+        .iter()
+        .find(|file| file.relative_path == "Proof/Events420.lean")
+        .expect("actual Security0 final proof event package");
+    let path = output.join(&module.relative_path);
+    fs::create_dir_all(path.parent().expect("final proof-event probe parent"))
+        .expect("create final proof-event probe parent");
+    fs::write(&path, &module.bytes).expect("write final proof-event probe module");
+    let text = std::str::from_utf8(&module.bytes).expect("generated final proof-event UTF-8");
+    assert!(text.contains(".preFoldPolynomial 107564"));
+    assert!(text.contains("(some (.result 107564 .summary))"));
+    assert!(!text.contains(" summary some "));
+    println!("generatedFinalProofEventProbe={}", path.display());
+}
+
+#[test]
+#[ignore = "CPU-only fixed Security0 dense replay renderer gate"]
+fn fixed_tall_security0_emits_dense_replay_module() {
+    let output = env::var_os("MXX_SECURITY0_REPLAY_PROBE_OUTPUT")
+        .map(PathBuf::from)
+        .expect("set MXX_SECURITY0_REPLAY_PROBE_OUTPUT to an explicit empty output directory");
+    assert!(!output.exists(), "Security0 replay probe directory must not already exist");
+    let source: TallCertificateSourceV1 = serde_json::from_slice(
+        &fs::read(TALL_SECURITY0_SOURCE_PATH).expect("fixed Security0 Source.json"),
+    )
+    .expect("strict fixed Security0 source");
+    let reconstructed = build_fixed_tall_certificate_source(&source)
+        .expect("Source.json-driven fixed Security0 source");
+    let manifest = prepare_tall_security0_lean_manifest(
+        &reconstructed.protocol,
+        &reconstructed.request,
+        &source.profile_identity(),
+    )
+    .expect("derive fixed Security0 dense replay module");
+    let module = manifest
+        .files
+        .iter()
+        .find(|file| file.relative_path == "Proof/Replay020.lean")
+        .expect("actual Security0 replay package 20");
+    let path = output.join(&module.relative_path);
+    fs::create_dir_all(path.parent().expect("replay probe parent"))
+        .expect("create replay probe parent");
+    fs::write(&path, &module.bytes).expect("write replay probe module");
+    let text = std::str::from_utf8(&module.bytes).expect("generated replay UTF-8");
+    assert_eq!(text.matches("theorem replayChunk").count(), 64);
+    assert!(text.contains("def replayState1332 : ReplayState := ⟨5328,"));
+    assert!(text.contains("def replayState1344 : ReplayState := ⟨5376,"));
+    assert!(text.contains(
+        "theorem replayChunk1332 : ReplayChain document history replayState1332 replayState1333 :=\n  .chunk 5332 (by rfl)"
+    ));
+    println!("generatedReplayProbe={}", path.display());
+}
+
+#[test]
 #[ignore = "CPU-only fixed Security0 Lean emitter; performs no backend execution"]
 fn fixed_tall_security0_emits_reached_lean() {
     let output = env::var_os("MXX_SECURITY0_LEAN_OUTPUT")

@@ -7,10 +7,10 @@ use crate::operational_noise::{
     },
     g0::{
         CanonicalEventOperator, CanonicalExpressionDescriptor, CanonicalExpressionOperator,
-        CanonicalExpressionSource, CanonicalStatementScope, IndexUseKind, SliceMemberRole,
-        StableArtifact, StableConstant, StableConstantValue, StableFamilySourceIdentity,
-        StableFrontierAxis, StableHashDefinition, StableHashVariant, StableLayout,
-        StableMatrixConstantKind, StableMatrixOperation, StableObservedOccurrence,
+        CanonicalExpressionSource, CanonicalStatementScope, IndexLutRow, IndexUseKind,
+        SliceMemberRole, StableArtifact, StableConstant, StableConstantValue,
+        StableFamilySourceIdentity, StableFrontierAxis, StableHashDefinition, StableHashVariant,
+        StableLayout, StableMatrixConstantKind, StableMatrixOperation, StableObservedOccurrence,
         StableObservedProducer, StableObservedSourceAccess, StableObservedWire, StablePlanRef,
         StableSampleDescriptor, StableSamplerOperation, StableScalarOperation, StableScope,
         StableTransformOperation, StableTrapdoorOperation, StableValueType,
@@ -20,6 +20,7 @@ use std::fmt::Write as _;
 
 const PACKAGE_SIZE: usize = 256;
 const EXPRESSION_INPUT_LEAF_SIZE: usize = 16;
+const INDEX_LUT_ROW_LEAF_SIZE: usize = 16;
 
 pub(super) fn render(
     document: &CertificateDocumentV1,
@@ -29,7 +30,7 @@ pub(super) fn render(
     render_packages("Program", "ProgramRow", &document.programs, program_row, &mut files)?;
     render_packages("Source", "SourceRow", &document.sources, source_row, &mut files)?;
     render_packages("Event", "EventRow", &document.events, event_row, &mut files)?;
-    render_packages("IndexUse", "IndexUseRow", &document.index_uses, index_use_row, &mut files)?;
+    render_index_use_packages(&document.index_uses, &mut files)?;
     render_packages(
         "SliceGroup",
         "SliceGroupRow",
@@ -115,6 +116,81 @@ fn array_refs(values: &[u64]) -> String {
     format!("#[{}]", values.iter().map(|value| event_ref(*value)).collect::<Vec<_>>().join(", "))
 }
 
+fn render_index_use_packages(
+    rows: &[CertificateIndexUse],
+    files: &mut Vec<super::TallSecurity0GeneratedFile>,
+) -> Result<(), String> {
+    for (package, chunk) in rows.chunks(PACKAGE_SIZE).enumerate() {
+        let module = format!("IndexUse{package:03}");
+        let mut source = header("Mxx.Certificate.OperationalNoise.TallSecurity0ABI", &module);
+        let start = package * PACKAGE_SIZE;
+        for (offset, row) in chunk.iter().enumerate() {
+            let row_id = start + offset;
+            render_index_lut_rows(row_id, &row.rows, &mut source)?;
+            writeln!(
+                source,
+                "def IndexUseRow{row_id} : TallSecurity0ABI.IndexUseRow :=\n  {}\n",
+                index_use_row(row, row_id)?
+            )
+            .expect("writing to String cannot fail");
+        }
+        writeln!(source, "end {NAMESPACE}.Cert.{module}").expect("writing to String cannot fail");
+        files.push(generated_file(format!("Cert/{module}.lean"), source));
+    }
+    Ok(())
+}
+
+fn render_index_lut_rows(row: usize, rows: &[IndexLutRow], out: &mut String) -> Result<(), String> {
+    let leaf_count = rows.len().div_ceil(INDEX_LUT_ROW_LEAF_SIZE);
+    if leaf_count == 0 {
+        writeln!(out, "def IndexLutRows{row} : IndexLutRows := ⟨.empty, 0⟩\n")
+            .expect("writing to String cannot fail");
+        return Ok(());
+    }
+
+    if leaf_count == 1 {
+        writeln!(
+            out,
+            "def IndexLutRows{row} : IndexLutRows :=\n  ⟨(.node 0 {} .empty .empty), {}⟩\n",
+            array_index_lut_rows(rows)?,
+            rows.len()
+        )
+        .expect("writing to String cannot fail");
+        return Ok(());
+    }
+
+    for (leaf, values) in rows.chunks(INDEX_LUT_ROW_LEAF_SIZE).enumerate() {
+        writeln!(
+            out,
+            "def IndexLutRowLeaf{row}_{leaf} : Array SchemaV1.IndexLutRow := {}",
+            array_index_lut_rows(values)?
+        )
+        .expect("writing to String cannot fail");
+    }
+    let leaves = balanced_index_lut_row_leaves(row, 0, leaf_count);
+    writeln!(out, "def IndexLutRows{row} : IndexLutRows :=\n  ⟨{leaves}, {}⟩\n", rows.len())
+        .expect("writing to String cannot fail");
+    Ok(())
+}
+
+fn balanced_index_lut_row_leaves(row: usize, start: usize, end: usize) -> String {
+    if start == end {
+        return ".empty".to_owned();
+    }
+    let middle = (start + end) / 2;
+    let left = balanced_index_lut_row_leaves(row, start, middle);
+    let right = balanced_index_lut_row_leaves(row, middle + 1, end);
+    format!("(.node {middle} IndexLutRowLeaf{row}_{middle} {left} {right})")
+}
+
+fn array_index_lut_rows(rows: &[IndexLutRow]) -> Result<String, String> {
+    Ok(format!("#[{}]", rows.iter().map(index_lut_row).collect::<Result<Vec<_>, _>>()?.join(", ")))
+}
+
+fn index_lut_row(row: &IndexLutRow) -> Result<String, String> {
+    Ok(format!("⟨{}, {}⟩", list(&row.tuple, |item| quoted(item))?, quoted(&row.output)?))
+}
+
 fn header(import: &str, suffix: &str) -> String {
     format!(
         "import {import}\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Cert.{suffix}\n\nopen Mxx.Certificate.OperationalNoise\nopen SchemaV1\nopen TallSecurity0ABI\n\n"
@@ -149,12 +225,12 @@ fn render_packages<T>(
 
 fn render_top(document: &CertificateDocumentV1) -> Result<String, String> {
     let tables = [
-        ("Expression", "ExpressionRow", document.expressions.len()),
-        ("Program", "ProgramRow", document.programs.len()),
-        ("Source", "SourceRow", document.sources.len()),
-        ("Event", "EventRow", document.events.len()),
-        ("IndexUse", "IndexUseRow", document.index_uses.len()),
-        ("SliceGroup", "SliceGroupRow", document.slice_groups.len()),
+        ("Expression", "TallSecurity0ABI.ExpressionRow", document.expressions.len()),
+        ("Program", "SchemaV1.ProgramRow", document.programs.len()),
+        ("Source", "SchemaV1.SourceRow", document.sources.len()),
+        ("Event", "SchemaV1.EventRow", document.events.len()),
+        ("IndexUse", "TallSecurity0ABI.IndexUseRow", document.index_uses.len()),
+        ("SliceGroup", "SchemaV1.SliceGroupRow", document.slice_groups.len()),
     ];
     let mut source = String::new();
     for (label, _, count) in tables {
@@ -185,7 +261,7 @@ fn render_top(document: &CertificateDocumentV1) -> Result<String, String> {
     source.push('\n');
     for (label, row_type, count) in tables {
         let root = render_balanced_table(label, row_type, count, &mut source);
-        writeln!(source, "def {label}Rows : RowTable SchemaV1.{row_type} := {root}\n")
+        writeln!(source, "def {label}Rows : RowTable {row_type} := {root}\n")
             .expect("writing to String cannot fail");
     }
     let residual = residual_root(&document.residual_root);
@@ -218,7 +294,7 @@ fn render_balanced_table(label: &str, row_type: &str, count: usize, out: &mut St
         if depth == 4 {
             let name = format!("{label}Tree{middle}");
             let value = node(label, row_type, start, end, 0, out);
-            writeln!(out, "def {name} : RowTable SchemaV1.{row_type} := {value}")
+            writeln!(out, "def {name} : RowTable {row_type} := {value}")
                 .expect("writing to String cannot fail");
             return name;
         }
@@ -809,7 +885,7 @@ fn frontier(value: &StableFrontierAxis) -> Result<String, String> {
     })
 }
 
-fn index_use_row(value: &CertificateIndexUse) -> Result<String, String> {
+fn index_use_row(value: &CertificateIndexUse, row: usize) -> Result<String, String> {
     let kind = match value.kind {
         IndexUseKind::IntegerExpression => ".integerExpression",
         IndexUseKind::FamilyGetStatic => ".familyGetStatic",
@@ -818,7 +894,7 @@ fn index_use_row(value: &CertificateIndexUse) -> Result<String, String> {
         IndexUseKind::IndexedSlice => ".indexedSlice",
     };
     Ok(format!(
-        "⟨{}, {}, {}, {kind}, {}, {}, {}, {}, {}⟩",
+        "⟨{}, {}, {}, {kind}, {}, {}, {}, {}, IndexLutRows{row}, by rfl⟩",
         observed_wire(&value.owner)?,
         option(value.result.as_ref(), |item| Ok(plan_ref(item)))?,
         option(value.consumed.as_ref(), |item| Ok(plan_ref(item)))?,
@@ -826,11 +902,6 @@ fn index_use_row(value: &CertificateIndexUse) -> Result<String, String> {
         option(value.output_range.as_ref(), |item| Ok(range(item)))?,
         value_type(&value.output_type)?,
         list(&value.frontier, frontier)?,
-        list(&value.rows, |row| Ok(format!(
-            "⟨{}, {}⟩",
-            list(&row.tuple, |item| quoted(item))?,
-            quoted(&row.output)?
-        )))?,
     ))
 }
 
@@ -877,6 +948,13 @@ fn residual_root(value: &CertificateResidualRootV1) -> String {
 mod tests {
     use super::*;
 
+    fn lut_row(tuple: &[&str], output: &str) -> IndexLutRow {
+        IndexLutRow {
+            tuple: tuple.iter().map(|item| (*item).to_owned()).collect(),
+            output: output.to_owned(),
+        }
+    }
+
     #[test]
     fn expression_inputs_use_one_fixed_type_at_zero_and_leaf_boundaries() {
         let mut zero = String::new();
@@ -918,5 +996,61 @@ mod tests {
         assert!(source.contains("def ExpressionInputs9307 : ExpressionInputs :="));
         assert!(source.contains(", 1153⟩"));
         assert!(!source.contains("[⟨0⟩, ⟨1⟩, ⟨2⟩, ⟨3⟩, ⟨4⟩, ⟨5⟩, ⟨6⟩, ⟨7⟩, ⟨8⟩, ⟨9⟩, ⟨10⟩, ⟨11⟩, ⟨12⟩, ⟨13⟩, ⟨14⟩, ⟨15⟩, ⟨16⟩"));
+    }
+
+    #[test]
+    fn index_lut_rows_use_one_fixed_type_at_zero_and_leaf_boundaries() {
+        let mut zero = String::new();
+        render_index_lut_rows(4, &[], &mut zero).expect("zero rows");
+        assert_eq!(zero, "def IndexLutRows4 : IndexLutRows := ⟨.empty, 0⟩\n\n");
+
+        let rows = (0..16)
+            .map(|value| lut_row(&[&value.to_string()], &value.to_string()))
+            .collect::<Vec<_>>();
+        let mut one_leaf = String::new();
+        render_index_lut_rows(5, &rows, &mut one_leaf).expect("one leaf");
+        assert!(one_leaf.starts_with("def IndexLutRows5 : IndexLutRows :=\n"));
+        assert!(one_leaf.contains("(.node 0 #[⟨[\"0\"], \"0\"⟩, ⟨[\"1\"], \"1\"⟩"));
+        assert!(one_leaf.contains("⟨[\"15\"], \"15\"⟩] .empty .empty), 16⟩"));
+        assert!(!one_leaf.contains("IndexLutRowLeaf"));
+    }
+
+    #[test]
+    fn index_lut_rows_preserve_duplicates_and_order_across_leaf_boundaries() {
+        let mut rows = (0..17)
+            .map(|value| lut_row(&[&value.to_string()], &format!("output-{value}")))
+            .collect::<Vec<_>>();
+        rows[2] = rows[0].clone();
+        rows[16] = rows[0].clone();
+        let mut source = String::new();
+        render_index_lut_rows(12, &rows, &mut source).expect("two leaves");
+        assert!(source.contains(
+            "IndexLutRowLeaf12_0 : Array SchemaV1.IndexLutRow := #[⟨[\"0\"], \"output-0\"⟩, ⟨[\"1\"], \"output-1\"⟩, ⟨[\"0\"], \"output-0\"⟩"
+        ));
+        assert!(source.contains(
+            "IndexLutRowLeaf12_1 : Array SchemaV1.IndexLutRow := #[⟨[\"0\"], \"output-0\"⟩]"
+        ));
+        assert!(source.contains("def IndexLutRows12 : IndexLutRows :=\n"));
+        assert!(source.contains(", 17⟩"));
+    }
+
+    #[test]
+    fn actual_scale_index_lut_rows_are_balanced_without_remapping() {
+        let rows = (0..3_601)
+            .map(|value| lut_row(&[&value.to_string()], &value.to_string()))
+            .collect::<Vec<_>>();
+        let mut source = String::new();
+        render_index_lut_rows(33, &rows, &mut source).expect("actual maximum rows");
+        assert_eq!(source.matches("def IndexLutRowLeaf33_").count(), 226);
+        assert!(source.contains(
+            "IndexLutRowLeaf33_0 : Array SchemaV1.IndexLutRow := #[⟨[\"0\"], \"0\"⟩, ⟨[\"1\"], \"1\"⟩"
+        ));
+        assert!(source.contains("⟨[\"14\"], \"14\"⟩, ⟨[\"15\"], \"15\"⟩]"));
+        assert!(source.contains(
+            "IndexLutRowLeaf33_225 : Array SchemaV1.IndexLutRow := #[⟨[\"3600\"], \"3600\"⟩]"
+        ));
+        assert!(source.contains("def IndexLutRows33 : IndexLutRows :=\n"));
+        assert!(source.contains(", 3601⟩"));
+        assert!(!source.contains("⟨[\"15\"], \"15\"⟩, ⟨[\"16\"], \"16\"⟩"));
     }
 }

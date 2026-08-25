@@ -17,6 +17,7 @@ use std::fmt::Write as _;
 
 const EVENT_LEAF_SIZE: usize = 16;
 const EVENT_PACKAGE_SIZE: usize = 256;
+const REPLAY_CHUNK_SIZE: usize = 4;
 
 #[derive(Clone)]
 struct FrameState {
@@ -33,7 +34,7 @@ pub(super) fn render(
     }
     let mut rendered = Vec::with_capacity(proof.events.len());
     let mut frame_starts = Vec::with_capacity(proof.events.len());
-    let mut states = Vec::with_capacity(proof.events.len().div_ceil(EVENT_LEAF_SIZE) + 1);
+    let mut states = Vec::with_capacity(proof.events.len().div_ceil(REPLAY_CHUNK_SIZE) + 1);
     let mut stack = Vec::<FrameState>::new();
     states.push(render_state(0, &stack)?);
     for (index, event) in proof.events.iter().enumerate() {
@@ -45,7 +46,7 @@ pub(super) fn render(
         frame_starts.push(frame_start);
         rendered.push(event_text(event)?);
         update_state(statement, index, event, &mut stack)?;
-        if (index + 1) % EVENT_LEAF_SIZE == 0 || index + 1 == proof.events.len() {
+        if (index + 1) % REPLAY_CHUNK_SIZE == 0 || index + 1 == proof.events.len() {
             states.push(render_state(index + 1, &stack)?);
         }
     }
@@ -70,11 +71,11 @@ pub(super) fn render(
     for package in 0..package_count {
         let start_event = package * EVENT_PACKAGE_SIZE;
         let end_event = (start_event + EVENT_PACKAGE_SIZE).min(proof.events.len());
-        let start_leaf = start_event / EVENT_LEAF_SIZE;
-        let end_leaf = end_event.div_ceil(EVENT_LEAF_SIZE);
+        let start_chunk = start_event / REPLAY_CHUNK_SIZE;
+        let end_chunk = end_event.div_ceil(REPLAY_CHUNK_SIZE);
         files.push(generated_file(
             format!("Proof/Replay{package:03}.lean"),
-            render_replay_package(package, start_leaf, end_leaf, &states),
+            render_replay_package(package, start_chunk, end_chunk, &states),
         ));
     }
     files.push(generated_file(
@@ -190,7 +191,7 @@ fn coefficient_bound(value: &NumericContract<CoefficientBound>) -> Result<String
         NumericContract::Missing => ".missing".to_owned(),
         NumericContract::Known(CoefficientBound::ExactZero) => ".exactZero".to_owned(),
         NumericContract::Known(CoefficientBound::Finite(value)) => {
-            format!(".finite {}", value.maximum_absolute_coefficient)
+            format!("(.finite {})", value.maximum_absolute_coefficient)
         }
         NumericContract::Known(CoefficientBound::Large) => ".large".to_owned(),
     })
@@ -354,12 +355,16 @@ fn merge(value: &ProofPayloadCoefficientMerge) -> Result<String, String> {
 }
 
 fn pre_fold(value: &ProofPayloadPreFoldPolynomial) -> Result<String, String> {
+    let summary_evidence = match value.summary_evidence.as_ref() {
+        Some(item) => format!("(some ({}))", value_ref(item)),
+        None => "none".to_owned(),
+    };
     Ok(format!(
         ".preFoldPolynomial {} {} {} {}",
         value.result_event,
         terms_text(&value.terms)?,
         summary_text(&value.summary)?,
-        option(value.summary_evidence.as_ref(), |item| Ok(value_ref(item)))?,
+        summary_evidence,
     ))
 }
 
@@ -473,38 +478,35 @@ fn render_balanced_leaves(start: usize, end: usize, depth: usize, out: &mut Stri
 
 fn render_replay_package(
     package: usize,
-    start_leaf: usize,
-    end_leaf: usize,
+    start_chunk: usize,
+    end_chunk: usize,
     states: &[String],
 ) -> String {
     let module = format!("Replay{package:03}");
     let mut source = format!(
         "import {MODULE_ROOT}.Proof.History\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Proof.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen {NAMESPACE}\n\n"
     );
-    for leaf in start_leaf..=end_leaf {
-        writeln!(source, "def replayState{leaf} : ReplayState := {}", states[leaf])
+    for chunk in start_chunk..=end_chunk {
+        writeln!(source, "def replayState{chunk} : ReplayState := {}", states[chunk])
             .expect("writing to String cannot fail");
     }
     source.push('\n');
-    for leaf in start_leaf..end_leaf {
-        let end =
-            ((leaf + 1) * EVENT_LEAF_SIZE).min(states.len().saturating_sub(1) * EVENT_LEAF_SIZE);
-        let actual_end = states[leaf + 1]
+    for chunk in start_chunk..end_chunk {
+        let actual_end = states[chunk + 1]
             .strip_prefix('⟨')
             .and_then(|text| text.split_once(',').map(|pair| pair.0))
             .expect("state renderer always begins with cursor");
         writeln!(
             source,
-            "theorem replayLeaf{leaf} : ReplayChain document history replayState{leaf} replayState{} :=\n  .chunk {actual_end} (by rfl)\n",
-            leaf + 1
+            "theorem replayChunk{chunk} : ReplayChain document history replayState{chunk} replayState{} :=\n  .chunk {actual_end} (by rfl)\n",
+            chunk + 1
         )
         .expect("writing to String cannot fail");
-        let _ = end;
     }
-    let chain = balanced_chain("replayLeaf", start_leaf, end_leaf);
+    let chain = balanced_chain("replayChunk", start_chunk, end_chunk);
     writeln!(
         source,
-        "theorem replayShard{package} : ReplayChain document history replayState{start_leaf} replayState{end_leaf} :=\n  {chain}\n\nend {NAMESPACE}.Proof.{module}"
+        "theorem replayShard{package} : ReplayChain document history replayState{start_chunk} replayState{end_chunk} :=\n  {chain}\n\nend {NAMESPACE}.Proof.{module}"
     )
     .expect("writing to String cannot fail");
     source
@@ -648,7 +650,150 @@ mod tests {
         };
         assert_eq!(
             pre_fold(&finite).expect("render finite pre-fold"),
-            ".preFoldPolynomial 8 [] .finite 7 some (.result 8 .summary)"
+            ".preFoldPolynomial 8 [] (.finite 7) (some (.result 8 .summary))"
         );
+
+        let predecessor = ProofPayloadPreFoldPolynomial {
+            result_event: 9,
+            terms: vec![],
+            summary: crate::operational_noise::normal_form::BoundedSummary::zero(),
+            summary_evidence: Some(ProofPayloadValueRef::Predecessor {
+                binding_event: 5,
+                input_position: 2,
+                projection: BoundProjection::Coefficient,
+            }),
+        };
+        assert_eq!(
+            pre_fold(&predecessor).expect("render predecessor evidence"),
+            ".preFoldPolynomial 9 [] .exactZero (some (.predecessor 2 5 .coefficient))"
+        );
+
+        let transfer = ProofPayloadPreFoldPolynomial {
+            result_event: 10,
+            terms: vec![],
+            summary: crate::operational_noise::normal_form::BoundedSummary::zero(),
+            summary_evidence: Some(ProofPayloadValueRef::Transfer(6)),
+        };
+        assert_eq!(
+            pre_fold(&transfer).expect("render transfer evidence"),
+            ".preFoldPolynomial 10 [] .exactZero (some (.transfer 6))"
+        );
+    }
+
+    #[test]
+    fn finite_bounds_are_parenthesized_in_every_reached_event_position() {
+        let finite = crate::operational_noise::normal_form::BoundedSummary::finite(
+            crate::operational_noise::facts::BoundExpression::new(7_u8.into()),
+        );
+        let coefficient = NumericContract::Known(CoefficientBound::Finite(
+            crate::operational_noise::facts::BoundExpression::new(7_u8.into()),
+        ));
+        assert_eq!(coefficient_bound(&coefficient).expect("finite coefficient"), "(.finite 7)");
+
+        let result_coefficient = ProofPayloadEvent::Result {
+            owner: owner(3),
+            value: ProofPayloadValue::Coefficient { bound: coefficient },
+        };
+        assert_eq!(
+            event_text(&result_coefficient).expect("finite coefficient result"),
+            ".resultCoefficient (⟨.program ⟨0⟩, ⟨3⟩⟩) (.finite 7)"
+        );
+
+        let result_exact = ProofPayloadEvent::Result {
+            owner: owner(3),
+            value: ProofPayloadValue::Exact { terms: vec![], summary: finite.clone() },
+        };
+        assert_eq!(
+            event_text(&result_exact).expect("finite exact result"),
+            ".resultExact (⟨.program ⟨0⟩, ⟨3⟩⟩) [] (.finite 7)"
+        );
+
+        let invocation_end = ProofPayloadEvent::InvocationEnd {
+            root: owner(3),
+            result: ProofPayloadValue::Exact { terms: vec![], summary: finite },
+            pre_fold_event: 11,
+        };
+        assert_eq!(
+            event_text(&invocation_end).expect("finite invocation end"),
+            ".invocationEndExact (⟨.program ⟨0⟩, ⟨3⟩⟩) 11 [] (.finite 7)"
+        );
+    }
+
+    #[test]
+    fn one_history_leaf_is_replayed_as_four_four_event_chunks() {
+        let states = vec![
+            "⟨0, []⟩".to_owned(),
+            "⟨4, []⟩".to_owned(),
+            "⟨8, []⟩".to_owned(),
+            "⟨12, []⟩".to_owned(),
+            "⟨16, []⟩".to_owned(),
+        ];
+        let replay = render_replay_package(0, 0, 4, &states);
+        assert!(replay.contains(
+            "theorem replayChunk0 : ReplayChain document history replayState0 replayState1 :=\n  .chunk 4 (by rfl)"
+        ));
+        assert!(replay.contains(
+            "theorem replayChunk3 : ReplayChain document history replayState3 replayState4 :=\n  .chunk 16 (by rfl)"
+        ));
+        assert!(replay.contains(
+            "(.trans (.trans replayChunk0 replayChunk1) (.trans replayChunk2 replayChunk3))"
+        ));
+    }
+
+    #[test]
+    fn final_partial_replay_chunk_uses_the_exact_event_cursor() {
+        let states = vec!["⟨0, []⟩".to_owned(), "⟨4, []⟩".to_owned(), "⟨5, []⟩".to_owned()];
+        let replay = render_replay_package(0, 0, 2, &states);
+        assert!(replay.contains(".chunk 4 (by rfl)"));
+        assert!(replay.contains(".chunk 5 (by rfl)"));
+    }
+
+    #[test]
+    fn nested_invocation_frames_are_exact_at_four_event_boundaries() {
+        let statement = statement();
+        let mut stack = Vec::new();
+        let outer = owner(0);
+        let inner = owner(1);
+        update_state(
+            &statement,
+            0,
+            &ProofPayloadEvent::InvocationStart { root: outer },
+            &mut stack,
+        )
+        .expect("start outer invocation");
+        assert_eq!(
+            render_state(4, &stack).expect("outer boundary"),
+            "⟨4, [⟨⟨.program ⟨0⟩, ⟨0⟩⟩, 0⟩]⟩"
+        );
+        update_state(
+            &statement,
+            4,
+            &ProofPayloadEvent::InvocationStart { root: inner },
+            &mut stack,
+        )
+        .expect("start inner invocation");
+        assert_eq!(
+            render_state(8, &stack).expect("nested boundary"),
+            "⟨8, [⟨⟨.program ⟨0⟩, ⟨1⟩⟩, 4⟩, ⟨⟨.program ⟨0⟩, ⟨0⟩⟩, 0⟩]⟩"
+        );
+    }
+
+    #[test]
+    fn dense_merge_probe_uses_four_event_states_from_5328_through_5376() {
+        let frame = "[⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]";
+        let mut states = vec![String::new(); 1345];
+        for chunk in 1332..=1344 {
+            states[chunk] = format!("⟨{}, {frame}⟩", chunk * REPLAY_CHUNK_SIZE);
+        }
+        let replay = render_replay_package(20, 1332, 1344, &states);
+        for cursor in (5328..=5376).step_by(REPLAY_CHUNK_SIZE) {
+            assert!(replay.contains(&format!("ReplayState := ⟨{cursor}, {frame}⟩")));
+        }
+        for (chunk, end) in (1332..1344).zip((5332..=5376).step_by(REPLAY_CHUNK_SIZE)) {
+            assert!(replay.contains(&format!(
+                "theorem replayChunk{chunk} : ReplayChain document history replayState{chunk} replayState{} :=\n  .chunk {end} (by rfl)",
+                chunk + 1
+            )));
+        }
     }
 }

@@ -18,6 +18,7 @@ pub(crate) mod program;
 pub(crate) mod protocol;
 pub(crate) mod relation;
 pub(crate) mod report;
+mod tall_e2e;
 mod toy_e2e;
 
 pub mod bound;
@@ -38,6 +39,10 @@ pub use simulation::{
     ProgressEventKind, ResidualTraceCounters, check_operational_noise_candidate,
     check_operational_noise_candidate_with_progress, prepare_base_feasibility_summary,
     prepare_g0_cpu_evidence_bytes, serialize_base_feasibility_summary,
+};
+pub use tall_e2e::{
+    TallSecurity0ProfileIdentity, TallSecurity0ReachedProjection,
+    prepare_tall_security0_reached_projection,
 };
 pub use toy_e2e::{
     ToyGeneratedLean, check_toy_operational_slice_source, generate_toy_operational_slice_lean,

@@ -22,7 +22,9 @@ use mxx_correctness::{
     operational_noise::{
         OperationalAcceptanceReport, OperationalCheckRequest, OperationalGadgetLayout,
         OperationalSimulationError, OperationalSimulationReport, ProgressEventKind,
+        TallSecurity0ProfileIdentity, check_operational_noise_candidate,
         check_operational_noise_candidate_with_progress, prepare_g0_cpu_evidence_bytes,
+        prepare_tall_security0_reached_projection,
     },
     operational_protocol_from_graphs,
 };
@@ -268,6 +270,23 @@ struct TallCertificateParametersV1 {
 }
 
 impl TallCertificateSourceV1 {
+    fn profile_identity(&self) -> TallSecurity0ProfileIdentity {
+        TallSecurity0ProfileIdentity {
+            source_schema_id: self.schema_id.clone(),
+            source_schema_version: self.schema_version,
+            profile: match self.profile {
+                TallG0Profile::Security0 => "Security0",
+                TallG0Profile::Security128 => "Security128",
+            }
+            .to_owned(),
+            source_revision: self.source_revision.clone(),
+            evaluator_version: self.evaluator_version.clone(),
+            rust_projection_version: self.rust_projection_version.clone(),
+            lean_abi_version: self.lean_abi_version.clone(),
+            request_target_id: self.request_target_id.clone(),
+        }
+    }
+
     fn fixed_profile(&self) -> Result<FixedTallG0Profile, String> {
         if self.schema_id != TALL_CERTIFICATE_SOURCE_SCHEMA_ID ||
             self.schema_version != TALL_CERTIFICATE_SOURCE_SCHEMA_VERSION ||
@@ -2398,38 +2417,46 @@ fn fixed_tall_security0_certificate_source_is_exact() {
 }
 
 #[test]
-#[ignore = "CPU-only fixed Security0 source reconstruction; performs no backend execution"]
-fn fixed_tall_security0_source_reconstructs_direct_semantics() {
+#[ignore = "CPU-only fixed Security0 reached projection; performs no backend execution"]
+fn fixed_tall_security0_source_projection_matches_ordinary_semantics() {
     let source: TallCertificateSourceV1 = serde_json::from_slice(
         &fs::read(TALL_SECURITY0_SOURCE_PATH).expect("fixed Security0 Source.json"),
     )
     .expect("strict fixed Security0 source");
-    let direct = prepare_fixed_tall_operational_source(TallG0Profile::Security0.fixed())
-        .expect("direct fixed Security0 source");
     let reconstructed = build_fixed_tall_certificate_source(&source)
         .expect("Source.json-driven fixed Security0 source");
 
-    assert_eq!(direct.fixed, reconstructed.fixed);
-    assert_eq!(direct.selected.parameters.to_crt(), reconstructed.selected.parameters.to_crt());
+    let identity = source.profile_identity();
+    let reconstructed_projection = prepare_tall_security0_reached_projection(
+        &reconstructed.protocol,
+        &reconstructed.request,
+        &identity,
+    )
+    .expect("Source.json-driven fixed Security0 reached projection");
+
+    let ordinary =
+        check_operational_noise_candidate(&reconstructed.protocol, &reconstructed.request)
+            .expect("ordinary fixed Security0 report");
+    assert_eq!(ordinary, reconstructed_projection.recorded_report);
+    let inventory: serde_json::Value =
+        serde_json::from_slice(&reconstructed_projection.inventory_bytes)
+            .expect("Security0 reached inventory JSON");
+    assert_eq!(inventory["closure"]["expressions"], 30_330);
+    assert_eq!(inventory["statement"]["total"], 35_975);
+    assert_eq!(inventory["proofEvents"], 107_567);
+    let reached = inventory["reached"].as_array().expect("reached event counts");
+    assert_eq!(reached.len(), 22);
     assert_eq!(
-        direct.selected.parameters.ring_dimension(),
-        reconstructed.selected.parameters.ring_dimension()
+        reached.iter().map(|row| row["count"].as_u64().expect("reached event count")).sum::<u64>(),
+        107_567
     );
-    assert_eq!(direct.request, reconstructed.request);
-
-    let direct_evidence = prepare_g0_cpu_evidence_bytes(&direct.protocol, &direct.request)
-        .expect("direct fixed Security0 semantic evidence");
-    let reconstructed_evidence =
-        prepare_g0_cpu_evidence_bytes(&reconstructed.protocol, &reconstructed.request)
-            .expect("Source.json-driven fixed Security0 semantic evidence");
-    assert_eq!(direct_evidence, reconstructed_evidence);
-
-    let evidence: serde_json::Value =
-        serde_json::from_slice(&reconstructed_evidence).expect("Security0 CPU evidence JSON");
-    assert_eq!(evidence["schema_id"], G0_CPU_OBSERVATION_SCHEMA_ID);
-    assert_eq!(evidence["schema_version"], G0_CPU_OBSERVATION_SCHEMA_VERSION);
-    assert_eq!(evidence["status"], G0_CPU_OBSERVATION_STATUS);
-    assert!(evidence["base_feasibility"]["accepted"].as_bool().expect("accepted report"));
+    println!(
+        "inventoryBytes={} projectionBytes={} {}",
+        reconstructed_projection.inventory_bytes.len(),
+        reconstructed_projection.projection_bytes.len(),
+        std::str::from_utf8(&reconstructed_projection.inventory_bytes)
+            .expect("Security0 reached inventory UTF-8")
+    );
 }
 
 fn assert_fixed_tall_g0_observation(bytes: &[u8], expected_profile: TallG0Profile) {

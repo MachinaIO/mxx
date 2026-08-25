@@ -81,6 +81,48 @@ def terminalAtomHistory : EventHistory :=
     annotated
       (.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner] .exactZero) 0]
 
+def boundFixtureOwner : Owner := closedOwner 0
+
+def boundFixtureReference : ValueRef := .result 1 .coefficient
+
+def boundFixtureHistory : EventHistory :=
+    smallHistory #[
+    annotated (.boundTransfer boundFixtureOwner (.identity boundFixtureReference)) 7,
+    annotated (.resultCoefficient boundFixtureOwner (.finite 3)) 7]
+
+theorem bound_identity_fixture :
+    BoundDerivedAt boundFixtureHistory 0 7 boundFixtureOwner
+      (.identity boundFixtureReference) (.finite ⟨3, by decide⟩) 3 := by
+  apply BoundDerivedAt.identity
+  · rfl
+  · refine ⟨boundFixtureOwner, none, ?_⟩
+    exact .coefficient (frameStart := 7) (by decide)
+      (by simp [CoeffClass.Interprets])
+
+theorem bound_identity_projection_fixture :
+    ProjectedBoundAt boundFixtureHistory 1 boundFixtureOwner none .coefficient
+      (.finite ⟨3, by decide⟩) 3 := by
+  exact boundTransfer_to_resultCoefficient bound_identity_fixture (by rfl) (by rfl)
+
+def exactBoundFixtureTerms : List Term := [canonicalSelfTerm boundFixtureOwner]
+
+def exactBoundFixtureHistory : EventHistory :=
+  smallHistory #[annotated
+    (.resultExact boundFixtureOwner exactBoundFixtureTerms (.finite 4)) 7]
+
+theorem exact_summary_projection_fixture :
+    ProjectedBoundAt exactBoundFixtureHistory 0 boundFixtureOwner
+      (some exactBoundFixtureTerms) .summary (.finite ⟨4, by decide⟩) 3 := by
+  exact .summary (frameStart := 7) exactBoundFixtureTerms (by rfl)
+    (by simp [CoeffClass.Interprets])
+
+theorem exact_finite_claim_fixture :
+    ExactClaimAt exactBoundFixtureHistory 257 (fun _ => 0) 0 boundFixtureOwner 0
+      exactBoundFixtureTerms (.finite 4) := by
+  apply exactFiniteClaimAt (actual := 0) (remainder := 0) (maximum := 4) (frameStart := 7) (by rfl)
+  · decide
+  · simp [centeredNorm, centeredCoefficient]
+
 theorem terminal_atom_at :
     TerminalExactAt sourceAtomDocument terminalAtomHistory none 0 1 sourceAtomOwner
       [canonicalSelfTerm sourceAtomOwner] := by
@@ -318,6 +360,12 @@ theorem canonical_relation_fixture :
 
 #print axioms generic_evaluation_fixture
 #print axioms generic_value_claim_fixture
+#print axioms bound_identity_fixture
+#print axioms bound_identity_projection_fixture
+#print axioms TallSemantics.boundTransfer_to_resultCoefficient
+#print axioms TallSemantics.BoundDerivedAt.sound
+#print axioms exact_summary_projection_fixture
+#print axioms exact_finite_claim_fixture
 #print axioms TallSemantics.coeffClassInterprets_to_boundInterprets
 #print axioms TallSemantics.addKnownList_sound
 #print axioms TallSemantics.exactValueClaim_of_coeffClass

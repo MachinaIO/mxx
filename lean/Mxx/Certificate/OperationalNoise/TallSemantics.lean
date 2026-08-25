@@ -145,6 +145,358 @@ def KeyEquivalent (left right : MonomialKey Owner) : Prop :=
   left.centralFactors.Perm right.centralFactors ∧
     left.orderedFactors = right.orderedFactors
 
+/-! Canonical comparison is local to this semantic layer.  In particular, it does not encode an
+    `Owner` as a `Nat`: scope tags and their contained rows are compared first, followed by the
+    expression row.  This gives central-factor sorting a total structural order without adding a
+    premise to the Rust certificate. -/
+
+private def compareNat (left right : Nat) : Ordering :=
+  if left < right then .lt else if right < left then .gt else .eq
+
+def ownerCompare (left right : Owner) : Ordering :=
+  let scopeComparison := match left.scope, right.scope with
+    | .closed leftRoot, .closed rightRoot => compareNat leftRoot.row rightRoot.row
+    | .closed _, .program _ => .lt
+    | .program _, .closed _ => .gt
+    | .program leftProgram, .program rightProgram =>
+        compareNat leftProgram.row rightProgram.row
+  match scopeComparison with
+  | .eq => compareNat left.expression.row right.expression.row
+  | comparison => comparison
+
+def ownerLe (left right : Owner) : Bool := (ownerCompare left right).isLE
+
+private def keyCompare (left right : MonomialKey Owner) : Ordering :=
+  match List.compareLex ownerCompare left.centralFactors right.centralFactors with
+  | .eq => List.compareLex ownerCompare left.orderedFactors right.orderedFactors
+  | comparison => comparison
+
+private def termCompare (left right : ExactTerm Owner) : Ordering :=
+  keyCompare left.key right.key
+
+private def termLe (left right : ExactTerm Owner) : Bool := (termCompare left right).isLE
+
+private def constructiveMergeAux {α : Type} (le : α → α → Bool) :
+    List α → List α → Nat → List α
+  | [], right, _ => right
+  | left, [], _ => left
+  | leftHead :: leftTail, rightHead :: rightTail, 0 => leftHead :: leftTail ++ rightHead :: rightTail
+  | leftHead :: leftTail, rightHead :: rightTail, fuel + 1 =>
+      if le leftHead rightHead then
+        leftHead :: constructiveMergeAux le leftTail (rightHead :: rightTail) fuel
+      else
+        rightHead :: constructiveMergeAux le (leftHead :: leftTail) rightTail fuel
+
+private def constructiveMerge {α : Type} (le : α → α → Bool)
+    (left right : List α) : List α :=
+  match right with
+  | [] => left
+  | rightHead :: rightTail =>
+      match left with
+      | [] => rightHead :: rightTail
+      | leftHead :: leftTail =>
+          constructiveMergeAux le (leftHead :: leftTail) (rightHead :: rightTail)
+            ((leftHead :: leftTail).length + (rightHead :: rightTail).length)
+
+private theorem constructiveMerge_nil_left {α : Type} (le : α → α → Bool)
+    (right : List α) : constructiveMerge le [] right = right := by
+  cases right <;> rfl
+
+private theorem constructiveMerge_nil_right {α : Type} (le : α → α → Bool)
+    (left : List α) : constructiveMerge le left [] = left := by
+  unfold constructiveMerge
+  rfl
+
+private theorem constructiveMerge_cons_cons {α : Type} (le : α → α → Bool)
+    (leftHead rightHead : α) (leftTail rightTail : List α) :
+    constructiveMerge le (leftHead :: leftTail) (rightHead :: rightTail) =
+      if le leftHead rightHead then
+        leftHead :: constructiveMerge le leftTail (rightHead :: rightTail)
+      else
+        rightHead :: constructiveMerge le (leftHead :: leftTail) rightTail := by
+  unfold constructiveMerge
+  cases leftTail <;> cases rightTail <;>
+    simp [constructiveMergeAux, Nat.add_assoc, Nat.add_left_comm, Nat.add_comm]
+
+private def constructiveMergePassAux {α : Type} (le : α → α → Bool) (width : Nat) :
+    Nat → List α → List α
+  | _fuel, [] => []
+  | fuel, factors =>
+      if width = 0 then factors
+      else match fuel with
+        | 0 => factors
+        | fuel + 1 =>
+            let left := factors.take width
+            let remainder := factors.drop width
+            let right := remainder.take width
+            let tail := remainder.drop width
+            constructiveMerge le left right ++
+              constructiveMergePassAux le width fuel tail
+
+private def constructiveMergePass {α : Type} (le : α → α → Bool)
+    (width : Nat) (factors : List α) : List α :=
+  constructiveMergePassAux le width factors.length factors
+
+private def constructiveMergeSortAux {α : Type} (le : α → α → Bool)
+    (factors : List α) (width : Nat) : Nat → List α
+  | 0 => factors
+  | fuel + 1 =>
+      if width < factors.length then
+        constructiveMergeSortAux le (constructiveMergePass le width factors) (width * 2) fuel
+      else factors
+
+private def constructiveMergeSort {α : Type} (le : α → α → Bool) (factors : List α) :
+    List α :=
+  constructiveMergeSortAux le factors 1 factors.length
+
+private theorem constructiveMerge_prod {α : Type} (env : Env α)
+    (le : α → α → Bool) (left right : List α) :
+    ((constructiveMerge le left right).map env).prod =
+      (left.map env).prod * (right.map env).prod := by
+  let motive : Nat → Prop := fun total =>
+    ∀ (left right : List α), left.length + right.length = total →
+      ((constructiveMerge le left right).map env).prod =
+        (left.map env).prod * (right.map env).prod
+  refine Nat.strongRecOn (motive := motive) (left.length + right.length) ?_ left right rfl
+  intro total inductionHypothesis left right totalEq
+  cases left with
+  | nil => simp [constructiveMerge_nil_left]
+  | cons leftHead leftTail =>
+      cases right with
+      | nil => simp [constructiveMerge_nil_right]
+      | cons rightHead rightTail =>
+          cases hb : le leftHead rightHead with
+          | false =>
+            rw [constructiveMerge_cons_cons]
+            simp only [hb, Bool.false_eq_true, ↓reduceIte]
+            simp only [List.map, List.prod_cons]
+            have recursive := inductionHypothesis
+              ((leftHead :: leftTail).length + rightTail.length)
+              (by rw [← totalEq]; simp) (leftHead :: leftTail) rightTail rfl
+            rw [recursive]
+            simp [Int.mul_assoc, Int.mul_left_comm]
+          | true =>
+            rw [constructiveMerge_cons_cons]
+            simp only [hb, ↓reduceIte]
+            simp only [List.map, List.prod_cons]
+            have recursive := inductionHypothesis
+              (leftTail.length + (rightHead :: rightTail).length)
+              (by rw [← totalEq]; simp) leftTail (rightHead :: rightTail) rfl
+            rw [recursive]
+            simp [Int.mul_assoc, Int.mul_left_comm]
+
+private theorem constructiveMergePassAux_prod {α : Type} (env : Env α)
+    (le : α → α → Bool) (width fuel : Nat) (factors : List α) :
+    ((constructiveMergePassAux le width fuel factors).map env).prod =
+      (factors.map env).prod := by
+  induction fuel generalizing factors with
+  | zero => cases factors <;> simp [constructiveMergePassAux]
+  | succ fuel ih =>
+      cases factors with
+      | nil => simp [constructiveMergePassAux]
+      | cons head tail =>
+          by_cases widthZero : width = 0
+          · simp [constructiveMergePassAux, widthZero]
+          · simp only [constructiveMergePassAux, widthZero, ↓reduceIte]
+            let left := (head :: tail).take width
+            let remainder := (head :: tail).drop width
+            let right := remainder.take width
+            let rest := remainder.drop width
+            have rightRest : right ++ rest = remainder := by
+              exact List.take_append_drop width remainder
+            have leftRemainder : left ++ remainder = head :: tail := by
+              exact List.take_append_drop width (head :: tail)
+            have leftRightRest : left ++ right ++ rest = head :: tail := by
+              rw [List.append_assoc, rightRest, leftRemainder]
+            rw [List.map_append, List.prod_append, constructiveMerge_prod env le left right,
+              ih rest]
+            rw [← List.prod_append, ← List.prod_append, ← List.map_append, ← List.map_append,
+              leftRightRest]
+
+private theorem constructiveMergePass_prod {α : Type} (env : Env α)
+    (le : α → α → Bool) (width : Nat) (factors : List α) :
+    ((constructiveMergePass le width factors).map env).prod =
+      (factors.map env).prod := by
+  exact constructiveMergePassAux_prod env le width factors.length factors
+
+private theorem constructiveMergeSortAux_prod {α : Type} (env : Env α)
+    (le : α → α → Bool) (factors : List α) (width fuel : Nat) :
+    ((constructiveMergeSortAux le factors width fuel).map env).prod =
+      (factors.map env).prod := by
+  induction fuel generalizing factors width with
+  | zero => rfl
+  | succ fuel ih =>
+      by_cases widthLt : width < factors.length
+      · simp only [constructiveMergeSortAux, widthLt, ↓reduceIte]
+        rw [ih, constructiveMergePass_prod]
+      · simp only [constructiveMergeSortAux, widthLt, ↓reduceIte]
+
+private theorem constructiveMergeSort_prod {α : Type} (env : Env α)
+    (le : α → α → Bool) (factors : List α) :
+    ((constructiveMergeSort le factors).map env).prod =
+      (factors.map env).prod := by
+  exact constructiveMergeSortAux_prod env le factors 1 factors.length
+
+private theorem evalPolynomial_append_forCanonical (env : Env Owner)
+    (left right : Polynomial Owner) :
+    evalPolynomial env (left ++ right) = evalPolynomial env left + evalPolynomial env right := by
+  induction left with
+  | nil => simp [evalPolynomial]
+  | cons term left ih =>
+      simp only [List.cons_append, evalPolynomial]
+      rw [ih]
+      simp [Int.add_assoc]
+
+private theorem constructiveMerge_evalPolynomial (env : Env Owner)
+    (le : ExactTerm Owner → ExactTerm Owner → Bool) (left right : Polynomial Owner) :
+    evalPolynomial env (constructiveMerge le left right) =
+      evalPolynomial env left + evalPolynomial env right := by
+  let motive : Nat → Prop := fun total =>
+    ∀ (left right : Polynomial Owner), left.length + right.length = total →
+      evalPolynomial env (constructiveMerge le left right) =
+        evalPolynomial env left + evalPolynomial env right
+  refine Nat.strongRecOn (motive := motive) (left.length + right.length) ?_ left right rfl
+  intro total inductionHypothesis left right totalEq
+  cases left with
+  | nil => simp [constructiveMerge_nil_left, evalPolynomial]
+  | cons leftHead leftTail =>
+      cases right with
+      | nil => simp [constructiveMerge_nil_right, evalPolynomial]
+      | cons rightHead rightTail =>
+          cases hb : le leftHead rightHead with
+          | false =>
+            rw [constructiveMerge_cons_cons]
+            simp only [hb, Bool.false_eq_true, ↓reduceIte]
+            simp only [evalPolynomial]
+            have recursive := inductionHypothesis
+              ((leftHead :: leftTail).length + rightTail.length)
+              (by rw [← totalEq]; simp) (leftHead :: leftTail) rightTail rfl
+            change rightHead.coefficient * evalMonomial env rightHead.key +
+              evalPolynomial env (constructiveMerge le (leftHead :: leftTail) rightTail) = _
+            rw [recursive]
+            simp only [evalPolynomial]
+            simp [Int.add_assoc, Int.add_left_comm]
+          | true =>
+            rw [constructiveMerge_cons_cons]
+            simp only [hb, ↓reduceIte]
+            simp only [evalPolynomial]
+            have recursive := inductionHypothesis
+              (leftTail.length + (rightHead :: rightTail).length)
+              (by rw [← totalEq]; simp) leftTail (rightHead :: rightTail) rfl
+            change leftHead.coefficient * evalMonomial env leftHead.key +
+              evalPolynomial env (constructiveMerge le leftTail (rightHead :: rightTail)) = _
+            rw [recursive]
+            simp only [evalPolynomial]
+            simp [Int.add_assoc, Int.add_left_comm]
+
+private theorem constructiveMergePassAux_evalPolynomial (env : Env Owner)
+    (le : ExactTerm Owner → ExactTerm Owner → Bool)
+    (width fuel : Nat) (factors : Polynomial Owner) :
+    evalPolynomial env (constructiveMergePassAux le width fuel factors) =
+      evalPolynomial env factors := by
+  induction fuel generalizing factors with
+  | zero => cases factors <;> simp [constructiveMergePassAux]
+  | succ fuel ih =>
+      cases factors with
+      | nil => simp [constructiveMergePassAux, evalPolynomial]
+      | cons head tail =>
+          by_cases widthZero : width = 0
+          · simp [constructiveMergePassAux, widthZero]
+          · simp only [constructiveMergePassAux, widthZero, ↓reduceIte]
+            let left := (head :: tail).take width
+            let remainder := (head :: tail).drop width
+            let right := remainder.take width
+            let rest := remainder.drop width
+            have rightRest : right ++ rest = remainder := by
+              exact List.take_append_drop width remainder
+            have leftRemainder : left ++ remainder = head :: tail := by
+              exact List.take_append_drop width (head :: tail)
+            have leftRightRest : left ++ right ++ rest = head :: tail := by
+              rw [List.append_assoc, rightRest, leftRemainder]
+            have merged := constructiveMerge_evalPolynomial env le left right
+            have restEval := ih rest
+            rw [evalPolynomial_append_forCanonical, merged, restEval]
+            rw [← evalPolynomial_append_forCanonical env left right,
+              ← evalPolynomial_append_forCanonical env (left ++ right) rest,
+              leftRightRest]
+
+private theorem constructiveMergePass_evalPolynomial (env : Env Owner)
+    (le : ExactTerm Owner → ExactTerm Owner → Bool)
+    (width : Nat) (factors : Polynomial Owner) :
+    evalPolynomial env (constructiveMergePass le width factors) =
+      evalPolynomial env factors := by
+  exact constructiveMergePassAux_evalPolynomial env le width factors.length factors
+
+private theorem constructiveMergeSort_evalPolynomialAux (env : Env Owner)
+    (le : ExactTerm Owner → ExactTerm Owner → Bool)
+    (factors : Polynomial Owner) (width fuel : Nat) :
+    evalPolynomial env (constructiveMergeSortAux le factors width fuel) =
+      evalPolynomial env factors := by
+  induction fuel generalizing factors width with
+  | zero => rfl
+  | succ fuel ih =>
+      by_cases widthLt : width < factors.length
+      · simp only [constructiveMergeSortAux, widthLt, ↓reduceIte]
+        rw [ih, constructiveMergePass_evalPolynomial]
+      · simp only [constructiveMergeSortAux, widthLt, ↓reduceIte]
+
+private theorem constructiveMergeSort_evalPolynomial (env : Env Owner)
+    (factors : Polynomial Owner) :
+    evalPolynomial env (constructiveMergeSort termLe factors) = evalPolynomial env factors := by
+  exact constructiveMergeSort_evalPolynomialAux env termLe factors 1 factors.length
+
+def canonicalKey (key : MonomialKey Owner) : MonomialKey Owner :=
+  { centralFactors := constructiveMergeSort ownerLe key.centralFactors
+    orderedFactors := key.orderedFactors }
+
+private def canonicalTerm (term : ExactTerm Owner) : ExactTerm Owner :=
+  { term with key := canonicalKey term.key }
+
+private def combineSame (coefficient : Int) (key : MonomialKey Owner) :
+    Polynomial Owner → Int × Polynomial Owner
+  | [] => (coefficient, [])
+  | term :: terms =>
+      if term.key = key then
+        combineSame (coefficient + term.coefficient) key terms
+      else
+        (coefficient, term :: terms)
+
+private theorem combineSame_tail_length (coefficient : Int) (key : MonomialKey Owner)
+    (terms : Polynomial Owner) : (combineSame coefficient key terms).2.length ≤ terms.length := by
+  induction terms generalizing coefficient with
+  | nil => exact Nat.le_refl _
+  | cons term terms ih =>
+      by_cases equal : term.key = key
+      · simp only [combineSame, equal, ↓reduceIte]
+        exact Nat.le_trans (ih (coefficient + term.coefficient)) (Nat.le_succ _)
+      · simp only [combineSame, equal, ↓reduceIte]
+        exact Nat.le_refl _
+
+private def combineCanonicalAux : Nat → Polynomial Owner → Polynomial Owner
+  | 0, terms => terms
+  | _fuel + 1, [] => []
+  | fuel + 1, term :: terms =>
+      let combined := combineSame term.coefficient term.key terms
+      if combined.1 = 0 then
+        combineCanonicalAux fuel combined.2
+      else
+        { coefficient := combined.1, key := term.key } :: combineCanonicalAux fuel combined.2
+
+private def combineCanonical (terms : Polynomial Owner) : Polynomial Owner :=
+  combineCanonicalAux terms.length terms
+
+def canonicalPolynomial (terms : Polynomial Owner) : Polynomial Owner :=
+  combineCanonical (constructiveMergeSort (fun left right => termLe left right)
+    (terms.map canonicalTerm))
+
+def CanonicalAgreement (left right : Polynomial Owner) : Prop :=
+  canonicalPolynomial left = canonicalPolynomial right
+
+instance canonicalAgreementDecidable (left right : Polynomial Owner) :
+    Decidable (CanonicalAgreement left right) := by
+  unfold CanonicalAgreement
+  infer_instance
+
 instance keyEquivalentDecidable (left right : MonomialKey Owner) :
     Decidable (KeyEquivalent left right) := by
   apply decidable_of_iff
@@ -170,6 +522,114 @@ theorem evalMonomial_of_key {Factor : Type} (env : Env Factor)
     (ordered : left.orderedFactors = right.orderedFactors) :
     evalMonomial env left = evalMonomial env right := by
   rw [evalMonomial, evalMonomial, ordered, list_prod_perm env central]
+
+private theorem evalPolynomial_perm (env : Env Owner)
+    {left right : Polynomial Owner} (permutation : left.Perm right) :
+    evalPolynomial env left = evalPolynomial env right := by
+  induction permutation with
+  | nil => rfl
+  | cons term permutation ih =>
+      simp only [evalPolynomial]
+      rw [ih]
+  | swap left right terms =>
+      simp only [evalPolynomial]
+      simp [Int.add_left_comm]
+  | trans first second ihFirst ihSecond => exact ihFirst.trans ihSecond
+
+private theorem evalMonomial_canonicalKey (env : Env Owner) (key : MonomialKey Owner) :
+    evalMonomial env (canonicalKey key) = evalMonomial env key := by
+  unfold canonicalKey evalMonomial
+  rw [constructiveMergeSort_prod env ownerLe key.centralFactors]
+
+private theorem evalPolynomial_map_canonicalTerm (env : Env Owner)
+    (terms : Polynomial Owner) :
+    evalPolynomial env (terms.map canonicalTerm) = evalPolynomial env terms := by
+  induction terms with
+  | nil => rfl
+  | cons term terms ih =>
+      simp only [List.map, evalPolynomial]
+      change term.coefficient * evalMonomial env (canonicalKey term.key) +
+        evalPolynomial env (terms.map canonicalTerm) =
+        term.coefficient * evalMonomial env term.key + evalPolynomial env terms
+      rw [evalMonomial_canonicalKey env term.key, ih]
+
+private theorem evalPolynomial_combineSame (env : Env Owner)
+    (coefficient : Int) (key : MonomialKey Owner) (terms : Polynomial Owner) :
+    coefficient * evalMonomial env key + evalPolynomial env terms =
+      (combineSame coefficient key terms).1 * evalMonomial env key +
+        evalPolynomial env (combineSame coefficient key terms).2 := by
+  induction terms generalizing coefficient with
+  | nil => rfl
+  | cons term terms ih =>
+      by_cases equal : term.key = key
+      · simp only [combineSame, equal, ↓reduceIte, evalPolynomial]
+        calc
+          coefficient * evalMonomial env key +
+              (term.coefficient * evalMonomial env key + evalPolynomial env terms) =
+              (coefficient * evalMonomial env key +
+                term.coefficient * evalMonomial env key) + evalPolynomial env terms := by
+            simp [Int.add_assoc]
+          _ = (coefficient + term.coefficient) * evalMonomial env key +
+              evalPolynomial env terms := by rw [← Int.add_mul]
+          _ = (combineSame (coefficient + term.coefficient) key terms).1 *
+                evalMonomial env key +
+              evalPolynomial env (combineSame (coefficient + term.coefficient) key terms).2 :=
+            ih (coefficient + term.coefficient)
+      · simp [combineSame, equal]
+
+private theorem evalPolynomial_combineCanonicalAux (env : Env Owner)
+    (fuel : Nat) (terms : Polynomial Owner) :
+    evalPolynomial env (combineCanonicalAux fuel terms) = evalPolynomial env terms := by
+  induction fuel generalizing terms with
+  | zero => rfl
+  | succ fuel ih =>
+      cases terms with
+      | nil => rfl
+      | cons term terms =>
+          let combined := combineSame term.coefficient term.key terms
+          have combinedSound :
+              term.coefficient * evalMonomial env term.key + evalPolynomial env terms =
+                combined.1 * evalMonomial env term.key + evalPolynomial env combined.2 := by
+            exact evalPolynomial_combineSame env term.coefficient term.key terms
+          have recursive := ih combined.2
+          by_cases zero : combined.1 = 0
+          · simp only [combineCanonicalAux, combined, zero, ↓reduceIte]
+            calc
+              evalPolynomial env (combineCanonicalAux fuel combined.2) =
+                  evalPolynomial env combined.2 := recursive
+              _ = term.coefficient * evalMonomial env term.key + evalPolynomial env terms := by
+                simp [zero] at combinedSound
+                exact combinedSound.symm
+          · simp only [combineCanonicalAux, combined, zero, ↓reduceIte, evalPolynomial]
+            calc
+              combined.1 * evalMonomial env term.key +
+                  evalPolynomial env (combineCanonicalAux fuel combined.2) =
+                  combined.1 * evalMonomial env term.key + evalPolynomial env combined.2 := by
+                rw [recursive]
+              _ = term.coefficient * evalMonomial env term.key + evalPolynomial env terms :=
+                combinedSound.symm
+
+private theorem evalPolynomial_combineCanonical (env : Env Owner)
+    (terms : Polynomial Owner) :
+    evalPolynomial env (combineCanonical terms) = evalPolynomial env terms := by
+  exact evalPolynomial_combineCanonicalAux env terms.length terms
+
+theorem canonicalPolynomial_eval (env : Env Owner) (terms : Polynomial Owner) :
+    evalPolynomial env (canonicalPolynomial terms) = evalPolynomial env terms := by
+  unfold canonicalPolynomial
+  calc
+    evalPolynomial env (combineCanonical (constructiveMergeSort termLe
+        (terms.map canonicalTerm))) =
+        evalPolynomial env (constructiveMergeSort termLe (terms.map canonicalTerm)) :=
+      evalPolynomial_combineCanonical env _
+    _ = evalPolynomial env (terms.map canonicalTerm) :=
+      constructiveMergeSort_evalPolynomial env (terms.map canonicalTerm)
+    _ = evalPolynomial env terms := evalPolynomial_map_canonicalTerm env terms
+
+theorem canonicalAgreement_eval (env : Env Owner) (left right : Polynomial Owner)
+    (agreement : CanonicalAgreement left right) :
+    evalPolynomial env left = evalPolynomial env right := by
+  rw [← canonicalPolynomial_eval env left, ← canonicalPolynomial_eval env right, agreement]
 
 theorem evalMonomial_of_productKey (env : Env Owner)
     {left right output : MonomialKey Owner}
@@ -621,6 +1081,30 @@ theorem productResultSound (env : Env Owner) (left right output : Polynomial Own
       (productPoly left right leftScalar rightScalar) agreement,
     evalPolynomial_productPoly]
 
+theorem addCanonicalResultSound (env : Env Owner) (left right output : Polynomial Owner)
+    (agreement : CanonicalAgreement output (add left right)) :
+    evalPolynomial env output = evalPolynomial env left + evalPolynomial env right := by
+  rw [canonicalAgreement_eval env output (add left right) agreement,
+    show add left right = left ++ right by rfl,
+    evalPolynomial_append env left right]
+
+theorem subCanonicalResultSound (env : Env Owner) (left right output : Polynomial Owner)
+    (agreement : CanonicalAgreement output (subtract left right)) :
+    evalPolynomial env output = evalPolynomial env left - evalPolynomial env right := by
+  rw [canonicalAgreement_eval env output (subtract left right) agreement,
+    show subtract left right = left ++ negate right by rfl,
+    evalPolynomial_append, evalPolynomial_negate]
+  rfl
+
+theorem productCanonicalResultSound (env : Env Owner) (left right output : Polynomial Owner)
+    (leftScalar rightScalar : Bool)
+    (agreement : CanonicalAgreement output
+      (productPoly left right leftScalar rightScalar)) :
+    evalPolynomial env output = evalPolynomial env left * evalPolynomial env right := by
+  rw [canonicalAgreement_eval env output
+      (productPoly left right leftScalar rightScalar) agreement,
+    evalPolynomial_productPoly]
+
 def relationPoly (accumulator : Polynomial Owner) (sourceKey : MonomialKey Owner)
     (context : MonomialContext Owner) (outerCoefficient : Int)
     (rhs : Polynomial Owner) : Polynomial Owner :=
@@ -696,6 +1180,96 @@ theorem relationResultSound (modulus : Nat) (env : Env Owner)
     simp [lhsPolynomial, relationReplacement, scalePolynomial, contextualize, evalPolynomial]
     rw [evalMonomial_of_key env sourceKeyEquivalent.1 sourceKeyEquivalent.2]
   have outputEval := coefficientAgreement_eval env output
+    (relationPoly accumulator sourceKey context outerCoefficient rhs) agreement
+  have relationEvalModular :
+      evalPolynomial env (relationPoly accumulator sourceKey context outerCoefficient rhs) %
+          Int.ofNat modulus = evalPolynomial env accumulator % Int.ofNat modulus := by
+    rw [relationPoly]
+    simp only [add, subtract]
+    rw [evalPolynomial_append env
+        (accumulator ++ negate [{ coefficient := outerCoefficient, key := sourceKey }])
+        (relationReplacement context outerCoefficient rhs),
+      evalPolynomial_append env accumulator
+        (negate [{ coefficient := outerCoefficient, key := sourceKey }]),
+      evalPolynomial_negate]
+    simp only [evalPolynomial]
+    simp only [Int.add_zero]
+    have replacementDifference :
+        (evalPolynomial env (relationReplacement context outerCoefficient rhs) -
+            outerCoefficient * evalMonomial env sourceKey) %
+          Int.ofNat modulus = 0 := by
+      have difference :=
+        Int.emod_eq_emod_iff_emod_sub_eq_zero.mp replacementCongruence.symm
+      rw [lhsReplacement] at difference
+      exact difference
+    calc
+      (evalPolynomial env accumulator +
+          -(outerCoefficient * evalMonomial env sourceKey) +
+          evalPolynomial env (relationReplacement context outerCoefficient rhs)) %
+            Int.ofNat modulus =
+          (evalPolynomial env accumulator +
+            (evalPolynomial env (relationReplacement context outerCoefficient rhs) -
+              outerCoefficient * evalMonomial env sourceKey)) %
+            Int.ofNat modulus := by
+        congr 1
+        simp [Int.sub_eq_add_neg, Int.add_assoc, Int.add_left_comm, Int.add_comm]
+      _ = (evalPolynomial env accumulator % Int.ofNat modulus +
+          (evalPolynomial env (relationReplacement context outerCoefficient rhs) -
+            outerCoefficient * evalMonomial env sourceKey) % Int.ofNat modulus) %
+            Int.ofNat modulus := by
+        rw [Int.add_emod]
+      _ = evalPolynomial env accumulator % Int.ofNat modulus := by
+        rw [replacementDifference]
+        simp
+  rw [outputEval, relationEvalModular]
+
+theorem relationCanonicalResultSound (modulus : Nat) (env : Env Owner)
+    (accumulator : Polynomial Owner) (sourceKey lhsKey : MonomialKey Owner)
+    (exteriorCentral : List Owner) (orderedStart orderedEndExclusive : Nat)
+    (outerCoefficient : Int) (rhs output : Polynomial Owner)
+    (sourceKeyEquivalent :
+      KeyEquivalent sourceKey
+        ((relationContext sourceKey exteriorCentral orderedStart orderedEndExclusive).plug lhsKey))
+    (baseRelation :
+      evalMonomial env lhsKey % Int.ofNat modulus =
+        evalPolynomial env rhs % Int.ofNat modulus)
+    (agreement : CanonicalAgreement output
+      (relationPoly accumulator sourceKey
+        (relationContext sourceKey exteriorCentral orderedStart orderedEndExclusive)
+        outerCoefficient rhs)) :
+    evalPolynomial env output % Int.ofNat modulus =
+      evalPolynomial env accumulator % Int.ofNat modulus := by
+  let context := relationContext sourceKey exteriorCentral orderedStart orderedEndExclusive
+  have contextSound : ∀ key,
+      (fun key => evalMonomial env key) (context.plug key) =
+        contextMultiplier env context * (fun key => evalMonomial env key) key := by
+    intro key
+    exact evalMonomial_contextPlug env context key
+  let lhsPolynomial : Polynomial Owner :=
+    [{ coefficient := 1, key := lhsKey }]
+  have baseRelation' :
+      EventReplay.evaluatePolynomial (fun key => evalMonomial env key) lhsPolynomial %
+          Int.ofNat modulus =
+        EventReplay.evaluatePolynomial (fun key => evalMonomial env key) rhs %
+          Int.ofNat modulus := by
+    calc
+      EventReplay.evaluatePolynomial (fun key => evalMonomial env key) lhsPolynomial %
+            Int.ofNat modulus = evalMonomial env lhsKey % Int.ofNat modulus := by
+        simp [lhsPolynomial, EventReplay.evaluatePolynomial]
+      _ = evalPolynomial env rhs % Int.ofNat modulus := baseRelation
+      _ = EventReplay.evaluatePolynomial (fun key => evalMonomial env key) rhs %
+            Int.ofNat modulus := by
+        rw [evalPolynomial_eventReplay]
+  have replacementCongruence := EventReplay.relationReplacement_modular modulus
+    (fun key => evalMonomial env key) context (contextMultiplier env context) outerCoefficient
+    lhsPolynomial rhs contextSound baseRelation'
+  rw [evalPolynomial_eventReplay, evalPolynomial_eventReplay] at replacementCongruence
+  have lhsReplacement :
+      evalPolynomial env (relationReplacement context outerCoefficient lhsPolynomial) =
+        outerCoefficient * evalMonomial env sourceKey := by
+    simp [lhsPolynomial, relationReplacement, scalePolynomial, contextualize, evalPolynomial]
+    rw [evalMonomial_of_key env sourceKeyEquivalent.1 sourceKeyEquivalent.2]
+  have outputEval := canonicalAgreement_eval env output
     (relationPoly accumulator sourceKey context outerCoefficient rhs) agreement
   have relationEvalModular :
       evalPolynomial env (relationPoly accumulator sourceKey context outerCoefficient rhs) %

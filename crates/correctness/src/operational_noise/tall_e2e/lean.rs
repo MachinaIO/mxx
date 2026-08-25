@@ -1,4 +1,5 @@
 mod proof;
+mod semantic;
 mod statement;
 mod statistics;
 
@@ -19,6 +20,7 @@ pub(super) fn render(
 ) -> Result<Vec<TallSecurity0GeneratedFile>, String> {
     let mut files = statement::render(statement)?;
     files.extend(proof::render(statement, proof)?);
+    files.extend(semantic::render(statement, proof)?);
     files.push(TallSecurity0GeneratedFile {
         relative_path: "SemanticOwnerStatistics.json".to_owned(),
         bytes: owner_claim_report_bytes.to_vec(),

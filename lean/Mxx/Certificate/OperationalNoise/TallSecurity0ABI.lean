@@ -270,18 +270,32 @@ def sameFrame (history : EventHistory) (state : ReplayState) (owner : Owner)
         decide (frame.root.scope = owner.scope) && decide (frame.start = entry.frameStart)
     | _, _ => false
 
-def exactFrameRange (history : EventHistory) (state : ReplayState)
+def specializationRangeValid (history : EventHistory) (state : ReplayState)
     (range : EventRange) : Bool :=
-  decide (range.start < range.end) && decide (range.end ≤ state.cursor) &&
-    match state.frames.head?, history.lookup range.start, history.lookup (range.end - 1) with
-    | some active, some first, some last =>
-        decide (active.start < range.start) && decide (first.frameStart = range.start) &&
-          decide (last.frameStart = range.start) &&
-          (match first.event, last.event with
-          | .invocationStart root, .invocationEndExact ended _ _ _ =>
-              decide (root = ended)
-          | _, _ => false)
+  decide (0 < range.start) && decide (range.start < range.end) &&
+    decide (range.end = state.cursor) &&
+    match state.frames.head?, history.lookup (range.start - 1), history.lookup range.start with
+    | some parent, some before, some first =>
+        decide (parent.start < range.start) && decide (before.frameStart = parent.start) &&
+          decide (first.frameStart = range.start) &&
+          (match first.event with
+          | .invocationStart child => decide (child.scope = parent.root.scope)
+          | _ => false)
     | _, _, _ => false
+
+def completedInvocationInRange (history : EventHistory) (range : EventRange)
+    (result : Nat) : Option Owner :=
+  if range.start ≤ result && result < range.end then
+    match history.lookup result with
+    | some { event := .invocationEndExact ended _ _ _, frameStart := childStart } =>
+        if range.start ≤ childStart && childStart ≤ result && childStart < range.end then
+          match history.lookup childStart with
+          | some { event := .invocationStart started, frameStart := annotatedStart } =>
+              if annotatedStart = childStart && started = ended then some ended else none
+          | _ => none
+        else none
+    | _ => none
+  else none
 
 def resultOwner? : Event → Option Owner
   | .resultExact owner _ _ | .resultCoefficient owner _ => some owner
@@ -320,10 +334,11 @@ def relationSourceValid (history : EventHistory) (state : ReplayState) (owner : 
           | .universal computed _ _ rhsResult =>
               match eventAt? history computed with
               | some (.specializationComputed computedOwner _ source) =>
-                  decide (computedOwner = owner) && decide (source.end = computed) &&
-                    decide (source.start ≤ rhsResult) && decide (rhsResult < source.end) &&
-                    exactFrameRange history state source &&
-                    exactTermExists history state rhsResult ordinal
+                  decide (computedOwner.scope = owner.scope) && decide (source.end = computed) &&
+                    specializationRangeValid history { state with cursor := computed } source &&
+                    (match completedInvocationInRange history source rhsResult with
+                    | some rhsOwner => decide (rhsOwner.scope = owner.scope)
+                    | none => false) && exactTermExists history state rhsResult ordinal
               | _ => false
           | .gadget _ _ _ inputResult =>
               sameFrame history state owner inputResult &&
@@ -470,24 +485,18 @@ def stepAt (document : TallDocument) (history : EventHistory) (state : ReplaySta
           (document.programs.lookup dispatch.preimageFamily.row).isSome &&
           (document.expressions.lookup dispatch.preimageSource.row).isSome &&
           (document.expressions.lookup dispatch.trapdoorSource.row).isSome &&
-          exactFrameRange history state source && decide (source.end = state.cursor) &&
-          (match eventAt? history source.start, eventAt? history (source.end - 1) with
-          | some (.invocationStart root), some (.invocationEndExact ended _ _ _) =>
-              decide (root.scope = owner.scope) && decide (ended.scope = owner.scope)
-          | _, _ => false) then accept state.frames else none
+          specializationRangeValid history state source then accept state.frames else none
   | .appliedRelation owner sourceMonomial _ orderedStart orderedEnd rule =>
       let ruleOk := match rule with
         | .universal computed lhs _ rhsResult =>
             sameFrame history state owner computed && monomialValid document lhs &&
               (match eventAt? history computed with
               | some (.specializationComputed computedOwner _ source) =>
-                  decide (computedOwner = owner) && decide (source.end = computed) &&
-                    decide (source.start ≤ rhsResult) && decide (rhsResult < source.end) &&
-                    exactFrameRange history state source &&
-                    (match eventAt? history rhsResult with
-                    | some (.invocationEndExact rhsOwner _ _ _) =>
-                        decide (rhsOwner.scope = owner.scope)
-                    | _ => false)
+                  decide (computedOwner.scope = owner.scope) && decide (source.end = computed) &&
+                    specializationRangeValid history { state with cursor := computed } source &&
+                    (match completedInvocationInRange history source rhsResult with
+                    | some rhsOwner => decide (rhsOwner.scope = owner.scope)
+                    | none => false)
               | _ => false)
         | .gadget gadget decomposition input inputResult =>
             ownerValid document gadget && ownerValid document decomposition &&

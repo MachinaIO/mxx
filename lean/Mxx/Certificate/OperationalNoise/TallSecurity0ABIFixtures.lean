@@ -328,7 +328,7 @@ def multipleRhsEvents : List Event :=
     .resultExact (closedOwner 1) [singletonTerm 1] .exactZero,
     .preFoldPolynomial 6 [singletonTerm 1] .exactZero none,
     .invocationEndExact (closedOwner 1) 7 [singletonTerm 1] .exactZero,
-    .specializationComputed (closedOwner 0) fixtureDispatch ⟨1, 9⟩,
+    .specializationComputed (closedOwner 3) fixtureDispatch ⟨1, 9⟩,
     .appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
       (.universal 9 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 5),
     .coefficientMerge
@@ -354,8 +354,76 @@ theorem in_range_nonfinal_rhs_accepted :
 def multipleRhsBeforeComputed : ReplayState :=
   ⟨9, [⟨closedOwner 0, 0⟩]⟩
 
-theorem nested_endpoint_equivalence :
-    exactFrameRange multipleRhsHistory multipleRhsBeforeComputed ⟨1, 9⟩ = true := by
+theorem nested_invocation_range_fixture :
+    specializationRangeValid multipleRhsHistory multipleRhsBeforeComputed ⟨1, 9⟩ = true ∧
+      completedInvocationInRange multipleRhsHistory ⟨1, 9⟩ 5 = some (closedOwner 2) := by
+  decide
+
+def siblingEvents : List Event :=
+  [ .invocationStart (closedOwner 0),
+    .invocationStart (closedOwner 1),
+    .resultExact (closedOwner 1) [singletonTerm 1] .exactZero,
+    .preFoldPolynomial 2 [singletonTerm 1] .exactZero none,
+    .invocationEndExact (closedOwner 1) 3 [singletonTerm 1] .exactZero,
+    .invocationStart (closedOwner 2),
+    .resultExact (closedOwner 2) [singletonTerm 2] .exactZero,
+    .preFoldPolynomial 6 [singletonTerm 2] .exactZero none,
+    .invocationEndExact (closedOwner 2) 7 [singletonTerm 2] .exactZero,
+    .specializationComputed (closedOwner 3) fixtureDispatch ⟨1, 9⟩,
+    .appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
+      (.universal 9 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 8),
+    .resultExact (closedOwner 0) [] .exactZero,
+    .preFoldPolynomial 11 [] .exactZero none,
+    .invocationEndExact (closedOwner 0) 12 [] .exactZero ]
+
+def siblingFrameStarts : List Nat := [0, 1, 1, 1, 1, 5, 5, 5, 5, 0, 0, 0, 0, 0]
+
+def siblingHistory : EventHistory :=
+  smallHistory (annotateEvents siblingEvents siblingFrameStarts)
+
+def siblingFinalState : ReplayState := ⟨siblingEvents.length, []⟩
+
+theorem sibling_specialization_and_rhs_accepted :
+    ReplayChain fixtureDocument siblingHistory initialState siblingFinalState :=
+  .trans (.chunk 4 (by rfl))
+    (.trans (.chunk 8 (by rfl)) (.trans (.chunk 12 (by rfl)) (.chunk 14 (by rfl))))
+
+def mismatchedInvocationHistory : EventHistory :=
+  smallHistory (annotateEvents
+    [ .invocationStart (closedOwner 0),
+      .invocationStart (closedOwner 1),
+      .resultExact (closedOwner 1) [] .exactZero,
+      .preFoldPolynomial 2 [] .exactZero none,
+      .invocationEndExact (closedOwner 2) 3 [] .exactZero ]
+    [0, 1, 1, 1, 1])
+
+def largeSparseRangeHistory : EventHistory where
+  leaves := .node 0
+    (#[annotated (.invocationStart (closedOwner 0)) 0,
+      annotated (.invocationStart (closedOwner 1)) 1] ++
+      Array.replicate 14 (annotated (.resultCoefficient (closedOwner 1) .exactZero) 1))
+    .empty .empty
+  size := 100000
+
+theorem specialization_range_rejections :
+    specializationRangeValid multipleRhsHistory multipleRhsBeforeComputed ⟨1, 1⟩ = false ∧
+      specializationRangeValid multipleRhsHistory multipleRhsBeforeComputed ⟨5, 1⟩ = false ∧
+      specializationRangeValid multipleRhsHistory multipleRhsBeforeComputed ⟨1, 8⟩ = false ∧
+      specializationRangeValid multipleRhsHistory multipleRhsBeforeComputed ⟨2, 9⟩ = false := by
+  decide
+
+theorem completed_invocation_rejections :
+    completedInvocationInRange mismatchedInvocationHistory ⟨1, 5⟩ 4 = none ∧
+      completedInvocationInRange multipleRhsHistory ⟨1, 5⟩ 8 = none ∧
+      completedInvocationInRange largeSparseRangeHistory ⟨1, 100000⟩ 999 = none := by
+  decide
+
+def largeSparseRangeState : ReplayState :=
+  ⟨100000, [⟨closedOwner 0, 0⟩]⟩
+
+theorem specialization_range_uses_bounded_lookups :
+    specializationRangeValid largeSparseRangeHistory largeSparseRangeState
+      ⟨1, 100000⟩ = true := by
   decide
 
 theorem wrong_nested_annotation_rejected :
@@ -427,7 +495,11 @@ theorem tall_security0_abi_fixture :
 #print axioms fixture_four_crosses_leaf_boundary
 #print axioms repeated_invocation_rejects_stale_references
 #print axioms in_range_nonfinal_rhs_accepted
-#print axioms nested_endpoint_equivalence
+#print axioms nested_invocation_range_fixture
+#print axioms sibling_specialization_and_rhs_accepted
+#print axioms specialization_range_rejections
+#print axioms completed_invocation_rejections
+#print axioms specialization_range_uses_bounded_lookups
 #print axioms wrong_nested_annotation_rejected
 #print axioms nested_frame_links_are_isolated
 #print axioms replay_chunk_crosses_64_boundary

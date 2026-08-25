@@ -2230,11 +2230,11 @@ fn render_operation(source: &mut String, operation: &OperationProbe, modulus: &s
         .expect("String write");
     writeln!(source, "def outputRaw : List Term := {}", raw_terms_text(&operation.output.terms))
         .expect("String write");
-    writeln!(source, "def left : Polynomial Owner := {}", terms_text(&left.terms))
+    writeln!(source, "def left : Polynomial Owner := leftRaw.map Term.toExact")
         .expect("String write");
-    writeln!(source, "def right : Polynomial Owner := {}", terms_text(&right.terms))
+    writeln!(source, "def right : Polynomial Owner := rightRaw.map Term.toExact")
         .expect("String write");
-    writeln!(source, "def output : Polynomial Owner := {}", terms_text(&operation.output.terms))
+    writeln!(source, "def output : Polynomial Owner := outputRaw.map Term.toExact")
         .expect("String write");
     writeln!(source, "def leftOwner : Owner := {}", owner_text(left.owner)).expect("String write");
     writeln!(source, "def rightOwner : Owner := {}", owner_text(right.owner))
@@ -3012,9 +3012,132 @@ fn reached_terminal_rule_text(rule: &ProofPayloadRule) -> Result<String, String>
     })
 }
 
+fn render_right_root_operation(
+    source: &mut String,
+    operation: &OperationProbe,
+    left_event: u64,
+    right_event: u64,
+) {
+    writeln!(source, "def leftRaw : List Term := SemanticRightRootResult{left_event}.rawTerms")
+        .expect("String write");
+    writeln!(source, "def rightRaw : List Term := SemanticRightRootResult{right_event}.rawTerms")
+        .expect("String write");
+    writeln!(source, "def outputRaw : List Term := {}", raw_terms_text(&operation.output.terms))
+        .expect("String write");
+    source.push_str(
+        "def left : Polynomial Owner := leftRaw.map Term.toExact\n\
+         def right : Polynomial Owner := rightRaw.map Term.toExact\n\
+         def output : Polynomial Owner := outputRaw.map Term.toExact\n",
+    );
+    writeln!(source, "def owner : Owner := {}", owner_text(operation.output.owner))
+        .expect("String write");
+    writeln!(source, "def rawTerms : List Term := outputRaw").expect("String write");
+    source.push_str("def summary : Bound := .exactZero\n");
+    writeln!(source, "def resultEvent : Nat := {}", operation.output_event).expect("String write");
+    match operation.kind {
+        OperationKind::Add => {
+            source.push_str("theorem resultAgreement : CanonicalAgreement output (add left right) := by\n  decide +kernel\n\ntheorem resultSound (env : Env Owner) :\n    evalPolynomial env output = evalPolynomial env left + evalPolynomial env right := by\n  exact addCanonicalResultSound env left right output resultAgreement\n\n");
+        }
+        OperationKind::Subtract => {
+            source.push_str("theorem resultAgreement : CanonicalAgreement output (subtract left right) := by\n  decide +kernel\n\ntheorem resultSound (env : Env Owner) :\n    evalPolynomial env output = evalPolynomial env left - evalPolynomial env right := by\n  exact subCanonicalResultSound env left right output resultAgreement\n\n");
+        }
+        OperationKind::Multiply | OperationKind::Tensor => {
+            writeln!(
+                source,
+                "def leftScalar : Bool := {}",
+                if operation.scalar_left { "true" } else { "false" }
+            )
+            .expect("String write");
+            writeln!(
+                source,
+                "def rightScalar : Bool := {}",
+                if operation.scalar_right { "true" } else { "false" }
+            )
+            .expect("String write");
+            source.push_str("theorem resultAgreement : CanonicalAgreement output\n    (productPoly left right leftScalar rightScalar) := by\n  decide +kernel\n\ntheorem resultSound (env : Env Owner) :\n    evalPolynomial env output = evalPolynomial env left * evalPolynomial env right := by\n  exact productCanonicalResultSound env left right output leftScalar rightScalar resultAgreement\n\n");
+        }
+        OperationKind::Direct => unreachable!("right-root direct operation"),
+    }
+}
+
+fn right_root_operation_refs(
+    operation: &OperationProbe,
+) -> Result<[&ProofPayloadValueRef; 2], String> {
+    let rule = operation
+        .rule
+        .as_ref()
+        .ok_or_else(|| format!("right-root Result {} has no typed rule", operation.output_event))?;
+    match rule {
+        ProofPayloadRule::Sum { inputs } => {
+            let [left, right] = inputs.as_slice() else {
+                return Err(format!(
+                    "right-root Result {} sum does not have two inputs",
+                    operation.output_event
+                ));
+            };
+            Ok([left, right])
+        }
+        ProofPayloadRule::Product { left, right, .. } |
+        ProofPayloadRule::Tensor { left, right, .. } => Ok([left, right]),
+        _ => Err(format!(
+            "right-root Result {} has an unsupported operation rule",
+            operation.output_event
+        )),
+    }
+}
+
+fn render_right_root_predecessor_premise(
+    source: &mut String,
+    name: &str,
+    owner: ProofPayloadOwner,
+    value: &ProofPayloadValueRef,
+    expected_source: u64,
+    index: &PayloadIndex,
+) -> Result<bool, String> {
+    match value {
+        ProofPayloadValueRef::Result { event, .. } if *event == expected_source => Ok(false),
+        ProofPayloadValueRef::Predecessor { binding_event, input_position, .. } => {
+            let ProofPayloadEvent::Predecessor {
+                consumer,
+                input_position: row_position,
+                predecessor,
+                source_result,
+            } = index.event(*binding_event)?
+            else {
+                return Err(format!(
+                    "right-root predecessor reference {binding_event} is not a Predecessor event"
+                ));
+            };
+            if *consumer != owner ||
+                row_position != input_position ||
+                *source_result != expected_source
+            {
+                return Err(format!(
+                    "right-root predecessor reference {binding_event} does not match its operation input"
+                ));
+            }
+            writeln!(
+                source,
+                "    ({name} : (history.lookup {binding_event}).map AnnotatedEvent.event =\n      some (.predecessor owner {input_position} {} {source_result}))",
+                format!("⟨{predecessor}⟩")
+            )
+            .expect("String write");
+            Ok(true)
+        }
+        ProofPayloadValueRef::Result { event, .. } => Err(format!(
+            "right-root direct Result reference {event} does not match dependency {expected_source}"
+        )),
+        ProofPayloadValueRef::Transfer(event) => Err(format!(
+            "right-root Result {} uses unsupported transfer reference {event}",
+            expected_source
+        )),
+    }
+}
+
 fn render_right_root_node(
     source: &mut String,
     node: &RightRootNode,
+    index: &PayloadIndex,
     modulus: &str,
 ) -> Result<(), String> {
     let event = node.result.event;
@@ -3023,24 +3146,26 @@ fn render_right_root_node(
         RightRootNodeKind::Terminal { producer_event, frame_start, rule, term } => {
             writeln!(source, "def owner : Owner := {}", owner_text(node.result.owner))
                 .expect("String write");
-            writeln!(source, "def term : Term := {}", raw_term_text(term)).expect("String write");
+            writeln!(source, "def rawTerms : List Term := [{}]", raw_term_text(term))
+                .expect("String write");
+            source.push_str("def summary : Bound := .exactZero\n");
             writeln!(source, "def producerEvent : Nat := {producer_event}").expect("String write");
             writeln!(source, "def resultEvent : Nat := {event}").expect("String write");
             writeln!(
                 source,
-                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  witness.terminalActual resultEvent"
+                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  witness.honestTerminalActual resultEvent"
             )
             .expect("String write");
             writeln!(
                 source,
-                "theorem terminalAt (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32) :\n    TerminalExactAt document history (some selector) producerEvent resultEvent owner term := by\n  refine ⟨by decide, rightRootOwnerAtSelector214 selector selectorLower selectorUpper _, ?_⟩\n  refine ⟨{}, {frame_start}, {}, ?_, ?_⟩\n  · rfl\n  · rfl",
+                "theorem terminalAt (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32) :\n    TerminalExactAt document history (some selector) producerEvent resultEvent owner rawTerms := by\n  refine ⟨by decide, rightRootOwnerAtSelector214 selector selectorLower selectorUpper _, ?_⟩\n  refine ⟨{}, {frame_start}, {}, ?_, ?_⟩\n  · rfl\n  · rfl",
                 reached_terminal_rule_text(rule)?,
                 reached_terminal_constructor(rule)?,
             )
             .expect("String write");
             writeln!(
                 source,
-                "theorem claimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact [term.toExact] .exactZero) := by\n  exact terminalExactClaim witness\n    (terminalAt selector selectorLower selectorUpper)"
+                "theorem claimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  exact terminalExactClaimAt witness\n    (terminalAt selector selectorLower selectorUpper)"
             )
             .expect("String write");
         }
@@ -3064,12 +3189,9 @@ fn render_right_root_node(
                     ));
                 }
             }
-            writeln!(source, "def selectedOwner : Owner := {}", owner_text(node.result.owner))
-                .expect("String write");
-            render_operation(source, operation, modulus);
-            render_operation_bindings(source, operation);
             let left_event = operation.input_events[0];
             let right_event = operation.input_events[1];
+            render_right_root_operation(source, operation, left_event, right_event);
             let operator = match operation.kind {
                 OperationKind::Add => "+",
                 OperationKind::Subtract => "-",
@@ -3091,9 +3213,42 @@ fn render_right_root_node(
                 }
                 OperationKind::Direct => unreachable!(),
             };
+            let refs = right_root_operation_refs(operation)?;
+            let expression_row = node.result.owner.expression_row;
+            let expression_module = expression_row / 256;
             writeln!(
                 source,
-                "theorem claimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact output .exactZero) := by\n  exact {theorem} {modulus} witness.env\n    (SemanticRightRootResult{left_event}.actual selector witness)\n    (SemanticRightRootResult{right_event}.actual selector witness) left right output\n    (SemanticRightRootResult{left_event}.claimSound selector selectorLower selectorUpper witness)\n    (SemanticRightRootResult{right_event}.claimSound selector selectorLower selectorUpper witness)\n    (resultSound witness.env) (by decide)"
+                "theorem claimOfHistory (selector : Nat)\n    (witness : Witness document history (some selector) {modulus})\n    (expressionAt : document.expressions.lookup {expression_row} =\n      some {NAMESPACE}.Cert.Expression{expression_module:03}.ExpressionRow{expression_row})"
+            )
+            .expect("String write");
+            let left_predecessor = render_right_root_predecessor_premise(
+                source,
+                "leftPredecessorAt",
+                node.result.owner,
+                refs[0],
+                left_event,
+                index,
+            )?;
+            let right_predecessor = render_right_root_predecessor_premise(
+                source,
+                "rightPredecessorAt",
+                node.result.owner,
+                refs[1],
+                right_event,
+                index,
+            )?;
+            writeln!(
+                source,
+                "    (ruleAt : (history.lookup {}).map AnnotatedEvent.event =\n      some (.boundTransfer owner ({})))\n    (leftClaim : ExactClaimAt history {modulus} witness.env\n      SemanticRightRootResult{left_event}.resultEvent\n      SemanticRightRootResult{left_event}.owner\n      (SemanticRightRootResult{left_event}.actual selector witness)\n      SemanticRightRootResult{left_event}.rawTerms\n      SemanticRightRootResult{left_event}.summary)\n    (rightClaim : ExactClaimAt history {modulus} witness.env\n      SemanticRightRootResult{right_event}.resultEvent\n      SemanticRightRootResult{right_event}.owner\n      (SemanticRightRootResult{right_event}.actual selector witness)\n      SemanticRightRootResult{right_event}.rawTerms\n      SemanticRightRootResult{right_event}.summary)\n    (outputAt : (history.lookup resultEvent).map AnnotatedEvent.event =\n      some (.resultExact owner rawTerms summary)) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  refine ⟨outputAt, ?_⟩\n  exact {theorem} {modulus} witness.env\n    (SemanticRightRootResult{left_event}.actual selector witness)\n    (SemanticRightRootResult{right_event}.actual selector witness) left right output\n    (by simpa [left, leftRaw, SemanticRightRootResult{left_event}.summary] using leftClaim.claim)\n    (by simpa [right, rightRaw, SemanticRightRootResult{right_event}.summary] using rightClaim.claim)\n    (resultSound witness.env) (by decide)",
+                operation.rule_event,
+                rule_text(operation.rule.as_ref().expect("typed right-root rule")),
+            )
+            .expect("String write");
+            writeln!(
+                source,
+                "\ntheorem claimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply claimOfHistory selector witness (by rfl){}{} (by rfl)\n  · exact SemanticRightRootResult{left_event}.claimSound\n      selector selectorLower selectorUpper witness\n  · exact SemanticRightRootResult{right_event}.claimSound\n      selector selectorLower selectorUpper witness\n  · rfl",
+                if left_predecessor { " (by rfl)" } else { "" },
+                if right_predecessor { " (by rfl)" } else { "" },
             )
             .expect("String write");
         }
@@ -3146,7 +3301,7 @@ fn render_right_root(
             );
         }
         for node in shard {
-            render_right_root_node(&mut source, node, modulus)?;
+            render_right_root_node(&mut source, node, index, modulus)?;
         }
         writeln!(source, "end {NAMESPACE}.Semantic").expect("String write");
         files.push(generated_file(format!("Semantic/{module}.lean"), source));
@@ -3157,7 +3312,7 @@ fn render_right_root(
     );
     writeln!(
         source,
-        "/-- The generated theorem application for the reached right exact-zero root. -/\ntheorem rightRootClaimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env\n      (SemanticRightRootResult6275.actual selector witness)\n      (.exact SemanticRightRootResult6275.output .exactZero) := by\n  exact SemanticRightRootResult6275.claimSound selector selectorLower selectorUpper witness"
+        "/-- The generated theorem application for the reached right exact-zero root. -/\ntheorem rightRootClaimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env\n      SemanticRightRootResult6275.resultEvent SemanticRightRootResult6275.owner\n      (SemanticRightRootResult6275.actual selector witness)\n      SemanticRightRootResult6275.rawTerms SemanticRightRootResult6275.summary := by\n  exact SemanticRightRootResult6275.claimSound selector selectorLower selectorUpper witness"
     )
     .expect("String write");
     source.push_str(&format!("\n\nend {NAMESPACE}.Semantic.SemanticRightRoot\n"));

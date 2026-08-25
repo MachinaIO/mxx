@@ -403,19 +403,47 @@ structure ToyReplayWitness (events : List ToyEvent) where
   gaussianBound : centeredNorm 257 (env (o 3)) ≤ 1
   universalEvent : eventAt? events 43 = some (.appliedUniversal (o 10) (m [0, 7])
     1 0 2 42 (m [0, 7]) none 41)
-  universalRelation : (m [0, 7]).eval env = (m [1]).eval env
+  universalRelation : (m [0, 7]).eval env % Int.ofNat 257 =
+    (m [1]).eval env % Int.ofNat 257
 
 def toyValuation (env : ToyEnv) (key : MonomialKey) : Int :=
   (key.orderedFactors.map (fun row => env (o row))).prod
 
 def universalContext : MonomialContext := ⟨[], [], []⟩
 
+/-- Context and its outer coefficient preserve an exact modular base relation. -/
+theorem relationReplacement_modular (modulus : Nat) (valuation : MonomialKey → Int)
+    (context : MonomialContext) (contextMultiplier outerCoefficient : Int)
+    (left right : Polynomial)
+    (contextSound : ∀ key, valuation (context.plug key) = contextMultiplier * valuation key)
+    (baseRelation : evaluatePolynomial valuation left % Int.ofNat modulus =
+      evaluatePolynomial valuation right % Int.ofNat modulus) :
+    evaluatePolynomial valuation (relationReplacement context outerCoefficient left) %
+        Int.ofNat modulus =
+      evaluatePolynomial valuation (relationReplacement context outerCoefficient right) %
+        Int.ofNat modulus := by
+  rw [evaluate_relationReplacement valuation context contextMultiplier outerCoefficient left
+      contextSound,
+    evaluate_relationReplacement valuation context contextMultiplier outerCoefficient right
+      contextSound]
+  calc
+    (outerCoefficient * contextMultiplier * evaluatePolynomial valuation left) %
+        Int.ofNat modulus =
+      ((outerCoefficient * contextMultiplier) % Int.ofNat modulus *
+        (evaluatePolynomial valuation left % Int.ofNat modulus)) % Int.ofNat modulus :=
+      Int.mul_emod _ _ _
+    _ = ((outerCoefficient * contextMultiplier) % Int.ofNat modulus *
+        (evaluatePolynomial valuation right % Int.ofNat modulus)) % Int.ofNat modulus := by
+      rw [baseRelation]
+    _ = (outerCoefficient * contextMultiplier * evaluatePolynomial valuation right) %
+        Int.ofNat modulus := (Int.mul_emod _ _ _).symm
+
 theorem fixed_relation_replay {events : List ToyEvent} (witness : ToyReplayWitness events) :
     evaluatePolynomial (toyValuation witness.env)
-        (relationReplacement universalContext 1 [(t 1 [0, 7]).toCore]) =
+        (relationReplacement universalContext 1 [(t 1 [0, 7]).toCore]) % 257 =
       evaluatePolynomial (toyValuation witness.env)
-        (relationReplacement universalContext 1 [(t 1 [1]).toCore]) := by
-  apply relationReplacement_congruent (contextMultiplier := 1)
+        (relationReplacement universalContext 1 [(t 1 [1]).toCore]) % 257 := by
+  apply relationReplacement_modular 257 (toyValuation witness.env) universalContext 1 1
   · intro key
     simp [universalContext, MonomialContext.plug, toyValuation]
   · simpa [evaluatePolynomial, ToyTerm.toCore, ToyMonomial.toCore, ToyOwner.toKeyFactor,
@@ -469,12 +497,23 @@ theorem fixed_bound_replay {events : List ToyEvent} (witness : ToyReplayWitness 
     Nat.add_le_add cancelledReplay survivorReplay
   have invocationReplay : 0 + [1].sum ≤ 0 + [1].sum :=
     preFold_to_invocationEnd cancelledReplay (.cons (Nat.le_refl 1) .nil)
-  have relationExact : (m [0, 7]).eval witness.env = (m [1]).eval witness.env := by
+  have relationModular :
+      (m [0, 7]).eval witness.env % Int.ofNat 257 =
+        (m [1]).eval witness.env % Int.ofNat 257 := by
     simpa [evaluatePolynomial, relationReplacement, universalContext, contextualize,
       scalePolynomial, MonomialContext.plug, toyValuation, ToyTerm.toCore, ToyMonomial.toCore,
       ToyOwner.toKeyFactor, t, m, o, ToyMonomial.eval] using relationReplay
-  rw [ToyResidual, relationExact]
-  simp
+  have residualRemainder : ToyResidual events witness.env % Int.ofNat 257 =
+      witness.env (o 3) % Int.ofNat 257 := by
+    unfold ToyResidual
+    rw [Int.add_emod, Int.sub_emod, relationModular]
+    simp
+  have centeredEquality : centeredNorm 257 (ToyResidual events witness.env) =
+      centeredNorm 257 (witness.env (o 3)) := by
+    unfold centeredNorm centeredCoefficient
+    simp only [show (257 : Nat) ≠ 0 by decide, ↓reduceIte]
+    rw [residualRemainder]
+  rw [centeredEquality]
   exact Nat.le_trans (by simpa using finalReplay) (by exact invocationReplay)
 
 theorem replay_sound {source : ToySource} {document : Document} {rows : ToyRows}
@@ -490,7 +529,11 @@ theorem replay_sound {source : ToySource} {document : Document} {rows : ToyRows}
     | _ => empty0).Interprets 257 witness.env (ToyResidual events witness.env)
   rw [finalEvent]
   change ∃ remainder, _ = _ ∧ centeredNorm 257 remainder ≤ 1
-  exact ⟨ToyResidual events witness.env, by simp [ToyTerms.eval], fixed_bound_replay witness⟩
+  refine ⟨witness.env (o 3), ?_, witness.gaussianBound⟩
+  simp only [ToyTerms.eval, List.map_nil, List.sum_nil, Int.sub_zero]
+  unfold ToyResidual
+  rw [Int.add_emod, Int.sub_emod, witness.universalRelation]
+  simp
 
 def ToyOperationalClaim (events : List ToyEvent) (witness : ToyReplayWitness events) : Prop :=
   (finalValue events).Interprets 257 witness.env (ToyResidual events witness.env) ∧

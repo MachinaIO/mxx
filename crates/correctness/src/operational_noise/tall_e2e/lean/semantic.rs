@@ -2,13 +2,13 @@ use super::{NAMESPACE, generated_file};
 use crate::operational_noise::{
     certificate_schema::CertificateDocumentV1,
     g0::{
-        CanonicalExpressionDescriptor, CanonicalExpressionOperator, StableMatrixOperation,
-        StableOperator,
+        BoundProjection, CanonicalExpressionDescriptor, CanonicalExpressionOperator,
+        StableMatrixOperation, StableOperator,
     },
     simulation::{
-        OperationalProofPayload, ProofPayloadCoefficientMergeSource, ProofPayloadEvent,
-        ProofPayloadMonomial, ProofPayloadOwner, ProofPayloadRelationRule, ProofPayloadRule,
-        ProofPayloadTerm, ProofPayloadValue, ProofPayloadValueRef,
+        OperationalProofPayload, ProofPayloadCoefficientMerge, ProofPayloadCoefficientMergeSource,
+        ProofPayloadEvent, ProofPayloadMonomial, ProofPayloadOwner, ProofPayloadRelationRule,
+        ProofPayloadRule, ProofPayloadTerm, ProofPayloadValue, ProofPayloadValueRef,
     },
 };
 use num_traits::Zero;
@@ -146,6 +146,7 @@ struct OperationProbe {
     scalar_left: bool,
     scalar_right: bool,
     raw_work: u64,
+    rule: Option<ProofPayloadRule>,
     composite_relations: Vec<RelationProbe>,
 }
 
@@ -179,6 +180,9 @@ struct RelationProbe {
     rhs: ResultRecord,
     output: ResultRecord,
     kind: RelationRuleKind,
+    rule: ProofPayloadRelationRule,
+    output_merge: ProofPayloadCoefficientMerge,
+    rhs_pre_fold_event: Option<u64>,
 }
 
 struct PendingRelation {
@@ -195,7 +199,10 @@ struct PendingRelation {
     rhs: ResultRecord,
     terms: BTreeMap<ProofPayloadMonomial, num_bigint::BigInt>,
     last_merge_event: Option<u64>,
+    last_merge: Option<ProofPayloadCoefficientMerge>,
     kind: RelationRuleKind,
+    rule: ProofPayloadRelationRule,
+    rhs_pre_fold_event: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -207,6 +214,7 @@ struct BoundProbe {
     root: ResultRecord,
     prefold_terms: Vec<ProofPayloadTerm>,
     prefold_summary: crate::operational_noise::normal_form::BoundedSummary,
+    prefold_evidence: Option<ProofPayloadValueRef>,
     end: ResultRecord,
     survivor_contributions: Vec<String>,
     survivor_bounds: Vec<String>,
@@ -478,7 +486,7 @@ fn typed_operation_rule(
     index: &PayloadIndex,
     result: &ResultRecord,
     kind: OperationKind,
-) -> Result<Option<(u64, [ProofPayloadValueRef; 2], (bool, bool))>, String> {
+) -> Result<Option<(u64, [ProofPayloadValueRef; 2], (bool, bool), ProofPayloadRule)>, String> {
     let result_frame = index.immediate_frames
         [usize::try_from(result.event).map_err(|_| "semantic event index overflow")?];
     let mut candidates = index
@@ -492,11 +500,12 @@ fn typed_operation_rule(
         })
         .filter_map(|(_, rule, event)| match (kind, rule) {
             (OperationKind::Add | OperationKind::Subtract, ProofPayloadRule::Sum { inputs }) => {
-                (inputs.len() == 2)
-                    .then(|| (*event, [inputs[0].clone(), inputs[1].clone()], (false, false)))
+                (inputs.len() == 2).then(|| {
+                    (*event, [inputs[0].clone(), inputs[1].clone()], (false, false), rule.clone())
+                })
             }
             (OperationKind::Multiply, ProofPayloadRule::Product { left, right, facts: _ }) => {
-                Some((*event, [left.clone(), right.clone()], (false, false)))
+                Some((*event, [left.clone(), right.clone()], (false, false), rule.clone()))
             }
             (
                 OperationKind::Tensor,
@@ -506,11 +515,11 @@ fn typed_operation_rule(
                     left_is_constant_polynomial: _,
                     right_is_constant_polynomial: _,
                 },
-            ) => Some((*event, [left.clone(), right.clone()], (false, false))),
+            ) => Some((*event, [left.clone(), right.clone()], (false, false), rule.clone())),
             _ => None,
         })
         .collect::<Vec<_>>();
-    candidates.sort_by_key(|(event, _, _)| *event);
+    candidates.sort_by_key(|(event, _, _, _)| *event);
     if candidates.len() > 1 {
         return Err(format!(
             "operator Result {} owner {} has {} ambiguous typed {:?} rules in its immediate frame",
@@ -520,10 +529,10 @@ fn typed_operation_rule(
             kind
         ));
     }
-    let Some((event, refs, flags)) = candidates.into_iter().next() else {
+    let Some((event, refs, flags, rule)) = candidates.into_iter().next() else {
         return Ok(None);
     };
-    Ok(Some((event, refs, flags)))
+    Ok(Some((event, refs, flags, rule)))
 }
 
 fn scalar_action_key(key: &ProofPayloadMonomial) -> ProofPayloadMonomial {
@@ -654,7 +663,8 @@ fn op_probe(
     result: &ResultRecord,
     kind: OperationKind,
 ) -> Result<OperationProbe, String> {
-    let Some((rule_event, input_refs, _flags)) = typed_operation_rule(index, result, kind)? else {
+    let Some((rule_event, input_refs, _flags, rule)) = typed_operation_rule(index, result, kind)?
+    else {
         return Err(format!(
             "operator Result {} owner {} has no preceding typed {:?} rule",
             result.event,
@@ -793,6 +803,7 @@ fn op_probe(
         scalar_left: scalar_flags.0,
         scalar_right: scalar_flags.1,
         raw_work,
+        rule: Some(rule),
         composite_relations: Vec::new(),
     })
 }
@@ -828,7 +839,7 @@ fn typed_operator_eligibility(
     ) {
         return Ok(false);
     }
-    let Some((_, refs, _)) = typed_operation_rule(index, result, kind)? else {
+    let Some((_, refs, _, _)) = typed_operation_rule(index, result, kind)? else {
         return Ok(false);
     };
     for value in refs {
@@ -881,7 +892,7 @@ fn finalize_relations(
     pending: &mut Vec<PendingRelation>,
     candidates: &mut Vec<RelationProbe>,
 ) -> Result<(), String> {
-    for relation in pending.drain(..) {
+    for mut relation in pending.drain(..) {
         let output_event = relation.last_merge_event.ok_or_else(|| {
             format!(
                 "relation application {} has no typed Relation coefficient merge",
@@ -917,6 +928,12 @@ fn finalize_relations(
             rhs: relation.rhs,
             output,
             kind: relation.kind,
+            rule: relation.rule,
+            output_merge: relation
+                .last_merge
+                .take()
+                .expect("relation finalization has a typed output merge"),
+            rhs_pre_fold_event: relation.rhs_pre_fold_event,
         });
     }
     Ok(())
@@ -1071,7 +1088,15 @@ fn relation_candidates(
                         rhs,
                         terms,
                         last_merge_event: None,
+                        last_merge: None,
                         kind,
+                        rule: rule.clone(),
+                        rhs_pre_fold_event: match index.event(rhs_event)? {
+                            ProofPayloadEvent::InvocationEnd { pre_fold_event, .. } => {
+                                Some(*pre_fold_event)
+                            }
+                            _ => None,
+                        },
                     });
                 }
                 ProofPayloadEvent::CoefficientMerge(merge) => {
@@ -1095,6 +1120,7 @@ fn relation_candidates(
                     *relation.terms.entry(merge.output.clone()).or_default() +=
                         &merge.signed_contribution;
                     relation.last_merge_event = Some(event);
+                    relation.last_merge = Some(merge.clone());
                 }
                 _ => {}
             }
@@ -1235,6 +1261,7 @@ fn bound_candidates(
                 root: root_result,
                 prefold_terms: prefold.terms.clone(),
                 prefold_summary: prefold.summary.clone(),
+                prefold_evidence: prefold.summary_evidence.clone(),
                 end: end_result,
                 survivor_contributions: survivors
                     .iter()
@@ -1318,6 +1345,18 @@ fn build_probes(
             scalar_left: false,
             scalar_right: false,
             raw_work: 0,
+            rule: Some(ProofPayloadRule::Sum {
+                inputs: vec![
+                    ProofPayloadValueRef::Result {
+                        event: 2,
+                        projection: BoundProjection::Coefficient,
+                    },
+                    ProofPayloadValueRef::Result {
+                        event: 3,
+                        projection: BoundProjection::Coefficient,
+                    },
+                ],
+            }),
             composite_relations: Vec::new(),
         }
     };
@@ -1960,6 +1999,31 @@ fn terms_text(terms: &[ProofPayloadTerm]) -> String {
     format!("[{}]", terms.iter().map(term_text).collect::<Vec<_>>().join(", "))
 }
 
+fn raw_term_text(term: &ProofPayloadTerm) -> String {
+    let central = term
+        .monomial
+        .central_factors
+        .iter()
+        .map(|owner| owner_text(*owner))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ordered = term
+        .monomial
+        .ordered_factors
+        .iter()
+        .map(|owner| owner_text(*owner))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{{ coefficient := ({}), monomial := {{ centralFactors := [{}], orderedFactors := [{}] }} }}",
+        term.coefficient, central, ordered
+    )
+}
+
+fn raw_terms_text(terms: &[ProofPayloadTerm]) -> String {
+    format!("[{}]", terms.iter().map(raw_term_text).collect::<Vec<_>>().join(", "))
+}
+
 fn summary_text(summary: &crate::operational_noise::normal_form::BoundedSummary) -> String {
     match summary.coefficient_bound() {
         crate::operational_noise::facts::NumericContract::Known(
@@ -1992,12 +2056,126 @@ fn summary_bound_nat_text(
     }
 }
 
+fn projection_text(value: &BoundProjection) -> &'static str {
+    match value {
+        BoundProjection::Coefficient => ".coefficient",
+        BoundProjection::Summary => ".summary",
+    }
+}
+
+fn value_ref_text(value: &ProofPayloadValueRef) -> String {
+    match value {
+        ProofPayloadValueRef::Predecessor { binding_event, input_position, projection } => {
+            format!(".predecessor {input_position} {binding_event} {}", projection_text(projection))
+        }
+        ProofPayloadValueRef::Result { event, projection } => {
+            format!(".result {event} {}", projection_text(projection))
+        }
+        ProofPayloadValueRef::Transfer(event) => format!(".transfer {event}"),
+    }
+}
+
+fn rule_text(value: &ProofPayloadRule) -> String {
+    match value {
+        ProofPayloadRule::Sum { inputs } => {
+            format!(".sum [{}]", inputs.iter().map(value_ref_text).collect::<Vec<_>>().join(", "))
+        }
+        ProofPayloadRule::Product { left, right, facts } => format!(
+            ".product ({}) ({}) ⟨{}, {}, {}, {}, {}⟩",
+            value_ref_text(left),
+            value_ref_text(right),
+            if facts.left_is_constant_polynomial { "true" } else { "false" },
+            if facts.right_is_constant_polynomial { "true" } else { "false" },
+            facts
+                .right_known_zero_rows
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |v| format!("some {v}")),
+            facts.left_support_upper.map_or_else(|| "none".to_owned(), |v| format!("some {v}")),
+            facts.right_support_upper.map_or_else(|| "none".to_owned(), |v| format!("some {v}")),
+        ),
+        ProofPayloadRule::Tensor {
+            left,
+            right,
+            left_is_constant_polynomial,
+            right_is_constant_polynomial,
+        } => format!(
+            ".tensor ({}) ({}) {} {}",
+            value_ref_text(left),
+            value_ref_text(right),
+            if *left_is_constant_polynomial { "true" } else { "false" },
+            if *right_is_constant_polynomial { "true" } else { "false" },
+        ),
+        _ => panic!("typed operation renderer received unsupported rule"),
+    }
+}
+
+fn relation_rule_text(value: &ProofPayloadRelationRule) -> String {
+    match value {
+        ProofPayloadRelationRule::Universal { computed, lhs, lhs_layout, rhs_result } => format!(
+            ".universal {computed} ({}) ({}) {rhs_result}",
+            monomial_text(lhs),
+            lhs_layout.as_ref().map_or_else(
+                || "none".to_owned(),
+                |layout| {
+                    format!(
+                        "some ⟨\"{}\", {}, {}⟩",
+                        layout.name, layout.row_stride, layout.column_stride
+                    )
+                }
+            ),
+        ),
+        ProofPayloadRelationRule::Gadget { gadget, decomposition, input, input_result } => format!(
+            ".gadget ({}) ({}) ⟨{input}⟩ {input_result}",
+            owner_text(*gadget),
+            owner_text(*decomposition),
+        ),
+    }
+}
+
+fn merge_text(value: &ProofPayloadCoefficientMerge) -> String {
+    let source = match &value.source {
+        ProofPayloadCoefficientMergeSource::Operator { inputs } => format!(
+            ".operator (⟨{}, {}⟩, ⟨{}, {}⟩)",
+            inputs[0].value_event,
+            inputs[0].term_ordinal,
+            inputs[1].value_event,
+            inputs[1].term_ordinal,
+        ),
+        ProofPayloadCoefficientMergeSource::Relation { application, source_term_ordinal } => {
+            format!(".relation {application} {source_term_ordinal}")
+        }
+    };
+    format!(
+        ".coefficientMerge (⟨{}, {}, {}, ({})⟩)",
+        owner_text(value.owner),
+        source,
+        monomial_text(&value.output),
+        value.signed_contribution,
+    )
+}
+
+fn emit_lookup(source: &mut String, name: &str, event_name: &str, event_value: String) {
+    writeln!(
+        source,
+        "theorem {name} : (history.lookup {event_name}).map AnnotatedEvent.event = some ({event_value}) := by\n  rfl\n"
+    )
+    .expect("String write");
+}
+
 fn render_operation(source: &mut String, operation: &OperationProbe) {
     if operation.kind == OperationKind::Direct {
         writeln!(
             source,
-            "def output : Polynomial Owner := {}",
-            terms_text(&operation.output.terms)
+            "def outputRaw : List Term := {}",
+            raw_terms_text(&operation.output.terms)
+        )
+        .expect("String write");
+        writeln!(source, "def output : Polynomial Owner := outputRaw.map Term.toExact")
+            .expect("String write");
+        writeln!(
+            source,
+            "def outputSummary : Bound := {}",
+            summary_text(&operation.output.summary)
         )
         .expect("String write");
         source.push_str("\ntheorem resultAgreement : CanonicalAgreement output output := by\n  decide +kernel\n");
@@ -2006,11 +2184,26 @@ fn render_operation(source: &mut String, operation: &OperationProbe) {
     }
     let left = &operation.inputs[0];
     let right = &operation.inputs[1];
+    writeln!(source, "def leftRaw : List Term := {}", raw_terms_text(&left.terms))
+        .expect("String write");
+    writeln!(source, "def rightRaw : List Term := {}", raw_terms_text(&right.terms))
+        .expect("String write");
+    writeln!(source, "def outputRaw : List Term := {}", raw_terms_text(&operation.output.terms))
+        .expect("String write");
     writeln!(source, "def left : Polynomial Owner := {}", terms_text(&left.terms))
         .expect("String write");
     writeln!(source, "def right : Polynomial Owner := {}", terms_text(&right.terms))
         .expect("String write");
     writeln!(source, "def output : Polynomial Owner := {}", terms_text(&operation.output.terms))
+        .expect("String write");
+    writeln!(source, "def leftOwner : Owner := {}", owner_text(left.owner)).expect("String write");
+    writeln!(source, "def rightOwner : Owner := {}", owner_text(right.owner))
+        .expect("String write");
+    writeln!(source, "def leftSummary : Bound := {}", summary_text(&left.summary))
+        .expect("String write");
+    writeln!(source, "def rightSummary : Bound := {}", summary_text(&right.summary))
+        .expect("String write");
+    writeln!(source, "def outputSummary : Bound := {}", summary_text(&operation.output.summary))
         .expect("String write");
     writeln!(source, "def selectedRawWork : Nat := {}", operation.raw_work).expect("String write");
     writeln!(source, "def selectedSumRuleEvent : Nat := {}", operation.rule_event)
@@ -2053,8 +2246,13 @@ fn render_operation(source: &mut String, operation: &OperationProbe) {
             .expect("String write");
             writeln!(
                 source,
-                "def relationRhs{ordinal} : Polynomial Owner := {}",
-                terms_text(&relation.rhs.terms)
+                "def relationRhs{ordinal}Raw : List Term := {}",
+                raw_terms_text(&relation.rhs.terms)
+            )
+            .expect("String write");
+            writeln!(
+                source,
+                "def relationRhs{ordinal} : Polynomial Owner := relationRhs{ordinal}Raw.map Term.toExact"
             )
             .expect("String write");
             writeln!(source, "def relationContext{ordinal} : MonomialContext Owner := relationContext sourceKey{ordinal} sourceKey{ordinal}.centralFactors {} {}", relation.start, relation.end)
@@ -2121,8 +2319,59 @@ fn render_operation(source: &mut String, operation: &OperationProbe) {
     }
 }
 
+fn render_operation_bindings(source: &mut String, operation: &OperationProbe) {
+    if operation.kind == OperationKind::Direct {
+        emit_lookup(
+            source,
+            "selectedResultAt",
+            "selectedEvent",
+            ".resultExact selectedOwner outputRaw outputSummary".to_owned(),
+        );
+        return;
+    }
+    emit_lookup(
+        source,
+        "selectedLeftResultAt",
+        "selectedLeftResultEvent",
+        ".resultExact leftOwner leftRaw leftSummary".to_owned(),
+    );
+    emit_lookup(
+        source,
+        "selectedRightResultAt",
+        "selectedRightResultEvent",
+        ".resultExact rightOwner rightRaw rightSummary".to_owned(),
+    );
+    emit_lookup(
+        source,
+        "selectedResultAt",
+        "selectedResultEvent",
+        ".resultExact selectedOwner outputRaw outputSummary".to_owned(),
+    );
+    let rule = operation.rule.as_ref().expect("typed operation rule for semantic operation");
+    emit_lookup(
+        source,
+        "selectedRuleAt",
+        "selectedSumRuleEvent",
+        format!(".boundTransfer selectedOwner ({})", rule_text(rule)),
+    );
+}
+
 fn render_relation(source: &mut String, relation: &RelationProbe) {
     source.push_str("open EventReplay\n");
+    writeln!(
+        source,
+        "def accumulatorRaw : List Term := {}",
+        raw_terms_text(&relation.accumulator.terms)
+    )
+    .expect("String write");
+    writeln!(source, "def relationRhsRaw : List Term := {}", raw_terms_text(&relation.rhs.terms))
+        .expect("String write");
+    writeln!(
+        source,
+        "def relationOutputRaw : List Term := {}",
+        raw_terms_text(&relation.output.terms)
+    )
+    .expect("String write");
     writeln!(
         source,
         "def accumulator : Polynomial Owner := {}",
@@ -2133,7 +2382,7 @@ fn render_relation(source: &mut String, relation: &RelationProbe) {
         .expect("String write");
     writeln!(source, "def lhsKey : MonomialKey Owner := {}", monomial_text(&relation.lhs))
         .expect("String write");
-    writeln!(source, "def relationRhs : Polynomial Owner := {}", terms_text(&relation.rhs.terms))
+    writeln!(source, "def relationRhs : Polynomial Owner := relationRhsRaw.map Term.toExact")
         .expect("String write");
     writeln!(
         source,
@@ -2158,6 +2407,43 @@ fn render_relation(source: &mut String, relation: &RelationProbe) {
         .expect("String write");
     source.push_str("theorem relationSound (env : Env Owner)\n    (baseRelation : evalMonomial env lhsKey % Int.ofNat 257 =\n      evalPolynomial env relationRhs % Int.ofNat 257) :\n    evalPolynomial env relationOutput % Int.ofNat 257 =\n      evalPolynomial env accumulator % Int.ofNat 257 := by\n  exact relationCanonicalResultSound 257 env accumulator sourceKey lhsKey\n    sourceKey.centralFactors ");
     writeln!(source, "{} {} ({}) relationRhs relationOutput\n    (by decide +kernel) baseRelation relationAgreement\n", relation.start, relation.end, relation.outer).expect("String write");
+}
+
+fn render_relation_bindings(source: &mut String, relation: &RelationProbe) {
+    writeln!(source, "def relationRhsEvent : Nat := {}", relation.rhs.event).expect("String write");
+    writeln!(source, "def relationRhsOwner : Owner := {}", owner_text(relation.rhs.owner))
+        .expect("String write");
+    writeln!(source, "def relationRhsSummary : Bound := {}", summary_text(&relation.rhs.summary))
+        .expect("String write");
+    writeln!(source, "def relationOutputEvent : Nat := {}", relation.output.event)
+        .expect("String write");
+    emit_lookup(
+        source,
+        "selectedRelationAt",
+        "selectedEvent",
+        format!(
+            ".appliedRelation selectedOwner ({}) ({}) {} {} ({})",
+            monomial_text(&relation.source),
+            relation.outer,
+            relation.start,
+            relation.end,
+            relation_rule_text(&relation.rule),
+        ),
+    );
+    let rhs_event = if let Some(pre_fold_event) = relation.rhs_pre_fold_event {
+        format!(
+            ".invocationEndExact relationRhsOwner {pre_fold_event} relationRhsRaw relationRhsSummary"
+        )
+    } else {
+        ".resultExact relationRhsOwner relationRhsRaw relationRhsSummary".to_owned()
+    };
+    emit_lookup(source, "selectedRhsResultAt", "relationRhsEvent", rhs_event);
+    emit_lookup(
+        source,
+        "selectedRelationOutputAt",
+        "relationOutputEvent",
+        merge_text(&relation.output_merge),
+    );
 }
 
 fn relation_expected_terms(relation: &RelationProbe) -> Vec<ProofPayloadTerm> {
@@ -2192,6 +2478,12 @@ fn relation_expected_terms(relation: &RelationProbe) -> Vec<ProofPayloadTerm> {
 }
 
 fn render_bound(source: &mut String, bound: &BoundProbe) {
+    writeln!(source, "def rootRaw : List Term := {}", raw_terms_text(&bound.root.terms))
+        .expect("String write");
+    writeln!(source, "def prefoldRaw : List Term := {}", raw_terms_text(&bound.prefold_terms))
+        .expect("String write");
+    writeln!(source, "def endRaw : List Term := {}", raw_terms_text(&bound.end.terms))
+        .expect("String write");
     writeln!(source, "def rootTerms : Polynomial Owner := {}", terms_text(&bound.root.terms))
         .expect("String write");
     writeln!(source, "def prefoldTerms : Polynomial Owner := {}", terms_text(&bound.prefold_terms))
@@ -2215,6 +2507,31 @@ fn render_bound(source: &mut String, bound: &BoundProbe) {
     render_survivor_witness(source, bound);
     source.push_str("\ntheorem prefoldResult : prefoldTerms = rootTerms := by rfl\n\ntheorem prefoldBoundSound : rootBound ≤ prefoldBound := by decide +kernel\n\n");
     source.push_str("\ntheorem prefoldSound :\n  preFoldBound rootBound prefoldBound survivorContributions survivorBounds := by\n  exact (preFoldSound rootTerms prefoldTerms prefoldResult prefoldBoundSound survivorBoundsSound).2\n\ntheorem endResult : endTerms = prefoldTerms := by rfl\n\ntheorem endSummaryResult : endSummary = prefoldSummary := by rfl\n\ntheorem endSound :\n  endTerms = prefoldTerms ∧ endSummary = prefoldSummary := by\n  exact ⟨endResult, endSummaryResult⟩\n\n");
+}
+
+fn render_bound_bindings(source: &mut String, bound: &BoundProbe) {
+    emit_lookup(
+        source,
+        "selectedRootResultAt",
+        "rootResultEvent",
+        ".resultExact selectedOwner rootRaw rootSummary".to_owned(),
+    );
+    let evidence = bound
+        .prefold_evidence
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), |value| format!("some ({})", value_ref_text(value)));
+    emit_lookup(
+        source,
+        "selectedPreFoldAt",
+        "prefoldEvent",
+        format!(".preFoldPolynomial rootResultEvent prefoldRaw prefoldSummary ({evidence})"),
+    );
+    emit_lookup(
+        source,
+        "selectedInvocationEndAt",
+        "endEvent",
+        ".invocationEndExact selectedOwner prefoldEvent endRaw endSummary".to_owned(),
+    );
 }
 
 fn render_survivor_witness(source: &mut String, bound: &BoundProbe) {
@@ -2296,7 +2613,8 @@ fn render_survivor_witness(source: &mut String, bound: &BoundProbe) {
 
 fn render_semantic_shard(module: &str, shard: &SemanticShard) -> (String, u64) {
     let mut source = format!(
-        "import Mxx.Certificate.OperationalNoise.TallSemantics\n\n\
+        "import Mxx.Certificate.OperationalNoise.TallSemantics\n\
+         import {NAMESPACE}.Proof.History\n\n\
          set_option autoImplicit false\n\
          set_option relaxedAutoImplicit false\n\n\
          namespace {NAMESPACE}.Semantic.{module}\n\n\
@@ -2330,6 +2648,7 @@ fn render_semantic_shard(module: &str, shard: &SemanticShard) -> (String, u64) {
         writeln!(source, "def selectedOwner : Owner := {}", owner_text(operation.output.owner))
             .expect("String write");
         render_operation(&mut source, operation);
+        render_operation_bindings(&mut source, operation);
         writeln!(source, "end Operation{ordinal}").expect("String write");
     }
     for (ordinal, relation) in shard.relations.iter().enumerate() {
@@ -2338,6 +2657,7 @@ fn render_semantic_shard(module: &str, shard: &SemanticShard) -> (String, u64) {
         writeln!(source, "def selectedOwner : Owner := {}", owner_text(relation.owner))
             .expect("String write");
         render_relation(&mut source, relation);
+        render_relation_bindings(&mut source, relation);
         writeln!(source, "end Relation{ordinal}").expect("String write");
     }
     for (ordinal, bound) in shard.bounds.iter().enumerate() {
@@ -2357,6 +2677,7 @@ fn render_semantic_shard(module: &str, shard: &SemanticShard) -> (String, u64) {
         )
         .expect("String write");
         render_bound(&mut source, bound);
+        render_bound_bindings(&mut source, bound);
         writeln!(source, "end Bound{ordinal}").expect("String write");
     }
     let theorem_count = source.matches("\ntheorem ").count() as u64;
@@ -2376,7 +2697,7 @@ impl BoundProbe {
 
 fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection]) -> String {
     let mut source = format!(
-        "import Mxx.Certificate.OperationalNoise.TallSemantics\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n"
+        "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n"
     );
     let selected = probes.iter().find(|selection| selection.name == probe);
     if let Some(selection) = selected {
@@ -2404,9 +2725,17 @@ fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection]) -> String 
                         &mut source,
                         selection.operation.as_ref().expect("operation probe"),
                     );
+                    render_operation_bindings(
+                        &mut source,
+                        selection.operation.as_ref().expect("operation probe"),
+                    );
                     source.push_str("end AddResult\n");
                 } else {
                     render_operation(
+                        &mut source,
+                        selection.operation.as_ref().expect("operation probe"),
+                    );
+                    render_operation_bindings(
                         &mut source,
                         selection.operation.as_ref().expect("operation probe"),
                     );
@@ -2418,6 +2747,7 @@ fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection]) -> String 
                 for (ordinal, relation) in selection.relations.iter().enumerate() {
                     writeln!(source, "namespace Relation{ordinal}").expect("String write");
                     render_relation(&mut source, relation);
+                    render_relation_bindings(&mut source, relation);
                     writeln!(source, "end Relation{ordinal}").expect("String write");
                 }
             }
@@ -2425,6 +2755,7 @@ fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection]) -> String 
         "bound-fold-result" => {
             if let Some(selection) = selected {
                 render_bound(&mut source, selection.bound.as_ref().expect("bound probe"));
+                render_bound_bindings(&mut source, selection.bound.as_ref().expect("bound probe"));
             }
         }
         _ => {}
@@ -2570,6 +2901,18 @@ mod tests {
             scalar_left: false,
             scalar_right: false,
             raw_work: 1,
+            rule: Some(ProofPayloadRule::Sum {
+                inputs: vec![
+                    ProofPayloadValueRef::Result {
+                        event: 2,
+                        projection: BoundProjection::Coefficient,
+                    },
+                    ProofPayloadValueRef::Result {
+                        event: 3,
+                        projection: BoundProjection::Coefficient,
+                    },
+                ],
+            }),
             composite_relations: Vec::new(),
         };
         let mut operation_source = String::new();
@@ -2596,6 +2939,7 @@ mod tests {
             },
             prefold_terms: vec![],
             prefold_summary: BoundedSummary::zero(),
+            prefold_evidence: None,
             end: ResultRecord {
                 event: 3,
                 owner: root,
@@ -2810,7 +3154,7 @@ mod tests {
             typed_operator_eligibility(&index, &result, OperationKind::Add)
                 .expect("typed Add classification")
         );
-        let (_, refs, _) = typed_operation_rule(&index, &result, OperationKind::Add)
+        let (_, refs, _, _) = typed_operation_rule(&index, &result, OperationKind::Add)
             .expect("typed Add rule")
             .expect("eligible Add rule");
         assert_eq!(index.value_ref(root, &refs[0]).expect("left ref").event, 1);
@@ -2903,6 +3247,8 @@ mod tests {
     fn add_operation(output: ResultRecord) -> OperationProbe {
         let left = add_result(output.owner, output.event - 4, 1);
         let right = add_result(output.owner, output.event - 3, 1);
+        let left_event = left.event;
+        let right_event = right.event;
         OperationProbe {
             kind: OperationKind::Add,
             rule_event: output.event - 2,
@@ -2913,6 +3259,18 @@ mod tests {
             scalar_left: false,
             scalar_right: false,
             raw_work: 1,
+            rule: Some(ProofPayloadRule::Sum {
+                inputs: vec![
+                    ProofPayloadValueRef::Result {
+                        event: left_event,
+                        projection: BoundProjection::Coefficient,
+                    },
+                    ProofPayloadValueRef::Result {
+                        event: right_event,
+                        projection: BoundProjection::Coefficient,
+                    },
+                ],
+            }),
             composite_relations: Vec::new(),
         }
     }
@@ -2994,6 +3352,36 @@ mod tests {
             rhs: record.clone(),
             output: record,
             kind,
+            rule: match kind {
+                RelationRuleKind::Gadget => ProofPayloadRelationRule::Gadget {
+                    gadget: root,
+                    decomposition: root,
+                    input: 0,
+                    input_result: event,
+                },
+                RelationRuleKind::Universal => ProofPayloadRelationRule::Universal {
+                    computed: event,
+                    lhs: ProofPayloadMonomial {
+                        central_factors: Vec::new(),
+                        ordered_factors: vec![root],
+                    },
+                    lhs_layout: None,
+                    rhs_result: event,
+                },
+            },
+            output_merge: ProofPayloadCoefficientMerge {
+                owner: root,
+                source: ProofPayloadCoefficientMergeSource::Relation {
+                    application: event,
+                    source_term_ordinal: 0,
+                },
+                output: ProofPayloadMonomial {
+                    central_factors: Vec::new(),
+                    ordered_factors: vec![root],
+                },
+                signed_contribution: BigInt::from(1),
+            },
+            rhs_pre_fold_event: None,
         }
     }
 

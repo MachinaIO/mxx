@@ -7,6 +7,8 @@ use std::{
     process::Command,
 };
 
+use super::tall_e2e::SECURITY0_EVENT_CHUNK_SIZE;
+
 const BALANCED_ROW_COUNT: usize = 5_000;
 const FUEL_HAVE_COUNT: usize = 1_000;
 const FUEL_HAVE_GROUP_MAX: usize = 64;
@@ -19,7 +21,6 @@ const SECURITY0_STATEMENT_ROW_COUNT: usize = 35_975;
 const SECURITY0_INDEX_USE_ROW_COUNT: usize = 199;
 const SECURITY0_SLICE_GROUP_ROW_COUNT: usize = 1;
 const SECURITY0_EVENT_COUNT: usize = 107_567;
-const SECURITY0_EVENT_CHUNK_SIZE: usize = 256;
 const SECURITY0_EVENT_LEAF_SIZE: usize = 16;
 const ALLOWED_AXIOMS: [&str; 2] = ["propext", "Quot.sound"];
 const SECURITY0_SPIKE_AXIOM_DECLARATIONS: &[&str] = &[

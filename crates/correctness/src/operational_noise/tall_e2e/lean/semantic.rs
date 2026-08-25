@@ -70,6 +70,23 @@ struct StatisticsReport {
     probes: Vec<ProbeStat>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SemanticShardReport {
+    schema_id: &'static str,
+    schema_version: u32,
+    shard_index: u64,
+    start_event: u64,
+    end_event: u64,
+    theorem_count: u64,
+    canonical_work: u64,
+    operation_count: u64,
+    relation_count: u64,
+    bound_count: u64,
+    raw_semantic_count: u64,
+    raw_family_counts: [u64; 6],
+}
+
 #[derive(Clone)]
 struct Frame {
     root: ProofPayloadOwner,
@@ -116,6 +133,7 @@ struct OperationProbe {
     scalar_left: bool,
     scalar_right: bool,
     raw_work: u64,
+    composite_relations: Vec<RelationProbe>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +155,8 @@ enum RelationRuleKind {
 struct RelationProbe {
     event: u64,
     owner: ProofPayloadOwner,
+    frame_start: u64,
+    frame_end: u64,
     source: ProofPayloadMonomial,
     lhs: ProofPayloadMonomial,
     outer: num_bigint::BigInt,
@@ -151,6 +171,8 @@ struct RelationProbe {
 struct PendingRelation {
     event: u64,
     owner: ProofPayloadOwner,
+    frame_start: u64,
+    frame_end: u64,
     source: ProofPayloadMonomial,
     lhs: ProofPayloadMonomial,
     outer: num_bigint::BigInt,
@@ -165,6 +187,10 @@ struct PendingRelation {
 
 #[derive(Clone)]
 struct BoundProbe {
+    root_result_event: u64,
+    prefold_event: u64,
+    end_event: u64,
+    survivor_events: Vec<u64>,
     root: ResultRecord,
     prefold_terms: Vec<ProofPayloadTerm>,
     prefold_summary: crate::operational_noise::normal_form::BoundedSummary,
@@ -186,6 +212,32 @@ struct ProbeSelection {
     operation: Option<OperationProbe>,
     relations: Vec<RelationProbe>,
     bound: Option<BoundProbe>,
+}
+
+struct SemanticShard {
+    index: u64,
+    start: u64,
+    end: u64,
+    operations: Vec<OperationProbe>,
+    relations: Vec<RelationProbe>,
+    bounds: Vec<BoundProbe>,
+    raw_semantic_count: u64,
+    raw_family_counts: [u64; 6],
+}
+
+impl SemanticShard {
+    fn canonical_work(&self) -> u64 {
+        self.operations
+            .iter()
+            .map(|operation| operation.raw_work)
+            .sum::<u64>()
+            .saturating_add(
+                self.relations.iter().map(|relation| relation.output.terms.len() as u64).sum(),
+            )
+            .saturating_add(
+                self.bounds.iter().map(|bound| bound.survivor_contributions.len() as u64).sum(),
+            )
+    }
 }
 
 impl ProbeStat {
@@ -550,7 +602,37 @@ fn op_probe(
         scalar_left: flags.0,
         scalar_right: flags.1,
         raw_work,
+        composite_relations: Vec::new(),
     })
+}
+
+fn attach_composite_relations(
+    mut operation: OperationProbe,
+    relations: &[RelationProbe],
+) -> Result<OperationProbe, String> {
+    let mut attached = relations
+        .iter()
+        .filter(|relation| {
+            relation.owner == operation.output.owner &&
+                relation.event > operation.rule_event &&
+                relation.event < operation.output_event
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    attached.sort_by_key(|relation| relation.event);
+    if attached.len() > 1 {
+        return Err(format!(
+            "operator Result {} has multiple attached relation applications: {}",
+            operation.output.event,
+            attached
+                .iter()
+                .map(|relation| relation.event.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    operation.composite_relations = attached;
+    Ok(operation)
 }
 
 fn typed_operator_eligibility(
@@ -644,6 +726,8 @@ fn finalize_relations(
         candidates.push(RelationProbe {
             event: relation.event,
             owner: relation.owner,
+            frame_start: relation.frame_start,
+            frame_end: relation.frame_end,
             source: relation.source,
             lhs: relation.lhs,
             outer: relation.outer,
@@ -796,6 +880,8 @@ fn relation_candidates(
                     pending.push(PendingRelation {
                         event,
                         owner: *owner,
+                        frame_start: *frame_start,
+                        frame_end: *frame_end,
                         source: source_monomial.clone(),
                         lhs,
                         outer: outer_coefficient.clone(),
@@ -875,6 +961,112 @@ fn frame_ranges(
     Ok(ranges)
 }
 
+fn bound_candidates(
+    index: &PayloadIndex,
+    ranges: &[(u64, u64, ProofPayloadOwner, u64)],
+) -> Result<Vec<(u64, u64, BoundProbe)>, String> {
+    let mut candidates = Vec::new();
+    for (start, end, root, _) in ranges {
+        let Some((end_event, end_owner, end_value, pre_fold_event)) =
+            index.ends.iter().find(|(event, _, _, _)| *event == *end)
+        else {
+            continue;
+        };
+        if *end_owner != *root {
+            return Err(format!("InvocationEnd {end_event} root does not match frame root"));
+        }
+        let Some((prefold_event, prefold)) =
+            index.prefolds.iter().find(|(event, _)| *event == *pre_fold_event)
+        else {
+            return Err(format!(
+                "InvocationEnd {end_event} references missing PreFold {pre_fold_event}"
+            ));
+        };
+        if *prefold_event < *start ||
+            *prefold_event >= *end ||
+            index.immediate_frames
+                [usize::try_from(*prefold_event).expect("indexed PreFold event")] !=
+                Some(*start)
+        {
+            return Err(format!(
+                "PreFold {prefold_event} is outside InvocationEnd {end_event} frame"
+            ));
+        }
+        let root_result = match index.event(prefold.result_event)? {
+            ProofPayloadEvent::Result { owner, .. } if *owner == *root => {
+                index.result(prefold.result_event)?
+            }
+            _ => {
+                return Err(format!(
+                    "PreFold {prefold_event} does not reference exact root Result {}",
+                    prefold.result_event
+                ))
+            }
+        };
+        if index.immediate_frames
+            [usize::try_from(prefold.result_event).expect("indexed Result event")] !=
+            Some(*start)
+        {
+            return Err(format!(
+                "Result {} is outside PreFold {prefold_event} frame",
+                prefold.result_event
+            ));
+        }
+        let end_result = match end_value {
+            ProofPayloadValue::Exact { terms, summary } => ResultRecord {
+                event: *end_event,
+                owner: *end_owner,
+                terms: terms.clone(),
+                summary: summary.clone(),
+            },
+            _ => return Err(format!("InvocationEnd {end_event} does not carry an exact result")),
+        };
+        let survivors = index
+            .survivors
+            .iter()
+            .filter(|(event, _)| {
+                *event >= *start &&
+                    *event < *end &&
+                    index.immediate_frames
+                        [usize::try_from(*event).expect("indexed survivor event")] ==
+                        Some(*start)
+            })
+            .map(|(_, fold)| (fold.coefficient.magnitude().to_string(), fold.bound.to_string()))
+            .collect::<Vec<_>>();
+        candidates.push((
+            *start,
+            *end,
+            BoundProbe {
+                root_result_event: prefold.result_event,
+                prefold_event: *prefold_event,
+                end_event: *end_event,
+                survivor_events: index
+                    .survivors
+                    .iter()
+                    .filter(|(event, _)| {
+                        *event >= *start &&
+                            *event < *end &&
+                            index.immediate_frames
+                                [usize::try_from(*event).expect("indexed survivor event")] ==
+                                Some(*start)
+                    })
+                    .map(|(event, _)| *event)
+                    .collect(),
+                root: root_result,
+                prefold_terms: prefold.terms.clone(),
+                prefold_summary: prefold.summary.clone(),
+                end: end_result,
+                survivor_contributions: survivors
+                    .iter()
+                    .map(|(actual, _)| actual.clone())
+                    .collect(),
+                survivor_bounds: survivors.into_iter().map(|(_, bound)| bound).collect(),
+            },
+        ));
+    }
+    Ok(candidates)
+}
+
 fn build_probes(
     statement: &CertificateDocumentV1,
     proof: &OperationalProofPayload,
@@ -946,6 +1138,7 @@ fn build_probes(
             scalar_left: false,
             scalar_right: false,
             raw_work: 0,
+            composite_relations: Vec::new(),
         }
     };
     probes.push(ProbeSelection {
@@ -1054,101 +1247,15 @@ fn build_probes(
         bound: None,
     });
 
-    let mut bound_candidates = Vec::new();
-    for (start, end, root, _) in ranges {
-        let Some((end_event, end_owner, end_value, pre_fold_event)) =
-            index.ends.iter().find(|(event, _, _, _)| *event == end)
-        else {
-            continue;
-        };
-        if *end_owner != root {
-            return Err(format!("InvocationEnd {end_event} root does not match frame root"));
-        }
-        let Some((prefold_event, prefold)) =
-            index.prefolds.iter().find(|(event, _)| *event == *pre_fold_event)
-        else {
-            return Err(format!(
-                "InvocationEnd {end_event} references missing PreFold {pre_fold_event}"
-            ));
-        };
-        if *prefold_event < start ||
-            *prefold_event >= end ||
-            index.immediate_frames
-                [usize::try_from(*prefold_event).expect("indexed PreFold event")] !=
-                Some(start)
-        {
-            return Err(format!(
-                "PreFold {prefold_event} is outside InvocationEnd {end_event} frame"
-            ));
-        }
-        let root_result = match index.event(prefold.result_event)? {
-            ProofPayloadEvent::Result { owner, .. } if *owner == root => {
-                index.result(prefold.result_event)?
-            }
-            _ => {
-                return Err(format!(
-                    "PreFold {prefold_event} does not reference exact root Result {}",
-                    prefold.result_event
-                ))
-            }
-        };
-        if index.immediate_frames
-            [usize::try_from(prefold.result_event).expect("indexed Result event")] !=
-            Some(start)
-        {
-            return Err(format!(
-                "Result {} is outside PreFold {prefold_event} frame",
-                prefold.result_event
-            ));
-        }
-        let end_result = match end_value {
-            ProofPayloadValue::Exact { terms, summary } => ResultRecord {
-                event: *end_event,
-                owner: *end_owner,
-                terms: terms.clone(),
-                summary: summary.clone(),
-            },
-            _ => return Err(format!("InvocationEnd {end_event} does not carry an exact result")),
-        };
-        let survivors = index
-            .survivors
-            .iter()
-            .filter(|(event, _)| {
-                *event >= start &&
-                    *event < end &&
-                    index.immediate_frames
-                        [usize::try_from(*event).expect("indexed survivor event")] ==
-                        Some(start)
-            })
-            .map(|(_, fold)| {
-                let contribution = fold.coefficient.magnitude().to_string();
-                (contribution, fold.bound.to_string())
-            })
-            .collect::<Vec<_>>();
-        bound_candidates.push((
-            start,
-            end,
-            BoundProbe {
-                root: root_result,
-                prefold_terms: prefold.terms.clone(),
-                prefold_summary: prefold.summary.clone(),
-                end: end_result,
-                survivor_contributions: survivors
-                    .iter()
-                    .map(|(actual, _)| actual.clone())
-                    .collect(),
-                survivor_bounds: survivors.into_iter().map(|(_, bound)| bound).collect(),
-            },
-        ));
-    }
+    let mut all_bound_candidates = bound_candidates(index, &ranges)?;
     let has_positive_survivors =
-        bound_candidates.iter().any(|(_, _, probe)| !probe.survivor_contributions.is_empty());
-    bound_candidates.retain(|(_, _, probe)| {
+        all_bound_candidates.iter().any(|(_, _, probe)| !probe.survivor_contributions.is_empty());
+    all_bound_candidates.retain(|(_, _, probe)| {
         !has_positive_survivors || !probe.survivor_contributions.is_empty()
     });
-    bound_candidates
+    all_bound_candidates
         .sort_by_key(|(start, end, probe)| (probe.survivor_contributions.len(), *start, *end));
-    let bound_frame = bound_candidates.into_iter().next().ok_or_else(|| {
+    let bound_frame = all_bound_candidates.into_iter().next().ok_or_else(|| {
         "CP3 bound/fold/result probe cannot map PreFold.result_event and InvocationEnd.pre_fold_event to exact root Results".to_owned()
     })?;
     probes.push(ProbeSelection {
@@ -1165,6 +1272,119 @@ fn build_probes(
         bound: Some(bound_frame.2),
     });
     Ok(probes)
+}
+
+const SEMANTIC_SHARD_CHUNK_SIZE: u64 =
+    crate::operational_noise::tall_e2e::SECURITY0_EVENT_CHUNK_SIZE as u64;
+
+fn raw_semantic_shard(index: &PayloadIndex) -> Result<(u64, u64, u64, [u64; 6]), String> {
+    let event_count =
+        u64::try_from(index.events.len()).map_err(|_| "semantic event count overflow")?;
+    let shard_count = event_count.div_ceil(SEMANTIC_SHARD_CHUNK_SIZE);
+    (0..shard_count)
+        .filter_map(|shard_index| {
+            let start = shard_index * SEMANTIC_SHARD_CHUNK_SIZE;
+            let end = (start + SEMANTIC_SHARD_CHUNK_SIZE).min(event_count);
+            let mut counts = [0_u64; 6];
+            for event in start..end {
+                match &index.events[usize::try_from(event).expect("indexed semantic event")] {
+                    ProofPayloadEvent::BoundTransfer { .. } => counts[0] += 1,
+                    ProofPayloadEvent::Result { .. } => counts[1] += 1,
+                    ProofPayloadEvent::AppliedRelation { .. } => counts[2] += 1,
+                    ProofPayloadEvent::SurvivorFold(_) => counts[3] += 1,
+                    ProofPayloadEvent::PreFoldPolynomial(_) => counts[4] += 1,
+                    ProofPayloadEvent::InvocationEnd { .. } => counts[5] += 1,
+                    _ => {}
+                }
+            }
+            let has_algebraic_operation = index.operations.iter().any(|(_, rule, event)| {
+                *event >= start &&
+                    *event < end &&
+                    matches!(rule, ProofPayloadRule::Sum { inputs } if inputs.len() == 2) ||
+                    (*event >= start &&
+                        *event < end &&
+                        matches!(
+                            rule,
+                            ProofPayloadRule::Product { .. } | ProofPayloadRule::Tensor { .. }
+                        ))
+            });
+            (has_algebraic_operation && counts[2] != 0 && counts[5] != 0).then_some((
+                shard_index,
+                start,
+                end,
+                counts,
+            ))
+        })
+        .max_by_key(|(shard_index, _, _, counts)| {
+            (counts.iter().sum::<u64>(), std::cmp::Reverse(*shard_index))
+        })
+        .ok_or_else(|| {
+            "Security0 semantic raw shard has no algebraic operation, relation, and InvocationEnd"
+                .to_owned()
+        })
+}
+
+fn semantic_shard_candidates(
+    statement: &CertificateDocumentV1,
+    index: &PayloadIndex,
+    _ranges: &[(u64, u64, ProofPayloadOwner, u64)],
+    relation_probes: &[RelationProbe],
+    bound_probes: &[(u64, u64, BoundProbe)],
+) -> Result<SemanticShard, String> {
+    let (shard_index, start, end, raw_family_counts) = raw_semantic_shard(index)?;
+    let mut operations = Vec::new();
+    for result in &index.results {
+        if result.event < start || result.event >= end {
+            continue;
+        }
+        let kind = match expression_kind(statement, result.owner)? {
+            Some(kind) if kind != OperationKind::Direct => kind,
+            _ => continue,
+        };
+        if !typed_operator_eligibility(index, result, kind)? {
+            continue;
+        }
+        let operation = op_probe(statement, index, result, kind)?;
+        let result_frame =
+            index.immediate_frames[usize::try_from(result.event).expect("indexed result event")];
+        let matching_relations = relation_probes
+            .iter()
+            .filter(|relation| {
+                relation.owner == result.owner &&
+                    relation.event > operation.rule_event &&
+                    relation.event < operation.output_event &&
+                    relation.frame_start == result_frame.unwrap_or(u64::MAX) &&
+                    relation.frame_end >= relation.event
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        operations.push(attach_composite_relations(operation, &matching_relations)?);
+    }
+    let relations = relation_probes
+        .iter()
+        .filter(|relation| relation.event >= start && relation.event < end)
+        .cloned()
+        .collect::<Vec<_>>();
+    let bounds = bound_probes
+        .iter()
+        .filter(|(_, frame_end, _)| *frame_end >= start && *frame_end < end)
+        .map(|(_, _, bound)| bound.clone())
+        .collect::<Vec<_>>();
+    if operations.is_empty() || relations.is_empty() || bounds.is_empty() {
+        return Err(format!(
+            "raw Security0 shard {shard_index} lacks required operation/relation/InvocationEnd mapping"
+        ));
+    }
+    Ok(SemanticShard {
+        index: shard_index,
+        start,
+        end,
+        operations,
+        relations,
+        bounds,
+        raw_semantic_count: raw_family_counts.iter().sum(),
+        raw_family_counts,
+    })
 }
 
 struct PayloadIndex {
@@ -1196,6 +1416,11 @@ pub(super) fn render(
     let (mut report, _selections, _long_monomial) = measure(proof)?;
     let index = PayloadIndex::new(proof)?;
     let probes = build_probes(statement, proof, &index)?;
+    let ranges = frame_ranges(proof)?;
+    let relation_probes = relation_candidates(&index, &ranges)?;
+    let all_bound_probes = bound_candidates(&index, &ranges)?;
+    let shard =
+        semantic_shard_candidates(statement, &index, &ranges, &relation_probes, &all_bound_probes)?;
     report.probes = probes.iter().map(ProbeStat::from_probe).collect();
     let report_bytes = serde_json::to_vec(&report)
         .map_err(|error| format!("semantic probe statistics encoding failed: {error}"))?;
@@ -1215,10 +1440,31 @@ pub(super) fn render(
     for (path, module, probe) in specs {
         files.push(generated_file(path, render_probe(module, probe, &probes)));
     }
+    let (shard_source, emitted_theorem_count) = render_semantic_shard("SemanticShard000", &shard);
+    files.push(generated_file("Semantic/SemanticShard000.lean", shard_source));
+    let shard_report = SemanticShardReport {
+        schema_id: SCHEMA_ID,
+        schema_version: SCHEMA_VERSION,
+        shard_index: shard.index,
+        start_event: shard.start,
+        end_event: shard.end,
+        theorem_count: emitted_theorem_count,
+        canonical_work: shard.canonical_work(),
+        operation_count: shard.operations.len() as u64,
+        relation_count: shard.relations.len() as u64,
+        bound_count: shard.bounds.len() as u64,
+        raw_semantic_count: shard.raw_semantic_count,
+        raw_family_counts: shard.raw_family_counts,
+    };
+    files.push(generated_file(
+        "Semantic/SemanticShardStatistics.json",
+        serde_json::to_string(&shard_report).expect("JSON is UTF-8"),
+    ));
     let mut index = String::new();
     for (_, module, _) in specs {
         writeln!(index, "import {NAMESPACE}.Semantic.{module}").expect("String write");
     }
+    writeln!(index, "import {NAMESPACE}.Semantic.SemanticShard000").expect("String write");
     files.push(generated_file("Semantic/Semantic.lean", index));
     Ok(files)
 }
@@ -1580,6 +1826,77 @@ fn render_operation(source: &mut String, operation: &OperationProbe) {
         .expect("String write");
     writeln!(source, "def selectedResultEvent : Nat := {}", operation.output_event)
         .expect("String write");
+    if let Some(relation) = operation.composite_relations.last() {
+        source.push_str("open EventReplay\n");
+        writeln!(
+            source,
+            "def leftScalar : Bool := {}",
+            if operation.scalar_left { "true" } else { "false" }
+        )
+        .expect("String write");
+        writeln!(
+            source,
+            "def rightScalar : Bool := {}",
+            if operation.scalar_right { "true" } else { "false" }
+        )
+        .expect("String write");
+        writeln!(
+            source,
+            "def productOutput : Polynomial Owner := {}",
+            "productPoly left right leftScalar rightScalar"
+        )
+        .expect("String write");
+        writeln!(
+            source,
+            "def relationOutput : Polynomial Owner := {}",
+            terms_text(&operation.output.terms)
+        )
+        .expect("String write");
+        writeln!(
+            source,
+            "def sourceKey : MonomialKey Owner := {}",
+            monomial_text(&relation.source)
+        )
+        .expect("String write");
+        writeln!(source, "def lhsKey : MonomialKey Owner := {}", monomial_text(&relation.lhs))
+            .expect("String write");
+        writeln!(
+            source,
+            "def relationRhs : Polynomial Owner := {}",
+            terms_text(&relation.rhs.terms)
+        )
+        .expect("String write");
+        writeln!(
+            source,
+            "def relationContext0 : MonomialContext Owner := relationContext sourceKey sourceKey.centralFactors {} {}",
+            relation.start,
+            relation.end
+        )
+        .expect("String write");
+        source.push_str(
+            "\ntheorem productAgreement : CanonicalAgreement productOutput (productPoly left right leftScalar rightScalar) := by\n  decide +kernel\n\n",
+        );
+        source.push_str(
+            "theorem relationAgreement : CanonicalAgreement relationOutput (relationPoly productOutput sourceKey relationContext0 ",
+        );
+        writeln!(source, "({}) relationRhs) := by decide +kernel", relation.outer)
+            .expect("String write");
+        source.push_str(
+            "\ntheorem resultSound (env : Env Owner)\n    (baseRelation : evalMonomial env lhsKey % Int.ofNat 257 =\n      evalPolynomial env relationRhs % Int.ofNat 257) :\n    evalPolynomial env relationOutput % Int.ofNat 257 =\n      (evalPolynomial env left * evalPolynomial env right) % Int.ofNat 257 := by\n  have productSound := productCanonicalResultSound env left right productOutput leftScalar rightScalar productAgreement\n  have relationSound := relationCanonicalResultSound 257 env productOutput sourceKey lhsKey\n    sourceKey.centralFactors ",
+        );
+        writeln!(
+            source,
+            "{} {} ({}) relationRhs relationOutput\n    (by decide +kernel) baseRelation relationAgreement",
+            relation.start,
+            relation.end,
+            relation.outer
+        )
+        .expect("String write");
+        source.push_str(
+            "  calc\n    evalPolynomial env relationOutput % Int.ofNat 257 = evalPolynomial env productOutput % Int.ofNat 257 := relationSound\n    _ = (evalPolynomial env left * evalPolynomial env right) % Int.ofNat 257 := by rw [productSound]\n\n",
+        );
+        return;
+    }
     match operation.kind {
         OperationKind::Direct => unreachable!("direct operation handled above"),
         OperationKind::Add => {
@@ -1724,6 +2041,77 @@ fn render_bound(source: &mut String, bound: &BoundProbe) {
     source.push_str("\ntheorem prefoldResult : prefoldTerms = rootTerms := by rfl\n\ntheorem prefoldBoundSound : rootBound ≤ prefoldBound := by decide +kernel\n\n");
     writeln!(source, "theorem survivorBoundsSound : List.Forall₂ (fun actual bound => actual ≤ bound) survivorContributions survivorBounds :=\n{survivors_proof}").expect("String write");
     source.push_str("\ntheorem prefoldSound :\n  preFoldBound rootBound prefoldBound survivorContributions survivorBounds := by\n  exact (preFoldSound rootTerms prefoldTerms prefoldResult prefoldBoundSound survivorBoundsSound).2\n\ntheorem endResult : endTerms = prefoldTerms := by rfl\n\ntheorem endSummaryResult : endSummary = prefoldSummary := by rfl\n\ntheorem endSound :\n  endTerms = prefoldTerms ∧ endSummary = prefoldSummary := by\n  exact ⟨endResult, endSummaryResult⟩\n\n");
+}
+
+fn render_semantic_shard(module: &str, shard: &SemanticShard) -> (String, u64) {
+    let mut source = format!(
+        "import Mxx.Certificate.OperationalNoise.TallSemantics\n\n\
+         set_option autoImplicit false\n\
+         set_option relaxedAutoImplicit false\n\n\
+         namespace {NAMESPACE}.Semantic.{module}\n\n\
+         open Mxx.Certificate.OperationalNoise\n\
+         open TallSecurity0ABI\n\
+         open TallSemantics\n\n"
+    );
+    writeln!(source, "def shardIndex : Nat := {}", shard.index).expect("String write");
+    writeln!(source, "def shardStartEvent : Nat := {}", shard.start).expect("String write");
+    writeln!(source, "def shardEndEvent : Nat := {}", shard.end).expect("String write");
+    writeln!(source, "def rawSemanticCount : Nat := {}", shard.raw_semantic_count)
+        .expect("String write");
+    writeln!(source, "def rawBoundTransferCount : Nat := {}", shard.raw_family_counts[0])
+        .expect("String write");
+    writeln!(source, "def rawResultCount : Nat := {}", shard.raw_family_counts[1])
+        .expect("String write");
+    writeln!(source, "def rawRelationCount : Nat := {}", shard.raw_family_counts[2])
+        .expect("String write");
+    writeln!(source, "def rawSurvivorFoldCount : Nat := {}", shard.raw_family_counts[3])
+        .expect("String write");
+    writeln!(source, "def rawPreFoldCount : Nat := {}", shard.raw_family_counts[4])
+        .expect("String write");
+    writeln!(source, "def rawInvocationEndCount : Nat := {}", shard.raw_family_counts[5])
+        .expect("String write");
+    writeln!(source, "def canonicalWork : Nat := {}", shard.canonical_work())
+        .expect("String write");
+    for (ordinal, operation) in shard.operations.iter().enumerate() {
+        writeln!(source, "\nnamespace Operation{ordinal}").expect("String write");
+        writeln!(source, "def selectedEvent : Nat := {}", operation.output_event)
+            .expect("String write");
+        writeln!(source, "def selectedOwner : Owner := {}", owner_text(operation.output.owner))
+            .expect("String write");
+        render_operation(&mut source, operation);
+        writeln!(source, "end Operation{ordinal}").expect("String write");
+    }
+    for (ordinal, relation) in shard.relations.iter().enumerate() {
+        writeln!(source, "\nnamespace Relation{ordinal}").expect("String write");
+        writeln!(source, "def selectedEvent : Nat := {}", relation.event).expect("String write");
+        writeln!(source, "def selectedOwner : Owner := {}", owner_text(relation.owner))
+            .expect("String write");
+        render_relation(&mut source, relation);
+        writeln!(source, "end Relation{ordinal}").expect("String write");
+    }
+    for (ordinal, bound) in shard.bounds.iter().enumerate() {
+        writeln!(source, "\nnamespace Bound{ordinal}").expect("String write");
+        writeln!(source, "def selectedEvent : Nat := {}", bound.end.event).expect("String write");
+        writeln!(source, "def selectedOwner : Owner := {}", owner_text(bound.end.owner))
+            .expect("String write");
+        writeln!(source, "def rootResultEvent : Nat := {}", bound.root_result_event)
+            .expect("String write");
+        writeln!(source, "def prefoldEvent : Nat := {}", bound.prefold_event)
+            .expect("String write");
+        writeln!(source, "def endEvent : Nat := {}", bound.end_event).expect("String write");
+        writeln!(
+            source,
+            "def survivorEvents : List Nat := [{}]",
+            bound.survivor_events.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
+        )
+        .expect("String write");
+        render_bound(&mut source, bound);
+        writeln!(source, "end Bound{ordinal}").expect("String write");
+    }
+    let theorem_count = source.matches("\ntheorem ").count() as u64;
+    writeln!(source, "\ndef theoremCount : Nat := {theorem_count}").expect("String write");
+    source.push_str(&format!("\nend {NAMESPACE}.Semantic.{module}\n"));
+    (source, theorem_count)
 }
 
 impl BoundProbe {
@@ -1931,6 +2319,7 @@ mod tests {
             scalar_left: false,
             scalar_right: false,
             raw_work: 1,
+            composite_relations: Vec::new(),
         };
         let mut operation_source = String::new();
         render_operation(&mut operation_source, &operation);
@@ -1944,6 +2333,10 @@ mod tests {
         assert!(!operation_source.contains("expected :"));
 
         let bound = BoundProbe {
+            root_result_event: 1,
+            prefold_event: 2,
+            end_event: 3,
+            survivor_events: vec![4, 5],
             root: ResultRecord {
                 event: 1,
                 owner: root,
@@ -2265,6 +2658,7 @@ mod tests {
             scalar_left: false,
             scalar_right: false,
             raw_work: 1,
+            composite_relations: Vec::new(),
         }
     }
 
@@ -2295,6 +2689,21 @@ mod tests {
         assert!(source.contains("addCanonicalResultSound"));
     }
 
+    #[test]
+    fn composite_operation_renders_product_then_relation_chain() {
+        let root = owner(7);
+        let output = add_result(root, 5327, 1);
+        let operation = add_operation(output);
+        let relation = relation_probe(RelationRuleKind::Gadget, 5326);
+        let operation = attach_composite_relations(operation, &[relation]).expect("one relation");
+        let mut source = String::new();
+        render_operation(&mut source, &operation);
+        assert!(source.contains("relationPoly productOutput sourceKey relationContext0"));
+        assert!(source.contains("productCanonicalResultSound"));
+        assert!(source.contains("relationCanonicalResultSound"));
+        assert!(source.contains("evalPolynomial env relationOutput % Int.ofNat 257"));
+    }
+
     fn relation_probe(kind: RelationRuleKind, event: u64) -> RelationProbe {
         let root = owner(7);
         let record =
@@ -2302,6 +2711,8 @@ mod tests {
         RelationProbe {
             event,
             owner: root,
+            frame_start: 0,
+            frame_end: 1,
             source: ProofPayloadMonomial {
                 central_factors: Vec::new(),
                 ordered_factors: vec![root],

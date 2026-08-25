@@ -29,6 +29,9 @@ const LEAN_ABI_VERSION: &str = "security0-replay-v1";
 const TARGET_ID: &str = "tall-threshold-decode";
 const PROJECTION_MAGIC: &[u8] = b"mxx.security0.reached-projection.v1\0";
 
+/// Shared event-shard boundary used by the Security0 structural replay and semantic shards.
+pub(crate) const SECURITY0_EVENT_CHUNK_SIZE: usize = 256;
+
 /// Pinned identities copied from the strict Security0 Source document by its owning generator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TallSecurity0ProfileIdentity {

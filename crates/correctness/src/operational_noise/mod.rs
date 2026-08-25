@@ -39,7 +39,9 @@ pub use simulation::{
     check_operational_noise_candidate_with_progress, prepare_base_feasibility_summary,
     prepare_g0_cpu_evidence_bytes, serialize_base_feasibility_summary,
 };
-pub use toy_e2e::check_toy_operational_slice_source;
+pub use toy_e2e::{
+    ToyGeneratedLean, check_toy_operational_slice_source, generate_toy_operational_slice_lean,
+};
 
 /// A concrete value supplied for one named protocol parameter.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,8 +1,10 @@
 //! Fixed Rust input and in-memory adapter for the singleton-preimage Gaussian toy slice.
 //!
-//! The adapter intentionally has no Lean renderer or generic proof language.  Its deterministic
-//! serialization is test/audit output only; the fixed source remains the sole generator input.
+//! The adapter intentionally has no generic proof language.  Its deterministic serialization is
+//! test/audit output only; the fixed source remains the sole generator input.
 //! It retains exactly the variants reached by this one honest run and rejects any other variant.
+
+mod lean;
 
 use super::{
     OperationalCheckRequest,
@@ -101,6 +103,13 @@ impl ToySourceV1 {
 struct ToySliceV1 {
     statement: CertificateDocumentV1,
     events: Vec<ToyEventV1>,
+}
+
+/// Deterministic, filesystem-free Lean output for the fixed toy vertical slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToyGeneratedLean {
+    pub cert: Vec<u8>,
+    pub proof: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -737,9 +746,15 @@ fn prepare_toy_slice(source: ToySourceV1) -> Result<ToySliceV1, String> {
 }
 
 /// Runs the fixed opt-in Rust authority and verifies that it projects into the narrow toy slice.
-/// Rendering and filesystem output are deliberately deferred to a later checkpoint.
 pub fn check_toy_operational_slice_source(source_json: &[u8]) -> Result<(), String> {
     prepare_toy_slice(ToySourceV1::parse(source_json)?)?.encode_audit_pretty().map(|_| ())
+}
+
+/// Runs the fixed Rust authority once and renders the reached toy certificate and proof as Lean.
+pub fn generate_toy_operational_slice_lean(source_json: &[u8]) -> Result<ToyGeneratedLean, String> {
+    let source = ToySourceV1::parse(source_json)?;
+    let slice = prepare_toy_slice(source.clone())?;
+    lean::render(&source, &slice)
 }
 
 #[cfg(test)]
@@ -841,6 +856,35 @@ mod tests {
             std::fs::write(&path, &first).expect("write toy projected-slice golden");
         }
         assert_eq!(first, std::fs::read(path).expect("read toy projected-slice golden"));
+    }
+
+    #[test]
+    fn generated_lean_is_source_driven_deterministic_and_matches_committed_files() {
+        let first = generate_toy_operational_slice_lean(SOURCE_BYTES).expect("first Lean output");
+        let second = generate_toy_operational_slice_lean(SOURCE_BYTES).expect("second Lean output");
+        assert_eq!(first, second);
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../lean/Mxx/Certificate/OperationalNoise/ToyGenerated");
+        let cert = root.join("Cert.lean");
+        let proof = root.join("Proof.lean");
+        if std::env::var_os("MXX_REGENERATE_CORRECTNESS").as_deref() ==
+            Some(std::ffi::OsStr::new("1"))
+        {
+            std::fs::create_dir_all(&root).expect("create generated Lean directory");
+            std::fs::write(&cert, &first.cert).expect("write generated Cert.lean");
+            std::fs::write(&proof, &first.proof).expect("write generated Proof.lean");
+        }
+        assert_eq!(first.cert, std::fs::read(cert).expect("read generated Cert.lean"));
+        assert_eq!(first.proof, std::fs::read(proof).expect("read generated Proof.lean"));
+
+        let cert = std::str::from_utf8(&first.cert).expect("UTF-8 Cert.lean");
+        let proof = std::str::from_utf8(&first.proof).expect("UTF-8 Proof.lean");
+        assert!(cert.contains("def source : ToySource"));
+        assert!(cert.contains("def document : Document"));
+        assert!(cert.contains("def rows : ToyRows"));
+        assert!(proof.contains("def events : List ToyEvent"));
+        assert!(proof.contains("proofValid : ToyValid source document rows events"));
     }
 
     #[test]

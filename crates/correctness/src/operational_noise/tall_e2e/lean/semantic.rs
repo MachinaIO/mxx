@@ -11,6 +11,7 @@ use crate::operational_noise::{
         ProofPayloadRule, ProofPayloadTerm, ProofPayloadValue, ProofPayloadValueRef,
     },
 };
+use num_bigint::BigUint;
 use num_traits::Zero;
 use serde::Serialize;
 use std::{
@@ -1622,6 +1623,7 @@ pub(super) fn render(
     statement: &CertificateDocumentV1,
     proof: &OperationalProofPayload,
 ) -> Result<Vec<super::super::TallSecurity0GeneratedFile>, String> {
+    let modulus = ciphertext_modulus_text(statement)?;
     let (mut report, _selections, _long_monomial) = measure(proof)?;
     let index = PayloadIndex::new(proof)?;
     let probes = build_probes(statement, proof, &index)?;
@@ -1647,14 +1649,14 @@ pub(super) fn render(
         ("Semantic/Semantic005.lean", "Semantic005", "bound-fold-result"),
     ];
     for (path, module, probe) in specs {
-        files.push(generated_file(path, render_probe(module, probe, &probes)));
+        files.push(generated_file(path, render_probe(module, probe, &probes, &modulus)));
     }
     let mut shard_reports = Vec::with_capacity(shards.len());
     let mut theorem_count = 0_u64;
     let mut canonical_work_total = 0_u64;
     for shard in &shards {
         let module = shard_module_name(shard.index);
-        let (shard_source, emitted_theorem_count) = render_semantic_shard(&module, shard);
+        let (shard_source, emitted_theorem_count) = render_semantic_shard(&module, shard, &modulus);
         files.push(generated_file(format!("Semantic/{module}.lean"), shard_source));
         theorem_count += emitted_theorem_count;
         canonical_work_total += shard.canonical_work();
@@ -1701,6 +1703,18 @@ pub(super) fn render(
     }
     files.push(generated_file("Semantic/Semantic.lean", index));
     Ok(files)
+}
+
+fn ciphertext_modulus_text(statement: &CertificateDocumentV1) -> Result<String, String> {
+    BigUint::parse_bytes(statement.ciphertext_modulus.as_bytes(), 10)
+        .filter(|value| !value.is_zero())
+        .map(|value| value.to_string())
+        .ok_or_else(|| {
+            format!(
+                "semantic renderer requires a positive decimal ciphertext modulus, got {:?}",
+                statement.ciphertext_modulus
+            )
+        })
 }
 
 fn measure(
@@ -2162,7 +2176,7 @@ fn emit_lookup(source: &mut String, name: &str, event_name: &str, event_value: S
     .expect("String write");
 }
 
-fn render_operation(source: &mut String, operation: &OperationProbe) {
+fn render_operation(source: &mut String, operation: &OperationProbe, modulus: &str) {
     if operation.kind == OperationKind::Direct {
         writeln!(
             source,
@@ -2266,28 +2280,28 @@ fn render_operation(source: &mut String, operation: &OperationProbe) {
             .expect("String write");
         source.push_str("\ntheorem resultSound (env : Env Owner)\n");
         for ordinal in 0..final_expected {
-            writeln!(source, "    (baseRelation{ordinal} : evalMonomial env lhsKey{ordinal} % Int.ofNat 257 = evalPolynomial env relationRhs{ordinal} % Int.ofNat 257)")
+            writeln!(source, "    (baseRelation{ordinal} : evalMonomial env lhsKey{ordinal} % Int.ofNat {modulus} = evalPolynomial env relationRhs{ordinal} % Int.ofNat {modulus})")
                 .expect("String write");
         }
-        source.push_str("    : evalPolynomial env output % Int.ofNat 257 =\n      (evalPolynomial env left * evalPolynomial env right) % Int.ofNat 257 := by\n  have productSound := productCanonicalResultSound env left right expected0 leftScalar rightScalar productAgreement\n");
+        writeln!(source, "    : evalPolynomial env output % Int.ofNat {modulus} =\n      (evalPolynomial env left * evalPolynomial env right) % Int.ofNat {modulus} := by\n  have productSound := productCanonicalResultSound env left right expected0 leftScalar rightScalar productAgreement").expect("String write");
         for (ordinal, relation) in operation.composite_relations.iter().enumerate() {
-            writeln!(source, "  have relationSound{ordinal} := relationCanonicalResultSound 257 env expected{ordinal} sourceKey{ordinal} lhsKey{ordinal} sourceKey{ordinal}.centralFactors {} {} ({}) relationRhs{ordinal} expected{} (by decide +kernel) baseRelation{ordinal} (by decide +kernel)", relation.start, relation.end, relation.outer, ordinal + 1)
+            writeln!(source, "  have relationSound{ordinal} := relationCanonicalResultSound {modulus} env expected{ordinal} sourceKey{ordinal} lhsKey{ordinal} sourceKey{ordinal}.centralFactors {} {} ({}) relationRhs{ordinal} expected{} (by decide +kernel) baseRelation{ordinal} (by decide +kernel)", relation.start, relation.end, relation.outer, ordinal + 1)
                 .expect("String write");
         }
         source.push_str("  have outputSound := canonicalAgreement_eval env output expected");
         writeln!(source, "{} resultAgreement", final_expected).expect("String write");
         source.push_str("  calc\n");
-        writeln!(source, "    evalPolynomial env output % Int.ofNat 257 = evalPolynomial env expected{} % Int.ofNat 257 := by rw [outputSound]", final_expected)
+        writeln!(source, "    evalPolynomial env output % Int.ofNat {modulus} = evalPolynomial env expected{} % Int.ofNat {modulus} := by rw [outputSound]", final_expected)
             .expect("String write");
         for ordinal in (0..final_expected).rev() {
             writeln!(
                 source,
-                "    _ = evalPolynomial env expected{} % Int.ofNat 257 := relationSound{ordinal}",
+                "    _ = evalPolynomial env expected{} % Int.ofNat {modulus} := relationSound{ordinal}",
                 ordinal
             )
             .expect("String write");
         }
-        source.push_str("    _ = (evalPolynomial env left * evalPolynomial env right) % Int.ofNat 257 := by rw [productSound]\n\n");
+        writeln!(source, "    _ = (evalPolynomial env left * evalPolynomial env right) % Int.ofNat {modulus} := by rw [productSound]\n").expect("String write");
         return;
     }
     match operation.kind {
@@ -2356,7 +2370,7 @@ fn render_operation_bindings(source: &mut String, operation: &OperationProbe) {
     );
 }
 
-fn render_relation(source: &mut String, relation: &RelationProbe) {
+fn render_relation(source: &mut String, relation: &RelationProbe, modulus: &str) {
     source.push_str("open EventReplay\n");
     writeln!(
         source,
@@ -2405,8 +2419,7 @@ fn render_relation(source: &mut String, relation: &RelationProbe) {
     source.push_str("theorem relationAgreement : CanonicalAgreement relationOutput (relationPoly accumulator sourceKey relationContext0 ");
     writeln!(source, "({}) relationRhs) := by decide +kernel\n", relation.outer)
         .expect("String write");
-    source.push_str("theorem relationSound (env : Env Owner)\n    (baseRelation : evalMonomial env lhsKey % Int.ofNat 257 =\n      evalPolynomial env relationRhs % Int.ofNat 257) :\n    evalPolynomial env relationOutput % Int.ofNat 257 =\n      evalPolynomial env accumulator % Int.ofNat 257 := by\n  exact relationCanonicalResultSound 257 env accumulator sourceKey lhsKey\n    sourceKey.centralFactors ");
-    writeln!(source, "{} {} ({}) relationRhs relationOutput\n    (by decide +kernel) baseRelation relationAgreement\n", relation.start, relation.end, relation.outer).expect("String write");
+    writeln!(source, "theorem relationSound (env : Env Owner)\n    (baseRelation : evalMonomial env lhsKey % Int.ofNat {modulus} =\n      evalPolynomial env relationRhs % Int.ofNat {modulus}) :\n    evalPolynomial env relationOutput % Int.ofNat {modulus} =\n      evalPolynomial env accumulator % Int.ofNat {modulus} := by\n  exact relationCanonicalResultSound {modulus} env accumulator sourceKey lhsKey\n    sourceKey.centralFactors {} {} ({}) relationRhs relationOutput\n    (by decide +kernel) baseRelation relationAgreement\n", relation.start, relation.end, relation.outer).expect("String write");
 }
 
 fn render_relation_bindings(source: &mut String, relation: &RelationProbe) {
@@ -2611,7 +2624,7 @@ fn render_survivor_witness(source: &mut String, bound: &BoundProbe) {
         .expect("String write");
 }
 
-fn render_semantic_shard(module: &str, shard: &SemanticShard) -> (String, u64) {
+fn render_semantic_shard(module: &str, shard: &SemanticShard, modulus: &str) -> (String, u64) {
     let mut source = format!(
         "import Mxx.Certificate.OperationalNoise.TallSemantics\n\
          import {NAMESPACE}.Proof.History\n\n\
@@ -2647,7 +2660,7 @@ fn render_semantic_shard(module: &str, shard: &SemanticShard) -> (String, u64) {
             .expect("String write");
         writeln!(source, "def selectedOwner : Owner := {}", owner_text(operation.output.owner))
             .expect("String write");
-        render_operation(&mut source, operation);
+        render_operation(&mut source, operation, modulus);
         render_operation_bindings(&mut source, operation);
         writeln!(source, "end Operation{ordinal}").expect("String write");
     }
@@ -2656,7 +2669,7 @@ fn render_semantic_shard(module: &str, shard: &SemanticShard) -> (String, u64) {
         writeln!(source, "def selectedEvent : Nat := {}", relation.event).expect("String write");
         writeln!(source, "def selectedOwner : Owner := {}", owner_text(relation.owner))
             .expect("String write");
-        render_relation(&mut source, relation);
+        render_relation(&mut source, relation, modulus);
         render_relation_bindings(&mut source, relation);
         writeln!(source, "end Relation{ordinal}").expect("String write");
     }
@@ -2695,7 +2708,7 @@ impl BoundProbe {
     }
 }
 
-fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection]) -> String {
+fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection], modulus: &str) -> String {
     let mut source = format!(
         "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n"
     );
@@ -2724,6 +2737,7 @@ fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection]) -> String 
                     render_operation(
                         &mut source,
                         selection.operation.as_ref().expect("operation probe"),
+                        modulus,
                     );
                     render_operation_bindings(
                         &mut source,
@@ -2734,6 +2748,7 @@ fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection]) -> String 
                     render_operation(
                         &mut source,
                         selection.operation.as_ref().expect("operation probe"),
+                        modulus,
                     );
                     render_operation_bindings(
                         &mut source,
@@ -2746,7 +2761,7 @@ fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection]) -> String 
             if let Some(selection) = selected {
                 for (ordinal, relation) in selection.relations.iter().enumerate() {
                     writeln!(source, "namespace Relation{ordinal}").expect("String write");
-                    render_relation(&mut source, relation);
+                    render_relation(&mut source, relation, modulus);
                     render_relation_bindings(&mut source, relation);
                     writeln!(source, "end Relation{ordinal}").expect("String write");
                 }
@@ -2861,6 +2876,7 @@ mod tests {
                 relations: Vec::new(),
                 bound: None,
             }],
+            "257",
         );
         assert!(source.contains("evalMonomial_of_key"));
         assert!(source.contains(".closed ⟨7⟩"));
@@ -2916,7 +2932,7 @@ mod tests {
             composite_relations: Vec::new(),
         };
         let mut operation_source = String::new();
-        render_operation(&mut operation_source, &operation);
+        render_operation(&mut operation_source, &operation, "257");
         assert!(operation_source.contains("CanonicalAgreement"));
         assert!(operation_source.contains("addCanonicalResultSound"));
         assert!(operation_source.contains("selectedSumRuleEvent"));
@@ -3293,7 +3309,7 @@ mod tests {
             relations: Vec::new(),
             bound: None,
         }];
-        let source = render_probe("Semantic002", "add-chain", &probes);
+        let source = render_probe("Semantic002", "add-chain", &probes, "257");
         assert!(source.contains("namespace AddResult"));
         assert!(source.contains("def selectedSumRuleEvent : Nat := 5325"));
         assert!(source.contains("def selectedLeftResultEvent : Nat := 5323"));
@@ -3315,7 +3331,7 @@ mod tests {
         ];
         let operation = attach_composite_relations(operation, &relations).expect("two relations");
         let mut source = String::new();
-        render_operation(&mut source, &operation);
+        render_operation(&mut source, &operation, "257");
         assert!(source.contains("def expected1 : Polynomial Owner := relationPoly expected0"));
         assert!(source.contains("def expected2 : Polynomial Owner := relationPoly expected1"));
         assert!(source.contains("relationSound1"));
@@ -3402,6 +3418,41 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert!(selected.iter().any(|probe| probe.kind == RelationRuleKind::Gadget));
         assert!(selected.iter().any(|probe| probe.kind == RelationRuleKind::Universal));
+    }
+
+    #[test]
+    fn relation_render_uses_statement_ciphertext_modulus() {
+        let modulus = "100418593683253592432016548326729029359133068138294319235841";
+        let relation = relation_probe(RelationRuleKind::Universal, 2);
+        let mut source = String::new();
+        render_relation(&mut source, &relation, modulus);
+        assert!(source.contains(&format!("Int.ofNat {modulus}")));
+        assert!(!source.contains("Int.ofNat 257"));
+    }
+
+    #[test]
+    fn invalid_ciphertext_modulus_is_rejected() {
+        let mut statement = CertificateDocumentV1 {
+            schema_id: "mxx.operational-noise.certificate",
+            schema_version: 1,
+            plaintext_modulus: "2".to_owned(),
+            ciphertext_modulus: "not-a-decimal".to_owned(),
+            ring_dimension: 1,
+            expressions: Vec::new(),
+            programs: Vec::new(),
+            sources: Vec::new(),
+            events: Vec::new(),
+            index_uses: Vec::new(),
+            slice_groups: Vec::new(),
+            residual_root:
+                crate::operational_noise::certificate_schema::CertificateResidualRootV1::Closed {
+                    expression: 0,
+                },
+        };
+        let error = ciphertext_modulus_text(&statement).expect_err("invalid modulus must fail");
+        assert!(error.contains("positive decimal ciphertext modulus"));
+        statement.ciphertext_modulus = "0".to_owned();
+        assert!(ciphertext_modulus_text(&statement).is_err());
     }
 
     #[test]

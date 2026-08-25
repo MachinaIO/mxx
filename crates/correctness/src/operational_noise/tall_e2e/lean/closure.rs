@@ -620,6 +620,34 @@ fn owner_for_value(index: &Index<'_>, event: u64) -> Result<ProofPayloadOwner, S
     }
 }
 
+fn collect_event_ids(index: &Index<'_>, start_event: u64) -> Result<Vec<u64>, String> {
+    index.event(start_event)?;
+    let mut pending = vec![start_event];
+    let mut reached = BTreeSet::new();
+    while let Some(event) = pending.pop() {
+        if !reached.insert(event) {
+            continue;
+        }
+        let mut frame = Some(index.frame(event)?);
+        while let Some(info) = frame {
+            pending.push(info.start);
+            frame = info.parent.and_then(|parent| index.frame(parent).ok());
+        }
+        let mut deps = Vec::new();
+        collect_event(index, event, &mut deps)?;
+        pending.extend(deps);
+    }
+    Ok(reached.into_iter().collect())
+}
+
+pub(crate) fn collect_security0_event_closure(
+    proof: &OperationalProofPayload,
+    start_event: u64,
+) -> Result<Vec<u64>, String> {
+    let index = Index::new(&proof.events)?;
+    collect_event_ids(&index, start_event)
+}
+
 fn collect(proof: &OperationalProofPayload) -> Result<DependencyClosure, String> {
     let index = Index::new(&proof.events)?;
     let (final_end_event, final_root) = proof
@@ -643,22 +671,7 @@ fn collect(proof: &OperationalProofPayload) -> Result<DependencyClosure, String>
     if index.frame(final_end_event)?.parent.is_some() {
         return Err("final InvocationEnd is nested instead of closing the outer frame".to_owned());
     }
-    let mut pending = vec![final_end_event];
-    let mut reached = BTreeSet::new();
-    while let Some(event) = pending.pop() {
-        if !reached.insert(event) {
-            continue;
-        }
-        let mut frame = Some(index.frame(event)?);
-        while let Some(info) = frame {
-            pending.push(info.start);
-            frame = info.parent.and_then(|parent| index.frame(parent).ok());
-        }
-        let mut deps = Vec::new();
-        collect_event(&index, event, &mut deps)?;
-        pending.extend(deps);
-    }
-    let event_ids = reached.into_iter().collect::<Vec<_>>();
+    let event_ids = collect_event_ids(&index, final_end_event)?;
     let mut event_counts = BTreeMap::new();
     let mut bound_rule_counts = BTreeMap::new();
     for event in &event_ids {
@@ -787,6 +800,10 @@ mod tests {
         assert_eq!(closure.event_ids, vec![0, 1, 2, 3, 4, 5, 6]);
         assert_eq!(closure.event_counts[&ClosureEventKind::CoefficientMergeOperator], 1);
         assert_eq!(closure.bound_rule_counts[&ClosureBoundRuleKind::AuthorityOperator], 1);
+        assert_eq!(
+            collect_security0_event_closure(&proof, 4).expect("collect exact Result closure"),
+            vec![0, 1, 2, 3, 4]
+        );
     }
 
     #[test]

@@ -1647,6 +1647,7 @@ pub(super) fn render(
     let modulus = ciphertext_modulus_text(statement)?;
     let (mut report, _selections, _long_monomial) = measure(proof)?;
     let index = PayloadIndex::new(proof)?;
+    let _left_root_closure = validate_left_root_closure(proof, &index)?;
     let probes = build_probes(statement, proof, &index)?;
     let ranges = frame_ranges(proof)?;
     let relation_probes = relation_candidates(&index, &ranges)?;
@@ -1729,6 +1730,80 @@ pub(super) fn render(
     }
     files.push(generated_file("Semantic/Semantic.lean", index));
     Ok(files)
+}
+
+fn reached_left_bound_rule(rule: &ProofPayloadRule) -> bool {
+    use crate::operational_noise::simulation::ProofPayloadAuthority;
+    matches!(
+        rule,
+        ProofPayloadRule::Authority(
+            ProofPayloadAuthority::FactStore |
+                ProofPayloadAuthority::ProgramFamilyFact |
+                ProofPayloadAuthority::Operator |
+                ProofPayloadAuthority::RelationPreimageSource { .. }
+        ) | ProofPayloadRule::Identity { .. } |
+            ProofPayloadRule::Sum { .. } |
+            ProofPayloadRule::Scale { .. } |
+            ProofPayloadRule::MonomialProduct { .. }
+    )
+}
+
+fn validate_left_root_closure(
+    proof: &OperationalProofPayload,
+    index: &PayloadIndex,
+) -> Result<Vec<u64>, String> {
+    const LEFT_ROOT_EVENT: u64 = 107_402;
+    const REACHED_RELATION_COUNT: usize = 1_905;
+    let root = index.result(LEFT_ROOT_EVENT)?;
+    if !matches!(
+        root.summary.coefficient_bound(),
+        crate::operational_noise::facts::NumericContract::Known(
+            crate::operational_noise::facts::CoefficientBound::Finite(_)
+        )
+    ) {
+        return Err(format!("Security0 left-root Result {LEFT_ROOT_EVENT} is not finite"));
+    }
+    let event_ids = super::closure::collect_security0_event_closure(proof, LEFT_ROOT_EVENT)?;
+    let mut relations = 0_usize;
+    let mut reached_rules = BTreeSet::new();
+    for event in &event_ids {
+        match index.event(*event)? {
+            ProofPayloadEvent::AppliedRelation { .. } => relations += 1,
+            ProofPayloadEvent::BoundTransfer { rule, .. } => {
+                if !reached_left_bound_rule(rule) {
+                    return Err(format!(
+                        "Security0 left-root closure reaches unsupported bound rule {rule:?} at event {event}"
+                    ));
+                }
+                reached_rules.insert(match rule {
+                    ProofPayloadRule::Authority(authority) => match authority {
+                        crate::operational_noise::simulation::ProofPayloadAuthority::FactStore => 0,
+                        crate::operational_noise::simulation::ProofPayloadAuthority::ProgramFamilyFact => 1,
+                        crate::operational_noise::simulation::ProofPayloadAuthority::Operator => 2,
+                        crate::operational_noise::simulation::ProofPayloadAuthority::RelationPreimageSource { .. } => 3,
+                        crate::operational_noise::simulation::ProofPayloadAuthority::Unavailable => unreachable!(),
+                    },
+                    ProofPayloadRule::Identity { .. } => 4,
+                    ProofPayloadRule::Sum { .. } => 5,
+                    ProofPayloadRule::Scale { .. } => 6,
+                    ProofPayloadRule::MonomialProduct { .. } => 7,
+                    _ => unreachable!(),
+                });
+            }
+            _ => {}
+        }
+    }
+    if relations != REACHED_RELATION_COUNT {
+        return Err(format!(
+            "Security0 left-root closure reaches {relations} relations, expected {REACHED_RELATION_COUNT}"
+        ));
+    }
+    if reached_rules != BTreeSet::from_iter(0_u8..8) {
+        return Err(format!(
+            "Security0 left-root closure does not reach exactly the eight supported bound-rule families: {reached_rules:?}"
+        ));
+    }
+    Ok(event_ids)
 }
 
 fn ciphertext_modulus_text(statement: &CertificateDocumentV1) -> Result<String, String> {

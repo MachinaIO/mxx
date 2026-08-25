@@ -103,6 +103,13 @@ const TALL_G0_GOLDEN_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../docs/correctness/tall-operational-noise-certificate-g0.json"
 );
+const TALL_SECURITY0_SOURCE_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/operational-noise-security0-v1/Source.json");
+const TALL_CERTIFICATE_SOURCE_SCHEMA_ID: &str = "mxx.operational-noise.tall-certificate-source";
+const TALL_CERTIFICATE_SOURCE_REVISION: &str = "tall-nested-rns-security0-v1";
+const TALL_CERTIFICATE_EVALUATOR_VERSION: &str = "tall-runtime-only-v1";
+const TALL_CERTIFICATE_RUST_PROJECTION_VERSION: &str = "operational-noise-certificate-v1";
+const TALL_CERTIFICATE_LEAN_ABI_VERSION: &str = "security0-replay-v1";
 
 fn log_graph_phase(phase: &'static str, state: &'static str, started: Option<&Instant>) {
     let (vm_rss_kib, vm_hwm_kib) = process_memory_kib();
@@ -165,7 +172,7 @@ struct TestConfig {
     reuse_checkpoint: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum TallG0Profile {
     Security0,
     Security128,
@@ -225,6 +232,73 @@ struct FixedTallG0Profile {
     scale: u64,
     error_sigma: f64,
     trapdoor_sigma: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TallCertificateSourceV1 {
+    schema_id: String,
+    schema_version: u32,
+    profile: TallG0Profile,
+    source_revision: String,
+    evaluator_version: String,
+    rust_projection_version: String,
+    lean_abi_version: String,
+    request_target_id: String,
+    parameters: TallCertificateParametersV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TallCertificateParametersV1 {
+    multiplication_count: usize,
+    crt_depth: usize,
+    log_ring_dimension: usize,
+    required_security_bits: u64,
+    reviewed_security_lower_bound_bits: u64,
+    crt_modulus_bits: usize,
+    requested_p_moduli_bits: Option<usize>,
+    gadget_base_bits: usize,
+    max_unreduced_multiplications: usize,
+    scale: String,
+    error_sigma: String,
+    trapdoor_sigma: String,
+}
+
+impl TallCertificateSourceV1 {
+    fn security0() -> Self {
+        Self {
+            schema_id: TALL_CERTIFICATE_SOURCE_SCHEMA_ID.to_owned(),
+            schema_version: 1,
+            profile: TallG0Profile::Security0,
+            source_revision: TALL_CERTIFICATE_SOURCE_REVISION.to_owned(),
+            evaluator_version: TALL_CERTIFICATE_EVALUATOR_VERSION.to_owned(),
+            rust_projection_version: TALL_CERTIFICATE_RUST_PROJECTION_VERSION.to_owned(),
+            lean_abi_version: TALL_CERTIFICATE_LEAN_ABI_VERSION.to_owned(),
+            request_target_id: TALL_OPERATIONAL_TARGET_ID.to_owned(),
+            parameters: TallCertificateParametersV1 {
+                multiplication_count: 1,
+                crt_depth: 7,
+                log_ring_dimension: 5,
+                required_security_bits: 0,
+                reviewed_security_lower_bound_bits: 0,
+                crt_modulus_bits: 28,
+                requested_p_moduli_bits: None,
+                gadget_base_bits: 14,
+                max_unreduced_multiplications: 2,
+                scale: "64".to_owned(),
+                error_sigma: "4".to_owned(),
+                trapdoor_sigma: "4.578".to_owned(),
+            },
+        }
+    }
+
+    fn fixed_profile(&self) -> Result<FixedTallG0Profile, String> {
+        if self != &Self::security0() {
+            return Err("Tall certificate source is not the fixed Security0 source".to_owned());
+        }
+        Ok(TallG0Profile::Security0.fixed())
+    }
 }
 
 impl FixedTallG0Profile {
@@ -432,22 +506,17 @@ impl TestConfig {
     }
 }
 
-fn fixed_tall_g0_profile_observation(
-    profile: TallG0Profile,
-) -> Result<TallG0SourceObservation, String> {
-    let fixed = profile.fixed();
+struct PreparedTallOperationalSource {
+    fixed: FixedTallG0Profile,
+    selected: PreparedCandidate,
+    protocol: mxx_correctness::ProtocolDecl,
+    request: OperationalCheckRequest,
+}
+
+fn prepare_fixed_tall_operational_source(
+    fixed: FixedTallG0Profile,
+) -> Result<PreparedTallOperationalSource, String> {
     let parameters = fixed.parameters();
-    let (q_moduli, _, _) = parameters.to_crt();
-    let resolved_p_moduli_bits = fixed.requested_p_moduli_bits.map_or_else(
-        || {
-            minimum_p_moduli_bits(
-                *q_moduli.iter().max().expect("fixed CRT basis is nonempty"),
-                fixed.max_unreduced_multiplications,
-            )
-            .ok_or_else(|| "fixed Tall G0 profile has no supporting p basis".to_owned())
-        },
-        Ok,
-    )?;
     let config = fixed.test_config();
     let selected = prepare_candidate(
         parameters,
@@ -460,6 +529,31 @@ fn fixed_tall_g0_profile_observation(
         &selected.encoding_graph,
         &selected.parameters,
         &selected.nested,
+    )?;
+    Ok(PreparedTallOperationalSource { fixed, selected, protocol, request })
+}
+
+fn build_fixed_tall_certificate_source(
+    source: &TallCertificateSourceV1,
+) -> Result<PreparedTallOperationalSource, String> {
+    prepare_fixed_tall_operational_source(source.fixed_profile()?)
+}
+
+fn fixed_tall_g0_profile_observation(
+    profile: TallG0Profile,
+) -> Result<TallG0SourceObservation, String> {
+    let PreparedTallOperationalSource { fixed, selected, protocol, request } =
+        prepare_fixed_tall_operational_source(profile.fixed())?;
+    let (q_moduli, _, _) = selected.parameters.to_crt();
+    let resolved_p_moduli_bits = fixed.requested_p_moduli_bits.map_or_else(
+        || {
+            minimum_p_moduli_bits(
+                *q_moduli.iter().max().expect("fixed CRT basis is nonempty"),
+                fixed.max_unreduced_multiplications,
+            )
+            .ok_or_else(|| "fixed Tall G0 profile has no supporting p basis".to_owned())
+        },
+        Ok,
     )?;
     let observation_bytes = prepare_g0_cpu_evidence_bytes(&protocol, &request)?;
     let observation: serde_json::Value =
@@ -2259,6 +2353,53 @@ fn fixed_tall_g0_profiles_are_exact() {
         assert_eq!(config.selected_parameters, Some((fixed.crt_depth, fixed.log_ring_dimension)));
         assert_eq!(config.run_mode, TallRunMode::Graph);
     }
+}
+
+#[test]
+fn fixed_tall_security0_certificate_source_is_exact() {
+    let bytes = fs::read(TALL_SECURITY0_SOURCE_PATH).expect("fixed Security0 Source.json");
+    let source: TallCertificateSourceV1 =
+        serde_json::from_slice(&bytes).expect("strict fixed Security0 source");
+    assert_eq!(source, TallCertificateSourceV1::security0());
+    assert_eq!(
+        source.fixed_profile().expect("fixed Security0 profile"),
+        TallG0Profile::Security0.fixed()
+    );
+}
+
+#[test]
+#[ignore = "CPU-only fixed Security0 source reconstruction; performs no backend execution"]
+fn fixed_tall_security0_source_reconstructs_direct_semantics() {
+    let source: TallCertificateSourceV1 = serde_json::from_slice(
+        &fs::read(TALL_SECURITY0_SOURCE_PATH).expect("fixed Security0 Source.json"),
+    )
+    .expect("strict fixed Security0 source");
+    let direct = prepare_fixed_tall_operational_source(TallG0Profile::Security0.fixed())
+        .expect("direct fixed Security0 source");
+    let reconstructed = build_fixed_tall_certificate_source(&source)
+        .expect("Source.json-driven fixed Security0 source");
+
+    assert_eq!(direct.fixed, reconstructed.fixed);
+    assert_eq!(direct.selected.parameters.to_crt(), reconstructed.selected.parameters.to_crt());
+    assert_eq!(
+        direct.selected.parameters.ring_dimension(),
+        reconstructed.selected.parameters.ring_dimension()
+    );
+    assert_eq!(direct.request, reconstructed.request);
+
+    let direct_evidence = prepare_g0_cpu_evidence_bytes(&direct.protocol, &direct.request)
+        .expect("direct fixed Security0 semantic evidence");
+    let reconstructed_evidence =
+        prepare_g0_cpu_evidence_bytes(&reconstructed.protocol, &reconstructed.request)
+            .expect("Source.json-driven fixed Security0 semantic evidence");
+    assert_eq!(direct_evidence, reconstructed_evidence);
+
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&reconstructed_evidence).expect("Security0 CPU evidence JSON");
+    assert_eq!(evidence["schema_id"], G0_CPU_OBSERVATION_SCHEMA_ID);
+    assert_eq!(evidence["schema_version"], G0_CPU_OBSERVATION_SCHEMA_VERSION);
+    assert_eq!(evidence["status"], G0_CPU_OBSERVATION_STATUS);
+    assert!(evidence["base_feasibility"]["accepted"].as_bool().expect("accepted report"));
 }
 
 fn assert_fixed_tall_g0_observation(bytes: &[u8], expected_profile: TallG0Profile) {

@@ -75,9 +75,6 @@ struct Frame {
     root: ProofPayloadOwner,
     start: u64,
     merge_count: u64,
-    add_chain: u64,
-    max_add_chain: u64,
-    max_add_chain_event: Option<u64>,
     has_prefold: bool,
 }
 
@@ -111,12 +108,14 @@ struct ResultRecord {
 #[derive(Clone)]
 struct OperationProbe {
     kind: OperationKind,
+    rule_event: u64,
+    input_events: [u64; 2],
+    output_event: u64,
     inputs: Vec<ResultRecord>,
     output: ResultRecord,
     scalar_left: bool,
     scalar_right: bool,
     raw_work: u64,
-    chain_tail: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,22 +382,31 @@ impl PayloadIndex {
 fn expression_kind(
     statement: &CertificateDocumentV1,
     owner: ProofPayloadOwner,
-) -> Option<OperationKind> {
-    let row = statement.expressions.get(usize::try_from(owner.expression_row).ok()?)?;
+) -> Result<Option<OperationKind>, String> {
+    let expression_row = usize::try_from(owner.expression_row).map_err(|_| {
+        format!("operator owner {} expression row does not fit platform usize", owner_text(owner))
+    })?;
+    let row = statement.expressions.get(expression_row).ok_or_else(|| {
+        format!(
+            "operator owner {} references missing expression row {}",
+            owner_text(owner),
+            owner.expression_row
+        )
+    })?;
     let CanonicalExpressionDescriptor::Operation {
         operator: CanonicalExpressionOperator::Stable(StableOperator::Matrix { operation }),
         ..
     } = &row.descriptor
     else {
-        return None;
+        return Ok(None);
     };
-    Some(match operation {
+    Ok(Some(match operation {
         StableMatrixOperation::Add => OperationKind::Add,
         StableMatrixOperation::Subtract => OperationKind::Subtract,
         StableMatrixOperation::Multiply => OperationKind::Multiply,
         StableMatrixOperation::Tensor { .. } => OperationKind::Tensor,
-        _ => return None,
-    })
+        _ => return Ok(None),
+    }))
 }
 
 fn typed_operation_rule(
@@ -444,7 +452,16 @@ fn typed_operation_rule(
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(event, _, _)| *event);
-    let Some((event, refs, flags)) = candidates.pop() else {
+    if candidates.len() > 1 {
+        return Err(format!(
+            "operator Result {} owner {} has {} ambiguous typed {:?} rules in its immediate frame",
+            result.event,
+            owner_text(result.owner),
+            candidates.len(),
+            kind
+        ));
+    }
+    let Some((event, refs, flags)) = candidates.into_iter().next() else {
         return Ok(None);
     };
     Ok(Some((event, refs, flags)))
@@ -522,18 +539,17 @@ fn op_probe(
         }
     }
     let raw_work = (inputs[0].terms.len() as u64).saturating_mul(inputs[1].terms.len() as u64);
-    let chain_tail = (kind == OperationKind::Add)
-        .then(|| operator_merges.iter().map(|(event, _)| *event).max())
-        .flatten();
     let _ = statement;
     Ok(OperationProbe {
         kind,
+        rule_event,
+        input_events: [inputs[0].event, inputs[1].event],
+        output_event: result.event,
         inputs,
         output: result.clone(),
         scalar_left: flags.0,
         scalar_right: flags.1,
         raw_work,
-        chain_tail,
     })
 }
 
@@ -562,6 +578,41 @@ fn typed_operator_eligibility(
         }
     }
     Ok(true)
+}
+
+fn select_add_output_index(
+    candidates: &[(&ResultRecord, OperationProbe)],
+) -> Result<usize, String> {
+    candidates
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (result, operation))| {
+            (result.terms.len(), operation.inputs[0].terms.len(), std::cmp::Reverse(result.event))
+        })
+        .map(|(index, _)| index)
+        .ok_or_else(|| "CP3 add probe has no actual matrix Add Result".to_owned())
+}
+
+fn select_relation_probes(candidates: Vec<RelationProbe>) -> Result<Vec<RelationProbe>, String> {
+    let mut selected = Vec::with_capacity(2);
+    for kind in [RelationRuleKind::Gadget, RelationRuleKind::Universal] {
+        let Some(probe) = candidates
+            .iter()
+            .filter(|probe| probe.kind == kind)
+            .max_by_key(|probe| (probe.output.terms.len(), std::cmp::Reverse(probe.event)))
+            .cloned()
+        else {
+            let label = match kind {
+                RelationRuleKind::Gadget => "Gadget",
+                RelationRuleKind::Universal => "Universal",
+            };
+            return Err(format!(
+                "CP3 relation probe requires an actual {label} relation application"
+            ));
+        };
+        selected.push(probe);
+    }
+    Ok(selected)
 }
 
 fn finalize_relations(
@@ -875,7 +926,7 @@ fn build_probes(
         .ok_or_else(|| {
             format!("8301-merge outer frame {}..{} has no exact root Result", outer.0, outer.1)
         })?;
-    let outer_kind = expression_kind(statement, outer_result.owner).ok_or_else(|| {
+    let outer_kind = expression_kind(statement, outer_result.owner)?.ok_or_else(|| {
         format!(
             "outer Result {} owner {} has no matrix Add/Subtract/Multiply/Tensor statement row",
             outer_result.event,
@@ -887,12 +938,14 @@ fn build_probes(
     } else {
         OperationProbe {
             kind: OperationKind::Direct,
+            rule_event: 0,
+            input_events: [0, 0],
+            output_event: outer_result.event,
             inputs: Vec::new(),
             output: outer_result.clone(),
             scalar_left: false,
             scalar_right: false,
             raw_work: 0,
-            chain_tail: None,
         }
     };
     probes.push(ProbeSelection {
@@ -909,32 +962,21 @@ fn build_probes(
         bound: None,
     });
 
-    let mut add_candidates = index
-        .results
-        .iter()
-        .filter_map(|result| {
-            if expression_kind(statement, result.owner) != Some(OperationKind::Add) {
-                return None;
-            }
-            let eligible = match typed_operator_eligibility(index, result, OperationKind::Add) {
-                Ok(eligible) => eligible,
-                Err(error) => return Some(Err(error)),
-            };
-            if !eligible {
-                return None;
-            }
-            Some(
-                op_probe(statement, index, result, OperationKind::Add).map(|probe| (result, probe)),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if add_candidates.is_empty() {
-        return Err("CP3 add-chain probe has no actual matrix Add Result".to_owned());
+    let mut add_candidates = Vec::new();
+    for result in &index.results {
+        let Some(kind) = expression_kind(statement, result.owner)? else {
+            continue;
+        };
+        if kind != OperationKind::Add {
+            continue;
+        }
+        if !typed_operator_eligibility(index, result, kind)? {
+            continue;
+        }
+        add_candidates.push((result, op_probe(statement, index, result, kind)?));
     }
-    add_candidates.sort_by_key(|(result, operation)| {
-        (result.terms.len(), operation.inputs[0].terms.len(), std::cmp::Reverse(result.event))
-    });
-    let (add_result, add_op) = add_candidates.pop().expect("nonempty add candidates");
+    let add_output_index = select_add_output_index(&add_candidates)?;
+    let (add_result, add_op) = add_candidates[add_output_index].clone();
     probes.push(ProbeSelection {
         name: "add-chain",
         event: add_result.event,
@@ -948,25 +990,19 @@ fn build_probes(
         relations: Vec::new(),
         bound: None,
     });
-
-    let mut product_candidates = index
-        .results
-        .iter()
-        .filter_map(|result| {
-            let kind = expression_kind(statement, result.owner)?;
-            if !matches!(kind, OperationKind::Multiply | OperationKind::Tensor) {
-                return None;
-            }
-            let eligible = match typed_operator_eligibility(index, result, kind) {
-                Ok(eligible) => eligible,
-                Err(error) => return Some(Err(error)),
-            };
-            if !eligible {
-                return None;
-            }
-            Some(op_probe(statement, index, result, kind).map(|probe| (result, probe)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut product_candidates = Vec::new();
+    for result in &index.results {
+        let Some(kind) = expression_kind(statement, result.owner)? else {
+            continue;
+        };
+        if !matches!(kind, OperationKind::Multiply | OperationKind::Tensor) {
+            continue;
+        }
+        if !typed_operator_eligibility(index, result, kind)? {
+            continue;
+        }
+        product_candidates.push((result, op_probe(statement, index, result, kind)?));
+    }
     if product_candidates.is_empty() {
         return Err(
             "CP3 Product/Tensor probe has no actual reached Product/Tensor Result".to_owned()
@@ -999,19 +1035,7 @@ fn build_probes(
             std::cmp::Reverse(probe.event),
         )
     });
-    let mut selected_relations = Vec::new();
-    for kind in [RelationRuleKind::Gadget, RelationRuleKind::Universal] {
-        if let Some(probe) = relation_probes
-            .iter()
-            .filter(|probe| probe.kind == kind)
-            .max_by_key(|probe| (probe.output.terms.len(), std::cmp::Reverse(probe.event)))
-        {
-            selected_relations.push(probe.clone());
-        }
-    }
-    if selected_relations.is_empty() {
-        return Err("CP3 relation probe cannot map a reached AppliedRelation to exact accumulator, RHS Result, and output Result".to_owned());
-    }
+    let selected_relations = select_relation_probes(relation_probes)?;
     probes.push(ProbeSelection {
         name: "relation",
         event: selected_relations[0].event,
@@ -1207,7 +1231,6 @@ fn measure(
     let mut max_factors: Option<NodeStat> = None;
     let mut long_merge: Option<(u64, ProofPayloadOwner, ProofPayloadMonomial)> = None;
     let mut outer_result: Option<FrameSelection> = None;
-    let mut add_chain: Option<Selection> = None;
     let mut product_tensor: Option<Selection> = None;
     let mut product_owners = BTreeSet::new();
     let mut relation: Option<Selection> = None;
@@ -1219,15 +1242,9 @@ fn measure(
     for (index, _event) in proof.events.iter().enumerate() {
         let event = u64::try_from(index).map_err(|_| "semantic event index overflow")?;
         match event_at(proof, index) {
-            ProofPayloadEvent::InvocationStart { root } => stack.push(Frame {
-                root: *root,
-                start: event,
-                merge_count: 0,
-                add_chain: 0,
-                max_add_chain: 0,
-                max_add_chain_event: None,
-                has_prefold: false,
-            }),
+            ProofPayloadEvent::InvocationStart { root } => {
+                stack.push(Frame { root: *root, start: event, merge_count: 0, has_prefold: false })
+            }
             ProofPayloadEvent::Result { owner, value } => {
                 if let ProofPayloadValue::Exact { terms, .. } = value {
                     exact_result_nodes += 1;
@@ -1250,25 +1267,10 @@ fn measure(
                         });
                     }
                 }
-                if let Some(frame) = stack.last_mut() {
-                    frame.add_chain = 0;
-                }
             }
             ProofPayloadEvent::CoefficientMerge(merge) => {
                 if let Some(frame) = stack.last_mut() {
                     frame.merge_count += 1;
-                    match merge.source {
-                        crate::operational_noise::simulation::ProofPayloadCoefficientMergeSource::Operator { .. } => {
-                            frame.add_chain += 1;
-                            if frame.add_chain > frame.max_add_chain {
-                                frame.max_add_chain = frame.add_chain;
-                                frame.max_add_chain_event = Some(event);
-                            }
-                        }
-                        crate::operational_noise::simulation::ProofPayloadCoefficientMergeSource::Relation { .. } => {
-                            frame.add_chain = 0;
-                        }
-                    }
                 }
                 let factor_len =
                     merge.output.central_factors.len() + merge.output.ordered_factors.len();
@@ -1326,22 +1328,6 @@ fn measure(
                         detail: "maximum merge-count invocation frame",
                     });
                 }
-                if let Some(chain_event) = frame.max_add_chain_event {
-                    if add_chain.as_ref().is_none_or(|selection| {
-                        frame.max_add_chain > selection.score ||
-                            (frame.max_add_chain == selection.score &&
-                                chain_event < selection.event)
-                    }) {
-                        add_chain = Some(Selection {
-                            event: chain_event,
-                            owner: frame.root,
-                            detail: "maximum consecutive operator-merge chain (chain length is in statistics)",
-                            score: frame.max_add_chain,
-                            frame_start: Some(frame.start),
-                            frame_end: Some(end),
-                        });
-                    }
-                }
                 if frame.has_prefold && bound_chain.as_ref().is_none() {
                     bound_chain = Some(FrameSelection {
                         start: frame.start,
@@ -1378,9 +1364,6 @@ fn measure(
             frame_start: Some(frame.start),
             frame_end: Some(frame.end),
         });
-    }
-    if let Some(selection) = add_chain {
-        selections.push(selection);
     }
     if let Some(selection) = product_tensor {
         selections.push(selection);
@@ -1589,9 +1572,14 @@ fn render_operation(source: &mut String, operation: &OperationProbe) {
     writeln!(source, "def output : Polynomial Owner := {}", terms_text(&operation.output.terms))
         .expect("String write");
     writeln!(source, "def selectedRawWork : Nat := {}", operation.raw_work).expect("String write");
-    if let Some(chain_tail) = operation.chain_tail {
-        writeln!(source, "def selectedChainTailEvent : Nat := {chain_tail}").expect("String write");
-    }
+    writeln!(source, "def selectedSumRuleEvent : Nat := {}", operation.rule_event)
+        .expect("String write");
+    writeln!(source, "def selectedLeftResultEvent : Nat := {}", operation.input_events[0])
+        .expect("String write");
+    writeln!(source, "def selectedRightResultEvent : Nat := {}", operation.input_events[1])
+        .expect("String write");
+    writeln!(source, "def selectedResultEvent : Nat := {}", operation.output_event)
+        .expect("String write");
     match operation.kind {
         OperationKind::Direct => unreachable!("direct operation handled above"),
         OperationKind::Add => {
@@ -1771,13 +1759,18 @@ fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection]) -> String 
         }
         "outer-result" | "add-chain" | "product-tensor" => {
             if let Some(selection) = selected {
-                render_operation(
-                    &mut source,
-                    selection.operation.as_ref().expect("operation probe"),
-                );
                 if probe == "add-chain" {
-                    source.push_str("namespace AddChainTail\n\n");
-                    source.push_str("theorem chainTailResultSound (env : Env Owner) :\n    evalPolynomial env output = evalPolynomial env left + evalPolynomial env right := by\n  exact resultSound env\n\nend AddChainTail\n");
+                    source.push_str("namespace AddResult\n\n");
+                    render_operation(
+                        &mut source,
+                        selection.operation.as_ref().expect("operation probe"),
+                    );
+                    source.push_str("end AddResult\n");
+                } else {
+                    render_operation(
+                        &mut source,
+                        selection.operation.as_ref().expect("operation probe"),
+                    );
                 }
             }
         }
@@ -1909,6 +1902,9 @@ mod tests {
 
         let operation = OperationProbe {
             kind: OperationKind::Add,
+            rule_event: 1,
+            input_events: [2, 3],
+            output_event: 4,
             inputs: vec![
                 ResultRecord {
                     event: 2,
@@ -1935,13 +1931,15 @@ mod tests {
             scalar_left: false,
             scalar_right: false,
             raw_work: 1,
-            chain_tail: Some(2),
         };
         let mut operation_source = String::new();
         render_operation(&mut operation_source, &operation);
         assert!(operation_source.contains("CanonicalAgreement"));
         assert!(operation_source.contains("addCanonicalResultSound"));
-        assert!(operation_source.contains("selectedChainTailEvent"));
+        assert!(operation_source.contains("selectedSumRuleEvent"));
+        assert!(operation_source.contains("selectedLeftResultEvent"));
+        assert!(operation_source.contains("selectedRightResultEvent"));
+        assert!(operation_source.contains("selectedResultEvent"));
         assert!(!operation_source.contains("CoefficientAgreement"));
         assert!(!operation_source.contains("expected :"));
 
@@ -2233,5 +2231,131 @@ mod tests {
         assert_eq!(result.owner, root);
         assert_eq!(index.immediate_frames[1], index.immediate_frames[2]);
         assert_eq!(index.immediate_frames[2], index.immediate_frames[3]);
+    }
+
+    fn add_result(root: ProofPayloadOwner, event: u64, term_count: usize) -> ResultRecord {
+        let monomial =
+            ProofPayloadMonomial { central_factors: vec![root], ordered_factors: vec![] };
+        ResultRecord {
+            event,
+            owner: root,
+            terms: (0..term_count)
+                .map(|index| ProofPayloadTerm {
+                    monomial: ProofPayloadMonomial {
+                        central_factors: monomial.central_factors.clone(),
+                        ordered_factors: vec![owner(index as u64)],
+                    },
+                    coefficient: BigInt::from(1),
+                })
+                .collect(),
+            summary: BoundedSummary::zero(),
+        }
+    }
+
+    fn add_operation(output: ResultRecord) -> OperationProbe {
+        let left = add_result(output.owner, output.event - 4, 1);
+        let right = add_result(output.owner, output.event - 3, 1);
+        OperationProbe {
+            kind: OperationKind::Add,
+            rule_event: output.event - 2,
+            input_events: [left.event, right.event],
+            output_event: output.event,
+            inputs: vec![left, right],
+            output,
+            scalar_left: false,
+            scalar_right: false,
+            raw_work: 1,
+        }
+    }
+
+    #[test]
+    fn add_result_render_retains_typed_event_ids() {
+        let root = owner(7);
+        let output_result = add_result(root, 5327, 3);
+        let operation = add_operation(output_result.clone());
+        let probes = vec![ProbeSelection {
+            name: "add-chain",
+            event: output_result.event,
+            owner: output_result.owner,
+            score: output_result.terms.len() as u64,
+            detail: "actual maximum intermediate Add Result",
+            frame_start: None,
+            frame_end: None,
+            long_key: None,
+            operation: Some(operation),
+            relations: Vec::new(),
+            bound: None,
+        }];
+        let source = render_probe("Semantic002", "add-chain", &probes);
+        assert!(source.contains("namespace AddResult"));
+        assert!(source.contains("def selectedSumRuleEvent : Nat := 5325"));
+        assert!(source.contains("def selectedLeftResultEvent : Nat := 5323"));
+        assert!(source.contains("def selectedRightResultEvent : Nat := 5324"));
+        assert!(source.contains("def selectedResultEvent : Nat := 5327"));
+        assert!(source.contains("addCanonicalResultSound"));
+    }
+
+    fn relation_probe(kind: RelationRuleKind, event: u64) -> RelationProbe {
+        let root = owner(7);
+        let record =
+            ResultRecord { event, owner: root, terms: Vec::new(), summary: BoundedSummary::zero() };
+        RelationProbe {
+            event,
+            owner: root,
+            source: ProofPayloadMonomial {
+                central_factors: Vec::new(),
+                ordered_factors: vec![root],
+            },
+            lhs: ProofPayloadMonomial { central_factors: Vec::new(), ordered_factors: vec![root] },
+            outer: BigInt::from(1),
+            start: 0,
+            end: 1,
+            accumulator: record.clone(),
+            rhs: record.clone(),
+            output: record,
+            kind,
+        }
+    }
+
+    #[test]
+    fn relation_selection_requires_gadget_and_universal() {
+        let gadget_error =
+            match select_relation_probes(vec![relation_probe(RelationRuleKind::Gadget, 1)]) {
+                Ok(_) => panic!("Universal relation must be required"),
+                Err(error) => error,
+            };
+        assert!(gadget_error.contains("Universal"));
+
+        let selected = select_relation_probes(vec![
+            relation_probe(RelationRuleKind::Gadget, 1),
+            relation_probe(RelationRuleKind::Universal, 2),
+        ])
+        .expect("both relation kinds");
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().any(|probe| probe.kind == RelationRuleKind::Gadget));
+        assert!(selected.iter().any(|probe| probe.kind == RelationRuleKind::Universal));
+    }
+
+    #[test]
+    fn expression_kind_reports_missing_owner_rows() {
+        let statement = CertificateDocumentV1 {
+            schema_id: "mxx.operational-noise.certificate",
+            schema_version: 1,
+            plaintext_modulus: "2".to_owned(),
+            ciphertext_modulus: "257".to_owned(),
+            ring_dimension: 1,
+            expressions: Vec::new(),
+            programs: Vec::new(),
+            sources: Vec::new(),
+            events: Vec::new(),
+            index_uses: Vec::new(),
+            slice_groups: Vec::new(),
+            residual_root:
+                crate::operational_noise::certificate_schema::CertificateResidualRootV1::Closed {
+                    expression: 0,
+                },
+        };
+        let error = expression_kind(&statement, owner(91)).expect_err("missing row must fail");
+        assert!(error.contains("missing expression row 91"));
     }
 }

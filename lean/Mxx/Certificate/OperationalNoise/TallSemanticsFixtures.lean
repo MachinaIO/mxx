@@ -24,9 +24,9 @@ theorem generic_evaluation_fixture : evalPolynomial fixtureEnv fixturePolynomial
 
 theorem generic_value_claim_fixture :
     ValueClaim.Interprets 257 fixtureEnv (-14) (.exact fixturePolynomial (.finite 1)) := by
-  refine ⟨1, ?_, ?_⟩
+  apply exactValueClaim_of_remainder 257 fixtureEnv (-14) fixturePolynomial 1 1
   · decide
-  · simp [boundInterprets, centeredNorm, centeredCoefficient]
+  · simp [centeredNorm, centeredCoefficient]
 
 def familyRoot : SchemaV1.ResidualRoot := .family ⟨0⟩ ⟨2, 5⟩
 

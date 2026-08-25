@@ -1355,6 +1355,16 @@ def ValueClaim.Interprets {Factor : Type} (modulus : Nat) (env : Env Factor)
           boundInterprets modulus summary remainder
   | .coefficient bound => boundInterprets modulus bound actual
 
+/- A reached proof supplies the remainder congruence; this constructor turns that ABI fact into
+   the event-level claim without introducing an evaluator or an owner-wide value assumption. -/
+theorem exactValueClaim_of_remainder {Factor : Type} (modulus : Nat) (env : Env Factor)
+    (actual : Int) (terms : Polynomial Factor) (maximum : Nat) (remainder : Int)
+    (congruence :
+      (actual - evalPolynomial env terms) % Int.ofNat modulus = remainder % Int.ofNat modulus)
+    (remainderBound : centeredNorm modulus remainder ≤ maximum) :
+    ValueClaim.Interprets modulus env actual (.exact terms (.finite maximum)) := by
+  exact ⟨remainder, congruence, remainderBound⟩
+
 theorem invocationEndSound (modulus : Nat) (env : Env Owner) (actual : Int)
     (prefoldTerms endTerms : Polynomial Owner)
     (prefoldSummary endSummary : Bound)

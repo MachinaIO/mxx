@@ -256,6 +256,14 @@ fn is_value_event(event: &ProofPayloadEvent) -> bool {
     )
 }
 
+fn is_exact_value_event(event: &ProofPayloadEvent) -> bool {
+    matches!(
+        event,
+        ProofPayloadEvent::Result { value: ProofPayloadValue::Exact { .. }, .. } |
+            ProofPayloadEvent::InvocationEnd { result: ProofPayloadValue::Exact { .. }, .. }
+    )
+}
+
 fn event_kind(event: &ProofPayloadEvent) -> ClosureEventKind {
     match event {
         ProofPayloadEvent::InvocationStart { .. } => ClosureEventKind::InvocationStart,
@@ -448,15 +456,15 @@ fn collect_relation(
             {
                 return Err(format!("universal specialization {computed} is not computed"));
             }
-            if !is_value_event(index.event(*rhs_result)?) {
-                return Err(format!("universal RHS {rhs_result} is not a value event"));
+            if !is_exact_value_event(index.event(*rhs_result)?) {
+                return Err(format!("universal RHS {rhs_result} is not an exact value event"));
             }
             work.extend([*computed, *rhs_result]);
         }
         ProofPayloadRelationRule::Gadget { input_result, .. } => {
             require_prior(*input_result, current, "gadget input result")?;
-            if !is_value_event(index.event(*input_result)?) {
-                return Err(format!("gadget input {input_result} is not a value event"));
+            if !is_exact_value_event(index.event(*input_result)?) {
+                return Err(format!("gadget input {input_result} is not an exact value event"));
             }
             work.push(*input_result);
         }
@@ -555,9 +563,9 @@ fn collect_event(index: &Index<'_>, event_id: u64, work: &mut Vec<u64>) -> Resul
             ProofPayloadCoefficientMergeSource::Operator { inputs } => {
                 for input in inputs {
                     require_prior(input.value_event, event_id, "operator merge input")?;
-                    if !is_value_event(index.event(input.value_event)?) {
+                    if !is_exact_value_event(index.event(input.value_event)?) {
                         return Err(format!(
-                            "operator merge input {} is not a value event",
+                            "operator merge input {} is not an exact value event",
                             input.value_event
                         ));
                     }

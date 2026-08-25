@@ -1492,16 +1492,6 @@ theorem exactValueClaim_product_of_mod_zero (modulus : Nat) (env : Env Owner)
     exact Int.emod_eq_emod_iff_emod_sub_eq_zero.mp productResidue
   · simp [boundInterprets, centeredNorm, centeredCoefficient]
 
-theorem exactValueClaim_relation_of_mod_zero {Factor : Type} (modulus : Nat) (env : Env Factor)
-    (actual : Int) (input output : Polynomial Factor)
-    (claim : ValueClaim.Interprets modulus env actual (.exact input .exactZero))
-    (outputEvalMod : evalPolynomial env output % Int.ofNat modulus =
-      evalPolynomial env input % Int.ofNat modulus)
-    (modulusPositive : 0 < modulus) :
-    ValueClaim.Interprets modulus env actual (.exact output .exactZero) := by
-  exact exactValueClaim_of_eval_mod_zero modulus env actual input output claim outputEvalMod
-    modulusPositive
-
 theorem exactValueClaim_sub_of_mod_zero {Factor : Type} (modulus : Nat) (env : Env Factor)
     (leftActual rightActual : Int) (leftTerms rightTerms output : Polynomial Factor)
     (maximum : Nat)
@@ -1526,6 +1516,36 @@ theorem exactValueClaim_sub_of_mod_zero {Factor : Type} (modulus : Nat) (env : E
       rw [rightModZero]
       simp
     _ = remainder % Int.ofNat modulus := by simpa [boundInterprets] using leftCongruence
+
+theorem centeredNorm_eq_of_emod_eq {modulus : Nat} {left right : Int}
+    (modulusPositive : 0 < modulus)
+    (residueEqual : left % Int.ofNat modulus = right % Int.ofNat modulus) :
+    centeredNorm modulus left = centeredNorm modulus right := by
+  unfold centeredNorm centeredCoefficient
+  simp only [Nat.ne_of_gt modulusPositive, ↓reduceIte]
+  rw [residueEqual]
+
+theorem centeredNorm_le_of_empty_finite_claim {Factor : Type} (modulus : Nat)
+    (env : Env Factor) (actual : Int) (maximum : Nat)
+    (claim : ValueClaim.Interprets modulus env actual (.exact [] (.finite maximum)))
+    (modulusPositive : 0 < modulus) :
+    centeredNorm modulus actual ≤ maximum := by
+  rcases claim with ⟨remainder, congruence, remainderBound⟩
+  have residueEqual : actual % Int.ofNat modulus = remainder % Int.ofNat modulus := by
+    simpa [evalPolynomial] using congruence
+  rw [centeredNorm_eq_of_emod_eq modulusPositive residueEqual]
+  simpa [boundInterprets] using remainderBound
+
+theorem finalStrictBound_of_empty_finite_claim {Factor : Type} (plaintextModulus modulus : Nat)
+    (env : Env Factor) (actual : Int) (maximum : Nat)
+    (claim : ValueClaim.Interprets modulus env actual (.exact [] (.finite maximum)))
+    (modulusPositive : 0 < modulus)
+    (certificateBound : 2 * plaintextModulus * maximum < modulus) :
+    2 * plaintextModulus * centeredNorm modulus actual < modulus := by
+  have actualBound :=
+    centeredNorm_le_of_empty_finite_claim modulus env actual maximum claim modulusPositive
+  exact Nat.lt_of_le_of_lt (Nat.mul_le_mul_left (2 * plaintextModulus) actualBound)
+    certificateBound
 
 theorem invocationEndSound (modulus : Nat) (env : Env Owner) (actual : Int)
     (prefoldTerms endTerms : Polynomial Owner)

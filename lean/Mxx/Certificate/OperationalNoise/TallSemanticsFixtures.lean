@@ -160,6 +160,17 @@ theorem exact_zero_right_preserves_bound_fixture :
   · exact exactClaim_mod_zero 257 fixtureEnv 0 [] rightClaim (by decide)
   · rfl
 
+theorem empty_finite_claim_bounds_actual_fixture
+    (claim : ValueClaim.Interprets 257 fixtureEnv 1 (.exact [] (.finite 1))) :
+    centeredNorm 257 1 ≤ 1 := by
+  exact centeredNorm_le_of_empty_finite_claim 257 fixtureEnv 1 1 claim (by decide)
+
+theorem empty_finite_claim_final_bound_fixture
+    (claim : ValueClaim.Interprets 257 fixtureEnv 1 (.exact [] (.finite 1))) :
+    2 * 2 * centeredNorm 257 1 < 257 := by
+  exact finalStrictBound_of_empty_finite_claim 2 257 fixtureEnv 1 1 claim
+    (by decide) (by decide)
+
 def familyRoot : SchemaV1.ResidualRoot := .family ⟨0⟩ ⟨2, 5⟩
 
 theorem statement_domain_fixture :
@@ -273,6 +284,11 @@ theorem canonical_relation_fixture :
 
 #print axioms generic_evaluation_fixture
 #print axioms generic_value_claim_fixture
+#print axioms TallSemantics.centeredNorm_eq_of_emod_eq
+#print axioms TallSemantics.centeredNorm_le_of_empty_finite_claim
+#print axioms TallSemantics.finalStrictBound_of_empty_finite_claim
+#print axioms empty_finite_claim_bounds_actual_fixture
+#print axioms empty_finite_claim_final_bound_fixture
 #print axioms statement_domain_fixture
 #print axioms constructive_raw_bound_fixture
 #print axioms TallSemantics.ValueDerived.interprets

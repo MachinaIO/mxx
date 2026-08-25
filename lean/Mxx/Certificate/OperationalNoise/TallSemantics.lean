@@ -1395,6 +1395,113 @@ theorem exactClaim_mod_zero {Factor : Type} (modulus : Nat) (env : Env Factor)
   rcases claim with ⟨remainder, congruence, remainderBound⟩
   rw [congruence, centeredNorm_eq_zero_mod modulusPositive remainderBound]
 
+/- A result event may change its polynomial representation while preserving its evaluated
+   residue.  This bridge deliberately takes that residue equality as an explicit premise: the
+   generator must supply the event-level canonical agreement, and Lean checks the consequence. -/
+theorem exactValueClaim_of_eval_mod_zero {Factor : Type} (modulus : Nat) (env : Env Factor)
+    (actual : Int) (input output : Polynomial Factor)
+    (claim : ValueClaim.Interprets modulus env actual (.exact input .exactZero))
+    (outputEvalMod : evalPolynomial env output % Int.ofNat modulus =
+      evalPolynomial env input % Int.ofNat modulus)
+    (modulusPositive : 0 < modulus) :
+    ValueClaim.Interprets modulus env actual (.exact output .exactZero) := by
+  have inputModZero := exactClaim_mod_zero modulus env actual input claim modulusPositive
+  refine ⟨0, ?_, ?_⟩
+  · have difference :
+        (actual - evalPolynomial env output) % Int.ofNat modulus =
+          (actual - evalPolynomial env input) % Int.ofNat modulus := by
+      rw [Int.sub_emod, Int.sub_emod, outputEvalMod]
+      simpa only [Int.emod_emod] using
+        (Int.sub_emod actual (evalPolynomial env input) (Int.ofNat modulus)).symm
+    rw [difference, inputModZero]
+    simp
+  · simp [boundInterprets, centeredNorm, centeredCoefficient]
+
+theorem exactValueClaim_add_of_mod_zero (modulus : Nat) (env : Env Owner)
+    (leftActual rightActual : Int) (left right output : Polynomial Owner)
+    (leftClaim : ValueClaim.Interprets modulus env leftActual (.exact left .exactZero))
+    (rightClaim : ValueClaim.Interprets modulus env rightActual (.exact right .exactZero))
+    (outputEval : evalPolynomial env output =
+      evalPolynomial env left + evalPolynomial env right)
+    (modulusPositive : 0 < modulus) :
+    ValueClaim.Interprets modulus env (leftActual + rightActual) (.exact output .exactZero) := by
+  refine ⟨0, ?_, ?_⟩
+  · have leftModZero := exactClaim_mod_zero modulus env leftActual left leftClaim modulusPositive
+    have rightModZero := exactClaim_mod_zero modulus env rightActual right rightClaim modulusPositive
+    rw [outputEval]
+    calc
+      (leftActual + rightActual - (evalPolynomial env left + evalPolynomial env right)) %
+          Int.ofNat modulus =
+          ((leftActual - evalPolynomial env left) +
+            (rightActual - evalPolynomial env right)) % Int.ofNat modulus := by
+              congr 1 <;> omega
+      _ = ((leftActual - evalPolynomial env left) % Int.ofNat modulus +
+        (rightActual - evalPolynomial env right) % Int.ofNat modulus) % Int.ofNat modulus := by
+          rw [Int.add_emod]
+      _ = 0 := by rw [leftModZero, rightModZero]; simp
+  · simp [boundInterprets, centeredNorm, centeredCoefficient]
+
+theorem exactValueClaim_sub_exactZero_of_mod_zero (modulus : Nat) (env : Env Owner)
+    (leftActual rightActual : Int) (left right output : Polynomial Owner)
+    (leftClaim : ValueClaim.Interprets modulus env leftActual (.exact left .exactZero))
+    (rightClaim : ValueClaim.Interprets modulus env rightActual (.exact right .exactZero))
+    (outputEval : evalPolynomial env output =
+      evalPolynomial env left - evalPolynomial env right)
+    (modulusPositive : 0 < modulus) :
+    ValueClaim.Interprets modulus env (leftActual - rightActual) (.exact output .exactZero) := by
+  refine ⟨0, ?_, ?_⟩
+  · have leftModZero := exactClaim_mod_zero modulus env leftActual left leftClaim modulusPositive
+    have rightModZero := exactClaim_mod_zero modulus env rightActual right rightClaim modulusPositive
+    rw [outputEval]
+    calc
+      (leftActual - rightActual - (evalPolynomial env left - evalPolynomial env right)) %
+          Int.ofNat modulus =
+          ((leftActual - evalPolynomial env left) -
+            (rightActual - evalPolynomial env right)) % Int.ofNat modulus := by
+              congr 1 <;> omega
+      _ = ((leftActual - evalPolynomial env left) % Int.ofNat modulus -
+        (rightActual - evalPolynomial env right) % Int.ofNat modulus) % Int.ofNat modulus := by
+          rw [Int.sub_emod]
+      _ = 0 := by rw [leftModZero, rightModZero]; simp
+  · simp [boundInterprets, centeredNorm, centeredCoefficient]
+
+theorem exactValueClaim_product_of_mod_zero (modulus : Nat) (env : Env Owner)
+    (leftActual rightActual : Int) (left right output : Polynomial Owner)
+    (leftClaim : ValueClaim.Interprets modulus env leftActual (.exact left .exactZero))
+    (rightClaim : ValueClaim.Interprets modulus env rightActual (.exact right .exactZero))
+    (outputEval : evalPolynomial env output =
+      evalPolynomial env left * evalPolynomial env right)
+    (modulusPositive : 0 < modulus) :
+    ValueClaim.Interprets modulus env (leftActual * rightActual) (.exact output .exactZero) := by
+  have leftModZero := exactClaim_mod_zero modulus env leftActual left leftClaim modulusPositive
+  have rightModZero := exactClaim_mod_zero modulus env rightActual right rightClaim modulusPositive
+  have leftResidue : leftActual % Int.ofNat modulus = evalPolynomial env left % Int.ofNat modulus :=
+    Int.emod_eq_emod_iff_emod_sub_eq_zero.mpr leftModZero
+  have rightResidue : rightActual % Int.ofNat modulus =
+      evalPolynomial env right % Int.ofNat modulus :=
+    Int.emod_eq_emod_iff_emod_sub_eq_zero.mpr rightModZero
+  refine ⟨0, ?_, ?_⟩
+  · rw [outputEval]
+    have productResidue :
+        (leftActual * rightActual) % Int.ofNat modulus =
+          (evalPolynomial env left * evalPolynomial env right) % Int.ofNat modulus := by
+      rw [Int.mul_emod, Int.mul_emod, leftResidue, rightResidue]
+      simpa only [Int.emod_emod] using
+        (Int.mul_emod (evalPolynomial env left) (evalPolynomial env right)
+          (Int.ofNat modulus)).symm
+    exact Int.emod_eq_emod_iff_emod_sub_eq_zero.mp productResidue
+  · simp [boundInterprets, centeredNorm, centeredCoefficient]
+
+theorem exactValueClaim_relation_of_mod_zero {Factor : Type} (modulus : Nat) (env : Env Factor)
+    (actual : Int) (input output : Polynomial Factor)
+    (claim : ValueClaim.Interprets modulus env actual (.exact input .exactZero))
+    (outputEvalMod : evalPolynomial env output % Int.ofNat modulus =
+      evalPolynomial env input % Int.ofNat modulus)
+    (modulusPositive : 0 < modulus) :
+    ValueClaim.Interprets modulus env actual (.exact output .exactZero) := by
+  exact exactValueClaim_of_eval_mod_zero modulus env actual input output claim outputEvalMod
+    modulusPositive
+
 theorem exactValueClaim_sub_of_mod_zero {Factor : Type} (modulus : Nat) (env : Env Factor)
     (leftActual rightActual : Int) (leftTerms rightTerms output : Polynomial Factor)
     (maximum : Nat)

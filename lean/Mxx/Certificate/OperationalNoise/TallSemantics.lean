@@ -1398,254 +1398,229 @@ theorem exactValueClaim_of_coeffClass {Factor : Type} (modulus : Nat) (env : Env
     ValueClaim.Interprets modulus env actual (.exact terms (coeffClassToTallBound bound)) := by
   exact ⟨remainder, congruence, coeffClassInterprets_to_boundInterprets remainderSound⟩
 
-/-! Bound replay is indexed by concrete history rows.  A projected bound is not a lookup
-function: its constructor exhibits the exact result row and the magnitude fact used by the
-coefficient-class theorem. -/
+/-! Bound derivations and result projections are mutually indexed by concrete history rows.
+    Every coefficient projection contains the `BoundDerivedAt` selected by the recorded producer;
+    no constructor accepts a standalone soundness proposition. -/
+mutual
+  inductive ProjectedBoundAt (history : EventHistory) :
+      Nat → Owner → Option (List Term) → Projection → CoeffClass → Nat → Prop where
+    | resultCoefficient {resultEvent producerEvent frameStart : Nat} {owner : Owner}
+        {rule : BoundRule}
+        {bound : CoeffClass} {actualMagnitude : Nat}
+        (adjacent : producerEvent + 1 = resultEvent)
+        (row : history.lookup resultEvent = some
+          ⟨.resultCoefficient owner (coeffClassToTallBound bound), frameStart⟩)
+        (derived : BoundDerivedAt history producerEvent frameStart owner rule bound actualMagnitude) :
+        ProjectedBoundAt history resultEvent owner none .coefficient bound actualMagnitude
+    | resultExactCoefficient {resultEvent : Nat} {owner : Owner} {terms : List Term}
+        {coefficientProducer frameStart : Nat}
+        {summary : Bound} {summaryProducer : Option Nat} {rule : BoundRule}
+        {bound : CoeffClass} {actualMagnitude : Nat}
+        (row : history.lookup resultEvent = some
+          ⟨.resultExact owner terms (coeffClassToTallBound bound) coefficientProducer
+            summary summaryProducer, frameStart⟩)
+        (derived : BoundDerivedAt history coefficientProducer frameStart owner rule
+          bound actualMagnitude) :
+        ProjectedBoundAt history resultEvent owner (some terms) .coefficient bound actualMagnitude
 
-/-! A projection is indexed by the exact result row.  The optional raw-term index is `none` for
-    a coefficient row and `some terms` for a summary row; this prevents a proof of one result
-    polynomial from being reused for another polynomial. -/
-inductive ProjectedBoundAt (history : EventHistory) (resultEvent : Nat) (owner : Owner) :
-    Option (List Term) → Projection → CoeffClass → Nat → Prop where
-  | coefficient {bound : CoeffClass} {actualMagnitude : Nat} {frameStart : Nat}
-      (row : history.lookup resultEvent = some
-        ⟨.resultCoefficient owner (coeffClassToTallBound bound), frameStart⟩)
-      (sound : bound.Interprets actualMagnitude) :
-      ProjectedBoundAt history resultEvent owner none .coefficient bound actualMagnitude
-  | exactCoefficient {bound : CoeffClass} {actualMagnitude : Nat} {frameStart : Nat}
-      (terms : List Term)
-      (row : history.lookup resultEvent = some
-        ⟨.resultExact owner terms (coeffClassToTallBound bound), frameStart⟩)
-      (sound : bound.Interprets actualMagnitude) :
-      ProjectedBoundAt history resultEvent owner (some terms) .coefficient bound actualMagnitude
-  | summary {bound : CoeffClass} {actualMagnitude : Nat} {frameStart : Nat}
-      (terms : List Term)
-      (row : history.lookup resultEvent = some
-        ⟨.resultExact owner terms (coeffClassToTallBound bound), frameStart⟩)
-      (sound : bound.Interprets actualMagnitude) :
-      ProjectedBoundAt history resultEvent owner (some terms) .summary bound actualMagnitude
+  inductive BoundInputAt (history : EventHistory) :
+      Owner → ValueRef → CoeffClass → Nat → Prop where
+    | result {consumer : Owner} {resultEvent : Nat} {resultOwner : Owner}
+        {rawTerms : Option (List Term)}
+        {bound : CoeffClass} {actualMagnitude : Nat}
+        (scope : resultOwner.scope = consumer.scope)
+        (projected : ProjectedBoundAt history resultEvent resultOwner rawTerms .coefficient
+          bound actualMagnitude) :
+        BoundInputAt history consumer (.result resultEvent .coefficient) bound actualMagnitude
+    | predecessor {consumer : Owner} {inputPosition bindingEvent : Nat}
+        {predecessor : ExpressionRef}
+        {resultEvent frameStart : Nat} {rawTerms : Option (List Term)}
+        {bound : CoeffClass} {actualMagnitude : Nat}
+        (bindingRow : history.lookup bindingEvent = some
+          ⟨.predecessor consumer inputPosition predecessor resultEvent, frameStart⟩)
+        (projected : ProjectedBoundAt history resultEvent ⟨consumer.scope, predecessor⟩
+          rawTerms .coefficient bound actualMagnitude) :
+        BoundInputAt history consumer
+          (.predecessor inputPosition bindingEvent .coefficient) bound actualMagnitude
 
-def boundReferenceAt (history : EventHistory) (reference : ValueRef)
-    (bound : CoeffClass) (actualMagnitude : Nat) : Prop :=
-  match reference with
-  | .result resultEvent projection =>
-      match projection with
-      | .coefficient =>
-          ∃ owner rawTerms,
-            ProjectedBoundAt history resultEvent owner rawTerms .coefficient bound actualMagnitude
-      | .summary =>
-          ∃ owner terms,
-            ProjectedBoundAt history resultEvent owner (some terms) .summary bound actualMagnitude
-  | .predecessor inputPosition bindingEvent projection =>
-      ∃ owner predecessor resultEvent frameStart,
-        history.lookup bindingEvent = some
-          ⟨.predecessor owner inputPosition predecessor resultEvent, frameStart⟩ ∧
-        match projection with
-        | .coefficient =>
-            ∃ resultOwner rawTerms,
-              ProjectedBoundAt history resultEvent resultOwner rawTerms .coefficient bound actualMagnitude
-        | .summary =>
-            ∃ resultOwner terms,
-              ProjectedBoundAt history resultEvent resultOwner (some terms) .summary bound actualMagnitude
-  | .transfer _ => False
+  inductive BoundInputsAt (history : EventHistory) :
+      Owner → List ValueRef → List CoeffClass → List Nat → Prop where
+    | nil {consumer : Owner} : BoundInputsAt history consumer [] [] []
+    | cons {consumer : Owner} {reference : ValueRef} {references : List ValueRef}
+        {bound : CoeffClass} {bounds : List CoeffClass}
+        {actualMagnitude : Nat} {actualMagnitudes : List Nat}
+        (head : BoundInputAt history consumer reference bound actualMagnitude)
+        (tail : BoundInputsAt history consumer references bounds actualMagnitudes) :
+        BoundInputsAt history consumer (reference :: references) (bound :: bounds)
+          (actualMagnitude :: actualMagnitudes)
 
-def BoundInputAt (history : EventHistory) (reference : ValueRef)
-    (bound : CoeffClass) (actualMagnitude : Nat) : Prop :=
-  boundReferenceAt history reference bound actualMagnitude
+  inductive FactorInputAt (history : EventHistory) :
+      Owner → FactorEvidence → CoeffClass → Nat → Prop where
+    | intro {consumer : Owner} {factor : FactorEvidence} {bound : CoeffClass}
+        {actualMagnitude : Nat}
+        (input : BoundInputAt history consumer factor.bound bound actualMagnitude) :
+        FactorInputAt history consumer factor bound actualMagnitude
 
-def FactorInputAt (history : EventHistory) (factor : FactorEvidence)
-    (bound : CoeffClass) (actualMagnitude : Nat) : Prop :=
-  boundReferenceAt history factor.bound bound actualMagnitude
+  inductive FactorInputsAt (history : EventHistory) :
+      Owner → List FactorEvidence → List CoeffClass → List Nat → Prop where
+    | nil {consumer : Owner} : FactorInputsAt history consumer [] [] []
+    | cons {consumer : Owner} {factor : FactorEvidence} {factors : List FactorEvidence}
+        {bound : CoeffClass} {bounds : List CoeffClass}
+        {actualMagnitude : Nat} {actualMagnitudes : List Nat}
+        (head : FactorInputAt history consumer factor bound actualMagnitude)
+        (tail : FactorInputsAt history consumer factors bounds actualMagnitudes) :
+        FactorInputsAt history consumer (factor :: factors) (bound :: bounds)
+          (actualMagnitude :: actualMagnitudes)
+
+  inductive BoundDerivedAt (history : EventHistory) :
+      Nat → Nat → Owner → BoundRule → CoeffClass → Nat → Prop where
+    | identity {transferEvent transferFrame : Nat} {owner : Owner}
+        {reference : ValueRef} {bound : CoeffClass} {actualMagnitude : Nat}
+        (transferRow : history.lookup transferEvent = some
+          ⟨.boundTransfer owner (.identity reference), transferFrame⟩)
+        (child : BoundInputAt history owner reference bound actualMagnitude) :
+        BoundDerivedAt history transferEvent transferFrame owner (.identity reference)
+          bound actualMagnitude
+    | sum {transferEvent transferFrame : Nat} {owner : Owner}
+        {references : List ValueRef} {bounds : List CoeffClass} {actuals : List Nat}
+        (transferRow : history.lookup transferEvent = some
+          ⟨.boundTransfer owner (.sum references), transferFrame⟩)
+        (children : BoundInputsAt history owner references bounds actuals) :
+        BoundDerivedAt history transferEvent transferFrame owner (.sum references)
+          (addKnownList bounds) actuals.sum
+    | scaleMagnitude {transferEvent transferFrame : Nat} {owner : Owner}
+        {reference : ValueRef} {factor : Nat}
+        {bound : CoeffClass} {actualMagnitude : Nat}
+        (transferRow : history.lookup transferEvent = some
+          ⟨.boundTransfer owner (.scale reference (.magnitude factor)), transferFrame⟩)
+        (child : BoundInputAt history owner reference bound actualMagnitude) :
+        BoundDerivedAt history transferEvent transferFrame owner
+          (.scale reference (.magnitude factor)) (scaleMagnitude factor bound)
+          (factor * actualMagnitude)
+    | monomialProduct {transferEvent transferFrame : Nat} {owner : Owner}
+        {monomial : Monomial} {headFactor : FactorEvidence}
+        {tailFactors : List FactorEvidence} {headBound : CoeffClass} {headActual : Nat}
+        {tailBounds : List CoeffClass} {tailActuals : List Nat}
+        (transferRow : history.lookup transferEvent = some
+          ⟨.boundTransfer owner (.monomialProduct monomial (headFactor :: tailFactors)),
+            transferFrame⟩)
+        (head : FactorInputAt history owner headFactor headBound headActual)
+        (tail : FactorInputsAt history owner tailFactors tailBounds tailActuals) :
+        BoundDerivedAt history transferEvent transferFrame owner
+          (.monomialProduct monomial (headFactor :: tailFactors))
+          (productNonempty headBound tailBounds) (headActual * tailActuals.prod)
+end
 
 theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {owner : Owner}
     {rawTerms : Option (List Term)} {projection : Projection} {bound : CoeffClass}
     {actualMagnitude : Nat}
-    (projected : ProjectedBoundAt history resultEvent owner rawTerms projection bound actualMagnitude) :
-    bound.Interprets actualMagnitude := by
-  cases projected with
-  | coefficient _ sound => exact sound
-  | exactCoefficient _ _ sound => exact sound
-  | summary _ _ sound => exact sound
-
-theorem boundReferenceAt_sound {history : EventHistory} {reference : ValueRef}
-    {bound : CoeffClass} {actualMagnitude : Nat}
-    (input : boundReferenceAt history reference bound actualMagnitude) :
-    bound.Interprets actualMagnitude := by
-  cases reference with
-  | predecessor inputPosition bindingEvent projection =>
-      rcases input with ⟨owner, predecessor, resultEvent, frameStart, row, projected⟩
-      cases projection with
-      | coefficient =>
-          rcases projected with ⟨resultOwner, rawTerms, projected⟩
-          exact ProjectedBoundAt.sound projected
-      | summary =>
-          rcases projected with ⟨resultOwner, terms, projected⟩
-          exact ProjectedBoundAt.sound projected
-  | result resultEvent projection =>
-      cases projection with
-      | coefficient =>
-          rcases input with ⟨owner, rawTerms, projected⟩
-          exact ProjectedBoundAt.sound projected
-      | summary =>
-          rcases input with ⟨owner, terms, projected⟩
-          exact ProjectedBoundAt.sound projected
-  | transfer event => cases input
-
-/-! Reached constructors compute their actual magnitude from child magnitudes. -/
-inductive BoundDerivedAt (history : EventHistory) (transferEvent transferFrame : Nat)
-    (owner : Owner) :
-    BoundRule → CoeffClass → Nat → Prop where
-  | identity {reference : ValueRef} {bound : CoeffClass}
-      {actualMagnitude : Nat}
-      (transferRow : history.lookup transferEvent = some
-        ⟨.boundTransfer owner (.identity reference), transferFrame⟩)
-      (child : BoundInputAt history reference bound actualMagnitude) :
-      BoundDerivedAt history transferEvent transferFrame owner (.identity reference) bound actualMagnitude
-  | sum {references : List ValueRef}
-      {bounds : List CoeffClass} {actuals : List Nat}
-      (transferRow : history.lookup transferEvent = some
-        ⟨.boundTransfer owner (.sum references), transferFrame⟩)
-      (children : List.Forall₂
-        (fun reference pair => BoundInputAt history reference pair.1 pair.2)
-        references (List.zip bounds actuals))
-      (referencesLength : references.length = bounds.length)
-      (boundsLength : bounds.length = actuals.length)
-      :
-      BoundDerivedAt history transferEvent transferFrame owner (.sum references)
-        (addKnownList bounds) actuals.sum
-  | scaleMagnitude {reference : ValueRef} {factor : Nat}
-      {bound : CoeffClass} {actualMagnitude : Nat}
-      (transferRow : history.lookup transferEvent = some
-        ⟨.boundTransfer owner (.scale reference (.magnitude factor)), transferFrame⟩)
-      (child : BoundInputAt history reference bound actualMagnitude) :
-      BoundDerivedAt history transferEvent transferFrame owner (.scale reference (.magnitude factor))
-        (scaleMagnitude factor bound) (factor * actualMagnitude)
-  | scaleValue {reference scaleReference : ValueRef}
-      {valueBound scaleBound : CoeffClass} {valueActual scaleActual : Nat}
-      (transferRow : history.lookup transferEvent = some
-        ⟨.boundTransfer owner (.scale reference (.value scaleReference)), transferFrame⟩)
-      (valueChild : BoundInputAt history reference valueBound valueActual)
-      (scaleChild : BoundInputAt history scaleReference scaleBound scaleActual) :
-      BoundDerivedAt history transferEvent transferFrame owner (.scale reference (.value scaleReference))
-        (scaleValue valueBound scaleBound) (valueActual * scaleActual)
-  | monomialProduct {monomial : Monomial} {headFactor : FactorEvidence}
-      {tailFactors : List FactorEvidence}
-      {headBound : CoeffClass} {headActual : Nat}
-      {tailBounds : List CoeffClass} {tailActuals : List Nat}
-      (transferRow : history.lookup transferEvent = some
-        ⟨.boundTransfer owner (.monomialProduct monomial (headFactor :: tailFactors)), transferFrame⟩)
-      (children : List.Forall₂
-        (fun factor pair => FactorInputAt history factor pair.1 pair.2)
-        (headFactor :: tailFactors)
-        (List.zip (headBound :: tailBounds) (headActual :: tailActuals)))
-      (factorsLength : (headFactor :: tailFactors).length = (headBound :: tailBounds).length)
-      (boundsLength : (headBound :: tailBounds).length = (headActual :: tailActuals).length) :
-      BoundDerivedAt history transferEvent transferFrame owner
-        (.monomialProduct monomial (headFactor :: tailFactors))
-        (productNonempty headBound tailBounds) (headActual * tailActuals.prod)
-
-theorem sumBoundInputs_sound {history : EventHistory} {references : List ValueRef}
-    {bounds : List CoeffClass} {actuals : List Nat}
-    (children : List.Forall₂
-      (fun reference pair => BoundInputAt history reference pair.1 pair.2)
-      references (List.zip bounds actuals))
-    (referencesLength : references.length = bounds.length)
-    (boundsLength : bounds.length = actuals.length) :
-    List.Forall₂ (fun bound actual => bound.Interprets actual) bounds actuals := by
-  induction references generalizing bounds actuals with
-  | nil =>
-      cases bounds with
-      | nil => cases actuals with
-        | nil => exact .nil
-        | cons actual actuals => simp_all [List.length]
-      | cons bound bounds => simp_all [List.length]
-  | cons reference references ih =>
-      cases bounds with
-      | nil => simp_all [List.length]
-      | cons bound bounds =>
-          cases actuals with
-          | nil => simp_all [List.length]
-          | cons actual actuals =>
-              simp [List.zip] at children
-              cases children with
-              | cons child children =>
-                  exact .cons (boundReferenceAt_sound child)
-                    (ih children (by simp_all) (by simp_all))
-
-theorem factorBoundInputs_sound {history : EventHistory} {factors : List FactorEvidence}
-    {bounds : List CoeffClass} {actuals : List Nat}
-    (children : List.Forall₂
-      (fun factor pair => FactorInputAt history factor pair.1 pair.2)
-      factors (List.zip bounds actuals))
-    (factorsLength : factors.length = bounds.length)
-    (boundsLength : bounds.length = actuals.length) :
-    List.Forall₂ (fun bound actual => bound.Interprets actual) bounds actuals := by
-  induction factors generalizing bounds actuals with
-  | nil =>
-      cases bounds with
-      | nil => cases actuals with
-        | nil => exact .nil
-        | cons actual actuals => simp_all [List.length]
-      | cons bound bounds => simp_all [List.length]
-  | cons factor factors ih =>
-      cases bounds with
-      | nil => simp_all [List.length]
-      | cons bound bounds =>
-          cases actuals with
-          | nil => simp_all [List.length]
-          | cons actual actuals =>
-              simp [List.zip] at children
-              cases children with
-              | cons child children =>
-                  exact .cons (boundReferenceAt_sound child)
-                    (ih children (by simp_all) (by simp_all))
+    (projected : ProjectedBoundAt history resultEvent owner rawTerms projection bound
+      actualMagnitude) : bound.Interprets actualMagnitude := by
+  refine ProjectedBoundAt.rec
+    (motive_1 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
+    (motive_2 := fun _ _ bound actual _ => bound.Interprets actual)
+    (motive_3 := fun _ _ bounds actuals _ =>
+      List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
+        bounds actuals)
+    (motive_4 := fun _ _ bound actual _ => bound.Interprets actual)
+    (motive_5 := fun _ _ bounds actuals _ =>
+      List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
+        bounds actuals)
+    (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
+  · intros
+    assumption
+  · intros
+    assumption
+  · intros
+    assumption
+  · intros
+    assumption
+  · exact .nil
+  · intros
+    exact .cons (by assumption) (by assumption)
+  · intros
+    assumption
+  · exact .nil
+  · intros
+    exact .cons (by assumption) (by assumption)
+  · intros
+    assumption
+  · intros
+    apply addKnownList_sound
+    assumption
+  · intros
+    apply scaleMagnitude_sound
+    assumption
+  · intros
+    apply productNonempty_sound <;> assumption
 
 theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFrame : Nat}
-    {owner : Owner}
-    {rule : BoundRule} {bound : CoeffClass} {actualMagnitude : Nat}
-    (derived : BoundDerivedAt history transferEvent transferFrame owner rule bound actualMagnitude) :
-    bound.Interprets actualMagnitude := by
-  cases derived with
-  | identity transferRow child =>
-      exact boundReferenceAt_sound child
-  | sum transferRow children referencesLength boundsLength =>
-      exact addKnownList_sound
-        (sumBoundInputs_sound children referencesLength boundsLength)
-  | scaleMagnitude transferRow child =>
-      exact scaleMagnitude_sound (boundReferenceAt_sound child)
-  | scaleValue transferRow valueChild scaleChild =>
-      exact scaleValue_sound (boundReferenceAt_sound valueChild)
-        (boundReferenceAt_sound scaleChild)
-  | monomialProduct transferRow children factorsLength boundsLength =>
-      have allSound := factorBoundInputs_sound children factorsLength boundsLength
-      cases allSound with
-      | cons head tail => exact productNonempty_sound head tail
+    {owner : Owner} {rule : BoundRule} {bound : CoeffClass} {actualMagnitude : Nat}
+    (derived : BoundDerivedAt history transferEvent transferFrame owner rule bound
+      actualMagnitude) : bound.Interprets actualMagnitude := by
+  refine BoundDerivedAt.rec
+    (motive_1 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
+    (motive_2 := fun _ _ bound actual _ => bound.Interprets actual)
+    (motive_3 := fun _ _ bounds actuals _ =>
+      List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
+        bounds actuals)
+    (motive_4 := fun _ _ bound actual _ => bound.Interprets actual)
+    (motive_5 := fun _ _ bounds actuals _ =>
+      List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
+        bounds actuals)
+    (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
+  · intros
+    assumption
+  · intros
+    assumption
+  · intros
+    assumption
+  · intros
+    assumption
+  · exact .nil
+  · intros
+    exact .cons (by assumption) (by assumption)
+  · intros
+    assumption
+  · exact .nil
+  · intros
+    exact .cons (by assumption) (by assumption)
+  · intros
+    assumption
+  · intros
+    apply addKnownList_sound
+    assumption
+  · intros
+    apply scaleMagnitude_sound
+    assumption
+  · intros
+    apply productNonempty_sound <;> assumption
 
-/-! A transfer is a producer row.  The result-row bridges below are separate so that a child
-    reference always carries its own source-result index. -/
 theorem boundTransfer_to_resultCoefficient
-    {history : EventHistory} {transferEvent resultEvent : Nat} {owner : Owner}
+    {history : EventHistory} {producerEvent resultEvent frameStart : Nat} {owner : Owner}
     {rule : BoundRule} {bound : CoeffClass} {actualMagnitude : Nat}
-    {transferFrame resultFrame : Nat}
-    (derived : BoundDerivedAt history transferEvent transferFrame owner rule bound actualMagnitude)
-    (resultRow : history.lookup resultEvent = some
-      ⟨.resultCoefficient owner (coeffClassToTallBound bound), resultFrame⟩)
-    (frameMatch : transferFrame = resultFrame) :
-    ProjectedBoundAt history resultEvent owner none .coefficient bound actualMagnitude := by
-  cases frameMatch
-  exact .coefficient resultRow derived.sound
+    (adjacent : producerEvent + 1 = resultEvent)
+    (row : history.lookup resultEvent = some
+      ⟨.resultCoefficient owner (coeffClassToTallBound bound), frameStart⟩)
+    (derived : BoundDerivedAt history producerEvent frameStart owner rule bound
+      actualMagnitude) :
+    ProjectedBoundAt history resultEvent owner none .coefficient bound actualMagnitude :=
+  .resultCoefficient adjacent row derived
 
 theorem boundTransfer_to_resultExactCoefficient
-    {history : EventHistory} {transferEvent resultEvent : Nat} {owner : Owner}
-    {rule : BoundRule} {bound : CoeffClass} {actualMagnitude : Nat}
-    {terms : List Term} {transferFrame resultFrame : Nat}
-    (derived : BoundDerivedAt history transferEvent transferFrame owner rule bound actualMagnitude)
-    (resultRow : history.lookup resultEvent = some
-      ⟨.resultExact owner terms (coeffClassToTallBound bound), resultFrame⟩)
-    (frameMatch : transferFrame = resultFrame) :
-    ProjectedBoundAt history resultEvent owner (some terms) .coefficient bound actualMagnitude := by
-  cases frameMatch
-  exact .exactCoefficient terms resultRow derived.sound
+    {history : EventHistory} {resultEvent coefficientProducer frameStart : Nat}
+    {owner : Owner} {terms : List Term} {summary : Bound}
+    {summaryProducer : Option Nat} {rule : BoundRule} {bound : CoeffClass}
+    {actualMagnitude : Nat}
+    (row : history.lookup resultEvent = some
+      ⟨.resultExact owner terms (coeffClassToTallBound bound) coefficientProducer summary
+        summaryProducer, frameStart⟩)
+    (derived : BoundDerivedAt history coefficientProducer frameStart owner rule bound
+      actualMagnitude) :
+    ProjectedBoundAt history resultEvent owner (some terms) .coefficient bound actualMagnitude :=
+  .resultExactCoefficient row derived
 
 theorem centeredNorm_eq_zero_mod {modulus : Nat} {value : Int}
     (modulusPositive : 0 < modulus) (normZero : centeredNorm modulus value = 0) :
@@ -1892,7 +1867,7 @@ def termContains (term : Term) (owner : Owner) : Prop := monomialContains term.m
 
 def eventContainsFactor (event : Event) (owner : Owner) : Prop :=
   match event with
-  | .resultExact _ terms _ | .invocationEndExact _ _ terms _ |
+  | .resultExact _ terms _ _ _ _ | .invocationEndExact _ _ terms _ |
       .preFoldPolynomial _ terms _ _ => ∃ term ∈ terms, termContains term owner
   | .appliedRelation _ sourceMonomial _ _ _ rule =>
       monomialContains sourceMonomial owner ∨ match rule with
@@ -1932,7 +1907,7 @@ def RelationApplicationAt (document : TallDocument) (history : EventHistory)
 
 def exactTermsAt? (history : EventHistory) (event : Nat) : Option (List Term) :=
   match TallSecurity0ABI.eventAt? history event with
-  | some (.resultExact _ terms _) | some (.invocationEndExact _ _ terms _) => some terms
+  | some (.resultExact _ terms _ _ _ _) | some (.invocationEndExact _ _ terms _) => some terms
   | _ => none
 
 def RelationCongruent (modulus : Nat) (history : EventHistory) (env : Env Owner)
@@ -1969,8 +1944,10 @@ inductive ReachedTerminalRule : BoundRule → Prop where
 structure ExactClaimAt (history : EventHistory) (modulus : Nat) (env : Env Owner)
     (event : Nat) (owner : Owner) (actual : Int) (rawTerms : List Term)
     (summary : Bound) : Prop where
-  row : (history.lookup event).map AnnotatedEvent.event =
-    some (.resultExact owner rawTerms summary)
+  row : ∃ coefficientBound coefficientProducer summaryProducer,
+    (history.lookup event).map AnnotatedEvent.event =
+      some (.resultExact owner rawTerms coefficientBound coefficientProducer summary
+        summaryProducer)
   claim : ValueClaim.Interprets modulus env actual
     (.exact (rawTerms.map Term.toExact) summary)
 
@@ -1979,15 +1956,18 @@ row and an explicit Rust-to-Lean congruence plus remainder bound. -/
 theorem exactFiniteClaimAt
     {history : EventHistory} {modulus resultEvent : Nat} {env : Env Owner}
     {owner : Owner} {rawTerms : List Term} {maximum : Nat} {actual remainder : Int}
-    {frameStart : Nat}
+    {frameStart coefficientProducer : Nat} {coefficientBound : Bound}
+    {summaryProducer : Option Nat}
     (row : history.lookup resultEvent = some
-      ⟨.resultExact owner rawTerms (.finite maximum), frameStart⟩)
+      ⟨.resultExact owner rawTerms coefficientBound coefficientProducer (.finite maximum)
+        summaryProducer, frameStart⟩)
     (congruence :
       (actual - evalPolynomial env (rawTerms.map Term.toExact)) % Int.ofNat modulus =
         remainder % Int.ofNat modulus)
     (remainderLe : centeredNorm modulus remainder ≤ maximum) :
     ExactClaimAt history modulus env resultEvent owner actual rawTerms (.finite maximum) := by
-  refine ⟨?_, exactValueClaim_of_remainder modulus env actual
+  refine ⟨⟨coefficientBound, coefficientProducer, summaryProducer, ?_⟩,
+    exactValueClaim_of_remainder modulus env actual
     (rawTerms.map Term.toExact) maximum remainder congruence remainderLe⟩
   rw [row]
   rfl
@@ -1996,11 +1976,11 @@ def TerminalExactAt (document : TallDocument) (history : EventHistory)
     (selector : Option Nat) (producer resultEvent : Nat) (owner : Owner)
     (rawTerms : List Term) : Prop :=
   producer + 1 = resultEvent ∧ ownerAtSelector document selector owner ∧
-    ∃ rule frameStart,
+    ∃ rule frameStart coefficientBound,
       ReachedTerminalRule rule ∧
         history.lookup producer = some ⟨.boundTransfer owner rule, frameStart⟩ ∧
         history.lookup resultEvent = some
-          ⟨.resultExact owner rawTerms .exactZero, frameStart⟩
+          ⟨.resultExact owner rawTerms coefficientBound producer .exactZero none, frameStart⟩
 
 /-- Honest primitive contracts and all reached relation congruences for one selector. -/
 structure Witness (document : TallDocument) (history : EventHistory) (selector : Option Nat)
@@ -2031,9 +2011,10 @@ def canonicalSelfClaim (owner : Owner) : ValueClaim Owner :=
   .exact [canonicalSelfTerm owner |>.toExact] .exactZero
 
 def exactResultAt (history : EventHistory) (resultEvent : Nat) (owner : Owner) : Prop :=
-  ∃ frameStart,
+  ∃ frameStart coefficientBound coefficientProducer,
     history.lookup resultEvent =
-      some ⟨.resultExact owner [canonicalSelfTerm owner] .exactZero, frameStart⟩
+      some ⟨.resultExact owner [canonicalSelfTerm owner] coefficientBound coefficientProducer
+        .exactZero none, frameStart⟩
 
 theorem terminalExactClaimAt {document : TallDocument} {history : EventHistory}
     {selector : Option Nat} {modulus producer resultEvent : Nat} {owner : Owner}
@@ -2043,7 +2024,8 @@ theorem terminalExactClaimAt {document : TallDocument} {history : EventHistory}
     ExactClaimAt history modulus witness.env resultEvent owner
       (witness.honestTerminalActual resultEvent) rawTerms .exactZero := by
   refine ⟨?_, 0, ?_, ?_⟩
-  · rcases terminal with ⟨_, _, rule, frameStart, _, _, resultAt⟩
+  · rcases terminal with ⟨_, _, rule, frameStart, coefficientBound, _, _, resultAt⟩
+    refine ⟨coefficientBound, producer, none, ?_⟩
     rw [resultAt]
     rfl
   · simpa using

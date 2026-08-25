@@ -34,12 +34,12 @@ def rootRelationRecords : List (Nat × AnnotatedEvent) :=
     ⟨.resultExact (p214 6790)
       [{ coefficient := 1
          monomial := { centralFactors := []
-                       orderedFactors := [p214 6790] } }] .exactZero, 0⟩),
+                       orderedFactors := [p214 6790] } }] .exactZero 0 .exactZero none, 0⟩),
    (6483,
     ⟨.resultExact (p214 7882)
       [{ coefficient := 1
          monomial := { centralFactors := []
-                       orderedFactors := [p214 7882] } }] .exactZero, 0⟩),
+                       orderedFactors := [p214 7882] } }] .exactZero 0 .exactZero none, 0⟩),
    (6512, ⟨.survivorFold 1 6511, 0⟩),
    (6513,
     ⟨.resultExact (p214 10368)
@@ -48,7 +48,8 @@ def rootRelationRecords : List (Nat × AnnotatedEvent) :=
                        orderedFactors := [p214 6770] } },
        { coefficient := -1
          monomial := { centralFactors := [p214 5519, p214 10365]
-                       orderedFactors := [p214 6544] } }] (.finite 26), 0⟩),
+                       orderedFactors := [p214 6544] } }] (.finite 26) 6511
+      (.finite 26) (some 6511), 0⟩),
    (6514,
     ⟨.predecessor rootRelationOwner 0 ⟨10368⟩ 6513, 0⟩),
    (6515,
@@ -89,7 +90,8 @@ def rootRelationRecords : List (Nat × AnnotatedEvent) :=
                        orderedFactors := [p214 6770, p214 7882] } },
        { coefficient := -1
          monomial := { centralFactors := [p214 5519, p214 10365]
-                       orderedFactors := [p214 6790] } }] (.finite 95420416), 0⟩)]
+                       orderedFactors := [p214 6790] } }] (.finite 95420416) 6522
+      (.finite 95420416) (some 6522), 0⟩)]
 
 def rootRelationLookup (event : Nat) : Option AnnotatedEvent :=
   (rootRelationRecords.find? (fun record => record.1 == event)).map Prod.snd
@@ -107,7 +109,8 @@ theorem rootRelationRecords_source_faithful :
                            orderedFactors := [p214 6770, p214 7882] } },
            { coefficient := -1
              monomial := { centralFactors := [p214 5519, p214 10365]
-                           orderedFactors := [p214 6790] } }] (.finite 95420416), 0⟩ := by
+                           orderedFactors := [p214 6790] } }] (.finite 95420416) 6522
+          (.finite 95420416) (some 6522), 0⟩ := by
   repeat' apply And.intro
   all_goals
     simp only [rootRelationLookup, rootRelationRecords, rootRelationEvent,
@@ -249,21 +252,24 @@ def frameRecords : List (Nat × AnnotatedEvent) :=
     ⟨.resultExact relationInput
       [{ coefficient := 1
          monomial := { centralFactors := []
-                       orderedFactors := [relationInput] } }] .exactZero, frameStart⟩),
+                       orderedFactors := [relationInput] } }] .exactZero 0 .exactZero none,
+      frameStart⟩),
    (relationTransferResult,
-    ⟨.resultExact (p214 25778) transferResultTerms .exactZero, frameStart⟩),
+    ⟨.resultExact (p214 25778) transferResultTerms .exactZero 0 .exactZero none,
+      frameStart⟩),
    (relationBaseResult,
-    ⟨.resultExact (p214 13465) baseResultTerms .exactZero, frameStart⟩),
+    ⟨.resultExact (p214 13465) baseResultTerms .exactZero 0 .exactZero none, frameStart⟩),
    (relationEvent,
     ⟨.appliedRelation relationOwner sourceMonomial (-1) 0 2
       (.gadget relationGadget relationDecomposition ⟨23424⟩ relationInputResult),
       frameStart⟩),
    (relationResult,
-    ⟨.resultExact relationOwner relationResultTerms .exactZero, frameStart⟩),
+    ⟨.resultExact relationOwner relationResultTerms .exactZero 0 .exactZero none, frameStart⟩),
    (rootIntermediateResult,
-    ⟨.resultExact (p214 17030) intermediateResultTerms .exactZero, frameStart⟩),
+    ⟨.resultExact (p214 17030) intermediateResultTerms .exactZero 0 .exactZero none,
+      frameStart⟩),
    (rootResult,
-    ⟨.resultExact frameOwner finalResultTerms .exactZero, frameStart⟩),
+    ⟨.resultExact frameOwner finalResultTerms .exactZero 0 .exactZero none, frameStart⟩),
    (preFoldEvent,
     ⟨.preFoldPolynomial rootResult finalResultTerms .exactZero none, frameStart⟩),
    (invocationEndEvent,
@@ -275,17 +281,17 @@ def frameLookup (event : Nat) : Option AnnotatedEvent :=
 
 def frameRelationTerms : List Term :=
   match frameLookup relationResult with
-  | some ⟨.resultExact _ terms _, _⟩ => terms
+  | some ⟨.resultExact _ terms _ _ _ _, _⟩ => terms
   | _ => []
 
 def frameBaseTerms : List Term :=
   match frameLookup relationBaseResult with
-  | some ⟨.resultExact _ terms _, _⟩ => terms
+  | some ⟨.resultExact _ terms _ _ _ _, _⟩ => terms
   | _ => []
 
 def frameTransferTerms : List Term :=
   match frameLookup relationTransferResult with
-  | some ⟨.resultExact _ terms _, _⟩ => terms
+  | some ⟨.resultExact _ terms _ _ _ _, _⟩ => terms
   | _ => []
 
 def frameRelationOwner : Owner :=
@@ -337,7 +343,7 @@ def frameRelationSourceKey : MonomialKey Owner := frameRelationSource.toKey
 
 def frameRootTerms : List Term :=
   match frameLookup rootResult with
-  | some ⟨.resultExact _ terms _, _⟩ => terms
+  | some ⟨.resultExact _ terms _ _ _ _, _⟩ => terms
   | _ => []
 
 def framePreFoldTerms : List Term :=
@@ -362,17 +368,21 @@ def frameEndSummary : Bound :=
 
 theorem frameRecords_source_faithful :
     frameLookup relationBaseResult =
-        some ⟨.resultExact (p214 13465) baseResultTerms .exactZero, frameStart⟩ ∧
+        some ⟨.resultExact (p214 13465) baseResultTerms .exactZero 0 .exactZero none,
+          frameStart⟩ ∧
       frameLookup relationTransferResult =
-        some ⟨.resultExact (p214 25778) transferResultTerms .exactZero, frameStart⟩ ∧
+        some ⟨.resultExact (p214 25778) transferResultTerms .exactZero 0 .exactZero none,
+          frameStart⟩ ∧
     frameLookup relationEvent =
         some ⟨.appliedRelation relationOwner sourceMonomial (-1) 0 2
           (.gadget relationGadget relationDecomposition ⟨23424⟩ relationInputResult),
           frameStart⟩ ∧
       frameLookup relationResult =
-        some ⟨.resultExact relationOwner relationResultTerms .exactZero, frameStart⟩ ∧
+        some ⟨.resultExact relationOwner relationResultTerms .exactZero 0 .exactZero none,
+          frameStart⟩ ∧
       frameLookup rootResult =
-        some ⟨.resultExact frameOwner finalResultTerms .exactZero, frameStart⟩ ∧
+        some ⟨.resultExact frameOwner finalResultTerms .exactZero 0 .exactZero none,
+          frameStart⟩ ∧
       frameLookup preFoldEvent =
         some ⟨.preFoldPolynomial rootResult finalResultTerms .exactZero none, frameStart⟩ ∧
       frameLookup invocationEndEvent =

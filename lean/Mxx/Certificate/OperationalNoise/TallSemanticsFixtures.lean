@@ -49,8 +49,10 @@ def sourceAtomDocument : TallDocument where
   residualRoot := .closed ⟨0⟩
 
 def sourceAtomHistory : EventHistory :=
-  smallHistory #[annotated
-    (.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner] .exactZero) 0]
+  smallHistory #[
+    annotated (.boundTransfer sourceAtomOwner (.sum [])) 0,
+    annotated (.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner]
+      .exactZero 0 .exactZero none) 0]
 
 def samplerAtomOwner : Owner := closedOwner 0
 
@@ -72,14 +74,17 @@ def samplerAtomDocument : TallDocument where
   residualRoot := .closed ⟨0⟩
 
 def samplerAtomHistory : EventHistory :=
-  smallHistory #[annotated
-    (.resultExact samplerAtomOwner [canonicalSelfTerm samplerAtomOwner] .exactZero) 0]
+  smallHistory #[
+    annotated (.boundTransfer samplerAtomOwner (.sum [])) 0,
+    annotated (.resultExact samplerAtomOwner [canonicalSelfTerm samplerAtomOwner]
+      .exactZero 0 .exactZero none) 0]
 
 def terminalAtomHistory : EventHistory :=
   smallHistory #[annotated
     (.boundTransfer sourceAtomOwner (.authority .factStore)) 0,
     annotated
-      (.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner] .exactZero) 0]
+      (.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner]
+        .exactZero 0 .exactZero none) 0]
 
 def boundFixtureOwner : Owner := closedOwner 0
 
@@ -87,46 +92,45 @@ def boundFixtureReference : ValueRef := .result 1 .coefficient
 
 def boundFixtureHistory : EventHistory :=
     smallHistory #[
+    annotated (.boundTransfer boundFixtureOwner (.sum [])) 7,
+    annotated (.resultExact boundFixtureOwner [] .exactZero 0 .exactZero none) 7,
     annotated (.boundTransfer boundFixtureOwner (.identity boundFixtureReference)) 7,
-    annotated (.resultCoefficient boundFixtureOwner (.finite 3)) 7]
+    annotated (.resultCoefficient boundFixtureOwner .exactZero) 7]
 
 theorem bound_identity_fixture :
-    BoundDerivedAt boundFixtureHistory 0 7 boundFixtureOwner
-      (.identity boundFixtureReference) (.finite ⟨3, by decide⟩) 3 := by
+    BoundDerivedAt boundFixtureHistory 2 7 boundFixtureOwner
+      (.identity boundFixtureReference) .exactZero 0 := by
   apply BoundDerivedAt.identity
   · rfl
-  · refine ⟨boundFixtureOwner, none, ?_⟩
-    exact .coefficient (frameStart := 7) (by decide)
-      (by simp [CoeffClass.Interprets])
+  · exact .result rfl (.resultExactCoefficient (rule := .sum []) (by rfl)
+      (.sum (by rfl) .nil))
 
 theorem bound_identity_projection_fixture :
-    ProjectedBoundAt boundFixtureHistory 1 boundFixtureOwner none .coefficient
-      (.finite ⟨3, by decide⟩) 3 := by
-  exact boundTransfer_to_resultCoefficient bound_identity_fixture (by rfl) (by rfl)
+    ProjectedBoundAt boundFixtureHistory 3 boundFixtureOwner none .coefficient
+      .exactZero 0 := by
+  exact .resultCoefficient rfl (by rfl) bound_identity_fixture
 
 def exactBoundFixtureTerms : List Term := [canonicalSelfTerm boundFixtureOwner]
 
 def exactBoundFixtureHistory : EventHistory :=
-  smallHistory #[annotated
-    (.resultExact boundFixtureOwner exactBoundFixtureTerms (.finite 4)) 7]
-
-theorem exact_summary_projection_fixture :
-    ProjectedBoundAt exactBoundFixtureHistory 0 boundFixtureOwner
-      (some exactBoundFixtureTerms) .summary (.finite ⟨4, by decide⟩) 3 := by
-  exact .summary (frameStart := 7) exactBoundFixtureTerms (by rfl)
-    (by simp [CoeffClass.Interprets])
+  smallHistory #[
+    annotated (.boundTransfer boundFixtureOwner (.sum [])) 7,
+    annotated (.resultExact boundFixtureOwner exactBoundFixtureTerms .exactZero 0
+      (.finite 4) (some 0)) 7]
 
 theorem exact_finite_claim_fixture :
-    ExactClaimAt exactBoundFixtureHistory 257 (fun _ => 0) 0 boundFixtureOwner 0
+    ExactClaimAt exactBoundFixtureHistory 257 (fun _ => 0) 1 boundFixtureOwner 0
       exactBoundFixtureTerms (.finite 4) := by
-  apply exactFiniteClaimAt (actual := 0) (remainder := 0) (maximum := 4) (frameStart := 7) (by rfl)
+  apply exactFiniteClaimAt (actual := 0) (remainder := 0) (maximum := 4) (frameStart := 7)
+    (coefficientProducer := 0) (coefficientBound := .exactZero)
+    (summaryProducer := some 0) (by rfl)
   · decide
   · simp [centeredNorm, centeredCoefficient]
 
 theorem terminal_atom_at :
     TerminalExactAt sourceAtomDocument terminalAtomHistory none 0 1 sourceAtomOwner
       [canonicalSelfTerm sourceAtomOwner] := by
-  refine ⟨rfl, rfl, .authority .factStore, 0, ?_, rfl, rfl⟩
+  refine ⟨rfl, rfl, .authority .factStore, 0, .exactZero, ?_, rfl, rfl⟩
   exact ReachedTerminalRule.authorityFactStore
 
 theorem terminal_exact_claim_fixture
@@ -138,12 +142,13 @@ theorem terminal_exact_claim_fixture
 theorem source_atom_fixture
     (witness : Witness sourceAtomDocument sourceAtomHistory none 257) :
   DerivedResult sourceAtomDocument sourceAtomHistory none 257 witness
-      sourceAtomOwner 0 := by
+      sourceAtomOwner 1 := by
   apply ValueDerived.sourceAtom ⟨0⟩
-  · refine ⟨0, ?_⟩
+  · refine ⟨0, .exactZero, 0, ?_⟩
     rfl
   · refine ⟨?_, ?_, ?_⟩
-    · refine ⟨⟨.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner] .exactZero, 0⟩,
+    · refine ⟨⟨.resultExact sourceAtomOwner [canonicalSelfTerm sourceAtomOwner]
+          .exactZero 0 .exactZero none, 0⟩,
         ?_, ?_⟩
       · rfl
       · exact ⟨canonicalSelfTerm sourceAtomOwner,
@@ -166,12 +171,13 @@ theorem source_atom_interprets
 theorem sampler_atom_fixture
     (witness : Witness samplerAtomDocument samplerAtomHistory none 257) :
   DerivedResult samplerAtomDocument samplerAtomHistory none 257 witness
-      samplerAtomOwner 0 := by
+      samplerAtomOwner 1 := by
   apply ValueDerived.samplerAtom ⟨0⟩
-  · refine ⟨0, ?_⟩
+  · refine ⟨0, .exactZero, 0, ?_⟩
     rfl
   · refine ⟨?_, ?_, ?_⟩
-    · refine ⟨⟨.resultExact samplerAtomOwner [canonicalSelfTerm samplerAtomOwner] .exactZero, 0⟩,
+    · refine ⟨⟨.resultExact samplerAtomOwner [canonicalSelfTerm samplerAtomOwner]
+          .exactZero 0 .exactZero none, 0⟩,
         ?_, ?_⟩
       · rfl
       · exact ⟨canonicalSelfTerm samplerAtomOwner,
@@ -363,8 +369,8 @@ theorem canonical_relation_fixture :
 #print axioms bound_identity_fixture
 #print axioms bound_identity_projection_fixture
 #print axioms TallSemantics.boundTransfer_to_resultCoefficient
+#print axioms TallSemantics.ProjectedBoundAt.sound
 #print axioms TallSemantics.BoundDerivedAt.sound
-#print axioms exact_summary_projection_fixture
 #print axioms exact_finite_claim_fixture
 #print axioms TallSemantics.coeffClassInterprets_to_boundInterprets
 #print axioms TallSemantics.addKnownList_sound

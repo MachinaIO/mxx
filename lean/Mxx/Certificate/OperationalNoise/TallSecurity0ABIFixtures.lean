@@ -242,28 +242,30 @@ def fixtureDispatch : UniversalDispatch := ⟨⟨0⟩, ⟨2⟩, ⟨3⟩⟩
 def fixtureEvents : List Event :=
   [ .invocationStart (closedOwner 0),
     .invocationStart (closedOwner 1),
-    .resultExact (closedOwner 1) [singletonTerm 1] .exactZero,
-    .preFoldPolynomial 2 [singletonTerm 1] .exactZero none,
-    .invocationEndExact (closedOwner 1) 3 [singletonTerm 1] .exactZero,
-    .specializationComputed (closedOwner 0) fixtureDispatch ⟨1, 5⟩,
+    .boundTransfer (closedOwner 1) (.authority .operator),
+    .resultExact (closedOwner 1) [singletonTerm 1] .exactZero 2 .exactZero none,
+    .preFoldPolynomial 3 [singletonTerm 1] .exactZero none,
+    .invocationEndExact (closedOwner 1) 4 [singletonTerm 1] .exactZero,
+    .specializationComputed (closedOwner 0) fixtureDispatch ⟨1, 6⟩,
     .appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
-      (.universal 5 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 4),
+      (.universal 6 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 5),
     .coefficientMerge
-      ⟨closedOwner 0, .relation 6 0, singletonMonomial 1, 1⟩,
-    .resultExact (closedOwner 2) [singletonTerm 2] (.finite 1),
-    .predecessor (closedOwner 0) 0 ⟨2⟩ 8,
-    .boundTransfer (closedOwner 0) (.identity (.predecessor 0 9 .coefficient)),
-    .predecessor (closedOwner 3) 0 ⟨2⟩ 8,
-    .boundTransfer (closedOwner 3) (.identity (.predecessor 0 11 .coefficient)),
-    .predecessor (closedOwner 0) 17 ⟨2⟩ 8,
-    .boundTransfer (closedOwner 0) (.identity (.predecessor 17 13 .coefficient)),
+      ⟨closedOwner 0, .relation 7 0, singletonMonomial 1, 1⟩,
+    .boundTransfer (closedOwner 2) (.authority .operator),
+    .resultExact (closedOwner 2) [singletonTerm 2] (.finite 1) 9 (.finite 1) (some 9),
+    .predecessor (closedOwner 0) 0 ⟨2⟩ 10,
+    .boundTransfer (closedOwner 0) (.identity (.predecessor 0 11 .coefficient)),
+    .predecessor (closedOwner 3) 0 ⟨2⟩ 10,
+    .boundTransfer (closedOwner 3) (.identity (.predecessor 0 13 .coefficient)),
+    .predecessor (closedOwner 0) 17 ⟨2⟩ 10,
+    .boundTransfer (closedOwner 0) (.identity (.predecessor 17 15 .coefficient)),
     .coefficientMerge
-      ⟨closedOwner 0, .operator (⟨8, 0⟩, ⟨8, 0⟩), singletonMonomial 2, 1⟩,
+      ⟨closedOwner 0, .operator (⟨10, 0⟩, ⟨10, 0⟩), singletonMonomial 2, 1⟩,
     .boundTransfer (closedOwner 0) (.authority (.relationPreimageSource ⟨2⟩)),
-    .survivorFold 1 16,
-    .resultExact (closedOwner 0) [] (.finite 1),
-    .preFoldPolynomial 18 [] (.finite 1) (some (.result 18 .summary)),
-    .invocationEndExact (closedOwner 0) 19 [] (.finite 1) ]
+    .survivorFold 1 18,
+    .resultExact (closedOwner 0) [] (.finite 1) 18 (.finite 1) (some 18),
+    .preFoldPolynomial 20 [] (.finite 1) (some (.result 20 .summary)),
+    .invocationEndExact (closedOwner 0) 21 [] (.finite 1) ]
 
 def annotateEvents (events : List Event) (frameStarts : List Nat) : Array AnnotatedEvent :=
   (List.zipWith (fun event frameStart => ⟨event, frameStart⟩) events frameStarts).toArray
@@ -279,8 +281,8 @@ def smallHistory (events : Array AnnotatedEvent) : EventHistory where
 def annotated (event : Event) (frameStart : Nat) : AnnotatedEvent :=
   ⟨event, frameStart⟩
 
-def fixtureFrameStarts : List Nat := [0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0]
+def fixtureFrameStarts : List Nat := [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0]
 
 def fixtureHistory : EventHistory :=
   smallHistory (annotateEvents fixtureEvents fixtureFrameStarts)
@@ -289,18 +291,19 @@ def fixtureFinalState : ReplayState := ⟨fixtureEvents.length, []⟩
 
 def fixtureState1 : ReplayState := ⟨1, [⟨closedOwner 0, 0⟩]⟩
 
-def fixtureState5 : ReplayState := ⟨5, [⟨closedOwner 0, 0⟩]⟩
+def fixtureState5 : ReplayState :=
+  ⟨5, [⟨closedOwner 1, 1⟩, ⟨closedOwner 0, 0⟩]⟩
 
-def fixtureState14 : ReplayState := ⟨14, [⟨closedOwner 0, 0⟩]⟩
+def fixtureState14 : ReplayState := ⟨16, [⟨closedOwner 0, 0⟩]⟩
 
-def fixtureState18 : ReplayState := ⟨18, [⟨closedOwner 0, 0⟩]⟩
+def fixtureState18 : ReplayState := ⟨20, [⟨closedOwner 0, 0⟩]⟩
 
 theorem fixture_four_mixed_lifecycle_and_prior_refs :
     replayRange fixtureDocument fixtureHistory 5 fixtureState1 = some fixtureState5 := by
   rfl
 
 theorem fixture_four_crosses_leaf_boundary :
-    replayRange fixtureDocument fixtureHistory 18 fixtureState14 = some fixtureState18 := by
+    replayRange fixtureDocument fixtureHistory 20 fixtureState14 = some fixtureState18 := by
   rfl
 
 theorem fixture_replay :
@@ -308,7 +311,7 @@ theorem fixture_replay :
   .trans (.chunk 4 (by rfl))
     (.trans (.chunk 8 (by rfl))
       (.trans (.chunk 12 (by rfl))
-        (.trans (.chunk 16 (by rfl)) (.trans (.chunk 20 (by rfl)) (.chunk 21 (by rfl))))))
+        (.trans (.chunk 16 (by rfl)) (.trans (.chunk 20 (by rfl)) (.chunk 23 (by rfl))))))
 
 theorem fixture_valid : Valid fixtureDocument fixtureHistory :=
   ⟨by decide, fixtureFinalState, fixture_replay, rfl, rfl⟩
@@ -320,7 +323,7 @@ theorem dangling_survivor_rejected :
 theorem end_without_prefold_rejected :
     replay fixtureDocument (smallHistory
       [ ⟨.invocationStart (closedOwner 0), 0⟩,
-        ⟨.resultExact (closedOwner 0) [] .exactZero, 0⟩,
+        ⟨.resultExact (closedOwner 0) [] .exactZero 0 .exactZero none, 0⟩,
         ⟨.invocationEndExact (closedOwner 0) 1 [] .exactZero, 0⟩ ].toArray) = none := by
   decide
 
@@ -346,7 +349,7 @@ theorem stale_relation_merge_rejected :
 
 theorem stale_summary_evidence_rejected :
     let history := smallHistory (repeatedStart ++
-      [annotated (.resultExact (closedOwner 0) [] (.finite 1)) 21,
+      [annotated (.resultExact (closedOwner 0) [] (.finite 1) 0 (.finite 1) (some 0)) 21,
         annotated (.preFoldPolynomial 22 [] (.finite 1) (some (.result 18 .summary))) 21]).toArray
     replayRange fixtureDocument history history.size repeatedState = none := by
   decide
@@ -367,7 +370,7 @@ theorem repeated_invocation_rejects_stale_references :
         (.coefficientMerge ⟨closedOwner 0, .relation 6 0, singletonMonomial 1, 1⟩) 21]).toArray
       replayRange fixtureDocument history history.size repeatedState = none) ∧
       (let history := smallHistory (repeatedStart ++
-        [annotated (.resultExact (closedOwner 0) [] (.finite 1)) 21,
+        [annotated (.resultExact (closedOwner 0) [] (.finite 1) 0 (.finite 1) (some 0)) 21,
           annotated (.preFoldPolynomial 22 [] (.finite 1) (some (.result 18 .summary))) 21]).toArray
       replayRange fixtureDocument history history.size repeatedState = none) ∧
       (let history := smallHistory
@@ -380,23 +383,26 @@ def multipleRhsEvents : List Event :=
   [ .invocationStart (closedOwner 0),
     .invocationStart (closedOwner 1),
     .invocationStart (closedOwner 2),
-    .resultExact (closedOwner 2) [singletonTerm 2] .exactZero,
-    .preFoldPolynomial 3 [singletonTerm 2] .exactZero none,
-    .invocationEndExact (closedOwner 2) 4 [singletonTerm 2] .exactZero,
-    .resultExact (closedOwner 1) [singletonTerm 1] .exactZero,
-    .preFoldPolynomial 6 [singletonTerm 1] .exactZero none,
-    .invocationEndExact (closedOwner 1) 7 [singletonTerm 1] .exactZero,
-    .specializationComputed (closedOwner 3) fixtureDispatch ⟨1, 9⟩,
+    .boundTransfer (closedOwner 2) (.authority .operator),
+    .resultExact (closedOwner 2) [singletonTerm 2] .exactZero 3 .exactZero none,
+    .preFoldPolynomial 4 [singletonTerm 2] .exactZero none,
+    .invocationEndExact (closedOwner 2) 5 [singletonTerm 2] .exactZero,
+    .boundTransfer (closedOwner 1) (.authority .operator),
+    .resultExact (closedOwner 1) [singletonTerm 1] .exactZero 7 .exactZero none,
+    .preFoldPolynomial 8 [singletonTerm 1] .exactZero none,
+    .invocationEndExact (closedOwner 1) 9 [singletonTerm 1] .exactZero,
+    .specializationComputed (closedOwner 3) fixtureDispatch ⟨1, 11⟩,
     .appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
-      (.universal 9 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 5),
+      (.universal 11 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 6),
     .coefficientMerge
-      ⟨closedOwner 0, .relation 10 0, singletonMonomial 1, 1⟩,
-    .resultExact (closedOwner 0) [] .exactZero,
-    .preFoldPolynomial 12 [] .exactZero none,
-    .invocationEndExact (closedOwner 0) 13 [] .exactZero ]
+      ⟨closedOwner 0, .relation 12 0, singletonMonomial 1, 1⟩,
+    .boundTransfer (closedOwner 0) (.authority .operator),
+    .resultExact (closedOwner 0) [] .exactZero 14 .exactZero none,
+    .preFoldPolynomial 15 [] .exactZero none,
+    .invocationEndExact (closedOwner 0) 16 [] .exactZero ]
 
-def multipleRhsFrameStarts : List Nat := [0, 1, 2, 2, 2, 2, 1, 1, 1, 0, 0, 0, 0, 0,
-  0]
+def multipleRhsFrameStarts : List Nat := [0, 1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0,
+  0, 0, 0, 0]
 
 def multipleRhsHistory : EventHistory :=
   smallHistory (annotateEvents multipleRhsEvents multipleRhsFrameStarts)
@@ -407,34 +413,39 @@ def multipleRhsFinalState : ReplayState :=
 theorem in_range_nonfinal_rhs_accepted :
     ReplayChain fixtureDocument multipleRhsHistory initialState multipleRhsFinalState :=
   .trans (.chunk 4 (by rfl))
-    (.trans (.chunk 8 (by rfl)) (.trans (.chunk 12 (by rfl)) (.chunk 15 (by rfl))))
+    (.trans (.chunk 8 (by rfl)) (.trans (.chunk 12 (by rfl))
+      (.trans (.chunk 16 (by rfl)) (.chunk 18 (by rfl)))))
 
 def multipleRhsBeforeComputed : ReplayState :=
-  ⟨9, [⟨closedOwner 0, 0⟩]⟩
+  ⟨11, [⟨closedOwner 0, 0⟩]⟩
 
 theorem nested_invocation_range_fixture :
-    specializationRangeValid multipleRhsHistory multipleRhsBeforeComputed ⟨1, 9⟩ = true ∧
-      completedInvocationInRange multipleRhsHistory ⟨1, 9⟩ 5 = some (closedOwner 2) := by
+    specializationRangeValid multipleRhsHistory multipleRhsBeforeComputed ⟨1, 11⟩ = true ∧
+      completedInvocationInRange multipleRhsHistory ⟨1, 11⟩ 6 = some (closedOwner 2) := by
   decide
 
 def siblingEvents : List Event :=
   [ .invocationStart (closedOwner 0),
     .invocationStart (closedOwner 1),
-    .resultExact (closedOwner 1) [singletonTerm 1] .exactZero,
-    .preFoldPolynomial 2 [singletonTerm 1] .exactZero none,
-    .invocationEndExact (closedOwner 1) 3 [singletonTerm 1] .exactZero,
+    .boundTransfer (closedOwner 1) (.authority .operator),
+    .resultExact (closedOwner 1) [singletonTerm 1] .exactZero 2 .exactZero none,
+    .preFoldPolynomial 3 [singletonTerm 1] .exactZero none,
+    .invocationEndExact (closedOwner 1) 4 [singletonTerm 1] .exactZero,
     .invocationStart (closedOwner 2),
-    .resultExact (closedOwner 2) [singletonTerm 2] .exactZero,
-    .preFoldPolynomial 6 [singletonTerm 2] .exactZero none,
-    .invocationEndExact (closedOwner 2) 7 [singletonTerm 2] .exactZero,
-    .specializationComputed (closedOwner 3) fixtureDispatch ⟨1, 9⟩,
+    .boundTransfer (closedOwner 2) (.authority .operator),
+    .resultExact (closedOwner 2) [singletonTerm 2] .exactZero 7 .exactZero none,
+    .preFoldPolynomial 8 [singletonTerm 2] .exactZero none,
+    .invocationEndExact (closedOwner 2) 9 [singletonTerm 2] .exactZero,
+    .specializationComputed (closedOwner 3) fixtureDispatch ⟨1, 11⟩,
     .appliedRelation (closedOwner 0) ⟨[], [closedOwner 2, closedOwner 3]⟩ 1 0 2
-      (.universal 9 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 8),
-    .resultExact (closedOwner 0) [] .exactZero,
-    .preFoldPolynomial 11 [] .exactZero none,
-    .invocationEndExact (closedOwner 0) 12 [] .exactZero ]
+      (.universal 11 ⟨[], [closedOwner 2, closedOwner 3]⟩ none 10),
+    .boundTransfer (closedOwner 0) (.authority .operator),
+    .resultExact (closedOwner 0) [] .exactZero 13 .exactZero none,
+    .preFoldPolynomial 14 [] .exactZero none,
+    .invocationEndExact (closedOwner 0) 15 [] .exactZero ]
 
-def siblingFrameStarts : List Nat := [0, 1, 1, 1, 1, 5, 5, 5, 5, 0, 0, 0, 0, 0]
+def siblingFrameStarts : List Nat := [0, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 0, 0, 0,
+  0, 0, 0]
 
 def siblingHistory : EventHistory :=
   smallHistory (annotateEvents siblingEvents siblingFrameStarts)
@@ -444,13 +455,14 @@ def siblingFinalState : ReplayState := ⟨siblingEvents.length, []⟩
 theorem sibling_specialization_and_rhs_accepted :
     ReplayChain fixtureDocument siblingHistory initialState siblingFinalState :=
   .trans (.chunk 4 (by rfl))
-    (.trans (.chunk 8 (by rfl)) (.trans (.chunk 12 (by rfl)) (.chunk 14 (by rfl))))
+    (.trans (.chunk 8 (by rfl)) (.trans (.chunk 12 (by rfl))
+      (.trans (.chunk 16 (by rfl)) (.chunk 17 (by rfl)))))
 
 def mismatchedInvocationHistory : EventHistory :=
   smallHistory (annotateEvents
     [ .invocationStart (closedOwner 0),
       .invocationStart (closedOwner 1),
-      .resultExact (closedOwner 1) [] .exactZero,
+      .resultExact (closedOwner 1) [] .exactZero 0 .exactZero none,
       .preFoldPolynomial 2 [] .exactZero none,
       .invocationEndExact (closedOwner 2) 3 [] .exactZero ]
     [0, 1, 1, 1, 1])
@@ -493,7 +505,7 @@ theorem wrong_nested_annotation_rejected :
 def nestedLinkPrefix : List Event :=
   [ .invocationStart (closedOwner 0),
     .invocationStart (closedOwner 1),
-    .resultExact (closedOwner 1) [singletonTerm 1] .exactZero,
+    .resultExact (closedOwner 1) [singletonTerm 1] .exactZero 0 .exactZero none,
     .preFoldPolynomial 2 [singletonTerm 1] .exactZero none,
     .invocationEndExact (closedOwner 1) 3 [singletonTerm 1] .exactZero ]
 

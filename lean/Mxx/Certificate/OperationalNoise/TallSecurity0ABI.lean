@@ -195,7 +195,9 @@ inductive Event where
   | invocationStart (root : Owner)
   | predecessor (consumer : Owner) (inputPosition : Nat) (predecessor : ExpressionRef)
       (sourceResult : Nat)
-  | resultExact (owner : Owner) (terms : List Term) (summary : Bound)
+  | resultExact (owner : Owner) (terms : List Term)
+      (coefficientBound : Bound) (coefficientProducer : Nat)
+      (summary : Bound) (summaryProducer : Option Nat)
   | resultCoefficient (owner : Owner) (bound : Bound)
   | invocationEndExact (root : Owner) (preFoldEvent : Nat) (terms : List Term) (summary : Bound)
   | specializationComputed (owner : Owner) (dispatch : UniversalDispatch) (source : EventRange)
@@ -306,7 +308,7 @@ def completedInvocationInRange (history : EventHistory) (range : EventRange)
   else none
 
 def resultOwner? : Event → Option Owner
-  | .resultExact owner _ _ | .resultCoefficient owner _ => some owner
+  | .resultExact owner _ _ _ _ _ | .resultCoefficient owner _ => some owner
   | _ => none
 
 def transferOwner? : Event → Option Owner
@@ -319,7 +321,8 @@ def relationOwner? : Event → Option Owner
   | _ => none
 
 def projectionAvailable : Event → Projection → Bool
-  | .resultExact _ _ summary, .coefficient => decide (summary ≠ .missing)
+  | .resultExact _ _ coefficientBound _ _ _, .coefficient =>
+      decide (coefficientBound ≠ .missing)
   | .resultExact .., .summary => true
   | .resultCoefficient _ bound, .coefficient => decide (bound ≠ .missing)
   | _, _ => false
@@ -330,7 +333,7 @@ def termExists (terms : List Term) (ordinal : Nat) : Bool :=
 def exactTermExists (history : EventHistory) (state : ReplayState)
     (event ordinal : Nat) : Bool :=
   prior state event && match eventAt? history event with
-    | some (.resultExact _ terms _) | some (.invocationEndExact _ _ terms _) =>
+    | some (.resultExact _ terms _ _ _ _) | some (.invocationEndExact _ _ terms _) =>
         termExists terms ordinal
     | _ => false
 
@@ -413,7 +416,7 @@ def termRefValid (history : EventHistory) (state : ReplayState)
     (reference : TermRef) : Bool :=
   prior state reference.valueEvent &&
     match eventAt? history reference.valueEvent with
-    | some (.resultExact _ terms _) => termExists terms reference.termOrdinal
+    | some (.resultExact _ terms _ _ _ _) => termExists terms reference.termOrdinal
     | _ => false
 
 def termRefOwnerLocal (history : EventHistory) (state : ReplayState) (owner : Owner)
@@ -437,6 +440,19 @@ def summaryEvidenceValid (history : EventHistory) (state : ReplayState) (frame :
           | none => false
       | none => false
   | _ => false
+
+def boundProducerValid (history : EventHistory) (state : ReplayState) (owner : Owner)
+    (producer : Nat) : Bool :=
+  sameFrame history state owner producer && match eventAt? history producer with
+    | some (.boundTransfer producerOwner _) => decide (producerOwner = owner)
+    | _ => false
+
+def summaryProducerValid (history : EventHistory) (state : ReplayState) (owner : Owner) :
+    Bound → Option Nat → Bool
+  | .exactZero, none => true
+  | .finite _, some producer | .large, some producer =>
+      boundProducerValid history state owner producer
+  | _, _ => false
 
 def append (state : ReplayState) (frames : List Frame) : ReplayState :=
   ⟨state.cursor + 1, frames⟩
@@ -471,9 +487,12 @@ def stepAt (document : TallDocument) (history : EventHistory) (state : ReplaySta
       then
         accept state.frames
       else none
-  | .resultExact owner terms _ =>
+  | .resultExact owner terms coefficientBound coefficientProducer summary summaryProducer =>
       if currentScope state owner && ownerValid document owner &&
-          terms.all (fun term => monomialValid document term.monomial) then
+          terms.all (fun term => monomialValid document term.monomial) &&
+          decide (coefficientBound ≠ .missing) &&
+          boundProducerValid history state owner coefficientProducer &&
+          summaryProducerValid history state owner summary summaryProducer then
         accept state.frames
       else none
   | .resultCoefficient owner _ =>
@@ -540,7 +559,7 @@ def stepAt (document : TallDocument) (history : EventHistory) (state : ReplaySta
           if terms.all (fun term => monomialValid document term.monomial) &&
               sameFrame history state frame.root resultEvent &&
               (match eventAt? history resultEvent with
-              | some (.resultExact owner _ _) => decide (owner = frame.root)
+              | some (.resultExact owner _ _ _ _ _) => decide (owner = frame.root)
               | _ => false) && summaryEvidenceValid history state frame evidence
           then accept state.frames else none
   | .survivorFold _ bound =>

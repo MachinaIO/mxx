@@ -2317,6 +2317,25 @@ fn render_operation(source: &mut String, operation: &OperationProbe, modulus: &s
         OperationKind::Subtract => {
             source.push_str("\ntheorem resultAgreement : CanonicalAgreement output (subtract left right) := by\n  decide +kernel\n");
             source.push_str("\ntheorem resultSound (env : Env Owner) :\n    evalPolynomial env output = evalPolynomial env left - evalPolynomial env right := by\n  exact subCanonicalResultSound env left right output resultAgreement\n\n");
+            let left_summary = summary_text(&left.summary);
+            let output_summary = summary_text(&operation.output.summary);
+            let right_is_exact_zero = matches!(
+                right.summary.coefficient_bound(),
+                crate::operational_noise::facts::NumericContract::Known(
+                    crate::operational_noise::facts::CoefficientBound::ExactZero
+                )
+            );
+            if left_summary == output_summary &&
+                left_summary.starts_with("(.finite ") &&
+                right_is_exact_zero
+            {
+                let maximum = summary_bound_nat_text(&left.summary);
+                writeln!(
+                    source,
+                    "theorem resultClaimSound (env : Env Owner) (leftActual rightActual : Int)\n    (leftClaim : ValueClaim.Interprets {modulus} env leftActual (.exact left leftSummary))\n    (rightClaim : ValueClaim.Interprets {modulus} env rightActual (.exact right rightSummary)) :\n    ValueClaim.Interprets {modulus} env (leftActual - rightActual) (.exact output outputSummary) := by\n  have result := exactValueClaim_sub_of_mod_zero {modulus} env leftActual rightActual\n    left right output {maximum}\n    (by simpa [leftSummary] using leftClaim)\n    (exactClaim_mod_zero {modulus} env rightActual right\n      (by simpa [rightSummary] using rightClaim) (by decide))\n    (resultSound env)\n  simpa [outputSummary] using result\n"
+                )
+                .expect("String write");
+            }
         }
         OperationKind::Multiply | OperationKind::Tensor => {
             writeln!(
@@ -2778,11 +2797,7 @@ fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection], modulus: &
         }
         "bound-fold-result" => {
             if let Some(selection) = selected {
-                render_bound(
-                    &mut source,
-                    selection.bound.as_ref().expect("bound probe"),
-                    modulus,
-                );
+                render_bound(&mut source, selection.bound.as_ref().expect("bound probe"), modulus);
                 render_bound_bindings(&mut source, selection.bound.as_ref().expect("bound probe"));
             }
         }

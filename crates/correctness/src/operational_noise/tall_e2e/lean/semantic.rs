@@ -1643,6 +1643,10 @@ pub(super) fn render(
         "SemanticProbeStatistics.json",
         String::from_utf8(report_bytes).expect("JSON is UTF-8"),
     )];
+    files.push(generated_file(
+        "Semantic/SemanticRightRoot.lean",
+        render_right_root(statement, &index, &modulus)?,
+    ));
 
     let specs = [
         ("Semantic/Semantic000.lean", "Semantic000", "long-monomial-merge"),
@@ -1698,6 +1702,7 @@ pub(super) fn render(
         serde_json::to_string(&aggregate_report).expect("JSON is UTF-8"),
     ));
     let mut index = String::new();
+    index.push_str("import Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Semantic.SemanticRightRoot\n");
     for (_, module, _) in specs {
         writeln!(index, "import {NAMESPACE}.Semantic.{module}").expect("String write");
     }
@@ -2805,6 +2810,50 @@ fn render_probe(module: &str, probe: &str, probes: &[ProbeSelection], modulus: &
     }
     source.push_str(&format!("end {NAMESPACE}.Semantic.{module}\n"));
     source
+}
+
+fn render_right_root(
+    statement: &CertificateDocumentV1,
+    index: &PayloadIndex,
+    modulus: &str,
+) -> Result<String, String> {
+    const RIGHT_ROOT_EVENT: u64 = 6275;
+    let result = index.by_event.get(&RIGHT_ROOT_EVENT).ok_or_else(|| {
+        format!("Security0 right exact-zero root Result {RIGHT_ROOT_EVENT} is missing")
+    })?;
+    let operation = op_probe(statement, index, result, OperationKind::Subtract)?;
+    if operation.output_event != RIGHT_ROOT_EVENT {
+        return Err(format!(
+            "right exact-zero root probe selected Result {}, expected {RIGHT_ROOT_EVENT}",
+            operation.output_event
+        ));
+    }
+    if !matches!(
+        result.summary.coefficient_bound(),
+        crate::operational_noise::facts::NumericContract::Known(
+            crate::operational_noise::facts::CoefficientBound::ExactZero
+        )
+    ) {
+        return Err(format!("right exact-zero root Result {RIGHT_ROOT_EVENT} is not exact-zero"));
+    }
+    let mut source = format!(
+        "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.SemanticRightRoot\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n"
+    );
+    writeln!(source, "def selectedEvent : Nat := {RIGHT_ROOT_EVENT}").expect("String write");
+    writeln!(source, "def selectedOwner : Owner := {}", owner_text(result.owner))
+        .expect("String write");
+    render_operation(&mut source, &operation, modulus);
+    render_operation_bindings(&mut source, &operation);
+    source.push_str(
+        "\n/-- The generated theorem application for the reached right exact-zero root. -/\n",
+    );
+    writeln!(
+        source,
+        "theorem rightRootClaimSound (env : Env Owner) (leftActual rightActual : Int)\n    (leftClaim : ValueClaim.Interprets {modulus} env leftActual (.exact left leftSummary))\n    (rightClaim : ValueClaim.Interprets {modulus} env rightActual (.exact right rightSummary)) :\n    ValueClaim.Interprets {modulus} env (leftActual - rightActual) (.exact output outputSummary) := by\n  exact exactValueClaim_sub_exactZero_of_mod_zero {modulus} env leftActual rightActual\n    left right output\n    (by simpa [leftSummary] using leftClaim)\n    (by simpa [rightSummary] using rightClaim)\n    (resultSound env)\n    (by decide)"
+    )
+    .expect("String write");
+    source.push_str(&format!("\n\nend {NAMESPACE}.Semantic.SemanticRightRoot\n"));
+    Ok(source)
 }
 
 #[cfg(test)]

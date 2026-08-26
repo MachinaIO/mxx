@@ -3076,16 +3076,18 @@ structure Witness (document : TallDocument) (history : EventHistory) (selector :
 
 /-- The reached finite Multiply uses the exact coefficient projection of its exact-zero right
     child to connect replayed coefficient magnitude to the semantic value.  The separate summary
-    Product derivation fixes the conservative factor and both finite classes recorded by Rust. -/
+    transfer may be a monomial fold rather than that Result's coefficient producer, so its finite
+    maximum is kept distinct and must conservatively cover the coefficient maximum. -/
 theorem operatorProductFiniteMergeClaimAt
     {document : TallDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
     {witness : Witness document history selector modulus}
-    {frameStart coefficientTransfer summaryTransfer rightCoefficientTransfer resultEvent : Nat}
+    {frameStart coefficientTransfer summaryTransfer rightCoefficientProducer rightSummaryTransfer
+      resultEvent : Nat}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
     {leftExpression rightExpression : ExpressionRef}
     {leftActual rightActual : Int} {leftRaw rightRaw outputRaw : List Term}
-    {leftMaximum rightMaximum : { value : Nat // 0 < value }}
+    {leftMaximum rightCoefficientMaximum rightSummaryMaximum : { value : Nat // 0 < value }}
     {leftScalar rightScalar : Bool} {base : Polynomial Owner}
     {valueType : ValueType} {coefficientBound rightCoefficientBound : Bound}
     {coefficientFacts summaryFacts : TallSecurity0ABI.ProductFacts}
@@ -3108,27 +3110,29 @@ theorem operatorProductFiniteMergeClaimAt
     (rightClaim : ExactClaimAt history modulus witness.env rightResult rightOwner rightActual
       rightRaw .exactZero)
     (_rightResultAt : history.lookup rightResult = some
-      ⟨.resultExact rightOwner rightRaw rightCoefficientBound rightCoefficientTransfer
+      ⟨.resultExact rightOwner rightRaw rightCoefficientBound rightCoefficientProducer
         .exactZero none, frameStart⟩)
     (rightProjection : ProjectedBoundAt history rightResult rightOwner (some rightRaw)
-      .coefficient (.finite rightMaximum) rightMagnitude)
+      .coefficient (.finite rightCoefficientMaximum) rightMagnitude)
+    (rightMaximumLe : rightCoefficientMaximum.val ≤ rightSummaryMaximum.val)
     (reconstruction : MergeReconstructionAt history frameStart owner
       (.operator leftResult rightResult) base (outputRaw.map Term.toExact))
     (productAgreement : CanonicalAgreement (add base reconstruction.deltas)
       (productPoly (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
         leftScalar rightScalar))
     (_summaryDerived : BoundDerivedAt history summaryTransfer frameStart owner
-      (.product (.result leftResult .summary) (.transfer rightCoefficientTransfer) summaryFacts)
-      (productWithFactor factor (.finite leftMaximum) (.finite rightMaximum)) summaryMagnitude)
+      (.product (.result leftResult .summary) (.transfer rightSummaryTransfer) summaryFacts)
+      (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum))
+      summaryMagnitude)
     (resultAt : history.lookup resultEvent = some
       ⟨.resultExact owner outputRaw coefficientBound coefficientTransfer
         (coeffClassToTallBound
-          (productWithFactor factor (.finite leftMaximum) (.finite rightMaximum)))
+          (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum)))
         (some summaryTransfer), frameStart⟩)
     (factorPositive : 0 < factor) (modulusPositive : 0 < modulus) :
     ExactClaimAt history modulus witness.env resultEvent owner (leftActual * rightActual) outputRaw
       (coeffClassToTallBound
-        (productWithFactor factor (.finite leftMaximum) (.finite rightMaximum))) := by
+        (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum))) := by
   have operationEval := productCanonicalResultSound witness.env
     (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
     (add base reconstruction.deltas) leftScalar rightScalar productAgreement
@@ -3137,13 +3141,15 @@ theorem operatorProductFiniteMergeClaimAt
         evalPolynomial witness.env (rightRaw.map Term.toExact) :=
     (canonicalAgreement_eval witness.env _ _ reconstruction.agreement).trans operationEval
   have rightMagnitudeCovers := witness.coefficientMagnitudeCovers rightResult rightOwner
-    rightActual rightRaw .exactZero (.finite rightMaximum) rightMagnitude
+    rightActual rightRaw .exactZero (.finite rightCoefficientMaximum) rightMagnitude
     rightClaim rightProjection
-  have rightMagnitudeSound : rightMagnitude ≤ rightMaximum.val := by
+  have rightMagnitudeCoefficientSound : rightMagnitude ≤ rightCoefficientMaximum.val := by
     simpa [CoeffClass.Interprets] using ProjectedBoundAt.sound rightProjection
+  have rightMagnitudeSound : rightMagnitude ≤ rightSummaryMaximum.val :=
+    Nat.le_trans rightMagnitudeCoefficientSound rightMaximumLe
   have claim := exactValueClaim_product_finite_left modulus factor witness.env
     leftActual rightActual (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
-    (outputRaw.map Term.toExact) leftMaximum.val rightMaximum.val rightMagnitude
+    (outputRaw.map Term.toExact) leftMaximum.val rightSummaryMaximum.val rightMagnitude
     leftClaim.claim rightClaim.claim outputEval rightMagnitudeCovers rightMagnitudeSound
     factorPositive modulusPositive
   refine ⟨⟨coefficientBound, coefficientTransfer, some summaryTransfer, ?_⟩, ?_⟩

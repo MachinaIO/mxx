@@ -390,7 +390,7 @@ theorem operator_add_singleton_survivor_fold_fixture
       (survivorMonomial := singletonSurvivorMonomial)
       (valueType := atomType)
       (maximum := singletonSurvivorMaximum) (coefficientBound := .large)
-      (rightCoefficientBound := .finite 1) (rightMagnitude := rightMagnitude)
+      (rightMagnitude := rightMagnitude)
       (survivorMagnitude := survivorMagnitude)
   · rfl
   · rfl

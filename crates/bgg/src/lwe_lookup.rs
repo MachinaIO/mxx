@@ -1436,11 +1436,7 @@ fn tall_lookup_kernel_for(
                 let low = low_matrices.get(input_index.clone());
                 let high = high_matrices.get(input_index.clone());
                 let output_plaintext = output_plaintexts.get(input_index);
-                let row = Mat::multi_row_gemm_accumulate(
-                    vec![(1, c_b.clone(), high), (1, input_row.clone(), low)],
-                    None,
-                );
-                Ok((row, output_plaintext))
+                Ok((c_b.clone() * high + input_row.clone() * low, output_plaintext))
             },
         )?;
         Ok((rows, plaintexts))

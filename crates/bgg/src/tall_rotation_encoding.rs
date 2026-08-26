@@ -368,26 +368,24 @@ impl TallRotationEncodingCompiler {
         key: TallRotationEncodingKey,
         public: &TallLinearTransformPublicWires,
         secret_rows: Family<Mat>,
-        secret_gadget_rows: Family<Mat>,
     ) -> Result<TallLinearTransformEncodingWires, TallCompileError> {
-        self.validate_online_layout(key, public, &secret_rows, &secret_gadget_rows)?;
+        self.validate_online_layout(key, public, &secret_rows)?;
         let ring = self.ring();
+        let gadget = ring.gadget(self.secret_size, self.gadget_base.clone(), self.digit_count);
         let forward_offset =
             usize::try_from(key.offset).map_err(|_| TallCompileError::InvalidRotationLayout)?;
         let backward_offset = usize::try_from((key.num_slots - key.offset) % key.num_slots)
             .map_err(|_| TallCompileError::InvalidRotationLayout)?;
-        // `(P_r S) G = P_r (S G)`: rotate the shared product rather than
-        // recomputing it for every offset and direction.
-        let shifted_forward = rotate_family(&secret_gadget_rows, forward_offset, self.slot_count)?;
-        let shifted_backward =
-            rotate_family(&secret_gadget_rows, backward_offset, self.slot_count)?;
+        let shifted_forward = rotate_family(&secret_rows, forward_offset, self.slot_count)?;
+        let shifted_backward = rotate_family(&secret_rows, backward_offset, self.slot_count)?;
         let c_forward = secret_rows.clone().parallel_zip(shifted_forward, {
             let ring = ring.clone();
             let a_forward = public.left_matrix.clone();
+            let gadget = gadget.clone();
             let sigma = self.error_sigma.clone();
             let columns = self.gadget_columns();
-            move |_, current, shifted_gadget| {
-                current * a_forward.clone() - shifted_gadget +
+            move |_, current, shifted| {
+                current * a_forward.clone() - shifted * gadget.clone() +
                     ring.gaussian(
                         (1, columns),
                         sigma.clone(),
@@ -398,10 +396,11 @@ impl TallRotationEncodingCompiler {
         let c_backward = secret_rows.parallel_zip(shifted_backward, {
             let ring = ring.clone();
             let a_backward = public.right_matrix.clone();
+            let gadget = gadget.clone();
             let sigma = self.error_sigma.clone();
             let columns = self.gadget_columns();
-            move |_, current, shifted_gadget| {
-                current * a_backward.clone() - shifted_gadget +
+            move |_, current, shifted| {
+                current * a_backward.clone() - shifted * gadget.clone() +
                     ring.gaussian(
                         (1, columns),
                         sigma.clone(),
@@ -497,17 +496,11 @@ impl TallRotationEncodingCompiler {
         key: TallRotationEncodingKey,
         public: &TallLinearTransformPublicWires,
         secret_rows: &Family<Mat>,
-        secret_gadget_rows: &Family<Mat>,
     ) -> Result<(), TallCompileError> {
         self.validate_secret_rows(secret_rows)?;
         if key.num_slots !=
             u32::try_from(self.slot_count)
                 .map_err(|_| TallCompileError::InvalidRotationLayout)? ||
-            secret_gadget_rows.count() != &IntExpr::constant(self.slot_count) ||
-            !same_matrix_type(
-                secret_gadget_rows.element_type(),
-                &self.ring().matrix_type((1, self.gadget_columns())),
-            ) ||
             !same_matrix_type(
                 public.left_matrix.matrix_type(),
                 &self.ring().matrix_type((self.secret_size, self.gadget_columns())),

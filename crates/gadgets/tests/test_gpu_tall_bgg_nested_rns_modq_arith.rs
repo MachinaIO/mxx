@@ -1323,9 +1323,6 @@ fn build_encoding_graph(
         slot_count: u32::try_from(physical_slots)
             .map_err(|_| "physical slot count exceeds u32".to_owned())?,
     };
-    let secret_gadget_rows = rotation_compiler
-        .secret_gadget_rows(secret_rows.clone())
-        .map_err(|error| error.to_string())?;
     let mut rotations = BTreeMap::new();
     for offset in rotation_offsets {
         if let Some((key, public)) = rotation_compiler
@@ -1333,7 +1330,7 @@ fn build_encoding_graph(
             .map_err(|error| error.to_string())?
         {
             let rotation = rotation_compiler
-                .encode_rotation(key, &public, secret_rows.clone(), secret_gadget_rows.clone())
+                .encode_rotation(key, &public, secret_rows.clone())
                 .map_err(|error| error.to_string())?;
             rotations.insert(key, rotation);
         }
@@ -1350,7 +1347,7 @@ fn build_encoding_graph(
                 blocks,
                 &scalars,
                 secret_rows.clone(),
-                secret_gadget_rows.clone(),
+                rotation_compiler.secret_gadget_rows(secret_rows.clone())?,
             )?;
             Ok::<_, mxx_bgg::TallCompileError>(((blocks, scalars), transform))
         })
@@ -1399,10 +1396,6 @@ fn build_encoding_graph(
             &mut slots,
         )
         .map_err(|error| error.to_string())?;
-    info!(
-        repeated_lane_mask_encodings = slots.repeated_lane_mask_encoding_count(),
-        "reused Tall repeated-lane mask encodings"
-    );
     let output =
         outputs.into_iter().next().ok_or_else(|| "encoding circuit has no output".to_owned())?;
     let BggTallPlaintext::Diagonal(output_plaintexts) = output.plaintext else {
@@ -1420,17 +1413,16 @@ fn build_encoding_graph(
         ));
     }
     let anchor_count = physical_slots / encoding_crt_depth;
-    // The anchor reducer already returns one encoding row per coefficient. Only
-    // the original secret family still needs a generated gather at anchor slots.
     let anchor_index_family = Parallel::range(anchor_count)
         .map_values(|index| index.as_int().mul(Int::constant(encoding_crt_depth)))
         .map_err(|error| error.to_string())?;
-    if output.rows.count() != &IntExpr::constant(anchor_count) ||
-        output_plaintexts.count() != &IntExpr::constant(anchor_count)
-    {
-        return Err("Tall anchor reduction did not shrink to one row per coefficient".to_owned());
-    }
-    let encoding_rows = output.rows;
+    let encoding_rows = output
+        .rows
+        .parallel_gather(anchor_index_family.clone())
+        .map_err(|error| error.to_string())?;
+    let output_plaintexts = output_plaintexts
+        .parallel_gather(anchor_index_family.clone())
+        .map_err(|error| error.to_string())?;
     let residual_secret_rows = secret_rows
         .clone()
         .parallel_gather(anchor_index_family)
@@ -2435,6 +2427,12 @@ fn configured_transform_count_appends_ntt_and_intt_after_multiplication() {
     multiplication_only.ntt_intt_count = 0;
     let multiplication_circuit =
         build_modq_arithmetic_circuit(&parameters, &multiplication_only, 8, 1, 10).circuit;
+    assert!(
+        required_tall_anchor_reduce_encoding(&multiplication_circuit)
+            .expect("baseline multiplication circuit has valid slot-transfer metadata")
+            .is_none(),
+        "NTT=0 baseline reconstruction must use cyclic rotations, not AnchorReduce",
+    );
 
     let mut with_round_trip = multiplication_only;
     with_round_trip.ntt_intt_count = 2;

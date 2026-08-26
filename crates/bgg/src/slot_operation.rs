@@ -1896,7 +1896,7 @@ mod tall {
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
-    use mxx_ir_core::{IntExpr, ValueHandle};
+    use mxx_ir_core::IntExpr;
     use std::collections::BTreeMap;
 
     /// Public-key slot lowering for the secret-transfer-free Tall subset.
@@ -2062,13 +2062,6 @@ mod tall {
         /// Direct tall-rotation encodings keyed by `(num_slots, normalized_offset)`.
         rotations: BTreeMap<TallRotationEncodingKey, TallLinearTransformEncodingWires>,
         anchor_reduce: Option<((u32, Vec<num_bigint::BigUint>), TallLinearTransformEncodingWires)>,
-        /// Reusable encodings of compact repeated-lane masks, keyed by their canonical scalars.
-        ///
-        /// The configured slot count fixes the repetition count, so the short lane pattern is a
-        /// complete semantic key. `None` and `Some(1)` are both canonicalized to `1`.
-        repeated_lane_mask_encodings: BTreeMap<Vec<u32>, BggTallEncodingWire>,
-        /// Decomposition shared by consecutive masks applied to the same Tall input.
-        cached_rhs_decomposition: Option<(ValueHandle, Mat)>,
     }
 
     impl BggTallSlotLowering {
@@ -2090,13 +2083,7 @@ mod tall {
                 sampler,
                 rotations,
                 anchor_reduce,
-                repeated_lane_mask_encodings: BTreeMap::new(),
-                cached_rhs_decomposition: None,
             }
-        }
-
-        pub fn repeated_lane_mask_encoding_count(&self) -> usize {
-            self.repeated_lane_mask_encodings.len()
         }
 
         fn transfer(
@@ -2118,7 +2105,7 @@ mod tall {
                 self.diagonal_mask_public_key.clone(),
                 masks,
             )?;
-            self.multiply_mask(&mask, input)
+            Ok(self.compiler.simd_mul(&mask, input)?)
         }
 
         fn configured_slot_count(&self) -> usize {
@@ -2128,26 +2115,6 @@ mod tall {
                 }
                 _ => unreachable!("Tall slot lowering requires a concrete secret-row family"),
             }
-        }
-
-        fn multiply_mask(
-            &mut self,
-            mask: &BggTallEncodingWire,
-            input: &BggTallEncodingWire,
-        ) -> Result<BggTallEncodingWire, CircuitCompileError> {
-            let input_handle = input.pubkey.matrix.value_handle();
-            let decomposition = match &self.cached_rhs_decomposition {
-                Some((cached_handle, decomposition)) if cached_handle == input_handle => {
-                    decomposition.clone()
-                }
-                _ => {
-                    let decomposition = self.compiler.public_key.decompose(&input.pubkey);
-                    self.cached_rhs_decomposition =
-                        Some((input_handle.clone(), decomposition.clone()));
-                    decomposition
-                }
-            };
-            Ok(self.compiler.simd_mul_with_decomposition(mask, input, decomposition)?)
         }
 
         fn transfer_identity_repeated_lanes(
@@ -2163,24 +2130,17 @@ mod tall {
                 self.configured_slot_count(),
                 gate,
             )?;
-            let key = canonical_lane_scalar_pattern(lane_scalars);
-            let mask = if let Some(mask) = self.repeated_lane_mask_encodings.get(&key) {
-                mask.clone()
-            } else {
-                let masks = identity_repeated_lane_masks(
-                    &self.sampler.layout.ring(),
-                    total_slots,
-                    lane_scalars,
-                )?;
-                let mask = self.sampler.sample_diagonal(
-                    self.secret_rows.clone(),
-                    self.diagonal_mask_public_key.clone(),
-                    masks,
-                )?;
-                self.repeated_lane_mask_encodings.insert(key, mask.clone());
-                mask
-            };
-            self.multiply_mask(&mask, input)
+            let masks = identity_repeated_lane_masks(
+                &self.sampler.layout.ring(),
+                total_slots,
+                lane_scalars,
+            )?;
+            let mask = self.sampler.sample_diagonal(
+                self.secret_rows.clone(),
+                self.diagonal_mask_public_key.clone(),
+                masks,
+            )?;
+            Ok(self.compiler.simd_mul(&mask, input)?)
         }
     }
 
@@ -2331,20 +2291,6 @@ mod tall {
                     .collect(),
             )
         })
-    }
-
-    fn canonical_lane_scalar_pattern(lane_scalars: &[Option<u32>]) -> Vec<u32> {
-        let scalars = lane_scalars.iter().map(|scalar| scalar.unwrap_or(1)).collect::<Vec<_>>();
-        let period = (1..=scalars.len())
-            .find(|period| {
-                scalars.len() % period == 0 &&
-                    scalars
-                        .iter()
-                        .enumerate()
-                        .all(|(index, scalar)| scalar == &scalars[index % period])
-            })
-            .expect("a scalar pattern always repeats over its full length");
-        scalars[..period].to_vec()
     }
 
     #[cfg(test)]

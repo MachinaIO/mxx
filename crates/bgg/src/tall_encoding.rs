@@ -13,7 +13,11 @@ use crate::{
     tall_rotation_encoding::{TallLinearTransformEncodingWires, TallRotationEncodingKey},
 };
 use mxx_dsl::{DslError, Family, Int, Mat, Parallel};
-use mxx_ir_core::{IntExpr, RealExpr, node::ConcatAxis, types::MatrixType};
+use mxx_ir_core::{
+    IntExpr, RealExpr,
+    node::{ConcatAxis, IndexRange},
+    types::MatrixType,
+};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use rayon::prelude::*;
@@ -146,31 +150,20 @@ impl BggTallEncodingCompiler {
         lhs: &BggTallEncodingWire,
         rhs: &BggTallEncodingWire,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
-        let decomposed_rhs = self.public_key.decompose(&rhs.pubkey);
-        self.simd_mul_with_decomposition(lhs, rhs, decomposed_rhs)
-    }
-
-    pub(crate) fn simd_mul_with_decomposition(
-        &self,
-        lhs: &BggTallEncodingWire,
-        rhs: &BggTallEncodingWire,
-        decomposed_rhs: Mat,
-    ) -> Result<BggTallEncodingWire, TallCompileError> {
         validate_pair(lhs, rhs)?;
         let BggTallPlaintext::Diagonal(lhs_plaintexts) = &lhs.plaintext else {
             return Err(TallCompileError::MissingLeftPlaintext);
         };
-        let row_decomposition = decomposed_rhs.clone();
+        let decomposed_rhs = rhs
+            .pubkey
+            .matrix
+            .clone()
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
+            .as_mat();
         let rows = lhs.rows.clone().parallel_zip3(
             rhs.rows.clone(),
             lhs_plaintexts.clone(),
-            move |_, left, right, plaintext| {
-                let scaled_right = right * plaintext;
-                Mat::multi_row_gemm_accumulate(
-                    vec![(1, left, row_decomposition.clone())],
-                    Some(scaled_right),
-                )
-            },
+            move |_, left, right, plaintext| left * decomposed_rhs.clone() + right * plaintext,
         )?;
         let plaintext = match &rhs.plaintext {
             BggTallPlaintext::Diagonal(rhs_plaintexts) => BggTallPlaintext::Diagonal(
@@ -182,11 +175,7 @@ impl BggTallEncodingCompiler {
         };
         Ok(BggTallEncodingWire {
             rows,
-            pubkey: self.public_key.mul_with_decomposition(
-                &lhs.pubkey,
-                &rhs.pubkey,
-                decomposed_rhs,
-            ),
+            pubkey: self.public_key.mul(&lhs.pubkey, &rhs.pubkey),
             plaintext,
             canonical_input_exclusive_upper: None,
         })
@@ -211,7 +200,7 @@ impl BggTallEncodingCompiler {
         self.scalar_mul(input, scalar, decomposed, true)
     }
 
-    /// Applies one provisioned cyclic rotation through the generic fixed linear transform.
+    /// Applies one provisioned cyclic rotation pair.
     pub fn rotate(
         &self,
         input: &BggTallEncodingWire,
@@ -235,17 +224,38 @@ impl BggTallEncodingCompiler {
         let rotated_rows = rotate_family(&input.rows, offset, num_slots)?;
         let rotated_plaintexts = rotate_family(plaintexts, offset, num_slots)?;
         let rotated_right_rows = rotate_family(&transform.right_rows, offset, num_slots)?;
-        let left_message_times_right_rows = rotated_plaintexts
+        let decomposed_input = input
+            .pubkey
+            .matrix
             .clone()
-            .parallel_zip(rotated_right_rows, |_, plaintext, right| right * plaintext)?;
-        self.linear_transform(
-            input,
-            transform,
-            transform.left_rows.clone(),
-            rotated_rows,
-            left_message_times_right_rows,
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
+            .as_mat();
+        let step1 =
+            transform.left_rows.clone().parallel_zip(rotated_rows, move |_, left, input| {
+                left * decomposed_input.clone() + input
+            })?;
+        let decomposed_right = transform
+            .right_matrix
+            .clone()
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
+            .as_mat();
+        let rows = step1.parallel_zip3(
             rotated_plaintexts.clone(),
-        )
+            rotated_right_rows,
+            move |_, intermediate, plaintext, right| {
+                intermediate * decomposed_right.clone() + right * plaintext
+            },
+        )?;
+        Ok(BggTallEncodingWire {
+            rows,
+            pubkey: self.linear_transform_public_key(
+                &input.pubkey,
+                &transform.left_matrix,
+                &transform.right_matrix,
+            ),
+            plaintext: BggTallPlaintext::Diagonal(rotated_plaintexts),
+            canonical_input_exclusive_upper: None,
+        })
     }
 
     /// Reduces every repeated CRT-lane block to one anchor row using one fixed
@@ -595,58 +605,40 @@ impl BggTallEncodingSampler {
         let count = public_keys.len();
         let gadget =
             ring.gadget(secret_size, self.layout.gadget_base.clone(), self.layout.digit_count);
-        let secret_gadget_rows =
-            secret_rows.clone().parallel_map(move |_, secret_row| secret_row * gadget.clone())?;
-        let public_matrices =
-            Family::pack(public_keys.iter().map(|key| key.matrix.clone()).collect())?;
         let sigma = self.gaussian_sigma.clone();
         let bound = self.gaussian_max_coefficient_bound.clone();
-        let flat_count =
-            IntExpr::Mul(Box::new(slot_count.clone()), Box::new(IntExpr::constant(count)));
-        let work_items = Parallel::range(flat_count).map_values({
-            let ring = ring.clone();
-            move |_| ring.zero((1, 1))
-        })?;
-        let mut broadcasts = Vec::with_capacity(count + 3);
-        broadcasts.push(secret_rows);
-        broadcasts.push(secret_gadget_rows);
-        broadcasts.push(public_matrices);
-        broadcasts.push(ones.clone());
-        broadcasts.extend(plaintexts.iter().cloned());
-        // Flatten `(i, j)` into one bounded parallel domain, with input index
-        // as the fast axis. Each instance owns one ordinary-width GEMM, while
-        // the executor's wave size bounds the number resident in VRAM.
-        let flat_rows = Family::<Mat>::parallel_zip_many_with_broadcast_values(
-            vec![work_items],
-            broadcasts,
-            move |index, _, families| {
-                let flat = index.as_int();
-                let inputs = Int::constant(count);
-                let slot = flat.clone().div(inputs.clone());
-                let input_index = flat.rem(inputs);
-                let secret_row = families[0].get(slot.clone());
-                let secret_gadget = families[1].get(slot.clone());
-                let public_matrix = families[2].get(input_index.clone());
-                let plaintext_family =
-                    Family::select(input_index, families.iter().skip(3).cloned().collect())?;
-                let plaintext = plaintext_family.get(slot);
-                let error = match (&sigma, &bound) {
+        let public_matrices = public_keys.iter().map(|key| key.matrix.clone()).collect::<Vec<_>>();
+        let mut input_families = Vec::with_capacity(count + 1);
+        input_families.push(secret_rows);
+        input_families.push(ones.clone());
+        input_families.extend(plaintexts.iter().cloned());
+        let row_families =
+            Family::<Mat>::parallel_zip_many_values(input_families, move |_, values| {
+                let secret_row = &values[0];
+                let secret_gadget = secret_row.clone() * gadget.clone();
+                let packed_error = match (&sigma, &bound) {
                     (Some(sigma), Some(bound)) => {
-                        ring.gaussian((1, columns), sigma.clone(), bound.clone())
+                        ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
                     }
-                    (None, None) => ring.zero((1, columns)),
+                    (None, None) => ring.zero((1, columns * count)),
                     _ => unreachable!("validated Gaussian sampler configuration"),
                 };
-                Ok(secret_row * public_matrix - plaintext.tensor(secret_gadget) + error)
-            },
-        )?;
-        let mut row_families = Vec::with_capacity(count);
-        for input_index in 0..count {
-            let indices = Parallel::range(slot_count.clone()).map_values(move |slot| {
-                slot.as_int().mul(Int::constant(count)).add(Int::constant(input_index))
+                (0..count)
+                    .map(|index| {
+                        let plaintext = if index == 0 { &values[1] } else { &values[index + 1] };
+                        let error = packed_error.clone().slice(
+                            None,
+                            Some(IndexRange {
+                                start: (columns * index).into(),
+                                end: (columns * (index + 1)).into(),
+                            }),
+                        );
+                        secret_row.clone() * public_matrices[index].clone() -
+                            plaintext.clone().tensor(secret_gadget.clone()) +
+                            error
+                    })
+                    .collect::<Vec<_>>()
             })?;
-            row_families.push(flat_rows.clone().parallel_gather(indices)?);
-        }
         let encodings = row_families
             .into_iter()
             .enumerate()
@@ -1148,7 +1140,17 @@ mod tests {
                 RuntimeValue::matrix(c_backward[slot].clone()),
             );
         }
-        let result = execute_graph(context.build().unwrap(), parameters, inputs);
+        let built = context.build().unwrap();
+        assert!(
+            !built
+                .graph
+                .scopes()
+                .values()
+                .flat_map(|scope| scope.nodes())
+                .any(|node| matches!(node.kind(), NodeKind::MatrixMulAccumulate { .. })),
+            "baseline Tall rotation must remain explicit Multiply/Add dataflow",
+        );
+        let result = execute_graph(built, parameters, inputs);
         assert_eq!(
             matrix_output(&result, "public"),
             &a_forward.mul_decompose(&input_public).mul_decompose(&a_backward)
@@ -1246,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn tall_sampler_parallelizes_slots_and_inputs_without_wide_rows() {
+    fn tall_sampler_is_blockwise_for_three_keys_and_uses_one_packed_error() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let secret_size = 2;
         let slots = 3;
@@ -1293,23 +1295,28 @@ mod tests {
             .iter()
             .filter(|node| matches!(node.kind(), NodeKind::GaussianSample { .. }))
             .collect::<Vec<_>>();
-        assert_eq!(gaussian_nodes.len(), 1, "one loop body samples one ordinary-width error");
+        assert_eq!(gaussian_nodes.len(), 1, "all blocks share one packed Gaussian");
         let NodeKind::GaussianSample { matrix_type, .. } = gaussian_nodes[0].kind() else {
             unreachable!("filtered Gaussian node")
         };
         assert_eq!(matrix_type.rows.canonicalize(), IntExpr::constant(1));
-        assert_eq!(matrix_type.columns.canonicalize(), IntExpr::constant(columns));
-        assert!(
-            nodes.iter().any(|node| {
-                matches!(
-                    node.kind(),
-                    NodeKind::ParallelLoop(loop_node)
-                        if loop_node.count.canonicalize()
-                            == IntExpr::constant(slots * public_keys.len())
-                )
-            }),
-            "the main sampler loop must flatten the `(j, i)` domain"
+        assert_eq!(
+            matrix_type.columns.canonicalize(),
+            IntExpr::constant(columns * public_keys.len())
         );
+        let packed_error = gaussian_nodes[0].output(0).expect("Gaussian output");
+        let error_slices = nodes
+            .iter()
+            .filter_map(|node| {
+                let NodeKind::Slice { columns: Some(range), rows: None } = node.kind() else {
+                    return None;
+                };
+                (node.arguments().first().map(|argument| argument.node()) ==
+                    Some(packed_error.node()))
+                .then_some(range)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(error_slices.len(), public_keys.len(), "each block slices the shared error");
     }
 
     #[test]
@@ -1598,12 +1605,9 @@ mod tests {
             (0..slots).map(|slot| ring.input(format!("secret-{slot}"), (1, secret_size))).collect(),
         )
         .unwrap();
-        let secret_gadget_rows = compiler.secret_gadget_rows(secret_rows.clone()).unwrap();
         for offset in [1, 3] {
             let (key, public) = compiler.import_artifacts(&artifacts, offset).unwrap().unwrap();
-            let rotation = compiler
-                .encode_rotation(key, &public, secret_rows.clone(), secret_gadget_rows.clone())
-                .unwrap();
+            let rotation = compiler.encode_rotation(key, &public, secret_rows.clone()).unwrap();
             context = context
                 .output(format!("a-forward-{offset}"), rotation.left_matrix)
                 .unwrap()
@@ -1916,32 +1920,18 @@ mod tests {
     }
 
     #[test]
-    fn compact_identity_lane_mask_graph_reuses_encodings_and_scales_with_lanes_not_slots() {
+    fn compact_identity_lane_mask_graph_scales_with_lanes_not_slots() {
         fn build(slot_count: usize, lanes: usize) -> BuiltGraph {
             assert_eq!(slot_count % lanes, 0);
             let ring = Ring::new(257, 8);
             let mut circuit = PolyCircuit::<DCRTPoly>::new();
             let input_gate = circuit.input(1).as_single_wire();
-            let lane_scalars = (0..lanes).map(|lane| Some((lane % 3) as u32)).collect::<Vec<_>>();
-            let first = circuit.slot_identity_repeated_lanes_gate(
-                input_gate,
-                slot_count / lanes,
-                lane_scalars.clone(),
-            );
-            let sibling = circuit.slot_identity_repeated_lanes_gate(
-                input_gate,
-                slot_count / lanes,
-                lane_scalars.iter().map(|scalar| scalar.map(|value| value + 2)).collect(),
-            );
             let transferred = circuit.slot_identity_repeated_lanes_gate(
-                first,
+                input_gate,
                 slot_count / lanes,
-                lane_scalars
-                    .into_iter()
-                    .map(|scalar| if scalar == Some(1) { None } else { scalar })
-                    .collect(),
+                (0..lanes).map(|lane| Some((lane % 3) as u32)).collect(),
             );
-            circuit.output([transferred, sibling]);
+            circuit.output([transferred]);
             let public_compiler =
                 BggPublicKeyCompiler { ring: ring.clone(), base: 4.into(), digit_count: 2.into() };
             let one_public = BggPublicKeyWire {
@@ -2013,7 +2003,7 @@ mod tests {
                 BTreeMap::new(),
                 None,
             );
-            let mut outputs = circuit_compiler
+            let output = circuit_compiler
                 .compile_tall_encodings_with_lowerings(
                     &circuit,
                     one,
@@ -2021,13 +2011,10 @@ mod tests {
                     &mut crate::NoPublicLookup::default(),
                     &mut lowering,
                 )
-                .expect("compact Tall transfer");
-            let output = outputs.remove(0);
-            let sibling_output = outputs.remove(0);
+                .expect("compact Tall transfer")
+                .remove(0);
             DslContext::new("compact-tall-slot-transfer")
                 .family_output("rows", output.rows)
-                .unwrap()
-                .family_output("sibling-rows", sibling_output.rows)
                 .unwrap()
                 .output("public", public_output.matrix)
                 .unwrap()
@@ -2045,18 +2032,10 @@ mod tests {
             assert_eq!(
                 nodes
                     .iter()
-                    .filter(|node| matches!(node.kind(), NodeKind::GadgetDecompose { .. }))
-                    .count(),
-                4,
-                "the public pass uses two decompositions; Tall sibling masks share one and their child uses another"
-            );
-            assert_eq!(
-                nodes
-                    .iter()
                     .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
                     .count(),
-                7,
-                "two distinct mask-generation paths remain shared across their uses"
+                3,
+                "mask generation, Tall sampling, and SIMD multiplication each retain one loop"
             );
         }
         let graph_size = |graph: &BuiltGraph| {

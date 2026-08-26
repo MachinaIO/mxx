@@ -2341,6 +2341,50 @@ theorem operatorProductMergeClaim
     (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) working
     leftClaim.claim rightClaim.claim outputEval modulusPositive
 
+/-- The reached Tensor path is the typed left-scalar action recorded by Security0.  Its exact
+    contribution polynomial is the same scalar-product construction used by Rust for a constant
+    polynomial left operand; non-scalar Tensor normalization is intentionally not covered here. -/
+theorem operatorTensorMergeClaim
+    {document : TallDocument} {history : EventHistory}
+    {modulus frameStart transferEvent : Nat} {env : Env Owner}
+    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
+    {leftActual rightActual : Int} {leftRaw rightRaw : List Term}
+    {working : Polynomial Owner} {leftReference rightReference : ValueRef}
+    {outputType : ValueType} {leftLayout rightLayout outputLayout : Layout}
+    (_operationAt :
+      (document.expressions.lookup owner.expression.row).map
+        TallSecurity0ABI.ExpressionRow.descriptor =
+        some (.operation (.stable (.matrix
+          (.tensor outputType leftLayout rightLayout outputLayout))) outputType))
+    (_transferAt : history.lookup transferEvent = some
+      ⟨.boundTransfer owner (.tensor leftReference rightReference true false), frameStart⟩)
+    (leftClaim : ExactClaimAt history modulus env leftResult leftOwner leftActual leftRaw
+      .exactZero)
+    (rightClaim : ExactClaimAt history modulus env rightResult rightOwner rightActual rightRaw
+      .exactZero)
+    (reconstruction : MergeReconstructionAt history frameStart owner
+      (.operator leftResult rightResult) [] working)
+    (tensorAgreement : CanonicalAgreement (add [] reconstruction.deltas)
+      (productPoly (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) true false))
+    (modulusPositive : 0 < modulus) :
+    ValueClaim.Interprets modulus env (leftActual * rightActual) (.exact working .exactZero) := by
+  have outputEval :
+        evalPolynomial env working =
+          evalPolynomial env (leftRaw.map Term.toExact) *
+            evalPolynomial env (rightRaw.map Term.toExact) := by
+      calc
+        evalPolynomial env working = evalPolynomial env (add [] reconstruction.deltas) :=
+          canonicalAgreement_eval env _ _ reconstruction.agreement
+        _ = evalPolynomial env
+            (productPoly (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) true false) :=
+          canonicalAgreement_eval env _ _ tensorAgreement
+        _ = evalPolynomial env (leftRaw.map Term.toExact) *
+            evalPolynomial env (rightRaw.map Term.toExact) :=
+          evalPolynomial_productPoly env _ _ true false
+  exact exactValueClaim_product_of_mod_zero modulus env leftActual rightActual
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) working
+    leftClaim.claim rightClaim.claim outputEval modulusPositive
+
 /-- Add copies the left polynomial and incorporates the right polynomial.  Collision deltas are
     kept as exact row evidence, while the canonical agreement covers both collision and direct
     insertion cases reached by Rust. -/

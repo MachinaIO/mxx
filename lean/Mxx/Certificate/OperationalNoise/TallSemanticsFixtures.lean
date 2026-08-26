@@ -167,6 +167,84 @@ def operator_merge_reconstruction_fixture :
   refine ⟨_, .leaf operator_merge_delta_fixture, ?_⟩
   decide +kernel
 
+def tensorFixtureLayout : Layout := ⟨"row-major-1x1", 1, 1⟩
+
+def tensorFixtureDocument : TallDocument where
+  schemaId := "mxx-operational-noise-certificate"
+  schemaVersion := 1
+  plaintextModulus := "2"
+  ciphertextModulus := "257"
+  ringDimension := 1
+  expressions := .node 0
+    { descriptor := .operation (.stable (.matrix
+        (.tensor atomType tensorFixtureLayout tensorFixtureLayout tensorFixtureLayout))) atomType
+      inputs := emptyExpressionInputs
+      program := none } .empty .empty
+  programs := .empty
+  sources := .empty
+  events := .empty
+  indexUses := .empty
+  sliceGroups := .empty
+  residualRoot := .closed ⟨0⟩
+
+def tensorMergeHistory : EventHistory :=
+  smallHistory #[
+    annotated (.resultExact boundFixtureOwner [mergeLeftTerm] (.finite 0) 0 .exactZero none) 7,
+    annotated (.resultExact boundFixtureOwner [mergeRightTerm] (.finite 0) 0 .exactZero none) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.tensor (.result 0 .coefficient) (.result 1 .coefficient) true false)) 7,
+    annotated (.coefficientMerge
+      ⟨boundFixtureOwner, .operator (⟨0, 0⟩, ⟨1, 0⟩),
+        { centralFactors := [], orderedFactors := [] }, 6⟩) 7]
+
+theorem tensor_merge_delta_fixture :
+    MergeDeltaAt tensorMergeHistory 3 7 boundFixtureOwner (.operator 0 1)
+      { coefficient := 6, key := { centralFactors := [], orderedFactors := [] } } := by
+  apply MergeDeltaAt.operator
+    (leftResult := 0) (leftOrdinal := 0) (rightResult := 1) (rightOrdinal := 0)
+    (leftTerms := [mergeLeftTerm]) (rightTerms := [mergeRightTerm])
+    (leftTerm := mergeLeftTerm) (rightTerm := mergeRightTerm)
+    (output := { centralFactors := [], orderedFactors := [] }) (signedContribution := 6)
+  all_goals rfl
+
+def tensor_merge_reconstruction_fixture :
+    MergeReconstructionAt tensorMergeHistory 7 boundFixtureOwner (.operator 0 1) []
+      [{ coefficient := 6, key := { centralFactors := [], orderedFactors := [] } }] := by
+  refine ⟨_, .leaf tensor_merge_delta_fixture, ?_⟩
+  decide +kernel
+
+theorem tensor_left_claim_fixture :
+    ExactClaimAt tensorMergeHistory 257 (fun _ => 1) 0 boundFixtureOwner 2
+      [mergeLeftTerm] .exactZero := by
+  refine ⟨⟨.finite 0, 0, none, rfl⟩, 0, ?_, ?_⟩
+  · decide +kernel
+  · simp [boundInterprets, centeredNorm, centeredCoefficient]
+
+theorem tensor_right_claim_fixture :
+    ExactClaimAt tensorMergeHistory 257 (fun _ => 1) 1 boundFixtureOwner 3
+      [mergeRightTerm] .exactZero := by
+  refine ⟨⟨.finite 0, 0, none, rfl⟩, 0, ?_, ?_⟩
+  · decide +kernel
+  · simp [boundInterprets, centeredNorm, centeredCoefficient]
+
+theorem operator_tensor_merge_claim_fixture :
+    ValueClaim.Interprets 257 (fun _ : Owner => 1) (2 * 3)
+      (.exact [{ coefficient := 6, key := { centralFactors := [], orderedFactors := [] } }]
+        .exactZero) := by
+  apply operatorTensorMergeClaim (document := tensorFixtureDocument)
+      (history := tensorMergeHistory) (frameStart := 7) (transferEvent := 2)
+      (owner := boundFixtureOwner) (leftResult := 0) (rightResult := 1)
+      (leftOwner := boundFixtureOwner) (rightOwner := boundFixtureOwner)
+      (leftRaw := [mergeLeftTerm]) (rightRaw := [mergeRightTerm])
+      (leftReference := .result 0 .coefficient) (rightReference := .result 1 .coefficient)
+      (reconstruction := tensor_merge_reconstruction_fixture)
+  · rfl
+  · rfl
+  · exact tensor_left_claim_fixture
+  · exact tensor_right_claim_fixture
+  · decide +kernel
+  · decide
+
 theorem wrong_merge_delta_reconstruction_rejected :
     ¬ CanonicalAgreement
       [{ coefficient := 5, key := { centralFactors := [], orderedFactors := [] } }]
@@ -524,10 +602,12 @@ theorem canonical_relation_fixture :
 #print axioms relation_merge_delta_fixture
 #print axioms balanced_merge_deltas_fixture
 #print axioms operator_merge_reconstruction_fixture
+#print axioms operator_tensor_merge_claim_fixture
 #print axioms wrong_merge_delta_reconstruction_rejected
 #print axioms TallSemantics.operatorAddMergeClaim
 #print axioms TallSemantics.operatorSubMergeClaim
 #print axioms TallSemantics.operatorProductMergeClaim
+#print axioms TallSemantics.operatorTensorMergeClaim
 #print axioms TallSemantics.universalRelationMergeClaim
 #print axioms TallSemantics.gadgetRelationMergeClaim
 #print axioms TallSemantics.exactClaimAt_of_mergeClaim

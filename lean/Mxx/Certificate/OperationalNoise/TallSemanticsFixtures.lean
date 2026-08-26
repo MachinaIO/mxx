@@ -108,6 +108,59 @@ def boundFixtureHistory : EventHistory :=
     annotated (.boundTransfer boundFixtureOwner
       (.scale productFixtureReference (.value productFixtureReference))) 7]
 
+def mergeLeftTerm : Term :=
+  { monomial := { centralFactors := [], orderedFactors := [] }, coefficient := 2 }
+
+def mergeRightTerm : Term :=
+  { monomial := { centralFactors := [], orderedFactors := [] }, coefficient := 3 }
+
+def operatorMergeHistory : EventHistory :=
+  smallHistory #[
+    annotated (.resultExact boundFixtureOwner [mergeLeftTerm] (.finite 0) 0 .exactZero none) 7,
+    annotated (.resultExact boundFixtureOwner [mergeRightTerm] (.finite 0) 0 .exactZero none) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.product (.result 0 .coefficient) (.result 1 .coefficient) productFixtureFacts)) 7,
+    annotated (.coefficientMerge
+      ⟨boundFixtureOwner, .operator (⟨0, 0⟩, ⟨1, 0⟩),
+        { centralFactors := [], orderedFactors := [] }, 6⟩) 7]
+
+theorem operator_merge_delta_fixture :
+    MergeDeltaAt operatorMergeHistory 3 7 boundFixtureOwner
+      { coefficient := 6, key := { centralFactors := [], orderedFactors := [] } } := by
+  apply MergeDeltaAt.operator
+    (leftResult := 0) (leftOrdinal := 0) (rightResult := 1) (rightOrdinal := 0)
+    (leftTerms := [mergeLeftTerm]) (rightTerms := [mergeRightTerm])
+    (leftTerm := mergeLeftTerm) (rightTerm := mergeRightTerm)
+    (output := { centralFactors := [], orderedFactors := [] }) (signedContribution := 6)
+  all_goals rfl
+
+def relationMergeHistory : EventHistory :=
+  smallHistory #[
+    annotated (.resultExact boundFixtureOwner [mergeLeftTerm] (.finite 0) 0 .exactZero none) 7,
+    annotated (.appliedRelation boundFixtureOwner
+      { centralFactors := [], orderedFactors := [] } 3 0 0
+      (.gadget boundFixtureOwner boundFixtureOwner ⟨0⟩ 0)) 7,
+    annotated (.coefficientMerge
+      ⟨boundFixtureOwner, .relation 1 0,
+        { centralFactors := [], orderedFactors := [] }, 6⟩) 7]
+
+theorem relation_merge_delta_fixture :
+    MergeDeltaAt relationMergeHistory 2 7 boundFixtureOwner
+      { coefficient := 6, key := { centralFactors := [], orderedFactors := [] } } := by
+  apply MergeDeltaAt.relation (application := 1) (rhsResult := 0)
+    (sourceTermOrdinal := 0) (source := { centralFactors := [], orderedFactors := [] })
+    (outerCoefficient := 3) (orderedStart := 0) (orderedEndExclusive := 0)
+    (rule := .gadget boundFixtureOwner boundFixtureOwner ⟨0⟩ 0)
+    (rhsTerms := [mergeLeftTerm]) (rhsTerm := mergeLeftTerm)
+    (output := { centralFactors := [], orderedFactors := [] }) (signedContribution := 6)
+  all_goals rfl
+
+theorem balanced_merge_deltas_fixture :
+    MergeDeltasAt operatorMergeHistory 7 boundFixtureOwner
+      [{ coefficient := 6, key := { centralFactors := [], orderedFactors := [] } },
+        { coefficient := 6, key := { centralFactors := [], orderedFactors := [] } }] := by
+  exact .append (.leaf operator_merge_delta_fixture) (.leaf operator_merge_delta_fixture)
+
 theorem bound_identity_fixture :
     BoundDerivedAt boundFixtureHistory 2 7 boundFixtureOwner
       (.identity boundFixtureReference) .exactZero 0 := by
@@ -455,6 +508,15 @@ theorem canonical_relation_fixture :
 #print axioms generic_evaluation_fixture
 #print axioms generic_value_claim_fixture
 #print axioms bound_identity_fixture
+#print axioms operator_merge_delta_fixture
+#print axioms relation_merge_delta_fixture
+#print axioms balanced_merge_deltas_fixture
+#print axioms TallSemantics.operatorAddMergeClaim
+#print axioms TallSemantics.operatorSubMergeClaim
+#print axioms TallSemantics.operatorProductMergeClaim
+#print axioms TallSemantics.universalRelationMergeClaim
+#print axioms TallSemantics.gadgetRelationMergeClaim
+#print axioms TallSemantics.exactClaimAt_of_mergeClaim
 #print axioms bound_transfer_input_fixture
 #print axioms bound_identity_projection_fixture
 #print axioms bound_summary_projection_fixture

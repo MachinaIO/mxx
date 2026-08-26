@@ -102,7 +102,11 @@ def boundFixtureHistory : EventHistory :=
     annotated (.boundTransfer boundFixtureOwner (.identity boundFixtureReference)) 7,
     annotated (.resultCoefficient boundFixtureOwner .exactZero) 7,
     annotated (.boundTransfer boundFixtureOwner
-      (.product productFixtureReference productFixtureReference productFixtureFacts)) 7]
+      (.product productFixtureReference productFixtureReference productFixtureFacts)) 7,
+    annotated (.boundTransfer boundFixtureOwner (.authority .operator)) 7,
+    annotated (.resultCoefficient boundFixtureOwner .exactZero) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.scale productFixtureReference (.value productFixtureReference))) 7]
 
 theorem bound_identity_fixture :
     BoundDerivedAt boundFixtureHistory 2 7 boundFixtureOwner
@@ -129,6 +133,40 @@ theorem bound_product_fixture :
   · rfl
   · exact .result rfl bound_identity_projection_fixture
   · exact .result rfl bound_identity_projection_fixture
+
+theorem authority_leaf_fixture :
+    AuthorityLeafAt boundFixtureHistory 5 6 7 boundFixtureOwner .operator .exactZero := by
+  exact .resultCoefficient rfl (by rfl) (by rfl)
+
+def authorityWitnessFixture : AuthorityWitness boundFixtureHistory where
+  authorityMagnitude := fun _ ↦ 0
+  authorityBound := by
+    intros _ _ _ _ _ bound _
+    cases bound <;> simp [CoeffClass.Interprets]
+
+theorem bound_authority_fixture :
+    BoundDerivedAt boundFixtureHistory 5 7 boundFixtureOwner (.authority .operator)
+      .exactZero (authorityWitnessFixture.authorityMagnitude 6) := by
+  exact .authority authorityWitnessFixture authority_leaf_fixture
+
+theorem bound_scale_value_fixture :
+    BoundDerivedAt boundFixtureHistory 7 7 boundFixtureOwner
+      (.scale productFixtureReference (.value productFixtureReference)) .exactZero 0 := by
+  apply BoundDerivedAt.scaleValue (valueBound := .exactZero) (scaleBound := .exactZero)
+    (valueActual := 0) (scaleActual := 0)
+  · rfl
+  · exact .result rfl bound_identity_projection_fixture
+  · exact .result rfl bound_identity_projection_fixture
+
+def zeroOwnerEnv : Env Owner := fun _ ↦ 0
+
+theorem finite_add_exact_zero_fixture :
+    ValueClaim.Interprets 257 zeroOwnerEnv 1 (.exact [] (.finite 1)) := by
+  apply exactValueClaim_add_right_mod_zero 257 zeroOwnerEnv 1 0 [] [] [] 1
+  · refine ⟨1, by decide, ?_⟩
+    simp [boundInterprets, centeredNorm, centeredCoefficient]
+  · decide
+  · rfl
 
 theorem exact_zero_recording_refines_finite_two_fixture :
     RecordedBoundRefines .exactZero (.finite ⟨2, by decide⟩) := by
@@ -393,6 +431,10 @@ theorem canonical_relation_fixture :
 #print axioms bound_identity_fixture
 #print axioms bound_identity_projection_fixture
 #print axioms bound_product_fixture
+#print axioms authority_leaf_fixture
+#print axioms bound_authority_fixture
+#print axioms bound_scale_value_fixture
+#print axioms finite_add_exact_zero_fixture
 #print axioms exact_zero_recording_refines_finite_two_fixture
 #print axioms TallSemantics.boundTransfer_to_resultCoefficient
 #print axioms TallSemantics.ProjectedBoundAt.sound

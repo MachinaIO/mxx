@@ -1416,6 +1416,37 @@ theorem exactValueClaim_of_coeffClass {Factor : Type} (modulus : Nat) (env : Env
     ValueClaim.Interprets modulus env actual (.exact terms (coeffClassToTallBound bound)) := by
   exact ⟨remainder, congruence, coeffClassInterprets_to_boundInterprets remainderSound⟩
 
+/-- A reached authority transfer and the unique Result row that records its coefficient bound. -/
+inductive AuthorityLeafAt (history : EventHistory) :
+    Nat → Nat → Nat → Owner → Authority → CoeffClass → Prop where
+  | resultCoefficient {producerEvent resultEvent frameStart : Nat} {owner : Owner}
+      {authority : Authority} {bound : CoeffClass}
+      (adjacent : producerEvent + 1 = resultEvent)
+      (transferRow : history.lookup producerEvent = some
+        ⟨.boundTransfer owner (.authority authority), frameStart⟩)
+      (resultRow : history.lookup resultEvent = some
+        ⟨.resultCoefficient owner (coeffClassToTallBound bound), frameStart⟩) :
+      AuthorityLeafAt history producerEvent resultEvent frameStart owner authority bound
+  | resultExact {producerEvent resultEvent frameStart : Nat} {owner : Owner}
+      {authority : Authority} {bound : CoeffClass} {terms : List Term}
+      {recordedCoefficientBound summary : Bound} {summaryProducer : Option Nat}
+      (producerBefore : producerEvent < resultEvent)
+      (transferRow : history.lookup producerEvent = some
+        ⟨.boundTransfer owner (.authority authority), frameStart⟩)
+      (resultRow : history.lookup resultEvent = some
+        ⟨.resultExact owner terms recordedCoefficientBound producerEvent summary
+          summaryProducer, frameStart⟩)
+      (refines : RecordedBoundRefines recordedCoefficientBound bound) :
+      AuthorityLeafAt history producerEvent resultEvent frameStart owner authority bound
+
+/-- The only semantic assumption used by authority coefficient leaves, indexed by their full
+    history evidence rather than by a freely supplied magnitude or soundness proposition. -/
+structure AuthorityWitness (history : EventHistory) where
+  authorityMagnitude : Nat → Nat
+  authorityBound : ∀ producerEvent resultEvent frameStart owner authority bound,
+    AuthorityLeafAt history producerEvent resultEvent frameStart owner authority bound →
+      bound.Interprets (authorityMagnitude resultEvent)
+
 /-! Bound derivations and result projections are mutually indexed by concrete history rows.
     Every coefficient projection contains the `BoundDerivedAt` selected by the recorded producer;
     no constructor accepts a standalone soundness proposition. -/
@@ -1495,6 +1526,12 @@ mutual
 
   inductive BoundDerivedAt (history : EventHistory) :
       Nat → Nat → Owner → BoundRule → CoeffClass → Nat → Prop where
+    | authority {producerEvent resultEvent frameStart : Nat} {owner : Owner}
+        {authority : Authority} {bound : CoeffClass}
+        (witness : AuthorityWitness history)
+        (leaf : AuthorityLeafAt history producerEvent resultEvent frameStart owner authority bound) :
+        BoundDerivedAt history producerEvent frameStart owner (.authority authority) bound
+          (witness.authorityMagnitude resultEvent)
     | identity {transferEvent transferFrame : Nat} {owner : Owner}
         {reference : ValueRef} {bound : CoeffClass} {actualMagnitude : Nat}
         (transferRow : history.lookup transferEvent = some
@@ -1518,6 +1555,16 @@ mutual
         BoundDerivedAt history transferEvent transferFrame owner
           (.scale reference (.magnitude factor)) (scaleMagnitude factor bound)
           (factor * actualMagnitude)
+    | scaleValue {transferEvent transferFrame : Nat} {owner : Owner}
+        {valueReference scaleReference : ValueRef}
+        {valueBound scaleBound : CoeffClass} {valueActual scaleActual : Nat}
+        (transferRow : history.lookup transferEvent = some
+          ⟨.boundTransfer owner (.scale valueReference (.value scaleReference)), transferFrame⟩)
+        (valueChild : BoundInputAt history owner valueReference valueBound valueActual)
+        (scaleChild : BoundInputAt history owner scaleReference scaleBound scaleActual) :
+        BoundDerivedAt history transferEvent transferFrame owner
+          (.scale valueReference (.value scaleReference)) (scaleValue valueBound scaleBound)
+          (valueActual * scaleActual)
     | monomialProduct {transferEvent transferFrame : Nat} {owner : Owner}
         {monomial : Monomial} {headFactor : FactorEvidence}
         {tailFactors : List FactorEvidence} {headBound : CoeffClass} {headActual : Nat}
@@ -1561,7 +1608,7 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
   · intros
     assumption
   · intros
@@ -1578,6 +1625,8 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
   · exact .nil
   · intros
     exact .cons (by assumption) (by assumption)
+  · intros
+    apply AuthorityWitness.authorityBound <;> assumption
   · intros
     assumption
   · intros
@@ -1586,6 +1635,8 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
   · intros
     apply scaleMagnitude_sound
     assumption
+  · intros
+    apply scaleValue_sound <;> assumption
   · intros
     apply productNonempty_sound <;> assumption
   · intros
@@ -1606,7 +1657,7 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
   · intros
     assumption
   · intros
@@ -1623,6 +1674,8 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
   · exact .nil
   · intros
     exact .cons (by assumption) (by assumption)
+  · intros
+    apply AuthorityWitness.authorityBound <;> assumption
   · intros
     assumption
   · intros
@@ -1631,6 +1684,8 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
   · intros
     apply scaleMagnitude_sound
     assumption
+  · intros
+    apply scaleValue_sound <;> assumption
   · intros
     apply productNonempty_sound <;> assumption
   · intros
@@ -1738,6 +1793,36 @@ theorem exactValueClaim_add_of_mod_zero (modulus : Nat) (env : Env Owner)
           rw [Int.add_emod]
       _ = 0 := by rw [leftModZero, rightModZero]; simp
   · simp [boundInterprets, centeredNorm, centeredCoefficient]
+
+/-- Adding an exact-zero remainder preserves the finite remainder carried by the left claim. -/
+theorem exactValueClaim_add_right_mod_zero {Factor : Type} (modulus : Nat) (env : Env Factor)
+    (leftActual rightActual : Int) (leftTerms rightTerms output : Polynomial Factor)
+    (maximum : Nat)
+    (leftClaim : ValueClaim.Interprets modulus env leftActual
+      (.exact leftTerms (.finite maximum)))
+    (rightModZero : (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus = 0)
+    (outputEval : evalPolynomial env output =
+      evalPolynomial env leftTerms + evalPolynomial env rightTerms) :
+    ValueClaim.Interprets modulus env (leftActual + rightActual)
+      (.exact output (.finite maximum)) := by
+  rcases leftClaim with ⟨remainder, leftCongruence, leftBound⟩
+  refine ⟨remainder, ?_, leftBound⟩
+  rw [outputEval]
+  calc
+    (leftActual + rightActual -
+        (evalPolynomial env leftTerms + evalPolynomial env rightTerms)) %
+          Int.ofNat modulus =
+        ((leftActual - evalPolynomial env leftTerms) +
+          (rightActual - evalPolynomial env rightTerms)) % Int.ofNat modulus := by
+            congr 1 <;> omega
+    _ = ((leftActual - evalPolynomial env leftTerms) % Int.ofNat modulus +
+      (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus) %
+        Int.ofNat modulus := by
+          rw [Int.add_emod]
+    _ = (leftActual - evalPolynomial env leftTerms) % Int.ofNat modulus := by
+      rw [rightModZero]
+      simp
+    _ = remainder % Int.ofNat modulus := leftCongruence
 
 theorem exactValueClaim_sub_exactZero_of_mod_zero (modulus : Nat) (env : Env Owner)
     (leftActual rightActual : Int) (left right output : Polynomial Owner)
@@ -1979,6 +2064,8 @@ inductive ReachedTerminalRule : BoundRule → Prop where
   | authorityFactStore : ReachedTerminalRule (.authority .factStore)
   | authorityProgramFamilyFact : ReachedTerminalRule (.authority .programFamilyFact)
   | authorityOperator : ReachedTerminalRule (.authority .operator)
+  | authorityRelationPreimageSource (source : ExpressionRef) :
+      ReachedTerminalRule (.authority (.relationPreimageSource source))
   | identity (input : ValueRef) : ReachedTerminalRule (.identity input)
   | scale (value : ValueRef) (factor : Scale) : ReachedTerminalRule (.scale value factor)
 
@@ -2026,7 +2113,7 @@ def TerminalExactAt (document : TallDocument) (history : EventHistory)
 
 /-- Honest primitive contracts and all reached relation congruences for one selector. -/
 structure Witness (document : TallDocument) (history : EventHistory) (selector : Option Nat)
-    (modulus : Nat) where
+    (modulus : Nat) extends AuthorityWitness history where
   env : Env Owner
   sourceBound : ∀ owner factorEvent source,
     SourceFactorAt document history selector owner factorEvent source →

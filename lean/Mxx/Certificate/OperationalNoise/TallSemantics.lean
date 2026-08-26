@@ -3074,10 +3074,84 @@ structure Witness (document : TallDocument) (history : EventHistory) (selector :
       (honestTerminalActual resultEvent - evalPolynomial env (rawTerms.map Term.toExact)) %
         Int.ofNat modulus = 0
 
-/-- The reached finite Multiply uses the exact coefficient projection of its exact-zero right
-    child to connect replayed coefficient magnitude to the semantic value.  The separate summary
-    transfer may be a monomial fold rather than that Result's coefficient producer, so its finite
-    maximum is kept distinct and must conservatively cover the coefficient maximum. -/
+/-- The reached finite Multiply accumulator uses the exact coefficient projection of its
+    exact-zero right child to connect replayed coefficient magnitude to the semantic value.  The
+    separate summary transfer may be a monomial fold rather than that Result's coefficient
+    producer, so its finite maximum is kept distinct and must cover the coefficient maximum. -/
+theorem operatorProductFiniteMergeClaim
+    {document : TallDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
+    {witness : Witness document history selector modulus}
+    {frameStart coefficientTransfer summaryTransfer rightCoefficientProducer rightSummaryTransfer :
+      Nat}
+    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
+    {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
+    {leftExpression rightExpression : ExpressionRef}
+    {leftActual rightActual : Int} {leftRaw rightRaw : List Term}
+    {working : Polynomial Owner}
+    {leftMaximum rightCoefficientMaximum rightSummaryMaximum : { value : Nat // 0 < value }}
+    {leftScalar rightScalar : Bool} {base : Polynomial Owner}
+    {valueType : ValueType} {rightCoefficientBound : Bound}
+    {coefficientFacts summaryFacts : TallSecurity0ABI.ProductFacts}
+    {rightMagnitude summaryMagnitude factor : Nat}
+    (_operationAt :
+      (document.expressions.lookup owner.expression.row).map
+        TallSecurity0ABI.ExpressionRow.descriptor =
+        some (.operation (.stable (.matrix .multiply)) valueType))
+    (_leftPredecessorAt : history.lookup leftBinding = some
+      ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
+    (_rightPredecessorAt : history.lookup rightBinding = some
+      ⟨.predecessor owner rightInputPosition rightExpression rightResult, frameStart⟩)
+    (_coefficientTransferAt : history.lookup coefficientTransfer = some
+      ⟨.boundTransfer owner
+        (.product (.predecessor leftInputPosition leftBinding .coefficient)
+          (.predecessor rightInputPosition rightBinding .coefficient) coefficientFacts),
+        frameStart⟩)
+    (leftClaim : ExactClaimAt history modulus witness.env leftResult leftOwner leftActual leftRaw
+      (.finite leftMaximum.val))
+    (rightClaim : ExactClaimAt history modulus witness.env rightResult rightOwner rightActual
+      rightRaw .exactZero)
+    (_rightResultAt : history.lookup rightResult = some
+      ⟨.resultExact rightOwner rightRaw rightCoefficientBound rightCoefficientProducer
+        .exactZero none, frameStart⟩)
+    (rightProjection : ProjectedBoundAt history rightResult rightOwner (some rightRaw)
+      .coefficient (.finite rightCoefficientMaximum) rightMagnitude)
+    (rightMaximumLe : rightCoefficientMaximum.val ≤ rightSummaryMaximum.val)
+    (reconstruction : MergeReconstructionAt history frameStart owner
+      (.operator leftResult rightResult) base working)
+    (productAgreement : CanonicalAgreement (add base reconstruction.deltas)
+      (productPoly (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+        leftScalar rightScalar))
+    (_summaryDerived : BoundDerivedAt history summaryTransfer frameStart owner
+      (.product (.result leftResult .summary) (.transfer rightSummaryTransfer) summaryFacts)
+      (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum))
+      summaryMagnitude)
+    (factorPositive : 0 < factor) (modulusPositive : 0 < modulus) :
+    ValueClaim.Interprets modulus witness.env (leftActual * rightActual)
+      (.exact working
+        (coeffClassToTallBound
+          (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum)))) := by
+  have operationEval := productCanonicalResultSound witness.env
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (add base reconstruction.deltas) leftScalar rightScalar productAgreement
+  have outputEval : evalPolynomial witness.env working =
+      evalPolynomial witness.env (leftRaw.map Term.toExact) *
+        evalPolynomial witness.env (rightRaw.map Term.toExact) :=
+    (canonicalAgreement_eval witness.env _ _ reconstruction.agreement).trans operationEval
+  have rightMagnitudeCovers := witness.coefficientMagnitudeCovers rightResult rightOwner
+    rightActual rightRaw .exactZero (.finite rightCoefficientMaximum) rightMagnitude
+    rightClaim rightProjection
+  have rightMagnitudeCoefficientSound : rightMagnitude ≤ rightCoefficientMaximum.val := by
+    simpa [CoeffClass.Interprets] using ProjectedBoundAt.sound rightProjection
+  have rightMagnitudeSound : rightMagnitude ≤ rightSummaryMaximum.val :=
+    Nat.le_trans rightMagnitudeCoefficientSound rightMaximumLe
+  have claim := exactValueClaim_product_finite_left modulus factor witness.env
+    leftActual rightActual (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    working leftMaximum.val rightSummaryMaximum.val rightMagnitude
+    leftClaim.claim rightClaim.claim outputEval rightMagnitudeCovers rightMagnitudeSound
+    factorPositive modulusPositive
+  simpa [productWithFactor, Nat.ne_of_gt factorPositive, coeffClassToTallBound] using claim
+
+/-- The final reached finite Multiply wrapper binds the accumulator claim to its exact Result. -/
 theorem operatorProductFiniteMergeClaimAt
     {document : TallDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
     {witness : Witness document history selector modulus}
@@ -3133,29 +3207,14 @@ theorem operatorProductFiniteMergeClaimAt
     ExactClaimAt history modulus witness.env resultEvent owner (leftActual * rightActual) outputRaw
       (coeffClassToTallBound
         (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum))) := by
-  have operationEval := productCanonicalResultSound witness.env
-    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
-    (add base reconstruction.deltas) leftScalar rightScalar productAgreement
-  have outputEval : evalPolynomial witness.env (outputRaw.map Term.toExact) =
-      evalPolynomial witness.env (leftRaw.map Term.toExact) *
-        evalPolynomial witness.env (rightRaw.map Term.toExact) :=
-    (canonicalAgreement_eval witness.env _ _ reconstruction.agreement).trans operationEval
-  have rightMagnitudeCovers := witness.coefficientMagnitudeCovers rightResult rightOwner
-    rightActual rightRaw .exactZero (.finite rightCoefficientMaximum) rightMagnitude
-    rightClaim rightProjection
-  have rightMagnitudeCoefficientSound : rightMagnitude ≤ rightCoefficientMaximum.val := by
-    simpa [CoeffClass.Interprets] using ProjectedBoundAt.sound rightProjection
-  have rightMagnitudeSound : rightMagnitude ≤ rightSummaryMaximum.val :=
-    Nat.le_trans rightMagnitudeCoefficientSound rightMaximumLe
-  have claim := exactValueClaim_product_finite_left modulus factor witness.env
-    leftActual rightActual (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
-    (outputRaw.map Term.toExact) leftMaximum.val rightSummaryMaximum.val rightMagnitude
-    leftClaim.claim rightClaim.claim outputEval rightMagnitudeCovers rightMagnitudeSound
+  have claim := operatorProductFiniteMergeClaim _operationAt _leftPredecessorAt
+    _rightPredecessorAt _coefficientTransferAt leftClaim rightClaim _rightResultAt
+    rightProjection rightMaximumLe reconstruction productAgreement _summaryDerived
     factorPositive modulusPositive
   refine ⟨⟨coefficientBound, coefficientTransfer, some summaryTransfer, ?_⟩, ?_⟩
   · rw [resultAt]
     rfl
-  · simpa [productWithFactor, Nat.ne_of_gt factorPositive, coeffClassToTallBound] using claim
+  · exact claim
 
 /-- One reached universal relation rewrite starts from an interpreted accumulator claim, checks
     the exact application through the witness, and routes the recorded Result through its

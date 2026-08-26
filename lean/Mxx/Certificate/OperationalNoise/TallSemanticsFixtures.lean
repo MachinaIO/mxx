@@ -957,6 +957,7 @@ theorem canonical_relation_fixture :
 #print axioms bound_scale_value_fixture
 #print axioms finite_add_exact_zero_fixture
 #print axioms TallSemantics.exactValueClaim_product_finite_left
+#print axioms TallSemantics.operatorProductFiniteMergeClaim
 #print axioms TallSemantics.operatorProductFiniteMergeClaimAt
 #print axioms finite_product_exact_zero_fixture
 #print axioms TallSemantics.exactFiniteValueClaim_of_eval_mod

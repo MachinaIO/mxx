@@ -1,0 +1,24 @@
+{
+  "schemaId": "mxx.operational-noise.tall-certificate-source",
+  "schemaVersion": 1,
+  "profile": "Security128",
+  "sourceRevision": "tall-nested-rns-security128-v1",
+  "evaluatorVersion": "tall-runtime-only-v1",
+  "rustProjectionVersion": "operational-noise-certificate-v1",
+  "leanAbiVersion": "security0-replay-v1",
+  "requestTargetId": "tall-threshold-decode",
+  "parameters": {
+    "multiplicationCount": 1,
+    "crtDepth": 20,
+    "logRingDimension": 15,
+    "requiredSecurityBits": 128,
+    "reviewedSecurityLowerBoundBits": 177,
+    "crtModulusBits": 28,
+    "requestedPModuliBits": null,
+    "gadgetBaseBits": 14,
+    "maxUnreducedMultiplications": 2,
+    "scale": "64",
+    "errorSigma": "4",
+    "trapdoorSigma": "4.578"
+  }
+}

@@ -109,9 +109,12 @@ const TALL_G0_GOLDEN_PATH: &str = concat!(
 );
 const TALL_SECURITY0_SOURCE_PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/operational-noise-security0-v1/Source.json");
+const TALL_SECURITY128_SOURCE_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/operational-noise-security128-v1/Source.json");
 const TALL_CERTIFICATE_SOURCE_SCHEMA_ID: &str = "mxx.operational-noise.tall-certificate-source";
 const TALL_CERTIFICATE_SOURCE_SCHEMA_VERSION: u32 = 1;
 const TALL_CERTIFICATE_SOURCE_REVISION: &str = "tall-nested-rns-security0-v1";
+const TALL_SECURITY128_CERTIFICATE_SOURCE_REVISION: &str = "tall-nested-rns-security128-v1";
 const TALL_CERTIFICATE_EVALUATOR_VERSION: &str = "tall-runtime-only-v1";
 const TALL_CERTIFICATE_RUST_PROJECTION_VERSION: &str = "operational-noise-certificate-v1";
 const TALL_CERTIFICATE_LEAN_ABI_VERSION: &str = "security0-replay-v1";
@@ -289,17 +292,20 @@ impl TallCertificateSourceV1 {
     }
 
     fn fixed_profile(&self) -> Result<FixedTallG0Profile, String> {
+        let expected_revision = match self.profile {
+            TallG0Profile::Security0 => TALL_CERTIFICATE_SOURCE_REVISION,
+            TallG0Profile::Security128 => TALL_SECURITY128_CERTIFICATE_SOURCE_REVISION,
+        };
         if self.schema_id != TALL_CERTIFICATE_SOURCE_SCHEMA_ID ||
             self.schema_version != TALL_CERTIFICATE_SOURCE_SCHEMA_VERSION ||
-            self.profile != TallG0Profile::Security0 ||
-            self.source_revision != TALL_CERTIFICATE_SOURCE_REVISION ||
+            self.source_revision != expected_revision ||
             self.evaluator_version != TALL_CERTIFICATE_EVALUATOR_VERSION ||
             self.rust_projection_version != TALL_CERTIFICATE_RUST_PROJECTION_VERSION ||
             self.lean_abi_version != TALL_CERTIFICATE_LEAN_ABI_VERSION ||
             self.request_target_id != TALL_OPERATIONAL_TARGET_ID
         {
             return Err(
-                "Tall certificate source identity is not the fixed Security0 identity".to_owned()
+                "Tall certificate source identity is not a fixed profile identity".to_owned()
             );
         }
 
@@ -321,10 +327,8 @@ impl TallCertificateSourceV1 {
             error_sigma,
             trapdoor_sigma,
         };
-        if fixed != TallG0Profile::Security0.fixed() {
-            return Err(
-                "Tall certificate source parameters are not the fixed Security0 profile".to_owned()
-            );
+        if fixed != self.profile.fixed() {
+            return Err("Tall certificate source parameters are not the fixed profile".to_owned());
         }
         Ok(fixed)
     }
@@ -2418,6 +2422,18 @@ fn fixed_tall_security0_certificate_source_is_exact() {
 }
 
 #[test]
+fn fixed_tall_security128_certificate_source_is_exact() {
+    let bytes = fs::read(TALL_SECURITY128_SOURCE_PATH).expect("fixed Security128 Source.json");
+    let source: TallCertificateSourceV1 =
+        serde_json::from_slice(&bytes).expect("strict fixed Security128 source");
+    let fixed = source.fixed_profile().expect("fixed Security128 profile");
+    assert_eq!(fixed, TallG0Profile::Security128.fixed());
+    assert_eq!(fixed.scale, source.parameters.scale.parse::<u64>().expect("source scale"));
+    assert_eq!(fixed.error_sigma, 4.0);
+    assert_eq!(fixed.trapdoor_sigma, 4.578);
+}
+
+#[test]
 #[ignore = "CPU-only fixed Security0 source reconstruction; performs no backend execution"]
 fn fixed_tall_security0_source_reconstructs_direct_semantics() {
     let source: TallCertificateSourceV1 = serde_json::from_slice(
@@ -2499,26 +2515,39 @@ fn fixed_tall_security0_source_projection_matches_ordinary_semantics() {
     );
 }
 
-fn emit_fixed_tall_security0_lean(output: &Path, revision: &str) -> Result<usize, String> {
-    if revision != TALL_CERTIFICATE_SOURCE_REVISION {
-        return Err("Security0 emitter revision does not match Source.json".to_owned());
+fn emit_fixed_tall_lean(
+    output: &Path,
+    source_path: &str,
+    revision: &str,
+    expected_profile: TallG0Profile,
+) -> Result<usize, String> {
+    let expected_revision = match expected_profile {
+        TallG0Profile::Security0 => TALL_CERTIFICATE_SOURCE_REVISION,
+        TallG0Profile::Security128 => TALL_SECURITY128_CERTIFICATE_SOURCE_REVISION,
+    };
+    if revision != expected_revision {
+        return Err("Tall emitter revision does not match Source.json".to_owned());
     }
-    let source: TallCertificateSourceV1 = serde_json::from_slice(
-        &fs::read(TALL_SECURITY0_SOURCE_PATH).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    let source: TallCertificateSourceV1 =
+        serde_json::from_slice(&fs::read(source_path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    if source.profile != expected_profile {
+        return Err("Tall emitter profile does not match Source.json".to_owned());
+    }
     let reconstructed = build_fixed_tall_certificate_source(&source)
-        .map_err(|error| format!("Source.json-driven fixed Security0 source failed: {error}"))?;
+        .map_err(|error| format!("Source.json-driven fixed Tall source failed: {error}"))?;
     let manifest = prepare_tall_security0_lean_manifest(
         &reconstructed.protocol,
         &reconstructed.request,
         &source.profile_identity(),
     )
-    .map_err(|error| format!("Security0 Lean generation failed: {error}"))?;
-    assert_security0_owner_claim_statistics(
-        &manifest.owner_claim_statistics,
-        &manifest.owner_claim_report_bytes,
-    );
+    .map_err(|error| format!("Tall Lean generation failed: {error}"))?;
+    if expected_profile == TallG0Profile::Security0 {
+        assert_security0_owner_claim_statistics(
+            &manifest.owner_claim_statistics,
+            &manifest.owner_claim_report_bytes,
+        );
+    }
     assert_eq!(
         manifest
             .files
@@ -2757,9 +2786,35 @@ fn fixed_tall_security0_emits_reached_lean() {
         .expect("set MXX_SECURITY0_SOURCE_REVISION to the pinned Source.json revision");
     assert!(!output.exists(), "Security0 Lean output directory must not already exist");
     fs::create_dir_all(&output).expect("create Security0 Lean output directory");
-    let count = emit_fixed_tall_security0_lean(&output, &revision)
-        .expect("emit fixed Security0 reached Lean modules");
+    let count = emit_fixed_tall_lean(
+        &output,
+        TALL_SECURITY0_SOURCE_PATH,
+        &revision,
+        TallG0Profile::Security0,
+    )
+    .expect("emit fixed Security0 reached Lean modules");
     assert!(count > 400, "Security0 renderer must emit the reached module set");
+    println!("generatedFiles={count} output={}", output.display());
+}
+
+#[test]
+#[ignore = "CPU-only fixed Security128 Lean emitter; performs no backend execution"]
+fn fixed_tall_security128_emits_reached_lean() {
+    let output = env::var_os("MXX_SECURITY128_LEAN_OUTPUT")
+        .map(PathBuf::from)
+        .expect("set MXX_SECURITY128_LEAN_OUTPUT to an explicit empty output directory");
+    let revision = env::var("MXX_SECURITY128_SOURCE_REVISION")
+        .expect("set MXX_SECURITY128_SOURCE_REVISION to the pinned Source.json revision");
+    assert!(!output.exists(), "Security128 Lean output directory must not already exist");
+    fs::create_dir_all(&output).expect("create Security128 Lean output directory");
+    let count = emit_fixed_tall_lean(
+        &output,
+        TALL_SECURITY128_SOURCE_PATH,
+        &revision,
+        TallG0Profile::Security128,
+    )
+    .expect("emit fixed Security128 reached Lean modules");
+    assert!(count > 400, "Security128 renderer must emit the reached module set");
     println!("generatedFiles={count} output={}", output.display());
 }
 

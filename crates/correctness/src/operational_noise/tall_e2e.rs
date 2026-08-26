@@ -21,8 +21,10 @@ use std::collections::BTreeMap;
 
 const SOURCE_SCHEMA_ID: &str = "mxx.operational-noise.tall-certificate-source";
 const SOURCE_SCHEMA_VERSION: u32 = 1;
-const PROFILE: &str = "Security0";
-const SOURCE_REVISION: &str = "tall-nested-rns-security0-v1";
+const SECURITY0_PROFILE: &str = "Security0";
+const SECURITY0_SOURCE_REVISION: &str = "tall-nested-rns-security0-v1";
+const SECURITY128_PROFILE: &str = "Security128";
+const SECURITY128_SOURCE_REVISION: &str = "tall-nested-rns-security128-v1";
 const EVALUATOR_VERSION: &str = "tall-runtime-only-v1";
 const RUST_PROJECTION_VERSION: &str = "operational-noise-certificate-v1";
 const LEAN_ABI_VERSION: &str = "security0-replay-v1";
@@ -182,7 +184,7 @@ struct StatementCounts {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReachedInventory {
-    profile: &'static str,
+    profile: String,
     closure: ClosureCounts,
     statement: StatementCounts,
     proof_events: u64,
@@ -213,12 +215,22 @@ pub fn prepare_tall_security0_reached_projection(
         .collect::<Result<Vec<_>, _>>()?;
     let (owner_claim_statistics, owner_claim_report_bytes) =
         lean::measure_owner_claims(&documents.proof.payload).map_err(|error| error.to_string())?;
-    let inventory_bytes = encode_inventory(&run.projection.closure, &documents.cert, &event_kinds)?;
+    let inventory_bytes = encode_inventory(
+        &identity.profile,
+        &run.projection.closure,
+        &documents.cert,
+        &event_kinds,
+    )?;
     let projection =
         ReachedProjection { statement: documents.cert, proof: documents.proof.payload };
     let projection_bytes = encode_projection(&projection)?;
     if inventory_bytes !=
-        encode_inventory(&run.projection.closure, &projection.statement, &event_kinds)? ||
+        encode_inventory(
+            &identity.profile,
+            &run.projection.closure,
+            &projection.statement,
+            &event_kinds,
+        )? ||
         projection_bytes != encode_projection(&projection)?
     {
         return Err("Security0 reached projection encoding is not deterministic".to_owned());
@@ -260,17 +272,20 @@ fn validate_identity(
     identity: &TallSecurity0ProfileIdentity,
     request: &OperationalCheckRequest,
 ) -> Result<(), String> {
+    let fixed_profile = (identity.profile == SECURITY0_PROFILE &&
+        identity.source_revision == SECURITY0_SOURCE_REVISION) ||
+        (identity.profile == SECURITY128_PROFILE &&
+            identity.source_revision == SECURITY128_SOURCE_REVISION);
     if identity.source_schema_id != SOURCE_SCHEMA_ID ||
         identity.source_schema_version != SOURCE_SCHEMA_VERSION ||
-        identity.profile != PROFILE ||
-        identity.source_revision != SOURCE_REVISION ||
+        !fixed_profile ||
         identity.evaluator_version != EVALUATOR_VERSION ||
         identity.rust_projection_version != RUST_PROJECTION_VERSION ||
         identity.lean_abi_version != LEAN_ABI_VERSION ||
         identity.request_target_id != TARGET_ID ||
         request.target_id != identity.request_target_id
     {
-        return Err("Tall Security0 projection identity does not match the fixed source".to_owned());
+        return Err("Tall projection identity does not match a fixed source".to_owned());
     }
     Ok(())
 }
@@ -352,6 +367,7 @@ fn reached_bound_kind(rule: &ProofPayloadRule) -> Result<ReachedBoundKind, Strin
 }
 
 fn encode_inventory(
+    profile: &str,
     closure: &super::simulation::CertificateClosure,
     statement: &CertificateDocumentV1,
     events: &[ReachedEventKind],
@@ -371,7 +387,7 @@ fn encode_inventory(
         .and_then(|value| value.checked_add(statement.events.len()))
         .ok_or_else(|| "Security0 statement row count overflow".to_owned())?;
     let inventory = ReachedInventory {
-        profile: PROFILE,
+        profile: profile.to_owned(),
         closure: ClosureCounts {
             expressions: cardinality(closure.expressions.len())?,
             programs: cardinality(closure.programs.len())?,

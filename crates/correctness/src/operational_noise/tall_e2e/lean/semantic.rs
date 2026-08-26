@@ -274,6 +274,7 @@ struct LeftRootRenderData<'a> {
     event_ids: Vec<u64>,
     bounds: Vec<LeftRootBoundNode<'a>>,
     relation_events: Vec<u64>,
+    authority_results: BTreeMap<u64, u64>,
 }
 
 struct FinalAddRenderData {
@@ -1685,7 +1686,12 @@ pub(super) fn render(
     let index = PayloadIndex::new(proof)?;
     let left_root = collect_left_root_render_data(proof, &index)?;
     let final_add = collect_final_add_render_data(&index)?;
-    let _ = (left_root.event_ids.len(), left_root.bounds.len(), left_root.relation_events.len());
+    let _ = (
+        left_root.event_ids.len(),
+        left_root.bounds.len(),
+        left_root.relation_events.len(),
+        left_root.authority_results.len(),
+    );
     let _ = (
         final_add.owner,
         final_add.left.event,
@@ -1796,6 +1802,103 @@ fn reached_left_bound_rule(rule: &ProofPayloadRule) -> bool {
     )
 }
 
+fn rule_references_transfer(rule: &ProofPayloadRule, transfer: u64) -> bool {
+    let reference_matches = |reference: &ProofPayloadValueRef| matches!(reference, ProofPayloadValueRef::Transfer(event) if *event == transfer);
+    match rule {
+        ProofPayloadRule::Authority(_) => false,
+        ProofPayloadRule::Identity { input } => reference_matches(input),
+        ProofPayloadRule::Sum { inputs } |
+        ProofPayloadRule::Maximum { inputs } |
+        ProofPayloadRule::WeightedSum { inputs } => inputs.iter().any(reference_matches),
+        ProofPayloadRule::Scale { value, scale } => {
+            reference_matches(value) ||
+                matches!(scale, crate::operational_noise::simulation::ProofPayloadScale::Value(reference) if reference_matches(reference))
+        }
+        ProofPayloadRule::MonomialProduct { factors, .. } => {
+            factors.iter().any(|factor| reference_matches(&factor.bound))
+        }
+        ProofPayloadRule::Product { left, right, .. } |
+        ProofPayloadRule::Tensor { left, right, .. } => {
+            reference_matches(left) || reference_matches(right)
+        }
+    }
+}
+
+fn collect_left_authority_results(
+    index: &PayloadIndex,
+    bounds: &[LeftRootBoundNode<'_>],
+) -> Result<BTreeMap<u64, u64>, String> {
+    let authority_events = bounds
+        .iter()
+        .filter_map(|bound| {
+            matches!(bound.rule, ProofPayloadRule::Authority(_)).then_some(bound.event)
+        })
+        .collect::<BTreeSet<_>>();
+    for bound in bounds {
+        if let Some(transfer) = authority_events
+            .iter()
+            .find(|transfer| rule_references_transfer(bound.rule, **transfer))
+        {
+            return Err(format!(
+                "Security0 reached bound row {} directly consumes authority transfer {transfer}",
+                bound.event
+            ));
+        }
+    }
+    let mut results = BTreeMap::<u64, Vec<u64>>::new();
+    for (position, event) in index.events.iter().enumerate() {
+        let result_event =
+            u64::try_from(position).map_err(|_| "authority result index overflow")?;
+        let (result_owner, producer) = match event {
+            ProofPayloadEvent::Result { owner, value: ProofPayloadValue::Coefficient { .. } } => (
+                *owner,
+                result_event.checked_sub(1).filter(|event| authority_events.contains(event)),
+            ),
+            ProofPayloadEvent::Result {
+                owner,
+                value: ProofPayloadValue::Exact { coefficient_producer, .. },
+            } => (
+                *owner,
+                authority_events.contains(coefficient_producer).then_some(*coefficient_producer),
+            ),
+            _ => continue,
+        };
+        let Some(producer) = producer else { continue };
+        let transfer_frame = index.immediate_frames
+            [usize::try_from(producer).map_err(|_| "authority event index overflow")?];
+        let result_frame = index.immediate_frames[position];
+        if transfer_frame != result_frame {
+            return Err(format!(
+                "Security0 authority transfer {producer} and Result {} are in different frames",
+                result_event
+            ));
+        }
+        let ProofPayloadEvent::BoundTransfer { owner, .. } = index.event(producer)? else {
+            unreachable!("authority set contains only bound transfers")
+        };
+        if *owner != result_owner {
+            return Err(format!(
+                "Security0 authority transfer {producer} and Result {} have different owners",
+                result_event
+            ));
+        }
+        results.entry(producer).or_default().push(result_event);
+    }
+    authority_events
+        .into_iter()
+        .map(|event| match results.remove(&event).as_deref() {
+            Some([result]) => Ok((event, *result)),
+            Some(found) => Err(format!(
+                "Security0 authority transfer {event} maps to {} supported Results instead of one",
+                found.len()
+            )),
+            None => Err(format!(
+                "Security0 authority transfer {event} has no supported same-frame Result"
+            )),
+        })
+        .collect()
+}
+
 fn collect_left_root_render_data<'a>(
     proof: &OperationalProofPayload,
     index: &'a PayloadIndex,
@@ -1871,7 +1974,8 @@ fn collect_left_root_render_data<'a>(
     }) {
         return Err(format!("Security0 left-root bound row {} is inconsistent", bound.event));
     }
-    Ok(LeftRootRenderData { event_ids, bounds, relation_events })
+    let authority_results = collect_left_authority_results(index, &bounds)?;
+    Ok(LeftRootRenderData { event_ids, bounds, relation_events, authority_results })
 }
 
 fn collect_final_add_render_data(index: &PayloadIndex) -> Result<FinalAddRenderData, String> {

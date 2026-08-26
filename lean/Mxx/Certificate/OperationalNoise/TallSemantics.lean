@@ -2849,6 +2849,51 @@ theorem operatorAddNoMergeExactZeroClaimAt
       (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
       (outputRaw.map Term.toExact) leftClaim.claim rightClaim.claim outputEval modulusPositive
 
+/-- The reached no-collision Subtract has the same structural Sum transfer as Add, but its
+    canonical output negates the right polynomial.  Exact-zero child remainders therefore yield
+    the exact-zero Result recorded without a summary producer. -/
+theorem operatorSubNoMergeExactZeroClaimAt
+    {document : TallDocument} {history : EventHistory}
+    {modulus frameStart transferEvent resultEvent : Nat} {env : Env Owner}
+    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
+    {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
+    {leftExpression rightExpression : ExpressionRef}
+    {leftActual rightActual : Int} {leftRaw rightRaw outputRaw : List Term}
+    {valueType : ValueType} {coefficientBound : Bound}
+    (_operationAt :
+      (document.expressions.lookup owner.expression.row).map
+        TallSecurity0ABI.ExpressionRow.descriptor =
+        some (.operation (.stable (.matrix .subtract)) valueType))
+    (_leftPredecessorAt : history.lookup leftBinding = some
+      ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
+    (_rightPredecessorAt : history.lookup rightBinding = some
+      ⟨.predecessor owner rightInputPosition rightExpression rightResult, frameStart⟩)
+    (_transferAt : history.lookup transferEvent = some
+      ⟨.boundTransfer owner
+        (.sum [.predecessor leftInputPosition leftBinding .coefficient,
+          .predecessor rightInputPosition rightBinding .coefficient]), frameStart⟩)
+    (leftClaim : ExactClaimAt history modulus env leftResult leftOwner leftActual leftRaw
+      .exactZero)
+    (rightClaim : ExactClaimAt history modulus env rightResult rightOwner rightActual rightRaw
+      .exactZero)
+    (resultAt : history.lookup resultEvent = some
+      ⟨.resultExact owner outputRaw coefficientBound transferEvent .exactZero none,
+        frameStart⟩)
+    (outputAgreement : CanonicalAgreement (outputRaw.map Term.toExact)
+      (subtract (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)))
+    (modulusPositive : 0 < modulus) :
+    ExactClaimAt history modulus env resultEvent owner (leftActual - rightActual) outputRaw
+      .exactZero := by
+  have outputEval := subCanonicalResultSound env
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (outputRaw.map Term.toExact) outputAgreement
+  refine ⟨⟨coefficientBound, transferEvent, none, ?_⟩, ?_⟩
+  · rw [resultAt]
+    rfl
+  · exact exactValueClaim_sub_exactZero_of_mod_zero modulus env leftActual rightActual
+      (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+      (outputRaw.map Term.toExact) leftClaim.claim rightClaim.claim outputEval modulusPositive
+
 /-- A reached merged Add binds its collision rows through reconstruction and records the sum of
     the two finite child summaries through the separate summary transfer. -/
 theorem operatorAddFiniteMergeClaimAt

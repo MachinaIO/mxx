@@ -366,6 +366,35 @@ theorem operator_add_no_merge_exact_zero_claim_fixture :
   · decide +kernel
   · decide
 
+def subNoMergeExactZeroDocument : TallDocument :=
+  { addNoMergeFixtureDocument with
+    expressions := .node 0
+      { descriptor := .operation (.stable (.matrix .subtract)) atomType
+        inputs := emptyExpressionInputs
+        program := none } .empty .empty }
+
+theorem operator_sub_no_merge_exact_zero_claim_fixture :
+    ExactClaimAt addNoMergeExactZeroHistory 257 (fun _ : Owner ↦ 0) 5
+      boundFixtureOwner 0 [] .exactZero := by
+  apply operatorSubNoMergeExactZeroClaimAt (document := subNoMergeExactZeroDocument)
+      (history := addNoMergeExactZeroHistory) (modulus := 257) (frameStart := 7)
+      (transferEvent := 4) (resultEvent := 5) (env := fun _ : Owner ↦ 0)
+      (owner := boundFixtureOwner) (leftOwner := boundFixtureOwner)
+      (rightOwner := boundFixtureOwner) (leftResult := 0) (rightResult := 1)
+      (leftBinding := 2) (rightBinding := 3) (leftInputPosition := 0)
+      (rightInputPosition := 1) (leftExpression := ⟨0⟩) (rightExpression := ⟨0⟩)
+      (leftActual := 0) (rightActual := 0) (leftRaw := []) (rightRaw := [])
+      (outputRaw := []) (valueType := atomType) (coefficientBound := .finite 0)
+  · rfl
+  · rfl
+  · rfl
+  · rfl
+  · exact add_no_merge_exact_zero_left_claim_fixture
+  · exact add_no_merge_exact_zero_right_claim_fixture
+  · rfl
+  · decide +kernel
+  · decide
+
 def addMergeHistory : EventHistory :=
   smallHistory #[
     annotated (.resultExact boundFixtureOwner [mergeLeftTerm] (.finite 0) 0 (.finite 1) none) 7,
@@ -903,6 +932,8 @@ theorem canonical_relation_fixture :
 #print axioms operator_add_no_merge_claim_fixture
 #print axioms TallSemantics.operatorAddNoMergeExactZeroClaimAt
 #print axioms operator_add_no_merge_exact_zero_claim_fixture
+#print axioms TallSemantics.operatorSubNoMergeExactZeroClaimAt
+#print axioms operator_sub_no_merge_exact_zero_claim_fixture
 #print axioms TallSemantics.exactValueClaim_sub_finite
 #print axioms TallSemantics.operatorAddFiniteMergeClaimAt
 #print axioms TallSemantics.operatorSubFiniteMergeClaimAt

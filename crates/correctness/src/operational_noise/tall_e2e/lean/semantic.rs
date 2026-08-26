@@ -1721,6 +1721,7 @@ pub(super) fn render(
     files.push(generated_file("Semantic/SemanticRightRoot.lean", right_root_index));
     files.extend(right_root_shards);
     files.extend(render_left_authorities(&index, &left_root, &modulus)?);
+    files.extend(render_left_bounds(statement, &index, &left_root, &modulus)?);
 
     let specs = [
         ("Semantic/Semantic000.lean", "Semantic000", "long-monomial-merge"),
@@ -1777,7 +1778,7 @@ pub(super) fn render(
     ));
     let mut index = String::new();
     index.push_str("import Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Semantic.SemanticRightRoot\n");
-    index.push_str("import Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Semantic.SemanticLeftAuthority\n");
+    index.push_str("import Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Semantic.SemanticLeftBound\n");
     for (_, module, _) in specs {
         writeln!(index, "import {NAMESPACE}.Semantic.{module}").expect("String write");
     }
@@ -1801,7 +1802,8 @@ fn reached_left_bound_rule(rule: &ProofPayloadRule) -> bool {
         ) | ProofPayloadRule::Identity { .. } |
             ProofPayloadRule::Sum { .. } |
             ProofPayloadRule::Scale { .. } |
-            ProofPayloadRule::MonomialProduct { .. }
+            ProofPayloadRule::MonomialProduct { .. } |
+            ProofPayloadRule::Product { .. }
     )
 }
 
@@ -1824,6 +1826,104 @@ fn rule_references_transfer(rule: &ProofPayloadRule, transfer: u64) -> bool {
         ProofPayloadRule::Tensor { left, right, .. } => {
             reference_matches(left) || reference_matches(right)
         }
+    }
+}
+
+fn reached_bound_references(rule: &ProofPayloadRule) -> Vec<&ProofPayloadValueRef> {
+    match rule {
+        ProofPayloadRule::Authority(_) => Vec::new(),
+        ProofPayloadRule::Identity { input } => vec![input],
+        ProofPayloadRule::Sum { inputs } => inputs.iter().collect(),
+        ProofPayloadRule::Scale { value, scale } => {
+            let mut references = vec![value];
+            if let crate::operational_noise::simulation::ProofPayloadScale::Value(reference) = scale
+            {
+                references.push(reference);
+            }
+            references
+        }
+        ProofPayloadRule::MonomialProduct { factors, .. } => {
+            factors.iter().map(|factor| &factor.bound).collect()
+        }
+        ProofPayloadRule::Product { left, right, .. } => vec![left, right],
+        _ => Vec::new(),
+    }
+}
+
+fn reached_bound_reference_producer(
+    index: &PayloadIndex,
+    consumer: ProofPayloadOwner,
+    reference: &ProofPayloadValueRef,
+) -> Result<u64, String> {
+    if let ProofPayloadValueRef::Transfer(event) = reference {
+        return match index.event(*event)? {
+            ProofPayloadEvent::BoundTransfer { owner, .. } if owner == &consumer => Ok(*event),
+            ProofPayloadEvent::BoundTransfer { .. } => {
+                Err(format!("direct transfer reference {event} has a different owner"))
+            }
+            _ => Err(format!("direct transfer reference {event} is not a BoundTransfer")),
+        };
+    }
+    let projection = match reference {
+        ProofPayloadValueRef::Result { projection, .. } |
+        ProofPayloadValueRef::Predecessor { projection, .. } => projection,
+        ProofPayloadValueRef::Transfer(_) => unreachable!(),
+    };
+    let result_event = reached_bound_result_event(index, consumer, reference)?;
+    match (projection, index.event(result_event)?) {
+        (
+            BoundProjection::Coefficient,
+            ProofPayloadEvent::Result { value: ProofPayloadValue::Coefficient { .. }, .. },
+        ) => result_event
+            .checked_sub(1)
+            .ok_or_else(|| format!("Result {result_event} has no coefficient producer")),
+        (
+            BoundProjection::Coefficient,
+            ProofPayloadEvent::Result {
+                value: ProofPayloadValue::Exact { coefficient_producer, .. },
+                ..
+            },
+        ) => Ok(*coefficient_producer),
+        (
+            BoundProjection::Summary,
+            ProofPayloadEvent::Result {
+                value: ProofPayloadValue::Exact { summary_producer: Some(producer), .. },
+                ..
+            },
+        ) => Ok(*producer),
+        (BoundProjection::Summary, ProofPayloadEvent::Result { .. }) => Err(format!(
+            "Security0 reached bound reference {reference:?} has no event-indexed summary producer"
+        )),
+        (_, _) => unreachable!("reached bound reference identifies a Result"),
+    }
+}
+
+fn reached_bound_result_event(
+    index: &PayloadIndex,
+    consumer: ProofPayloadOwner,
+    reference: &ProofPayloadValueRef,
+) -> Result<u64, String> {
+    let event = match reference {
+        ProofPayloadValueRef::Result { event, .. } => *event,
+        ProofPayloadValueRef::Predecessor { binding_event, input_position, .. } => {
+            let (binding_consumer, position, source_result) = index
+                .predecessors
+                .get(binding_event)
+                .ok_or_else(|| format!("bound predecessor {binding_event} is missing"))?;
+            if binding_consumer != &consumer || position != input_position {
+                return Err(format!(
+                    "bound predecessor {binding_event} owner/input does not match its consumer"
+                ));
+            }
+            *source_result
+        }
+        ProofPayloadValueRef::Transfer(event) => {
+            return Err(format!("unsupported direct transfer reference {event}"));
+        }
+    };
+    match index.event(event)? {
+        ProofPayloadEvent::Result { .. } => Ok(event),
+        _ => Err(format!("payload reference {event} does not identify a Result")),
     }
 }
 
@@ -1960,15 +2060,55 @@ fn collect_left_root_render_data<'a>(
             "Security0 left-root closure does not reach exactly the eight supported bound-rule families: {reached_rules:?}"
         ));
     }
-    if bounds.len() != 9_173 {
+    // The structural closure contains 9,173 transfer rows. Following only stored Result producer
+    // IDs reaches 9,234; recursively following the direct transfer references selected by those
+    // rules closes this semantic slice at 13,821 without traversing unrelated history.
+    let mut bound_events = bounds.iter().map(|bound| bound.event).collect::<BTreeSet<_>>();
+    loop {
+        let mut added = Vec::new();
+        for event in bound_events.iter().copied().collect::<Vec<_>>() {
+            let ProofPayloadEvent::BoundTransfer { owner, rule } = index.event(event)? else {
+                unreachable!("left bound event set contains only transfers")
+            };
+            for reference in reached_bound_references(rule) {
+                let producer = reached_bound_reference_producer(index, *owner, reference)?;
+                if bound_events.insert(producer) {
+                    let ProofPayloadEvent::BoundTransfer { rule, .. } = index.event(producer)?
+                    else {
+                        return Err(format!(
+                            "Security0 reached bound producer {producer} is not a BoundTransfer"
+                        ));
+                    };
+                    if !reached_left_bound_rule(rule) {
+                        return Err(format!(
+                            "Security0 reached bound producer {producer} has unsupported rule {rule:?}"
+                        ));
+                    }
+                    added.push(producer);
+                }
+            }
+        }
+        if added.is_empty() {
+            break;
+        }
+    }
+    bounds = bound_events
+        .into_iter()
+        .map(|event| match index.event(event)? {
+            ProofPayloadEvent::BoundTransfer { owner, rule } => {
+                Ok(LeftRootBoundNode { event, owner: *owner, rule })
+            }
+            _ => unreachable!("expanded left bound event set contains only transfers"),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if bounds.len() != 13_821 {
         return Err(format!(
-            "Security0 left-root closure reaches {} bound rows, expected 9173",
+            "Security0 left-root semantic closure reaches {} bound rows, expected 13821",
             bounds.len()
         ));
     }
     if let Some(bound) = bounds.iter().find(|bound| {
-        event_ids.binary_search(&bound.event).is_err() ||
-            !reached_left_bound_rule(bound.rule) ||
+        !reached_left_bound_rule(bound.rule) ||
             !matches!(
                 index.event(bound.event),
                 Ok(ProofPayloadEvent::BoundTransfer { owner, rule })
@@ -2161,7 +2301,7 @@ fn render_left_authorities(
                 .expect("String write");
             writeln!(source, "def producerEvent : Nat := {event}\ndef resultEvent : Nat := {result_event}\ndef frameStart : Nat := {frame}").expect("String write");
             writeln!(source, "theorem leaf : AuthorityLeafAt history producerEvent resultEvent frameStart owner authority bound := by\n  exact {constructor}").expect("String write");
-            writeln!(source, "theorem derived (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) :\n    BoundDerivedAt history producerEvent frameStart owner (.authority authority) bound\n      (witness.authorityMagnitude resultEvent) := by\n  exact .authority witness.toAuthorityWitness leaf\nend LeftAuthority{event}\n").expect("String write");
+            writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Nat :=\n  witness.authorityMagnitude resultEvent\ntheorem derived (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) :\n    BoundDerivedAt history producerEvent frameStart owner (.authority authority) bound\n      (actual selector witness) := by\n  exact .authority witness.toAuthorityWitness leaf\nend LeftAuthority{event}\n").expect("String write");
         }
         writeln!(source, "end {NAMESPACE}.Semantic").expect("String write");
         files.push(generated_file(format!("Semantic/{module}.lean"), source));
@@ -2170,6 +2310,601 @@ fn render_left_authorities(
     files.push(generated_file(
         "Semantic/SemanticLeftAuthority.lean",
         format!("import {NAMESPACE}.Semantic.SemanticLeftAuthorityShard{last:03}\n"),
+    ));
+    Ok(files)
+}
+
+fn left_bound_namespace(event: u64, rule: &ProofPayloadRule) -> String {
+    if matches!(rule, ProofPayloadRule::Authority(_)) {
+        format!("LeftAuthority{event}")
+    } else {
+        format!("LeftBound{event}")
+    }
+}
+
+fn left_factor_text(
+    factor: &crate::operational_noise::simulation::ProofPayloadFactorEvidence,
+) -> String {
+    format!(
+        "⟨{}, {}, {}⟩",
+        value_ref_text(&factor.bound),
+        if factor.is_constant_polynomial { "true" } else { "false" },
+        factor.support_upper.map_or_else(|| "none".to_owned(), |value| format!("some {value}")),
+    )
+}
+
+fn left_rule_text(rule: &ProofPayloadRule) -> Result<String, String> {
+    Ok(match rule {
+        ProofPayloadRule::Identity { input } => {
+            format!(".identity ({})", value_ref_text(input))
+        }
+        ProofPayloadRule::Sum { inputs } => {
+            format!(".sum [{}]", inputs.iter().map(value_ref_text).collect::<Vec<_>>().join(", "))
+        }
+        ProofPayloadRule::Scale { value, scale } => format!(
+            ".scale ({}) ({})",
+            value_ref_text(value),
+            match scale {
+                crate::operational_noise::simulation::ProofPayloadScale::Value(reference) => {
+                    format!(".value ({})", value_ref_text(reference))
+                }
+                crate::operational_noise::simulation::ProofPayloadScale::Magnitude(value) => {
+                    format!(".magnitude {value}")
+                }
+            }
+        ),
+        ProofPayloadRule::MonomialProduct { monomial, factors } => format!(
+            ".monomialProduct {} [{}]",
+            monomial_text(monomial),
+            factors.iter().map(left_factor_text).collect::<Vec<_>>().join(", ")
+        ),
+        ProofPayloadRule::Product { .. } => rule_text(rule),
+        _ => return Err(format!("unsupported reached left bound rule {rule:?}")),
+    })
+}
+
+fn reached_product_shape(
+    statement: &CertificateDocumentV1,
+    owner: ProofPayloadOwner,
+    facts: &crate::operational_noise::bound::MatrixProductFacts,
+) -> Result<(usize, usize, usize, usize, usize, usize), String> {
+    let row = statement
+        .expressions
+        .get(usize::try_from(owner.expression_row).map_err(|_| "product owner row overflow")?)
+        .ok_or_else(|| format!("product owner {} has no expression row", owner_text(owner)))?;
+    let [left_row, right_row] = row.inputs.as_slice() else {
+        return Err(format!(
+            "product owner {} does not have two statement inputs",
+            owner_text(owner)
+        ));
+    };
+    let matrix = |expression: u64| -> Result<(usize, usize, usize), String> {
+        let row = statement
+            .expressions
+            .get(usize::try_from(expression).map_err(|_| "product input row overflow")?)
+            .ok_or_else(|| format!("product input expression {expression} is missing"))?;
+        let value_type = match &row.descriptor {
+            CanonicalExpressionDescriptor::Operation { value_type, .. } => value_type,
+            CanonicalExpressionDescriptor::Source { source } => {
+                let source = match source {
+                    crate::operational_noise::g0::CanonicalExpressionSource::Direct { source } |
+                    crate::operational_noise::g0::CanonicalExpressionSource::Family {
+                        source,
+                        ..
+                    } => *source,
+                };
+                match statement
+                    .sources
+                    .get(usize::try_from(source).map_err(|_| "product source row overflow")?)
+                    .ok_or_else(|| format!("product source row {source} is missing"))?
+                {
+                    crate::operational_noise::certificate_schema::CertificateSourceRowV1::Constant {
+                        value,
+                    } => &value.value_type,
+                    crate::operational_noise::certificate_schema::CertificateSourceRowV1::Direct {
+                        identity,
+                        ..
+                    } => &identity.value_type,
+                    crate::operational_noise::certificate_schema::CertificateSourceRowV1::Family {
+                        identity,
+                        ..
+                    } => &identity.element_type,
+                }
+            }
+            CanonicalExpressionDescriptor::Event { operator } => {
+                let event = match operator {
+                    crate::operational_noise::g0::CanonicalEventOperator::Sample { event } |
+                    crate::operational_noise::g0::CanonicalEventOperator::Sampler { event } => {
+                        event.row
+                    }
+                    crate::operational_noise::g0::CanonicalEventOperator::GadgetDecompose {
+                        events,
+                    } => {
+                        events
+                            .first()
+                            .ok_or_else(|| {
+                                format!("product event expression {expression} has no event rows")
+                            })?
+                            .row
+                    }
+                };
+                match statement
+                    .events
+                    .get(usize::try_from(event).map_err(|_| "product event row overflow")?)
+                    .ok_or_else(|| format!("product event row {event} is missing"))?
+                {
+                    crate::operational_noise::certificate_schema::CertificateEventRowV1::Sample {
+                        descriptor,
+                        ..
+                    } => &descriptor.output_type,
+                    crate::operational_noise::certificate_schema::CertificateEventRowV1::Sampler {
+                        operation,
+                        ..
+                    } => match operation {
+                        crate::operational_noise::g0::StableSamplerOperation::UniformResidue {
+                            output,
+                        } |
+                        crate::operational_noise::g0::StableSamplerOperation::UniformInterval {
+                            output,
+                            ..
+                        } |
+                        crate::operational_noise::g0::StableSamplerOperation::Gaussian {
+                            output,
+                            ..
+                        } |
+                        crate::operational_noise::g0::StableSamplerOperation::Hash {
+                            output,
+                            ..
+                        } |
+                        crate::operational_noise::g0::StableSamplerOperation::Trapdoor {
+                            output,
+                            ..
+                        } |
+                        crate::operational_noise::g0::StableSamplerOperation::Preimage {
+                            output,
+                            ..
+                        } => output,
+                    },
+                    crate::operational_noise::certificate_schema::CertificateEventRowV1::GadgetDecompose {
+                        output,
+                        ..
+                    } => output,
+                }
+            }
+        };
+        let crate::operational_noise::g0::StableValueType::Matrix {
+            ring_dimension,
+            rows,
+            columns,
+            ..
+        } = value_type
+        else {
+            return Err(format!("product input expression {expression} is not matrix-typed"));
+        };
+        Ok((*rows, *columns, *ring_dimension))
+    };
+    let (left_rows, left_columns, ring_dimension) = matrix(*left_row)?;
+    let (right_rows, right_columns, right_ring_dimension) = matrix(*right_row)?;
+    if ring_dimension != right_ring_dimension || ring_dimension == 0 {
+        return Err(format!("product owner {} has inconsistent ring dimensions", owner_text(owner)));
+    }
+    let support = |constant: bool, upper: Option<usize>| {
+        if constant { 1 } else { upper.unwrap_or(ring_dimension) }
+    };
+    for upper in [facts.left_support_upper, facts.right_support_upper].into_iter().flatten() {
+        if upper > ring_dimension {
+            return Err(format!("product owner {} has invalid support upper", owner_text(owner)));
+        }
+    }
+    let left_scalar = left_rows == 1 && left_columns == 1;
+    let right_scalar = right_rows == 1 && right_columns == 1;
+    let factor = if left_scalar {
+        support(facts.left_is_constant_polynomial, facts.left_support_upper)
+    } else if right_scalar {
+        support(facts.right_is_constant_polynomial, facts.right_support_upper)
+    } else {
+        if left_columns != right_rows {
+            return Err(format!(
+                "product owner {} has incompatible matrix inputs",
+                owner_text(owner)
+            ));
+        }
+        let zero_rows = facts.right_known_zero_rows.as_ref().map_or(Ok(0_usize), |value| {
+            usize::try_from(value).map_err(|_| "product zero-row count overflow".to_owned())
+        })?;
+        if zero_rows > right_rows {
+            return Err(format!("product owner {} has invalid zero rows", owner_text(owner)));
+        }
+        (left_columns - zero_rows) *
+            if facts.left_is_constant_polynomial || facts.right_is_constant_polynomial {
+                1
+            } else {
+                ring_dimension
+            }
+    };
+    Ok((left_rows, left_columns, right_rows, right_columns, ring_dimension, factor))
+}
+
+fn left_bound_source<'a>(
+    index: &PayloadIndex,
+    data: &'a LeftRootRenderData<'_>,
+    consumer: ProofPayloadOwner,
+    reference: &ProofPayloadValueRef,
+) -> Result<(Option<u64>, &'a LeftRootBoundNode<'a>), String> {
+    if let ProofPayloadValueRef::Transfer(event) = reference {
+        let node = data
+            .bounds
+            .iter()
+            .find(|node| node.event == *event && node.owner == consumer)
+            .ok_or_else(|| {
+            format!("Security0 direct transfer input {event} is outside the semantic closure")
+        })?;
+        return Ok((None, node));
+    }
+    let projection = match reference {
+        ProofPayloadValueRef::Result { projection, .. } |
+        ProofPayloadValueRef::Predecessor { projection, .. } => projection,
+        ProofPayloadValueRef::Transfer(event) => {
+            return Err(format!(
+                "Security0 left bound renderer reached unsupported direct transfer reference {event}"
+            ));
+        }
+    };
+    let result_event = reached_bound_result_event(index, consumer, reference)?;
+    let producer = match (projection, index.event(result_event)?) {
+        (
+            BoundProjection::Coefficient,
+            ProofPayloadEvent::Result { value: ProofPayloadValue::Coefficient { .. }, .. },
+        ) => result_event
+            .checked_sub(1)
+            .ok_or_else(|| format!("Result {result_event} has no coefficient producer"))?,
+        (
+            BoundProjection::Summary,
+            ProofPayloadEvent::Result { value: ProofPayloadValue::Coefficient { .. }, .. },
+        ) => {
+            return Err(format!(
+                "Security0 left bound reference {reference:?} selects a ResultCoefficient summary"
+            ));
+        }
+        (
+            BoundProjection::Coefficient,
+            ProofPayloadEvent::Result {
+                value: ProofPayloadValue::Exact { coefficient_producer, .. },
+                ..
+            },
+        ) => *coefficient_producer,
+        (
+            BoundProjection::Summary,
+            ProofPayloadEvent::Result {
+                value: ProofPayloadValue::Exact { summary_producer: Some(producer), .. },
+                ..
+            },
+        ) => *producer,
+        (
+            BoundProjection::Summary,
+            ProofPayloadEvent::Result {
+                value: ProofPayloadValue::Exact { summary_producer: None, .. },
+                ..
+            },
+        ) => {
+            return Err(format!(
+                "Security0 left bound reference {reference:?} selects an unresolved ResultExact summary"
+            ));
+        }
+        (_, _) => unreachable!("reached bound reference identifies a Result"),
+    };
+    let node = data
+        .bounds
+        .iter()
+        .find(|node| node.event == producer)
+        .ok_or_else(|| {
+            format!(
+                "Security0 left bound input Result {} selects producer {producer} outside the left closure",
+                result_event
+            )
+        })?;
+    Ok((Some(result_event), node))
+}
+
+fn left_bound_dependency_names(
+    index: &PayloadIndex,
+    data: &LeftRootRenderData<'_>,
+    root: &LeftRootBoundNode<'_>,
+) -> Result<Vec<String>, String> {
+    fn visit(
+        index: &PayloadIndex,
+        data: &LeftRootRenderData<'_>,
+        node: &LeftRootBoundNode<'_>,
+        events: &mut BTreeSet<u64>,
+    ) -> Result<(), String> {
+        if !events.insert(node.event) {
+            return Ok(());
+        }
+        for reference in reached_bound_references(node.rule) {
+            let (_, producer) = left_bound_source(index, data, node.owner, reference)?;
+            visit(index, data, producer, events)?;
+        }
+        Ok(())
+    }
+
+    let mut events = BTreeSet::new();
+    visit(index, data, root, &mut events)?;
+    events
+        .into_iter()
+        .map(|event| {
+            let node = data
+                .bounds
+                .iter()
+                .find(|node| node.event == event)
+                .ok_or_else(|| format!("Security0 left bound dependency {event} is missing"))?;
+            Ok(format!("{}.bound", left_bound_namespace(node.event, node.rule)))
+        })
+        .collect()
+}
+
+fn render_left_bound_input(
+    source: &mut String,
+    index: &PayloadIndex,
+    data: &LeftRootRenderData<'_>,
+    node: &LeftRootBoundNode<'_>,
+    ordinal: usize,
+    reference: &ProofPayloadValueRef,
+    modulus: &str,
+) -> Result<(String, String), String> {
+    let (result_event, producer) = left_bound_source(index, data, node.owner, reference)?;
+    let producer_namespace = left_bound_namespace(producer.event, producer.rule);
+    let name = format!("input{ordinal}");
+    if matches!(reference, ProofPayloadValueRef::Transfer(_)) {
+        writeln!(
+            source,
+            "theorem {name} (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) :\n    BoundInputAt history owner ({})\n      {producer_namespace}.bound ({producer_namespace}.actual selector witness) := by\n  exact .transfer ({producer_namespace}.derived selector witness)\n",
+            value_ref_text(reference)
+        )
+        .expect("String write");
+        return Ok((producer_namespace, name));
+    }
+    let result_event = result_event.expect("non-transfer input has a Result");
+    let (raw_terms, result_owner) = match index.event(result_event)? {
+        ProofPayloadEvent::Result { owner, value: ProofPayloadValue::Coefficient { .. } } => {
+            ("none".to_owned(), owner_text(*owner))
+        }
+        ProofPayloadEvent::Result { owner, value: ProofPayloadValue::Exact { terms, .. } } => {
+            (format!("some ({})", raw_terms_text(terms)), owner_text(*owner))
+        }
+        _ => unreachable!("reached bound input identifies a Result"),
+    };
+    let projection = match reference {
+        ProofPayloadValueRef::Result { projection, .. } |
+        ProofPayloadValueRef::Predecessor { projection, .. } => projection,
+        ProofPayloadValueRef::Transfer(_) => unreachable!(),
+    };
+    let projector = match (projection, index.event(result_event)?) {
+        (
+            BoundProjection::Coefficient,
+            ProofPayloadEvent::Result { value: ProofPayloadValue::Coefficient { .. }, .. },
+        ) => format!(
+            ".resultCoefficient (by decide) (by rfl) ({producer_namespace}.derived selector witness)"
+        ),
+        (
+            BoundProjection::Coefficient,
+            ProofPayloadEvent::Result { value: ProofPayloadValue::Exact { .. }, .. },
+        ) => {
+            let dependencies = left_bound_dependency_names(index, data, producer)?.join(", ");
+            let refines = format!(
+                "by dsimp [{dependencies}, addKnownList, addKnown, productWithFactor, \
+                 scaleMagnitude, scaleValue, productNonempty, RecordedBoundRefines] <;> decide"
+            );
+            format!(
+                ".resultExactCoefficient (by rfl)\n      ({refines})\n      ({producer_namespace}.derived selector witness)"
+            )
+        }
+        (
+            BoundProjection::Summary,
+            ProofPayloadEvent::Result { value: ProofPayloadValue::Exact { .. }, .. },
+        ) => {
+            format!(".resultExactSummary (by rfl) ({producer_namespace}.derived selector witness)")
+        }
+        _ => unreachable!("validated left bound projection and Result kind"),
+    };
+    writeln!(
+        source,
+        "theorem {name} (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) :\n    BoundInputAt history owner ({})\n      {producer_namespace}.bound ({producer_namespace}.actual selector witness) := by",
+        value_ref_text(reference)
+    )
+    .expect("String write");
+    match reference {
+        ProofPayloadValueRef::Result { .. } => {
+            let constructor = match projection {
+                BoundProjection::Coefficient => ".result",
+                BoundProjection::Summary => ".resultSummary",
+            };
+            writeln!(
+                source,
+                "  refine {constructor} (resultOwner := {result_owner}) \
+                 (rawTerms := {raw_terms}) (by decide) ?_\n  exact {projector}\n"
+            )
+            .expect("String write");
+        }
+        ProofPayloadValueRef::Predecessor { .. } => {
+            writeln!(
+                source,
+                "  refine .predecessor (rawTerms := {raw_terms}) (by rfl) ?_\n  exact {projector}\n"
+            )
+            .expect("String write");
+        }
+        ProofPayloadValueRef::Transfer(_) => unreachable!(),
+    }
+    Ok((producer_namespace, name))
+}
+
+fn render_left_bounds(
+    statement: &CertificateDocumentV1,
+    index: &PayloadIndex,
+    data: &LeftRootRenderData<'_>,
+    modulus: &str,
+) -> Result<Vec<super::super::TallSecurity0GeneratedFile>, String> {
+    const CHUNK_SIZE: usize = 16;
+    let nodes = data
+        .bounds
+        .iter()
+        .filter(|node| !matches!(node.rule, ProofPayloadRule::Authority(_)))
+        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    for (shard_index, shard) in nodes.chunks(CHUNK_SIZE).enumerate() {
+        let module = format!("SemanticLeftBoundShard{shard_index:03}");
+        let mut source = shard_index.checked_sub(1).map_or_else(
+            || format!("import {NAMESPACE}.Semantic.SemanticLeftAuthority\n"),
+            |previous| format!("import {NAMESPACE}.Semantic.SemanticLeftBoundShard{previous:03}\n"),
+        );
+        source
+            .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
+        writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
+        source.push_str("open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\nopen EventReplay\n\n");
+        for node in shard {
+            let frame = index.immediate_frames
+                [usize::try_from(node.event).map_err(|_| "left bound event index overflow")?]
+            .ok_or_else(|| format!("left bound event {} has no frame", node.event))?;
+            writeln!(source, "namespace LeftBound{}", node.event).expect("String write");
+            writeln!(source, "def owner : Owner := {}", owner_text(node.owner))
+                .expect("String write");
+            writeln!(
+                source,
+                "def transferEvent : Nat := {}\ndef frameStart : Nat := {frame}",
+                node.event
+            )
+            .expect("String write");
+            writeln!(source, "def rule : BoundRule := {}", left_rule_text(node.rule)?)
+                .expect("String write");
+
+            let references = match node.rule {
+                ProofPayloadRule::Identity { input } => vec![input],
+                ProofPayloadRule::Sum { inputs } => inputs.iter().collect(),
+                ProofPayloadRule::Scale { value, scale } => {
+                    let mut values = vec![value];
+                    if let crate::operational_noise::simulation::ProofPayloadScale::Value(scale) =
+                        scale
+                    {
+                        values.push(scale);
+                    }
+                    values
+                }
+                ProofPayloadRule::MonomialProduct { factors, .. } => {
+                    factors.iter().map(|factor| &factor.bound).collect()
+                }
+                ProofPayloadRule::Product { left, right, .. } => vec![left, right],
+                _ => unreachable!("filtered reached compositional rule"),
+            };
+            let inputs = references
+                .iter()
+                .enumerate()
+                .map(|(ordinal, reference)| {
+                    render_left_bound_input(
+                        &mut source,
+                        index,
+                        data,
+                        node,
+                        ordinal,
+                        reference,
+                        modulus,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let child_bounds = inputs
+                .iter()
+                .map(|(namespace, _)| format!("{namespace}.bound"))
+                .collect::<Vec<_>>();
+            let child_actuals = inputs
+                .iter()
+                .map(|(namespace, _)| format!("{namespace}.actual selector witness"))
+                .collect::<Vec<_>>();
+            let (bound, actual, proof) = match node.rule {
+                ProofPayloadRule::Identity { .. } => (
+                    child_bounds[0].clone(),
+                    child_actuals[0].clone(),
+                    "refine .identity (by rfl) (input0 selector witness)".to_owned(),
+                ),
+                ProofPayloadRule::Sum { .. } => {
+                    let children = (0..inputs.len()).rev().fold(".nil".to_owned(), |tail, ordinal| {
+                        format!(".cons (input{ordinal} selector witness) ({tail})")
+                    });
+                    (
+                        format!("addKnownList [{}]", child_bounds.join(", ")),
+                        format!("[{}].sum", child_actuals.join(", ")),
+                        format!("refine .sum (by rfl) ({children})"),
+                    )
+                }
+                ProofPayloadRule::Scale {
+                    scale: crate::operational_noise::simulation::ProofPayloadScale::Magnitude(value),
+                    ..
+                } => (
+                    format!("scaleMagnitude {value} {}", child_bounds[0]),
+                    format!("{value} * ({})", child_actuals[0]),
+                    "refine .scaleMagnitude (by rfl) (input0 selector witness)".to_owned(),
+                ),
+                ProofPayloadRule::Scale {
+                    scale: crate::operational_noise::simulation::ProofPayloadScale::Value(_),
+                    ..
+                } => (
+                    format!("scaleValue {} {}", child_bounds[0], child_bounds[1]),
+                    format!("({}) * ({})", child_actuals[0], child_actuals[1]),
+                    "refine .scaleValue (by rfl) (input0 selector witness) (input1 selector witness)"
+                        .to_owned(),
+                ),
+                ProofPayloadRule::MonomialProduct { factors, .. } => {
+                    if factors.is_empty() {
+                        return Err(format!(
+                            "Security0 reached monomial-product {} has no factors",
+                            node.event
+                        ));
+                    }
+                    let tail_bounds = child_bounds[1..].join(", ");
+                    let tail_actuals = child_actuals[1..].join(", ");
+                    let tail = (1..inputs.len()).rev().fold(".nil".to_owned(), |tail, ordinal| {
+                        format!(".cons (.intro (input{ordinal} selector witness)) ({tail})")
+                    });
+                    (
+                        format!("productNonempty {} [{tail_bounds}]", child_bounds[0]),
+                        format!("({}) * ([{tail_actuals}].prod)", child_actuals[0]),
+                        format!(
+                            "refine .monomialProduct (by rfl) (.intro (input0 selector witness)) ({tail})"
+                        ),
+                    )
+                }
+                ProofPayloadRule::Product { facts, .. } => {
+                    let (left_rows, left_columns, right_rows, right_columns, ring_dimension, factor) =
+                        reached_product_shape(statement, node.owner, facts)?;
+                    (
+                        format!(
+                            "productWithFactor {factor} {} {}",
+                            child_bounds[0], child_bounds[1]
+                        ),
+                        format!(
+                            "{factor} * ({}) * ({})",
+                            child_actuals[0], child_actuals[1]
+                        ),
+                        format!(
+                            "refine .product (leftRows := {left_rows}) (leftColumns := {left_columns}) \
+                             (rightRows := {right_rows}) (rightColumns := {right_columns}) \
+                             (ringDimension := {ring_dimension}) (factor := {factor}) (by rfl) \
+                             (by decide) (input0 selector witness) (input1 selector witness)"
+                        ),
+                    )
+                }
+                _ => unreachable!("filtered reached compositional rule"),
+            };
+            writeln!(source, "def bound : CoeffClass := {bound}").expect("String write");
+            writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Nat := {actual}")
+                .expect("String write");
+            writeln!(source, "theorem derived (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) :\n    BoundDerivedAt history transferEvent frameStart owner rule bound\n      (actual selector witness) := by\n  unfold rule bound actual\n  {proof}\nend LeftBound{}\n", node.event)
+                .expect("String write");
+        }
+        writeln!(source, "end {NAMESPACE}.Semantic").expect("String write");
+        files.push(generated_file(format!("Semantic/{module}.lean"), source));
+    }
+    let last = nodes.len().div_ceil(CHUNK_SIZE) - 1;
+    files.push(generated_file(
+        "Semantic/SemanticLeftBound.lean",
+        format!("import {NAMESPACE}.Semantic.SemanticLeftBoundShard{last:03}\n"),
     ));
     Ok(files)
 }

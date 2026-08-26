@@ -2997,7 +2997,7 @@ theorem operatorProductFiniteMergeClaimAt
     {leftActual rightActual : Int} {leftRaw rightRaw outputRaw : List Term}
     {leftMaximum rightMaximum : { value : Nat // 0 < value }}
     {leftScalar rightScalar : Bool} {base : Polynomial Owner}
-    {valueType : ValueType} {coefficientBound : Bound}
+    {valueType : ValueType} {coefficientBound rightCoefficientBound : Bound}
     {coefficientFacts summaryFacts : TallSecurity0ABI.ProductFacts}
     {rightMagnitude summaryMagnitude factor : Nat}
     (_operationAt :
@@ -3017,6 +3017,9 @@ theorem operatorProductFiniteMergeClaimAt
       (.finite leftMaximum.val))
     (rightClaim : ExactClaimAt history modulus witness.env rightResult rightOwner rightActual
       rightRaw .exactZero)
+    (_rightResultAt : history.lookup rightResult = some
+      ⟨.resultExact rightOwner rightRaw rightCoefficientBound rightCoefficientTransfer
+        .exactZero none, frameStart⟩)
     (rightProjection : ProjectedBoundAt history rightResult rightOwner (some rightRaw)
       .coefficient (.finite rightMaximum) rightMagnitude)
     (reconstruction : MergeReconstructionAt history frameStart owner

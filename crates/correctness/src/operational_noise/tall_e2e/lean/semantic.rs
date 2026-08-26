@@ -296,7 +296,6 @@ struct FinalAddRenderData {
     owner: ProofPayloadOwner,
     left: ResultRecord,
     right: ResultRecord,
-    transfer_rule: ProofPayloadRule,
     merge_events: Vec<u64>,
     result: ResultRecord,
     prefold_event: u64,
@@ -1737,6 +1736,16 @@ pub(super) fn render(
     let index = PayloadIndex::new(proof)?;
     let mut left_root = collect_left_root_render_data(proof, &index)?;
     let final_add = collect_final_add_render_data(&index)?;
+    for &event in &final_add.merge_events {
+        let ProofPayloadEvent::CoefficientMerge(merge) = index.event(event)? else {
+            unreachable!("validated final Add merge event");
+        };
+        left_root.merges.push(LeftRootMergeNode {
+            event,
+            result_event: final_add.result.event,
+            merge,
+        });
+    }
     let _ = (
         left_root.event_ids.len(),
         left_root.bounds.len(),
@@ -1744,16 +1753,6 @@ pub(super) fn render(
         left_root.merges.len(),
         left_root.exact_results.len(),
         left_root.authority_results.len(),
-    );
-    let _ = (
-        final_add.owner,
-        final_add.left.event,
-        final_add.right.event,
-        final_add.transfer_rule,
-        final_add.merge_events.len(),
-        final_add.result.event,
-        final_add.prefold_event,
-        final_add.end_event,
     );
     let probes = build_probes(statement, proof, &index)?;
     let ranges = frame_ranges(proof)?;
@@ -1803,6 +1802,7 @@ pub(super) fn render(
         &relation_probes,
         &modulus,
     )?);
+    files.push(render_final_add(statement, &index, &final_add, &modulus)?);
 
     let specs = [
         ("Semantic/Semantic000.lean", "Semantic000", "long-monomial-merge"),
@@ -2315,10 +2315,10 @@ fn collect_final_add_render_data(index: &PayloadIndex) -> Result<FinalAddRenderD
             ));
         }
     }
-    let transfer_rule = match index.event(TRANSFER)? {
+    match index.event(TRANSFER)? {
         ProofPayloadEvent::BoundTransfer {
             owner: transfer_owner,
-            rule: rule @ ProofPayloadRule::Sum { inputs },
+            rule: ProofPayloadRule::Sum { inputs },
         } if *transfer_owner == owner &&
             inputs.as_ref() ==
                 [
@@ -2334,10 +2334,10 @@ fn collect_final_add_render_data(index: &PayloadIndex) -> Result<FinalAddRenderD
                     },
                 ] =>
         {
-            rule.clone()
+            ()
         }
         _ => return Err("Security0 final Add transfer row is inconsistent".to_owned()),
-    };
+    }
     match index.event(RESULT)? {
         ProofPayloadEvent::Result {
             owner: result_owner,
@@ -2393,7 +2393,6 @@ fn collect_final_add_render_data(index: &PayloadIndex) -> Result<FinalAddRenderD
         owner,
         left,
         right,
-        transfer_rule,
         merge_events,
         result,
         prefold_event: PREFOLD,
@@ -3046,7 +3045,8 @@ fn render_left_claim_node(
     match &node.start {
         LeftClaimStart::RightRoot => {
             source.push_str(&format!(
-                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  SemanticRightRootResult6275.actual selector witness\n\ntheorem claimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  simpa [resultEvent, owner, rawTerms, summary, actual] using\n    SemanticRightRoot.rightRootClaimSound selector selectorLower selectorUpper witness\n"
+                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualLeftResult{}.actual selector witness\n\ntheorem claimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  simpa [resultEvent, owner, rawTerms, summary, actual,\n    Cert.ResidualLeftResult{}.actual] using\n    SemanticRightRoot.rightRootClaimSound selector selectorLower selectorUpper witness\n",
+                event, event
             ));
         }
         LeftClaimStart::Terminal { producer_event } => {
@@ -3076,7 +3076,7 @@ fn render_left_claim_node(
                 ));
             }
             writeln!(source, "def producerEvent : Nat := {producer_event}").expect("String write");
-            writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  witness.honestTerminalActual resultEvent").expect("String write");
+            writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualLeftResult{event}.actual selector witness").expect("String write");
             writeln!(source, "theorem terminalAt (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32) :\n    TerminalExactAt document history (some selector) producerEvent resultEvent owner rawTerms := by\n  refine ⟨by decide, ?_, ?_⟩\n  · simp [ownerAtSelector, document, owner, selectorLower, selectorUpper]\n  · refine ⟨{}, {frame}, {}, {}, ?_, ?_⟩\n    · rfl\n    · rfl", reached_terminal_rule_text(rule)?, recorded_bound_text(coefficient_bound), reached_terminal_constructor(rule)?).expect("String write");
             writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  exact terminalExactClaimAt witness (terminalAt selector selectorLower selectorUpper)").expect("String write");
         }
@@ -3084,7 +3084,7 @@ fn render_left_claim_node(
             let first_relation = *node.relations.first().ok_or_else(|| {
                 format!("Security0 Result {event} has a prior accumulator but no relation")
             })?;
-            writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  LeftClaimResult{result_event}.actual selector witness")
+            writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualLeftResult{event}.actual selector witness")
                 .expect("String write");
             writeln!(source, "theorem mergeClaim (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact LeftRelationMerge{first_relation}.accumulator summary) := by\n  simpa [actual, summary, LeftRelationMerge{first_relation}.accumulator] using\n    (LeftClaimResult{result_event}.claimSound selector selectorLower selectorUpper witness).claim")
                 .expect("String write");
@@ -3106,15 +3106,10 @@ fn render_left_claim_node(
             let left = index.result(*left_result)?;
             let right = index.result(*right_result)?;
             let value_type = owner_value_type_text(statement, node.result.owner)?;
-            let operator = match kind {
-                OperationKind::Add => "+",
-                OperationKind::Subtract => "-",
-                OperationKind::Multiply | OperationKind::Tensor => "*",
-                OperationKind::Direct => {
-                    return Err(format!("Security0 left Result {event} reaches Direct"));
-                }
-            };
-            writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  LeftClaimResult{left_result}.actual selector witness {operator}\n    LeftClaimResult{right_result}.actual selector witness").expect("String write");
+            if *kind == OperationKind::Direct {
+                return Err(format!("Security0 left Result {event} reaches Direct"));
+            }
+            writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualLeftResult{event}.actual selector witness").expect("String write");
             let left_zero = summary_text(&left.summary) == ".exactZero";
             let right_zero = summary_text(&right.summary) == ".exactZero";
             let output_zero = summary_text(&node.result.summary) == ".exactZero";
@@ -3693,6 +3688,49 @@ fn render_left_claims(
         .map(|(position, node)| (node.result.event, position / CHUNK_SIZE))
         .collect::<BTreeMap<_, _>>();
     for (shard_index, shard) in nodes.chunks(CHUNK_SIZE).enumerate() {
+        let residual_module = format!("ResidualLeftShard{shard_index:03}");
+        let mut residual = format!(
+            "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\nimport {NAMESPACE}.Cert.ResidualRight\n"
+        );
+        let residual_dependencies = shard
+            .iter()
+            .flat_map(left_claim_dependencies)
+            .filter_map(|event| shard_by_event.get(&event).copied())
+            .filter(|dependency| *dependency != shard_index)
+            .collect::<BTreeSet<_>>();
+        for dependency in residual_dependencies {
+            writeln!(residual, "import {NAMESPACE}.Cert.ResidualLeftShard{dependency:03}")
+                .expect("String write");
+        }
+        residual
+            .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
+        writeln!(residual, "namespace {NAMESPACE}.Cert\n").expect("String write");
+        residual.push_str(
+            "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+        );
+        for node in shard {
+            let event = node.result.event;
+            writeln!(residual, "namespace ResidualLeftResult{event}").expect("String write");
+            match node.start {
+                LeftClaimStart::RightRoot => writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  ResidualRightResult6275.actual selector witness"),
+                LeftClaimStart::Terminal { .. } => writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  witness.honestTerminalActual {event}"),
+                LeftClaimStart::PriorResult { result_event } => writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  ResidualLeftResult{result_event}.actual selector witness"),
+                LeftClaimStart::Operator { kind, left_result, right_result, .. } => {
+                    let operator = match kind {
+                        OperationKind::Add => "+",
+                        OperationKind::Subtract => "-",
+                        OperationKind::Multiply | OperationKind::Tensor => "*",
+                        OperationKind::Direct => return Err(format!("Security0 residual Result {event} reaches Direct")),
+                    };
+                    writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  ResidualLeftResult{left_result}.actual selector witness {operator}\n    ResidualLeftResult{right_result}.actual selector witness")
+                }
+            }
+            .expect("String write");
+            writeln!(residual, "end ResidualLeftResult{event}\n").expect("String write");
+        }
+        writeln!(residual, "end {NAMESPACE}.Cert").expect("String write");
+        files.push(generated_file(format!("Cert/{residual_module}.lean"), residual));
+
         let module = format!("SemanticLeftClaimShard{shard_index:03}");
         let dependency_shards = shard
             .iter()
@@ -3701,7 +3739,7 @@ fn render_left_claims(
             .filter(|dependency| *dependency != shard_index)
             .collect::<BTreeSet<_>>();
         let mut source = format!(
-            "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\nimport {NAMESPACE}.Semantic.SemanticRightRoot\nimport {NAMESPACE}.Semantic.SemanticLeftAuthority\nimport {NAMESPACE}.Semantic.SemanticLeftBound\nimport {NAMESPACE}.Semantic.SemanticLeftMergeTree\n"
+            "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\nimport {NAMESPACE}.Cert.{residual_module}\nimport {NAMESPACE}.Semantic.SemanticRightRoot\nimport {NAMESPACE}.Semantic.SemanticLeftAuthority\nimport {NAMESPACE}.Semantic.SemanticLeftBound\nimport {NAMESPACE}.Semantic.SemanticLeftMergeTree\n"
         );
         for dependency in dependency_shards {
             writeln!(source, "import {NAMESPACE}.Semantic.SemanticLeftClaimShard{dependency:03}")
@@ -3754,7 +3792,142 @@ fn render_left_claims(
             "import {NAMESPACE}.Semantic.{root}\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.SemanticLeftClaim\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\ntheorem leftRootClaimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env\n      LeftClaimResult107402.resultEvent LeftClaimResult107402.owner\n      (LeftClaimResult107402.actual selector witness)\n      LeftClaimResult107402.rawTerms LeftClaimResult107402.summary := by\n  exact LeftClaimResult107402.claimSound selector selectorLower selectorUpper witness\n\nend {NAMESPACE}.Semantic.SemanticLeftClaim\n"
         ),
     ));
+    let mut residual_top = String::new();
+    for shard in 0..nodes.len().div_ceil(CHUNK_SIZE) {
+        writeln!(residual_top, "import {NAMESPACE}.Cert.ResidualLeftShard{shard:03}")
+            .expect("String write");
+    }
+    residual_top
+        .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
+    writeln!(residual_top, "namespace {NAMESPACE}.Cert\n").expect("String write");
+    residual_top.push_str(
+        "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+    );
+    writeln!(residual_top, "def security0Residual : (selector : Option Nat) →\n    Witness document history selector {modulus} → Int\n  | none, _ => 0\n  | some selector, witness =>\n      ResidualLeftResult107402.actual selector witness -\n        ResidualRightResult6275.actual selector witness\n\nend {NAMESPACE}.Cert")
+        .expect("String write");
+    files.push(generated_file("Cert/Security0Residual.lean", residual_top));
     Ok(files)
+}
+
+fn render_final_add(
+    statement: &CertificateDocumentV1,
+    index: &PayloadIndex,
+    data: &FinalAddRenderData,
+    modulus: &str,
+) -> Result<super::super::TallSecurity0GeneratedFile, String> {
+    const LEFT_BINDING: u64 = 107_403;
+    const RIGHT_BINDING: u64 = 107_404;
+    const TRANSFER: u64 = 107_405;
+    const FIRST_MERGE: u64 = 107_406;
+
+    let frame_start = index.immediate_frames
+        [usize::try_from(data.result.event).map_err(|_| "final Result event overflow")?]
+    .ok_or_else(|| "Security0 final Result is outside an invocation frame".to_owned())?;
+    let predecessor = |event, expected_position, expected_result| match index.event(event)? {
+        ProofPayloadEvent::Predecessor { consumer, input_position, predecessor, source_result }
+            if *consumer == data.owner &&
+                *input_position == expected_position &&
+                *source_result == expected_result =>
+        {
+            Ok(*predecessor)
+        }
+        _ => Err(format!("Security0 final predecessor row {event} is inconsistent")),
+    };
+    let left_expression = predecessor(LEFT_BINDING, 0, data.left.event)?;
+    let right_expression = predecessor(RIGHT_BINDING, 1, data.right.event)?;
+    if expression_kind(statement, data.owner)? != Some(OperationKind::Subtract) {
+        return Err("Security0 final operation is not the fixed subtract descriptor".to_owned());
+    }
+    let value_type = owner_value_type_text(statement, data.owner)?;
+    let left_maximum = summary_bound_nat_text(&data.left.summary);
+    let result_maximum = summary_bound_nat_text(&data.result.summary);
+    if summary_text(&data.left.summary) != format!("(.finite {left_maximum})") ||
+        summary_text(&data.right.summary) != ".exactZero" ||
+        result_maximum != left_maximum
+    {
+        return Err("Security0 final Sub does not preserve the finite left summary".to_owned());
+    }
+    let (coefficient_bound, coefficient_producer, summary_producer) =
+        match index.event(data.result.event)? {
+            ProofPayloadEvent::Result {
+                owner,
+                value:
+                    ProofPayloadValue::Exact {
+                        coefficient_bound,
+                        coefficient_producer,
+                        summary_producer,
+                        ..
+                    },
+            } if *owner == data.owner => {
+                (recorded_bound_text(coefficient_bound), *coefficient_producer, *summary_producer)
+            }
+            _ => unreachable!("validated final exact Result"),
+        };
+    if coefficient_producer != TRANSFER || summary_producer.is_some() {
+        return Err("Security0 final Result producer metadata is inconsistent".to_owned());
+    }
+    let (end_coefficient_bound, end_coefficient_producer, end_summary_producer) =
+        match index.event(data.end_event)? {
+            ProofPayloadEvent::InvocationEnd {
+                root,
+                result:
+                    ProofPayloadValue::Exact {
+                        terms,
+                        coefficient_bound,
+                        coefficient_producer,
+                        summary,
+                        summary_producer,
+                    },
+                pre_fold_event,
+            } if *root == data.owner &&
+                *pre_fold_event == data.prefold_event &&
+                terms == &data.result.terms &&
+                summary == &data.result.summary =>
+            {
+                (recorded_bound_text(coefficient_bound), *coefficient_producer, *summary_producer)
+            }
+            _ => unreachable!("validated final InvocationEnd"),
+        };
+    let end_summary_producer_text =
+        end_summary_producer.map_or_else(|| "none".to_owned(), |event| format!("some {event}"));
+    let mut source = format!(
+        "import {NAMESPACE}.Semantic.SemanticLeftClaim\n\
+         import {NAMESPACE}.Semantic.SemanticRightRoot\n\
+         import {NAMESPACE}.Semantic.SemanticLeftMergeTree\n\
+         import {NAMESPACE}.Cert.Security0Residual\n\
+         import {NAMESPACE}.Proof.Proof\n\n\
+         set_option autoImplicit false\n\
+         set_option relaxedAutoImplicit false\n\n\
+         namespace {NAMESPACE}.Semantic.SemanticFinal\n\n\
+         open Mxx.Certificate.OperationalNoise\n\
+         open TallSecurity0ABI\n\
+         open TallSemantics\n\n"
+    );
+    writeln!(source, "def owner : Owner := {}", owner_text(data.owner)).expect("String write");
+    writeln!(source, "def resultEvent : Nat := {}", data.result.event).expect("String write");
+    writeln!(source, "def preFoldEvent : Nat := {}", data.prefold_event).expect("String write");
+    writeln!(source, "def endEvent : Nat := {}", data.end_event).expect("String write");
+    writeln!(source, "def rawTerms : List Term := {}", raw_terms_text(&data.result.terms))
+        .expect("String write");
+    writeln!(source, "def summary : Bound := .finite {result_maximum}").expect("String write");
+    writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.security0Residual (some selector) witness\n")
+        .expect("String write");
+    writeln!(source, "theorem resultClaimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply operatorSubFiniteLeftMergeClaimAt\n    (document := document) (history := history) (modulus := {modulus})\n    (frameStart := {frame_start}) (coefficientTransfer := {TRANSFER})\n    (resultEvent := resultEvent) (env := witness.env) (owner := owner)\n    (leftOwner := LeftClaimResult{}.owner)\n    (rightOwner := SemanticRightRootResult{}.owner)\n    (leftResult := {}) (rightResult := {})\n    (leftBinding := {LEFT_BINDING}) (rightBinding := {RIGHT_BINDING})\n    (leftInputPosition := 0) (rightInputPosition := 1)\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (leftActual := LeftClaimResult{}.actual selector witness)\n    (rightActual := SemanticRightRootResult{}.actual selector witness)\n    (leftRaw := LeftClaimResult{}.rawTerms)\n    (rightRaw := SemanticRightRootResult{}.rawTerms)\n    (outputRaw := rawTerms) (leftMaximum := {left_maximum})\n    (base := LeftOperatorMerge{FIRST_MERGE}.base) (valueType := {value_type})\n    (coefficientBound := {coefficient_bound})\n    (reconstruction := LeftOperatorMerge{FIRST_MERGE}.reconstruction)\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · exact SemanticLeftClaim.leftRootClaimSound selector selectorLower selectorUpper witness\n  · exact SemanticRightRoot.rightRootClaimSound selector selectorLower selectorUpper witness\n  · exact LeftOperatorMerge{FIRST_MERGE}.operationAgreement\n  · rfl\n  · decide\n", data.left.event, data.right.event, data.left.event, data.right.event, data.left.event, data.right.event, data.left.event, data.right.event)
+        .expect("String write");
+    writeln!(source, "theorem preFoldAt : history.lookup preFoldEvent = some\n    ⟨.preFoldPolynomial resultEvent rawTerms summary\n      (some (.result resultEvent .summary)), {frame_start}⟩ := by\n  rfl\n")
+        .expect("String write");
+    writeln!(source, "theorem invocationEndAt : history.lookup endEvent = some\n    ⟨.invocationEndExact owner preFoldEvent rawTerms {end_coefficient_bound}\n      {end_coefficient_producer} summary {end_summary_producer_text}, {frame_start}⟩ := by\n  rfl\n")
+        .expect("String write");
+    writeln!(source, "theorem invocationEndClaimSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact (rawTerms.map Term.toExact) summary) := by\n  exact invocationEndSound {modulus} witness.env (actual selector witness)\n    (rawTerms.map Term.toExact) (rawTerms.map Term.toExact) summary summary\n    (resultClaimSound selector selectorLower selectorUpper witness).claim rfl rfl\n")
+        .expect("String write");
+    writeln!(source, "theorem strictBoundSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    2 * {} * centeredNorm {modulus} (actual selector witness) < {modulus} := by\n  apply finalStrictBound_of_empty_finite_claim {} {modulus} witness.env\n    (actual selector witness) {result_maximum}\n  · simpa [rawTerms, summary] using\n      invocationEndClaimSound selector selectorLower selectorUpper witness\n  · decide\n  · decide\n", statement.plaintext_modulus, statement.plaintext_modulus)
+        .expect("String write");
+    writeln!(source, "theorem fixedSemanticSound (selector : Nat) (selectorLower : 0 ≤ selector)\n    (selectorUpper : selector < 32)\n    (witness : Witness document history (some selector) {modulus}) :\n    history.lookup preFoldEvent = some\n        ⟨.preFoldPolynomial resultEvent rawTerms summary\n          (some (.result resultEvent .summary)), {frame_start}⟩ ∧\n      history.lookup endEvent = some\n        ⟨.invocationEndExact owner preFoldEvent rawTerms {end_coefficient_bound}\n          {end_coefficient_producer} summary {end_summary_producer_text}, {frame_start}⟩ ∧\n      ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n        (.exact (rawTerms.map Term.toExact) summary) ∧\n      2 * {} * centeredNorm {modulus} (actual selector witness) < {modulus} := by\n  exact ⟨preFoldAt, invocationEndAt,\n    invocationEndClaimSound selector selectorLower selectorUpper witness,\n    strictBoundSound selector selectorLower selectorUpper witness⟩\n", statement.plaintext_modulus)
+        .expect("String write");
+    writeln!(source, "theorem fixedAcceptance :\n    Security0Accepted document history {} {modulus} 32 endEvent preFoldEvent\n      {result_maximum} owner rawTerms {end_coefficient_bound} {end_coefficient_producer}\n      summary {end_summary_producer_text} Cert.security0Residual := by\n  refine ⟨proofValid, rfl, rfl, rfl, rfl, rfl, ⟨{frame_start}, invocationEndAt⟩, ?_⟩\n  change ∀ selector, 0 ≤ selector → selector < 32 →\n    ∀ witness : Witness document history (some selector) {modulus}, _\n  intro selector selectorLower selectorUpper witness\n  exact ⟨by\n    simpa [actual, Cert.security0Residual] using\n      invocationEndClaimSound selector selectorLower selectorUpper witness, by\n    simpa [actual, Cert.security0Residual] using\n      strictBoundSound selector selectorLower selectorUpper witness⟩\n", statement.plaintext_modulus)
+        .expect("String write");
+    writeln!(source, "end {NAMESPACE}.Semantic.SemanticFinal").expect("String write");
+    Ok(generated_file("Semantic/SemanticFinal.lean", source))
 }
 
 fn render_left_merge_deltas(
@@ -6447,7 +6620,7 @@ fn render_right_root_node(
             writeln!(source, "def resultEvent : Nat := {event}").expect("String write");
             writeln!(
                 source,
-                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  witness.honestTerminalActual resultEvent"
+                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualRightResult{event}.actual selector witness"
             )
             .expect("String write");
             writeln!(
@@ -6487,17 +6660,12 @@ fn render_right_root_node(
             let left_event = operation.input_events[0];
             let right_event = operation.input_events[1];
             render_right_root_operation(source, operation, left_event, right_event);
-            let operator = match operation.kind {
-                OperationKind::Add => "+",
-                OperationKind::Subtract => "-",
-                OperationKind::Multiply | OperationKind::Tensor => "*",
-                OperationKind::Direct => {
-                    return Err(format!("right-root Result {event} is a direct operation"));
-                }
-            };
+            if operation.kind == OperationKind::Direct {
+                return Err(format!("right-root Result {event} is a direct operation"));
+            }
             writeln!(
                 source,
-                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  SemanticRightRootResult{left_event}.actual selector witness {operator}\n    SemanticRightRootResult{right_event}.actual selector witness"
+                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualRightResult{event}.actual selector witness"
             )
             .expect("String write");
             let theorem = match operation.kind {
@@ -6575,6 +6743,42 @@ fn render_right_root(
     }
     let mut files = Vec::new();
     for (shard_index, shard) in nodes.chunks(CHUNK_SIZE).enumerate() {
+        let residual_module = format!("ResidualRightShard{shard_index:03}");
+        let previous_residual = shard_index
+            .checked_sub(1)
+            .map(|index| format!("import {NAMESPACE}.Cert.ResidualRightShard{index:03}\n"));
+        let mut residual = previous_residual.unwrap_or_else(|| {
+            format!(
+                "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n"
+            )
+        });
+        residual
+            .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
+        writeln!(residual, "namespace {NAMESPACE}.Cert\n").expect("String write");
+        residual.push_str(
+            "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+        );
+        for node in shard {
+            let event = node.result.event;
+            writeln!(residual, "namespace ResidualRightResult{event}").expect("String write");
+            match &node.kind {
+                RightRootNodeKind::Terminal { .. } => writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  witness.honestTerminalActual {event}"),
+                RightRootNodeKind::Operation(operation) => {
+                    let operator = match operation.kind {
+                        OperationKind::Add => "+",
+                        OperationKind::Subtract => "-",
+                        OperationKind::Multiply | OperationKind::Tensor => "*",
+                        OperationKind::Direct => return Err(format!("right residual Result {event} reaches Direct")),
+                    };
+                    writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  ResidualRightResult{}.actual selector witness {operator}\n    ResidualRightResult{}.actual selector witness", operation.input_events[0], operation.input_events[1])
+                }
+            }
+            .expect("String write");
+            writeln!(residual, "end ResidualRightResult{event}\n").expect("String write");
+        }
+        writeln!(residual, "end {NAMESPACE}.Cert").expect("String write");
+        files.push(generated_file(format!("Cert/{residual_module}.lean"), residual));
+
         let module = format!("SemanticRightRootShard{shard_index:03}");
         let previous = shard_index
             .checked_sub(1)
@@ -6584,6 +6788,7 @@ fn render_right_root(
                 "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n"
             )
         });
+        writeln!(source, "import {NAMESPACE}.Cert.{residual_module}").expect("String write");
         source
             .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
         writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
@@ -6602,6 +6807,10 @@ fn render_right_root(
         files.push(generated_file(format!("Semantic/{module}.lean"), source));
     }
     let last_shard = nodes.len().div_ceil(CHUNK_SIZE) - 1;
+    files.push(generated_file(
+        "Cert/ResidualRight.lean",
+        format!("import {NAMESPACE}.Cert.ResidualRightShard{last_shard:03}\n"),
+    ));
     let mut source = format!(
         "import {NAMESPACE}.Semantic.SemanticRightRootShard{last_shard:03}\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.SemanticRightRoot\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n"
     );

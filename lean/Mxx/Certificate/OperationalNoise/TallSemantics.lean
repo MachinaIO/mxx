@@ -2153,6 +2153,152 @@ private theorem centeredNorm_neg (modulus : Nat) (modulusPositive : 0 < modulus)
       | rw [Int.natAbs_of_nonpos (by omega)]
     all_goals omega
 
+private theorem centeredNorm_le_natAbs_of_nonnegative (modulus : Nat)
+    (modulusPositive : 0 < modulus) (value : Int) (valueNonnegative : 0 ≤ value) :
+    centeredNorm modulus value ≤ value.natAbs := by
+  let q : Int := modulus
+  let residue := value % q
+  have qPositive : 0 < q := by
+    simpa [q] using (Int.natCast_pos.mpr modulusPositive)
+  have residueNonnegative : 0 ≤ residue := Int.emod_nonneg value (Int.ne_of_gt qPositive)
+  have residueLess : residue < q := Int.emod_lt_of_pos value qPositive
+  have residueAbs : residue.natAbs = value.natAbs % q.natAbs := by
+    simpa [residue] using Int.natAbs_emod_of_nonneg valueNonnegative q
+  have residueLe : residue.natAbs ≤ value.natAbs := by
+    rw [residueAbs]
+    exact Nat.mod_le _ _
+  have residueLeInt : residue ≤ value := by
+    rw [← Int.ofNat_natAbs_of_nonneg residueNonnegative,
+      ← Int.ofNat_natAbs_of_nonneg valueNonnegative]
+    exact_mod_cast residueLe
+  unfold centeredNorm centeredCoefficient
+  simp only [Nat.ne_of_gt modulusPositive, ↓reduceIte]
+  change (if 2 * residue ≤ q then residue else residue - q).natAbs ≤ value.natAbs
+  split
+  · exact residueLe
+  · rw [← Int.ofNat_le]
+    rw [Int.ofNat_natAbs_of_nonpos (by omega)]
+    rw [Int.ofNat_natAbs_of_nonneg valueNonnegative]
+    omega
+
+private theorem centeredNorm_le_natAbs (modulus : Nat) (modulusPositive : 0 < modulus)
+    (value : Int) : centeredNorm modulus value ≤ value.natAbs := by
+  by_cases valueNonnegative : 0 ≤ value
+  · exact centeredNorm_le_natAbs_of_nonnegative modulus modulusPositive value valueNonnegative
+  · rw [← centeredNorm_neg modulus modulusPositive value, ← Int.natAbs_neg value]
+    exact centeredNorm_le_natAbs_of_nonnegative modulus modulusPositive (-value) (by omega)
+
+private theorem centeredNorm_mul_le (modulus : Nat) (modulusPositive : 0 < modulus)
+    (left right : Int) :
+    centeredNorm modulus (left * right) ≤ centeredNorm modulus left * centeredNorm modulus right := by
+  let leftCentered := centeredCoefficient modulus left
+  let rightCentered := centeredCoefficient modulus right
+  have leftResidue : leftCentered % Int.ofNat modulus = left % Int.ofNat modulus := by
+    unfold leftCentered centeredCoefficient
+    simp only [Nat.ne_of_gt modulusPositive, ↓reduceIte]
+    split
+    · simp only [Int.emod_emod]
+    · rw [Int.sub_emod]
+      simp
+  have rightResidue : rightCentered % Int.ofNat modulus = right % Int.ofNat modulus := by
+    unfold rightCentered centeredCoefficient
+    simp only [Nat.ne_of_gt modulusPositive, ↓reduceIte]
+    split
+    · simp only [Int.emod_emod]
+    · rw [Int.sub_emod]
+      simp
+  have productResidue :
+      (left * right) % Int.ofNat modulus =
+        (leftCentered * rightCentered) % Int.ofNat modulus := by
+    calc
+      (left * right) % Int.ofNat modulus =
+          ((left % Int.ofNat modulus) * (right % Int.ofNat modulus)) %
+            Int.ofNat modulus :=
+        Int.mul_emod left right (Int.ofNat modulus)
+      _ = ((leftCentered % Int.ofNat modulus) *
+          (rightCentered % Int.ofNat modulus)) % Int.ofNat modulus := by
+        rw [leftResidue, rightResidue]
+      _ = (leftCentered * rightCentered) % Int.ofNat modulus :=
+        (Int.mul_emod leftCentered rightCentered (Int.ofNat modulus)).symm
+  calc
+    centeredNorm modulus (left * right) =
+        centeredNorm modulus (leftCentered * rightCentered) :=
+      centeredNorm_eq_of_emod_eq modulusPositive productResidue
+    _ ≤ (leftCentered * rightCentered).natAbs :=
+      centeredNorm_le_natAbs modulus modulusPositive _
+    _ = centeredNorm modulus left * centeredNorm modulus right := by
+      rw [Int.natAbs_mul]
+      rfl
+
+/-- The reached finite Product multiplies the left remainder by an exact-zero right value.
+    The explicit magnitude bound is supplied by the row-indexed coefficient witness. -/
+theorem exactValueClaim_product_finite_left (modulus factor : Nat) (env : Env Owner)
+    (leftActual rightActual : Int) (left right output : Polynomial Owner)
+    (leftMaximum rightMaximum rightMagnitude : Nat)
+    (leftClaim : ValueClaim.Interprets modulus env leftActual
+      (.exact left (.finite leftMaximum)))
+    (rightClaim : ValueClaim.Interprets modulus env rightActual (.exact right .exactZero))
+    (outputEval : evalPolynomial env output = evalPolynomial env left * evalPolynomial env right)
+    (rightMagnitudeCovers : centeredNorm modulus rightActual ≤ rightMagnitude)
+    (rightMagnitudeSound : rightMagnitude ≤ rightMaximum)
+    (factorPositive : 0 < factor) (modulusPositive : 0 < modulus) :
+    ValueClaim.Interprets modulus env (leftActual * rightActual)
+      (.exact output (.finite (factor * leftMaximum * rightMaximum))) := by
+  rcases leftClaim with ⟨leftRemainder, leftCongruence, leftBound⟩
+  have rightModZero := exactClaim_mod_zero modulus env rightActual right rightClaim modulusPositive
+  have leftProductResidue :
+      ((leftActual - evalPolynomial env left) * rightActual) % Int.ofNat modulus =
+        (leftRemainder * rightActual) % Int.ofNat modulus := by
+    calc
+      ((leftActual - evalPolynomial env left) * rightActual) % Int.ofNat modulus =
+          (((leftActual - evalPolynomial env left) % Int.ofNat modulus) *
+            (rightActual % Int.ofNat modulus)) % Int.ofNat modulus :=
+        Int.mul_emod _ _ _
+      _ = ((leftRemainder % Int.ofNat modulus) *
+          (rightActual % Int.ofNat modulus)) % Int.ofNat modulus := by
+        rw [leftCongruence]
+      _ = (leftRemainder * rightActual) % Int.ofNat modulus :=
+        (Int.mul_emod _ _ _).symm
+  have rightDifferenceProductZero :
+      (evalPolynomial env left * (rightActual - evalPolynomial env right)) %
+          Int.ofNat modulus = 0 := by
+    rw [Int.mul_emod, rightModZero]
+    simp
+  refine ⟨leftRemainder * rightActual, ?_, ?_⟩
+  · rw [outputEval]
+    calc
+      (leftActual * rightActual - evalPolynomial env left * evalPolynomial env right) %
+            Int.ofNat modulus =
+          ((leftActual - evalPolynomial env left) * rightActual +
+            evalPolynomial env left * (rightActual - evalPolynomial env right)) %
+              Int.ofNat modulus := by
+                congr 1
+                rw [Int.sub_mul, Int.mul_sub]
+                omega
+      _ = (((leftActual - evalPolynomial env left) * rightActual) % Int.ofNat modulus +
+          (evalPolynomial env left *
+            (rightActual - evalPolynomial env right)) % Int.ofNat modulus) %
+              Int.ofNat modulus := by rw [Int.add_emod]
+      _ = ((leftRemainder * rightActual) % Int.ofNat modulus + 0) %
+            Int.ofNat modulus := by rw [leftProductResidue, rightDifferenceProductZero]
+      _ = (leftRemainder * rightActual) % Int.ofNat modulus := by simp
+  · have productNorm := centeredNorm_mul_le modulus modulusPositive leftRemainder rightActual
+    have leftBound' : centeredNorm modulus leftRemainder ≤ leftMaximum := by
+      simpa [boundInterprets] using leftBound
+    have magnitudeBound : centeredNorm modulus leftRemainder *
+        centeredNorm modulus rightActual ≤ leftMaximum * rightMaximum :=
+      Nat.mul_le_mul leftBound' (Nat.le_trans rightMagnitudeCovers rightMagnitudeSound)
+    have factorWeakening : leftMaximum * rightMaximum ≤
+        factor * leftMaximum * rightMaximum := by
+      calc
+        leftMaximum * rightMaximum = 1 * (leftMaximum * rightMaximum) := by simp
+        _ ≤ factor * (leftMaximum * rightMaximum) :=
+          Nat.mul_le_mul_right _ (Nat.succ_le_iff.mpr factorPositive)
+        _ = factor * leftMaximum * rightMaximum := by simp [Nat.mul_assoc]
+    change centeredNorm modulus (leftRemainder * rightActual) ≤
+      factor * leftMaximum * rightMaximum
+    exact Nat.le_trans productNorm (Nat.le_trans magnitudeBound factorWeakening)
+
 /-- Two finite exact remainders subtract with the sum of their recorded bounds. -/
 theorem exactValueClaim_sub_finite {Factor : Type} (modulus : Nat) (env : Env Factor)
     (leftActual rightActual : Int) (leftTerms rightTerms output : Polynomial Factor)
@@ -2817,6 +2963,10 @@ def TerminalExactAt (document : TallDocument) (history : EventHistory)
 structure Witness (document : TallDocument) (history : EventHistory) (selector : Option Nat)
     (modulus : Nat) extends AuthorityWitness history where
   env : Env Owner
+  coefficientMagnitudeCovers : ∀ resultEvent owner actual rawTerms summary bound magnitude,
+    ExactClaimAt history modulus env resultEvent owner actual rawTerms summary →
+      ProjectedBoundAt history resultEvent owner (some rawTerms) .coefficient bound magnitude →
+        centeredNorm modulus actual ≤ magnitude
   sourceBound : ∀ owner factorEvent source,
     SourceFactorAt document history selector owner factorEvent source →
       ∃ contract, sourceRawContract? document source = some contract ∧
@@ -2833,6 +2983,80 @@ structure Witness (document : TallDocument) (history : EventHistory) (selector :
     TerminalExactAt document history selector producer resultEvent owner rawTerms →
       (honestTerminalActual resultEvent - evalPolynomial env (rawTerms.map Term.toExact)) %
         Int.ofNat modulus = 0
+
+/-- The reached finite Multiply uses the exact coefficient projection of its exact-zero right
+    child to connect replayed coefficient magnitude to the semantic value.  The separate summary
+    Product derivation fixes the conservative factor and both finite classes recorded by Rust. -/
+theorem operatorProductFiniteMergeClaimAt
+    {document : TallDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
+    {witness : Witness document history selector modulus}
+    {frameStart coefficientTransfer summaryTransfer rightCoefficientTransfer resultEvent : Nat}
+    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
+    {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
+    {leftExpression rightExpression : ExpressionRef}
+    {leftActual rightActual : Int} {leftRaw rightRaw outputRaw : List Term}
+    {leftMaximum rightMaximum : { value : Nat // 0 < value }}
+    {leftScalar rightScalar : Bool} {base : Polynomial Owner}
+    {valueType : ValueType} {coefficientBound : Bound}
+    {coefficientFacts summaryFacts : TallSecurity0ABI.ProductFacts}
+    {rightMagnitude summaryMagnitude factor : Nat}
+    (_operationAt :
+      (document.expressions.lookup owner.expression.row).map
+        TallSecurity0ABI.ExpressionRow.descriptor =
+        some (.operation (.stable (.matrix .multiply)) valueType))
+    (_leftPredecessorAt : history.lookup leftBinding = some
+      ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
+    (_rightPredecessorAt : history.lookup rightBinding = some
+      ⟨.predecessor owner rightInputPosition rightExpression rightResult, frameStart⟩)
+    (_coefficientTransferAt : history.lookup coefficientTransfer = some
+      ⟨.boundTransfer owner
+        (.product (.predecessor leftInputPosition leftBinding .coefficient)
+          (.predecessor rightInputPosition rightBinding .coefficient) coefficientFacts),
+        frameStart⟩)
+    (leftClaim : ExactClaimAt history modulus witness.env leftResult leftOwner leftActual leftRaw
+      (.finite leftMaximum.val))
+    (rightClaim : ExactClaimAt history modulus witness.env rightResult rightOwner rightActual
+      rightRaw .exactZero)
+    (rightProjection : ProjectedBoundAt history rightResult rightOwner (some rightRaw)
+      .coefficient (.finite rightMaximum) rightMagnitude)
+    (reconstruction : MergeReconstructionAt history frameStart owner
+      (.operator leftResult rightResult) base (outputRaw.map Term.toExact))
+    (productAgreement : CanonicalAgreement (add base reconstruction.deltas)
+      (productPoly (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+        leftScalar rightScalar))
+    (_summaryDerived : BoundDerivedAt history summaryTransfer frameStart owner
+      (.product (.result leftResult .summary) (.transfer rightCoefficientTransfer) summaryFacts)
+      (productWithFactor factor (.finite leftMaximum) (.finite rightMaximum)) summaryMagnitude)
+    (resultAt : history.lookup resultEvent = some
+      ⟨.resultExact owner outputRaw coefficientBound coefficientTransfer
+        (coeffClassToTallBound
+          (productWithFactor factor (.finite leftMaximum) (.finite rightMaximum)))
+        (some summaryTransfer), frameStart⟩)
+    (factorPositive : 0 < factor) (modulusPositive : 0 < modulus) :
+    ExactClaimAt history modulus witness.env resultEvent owner (leftActual * rightActual) outputRaw
+      (coeffClassToTallBound
+        (productWithFactor factor (.finite leftMaximum) (.finite rightMaximum))) := by
+  have operationEval := productCanonicalResultSound witness.env
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (add base reconstruction.deltas) leftScalar rightScalar productAgreement
+  have outputEval : evalPolynomial witness.env (outputRaw.map Term.toExact) =
+      evalPolynomial witness.env (leftRaw.map Term.toExact) *
+        evalPolynomial witness.env (rightRaw.map Term.toExact) :=
+    (canonicalAgreement_eval witness.env _ _ reconstruction.agreement).trans operationEval
+  have rightMagnitudeCovers := witness.coefficientMagnitudeCovers rightResult rightOwner
+    rightActual rightRaw .exactZero (.finite rightMaximum) rightMagnitude
+    rightClaim rightProjection
+  have rightMagnitudeSound : rightMagnitude ≤ rightMaximum.val := by
+    simpa [CoeffClass.Interprets] using ProjectedBoundAt.sound rightProjection
+  have claim := exactValueClaim_product_finite_left modulus factor witness.env
+    leftActual rightActual (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (outputRaw.map Term.toExact) leftMaximum.val rightMaximum.val rightMagnitude
+    leftClaim.claim rightClaim.claim outputEval rightMagnitudeCovers rightMagnitudeSound
+    factorPositive modulusPositive
+  refine ⟨⟨coefficientBound, coefficientTransfer, some summaryTransfer, ?_⟩, ?_⟩
+  · rw [resultAt]
+    rfl
+  · simpa [productWithFactor, Nat.ne_of_gt factorPositive, coeffClassToTallBound] using claim
 
 /-- One reached universal relation rewrite starts from an interpreted accumulator claim, checks
     the exact application through the witness, and routes the recorded Result through its

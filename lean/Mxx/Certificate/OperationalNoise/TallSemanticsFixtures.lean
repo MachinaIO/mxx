@@ -556,6 +556,24 @@ theorem finite_add_exact_zero_fixture :
   · decide
   · rfl
 
+theorem finite_product_exact_zero_fixture :
+    ValueClaim.Interprets 257 (fun _ : Owner ↦ 1) 9
+      (.exact [{ coefficient := 6, key := mergeLeftTerm.monomial.toKey }] (.finite 4)) := by
+  apply exactValueClaim_product_finite_left 257 1 (fun _ : Owner ↦ 1)
+      3 3 [mergeLeftTerm.toExact] [mergeRightTerm.toExact]
+      [{ coefficient := 6, key := mergeLeftTerm.monomial.toKey }] 1 4 3
+  · refine ⟨1, ?_, ?_⟩
+    · decide +kernel
+    · simp [boundInterprets, centeredNorm, centeredCoefficient]
+  · refine ⟨0, ?_, ?_⟩
+    · decide +kernel
+    · simp [boundInterprets, centeredNorm, centeredCoefficient]
+  · decide +kernel
+  · decide
+  · decide
+  · decide
+  · decide
+
 def finiteRewriteOutput : Polynomial Owner :=
   [{ coefficient := 257, key := { centralFactors := [], orderedFactors := [] } }]
 
@@ -859,6 +877,9 @@ theorem canonical_relation_fixture :
 #print axioms bound_authority_fixture
 #print axioms bound_scale_value_fixture
 #print axioms finite_add_exact_zero_fixture
+#print axioms TallSemantics.exactValueClaim_product_finite_left
+#print axioms TallSemantics.operatorProductFiniteMergeClaimAt
+#print axioms finite_product_exact_zero_fixture
 #print axioms TallSemantics.exactFiniteValueClaim_of_eval_mod
 #print axioms finite_relation_rewrite_fixture
 #print axioms exact_zero_recording_refines_finite_two_fixture

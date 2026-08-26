@@ -98,7 +98,7 @@ def productFixtureFacts : TallSecurity0ABI.ProductFacts :=
 def boundFixtureHistory : EventHistory :=
     smallHistory #[
     annotated (.boundTransfer boundFixtureOwner (.sum [])) 7,
-    annotated (.resultExact boundFixtureOwner [] .exactZero 0 .exactZero none) 7,
+    annotated (.resultExact boundFixtureOwner [] .exactZero 0 .exactZero (some 0)) 7,
     annotated (.boundTransfer boundFixtureOwner (.identity boundFixtureReference)) 7,
     annotated (.resultCoefficient boundFixtureOwner .exactZero) 7,
     annotated (.boundTransfer boundFixtureOwner
@@ -120,6 +120,12 @@ theorem bound_identity_projection_fixture :
     ProjectedBoundAt boundFixtureHistory 3 boundFixtureOwner none .coefficient
       .exactZero 0 := by
   exact .resultCoefficient rfl (by rfl) bound_identity_fixture
+
+theorem bound_summary_projection_fixture :
+    ProjectedBoundAt boundFixtureHistory 1 boundFixtureOwner (some []) .summary
+      .exactZero 0 := by
+  exact boundTransfer_to_resultExactSummary (rule := .sum []) (by rfl)
+    (.sum (by rfl) .nil)
 
 theorem bound_product_fixture :
     BoundDerivedAt boundFixtureHistory 4 7 boundFixtureOwner
@@ -430,6 +436,7 @@ theorem canonical_relation_fixture :
 #print axioms generic_value_claim_fixture
 #print axioms bound_identity_fixture
 #print axioms bound_identity_projection_fixture
+#print axioms bound_summary_projection_fixture
 #print axioms bound_product_fixture
 #print axioms authority_leaf_fixture
 #print axioms bound_authority_fixture

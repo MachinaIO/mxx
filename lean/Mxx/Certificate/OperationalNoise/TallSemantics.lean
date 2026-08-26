@@ -1474,6 +1474,16 @@ mutual
           producerBound actualMagnitude) :
         ProjectedBoundAt history resultEvent owner (some terms) .coefficient producerBound
           actualMagnitude
+    | resultExactSummary {resultEvent producerEvent frameStart coefficientProducer : Nat}
+        {owner : Owner} {terms : List Term} {recordedCoefficientBound : Bound}
+        {rule : BoundRule} {producerBound : CoeffClass} {actualMagnitude : Nat}
+        (row : history.lookup resultEvent = some
+          ⟨.resultExact owner terms recordedCoefficientBound coefficientProducer
+            (coeffClassToTallBound producerBound) (some producerEvent), frameStart⟩)
+        (derived : BoundDerivedAt history producerEvent frameStart owner rule producerBound
+          actualMagnitude) :
+        ProjectedBoundAt history resultEvent owner (some terms) .summary producerBound
+          actualMagnitude
 
   inductive BoundInputAt (history : EventHistory) :
       Owner → ValueRef → CoeffClass → Nat → Prop where
@@ -1608,7 +1618,9 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
+  · intros
+    assumption
   · intros
     assumption
   · intros
@@ -1657,7 +1669,9 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
+  · intros
+    assumption
   · intros
     assumption
   · intros
@@ -1717,6 +1731,19 @@ theorem boundTransfer_to_resultExactCoefficient
     ProjectedBoundAt history resultEvent owner (some terms) .coefficient producerBound
       actualMagnitude :=
   .resultExactCoefficient row refines derived
+
+theorem boundTransfer_to_resultExactSummary
+    {history : EventHistory} {producerEvent resultEvent frameStart coefficientProducer : Nat}
+    {owner : Owner} {terms : List Term} {recordedCoefficientBound : Bound}
+    {rule : BoundRule} {producerBound : CoeffClass} {actualMagnitude : Nat}
+    (row : history.lookup resultEvent = some
+      ⟨.resultExact owner terms recordedCoefficientBound coefficientProducer
+        (coeffClassToTallBound producerBound) (some producerEvent), frameStart⟩)
+    (derived : BoundDerivedAt history producerEvent frameStart owner rule producerBound
+      actualMagnitude) :
+    ProjectedBoundAt history resultEvent owner (some terms) .summary producerBound
+      actualMagnitude :=
+  .resultExactSummary row derived
 
 theorem centeredNorm_eq_zero_mod {modulus : Nat} {value : Int}
     (modulusPositive : 0 < modulus) (normZero : centeredNorm modulus value = 0) :

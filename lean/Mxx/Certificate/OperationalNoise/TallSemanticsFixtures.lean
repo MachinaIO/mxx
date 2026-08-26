@@ -182,6 +182,18 @@ theorem finite_add_exact_zero_fixture :
   · decide
   · rfl
 
+def finiteRewriteOutput : Polynomial Owner :=
+  [{ coefficient := 257, key := { centralFactors := [], orderedFactors := [] } }]
+
+theorem finite_relation_rewrite_fixture :
+    ValueClaim.Interprets 257 zeroOwnerEnv 1
+      (.exact finiteRewriteOutput (.finite 1)) := by
+  apply exactFiniteValueClaim_of_eval_mod 257 zeroOwnerEnv 1 [] finiteRewriteOutput 1
+  · refine ⟨1, ?_, ?_⟩
+    · decide
+    · simp [boundInterprets, centeredNorm, centeredCoefficient]
+  · decide
+
 theorem exact_zero_recording_refines_finite_two_fixture :
     RecordedBoundRefines .exactZero (.finite ⟨2, by decide⟩) := by
   trivial
@@ -452,6 +464,8 @@ theorem canonical_relation_fixture :
 #print axioms bound_authority_fixture
 #print axioms bound_scale_value_fixture
 #print axioms finite_add_exact_zero_fixture
+#print axioms TallSemantics.exactFiniteValueClaim_of_eval_mod
+#print axioms finite_relation_rewrite_fixture
 #print axioms exact_zero_recording_refines_finite_two_fixture
 #print axioms TallSemantics.boundTransfer_to_resultCoefficient
 #print axioms TallSemantics.ProjectedBoundAt.sound

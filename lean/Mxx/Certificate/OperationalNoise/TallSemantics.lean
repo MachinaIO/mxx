@@ -1833,6 +1833,30 @@ theorem exactValueClaim_of_eval_mod_zero {Factor : Type} (modulus : Nat) (env : 
     simp
   · simp [boundInterprets, centeredNorm, centeredCoefficient]
 
+/-- A reached relation or canonical merge may change the exact polynomial while preserving its
+    residue.  A finite remainder claim follows that checked residue equality without changing its
+    remainder witness or bound. -/
+theorem exactFiniteValueClaim_of_eval_mod {Factor : Type} (modulus : Nat) (env : Env Factor)
+    (actual : Int) (input output : Polynomial Factor) (maximum : Nat)
+    (claim : ValueClaim.Interprets modulus env actual (.exact input (.finite maximum)))
+    (outputEvalMod : evalPolynomial env output % Int.ofNat modulus =
+      evalPolynomial env input % Int.ofNat modulus) :
+    ValueClaim.Interprets modulus env actual (.exact output (.finite maximum)) := by
+  rcases claim with ⟨remainder, congruence, remainderBound⟩
+  refine ⟨remainder, ?_, remainderBound⟩
+  calc
+    (actual - evalPolynomial env output) % Int.ofNat modulus =
+        (actual % Int.ofNat modulus -
+          evalPolynomial env output % Int.ofNat modulus) % Int.ofNat modulus := by
+            rw [Int.sub_emod]
+    _ = (actual % Int.ofNat modulus -
+          evalPolynomial env input % Int.ofNat modulus) % Int.ofNat modulus := by
+            rw [outputEvalMod]
+    _ = (actual - evalPolynomial env input) % Int.ofNat modulus := by
+          simpa only [Int.emod_emod] using
+            (Int.sub_emod actual (evalPolynomial env input) (Int.ofNat modulus)).symm
+    _ = remainder % Int.ofNat modulus := congruence
+
 theorem exactValueClaim_add_of_mod_zero (modulus : Nat) (env : Env Owner)
     (leftActual rightActual : Int) (left right output : Polynomial Owner)
     (leftClaim : ValueClaim.Interprets modulus env leftActual (.exact left .exactZero))

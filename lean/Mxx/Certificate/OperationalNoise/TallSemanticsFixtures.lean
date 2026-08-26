@@ -320,60 +320,6 @@ theorem operator_add_no_merge_claim_fixture :
   · decide +kernel
   · decide
 
-def addNoMergeLeftZeroHistory : EventHistory :=
-  smallHistory #[
-    annotated (.resultExact boundFixtureOwner [] (.finite 0) 0 .exactZero none) 7,
-    annotated (.resultExact boundFixtureOwner [mergeRightTerm]
-      (.finite 0) 0 (.finite 2) none) 7,
-    annotated (.predecessor boundFixtureOwner 0 ⟨0⟩ 0) 7,
-    annotated (.predecessor boundFixtureOwner 1 ⟨0⟩ 1) 7,
-    annotated (.boundTransfer boundFixtureOwner
-      (.sum [.predecessor 0 2 .coefficient, .predecessor 1 3 .coefficient])) 7,
-    annotated (.boundTransfer boundFixtureOwner
-      (.sum [.result 0 .summary, .result 1 .summary])) 7,
-    annotated (.resultExact boundFixtureOwner [mergeRightTerm]
-      (.finite 0) 4 (.finite 2) (some 5)) 7]
-
-theorem add_no_merge_left_zero_claim_fixture :
-    ExactClaimAt addNoMergeLeftZeroHistory 257 (fun _ : Owner ↦ 1) 0
-      boundFixtureOwner 0 [] .exactZero := by
-  refine ⟨⟨.finite 0, 0, none, rfl⟩, 0, ?_, ?_⟩
-  · decide +kernel
-  · simp [boundInterprets, centeredNorm, centeredCoefficient]
-
-theorem add_no_merge_right_finite_claim_fixture :
-    ExactClaimAt addNoMergeLeftZeroHistory 257 (fun _ : Owner ↦ 1) 1
-      boundFixtureOwner 5 [mergeRightTerm] (.finite 2) := by
-  apply exactFiniteClaimAt (remainder := 2)
-  · rfl
-  · decide +kernel
-  · simp [centeredNorm, centeredCoefficient]
-
-theorem operator_add_no_merge_left_zero_claim_fixture :
-    ExactClaimAt addNoMergeLeftZeroHistory 257 (fun _ : Owner ↦ 1) 6
-      boundFixtureOwner 5 [mergeRightTerm] (.finite 2) := by
-  apply operatorAddNoMergeLeftZeroClaimAt (document := addNoMergeFixtureDocument)
-      (history := addNoMergeLeftZeroHistory) (modulus := 257) (frameStart := 7)
-      (transferEvent := 4) (summaryTransferEvent := 5) (resultEvent := 6)
-      (env := fun _ : Owner ↦ 1) (owner := boundFixtureOwner)
-      (leftOwner := boundFixtureOwner) (rightOwner := boundFixtureOwner)
-      (leftResult := 0) (rightResult := 1) (leftBinding := 2) (rightBinding := 3)
-      (leftInputPosition := 0) (rightInputPosition := 1)
-      (leftExpression := ⟨0⟩) (rightExpression := ⟨0⟩)
-      (leftActual := 0) (rightActual := 5) (leftRaw := [])
-      (rightRaw := [mergeRightTerm]) (outputRaw := [mergeRightTerm])
-      (rightMaximum := 2) (valueType := atomType) (coefficientBound := .finite 0)
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · exact add_no_merge_left_zero_claim_fixture
-  · exact add_no_merge_right_finite_claim_fixture
-  · rfl
-  · decide +kernel
-  · decide
-
 def addNoMergeExactZeroHistory : EventHistory :=
   smallHistory #[
     annotated (.resultExact boundFixtureOwner [] (.finite 0) 0 .exactZero none) 7,
@@ -383,6 +329,80 @@ def addNoMergeExactZeroHistory : EventHistory :=
     annotated (.boundTransfer boundFixtureOwner
       (.sum [.predecessor 0 2 .coefficient, .predecessor 1 3 .coefficient])) 7,
     annotated (.resultExact boundFixtureOwner [] (.finite 0) 4 .exactZero none) 7]
+
+def singletonSurvivorDocument : TallDocument :=
+  { addNoMergeFixtureDocument with
+    expressions := .node 0
+      { descriptor := .operation (.stable (.scalar (.add))) (.int)
+        inputs := emptyExpressionInputs
+        program := none } .empty .empty }
+
+def singletonSurvivorMonomial : Monomial :=
+  { centralFactors := [], orderedFactors := [] }
+
+def singletonSurvivorTerm : Term :=
+  { monomial := singletonSurvivorMonomial, coefficient := 1 }
+
+def singletonSurvivorMaximum : { value : Nat // 0 < value } := ⟨1, by decide⟩
+
+def singletonSurvivorHistory : EventHistory :=
+  smallHistory #[
+    annotated (.boundTransfer boundFixtureOwner (.authority .operator)) 7,
+    annotated (.resultExact boundFixtureOwner [singletonSurvivorTerm]
+      (.finite 1) 0 .exactZero none) 7,
+    annotated (.resultExact boundFixtureOwner [] .exactZero 0 .exactZero none) 7,
+    annotated (.predecessor boundFixtureOwner 0 ⟨0⟩ 2) 7,
+    annotated (.predecessor boundFixtureOwner 1 ⟨0⟩ 1) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.sum [.predecessor 0 3 .coefficient, .predecessor 1 4 .coefficient])) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.monomialProduct singletonSurvivorMonomial
+        [⟨.result 1 .coefficient, false, none⟩])) 7,
+    annotated (.survivorFold 1 6) 7,
+    annotated (.resultExact boundFixtureOwner [] .large 5 (.finite 1) (some 6)) 7]
+
+theorem operator_add_singleton_survivor_fold_fixture
+    (witness : Witness singletonSurvivorDocument singletonSurvivorHistory none 257)
+    (leftActual rightActual : Int) (rightMagnitude survivorMagnitude : Nat)
+    (leftClaim : ExactClaimAt singletonSurvivorHistory 257 witness.env 2
+      boundFixtureOwner leftActual [] .exactZero)
+    (rightClaim : ExactClaimAt singletonSurvivorHistory 257 witness.env 1
+      boundFixtureOwner rightActual [singletonSurvivorTerm] .exactZero)
+    (rightProjection : ProjectedBoundAt singletonSurvivorHistory 1 boundFixtureOwner
+      (some [singletonSurvivorTerm]) .coefficient (.finite singletonSurvivorMaximum)
+      rightMagnitude)
+    (survivorDerived : BoundDerivedAt singletonSurvivorHistory 6 7 boundFixtureOwner
+      (.monomialProduct singletonSurvivorMonomial
+        [⟨.result 1 .coefficient, false, none⟩])
+      (.finite singletonSurvivorMaximum) survivorMagnitude) :
+    ExactClaimAt singletonSurvivorHistory 257 witness.env 8 boundFixtureOwner
+      (leftActual + rightActual) [] (.finite 1) := by
+  apply operatorAddSingletonSurvivorFoldClaimAt (document := singletonSurvivorDocument)
+      (history := singletonSurvivorHistory) (selector := none) (modulus := 257)
+      (witness := witness) (frameStart := 7) (coefficientTransfer := 5)
+      (survivorTransfer := 6) (survivorEvent := 7) (resultEvent := 8)
+      (rightCoefficientProducer := 0) (owner := boundFixtureOwner)
+      (leftOwner := boundFixtureOwner) (rightOwner := boundFixtureOwner)
+      (leftResult := 2) (rightResult := 1) (leftBinding := 3) (rightBinding := 4)
+      (leftInputPosition := 0) (rightInputPosition := 1)
+      (leftExpression := ⟨0⟩) (rightExpression := ⟨0⟩)
+      (leftActual := leftActual) (rightActual := rightActual) (leftRaw := [])
+      (survivorMonomial := singletonSurvivorMonomial)
+      (maximum := singletonSurvivorMaximum) (coefficientBound := .large)
+      (rightCoefficientBound := .finite 1) (rightMagnitude := rightMagnitude)
+      (survivorMagnitude := survivorMagnitude)
+  · rfl
+  · rfl
+  · rfl
+  · rfl
+  · exact leftClaim
+  · exact rightClaim
+  · rfl
+  · exact rightProjection
+  · exact survivorDerived
+  · rfl
+  · rfl
+  · decide
 
 theorem add_no_merge_exact_zero_left_claim_fixture :
     ExactClaimAt addNoMergeExactZeroHistory 257 (fun _ : Owner ↦ 0) 0
@@ -1039,8 +1059,8 @@ theorem canonical_relation_fixture :
 #print axioms TallSemantics.exactValueClaim_add_finite
 #print axioms TallSemantics.operatorAddNoMergeClaim
 #print axioms operator_add_no_merge_claim_fixture
-#print axioms TallSemantics.operatorAddNoMergeLeftZeroClaimAt
-#print axioms operator_add_no_merge_left_zero_claim_fixture
+#print axioms TallSemantics.operatorAddSingletonSurvivorFoldClaimAt
+#print axioms operator_add_singleton_survivor_fold_fixture
 #print axioms TallSemantics.operatorSubNoMergeClaim
 #print axioms operator_sub_no_merge_claim_fixture
 #print axioms TallSemantics.operatorAddNoMergeExactZeroClaimAt

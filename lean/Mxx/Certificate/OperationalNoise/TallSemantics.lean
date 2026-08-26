@@ -2804,58 +2804,6 @@ theorem operatorAddNoMergeClaim
       (outputRaw.map Term.toExact) leftMaximum rightMaximum leftClaim.claim rightClaim.claim
       outputEval modulusPositive
 
-/-- This reached no-collision Add has an exact-zero left remainder and a finite right remainder,
-    so the Result preserves exactly the right finite maximum.  Both Sum rows remain bound in the
-    original Rust operand order. -/
-theorem operatorAddNoMergeLeftZeroClaimAt
-    {document : TallDocument} {history : EventHistory}
-    {modulus frameStart transferEvent summaryTransferEvent resultEvent : Nat} {env : Env Owner}
-    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
-    {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
-    {leftExpression rightExpression : ExpressionRef}
-    {leftActual rightActual : Int} {leftRaw rightRaw outputRaw : List Term}
-    {rightMaximum : Nat} {valueType : ValueType} {coefficientBound : Bound}
-    (_operationAt :
-      (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
-        some (.operation (.stable (.matrix .add)) valueType))
-    (_leftPredecessorAt : history.lookup leftBinding = some
-      ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
-    (_rightPredecessorAt : history.lookup rightBinding = some
-      ⟨.predecessor owner rightInputPosition rightExpression rightResult, frameStart⟩)
-    (_transferAt : history.lookup transferEvent = some
-      ⟨.boundTransfer owner
-        (.sum [.predecessor leftInputPosition leftBinding .coefficient,
-          .predecessor rightInputPosition rightBinding .coefficient]), frameStart⟩)
-    (_summaryTransferAt : history.lookup summaryTransferEvent = some
-      ⟨.boundTransfer owner
-        (.sum [.result leftResult .summary, .result rightResult .summary]), frameStart⟩)
-    (leftClaim : ExactClaimAt history modulus env leftResult leftOwner leftActual leftRaw
-      .exactZero)
-    (rightClaim : ExactClaimAt history modulus env rightResult rightOwner rightActual rightRaw
-      (.finite rightMaximum))
-    (resultAt : history.lookup resultEvent = some
-      ⟨.resultExact owner outputRaw coefficientBound transferEvent (.finite rightMaximum)
-        (some summaryTransferEvent), frameStart⟩)
-    (outputAgreement : CanonicalAgreement (outputRaw.map Term.toExact)
-      (add (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)))
-    (modulusPositive : 0 < modulus) :
-    ExactClaimAt history modulus env resultEvent owner (leftActual + rightActual) outputRaw
-      (.finite rightMaximum) := by
-  have outputEval := addCanonicalResultSound env
-    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
-    (outputRaw.map Term.toExact) outputAgreement
-  have leftModZero := exactClaim_mod_zero modulus env leftActual
-    (leftRaw.map Term.toExact) leftClaim.claim modulusPositive
-  have swappedClaim := exactValueClaim_add_right_mod_zero modulus env rightActual leftActual
-    (rightRaw.map Term.toExact) (leftRaw.map Term.toExact)
-    (outputRaw.map Term.toExact) rightMaximum rightClaim.claim leftModZero
-    (outputEval.trans (Int.add_comm _ _))
-  refine ⟨⟨coefficientBound, transferEvent, some summaryTransferEvent, ?_⟩, ?_⟩
-  · rw [resultAt]
-    rfl
-  · simpa only [Int.add_comm] using swappedClaim
-
 /-- A reached no-collision Subtract records the sum of the two finite remainder maxima even
     though its exact polynomial negates the right input.  The two predecessor rows bind both
     coefficient and summary transfers to the same child Results. -/
@@ -3175,6 +3123,98 @@ structure Witness (document : TallDocument) (history : EventHistory) (selector :
     TerminalExactAt document history selector producer resultEvent owner rawTerms →
       (honestTerminalActual resultEvent - evalPolynomial env (rawTerms.map Term.toExact)) %
         Int.ofNat modulus = 0
+
+/-- The reached Result6329 path adds two exact-zero children without merge rows, then folds the
+    right singleton survivor into a finite summary.  The singleton monomial is shared by the
+    right Result and its monomial-product transfer; the Result keeps exactly the left terms. -/
+theorem operatorAddSingletonSurvivorFoldClaimAt
+    {document : TallDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
+    {witness : Witness document history selector modulus}
+    {frameStart coefficientTransfer survivorTransfer survivorEvent resultEvent
+      rightCoefficientProducer : Nat}
+    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
+    {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
+    {leftExpression rightExpression : ExpressionRef}
+    {leftActual rightActual : Int} {leftRaw : List Term} {survivorMonomial : Monomial}
+    {maximum : { value : Nat // 0 < value }}
+    {coefficientBound rightCoefficientBound : Bound}
+    {rightMagnitude survivorMagnitude : Nat}
+    (_operationAt :
+      (document.expressions.lookup owner.expression.row).map
+        TallSecurity0ABI.ExpressionRow.descriptor =
+        some (.operation (.stable (.scalar (.add))) (.int)))
+    (_leftPredecessorAt : history.lookup leftBinding = some
+      ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
+    (_rightPredecessorAt : history.lookup rightBinding = some
+      ⟨.predecessor owner rightInputPosition rightExpression rightResult, frameStart⟩)
+    (_coefficientTransferAt : history.lookup coefficientTransfer = some
+      ⟨.boundTransfer owner
+        (.sum [.predecessor leftInputPosition leftBinding .coefficient,
+          .predecessor rightInputPosition rightBinding .coefficient]), frameStart⟩)
+    (leftClaim : ExactClaimAt history modulus witness.env leftResult leftOwner leftActual leftRaw
+      .exactZero)
+    (rightClaim : ExactClaimAt history modulus witness.env rightResult rightOwner rightActual
+      [{ monomial := survivorMonomial, coefficient := 1 }] .exactZero)
+    (_rightResultAt : history.lookup rightResult = some
+      ⟨.resultExact rightOwner [{ monomial := survivorMonomial, coefficient := 1 }]
+        rightCoefficientBound rightCoefficientProducer .exactZero none, frameStart⟩)
+    (rightProjection : ProjectedBoundAt history rightResult rightOwner
+      (some [{ monomial := survivorMonomial, coefficient := 1 }]) .coefficient
+      (.finite maximum) rightMagnitude)
+    (_survivorDerived : BoundDerivedAt history survivorTransfer frameStart owner
+      (.monomialProduct survivorMonomial
+        [⟨.result rightResult .coefficient, false, none⟩])
+      (.finite maximum) survivorMagnitude)
+    (_survivorAt : history.lookup survivorEvent = some
+      ⟨.survivorFold 1 survivorTransfer, frameStart⟩)
+    (resultAt : history.lookup resultEvent = some
+      ⟨.resultExact owner leftRaw coefficientBound coefficientTransfer (.finite maximum.val)
+        (some survivorTransfer), frameStart⟩)
+    (modulusPositive : 0 < modulus) :
+    ExactClaimAt history modulus witness.env resultEvent owner (leftActual + rightActual) leftRaw
+      (.finite maximum.val) := by
+  let rightRaw : List Term := [{ monomial := survivorMonomial, coefficient := 1 }]
+  have operationEval := addCanonicalResultSound witness.env
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (add (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)) (by rfl)
+  have priorClaim := exactValueClaim_add_of_mod_zero modulus witness.env leftActual rightActual
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (add (leftRaw.map Term.toExact) (rightRaw.map Term.toExact))
+    leftClaim.claim rightClaim.claim operationEval modulusPositive
+  have priorModZero := exactClaim_mod_zero modulus witness.env (leftActual + rightActual)
+    (add (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)) priorClaim modulusPositive
+  have rightModZero := exactClaim_mod_zero modulus witness.env rightActual
+    (rightRaw.map Term.toExact) rightClaim.claim modulusPositive
+  have rightResidue : rightActual % Int.ofNat modulus =
+      evalPolynomial witness.env (rightRaw.map Term.toExact) % Int.ofNat modulus :=
+    Int.emod_eq_emod_iff_emod_sub_eq_zero.mpr rightModZero
+  have rightMagnitudeCovers := witness.coefficientMagnitudeCovers rightResult rightOwner
+    rightActual rightRaw .exactZero (.finite maximum) rightMagnitude rightClaim rightProjection
+  have rightMagnitudeSound : rightMagnitude ≤ maximum.val := by
+    simpa [CoeffClass.Interprets] using ProjectedBoundAt.sound rightProjection
+  refine ⟨⟨coefficientBound, coefficientTransfer, some survivorTransfer, ?_⟩,
+    rightActual, ?_, Nat.le_trans rightMagnitudeCovers rightMagnitudeSound⟩
+  · rw [resultAt]
+    rfl
+  · calc
+      (leftActual + rightActual - evalPolynomial witness.env (leftRaw.map Term.toExact)) %
+          Int.ofNat modulus =
+          ((leftActual + rightActual -
+              evalPolynomial witness.env
+                (add (leftRaw.map Term.toExact) (rightRaw.map Term.toExact))) +
+            evalPolynomial witness.env (rightRaw.map Term.toExact)) % Int.ofNat modulus := by
+              rw [operationEval]
+              congr 1 <;> omega
+      _ = ((leftActual + rightActual -
+            evalPolynomial witness.env
+              (add (leftRaw.map Term.toExact) (rightRaw.map Term.toExact))) %
+              Int.ofNat modulus +
+            evalPolynomial witness.env (rightRaw.map Term.toExact) % Int.ofNat modulus) %
+              Int.ofNat modulus := by rw [Int.add_emod]
+      _ = evalPolynomial witness.env (rightRaw.map Term.toExact) % Int.ofNat modulus := by
+            rw [priorModZero]
+            simp
+      _ = rightActual % Int.ofNat modulus := rightResidue.symm
 
 /-- The reached finite Multiply accumulator uses the exact coefficient projection of its
     exact-zero right child to connect replayed coefficient magnitude to the semantic value.  The

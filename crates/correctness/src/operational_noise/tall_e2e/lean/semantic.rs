@@ -183,7 +183,7 @@ struct RelationProbe {
     output: ResultRecord,
     kind: RelationRuleKind,
     rule: ProofPayloadRelationRule,
-    output_merge: ProofPayloadCoefficientMerge,
+    output_merges: Vec<(u64, ProofPayloadCoefficientMerge)>,
     rhs_pre_fold_event: Option<u64>,
 }
 
@@ -200,8 +200,8 @@ struct PendingRelation {
     accumulator: ResultRecord,
     rhs: ResultRecord,
     terms: BTreeMap<ProofPayloadMonomial, num_bigint::BigInt>,
+    output_merges: Vec<(u64, ProofPayloadCoefficientMerge)>,
     last_merge_event: Option<u64>,
-    last_merge: Option<ProofPayloadCoefficientMerge>,
     kind: RelationRuleKind,
     rule: ProofPayloadRelationRule,
     rhs_pre_fold_event: Option<u64>,
@@ -275,6 +275,12 @@ struct LeftRootMergeNode<'a> {
     event: u64,
     result_event: u64,
     merge: &'a ProofPayloadCoefficientMerge,
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum LeftMergeGroupKey {
+    Operator { frame: u64, owner: ProofPayloadOwner, left_result: u64, right_result: u64 },
+    Relation { frame: u64, owner: ProofPayloadOwner, application: u64 },
 }
 
 struct LeftRootRenderData<'a> {
@@ -956,7 +962,7 @@ fn finalize_relations(
     pending: &mut Vec<PendingRelation>,
     candidates: &mut Vec<RelationProbe>,
 ) -> Result<(), String> {
-    for mut relation in pending.drain(..) {
+    for relation in pending.drain(..) {
         let output_event = relation.last_merge_event.ok_or_else(|| {
             format!(
                 "relation application {} has no typed Relation coefficient merge",
@@ -993,10 +999,7 @@ fn finalize_relations(
             output,
             kind: relation.kind,
             rule: relation.rule,
-            output_merge: relation
-                .last_merge
-                .take()
-                .expect("relation finalization has a typed output merge"),
+            output_merges: relation.output_merges,
             rhs_pre_fold_event: relation.rhs_pre_fold_event,
         });
     }
@@ -1151,8 +1154,8 @@ fn relation_candidates(
                         accumulator,
                         rhs,
                         terms,
+                        output_merges: Vec::new(),
                         last_merge_event: None,
-                        last_merge: None,
                         kind,
                         rule: rule.clone(),
                         rhs_pre_fold_event: match index.event(rhs_event)? {
@@ -1183,8 +1186,8 @@ fn relation_candidates(
                     };
                     *relation.terms.entry(merge.output.clone()).or_default() +=
                         &merge.signed_contribution;
+                    relation.output_merges.push((event, merge.clone()));
                     relation.last_merge_event = Some(event);
-                    relation.last_merge = Some(merge.clone());
                 }
                 _ => {}
             }
@@ -1732,6 +1735,7 @@ pub(super) fn render(
     files.extend(right_root_shards);
     files.extend(render_left_authorities(&index, &left_root, &modulus)?);
     files.extend(render_left_bounds(statement, &index, &left_root, &modulus)?);
+    files.extend(render_left_merge_deltas(&index, &left_root)?);
 
     let specs = [
         ("Semantic/Semantic000.lean", "Semantic000", "long-monomial-merge"),
@@ -1789,6 +1793,7 @@ pub(super) fn render(
     let mut index = String::new();
     index.push_str("import Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Semantic.SemanticRightRoot\n");
     index.push_str("import Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Semantic.SemanticLeftBound\n");
+    index.push_str("import Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Semantic.SemanticLeftMergeTree\n");
     for (_, module, _) in specs {
         writeln!(index, "import {NAMESPACE}.Semantic.{module}").expect("String write");
     }
@@ -2327,6 +2332,279 @@ fn collect_final_add_render_data(index: &PayloadIndex) -> Result<FinalAddRenderD
         prefold_event: PREFOLD,
         end_event: END,
     })
+}
+
+fn render_left_merge_deltas(
+    index: &PayloadIndex,
+    data: &LeftRootRenderData<'_>,
+) -> Result<Vec<super::super::TallSecurity0GeneratedFile>, String> {
+    const CHUNK_SIZE: usize = 16;
+    let mut files = Vec::new();
+    for (shard_index, shard) in data.merges.chunks(CHUNK_SIZE).enumerate() {
+        let module = format!("SemanticLeftMergeDeltaShard{shard_index:03}");
+        let mut source = format!(
+            "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n"
+        );
+        source
+            .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
+        writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
+        source.push_str(
+            "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+        );
+        for node in shard {
+            let event = node.event;
+            let frame = index.immediate_frames
+                [usize::try_from(event).map_err(|_| "left merge event index overflow")?]
+            .ok_or_else(|| format!("left merge event {event} has no immediate frame"))?;
+            writeln!(source, "namespace LeftMerge{event}").expect("String write");
+            writeln!(source, "def owner : Owner := {}", owner_text(node.merge.owner))
+                .expect("String write");
+            writeln!(source, "def mergeEvent : Nat := {event}\ndef frameStart : Nat := {frame}")
+                .expect("String write");
+            let delta = ProofPayloadTerm {
+                coefficient: node.merge.signed_contribution.clone(),
+                monomial: node.merge.output.clone(),
+            };
+            writeln!(source, "def delta : ExactTerm Owner := {}", term_text(&delta),)
+                .expect("String write");
+            match &node.merge.source {
+                ProofPayloadCoefficientMergeSource::Operator { inputs } => {
+                    let left = index.result(inputs[0].value_event)?;
+                    let right = index.result(inputs[1].value_event)?;
+                    let left_ordinal = usize::try_from(inputs[0].term_ordinal)
+                        .map_err(|_| format!("left merge event {event} term ordinal overflow"))?;
+                    let right_ordinal = usize::try_from(inputs[1].term_ordinal)
+                        .map_err(|_| format!("left merge event {event} term ordinal overflow"))?;
+                    let left_term = left.terms.get(left_ordinal).ok_or_else(|| {
+                        format!("left merge event {event} left term is out of range")
+                    })?;
+                    let right_term = right.terms.get(right_ordinal).ok_or_else(|| {
+                        format!("left merge event {event} right term is out of range")
+                    })?;
+                    writeln!(source, "def leftRaw : List Term := {}", raw_terms_text(&left.terms))
+                        .expect("String write");
+                    writeln!(
+                        source,
+                        "def rightRaw : List Term := {}",
+                        raw_terms_text(&right.terms)
+                    )
+                    .expect("String write");
+                    writeln!(
+                        source,
+                        "def group : MergeGroup := .operator {} {}",
+                        inputs[0].value_event, inputs[1].value_event
+                    )
+                    .expect("String write");
+                    writeln!(source, "theorem deltaAt : MergeDeltaAt history mergeEvent frameStart owner group delta := by\n  unfold group delta\n  apply MergeDeltaAt.operator (leftResult := {}) (leftOrdinal := {})\n    (rightResult := {}) (rightOrdinal := {}) (leftTerms := leftRaw)\n    (rightTerms := rightRaw) (leftTerm := {}) (rightTerm := {})\n    (output := {}) (signedContribution := ({})) <;> rfl",
+                        inputs[0].value_event,
+                        inputs[0].term_ordinal,
+                        inputs[1].value_event,
+                        inputs[1].term_ordinal,
+                        raw_term_text(left_term),
+                        raw_term_text(right_term),
+                        monomial_text(&node.merge.output),
+                        node.merge.signed_contribution,
+                    ).expect("String write");
+                }
+                ProofPayloadCoefficientMergeSource::Relation {
+                    application,
+                    source_term_ordinal,
+                } => {
+                    let (source_monomial, outer, start, end, rule) = match index
+                        .event(*application)?
+                    {
+                        ProofPayloadEvent::AppliedRelation {
+                            owner,
+                            source_monomial,
+                            outer_coefficient,
+                            ordered_start,
+                            ordered_end_exclusive,
+                            rule,
+                        } if *owner == node.merge.owner => (
+                            source_monomial,
+                            outer_coefficient,
+                            ordered_start,
+                            ordered_end_exclusive,
+                            rule,
+                        ),
+                        _ => {
+                            return Err(format!(
+                                "left relation merge event {event} has an inconsistent application {application}"
+                            ));
+                        }
+                    };
+                    let rhs_event = match rule {
+                        ProofPayloadRelationRule::Universal { rhs_result, .. } => *rhs_result,
+                        ProofPayloadRelationRule::Gadget { input_result, .. } => *input_result,
+                    };
+                    let rhs = index.result(rhs_event)?;
+                    let ordinal = usize::try_from(*source_term_ordinal).map_err(|_| {
+                        format!("left relation merge event {event} term ordinal overflow")
+                    })?;
+                    let rhs_term = rhs.terms.get(ordinal).ok_or_else(|| {
+                        format!("left relation merge event {event} source term is out of range")
+                    })?;
+                    writeln!(source, "def rhsRaw : List Term := {}", raw_terms_text(&rhs.terms))
+                        .expect("String write");
+                    writeln!(source, "def group : MergeGroup := .relation {application}")
+                        .expect("String write");
+                    writeln!(source, "theorem deltaAt : MergeDeltaAt history mergeEvent frameStart owner group delta := by\n  unfold group delta\n  apply MergeDeltaAt.relation (application := {application}) (rhsResult := {rhs_event})\n    (sourceTermOrdinal := {source_term_ordinal}) (source := {})\n    (outerCoefficient := ({outer})) (orderedStart := {start})\n    (orderedEndExclusive := {end}) (rule := {}) (rhsTerms := rhsRaw)\n    (rhsTerm := {}) (output := {}) (signedContribution := ({})) <;> rfl",
+                        monomial_text(source_monomial),
+                        relation_rule_text(rule),
+                        raw_term_text(rhs_term),
+                        monomial_text(&node.merge.output),
+                        node.merge.signed_contribution,
+                    ).expect("String write");
+                }
+            }
+            writeln!(source, "end LeftMerge{event}\n").expect("String write");
+        }
+        writeln!(source, "end {NAMESPACE}.Semantic").expect("String write");
+        files.push(generated_file(format!("Semantic/{module}.lean"), source));
+    }
+    let merge_shards = data
+        .merges
+        .iter()
+        .enumerate()
+        .map(|(position, node)| (node.event, position / CHUNK_SIZE))
+        .collect::<BTreeMap<_, _>>();
+    let mut groups = BTreeMap::<LeftMergeGroupKey, Vec<&LeftRootMergeNode<'_>>>::new();
+    for node in &data.merges {
+        let frame = index.immediate_frames
+            [usize::try_from(node.event).map_err(|_| "left merge event index overflow")?]
+        .ok_or_else(|| format!("left merge event {} has no immediate frame", node.event))?;
+        let key = match &node.merge.source {
+            ProofPayloadCoefficientMergeSource::Operator { inputs } => {
+                LeftMergeGroupKey::Operator {
+                    frame,
+                    owner: node.merge.owner,
+                    left_result: inputs[0].value_event,
+                    right_result: inputs[1].value_event,
+                }
+            }
+            ProofPayloadCoefficientMergeSource::Relation { application, .. } => {
+                LeftMergeGroupKey::Relation {
+                    frame,
+                    owner: node.merge.owner,
+                    application: *application,
+                }
+            }
+        };
+        groups.entry(key).or_default().push(node);
+    }
+    let groups = groups.into_iter().collect::<Vec<_>>();
+    for (shard_index, shard) in groups.chunks(CHUNK_SIZE).enumerate() {
+        let module = format!("SemanticLeftMergeTreeShard{shard_index:03}");
+        let mut source = String::new();
+        let leaf_shards = shard
+            .iter()
+            .flat_map(|(_, nodes)| nodes.iter().map(|node| merge_shards[&node.event]))
+            .collect::<BTreeSet<_>>();
+        for leaf_shard in leaf_shards {
+            writeln!(
+                source,
+                "import {NAMESPACE}.Semantic.SemanticLeftMergeDeltaShard{leaf_shard:03}"
+            )
+            .expect("String write");
+        }
+        source
+            .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
+        writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
+        source.push_str(
+            "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+        );
+        for (key, nodes) in shard {
+            let first_event = nodes[0].event;
+            let (namespace, frame, owner, group) = match key {
+                LeftMergeGroupKey::Operator { frame, owner, left_result, right_result } => (
+                    format!("LeftOperatorMerge{first_event}"),
+                    frame,
+                    owner,
+                    format!(".operator {left_result} {right_result}"),
+                ),
+                LeftMergeGroupKey::Relation { frame, owner, application } => (
+                    format!("LeftRelationMerge{application}"),
+                    frame,
+                    owner,
+                    format!(".relation {application}"),
+                ),
+            };
+            writeln!(source, "namespace {namespace}").expect("String write");
+            writeln!(source, "def frameStart : Nat := {frame}").expect("String write");
+            writeln!(source, "def owner : Owner := {}", owner_text(*owner)).expect("String write");
+            writeln!(source, "def group : MergeGroup := {group}").expect("String write");
+            let mut level = Vec::<(String, String)>::new();
+            for (position, node) in nodes.iter().enumerate() {
+                let deltas = format!("deltas0_{position}");
+                let rows = format!("rows0_{position}");
+                writeln!(
+                    source,
+                    "def {deltas} : Polynomial Owner := [LeftMerge{}.delta]",
+                    node.event
+                )
+                .expect("String write");
+                writeln!(source, "theorem {rows} : MergeDeltasAt history frameStart owner group {deltas} := by\n  exact .leaf LeftMerge{}.deltaAt", node.event).expect("String write");
+                level.push((deltas, rows));
+            }
+            let mut depth = 1;
+            while level.len() > 1 {
+                let mut next = Vec::with_capacity(level.len().div_ceil(2));
+                for (position, pair) in level.chunks(2).enumerate() {
+                    if let [(left_deltas, left_rows), (right_deltas, right_rows)] = pair {
+                        let deltas = format!("deltas{depth}_{position}");
+                        let rows = format!("rows{depth}_{position}");
+                        writeln!(
+                            source,
+                            "def {deltas} : Polynomial Owner := {left_deltas} ++ {right_deltas}"
+                        )
+                        .expect("String write");
+                        writeln!(source, "theorem {rows} : MergeDeltasAt history frameStart owner group {deltas} := by\n  exact .append {left_rows} {right_rows}").expect("String write");
+                        next.push((deltas, rows));
+                    } else {
+                        next.push(pair[0].clone());
+                    }
+                }
+                level = next;
+                depth += 1;
+            }
+            let (root_deltas, root_rows) = &level[0];
+            writeln!(source, "abbrev deltas : Polynomial Owner := {root_deltas}")
+                .expect("String write");
+            writeln!(
+                source,
+                "theorem rows : MergeDeltasAt history frameStart owner group deltas := {root_rows}"
+            )
+            .expect("String write");
+            writeln!(source, "end {namespace}\n").expect("String write");
+        }
+        writeln!(source, "end {NAMESPACE}.Semantic").expect("String write");
+        files.push(generated_file(format!("Semantic/{module}.lean"), source));
+    }
+    let mut import_level = (0..groups.len().div_ceil(CHUNK_SIZE))
+        .map(|shard| format!("SemanticLeftMergeTreeShard{shard:03}"))
+        .collect::<Vec<_>>();
+    let mut depth = 0;
+    while import_level.len() > 1 {
+        let mut next = Vec::with_capacity(import_level.len().div_ceil(CHUNK_SIZE));
+        for (position, chunk) in import_level.chunks(CHUNK_SIZE).enumerate() {
+            let module = format!("SemanticLeftMergeTreeImport{depth:02}_{position:03}");
+            let mut source = String::new();
+            for dependency in chunk {
+                writeln!(source, "import {NAMESPACE}.Semantic.{dependency}").expect("String write");
+            }
+            files.push(generated_file(format!("Semantic/{module}.lean"), source));
+            next.push(module);
+        }
+        import_level = next;
+        depth += 1;
+    }
+    let root =
+        import_level.first().ok_or_else(|| "Security0 left merge tree is empty".to_owned())?;
+    files.push(generated_file(
+        "Semantic/SemanticLeftMergeTree.lean",
+        format!("import {NAMESPACE}.Semantic.{root}\n"),
+    ));
+    Ok(files)
 }
 
 fn render_left_authorities(
@@ -3824,7 +4102,9 @@ fn render_relation_bindings(source: &mut String, relation: &RelationProbe) {
         source,
         "selectedRelationOutputAt",
         "relationOutputEvent",
-        merge_text(&relation.output_merge),
+        merge_text(
+            &relation.output_merges.last().expect("relation probe has a typed output merge").1,
+        ),
     );
 }
 
@@ -5260,18 +5540,21 @@ mod tests {
                     rhs_result: event,
                 },
             },
-            output_merge: ProofPayloadCoefficientMerge {
-                owner: root,
-                source: ProofPayloadCoefficientMergeSource::Relation {
-                    application: event,
-                    source_term_ordinal: 0,
+            output_merges: vec![(
+                event,
+                ProofPayloadCoefficientMerge {
+                    owner: root,
+                    source: ProofPayloadCoefficientMergeSource::Relation {
+                        application: event,
+                        source_term_ordinal: 0,
+                    },
+                    output: ProofPayloadMonomial {
+                        central_factors: Vec::new(),
+                        ordered_factors: vec![root],
+                    },
+                    signed_contribution: BigInt::from(1),
                 },
-                output: ProofPayloadMonomial {
-                    central_factors: Vec::new(),
-                    ordered_factors: vec![root],
-                },
-                signed_contribution: BigInt::from(1),
-            },
+            )],
             rhs_pre_fold_event: None,
         }
     }

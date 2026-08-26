@@ -478,6 +478,61 @@ def subtractMergeFixtureDocument : TallDocument :=
 def subtractMergeOutputTerm : Term :=
   { monomial := { centralFactors := [], orderedFactors := [] }, coefficient := -1 }
 
+def subtractNoMergeHistory : EventHistory :=
+  smallHistory #[
+    annotated (.resultExact boundFixtureOwner [mergeLeftTerm] (.finite 0) 0 (.finite 1) none) 7,
+    annotated (.resultExact boundFixtureOwner [mergeRightTerm] (.finite 0) 0 (.finite 2) none) 7,
+    annotated (.predecessor boundFixtureOwner 0 ⟨0⟩ 0) 7,
+    annotated (.predecessor boundFixtureOwner 1 ⟨0⟩ 1) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.sum [.predecessor 0 2 .coefficient, .predecessor 1 3 .coefficient])) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.sum [.result 0 .summary, .result 1 .summary])) 7,
+    annotated (.resultExact boundFixtureOwner [subtractMergeOutputTerm]
+      (.finite 0) 4 (.finite 3) (some 5)) 7]
+
+theorem subtract_no_merge_left_claim_fixture :
+    ExactClaimAt subtractNoMergeHistory 257 (fun _ : Owner ↦ 1) 0 boundFixtureOwner 3
+      [mergeLeftTerm] (.finite 1) := by
+  apply exactFiniteClaimAt (remainder := 1)
+  · rfl
+  · decide +kernel
+  · simp [centeredNorm, centeredCoefficient]
+
+theorem subtract_no_merge_right_claim_fixture :
+    ExactClaimAt subtractNoMergeHistory 257 (fun _ : Owner ↦ 1) 1 boundFixtureOwner 5
+      [mergeRightTerm] (.finite 2) := by
+  apply exactFiniteClaimAt (remainder := 2)
+  · rfl
+  · decide +kernel
+  · simp [centeredNorm, centeredCoefficient]
+
+theorem operator_sub_no_merge_claim_fixture :
+    ExactClaimAt subtractNoMergeHistory 257 (fun _ : Owner ↦ 1) 6 boundFixtureOwner (-2)
+      [subtractMergeOutputTerm] (.finite 3) := by
+  apply operatorSubNoMergeClaim (document := subtractMergeFixtureDocument)
+      (history := subtractNoMergeHistory) (modulus := 257) (frameStart := 7)
+      (transferEvent := 4) (summaryTransferEvent := 5) (resultEvent := 6)
+      (env := fun _ : Owner ↦ 1) (owner := boundFixtureOwner)
+      (leftOwner := boundFixtureOwner) (rightOwner := boundFixtureOwner)
+      (leftResult := 0) (rightResult := 1) (leftBinding := 2) (rightBinding := 3)
+      (leftInputPosition := 0) (rightInputPosition := 1)
+      (leftExpression := ⟨0⟩) (rightExpression := ⟨0⟩)
+      (leftActual := 3) (rightActual := 5)
+      (leftRaw := [mergeLeftTerm]) (rightRaw := [mergeRightTerm])
+      (outputRaw := [subtractMergeOutputTerm]) (leftMaximum := 1) (rightMaximum := 2)
+      (valueType := atomType) (coefficientBound := .finite 0)
+  · rfl
+  · rfl
+  · rfl
+  · rfl
+  · rfl
+  · exact subtract_no_merge_left_claim_fixture
+  · exact subtract_no_merge_right_claim_fixture
+  · rfl
+  · decide +kernel
+  · decide
+
 def subtractMergeHistory : EventHistory :=
   smallHistory #[
     annotated (.resultExact boundFixtureOwner [mergeLeftTerm] (.finite 0) 0 (.finite 1) none) 7,
@@ -930,6 +985,8 @@ theorem canonical_relation_fixture :
 #print axioms TallSemantics.exactValueClaim_add_finite
 #print axioms TallSemantics.operatorAddNoMergeClaim
 #print axioms operator_add_no_merge_claim_fixture
+#print axioms TallSemantics.operatorSubNoMergeClaim
+#print axioms operator_sub_no_merge_claim_fixture
 #print axioms TallSemantics.operatorAddNoMergeExactZeroClaimAt
 #print axioms operator_add_no_merge_exact_zero_claim_fixture
 #print axioms TallSemantics.operatorSubNoMergeExactZeroClaimAt

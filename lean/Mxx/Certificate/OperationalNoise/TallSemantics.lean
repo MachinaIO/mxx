@@ -2804,6 +2804,56 @@ theorem operatorAddNoMergeClaim
       (outputRaw.map Term.toExact) leftMaximum rightMaximum leftClaim.claim rightClaim.claim
       outputEval modulusPositive
 
+/-- A reached no-collision Subtract records the sum of the two finite remainder maxima even
+    though its exact polynomial negates the right input.  The two predecessor rows bind both
+    coefficient and summary transfers to the same child Results. -/
+theorem operatorSubNoMergeClaim
+    {document : TallDocument} {history : EventHistory}
+    {modulus frameStart transferEvent summaryTransferEvent resultEvent : Nat} {env : Env Owner}
+    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
+    {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
+    {leftExpression rightExpression : ExpressionRef}
+    {leftActual rightActual : Int} {leftRaw rightRaw outputRaw : List Term}
+    {leftMaximum rightMaximum : Nat} {valueType : ValueType} {coefficientBound : Bound}
+    (_operationAt :
+      (document.expressions.lookup owner.expression.row).map
+        TallSecurity0ABI.ExpressionRow.descriptor =
+        some (.operation (.stable (.matrix .subtract)) valueType))
+    (_leftPredecessorAt : history.lookup leftBinding = some
+      ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
+    (_rightPredecessorAt : history.lookup rightBinding = some
+      ⟨.predecessor owner rightInputPosition rightExpression rightResult, frameStart⟩)
+    (_transferAt : history.lookup transferEvent = some
+      ⟨.boundTransfer owner
+        (.sum [.predecessor leftInputPosition leftBinding .coefficient,
+          .predecessor rightInputPosition rightBinding .coefficient]), frameStart⟩)
+    (_summaryTransferAt : history.lookup summaryTransferEvent = some
+      ⟨.boundTransfer owner
+        (.sum [.result leftResult .summary, .result rightResult .summary]), frameStart⟩)
+    (leftClaim : ExactClaimAt history modulus env leftResult leftOwner leftActual leftRaw
+      (.finite leftMaximum))
+    (rightClaim : ExactClaimAt history modulus env rightResult rightOwner rightActual rightRaw
+      (.finite rightMaximum))
+    (resultAt : history.lookup resultEvent = some
+      ⟨.resultExact owner outputRaw coefficientBound transferEvent
+        (.finite (leftMaximum + rightMaximum))
+        (some summaryTransferEvent), frameStart⟩)
+    (outputAgreement : CanonicalAgreement (outputRaw.map Term.toExact)
+      (subtract (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)))
+    (modulusPositive : 0 < modulus) :
+    ExactClaimAt history modulus env resultEvent owner (leftActual - rightActual) outputRaw
+      (.finite (leftMaximum + rightMaximum)) := by
+  have outputEval := subCanonicalResultSound env
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (outputRaw.map Term.toExact) outputAgreement
+  refine ⟨⟨coefficientBound, transferEvent, some summaryTransferEvent, ?_⟩, ?_⟩
+  · rw [resultAt]
+    rfl
+  · exact exactValueClaim_sub_finite modulus env leftActual rightActual
+      (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+      (outputRaw.map Term.toExact) leftMaximum rightMaximum leftClaim.claim rightClaim.claim
+      outputEval modulusPositive
+
 /-- A reached no-collision Add with two exact-zero children records no summary producer.  The
     operation, predecessor, coefficient-transfer, and Result rows bind the semantic addition to
     the exact Rust events, while the canonical agreement checks the complete copied output. -/

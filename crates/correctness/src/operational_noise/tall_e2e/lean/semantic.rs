@@ -271,10 +271,18 @@ struct LeftRootBoundNode<'a> {
     rule: &'a ProofPayloadRule,
 }
 
+struct LeftRootMergeNode<'a> {
+    event: u64,
+    result_event: u64,
+    merge: &'a ProofPayloadCoefficientMerge,
+}
+
 struct LeftRootRenderData<'a> {
     event_ids: Vec<u64>,
     bounds: Vec<LeftRootBoundNode<'a>>,
     relation_events: Vec<u64>,
+    merges: Vec<LeftRootMergeNode<'a>>,
+    exact_results: Vec<ResultRecord>,
     authority_results: BTreeMap<u64, u64>,
 }
 
@@ -1691,6 +1699,8 @@ pub(super) fn render(
         left_root.event_ids.len(),
         left_root.bounds.len(),
         left_root.relation_events.len(),
+        left_root.merges.len(),
+        left_root.exact_results.len(),
         left_root.authority_results.len(),
     );
     let _ = (
@@ -2019,11 +2029,17 @@ fn collect_left_root_render_data<'a>(
     }
     let event_ids = super::closure::collect_security0_event_closure(proof, LEFT_ROOT_EVENT)?;
     let mut relation_events = Vec::new();
+    let mut merge_rows = Vec::new();
+    let mut exact_results = Vec::new();
     let mut bounds = Vec::new();
     let mut reached_rules = BTreeSet::new();
     for event in &event_ids {
         match index.event(*event)? {
             ProofPayloadEvent::AppliedRelation { .. } => relation_events.push(*event),
+            ProofPayloadEvent::CoefficientMerge(merge) => merge_rows.push((*event, merge)),
+            ProofPayloadEvent::Result { value: ProofPayloadValue::Exact { .. }, .. } => {
+                exact_results.push(index.result(*event)?)
+            }
             ProofPayloadEvent::BoundTransfer { owner, rule } => {
                 if !reached_left_bound_rule(rule) {
                     return Err(format!(
@@ -2055,10 +2071,85 @@ fn collect_left_root_render_data<'a>(
             relation_events.len()
         ));
     }
+    let operator_merge_count = merge_rows
+        .iter()
+        .filter(|(_, merge)| {
+            matches!(merge.source, ProofPayloadCoefficientMergeSource::Operator { .. })
+        })
+        .count();
+    let relation_merge_count = merge_rows.len().saturating_sub(operator_merge_count);
+    if (operator_merge_count, relation_merge_count) != (6_367, 3_406) {
+        return Err(format!(
+            "Security0 left-root closure reaches {operator_merge_count} operator and {relation_merge_count} relation coefficient merges, expected 6367 and 3406"
+        ));
+    }
     if reached_rules != BTreeSet::from_iter(0_u8..8) {
         return Err(format!(
             "Security0 left-root closure does not reach exactly the eight supported bound-rule families: {reached_rules:?}"
         ));
+    }
+    let merges = merge_rows
+        .into_iter()
+        .map(|(event, merge)| {
+            let frame = index.immediate_frames
+                [usize::try_from(event).map_err(|_| "left merge event index overflow")?];
+            let result_event = exact_results
+                .iter()
+                .find(|result| {
+                    result.event > event &&
+                        result.owner == merge.owner &&
+                        index.immediate_frames[usize::try_from(result.event)
+                            .expect("indexed left merge Result")] ==
+                            frame
+                })
+                .map(|result| result.event)
+                .ok_or_else(|| {
+                    format!(
+                        "Security0 left coefficient merge {event} has no following same-frame Result"
+                    )
+                })?;
+            Ok(LeftRootMergeNode { event, result_event, merge })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for node in &merges {
+        if node.result_event <= node.event ||
+            node.merge.owner != index.result(node.result_event)?.owner
+        {
+            return Err(format!(
+                "Security0 left coefficient merge {} is not bound to its following Result {}",
+                node.event, node.result_event
+            ));
+        }
+        match &node.merge.source {
+            ProofPayloadCoefficientMergeSource::Operator { inputs } => {
+                for input in inputs {
+                    if input.value_event >= node.event {
+                        return Err(format!(
+                            "Security0 left operator merge {} has non-prior input Result {}",
+                            node.event, input.value_event
+                        ));
+                    }
+                    let result = index.result(input.value_event)?;
+                    if usize::try_from(input.term_ordinal)
+                        .ok()
+                        .is_none_or(|ordinal| ordinal >= result.terms.len())
+                    {
+                        return Err(format!(
+                            "Security0 left operator merge {} has out-of-range term {} for Result {}",
+                            node.event, input.term_ordinal, input.value_event
+                        ));
+                    }
+                }
+            }
+            ProofPayloadCoefficientMergeSource::Relation { application, .. } => {
+                if *application >= node.event || !relation_events.contains(application) {
+                    return Err(format!(
+                        "Security0 left relation merge {} has unavailable application {}",
+                        node.event, application
+                    ));
+                }
+            }
+        }
     }
     // The structural closure contains 9,173 transfer rows. Following only stored Result producer
     // IDs reaches 9,234; recursively following the direct transfer references selected by those
@@ -2118,7 +2209,14 @@ fn collect_left_root_render_data<'a>(
         return Err(format!("Security0 left-root bound row {} is inconsistent", bound.event));
     }
     let authority_results = collect_left_authority_results(index, &bounds)?;
-    Ok(LeftRootRenderData { event_ids, bounds, relation_events, authority_results })
+    Ok(LeftRootRenderData {
+        event_ids,
+        bounds,
+        relation_events,
+        merges,
+        exact_results,
+        authority_results,
+    })
 }
 
 fn collect_final_add_render_data(index: &PayloadIndex) -> Result<FinalAddRenderData, String> {

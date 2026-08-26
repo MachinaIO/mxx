@@ -3612,7 +3612,8 @@ def Security0Accepted (document : TallDocument) (history : EventHistory)
     (finalOwner : Owner) (finalTerms : List Term) (finalCoefficientBound : Bound)
     (finalCoefficientProducer : Nat) (finalSummary : Bound)
     (finalSummaryProducer : Option Nat)
-    (residual : Option Nat → Env Owner → Int) : Prop :=
+    (residual : (selector : Option Nat) →
+      Witness document history selector ciphertextModulus → Int) : Prop :=
   TallSecurity0ABI.Valid document history ∧
     document.plaintextModulus = toString plaintextModulus ∧
     document.ciphertextModulus = toString ciphertextModulus ∧
@@ -3625,10 +3626,10 @@ def Security0Accepted (document : TallDocument) (history : EventHistory)
           finalCoefficientProducer finalSummary finalSummaryProducer, frameStart⟩) ∧
     ForStatement document.residualRoot fun selector ↦
       ∀ witness : Witness document history selector ciphertextModulus,
-        ValueClaim.Interprets ciphertextModulus witness.env (residual selector witness.env)
+        ValueClaim.Interprets ciphertextModulus witness.env (residual selector witness)
             (.exact (finalTerms.map Term.toExact) finalSummary) ∧
           2 * plaintextModulus * centeredNorm ciphertextModulus
-            (residual selector witness.env) < ciphertextModulus
+            (residual selector witness) < ciphertextModulus
 
 theorem forall₂_append {α β : Type} {r : α → β → Prop}
     {left left' right right' : List _} :

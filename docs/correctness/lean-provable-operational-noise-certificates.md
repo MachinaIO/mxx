@@ -202,6 +202,12 @@ prevents the generated statement from selecting a different row or bound. That R
 does not prove the norm inequality in Lean. The kernel theorem remains conditional on the caller
 supplying `Witness.recordedCoefficientCovers` for the honest run.
 
+Accordingly, the fixed Security0 statement takes the residual value as a dependent function of
+both the selector and its honest-run `Witness`, rather than as a function of `Env` alone. The
+Source/Cert-side function is part of the fixed statement, and the generated Proof supplies the
+kernel-checked derivation for it. Instantiating that function with the honest witness is the
+execution-correspondence obligation; no existential residual value is introduced by the proof.
+
 Lean compilation also remains relative to two audited trusted-code propositions: the fixed Lean
 value/matrix/interpreter semantics match the pinned Rust operational-noise semantics, and the
 trusted canonical projection reruns the pinned checker and maps the accepted `Source.json` to the

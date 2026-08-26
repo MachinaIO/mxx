@@ -317,6 +317,12 @@ row や bound を選ぶことを防ぐ。ただし、この Rust assert は norm
 kernel theorem は、呼び出し側が honest run に対する `Witness.recordedCoefficientCovers` を供給する
 ことを仮定した条件付き定理のままである。
 
+したがって、固定 Security0 statement の residual 値は `Env` だけの関数ではなく、selector と
+その honest-run `Witness` の両方に依存する関数とする。Source/Cert 側で固定した関数が statement
+であり、生成 Proof はその関数について kernel が検査する導出を与える。honest witness をその
+関数へ具体化することが実行との correspondence obligation であり、proof が existential な
+residual 値を新たに選ぶことはない。
+
 さらに Lean compile は、次の二つを trusted code の監査事項として信頼する。
 
 ```text

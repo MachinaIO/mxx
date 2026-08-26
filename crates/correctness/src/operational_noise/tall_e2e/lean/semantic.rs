@@ -4794,15 +4794,14 @@ fn right_root_operation_refs(
     }
 }
 
-fn render_right_root_predecessor_premise(
-    source: &mut String,
+fn right_root_predecessor_evidence_clause(
     owner: ProofPayloadOwner,
     value: &ProofPayloadValueRef,
     expected_source: u64,
     index: &PayloadIndex,
-) -> Result<bool, String> {
+) -> Result<Option<String>, String> {
     match value {
-        ProofPayloadValueRef::Result { event, .. } if *event == expected_source => Ok(false),
+        ProofPayloadValueRef::Result { event, .. } if *event == expected_source => Ok(None),
         ProofPayloadValueRef::Predecessor { binding_event, input_position, .. } => {
             let ProofPayloadEvent::Predecessor {
                 consumer,
@@ -4823,13 +4822,10 @@ fn render_right_root_predecessor_premise(
                     "right-root predecessor reference {binding_event} does not match its operation input"
                 ));
             }
-            writeln!(
-                source,
-                " ∧\n      (history.lookup {binding_event}).map AnnotatedEvent.event =\n        some (.predecessor owner {input_position} {} {source_result})",
-                format!("⟨{predecessor}⟩")
-            )
-            .expect("String write");
-            Ok(true)
+            Ok(Some(format!(
+                "(history.lookup {binding_event}).map AnnotatedEvent.event =\n      some (.predecessor {} {input_position} ⟨{predecessor}⟩ {source_result})",
+                owner_text(owner),
+            )))
         }
         ProofPayloadValueRef::Result { event, .. } => Err(format!(
             "right-root direct Result reference {event} does not match dependency {expected_source}"
@@ -4839,6 +4835,62 @@ fn render_right_root_predecessor_premise(
             expected_source
         )),
     }
+}
+
+fn right_root_operation_evidence(
+    node: &RightRootNode,
+    operation: &OperationProbe,
+    index: &PayloadIndex,
+) -> Result<(String, usize), String> {
+    let refs = right_root_operation_refs(operation)?;
+    let expression_row = node.result.owner.expression_row;
+    let expression_module = expression_row / 256;
+    let mut clauses = vec![format!(
+        "document.expressions.lookup {expression_row} =\n      some {NAMESPACE}.Cert.Expression{expression_module:03}.ExpressionRow{expression_row}"
+    )];
+    if let Some(clause) = right_root_predecessor_evidence_clause(
+        node.result.owner,
+        refs[0],
+        operation.input_events[0],
+        index,
+    )? {
+        clauses.push(clause);
+    }
+    if let Some(clause) = right_root_predecessor_evidence_clause(
+        node.result.owner,
+        refs[1],
+        operation.input_events[1],
+        index,
+    )? {
+        clauses.push(clause);
+    }
+    clauses.push(format!(
+        "(history.lookup {}).map AnnotatedEvent.event =\n      some (.boundTransfer {} ({}))",
+        operation.rule_event,
+        owner_text(node.result.owner),
+        rule_text(operation.rule.as_ref().expect("typed right-root rule")),
+    ));
+    let proof_count = clauses.len();
+    Ok((format!("def operationEvidence : Prop :=\n  {}", clauses.join(" ∧\n    ")), proof_count))
+}
+
+fn right_root_operation_actual_source(
+    event: u64,
+    operation: &OperationProbe,
+    modulus: &str,
+) -> Result<String, String> {
+    let operator = match operation.kind {
+        OperationKind::Add => "+",
+        OperationKind::Subtract => "-",
+        OperationKind::Multiply | OperationKind::Tensor => "*",
+        OperationKind::Direct => {
+            return Err(format!("right residual Result {event} reaches Direct"));
+        }
+    };
+    Ok(format!(
+        "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int := by\n  letI : Decidable operationEvidence := isTrue operationEvidenceSound\n  exact if operationEvidence then\n    ResidualRightResult{}.actual selector witness {operator}\n      ResidualRightResult{}.actual selector witness\n    else 0",
+        operation.input_events[0], operation.input_events[1],
+    ))
 }
 
 fn render_right_root_node(
@@ -4878,7 +4930,7 @@ fn render_right_root_node(
             writeln!(source, "def resultEvent : Nat := {event}").expect("String write");
             writeln!(
                 source,
-                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualRightResult{event}.actual selector witness"
+                "abbrev actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualRightResult{event}.actual selector witness"
             )
             .expect("String write");
             writeln!(
@@ -4923,7 +4975,7 @@ fn render_right_root_node(
             }
             writeln!(
                 source,
-                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualRightResult{event}.actual selector witness"
+                "abbrev actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualRightResult{event}.actual selector witness"
             )
             .expect("String write");
             let theorem = match operation.kind {
@@ -4934,39 +4986,18 @@ fn render_right_root_node(
                 }
                 OperationKind::Direct => unreachable!(),
             };
-            let refs = right_root_operation_refs(operation)?;
-            let expression_row = node.result.owner.expression_row;
-            let expression_module = expression_row / 256;
+            let (_, operation_history_arity) =
+                right_root_operation_evidence(node, operation, index)?;
             writeln!(
                 source,
-                "theorem claimOfHistory (selector : Nat)\n    (witness : Witness document history (some selector) {modulus})\n    (operationAt : document.expressions.lookup {expression_row} =\n      some {NAMESPACE}.Cert.Expression{expression_module:03}.ExpressionRow{expression_row}"
+                "theorem claimOfHistory (selector : Nat)\n    (witness : Witness document history (some selector) {modulus})\n    (operationAt : Cert.ResidualRightResult{event}.operationEvidence)"
             )
             .expect("String write");
-            let left_predecessor = render_right_root_predecessor_premise(
-                source,
-                node.result.owner,
-                refs[0],
-                left_event,
-                index,
-            )?;
-            let right_predecessor = render_right_root_predecessor_premise(
-                source,
-                node.result.owner,
-                refs[1],
-                right_event,
-                index,
-            )?;
-            let operation_history_arity =
-                2 + usize::from(left_predecessor) + usize::from(right_predecessor);
-            let operation_history_pattern =
-                (0..operation_history_arity).map(|_| "_").collect::<Vec<_>>().join(", ");
             let operation_history_proofs =
                 (0..operation_history_arity).map(|_| "by rfl").collect::<Vec<_>>().join(", ");
             writeln!(
                 source,
-                " ∧\n      (history.lookup {}).map AnnotatedEvent.event =\n        some (.boundTransfer owner ({})))\n    (leftClaim : ExactClaimAt history {modulus} witness.env\n      SemanticRightRootResult{left_event}.resultEvent\n      SemanticRightRootResult{left_event}.owner\n      (SemanticRightRootResult{left_event}.actual selector witness)\n      SemanticRightRootResult{left_event}.rawTerms\n      SemanticRightRootResult{left_event}.summary)\n    (rightClaim : ExactClaimAt history {modulus} witness.env\n      SemanticRightRootResult{right_event}.resultEvent\n      SemanticRightRootResult{right_event}.owner\n      (SemanticRightRootResult{right_event}.actual selector witness)\n      SemanticRightRootResult{right_event}.rawTerms\n      SemanticRightRootResult{right_event}.summary)\n    {{frameStart coefficientProducer : Nat}} {{coefficientBound : Bound}}\n    {{summaryProducer : Option Nat}}\n    (outputAt : history.lookup resultEvent = some\n      ⟨.resultExact owner rawTerms coefficientBound coefficientProducer summary summaryProducer,\n        frameStart⟩) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  rcases operationAt with ⟨{operation_history_pattern}⟩\n  refine ⟨⟨coefficientBound, coefficientProducer, summaryProducer, ?_⟩, ?_⟩\n  · rw [outputAt]\n    rfl\n  · exact {theorem} {modulus} witness.env\n      (SemanticRightRootResult{left_event}.actual selector witness)\n      (SemanticRightRootResult{right_event}.actual selector witness) left right output\n      (by simpa [left, leftRaw, SemanticRightRootResult{left_event}.summary] using leftClaim.claim)\n      (by simpa [right, rightRaw, SemanticRightRootResult{right_event}.summary] using rightClaim.claim)\n      (resultSound witness.env) (by decide)",
-                operation.rule_event,
-                rule_text(operation.rule.as_ref().expect("typed right-root rule")),
+                "\n    (leftClaim : ExactClaimAt history {modulus} witness.env\n      SemanticRightRootResult{left_event}.resultEvent\n      SemanticRightRootResult{left_event}.owner\n      (SemanticRightRootResult{left_event}.actual selector witness)\n      SemanticRightRootResult{left_event}.rawTerms\n      SemanticRightRootResult{left_event}.summary)\n    (rightClaim : ExactClaimAt history {modulus} witness.env\n      SemanticRightRootResult{right_event}.resultEvent\n      SemanticRightRootResult{right_event}.owner\n      (SemanticRightRootResult{right_event}.actual selector witness)\n      SemanticRightRootResult{right_event}.rawTerms\n      SemanticRightRootResult{right_event}.summary)\n    {{frameStart coefficientProducer : Nat}} {{coefficientBound : Bound}}\n    {{summaryProducer : Option Nat}}\n    (outputAt : history.lookup resultEvent = some\n      ⟨.resultExact owner rawTerms coefficientBound coefficientProducer summary summaryProducer,\n        frameStart⟩) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  refine ⟨⟨coefficientBound, coefficientProducer, summaryProducer, ?_⟩, ?_⟩\n  · rw [outputAt]\n    rfl\n  · simpa only [actual, Cert.ResidualRightResult{event}.actual, if_pos operationAt,\n      SemanticRightRootResult{left_event}.actual,\n      SemanticRightRootResult{right_event}.actual, rawTerms, outputRaw, output, summary] using\n      {theorem} {modulus} witness.env\n        (SemanticRightRootResult{left_event}.actual selector witness)\n        (SemanticRightRootResult{right_event}.actual selector witness) left right output\n        (by simpa [left, leftRaw, SemanticRightRootResult{left_event}.summary] using leftClaim.claim)\n        (by simpa [right, rightRaw, SemanticRightRootResult{right_event}.summary] using rightClaim.claim)\n        (resultSound witness.env) (by decide)",
             )
             .expect("String write");
             writeln!(
@@ -5024,13 +5055,23 @@ fn render_right_root(
             match &node.kind {
                 RightRootNodeKind::Terminal { .. } => writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  witness.honestTerminalActual {event}"),
                 RightRootNodeKind::Operation(operation) => {
-                    let operator = match operation.kind {
-                        OperationKind::Add => "+",
-                        OperationKind::Subtract => "-",
-                        OperationKind::Multiply | OperationKind::Tensor => "*",
-                        OperationKind::Direct => return Err(format!("right residual Result {event} reaches Direct")),
-                    };
-                    writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  ResidualRightResult{}.actual selector witness {operator}\n    ResidualRightResult{}.actual selector witness", operation.input_events[0], operation.input_events[1])
+                    let (operation_evidence, operation_history_arity) =
+                        right_root_operation_evidence(node, operation, index)?;
+                    writeln!(residual, "{operation_evidence}").expect("String write");
+                    let operation_history_proofs = (0..operation_history_arity)
+                        .map(|_| "by rfl")
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    writeln!(
+                        residual,
+                        "theorem operationEvidenceSound : operationEvidence :=\n  ⟨{operation_history_proofs}⟩"
+                    )
+                    .expect("String write");
+                    writeln!(
+                        residual,
+                        "{}",
+                        right_root_operation_actual_source(event, operation, modulus)?
+                    )
                 }
             }
             .expect("String write");
@@ -5328,6 +5369,46 @@ mod tests {
             Err(error) => error,
         };
         assert!(transfer_error.contains("bound-only"));
+
+        let ProofPayloadEvent::BoundTransfer { rule, .. } =
+            index.event(5).expect("typed Add transfer")
+        else {
+            panic!("event 5 must be the typed Add transfer");
+        };
+        let operation = OperationProbe {
+            kind: OperationKind::Add,
+            rule_event: 5,
+            input_events: [1, 3],
+            output_event: 6,
+            inputs: vec![
+                index.result(1).expect("left result"),
+                index.result(3).expect("right result"),
+            ],
+            output: result.clone(),
+            scalar_left: false,
+            scalar_right: false,
+            rule: Some(rule.clone()),
+            composite_relations: Vec::new(),
+        };
+        let node = RightRootNode { result, kind: RightRootNodeKind::Operation(operation.clone()) };
+        let (evidence, evidence_arity) = right_root_operation_evidence(&node, &operation, &index)
+            .expect("right-root operation evidence");
+        assert_eq!(evidence_arity, 4);
+        assert!(evidence.contains("document.expressions.lookup 7"));
+        assert!(evidence.contains("history.lookup 2"));
+        assert!(evidence.contains("history.lookup 4"));
+        assert!(evidence.contains("history.lookup 5"));
+        let actual = right_root_operation_actual_source(6, &operation, "257")
+            .expect("guarded right-root actual");
+        assert!(actual.contains("if operationEvidence then"));
+        assert!(actual.contains("ResidualRightResult1.actual selector witness +"));
+
+        let mut rendered = String::new();
+        render_right_root_node(&mut rendered, &node, &index, "257")
+            .expect("right-root operation claim");
+        assert!(rendered.contains("operationAt : Cert.ResidualRightResult6.operationEvidence"));
+        assert!(rendered.contains("if_pos operationAt"));
+        assert!(!rendered.contains("rcases operationAt"));
     }
 
     #[test]

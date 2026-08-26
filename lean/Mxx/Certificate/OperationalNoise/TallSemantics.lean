@@ -3429,7 +3429,7 @@ theorem gadgetRelationMergeClaim
         (.gadget gadget decomposition input inputResult), frameStart⟩)
     (rhsTermsAt : exactTermsAt? history inputResult = some rhsRaw)
     (gadgetKeyEquivalent : KeyEquivalent lhs.toKey
-      { centralFactors := [gadget, decomposition], orderedFactors := [] })
+      { centralFactors := [], orderedFactors := [gadget, decomposition] })
     (accumulatorClaim : ValueClaim.Interprets modulus witness.env actual
       (.exact accumulator summary))
     (reconstruction : MergeReconstructionAt history frameStart owner (.relation application)

@@ -333,7 +333,7 @@ def addNoMergeExactZeroHistory : EventHistory :=
 def singletonSurvivorDocument : TallDocument :=
   { addNoMergeFixtureDocument with
     expressions := .node 0
-      { descriptor := .operation (.stable (.scalar (.add))) (.int)
+      { descriptor := .operation (.stable (.matrix .add)) atomType
         inputs := emptyExpressionInputs
         program := none } .empty .empty }
 
@@ -388,6 +388,7 @@ theorem operator_add_singleton_survivor_fold_fixture
       (leftExpression := ⟨0⟩) (rightExpression := ⟨0⟩)
       (leftActual := leftActual) (rightActual := rightActual) (leftRaw := [])
       (survivorMonomial := singletonSurvivorMonomial)
+      (valueType := atomType)
       (maximum := singletonSurvivorMaximum) (coefficientBound := .large)
       (rightCoefficientBound := .finite 1) (rightMagnitude := rightMagnitude)
       (survivorMagnitude := survivorMagnitude)

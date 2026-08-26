@@ -3136,13 +3136,14 @@ theorem operatorAddSingletonSurvivorFoldClaimAt
     {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
     {leftExpression rightExpression : ExpressionRef}
     {leftActual rightActual : Int} {leftRaw : List Term} {survivorMonomial : Monomial}
+    {valueType : ValueType}
     {maximum : { value : Nat // 0 < value }}
     {coefficientBound rightCoefficientBound : Bound}
     {rightMagnitude survivorMagnitude : Nat}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
         TallSecurity0ABI.ExpressionRow.descriptor =
-        some (.operation (.stable (.scalar (.add))) (.int)))
+        some (.operation (.stable (.matrix .add)) valueType))
     (_leftPredecessorAt : history.lookup leftBinding = some
       ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
     (_rightPredecessorAt : history.lookup rightBinding = some

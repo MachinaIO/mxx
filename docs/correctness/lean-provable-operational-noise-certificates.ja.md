@@ -263,6 +263,7 @@ accepted operational theorem を実際の一回の実行に適用するとき、
 InputContract checkedCert inputs
 SamplerContract checkedCert inputs samplers
 HonestTerminalCongruence checkedCert run
+RecordedCoefficientCoverage checkedCert run
 ```
 
 実際の一回の実行へ結び付けるには、さらに Lean claim の外で次の三命題を確認する。
@@ -305,6 +306,16 @@ event 番号で引いた `honestTerminalActual` と、同じ history row に記�
 出したりはできない。呼び出し側が honest Rust execution の実値を `honestTerminalActual` に入れ、
 congruence を示す必要がある。したがって、これは生成 proof が compile しただけでは得られない、
 定理の statement と実行を結ぶ modeling assumption である。
+
+固定した selector の honest run について、coefficient reference から使われる各 exact `Result` にも
+event 単位の modeling premise が残る。その実値の centered coefficient norm は、同じ `Result`
+event に正規化後の authoritative coefficient bound として記録された値以下でなければならない。
+`Witness.recordedCoefficientCovers` は、正確な event、frame、owner、normalized terms、coefficient
+producer、summary、recorded bound で index されたこの条件を保持する。opt-in Rust projection は、
+これらの field が immutable `ProofPayload` と完全に一致することを assert し、生成 statement が別の
+row や bound を選ぶことを防ぐ。ただし、この Rust assert は norm の不等式を Lean 内で証明しない。
+kernel theorem は、呼び出し側が honest run に対する `Witness.recordedCoefficientCovers` を供給する
+ことを仮定した条件付き定理のままである。
 
 さらに Lean compile は、次の二つを trusted code の監査事項として信頼する。
 

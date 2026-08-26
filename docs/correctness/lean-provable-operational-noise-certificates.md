@@ -152,6 +152,7 @@ modeling premises:
 InputContract checkedCert inputs
 SamplerContract checkedCert inputs samplers
 HonestTerminalCongruence checkedCert run
+RecordedCoefficientCoverage checkedCert run
 ```
 
 For a real execution, the operator must additionally establish the following bridge outside the
@@ -190,6 +191,16 @@ generated proof producer can prove which row is terminal, but it cannot prove or
 field: the caller must instantiate `honestTerminalActual` from the honest Rust execution and
 establish the congruence. This is a modeling assumption connecting the theorem statement to the
 execution, not a fact obtained merely by compiling the generated proof.
+
+For a fixed selector and honest run, every exact `Result` used through a coefficient reference
+also has an event-local modeling premise: its actual centered coefficient norm is at most the
+authoritative post-normalization coefficient bound recorded in that same `Result` event.
+`Witness.recordedCoefficientCovers` carries this conditional premise, indexed by the exact event,
+frame, owner, normalized terms, coefficient producer, summary, and recorded bound. The opt-in Rust
+projection asserts that all of those fields are identical to the immutable `ProofPayload`; this
+prevents the generated statement from selecting a different row or bound. That Rust assertion
+does not prove the norm inequality in Lean. The kernel theorem remains conditional on the caller
+supplying `Witness.recordedCoefficientCovers` for the honest run.
 
 Lean compilation also remains relative to two audited trusted-code propositions: the fixed Lean
 value/matrix/interpreter semantics match the pinned Rust operational-noise semantics, and the

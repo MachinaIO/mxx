@@ -116,6 +116,10 @@ theorem bound_identity_fixture :
   · exact .result rfl (.resultExactCoefficient (rule := .sum []) (by rfl)
       (by simp [RecordedBoundRefines]) (.sum (by rfl) .nil))
 
+theorem bound_transfer_input_fixture :
+    BoundInputAt boundFixtureHistory boundFixtureOwner (.transfer 2) .exactZero 0 := by
+  exact boundDerived_to_transferInput bound_identity_fixture
+
 theorem bound_identity_projection_fixture :
     ProjectedBoundAt boundFixtureHistory 3 boundFixtureOwner none .coefficient
       .exactZero 0 := by
@@ -435,6 +439,7 @@ theorem canonical_relation_fixture :
 #print axioms generic_evaluation_fixture
 #print axioms generic_value_claim_fixture
 #print axioms bound_identity_fixture
+#print axioms bound_transfer_input_fixture
 #print axioms bound_identity_projection_fixture
 #print axioms bound_summary_projection_fixture
 #print axioms bound_product_fixture

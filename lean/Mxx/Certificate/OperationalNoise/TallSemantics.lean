@@ -1504,6 +1504,11 @@ mutual
           rawTerms .coefficient bound actualMagnitude) :
         BoundInputAt history consumer
           (.predecessor inputPosition bindingEvent .coefficient) bound actualMagnitude
+    | transfer {consumer : Owner} {transferEvent transferFrame : Nat} {rule : BoundRule}
+        {bound : CoeffClass} {actualMagnitude : Nat}
+        (derived : BoundDerivedAt history transferEvent transferFrame consumer rule bound
+          actualMagnitude) :
+        BoundInputAt history consumer (.transfer transferEvent) bound actualMagnitude
 
   inductive BoundInputsAt (history : EventHistory) :
       Owner → List ValueRef → List CoeffClass → List Nat → Prop where
@@ -1618,7 +1623,9 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
+  · intros
+    assumption
   · intros
     assumption
   · intros
@@ -1669,7 +1676,9 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
+  · intros
+    assumption
   · intros
     assumption
   · intros
@@ -1744,6 +1753,14 @@ theorem boundTransfer_to_resultExactSummary
     ProjectedBoundAt history resultEvent owner (some terms) .summary producerBound
       actualMagnitude :=
   .resultExactSummary row derived
+
+theorem boundDerived_to_transferInput
+    {history : EventHistory} {transferEvent transferFrame : Nat} {owner : Owner}
+    {rule : BoundRule} {bound : CoeffClass} {actualMagnitude : Nat}
+    (derived : BoundDerivedAt history transferEvent transferFrame owner rule bound
+      actualMagnitude) :
+    BoundInputAt history owner (.transfer transferEvent) bound actualMagnitude :=
+  .transfer derived
 
 theorem centeredNorm_eq_zero_mod {modulus : Nat} {value : Int}
     (modulusPositive : 0 < modulus) (normZero : centeredNorm modulus value = 0) :

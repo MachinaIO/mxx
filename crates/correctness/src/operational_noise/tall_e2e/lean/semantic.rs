@@ -6,9 +6,10 @@ use crate::operational_noise::{
         StableMatrixOperation, StableOperator,
     },
     simulation::{
-        OperationalProofPayload, ProofPayloadCoefficientMerge, ProofPayloadCoefficientMergeSource,
-        ProofPayloadEvent, ProofPayloadMonomial, ProofPayloadOwner, ProofPayloadRelationRule,
-        ProofPayloadRule, ProofPayloadTerm, ProofPayloadValue, ProofPayloadValueRef,
+        OperationalProofPayload, ProofPayloadAuthority, ProofPayloadCoefficientMerge,
+        ProofPayloadCoefficientMergeSource, ProofPayloadEvent, ProofPayloadMonomial,
+        ProofPayloadOwner, ProofPayloadRelationRule, ProofPayloadRule, ProofPayloadTerm,
+        ProofPayloadValue, ProofPayloadValueRef,
     },
 };
 use num_bigint::BigUint;
@@ -1719,6 +1720,7 @@ pub(super) fn render(
         render_right_root(statement, &index, &relation_probes, &modulus)?;
     files.push(generated_file("Semantic/SemanticRightRoot.lean", right_root_index));
     files.extend(right_root_shards);
+    files.extend(render_left_authorities(&index, &left_root, &modulus)?);
 
     let specs = [
         ("Semantic/Semantic000.lean", "Semantic000", "long-monomial-merge"),
@@ -1775,6 +1777,7 @@ pub(super) fn render(
     ));
     let mut index = String::new();
     index.push_str("import Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Semantic.SemanticRightRoot\n");
+    index.push_str("import Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Semantic.SemanticLeftAuthority\n");
     for (_, module, _) in specs {
         writeln!(index, "import {NAMESPACE}.Semantic.{module}").expect("String write");
     }
@@ -2086,6 +2089,89 @@ fn collect_final_add_render_data(index: &PayloadIndex) -> Result<FinalAddRenderD
         prefold_event: PREFOLD,
         end_event: END,
     })
+}
+
+fn render_left_authorities(
+    index: &PayloadIndex,
+    data: &LeftRootRenderData<'_>,
+    modulus: &str,
+) -> Result<Vec<super::super::TallSecurity0GeneratedFile>, String> {
+    const CHUNK_SIZE: usize = 16;
+    let authorities = data
+        .bounds
+        .iter()
+        .filter_map(|node| match node.rule {
+            ProofPayloadRule::Authority(authority) => Some((node, authority)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    for (shard_index, shard) in authorities.chunks(CHUNK_SIZE).enumerate() {
+        let module = format!("SemanticLeftAuthorityShard{shard_index:03}");
+        let mut source = shard_index.checked_sub(1).map_or_else(
+            || format!("import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n"),
+            |previous| format!("import {NAMESPACE}.Semantic.SemanticLeftAuthorityShard{previous:03}\n"),
+        );
+        source
+            .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
+        writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
+        source.push_str("open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\nopen EventReplay\n\n");
+        for (node, authority) in shard {
+            let event = node.event;
+            let result_event = data.authority_results[&event];
+            let frame = index.immediate_frames
+                [usize::try_from(event).map_err(|_| "authority event index overflow")?]
+            .ok_or_else(|| format!("authority event {event} has no frame"))?;
+            let (recorded, constructor) = match index.event(result_event)? {
+                ProofPayloadEvent::Result {
+                    value: ProofPayloadValue::Coefficient { bound },
+                    ..
+                } => (bound, ".resultCoefficient (by decide) (by rfl) (by rfl)".to_owned()),
+                ProofPayloadEvent::Result {
+                    value:
+                        ProofPayloadValue::Exact {
+                            terms,
+                            coefficient_bound,
+                            summary,
+                            summary_producer,
+                            ..
+                        },
+                    ..
+                } => (
+                    coefficient_bound,
+                    format!(
+                        ".resultExact (terms := {}) (recordedCoefficientBound := {}) \
+                         (summary := {}) (summaryProducer := {}) (by decide) (by rfl) \
+                         (by rfl) (by simp [bound, RecordedBoundRefines])",
+                        raw_terms_text(terms),
+                        recorded_bound_text(coefficient_bound),
+                        summary_text(summary),
+                        summary_producer
+                            .map_or_else(|| "none".to_owned(), |event| format!("some {event}")),
+                    ),
+                ),
+                _ => unreachable!("authority gate accepted only Results"),
+            };
+            writeln!(source, "namespace LeftAuthority{event}").expect("String write");
+            writeln!(source, "def owner : Owner := {}", owner_text(node.owner))
+                .expect("String write");
+            writeln!(source, "def authority : Authority := {}", authority_text(authority)?)
+                .expect("String write");
+            writeln!(source, "def bound : CoeffClass := {}", coeff_class_text(recorded)?)
+                .expect("String write");
+            writeln!(source, "def producerEvent : Nat := {event}\ndef resultEvent : Nat := {result_event}\ndef frameStart : Nat := {frame}").expect("String write");
+            writeln!(source, "theorem leaf : AuthorityLeafAt history producerEvent resultEvent frameStart owner authority bound := by\n  exact {constructor}").expect("String write");
+            writeln!(source, "theorem derived (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) :\n    BoundDerivedAt history producerEvent frameStart owner (.authority authority) bound\n      (witness.authorityMagnitude resultEvent) := by\n  exact .authority witness.toAuthorityWitness leaf\nend LeftAuthority{event}\n").expect("String write");
+        }
+        writeln!(source, "end {NAMESPACE}.Semantic").expect("String write");
+        files.push(generated_file(format!("Semantic/{module}.lean"), source));
+    }
+    let last = authorities.len().div_ceil(CHUNK_SIZE) - 1;
+    files.push(generated_file(
+        "Semantic/SemanticLeftAuthority.lean",
+        format!("import {NAMESPACE}.Semantic.SemanticLeftAuthorityShard{last:03}\n"),
+    ));
+    Ok(files)
 }
 
 fn ciphertext_modulus_text(statement: &CertificateDocumentV1) -> Result<String, String> {
@@ -2434,6 +2520,54 @@ fn summary_text(summary: &crate::operational_noise::normal_form::BoundedSummary)
         ) => ".large".to_owned(),
         crate::operational_noise::facts::NumericContract::Missing => ".missing".to_owned(),
     }
+}
+
+fn coeff_class_text(
+    bound: &crate::operational_noise::facts::NumericContract<
+        crate::operational_noise::facts::CoefficientBound,
+    >,
+) -> Result<String, String> {
+    use crate::operational_noise::facts::{CoefficientBound, NumericContract};
+    Ok(match bound {
+        NumericContract::Known(CoefficientBound::ExactZero) => ".exactZero".to_owned(),
+        NumericContract::Known(CoefficientBound::Finite(value)) => {
+            format!(".finite ⟨{}, by decide⟩", value.maximum_absolute_coefficient)
+        }
+        NumericContract::Known(CoefficientBound::Large) => ".large".to_owned(),
+        NumericContract::Missing => {
+            return Err("reached authority Result has a missing coefficient bound".to_owned());
+        }
+    })
+}
+
+fn recorded_bound_text(
+    bound: &crate::operational_noise::facts::NumericContract<
+        crate::operational_noise::facts::CoefficientBound,
+    >,
+) -> String {
+    use crate::operational_noise::facts::{CoefficientBound, NumericContract};
+    match bound {
+        NumericContract::Known(CoefficientBound::ExactZero) => ".exactZero".to_owned(),
+        NumericContract::Known(CoefficientBound::Finite(value)) => {
+            format!(".finite {}", value.maximum_absolute_coefficient)
+        }
+        NumericContract::Known(CoefficientBound::Large) => ".large".to_owned(),
+        NumericContract::Missing => ".missing".to_owned(),
+    }
+}
+
+fn authority_text(authority: &ProofPayloadAuthority) -> Result<String, String> {
+    Ok(match authority {
+        ProofPayloadAuthority::FactStore => ".factStore".to_owned(),
+        ProofPayloadAuthority::ProgramFamilyFact => ".programFamilyFact".to_owned(),
+        ProofPayloadAuthority::Operator => ".operator".to_owned(),
+        ProofPayloadAuthority::RelationPreimageSource { source } => {
+            format!(".relationPreimageSource ⟨{source}⟩")
+        }
+        ProofPayloadAuthority::Unavailable => {
+            return Err("reached authority renderer received unavailable authority".to_owned());
+        }
+    })
 }
 
 fn summary_bound_nat_text(

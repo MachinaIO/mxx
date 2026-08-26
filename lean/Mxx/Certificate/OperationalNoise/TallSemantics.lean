@@ -1934,6 +1934,100 @@ theorem exactValueClaim_add_right_mod_zero {Factor : Type} (modulus : Nat) (env 
       simp
     _ = remainder % Int.ofNat modulus := leftCongruence
 
+private theorem centeredNorm_add_le (modulus : Nat) (modulusPositive : 0 < modulus)
+    (left right : Int) :
+    centeredNorm modulus (left + right) ≤
+      centeredNorm modulus left + centeredNorm modulus right := by
+  let q : Int := modulus
+  let x := left % q
+  let y := right % q
+  have qPositive : 0 < q := by
+    simpa [q] using (Int.natCast_pos.mpr modulusPositive)
+  have xNonnegative : 0 ≤ x := Int.emod_nonneg left (Int.ne_of_gt qPositive)
+  have xLess : x < q := Int.emod_lt_of_pos left qPositive
+  have yNonnegative : 0 ≤ y := Int.emod_nonneg right (Int.ne_of_gt qPositive)
+  have yLess : y < q := Int.emod_lt_of_pos right qPositive
+  have addMod : (left + right) % q = (x + y) % q := by
+    simp [x, y, Int.add_emod]
+  have sumMod :
+      (x + y < q ∧ (x + y) % q = x + y) ∨
+        (q ≤ x + y ∧ (x + y) % q = x + y - q) := by
+    by_cases sumLess : x + y < q
+    · exact Or.inl ⟨sumLess, Int.emod_eq_of_lt (by omega) sumLess⟩
+    · right
+      have reducedNonnegative : 0 ≤ x + y - q := by omega
+      have reducedLess : x + y - q < q := by omega
+      refine ⟨by omega, ?_⟩
+      calc
+        (x + y) % q = (x + y - q) % q := by
+          rw [Int.sub_emod]
+          simp
+        _ = x + y - q := Int.emod_eq_of_lt reducedNonnegative reducedLess
+  unfold centeredNorm centeredCoefficient
+  simp only [Nat.ne_of_gt modulusPositive, ↓reduceIte]
+  change (if 2 * ((left + right) % q) ≤ q then (left + right) % q
+      else (left + right) % q - q).natAbs ≤
+    (if 2 * x ≤ q then x else x - q).natAbs +
+      (if 2 * y ≤ q then y else y - q).natAbs
+  rw [addMod] at *
+  rcases sumMod with ⟨sumRange, sumMod⟩ | ⟨sumRange, sumMod⟩
+  all_goals simp only [sumMod] at *
+  all_goals split <;> split <;> split <;> rw [← Int.ofNat_le, Int.natCast_add]
+  all_goals
+    dsimp [x, y, q] at *
+    repeat first
+      | rw [Int.natAbs_of_nonneg (by omega)]
+      | rw [Int.ofNat_natAbs_of_nonpos (by omega)]
+    omega
+
+/-- Two finite exact remainders add with the sum of their recorded coefficient bounds. -/
+theorem exactValueClaim_add_finite {Factor : Type} (modulus : Nat) (env : Env Factor)
+    (leftActual rightActual : Int) (leftTerms rightTerms output : Polynomial Factor)
+    (leftMaximum rightMaximum : Nat)
+    (leftClaim : ValueClaim.Interprets modulus env leftActual
+      (.exact leftTerms (.finite leftMaximum)))
+    (rightClaim : ValueClaim.Interprets modulus env rightActual
+      (.exact rightTerms (.finite rightMaximum)))
+    (outputEval : evalPolynomial env output =
+      evalPolynomial env leftTerms + evalPolynomial env rightTerms)
+    (modulusPositive : 0 < modulus) :
+    ValueClaim.Interprets modulus env (leftActual + rightActual)
+      (.exact output (.finite (leftMaximum + rightMaximum))) := by
+  rcases leftClaim with ⟨leftRemainder, leftCongruence, leftBound⟩
+  rcases rightClaim with ⟨rightRemainder, rightCongruence, rightBound⟩
+  refine ⟨leftRemainder + rightRemainder, ?_, ?_⟩
+  · rw [outputEval]
+    calc
+      (leftActual + rightActual -
+          (evalPolynomial env leftTerms + evalPolynomial env rightTerms)) %
+            Int.ofNat modulus =
+          ((leftActual - evalPolynomial env leftTerms) +
+            (rightActual - evalPolynomial env rightTerms)) % Int.ofNat modulus := by
+              congr 1 <;> omega
+      _ = ((leftActual - evalPolynomial env leftTerms) % Int.ofNat modulus +
+          (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus) %
+            Int.ofNat modulus := by rw [Int.add_emod]
+      _ = (leftRemainder % Int.ofNat modulus +
+          rightRemainder % Int.ofNat modulus) % Int.ofNat modulus := by
+            apply congrArg (fun value ↦ value % Int.ofNat modulus)
+            calc
+              (leftActual - evalPolynomial env leftTerms) % Int.ofNat modulus +
+                    (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus =
+                  leftRemainder % Int.ofNat modulus +
+                    (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus :=
+                congrArg (fun value ↦ value +
+                  (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus)
+                  leftCongruence
+              _ = leftRemainder % Int.ofNat modulus +
+                    rightRemainder % Int.ofNat modulus :=
+                congrArg (fun value ↦ leftRemainder % Int.ofNat modulus + value)
+                  rightCongruence
+      _ = (leftRemainder + rightRemainder) % Int.ofNat modulus := by
+            exact (Int.add_emod leftRemainder rightRemainder (Int.ofNat modulus)).symm
+  · have remainderTriangle := centeredNorm_add_le modulus modulusPositive
+      leftRemainder rightRemainder
+    exact Nat.le_trans remainderTriangle (Nat.add_le_add leftBound rightBound)
+
 theorem exactValueClaim_sub_exactZero_of_mod_zero (modulus : Nat) (env : Env Owner)
     (leftActual rightActual : Int) (left right output : Polynomial Owner)
     (leftClaim : ValueClaim.Interprets modulus env leftActual (.exact left .exactZero))
@@ -2422,6 +2516,56 @@ theorem operatorAddMergeClaim
   exact exactValueClaim_add_of_mod_zero modulus env leftActual rightActual
     (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) working
     leftClaim.claim rightClaim.claim outputEval modulusPositive
+
+/-- The reached no-collision Add has no merge rows.  Its two predecessor rows bind the Sum
+    transfer directly to the exact child Results, while the final Result row and canonical
+    agreement bind the complete copied output polynomial. -/
+theorem operatorAddNoMergeClaim
+    {document : TallDocument} {history : EventHistory}
+    {modulus frameStart transferEvent summaryTransferEvent resultEvent : Nat} {env : Env Owner}
+    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
+    {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
+    {leftExpression rightExpression : ExpressionRef}
+    {leftActual rightActual : Int} {leftRaw rightRaw outputRaw : List Term}
+    {leftMaximum rightMaximum : Nat} {valueType : ValueType} {coefficientBound : Bound}
+    (_operationAt :
+      (document.expressions.lookup owner.expression.row).map
+        TallSecurity0ABI.ExpressionRow.descriptor =
+        some (.operation (.stable (.matrix .add)) valueType))
+    (_leftPredecessorAt : history.lookup leftBinding = some
+      ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
+    (_rightPredecessorAt : history.lookup rightBinding = some
+      ⟨.predecessor owner rightInputPosition rightExpression rightResult, frameStart⟩)
+    (_transferAt : history.lookup transferEvent = some
+      ⟨.boundTransfer owner
+        (.sum [.predecessor leftInputPosition leftBinding .coefficient,
+          .predecessor rightInputPosition rightBinding .coefficient]), frameStart⟩)
+    (_summaryTransferAt : history.lookup summaryTransferEvent = some
+      ⟨.boundTransfer owner
+        (.sum [.result leftResult .summary, .result rightResult .summary]), frameStart⟩)
+    (leftClaim : ExactClaimAt history modulus env leftResult leftOwner leftActual leftRaw
+      (.finite leftMaximum))
+    (rightClaim : ExactClaimAt history modulus env rightResult rightOwner rightActual rightRaw
+      (.finite rightMaximum))
+    (resultAt : history.lookup resultEvent = some
+      ⟨.resultExact owner outputRaw coefficientBound transferEvent
+        (.finite (leftMaximum + rightMaximum))
+        (some summaryTransferEvent), frameStart⟩)
+    (outputAgreement : CanonicalAgreement (outputRaw.map Term.toExact)
+      (add (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)))
+    (modulusPositive : 0 < modulus) :
+    ExactClaimAt history modulus env resultEvent owner (leftActual + rightActual) outputRaw
+      (.finite (leftMaximum + rightMaximum)) := by
+  have outputEval := addCanonicalResultSound env
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (outputRaw.map Term.toExact) outputAgreement
+  refine ⟨⟨coefficientBound, transferEvent, some summaryTransferEvent, ?_⟩, ?_⟩
+  · rw [resultAt]
+    rfl
+  · exact exactValueClaim_add_finite modulus env leftActual rightActual
+      (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+      (outputRaw.map Term.toExact) leftMaximum rightMaximum leftClaim.claim rightClaim.claim
+      outputEval modulusPositive
 
 /-- Subtract shares the Add execution shape but negates the right contribution. -/
 theorem operatorSubMergeClaim

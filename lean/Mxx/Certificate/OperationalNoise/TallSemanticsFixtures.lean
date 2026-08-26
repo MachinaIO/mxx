@@ -245,6 +245,81 @@ theorem operator_tensor_merge_claim_fixture :
   · decide +kernel
   · decide
 
+def addNoMergeFixtureDocument : TallDocument where
+  schemaId := "mxx-operational-noise-certificate"
+  schemaVersion := 1
+  plaintextModulus := "2"
+  ciphertextModulus := "257"
+  ringDimension := 1
+  expressions := .node 0
+    { descriptor := .operation (.stable (.matrix .add)) atomType
+      inputs := emptyExpressionInputs
+      program := none } .empty .empty
+  programs := .empty
+  sources := .empty
+  events := .empty
+  indexUses := .empty
+  sliceGroups := .empty
+  residualRoot := .closed ⟨0⟩
+
+def addNoMergeOutputTerm : Term :=
+  { monomial := { centralFactors := [], orderedFactors := [] }, coefficient := 5 }
+
+def addNoMergeHistory : EventHistory :=
+  smallHistory #[
+    annotated (.resultExact boundFixtureOwner [mergeLeftTerm] (.finite 0) 0 (.finite 1) none) 7,
+    annotated (.resultExact boundFixtureOwner [mergeRightTerm] (.finite 0) 0 (.finite 2) none) 7,
+    annotated (.predecessor boundFixtureOwner 0 ⟨0⟩ 0) 7,
+    annotated (.predecessor boundFixtureOwner 1 ⟨0⟩ 1) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.sum [.predecessor 0 2 .coefficient, .predecessor 1 3 .coefficient])) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.sum [.result 0 .summary, .result 1 .summary])) 7,
+    annotated (.resultExact boundFixtureOwner [addNoMergeOutputTerm]
+      (.finite 0) 4 (.finite 3) (some 5)) 7]
+
+theorem add_no_merge_left_claim_fixture :
+    ExactClaimAt addNoMergeHistory 257 (fun _ : Owner ↦ 1) 0 boundFixtureOwner 3
+      [mergeLeftTerm] (.finite 1) := by
+  apply exactFiniteClaimAt (remainder := 1)
+  · rfl
+  · decide +kernel
+  · simp [centeredNorm, centeredCoefficient]
+
+theorem add_no_merge_right_claim_fixture :
+    ExactClaimAt addNoMergeHistory 257 (fun _ : Owner ↦ 1) 1 boundFixtureOwner 5
+      [mergeRightTerm] (.finite 2) := by
+  apply exactFiniteClaimAt (remainder := 2)
+  · rfl
+  · decide +kernel
+  · simp [centeredNorm, centeredCoefficient]
+
+theorem operator_add_no_merge_claim_fixture :
+    ExactClaimAt addNoMergeHistory 257 (fun _ : Owner ↦ 1) 6 boundFixtureOwner 8
+      [addNoMergeOutputTerm] (.finite 3) := by
+  apply operatorAddNoMergeClaim (document := addNoMergeFixtureDocument)
+      (history := addNoMergeHistory) (modulus := 257) (frameStart := 7)
+      (transferEvent := 4) (summaryTransferEvent := 5) (resultEvent := 6)
+      (env := fun _ : Owner ↦ 1) (owner := boundFixtureOwner)
+      (leftOwner := boundFixtureOwner) (rightOwner := boundFixtureOwner)
+      (leftResult := 0) (rightResult := 1) (leftBinding := 2) (rightBinding := 3)
+      (leftInputPosition := 0) (rightInputPosition := 1)
+      (leftExpression := ⟨0⟩) (rightExpression := ⟨0⟩)
+      (leftActual := 3) (rightActual := 5)
+      (leftRaw := [mergeLeftTerm]) (rightRaw := [mergeRightTerm])
+      (outputRaw := [addNoMergeOutputTerm]) (leftMaximum := 1) (rightMaximum := 2)
+      (valueType := atomType) (coefficientBound := .finite 0)
+  · rfl
+  · rfl
+  · rfl
+  · rfl
+  · rfl
+  · exact add_no_merge_left_claim_fixture
+  · exact add_no_merge_right_claim_fixture
+  · rfl
+  · decide +kernel
+  · decide
+
 theorem wrong_merge_delta_reconstruction_rejected :
     ¬ CanonicalAgreement
       [{ coefficient := 5, key := { centralFactors := [], orderedFactors := [] } }]
@@ -603,6 +678,9 @@ theorem canonical_relation_fixture :
 #print axioms balanced_merge_deltas_fixture
 #print axioms operator_merge_reconstruction_fixture
 #print axioms operator_tensor_merge_claim_fixture
+#print axioms TallSemantics.exactValueClaim_add_finite
+#print axioms TallSemantics.operatorAddNoMergeClaim
+#print axioms operator_add_no_merge_claim_fixture
 #print axioms wrong_merge_delta_reconstruction_rejected
 #print axioms TallSemantics.operatorAddMergeClaim
 #print axioms TallSemantics.operatorSubMergeClaim

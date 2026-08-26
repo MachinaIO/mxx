@@ -125,7 +125,7 @@ def operatorMergeHistory : EventHistory :=
         { centralFactors := [], orderedFactors := [] }, 6⟩) 7]
 
 theorem operator_merge_delta_fixture :
-    MergeDeltaAt operatorMergeHistory 3 7 boundFixtureOwner
+    MergeDeltaAt operatorMergeHistory 3 7 boundFixtureOwner (.operator 0 1)
       { coefficient := 6, key := { centralFactors := [], orderedFactors := [] } } := by
   apply MergeDeltaAt.operator
     (leftResult := 0) (leftOrdinal := 0) (rightResult := 1) (rightOrdinal := 0)
@@ -145,7 +145,7 @@ def relationMergeHistory : EventHistory :=
         { centralFactors := [], orderedFactors := [] }, 6⟩) 7]
 
 theorem relation_merge_delta_fixture :
-    MergeDeltaAt relationMergeHistory 2 7 boundFixtureOwner
+    MergeDeltaAt relationMergeHistory 2 7 boundFixtureOwner (.relation 1)
       { coefficient := 6, key := { centralFactors := [], orderedFactors := [] } } := by
   apply MergeDeltaAt.relation (application := 1) (rhsResult := 0)
     (sourceTermOrdinal := 0) (source := { centralFactors := [], orderedFactors := [] })
@@ -156,10 +156,22 @@ theorem relation_merge_delta_fixture :
   all_goals rfl
 
 theorem balanced_merge_deltas_fixture :
-    MergeDeltasAt operatorMergeHistory 7 boundFixtureOwner
+    MergeDeltasAt operatorMergeHistory 7 boundFixtureOwner (.operator 0 1)
       [{ coefficient := 6, key := { centralFactors := [], orderedFactors := [] } },
         { coefficient := 6, key := { centralFactors := [], orderedFactors := [] } }] := by
   exact .append (.leaf operator_merge_delta_fixture) (.leaf operator_merge_delta_fixture)
+
+def operator_merge_reconstruction_fixture :
+    MergeReconstructionAt operatorMergeHistory 7 boundFixtureOwner (.operator 0 1) []
+      [{ coefficient := 6, key := { centralFactors := [], orderedFactors := [] } }] := by
+  refine ⟨_, .leaf operator_merge_delta_fixture, ?_⟩
+  decide +kernel
+
+theorem wrong_merge_delta_reconstruction_rejected :
+    ¬ CanonicalAgreement
+      [{ coefficient := 5, key := { centralFactors := [], orderedFactors := [] } }]
+      (add [] [{ coefficient := 6, key := { centralFactors := [], orderedFactors := [] } }]) := by
+  decide +kernel
 
 theorem bound_identity_fixture :
     BoundDerivedAt boundFixtureHistory 2 7 boundFixtureOwner
@@ -511,6 +523,8 @@ theorem canonical_relation_fixture :
 #print axioms operator_merge_delta_fixture
 #print axioms relation_merge_delta_fixture
 #print axioms balanced_merge_deltas_fixture
+#print axioms operator_merge_reconstruction_fixture
+#print axioms wrong_merge_delta_reconstruction_rejected
 #print axioms TallSemantics.operatorAddMergeClaim
 #print axioms TallSemantics.operatorSubMergeClaim
 #print axioms TallSemantics.operatorProductMergeClaim

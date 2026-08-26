@@ -2169,8 +2169,12 @@ def RelationCongruent (modulus : Nat) (history : EventHistory) (env : Env Owner)
 /-! A merge delta is the exact signed term recorded by one reached merge row.  Operator and
 relation sources are kept separate so the later semantic constructor can bind the correct base
 polynomial instead of incorrectly treating deltas as a whole Result polynomial. -/
+inductive MergeGroup where
+  | operator (leftResult rightResult : Nat)
+  | relation (application : Nat)
+
 inductive MergeDeltaAt (history : EventHistory) (mergeEvent frameStart : Nat)
-    (owner : Owner) : ExactTerm Owner → Prop where
+    (owner : Owner) : MergeGroup → ExactTerm Owner → Prop where
   | operator
       {leftResult leftOrdinal rightResult rightOrdinal : Nat}
       {leftTerms rightTerms : List Term} {leftTerm rightTerm : Term}
@@ -2183,7 +2187,7 @@ inductive MergeDeltaAt (history : EventHistory) (mergeEvent frameStart : Nat)
         ⟨.coefficientMerge
           ⟨owner, .operator (⟨leftResult, leftOrdinal⟩, ⟨rightResult, rightOrdinal⟩),
             output, signedContribution⟩, frameStart⟩)
-      : MergeDeltaAt history mergeEvent frameStart owner
+      : MergeDeltaAt history mergeEvent frameStart owner (.operator leftResult rightResult)
         { coefficient := signedContribution, key := output.toKey }
   | relation
       {application rhsResult sourceTermOrdinal : Nat} {source : Monomial}
@@ -2203,19 +2207,27 @@ inductive MergeDeltaAt (history : EventHistory) (mergeEvent frameStart : Nat)
         ⟨.coefficientMerge
           ⟨owner, .relation application sourceTermOrdinal, output, signedContribution⟩,
             frameStart⟩)
-      : MergeDeltaAt history mergeEvent frameStart owner
+      : MergeDeltaAt history mergeEvent frameStart owner (.relation application)
         { coefficient := signedContribution, key := output.toKey }
 
 /-- A balanced proof tree combines recorded deltas without introducing a second event ledger. -/
-inductive MergeDeltasAt (history : EventHistory) (frameStart : Nat) (owner : Owner) :
+inductive MergeDeltasAt (history : EventHistory) (frameStart : Nat) (owner : Owner)
+    (group : MergeGroup) :
     Polynomial Owner → Prop where
   | leaf {mergeEvent : Nat} {term : ExactTerm Owner} :
-      MergeDeltaAt history mergeEvent frameStart owner term →
-        MergeDeltasAt history frameStart owner [term]
+      MergeDeltaAt history mergeEvent frameStart owner group term →
+        MergeDeltasAt history frameStart owner group [term]
   | append {left right : Polynomial Owner} :
-      MergeDeltasAt history frameStart owner left →
-        MergeDeltasAt history frameStart owner right →
-          MergeDeltasAt history frameStart owner (left ++ right)
+      MergeDeltasAt history frameStart owner group left →
+        MergeDeltasAt history frameStart owner group right →
+          MergeDeltasAt history frameStart owner group (left ++ right)
+
+/-- The exact row-derived delta polynomial is applied to one explicit base polynomial. -/
+structure MergeReconstructionAt (history : EventHistory) (frameStart : Nat) (owner : Owner)
+    (group : MergeGroup) (base output : Polynomial Owner) where
+  deltas : Polynomial Owner
+  rows : MergeDeltasAt history frameStart owner group deltas
+  agreement : CanonicalAgreement output (add base deltas)
 
 def canonicalSelfTerm (owner : Owner) : Term :=
   { monomial := { centralFactors := [], orderedFactors := [owner] }
@@ -2291,7 +2303,7 @@ theorem operatorProductMergeClaim
     {modulus frameStart transferEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftActual rightActual : Int} {leftRaw rightRaw : List Term}
-    {deltas : Polynomial Owner} {leftScalar rightScalar : Bool}
+    {working : Polynomial Owner} {leftScalar rightScalar : Bool}
     {leftReference rightReference : ValueRef} {facts : TallSecurity0ABI.ProductFacts}
     {valueType : ValueType}
     (_operationAt :
@@ -2304,18 +2316,21 @@ theorem operatorProductMergeClaim
       .exactZero)
     (rightClaim : ExactClaimAt history modulus env rightResult rightOwner rightActual rightRaw
       .exactZero)
-    (_deltasAt : MergeDeltasAt history frameStart owner deltas)
-    (productAgreement : CanonicalAgreement deltas
+    (reconstruction : MergeReconstructionAt history frameStart owner
+      (.operator leftResult rightResult) [] working)
+    (productAgreement : CanonicalAgreement (add [] reconstruction.deltas)
       (productPoly (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
         leftScalar rightScalar))
     (modulusPositive : 0 < modulus) :
-    ValueClaim.Interprets modulus env (leftActual * rightActual) (.exact deltas .exactZero) := by
+    ValueClaim.Interprets modulus env (leftActual * rightActual) (.exact working .exactZero) := by
   have outputEval :
-        evalPolynomial env deltas =
+        evalPolynomial env working =
           evalPolynomial env (leftRaw.map Term.toExact) *
             evalPolynomial env (rightRaw.map Term.toExact) := by
       calc
-        evalPolynomial env deltas = evalPolynomial env
+        evalPolynomial env working = evalPolynomial env (add [] reconstruction.deltas) :=
+          canonicalAgreement_eval env _ _ reconstruction.agreement
+        _ = evalPolynomial env
             (productPoly (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
               leftScalar rightScalar) :=
           canonicalAgreement_eval env _ _ productAgreement
@@ -2323,7 +2338,7 @@ theorem operatorProductMergeClaim
             evalPolynomial env (rightRaw.map Term.toExact) :=
           evalPolynomial_productPoly env _ _ leftScalar rightScalar
   exact exactValueClaim_product_of_mod_zero modulus env leftActual rightActual
-    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) deltas
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) working
     leftClaim.claim rightClaim.claim outputEval modulusPositive
 
 /-- Add copies the left polynomial and incorporates the right polynomial.  Collision deltas are
@@ -2334,7 +2349,7 @@ theorem operatorAddMergeClaim
     {modulus frameStart transferEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftActual rightActual : Int} {leftRaw rightRaw : List Term}
-    {base deltas : Polynomial Owner} {leftReference rightReference : ValueRef}
+    {base working : Polynomial Owner} {leftReference rightReference : ValueRef}
     {valueType : ValueType}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
@@ -2346,17 +2361,22 @@ theorem operatorAddMergeClaim
       .exactZero)
     (rightClaim : ExactClaimAt history modulus env rightResult rightOwner rightActual rightRaw
       .exactZero)
-    (_deltasAt : MergeDeltasAt history frameStart owner deltas)
-    (operationAgreement : CanonicalAgreement (add base deltas)
+    (reconstruction : MergeReconstructionAt history frameStart owner
+      (.operator leftResult rightResult) base working)
+    (operationAgreement : CanonicalAgreement (add base reconstruction.deltas)
       (add (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)))
     (modulusPositive : 0 < modulus) :
     ValueClaim.Interprets modulus env (leftActual + rightActual)
-      (.exact (add base deltas) .exactZero) := by
-  have outputEval := addCanonicalResultSound env
-    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) (add base deltas)
-    operationAgreement
+      (.exact working .exactZero) := by
+  have reconstructedEval := addCanonicalResultSound env
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (add base reconstruction.deltas) operationAgreement
+  have outputEval : evalPolynomial env working =
+      evalPolynomial env (leftRaw.map Term.toExact) +
+        evalPolynomial env (rightRaw.map Term.toExact) :=
+    (canonicalAgreement_eval env _ _ reconstruction.agreement).trans reconstructedEval
   exact exactValueClaim_add_of_mod_zero modulus env leftActual rightActual
-    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) (add base deltas)
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) working
     leftClaim.claim rightClaim.claim outputEval modulusPositive
 
 /-- Subtract shares the Add execution shape but negates the right contribution. -/
@@ -2365,7 +2385,7 @@ theorem operatorSubMergeClaim
     {modulus frameStart transferEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftActual rightActual : Int} {leftRaw rightRaw : List Term}
-    {base deltas : Polynomial Owner} {leftReference rightReference : ValueRef}
+    {base working : Polynomial Owner} {leftReference rightReference : ValueRef}
     {valueType : ValueType}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
@@ -2377,17 +2397,22 @@ theorem operatorSubMergeClaim
       .exactZero)
     (rightClaim : ExactClaimAt history modulus env rightResult rightOwner rightActual rightRaw
       .exactZero)
-    (_deltasAt : MergeDeltasAt history frameStart owner deltas)
-    (operationAgreement : CanonicalAgreement (add base deltas)
+    (reconstruction : MergeReconstructionAt history frameStart owner
+      (.operator leftResult rightResult) base working)
+    (operationAgreement : CanonicalAgreement (add base reconstruction.deltas)
       (subtract (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)))
     (modulusPositive : 0 < modulus) :
     ValueClaim.Interprets modulus env (leftActual - rightActual)
-      (.exact (add base deltas) .exactZero) := by
-  have outputEval := subCanonicalResultSound env
-    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) (add base deltas)
-    operationAgreement
+      (.exact working .exactZero) := by
+  have reconstructedEval := subCanonicalResultSound env
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (add base reconstruction.deltas) operationAgreement
+  have outputEval : evalPolynomial env working =
+      evalPolynomial env (leftRaw.map Term.toExact) -
+        evalPolynomial env (rightRaw.map Term.toExact) :=
+    (canonicalAgreement_eval env _ _ reconstruction.agreement).trans reconstructedEval
   exact exactValueClaim_sub_exactZero_of_mod_zero modulus env leftActual rightActual
-    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) (add base deltas)
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) working
     leftClaim.claim rightClaim.claim outputEval modulusPositive
 
 def TerminalExactAt (document : TallDocument) (history : EventHistory)
@@ -2430,7 +2455,7 @@ theorem universalRelationMergeClaim
     {application frameStart computed rhsResult : Nat}
     {owner : Owner} {source lhs : Monomial} {lhsLayout : Option Layout}
     {outerCoefficient : Int} {orderedStart orderedEndExclusive : Nat}
-    {rhsRaw : List Term} {accumulator base deltas : Polynomial Owner}
+    {rhsRaw : List Term} {accumulator working : Polynomial Owner}
     {actual : Int} {summary : Bound}
     (applicationValid : RelationApplicationAt document history selector application)
     (applicationRow : history.lookup application = some
@@ -2439,15 +2464,18 @@ theorem universalRelationMergeClaim
     (rhsTermsAt : exactTermsAt? history rhsResult = some rhsRaw)
     (accumulatorClaim : ValueClaim.Interprets modulus witness.env actual
       (.exact accumulator summary))
-    (_deltasAt : MergeDeltasAt history frameStart owner deltas)
-    (relationAgreement : CanonicalAgreement (add base deltas)
+    (reconstruction : MergeReconstructionAt history frameStart owner (.relation application)
+      (subtract accumulator [{ coefficient := outerCoefficient, key := source.toKey }]) working)
+    (relationAgreement : CanonicalAgreement
+      (add (subtract accumulator [{ coefficient := outerCoefficient, key := source.toKey }])
+        reconstruction.deltas)
       (relationPoly accumulator source.toKey
         (relationContext source.toKey source.centralFactors orderedStart orderedEndExclusive)
         outerCoefficient (rhsRaw.map Term.toExact)))
     (sourceKeyEquivalent : KeyEquivalent source.toKey
       ((relationContext source.toKey source.centralFactors orderedStart
         orderedEndExclusive).plug lhs.toKey)) :
-    ValueClaim.Interprets modulus witness.env actual (.exact (add base deltas) summary) := by
+    ValueClaim.Interprets modulus witness.env actual (.exact working summary) := by
   have congruent := witness.relationCongruence application applicationValid
   rw [RelationCongruent, TallSecurity0ABI.eventAt?, applicationRow] at congruent
   rcases congruent with ⟨_, rhsTerms, rhsLookup, baseRelation⟩
@@ -2457,10 +2485,16 @@ theorem universalRelationMergeClaim
   subst rhsTerms
   have workingSound := relationCanonicalResultSound modulus witness.env accumulator
     source.toKey lhs.toKey source.centralFactors orderedStart orderedEndExclusive
-    outerCoefficient (rhsRaw.map Term.toExact) (add base deltas)
+    outerCoefficient (rhsRaw.map Term.toExact)
+    (add (subtract accumulator [{ coefficient := outerCoefficient, key := source.toKey }])
+      reconstruction.deltas)
     sourceKeyEquivalent baseRelation relationAgreement
+  have outputSound : evalPolynomial witness.env working % Int.ofNat modulus =
+      evalPolynomial witness.env accumulator % Int.ofNat modulus := by
+    rw [canonicalAgreement_eval witness.env _ _ reconstruction.agreement]
+    exact workingSound
   exact exactValueClaim_of_eval_mod modulus witness.env actual accumulator
-    (add base deltas) summary accumulatorClaim workingSound
+    working summary accumulatorClaim outputSound
 
 /-- Gadget relation replay is the reached two-factor specialization of the same delta path. -/
 theorem gadgetRelationMergeClaim
@@ -2470,7 +2504,7 @@ theorem gadgetRelationMergeClaim
     {owner gadget decomposition : Owner} {input : ExpressionRef}
     {source lhs : Monomial} {outerCoefficient : Int}
     {orderedStart orderedEndExclusive : Nat} {rhsRaw : List Term}
-    {accumulator base deltas : Polynomial Owner} {actual : Int}
+    {accumulator working : Polynomial Owner} {actual : Int}
     {summary : Bound}
     (applicationValid : RelationApplicationAt document history selector application)
     (applicationRow : history.lookup application = some
@@ -2481,15 +2515,18 @@ theorem gadgetRelationMergeClaim
       { centralFactors := [gadget, decomposition], orderedFactors := [] })
     (accumulatorClaim : ValueClaim.Interprets modulus witness.env actual
       (.exact accumulator summary))
-    (_deltasAt : MergeDeltasAt history frameStart owner deltas)
-    (relationAgreement : CanonicalAgreement (add base deltas)
+    (reconstruction : MergeReconstructionAt history frameStart owner (.relation application)
+      (subtract accumulator [{ coefficient := outerCoefficient, key := source.toKey }]) working)
+    (relationAgreement : CanonicalAgreement
+      (add (subtract accumulator [{ coefficient := outerCoefficient, key := source.toKey }])
+        reconstruction.deltas)
       (relationPoly accumulator source.toKey
         (relationContext source.toKey source.centralFactors orderedStart orderedEndExclusive)
         outerCoefficient (rhsRaw.map Term.toExact)))
     (sourceKeyEquivalent : KeyEquivalent source.toKey
       ((relationContext source.toKey source.centralFactors orderedStart
         orderedEndExclusive).plug lhs.toKey)) :
-    ValueClaim.Interprets modulus witness.env actual (.exact (add base deltas) summary) := by
+    ValueClaim.Interprets modulus witness.env actual (.exact working summary) := by
   have congruent := witness.relationCongruence application applicationValid
   rw [RelationCongruent, TallSecurity0ABI.eventAt?, applicationRow] at congruent
   rcases congruent with ⟨rhsTerms, rhsLookup, baseRelation⟩
@@ -2508,10 +2545,16 @@ theorem gadgetRelationMergeClaim
     exact baseRelation
   have workingSound := relationCanonicalResultSound modulus witness.env accumulator
     source.toKey lhs.toKey source.centralFactors orderedStart orderedEndExclusive
-    outerCoefficient (rhsRaw.map Term.toExact) (add base deltas)
+    outerCoefficient (rhsRaw.map Term.toExact)
+    (add (subtract accumulator [{ coefficient := outerCoefficient, key := source.toKey }])
+      reconstruction.deltas)
     sourceKeyEquivalent gadgetBaseRelation relationAgreement
+  have outputSound : evalPolynomial witness.env working % Int.ofNat modulus =
+      evalPolynomial witness.env accumulator % Int.ofNat modulus := by
+    rw [canonicalAgreement_eval witness.env _ _ reconstruction.agreement]
+    exact workingSound
   exact exactValueClaim_of_eval_mod modulus witness.env actual accumulator
-    (add base deltas) summary accumulatorClaim workingSound
+    working summary accumulatorClaim outputSound
 
 /-! Atomic derivations require validated source or sampler provenance.  The result indices are
     intentional: constructors cannot choose an arbitrary actual value, term list, summary, or

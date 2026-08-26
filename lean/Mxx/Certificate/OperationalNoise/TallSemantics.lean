@@ -2112,6 +2112,97 @@ theorem centeredNorm_eq_of_emod_eq {modulus : Nat} {left right : Int}
   simp only [Nat.ne_of_gt modulusPositive, ↓reduceIte]
   rw [residueEqual]
 
+private theorem centeredNorm_neg (modulus : Nat) (modulusPositive : 0 < modulus)
+    (value : Int) : centeredNorm modulus (-value) = centeredNorm modulus value := by
+  let q : Int := modulus
+  let residue := value % q
+  have qPositive : 0 < q := by
+    simpa [q] using (Int.natCast_pos.mpr modulusPositive)
+  have residueNonnegative : 0 ≤ residue := Int.emod_nonneg value (Int.ne_of_gt qPositive)
+  have residueLess : residue < q := Int.emod_lt_of_pos value qPositive
+  by_cases residueZero : residue = 0
+  · have negMod : (-value) % q = 0 := by
+      rw [← Int.dvd_iff_emod_eq_zero]
+      apply Int.dvd_neg.mpr
+      rw [Int.dvd_iff_emod_eq_zero]
+      exact residueZero
+    unfold centeredNorm centeredCoefficient
+    simp only [Nat.ne_of_gt modulusPositive, ↓reduceIte]
+    change (if 2 * ((-value) % q) ≤ q then (-value) % q
+      else (-value) % q - q).natAbs =
+        (if 2 * residue ≤ q then residue else residue - q).natAbs
+    simp [negMod, residueZero, show 0 ≤ q by omega]
+  · have negMod : (-value) % q = q - residue := by
+      apply (Int.emod_eq_iff (Int.ne_of_gt qPositive)).2
+      refine ⟨by omega, ?_, ?_⟩
+      · rw [Int.ofNat_natAbs_of_nonneg (by omega)]
+        omega
+      · have divisible : q ∣ value - residue := by
+          simpa [residue] using (Int.dvd_self_sub_emod (x := value) (m := q))
+        rw [show q - residue - -value = q + (value - residue) by omega]
+        exact Int.dvd_add (Int.dvd_refl q) divisible
+    unfold centeredNorm centeredCoefficient
+    simp only [Nat.ne_of_gt modulusPositive, ↓reduceIte]
+    change (if 2 * ((-value) % q) ≤ q then (-value) % q
+      else (-value) % q - q).natAbs =
+        (if 2 * residue ≤ q then residue else residue - q).natAbs
+    rw [negMod]
+    split <;> split
+    all_goals repeat first
+      | rw [Int.natAbs_of_nonneg (by omega)]
+      | rw [Int.natAbs_of_nonpos (by omega)]
+    all_goals omega
+
+/-- Two finite exact remainders subtract with the sum of their recorded bounds. -/
+theorem exactValueClaim_sub_finite {Factor : Type} (modulus : Nat) (env : Env Factor)
+    (leftActual rightActual : Int) (leftTerms rightTerms output : Polynomial Factor)
+    (leftMaximum rightMaximum : Nat)
+    (leftClaim : ValueClaim.Interprets modulus env leftActual
+      (.exact leftTerms (.finite leftMaximum)))
+    (rightClaim : ValueClaim.Interprets modulus env rightActual
+      (.exact rightTerms (.finite rightMaximum)))
+    (outputEval : evalPolynomial env output =
+      evalPolynomial env leftTerms - evalPolynomial env rightTerms)
+    (modulusPositive : 0 < modulus) :
+    ValueClaim.Interprets modulus env (leftActual - rightActual)
+      (.exact output (.finite (leftMaximum + rightMaximum))) := by
+  rcases leftClaim with ⟨leftRemainder, leftCongruence, leftBound⟩
+  rcases rightClaim with ⟨rightRemainder, rightCongruence, rightBound⟩
+  refine ⟨leftRemainder - rightRemainder, ?_, ?_⟩
+  · rw [outputEval]
+    calc
+      (leftActual - rightActual -
+          (evalPolynomial env leftTerms - evalPolynomial env rightTerms)) %
+            Int.ofNat modulus =
+          ((leftActual - evalPolynomial env leftTerms) -
+            (rightActual - evalPolynomial env rightTerms)) % Int.ofNat modulus := by
+              congr 1 <;> omega
+      _ = ((leftActual - evalPolynomial env leftTerms) % Int.ofNat modulus -
+          (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus) %
+            Int.ofNat modulus := by rw [Int.sub_emod]
+      _ = (leftRemainder % Int.ofNat modulus -
+          rightRemainder % Int.ofNat modulus) % Int.ofNat modulus := by
+            apply congrArg (fun value ↦ value % Int.ofNat modulus)
+            calc
+              (leftActual - evalPolynomial env leftTerms) % Int.ofNat modulus -
+                    (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus =
+                  leftRemainder % Int.ofNat modulus -
+                    (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus :=
+                congrArg (fun value ↦ value -
+                  (rightActual - evalPolynomial env rightTerms) % Int.ofNat modulus)
+                  leftCongruence
+              _ = leftRemainder % Int.ofNat modulus -
+                    rightRemainder % Int.ofNat modulus :=
+                congrArg (fun value ↦ leftRemainder % Int.ofNat modulus - value)
+                  rightCongruence
+      _ = (leftRemainder - rightRemainder) % Int.ofNat modulus := by
+            exact (Int.sub_emod leftRemainder rightRemainder (Int.ofNat modulus)).symm
+  · have remainderTriangle := centeredNorm_add_le modulus modulusPositive
+      leftRemainder (-rightRemainder)
+    rw [centeredNorm_neg modulus modulusPositive rightRemainder] at remainderTriangle
+    exact Nat.le_trans (by simpa [Int.sub_eq_add_neg] using remainderTriangle)
+      (Nat.add_le_add leftBound rightBound)
+
 theorem centeredNorm_le_of_empty_finite_claim {Factor : Type} (modulus : Nat)
     (env : Env Factor) (actual : Int) (maximum : Nat)
     (claim : ValueClaim.Interprets modulus env actual (.exact [] (.finite maximum)))
@@ -2567,6 +2658,61 @@ theorem operatorAddNoMergeClaim
       (outputRaw.map Term.toExact) leftMaximum rightMaximum leftClaim.claim rightClaim.claim
       outputEval modulusPositive
 
+/-- A reached merged Add binds its collision rows through reconstruction and records the sum of
+    the two finite child summaries through the separate summary transfer. -/
+theorem operatorAddFiniteMergeClaimAt
+    {document : TallDocument} {history : EventHistory}
+    {modulus frameStart coefficientTransfer summaryTransfer resultEvent : Nat} {env : Env Owner}
+    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
+    {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
+    {leftExpression rightExpression : ExpressionRef}
+    {leftActual rightActual : Int} {leftRaw rightRaw outputRaw : List Term}
+    {leftMaximum rightMaximum : Nat} {base : Polynomial Owner}
+    {valueType : ValueType} {coefficientBound : Bound}
+    (_operationAt :
+      (document.expressions.lookup owner.expression.row).map
+        TallSecurity0ABI.ExpressionRow.descriptor =
+        some (.operation (.stable (.matrix .add)) valueType))
+    (_leftPredecessorAt : history.lookup leftBinding = some
+      ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
+    (_rightPredecessorAt : history.lookup rightBinding = some
+      ⟨.predecessor owner rightInputPosition rightExpression rightResult, frameStart⟩)
+    (_coefficientTransferAt : history.lookup coefficientTransfer = some
+      ⟨.boundTransfer owner
+        (.sum [.predecessor leftInputPosition leftBinding .coefficient,
+          .predecessor rightInputPosition rightBinding .coefficient]), frameStart⟩)
+    (_summaryTransferAt : history.lookup summaryTransfer = some
+      ⟨.boundTransfer owner
+        (.sum [.result leftResult .summary, .result rightResult .summary]), frameStart⟩)
+    (leftClaim : ExactClaimAt history modulus env leftResult leftOwner leftActual leftRaw
+      (.finite leftMaximum))
+    (rightClaim : ExactClaimAt history modulus env rightResult rightOwner rightActual rightRaw
+      (.finite rightMaximum))
+    (reconstruction : MergeReconstructionAt history frameStart owner
+      (.operator leftResult rightResult) base (outputRaw.map Term.toExact))
+    (operationAgreement : CanonicalAgreement (add base reconstruction.deltas)
+      (add (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)))
+    (resultAt : history.lookup resultEvent = some
+      ⟨.resultExact owner outputRaw coefficientBound coefficientTransfer
+        (.finite (leftMaximum + rightMaximum)) (some summaryTransfer), frameStart⟩)
+    (modulusPositive : 0 < modulus) :
+    ExactClaimAt history modulus env resultEvent owner (leftActual + rightActual) outputRaw
+      (.finite (leftMaximum + rightMaximum)) := by
+  have operationEval := addCanonicalResultSound env
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (add base reconstruction.deltas) operationAgreement
+  have outputEval : evalPolynomial env (outputRaw.map Term.toExact) =
+      evalPolynomial env (leftRaw.map Term.toExact) +
+        evalPolynomial env (rightRaw.map Term.toExact) :=
+    (canonicalAgreement_eval env _ _ reconstruction.agreement).trans operationEval
+  refine ⟨⟨coefficientBound, coefficientTransfer, some summaryTransfer, ?_⟩, ?_⟩
+  · rw [resultAt]
+    rfl
+  · exact exactValueClaim_add_finite modulus env leftActual rightActual
+      (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+      (outputRaw.map Term.toExact) leftMaximum rightMaximum leftClaim.claim rightClaim.claim
+      outputEval modulusPositive
+
 /-- Subtract shares the Add execution shape but negates the right contribution. -/
 theorem operatorSubMergeClaim
     {document : TallDocument} {history : EventHistory}
@@ -2602,6 +2748,60 @@ theorem operatorSubMergeClaim
   exact exactValueClaim_sub_exactZero_of_mod_zero modulus env leftActual rightActual
     (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) working
     leftClaim.claim rightClaim.claim outputEval modulusPositive
+
+/-- A reached merged Subtract binds both collision deltas and its additive finite summary row. -/
+theorem operatorSubFiniteMergeClaimAt
+    {document : TallDocument} {history : EventHistory}
+    {modulus frameStart coefficientTransfer summaryTransfer resultEvent : Nat} {env : Env Owner}
+    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
+    {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
+    {leftExpression rightExpression : ExpressionRef}
+    {leftActual rightActual : Int} {leftRaw rightRaw outputRaw : List Term}
+    {leftMaximum rightMaximum : Nat} {base : Polynomial Owner}
+    {valueType : ValueType} {coefficientBound : Bound}
+    (_operationAt :
+      (document.expressions.lookup owner.expression.row).map
+        TallSecurity0ABI.ExpressionRow.descriptor =
+        some (.operation (.stable (.matrix .subtract)) valueType))
+    (_leftPredecessorAt : history.lookup leftBinding = some
+      ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
+    (_rightPredecessorAt : history.lookup rightBinding = some
+      ⟨.predecessor owner rightInputPosition rightExpression rightResult, frameStart⟩)
+    (_coefficientTransferAt : history.lookup coefficientTransfer = some
+      ⟨.boundTransfer owner
+        (.sum [.predecessor leftInputPosition leftBinding .coefficient,
+          .predecessor rightInputPosition rightBinding .coefficient]), frameStart⟩)
+    (_summaryTransferAt : history.lookup summaryTransfer = some
+      ⟨.boundTransfer owner
+        (.sum [.result leftResult .summary, .result rightResult .summary]), frameStart⟩)
+    (leftClaim : ExactClaimAt history modulus env leftResult leftOwner leftActual leftRaw
+      (.finite leftMaximum))
+    (rightClaim : ExactClaimAt history modulus env rightResult rightOwner rightActual rightRaw
+      (.finite rightMaximum))
+    (reconstruction : MergeReconstructionAt history frameStart owner
+      (.operator leftResult rightResult) base (outputRaw.map Term.toExact))
+    (operationAgreement : CanonicalAgreement (add base reconstruction.deltas)
+      (subtract (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)))
+    (resultAt : history.lookup resultEvent = some
+      ⟨.resultExact owner outputRaw coefficientBound coefficientTransfer
+        (.finite (leftMaximum + rightMaximum)) (some summaryTransfer), frameStart⟩)
+    (modulusPositive : 0 < modulus) :
+    ExactClaimAt history modulus env resultEvent owner (leftActual - rightActual) outputRaw
+      (.finite (leftMaximum + rightMaximum)) := by
+  have operationEval := subCanonicalResultSound env
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (add base reconstruction.deltas) operationAgreement
+  have outputEval : evalPolynomial env (outputRaw.map Term.toExact) =
+      evalPolynomial env (leftRaw.map Term.toExact) -
+        evalPolynomial env (rightRaw.map Term.toExact) :=
+    (canonicalAgreement_eval env _ _ reconstruction.agreement).trans operationEval
+  refine ⟨⟨coefficientBound, coefficientTransfer, some summaryTransfer, ?_⟩, ?_⟩
+  · rw [resultAt]
+    rfl
+  · exact exactValueClaim_sub_finite modulus env leftActual rightActual
+      (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+      (outputRaw.map Term.toExact) leftMaximum rightMaximum leftClaim.claim rightClaim.claim
+      outputEval modulusPositive
 
 def TerminalExactAt (document : TallDocument) (history : EventHistory)
     (selector : Option Nat) (producer resultEvent : Nat) (owner : Owner)

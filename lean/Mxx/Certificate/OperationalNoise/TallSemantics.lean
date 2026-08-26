@@ -3608,7 +3608,8 @@ def rootMatchesOwner (root : SchemaV1.ResidualRoot) (owner : Owner) : Prop :=
 
 /-- The fixed Security0 statement; later checkpoints construct, rather than assume, its proof. -/
 def Security0Accepted (document : TallDocument) (history : EventHistory)
-    (plaintextModulus ciphertextModulus ringDimension finalEvent preFoldEvent finalBound : Nat)
+    (plaintextModulus ciphertextModulus ringDimension finalEvent preFoldEvent finalResultEvent
+      finalBound : Nat)
     (finalOwner : Owner) (finalTerms : List Term) (finalCoefficientBound : Bound)
     (finalCoefficientProducer : Nat) (finalSummary : Bound)
     (finalSummaryProducer : Option Nat)
@@ -3621,9 +3622,15 @@ def Security0Accepted (document : TallDocument) (history : EventHistory)
     rootMatchesOwner document.residualRoot finalOwner ∧
     finalSummary = .finite finalBound ∧
     (∃ frameStart,
-      history.lookup finalEvent = some
-        ⟨.invocationEndExact finalOwner preFoldEvent finalTerms finalCoefficientBound
-          finalCoefficientProducer finalSummary finalSummaryProducer, frameStart⟩) ∧
+      history.lookup finalResultEvent = some
+          ⟨.resultExact finalOwner finalTerms finalCoefficientBound finalCoefficientProducer
+            finalSummary finalSummaryProducer, frameStart⟩ ∧
+        history.lookup preFoldEvent = some
+          ⟨.preFoldPolynomial finalResultEvent finalTerms finalSummary
+            (some (.result finalResultEvent .summary)), frameStart⟩ ∧
+        history.lookup finalEvent = some
+          ⟨.invocationEndExact finalOwner preFoldEvent finalTerms finalCoefficientBound
+            finalCoefficientProducer finalSummary finalSummaryProducer, frameStart⟩) ∧
     ForStatement document.residualRoot fun selector ↦
       ∀ witness : Witness document history selector ciphertextModulus,
         ValueClaim.Interprets ciphertextModulus witness.env (residual selector witness)

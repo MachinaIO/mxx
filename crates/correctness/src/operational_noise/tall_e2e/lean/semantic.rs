@@ -276,6 +276,17 @@ struct LeftRootRenderData<'a> {
     relation_events: Vec<u64>,
 }
 
+struct FinalAddRenderData {
+    owner: ProofPayloadOwner,
+    left: ResultRecord,
+    right: ResultRecord,
+    transfer_rule: ProofPayloadRule,
+    merge_events: Vec<u64>,
+    result: ResultRecord,
+    prefold_event: u64,
+    end_event: u64,
+}
+
 impl SemanticShard {
     fn canonical_work(&self) -> u64 {
         self.operations
@@ -1673,7 +1684,18 @@ pub(super) fn render(
     let (mut report, _selections, _long_monomial) = measure(proof)?;
     let index = PayloadIndex::new(proof)?;
     let left_root = collect_left_root_render_data(proof, &index)?;
+    let final_add = collect_final_add_render_data(&index)?;
     let _ = (left_root.event_ids.len(), left_root.bounds.len(), left_root.relation_events.len());
+    let _ = (
+        final_add.owner,
+        final_add.left.event,
+        final_add.right.event,
+        final_add.transfer_rule,
+        final_add.merge_events.len(),
+        final_add.result.event,
+        final_add.prefold_event,
+        final_add.end_event,
+    );
     let probes = build_probes(statement, proof, &index)?;
     let ranges = frame_ranges(proof)?;
     let relation_probes = relation_candidates(&index, &ranges)?;
@@ -1832,20 +1854,134 @@ fn collect_left_root_render_data<'a>(
             "Security0 left-root closure does not reach exactly the eight supported bound-rule families: {reached_rules:?}"
         ));
     }
-    if bounds.len() != 9_234 ||
-        bounds.iter().any(|bound| {
-            !event_ids.binary_search(&bound.event).is_ok() ||
-                !reached_left_bound_rule(bound.rule) ||
-                !matches!(
-                    index.event(bound.event),
-                    Ok(ProofPayloadEvent::BoundTransfer { owner, rule })
-                        if *owner == bound.owner && rule == bound.rule
-                )
-        })
-    {
-        return Err("Security0 left-root typed bound collection is inconsistent".to_owned());
+    if bounds.len() != 9_173 {
+        return Err(format!(
+            "Security0 left-root closure reaches {} bound rows, expected 9173",
+            bounds.len()
+        ));
+    }
+    if let Some(bound) = bounds.iter().find(|bound| {
+        event_ids.binary_search(&bound.event).is_err() ||
+            !reached_left_bound_rule(bound.rule) ||
+            !matches!(
+                index.event(bound.event),
+                Ok(ProofPayloadEvent::BoundTransfer { owner, rule })
+                    if *owner == bound.owner && rule == bound.rule
+            )
+    }) {
+        return Err(format!("Security0 left-root bound row {} is inconsistent", bound.event));
     }
     Ok(LeftRootRenderData { event_ids, bounds, relation_events })
+}
+
+fn collect_final_add_render_data(index: &PayloadIndex) -> Result<FinalAddRenderData, String> {
+    const LEFT_RESULT: u64 = 107_402;
+    const RIGHT_RESULT: u64 = 6_275;
+    const LEFT_BINDING: u64 = 107_403;
+    const RIGHT_BINDING: u64 = 107_404;
+    const TRANSFER: u64 = 107_405;
+    const FIRST_MERGE: u64 = 107_406;
+    const RESULT: u64 = 107_564;
+    const PREFOLD: u64 = 107_565;
+    const END: u64 = 107_566;
+
+    let left = index.result(LEFT_RESULT)?;
+    let right = index.result(RIGHT_RESULT)?;
+    let result = index.result(RESULT)?;
+    let owner = result.owner;
+    for (binding, position, source) in
+        [(LEFT_BINDING, 0, LEFT_RESULT), (RIGHT_BINDING, 1, RIGHT_RESULT)]
+    {
+        if index.predecessors.get(&binding) != Some(&(owner, position, source)) {
+            return Err(format!(
+                "Security0 final Add predecessor {binding} does not bind input {position} to Result {source}"
+            ));
+        }
+    }
+    let transfer_rule = match index.event(TRANSFER)? {
+        ProofPayloadEvent::BoundTransfer {
+            owner: transfer_owner,
+            rule: rule @ ProofPayloadRule::Sum { inputs },
+        } if *transfer_owner == owner &&
+            inputs.as_ref() ==
+                [
+                    ProofPayloadValueRef::Predecessor {
+                        binding_event: LEFT_BINDING,
+                        input_position: 0,
+                        projection: crate::operational_noise::g0::BoundProjection::Coefficient,
+                    },
+                    ProofPayloadValueRef::Predecessor {
+                        binding_event: RIGHT_BINDING,
+                        input_position: 1,
+                        projection: crate::operational_noise::g0::BoundProjection::Coefficient,
+                    },
+                ] =>
+        {
+            rule.clone()
+        }
+        _ => return Err("Security0 final Add transfer row is inconsistent".to_owned()),
+    };
+    match index.event(RESULT)? {
+        ProofPayloadEvent::Result {
+            owner: result_owner,
+            value:
+                ProofPayloadValue::Exact {
+                    terms, coefficient_producer, summary, summary_producer, ..
+                },
+        } if *result_owner == owner &&
+            terms.is_empty() &&
+            *coefficient_producer == TRANSFER &&
+            summary == &result.summary &&
+            summary_producer.is_none() => {}
+        _ => return Err("Security0 final Add Result row is inconsistent".to_owned()),
+    }
+    if !matches!(
+        result.summary.coefficient_bound(),
+        crate::operational_noise::facts::NumericContract::Known(
+            crate::operational_noise::facts::CoefficientBound::Finite(_)
+        )
+    ) {
+        return Err("Security0 final Add Result summary is not finite".to_owned());
+    }
+    let merge_events = (FIRST_MERGE..RESULT)
+        .map(|event| match index.event(event)? {
+            ProofPayloadEvent::CoefficientMerge(merge) if merge.owner == owner => Ok(event),
+            _ => Err(format!("Security0 final Add merge row {event} is inconsistent")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    match index.event(PREFOLD)? {
+        ProofPayloadEvent::PreFoldPolynomial(prefold)
+            if prefold.result_event == RESULT &&
+                prefold.terms == result.terms &&
+                prefold.summary == result.summary &&
+                prefold.summary_evidence ==
+                    Some(ProofPayloadValueRef::Result {
+                        event: RESULT,
+                        projection: crate::operational_noise::g0::BoundProjection::Summary,
+                    }) => {}
+        _ => return Err("Security0 final Add PreFold row is inconsistent".to_owned()),
+    }
+    match index.event(END)? {
+        ProofPayloadEvent::InvocationEnd { root, result: end, pre_fold_event }
+            if *root == owner &&
+                *pre_fold_event == PREFOLD &&
+                matches!(
+                    end,
+                    ProofPayloadValue::Exact { terms, summary, .. }
+                        if terms == &result.terms && summary == &result.summary
+                ) => {}
+        _ => return Err("Security0 final Add InvocationEnd row is inconsistent".to_owned()),
+    }
+    Ok(FinalAddRenderData {
+        owner,
+        left,
+        right,
+        transfer_rule,
+        merge_events,
+        result,
+        prefold_event: PREFOLD,
+        end_event: END,
+    })
 }
 
 fn ciphertext_modulus_text(statement: &CertificateDocumentV1) -> Result<String, String> {

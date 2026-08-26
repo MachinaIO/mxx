@@ -2999,6 +2999,61 @@ theorem operatorAddFiniteMergeClaimAt
       (outputRaw.map Term.toExact) leftMaximum rightMaximum leftClaim.claim rightClaim.claim
       outputEval modulusPositive
 
+/-- The reached final Add preserves the left finite remainder because the right child has an
+    exact-zero remainder.  Its collision rows reconstruct the exact output polynomial, while the
+    Result records the unchanged left maximum without a separate summary producer. -/
+theorem operatorAddFiniteLeftMergeClaimAt
+    {document : TallDocument} {history : EventHistory}
+    {modulus frameStart coefficientTransfer resultEvent : Nat} {env : Env Owner}
+    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
+    {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
+    {leftExpression rightExpression : ExpressionRef}
+    {leftActual rightActual : Int} {leftRaw rightRaw outputRaw : List Term}
+    {leftMaximum : Nat} {base : Polynomial Owner}
+    {valueType : ValueType} {coefficientBound : Bound}
+    (_operationAt :
+      (document.expressions.lookup owner.expression.row).map
+        TallSecurity0ABI.ExpressionRow.descriptor =
+        some (.operation (.stable (.matrix .add)) valueType))
+    (_leftPredecessorAt : history.lookup leftBinding = some
+      ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
+    (_rightPredecessorAt : history.lookup rightBinding = some
+      ⟨.predecessor owner rightInputPosition rightExpression rightResult, frameStart⟩)
+    (_coefficientTransferAt : history.lookup coefficientTransfer = some
+      ⟨.boundTransfer owner
+        (.sum [.predecessor leftInputPosition leftBinding .coefficient,
+          .predecessor rightInputPosition rightBinding .coefficient]), frameStart⟩)
+    (leftClaim : ExactClaimAt history modulus env leftResult leftOwner leftActual leftRaw
+      (.finite leftMaximum))
+    (rightClaim : ExactClaimAt history modulus env rightResult rightOwner rightActual rightRaw
+      .exactZero)
+    (reconstruction : MergeReconstructionAt history frameStart owner
+      (.operator leftResult rightResult) base (outputRaw.map Term.toExact))
+    (operationAgreement : CanonicalAgreement (add base reconstruction.deltas)
+      (add (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)))
+    (resultAt : history.lookup resultEvent = some
+      ⟨.resultExact owner outputRaw coefficientBound coefficientTransfer
+        (.finite leftMaximum) none, frameStart⟩)
+    (modulusPositive : 0 < modulus) :
+    ExactClaimAt history modulus env resultEvent owner (leftActual + rightActual) outputRaw
+      (.finite leftMaximum) := by
+  have operationEval := addCanonicalResultSound env
+    (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+    (add base reconstruction.deltas) operationAgreement
+  have outputEval : evalPolynomial env (outputRaw.map Term.toExact) =
+      evalPolynomial env (leftRaw.map Term.toExact) +
+        evalPolynomial env (rightRaw.map Term.toExact) :=
+    (canonicalAgreement_eval env _ _ reconstruction.agreement).trans operationEval
+  have rightModZero := exactClaim_mod_zero modulus env rightActual
+    (rightRaw.map Term.toExact) rightClaim.claim modulusPositive
+  refine ⟨⟨coefficientBound, coefficientTransfer, none, ?_⟩, ?_⟩
+  · rw [resultAt]
+    rfl
+  · exact exactValueClaim_add_right_mod_zero modulus env leftActual rightActual
+      (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
+      (outputRaw.map Term.toExact) leftMaximum leftClaim.claim rightModZero
+      outputEval
+
 /-- Subtract shares the Add execution shape but negates the right contribution. -/
 theorem operatorSubMergeClaim
     {document : TallDocument} {history : EventHistory}

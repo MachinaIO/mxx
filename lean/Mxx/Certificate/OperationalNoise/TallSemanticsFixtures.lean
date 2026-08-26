@@ -543,6 +543,75 @@ theorem operator_add_finite_merge_claim_fixture :
   · rfl
   · decide
 
+def addFiniteLeftMergeHistory : EventHistory :=
+  smallHistory #[
+    annotated (.resultExact boundFixtureOwner [mergeLeftTerm] (.finite 0) 0
+      (.finite 1) none) 7,
+    annotated (.resultExact boundFixtureOwner [mergeRightTerm] (.finite 0) 0
+      .exactZero none) 7,
+    annotated (.predecessor boundFixtureOwner 0 ⟨0⟩ 0) 7,
+    annotated (.predecessor boundFixtureOwner 1 ⟨0⟩ 1) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.sum [.predecessor 0 2 .coefficient, .predecessor 1 3 .coefficient])) 7,
+    annotated (.coefficientMerge
+      ⟨boundFixtureOwner, .operator (⟨0, 0⟩, ⟨1, 0⟩), mergeRightTerm.monomial, 3⟩) 7,
+    annotated (.resultExact boundFixtureOwner [addNoMergeOutputTerm]
+      (.finite 0) 4 (.finite 1) none) 7]
+
+theorem add_finite_left_merge_left_claim_fixture :
+    ExactClaimAt addFiniteLeftMergeHistory 257 (fun _ : Owner ↦ 1) 0
+      boundFixtureOwner 3 [mergeLeftTerm] (.finite 1) := by
+  apply exactFiniteClaimAt (remainder := 1)
+  · rfl
+  · decide +kernel
+  · simp [centeredNorm, centeredCoefficient]
+
+theorem add_finite_left_merge_right_claim_fixture :
+    ExactClaimAt addFiniteLeftMergeHistory 257 (fun _ : Owner ↦ 1) 1
+      boundFixtureOwner 3 [mergeRightTerm] .exactZero := by
+  refine ⟨⟨.finite 0, 0, none, rfl⟩, 0, ?_, ?_⟩
+  · decide +kernel
+  · simp [boundInterprets, centeredNorm, centeredCoefficient]
+
+def add_finite_left_merge_reconstruction_fixture :
+    MergeReconstructionAt addFiniteLeftMergeHistory 7 boundFixtureOwner (.operator 0 1)
+      [mergeLeftTerm.toExact] [addNoMergeOutputTerm.toExact] := by
+  refine ⟨[mergeRightTerm.toExact], ?_, ?_⟩
+  · apply MergeDeltasAt.leaf
+    apply MergeDeltaAt.operator
+      (mergeEvent := 5) (leftResult := 0) (leftOrdinal := 0)
+      (rightResult := 1) (rightOrdinal := 0)
+      (leftTerms := [mergeLeftTerm]) (rightTerms := [mergeRightTerm])
+      (leftTerm := mergeLeftTerm) (rightTerm := mergeRightTerm)
+      (output := mergeRightTerm.monomial) (signedContribution := 3)
+    all_goals rfl
+  · decide +kernel
+
+theorem operator_add_finite_left_merge_claim_fixture :
+    ExactClaimAt addFiniteLeftMergeHistory 257 (fun _ : Owner ↦ 1) 6
+      boundFixtureOwner 6 [addNoMergeOutputTerm] (.finite 1) := by
+  apply operatorAddFiniteLeftMergeClaimAt (document := addNoMergeFixtureDocument)
+      (history := addFiniteLeftMergeHistory) (modulus := 257) (frameStart := 7)
+      (coefficientTransfer := 4) (resultEvent := 6) (env := fun _ : Owner ↦ 1)
+      (owner := boundFixtureOwner) (leftOwner := boundFixtureOwner)
+      (rightOwner := boundFixtureOwner) (leftResult := 0) (rightResult := 1)
+      (leftBinding := 2) (rightBinding := 3) (leftInputPosition := 0)
+      (rightInputPosition := 1) (leftExpression := ⟨0⟩) (rightExpression := ⟨0⟩)
+      (leftActual := 3) (rightActual := 3) (leftRaw := [mergeLeftTerm])
+      (rightRaw := [mergeRightTerm]) (outputRaw := [addNoMergeOutputTerm])
+      (leftMaximum := 1) (base := [mergeLeftTerm.toExact]) (valueType := atomType)
+      (coefficientBound := .finite 0)
+      (reconstruction := add_finite_left_merge_reconstruction_fixture)
+  · rfl
+  · rfl
+  · rfl
+  · rfl
+  · exact add_finite_left_merge_left_claim_fixture
+  · exact add_finite_left_merge_right_claim_fixture
+  · decide +kernel
+  · rfl
+  · decide
+
 def subtractMergeFixtureDocument : TallDocument :=
   { addNoMergeFixtureDocument with
     expressions := .node 0
@@ -1070,8 +1139,10 @@ theorem canonical_relation_fixture :
 #print axioms operator_sub_no_merge_exact_zero_claim_fixture
 #print axioms TallSemantics.exactValueClaim_sub_finite
 #print axioms TallSemantics.operatorAddFiniteMergeClaimAt
+#print axioms TallSemantics.operatorAddFiniteLeftMergeClaimAt
 #print axioms TallSemantics.operatorSubFiniteMergeClaimAt
 #print axioms operator_add_finite_merge_claim_fixture
+#print axioms operator_add_finite_left_merge_claim_fixture
 #print axioms operator_sub_finite_merge_claim_fixture
 #print axioms wrong_merge_delta_reconstruction_rejected
 #print axioms TallSemantics.operatorAddMergeClaim

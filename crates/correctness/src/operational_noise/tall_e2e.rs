@@ -21,15 +21,11 @@ use std::collections::BTreeMap;
 
 const SOURCE_SCHEMA_ID: &str = "mxx.operational-noise.tall-certificate-source";
 const SOURCE_SCHEMA_VERSION: u32 = 1;
-const SECURITY0_PROFILE: &str = "Security0";
-const SECURITY0_SOURCE_REVISION: &str = "tall-nested-rns-security0-v1";
-const SECURITY128_PROFILE: &str = "Security128";
-const SECURITY128_SOURCE_REVISION: &str = "tall-nested-rns-security128-v1";
 const EVALUATOR_VERSION: &str = "tall-runtime-only-v1";
 const RUST_PROJECTION_VERSION: &str = "operational-noise-certificate-v1";
-const LEAN_ABI_VERSION: &str = "security0-replay-v1";
+const LEAN_ABI_VERSION: &str = "tall-replay-v1";
 const TARGET_ID: &str = "tall-threshold-decode";
-const PROJECTION_MAGIC: &[u8] = b"mxx.security0.reached-projection.v1\0";
+const PROJECTION_MAGIC: &[u8] = b"mxx.tall.reached-projection.v1\0";
 
 /// Shared event-shard boundary used by the Security0 structural replay and semantic shards.
 pub(crate) const SECURITY0_EVENT_CHUNK_SIZE: usize = 256;
@@ -58,7 +54,7 @@ pub struct TallSecurity0ReachedProjection {
 }
 
 /// One deterministic generated artifact, relative to
-/// `Mxx/Certificate/OperationalNoise/TallSecurity0Generated`.
+/// `Mxx/Certificate/OperationalNoise/Tall{Profile}Generated`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TallSecurity0GeneratedFile {
     pub relative_path: String,
@@ -257,8 +253,12 @@ pub fn prepare_tall_security0_lean_manifest(
     let documents = derive_certificate_documents(&run).map_err(|error| error.to_string())?;
     let (owner_claim_statistics, owner_claim_report_bytes) =
         lean::measure_owner_claims(&documents.proof.payload).map_err(|error| error.to_string())?;
-    let rendered =
-        lean::render(&documents.cert, &documents.proof.payload, &owner_claim_report_bytes)?;
+    let rendered = lean::render(
+        &documents.cert,
+        &documents.proof.payload,
+        &owner_claim_report_bytes,
+        identity,
+    )?;
     let recorded_report = run.accepted_report.into_simulation_report();
     Ok(TallSecurity0LeanManifest {
         files: rendered,
@@ -272,13 +272,14 @@ fn validate_identity(
     identity: &TallSecurity0ProfileIdentity,
     request: &OperationalCheckRequest,
 ) -> Result<(), String> {
-    let fixed_profile = (identity.profile == SECURITY0_PROFILE &&
-        identity.source_revision == SECURITY0_SOURCE_REVISION) ||
-        (identity.profile == SECURITY128_PROFILE &&
-            identity.source_revision == SECURITY128_SOURCE_REVISION);
+    let profile_is_module_segment = !identity.profile.is_empty() &&
+        identity.profile.bytes().enumerate().all(|(position, byte)| {
+            byte.is_ascii_alphabetic() || (position > 0 && byte.is_ascii_digit())
+        });
     if identity.source_schema_id != SOURCE_SCHEMA_ID ||
         identity.source_schema_version != SOURCE_SCHEMA_VERSION ||
-        !fixed_profile ||
+        !profile_is_module_segment ||
+        identity.source_revision.is_empty() ||
         identity.evaluator_version != EVALUATOR_VERSION ||
         identity.rust_projection_version != RUST_PROJECTION_VERSION ||
         identity.lean_abi_version != LEAN_ABI_VERSION ||

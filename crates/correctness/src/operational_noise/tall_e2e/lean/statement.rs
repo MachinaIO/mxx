@@ -265,6 +265,15 @@ fn render_top(document: &CertificateDocumentV1) -> Result<String, String> {
             .expect("writing to String cannot fail");
     }
     let residual = residual_root(&document.residual_root);
+    let CertificateResidualRootV1::Family { domain, .. } = document.residual_root else {
+        return Err("Tall reached statement rendering requires a family residual root".to_owned());
+    };
+    writeln!(source, "def selectorMinimum : Nat := {}", domain.minimum)
+        .expect("writing to String cannot fail");
+    writeln!(source, "def selectorMaximum : Nat := {}", domain.maximum_exclusive)
+        .expect("writing to String cannot fail");
+    writeln!(source, "def ringDimension : Nat := {}\n", document.ring_dimension)
+        .expect("writing to String cannot fail");
     writeln!(
         source,
         "def document : TallDocument :=\n  {{ schemaId := {}\n    schemaVersion := {}\n    plaintextModulus := {}\n    ciphertextModulus := {}\n    ringDimension := {}\n    expressions := ExpressionRows\n    programs := ProgramRows\n    sources := SourceRows\n    events := EventRows\n    indexUses := IndexUseRows\n    sliceGroups := SliceGroupRows\n    residualRoot := {residual} }}\n\nend {NAMESPACE}",

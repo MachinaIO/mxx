@@ -3,11 +3,32 @@ use super::super::super::simulation::{
     ProofPayloadEvent, ProofPayloadOwner, ProofPayloadRelationRule, ProofPayloadRule,
     ProofPayloadScale, ProofPayloadValue, ProofPayloadValueRef,
 };
+use crate::operational_noise::{
+    certificate_schema::{CertificateDocumentV1, CertificateRange, CertificateResidualRootV1},
+    g0::{
+        BoundProjection, CanonicalExpressionDescriptor, CanonicalExpressionOperator,
+        StableMatrixOperation, StableOperator,
+    },
+    simulation::ProofPayloadScope,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-const SECURITY0_PROGRAM: u64 = 214;
-const SECURITY0_ROOT_EXPRESSION: u64 = 30_220;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReachedSemanticSlice {
+    pub root_owner: ProofPayloadOwner,
+    pub selector_domain: CertificateRange,
+    pub ring_dimension: u64,
+    pub left_result: u64,
+    pub right_result: u64,
+    pub left_binding: u64,
+    pub right_binding: u64,
+    pub transfer: u64,
+    pub first_merge: u64,
+    pub result: u64,
+    pub prefold: u64,
+    pub end: u64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "event", content = "detail")]
@@ -690,21 +711,206 @@ fn collect(proof: &OperationalProofPayload) -> Result<DependencyClosure, String>
     })
 }
 
-pub(crate) fn collect_security0_final_closure(
+fn exact_event(proof: &OperationalProofPayload, event: u64) -> Result<&ProofPayloadEvent, String> {
+    proof.events.get(event_index(event)?).ok_or_else(|| format!("event {event} is missing"))
+}
+
+pub(crate) fn resolve_reached_semantic_slice(
+    statement: &CertificateDocumentV1,
     proof: &OperationalProofPayload,
+) -> Result<ReachedSemanticSlice, String> {
+    let CertificateResidualRootV1::Family { program, domain } = statement.residual_root else {
+        return Err("Tall reached semantics requires a family residual root".to_owned());
+    };
+    let program_row = statement
+        .programs
+        .get(usize::try_from(program).map_err(|_| "residual program index overflow")?)
+        .ok_or_else(|| format!("residual program {program} is missing"))?;
+    let family = program_row
+        .family
+        .as_ref()
+        .ok_or_else(|| format!("residual program {program} is not a family"))?;
+    if family.domain != domain {
+        return Err(format!(
+            "residual program {program} family domain disagrees with residual root"
+        ));
+    }
+    if family.element_type != program_row.output {
+        return Err(format!(
+            "residual program {program} family element type disagrees with program output"
+        ));
+    }
+    let root_expression = statement
+        .expressions
+        .get(usize::try_from(program_row.root).map_err(|_| "root expression index overflow")?)
+        .ok_or_else(|| format!("residual root expression {} is missing", program_row.root))?;
+    if !matches!(
+        &root_expression.descriptor,
+        CanonicalExpressionDescriptor::Operation {
+            operator: CanonicalExpressionOperator::Stable(StableOperator::Matrix {
+                operation: StableMatrixOperation::Subtract,
+            }),
+            value_type,
+        } if value_type == &program_row.output
+    ) {
+        return Err(
+            "residual root expression is not the reached matrix subtraction with program output type"
+                .to_owned(),
+        );
+    }
+    let root_owner = ProofPayloadOwner {
+        scope: ProofPayloadScope::Program { program_row: program },
+        expression_row: program_row.root,
+    };
+    let index = Index::new(&proof.events)?;
+    let ends = proof
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| match event {
+            ProofPayloadEvent::InvocationEnd { root, .. }
+                if *root == root_owner &&
+                    index.frames[position].is_some_and(|frame| frame.parent.is_none()) =>
+            {
+                event_id(position).ok()
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [end] = ends.as_slice() else {
+        return Err(format!(
+            "residual root has {} outer InvocationEnd rows instead of one",
+            ends.len()
+        ));
+    };
+    let ProofPayloadEvent::InvocationEnd { result: end_value, pre_fold_event: prefold, .. } =
+        exact_event(proof, *end)?
+    else {
+        unreachable!("selected invocation end")
+    };
+    let ProofPayloadEvent::PreFoldPolynomial(prefold_value) = exact_event(proof, *prefold)? else {
+        return Err(format!("InvocationEnd {end} references non-PreFold event {prefold}"));
+    };
+    let result = prefold_value.result_event;
+    let ProofPayloadEvent::Result { owner, value: result_value } = exact_event(proof, result)?
+    else {
+        return Err(format!("PreFold {prefold} references non-Result event {result}"));
+    };
+    if *owner != root_owner {
+        return Err(format!("final Result {result} owner does not match residual root"));
+    }
+    let ProofPayloadValue::Exact {
+        terms,
+        coefficient_producer: transfer,
+        summary,
+        summary_producer,
+        ..
+    } = result_value
+    else {
+        return Err(format!("final Result {result} is not exact"));
+    };
+    if !terms.is_empty() || summary_producer.is_some() {
+        return Err(format!("final Result {result} has unexpected terms or summary producer"));
+    }
+    if prefold_value.terms != *terms ||
+        prefold_value.summary != *summary ||
+        prefold_value.summary_evidence !=
+            Some(ProofPayloadValueRef::Result {
+                event: result,
+                projection: BoundProjection::Summary,
+            })
+    {
+        return Err(format!("PreFold {prefold} does not exactly bind final Result {result}"));
+    }
+    if end_value != result_value {
+        return Err(format!("InvocationEnd {end} metadata differs from final Result {result}"));
+    }
+    let ProofPayloadEvent::BoundTransfer {
+        owner: transfer_owner,
+        rule: ProofPayloadRule::Sum { inputs },
+    } = exact_event(proof, *transfer)?
+    else {
+        return Err(format!("final coefficient producer {transfer} is not a Sum transfer"));
+    };
+    if *transfer_owner != root_owner || inputs.len() != 2 {
+        return Err(format!("final Sum transfer {transfer} has unexpected owner or arity"));
+    }
+    let mut resolved = Vec::with_capacity(2);
+    for (expected_position, input) in inputs.iter().enumerate() {
+        let ProofPayloadValueRef::Predecessor { binding_event, input_position, projection } = input
+        else {
+            return Err(format!(
+                "final Sum transfer {transfer} input {expected_position} is not a predecessor"
+            ));
+        };
+        if *input_position != expected_position as u32 ||
+            *projection != BoundProjection::Coefficient
+        {
+            return Err(format!(
+                "final Sum transfer {transfer} input {expected_position} has unexpected position/projection"
+            ));
+        }
+        let ProofPayloadEvent::Predecessor {
+            consumer,
+            input_position: row_position,
+            source_result,
+            ..
+        } = exact_event(proof, *binding_event)?
+        else {
+            return Err(format!("final binding {binding_event} is not a Predecessor row"));
+        };
+        if *consumer != root_owner || row_position != input_position {
+            return Err(format!("final binding {binding_event} owner/position mismatch"));
+        }
+        let ProofPayloadEvent::Result {
+            owner: source_owner,
+            value: ProofPayloadValue::Exact { .. },
+        } = exact_event(proof, *source_result)?
+        else {
+            return Err(format!(
+                "final binding {binding_event} source {source_result} is not an exact Result"
+            ));
+        };
+        if source_owner.scope != root_owner.scope {
+            return Err(format!("final binding {binding_event} source is outside residual scope"));
+        }
+        resolved.push((*binding_event, *source_result));
+    }
+    let first_merge = transfer.checked_add(1).ok_or("final transfer event overflow")?;
+    if first_merge >= result {
+        return Err("final result has no coefficient-merge interval".to_owned());
+    }
+    for event in first_merge..result {
+        if !matches!(exact_event(proof, event)?, ProofPayloadEvent::CoefficientMerge(merge) if merge.owner == root_owner)
+        {
+            return Err(format!(
+                "final merge interval event {event} is not a same-owner CoefficientMerge"
+            ));
+        }
+    }
+    Ok(ReachedSemanticSlice {
+        root_owner,
+        selector_domain: domain,
+        ring_dimension: statement.ring_dimension,
+        left_result: resolved[0].1,
+        right_result: resolved[1].1,
+        left_binding: resolved[0].0,
+        right_binding: resolved[1].0,
+        transfer: *transfer,
+        first_merge,
+        result,
+        prefold: *prefold,
+        end: *end,
+    })
+}
+
+pub(crate) fn collect_reached_final_closure(
+    proof: &OperationalProofPayload,
+    slice: &ReachedSemanticSlice,
 ) -> Result<DependencyClosure, String> {
     let closure = collect(proof)?;
-    let expected = ProofPayloadOwner {
-        scope: super::super::super::simulation::ProofPayloadScope::Program {
-            program_row: SECURITY0_PROGRAM,
-        },
-        expression_row: SECURITY0_ROOT_EXPRESSION,
-    };
-    if closure.final_root != expected {
-        return Err(format!(
-            "Security0 final root {:?} does not match fixed root {:?}",
-            closure.final_root, expected
-        ));
+    if closure.final_end_event != slice.end || closure.final_root != slice.root_owner {
+        return Err("final dependency closure disagrees with reached semantic slice".to_owned());
     }
     Ok(closure)
 }

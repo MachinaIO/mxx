@@ -5,7 +5,7 @@
   "sourceRevision": "tall-nested-rns-security0-v1",
   "evaluatorVersion": "tall-runtime-only-v1",
   "rustProjectionVersion": "operational-noise-certificate-v1",
-  "leanAbiVersion": "security0-replay-v1",
+  "leanAbiVersion": "tall-replay-v1",
   "requestTargetId": "tall-threshold-decode",
   "parameters": {
     "multiplicationCount": 1,

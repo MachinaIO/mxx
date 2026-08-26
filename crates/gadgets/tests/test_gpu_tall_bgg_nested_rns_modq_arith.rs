@@ -117,7 +117,7 @@ const TALL_CERTIFICATE_SOURCE_REVISION: &str = "tall-nested-rns-security0-v1";
 const TALL_SECURITY128_CERTIFICATE_SOURCE_REVISION: &str = "tall-nested-rns-security128-v1";
 const TALL_CERTIFICATE_EVALUATOR_VERSION: &str = "tall-runtime-only-v1";
 const TALL_CERTIFICATE_RUST_PROJECTION_VERSION: &str = "operational-noise-certificate-v1";
-const TALL_CERTIFICATE_LEAN_ABI_VERSION: &str = "security0-replay-v1";
+const TALL_CERTIFICATE_LEAN_ABI_VERSION: &str = "tall-replay-v1";
 
 fn log_graph_phase(phase: &'static str, state: &'static str, started: Option<&Instant>) {
     let (vm_rss_kib, vm_hwm_kib) = process_memory_kib();

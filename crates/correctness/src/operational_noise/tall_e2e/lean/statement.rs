@@ -7,20 +7,25 @@ use crate::operational_noise::{
     },
     g0::{
         CanonicalEventOperator, CanonicalExpressionDescriptor, CanonicalExpressionOperator,
-        CanonicalExpressionSource, CanonicalStatementScope, IndexLutRow, IndexUseKind,
+        CanonicalExpressionSource, CanonicalStatementScope, IndexLutRow, IndexUseKind, SliceLutRow,
         SliceMemberRole, StableArtifact, StableConstant, StableConstantValue,
         StableFamilySourceIdentity, StableFrontierAxis, StableHashDefinition, StableHashVariant,
         StableLayout, StableMatrixConstantKind, StableMatrixOperation, StableObservedOccurrence,
-        StableObservedProducer, StableObservedSourceAccess, StableObservedWire, StablePlanRef,
-        StableSampleDescriptor, StableSamplerOperation, StableScalarOperation, StableScope,
-        StableTransformOperation, StableTrapdoorOperation, StableValueType,
+        StableObservedProducer, StableObservedSourceAccess, StableObservedWire, StableOperator,
+        StablePlanRef, StableSampleDescriptor, StableSamplerOperation, StableScalarOperation,
+        StableScope, StableTransformOperation, StableTrapdoorOperation, StableValueType,
     },
 };
-use std::fmt::Write as _;
+use num_bigint::BigInt;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+};
 
 const PACKAGE_SIZE: usize = 256;
 const EXPRESSION_INPUT_LEAF_SIZE: usize = 16;
-const INDEX_LUT_ROW_LEAF_SIZE: usize = 16;
+const SLICE_LUT_ROW_LEAF_SIZE: usize = 256;
+const SLICE_LUT_ROW_FANOUT: usize = 16;
 
 pub(super) fn render(
     document: &CertificateDocumentV1,
@@ -30,14 +35,8 @@ pub(super) fn render(
     render_packages("Program", "ProgramRow", &document.programs, program_row, &mut files)?;
     render_packages("Source", "SourceRow", &document.sources, source_row, &mut files)?;
     render_packages("Event", "EventRow", &document.events, event_row, &mut files)?;
-    render_index_use_packages(&document.index_uses, &mut files)?;
-    render_packages(
-        "SliceGroup",
-        "SliceGroupRow",
-        &document.slice_groups,
-        slice_group_row,
-        &mut files,
-    )?;
+    render_index_use_packages(document, &mut files)?;
+    render_slice_group_packages(&document.slice_groups, &mut files)?;
     files.push(generated_file("Cert/Cert.lean", render_top(document)?));
     Ok(files)
 }
@@ -117,20 +116,23 @@ fn array_refs(values: &[u64]) -> String {
 }
 
 fn render_index_use_packages(
-    rows: &[CertificateIndexUse],
+    document: &CertificateDocumentV1,
     files: &mut Vec<super::TallSecurity0GeneratedFile>,
 ) -> Result<(), String> {
+    let rows = &document.index_uses;
     for (package, chunk) in rows.chunks(PACKAGE_SIZE).enumerate() {
         let module = format!("IndexUse{package:03}");
         let mut source = header("Mxx.Certificate.OperationalNoise.TallSecurity0ABI", &module);
         let start = package * PACKAGE_SIZE;
         for (offset, row) in chunk.iter().enumerate() {
             let row_id = start + offset;
-            render_index_lut_rows(row_id, &row.rows, &mut source)?;
+            let row_value = project_index_lut_rows(document, row).map_err(|error| {
+                format!("index use row {row_id} has unsupported typed index expression: {error}")
+            })?;
             writeln!(
                 source,
                 "def IndexUseRow{row_id} : TallSecurity0ABI.IndexUseRow :=\n  {}\n",
-                index_use_row(row, row_id)?
+                index_use_row(row, &row_value)?
             )
             .expect("writing to String cannot fail");
         }
@@ -140,55 +142,453 @@ fn render_index_use_packages(
     Ok(())
 }
 
-fn render_index_lut_rows(row: usize, rows: &[IndexLutRow], out: &mut String) -> Result<(), String> {
-    let leaf_count = rows.len().div_ceil(INDEX_LUT_ROW_LEAF_SIZE);
-    if leaf_count == 0 {
-        writeln!(out, "def IndexLutRows{row} : IndexLutRows := ⟨.empty, 0⟩\n")
-            .expect("writing to String cannot fail");
-        return Ok(());
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProjectedIndexExpression {
+    Binding { expression: u64, position: usize },
+    Constant { expression: u64, value: BigInt },
+    Add { expression: u64, left: Box<Self>, right: Box<Self> },
+    Subtract { expression: u64, left: Box<Self>, right: Box<Self> },
+    Multiply { expression: u64, left: Box<Self>, right: Box<Self> },
+    Divide { expression: u64, left: Box<Self>, right: Box<Self> },
+    Remainder { expression: u64, left: Box<Self>, right: Box<Self> },
+    Negate { expression: u64, value: Box<Self> },
+}
+
+impl ProjectedIndexExpression {
+    fn evaluate(&self, bindings: &[BigInt]) -> Result<BigInt, String> {
+        let pair = |left: &Self, right: &Self| {
+            Ok::<_, String>((left.evaluate(bindings)?, right.evaluate(bindings)?))
+        };
+        match self {
+            Self::Binding { position, .. } => bindings
+                .get(*position)
+                .cloned()
+                .ok_or_else(|| "typed index binding position is missing".to_owned()),
+            Self::Constant { value, .. } => Ok(value.clone()),
+            Self::Add { left, right, .. } => {
+                let (left, right) = pair(left, right)?;
+                Ok(left + right)
+            }
+            Self::Subtract { left, right, .. } => {
+                let (left, right) = pair(left, right)?;
+                Ok(left - right)
+            }
+            Self::Multiply { left, right, .. } => {
+                let (left, right) = pair(left, right)?;
+                Ok(left * right)
+            }
+            Self::Divide { left, right, .. } => {
+                let (left, right) = pair(left, right)?;
+                mxx_ir_core::expr::euclidean_div_rem(&left, &right)
+                    .map(|pair| pair.0)
+                    .map_err(|_| "typed index division has a zero divisor".to_owned())
+            }
+            Self::Remainder { left, right, .. } => {
+                let (left, right) = pair(left, right)?;
+                mxx_ir_core::expr::euclidean_div_rem(&left, &right)
+                    .map(|pair| pair.1)
+                    .map_err(|_| "typed index remainder has a zero divisor".to_owned())
+            }
+            Self::Negate { value, .. } => Ok(-value.evaluate(bindings)?),
+        }
     }
 
-    if leaf_count == 1 {
-        writeln!(
-            out,
-            "def IndexLutRows{row} : IndexLutRows :=\n  ⟨(.node 0 {} .empty .empty), {}⟩\n",
-            array_index_lut_rows(rows)?,
-            rows.len()
-        )
-        .expect("writing to String cannot fail");
-        return Ok(());
+    fn render(&self) -> String {
+        let binary = |constructor: &str, expression: u64, left: &Self, right: &Self| {
+            format!(".{constructor} ⟨{expression}⟩ ({}) ({})", left.render(), right.render())
+        };
+        match self {
+            Self::Binding { expression, .. } => format!(".binding ⟨{expression}⟩"),
+            Self::Constant { expression, value } => {
+                format!(".constant ⟨{expression}⟩ ({value})")
+            }
+            Self::Add { expression, left, right } => binary("add", *expression, left, right),
+            Self::Subtract { expression, left, right } => {
+                binary("subtract", *expression, left, right)
+            }
+            Self::Multiply { expression, left, right } => {
+                binary("multiply", *expression, left, right)
+            }
+            Self::Divide { expression, left, right } => binary("divide", *expression, left, right),
+            Self::Remainder { expression, left, right } => {
+                binary("remainder", *expression, left, right)
+            }
+            Self::Negate { expression, value } => {
+                format!(".negate ⟨{expression}⟩ ({})", value.render())
+            }
+        }
     }
+}
 
-    for (leaf, values) in rows.chunks(INDEX_LUT_ROW_LEAF_SIZE).enumerate() {
-        writeln!(
-            out,
-            "def IndexLutRowLeaf{row}_{leaf} : Array SchemaV1.IndexLutRow := {}",
-            array_index_lut_rows(values)?
-        )
-        .expect("writing to String cannot fail");
+fn project_index_lut_rows(
+    document: &CertificateDocumentV1,
+    use_row: &CertificateIndexUse,
+) -> Result<String, String> {
+    let mut bindings = BTreeMap::new();
+    for (position, axis) in use_row.frontier.iter().enumerate() {
+        let expression = validate_index_frontier_axis(document, axis)?;
+        if bindings.insert(expression, position).is_some() {
+            return Err(format!("frontier expression {expression} is duplicated"));
+        }
     }
-    let leaves = balanced_index_lut_row_leaves(row, 0, leaf_count);
-    writeln!(out, "def IndexLutRows{row} : IndexLutRows :=\n  ⟨{leaves}, {}⟩\n", rows.len())
-        .expect("writing to String cannot fail");
+    let StablePlanRef::Expression { row: root } = use_row.index else {
+        return Err("typed index root is not an expression reference".to_owned());
+    };
+    let expression = project_index_expression(document, root, &bindings, &mut BTreeSet::new())?;
+    validate_projected_index_rows(&expression, &use_row.frontier, &use_row.rows)?;
+    Ok(format!("⟨{}⟩", expression.render()))
+}
+
+fn validate_index_frontier_axis(
+    document: &CertificateDocumentV1,
+    axis: &StableFrontierAxis,
+) -> Result<u64, String> {
+    let reference = match axis {
+        StableFrontierAxis::Argument { expression, .. } |
+        StableFrontierAxis::ExtractedCoefficient { expression, .. } => expression,
+    };
+    let StablePlanRef::Expression { row } = reference else {
+        return Err("frontier binding is not an expression reference".to_owned());
+    };
+    let node = document
+        .expressions
+        .get(usize::try_from(*row).map_err(|_| "frontier expression overflows usize")?)
+        .ok_or_else(|| format!("frontier expression {row} is missing"))?;
+    let CanonicalExpressionDescriptor::Operation { operator, value_type } = &node.descriptor else {
+        return Err(format!("frontier expression {row} is not an operation"));
+    };
+    if value_type != &StableValueType::Int {
+        return Err(format!("frontier expression {row} is not integer typed"));
+    }
+    match (axis, operator) {
+        (
+            StableFrontierAxis::Argument { position: expected, .. },
+            CanonicalExpressionOperator::Stable(StableOperator::Argument {
+                position,
+                value_type: StableValueType::Int,
+            }),
+        ) if position == expected => {}
+        (
+            StableFrontierAxis::ExtractedCoefficient { domain, .. },
+            CanonicalExpressionOperator::Stable(StableOperator::ExtractCoefficient {
+                canonical_input_exclusive_upper: Some(upper),
+                ..
+            }),
+        ) if domain.0 == 0 && *upper == domain.1.to_string() => {}
+        _ => return Err(format!("frontier expression {row} descriptor does not match its axis")),
+    }
+    Ok(*row)
+}
+
+fn project_index_expression(
+    document: &CertificateDocumentV1,
+    expression: u64,
+    bindings: &BTreeMap<u64, usize>,
+    visiting: &mut BTreeSet<u64>,
+) -> Result<ProjectedIndexExpression, String> {
+    if let Some(position) = bindings.get(&expression) {
+        return Ok(ProjectedIndexExpression::Binding { expression, position: *position });
+    }
+    if !visiting.insert(expression) {
+        return Err(format!("typed index expression cycle at {expression}"));
+    }
+    let result = (|| {
+        let node = document
+            .expressions
+            .get(usize::try_from(expression).map_err(|_| "index expression overflows usize")?)
+            .ok_or_else(|| format!("typed index expression {expression} is missing"))?;
+        if let CanonicalExpressionDescriptor::Source {
+            source: CanonicalExpressionSource::Direct { source },
+        } = &node.descriptor
+        {
+            if !node.inputs.is_empty() {
+                return Err(format!("typed index constant source {expression} has inputs"));
+            }
+            let source = document
+                .sources
+                .get(usize::try_from(*source).map_err(|_| "constant source overflows usize")?)
+                .ok_or_else(|| format!("typed index constant source {source} is missing"))?;
+            let CertificateSourceRowV1::Constant { value } = source else {
+                return Err(format!("typed index source expression {expression} is not constant"));
+            };
+            if value.value_type != StableValueType::Int {
+                return Err(format!(
+                    "typed index constant source {expression} is not integer typed"
+                ));
+            }
+            let StableConstantValue::Int { value } = &value.value else {
+                return Err(format!("typed index constant source {expression} is not an integer"));
+            };
+            let parsed = value
+                .parse::<BigInt>()
+                .map_err(|_| format!("typed index constant source {expression} is not decimal"))?;
+            if parsed.to_string() != *value {
+                return Err(format!("typed index constant source {expression} is not canonical"));
+            }
+            return Ok(ProjectedIndexExpression::Constant { expression, value: parsed });
+        }
+        let CanonicalExpressionDescriptor::Operation { operator, value_type } = &node.descriptor
+        else {
+            return Err(format!("typed index expression {expression} is not an operation"));
+        };
+        if value_type != &StableValueType::Int {
+            return Err(format!("typed index expression {expression} is not integer typed"));
+        }
+        let project_input = |position: usize, visiting: &mut BTreeSet<u64>| {
+            let input = node.inputs.get(position).copied().ok_or_else(|| {
+                format!("typed index expression {expression} is missing input {position}")
+            })?;
+            project_index_expression(document, input, bindings, visiting)
+        };
+        match operator {
+            CanonicalExpressionOperator::Stable(StableOperator::Constant { value }) => {
+                if !node.inputs.is_empty() || value.value_type != StableValueType::Int {
+                    return Err(format!(
+                        "typed index constant {expression} has invalid type or arity"
+                    ));
+                }
+                let StableConstantValue::Int { value } = &value.value else {
+                    return Err(format!("typed index constant {expression} is not an integer"));
+                };
+                let parsed = value
+                    .parse::<BigInt>()
+                    .map_err(|_| format!("typed index constant {expression} is not decimal"))?;
+                if parsed.to_string() != *value {
+                    return Err(format!("typed index constant {expression} is not canonical"));
+                }
+                Ok(ProjectedIndexExpression::Constant { expression, value: parsed })
+            }
+            CanonicalExpressionOperator::Stable(StableOperator::Scalar { operation }) => {
+                let binary = |constructor: fn(
+                    u64,
+                    Box<ProjectedIndexExpression>,
+                    Box<ProjectedIndexExpression>,
+                ) -> ProjectedIndexExpression,
+                              visiting: &mut BTreeSet<u64>| {
+                    if node.inputs.len() != 2 {
+                        return Err(format!(
+                            "typed index expression {expression} has invalid binary arity"
+                        ));
+                    }
+                    Ok(constructor(
+                        expression,
+                        Box::new(project_input(0, visiting)?),
+                        Box::new(project_input(1, visiting)?),
+                    ))
+                };
+                match operation {
+                    StableScalarOperation::Add => binary(
+                        |expression, left, right| ProjectedIndexExpression::Add {
+                            expression,
+                            left,
+                            right,
+                        },
+                        visiting,
+                    ),
+                    StableScalarOperation::Subtract => binary(
+                        |expression, left, right| ProjectedIndexExpression::Subtract {
+                            expression,
+                            left,
+                            right,
+                        },
+                        visiting,
+                    ),
+                    StableScalarOperation::Multiply => binary(
+                        |expression, left, right| ProjectedIndexExpression::Multiply {
+                            expression,
+                            left,
+                            right,
+                        },
+                        visiting,
+                    ),
+                    StableScalarOperation::Divide => binary(
+                        |expression, left, right| ProjectedIndexExpression::Divide {
+                            expression,
+                            left,
+                            right,
+                        },
+                        visiting,
+                    ),
+                    StableScalarOperation::Remainder => binary(
+                        |expression, left, right| ProjectedIndexExpression::Remainder {
+                            expression,
+                            left,
+                            right,
+                        },
+                        visiting,
+                    ),
+                    StableScalarOperation::Negate => {
+                        if node.inputs.len() != 1 {
+                            return Err(format!(
+                                "typed index expression {expression} has invalid unary arity"
+                            ));
+                        }
+                        Ok(ProjectedIndexExpression::Negate {
+                            expression,
+                            value: Box::new(project_input(0, visiting)?),
+                        })
+                    }
+                    _ => Err(format!(
+                        "typed index expression {expression} uses unsupported scalar operation {operation:?}"
+                    )),
+                }
+            }
+            CanonicalExpressionOperator::Stable(
+                StableOperator::Argument { .. } | StableOperator::ExtractCoefficient { .. },
+            ) => Err(format!("typed index expression {expression} has no frontier binding")),
+            _ => Err(format!("typed index expression {expression} has an unsupported descriptor")),
+        }
+    })();
+    visiting.remove(&expression);
+    result
+}
+
+fn validate_projected_index_rows(
+    expression: &ProjectedIndexExpression,
+    frontier: &[StableFrontierAxis],
+    rows: &[IndexLutRow],
+) -> Result<(), String> {
+    let widths = frontier
+        .iter()
+        .map(|axis| {
+            let (minimum, maximum) = match axis {
+                StableFrontierAxis::Argument { domain, .. } |
+                StableFrontierAxis::ExtractedCoefficient { domain, .. } => *domain,
+            };
+            maximum
+                .checked_sub(minimum)
+                .and_then(|width| usize::try_from(width).ok())
+                .ok_or_else(|| "frontier domain is invalid or too wide".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let row_count = widths.iter().try_fold(1_usize, |count, width| {
+        count.checked_mul(*width).ok_or_else(|| "frontier product overflows usize".to_owned())
+    })?;
+    if rows.len() != row_count {
+        return Err(format!("raw LUT has {} rows but frontier requires {row_count}", rows.len()));
+    }
+    for (row_position, row) in rows.iter().enumerate() {
+        let mut remainder = row_position;
+        let mut tuple = Vec::with_capacity(frontier.len());
+        for (axis_position, axis) in frontier.iter().enumerate() {
+            let tail = widths[axis_position + 1..]
+                .iter()
+                .try_fold(1_usize, |count, width| count.checked_mul(*width))
+                .ok_or_else(|| "frontier suffix product overflows usize".to_owned())?;
+            let digit = if tail == 0 { 0 } else { remainder / tail };
+            if tail != 0 {
+                remainder %= tail;
+            }
+            let minimum = match axis {
+                StableFrontierAxis::Argument { domain, .. } |
+                StableFrontierAxis::ExtractedCoefficient { domain, .. } => domain.0,
+            };
+            tuple.push(BigInt::from(minimum) + BigInt::from(digit));
+        }
+        let expected_tuple = tuple.iter().map(ToString::to_string).collect::<Vec<_>>();
+        if row.tuple != expected_tuple {
+            return Err(format!("raw LUT tuple mismatch at row {row_position}"));
+        }
+        let output = expression.evaluate(&tuple)?;
+        if row.output != output.to_string() {
+            return Err(format!("raw LUT output mismatch at row {row_position}"));
+        }
+    }
     Ok(())
 }
 
-fn balanced_index_lut_row_leaves(row: usize, start: usize, end: usize) -> String {
-    if start == end {
-        return ".empty".to_owned();
+fn render_slice_group_packages(
+    rows: &[CertificateSliceGroup],
+    files: &mut Vec<super::TallSecurity0GeneratedFile>,
+) -> Result<(), String> {
+    let row_values = rows
+        .iter()
+        .enumerate()
+        .map(|(row, value)| render_slice_lut_row_packages(row, &value.rows, files))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (package, chunk) in rows.chunks(PACKAGE_SIZE).enumerate() {
+        let module = format!("SliceGroup{package:03}");
+        let start = package * PACKAGE_SIZE;
+        let mut imports = vec!["Mxx.Certificate.OperationalNoise.TallSecurity0ABI".to_owned()];
+        imports.extend(row_values[start..start + chunk.len()].iter().filter_map(|(_, root)| {
+            root.as_ref().map(|root| format!("{MODULE_ROOT}.Cert.{root}"))
+        }));
+        let mut source =
+            imports.iter().map(|import| format!("import {import}")).collect::<Vec<_>>().join("\n");
+        write!(
+            source,
+            "\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Cert.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen SchemaV1\nopen TallSecurity0ABI\n\n"
+        )
+        .expect("writing to String cannot fail");
+        for (offset, row) in chunk.iter().enumerate() {
+            let row_id = start + offset;
+            writeln!(
+                source,
+                "def SliceGroupRow{row_id} : SchemaV1.SliceGroupRow :=\n  {}\n",
+                slice_group_row(row, &row_values[row_id].0)?
+            )
+            .expect("writing to String cannot fail");
+        }
+        writeln!(source, "end {NAMESPACE}.Cert.{module}").expect("writing to String cannot fail");
+        files.push(generated_file(format!("Cert/{module}.lean"), source));
     }
-    let middle = (start + end) / 2;
-    let left = balanced_index_lut_row_leaves(row, start, middle);
-    let right = balanced_index_lut_row_leaves(row, middle + 1, end);
-    format!("(.node {middle} IndexLutRowLeaf{row}_{middle} {left} {right})")
+    Ok(())
 }
 
-fn array_index_lut_rows(rows: &[IndexLutRow]) -> Result<String, String> {
-    Ok(format!("#[{}]", rows.iter().map(index_lut_row).collect::<Result<Vec<_>, _>>()?.join(", ")))
-}
+fn render_slice_lut_row_packages(
+    row: usize,
+    rows: &[SliceLutRow],
+    files: &mut Vec<super::TallSecurity0GeneratedFile>,
+) -> Result<(String, Option<String>), String> {
+    if rows.len() <= SLICE_LUT_ROW_LEAF_SIZE {
+        return Ok((list(rows, slice_lut_row)?, None));
+    }
 
-fn index_lut_row(row: &IndexLutRow) -> Result<String, String> {
-    Ok(format!("⟨{}, {}⟩", list(&row.tuple, |item| quoted(item))?, quoted(&row.output)?))
+    let mut children = Vec::new();
+    for (leaf, values) in rows.chunks(SLICE_LUT_ROW_LEAF_SIZE).enumerate() {
+        let module = format!("SliceGroupRows{row}Leaf{leaf:04}");
+        let mut source = header("Mxx.Certificate.OperationalNoise.TallSecurity0ABI", &module);
+        writeln!(
+            source,
+            "def rows : List SchemaV1.SliceLutRow := {}\n\nend {NAMESPACE}.Cert.{module}",
+            list(values, slice_lut_row)?
+        )
+        .expect("writing to String cannot fail");
+        files.push(generated_file(format!("Cert/{module}.lean"), source));
+        children.push(module);
+    }
+
+    let mut level = 0;
+    while children.len() > 1 {
+        let mut parents = Vec::new();
+        for (node, group) in children.chunks(SLICE_LUT_ROW_FANOUT).enumerate() {
+            let module = format!("SliceGroupRows{row}Level{level}_{node:04}");
+            let mut source = group
+                .iter()
+                .map(|child| format!("import {MODULE_ROOT}.Cert.{child}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            write!(
+                source,
+                "\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Cert.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen SchemaV1\n\ndef rows : List SchemaV1.SliceLutRow :=\n  {}\n\nend {NAMESPACE}.Cert.{module}",
+                group
+                    .iter()
+                    .map(|child| format!("{NAMESPACE}.Cert.{child}.rows"))
+                    .collect::<Vec<_>>()
+                    .join(" ++\n    ")
+            )
+            .expect("writing to String cannot fail");
+            files.push(generated_file(format!("Cert/{module}.lean"), source));
+            parents.push(module);
+        }
+        children = parents;
+        level += 1;
+    }
+    let root = children
+        .into_iter()
+        .next()
+        .ok_or_else(|| "large slice LUT row collection had no leaves".to_owned())?;
+    Ok((format!("{NAMESPACE}.Cert.{root}.rows"), Some(root)))
 }
 
 fn header(import: &str, suffix: &str) -> String {
@@ -894,7 +1294,7 @@ fn frontier(value: &StableFrontierAxis) -> Result<String, String> {
     })
 }
 
-fn index_use_row(value: &CertificateIndexUse, row: usize) -> Result<String, String> {
+fn index_use_row(value: &CertificateIndexUse, rows: &str) -> Result<String, String> {
     let kind = match value.kind {
         IndexUseKind::IntegerExpression => ".integerExpression",
         IndexUseKind::FamilyGetStatic => ".familyGetStatic",
@@ -903,18 +1303,17 @@ fn index_use_row(value: &CertificateIndexUse, row: usize) -> Result<String, Stri
         IndexUseKind::IndexedSlice => ".indexedSlice",
     };
     Ok(format!(
-        "⟨{}, {}, {}, {kind}, {}, {}, {}, {}, IndexLutRows{row}, by rfl⟩",
+        "⟨{}, {}, {}, {kind}, {}, {}, {}, {rows}⟩",
         observed_wire(&value.owner)?,
         option(value.result.as_ref(), |item| Ok(plan_ref(item)))?,
         option(value.consumed.as_ref(), |item| Ok(plan_ref(item)))?,
-        plan_ref(&value.index),
         option(value.output_range.as_ref(), |item| Ok(range(item)))?,
         value_type(&value.output_type)?,
         list(&value.frontier, frontier)?,
     ))
 }
 
-fn slice_group_row(value: &CertificateSliceGroup) -> Result<String, String> {
+fn slice_group_row(value: &CertificateSliceGroup, rows: &str) -> Result<String, String> {
     Ok(format!(
         "⟨{}, {}, {}, {}, {}, {}, {}, {}, {}⟩",
         observed_wire(&value.owner)?,
@@ -933,14 +1332,18 @@ fn slice_group_row(value: &CertificateSliceGroup) -> Result<String, String> {
             };
             Ok(format!("⟨{role}, {}, {}⟩", plan_ref(&member.expression), range(&member.range)))
         })?,
-        list(&value.rows, |row| Ok(format!(
-            "⟨{}, {}, {}, {}, {}⟩",
-            list(&row.tuple, |item| quoted(item))?,
-            quoted(&row.row_start)?,
-            quoted(&row.row_end_exclusive)?,
-            quoted(&row.column_start)?,
-            quoted(&row.column_end_exclusive)?
-        )))?,
+        rows,
+    ))
+}
+
+fn slice_lut_row(row: &SliceLutRow) -> Result<String, String> {
+    Ok(format!(
+        "⟨{}, {}, {}, {}, {}⟩",
+        list(&row.tuple, |item| quoted(item))?,
+        quoted(&row.row_start)?,
+        quoted(&row.row_end_exclusive)?,
+        quoted(&row.column_start)?,
+        quoted(&row.column_end_exclusive)?
     ))
 }
 
@@ -961,6 +1364,17 @@ mod tests {
         IndexLutRow {
             tuple: tuple.iter().map(|item| (*item).to_owned()).collect(),
             output: output.to_owned(),
+        }
+    }
+
+    fn slice_row(value: usize) -> SliceLutRow {
+        let value = value.to_string();
+        SliceLutRow {
+            tuple: vec![value.clone()],
+            row_start: value.clone(),
+            row_end_exclusive: value.clone(),
+            column_start: value.clone(),
+            column_end_exclusive: value,
         }
     }
 
@@ -1007,59 +1421,88 @@ mod tests {
         assert!(!source.contains("[⟨0⟩, ⟨1⟩, ⟨2⟩, ⟨3⟩, ⟨4⟩, ⟨5⟩, ⟨6⟩, ⟨7⟩, ⟨8⟩, ⟨9⟩, ⟨10⟩, ⟨11⟩, ⟨12⟩, ⟨13⟩, ⟨14⟩, ⟨15⟩, ⟨16⟩"));
     }
 
-    #[test]
-    fn index_lut_rows_use_one_fixed_type_at_zero_and_leaf_boundaries() {
-        let mut zero = String::new();
-        render_index_lut_rows(4, &[], &mut zero).expect("zero rows");
-        assert_eq!(zero, "def IndexLutRows4 : IndexLutRows := ⟨.empty, 0⟩\n\n");
-
-        let rows = (0..16)
-            .map(|value| lut_row(&[&value.to_string()], &value.to_string()))
-            .collect::<Vec<_>>();
-        let mut one_leaf = String::new();
-        render_index_lut_rows(5, &rows, &mut one_leaf).expect("one leaf");
-        assert!(one_leaf.starts_with("def IndexLutRows5 : IndexLutRows :=\n"));
-        assert!(one_leaf.contains("(.node 0 #[⟨[\"0\"], \"0\"⟩, ⟨[\"1\"], \"1\"⟩"));
-        assert!(one_leaf.contains("⟨[\"15\"], \"15\"⟩] .empty .empty), 16⟩"));
-        assert!(!one_leaf.contains("IndexLutRowLeaf"));
+    fn argument_axis(expression: u64, position: u32, domain: (u64, u64)) -> StableFrontierAxis {
+        StableFrontierAxis::Argument {
+            owner: StableObservedOccurrence { definition: StableScope::Root, path: 0 },
+            expression: StablePlanRef::Expression { row: expression },
+            position,
+            domain,
+        }
     }
 
     #[test]
-    fn index_lut_rows_preserve_duplicates_and_order_across_leaf_boundaries() {
-        let mut rows = (0..17)
-            .map(|value| lut_row(&[&value.to_string()], &format!("output-{value}")))
-            .collect::<Vec<_>>();
-        rows[2] = rows[0].clone();
-        rows[16] = rows[0].clone();
-        let mut source = String::new();
-        render_index_lut_rows(12, &rows, &mut source).expect("two leaves");
-        assert!(source.contains(
-            "IndexLutRowLeaf12_0 : Array SchemaV1.IndexLutRow := #[⟨[\"0\"], \"output-0\"⟩, ⟨[\"1\"], \"output-1\"⟩, ⟨[\"0\"], \"output-0\"⟩"
-        ));
-        assert!(source.contains(
-            "IndexLutRowLeaf12_1 : Array SchemaV1.IndexLutRow := #[⟨[\"0\"], \"output-0\"⟩]"
-        ));
-        assert!(source.contains("def IndexLutRows12 : IndexLutRows :=\n"));
-        assert!(source.contains(", 17⟩"));
+    fn typed_index_projection_preserves_mixed_radix_order_and_exact_raw_rows() {
+        let expression = ProjectedIndexExpression::Subtract {
+            expression: 12,
+            left: Box::new(ProjectedIndexExpression::Binding { expression: 10, position: 0 }),
+            right: Box::new(ProjectedIndexExpression::Binding { expression: 11, position: 1 }),
+        };
+        let frontier = vec![argument_axis(10, 0, (3, 5)), argument_axis(11, 1, (7, 10))];
+        let raw = [("3", "7"), ("3", "8"), ("3", "9"), ("4", "7"), ("4", "8"), ("4", "9")].map(
+            |(left, right)| {
+                let output = left.parse::<i64>().unwrap() - right.parse::<i64>().unwrap();
+                lut_row(&[left, right], &output.to_string())
+            },
+        );
+        validate_projected_index_rows(&expression, &frontier, &raw)
+            .expect("last frontier axis changes fastest and nonzero domains are preserved");
+        let mut changed = raw.clone();
+        changed[1].tuple[1] = "08".to_owned();
+        assert!(validate_projected_index_rows(&expression, &frontier, &changed).is_err());
+        let mut changed = raw.clone();
+        changed[2].output = "-05".to_owned();
+        assert!(validate_projected_index_rows(&expression, &frontier, &changed).is_err());
+        let mut changed = raw.clone();
+        changed.swap(1, 2);
+        assert!(validate_projected_index_rows(&expression, &frontier, &changed).is_err());
+        assert!(validate_projected_index_rows(&expression, &frontier, &raw[..5]).is_err());
     }
 
     #[test]
-    fn actual_scale_index_lut_rows_are_balanced_without_remapping() {
-        let rows = (0..3_601)
-            .map(|value| lut_row(&[&value.to_string()], &value.to_string()))
-            .collect::<Vec<_>>();
-        let mut source = String::new();
-        render_index_lut_rows(33, &rows, &mut source).expect("actual maximum rows");
-        assert_eq!(source.matches("def IndexLutRowLeaf33_").count(), 226);
-        assert!(source.contains(
-            "IndexLutRowLeaf33_0 : Array SchemaV1.IndexLutRow := #[⟨[\"0\"], \"0\"⟩, ⟨[\"1\"], \"1\"⟩"
-        ));
-        assert!(source.contains("⟨[\"14\"], \"14\"⟩, ⟨[\"15\"], \"15\"⟩]"));
-        assert!(source.contains(
-            "IndexLutRowLeaf33_225 : Array SchemaV1.IndexLutRow := #[⟨[\"3600\"], \"3600\"⟩]"
-        ));
-        assert!(source.contains("def IndexLutRows33 : IndexLutRows :=\n"));
-        assert!(source.contains(", 3601⟩"));
-        assert!(!source.contains("⟨[\"15\"], \"15\"⟩, ⟨[\"16\"], \"16\"⟩"));
+    fn typed_index_projection_matches_euclidean_division_and_rejects_zero_divisor() {
+        let constant = |expression, value| ProjectedIndexExpression::Constant {
+            expression,
+            value: BigInt::from(value),
+        };
+        let divide = ProjectedIndexExpression::Divide {
+            expression: 2,
+            left: Box::new(constant(0, -7)),
+            right: Box::new(constant(1, -3)),
+        };
+        let remainder = ProjectedIndexExpression::Remainder {
+            expression: 3,
+            left: Box::new(constant(0, -7)),
+            right: Box::new(constant(1, -3)),
+        };
+        assert_eq!(divide.evaluate(&[]).unwrap(), BigInt::from(-3));
+        assert_eq!(remainder.evaluate(&[]).unwrap(), BigInt::from(2));
+        let zero = ProjectedIndexExpression::Divide {
+            expression: 4,
+            left: Box::new(constant(0, -7)),
+            right: Box::new(constant(1, 0)),
+        };
+        assert!(zero.evaluate(&[]).is_err());
+    }
+
+    #[test]
+    fn large_slice_lut_rows_are_deterministically_sharded_without_remapping() {
+        let rows = (0..257).map(slice_row).collect::<Vec<_>>();
+        let mut first = Vec::new();
+        let first_root = render_slice_lut_row_packages(7, &rows, &mut first).expect("first render");
+        let mut second = Vec::new();
+        let second_root =
+            render_slice_lut_row_packages(7, &rows, &mut second).expect("second render");
+
+        assert_eq!(first_root, second_root);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0].relative_path, "Cert/SliceGroupRows7Leaf0000.lean");
+        assert_eq!(first[1].relative_path, "Cert/SliceGroupRows7Leaf0001.lean");
+        assert_eq!(first[2].relative_path, "Cert/SliceGroupRows7Level0_0000.lean");
+        let first_leaf = String::from_utf8(first[0].bytes.clone()).expect("UTF-8 leaf");
+        let second_leaf = String::from_utf8(first[1].bytes.clone()).expect("UTF-8 leaf");
+        assert!(first_leaf.contains("⟨[\"255\"], \"255\", \"255\", \"255\", \"255\"⟩"));
+        assert!(second_leaf.contains("⟨[\"256\"], \"256\", \"256\", \"256\", \"256\"⟩"));
+        assert_eq!(first_root.0, format!("{NAMESPACE}.Cert.SliceGroupRows7Level0_0000.rows"));
     }
 }

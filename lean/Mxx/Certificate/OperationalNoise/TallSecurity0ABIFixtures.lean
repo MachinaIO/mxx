@@ -138,27 +138,39 @@ def balancedLeafTable {α : Type} (values : Nat → Array α) (start count : Nat
 termination_by count
 decreasing_by all_goals omega
 
-def repeatedIndexLutRow : SchemaV1.IndexLutRow := ⟨["0"], "7"⟩
+def twoAxisIndexFrontier : List SchemaV1.FrontierAxis :=
+  [.argument ⟨.root, 0⟩ (.expression ⟨10⟩) 0 (3, 5),
+    .argument ⟨.root, 0⟩ (.expression ⟨11⟩) 1 (7, 10)]
 
-def repeatedIndexLutLeaf (leaf : Nat) : Array SchemaV1.IndexLutRow :=
-  Array.replicate (if leaf = 225 then 1 else orderedLeafSize) repeatedIndexLutRow
-
-def repeatedIndexLutRows : IndexLutRows where
-  leaves := balancedLeafTable repeatedIndexLutLeaf 0 226
-  size := 3601
+def subtractIndexLutRows : IndexLutRows :=
+  ⟨.add ⟨15⟩
+    (.subtract ⟨12⟩ (.binding ⟨10⟩) (.binding ⟨11⟩))
+    (.constant ⟨14⟩ (-2))⟩
 
 theorem index_lut_rows_fixture :
-    repeatedIndexLutRows.Valid ∧
-      repeatedIndexLutRows.get? 0 = some repeatedIndexLutRow ∧
-      repeatedIndexLutRows.get? 15 = some repeatedIndexLutRow ∧
-      repeatedIndexLutRows.get? 16 = some repeatedIndexLutRow ∧
-      repeatedIndexLutRows.get? 3600 = some repeatedIndexLutRow ∧
-      repeatedIndexLutRows.get? 3601 = none := by
-  simp [OrderedLeaves.Valid, OrderedLeaves.wellFormed, OrderedLeaves.leafCount,
-    OrderedLeaves.expectedLeafSize, OrderedLeaves.get?, repeatedIndexLutRows,
-    balancedLeafTable, repeatedIndexLutLeaf, orderedLeafSize, rowTableNodeCount,
-    RowTable.wellFormed, RowTable.orderedFrom, RowTable.balanced, RowTable.height,
-    RowTable.allBool, RowTable.lookup, repeatedIndexLutRow]
+    subtractIndexLutRows.get? twoAxisIndexFrontier 0 = some ⟨["3", "7"], "-6"⟩ ∧
+      subtractIndexLutRows.get? twoAxisIndexFrontier 1 = some ⟨["3", "8"], "-7"⟩ ∧
+      subtractIndexLutRows.get? twoAxisIndexFrontier 2 = some ⟨["3", "9"], "-8"⟩ ∧
+      subtractIndexLutRows.get? twoAxisIndexFrontier 3 = some ⟨["4", "7"], "-5"⟩ ∧
+      subtractIndexLutRows.get? twoAxisIndexFrontier 5 = some ⟨["4", "9"], "-7"⟩ ∧
+      subtractIndexLutRows.get? twoAxisIndexFrontier 6 = none := by
+  decide
+
+def negativeDivisionRows : IndexLutRows :=
+  ⟨.divide ⟨20⟩ (.constant ⟨21⟩ (-7)) (.constant ⟨22⟩ (-3))⟩
+
+def negativeRemainderRows : IndexLutRows :=
+  ⟨.remainder ⟨23⟩ (.constant ⟨21⟩ (-7)) (.constant ⟨22⟩ (-3))⟩
+
+def zeroDivisionRows : IndexLutRows :=
+  ⟨.divide ⟨24⟩ (.constant ⟨21⟩ (-7)) (.constant ⟨25⟩ 0)⟩
+
+theorem typed_index_euclidean_fixture :
+    negativeDivisionRows.get? [] 0 = some ⟨[], "-3"⟩ ∧
+      negativeRemainderRows.get? [] 0 = some ⟨[], "2"⟩ ∧
+      zeroDivisionRows.get? [] 0 = none ∧
+      negativeDivisionRows.get? [] 1 = none := by
+  decide
 
 def closedOwner (expression : Nat) : Owner := ⟨.closed ⟨0⟩, ⟨expression⟩⟩
 
@@ -596,5 +608,6 @@ theorem tall_security0_abi_fixture :
 #print axioms malformed_expression_inputs_rejected
 #print axioms generic_ordered_leaves_fixture
 #print axioms index_lut_rows_fixture
+#print axioms typed_index_euclidean_fixture
 
 end Mxx.Certificate.OperationalNoise.TallSecurity0ABI

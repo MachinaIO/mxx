@@ -46,7 +46,90 @@ def OrderedLeaves.Valid {α : Type} (rows : OrderedLeaves α) : Prop :=
 
 abbrev ExpressionInputs := OrderedLeaves ExpressionRef
 
-abbrev IndexLutRows := OrderedLeaves SchemaV1.IndexLutRow
+inductive IndexExpression where
+  | binding (expression : ExpressionRef)
+  | constant (expression : ExpressionRef) (value : Int)
+  | add (expression : ExpressionRef) (left right : IndexExpression)
+  | subtract (expression : ExpressionRef) (left right : IndexExpression)
+  | multiply (expression : ExpressionRef) (left right : IndexExpression)
+  | divide (expression : ExpressionRef) (left right : IndexExpression)
+  | remainder (expression : ExpressionRef) (left right : IndexExpression)
+  | negate (expression : ExpressionRef) (value : IndexExpression)
+deriving Repr
+
+def IndexExpression.reference : IndexExpression → ExpressionRef
+  | .binding expression | .constant expression _ | .add expression _ _ |
+      .subtract expression _ _ | .multiply expression _ _ | .divide expression _ _ |
+      .remainder expression _ _ | .negate expression _ => expression
+
+def IndexExpression.lookup (bindings : List (ExpressionRef × Int))
+    (expression : ExpressionRef) : Option Int :=
+  (bindings.find? fun binding => binding.1 = expression).map Prod.snd
+
+def IndexExpression.euclideanDivRem (numerator denominator : Int) : Option (Int × Int) :=
+  if denominator = 0 then none
+  else
+    let positiveDenominator : Int := Int.ofNat denominator.natAbs
+    some (numerator / positiveDenominator, numerator % positiveDenominator)
+
+def IndexExpression.evaluate (bindings : List (ExpressionRef × Int)) :
+    IndexExpression → Option Int
+  | .binding expression => IndexExpression.lookup bindings expression
+  | .constant _ value => some value
+  | .add _ left right => return (← left.evaluate bindings) + (← right.evaluate bindings)
+  | .subtract _ left right => return (← left.evaluate bindings) - (← right.evaluate bindings)
+  | .multiply _ left right => return (← left.evaluate bindings) * (← right.evaluate bindings)
+  | .divide _ left right => do
+      let leftValue ← left.evaluate bindings
+      let rightValue ← right.evaluate bindings
+      (IndexExpression.euclideanDivRem leftValue rightValue).map Prod.fst
+  | .remainder _ left right => do
+      let leftValue ← left.evaluate bindings
+      let rightValue ← right.evaluate bindings
+      (IndexExpression.euclideanDivRem leftValue rightValue).map Prod.snd
+  | .negate _ value => return -(← value.evaluate bindings)
+
+structure IndexLutRows where
+  expression : IndexExpression
+deriving Repr
+
+def frontierAxisRange : SchemaV1.FrontierAxis → Nat × Nat
+  | .argument _ _ _ domain | .extractedCoefficient _ _ domain => domain
+
+def frontierAxisExpression : SchemaV1.FrontierAxis → Option ExpressionRef
+  | .argument _ (.expression expression) _ _ |
+      .extractedCoefficient _ (.expression expression) _ => some expression
+  | .argument _ (.family _) _ _ | .extractedCoefficient _ (.family _) _ => none
+
+def frontierSize : List SchemaV1.FrontierAxis → Nat
+  | [] => 1
+  | axis :: rest =>
+      let domain := frontierAxisRange axis
+      (domain.2 - domain.1) * frontierSize rest
+
+def frontierBindingsAt : List SchemaV1.FrontierAxis → Nat →
+    Option (List (ExpressionRef × Int))
+  | [], position => if position = 0 then some [] else none
+  | axis :: rest, position => do
+      let expression ← frontierAxisExpression axis
+      let tailSize := frontierSize rest
+      if tailSize = 0 then none
+      else
+        let domain := frontierAxisRange axis
+        let width := domain.2 - domain.1
+        let digit := position / tailSize
+        if digit < width then
+          let tail ← frontierBindingsAt rest (position % tailSize)
+          some ((expression, Int.ofNat (domain.1 + digit)) :: tail)
+        else none
+
+def IndexLutRows.get? (rows : IndexLutRows) (frontier : List SchemaV1.FrontierAxis)
+    (position : Nat) : Option SchemaV1.IndexLutRow := do
+  if position < frontierSize frontier then
+    let bindings ← frontierBindingsAt frontier position
+    let output ← rows.expression.evaluate bindings
+    some ⟨bindings.map fun binding => toString binding.2, toString output⟩
+  else none
 
 structure ExpressionRow where
   descriptor : SchemaV1.ExpressionDescriptor
@@ -59,13 +142,14 @@ structure IndexUseRow where
   result : Option SchemaV1.PlanRef
   consumed : Option SchemaV1.PlanRef
   kind : SchemaV1.IndexUseKind
-  index : SchemaV1.PlanRef
   outputRange : Option SchemaV1.Range
   outputType : SchemaV1.ValueType
   frontier : List SchemaV1.FrontierAxis
   rows : IndexLutRows
-  rowsValid : rows.Valid
 deriving Repr
+
+def IndexUseRow.index (row : IndexUseRow) : SchemaV1.PlanRef :=
+  .expression row.rows.expression.reference
 
 structure TallDocument where
   schemaId : String

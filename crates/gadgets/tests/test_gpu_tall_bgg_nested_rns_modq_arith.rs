@@ -2656,13 +2656,12 @@ fn fixed_tall_security0_emits_actual_maximum_index_lut_module() {
     fs::write(&path, &module.bytes).expect("write index-use probe module");
     let text = std::str::from_utf8(&module.bytes).expect("generated index-use UTF-8");
     assert_eq!(text.matches("def IndexUseRow").count(), 199);
-    assert!(text.contains("def IndexLutRows33 : IndexLutRows :="));
-    assert!(text.contains(", 3601⟩"));
-    assert_eq!(text.matches("def IndexLutRowLeaf33_").count(), 226);
-    assert!(text.contains(
-        "IndexLutRowLeaf33_225 : Array SchemaV1.IndexLutRow := #[⟨[\"3600\"], \"3600\"⟩]"
-    ));
     assert!(text.contains("def IndexUseRow33 : TallSecurity0ABI.IndexUseRow :="));
+    assert!(text.contains("⟨.binding ⟨"));
+    assert!(!text.contains("IndexLutRows.identity"));
+    assert!(!text.contains("IndexLutRows.multiply"));
+    assert!(!text.contains("IndexLutRows.cyclicShift"));
+    assert!(!text.contains("IndexLutRowLeaf"));
     println!("generatedIndexUseProbe={}", path.display());
 }
 

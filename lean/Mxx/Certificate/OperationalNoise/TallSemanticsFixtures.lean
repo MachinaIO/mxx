@@ -131,6 +131,10 @@ theorem bound_summary_projection_fixture :
   exact boundTransfer_to_resultExactSummary (rule := .sum []) (by rfl)
     (.sum (by rfl) .nil)
 
+theorem bound_result_summary_input_fixture :
+    BoundInputAt boundFixtureHistory boundFixtureOwner (.result 1 .summary) .exactZero 0 := by
+  exact projectedSummary_to_resultInput rfl bound_summary_projection_fixture
+
 theorem bound_product_fixture :
     BoundDerivedAt boundFixtureHistory 4 7 boundFixtureOwner
       (.product productFixtureReference productFixtureReference productFixtureFacts)
@@ -442,6 +446,7 @@ theorem canonical_relation_fixture :
 #print axioms bound_transfer_input_fixture
 #print axioms bound_identity_projection_fixture
 #print axioms bound_summary_projection_fixture
+#print axioms bound_result_summary_input_fixture
 #print axioms bound_product_fixture
 #print axioms authority_leaf_fixture
 #print axioms bound_authority_fixture

@@ -1494,6 +1494,12 @@ mutual
         (projected : ProjectedBoundAt history resultEvent resultOwner rawTerms .coefficient
           bound actualMagnitude) :
         BoundInputAt history consumer (.result resultEvent .coefficient) bound actualMagnitude
+    | resultSummary {consumer : Owner} {resultEvent : Nat} {resultOwner : Owner}
+        {rawTerms : Option (List Term)} {bound : CoeffClass} {actualMagnitude : Nat}
+        (scope : resultOwner.scope = consumer.scope)
+        (projected : ProjectedBoundAt history resultEvent resultOwner rawTerms .summary
+          bound actualMagnitude) :
+        BoundInputAt history consumer (.result resultEvent .summary) bound actualMagnitude
     | predecessor {consumer : Owner} {inputPosition bindingEvent : Nat}
         {predecessor : ExpressionRef}
         {resultEvent frameStart : Nat} {rawTerms : Option (List Term)}
@@ -1623,7 +1629,9 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
+  · intros
+    assumption
   · intros
     assumption
   · intros
@@ -1676,7 +1684,9 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
+  · intros
+    assumption
   · intros
     assumption
   · intros
@@ -1761,6 +1771,15 @@ theorem boundDerived_to_transferInput
       actualMagnitude) :
     BoundInputAt history owner (.transfer transferEvent) bound actualMagnitude :=
   .transfer derived
+
+theorem projectedSummary_to_resultInput
+    {history : EventHistory} {consumer : Owner} {resultEvent : Nat} {resultOwner : Owner}
+    {rawTerms : Option (List Term)} {bound : CoeffClass} {actualMagnitude : Nat}
+    (scope : resultOwner.scope = consumer.scope)
+    (projected : ProjectedBoundAt history resultEvent resultOwner rawTerms .summary bound
+      actualMagnitude) :
+    BoundInputAt history consumer (.result resultEvent .summary) bound actualMagnitude :=
+  .resultSummary scope projected
 
 theorem centeredNorm_eq_zero_mod {modulus : Nat} {value : Int}
     (modulusPositive : 0 < modulus) (normZero : centeredNorm modulus value = 0) :

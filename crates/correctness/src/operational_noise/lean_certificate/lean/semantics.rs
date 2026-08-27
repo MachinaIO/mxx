@@ -1,4 +1,4 @@
-use super::{NAMESPACE, closure::ReachedSemanticSlice, generated_file};
+use super::{NAMESPACE, dependency::ReachedSemanticSlice, generated_file};
 use crate::operational_noise::{
     certificate_schema::{CertificateDocumentV1, CertificateResidualRootV1},
     g0::{
@@ -1035,7 +1035,7 @@ pub(super) fn render(
     statement: &CertificateDocumentV1,
     proof: &OperationalProofPayload,
     slice: &ReachedSemanticSlice,
-) -> Result<Vec<super::super::TallSecurity0GeneratedFile>, String> {
+) -> Result<Vec<super::super::GeneratedLeanFile>, String> {
     let modulus = ciphertext_modulus_text(statement)?;
     let index = PayloadIndex::new(proof)?;
     let mut left_root = collect_left_root_render_data(proof, &index, slice.left_result)?;
@@ -1188,7 +1188,7 @@ fn reached_bound_reference_producer(
             },
         ) => Ok(*producer),
         (BoundProjection::Summary, ProofPayloadEvent::Result { .. }) => Err(format!(
-            "Security0 reached bound reference {reference:?} has no event-indexed summary producer"
+            "certificate reached bound reference {reference:?} has no event-indexed summary producer"
         )),
         (_, _) => unreachable!("reached bound reference identifies a Result"),
     }
@@ -1239,7 +1239,7 @@ fn collect_left_authority_results(
             .find(|transfer| rule_references_transfer(bound.rule, **transfer))
         {
             return Err(format!(
-                "Security0 reached bound row {} directly consumes authority transfer {transfer}",
+                "certificate reached bound row {} directly consumes authority transfer {transfer}",
                 bound.event
             ));
         }
@@ -1268,7 +1268,7 @@ fn collect_left_authority_results(
         let result_frame = index.immediate_frames[position];
         if transfer_frame != result_frame {
             return Err(format!(
-                "Security0 authority transfer {producer} and Result {} are in different frames",
+                "certificate authority transfer {producer} and Result {} are in different frames",
                 result_event
             ));
         }
@@ -1277,7 +1277,7 @@ fn collect_left_authority_results(
         };
         if *owner != result_owner {
             return Err(format!(
-                "Security0 authority transfer {producer} and Result {} have different owners",
+                "certificate authority transfer {producer} and Result {} have different owners",
                 result_event
             ));
         }
@@ -1288,11 +1288,11 @@ fn collect_left_authority_results(
         .map(|event| match results.remove(&event).as_deref() {
             Some([result]) => Ok((event, *result)),
             Some(found) => Err(format!(
-                "Security0 authority transfer {event} maps to {} supported Results instead of one",
+                "certificate authority transfer {event} maps to {} supported Results instead of one",
                 found.len()
             )),
             None => Err(format!(
-                "Security0 authority transfer {event} has no supported same-frame Result"
+                "certificate authority transfer {event} has no supported same-frame Result"
             )),
         })
         .collect()
@@ -1312,7 +1312,7 @@ fn collect_left_root_render_data<'a>(
     ) {
         return Err(format!("reached left-root Result {left_root_event} is not finite"));
     }
-    let event_ids = super::closure::collect_security0_event_closure(proof, left_root_event)?;
+    let event_ids = super::dependency::collect_event_closure(proof, left_root_event)?;
     let mut relation_events = Vec::new();
     let mut merge_rows = Vec::new();
     let mut exact_results = Vec::new();
@@ -1327,7 +1327,7 @@ fn collect_left_root_render_data<'a>(
             ProofPayloadEvent::BoundTransfer { owner, rule } => {
                 if !reached_left_bound_rule(rule) {
                     return Err(format!(
-                        "Security0 left-root closure reaches unsupported bound rule {rule:?} at event {event}"
+                        "certificate left-root closure reaches unsupported bound rule {rule:?} at event {event}"
                     ));
                 }
                 bounds.push(LeftRootBoundNode { event: *event, owner: *owner, rule });
@@ -1352,7 +1352,7 @@ fn collect_left_root_render_data<'a>(
                 .map(|result| result.event)
                 .ok_or_else(|| {
                     format!(
-                        "Security0 left coefficient merge {event} has no following same-frame Result"
+                        "certificate left coefficient merge {event} has no following same-frame Result"
                     )
                 })?;
             Ok(LeftRootMergeNode { event, result_event, merge })
@@ -1363,7 +1363,7 @@ fn collect_left_root_render_data<'a>(
             node.merge.owner != index.result(node.result_event)?.owner
         {
             return Err(format!(
-                "Security0 left coefficient merge {} is not bound to its following Result {}",
+                "certificate left coefficient merge {} is not bound to its following Result {}",
                 node.event, node.result_event
             ));
         }
@@ -1372,7 +1372,7 @@ fn collect_left_root_render_data<'a>(
                 for input in inputs {
                     if input.value_event >= node.event {
                         return Err(format!(
-                            "Security0 left operator merge {} has non-prior input Result {}",
+                            "certificate left operator merge {} has non-prior input Result {}",
                             node.event, input.value_event
                         ));
                     }
@@ -1382,7 +1382,7 @@ fn collect_left_root_render_data<'a>(
                         .is_none_or(|ordinal| ordinal >= result.terms.len())
                     {
                         return Err(format!(
-                            "Security0 left operator merge {} has out-of-range term {} for Result {}",
+                            "certificate left operator merge {} has out-of-range term {} for Result {}",
                             node.event, input.term_ordinal, input.value_event
                         ));
                     }
@@ -1391,7 +1391,7 @@ fn collect_left_root_render_data<'a>(
             ProofPayloadCoefficientMergeSource::Relation { application, .. } => {
                 if *application >= node.event || !relation_events.contains(application) {
                     return Err(format!(
-                        "Security0 left relation merge {} has unavailable application {}",
+                        "certificate left relation merge {} has unavailable application {}",
                         node.event, application
                     ));
                 }
@@ -1413,12 +1413,12 @@ fn collect_left_root_render_data<'a>(
                     let ProofPayloadEvent::BoundTransfer { rule, .. } = index.event(producer)?
                     else {
                         return Err(format!(
-                            "Security0 reached bound producer {producer} is not a BoundTransfer"
+                            "certificate reached bound producer {producer} is not a BoundTransfer"
                         ));
                     };
                     if !reached_left_bound_rule(rule) {
                         return Err(format!(
-                            "Security0 reached bound producer {producer} has unsupported rule {rule:?}"
+                            "certificate reached bound producer {producer} has unsupported rule {rule:?}"
                         ));
                     }
                     added.push(producer);
@@ -1446,7 +1446,7 @@ fn collect_left_root_render_data<'a>(
                     if *owner == bound.owner && rule == bound.rule
             )
     }) {
-        return Err(format!("Security0 left-root bound row {} is inconsistent", bound.event));
+        return Err(format!("certificate left-root bound row {} is inconsistent", bound.event));
     }
     let authority_results = collect_left_authority_results(index, &bounds)?;
     Ok(LeftRootRenderData { bounds, merges, authority_results })
@@ -1465,7 +1465,7 @@ fn collect_final_add_render_data(
     {
         if index.predecessors.get(&binding) != Some(&(owner, position, source)) {
             return Err(format!(
-                "Security0 final Add predecessor {binding} does not bind input {position} to Result {source}"
+                "certificate final Add predecessor {binding} does not bind input {position} to Result {source}"
             ));
         }
     }
@@ -1490,7 +1490,7 @@ fn collect_final_add_render_data(
         {
             ()
         }
-        _ => return Err("Security0 final Add transfer row is inconsistent".to_owned()),
+        _ => return Err("certificate final Add transfer row is inconsistent".to_owned()),
     }
     match index.event(slice.result)? {
         ProofPayloadEvent::Result {
@@ -1504,7 +1504,7 @@ fn collect_final_add_render_data(
             *coefficient_producer == slice.transfer &&
             summary == &result.summary &&
             summary_producer.is_none() => {}
-        _ => return Err("Security0 final Add Result row is inconsistent".to_owned()),
+        _ => return Err("certificate final Add Result row is inconsistent".to_owned()),
     }
     if !matches!(
         result.summary.coefficient_bound(),
@@ -1512,12 +1512,12 @@ fn collect_final_add_render_data(
             crate::operational_noise::facts::CoefficientBound::Finite(_)
         )
     ) {
-        return Err("Security0 final Add Result summary is not finite".to_owned());
+        return Err("certificate final Add Result summary is not finite".to_owned());
     }
     let merge_events = (slice.first_merge..slice.result)
         .map(|event| match index.event(event)? {
             ProofPayloadEvent::CoefficientMerge(merge) if merge.owner == owner => Ok(event),
-            _ => Err(format!("Security0 final Add merge row {event} is inconsistent")),
+            _ => Err(format!("certificate final Add merge row {event} is inconsistent")),
         })
         .collect::<Result<Vec<_>, _>>()?;
     match index.event(slice.prefold)? {
@@ -1530,7 +1530,7 @@ fn collect_final_add_render_data(
                         event: slice.result,
                         projection: crate::operational_noise::g0::BoundProjection::Summary,
                     }) => {}
-        _ => return Err("Security0 final Add PreFold row is inconsistent".to_owned()),
+        _ => return Err("certificate final Add PreFold row is inconsistent".to_owned()),
     }
     match index.event(slice.end)? {
         ProofPayloadEvent::InvocationEnd { root, result: end, pre_fold_event }
@@ -1541,7 +1541,7 @@ fn collect_final_add_render_data(
                     ProofPayloadValue::Exact { terms, summary, .. }
                         if terms == &result.terms && summary == &result.summary
                 ) => {}
-        _ => return Err("Security0 final Add InvocationEnd row is inconsistent".to_owned()),
+        _ => return Err("certificate final Add InvocationEnd row is inconsistent".to_owned()),
     }
     Ok(FinalAddRenderData {
         owner,
@@ -1560,7 +1560,7 @@ fn add_sub_merge_polynomials(
     right: &[ProofPayloadTerm],
 ) -> Result<(Vec<ProofPayloadTerm>, Vec<ProofPayloadTerm>), String> {
     if !matches!(kind, OperationKind::Add | OperationKind::Subtract) {
-        return Err("Security0 merge base requested for a non-Add/Sub operation".to_owned());
+        return Err("certificate merge base requested for a non-Add/Sub operation".to_owned());
     }
     let mut base = left
         .iter()
@@ -1640,7 +1640,7 @@ fn operator_transfer_for_group(
     match candidates.as_slice() {
         [event] => Ok(*event),
         _ => Err(format!(
-            "Security0 operator merge {first_merge_event} has {} event-local typed transfer candidates after Result boundary {previous_result}",
+            "certificate operator merge {first_merge_event} has {} event-local typed transfer candidates after Result boundary {previous_result}",
             candidates.len()
         )),
     }
@@ -1658,7 +1658,7 @@ fn operator_transfer_without_merges(
         } if *owner == result.owner => *coefficient_producer,
         _ => {
             return Err(format!(
-                "Security0 no-merge Result {} is not the expected exact row",
+                "certificate no-merge Result {} is not the expected exact row",
                 result.event
             ));
         }
@@ -1712,7 +1712,7 @@ fn operator_transfer_without_merges(
     match candidates.as_slice() {
         [candidate] => Ok(*candidate),
         _ => Err(format!(
-            "Security0 no-merge Result {} has {} event-local typed transfer candidates after Result boundary {previous_result}",
+            "certificate no-merge Result {} has {} event-local typed transfer candidates after Result boundary {previous_result}",
             result.event,
             candidates.len()
         )),
@@ -1762,7 +1762,7 @@ fn collect_left_claim_nodes<'a>(
             continue;
         }
         let result = index.by_event.get(&result_event).ok_or_else(|| {
-            format!("Security0 left claim dependency {result_event} is not an exact Result")
+            format!("certificate left claim dependency {result_event} is not an exact Result")
         })?;
         if result_event == right_root_event {
             nodes.insert(
@@ -1787,17 +1787,17 @@ fn collect_left_claim_nodes<'a>(
             )) => {
                 if owner != result.owner {
                     return Err(format!(
-                        "Security0 Result {result_event} begins with a foreign operator merge"
+                        "certificate Result {result_event} begins with a foreign operator merge"
                     ));
                 }
                 let kind = expression_kind(statement, owner)?.ok_or_else(|| {
                     format!(
-                        "Security0 Result {result_event} operator owner has no reached operation"
+                        "certificate Result {result_event} operator owner has no reached operation"
                     )
                 })?;
                 if kind == OperationKind::Direct {
                     return Err(format!(
-                        "Security0 Result {result_event} reaches unsupported {kind:?}"
+                        "certificate Result {result_event} reaches unsupported {kind:?}"
                     ));
                 }
                 let transfer_event = operator_transfer_for_group(
@@ -1824,7 +1824,7 @@ fn collect_left_claim_nodes<'a>(
             Some((_, LeftMergeGroupKey::Relation { frame, owner, application })) => {
                 let relation = relation_by_event.get(&application).ok_or_else(|| {
                     format!(
-                        "Security0 Result {result_event} begins with unknown relation {application}"
+                        "certificate Result {result_event} begins with unknown relation {application}"
                     )
                 })?;
                 let prior = index
@@ -1839,7 +1839,7 @@ fn collect_left_claim_nodes<'a>(
                     })
                     .max_by_key(|candidate| candidate.event)
                     .ok_or_else(|| format!(
-                        "Security0 relation {application} has no event-indexed accumulator Result"
+                        "certificate relation {application} has no event-indexed accumulator Result"
                     ))?;
                 pending.push(prior.event);
                 (LeftClaimStart::PriorResult { result_event: prior.event }, 0)
@@ -1929,7 +1929,7 @@ fn collect_left_claim_nodes<'a>(
                 }
                 let producer_event = result_event
                     .checked_sub(1)
-                    .ok_or_else(|| "Security0 terminal Result 0 has no producer".to_owned())?;
+                    .ok_or_else(|| "certificate terminal Result 0 has no producer".to_owned())?;
                 match index.event(producer_event)? {
                     ProofPayloadEvent::BoundTransfer { owner, rule }
                         if *owner == result.owner &&
@@ -1945,7 +1945,7 @@ fn collect_left_claim_nodes<'a>(
                     }
                     event => {
                         return Err(format!(
-                            "Security0 left Result {result_event} has no merge phases and unsupported terminal producer {event:?}"
+                            "certificate left Result {result_event} has no merge phases and unsupported terminal producer {event:?}"
                         ))
                     }
                 }
@@ -1955,12 +1955,12 @@ fn collect_left_claim_nodes<'a>(
         for (_, phase) in phases.into_iter().skip(relation_start) {
             let LeftMergeGroupKey::Relation { application, owner, .. } = phase else {
                 return Err(format!(
-                    "Security0 Result {result_event} contains a second operator merge phase"
+                    "certificate Result {result_event} contains a second operator merge phase"
                 ));
             };
             if owner != result.owner || !relation_by_event.contains_key(&application) {
                 return Err(format!(
-                    "Security0 Result {result_event} contains inconsistent relation {application}"
+                    "certificate Result {result_event} contains inconsistent relation {application}"
                 ));
             }
             relations.push(application);
@@ -2021,7 +2021,7 @@ fn collect_left_claim_nodes<'a>(
                     input_is_zero(&right)
                 );
                 let detail = format!(
-                    "Security0 merged {kind:?} operator Result {} (first merge {first_merge_event}) reaches unsupported summary transition {:?}, {:?} -> {:?}",
+                    "certificate merged {kind:?} operator Result {} (first merge {first_merge_event}) reaches unsupported summary transition {:?}, {:?} -> {:?}",
                     node.result.event, left.summary, right.summary, node.result.summary
                 );
                 let entry = unsupported_transitions.entry(category).or_insert((0, detail));
@@ -2043,7 +2043,7 @@ fn collect_left_claim_nodes<'a>(
         for dependency in left_claim_dependencies(node) {
             if dependency >= node.result.event || !result_events.contains(&dependency) {
                 return Err(format!(
-                    "Security0 left claim Result {} has non-topological dependency {dependency}",
+                    "certificate left claim Result {} has non-topological dependency {dependency}",
                     node.result.event
                 ));
             }
@@ -2058,7 +2058,7 @@ fn exact_result_producers(index: &PayloadIndex, event: u64) -> Result<(u64, Opti
             value: ProofPayloadValue::Exact { coefficient_producer, summary_producer, .. },
             ..
         } => Ok((*coefficient_producer, *summary_producer)),
-        _ => Err(format!("Security0 left claim Result {event} is not exact")),
+        _ => Err(format!("certificate left claim Result {event} is not exact")),
     }
 }
 
@@ -2070,7 +2070,7 @@ fn predecessor_ref_data(
 ) -> Result<(u64, u64, u64), String> {
     let ProofPayloadValueRef::Predecessor { binding_event, input_position, .. } = reference else {
         return Err(format!(
-            "Security0 finite operation Result dependency {expected_result} is not predecessor-bound"
+            "certificate finite operation Result dependency {expected_result} is not predecessor-bound"
         ));
     };
     let ProofPayloadEvent::Predecessor {
@@ -2081,7 +2081,7 @@ fn predecessor_ref_data(
     } = index.event(*binding_event)?
     else {
         return Err(format!(
-            "Security0 predecessor binding {binding_event} is not a Predecessor row"
+            "certificate predecessor binding {binding_event} is not a Predecessor row"
         ));
     };
     if *row_consumer != consumer ||
@@ -2089,7 +2089,7 @@ fn predecessor_ref_data(
         *source_result != expected_result
     {
         return Err(format!(
-            "Security0 predecessor binding {binding_event} does not bind Result {expected_result}"
+            "certificate predecessor binding {binding_event} does not bind Result {expected_result}"
         ));
     }
     Ok((*binding_event, u64::from(*input_position), *predecessor))
@@ -2111,7 +2111,7 @@ fn render_relation_claim_chain(
     let mut reordered_outputs = vec![Vec::new(); node.relations.len()];
     for (ordinal, application) in node.relations.iter().enumerate().rev() {
         let relation = relation_by_event.get(application).ok_or_else(|| {
-            format!("Security0 relation continuation {application} has no semantic probe")
+            format!("certificate relation continuation {application} has no semantic probe")
         })?;
         reordered_outputs[ordinal] = reordered
             .iter()
@@ -2132,7 +2132,7 @@ fn render_relation_claim_chain(
     let mut previous_working = initial_working.to_owned();
     for (ordinal, application) in node.relations.iter().enumerate() {
         let relation = relation_by_event.get(application).ok_or_else(|| {
-            format!("Security0 relation continuation {application} has no semantic probe")
+            format!("certificate relation continuation {application} has no semantic probe")
         })?;
         writeln!(source, "theorem relationApplicationAt{ordinal} (selector : Nat)\n    (selectorLower : selectorMinimum ≤ selector) (selectorUpper : selector < selectorMaximum) :\n    RelationApplicationAt document history (some selector) {application} := by\n  refine ⟨_, _, _, _, _, _, _, by rfl, rfl, ?_, by decide⟩\n  simp only [selectorMinimum] at selectorLower\n  simp only [selectorMaximum] at selectorUpper\n  simp [ownerAtSelector, document, selectorLower, selectorUpper]")
             .expect("String write");
@@ -2237,7 +2237,7 @@ fn render_left_claim_node(
         }
         LeftClaimStart::PriorResult { result_event } => {
             let first_relation = *node.relations.first().ok_or_else(|| {
-                format!("Security0 Result {event} has a prior accumulator but no relation")
+                format!("certificate Result {event} has a prior accumulator but no relation")
             })?;
             writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualLeftResult{event}.actual selector witness")
                 .expect("String write");
@@ -2262,7 +2262,7 @@ fn render_left_claim_node(
             let right = index.result(*right_result)?;
             let value_type = owner_value_type_text(statement, node.result.owner)?;
             if *kind == OperationKind::Direct {
-                return Err(format!("Security0 left Result {event} reaches Direct"));
+                return Err(format!("certificate left Result {event} reaches Direct"));
             }
             writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualLeftResult{event}.actual selector witness").expect("String write");
             let left_zero = summary_text(&left.summary) == ".exactZero";
@@ -2282,7 +2282,7 @@ fn render_left_claim_node(
                         };
                         let left_maximum = finite_maximum(&left).ok_or_else(|| {
                             format!(
-                                "Security0 finite Product Result {event} has non-finite left input"
+                                "certificate finite Product Result {event} has non-finite left input"
                             )
                         })?;
                         let (right_coefficient_transfer, right_maximum) =
@@ -2303,7 +2303,7 @@ fn render_left_claim_node(
                             } => (*coefficient_producer, bound.maximum_absolute_coefficient.clone()),
                             _ => {
                                 return Err(format!(
-                                    "Security0 finite Product Result {event} right Result does not \
+                                    "certificate finite Product Result {event} right Result does not \
                                      carry an authoritative finite coefficient bound"
                                 ));
                             }
@@ -2314,7 +2314,7 @@ fn render_left_claim_node(
                             .find(|bound| bound.event == right_coefficient_transfer)
                             .ok_or_else(|| {
                                 format!(
-                                    "Security0 finite Product Result {event} right coefficient producer \
+                                    "certificate finite Product Result {event} right coefficient producer \
                                      {right_coefficient_transfer} is outside the bound closure"
                                 )
                             })?;
@@ -2329,14 +2329,14 @@ fn render_left_claim_node(
                             )) => bound.maximum_absolute_coefficient.clone(),
                             _ => {
                                 return Err(format!(
-                                    "Security0 finite Product Result {event} right coefficient \
+                                    "certificate finite Product Result {event} right coefficient \
                                      producer does not replay to a finite bound"
                                 ));
                             }
                         };
                         if right_maximum > right_producer_maximum {
                             return Err(format!(
-                                "Security0 finite Product Result {event} recorded coefficient bound \
+                                "certificate finite Product Result {event} recorded coefficient bound \
                                  does not refine its stored producer"
                             ));
                         }
@@ -2351,7 +2351,7 @@ fn render_left_claim_node(
                         } = index.event(*transfer_event)?
                         else {
                             return Err(format!(
-                                "Security0 finite Product Result {event} has no coefficient Product row"
+                                "certificate finite Product Result {event} has no coefficient Product row"
                             ));
                         };
                         let (left_binding, left_position, left_expression) = predecessor_ref_data(
@@ -2370,7 +2370,7 @@ fn render_left_claim_node(
                         let (_, summary_producer) = exact_result_producers(index, event)?;
                         let summary_transfer = summary_producer.ok_or_else(|| {
                             format!(
-                                "Security0 finite Product Result {event} has no summary producer"
+                                "certificate finite Product Result {event} has no summary producer"
                             )
                         })?;
                         let summary_node = data
@@ -2379,7 +2379,7 @@ fn render_left_claim_node(
                             .find(|bound| bound.event == summary_transfer)
                             .ok_or_else(|| {
                                 format!(
-                                    "Security0 finite Product Result {event} summary producer \
+                                    "certificate finite Product Result {event} summary producer \
                                      {summary_transfer} is outside the bound closure"
                                 )
                             })?;
@@ -2394,12 +2394,12 @@ fn render_left_claim_node(
                         } = summary_node.rule
                         else {
                             return Err(format!(
-                                "Security0 finite Product Result {event} summary producer has unsupported rule"
+                                "certificate finite Product Result {event} summary producer has unsupported rule"
                             ));
                         };
                         if *summary_left != *left_result {
                             return Err(format!(
-                                "Security0 finite Product Result {event} summary producer references \
+                                "certificate finite Product Result {event} summary producer references \
                                  unexpected left input"
                             ));
                         }
@@ -2409,7 +2409,7 @@ fn render_left_claim_node(
                             .find(|bound| bound.event == *summary_right)
                             .ok_or_else(|| {
                                 format!(
-                                    "Security0 finite Product Result {event} right summary transfer \
+                                    "certificate finite Product Result {event} right summary transfer \
                                      {summary_right} is outside the bound closure"
                                 )
                             })?;
@@ -2421,14 +2421,14 @@ fn render_left_claim_node(
                             )) => bound.maximum_absolute_coefficient.clone(),
                             _ => {
                                 return Err(format!(
-                                    "Security0 finite Product Result {event} right summary transfer \
+                                    "certificate finite Product Result {event} right summary transfer \
                                      {summary_right} does not replay to a finite bound"
                                 ));
                             }
                         };
                         if right_maximum > right_summary_maximum {
                             return Err(format!(
-                                "Security0 finite Product Result {event} coefficient maximum exceeds \
+                                "certificate finite Product Result {event} coefficient maximum exceeds \
                                  its replayed summary-input maximum"
                             ));
                         }
@@ -2470,7 +2470,7 @@ fn render_left_claim_node(
                         let right_scalar = if scalar_flags.1 { "true" } else { "false" };
                         writeln!(
                             source,
-                            "def computedSummary : Bound :=\n  coeffClassToTallBound\n    (EventReplay.productWithFactor {factor}\n      (.finite ⟨{left_maximum}, by decide⟩)\n      (.finite ⟨{right_summary_maximum}, by decide⟩))"
+                            "def computedSummary : Bound :=\n  coeffClassToBound\n    (EventReplay.productWithFactor {factor}\n      (.finite ⟨{left_maximum}, by decide⟩)\n      (.finite ⟨{right_summary_maximum}, by decide⟩))"
                         )
                         .expect("String write");
                         writeln!(source, "theorem computedMergeClaim (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact LeftOperatorMerge{first_merge_event}.working computedSummary) := by\n  apply operatorProductFiniteMergeClaim\n    (document := document) (history := history) (modulus := {modulus})\n    (selector := some selector) (witness := witness) (frameStart := LeftOperatorMerge{first_merge_event}.frameStart)\n    (owner := owner) (leftOwner := LeftClaimResult{left_result}.owner)\n    (rightOwner := LeftClaimResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftActual := LeftClaimResult{left_result}.actual selector witness)\n    (rightActual := LeftClaimResult{right_result}.actual selector witness)\n    (leftRaw := LeftClaimResult{left_result}.rawTerms)\n    (rightRaw := LeftClaimResult{right_result}.rawTerms)\n    (working := LeftOperatorMerge{first_merge_event}.working)\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (coefficientTransfer := {transfer_event}) (summaryTransfer := {summary_transfer})\n    (rightCoefficientProducer := {right_coefficient_transfer})\n    (rightSummaryTransfer := {summary_right})\n    (leftMaximum := ⟨{left_maximum}, by decide⟩)\n    (rightProducerMaximum := ⟨{right_producer_maximum}, by decide⟩)\n    (rightRecordedMaximum := {right_maximum})\n    (rightSummaryMaximum := ⟨{right_summary_maximum}, by decide⟩)\n    (leftScalar := {left_scalar}) (rightScalar := {right_scalar}) (factor := {factor})\n    (valueType := {value_type}) (base := LeftOperatorMerge{first_merge_event}.base)\n    (coefficientFacts := {coefficient_facts}) (summaryFacts := {summary_facts})\n    (rightMagnitude := {right_producer_namespace}.actual selector witness)\n    (summaryMagnitude := LeftBound{summary_transfer}.actual selector witness)\n    (reconstruction := LeftOperatorMerge{first_merge_event}.reconstruction)\n    (rightResultAt := by rfl)\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · exact LeftClaimResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftClaimResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · exact .resultExactCoefficient (by rfl)\n      (by dsimp [{right_dependencies}, addKnownList, EventReplay.addKnown, EventReplay.productWithFactor,\n        EventReplay.scaleMagnitude, EventReplay.scaleValue, EventReplay.productNonempty,\n        RecordedBoundRefines] <;> decide)\n      ({right_producer_namespace}.derived selector witness)\n  · dsimp [RecordedBoundRefines]\n    decide\n  · decide\n  · exact LeftOperatorMerge{first_merge_event}.operationAgreement\n  · exact LeftBound{summary_transfer}.derived selector witness\n  · decide\n  · decide").expect("String write");
@@ -2486,7 +2486,7 @@ fn render_left_claim_node(
                     } else {
                         if !matches!(kind, OperationKind::Add | OperationKind::Subtract) {
                             return Err(format!(
-                                "Security0 finite {kind:?} Result {event} awaits its reached theorem ABI"
+                                "certificate finite {kind:?} Result {event} awaits its reached theorem ABI"
                             ));
                         }
                         let ProofPayloadEvent::BoundTransfer {
@@ -2495,12 +2495,12 @@ fn render_left_claim_node(
                         } = index.event(*transfer_event)?
                         else {
                             return Err(format!(
-                                "Security0 finite {kind:?} Result {event} has no Sum row"
+                                "certificate finite {kind:?} Result {event} has no Sum row"
                             ));
                         };
                         let [left_ref, right_ref] = inputs.as_slice() else {
                             return Err(format!(
-                                "Security0 finite {kind:?} Result {event} Sum is not binary"
+                                "certificate finite {kind:?} Result {event} Sum is not binary"
                             ));
                         };
                         let (left_binding, left_position, left_expression) =
@@ -2515,7 +2515,7 @@ fn render_left_claim_node(
                         let (_, summary_producer) = exact_result_producers(index, event)?;
                         let summary_transfer = summary_producer.ok_or_else(|| {
                             format!(
-                                "Security0 finite {kind:?} Result {event} has no summary producer"
+                                "certificate finite {kind:?} Result {event} has no summary producer"
                             )
                         })?;
                         let finite_maximum = |result: &ResultRecord| match result
@@ -2526,7 +2526,7 @@ fn render_left_claim_node(
                                 crate::operational_noise::facts::CoefficientBound::Finite(bound),
                             ) => Ok(bound.maximum_absolute_coefficient.clone()),
                             _ => Err(format!(
-                                "Security0 finite {kind:?} Result {event} has a non-finite input"
+                                "certificate finite {kind:?} Result {event} has a non-finite input"
                             )),
                         };
                         let left_maximum = finite_maximum(&left)?;
@@ -2559,7 +2559,7 @@ fn render_left_claim_node(
                         operation.input_events != [*left_result, *right_result]
                     {
                         return Err(format!(
-                            "Security0 exact-zero Result {event} operation probe changed its selected history rows"
+                            "certificate exact-zero Result {event} operation probe changed its selected history rows"
                         ));
                     }
                     let rule_arguments = match operation
@@ -2570,7 +2570,7 @@ fn render_left_claim_node(
                         ProofPayloadRule::Sum { inputs } => {
                             let [left, right] = inputs.as_slice() else {
                                 return Err(format!(
-                                    "Security0 exact-zero Result {event} Sum is not binary"
+                                    "certificate exact-zero Result {event} Sum is not binary"
                                 ));
                             };
                             format!(
@@ -2608,7 +2608,7 @@ fn render_left_claim_node(
                         } => {
                             if !left_is_constant_polynomial || *right_is_constant_polynomial {
                                 return Err(format!(
-                                    "Security0 exact-zero Tensor Result {event} is not the reached scalar shape"
+                                    "certificate exact-zero Tensor Result {event} is not the reached scalar shape"
                                 ));
                             }
                             format!(
@@ -2619,7 +2619,7 @@ fn render_left_claim_node(
                         }
                         _ => {
                             return Err(format!(
-                                "Security0 exact-zero Result {event} has an unsupported typed rule"
+                                "certificate exact-zero Result {event} has an unsupported typed rule"
                             ));
                         }
                     };
@@ -2627,16 +2627,20 @@ fn render_left_claim_node(
                 }
             } else {
                 if !matches!(kind, OperationKind::Add | OperationKind::Subtract) {
-                    return Err(format!("Security0 no-merge Result {event} is not reached Add/Sub"));
+                    return Err(format!(
+                        "certificate no-merge Result {event} is not reached Add/Sub"
+                    ));
                 }
                 let ProofPayloadEvent::BoundTransfer {
                     rule: ProofPayloadRule::Sum { inputs }, ..
                 } = index.event(*transfer_event)?
                 else {
-                    return Err(format!("Security0 no-merge Add Result {event} has no Sum row"));
+                    return Err(format!("certificate no-merge Add Result {event} has no Sum row"));
                 };
                 let [left_ref, right_ref] = inputs.as_slice() else {
-                    return Err(format!("Security0 no-merge Add Result {event} Sum is not binary"));
+                    return Err(format!(
+                        "certificate no-merge Add Result {event} Sum is not binary"
+                    ));
                 };
                 let (left_binding, left_position, left_expression) =
                     predecessor_ref_data(index, node.result.owner, left_ref, *left_result)?;
@@ -2660,23 +2664,23 @@ fn render_left_claim_node(
                         ) => bound.maximum_absolute_coefficient,
                         _ => {
                             return Err(format!(
-                                "Security0 survivor-fold Add Result {event} is not finite"
+                                "certificate survivor-fold Add Result {event} is not finite"
                             ));
                         }
                     };
                     if node.result.terms != left.terms {
                         return Err(format!(
-                            "Security0 survivor-fold Add Result {event} does not retain exactly its left terms"
+                            "certificate survivor-fold Add Result {event} does not retain exactly its left terms"
                         ));
                     }
                     let [right_term] = right.terms.as_slice() else {
                         return Err(format!(
-                            "Security0 survivor-fold Add Result {event} right input is not a singleton"
+                            "certificate survivor-fold Add Result {event} right input is not a singleton"
                         ));
                     };
                     if right_term.coefficient != 1.into() {
                         return Err(format!(
-                            "Security0 survivor-fold Add Result {event} right singleton coefficient is not one"
+                            "certificate survivor-fold Add Result {event} right singleton coefficient is not one"
                         ));
                     }
                     let (right_coefficient_producer, _) =
@@ -2687,7 +2691,7 @@ fn render_left_claim_node(
                         .find(|bound| bound.event == right_coefficient_producer)
                         .ok_or_else(|| {
                             format!(
-                                "Security0 survivor-fold Add Result {event} right coefficient producer \
+                                "certificate survivor-fold Add Result {event} right coefficient producer \
                                  {right_coefficient_producer} is outside the bound closure"
                             )
                         })?;
@@ -2697,14 +2701,14 @@ fn render_left_claim_node(
                         .get(&right_coefficient_producer)
                         .ok_or_else(|| {
                             format!(
-                                "Security0 survivor-fold Add Result {event} right coefficient producer \
+                                "certificate survivor-fold Add Result {event} right coefficient producer \
                                  {right_coefficient_producer} was not replayed"
                             )
                         })?;
                     let (_, summary_producer) = exact_result_producers(index, event)?;
                     let survivor_transfer = summary_producer.ok_or_else(|| {
                         format!(
-                            "Security0 survivor-fold Add Result {event} has no summary producer"
+                            "certificate survivor-fold Add Result {event} has no summary producer"
                         )
                     })?;
                     let survivor_node = data
@@ -2713,7 +2717,7 @@ fn render_left_claim_node(
                         .find(|bound| bound.event == survivor_transfer)
                         .ok_or_else(|| {
                             format!(
-                                "Security0 survivor-fold Add Result {event} summary producer \
+                                "certificate survivor-fold Add Result {event} summary producer \
                                  {survivor_transfer} is outside the bound closure"
                             )
                         })?;
@@ -2721,7 +2725,7 @@ fn render_left_claim_node(
                         survivor_node.rule
                     else {
                         return Err(format!(
-                            "Security0 survivor-fold Add Result {event} summary producer is not monomial-product"
+                            "certificate survivor-fold Add Result {event} summary producer is not monomial-product"
                         ));
                     };
                     let [
@@ -2737,18 +2741,18 @@ fn render_left_claim_node(
                     ] = factors.as_slice()
                     else {
                         return Err(format!(
-                            "Security0 survivor-fold Add Result {event} summary producer has unsupported inputs"
+                            "certificate survivor-fold Add Result {event} summary producer has unsupported inputs"
                         ));
                     };
                     if *folded_result != *right_result || *monomial != right_term.monomial {
                         return Err(format!(
-                            "Security0 survivor-fold Add Result {event} summary producer does not identify its right singleton"
+                            "certificate survivor-fold Add Result {event} summary producer does not identify its right singleton"
                         ));
                     }
                     let survivor_replayed =
                         replayed_bounds.get(&survivor_transfer).ok_or_else(|| {
                             format!(
-                                "Security0 survivor-fold Add Result {event} summary producer \
+                                "certificate survivor-fold Add Result {event} summary producer \
                              {survivor_transfer} was not replayed"
                             )
                         })?;
@@ -2761,25 +2765,27 @@ fn render_left_claim_node(
                     );
                     if right_replayed != &expected_finite || survivor_replayed != &expected_finite {
                         return Err(format!(
-                            "Security0 survivor-fold Add Result {event} does not replay to its recorded finite summary"
+                            "certificate survivor-fold Add Result {event} does not replay to its recorded finite summary"
                         ));
                     }
                     let survivor_event = event.checked_sub(1).ok_or_else(|| {
-                        format!("Security0 survivor-fold Add Result {event} has no preceding event")
+                        format!(
+                            "certificate survivor-fold Add Result {event} has no preceding event"
+                        )
                     })?;
                     let ProofPayloadEvent::SurvivorFold(fold) = index.event(survivor_event)? else {
                         return Err(format!(
-                            "Security0 survivor-fold Add Result {event} is not preceded by SurvivorFold"
+                            "certificate survivor-fold Add Result {event} is not preceded by SurvivorFold"
                         ));
                     };
                     if fold.coefficient != 1.into() || fold.bound != survivor_transfer {
                         return Err(format!(
-                            "Security0 survivor-fold Add Result {event} has inconsistent fold evidence"
+                            "certificate survivor-fold Add Result {event} has inconsistent fold evidence"
                         ));
                     }
                     let frame_start = index.immediate_frames
                         [usize::try_from(event).map_err(|_| "left Result index overflow")?]
-                    .ok_or_else(|| format!("Security0 Result {event} has no invocation frame"))?;
+                    .ok_or_else(|| format!("certificate Result {event} has no invocation frame"))?;
                     let survivor_namespace =
                         left_bound_namespace(survivor_node.event, survivor_node.rule);
                     writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply operatorAddSingletonSurvivorFoldClaimAt\n    (document := document) (history := history) (modulus := {modulus})\n    (witness := witness) (frameStart := {frame_start})\n    (valueType := {value_type})\n    (coefficientTransfer := {transfer_event}) (survivorTransfer := {survivor_transfer})\n    (survivorEvent := {survivor_event}) (resultEvent := resultEvent)\n    (rightCoefficientProducer := {right_coefficient_producer})\n    (owner := owner) (leftOwner := LeftClaimResult{left_result}.owner)\n    (rightOwner := LeftClaimResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (leftActual := LeftClaimResult{left_result}.actual selector witness)\n    (rightActual := LeftClaimResult{right_result}.actual selector witness)\n    (leftRaw := LeftClaimResult{left_result}.rawTerms)\n    (survivorMonomial := {}) (maximum := ⟨{finite_maximum}, by decide⟩)\n    (rightMagnitude := {right_producer_namespace}.actual selector witness)\n    (survivorMagnitude := {survivor_namespace}.actual selector witness)\n  · decide +kernel\n  · rfl\n  · rfl\n  · rfl\n  · exact LeftClaimResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftClaimResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · rfl\n  · exact .resultExactCoefficient (by rfl)\n      (by dsimp [{right_producer_namespace}.bound, RecordedBoundRefines] <;> decide)\n      ({right_producer_namespace}.derived selector witness)\n  · exact {survivor_namespace}.derived selector witness\n  · rfl\n  · rfl\n  · decide", monomial_text(monomial)).expect("String write");
@@ -2789,7 +2795,7 @@ fn render_left_claim_node(
                         (OperationKind::Subtract, false, false) => "operatorSubNoMergeClaim",
                         _ => {
                             return Err(format!(
-                                "Security0 finite no-merge Result {event} has an unsupported reached summary transition"
+                                "certificate finite no-merge Result {event} has an unsupported reached summary transition"
                             ));
                         }
                     };
@@ -2799,18 +2805,18 @@ fn render_left_claim_node(
                     );
                     let (_, summary_producer) = exact_result_producers(index, event)?;
                     let summary_transfer = summary_producer.ok_or_else(|| {
-                        format!("Security0 no-merge Add Result {event} has no summary producer")
+                        format!("certificate no-merge Add Result {event} has no summary producer")
                     })?;
                     let frame_start = index.immediate_frames
                         [usize::try_from(event).map_err(|_| "left Result index overflow")?]
-                    .ok_or_else(|| format!("Security0 Result {event} has no invocation frame"))?;
+                    .ok_or_else(|| format!("certificate Result {event} has no invocation frame"))?;
                     let finite_maximum =
                         |result: &ResultRecord| match result.summary.coefficient_bound() {
                             crate::operational_noise::facts::NumericContract::Known(
                                 crate::operational_noise::facts::CoefficientBound::Finite(bound),
                             ) => Ok(bound.maximum_absolute_coefficient.clone()),
                             _ => Err(format!(
-                                "Security0 finite no-merge Result {event} has a non-finite input"
+                                "certificate finite no-merge Result {event} has a non-finite input"
                             )),
                         };
                     let left_maximum = finite_maximum(&left)?;
@@ -2832,7 +2838,7 @@ fn render_left_claims(
     relation_probes: &[RelationProbe],
     modulus: &str,
     slice: &ReachedSemanticSlice,
-) -> Result<Vec<super::super::TallSecurity0GeneratedFile>, String> {
+) -> Result<Vec<super::super::GeneratedLeanFile>, String> {
     const CHUNK_SIZE: usize = 16;
     let replayed_bounds = replay_left_bound_classes(statement, index, data)?;
     let relation_by_event =
@@ -2846,7 +2852,7 @@ fn render_left_claims(
     for (shard_index, shard) in nodes.chunks(CHUNK_SIZE).enumerate() {
         let residual_module = format!("ResidualLeftShard{shard_index:03}");
         let mut residual = format!(
-            "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\nimport {NAMESPACE}.Cert.ResidualRight\n"
+            "import Mxx.Certificate.OperationalNoise.CertificateSemantics\nimport {NAMESPACE}.Proof.History\nimport {NAMESPACE}.Cert.ResidualRight\n"
         );
         let residual_dependencies = shard
             .iter()
@@ -2862,7 +2868,7 @@ fn render_left_claims(
             .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
         writeln!(residual, "namespace {NAMESPACE}.Cert\n").expect("String write");
         residual.push_str(
-            "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+            "open Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\n\n",
         );
         for node in shard {
             let event = node.result.event;
@@ -2876,7 +2882,7 @@ fn render_left_claims(
                         OperationKind::Add => "+",
                         OperationKind::Subtract => "-",
                         OperationKind::Multiply | OperationKind::Tensor => "*",
-                        OperationKind::Direct => return Err(format!("Security0 residual Result {event} reaches Direct")),
+                        OperationKind::Direct => return Err(format!("certificate residual Result {event} reaches Direct")),
                     };
                     writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  ResidualLeftResult{left_result}.actual selector witness {operator}\n    ResidualLeftResult{right_result}.actual selector witness")
                 }
@@ -2895,7 +2901,7 @@ fn render_left_claims(
             .filter(|dependency| *dependency != shard_index)
             .collect::<BTreeSet<_>>();
         let mut source = format!(
-            "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\nimport {NAMESPACE}.Cert.{residual_module}\nimport {NAMESPACE}.Semantic.SemanticRightRoot\nimport {NAMESPACE}.Semantic.SemanticLeftAuthority\nimport {NAMESPACE}.Semantic.SemanticLeftBound\nimport {NAMESPACE}.Semantic.SemanticLeftMergeTree\n"
+            "import Mxx.Certificate.OperationalNoise.CertificateSemantics\nimport {NAMESPACE}.Proof.History\nimport {NAMESPACE}.Cert.{residual_module}\nimport {NAMESPACE}.Semantic.SemanticRightRoot\nimport {NAMESPACE}.Semantic.SemanticLeftAuthority\nimport {NAMESPACE}.Semantic.SemanticLeftBound\nimport {NAMESPACE}.Semantic.SemanticLeftMergeTree\n"
         );
         for dependency in dependency_shards {
             writeln!(source, "import {NAMESPACE}.Semantic.SemanticLeftClaimShard{dependency:03}")
@@ -2905,7 +2911,7 @@ fn render_left_claims(
             .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
         writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
         source.push_str(
-            "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+            "open Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\n\n",
         );
         for node in shard {
             render_left_claim_node(
@@ -2941,11 +2947,11 @@ fn render_left_claims(
         depth += 1;
     }
     let root =
-        import_level.first().ok_or_else(|| "Security0 left claim closure is empty".to_owned())?;
+        import_level.first().ok_or_else(|| "certificate left claim closure is empty".to_owned())?;
     files.push(generated_file(
         "Semantic/SemanticLeftClaim.lean",
         format!(
-            "import {NAMESPACE}.Semantic.{root}\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.SemanticLeftClaim\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\ntheorem leftRootClaimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env\n      LeftClaimResult{left}.resultEvent LeftClaimResult{left}.owner\n      (LeftClaimResult{left}.actual selector witness)\n      LeftClaimResult{left}.rawTerms LeftClaimResult{left}.summary := by\n  exact LeftClaimResult{left}.claimSound selector selectorLower selectorUpper witness\n\nend {NAMESPACE}.Semantic.SemanticLeftClaim\n",
+            "import {NAMESPACE}.Semantic.{root}\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.SemanticLeftClaim\n\nopen Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\n\ntheorem leftRootClaimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env\n      LeftClaimResult{left}.resultEvent LeftClaimResult{left}.owner\n      (LeftClaimResult{left}.actual selector witness)\n      LeftClaimResult{left}.rawTerms LeftClaimResult{left}.summary := by\n  exact LeftClaimResult{left}.claimSound selector selectorLower selectorUpper witness\n\nend {NAMESPACE}.Semantic.SemanticLeftClaim\n",
             left = slice.left_result,
         ),
     ));
@@ -2958,7 +2964,7 @@ fn render_left_claims(
         .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
     writeln!(residual_top, "namespace {NAMESPACE}.Cert\n").expect("String write");
     residual_top.push_str(
-        "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+        "open Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\n\n",
     );
     writeln!(residual_top, "def statementResidual : (selector : Option Nat) →\n    Witness document history selector {modulus} → Int\n  | none, _ => 0\n  | some selector, witness =>\n      ResidualLeftResult{}.actual selector witness -\n        ResidualRightResult{}.actual selector witness\n\nend {NAMESPACE}.Cert", slice.left_result, slice.right_result)
         .expect("String write");
@@ -2972,7 +2978,7 @@ fn render_final_add(
     data: &FinalAddRenderData,
     modulus: &str,
     slice: &ReachedSemanticSlice,
-) -> Result<super::super::TallSecurity0GeneratedFile, String> {
+) -> Result<super::super::GeneratedLeanFile, String> {
     let left_binding = slice.left_binding;
     let right_binding = slice.right_binding;
     let transfer = slice.transfer;
@@ -2988,7 +2994,7 @@ fn render_final_add(
 
     let frame_start = index.immediate_frames
         [usize::try_from(data.result.event).map_err(|_| "final Result event overflow")?]
-    .ok_or_else(|| "Security0 final Result is outside an invocation frame".to_owned())?;
+    .ok_or_else(|| "certificate final Result is outside an invocation frame".to_owned())?;
     let predecessor = |event, expected_position, expected_result| match index.event(event)? {
         ProofPayloadEvent::Predecessor { consumer, input_position, predecessor, source_result }
             if *consumer == data.owner &&
@@ -2997,12 +3003,12 @@ fn render_final_add(
         {
             Ok(*predecessor)
         }
-        _ => Err(format!("Security0 final predecessor row {event} is inconsistent")),
+        _ => Err(format!("certificate final predecessor row {event} is inconsistent")),
     };
     let left_expression = predecessor(slice.left_binding, 0, data.left.event)?;
     let right_expression = predecessor(slice.right_binding, 1, data.right.event)?;
     if expression_kind(statement, data.owner)? != Some(OperationKind::Subtract) {
-        return Err("Security0 final operation is not the fixed subtract descriptor".to_owned());
+        return Err("certificate final operation is not the fixed subtract descriptor".to_owned());
     }
     let value_type = owner_value_type_text(statement, data.owner)?;
     let left_maximum = summary_bound_nat_text(&data.left.summary);
@@ -3011,7 +3017,7 @@ fn render_final_add(
         summary_text(&data.right.summary) != ".exactZero" ||
         result_maximum != left_maximum
     {
-        return Err("Security0 final Sub does not preserve the finite left summary".to_owned());
+        return Err("certificate final Sub does not preserve the finite left summary".to_owned());
     }
     let (coefficient_bound, coefficient_producer, summary_producer) =
         match index.event(data.result.event)? {
@@ -3030,7 +3036,7 @@ fn render_final_add(
             _ => unreachable!("validated final exact Result"),
         };
     if coefficient_producer != transfer || summary_producer.is_some() {
-        return Err("Security0 final Result producer metadata is inconsistent".to_owned());
+        return Err("certificate final Result producer metadata is inconsistent".to_owned());
     }
     let (end_coefficient_bound, end_coefficient_producer, end_summary_producer) =
         match index.event(data.end_event)? {
@@ -3060,7 +3066,7 @@ fn render_final_add(
         coefficient_producer != end_coefficient_producer ||
         summary_producer != end_summary_producer
     {
-        return Err("Security0 final Result and InvocationEnd producer metadata differ".to_owned());
+        return Err("certificate final Result and InvocationEnd producer metadata differ".to_owned());
     }
     let mut source = format!(
         "import {NAMESPACE}.Semantic.SemanticLeftClaim\n\
@@ -3072,8 +3078,8 @@ fn render_final_add(
          set_option relaxedAutoImplicit false\n\n\
          namespace {NAMESPACE}.Semantic.SemanticFinal\n\n\
          open Mxx.Certificate.OperationalNoise\n\
-         open TallSecurity0ABI\n\
-         open TallSemantics\n\n"
+         open CertificateABI\n\
+         open CertificateSemantics\n\n"
     );
     writeln!(source, "def owner : Owner := {}", owner_text(data.owner)).expect("String write");
     writeln!(source, "def resultEvent : Nat := {}", data.result.event).expect("String write");
@@ -3098,7 +3104,7 @@ fn render_final_add(
         .expect("String write");
     writeln!(source, "theorem fixedSemanticSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    history.lookup resultEvent = some\n        ⟨.resultExact owner rawTerms {end_coefficient_bound} {end_coefficient_producer}\n          summary {end_summary_producer_text}, {frame_start}⟩ ∧\n      history.lookup preFoldEvent = some\n        ⟨.preFoldPolynomial resultEvent rawTerms summary\n          (some (.result resultEvent .summary)), {frame_start}⟩ ∧\n      history.lookup endEvent = some\n        ⟨.invocationEndExact owner preFoldEvent rawTerms {end_coefficient_bound}\n          {end_coefficient_producer} summary {end_summary_producer_text}, {frame_start}⟩ ∧\n      ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n        (.exact (rawTerms.map Term.toExact) summary) ∧\n      2 * {} * centeredNorm {modulus} (actual selector witness) < {modulus} := by\n  exact ⟨resultAt, preFoldAt, invocationEndAt,\n    invocationEndClaimSound selector selectorLower selectorUpper witness,\n    strictBoundSound selector selectorLower selectorUpper witness⟩\n", statement.plaintext_modulus)
         .expect("String write");
-    writeln!(source, "theorem fixedAcceptance :\n    Security0Accepted document history {} {modulus} ringDimension endEvent preFoldEvent resultEvent\n      {result_maximum} owner rawTerms {end_coefficient_bound} {end_coefficient_producer}\n      summary {end_summary_producer_text} Cert.statementResidual := by\n  refine ⟨proofValid, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨⟨{frame_start}, resultAt, preFoldAt, invocationEndAt⟩, ?_⟩\n  change ∀ selector, selectorMinimum ≤ selector → selector < selectorMaximum →\n    ∀ witness : Witness document history (some selector) {modulus}, _\n  intro selector selectorLower selectorUpper witness\n  exact ⟨by\n    simpa [actual, Cert.statementResidual] using\n      invocationEndClaimSound selector selectorLower selectorUpper witness, by\n    simpa [actual, Cert.statementResidual] using\n      strictBoundSound selector selectorLower selectorUpper witness⟩\n", statement.plaintext_modulus)
+    writeln!(source, "theorem fixedAcceptance :\n    OperationalCertificateAccepted document history {} {modulus} ringDimension endEvent preFoldEvent resultEvent\n      {result_maximum} owner rawTerms {end_coefficient_bound} {end_coefficient_producer}\n      summary {end_summary_producer_text} Cert.statementResidual := by\n  refine ⟨proofValid, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨⟨{frame_start}, resultAt, preFoldAt, invocationEndAt⟩, ?_⟩\n  change ∀ selector, selectorMinimum ≤ selector → selector < selectorMaximum →\n    ∀ witness : Witness document history (some selector) {modulus}, _\n  intro selector selectorLower selectorUpper witness\n  exact ⟨by\n    simpa [actual, Cert.statementResidual] using\n      invocationEndClaimSound selector selectorLower selectorUpper witness, by\n    simpa [actual, Cert.statementResidual] using\n      strictBoundSound selector selectorLower selectorUpper witness⟩\n", statement.plaintext_modulus)
         .expect("String write");
     writeln!(source, "end {NAMESPACE}.Semantic.SemanticFinal").expect("String write");
     Ok(generated_file("Semantic/SemanticFinal.lean", source))
@@ -3109,7 +3115,7 @@ fn render_left_merge_deltas(
     index: &PayloadIndex,
     data: &LeftRootRenderData<'_>,
     relation_probes: &[RelationProbe],
-) -> Result<Vec<super::super::TallSecurity0GeneratedFile>, String> {
+) -> Result<Vec<super::super::GeneratedLeanFile>, String> {
     const CHUNK_SIZE: usize = 16;
     let mut files = Vec::new();
     let relation_by_event = relation_probes
@@ -3119,13 +3125,13 @@ fn render_left_merge_deltas(
     for (shard_index, shard) in data.merges.chunks(CHUNK_SIZE).enumerate() {
         let module = format!("SemanticLeftMergeDeltaShard{shard_index:03}");
         let mut source = format!(
-            "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n"
+            "import Mxx.Certificate.OperationalNoise.CertificateSemantics\nimport {NAMESPACE}.Proof.History\n"
         );
         source
             .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
         writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
         source.push_str(
-            "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\nopen EventReplay\n\n",
+            "open Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\nopen EventReplay\n\n",
         );
         for node in shard {
             let event = node.event;
@@ -3285,7 +3291,7 @@ fn render_left_merge_deltas(
             .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
         writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
         source.push_str(
-            "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+            "open Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\n\n",
         );
         for (key, nodes) in shard {
             let first_event = nodes[0].event;
@@ -3355,7 +3361,7 @@ fn render_left_merge_deltas(
                     let right = index.result(*right_result)?;
                     let kind = expression_kind(statement, *owner)?.ok_or_else(|| {
                         format!(
-                            "Security0 operator merge {first_event} owner has no reached matrix operation"
+                            "certificate operator merge {first_event} owner has no reached matrix operation"
                         )
                     })?;
                     let (base, working, operation) = match kind {
@@ -3413,7 +3419,7 @@ fn render_left_merge_deltas(
                                     } => (true, false),
                                     _ => {
                                         return Err(format!(
-                                            "Security0 Tensor merge {first_event} does not use the reached true/false transfer"
+                                            "certificate Tensor merge {first_event} does not use the reached true/false transfer"
                                         ));
                                     }
                                 }
@@ -3436,7 +3442,7 @@ fn render_left_merge_deltas(
                         }
                         OperationKind::Direct => {
                             return Err(format!(
-                                "Security0 operator merge {first_event} reaches unsupported {kind:?}"
+                                "certificate operator merge {first_event} reaches unsupported {kind:?}"
                             ));
                         }
                     };
@@ -3458,7 +3464,7 @@ fn render_left_merge_deltas(
                 LeftMergeGroupKey::Relation { application, .. } => {
                     let relation = relation_by_event.get(application).ok_or_else(|| {
                         format!(
-                            "Security0 relation merge application {application} has no semantic probe"
+                            "certificate relation merge application {application} has no semantic probe"
                         )
                     })?;
                     writeln!(
@@ -3520,7 +3526,7 @@ fn render_left_merge_deltas(
         depth += 1;
     }
     let root =
-        import_level.first().ok_or_else(|| "Security0 left merge tree is empty".to_owned())?;
+        import_level.first().ok_or_else(|| "certificate left merge tree is empty".to_owned())?;
     files.push(generated_file(
         "Semantic/SemanticLeftMergeTree.lean",
         format!("import {NAMESPACE}.Semantic.{root}\n"),
@@ -3531,7 +3537,7 @@ fn render_left_merge_deltas(
 fn result_raw_terms_reference(event: u64) -> Result<String, String> {
     let event_index =
         usize::try_from(event).map_err(|_| format!("ResultExact event {event} index overflow"))?;
-    let package = event_index / super::proof::EVENT_PACKAGE_SIZE;
+    let package = event_index / super::history::EVENT_PACKAGE_SIZE;
     Ok(format!("Proof.Events{package:03}.exact{event}RawTerms"))
 }
 
@@ -3539,7 +3545,7 @@ fn render_left_authorities(
     index: &PayloadIndex,
     data: &LeftRootRenderData<'_>,
     modulus: &str,
-) -> Result<Vec<super::super::TallSecurity0GeneratedFile>, String> {
+) -> Result<Vec<super::super::GeneratedLeanFile>, String> {
     const CHUNK_SIZE: usize = 16;
     let authorities = data
         .bounds
@@ -3553,13 +3559,13 @@ fn render_left_authorities(
     for (shard_index, shard) in authorities.chunks(CHUNK_SIZE).enumerate() {
         let module = format!("SemanticLeftAuthorityShard{shard_index:03}");
         let mut source = shard_index.checked_sub(1).map_or_else(
-            || format!("import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n"),
+            || format!("import Mxx.Certificate.OperationalNoise.CertificateSemantics\nimport {NAMESPACE}.Proof.History\n"),
             |previous| format!("import {NAMESPACE}.Semantic.SemanticLeftAuthorityShard{previous:03}\n"),
         );
         source
             .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
         writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
-        source.push_str("open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\nopen EventReplay\n\n");
+        source.push_str("open Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\nopen EventReplay\n\n");
         for (node, authority) in shard {
             let event = node.event;
             let result_event = data.authority_results[&event];
@@ -3841,7 +3847,7 @@ fn left_bound_source<'a>(
             .iter()
             .find(|node| node.event == *event && node.owner == consumer)
             .ok_or_else(|| {
-            format!("Security0 direct transfer input {event} is outside the semantic closure")
+            format!("certificate direct transfer input {event} is outside the semantic closure")
         })?;
         return Ok((None, node));
     }
@@ -3850,7 +3856,7 @@ fn left_bound_source<'a>(
         ProofPayloadValueRef::Predecessor { projection, .. } => projection,
         ProofPayloadValueRef::Transfer(event) => {
             return Err(format!(
-                "Security0 left bound renderer reached unsupported direct transfer reference {event}"
+                "certificate left bound renderer reached unsupported direct transfer reference {event}"
             ));
         }
     };
@@ -3867,7 +3873,7 @@ fn left_bound_source<'a>(
             ProofPayloadEvent::Result { value: ProofPayloadValue::Coefficient { .. }, .. },
         ) => {
             return Err(format!(
-                "Security0 left bound reference {reference:?} selects a ResultCoefficient summary"
+                "certificate left bound reference {reference:?} selects a ResultCoefficient summary"
             ));
         }
         (
@@ -3892,7 +3898,7 @@ fn left_bound_source<'a>(
             },
         ) => {
             return Err(format!(
-                "Security0 left bound reference {reference:?} selects an unresolved ResultExact summary"
+                "certificate left bound reference {reference:?} selects an unresolved ResultExact summary"
             ));
         }
         (_, _) => unreachable!("reached bound reference identifies a Result"),
@@ -3903,7 +3909,7 @@ fn left_bound_source<'a>(
         .find(|node| node.event == producer)
         .ok_or_else(|| {
             format!(
-                "Security0 left bound input Result {} selects producer {producer} outside the left closure",
+                "certificate left bound input Result {} selects producer {producer} outside the left closure",
                 result_event
             )
         })?;
@@ -3932,7 +3938,7 @@ fn replay_left_bound_classes(
     for node in &data.bounds {
         let bound = if matches!(node.rule, ProofPayloadRule::Authority(_)) {
             let result_event = data.authority_results.get(&node.event).ok_or_else(|| {
-                format!("Security0 authority bound {} has no mapped Result", node.event)
+                format!("certificate authority bound {} has no mapped Result", node.event)
             })?;
             match index.event(*result_event)? {
                 ProofPayloadEvent::Result {
@@ -3952,7 +3958,7 @@ fn replay_left_bound_classes(
                     let (_, producer) = left_bound_source(index, data, node.owner, reference)?;
                     replayed.get(&producer.event).cloned().ok_or_else(|| {
                         format!(
-                            "Security0 bound {} depends on unreplayed producer {}",
+                            "certificate bound {} depends on unreplayed producer {}",
                             node.event, producer.event
                         )
                     })
@@ -3980,7 +3986,7 @@ fn replay_left_bound_classes(
         };
         if matches!(bound, NumericContract::Missing) {
             return Err(format!(
-                "Security0 reached bound {} replays to a missing class",
+                "certificate reached bound {} replays to a missing class",
                 node.event
             ));
         }
@@ -4086,7 +4092,7 @@ fn render_left_bounds(
     index: &PayloadIndex,
     data: &LeftRootRenderData<'_>,
     modulus: &str,
-) -> Result<Vec<super::super::TallSecurity0GeneratedFile>, String> {
+) -> Result<Vec<super::super::GeneratedLeanFile>, String> {
     const CHUNK_SIZE: usize = 16;
     let replayed = replay_left_bound_classes(statement, index, data)?;
     let nodes = data
@@ -4104,7 +4110,7 @@ fn render_left_bounds(
         source
             .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
         writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
-        source.push_str("open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\nopen EventReplay\n\n");
+        source.push_str("open Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\nopen EventReplay\n\n");
         for node in shard {
             let frame = index.immediate_frames
                 [usize::try_from(node.event).map_err(|_| "left bound event index overflow")?]
@@ -4198,7 +4204,7 @@ fn render_left_bounds(
                 ProofPayloadRule::MonomialProduct { factors, .. } => {
                     if factors.is_empty() {
                         return Err(format!(
-                            "Security0 reached monomial-product {} has no factors",
+                            "certificate reached monomial-product {} has no factors",
                             node.event
                         ));
                     }
@@ -4237,11 +4243,10 @@ fn render_left_bounds(
                 }
                 _ => unreachable!("filtered reached compositional rule"),
             };
-            let replayed_bound = coeff_class_text(
-                replayed
-                    .get(&node.event)
-                    .ok_or_else(|| format!("Security0 bound {} was not replayed", node.event))?,
-            )?;
+            let replayed_bound =
+                coeff_class_text(replayed.get(&node.event).ok_or_else(|| {
+                    format!("certificate bound {} was not replayed", node.event)
+                })?)?;
             let child_bound_defs = inputs
                 .iter()
                 .map(|(namespace, _)| format!("{namespace}.bound"))
@@ -4574,7 +4579,7 @@ fn right_root_nodes(
     right_root_event: u64,
 ) -> Result<Vec<RightRootNode>, String> {
     let CertificateResidualRootV1::Family { program, .. } = statement.residual_root else {
-        return Err("Security0 right-root semantics requires a family residual root".to_owned());
+        return Err("certificate right-root semantics requires a family residual root".to_owned());
     };
     let mut pending = vec![right_root_event];
     let mut nodes = BTreeMap::<u64, RightRootNode>::new();
@@ -4583,7 +4588,7 @@ fn right_root_nodes(
             continue;
         }
         let result = index.by_event.get(&event).ok_or_else(|| {
-            format!("Security0 right-root dependency {event} is not an exact Result")
+            format!("certificate right-root dependency {event} is not an exact Result")
         })?;
         if !matches!(
             result.summary.coefficient_bound(),
@@ -4591,7 +4596,9 @@ fn right_root_nodes(
                 crate::operational_noise::facts::CoefficientBound::ExactZero
             )
         ) {
-            return Err(format!("Security0 right-root dependency Result {event} is not exact-zero"));
+            return Err(format!(
+                "certificate right-root dependency Result {event} is not exact-zero"
+            ));
         }
         if !matches!(
             result.owner.scope,
@@ -4599,7 +4606,7 @@ fn right_root_nodes(
                 if program_row == program
         ) {
             return Err(format!(
-                "Security0 right-root dependency Result {event} is outside residual program {program}"
+                "certificate right-root dependency Result {event} is outside residual program {program}"
             ));
         }
         let kind = match expression_kind(statement, result.owner)? {
@@ -4747,7 +4754,7 @@ fn render_right_root_operation(
         .expect("String write");
     writeln!(source, "def rightRaw : List Term := SemanticRightRootResult{right_event}.rawTerms")
         .expect("String write");
-    let event_package = operation.output_event as usize / super::proof::EVENT_PACKAGE_SIZE;
+    let event_package = operation.output_event as usize / super::history::EVENT_PACKAGE_SIZE;
     writeln!(
         source,
         "def outputRaw : List Term := Proof.Events{event_package:03}.exact{}RawTerms",
@@ -5039,7 +5046,7 @@ fn render_right_root(
     relation_probes: &[RelationProbe],
     modulus: &str,
     right_root_event: u64,
-) -> Result<(String, Vec<super::super::TallSecurity0GeneratedFile>), String> {
+) -> Result<(String, Vec<super::super::GeneratedLeanFile>), String> {
     const CHUNK_SIZE: usize = 16;
     let nodes = right_root_nodes(statement, index, relation_probes, right_root_event)?;
     let mut files = Vec::new();
@@ -5050,14 +5057,14 @@ fn render_right_root(
             .map(|index| format!("import {NAMESPACE}.Cert.ResidualRightShard{index:03}\n"));
         let mut residual = previous_residual.unwrap_or_else(|| {
             format!(
-                "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n"
+                "import Mxx.Certificate.OperationalNoise.CertificateSemantics\nimport {NAMESPACE}.Proof.History\n"
             )
         });
         residual
             .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
         writeln!(residual, "namespace {NAMESPACE}.Cert\n").expect("String write");
         residual.push_str(
-            "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+            "open Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\n\n",
         );
         for node in shard {
             let event = node.result.event;
@@ -5096,7 +5103,7 @@ fn render_right_root(
             .map(|index| format!("import {NAMESPACE}.Semantic.SemanticRightRootShard{index:03}\n"));
         let mut source = previous.unwrap_or_else(|| {
             format!(
-                "import Mxx.Certificate.OperationalNoise.TallSemantics\nimport {NAMESPACE}.Proof.History\n"
+                "import Mxx.Certificate.OperationalNoise.CertificateSemantics\nimport {NAMESPACE}.Proof.History\n"
             )
         });
         writeln!(source, "import {NAMESPACE}.Cert.{residual_module}").expect("String write");
@@ -5104,7 +5111,7 @@ fn render_right_root(
             .push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
         writeln!(source, "namespace {NAMESPACE}.Semantic\n").expect("String write");
         source.push_str(
-            "open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n",
+            "open Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\n\n",
         );
         if shard_index == 0 {
             let CertificateResidualRootV1::Family { program, .. } = statement.residual_root else {
@@ -5125,7 +5132,7 @@ fn render_right_root(
         format!("import {NAMESPACE}.Cert.ResidualRightShard{last_shard:03}\n"),
     ));
     let mut source = format!(
-        "import {NAMESPACE}.Semantic.SemanticRightRootShard{last_shard:03}\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.SemanticRightRoot\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen TallSemantics\n\n"
+        "import {NAMESPACE}.Semantic.SemanticRightRootShard{last_shard:03}\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Semantic.SemanticRightRoot\n\nopen Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\n\n"
     );
     writeln!(
         source,
@@ -5175,7 +5182,7 @@ mod tests {
     }
 
     #[test]
-    fn reached_terminal_rules_match_the_fixed_security0_boundary() {
+    fn reached_terminal_rules_match_certificate_boundary() {
         use crate::operational_noise::simulation::{ProofPayloadAuthority, ProofPayloadScale};
 
         let value =

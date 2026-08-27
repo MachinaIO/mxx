@@ -29,7 +29,7 @@ const SLICE_LUT_ROW_FANOUT: usize = 16;
 
 pub(super) fn render(
     document: &CertificateDocumentV1,
-) -> Result<Vec<super::TallSecurity0GeneratedFile>, String> {
+) -> Result<Vec<super::GeneratedLeanFile>, String> {
     let mut files = Vec::new();
     render_expression_packages(&document.expressions, &mut files)?;
     render_packages("Program", "ProgramRow", &document.programs, program_row, &mut files)?;
@@ -43,18 +43,18 @@ pub(super) fn render(
 
 fn render_expression_packages(
     rows: &[CertificateExpressionRow],
-    files: &mut Vec<super::TallSecurity0GeneratedFile>,
+    files: &mut Vec<super::GeneratedLeanFile>,
 ) -> Result<(), String> {
     for (package, chunk) in rows.chunks(PACKAGE_SIZE).enumerate() {
         let module = format!("Expression{package:03}");
-        let mut source = header("Mxx.Certificate.OperationalNoise.TallSecurity0ABI", &module);
+        let mut source = header("Mxx.Certificate.OperationalNoise.CertificateABI", &module);
         let start = package * PACKAGE_SIZE;
         for (offset, row) in chunk.iter().enumerate() {
             let row_id = start + offset;
             render_expression_inputs(row_id, &row.inputs, &mut source);
             writeln!(
                 source,
-                "def ExpressionRow{row_id} : TallSecurity0ABI.ExpressionRow :=\n  {}\n",
+                "def ExpressionRow{row_id} : CertificateABI.ExpressionRow :=\n  {}\n",
                 expression_row(row, row_id)?
             )
             .expect("writing to String cannot fail");
@@ -117,12 +117,12 @@ fn array_refs(values: &[u64]) -> String {
 
 fn render_index_use_packages(
     document: &CertificateDocumentV1,
-    files: &mut Vec<super::TallSecurity0GeneratedFile>,
+    files: &mut Vec<super::GeneratedLeanFile>,
 ) -> Result<(), String> {
     let rows = &document.index_uses;
     for (package, chunk) in rows.chunks(PACKAGE_SIZE).enumerate() {
         let module = format!("IndexUse{package:03}");
-        let mut source = header("Mxx.Certificate.OperationalNoise.TallSecurity0ABI", &module);
+        let mut source = header("Mxx.Certificate.OperationalNoise.CertificateABI", &module);
         let start = package * PACKAGE_SIZE;
         for (offset, row) in chunk.iter().enumerate() {
             let row_id = start + offset;
@@ -131,7 +131,7 @@ fn render_index_use_packages(
             })?;
             writeln!(
                 source,
-                "def IndexUseRow{row_id} : TallSecurity0ABI.IndexUseRow :=\n  {}\n",
+                "def IndexUseRow{row_id} : CertificateABI.IndexUseRow :=\n  {}\n",
                 index_use_row(row, &row_value)?
             )
             .expect("writing to String cannot fail");
@@ -499,7 +499,7 @@ fn validate_projected_index_rows(
 
 fn render_slice_group_packages(
     rows: &[CertificateSliceGroup],
-    files: &mut Vec<super::TallSecurity0GeneratedFile>,
+    files: &mut Vec<super::GeneratedLeanFile>,
 ) -> Result<(), String> {
     let row_values = rows
         .iter()
@@ -509,7 +509,7 @@ fn render_slice_group_packages(
     for (package, chunk) in rows.chunks(PACKAGE_SIZE).enumerate() {
         let module = format!("SliceGroup{package:03}");
         let start = package * PACKAGE_SIZE;
-        let mut imports = vec!["Mxx.Certificate.OperationalNoise.TallSecurity0ABI".to_owned()];
+        let mut imports = vec!["Mxx.Certificate.OperationalNoise.CertificateABI".to_owned()];
         imports.extend(row_values[start..start + chunk.len()].iter().filter_map(|(_, root)| {
             root.as_ref().map(|root| format!("{MODULE_ROOT}.Cert.{root}"))
         }));
@@ -517,7 +517,7 @@ fn render_slice_group_packages(
             imports.iter().map(|import| format!("import {import}")).collect::<Vec<_>>().join("\n");
         write!(
             source,
-            "\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Cert.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen SchemaV1\nopen TallSecurity0ABI\n\n"
+            "\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Cert.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen SchemaV1\nopen CertificateABI\n\n"
         )
         .expect("writing to String cannot fail");
         for (offset, row) in chunk.iter().enumerate() {
@@ -538,7 +538,7 @@ fn render_slice_group_packages(
 fn render_slice_lut_row_packages(
     row: usize,
     rows: &[SliceLutRow],
-    files: &mut Vec<super::TallSecurity0GeneratedFile>,
+    files: &mut Vec<super::GeneratedLeanFile>,
 ) -> Result<(String, Option<String>), String> {
     if rows.len() <= SLICE_LUT_ROW_LEAF_SIZE {
         return Ok((list(rows, slice_lut_row)?, None));
@@ -547,7 +547,7 @@ fn render_slice_lut_row_packages(
     let mut children = Vec::new();
     for (leaf, values) in rows.chunks(SLICE_LUT_ROW_LEAF_SIZE).enumerate() {
         let module = format!("SliceGroupRows{row}Leaf{leaf:04}");
-        let mut source = header("Mxx.Certificate.OperationalNoise.TallSecurity0ABI", &module);
+        let mut source = header("Mxx.Certificate.OperationalNoise.CertificateABI", &module);
         writeln!(
             source,
             "def rows : List SchemaV1.SliceLutRow := {}\n\nend {NAMESPACE}.Cert.{module}",
@@ -593,7 +593,7 @@ fn render_slice_lut_row_packages(
 
 fn header(import: &str, suffix: &str) -> String {
     format!(
-        "import {import}\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Cert.{suffix}\n\nopen Mxx.Certificate.OperationalNoise\nopen SchemaV1\nopen TallSecurity0ABI\n\n"
+        "import {import}\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Cert.{suffix}\n\nopen Mxx.Certificate.OperationalNoise\nopen SchemaV1\nopen CertificateABI\n\n"
     )
 }
 
@@ -602,11 +602,11 @@ fn render_packages<T>(
     row_type: &str,
     rows: &[T],
     render: fn(&T) -> Result<String, String>,
-    files: &mut Vec<super::TallSecurity0GeneratedFile>,
+    files: &mut Vec<super::GeneratedLeanFile>,
 ) -> Result<(), String> {
     for (package, chunk) in rows.chunks(PACKAGE_SIZE).enumerate() {
         let module = format!("{label}{package:03}");
-        let mut source = header("Mxx.Certificate.OperationalNoise.TallSecurity0ABI", &module);
+        let mut source = header("Mxx.Certificate.OperationalNoise.CertificateABI", &module);
         let start = package * PACKAGE_SIZE;
         for (offset, row) in chunk.iter().enumerate() {
             writeln!(
@@ -625,11 +625,11 @@ fn render_packages<T>(
 
 fn render_top(document: &CertificateDocumentV1) -> Result<String, String> {
     let tables = [
-        ("Expression", "TallSecurity0ABI.ExpressionRow", document.expressions.len()),
+        ("Expression", "CertificateABI.ExpressionRow", document.expressions.len()),
         ("Program", "SchemaV1.ProgramRow", document.programs.len()),
         ("Source", "SchemaV1.SourceRow", document.sources.len()),
         ("Event", "SchemaV1.EventRow", document.events.len()),
-        ("IndexUse", "TallSecurity0ABI.IndexUseRow", document.index_uses.len()),
+        ("IndexUse", "CertificateABI.IndexUseRow", document.index_uses.len()),
         ("SliceGroup", "SchemaV1.SliceGroupRow", document.slice_groups.len()),
     ];
     let mut source = String::new();
@@ -641,8 +641,7 @@ fn render_top(document: &CertificateDocumentV1) -> Result<String, String> {
     }
     source.push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
     writeln!(source, "namespace {NAMESPACE}\n").expect("writing to String cannot fail");
-    source
-        .push_str("open Mxx.Certificate.OperationalNoise\nopen SchemaV1\nopen TallSecurity0ABI\n");
+    source.push_str("open Mxx.Certificate.OperationalNoise\nopen SchemaV1\nopen CertificateABI\n");
     for (label, _, _) in tables {
         for package in 0..match label {
             "Expression" => document.expressions.len(),
@@ -666,7 +665,9 @@ fn render_top(document: &CertificateDocumentV1) -> Result<String, String> {
     }
     let residual = residual_root(&document.residual_root);
     let CertificateResidualRootV1::Family { domain, .. } = document.residual_root else {
-        return Err("Tall reached statement rendering requires a family residual root".to_owned());
+        return Err(
+            "certificate reached statement rendering requires a family residual root".to_owned()
+        );
     };
     writeln!(source, "def selectorMinimum : Nat := {}", domain.minimum)
         .expect("writing to String cannot fail");
@@ -676,7 +677,7 @@ fn render_top(document: &CertificateDocumentV1) -> Result<String, String> {
         .expect("writing to String cannot fail");
     writeln!(
         source,
-        "def document : TallDocument :=\n  {{ schemaId := {}\n    schemaVersion := {}\n    plaintextModulus := {}\n    ciphertextModulus := {}\n    ringDimension := {}\n    expressions := ExpressionRows\n    programs := ProgramRows\n    sources := SourceRows\n    events := EventRows\n    indexUses := IndexUseRows\n    sliceGroups := SliceGroupRows\n    residualRoot := {residual} }}\n\nend {NAMESPACE}",
+        "def document : CertificateDocument :=\n  {{ schemaId := {}\n    schemaVersion := {}\n    plaintextModulus := {}\n    ciphertextModulus := {}\n    ringDimension := {}\n    expressions := ExpressionRows\n    programs := ProgramRows\n    sources := SourceRows\n    events := EventRows\n    indexUses := IndexUseRows\n    sliceGroups := SliceGroupRows\n    residualRoot := {residual} }}\n\nend {NAMESPACE}",
         quoted(document.schema_id)?,
         document.schema_version,
         quoted(&document.plaintext_modulus)?,

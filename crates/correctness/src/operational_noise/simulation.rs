@@ -153,7 +153,7 @@ const G0_CPU_EVIDENCE_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 enum G0CpuEvidenceStatus {
-    CpuObservationOnlyNotG0HardGateOrTallEvidence,
+    CpuObservationOnlyNotAcceptanceEvidence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -4805,7 +4805,7 @@ pub fn prepare_g0_cpu_evidence_bytes(
     let evidence = G0CpuEvidence {
         schema_id: G0_CPU_EVIDENCE_SCHEMA_ID,
         schema_version: G0_CPU_EVIDENCE_SCHEMA_VERSION,
-        status: G0CpuEvidenceStatus::CpuObservationOnlyNotG0HardGateOrTallEvidence,
+        status: G0CpuEvidenceStatus::CpuObservationOnlyNotAcceptanceEvidence,
         base_feasibility,
         residual_coverage_matrix,
         lut: lut_observation,
@@ -6641,7 +6641,7 @@ mod tests {
                 .expect("ideal graph"),
         )
         .expect("pure ideal");
-        let endpoint = EndpointSpecId::ToyThresholdDecode;
+        let endpoint = EndpointSpecId::ThresholdDecode;
         ProtocolDecl::new(crate::ProtocolDecl {
             params: Vec::new(),
             bundle: ClosedProtocolBundle {
@@ -6739,7 +6739,7 @@ mod tests {
                 .expect("ideal graph"),
         )
         .expect("pure ideal");
-        let endpoint = EndpointSpecId::ToyThresholdDecode;
+        let endpoint = EndpointSpecId::ThresholdDecode;
         ProtocolDecl::new(crate::ProtocolDecl {
             params: Vec::new(),
             bundle: ClosedProtocolBundle {
@@ -6835,7 +6835,7 @@ mod tests {
                 .expect("ideal graph"),
         )
         .expect("pure ideal");
-        let endpoint = EndpointSpecId::DiamondBooleanInterval;
+        let endpoint = EndpointSpecId::BooleanInterval;
         ProtocolDecl::new(crate::ProtocolDecl {
             params: Vec::new(),
             bundle: ClosedProtocolBundle {
@@ -6865,7 +6865,7 @@ mod tests {
                         spec: endpoint,
                         stage: stage_id.clone(),
                         semantic_anchor: "boolean.decoded".to_owned(),
-                        semantics: EndpointSemanticBinding::DiamondBoolean {
+                        semantics: EndpointSemanticBinding::BooleanInterval {
                             residual_stage: stage_id.clone(),
                             residual_anchor: "boolean.residual".to_owned(),
                             carrier_stage: stage_id.clone(),
@@ -8907,7 +8907,7 @@ mod tests {
         assert_eq!(document["schema_id"], G0_CPU_EVIDENCE_SCHEMA_ID);
         assert_eq!(document["schema_version"], G0_CPU_EVIDENCE_SCHEMA_VERSION);
         assert_eq!(document["schema_version"], 6);
-        assert_eq!(document["status"], "CpuObservationOnlyNotG0HardGateOrTallEvidence");
+        assert_eq!(document["status"], "CpuObservationOnlyNotAcceptanceEvidence");
         let base = &document["base_feasibility"];
         assert_eq!(
             object_keys(base),

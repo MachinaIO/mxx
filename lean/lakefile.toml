@@ -8,11 +8,9 @@ defaultTargets = [
   "Mxx.Certificate.OperationalNoise.RelationReplay",
   "Mxx.Certificate.OperationalNoise.G2Fixtures",
   "Mxx.Certificate.OperationalNoise.SchemaV1Fixtures",
-  "Mxx.Certificate.OperationalNoise.ToyABIFixtures",
-  "Mxx.Certificate.OperationalNoise.TallSecurity0ABIFixtures",
-  "Mxx.Certificate.OperationalNoise.TallSemantics",
-  "Mxx.Certificate.OperationalNoise.TallSemanticsFixtures",
-  "Mxx.Certificate.OperationalNoise.TallGadgetCP2Fixtures",
+  "Mxx.Certificate.OperationalNoise.CertificateABIFixtures",
+  "Mxx.Certificate.OperationalNoise.CertificateSemantics",
+  "Mxx.Certificate.OperationalNoise.CertificateSemanticsFixtures",
 ]
 
 [[lean_lib]]

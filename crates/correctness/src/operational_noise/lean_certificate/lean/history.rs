@@ -49,9 +49,9 @@ struct ResultReplayEvent {
 pub(super) fn render(
     statement: &CertificateDocumentV1,
     proof: &OperationalProofPayload,
-) -> Result<Vec<super::TallSecurity0GeneratedFile>, String> {
+) -> Result<Vec<super::GeneratedLeanFile>, String> {
     if proof.events.is_empty() {
-        return Err("Security0 proof payload is empty".to_owned());
+        return Err("certificate proof payload is empty".to_owned());
     }
     let mut rendered = Vec::with_capacity(proof.events.len());
     let mut exact_terms_events = Vec::with_capacity(proof.events.len());
@@ -111,7 +111,7 @@ pub(super) fn render(
         }
     }
     if !stack.is_empty() {
-        return Err("Security0 proof payload ends with an active invocation frame".to_owned());
+        return Err("certificate proof payload ends with an active invocation frame".to_owned());
     }
 
     let mut files = Vec::new();
@@ -218,7 +218,9 @@ fn event_text_with_terms(
                 option(summary_producer.as_ref(), |event| Ok(event.to_string()))?,
             ),
             ProofPayloadValue::Coefficient { .. } => {
-                return Err("unsupported coefficient InvocationEnd in Security0 renderer".to_owned());
+                return Err(
+                    "unsupported coefficient InvocationEnd in certificate renderer".to_owned()
+                );
             }
         },
         ProofPayloadEvent::SpecializationComputed { owner: event_owner, dispatch, source } => {
@@ -233,7 +235,7 @@ fn event_text_with_terms(
             )
         }
         ProofPayloadEvent::SpecializationCacheHit { .. } => {
-            return Err("unsupported specialization cache hit in Security0 renderer".to_owned());
+            return Err("unsupported specialization cache hit in certificate renderer".to_owned());
         }
         ProofPayloadEvent::AppliedRelation {
             owner: event_owner,
@@ -378,10 +380,10 @@ fn rule_text(value: &ProofPayloadRule) -> Result<String, String> {
             super::bool_text(*right_is_constant_polynomial)
         ),
         ProofPayloadRule::Maximum { .. } => {
-            return Err("unsupported Maximum bound rule in Security0 renderer".to_owned());
+            return Err("unsupported Maximum bound rule in certificate renderer".to_owned());
         }
         ProofPayloadRule::WeightedSum { .. } => {
-            return Err("unsupported WeightedSum bound rule in Security0 renderer".to_owned());
+            return Err("unsupported WeightedSum bound rule in certificate renderer".to_owned());
         }
     })
 }
@@ -395,7 +397,7 @@ fn authority_text(value: &ProofPayloadAuthority) -> Result<String, String> {
             format!(".relationPreimageSource ⟨{source}⟩")
         }
         ProofPayloadAuthority::Unavailable => {
-            return Err("unsupported unavailable authority in Security0 renderer".to_owned());
+            return Err("unsupported unavailable authority in certificate renderer".to_owned());
         }
     })
 }
@@ -481,14 +483,14 @@ fn update_state(
                 .expressions
                 .get(usize::try_from(root.expression_row).map_err(|_| "expression row overflow")?)
                 .ok_or_else(|| {
-                    format!("Security0 invocation root {} is dangling", root.expression_row)
+                    format!("certificate invocation root {} is dangling", root.expression_row)
                 })?;
             stack.push(FrameState { root: *root, start: index });
         }
         ProofPayloadEvent::InvocationEnd { root, .. } => {
-            let frame = stack.pop().ok_or("Security0 invocation end has no active frame")?;
+            let frame = stack.pop().ok_or("certificate invocation end has no active frame")?;
             if frame.root != *root {
-                return Err("Security0 invocation end root does not match active frame".to_owned());
+                return Err("certificate invocation end root does not match active frame".to_owned());
             }
         }
         _ => {}
@@ -515,7 +517,7 @@ fn render_event_package(
 ) -> String {
     let module = format!("Events{package:03}");
     let mut source = format!(
-        "import {MODULE_ROOT}.Cert.Cert\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Proof.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\n\n"
+        "import {MODULE_ROOT}.Cert.Cert\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Proof.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen CertificateABI\n\n"
     );
     for index in start..end {
         if let Some(exact) = &exact_terms_events[index] {
@@ -568,7 +570,7 @@ fn render_history(event_count: usize, package_count: usize) -> String {
     }
     source.push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
     writeln!(source, "namespace {NAMESPACE}\n").expect("writing to String cannot fail");
-    source.push_str("open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\n");
+    source.push_str("open Mxx.Certificate.OperationalNoise\nopen CertificateABI\n");
     for package in 0..package_count {
         writeln!(source, "open Proof.Events{package:03}").expect("writing to String cannot fail");
     }
@@ -815,7 +817,7 @@ fn render_replay_package(
 ) -> String {
     let module = format!("Replay{package:03}");
     let mut source = format!(
-        "import {MODULE_ROOT}.Proof.History\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Proof.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\nopen {NAMESPACE}\n\n"
+        "import {MODULE_ROOT}.Proof.History\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Proof.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen {NAMESPACE}\n\n"
     );
     for chunk in start_chunk..=end_chunk {
         writeln!(source, "def replayState{chunk} : ReplayState := {}", states[chunk])
@@ -984,7 +986,7 @@ fn render_top(event_count: usize, package_count: usize, final_leaf: usize) -> St
     }
     source.push_str("\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\n");
     writeln!(source, "namespace {NAMESPACE}\n").expect("writing to String cannot fail");
-    source.push_str("open Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\n");
+    source.push_str("open Mxx.Certificate.OperationalNoise\nopen CertificateABI\n");
     for package in 0..package_count {
         writeln!(source, "open Proof.Replay{package:03}").expect("writing to String cannot fail");
     }

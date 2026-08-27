@@ -1,22 +1,22 @@
-import Mxx.Certificate.OperationalNoise.TallSecurity0ABI
+import Mxx.Certificate.OperationalNoise.CertificateABI
 
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
 
-namespace Mxx.Certificate.OperationalNoise.TallSemantics
+namespace Mxx.Certificate.OperationalNoise.CertificateSemantics
 
 open Mxx.Certificate.OperationalNoise
 open EventReplay
 open SchemaV1
-open TallSecurity0ABI
+open CertificateABI
 
-/-! Pure semantic statements shared by the fixed toy and Tall certificate ABIs. -/
+/-! Pure semantic statements for certificate claims and replay events. -/
 
 /-- A semantic environment assigns values only to factors that occur in monomial keys. -/
 abbrev Env (Factor : Type) := Factor → Int
 
-/-! Tall factors are not assigned an artificial numeric order. Their central representation is
-    the source order; semantic equalities use `List.Perm` below. -/
+/-! Factors are not assigned an artificial numeric order. Their central representation is the
+    source order; semantic equalities use `List.Perm` below. -/
 instance ownerCentralNormalizer : CentralNormalizer Owner where
   normalize := id
 
@@ -30,7 +30,7 @@ def evalPolynomial {Factor : Type} (env : Env Factor) : Polynomial Factor → In
 
 def termPolynomial (terms : List Term) : Polynomial Owner := terms.map Term.toExact
 
-def replayProductFacts (facts : TallSecurity0ABI.ProductFacts) : EventReplay.ProductFacts :=
+def replayProductFacts (facts : CertificateABI.ProductFacts) : EventReplay.ProductFacts :=
   { leftConstantPolynomial := facts.leftIsConstantPolynomial
     rightConstantPolynomial := facts.rightIsConstantPolynomial
     rightKnownZeroRows := facts.rightKnownZeroRows
@@ -1320,7 +1320,7 @@ theorem relationCanonicalResultSound (modulus : Nat) (env : Env Owner)
         simp
   rw [outputEval, relationEvalModular]
 
-/- The coefficient-transfer primitives are intentionally kept in `EventReplay`.  Tall generated
+/- The coefficient-transfer primitives are intentionally kept in `EventReplay`.  Generated
    proofs use those soundness lemmas directly, so this layer does not add same-shaped aliases. -/
 
 def preFoldBound (summaryActual summaryBound : Nat)
@@ -1349,7 +1349,7 @@ def boundInterprets (modulus : Nat) (bound : Bound) (value : Int) : Prop :=
   | .large => True
   | .missing => False
 
-def coeffClassToTallBound : CoeffClass → Bound
+def boundOfCoeffClass : CoeffClass → Bound
   | .exactZero => .exactZero
   | .finite maximum => .finite maximum.val
   | .large => .large
@@ -1367,7 +1367,7 @@ def RecordedBoundRefines : Bound → CoeffClass → Prop
 
 theorem coeffClassInterprets_to_boundInterprets {modulus : Nat} {value : Int}
     {bound : CoeffClass} (sound : bound.Interprets (centeredNorm modulus value)) :
-    boundInterprets modulus (coeffClassToTallBound bound) value := by
+    boundInterprets modulus (boundOfCoeffClass bound) value := by
   cases bound with
   | exactZero => exact sound
   | finite maximum => exact sound
@@ -1413,7 +1413,7 @@ theorem exactValueClaim_of_coeffClass {Factor : Type} (modulus : Nat) (env : Env
     (congruence :
       (actual - evalPolynomial env terms) % Int.ofNat modulus = remainder % Int.ofNat modulus)
     (remainderSound : bound.Interprets (centeredNorm modulus remainder)) :
-    ValueClaim.Interprets modulus env actual (.exact terms (coeffClassToTallBound bound)) := by
+    ValueClaim.Interprets modulus env actual (.exact terms (boundOfCoeffClass bound)) := by
   exact ⟨remainder, congruence, coeffClassInterprets_to_boundInterprets remainderSound⟩
 
 /-- A reached authority transfer and the unique Result row that records its coefficient bound. -/
@@ -1425,7 +1425,7 @@ inductive AuthorityLeafAt (history : EventHistory) :
       (transferRow : history.lookup producerEvent = some
         ⟨.boundTransfer owner (.authority authority), frameStart⟩)
       (resultRow : history.lookup resultEvent = some
-        ⟨.resultCoefficient owner (coeffClassToTallBound bound), frameStart⟩) :
+        ⟨.resultCoefficient owner (boundOfCoeffClass bound), frameStart⟩) :
       AuthorityLeafAt history producerEvent resultEvent frameStart owner authority bound
   | resultExact {producerEvent resultEvent frameStart : Nat} {owner : Owner}
       {authority : Authority} {bound : CoeffClass} {terms : List Term}
@@ -1458,7 +1458,7 @@ mutual
         {bound : CoeffClass} {actualMagnitude : Nat}
         (adjacent : producerEvent + 1 = resultEvent)
         (row : history.lookup resultEvent = some
-          ⟨.resultCoefficient owner (coeffClassToTallBound bound), frameStart⟩)
+          ⟨.resultCoefficient owner (boundOfCoeffClass bound), frameStart⟩)
         (derived : BoundDerivedAt history producerEvent frameStart owner rule bound actualMagnitude) :
         ProjectedBoundAt history resultEvent owner none .coefficient bound actualMagnitude
     | resultExactCoefficient {resultEvent : Nat} {owner : Owner} {terms : List Term}
@@ -1479,7 +1479,7 @@ mutual
         {rule : BoundRule} {producerBound : CoeffClass} {actualMagnitude : Nat}
         (row : history.lookup resultEvent = some
           ⟨.resultExact owner terms recordedCoefficientBound coefficientProducer
-            (coeffClassToTallBound producerBound) (some producerEvent), frameStart⟩)
+            (boundOfCoeffClass producerBound) (some producerEvent), frameStart⟩)
         (derived : BoundDerivedAt history producerEvent frameStart owner rule producerBound
           actualMagnitude) :
         ProjectedBoundAt history resultEvent owner (some terms) .summary producerBound
@@ -1599,7 +1599,7 @@ mutual
           (.monomialProduct monomial (headFactor :: tailFactors))
           (productNonempty headBound tailBounds) (headActual * tailActuals.prod)
     | product {transferEvent transferFrame : Nat} {owner : Owner}
-        {left right : ValueRef} {facts : TallSecurity0ABI.ProductFacts}
+        {left right : ValueRef} {facts : CertificateABI.ProductFacts}
         {leftRows leftColumns rightRows rightColumns ringDimension factor : Nat}
         {leftBound rightBound : CoeffClass} {leftActual rightActual : Nat}
         (transferRow : history.lookup transferEvent = some
@@ -1729,7 +1729,7 @@ theorem boundTransfer_to_resultCoefficient
     {rule : BoundRule} {bound : CoeffClass} {actualMagnitude : Nat}
     (adjacent : producerEvent + 1 = resultEvent)
     (row : history.lookup resultEvent = some
-      ⟨.resultCoefficient owner (coeffClassToTallBound bound), frameStart⟩)
+      ⟨.resultCoefficient owner (boundOfCoeffClass bound), frameStart⟩)
     (derived : BoundDerivedAt history producerEvent frameStart owner rule bound
       actualMagnitude) :
     ProjectedBoundAt history resultEvent owner none .coefficient bound actualMagnitude :=
@@ -1757,7 +1757,7 @@ theorem boundTransfer_to_resultExactSummary
     {rule : BoundRule} {producerBound : CoeffClass} {actualMagnitude : Nat}
     (row : history.lookup resultEvent = some
       ⟨.resultExact owner terms recordedCoefficientBound coefficientProducer
-        (coeffClassToTallBound producerBound) (some producerEvent), frameStart⟩)
+        (boundOfCoeffClass producerBound) (some producerEvent), frameStart⟩)
     (derived : BoundDerivedAt history producerEvent frameStart owner rule producerBound
       actualMagnitude) :
     ProjectedBoundAt history resultEvent owner (some terms) .summary producerBound
@@ -2394,7 +2394,7 @@ def rawValueContractInterprets (modulus : Nat) (value : Int)
     contract.coefficientClass = some coefficientClass ∧
       rawCoefficientClassInterprets modulus value coefficientClass
 
-def ownerAtSelector (document : TallDocument) (selector : Option Nat) (owner : Owner) : Prop :=
+def ownerAtSelector (document : CertificateDocument) (selector : Option Nat) (owner : Owner) : Prop :=
   match document.residualRoot, owner.scope, selector with
   | .closed root, .closed ownerRoot, none => root = ownerRoot
   | .family program domain, .program ownerProgram, some selected =>
@@ -2420,11 +2420,11 @@ def eventContract? : SchemaV1.EventRow → Option RawValueContract
   | .sample _ _ contract | .sampler _ _ contract | .gadgetDecompose _ _ _ _ _ _ _ contract =>
       contract
 
-def sourceRawContract? (document : TallDocument) (source : SourceRef) :
+def sourceRawContract? (document : CertificateDocument) (source : SourceRef) :
     Option RawValueContract :=
   (document.sources.lookup source.row).bind sourceContract?
 
-def eventRawContract? (document : TallDocument) (event : EventRef) : Option RawValueContract :=
+def eventRawContract? (document : CertificateDocument) (event : EventRef) : Option RawValueContract :=
   (document.events.lookup event.row).bind eventContract?
 
 def monomialContains (monomial : Monomial) (owner : Owner) : Prop :=
@@ -2447,7 +2447,7 @@ def eventContainsFactor (event : Event) (owner : Owner) : Prop :=
 def FactorAtomAt (history : EventHistory) (event : Nat) (owner : Owner) : Prop :=
   ∃ entry, history.lookup event = some entry ∧ eventContainsFactor entry.event owner
 
-def SourceFactorAt (document : TallDocument) (history : EventHistory) (selector : Option Nat)
+def SourceFactorAt (document : CertificateDocument) (history : EventHistory) (selector : Option Nat)
     (owner : Owner) (factorEvent : Nat) (source : SourceRef) : Prop :=
   FactorAtomAt history factorEvent owner ∧ ownerAtSelector document selector owner ∧
     ∃ expression sourceRow,
@@ -2455,7 +2455,7 @@ def SourceFactorAt (document : TallDocument) (history : EventHistory) (selector 
         sourceRef? expression.descriptor = some source ∧
         document.sources.lookup source.row = some sourceRow
 
-def SamplerFactorAt (document : TallDocument) (history : EventHistory) (selector : Option Nat)
+def SamplerFactorAt (document : CertificateDocument) (history : EventHistory) (selector : Option Nat)
     (owner : Owner) (factorEvent : Nat) (event : EventRef) : Prop :=
   FactorAtomAt history factorEvent owner ∧ ownerAtSelector document selector owner ∧
     ∃ expression eventRow,
@@ -2463,27 +2463,27 @@ def SamplerFactorAt (document : TallDocument) (history : EventHistory) (selector
         event ∈ expressionEventRefs expression.descriptor ∧
         document.events.lookup event.row = some eventRow
 
-def RelationApplicationAt (document : TallDocument) (history : EventHistory)
+def RelationApplicationAt (document : CertificateDocument) (history : EventHistory)
     (selector : Option Nat) (application : Nat) : Prop :=
   ∃ entry owner sourceMonomial outerCoefficient orderedStart orderedEndExclusive rule,
     history.lookup application = some entry ∧
       entry.event = .appliedRelation owner sourceMonomial outerCoefficient orderedStart
         orderedEndExclusive rule ∧
       ownerAtSelector document selector owner ∧
-      TallSecurity0ABI.ownerValid document owner = true
+      CertificateABI.ownerValid document owner = true
 
 def exactTermsAt? (history : EventHistory) (event : Nat) : Option (List Term) :=
-  match TallSecurity0ABI.eventAt? history event with
+  match CertificateABI.eventAt? history event with
   | some (.resultExact _ terms _ _ _ _) |
       some (.invocationEndExact _ _ terms _ _ _ _) => some terms
   | _ => none
 
 def RelationCongruent (modulus : Nat) (history : EventHistory) (env : Env Owner)
     (application : Nat) : Prop :=
-  match TallSecurity0ABI.eventAt? history application with
+  match CertificateABI.eventAt? history application with
   | some (.appliedRelation _ _ _ _ _ (.universal computed lhs _ rhsResult)) =>
       (∃ computedOwner dispatch source,
-        TallSecurity0ABI.eventAt? history computed =
+        CertificateABI.eventAt? history computed =
             some (Event.specializationComputed computedOwner dispatch source) ∧
           source.end = computed ∧ source.start ≤ rhsResult ∧ rhsResult < source.end) ∧
         ∃ rhsTerms,
@@ -2564,14 +2564,14 @@ def canonicalSelfTerm (owner : Owner) : Term :=
   { monomial := { centralFactors := [], orderedFactors := [owner] }
     coefficient := 1 }
 
-inductive ReachedTerminalRule : BoundRule → Prop where
-  | authorityFactStore : ReachedTerminalRule (.authority .factStore)
-  | authorityProgramFamilyFact : ReachedTerminalRule (.authority .programFamilyFact)
-  | authorityOperator : ReachedTerminalRule (.authority .operator)
+inductive TerminalBoundRule : BoundRule → Prop where
+  | authorityFactStore : TerminalBoundRule (.authority .factStore)
+  | authorityProgramFamilyFact : TerminalBoundRule (.authority .programFamilyFact)
+  | authorityOperator : TerminalBoundRule (.authority .operator)
   | authorityRelationPreimageSource (source : ExpressionRef) :
-      ReachedTerminalRule (.authority (.relationPreimageSource source))
-  | identity (input : ValueRef) : ReachedTerminalRule (.identity input)
-  | scale (value : ValueRef) (factor : Scale) : ReachedTerminalRule (.scale value factor)
+      TerminalBoundRule (.authority (.relationPreimageSource source))
+  | identity (input : ValueRef) : TerminalBoundRule (.identity input)
+  | scale (value : ValueRef) (factor : Scale) : TerminalBoundRule (.scale value factor)
 
 /-- An interpreted exact claim tied to the precise `Result` row at one history index. -/
 structure ExactClaimAt (history : EventHistory) (modulus : Nat) (env : Env Owner)
@@ -2630,16 +2630,16 @@ theorem exactClaimAt_of_mergeClaim
 /-- The reached product path starts from the empty product accumulator.  Its row-bound deltas
     must reconstruct both the recorded Result and the substantive Cartesian product. -/
 theorem operatorProductMergeClaim
-    {document : TallDocument} {history : EventHistory}
+    {document : CertificateDocument} {history : EventHistory}
     {modulus frameStart transferEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftActual rightActual : Int} {leftRaw rightRaw : List Term}
     {working : Polynomial Owner} {leftScalar rightScalar : Bool}
-    {leftReference rightReference : ValueRef} {facts : TallSecurity0ABI.ProductFacts}
+    {leftReference rightReference : ValueRef} {facts : CertificateABI.ProductFacts}
     {valueType : ValueType}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .multiply)) valueType))
     (_transferAt : history.lookup transferEvent = some
       ⟨.boundTransfer owner (.product leftReference rightReference facts), frameStart⟩)
@@ -2672,11 +2672,11 @@ theorem operatorProductMergeClaim
     (leftRaw.map Term.toExact) (rightRaw.map Term.toExact) working
     leftClaim.claim rightClaim.claim outputEval modulusPositive
 
-/-- The reached Tensor path is the typed left-scalar action recorded by Security0.  Its exact
+/-- The Tensor path is the typed left-scalar action recorded by the event trace.  Its exact
     contribution polynomial is the same scalar-product construction used by Rust for a constant
     polynomial left operand; non-scalar Tensor normalization is intentionally not covered here. -/
 theorem operatorTensorMergeClaim
-    {document : TallDocument} {history : EventHistory}
+    {document : CertificateDocument} {history : EventHistory}
     {modulus frameStart transferEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftActual rightActual : Int} {leftRaw rightRaw : List Term}
@@ -2684,7 +2684,7 @@ theorem operatorTensorMergeClaim
     {outputType : ValueType} {leftLayout rightLayout outputLayout : Layout}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix
           (.tensor outputType leftLayout rightLayout outputLayout))) outputType))
     (_transferAt : history.lookup transferEvent = some
@@ -2720,7 +2720,7 @@ theorem operatorTensorMergeClaim
     kept as exact row evidence, while the canonical agreement covers both collision and direct
     insertion cases reached by Rust. -/
 theorem operatorAddMergeClaim
-    {document : TallDocument} {history : EventHistory}
+    {document : CertificateDocument} {history : EventHistory}
     {modulus frameStart transferEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftActual rightActual : Int} {leftRaw rightRaw : List Term}
@@ -2728,7 +2728,7 @@ theorem operatorAddMergeClaim
     {valueType : ValueType}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .add)) valueType))
     (_transferAt : history.lookup transferEvent = some
       ⟨.boundTransfer owner (.sum [leftReference, rightReference]), frameStart⟩)
@@ -2758,7 +2758,7 @@ theorem operatorAddMergeClaim
     transfer directly to the exact child Results, while the final Result row and canonical
     agreement bind the complete copied output polynomial. -/
 theorem operatorAddNoMergeClaim
-    {document : TallDocument} {history : EventHistory}
+    {document : CertificateDocument} {history : EventHistory}
     {modulus frameStart transferEvent summaryTransferEvent resultEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
@@ -2767,7 +2767,7 @@ theorem operatorAddNoMergeClaim
     {leftMaximum rightMaximum : Nat} {valueType : ValueType} {coefficientBound : Bound}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .add)) valueType))
     (_leftPredecessorAt : history.lookup leftBinding = some
       ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
@@ -2808,7 +2808,7 @@ theorem operatorAddNoMergeClaim
     though its exact polynomial negates the right input.  The two predecessor rows bind both
     coefficient and summary transfers to the same child Results. -/
 theorem operatorSubNoMergeClaim
-    {document : TallDocument} {history : EventHistory}
+    {document : CertificateDocument} {history : EventHistory}
     {modulus frameStart transferEvent summaryTransferEvent resultEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
@@ -2817,7 +2817,7 @@ theorem operatorSubNoMergeClaim
     {leftMaximum rightMaximum : Nat} {valueType : ValueType} {coefficientBound : Bound}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .subtract)) valueType))
     (_leftPredecessorAt : history.lookup leftBinding = some
       ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
@@ -2858,7 +2858,7 @@ theorem operatorSubNoMergeClaim
     operation, predecessor, coefficient-transfer, and Result rows bind the semantic addition to
     the exact Rust events, while the canonical agreement checks the complete copied output. -/
 theorem operatorAddNoMergeExactZeroClaimAt
-    {document : TallDocument} {history : EventHistory}
+    {document : CertificateDocument} {history : EventHistory}
     {modulus frameStart transferEvent resultEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
@@ -2867,7 +2867,7 @@ theorem operatorAddNoMergeExactZeroClaimAt
     {valueType : ValueType} {coefficientBound : Bound}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .add)) valueType))
     (_leftPredecessorAt : history.lookup leftBinding = some
       ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
@@ -2903,7 +2903,7 @@ theorem operatorAddNoMergeExactZeroClaimAt
     canonical output negates the right polynomial.  Exact-zero child remainders therefore yield
     the exact-zero Result recorded without a summary producer. -/
 theorem operatorSubNoMergeExactZeroClaimAt
-    {document : TallDocument} {history : EventHistory}
+    {document : CertificateDocument} {history : EventHistory}
     {modulus frameStart transferEvent resultEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
@@ -2912,7 +2912,7 @@ theorem operatorSubNoMergeExactZeroClaimAt
     {valueType : ValueType} {coefficientBound : Bound}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .subtract)) valueType))
     (_leftPredecessorAt : history.lookup leftBinding = some
       ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
@@ -2947,7 +2947,7 @@ theorem operatorSubNoMergeExactZeroClaimAt
 /-- A reached merged Add binds its collision rows through reconstruction and records the sum of
     the two finite child summaries through the separate summary transfer. -/
 theorem operatorAddFiniteMergeClaimAt
-    {document : TallDocument} {history : EventHistory}
+    {document : CertificateDocument} {history : EventHistory}
     {modulus frameStart coefficientTransfer summaryTransfer resultEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
@@ -2957,7 +2957,7 @@ theorem operatorAddFiniteMergeClaimAt
     {valueType : ValueType} {coefficientBound : Bound}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .add)) valueType))
     (_leftPredecessorAt : history.lookup leftBinding = some
       ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
@@ -3003,7 +3003,7 @@ theorem operatorAddFiniteMergeClaimAt
     exact-zero remainder.  Its collision rows reconstruct the exact output polynomial, while the
     Result records the unchanged left maximum without a separate summary producer. -/
 theorem operatorSubFiniteLeftMergeClaimAt
-    {document : TallDocument} {history : EventHistory}
+    {document : CertificateDocument} {history : EventHistory}
     {modulus frameStart coefficientTransfer resultEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
@@ -3013,7 +3013,7 @@ theorem operatorSubFiniteLeftMergeClaimAt
     {valueType : ValueType} {coefficientBound : Bound}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .subtract)) valueType))
     (_leftPredecessorAt : history.lookup leftBinding = some
       ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
@@ -3056,7 +3056,7 @@ theorem operatorSubFiniteLeftMergeClaimAt
 
 /-- Subtract shares the Add execution shape but negates the right contribution. -/
 theorem operatorSubMergeClaim
-    {document : TallDocument} {history : EventHistory}
+    {document : CertificateDocument} {history : EventHistory}
     {modulus frameStart transferEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftActual rightActual : Int} {leftRaw rightRaw : List Term}
@@ -3064,7 +3064,7 @@ theorem operatorSubMergeClaim
     {valueType : ValueType}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .subtract)) valueType))
     (_transferAt : history.lookup transferEvent = some
       ⟨.boundTransfer owner (.sum [leftReference, rightReference]), frameStart⟩)
@@ -3092,7 +3092,7 @@ theorem operatorSubMergeClaim
 
 /-- A reached merged Subtract binds both collision deltas and its additive finite summary row. -/
 theorem operatorSubFiniteMergeClaimAt
-    {document : TallDocument} {history : EventHistory}
+    {document : CertificateDocument} {history : EventHistory}
     {modulus frameStart coefficientTransfer summaryTransfer resultEvent : Nat} {env : Env Owner}
     {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
     {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
@@ -3102,7 +3102,7 @@ theorem operatorSubFiniteMergeClaimAt
     {valueType : ValueType} {coefficientBound : Bound}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .subtract)) valueType))
     (_leftPredecessorAt : history.lookup leftBinding = some
       ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
@@ -3144,18 +3144,18 @@ theorem operatorSubFiniteMergeClaimAt
       (outputRaw.map Term.toExact) leftMaximum rightMaximum leftClaim.claim rightClaim.claim
       outputEval modulusPositive
 
-def TerminalExactAt (document : TallDocument) (history : EventHistory)
+def TerminalExactAt (document : CertificateDocument) (history : EventHistory)
     (selector : Option Nat) (producer resultEvent : Nat) (owner : Owner)
     (rawTerms : List Term) : Prop :=
   producer + 1 = resultEvent ∧ ownerAtSelector document selector owner ∧
     ∃ rule frameStart coefficientBound,
-      ReachedTerminalRule rule ∧
+      TerminalBoundRule rule ∧
         history.lookup producer = some ⟨.boundTransfer owner rule, frameStart⟩ ∧
         history.lookup resultEvent = some
           ⟨.resultExact owner rawTerms coefficientBound producer .exactZero none, frameStart⟩
 
 /-- Honest primitive contracts and all reached relation congruences for one selector. -/
-structure Witness (document : TallDocument) (history : EventHistory) (selector : Option Nat)
+structure Witness (document : CertificateDocument) (history : EventHistory) (selector : Option Nat)
     (modulus : Nat) extends AuthorityWitness history where
   env : Env Owner
   recordedCoefficientCovers : ∀ resultEvent frameStart owner actual rawTerms maximum
@@ -3186,7 +3186,7 @@ structure Witness (document : TallDocument) (history : EventHistory) (selector :
     right singleton survivor into a finite summary.  The singleton monomial is shared by the
     right Result and its monomial-product transfer; the Result keeps exactly the left terms. -/
 theorem operatorAddSingletonSurvivorFoldClaimAt
-    {document : TallDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
+    {document : CertificateDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
     {witness : Witness document history selector modulus}
     {frameStart coefficientTransfer survivorTransfer survivorEvent resultEvent
       rightCoefficientProducer : Nat}
@@ -3200,7 +3200,7 @@ theorem operatorAddSingletonSurvivorFoldClaimAt
     {rightMagnitude survivorMagnitude : Nat}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .add)) valueType))
     (_leftPredecessorAt : history.lookup leftBinding = some
       ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
@@ -3279,7 +3279,7 @@ theorem operatorAddSingletonSurvivorFoldClaimAt
     coefficient contract.  The separate summary transfer may use another conservative producer,
     so the recorded maximum is compared directly with the summary maximum. -/
 theorem operatorProductFiniteMergeClaim
-    {document : TallDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
+    {document : CertificateDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
     {witness : Witness document history selector modulus}
     {frameStart coefficientTransfer summaryTransfer rightCoefficientProducer rightSummaryTransfer :
       Nat}
@@ -3292,11 +3292,11 @@ theorem operatorProductFiniteMergeClaim
     {rightRecordedMaximum : Nat}
     {leftScalar rightScalar : Bool} {base : Polynomial Owner}
     {valueType : ValueType}
-    {coefficientFacts summaryFacts : TallSecurity0ABI.ProductFacts}
+    {coefficientFacts summaryFacts : CertificateABI.ProductFacts}
     {rightMagnitude summaryMagnitude factor : Nat}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .multiply)) valueType))
     (_leftPredecessorAt : history.lookup leftBinding = some
       ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
@@ -3331,7 +3331,7 @@ theorem operatorProductFiniteMergeClaim
     (factorPositive : 0 < factor) (modulusPositive : 0 < modulus) :
     ValueClaim.Interprets modulus witness.env (leftActual * rightActual)
       (.exact working
-        (coeffClassToTallBound
+        (boundOfCoeffClass
           (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum)))) := by
   have operationEval := productCanonicalResultSound witness.env
     (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
@@ -3348,11 +3348,11 @@ theorem operatorProductFiniteMergeClaim
     working leftMaximum.val rightSummaryMaximum.val rightRecordedMaximum
     leftClaim.claim rightClaim.claim outputEval rightRecordedCovers rightMaximumLe
     factorPositive modulusPositive
-  simpa [productWithFactor, Nat.ne_of_gt factorPositive, coeffClassToTallBound] using claim
+  simpa [productWithFactor, Nat.ne_of_gt factorPositive, boundOfCoeffClass] using claim
 
 /-- The final reached finite Multiply wrapper binds the accumulator claim to its exact Result. -/
 theorem operatorProductFiniteMergeClaimAt
-    {document : TallDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
+    {document : CertificateDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
     {witness : Witness document history selector modulus}
     {frameStart coefficientTransfer summaryTransfer rightCoefficientProducer rightSummaryTransfer
       resultEvent : Nat}
@@ -3364,11 +3364,11 @@ theorem operatorProductFiniteMergeClaimAt
     {rightRecordedMaximum : Nat}
     {leftScalar rightScalar : Bool} {base : Polynomial Owner}
     {valueType : ValueType} {coefficientBound : Bound}
-    {coefficientFacts summaryFacts : TallSecurity0ABI.ProductFacts}
+    {coefficientFacts summaryFacts : CertificateABI.ProductFacts}
     {rightMagnitude summaryMagnitude factor : Nat}
     (_operationAt :
       (document.expressions.lookup owner.expression.row).map
-        TallSecurity0ABI.ExpressionRow.descriptor =
+        CertificateABI.ExpressionRow.descriptor =
         some (.operation (.stable (.matrix .multiply)) valueType))
     (_leftPredecessorAt : history.lookup leftBinding = some
       ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
@@ -3402,12 +3402,12 @@ theorem operatorProductFiniteMergeClaimAt
       summaryMagnitude)
     (resultAt : history.lookup resultEvent = some
       ⟨.resultExact owner outputRaw coefficientBound coefficientTransfer
-        (coeffClassToTallBound
+        (boundOfCoeffClass
           (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum)))
         (some summaryTransfer), frameStart⟩)
     (factorPositive : 0 < factor) (modulusPositive : 0 < modulus) :
     ExactClaimAt history modulus witness.env resultEvent owner (leftActual * rightActual) outputRaw
-      (coeffClassToTallBound
+      (boundOfCoeffClass
         (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum))) := by
   have claim := operatorProductFiniteMergeClaim _operationAt _leftPredecessorAt
     _rightPredecessorAt _coefficientTransferAt leftClaim rightClaim rightResultAt
@@ -3422,7 +3422,7 @@ theorem operatorProductFiniteMergeClaimAt
     the exact application through the witness, and routes the recorded Result through its
     row-bound merge deltas and substantive relation polynomial. -/
 theorem universalRelationMergeClaim
-    {document : TallDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
+    {document : CertificateDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
     {witness : Witness document history selector modulus}
     {application frameStart computed rhsResult : Nat}
     {owner : Owner} {source lhs : Monomial} {lhsLayout : Option Layout}
@@ -3449,7 +3449,7 @@ theorem universalRelationMergeClaim
         orderedEndExclusive).plug lhs.toKey)) :
     ValueClaim.Interprets modulus witness.env actual (.exact working summary) := by
   have congruent := witness.relationCongruence application applicationValid
-  rw [RelationCongruent, TallSecurity0ABI.eventAt?, applicationRow] at congruent
+  rw [RelationCongruent, CertificateABI.eventAt?, applicationRow] at congruent
   rcases congruent with ⟨_, rhsTerms, rhsLookup, baseRelation⟩
   have rhsExact : rhsTerms = rhsRaw := by
     rw [rhsTermsAt] at rhsLookup
@@ -3470,7 +3470,7 @@ theorem universalRelationMergeClaim
 
 /-- Gadget relation replay is the reached two-factor specialization of the same delta path. -/
 theorem gadgetRelationMergeClaim
-    {document : TallDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
+    {document : CertificateDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
     {witness : Witness document history selector modulus}
     {application frameStart inputResult : Nat}
     {owner gadget decomposition : Owner} {input : ExpressionRef}
@@ -3500,7 +3500,7 @@ theorem gadgetRelationMergeClaim
         orderedEndExclusive).plug lhs.toKey)) :
     ValueClaim.Interprets modulus witness.env actual (.exact working summary) := by
   have congruent := witness.relationCongruence application applicationValid
-  rw [RelationCongruent, TallSecurity0ABI.eventAt?, applicationRow] at congruent
+  rw [RelationCongruent, CertificateABI.eventAt?, applicationRow] at congruent
   rcases congruent with ⟨rhsTerms, rhsLookup, baseRelation⟩
   have rhsExact : rhsTerms = rhsRaw := by
     rw [rhsTermsAt] at rhsLookup
@@ -3541,7 +3541,7 @@ def exactResultAt (history : EventHistory) (resultEvent : Nat) (owner : Owner) :
       some ⟨.resultExact owner [canonicalSelfTerm owner] coefficientBound coefficientProducer
         .exactZero none, frameStart⟩
 
-theorem terminalExactClaimAt {document : TallDocument} {history : EventHistory}
+theorem terminalExactClaimAt {document : CertificateDocument} {history : EventHistory}
     {selector : Option Nat} {modulus producer resultEvent : Nat} {owner : Owner}
     {rawTerms : List Term}
     (witness : Witness document history selector modulus)
@@ -3557,7 +3557,7 @@ theorem terminalExactClaimAt {document : TallDocument} {history : EventHistory}
       witness.honestTerminalCongruence producer resultEvent owner rawTerms terminal
   · simp [boundInterprets, centeredNorm, centeredCoefficient]
 
-inductive ValueDerived (document : TallDocument) (history : EventHistory)
+inductive ValueDerived (document : CertificateDocument) (history : EventHistory)
     (selector : Option Nat) (modulus : Nat)
     (witness : Witness document history selector modulus)
     (owner : Owner) (resultEvent : Nat) : Int → ValueClaim Owner → Prop where
@@ -3572,14 +3572,14 @@ inductive ValueDerived (document : TallDocument) (history : EventHistory)
       ValueDerived document history selector modulus witness owner resultEvent
         (witness.env owner) (canonicalSelfClaim owner)
 
-abbrev DerivedResult (document : TallDocument) (history : EventHistory)
+abbrev DerivedResult (document : CertificateDocument) (history : EventHistory)
     (selector : Option Nat) (modulus : Nat)
     (witness : Witness document history selector modulus)
     (owner : Owner) (resultEvent : Nat) : Prop :=
   ValueDerived document history selector modulus witness owner resultEvent
     (witness.env owner) (canonicalSelfClaim owner)
 
-theorem ValueDerived.interprets {document : TallDocument} {history : EventHistory}
+theorem ValueDerived.interprets {document : CertificateDocument} {history : EventHistory}
     {selector : Option Nat} {modulus : Nat}
     {witness : Witness document history selector modulus}
     {owner : Owner} {resultEvent : Nat}
@@ -3589,11 +3589,7 @@ theorem ValueDerived.interprets {document : TallDocument} {history : EventHistor
   · simp [evalPolynomial, evalMonomial, canonicalSelfTerm, Term.toExact, Monomial.toKey]
   · simp [boundInterprets, centeredNorm, centeredCoefficient]
 
-abbrev TallEnv := Env Owner
-
-abbrev TallValueClaim := ValueClaim Owner
-
-def ForStatement (root : SchemaV1.ResidualRoot) (claim : Option Nat → Prop) : Prop :=
+def ForResidualRoot (root : SchemaV1.ResidualRoot) (claim : Option Nat → Prop) : Prop :=
   match root with
   | .closed _ => claim none
   | .family _ domain =>
@@ -3606,8 +3602,8 @@ def rootMatchesOwner (root : SchemaV1.ResidualRoot) (owner : Owner) : Prop :=
   | .family program _, .program ownerProgram => program = ownerProgram
   | _, _ => False
 
-/-- The fixed Security0 statement; later checkpoints construct, rather than assume, its proof. -/
-def Security0Accepted (document : TallDocument) (history : EventHistory)
+/-- The generic operational-certificate acceptance statement. -/
+def OperationalCertificateAccepted (document : CertificateDocument) (history : EventHistory)
     (plaintextModulus ciphertextModulus ringDimension finalEvent preFoldEvent finalResultEvent
       finalBound : Nat)
     (finalOwner : Owner) (finalTerms : List Term) (finalCoefficientBound : Bound)
@@ -3615,7 +3611,7 @@ def Security0Accepted (document : TallDocument) (history : EventHistory)
     (finalSummaryProducer : Option Nat)
     (residual : (selector : Option Nat) →
       Witness document history selector ciphertextModulus → Int) : Prop :=
-  TallSecurity0ABI.Valid document history ∧
+  CertificateABI.Valid document history ∧
     document.plaintextModulus = toString plaintextModulus ∧
     document.ciphertextModulus = toString ciphertextModulus ∧
     document.ringDimension = ringDimension ∧
@@ -3631,7 +3627,7 @@ def Security0Accepted (document : TallDocument) (history : EventHistory)
         history.lookup finalEvent = some
           ⟨.invocationEndExact finalOwner preFoldEvent finalTerms finalCoefficientBound
             finalCoefficientProducer finalSummary finalSummaryProducer, frameStart⟩) ∧
-    ForStatement document.residualRoot fun selector ↦
+    ForResidualRoot document.residualRoot fun selector ↦
       ∀ witness : Witness document history selector ciphertextModulus,
         ValueClaim.Interprets ciphertextModulus witness.env (residual selector witness)
             (.exact (finalTerms.map Term.toExact) finalSummary) ∧
@@ -3647,4 +3643,4 @@ theorem forall₂_append {α β : Type} {r : α → β → Prop}
   | nil => simpa using second
   | cons head tail ih => exact List.Forall₂.cons head (ih second)
 
-end Mxx.Certificate.OperationalNoise.TallSemantics
+end Mxx.Certificate.OperationalNoise.CertificateSemantics

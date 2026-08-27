@@ -1,16 +1,16 @@
-import Mxx.Certificate.OperationalNoise.TallSemantics
-import Mxx.Certificate.OperationalNoise.TallSecurity0ABIFixtures
+import Mxx.Certificate.OperationalNoise.CertificateSemantics
+import Mxx.Certificate.OperationalNoise.CertificateABIFixtures
 
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
 
-namespace Mxx.Certificate.OperationalNoise.TallSemanticsFixtures
+namespace Mxx.Certificate.OperationalNoise.CertificateSemanticsFixtures
 
 open Mxx.Certificate.OperationalNoise
 open EventReplay
 open SchemaV1
-open TallSecurity0ABI
-open TallSemantics
+open CertificateABI
+open CertificateSemantics
 
 def atomType : ValueType := .matrix "257" 1 1 1
 
@@ -21,7 +21,7 @@ def atomContract : RawValueContract :=
     polynomialSupportUpper := none }
 
 def atomSourceIdentity : SourceIdentity :=
-  { definition := "toy-source"
+  { definition := "fixture-source"
     sampleEvent := none
     outputRole := "value"
     artifact := none
@@ -31,7 +31,7 @@ def atomSourceIdentity : SourceIdentity :=
 
 def sourceAtomOwner : Owner := closedOwner 0
 
-def sourceAtomDocument : TallDocument where
+def sourceAtomDocument : CertificateDocument where
   schemaId := "mxx-operational-noise-certificate"
   schemaVersion := 1
   plaintextModulus := "2"
@@ -56,7 +56,7 @@ def sourceAtomHistory : EventHistory :=
 
 def samplerAtomOwner : Owner := closedOwner 0
 
-def samplerAtomDocument : TallDocument where
+def samplerAtomDocument : CertificateDocument where
   schemaId := "mxx-operational-noise-certificate"
   schemaVersion := 1
   plaintextModulus := "2"
@@ -92,7 +92,7 @@ def boundFixtureReference : ValueRef := .result 1 .coefficient
 
 def productFixtureReference : ValueRef := .result 3 .coefficient
 
-def productFixtureFacts : TallSecurity0ABI.ProductFacts :=
+def productFixtureFacts : CertificateABI.ProductFacts :=
   ⟨false, false, none, none, none⟩
 
 def boundFixtureHistory : EventHistory :=
@@ -169,7 +169,7 @@ def operator_merge_reconstruction_fixture :
 
 def tensorFixtureLayout : Layout := ⟨"row-major-1x1", 1, 1⟩
 
-def tensorFixtureDocument : TallDocument where
+def tensorFixtureDocument : CertificateDocument where
   schemaId := "mxx-operational-noise-certificate"
   schemaVersion := 1
   plaintextModulus := "2"
@@ -245,7 +245,7 @@ theorem operator_tensor_merge_claim_fixture :
   · decide +kernel
   · decide
 
-def addNoMergeFixtureDocument : TallDocument where
+def addNoMergeFixtureDocument : CertificateDocument where
   schemaId := "mxx-operational-noise-certificate"
   schemaVersion := 1
   plaintextModulus := "2"
@@ -330,7 +330,7 @@ def addNoMergeExactZeroHistory : EventHistory :=
       (.sum [.predecessor 0 2 .coefficient, .predecessor 1 3 .coefficient])) 7,
     annotated (.resultExact boundFixtureOwner [] (.finite 0) 4 .exactZero none) 7]
 
-def singletonSurvivorDocument : TallDocument :=
+def singletonSurvivorDocument : CertificateDocument :=
   { addNoMergeFixtureDocument with
     expressions := .node 0
       { descriptor := .operation (.stable (.matrix .add)) atomType
@@ -441,7 +441,7 @@ theorem operator_add_no_merge_exact_zero_claim_fixture :
   · decide +kernel
   · decide
 
-def subNoMergeExactZeroDocument : TallDocument :=
+def subNoMergeExactZeroDocument : CertificateDocument :=
   { addNoMergeFixtureDocument with
     expressions := .node 0
       { descriptor := .operation (.stable (.matrix .subtract)) atomType
@@ -543,7 +543,7 @@ theorem operator_add_finite_merge_claim_fixture :
   · rfl
   · decide
 
-def finiteLeftSubtractDocument : TallDocument :=
+def finiteLeftSubtractDocument : CertificateDocument :=
   { addNoMergeFixtureDocument with
     expressions := .node 0
       { descriptor := .operation (.stable (.matrix .subtract)) atomType
@@ -622,7 +622,7 @@ theorem operator_sub_finite_left_merge_claim_fixture :
   · rfl
   · decide
 
-def subtractMergeFixtureDocument : TallDocument :=
+def subtractMergeFixtureDocument : CertificateDocument :=
   { addNoMergeFixtureDocument with
     expressions := .node 0
       { descriptor := .operation (.stable (.matrix .subtract)) atomType
@@ -895,7 +895,7 @@ theorem terminal_atom_at :
     TerminalExactAt sourceAtomDocument terminalAtomHistory none 0 1 sourceAtomOwner
       [canonicalSelfTerm sourceAtomOwner] := by
   refine ⟨rfl, rfl, .authority .factStore, 0, .exactZero, ?_, rfl, rfl⟩
-  exact ReachedTerminalRule.authorityFactStore
+  exact TerminalBoundRule.authorityFactStore
 
 theorem terminal_exact_claim_fixture
     (witness : Witness sourceAtomDocument terminalAtomHistory none 257) :
@@ -989,7 +989,7 @@ theorem reached_sum_class_fixture :
 
 theorem reached_finite_exact_claim_fixture :
     ValueClaim.Interprets 257 fixtureEnv (-14)
-      (.exact fixturePolynomial (coeffClassToTallBound finiteOneClass)) := by
+      (.exact fixturePolynomial (boundOfCoeffClass finiteOneClass)) := by
   apply exactValueClaim_of_coeffClass 257 fixtureEnv (-14) fixturePolynomial finiteOneClass 1
   · decide
   · simp [finiteOneClass, CoeffClass.Interprets, centeredNorm, centeredCoefficient]
@@ -1020,9 +1020,9 @@ theorem empty_finite_claim_final_bound_fixture
 def familyRoot : SchemaV1.ResidualRoot := .family ⟨0⟩ ⟨2, 5⟩
 
 theorem statement_domain_fixture :
-    ForStatement familyRoot (fun selector ↦ selector = some 2 ∨ selector = some 3 ∨
+    ForResidualRoot familyRoot (fun selector ↦ selector = some 2 ∨ selector = some 3 ∨
       selector = some 4) := by
-  simp [ForStatement, familyRoot]
+  simp [ForResidualRoot, familyRoot]
   intro selector lower upper
   omega
 
@@ -1113,7 +1113,7 @@ theorem canonical_relation_fixture :
   decide
 
 #print axioms canonicalPolynomial_eval
-#print axioms Mxx.Certificate.OperationalNoise.TallSemantics.forall₂_append
+#print axioms Mxx.Certificate.OperationalNoise.CertificateSemantics.forall₂_append
 #print axioms canonicalAgreement_eval
 #print axioms addCanonicalResultSound
 #print axioms subCanonicalResultSound
@@ -1125,7 +1125,7 @@ theorem canonical_relation_fixture :
 #print axioms cp3_coefficient_mutation_rejected
 #print axioms cp3_omitted_term_rejected
 #print axioms cp3_extra_term_rejected
-#print axioms Mxx.Certificate.OperationalNoise.TallSemantics.relationCanonicalResultSound
+#print axioms Mxx.Certificate.OperationalNoise.CertificateSemantics.relationCanonicalResultSound
 #print axioms canonical_relation_fixture
 
 #print axioms generic_evaluation_fixture
@@ -1136,32 +1136,32 @@ theorem canonical_relation_fixture :
 #print axioms balanced_merge_deltas_fixture
 #print axioms operator_merge_reconstruction_fixture
 #print axioms operator_tensor_merge_claim_fixture
-#print axioms TallSemantics.exactValueClaim_add_finite
-#print axioms TallSemantics.operatorAddNoMergeClaim
+#print axioms CertificateSemantics.exactValueClaim_add_finite
+#print axioms CertificateSemantics.operatorAddNoMergeClaim
 #print axioms operator_add_no_merge_claim_fixture
-#print axioms TallSemantics.operatorAddSingletonSurvivorFoldClaimAt
+#print axioms CertificateSemantics.operatorAddSingletonSurvivorFoldClaimAt
 #print axioms operator_add_singleton_survivor_fold_fixture
-#print axioms TallSemantics.operatorSubNoMergeClaim
+#print axioms CertificateSemantics.operatorSubNoMergeClaim
 #print axioms operator_sub_no_merge_claim_fixture
-#print axioms TallSemantics.operatorAddNoMergeExactZeroClaimAt
+#print axioms CertificateSemantics.operatorAddNoMergeExactZeroClaimAt
 #print axioms operator_add_no_merge_exact_zero_claim_fixture
-#print axioms TallSemantics.operatorSubNoMergeExactZeroClaimAt
+#print axioms CertificateSemantics.operatorSubNoMergeExactZeroClaimAt
 #print axioms operator_sub_no_merge_exact_zero_claim_fixture
-#print axioms TallSemantics.exactValueClaim_sub_finite
-#print axioms TallSemantics.operatorAddFiniteMergeClaimAt
-#print axioms TallSemantics.operatorSubFiniteLeftMergeClaimAt
-#print axioms TallSemantics.operatorSubFiniteMergeClaimAt
+#print axioms CertificateSemantics.exactValueClaim_sub_finite
+#print axioms CertificateSemantics.operatorAddFiniteMergeClaimAt
+#print axioms CertificateSemantics.operatorSubFiniteLeftMergeClaimAt
+#print axioms CertificateSemantics.operatorSubFiniteMergeClaimAt
 #print axioms operator_add_finite_merge_claim_fixture
 #print axioms operator_sub_finite_left_merge_claim_fixture
 #print axioms operator_sub_finite_merge_claim_fixture
 #print axioms wrong_merge_delta_reconstruction_rejected
-#print axioms TallSemantics.operatorAddMergeClaim
-#print axioms TallSemantics.operatorSubMergeClaim
-#print axioms TallSemantics.operatorProductMergeClaim
-#print axioms TallSemantics.operatorTensorMergeClaim
-#print axioms TallSemantics.universalRelationMergeClaim
-#print axioms TallSemantics.gadgetRelationMergeClaim
-#print axioms TallSemantics.exactClaimAt_of_mergeClaim
+#print axioms CertificateSemantics.operatorAddMergeClaim
+#print axioms CertificateSemantics.operatorSubMergeClaim
+#print axioms CertificateSemantics.operatorProductMergeClaim
+#print axioms CertificateSemantics.operatorTensorMergeClaim
+#print axioms CertificateSemantics.universalRelationMergeClaim
+#print axioms CertificateSemantics.gadgetRelationMergeClaim
+#print axioms CertificateSemantics.exactClaimAt_of_mergeClaim
 #print axioms bound_transfer_input_fixture
 #print axioms bound_identity_projection_fixture
 #print axioms bound_summary_projection_fixture
@@ -1171,34 +1171,34 @@ theorem canonical_relation_fixture :
 #print axioms bound_authority_fixture
 #print axioms bound_scale_value_fixture
 #print axioms finite_add_exact_zero_fixture
-#print axioms TallSemantics.exactValueClaim_product_finite_left
-#print axioms TallSemantics.operatorProductFiniteMergeClaim
-#print axioms TallSemantics.operatorProductFiniteMergeClaimAt
+#print axioms CertificateSemantics.exactValueClaim_product_finite_left
+#print axioms CertificateSemantics.operatorProductFiniteMergeClaim
+#print axioms CertificateSemantics.operatorProductFiniteMergeClaimAt
 #print axioms finite_product_exact_zero_fixture
-#print axioms TallSemantics.exactFiniteValueClaim_of_eval_mod
+#print axioms CertificateSemantics.exactFiniteValueClaim_of_eval_mod
 #print axioms finite_relation_rewrite_fixture
 #print axioms exact_zero_recording_refines_finite_two_fixture
-#print axioms TallSemantics.boundTransfer_to_resultCoefficient
-#print axioms TallSemantics.ProjectedBoundAt.sound
-#print axioms TallSemantics.BoundDerivedAt.sound
+#print axioms CertificateSemantics.boundTransfer_to_resultCoefficient
+#print axioms CertificateSemantics.ProjectedBoundAt.sound
+#print axioms CertificateSemantics.BoundDerivedAt.sound
 #print axioms exact_finite_claim_fixture
-#print axioms TallSemantics.coeffClassInterprets_to_boundInterprets
-#print axioms TallSemantics.addKnownList_sound
-#print axioms TallSemantics.exactValueClaim_of_coeffClass
+#print axioms CertificateSemantics.coeffClassInterprets_to_boundInterprets
+#print axioms CertificateSemantics.addKnownList_sound
+#print axioms CertificateSemantics.exactValueClaim_of_coeffClass
 #print axioms reached_sum_class_fixture
 #print axioms reached_finite_exact_claim_fixture
-#print axioms TallSemantics.centeredNorm_eq_of_emod_eq
-#print axioms TallSemantics.centeredNorm_le_of_empty_finite_claim
-#print axioms TallSemantics.finalStrictBound_of_empty_finite_claim
+#print axioms CertificateSemantics.centeredNorm_eq_of_emod_eq
+#print axioms CertificateSemantics.centeredNorm_le_of_empty_finite_claim
+#print axioms CertificateSemantics.finalStrictBound_of_empty_finite_claim
 #print axioms empty_finite_claim_bounds_actual_fixture
 #print axioms empty_finite_claim_final_bound_fixture
 #print axioms statement_domain_fixture
 #print axioms constructive_raw_bound_fixture
-#print axioms TallSemantics.ValueDerived.interprets
-#print axioms TallSemantics.terminalExactClaimAt
+#print axioms CertificateSemantics.ValueDerived.interprets
+#print axioms CertificateSemantics.terminalExactClaimAt
 #print axioms terminal_atom_at
 #print axioms terminal_exact_claim_fixture
 #print axioms source_atom_interprets
 #print axioms sampler_atom_interprets
 
-end Mxx.Certificate.OperationalNoise.TallSemanticsFixtures
+end Mxx.Certificate.OperationalNoise.CertificateSemanticsFixtures

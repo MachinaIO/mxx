@@ -1,12 +1,12 @@
-mod closure;
-mod proof;
-mod semantic;
+mod dependency;
+mod history;
+mod semantics;
 mod statement;
 mod statistics;
 
 pub(super) use statistics::measure_owner_claims;
 
-use super::{TallSecurity0GeneratedFile, TallSecurity0ProfileIdentity};
+use super::{GeneratedLeanFile, LeanArtifactConfig};
 use crate::operational_noise::{
     certificate_schema::{CertificateDocumentV1, CertificateIndexUse, CertificateSliceGroup},
     facts::{CoefficientBound, NumericContract},
@@ -15,47 +15,45 @@ use crate::operational_noise::{
 use num_bigint::BigUint;
 use serde::Serialize;
 
-const NAMESPACE: &str = "Mxx.Certificate.OperationalNoise.TallReachedGenerated";
-const MODULE_ROOT: &str = "Mxx.Certificate.OperationalNoise.TallReachedGenerated";
+const NAMESPACE: &str = "Mxx.Certificate.OperationalNoise.Generated";
+const MODULE_ROOT: &str = "Mxx.Certificate.OperationalNoise.Generated";
 
 pub(super) fn render(
     statement: &CertificateDocumentV1,
     proof: &OperationalProofPayload,
     owner_claim_report_bytes: &[u8],
-    identity: &TallSecurity0ProfileIdentity,
+    identity: &LeanArtifactConfig,
     ordinary_rust_noise_bound: &BigUint,
     recorder_peak_retained_logical_items: u64,
     proof_projection_peak_retained_logical_items: u64,
-) -> Result<Vec<TallSecurity0GeneratedFile>, String> {
-    let semantic_slice = closure::resolve_reached_semantic_slice(statement, proof)?;
-    let dependency_closure = closure::collect_reached_final_closure(proof, &semantic_slice)?;
+) -> Result<Vec<GeneratedLeanFile>, String> {
+    let semantic_slice = dependency::resolve_reached_semantic_slice(statement, proof)?;
+    let dependency_closure = dependency::collect_reached_final_closure(proof, &semantic_slice)?;
     let final_proof_bound =
         validate_final_bound(proof, dependency_closure.final_end_event, ordinary_rust_noise_bound)?;
     let mut files = statement::render(statement)?;
-    files.extend(proof::render(statement, proof)?);
-    files.extend(semantic::render(statement, proof, &semantic_slice)?);
-    files.push(TallSecurity0GeneratedFile {
+    files.extend(history::render(statement, proof)?);
+    files.extend(semantics::render(statement, proof, &semantic_slice)?);
+    files.push(GeneratedLeanFile {
         relative_path: "SemanticOwnerStatistics.json".to_owned(),
         bytes: owner_claim_report_bytes.to_vec(),
     });
-    files.push(TallSecurity0GeneratedFile {
+    files.push(GeneratedLeanFile {
         relative_path: "SemanticDependencyClosure.json".to_owned(),
         bytes: dependency_closure.report_bytes()?,
     });
-    let profile_namespace =
-        format!("Mxx.Certificate.OperationalNoise.Tall{}Generated", identity.profile);
+    let artifact_namespace = &identity.module_root;
     for file in &mut files {
         if file.relative_path.ends_with(".lean") {
             let source = String::from_utf8(std::mem::take(&mut file.bytes))
                 .map_err(|error| format!("generated Lean source is not UTF-8: {error}"))?;
-            file.bytes = source.replace(NAMESPACE, &profile_namespace).into_bytes();
+            file.bytes = source.replace(NAMESPACE, artifact_namespace).into_bytes();
         }
     }
     let metrics = CertificateMetrics::from_rendered(
         statement,
         proof,
         &dependency_closure,
-        identity,
         ordinary_rust_noise_bound,
         &final_proof_bound,
         recorder_peak_retained_logical_items,
@@ -63,8 +61,8 @@ pub(super) fn render(
         &files,
     )?;
     let metrics_bytes = serde_json::to_vec(&metrics)
-        .map_err(|error| format!("Tall certificate metrics encoding failed: {error}"))?;
-    files.push(TallSecurity0GeneratedFile {
+        .map_err(|error| format!("certificate metrics encoding failed: {error}"))?;
+    files.push(GeneratedLeanFile {
         relative_path: "CertificateMetrics.json".to_owned(),
         bytes: metrics_bytes,
     });
@@ -77,8 +75,6 @@ pub(super) fn render(
 struct CertificateMetrics {
     schema_id: &'static str,
     schema_version: u32,
-    profile: String,
-    source_revision: String,
     statement: StatementMetrics,
     proof: ProofMetrics,
     raw_lut: RawLutMetrics,
@@ -133,13 +129,12 @@ impl CertificateMetrics {
     fn from_rendered(
         statement: &CertificateDocumentV1,
         proof: &OperationalProofPayload,
-        dependency_closure: &closure::DependencyClosure,
-        identity: &TallSecurity0ProfileIdentity,
+        dependency_closure: &dependency::DependencyClosure,
         ordinary_rust_noise_bound: &BigUint,
         final_bound: &BigUint,
         recorder_peak_retained_logical_items: u64,
         proof_projection_peak_retained_logical_items: u64,
-        files: &[TallSecurity0GeneratedFile],
+        files: &[GeneratedLeanFile],
     ) -> Result<Self, String> {
         let expression_rows = cardinality(statement.expressions.len(), "expression rows")?;
         let program_rows = cardinality(statement.programs.len(), "program rows")?;
@@ -150,7 +145,7 @@ impl CertificateMetrics {
             |total, use_row| -> Result<u64, String> {
                 total
                     .checked_add(cardinality(use_row.rows.len(), "index-use rows")?)
-                    .ok_or_else(|| "Tall certificate index-use row count overflow".to_owned())
+                    .ok_or_else(|| "certificate index-use row count overflow".to_owned())
             },
         )?;
         let slice_group_rows = statement.slice_groups.iter().try_fold(
@@ -158,36 +153,34 @@ impl CertificateMetrics {
             |total, group| -> Result<u64, String> {
                 total
                     .checked_add(cardinality(group.rows.len(), "SliceGroup rows")?)
-                    .ok_or_else(|| "Tall certificate SliceGroup row count overflow".to_owned())
+                    .ok_or_else(|| "certificate SliceGroup row count overflow".to_owned())
             },
         )?;
         let n = expression_rows
             .checked_add(program_rows)
             .and_then(|value| value.checked_add(source_rows))
             .and_then(|value| value.checked_add(event_rows))
-            .ok_or_else(|| "Tall certificate statement N overflow".to_owned())?;
+            .ok_or_else(|| "certificate statement N overflow".to_owned())?;
         let proof_bytes = proof
             .encode_canonical()
-            .map_err(|error| format!("Tall proof canonical encoding failed: {error:?}"))?;
+            .map_err(|error| format!("proof canonical encoding failed: {error:?}"))?;
         let proof_logical_items = proof
             .logical_items()
-            .map_err(|error| format!("Tall proof logical-item count failed: {error:?}"))?;
+            .map_err(|error| format!("proof logical-item count failed: {error:?}"))?;
         let raw_lut_bytes = serde_json::to_vec(&RawLutPayload {
             index_uses: &statement.index_uses,
             slice_groups: &statement.slice_groups,
         })
-        .map_err(|error| format!("Tall raw LUT metrics encoding failed: {error}"))?;
+        .map_err(|error| format!("raw LUT metrics encoding failed: {error}"))?;
         let (artifact_file_count, artifact_byte_total) = artifact_totals(files)?;
         let cache_hits = dependency_closure
             .event_counts
-            .get(&closure::ClosureEventKind::SpecializationCacheHit)
+            .get(&dependency::ClosureEventKind::SpecializationCacheHit)
             .copied()
             .unwrap_or(0);
         Ok(Self {
-            schema_id: "mxx.operational-noise.tall-certificate-metrics",
+            schema_id: "mxx.operational-noise.certificate-metrics",
             schema_version: 1,
-            profile: identity.profile.clone(),
-            source_revision: identity.source_revision.clone(),
             statement: StatementMetrics {
                 expression_rows,
                 program_rows,
@@ -225,15 +218,15 @@ impl CertificateMetrics {
 }
 
 fn cardinality(value: usize, label: &str) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| format!("Tall certificate {label} overflow"))
+    u64::try_from(value).map_err(|_| format!("certificate {label} overflow"))
 }
 
-fn artifact_totals(files: &[TallSecurity0GeneratedFile]) -> Result<(u64, u64), String> {
+fn artifact_totals(files: &[GeneratedLeanFile]) -> Result<(u64, u64), String> {
     let file_count = cardinality(files.len(), "generated artifact files")?;
     let byte_total = files.iter().try_fold(0_u64, |total, file| {
         total
             .checked_add(cardinality(file.bytes.len(), "generated artifact bytes")?)
-            .ok_or_else(|| "Tall generated artifact byte total overflow".to_owned())
+            .ok_or_else(|| "generated artifact byte total overflow".to_owned())
     })?;
     Ok((file_count, byte_total))
 }
@@ -303,13 +296,13 @@ fn validate_final_bound(
     Ok(final_bound)
 }
 
-fn generated_file(relative_path: impl Into<String>, source: String) -> TallSecurity0GeneratedFile {
-    TallSecurity0GeneratedFile { relative_path: relative_path.into(), bytes: source.into_bytes() }
+fn generated_file(relative_path: impl Into<String>, source: String) -> GeneratedLeanFile {
+    GeneratedLeanFile { relative_path: relative_path.into(), bytes: source.into_bytes() }
 }
 
 fn quoted(value: &str) -> Result<String, String> {
     serde_json::to_string(value)
-        .map_err(|error| format!("Security0 Lean string encoding failed: {error}"))
+        .map_err(|error| format!("certificate Lean string encoding failed: {error}"))
 }
 
 fn list<T>(values: &[T], render: impl Fn(&T) -> Result<String, String>) -> Result<String, String> {
@@ -388,8 +381,8 @@ mod tests {
     #[test]
     fn artifact_totals_are_computed_before_metrics_file() {
         let files = vec![
-            TallSecurity0GeneratedFile { relative_path: "a".to_owned(), bytes: vec![1, 2] },
-            TallSecurity0GeneratedFile { relative_path: "b".to_owned(), bytes: vec![3] },
+            GeneratedLeanFile { relative_path: "a".to_owned(), bytes: vec![1, 2] },
+            GeneratedLeanFile { relative_path: "b".to_owned(), bytes: vec![3] },
         ];
         assert_eq!(artifact_totals(&files).expect("artifact totals"), (2, 3));
     }

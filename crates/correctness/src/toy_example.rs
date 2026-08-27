@@ -85,7 +85,7 @@ pub fn protocol() -> ProtocolDecl {
     .expect("sampler-free ideal");
 
     let message_id = ProtocolInputId::from("message");
-    let endpoint = EndpointSpecId::ToyThresholdDecode;
+    let endpoint = EndpointSpecId::ThresholdDecode;
     ProtocolDecl::new(ProtocolDecl {
         params: vec![ParameterDecl { name: "cutoff".to_owned(), kind: ParameterKind::Dimension }],
         bundle: ClosedProtocolBundle {
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn toy_protocol_is_a_closed_bundle_with_a_decoded_endpoint() {
         let protocol = protocol();
-        assert_eq!(protocol.bundle.endpoint_specs, vec![EndpointSpecId::ToyThresholdDecode]);
+        assert_eq!(protocol.bundle.endpoint_specs, vec![EndpointSpecId::ThresholdDecode]);
         assert_eq!(protocol.bundle.endpoints.entries[0].semantic_anchor, DECODED_ENDPOINT);
         assert!(matches!(
             protocol.bundle.input_contract.inputs[0].value,

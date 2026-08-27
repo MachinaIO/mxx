@@ -949,7 +949,7 @@ impl DiamondWeProtocolFamily {
                 destinations: vec![workflow_destination(&encrypt_id, HASH_KEY_INPUT)],
             },
         ]);
-        let endpoint = EndpointSpecId::DiamondBooleanInterval;
+        let endpoint = EndpointSpecId::BooleanInterval;
         let decoder_node = decryption.graph.outputs()[DECODED_OUTPUT].value.node;
         let declaration = ProtocolDecl {
             params: [
@@ -1024,7 +1024,7 @@ impl DiamondWeProtocolFamily {
                         spec: endpoint,
                         stage: decrypt_id.clone(),
                         semantic_anchor: "diamond.decoder.result".to_owned(),
-                        semantics: EndpointSemanticBinding::DiamondBoolean {
+                        semantics: EndpointSemanticBinding::BooleanInterval {
                             residual_stage: decrypt_id.clone(),
                             residual_anchor: "diamond.decoder.residual".to_owned(),
                             carrier_stage: encrypt_id.clone(),

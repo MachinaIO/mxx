@@ -81,8 +81,8 @@ pub struct TrapdoorContractMismatch {
 /// A closed endpoint registry key used by the Rust operational checker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum EndpointSpecId {
-    ToyThresholdDecode,
-    DiamondBooleanInterval,
+    ThresholdDecode,
+    BooleanInterval,
 }
 
 /// A symbolic upper bound explicitly assumed by an external-input contract.
@@ -224,7 +224,7 @@ impl ComparatorSpec {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EndpointSemanticBinding {
     ThresholdDecode,
-    DiamondBoolean {
+    BooleanInterval {
         residual_stage: StageId,
         residual_anchor: String,
         carrier_stage: StageId,
@@ -582,10 +582,10 @@ impl ClosedProtocolBundle {
                 return Err(BundleValidationError::EndpointAnchorMismatch);
             }
             match (&endpoint.spec, &endpoint.semantics) {
-                (EndpointSpecId::ToyThresholdDecode, EndpointSemanticBinding::ThresholdDecode) => {}
+                (EndpointSpecId::ThresholdDecode, EndpointSemanticBinding::ThresholdDecode) => {}
                 (
-                    EndpointSpecId::DiamondBooleanInterval,
-                    EndpointSemanticBinding::DiamondBoolean {
+                    EndpointSpecId::BooleanInterval,
+                    EndpointSemanticBinding::BooleanInterval {
                         residual_stage,
                         residual_anchor,
                         carrier_stage,
@@ -728,7 +728,7 @@ impl ClosedProtocolBundle {
             match (&target.kind, endpoint.spec, decoder.kind()) {
                 (
                     OperationalDecoderKind::ThresholdDecode { plaintext_modulus },
-                    EndpointSpecId::ToyThresholdDecode,
+                    EndpointSpecId::ThresholdDecode,
                     NodeKind::ThresholdDecode {
                         plaintext_modulus: decoder_plaintext_modulus,
                         output_bool: true,
@@ -767,10 +767,10 @@ impl ClosedProtocolBundle {
                 }
                 (
                     OperationalDecoderKind::BooleanInterval,
-                    EndpointSpecId::DiamondBooleanInterval,
+                    EndpointSpecId::BooleanInterval,
                     NodeKind::IntCompare(IntCompareOp::Equal),
                 ) => {
-                    let EndpointSemanticBinding::DiamondBoolean {
+                    let EndpointSemanticBinding::BooleanInterval {
                         residual_stage,
                         residual_anchor,
                         ..
@@ -1302,7 +1302,7 @@ mod tests {
                 .expect("ideal graph"),
         )
         .expect("pure ideal");
-        let endpoint = EndpointSpecId::ToyThresholdDecode;
+        let endpoint = EndpointSpecId::ThresholdDecode;
 
         ClosedProtocolBundle {
             workflow: Workflow {
@@ -1421,7 +1421,7 @@ mod tests {
         let input = ProtocolInputId::from("message");
         let residual_input = ProtocolInputId::from("residual");
         let decoder_stage_id = StageId("decoder-stage".to_owned());
-        let interval_endpoint = EndpointSpecId::DiamondBooleanInterval;
+        let interval_endpoint = EndpointSpecId::BooleanInterval;
 
         ClosedProtocolBundle {
             workflow: Workflow {
@@ -1460,7 +1460,7 @@ mod tests {
                     spec: interval_endpoint,
                     stage: decoder_stage_id.clone(),
                     semantic_anchor: "interval.result".to_owned(),
-                    semantics: EndpointSemanticBinding::DiamondBoolean {
+                    semantics: EndpointSemanticBinding::BooleanInterval {
                         residual_stage: decoder_stage_id.clone(),
                         residual_anchor: "interval.residual".to_owned(),
                         carrier_stage: decoder_stage_id.clone(),
@@ -1571,7 +1571,7 @@ mod tests {
         .expect("pure ideal");
         let residual_input = ProtocolInputId::from("residual");
         let message_input = ProtocolInputId::from("message");
-        let endpoint = EndpointSpecId::DiamondBooleanInterval;
+        let endpoint = EndpointSpecId::BooleanInterval;
 
         ClosedProtocolBundle {
             workflow: Workflow {
@@ -1600,7 +1600,7 @@ mod tests {
                     spec: endpoint,
                     stage: stage_id.clone(),
                     semantic_anchor: "interval.result".to_owned(),
-                    semantics: EndpointSemanticBinding::DiamondBoolean {
+                    semantics: EndpointSemanticBinding::BooleanInterval {
                         residual_stage: stage_id.clone(),
                         residual_anchor: "interval.residual".to_owned(),
                         carrier_stage: stage_id.clone(),
@@ -1909,16 +1909,16 @@ mod tests {
     #[test]
     fn endpoint_cardinality_is_rejected_before_analysis() {
         let mut bundle = valid_bundle();
-        bundle.endpoint_specs.push(EndpointSpecId::ToyThresholdDecode);
+        bundle.endpoint_specs.push(EndpointSpecId::ThresholdDecode);
         assert_eq!(bundle.validate(), Err(BundleValidationError::EndpointCardinalityMismatch));
     }
 
     #[test]
     fn structural_validation_does_not_claim_endpoint_soundness() {
         let mut bundle = valid_bundle();
-        bundle.endpoint_specs.push(EndpointSpecId::ToyThresholdDecode);
+        bundle.endpoint_specs.push(EndpointSpecId::ThresholdDecode);
         bundle.endpoints.entries.push(EndpointAnchor {
-            spec: EndpointSpecId::ToyThresholdDecode,
+            spec: EndpointSpecId::ThresholdDecode,
             stage: StageId("stage".to_owned()),
             semantic_anchor: "decoded-result".to_owned(),
             semantics: EndpointSemanticBinding::ThresholdDecode,
@@ -1932,7 +1932,7 @@ mod tests {
             unreachable!("fixture uses mapped equality")
         };
         endpoints.push(ComparatorEndpointBinding {
-            endpoint: EndpointSpecId::ToyThresholdDecode,
+            endpoint: EndpointSpecId::ThresholdDecode,
             actual_input: "actual".to_owned(),
             ideal_input: "ideal".to_owned(),
             result_output: "failure".to_owned(),

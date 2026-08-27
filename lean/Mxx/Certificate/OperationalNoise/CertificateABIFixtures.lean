@@ -1,9 +1,9 @@
-import Mxx.Certificate.OperationalNoise.TallSecurity0ABI
+import Mxx.Certificate.OperationalNoise.CertificateABI
 
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
 
-namespace Mxx.Certificate.OperationalNoise.TallSecurity0ABI
+namespace Mxx.Certificate.OperationalNoise.CertificateABI
 
 open SchemaV1
 
@@ -49,13 +49,13 @@ def fixturePreimageExpression : ExpressionRow where
   program := none
 
 def fixtureWire : ObservedWire where
-  stage := "security0-fixture"
+  stage := "fixture"
   definition := .root
   path := 0
   node := 0
   port := 0
 
-def fixtureDocument : TallDocument where
+def fixtureDocument : CertificateDocument where
   schemaId := "mxx-operational-noise-certificate"
   schemaVersion := 1
   plaintextModulus := "2"
@@ -592,12 +592,12 @@ theorem malformed_history_rejected :
     malformedFinalLeaf.wellFormed = false ∧ gappedLeafHistory.wellFormed = false := by
   decide
 
-theorem tall_security0_abi_fixture :
+theorem certificate_abi_fixture :
     Valid fixtureDocument fixtureHistory ∧
       stepAt fixtureDocument (smallHistory #[⟨.survivorFold 1 0, 0⟩]) initialState = none :=
   ⟨fixture_valid, dangling_survivor_rejected⟩
 
-#print axioms tall_security0_abi_fixture
+#print axioms certificate_abi_fixture
 #print axioms term_exists_fixture
 #print axioms owner_product_key_fixture
 #print axioms owner_product_key_rejections
@@ -624,4 +624,4 @@ theorem tall_security0_abi_fixture :
 #print axioms index_lut_rows_fixture
 #print axioms typed_index_euclidean_fixture
 
-end Mxx.Certificate.OperationalNoise.TallSecurity0ABI
+end Mxx.Certificate.OperationalNoise.CertificateABI

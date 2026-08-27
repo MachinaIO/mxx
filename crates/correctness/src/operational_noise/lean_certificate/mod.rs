@@ -1,79 +1,87 @@
-//! Opt-in reached inventory for the fixed Security0 Tall certificate source.
+//! Protocol-neutral Lean certificate projection and generation.
 //!
-//! Tall construction remains in its owning integration target. This module accepts an already
-//! built protocol and request, runs the existing certificate authority once, and retains the
-//! exact typed statement and proof payload without introducing a second proof language.
+//! Protocol construction remains in the owning integration target. This module accepts an
+//! already-built protocol and request, runs the existing certificate authority once, and retains
+//! the exact typed statement and proof payload without introducing a second proof language.
 
+#[path = "lean/mod.rs"]
 mod lean;
 
-use super::{
-    OperationalCheckRequest, OperationalSimulationReport,
-    certificate_schema::CertificateDocumentV1,
-    simulation::{
-        OperationalProofPayload, ProofPayloadAuthority, ProofPayloadCoefficientMergeSource,
-        ProofPayloadEvent, ProofPayloadRelationRule, ProofPayloadRule, ProofPayloadValue,
-        derive_certificate_documents, prepare_operational_certificate,
+pub(crate) const EVENT_PACKAGE_SIZE: usize = 256;
+
+use crate::{
+    ProtocolDecl,
+    operational_noise::{
+        OperationalCheckRequest, OperationalSimulationReport,
+        certificate_schema::CertificateDocumentV1,
+        simulation::{
+            OperationalProofPayload, ProofPayloadAuthority, ProofPayloadCoefficientMergeSource,
+            ProofPayloadEvent, ProofPayloadRelationRule, ProofPayloadRule, ProofPayloadValue,
+            derive_certificate_documents, prepare_operational_certificate,
+        },
     },
 };
-use crate::ProtocolDecl;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-const SOURCE_SCHEMA_ID: &str = "mxx.operational-noise.tall-certificate-source";
-const SOURCE_SCHEMA_VERSION: u32 = 1;
-const EVALUATOR_VERSION: &str = "tall-runtime-only-v1";
-const RUST_PROJECTION_VERSION: &str = "operational-noise-certificate-v1";
-const LEAN_ABI_VERSION: &str = "tall-replay-v1";
-const TARGET_ID: &str = "tall-threshold-decode";
-const PROJECTION_MAGIC: &[u8] = b"mxx.tall.reached-projection.v1\0";
+const PROJECTION_MAGIC: &[u8] = b"mxx.operational-noise.projection.v1\0";
 
-/// Shared event-shard boundary used by the Security0 structural replay and semantic shards.
-pub(crate) const SECURITY0_EVENT_CHUNK_SIZE: usize = 256;
-
-/// Pinned identities copied from the strict Security0 Source document by its owning generator.
+/// Validated mechanics for a generated Lean artifact.
+///
+/// The protocol owner chooses the destination namespace; no protocol semantics or source
+/// identity is carried by this configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TallSecurity0ProfileIdentity {
-    pub source_schema_id: String,
-    pub source_schema_version: u32,
-    pub profile: String,
-    pub source_revision: String,
-    pub evaluator_version: String,
-    pub rust_projection_version: String,
-    pub lean_abi_version: String,
-    pub request_target_id: String,
+pub struct LeanArtifactConfig {
+    pub(crate) module_root: String,
 }
 
-/// Deterministic output of one opt-in Security0 projection run.
+impl LeanArtifactConfig {
+    pub fn new(module_root: impl Into<String>) -> Result<Self, String> {
+        let module_root = module_root.into();
+        let valid = !module_root.is_empty() &&
+            module_root.split('.').all(|segment| {
+                !segment.is_empty() &&
+                    segment.bytes().enumerate().all(|(position, byte)| {
+                        byte.is_ascii_alphabetic() || (position > 0 && byte.is_ascii_digit())
+                    })
+            });
+        if !valid {
+            return Err("generated Lean module root is not a valid namespace".to_owned());
+        }
+        Ok(Self { module_root })
+    }
+}
+
+/// Deterministic output of one opt-in certificate projection run.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TallSecurity0ReachedProjection {
+pub struct OperationalCertificateProjection {
     pub inventory_bytes: Vec<u8>,
     pub projection_bytes: Vec<u8>,
     pub recorded_report: OperationalSimulationReport,
-    pub owner_claim_statistics: TallSecurity0OwnerClaimStatistics,
+    pub owner_claim_statistics: OwnerClaimStatistics,
     pub owner_claim_report_bytes: Vec<u8>,
 }
 
-/// One deterministic generated artifact, relative to
-/// `Mxx/Certificate/OperationalNoise/Tall{Profile}Generated`.
+/// One deterministic generated artifact, relative to the configured Lean module root.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TallSecurity0GeneratedFile {
+pub struct GeneratedLeanFile {
     pub relative_path: String,
     pub bytes: Vec<u8>,
 }
 
-/// Filesystem-free output of one fixed Security0 certificate run.
+/// Filesystem-free output of one operational certificate run.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TallSecurity0LeanManifest {
-    pub files: Vec<TallSecurity0GeneratedFile>,
+pub struct OperationalCertificateLeanManifest {
+    pub files: Vec<GeneratedLeanFile>,
     pub recorded_report: OperationalSimulationReport,
-    pub owner_claim_statistics: TallSecurity0OwnerClaimStatistics,
+    pub owner_claim_statistics: OwnerClaimStatistics,
     pub owner_claim_report_bytes: Vec<u8>,
 }
 
-/// Deterministic semantic-claim counts observed while rendering the opt-in Security0 proof.
+/// Deterministic semantic-claim counts observed while rendering the opt-in certificate proof.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TallSecurity0OwnerClaimStatistics {
+pub struct OwnerClaimStatistics {
     pub result_events: u64,
     pub owners: u64,
     pub multi_payload_owners: u64,
@@ -180,7 +188,6 @@ struct StatementCounts {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReachedInventory {
-    profile: String,
     closure: ClosureCounts,
     statement: StatementCounts,
     proof_events: u64,
@@ -192,13 +199,11 @@ struct ReachedProjection {
     proof: OperationalProofPayload,
 }
 
-/// Run the fixed Security0 certificate authority once and return deterministic reached bytes.
-pub fn prepare_tall_security0_reached_projection(
+/// Run the certificate authority once and return deterministic projection bytes.
+pub fn prepare_operational_certificate_projection(
     protocol: &ProtocolDecl,
     request: &OperationalCheckRequest,
-    identity: &TallSecurity0ProfileIdentity,
-) -> Result<TallSecurity0ReachedProjection, String> {
-    validate_identity(identity, request)?;
+) -> Result<OperationalCertificateProjection, String> {
     let run =
         prepare_operational_certificate(protocol, request).map_err(|error| error.to_string())?;
     let documents = derive_certificate_documents(&run).map_err(|error| error.to_string())?;
@@ -211,28 +216,18 @@ pub fn prepare_tall_security0_reached_projection(
         .collect::<Result<Vec<_>, _>>()?;
     let (owner_claim_statistics, owner_claim_report_bytes) =
         lean::measure_owner_claims(&documents.proof.payload).map_err(|error| error.to_string())?;
-    let inventory_bytes = encode_inventory(
-        &identity.profile,
-        &run.projection.closure,
-        &documents.cert,
-        &event_kinds,
-    )?;
+    let inventory_bytes = encode_inventory(&run.projection.closure, &documents.cert, &event_kinds)?;
     let projection =
         ReachedProjection { statement: documents.cert, proof: documents.proof.payload };
     let projection_bytes = encode_projection(&projection)?;
     if inventory_bytes !=
-        encode_inventory(
-            &identity.profile,
-            &run.projection.closure,
-            &projection.statement,
-            &event_kinds,
-        )? ||
+        encode_inventory(&run.projection.closure, &projection.statement, &event_kinds)? ||
         projection_bytes != encode_projection(&projection)?
     {
-        return Err("Security0 reached projection encoding is not deterministic".to_owned());
+        return Err("certificate reached projection encoding is not deterministic".to_owned());
     }
     let recorded_report = run.accepted_report.clone().into_simulation_report();
-    Ok(TallSecurity0ReachedProjection {
+    Ok(OperationalCertificateProjection {
         inventory_bytes,
         projection_bytes,
         recorded_report,
@@ -241,13 +236,12 @@ pub fn prepare_tall_security0_reached_projection(
     })
 }
 
-/// Run the fixed Security0 authority once and render its exact reached statement and proof.
-pub fn prepare_tall_security0_lean_manifest(
+/// Run the certificate authority once and render its exact reached statement and proof.
+pub fn generate_operational_certificate_lean(
     protocol: &ProtocolDecl,
     request: &OperationalCheckRequest,
-    identity: &TallSecurity0ProfileIdentity,
-) -> Result<TallSecurity0LeanManifest, String> {
-    validate_identity(identity, request)?;
+    artifact: &LeanArtifactConfig,
+) -> Result<OperationalCertificateLeanManifest, String> {
     let run =
         prepare_operational_certificate(protocol, request).map_err(|error| error.to_string())?;
     let documents = derive_certificate_documents(&run).map_err(|error| error.to_string())?;
@@ -261,41 +255,18 @@ pub fn prepare_tall_security0_lean_manifest(
         &documents.cert,
         &documents.proof.payload,
         &owner_claim_report_bytes,
-        identity,
+        artifact,
         &ordinary_rust_noise_bound,
         recorder_peak_retained_logical_items,
         proof_projection_peak_retained_logical_items,
     )?;
     let recorded_report = run.accepted_report.into_simulation_report();
-    Ok(TallSecurity0LeanManifest {
+    Ok(OperationalCertificateLeanManifest {
         files: rendered,
         recorded_report,
         owner_claim_statistics,
         owner_claim_report_bytes,
     })
-}
-
-fn validate_identity(
-    identity: &TallSecurity0ProfileIdentity,
-    request: &OperationalCheckRequest,
-) -> Result<(), String> {
-    let profile_is_module_segment = !identity.profile.is_empty() &&
-        identity.profile.bytes().enumerate().all(|(position, byte)| {
-            byte.is_ascii_alphabetic() || (position > 0 && byte.is_ascii_digit())
-        });
-    if identity.source_schema_id != SOURCE_SCHEMA_ID ||
-        identity.source_schema_version != SOURCE_SCHEMA_VERSION ||
-        !profile_is_module_segment ||
-        identity.source_revision.is_empty() ||
-        identity.evaluator_version != EVALUATOR_VERSION ||
-        identity.rust_projection_version != RUST_PROJECTION_VERSION ||
-        identity.lean_abi_version != LEAN_ABI_VERSION ||
-        identity.request_target_id != TARGET_ID ||
-        request.target_id != identity.request_target_id
-    {
-        return Err("Tall projection identity does not match a fixed source".to_owned());
-    }
-    Ok(())
 }
 
 fn reached_event_kind(event: &ProofPayloadEvent) -> Result<ReachedEventKind, String> {
@@ -311,13 +282,13 @@ fn reached_event_kind(event: &ProofPayloadEvent) -> Result<ReachedEventKind, Str
         ProofPayloadEvent::InvocationEnd {
             result: ProofPayloadValue::Coefficient { .. }, ..
         } => {
-            return Err("unsupported coefficient InvocationEnd in fixed Security0 trace".to_owned());
+            return Err("unsupported coefficient InvocationEnd in certificate trace".to_owned());
         }
         ProofPayloadEvent::SpecializationComputed { .. } => {
             ReachedEventKind::SpecializationComputed
         }
         ProofPayloadEvent::SpecializationCacheHit { .. } => {
-            return Err("unsupported specialization cache hit in fixed Security0 trace".to_owned());
+            return Err("unsupported specialization cache hit in certificate trace".to_owned());
         }
         ProofPayloadEvent::AppliedRelation { rule, .. } => {
             ReachedEventKind::AppliedRelation(match rule {
@@ -356,18 +327,18 @@ fn reached_bound_kind(rule: &ProofPayloadRule) -> Result<ReachedBoundKind, Strin
                 ReachedAuthorityKind::RelationPreimageSource
             }
             ProofPayloadAuthority::Unavailable => {
-                return Err("unsupported unavailable bound in fixed Security0 trace".to_owned());
+                return Err("unsupported unavailable bound in certificate trace".to_owned());
             }
         }),
         ProofPayloadRule::Identity { .. } => ReachedBoundKind::Identity,
         ProofPayloadRule::Sum { .. } => ReachedBoundKind::Sum,
         ProofPayloadRule::Maximum { .. } => {
-            return Err("unsupported maximum bound in fixed Security0 trace".to_owned());
+            return Err("unsupported maximum bound in certificate trace".to_owned());
         }
         ProofPayloadRule::Scale { .. } => ReachedBoundKind::Scale,
         ProofPayloadRule::MonomialProduct { .. } => ReachedBoundKind::MonomialProduct,
         ProofPayloadRule::WeightedSum { .. } => {
-            return Err("unsupported weighted-sum bound in fixed Security0 trace".to_owned());
+            return Err("unsupported weighted-sum bound in certificate trace".to_owned());
         }
         ProofPayloadRule::Product { .. } => ReachedBoundKind::Product,
         ProofPayloadRule::Tensor { .. } => ReachedBoundKind::Tensor,
@@ -375,8 +346,7 @@ fn reached_bound_kind(rule: &ProofPayloadRule) -> Result<ReachedBoundKind, Strin
 }
 
 fn encode_inventory(
-    profile: &str,
-    closure: &super::simulation::CertificateClosure,
+    closure: &crate::operational_noise::simulation::CertificateClosure,
     statement: &CertificateDocumentV1,
     events: &[ReachedEventKind],
 ) -> Result<Vec<u8>, String> {
@@ -385,7 +355,7 @@ fn encode_inventory(
         let count = counts.entry(*kind).or_default();
         *count = count
             .checked_add(1)
-            .ok_or_else(|| "Security0 reached event count overflow".to_owned())?;
+            .ok_or_else(|| "certificate reached event count overflow".to_owned())?;
     }
     let statement_total = statement
         .expressions
@@ -393,9 +363,8 @@ fn encode_inventory(
         .checked_add(statement.programs.len())
         .and_then(|value| value.checked_add(statement.sources.len()))
         .and_then(|value| value.checked_add(statement.events.len()))
-        .ok_or_else(|| "Security0 statement row count overflow".to_owned())?;
+        .ok_or_else(|| "certificate statement row count overflow".to_owned())?;
     let inventory = ReachedInventory {
-        profile: profile.to_owned(),
         closure: ClosureCounts {
             expressions: cardinality(closure.expressions.len())?,
             programs: cardinality(closure.programs.len())?,
@@ -418,7 +387,7 @@ fn encode_inventory(
         reached: counts.into_iter().map(|(kind, count)| ReachedCount { kind, count }).collect(),
     };
     serde_json::to_vec(&inventory)
-        .map_err(|error| format!("Security0 reached inventory encoding failed: {error}"))
+        .map_err(|error| format!("certificate reached inventory encoding failed: {error}"))
 }
 
 fn encode_projection(projection: &ReachedProjection) -> Result<Vec<u8>, String> {
@@ -426,17 +395,17 @@ fn encode_projection(projection: &ReachedProjection) -> Result<Vec<u8>, String> 
     let proof = projection
         .proof
         .encode_canonical()
-        .map_err(|_| "Security0 proof payload length overflow".to_owned())?;
+        .map_err(|_| "certificate proof payload length overflow".to_owned())?;
     let statement_len = u64::try_from(statement.len())
-        .map_err(|_| "Security0 statement byte length overflow".to_owned())?;
+        .map_err(|_| "certificate statement byte length overflow".to_owned())?;
     let proof_len = u64::try_from(proof.len())
-        .map_err(|_| "Security0 proof byte length overflow".to_owned())?;
+        .map_err(|_| "certificate proof byte length overflow".to_owned())?;
     let capacity = PROJECTION_MAGIC
         .len()
         .checked_add(16)
         .and_then(|value| value.checked_add(statement.len()))
         .and_then(|value| value.checked_add(proof.len()))
-        .ok_or_else(|| "Security0 projection byte length overflow".to_owned())?;
+        .ok_or_else(|| "certificate projection byte length overflow".to_owned())?;
     let mut bytes = Vec::with_capacity(capacity);
     bytes.extend_from_slice(PROJECTION_MAGIC);
     bytes.extend_from_slice(&statement_len.to_be_bytes());
@@ -447,5 +416,5 @@ fn encode_projection(projection: &ReachedProjection) -> Result<Vec<u8>, String> 
 }
 
 fn cardinality(value: usize) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| "Security0 inventory cardinality overflow".to_owned())
+    u64::try_from(value).map_err(|_| "certificate inventory cardinality overflow".to_owned())
 }

@@ -20,12 +20,12 @@ use mxx_correctness::{
     EndpointSemanticBinding, EndpointSpecId, ExactMatrixInputMetadata, OperationalDecoderKind,
     OperationalDecoderTarget, OutputRef, StageId,
     operational_noise::{
-        OperationalAcceptanceReport, OperationalCheckRequest, OperationalGadgetLayout,
-        OperationalSimulationError, OperationalSimulationReport, ProgressEventKind,
-        TallSecurity0GeneratedFile, TallSecurity0LeanManifest, TallSecurity0OwnerClaimStatistics,
-        TallSecurity0ProfileIdentity, check_operational_noise_candidate,
-        check_operational_noise_candidate_with_progress, prepare_g0_cpu_evidence_bytes,
-        prepare_tall_security0_lean_manifest, prepare_tall_security0_reached_projection,
+        GeneratedLeanFile, LeanArtifactConfig, OperationalAcceptanceReport,
+        OperationalCertificateLeanManifest, OperationalCheckRequest, OperationalGadgetLayout,
+        OperationalSimulationError, OperationalSimulationReport, OwnerClaimStatistics,
+        ProgressEventKind, check_operational_noise_candidate,
+        check_operational_noise_candidate_with_progress, generate_operational_certificate_lean,
+        prepare_g0_cpu_evidence_bytes, prepare_operational_certificate_projection,
     },
     operational_protocol_from_graphs,
 };
@@ -303,21 +303,14 @@ impl TallCertificateSourceV1 {
         Ok(bytes)
     }
 
-    fn profile_identity(&self) -> TallSecurity0ProfileIdentity {
-        TallSecurity0ProfileIdentity {
-            source_schema_id: self.schema_id.clone(),
-            source_schema_version: self.schema_version,
-            profile: match self.profile {
+    fn artifact_config(&self) -> Result<LeanArtifactConfig, String> {
+        LeanArtifactConfig::new(format!(
+            "Mxx.Certificate.OperationalNoise.Tall{}Generated",
+            match self.profile {
                 TallG0Profile::Security0 => "Security0",
                 TallG0Profile::Security128 => "Security128",
             }
-            .to_owned(),
-            source_revision: self.source_revision.clone(),
-            evaluator_version: self.evaluator_version.clone(),
-            rust_projection_version: self.rust_projection_version.clone(),
-            lean_abi_version: self.lean_abi_version.clone(),
-            request_target_id: self.request_target_id.clone(),
-        }
+        ))
     }
 
     fn fixed_profile(&self) -> Result<FixedTallG0Profile, String> {
@@ -1052,7 +1045,7 @@ fn build_tall_operational_source(
         .ok_or_else(|| "Tall operational decoder output is absent".to_owned())?
         .value
         .node;
-    let endpoint = EndpointSpecId::ToyThresholdDecode;
+    let endpoint = EndpointSpecId::ThresholdDecode;
     let ideal = IdealSpec::new(
         DslContext::new("gpu-tall-nested-rns-operational-ideal")
             .bool_output(TALL_OPERATIONAL_DECODED, Bool::constant(false))
@@ -2532,13 +2525,9 @@ fn fixed_tall_security0_source_projection_matches_ordinary_semantics() {
     let reconstructed = build_fixed_tall_certificate_source(&source)
         .expect("Source.json-driven fixed Security0 source");
 
-    let identity = source.profile_identity();
-    let reconstructed_projection = prepare_tall_security0_reached_projection(
-        &reconstructed.protocol,
-        &reconstructed.request,
-        &identity,
-    )
-    .expect("Source.json-driven fixed Security0 reached projection");
+    let reconstructed_projection =
+        prepare_operational_certificate_projection(&reconstructed.protocol, &reconstructed.request)
+            .expect("Source.json-driven fixed Security0 reached projection");
 
     let ordinary =
         check_operational_noise_candidate(&reconstructed.protocol, &reconstructed.request)
@@ -2618,7 +2607,7 @@ fn prepare_fixed_tall_lean_manifest(
     source_path: &str,
     revision: &str,
     expected_profile: TallG0Profile,
-) -> Result<(PreparedTallOperationalSource, TallSecurity0LeanManifest), String> {
+) -> Result<(PreparedTallOperationalSource, OperationalCertificateLeanManifest), String> {
     let expected_revision = match expected_profile {
         TallG0Profile::Security0 => TALL_CERTIFICATE_SOURCE_REVISION,
         TallG0Profile::Security128 => TALL_SECURITY128_CERTIFICATE_SOURCE_REVISION,
@@ -2634,10 +2623,10 @@ fn prepare_fixed_tall_lean_manifest(
     }
     let reconstructed = build_fixed_tall_certificate_source(&source)
         .map_err(|error| format!("Source.json-driven fixed Tall source failed: {error}"))?;
-    let manifest = prepare_tall_security0_lean_manifest(
+    let manifest = generate_operational_certificate_lean(
         &reconstructed.protocol,
         &reconstructed.request,
-        &source.profile_identity(),
+        &source.artifact_config().expect("valid generated artifact namespace"),
     )
     .map_err(|error| format!("Tall Lean generation failed: {error}"))?;
     if expected_profile == TallG0Profile::Security0 {
@@ -2657,7 +2646,7 @@ fn prepare_fixed_tall_lean_manifest(
     Ok((reconstructed, manifest))
 }
 
-fn manifest_paths(files: &[TallSecurity0GeneratedFile]) -> Vec<String> {
+fn manifest_paths(files: &[GeneratedLeanFile]) -> Vec<String> {
     let mut paths = files.iter().map(|file| file.relative_path.clone()).collect::<Vec<_>>();
     paths.sort();
     paths
@@ -2689,10 +2678,7 @@ fn collect_relative_files(root: &Path) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
-fn assert_security0_owner_claim_statistics(
-    statistics: &TallSecurity0OwnerClaimStatistics,
-    report_bytes: &[u8],
-) {
+fn assert_security0_owner_claim_statistics(statistics: &OwnerClaimStatistics, report_bytes: &[u8]) {
     assert_eq!(statistics.result_events, 26_377);
     assert_eq!(statistics.owners, 9_735);
     assert_eq!(statistics.multi_payload_owners, 245);
@@ -2727,10 +2713,10 @@ fn fixed_tall_security0_emits_actual_maximum_expression_input_module() {
     .expect("strict fixed Security0 source");
     let reconstructed = build_fixed_tall_certificate_source(&source)
         .expect("Source.json-driven fixed Security0 source");
-    let manifest = prepare_tall_security0_lean_manifest(
+    let manifest = generate_operational_certificate_lean(
         &reconstructed.protocol,
         &reconstructed.request,
-        &source.profile_identity(),
+        &source.artifact_config().expect("valid generated artifact namespace"),
     )
     .expect("derive fixed Security0 maximum expression input module");
     let module = manifest
@@ -2763,10 +2749,10 @@ fn fixed_tall_security0_emits_actual_maximum_index_lut_module() {
     .expect("strict fixed Security0 source");
     let reconstructed = build_fixed_tall_certificate_source(&source)
         .expect("Source.json-driven fixed Security0 source");
-    let manifest = prepare_tall_security0_lean_manifest(
+    let manifest = generate_operational_certificate_lean(
         &reconstructed.protocol,
         &reconstructed.request,
-        &source.profile_identity(),
+        &source.artifact_config().expect("valid generated artifact namespace"),
     )
     .expect("derive fixed Security0 maximum index LUT module");
     let module = manifest
@@ -2780,7 +2766,7 @@ fn fixed_tall_security0_emits_actual_maximum_index_lut_module() {
     fs::write(&path, &module.bytes).expect("write index-use probe module");
     let text = std::str::from_utf8(&module.bytes).expect("generated index-use UTF-8");
     assert_eq!(text.matches("def IndexUseRow").count(), 199);
-    assert!(text.contains("def IndexUseRow33 : TallSecurity0ABI.IndexUseRow :="));
+    assert!(text.contains("def IndexUseRow33 : CertificateABI.IndexUseRow :="));
     assert!(text.contains("⟨.binding ⟨"));
     assert!(!text.contains("IndexLutRows.identity"));
     assert!(!text.contains("IndexLutRows.multiply"));
@@ -2802,10 +2788,10 @@ fn fixed_tall_security0_emits_first_proof_event_module() {
     .expect("strict fixed Security0 source");
     let reconstructed = build_fixed_tall_certificate_source(&source)
         .expect("Source.json-driven fixed Security0 source");
-    let manifest = prepare_tall_security0_lean_manifest(
+    let manifest = generate_operational_certificate_lean(
         &reconstructed.protocol,
         &reconstructed.request,
-        &source.profile_identity(),
+        &source.artifact_config().expect("valid generated artifact namespace"),
     )
     .expect("derive fixed Security0 first proof event module");
     let module = manifest
@@ -2839,10 +2825,10 @@ fn fixed_tall_security0_emits_final_proof_event_module() {
     .expect("strict fixed Security0 source");
     let reconstructed = build_fixed_tall_certificate_source(&source)
         .expect("Source.json-driven fixed Security0 source");
-    let manifest = prepare_tall_security0_lean_manifest(
+    let manifest = generate_operational_certificate_lean(
         &reconstructed.protocol,
         &reconstructed.request,
-        &source.profile_identity(),
+        &source.artifact_config().expect("valid generated artifact namespace"),
     )
     .expect("derive fixed Security0 final proof event module");
     let module = manifest
@@ -2874,10 +2860,10 @@ fn fixed_tall_security0_emits_dense_replay_module() {
     .expect("strict fixed Security0 source");
     let reconstructed = build_fixed_tall_certificate_source(&source)
         .expect("Source.json-driven fixed Security0 source");
-    let manifest = prepare_tall_security0_lean_manifest(
+    let manifest = generate_operational_certificate_lean(
         &reconstructed.protocol,
         &reconstructed.request,
-        &source.profile_identity(),
+        &source.artifact_config().expect("valid generated artifact namespace"),
     )
     .expect("derive fixed Security0 dense replay module");
     let module = manifest
@@ -3284,7 +3270,7 @@ fn single_lwe_public_lut_signal_check(
         .build()
         .expect("public-LUT encoding graph");
     let decoder_node = encoding.graph.outputs()["decoded"].value.node;
-    let endpoint = EndpointSpecId::ToyThresholdDecode;
+    let endpoint = EndpointSpecId::ThresholdDecode;
     let ideal = IdealSpec::new(
         DslContext::new("single-lwe-public-lut-ideal")
             .bool_output("decoded", Bool::constant(false))

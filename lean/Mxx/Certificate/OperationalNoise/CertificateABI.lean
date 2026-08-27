@@ -4,12 +4,12 @@ import Mxx.Certificate.OperationalNoise.SchemaV1
 set_option autoImplicit false
 set_option relaxedAutoImplicit false
 
-namespace Mxx.Certificate.OperationalNoise.TallSecurity0ABI
+namespace Mxx.Certificate.OperationalNoise.CertificateABI
 
 open Mxx.Certificate.OperationalNoise
 open SchemaV1
 
-/-! Reached-only chronological ABI for the fixed Tall Security0 proof payload. -/
+/-! Chronological ABI for an operational-noise proof payload. -/
 
 def rowTableNodeCount {α : Type} : RowTable α → Nat
   | .empty => 0
@@ -151,7 +151,7 @@ deriving Repr
 def IndexUseRow.index (row : IndexUseRow) : SchemaV1.PlanRef :=
   .expression row.rows.expression.reference
 
-structure TallDocument where
+structure CertificateDocument where
   schemaId : String
   schemaVersion : Nat
   plaintextModulus : String
@@ -339,14 +339,14 @@ deriving DecidableEq, Repr
 
 def initialState : ReplayState := ⟨0, []⟩
 
-def ownerValid (document : TallDocument) (owner : Owner) : Bool :=
+def ownerValid (document : CertificateDocument) (owner : Owner) : Bool :=
   match document.expressions.lookup owner.expression.row with
   | some expression => expression.inputs.wellFormed && match owner.scope with
       | .closed root => decide (document.residualRoot = .closed root)
       | .program program => (document.programs.lookup program.row).isSome
   | none => false
 
-def monomialValid (document : TallDocument) (monomial : Monomial) : Bool :=
+def monomialValid (document : CertificateDocument) (monomial : Monomial) : Bool :=
   (monomial.centralFactors ++ monomial.orderedFactors).all (ownerValid document)
 
 def currentScope (state : ReplayState) (owner : Owner) : Bool :=
@@ -472,7 +472,7 @@ def scaleValid (history : EventHistory) (state : ReplayState) (owner : Owner) :
   | .value value => valueRefValid history state owner value
   | .magnitude _ => true
 
-def preimageSourceValid (document : TallDocument) (source : ExpressionRef) : Bool :=
+def preimageSourceValid (document : CertificateDocument) (source : ExpressionRef) : Bool :=
   let event? := match document.expressions.lookup source.row with
     | some { descriptor := .event (.sampler event), .. }
     | some { descriptor := .operation (.event (.sampler event)) _, .. } => some event
@@ -483,7 +483,7 @@ def preimageSourceValid (document : TallDocument) (source : ExpressionRef) : Boo
       | _ => false
   | none => false
 
-def ruleValid (document : TallDocument) (history : EventHistory) (state : ReplayState)
+def ruleValid (document : CertificateDocument) (history : EventHistory) (state : ReplayState)
     (owner : Owner) : BoundRule → Bool
   | .authority (.relationPreimageSource source) =>
       preimageSourceValid document source
@@ -547,7 +547,7 @@ def append (state : ReplayState) (frames : List Frame) : ReplayState :=
   ⟨state.cursor + 1, frames⟩
 
 /-- One honest chronological replay step. Failed structural references return `none`. -/
-def stepAt (document : TallDocument) (history : EventHistory) (state : ReplayState) :
+def stepAt (document : CertificateDocument) (history : EventHistory) (state : ReplayState) :
     Option ReplayState := do
   let entry ← history.lookup state.cursor
   let event := entry.event
@@ -677,7 +677,7 @@ def stepAt (document : TallDocument) (history : EventHistory) (state : ReplaySta
 
 /-- Replay one exact-result event from its recorded row and checked branch guard. -/
 theorem stepAt_resultExact
-    (document : TallDocument) (history : EventHistory) (state : ReplayState)
+    (document : CertificateDocument) (history : EventHistory) (state : ReplayState)
     (owner : Owner) (terms : List Term) (coefficientBound : Bound)
     (coefficientProducer : Nat) (summary : Bound) (summaryProducer : Option Nat)
     (frameStart : Nat)
@@ -702,7 +702,7 @@ theorem stepAt_resultExact
   rw [guardAt]
   rfl
 
-def replayBlock (document : TallDocument) (history : EventHistory) (endExclusive : Nat)
+def replayBlock (document : CertificateDocument) (history : EventHistory) (endExclusive : Nat)
     (state : ReplayState) : Option ReplayState :=
   let steps := Nat.min (endExclusive - state.cursor) 4
   let rec run : Nat → ReplayState → Option ReplayState
@@ -712,7 +712,7 @@ def replayBlock (document : TallDocument) (history : EventHistory) (endExclusive
         run remaining next
   run steps state
 
-def replayRange (document : TallDocument) (history : EventHistory) (endExclusive : Nat)
+def replayRange (document : CertificateDocument) (history : EventHistory) (endExclusive : Nat)
     (state : ReplayState) : Option ReplayState := do
   let steps := endExclusive - state.cursor
   if state.cursor ≤ endExclusive && endExclusive ≤ history.size && steps ≤ 4 then
@@ -720,10 +720,10 @@ def replayRange (document : TallDocument) (history : EventHistory) (endExclusive
     if finish.cursor = endExclusive then some finish else none
   else none
 
-def replay (document : TallDocument) (history : EventHistory) : Option ReplayState :=
+def replay (document : CertificateDocument) (history : EventHistory) : Option ReplayState :=
   replayRange document history history.size initialState
 
-inductive ReplayChain (document : TallDocument) (history : EventHistory) :
+inductive ReplayChain (document : CertificateDocument) (history : EventHistory) :
     ReplayState → ReplayState → Prop
   | chunk {start finish : ReplayState} (endExclusive : Nat)
       (replayed : replayRange document history endExclusive start = some finish) :
@@ -733,12 +733,12 @@ inductive ReplayChain (document : TallDocument) (history : EventHistory) :
       (right : ReplayChain document history middle finish) :
       ReplayChain document history start finish
 
-def Valid (document : TallDocument) (history : EventHistory) : Prop :=
+def Valid (document : CertificateDocument) (history : EventHistory) : Prop :=
   history.wellFormed = true ∧
     ∃ state, ReplayChain document history initialState state ∧ state.cursor = history.size ∧
       state.frames = []
 
-theorem validOfReplay (document : TallDocument) (history : EventHistory)
+theorem validOfReplay (document : CertificateDocument) (history : EventHistory)
     (state : ReplayState)
     (replayed : replayRange document history history.size initialState = some state)
     (historyValid : history.wellFormed = true)
@@ -746,4 +746,4 @@ theorem validOfReplay (document : TallDocument) (history : EventHistory)
     Valid document history :=
   ⟨historyValid, state, .chunk history.size replayed, finished, closed⟩
 
-end Mxx.Certificate.OperationalNoise.TallSecurity0ABI
+end Mxx.Certificate.OperationalNoise.CertificateABI

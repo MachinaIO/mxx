@@ -11,6 +11,7 @@ pub(crate) mod g0;
 #[cfg(test)]
 mod g0_kernel_spikes;
 pub(crate) mod job;
+mod lean_certificate;
 pub(crate) mod lower;
 pub(crate) mod monomial;
 pub(crate) mod normal_form;
@@ -18,7 +19,6 @@ pub(crate) mod program;
 pub(crate) mod protocol;
 pub(crate) mod relation;
 pub(crate) mod report;
-mod tall_e2e;
 mod toy_e2e;
 
 pub mod bound;
@@ -33,17 +33,17 @@ pub use error::{
     OperationalSimulationError, ProductionArenaContext, ProductionError, ProductionMatrixType,
     ProductionPhase, ProductionRootRole, ProductionValueType, RequestError,
 };
+pub use lean_certificate::{
+    GeneratedLeanFile, LeanArtifactConfig, OperationalCertificateLeanManifest,
+    OperationalCertificateProjection, OwnerClaimStatistics, generate_operational_certificate_lean,
+    prepare_operational_certificate_projection,
+};
 pub use simulation::{
     BASE_FEASIBILITY_SCHEMA_ID, BASE_FEASIBILITY_SCHEMA_VERSION, BaseFeasibilityCounters,
     BaseFeasibilitySummary, BaseNBreakdown, OrdinaryBaselineCounters, ProgressEvent,
     ProgressEventKind, ResidualTraceCounters, check_operational_noise_candidate,
     check_operational_noise_candidate_with_progress, prepare_base_feasibility_summary,
     prepare_g0_cpu_evidence_bytes, serialize_base_feasibility_summary,
-};
-pub use tall_e2e::{
-    TallSecurity0GeneratedFile, TallSecurity0LeanManifest, TallSecurity0OwnerClaimStatistics,
-    TallSecurity0ProfileIdentity, TallSecurity0ReachedProjection,
-    prepare_tall_security0_lean_manifest, prepare_tall_security0_reached_projection,
 };
 pub use toy_e2e::{
     ToyGeneratedLean, check_toy_operational_slice_source, generate_toy_operational_slice_lean,

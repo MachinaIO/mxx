@@ -7,7 +7,7 @@ use std::{
     process::Command,
 };
 
-use super::tall_e2e::SECURITY0_EVENT_CHUNK_SIZE;
+use super::lean_certificate::EVENT_PACKAGE_SIZE;
 
 const BALANCED_ROW_COUNT: usize = 5_000;
 const FUEL_HAVE_COUNT: usize = 1_000;
@@ -576,14 +576,14 @@ fn render_security0_structure_module(
         statement_gates.iter().map(|gate| gate.1.as_str()).collect::<String>();
     let statement_row_count = statement.statement_rows();
     format!(
-        "import Mxx.Certificate.OperationalNoise.TallSecurity0ABI\n\
+        "import Mxx.Certificate.OperationalNoise.CertificateABI\n\
          \n\
          set_option autoImplicit false\n\
          set_option relaxedAutoImplicit false\n\
          \n\
          namespace Mxx.Certificate.OperationalNoise.G0Security0StructuralSpike\n\
          \n\
-         open SchemaV1 TallSecurity0ABI\n\
+         open SchemaV1 CertificateABI\n\
          \n\
          def statementType : ValueType := .matrix \"257\" 1 1 1\n\
          \n\
@@ -1016,7 +1016,7 @@ fn g0_kernel_spike_compiles_security0_actual_structure() {
     let source = render_security0_structure_module(
         SECURITY0_STATEMENT_CARDINALITIES,
         SECURITY0_EVENT_COUNT,
-        SECURITY0_EVENT_CHUNK_SIZE,
+        EVENT_PACKAGE_SIZE,
     );
     assert_generated_source(&source);
 
@@ -1041,7 +1041,7 @@ fn g0_kernel_spike_compiles_security0_actual_structure() {
     println!("index_use_rows={SECURITY0_INDEX_USE_ROW_COUNT}");
     println!("slice_group_rows={SECURITY0_SLICE_GROUP_ROW_COUNT}");
     println!("events={SECURITY0_EVENT_COUNT}");
-    println!("event_chunks={}", SECURITY0_EVENT_COUNT.div_ceil(SECURITY0_EVENT_CHUNK_SIZE),);
+    println!("event_chunks={}", SECURITY0_EVENT_COUNT.div_ceil(EVENT_PACKAGE_SIZE),);
     println!("PASS");
 }
 

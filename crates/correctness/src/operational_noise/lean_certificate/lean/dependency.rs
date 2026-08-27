@@ -1,15 +1,14 @@
-use super::super::super::simulation::{
-    OperationalProofPayload, ProofPayloadAuthority, ProofPayloadCoefficientMergeSource,
-    ProofPayloadEvent, ProofPayloadOwner, ProofPayloadRelationRule, ProofPayloadRule,
-    ProofPayloadScale, ProofPayloadValue, ProofPayloadValueRef,
-};
 use crate::operational_noise::{
     certificate_schema::{CertificateDocumentV1, CertificateRange, CertificateResidualRootV1},
     g0::{
         BoundProjection, CanonicalExpressionDescriptor, CanonicalExpressionOperator,
         StableMatrixOperation, StableOperator,
     },
-    simulation::ProofPayloadScope,
+    simulation::{
+        OperationalProofPayload, ProofPayloadAuthority, ProofPayloadCoefficientMergeSource,
+        ProofPayloadEvent, ProofPayloadOwner, ProofPayloadRelationRule, ProofPayloadRule,
+        ProofPayloadScale, ProofPayloadScope, ProofPayloadValue, ProofPayloadValueRef,
+    },
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -129,21 +128,19 @@ impl DependencyClosure {
             bound_rule_counts,
         };
         serde_json::to_vec(&report)
-            .map_err(|error| format!("Security0 dependency closure encoding failed: {error}"))
+            .map_err(|error| format!("certificate dependency closure encoding failed: {error}"))
     }
 }
 
 impl From<ProofPayloadOwner> for OwnerReport {
     fn from(owner: ProofPayloadOwner) -> Self {
         match owner.scope {
-            super::super::super::simulation::ProofPayloadScope::Closed { root_expression_row } => {
-                Self {
-                    scope: "closed",
-                    scope_row: root_expression_row,
-                    expression_row: owner.expression_row,
-                }
-            }
-            super::super::super::simulation::ProofPayloadScope::Program { program_row } => Self {
+            ProofPayloadScope::Closed { root_expression_row } => Self {
+                scope: "closed",
+                scope_row: root_expression_row,
+                expression_row: owner.expression_row,
+            },
+            ProofPayloadScope::Program { program_row } => Self {
                 scope: "program",
                 scope_row: program_row,
                 expression_row: owner.expression_row,
@@ -290,20 +287,12 @@ fn event_kind(event: &ProofPayloadEvent) -> ClosureEventKind {
         ProofPayloadEvent::InvocationStart { .. } => ClosureEventKind::InvocationStart,
         ProofPayloadEvent::Predecessor { .. } => ClosureEventKind::Predecessor,
         ProofPayloadEvent::Result { value, .. } => match value {
-            super::super::super::simulation::ProofPayloadValue::Exact { .. } => {
-                ClosureEventKind::ResultExact
-            }
-            super::super::super::simulation::ProofPayloadValue::Coefficient { .. } => {
-                ClosureEventKind::ResultCoefficient
-            }
+            ProofPayloadValue::Exact { .. } => ClosureEventKind::ResultExact,
+            ProofPayloadValue::Coefficient { .. } => ClosureEventKind::ResultCoefficient,
         },
         ProofPayloadEvent::InvocationEnd { result, .. } => match result {
-            super::super::super::simulation::ProofPayloadValue::Exact { .. } => {
-                ClosureEventKind::InvocationEndExact
-            }
-            super::super::super::simulation::ProofPayloadValue::Coefficient { .. } => {
-                ClosureEventKind::InvocationEndCoefficient
-            }
+            ProofPayloadValue::Exact { .. } => ClosureEventKind::InvocationEndExact,
+            ProofPayloadValue::Coefficient { .. } => ClosureEventKind::InvocationEndCoefficient,
         },
         ProofPayloadEvent::SpecializationComputed { .. } => {
             ClosureEventKind::SpecializationComputed
@@ -561,7 +550,7 @@ fn collect_event(index: &Index<'_>, event_id: u64, work: &mut Vec<u64>) -> Resul
             work.extend(producer_events(index, event_id, *owner)?);
         }
         ProofPayloadEvent::InvocationEnd { root, pre_fold_event, result } => {
-            if !matches!(result, super::super::super::simulation::ProofPayloadValue::Exact { .. }) {
+            if !matches!(result, ProofPayloadValue::Exact { .. }) {
                 return Err(format!("final closure event {event_id} has a non-exact result"));
             }
             require_prior(*pre_fold_event, event_id, "invocation-end pre-fold")?;
@@ -661,7 +650,7 @@ fn collect_event_ids(index: &Index<'_>, start_event: u64) -> Result<Vec<u64>, St
     Ok(reached.into_iter().collect())
 }
 
-pub(crate) fn collect_security0_event_closure(
+pub(crate) fn collect_event_closure(
     proof: &OperationalProofPayload,
     start_event: u64,
 ) -> Result<Vec<u64>, String> {
@@ -720,7 +709,7 @@ pub(crate) fn resolve_reached_semantic_slice(
     proof: &OperationalProofPayload,
 ) -> Result<ReachedSemanticSlice, String> {
     let CertificateResidualRootV1::Family { program, domain } = statement.residual_root else {
-        return Err("Tall reached semantics requires a family residual root".to_owned());
+        return Err("certificate reached semantics requires a family residual root".to_owned());
     };
     let program_row = statement
         .programs
@@ -1005,13 +994,13 @@ mod tests {
                 ProofPayloadEvent::InvocationEnd { root, result: exact(), pre_fold_event: 5 },
             ],
         };
-        let closure = collect(&proof).expect("collect toy final closure");
+        let closure = collect(&proof).expect("collect certificate final closure");
         assert_eq!(closure.final_end_event, 6);
         assert_eq!(closure.event_ids, vec![0, 1, 2, 3, 4, 5, 6]);
         assert_eq!(closure.event_counts[&ClosureEventKind::CoefficientMergeOperator], 1);
         assert_eq!(closure.bound_rule_counts[&ClosureBoundRuleKind::AuthorityOperator], 1);
         assert_eq!(
-            collect_security0_event_closure(&proof, 4).expect("collect exact Result closure"),
+            collect_event_closure(&proof, 4).expect("collect exact Result closure"),
             vec![0, 1, 2, 3, 4]
         );
     }

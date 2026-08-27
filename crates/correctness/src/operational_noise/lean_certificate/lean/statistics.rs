@@ -1,11 +1,11 @@
 use crate::operational_noise::{
     facts::{CoefficientBound, NumericContract},
+    lean_certificate::OwnerClaimStatistics,
     normal_form::BoundedSummary,
     simulation::{
         OperationalProofPayload, ProofPayloadEvent, ProofPayloadMonomial, ProofPayloadOwner,
         ProofPayloadRule, ProofPayloadScope, ProofPayloadTerm, ProofPayloadValue,
     },
-    tall_e2e::TallSecurity0OwnerClaimStatistics,
 };
 use num_bigint::BigInt;
 use num_traits::Zero;
@@ -101,7 +101,7 @@ struct Frame {
 struct DiagnosticReport {
     schema_id: &'static str,
     schema_version: u32,
-    statistics: TallSecurity0OwnerClaimStatistics,
+    statistics: OwnerClaimStatistics,
     owners: Vec<OwnerRow>,
 }
 
@@ -168,7 +168,7 @@ struct BindingDto {
 
 pub(crate) fn measure_owner_claims(
     proof: &OperationalProofPayload,
-) -> Result<(TallSecurity0OwnerClaimStatistics, Vec<u8>), OwnerClaimInvariantError> {
+) -> Result<(OwnerClaimStatistics, Vec<u8>), OwnerClaimInvariantError> {
     let mut stack = Vec::<Frame>::new();
     let mut occurrences = BTreeMap::<ProofPayloadOwner, Vec<ResultOccurrence>>::new();
     let mut factor_owners = BTreeSet::<ProofPayloadOwner>::new();
@@ -259,7 +259,7 @@ pub(crate) fn measure_owner_claims(
         ));
     }
 
-    let mut statistics = TallSecurity0OwnerClaimStatistics {
+    let mut statistics = OwnerClaimStatistics {
         result_events: occurrences.values().try_fold(0_u64, |sum, values| {
             sum.checked_add(u64::try_from(values.len()).map_err(|_| "result count overflow")?)
                 .ok_or_else(|| "result count overflow".to_owned())

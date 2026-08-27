@@ -4648,7 +4648,7 @@ pub(crate) fn singleton_preimage_protocol(
         .build()
         .expect("consumer graph");
     let decoder_node = consumer.graph.outputs()["decoded"].value.node;
-    let endpoint = EndpointSpecId::ToyThresholdDecode;
+    let endpoint = EndpointSpecId::ThresholdDecode;
     let decoder_stage = StageId("consumer".to_owned());
     operational_protocol_from_graphs(
         vec![("consumer".to_owned(), &consumer)],
@@ -4801,7 +4801,7 @@ pub(crate) mod tests {
             .build()
             .expect("consumer graph");
         let decoder_node = consumer.graph.outputs()["decoded"].value.node;
-        let endpoint = EndpointSpecId::ToyThresholdDecode;
+        let endpoint = EndpointSpecId::ThresholdDecode;
         let decoder_stage = StageId("consumer".to_owned());
         operational_protocol_from_graphs(
             vec![("producer".to_owned(), &producer), ("consumer".to_owned(), &consumer)],
@@ -5266,7 +5266,7 @@ pub(crate) mod tests {
             .build()
             .expect("consumer graph");
         let decoder_node = consumer.graph.outputs()["decoded"].value.node;
-        let endpoint = EndpointSpecId::ToyThresholdDecode;
+        let endpoint = EndpointSpecId::ThresholdDecode;
         let decoder_stage = StageId("consumer".to_owned());
         operational_protocol_from_graphs(
             vec![("producer".to_owned(), &producer), ("consumer".to_owned(), &consumer)],

@@ -27,13 +27,12 @@ pub(super) fn render(
     recorder_peak_retained_logical_items: u64,
     proof_projection_peak_retained_logical_items: u64,
 ) -> Result<Vec<GeneratedLeanFile>, String> {
-    let semantic_slice = dependency::resolve_reached_semantic_slice(statement, proof)?;
-    let dependency_closure = dependency::collect_reached_final_closure(proof, &semantic_slice)?;
+    let dependency_closure = dependency::collect_residual_closure(statement, proof)?;
     let final_proof_bound =
         validate_final_bound(proof, dependency_closure.final_end_event, ordinary_rust_noise_bound)?;
     let mut files = statement::render(statement)?;
     files.extend(history::render(statement, proof)?);
-    files.extend(semantics::render(statement, proof, &semantic_slice)?);
+    files.extend(semantics::render(statement, proof, &dependency_closure)?);
     files.push(GeneratedLeanFile {
         relative_path: "SemanticOwnerStatistics.json".to_owned(),
         bytes: owner_claim_report_bytes.to_vec(),

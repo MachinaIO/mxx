@@ -4721,7 +4721,7 @@ where
 }
 
 /// Produce deterministic CPU-observation evidence bytes without emitting a file or claiming a
-/// G0 hard gate, Tall execution, or GPU evidence.
+/// G0 hard gate, protocol execution, or GPU evidence.
 pub fn prepare_g0_cpu_evidence_bytes(
     protocol: &ProtocolDecl,
     request: &super::OperationalCheckRequest,

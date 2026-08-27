@@ -1863,7 +1863,7 @@ impl ExprArena {
                 // Graph-IR matrix multiplication follows the runtime contract: a 1x1
                 // matrix is a ring scalar and broadcasts over the other operand.  Only
                 // non-scalar operands require the ordinary inner-dimension rule.  Keeping
-                // this rule in the arena (rather than special-casing a Tall node) ensures
+                // this rule in the arena (rather than special-casing a protocol node) ensures
                 // every production graph and normal-form operation shares one type transfer.
                 let output = if left.rows == 1 && left.columns == 1 {
                     right.clone()

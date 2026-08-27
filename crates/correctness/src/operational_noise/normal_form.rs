@@ -1077,7 +1077,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
         *self.remaining_uses.entry(root).or_default() += 1;
 
-        // Tall's `right * plaintext` is a one-sided scalar action.  If the finite 1x1 plaintext
+        // A `right * scalar` expression is a one-sided scalar action.  If the finite 1x1 scalar
         // branch were collapsed before this edge, a later Large row product could not recover the
         // exact scalar factors required by the two-lane contract.  Delay only uniquely-consumed
         // scalar branches, and only until their immediate non-scalar Multiply.
@@ -7636,7 +7636,7 @@ mod tests {
     }
 
     #[test]
-    fn tall_shaped_large_gadget_plus_noise_rewrites_and_compresses_immediately() {
+    fn large_gadget_plus_noise_rewrites_and_compresses_immediately() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let modulus = BigUint::from(17_u8);
@@ -8563,7 +8563,7 @@ mod tests {
     }
 
     #[test]
-    fn tall_shaped_bounded_scalar_addition_keeps_identity_until_large_product() {
+    fn bounded_scalar_addition_keeps_identity_until_large_product() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let modulus = BigUint::from(17_u8);
@@ -15028,7 +15028,7 @@ mod tests {
     }
 
     #[test]
-    fn tall_shaped_remainder_records_the_scoped_rhs_descriptor() {
+    fn remainder_records_the_scoped_rhs_descriptor() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();

@@ -70,11 +70,7 @@ pub struct ExactResidualFactorDiagnostic {
     pub detail: String,
 }
 
-/// The only machine-readable registry of phase error variants.
-///
-/// Production gets exactly the closed enums below. Tests additionally get the corresponding
-/// `owner.variant` tags, generated from this same invocation so a ledger cannot drift from the
-/// public API.
+/// Defines the closed production error enums from one shared registry.
 macro_rules! operational_error_registry {
     (
         $(
@@ -102,14 +98,6 @@ macro_rules! operational_error_registry {
             impl std::error::Error for $enum_name {}
         )*
 
-        #[cfg(test)]
-        pub const ALL_OPERATIONAL_ERROR_TAGS: &[&str] = &[
-            $(
-                $(
-                    concat!(stringify!($owner), ".", stringify!($variant)),
-                )*
-            )*
-        ];
     };
 }
 
@@ -502,10 +490,7 @@ impl From<ProductionError> for OperationalSimulationError {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ALL_OPERATIONAL_ERROR_TAGS, ProductionError, ProductionMatrixType, ProductionRootRole,
-        ProductionValueType,
-    };
+    use super::{ProductionError, ProductionMatrixType, ProductionRootRole, ProductionValueType};
     use crate::{
         StageId,
         operational_noise::{
@@ -517,44 +502,6 @@ mod tests {
     };
     use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef};
     use num_bigint::BigUint;
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn tall_error_ledger_is_an_exact_bijection_with_the_registry() {
-        let ledger: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../docs/correctness/tall-operational-error-ledger.json"
-        ))
-        .expect("Tall operational-error ledger must be valid JSON");
-        let entries = ledger["entries"].as_array().expect("ledger entries must be an array");
-
-        let registered = ALL_OPERATIONAL_ERROR_TAGS.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(registered.len(), ALL_OPERATIONAL_ERROR_TAGS.len(), "duplicate registry tag");
-
-        let mut ledger_tags = BTreeSet::new();
-        for entry in entries {
-            let tag = entry["error_tag"].as_str().expect("ledger row must have an error_tag");
-            assert!(registered.contains(tag), "unknown ledger error tag: {tag}");
-            assert!(ledger_tags.insert(tag), "duplicate ledger error tag: {tag}");
-            assert!(
-                entry["tall_reachability"].as_str().is_some_and(|value| !value.is_empty()),
-                "ledger row must classify Tall reachability: {tag}"
-            );
-            assert!(
-                entry["classification"].as_str().is_some_and(|value| !value.is_empty()),
-                "ledger row must classify the error: {tag}"
-            );
-            assert!(
-                entry["rationale"].as_str().is_some_and(|value| !value.is_empty()),
-                "ledger row must explain its classification: {tag}"
-            );
-        }
-
-        assert_eq!(
-            ledger_tags, registered,
-            "ledger must contain every registered tag exactly once"
-        );
-    }
-
     #[test]
     fn report_conversion_preserves_exact_residual_category_without_proof_data() {
         let error = ProductionError::from(ReportError::ExactResidual {

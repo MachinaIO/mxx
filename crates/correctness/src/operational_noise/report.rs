@@ -6,7 +6,8 @@
 //! acceptance inequality.
 
 use super::{
-    OperationalAcceptanceReport, OperationalSimulationDiagnostics, OperationalSimulationReport,
+    OperationalAcceptanceReport, OperationalCounterSnapshot, OperationalSimulationDiagnostics,
+    OperationalSimulationReport,
     arena::ResolvedValueType,
     facts::{CoefficientBound, NumericContract},
     g0::{FeasibilitySink, NoFeasibility},
@@ -84,7 +85,23 @@ pub(crate) struct OperationalReport {
 }
 
 impl OperationalReport {
+    pub(crate) fn counter_snapshot(&self) -> OperationalCounterSnapshot {
+        OperationalCounterSnapshot {
+            occurrences: self.counters.occurrences,
+            samples: self.counters.samples,
+            normalization_nodes_processed: self.counters.normalization.nodes_processed,
+            normalization_nodes_total: self.counters.normalization.nodes_total,
+            normalization_exact_term_count: self.counters.normalization.final_exact_term_count,
+            normalization_relation_candidates: self.counters.normalization.relation_candidates,
+            normalization_relations_applied: self.counters.normalization.relation_applied,
+            normalization_relations_remaining: self.counters.normalization.relation_remaining,
+            normalization_bounded_fold_count: self.counters.normalization.bounded_fold_count,
+            normalization_peak_cached_values: self.counters.normalization.peak_cached_values,
+        }
+    }
+
     pub(crate) fn into_simulation_report(self) -> OperationalSimulationReport {
+        let counter_snapshot = self.counter_snapshot();
         OperationalSimulationReport {
             target_id: self.target_id,
             noise_bound: self.noise_bound,
@@ -92,6 +109,7 @@ impl OperationalReport {
             accepted: self.accepted,
             acceptance: self.acceptance,
             diagnostics: self.diagnostics,
+            counter_snapshot,
         }
     }
 }

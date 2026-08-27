@@ -200,6 +200,29 @@ pub struct OperationalSimulationReport {
     pub accepted: bool,
     pub acceptance: OperationalAcceptanceReport,
     pub diagnostics: OperationalSimulationDiagnostics,
+    /// Deterministic checker counters retained for opt-in certificate parity checks.
+    ///
+    /// These counters are already collected by the normal checker; exposing this immutable
+    /// snapshot does not add a second traversal or alter the normal computation.
+    pub counter_snapshot: OperationalCounterSnapshot,
+}
+
+/// Deterministic core counters from one operational checker run.
+///
+/// Wall-clock timings and allocator observations are intentionally excluded so direct checker
+/// output can be compared with Source-driven certificate preparation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OperationalCounterSnapshot {
+    pub occurrences: u64,
+    pub samples: u64,
+    pub normalization_nodes_processed: u64,
+    pub normalization_nodes_total: u64,
+    pub normalization_exact_term_count: u64,
+    pub normalization_relation_candidates: u64,
+    pub normalization_relations_applied: u64,
+    pub normalization_relations_remaining: u64,
+    pub normalization_bounded_fold_count: u64,
+    pub normalization_peak_cached_values: u64,
 }
 
 #[cfg(test)]

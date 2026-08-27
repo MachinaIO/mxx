@@ -22,10 +22,10 @@ use mxx_correctness::{
     operational_noise::{
         OperationalAcceptanceReport, OperationalCheckRequest, OperationalGadgetLayout,
         OperationalSimulationError, OperationalSimulationReport, ProgressEventKind,
-        TallSecurity0OwnerClaimStatistics, TallSecurity0ProfileIdentity,
-        check_operational_noise_candidate, check_operational_noise_candidate_with_progress,
-        prepare_g0_cpu_evidence_bytes, prepare_tall_security0_lean_manifest,
-        prepare_tall_security0_reached_projection,
+        TallSecurity0GeneratedFile, TallSecurity0LeanManifest, TallSecurity0OwnerClaimStatistics,
+        TallSecurity0ProfileIdentity, check_operational_noise_candidate,
+        check_operational_noise_candidate_with_progress, prepare_g0_cpu_evidence_bytes,
+        prepare_tall_security0_lean_manifest, prepare_tall_security0_reached_projection,
     },
     operational_protocol_from_graphs,
 };
@@ -242,7 +242,7 @@ struct FixedTallG0Profile {
     trapdoor_sigma: f64,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TallCertificateSourceV1 {
     schema_id: String,
@@ -256,7 +256,7 @@ struct TallCertificateSourceV1 {
     parameters: TallCertificateParametersV1,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TallCertificateParametersV1 {
     multiplication_count: usize,
@@ -274,6 +274,35 @@ struct TallCertificateParametersV1 {
 }
 
 impl TallCertificateSourceV1 {
+    fn from_profile(profile: TallG0Profile) -> Self {
+        Self::from_fixed_profile(profile.fixed())
+    }
+
+    fn from_fixed_profile(fixed: FixedTallG0Profile) -> Self {
+        let source_revision = match fixed.profile {
+            TallG0Profile::Security0 => TALL_CERTIFICATE_SOURCE_REVISION,
+            TallG0Profile::Security128 => TALL_SECURITY128_CERTIFICATE_SOURCE_REVISION,
+        };
+        Self {
+            schema_id: TALL_CERTIFICATE_SOURCE_SCHEMA_ID.to_owned(),
+            schema_version: TALL_CERTIFICATE_SOURCE_SCHEMA_VERSION,
+            profile: fixed.profile,
+            source_revision: source_revision.to_owned(),
+            evaluator_version: TALL_CERTIFICATE_EVALUATOR_VERSION.to_owned(),
+            rust_projection_version: TALL_CERTIFICATE_RUST_PROJECTION_VERSION.to_owned(),
+            lean_abi_version: TALL_CERTIFICATE_LEAN_ABI_VERSION.to_owned(),
+            request_target_id: TALL_OPERATIONAL_TARGET_ID.to_owned(),
+            parameters: TallCertificateParametersV1::from_fixed_profile(fixed),
+        }
+    }
+
+    fn encode_fixed_profile(profile: TallG0Profile) -> Result<Vec<u8>, String> {
+        let mut bytes = serde_json::to_vec_pretty(&Self::from_profile(profile))
+            .map_err(|error| format!("fixed Tall certificate source encoding failed: {error}"))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
     fn profile_identity(&self) -> TallSecurity0ProfileIdentity {
         TallSecurity0ProfileIdentity {
             source_schema_id: self.schema_id.clone(),
@@ -331,6 +360,25 @@ impl TallCertificateSourceV1 {
             return Err("Tall certificate source parameters are not the fixed profile".to_owned());
         }
         Ok(fixed)
+    }
+}
+
+impl TallCertificateParametersV1 {
+    fn from_fixed_profile(fixed: FixedTallG0Profile) -> Self {
+        Self {
+            multiplication_count: fixed.multiplication_count,
+            crt_depth: fixed.crt_depth,
+            log_ring_dimension: fixed.log_ring_dimension,
+            required_security_bits: fixed.required_security_bits,
+            reviewed_security_lower_bound_bits: fixed.reviewed_security_lower_bound_bits,
+            crt_modulus_bits: fixed.crt_modulus_bits,
+            requested_p_moduli_bits: fixed.requested_p_moduli_bits,
+            gadget_base_bits: fixed.gadget_base_bits,
+            max_unreduced_multiplications: fixed.max_unreduced_multiplications,
+            scale: fixed.scale.to_string(),
+            error_sigma: fixed.error_sigma.to_string(),
+            trapdoor_sigma: fixed.trapdoor_sigma.to_string(),
+        }
     }
 }
 
@@ -2412,8 +2460,11 @@ fn fixed_tall_g0_profiles_are_exact() {
 #[test]
 fn fixed_tall_security0_certificate_source_is_exact() {
     let bytes = fs::read(TALL_SECURITY0_SOURCE_PATH).expect("fixed Security0 Source.json");
+    let generated = TallCertificateSourceV1::encode_fixed_profile(TallG0Profile::Security0)
+        .expect("canonical fixed Security0 source");
+    assert_eq!(generated, bytes);
     let source: TallCertificateSourceV1 =
-        serde_json::from_slice(&bytes).expect("strict fixed Security0 source");
+        serde_json::from_slice(&generated).expect("strict fixed Security0 source");
     let fixed = source.fixed_profile().expect("fixed Security0 profile");
     assert_eq!(fixed, TallG0Profile::Security0.fixed());
     assert_eq!(fixed.scale, source.parameters.scale.parse::<u64>().expect("source scale"));
@@ -2424,8 +2475,11 @@ fn fixed_tall_security0_certificate_source_is_exact() {
 #[test]
 fn fixed_tall_security128_certificate_source_is_exact() {
     let bytes = fs::read(TALL_SECURITY128_SOURCE_PATH).expect("fixed Security128 Source.json");
+    let generated = TallCertificateSourceV1::encode_fixed_profile(TallG0Profile::Security128)
+        .expect("canonical fixed Security128 source");
+    assert_eq!(generated, bytes);
     let source: TallCertificateSourceV1 =
-        serde_json::from_slice(&bytes).expect("strict fixed Security128 source");
+        serde_json::from_slice(&generated).expect("strict fixed Security128 source");
     let fixed = source.fixed_profile().expect("fixed Security128 profile");
     assert_eq!(fixed, TallG0Profile::Security128.fixed());
     assert_eq!(fixed.scale, source.parameters.scale.parse::<u64>().expect("source scale"));
@@ -2521,6 +2575,50 @@ fn emit_fixed_tall_lean(
     revision: &str,
     expected_profile: TallG0Profile,
 ) -> Result<usize, String> {
+    let direct = prepare_fixed_tall_operational_source(expected_profile.fixed())?;
+    let direct_report = check_operational_noise_candidate(&direct.protocol, &direct.request)
+        .map_err(|error| format!("direct fixed Tall report failed: {error}"))?;
+    let (_source_reconstructed, first_manifest) =
+        prepare_fixed_tall_lean_manifest(source_path, revision, expected_profile)?;
+    assert_eq!(direct_report, first_manifest.recorded_report);
+
+    let first_paths = manifest_paths(&first_manifest.files);
+    let first_report = first_manifest.recorded_report.clone();
+    let first_statistics = first_manifest.owner_claim_statistics.clone();
+    let first_statistics_bytes = first_manifest.owner_claim_report_bytes.clone();
+    for file in &first_manifest.files {
+        let path = output.join(&file.relative_path);
+        fs::create_dir_all(path.parent().ok_or("generated file has no parent")?)
+            .map_err(|error| error.to_string())?;
+        fs::write(path, &file.bytes).map_err(|error| error.to_string())?;
+    }
+    drop(first_manifest);
+    drop(direct);
+
+    let first_disk_paths = collect_relative_files(output)?;
+    assert_eq!(first_disk_paths, first_paths);
+
+    let (_, second_manifest) =
+        prepare_fixed_tall_lean_manifest(source_path, revision, expected_profile)?;
+    assert_eq!(second_manifest.recorded_report, first_report);
+    assert_eq!(second_manifest.owner_claim_statistics, first_statistics);
+    assert_eq!(second_manifest.owner_claim_report_bytes, first_statistics_bytes);
+    let second_paths = manifest_paths(&second_manifest.files);
+    assert_eq!(second_paths, first_paths);
+    for file in &second_manifest.files {
+        let path = output.join(&file.relative_path);
+        let first_bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        assert_eq!(first_bytes, file.bytes, "generated file changed: {}", file.relative_path);
+    }
+    assert_eq!(collect_relative_files(output)?, first_paths);
+    Ok(first_paths.len())
+}
+
+fn prepare_fixed_tall_lean_manifest(
+    source_path: &str,
+    revision: &str,
+    expected_profile: TallG0Profile,
+) -> Result<(PreparedTallOperationalSource, TallSecurity0LeanManifest), String> {
     let expected_revision = match expected_profile {
         TallG0Profile::Security0 => TALL_CERTIFICATE_SOURCE_REVISION,
         TallG0Profile::Security128 => TALL_SECURITY128_CERTIFICATE_SOURCE_REVISION,
@@ -2556,13 +2654,39 @@ fn emit_fixed_tall_lean(
             .map(|file| file.bytes.as_slice()),
         Some(manifest.owner_claim_report_bytes.as_slice())
     );
-    for file in &manifest.files {
-        let path = output.join(&file.relative_path);
-        fs::create_dir_all(path.parent().ok_or("generated file has no parent")?)
-            .map_err(|error| error.to_string())?;
-        fs::write(path, &file.bytes).map_err(|error| error.to_string())?;
+    Ok((reconstructed, manifest))
+}
+
+fn manifest_paths(files: &[TallSecurity0GeneratedFile]) -> Vec<String> {
+    let mut paths = files.iter().map(|file| file.relative_path.clone()).collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+fn collect_relative_files(root: &Path) -> Result<Vec<String>, String> {
+    fn visit(root: &Path, current: &Path, paths: &mut Vec<String>) -> Result<(), String> {
+        for entry in fs::read_dir(current).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, paths)?;
+            } else if path.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|error| error.to_string())?
+                    .to_str()
+                    .ok_or("generated path is not UTF-8")?
+                    .to_owned();
+                paths.push(relative);
+            }
+        }
+        Ok(())
     }
-    Ok(manifest.files.len())
+
+    let mut paths = Vec::new();
+    visit(root, root, &mut paths)?;
+    paths.sort();
+    Ok(paths)
 }
 
 fn assert_security0_owner_claim_statistics(

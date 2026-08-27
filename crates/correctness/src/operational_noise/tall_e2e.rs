@@ -253,11 +253,18 @@ pub fn prepare_tall_security0_lean_manifest(
     let documents = derive_certificate_documents(&run).map_err(|error| error.to_string())?;
     let (owner_claim_statistics, owner_claim_report_bytes) =
         lean::measure_owner_claims(&documents.proof.payload).map_err(|error| error.to_string())?;
+    let recorder_peak_retained_logical_items = run.trace.recorder_retention().peak_logical_items;
+    let proof_projection_peak_retained_logical_items =
+        documents.proof.generator_peak_retained_logical_items;
+    let ordinary_rust_noise_bound = run.accepted_report.noise_bound.clone();
     let rendered = lean::render(
         &documents.cert,
         &documents.proof.payload,
         &owner_claim_report_bytes,
         identity,
+        &ordinary_rust_noise_bound,
+        recorder_peak_retained_logical_items,
+        proof_projection_peak_retained_logical_items,
     )?;
     let recorded_report = run.accepted_report.into_simulation_report();
     Ok(TallSecurity0LeanManifest {

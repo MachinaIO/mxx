@@ -3,8 +3,9 @@
 ## 1. この文書の目的
 
 この文書は、mxx の Rust 実装が行う operational-noise 判定について、同じ判定根拠を
-Lean で独立に検証できる certificate を作るための設計仕様である。現在の task により実装は
-許可されているが、以下の gate と各変更の review を必須とする。
+Lean で独立に検証できる、現在の Tall vertical slice の実装仕様である。実装は許可されて
+いるが、以下の gate と各変更の review を必須とする。現在は Security0/Security128 の最終
+evidence gate に近い実装途中である。
 
 対応する英語版は
 `docs/correctness/lean-provable-operational-noise-certificates.md` である。両文書は同じ要件を
@@ -31,14 +32,16 @@ Rust は certificate の作成者であり、Lean は検証者である。Rust �
 
 最初の対象は、受理済みの Tall BGG nested-RNS operational-noise パラメータ
 セットを一つ証明することである。ここで Tall は対象となる統合 workload の名称、
-BGG と nested-RNS はその暗号構成を指す。pinned checker を再実行した結果、request は
-正確に一つの `ResolvedAcceptanceTarget` へ解決され、その kind は
-`ResolvedDecoderKind::Threshold` でなければならない。canonical projection はその kind
-から平文 modulus `p` を、`ResolvedAcceptanceTarget.ciphertext_modulus` から暗号文
-modulus `q` を、`ProductionRoots.residual` から residual root を取り出す。certificate は
-狭義な noise 条件だけを証明し、
-runtime decoder の出力は仕様化も証明もしない。複数パラメータを一度に扱う一般定理は初期対象に
-含めない。
+BGG と nested-RNS はその暗号構成を指す。pinned checker の request は正確に一つの
+`ResolvedAcceptanceTarget` へ解決され、その kind は `ResolvedDecoderKind::Threshold` で
+なければならない。`Source.json` は、固定した Tall constructor、正確な
+`OperationalCheckRequest`、pinned source/evaluator identity からなる canonical な固定
+profile recipe である。projection は recipe から checker を再構成し、kind から平文 modulus
+`p` を、`ResolvedAcceptanceTarget.ciphertext_modulus` から暗号文 modulus `q` を、
+`ProductionRoots.residual` から residual root を取り出す。直接 Rust を実行した結果と
+`Source.json` から再構成した結果は report と決定的な core counter が一致しなければならない。
+certificate は狭義の noise 条件だけを証明し、runtime decoder の出力は仕様化も証明もしない。
+複数パラメータを一度に扱う一般定理は初期対象に含めない。
 
 ## 2. 最初に知っておく用語
 
@@ -121,9 +124,9 @@ Rust の判定を近似したり、別の判定へ読み替えたりしてはな
    `2 * p * noise < q` を Lean kernel が検証する。
 3. `native_decide`、`sorry`、生成 axiom、protocol 固有の trusted code、node 番号への依存、
    debug 文字列による identity、fixture 値の列挙による証明を使わない。
-4. 定理の主張を決めるデータは、固定した protocol bundle と
-   `OperationalCheckRequest` から決定的に作る。証明の並べ方や証明項を変えても、定理の主張は
-   変わらない。
+4. 定理の主張を決めるデータは、固定 profile recipe、正確な `OperationalCheckRequest`、
+   pinned audited Tall constructor から決定的に作る。証明の並べ方や証明項を変えても、定理の
+   主張は変わらない。
 5. residual proof closure 内で、Rust checker が使った型付き identity、scope ごとの event、
    relation の適用条件、bound の transfer rule をそのまま保持する。
 6. certificate 出力を無効にした通常実行では、観測・記録処理を実行せず、計算量を増やさない。
@@ -162,16 +165,21 @@ Boolean の検査結果を結ぶ共通 lemma を用意し、固定 theorem
 
 ### 5.3 生成物の分離
 
-定理の主張を決めるデータと、その証明の書き方を分離する。
+定理の主張を決めるデータと、その証明の書き方を分離する。`Source.json` は完全な frozen
+bundle serialization ではなく、固定 profile recipe である。正確な request identity、固定
+した audited Tall constructor parameter、pinned source/evaluator version だけを保持し、
+bundle の実行意味を再実装しない。target/environment の重複、normal form、LUT output、bound
+ledger、proof は含めない。
 
-- `Source.json`: G3 で追加する単一 canonical frozen-bundle serializer の完全な出力、request、
-  pinned source/evaluator version。既存 bundle の第二の実行意味モデルではなく、target/environment
-  の重複、normal form、LUT output、bound ledger、proof を含めない
-- `Cert.lean`: certificate の statement data と局所 validity proof
-- `Proof.lean`: 固定された主張を証明する通常の Lean proof
-- G3 で追加する、最終受理だけを行う固定 acceptance module
+generator は、commit 対象の小さい ABI として次の sharded output を生成する。
 
-これにより、証明生成器が証明しやすい別の主張へ差し替えることを防ぐ。
+- `Cert/`: statement row と局所的な validity proof
+- `Proof/`: immutable history と通常の theorem application
+- `Semantic/`: 到達した semantic theorem application と固定 acceptance への合成
+
+最後に固定 `TallSemantics.Security0Accepted` module がこれらを import して kernel で検査する。
+現在の profile では生成 Lean output は約 720 MB の build artifact であり、repository に
+commit する必要はない。これにより、generator が証明しやすい別の主張へ差し替わることを防ぐ。
 
 ## 6. 信頼する範囲
 
@@ -180,15 +188,23 @@ Boolean の検査結果を結ぶ共通 lemma を用意し、固定 theorem
 信頼するコードは protocol に依存しない次の部分に限定する。
 
 - Lean の matrix、scalar、`Value` の意味
-- Lean の expression/program interpreter
+- 到達した residual closure に必要な Tall の固定 expression/program semantics
 - input と sampler の contract
 - `RowTable`、`Cert.Valid`、`Cert.wellFormed` と共通 reflection lemma
-- operational claim の固定定義
-- Rust 側で identity を補足する sidecar、canonical projection、serializer
+- 固定 `TallSemantics.Security0Accepted` endpoint
+- Rust 側で identity を補足する sidecar と canonical source projection
 
 Rust の normalizer、relation search、bound search、proof の順序決定、proof renderer は証明の
 材料を作るが、正しいものとしては信頼しない。誤った材料は Lean の検査で拒否されなければ
 ならない。
+
+ここで使う三つの用語を先に定義する。`ValueClaim` は一つの event の result についての主張で
+あり、その result が記録された terms と合同で、記録された bound を満たすことを表す。owner
+が同じでも、別 event の claim を一つの global value として扱うものではない。`Witness` は、
+event-local claim を実行へ具体化するための environment、sampler contract、relation congruence、
+honest terminal bridge を供給する。`ExactClaimAt` は claim を特定の event、owner invocation、
+terms、summary、history row と結び付ける。したがって Lean は、同じ owner を持つ全 row の payload
+が一致するという仮定なしに、各 theorem application を検査できる。
 
 certificate の row は、定理が対象とする source 自体を決める。このため、source の選択と
 source から certificate への canonical projection は監査対象の trusted boundary とする。
@@ -206,25 +222,20 @@ witness の入れ替え・偽造を網羅的に拒否する検査はこの範囲
 
 ### 6.2 Source artifact
 
-canonical source artifact は、certificate 用に追加する単一の canonical frozen-bundle serializer
-の完全な出力として次を含む。これは `ProtocolDecl` や `ClosedProtocolBundle` の第二の実行
-意味モデルではなく、既存データを表す wire format である。
+`Source.json` は完全な frozen-bundle serialization ではなく、canonical な固定 profile recipe
+である。正確な `OperationalCheckRequest`、固定した audited Tall constructor parameter、pinned
+source/evaluator version を保持し、bundle の実行意味を再実装しない。target/environment の重複、
+normal form、LUT output、bound ledger、proof は含めない。
 
-- 固定 protocol bundle の完全な serializer 出力
-- 正確な `OperationalCheckRequest`
-- 固定した source と evaluator の version
-
-`OperationalCheckRequest` 自体が `target_id` と parameter environment を持つため、別の source field
-として重複させない。canonical projection は pinned checker を再実行し、正常に解決された
+canonical projection は recipe から pinned checker run を再構成し、正常に解決された
 `ResolvedAcceptanceTarget` が正確に一つあることを要求する。その kind は
 `ResolvedDecoderKind::Threshold { plaintext_modulus }` でなければならず、この値を `p`、
 `ciphertext_modulus` を `q`、`ProductionRoots.residual` を residual root とする。
-`BooleanInterval`、target の解決失敗、resolved target の欠落や複数生成、target ID または resolved
-modulus の不一致が一つでもあれば certificate 生成を拒否する。具体的には、resolved
-`target_id` と request の `target_id`、project した `q` と residual ring modulus、project した
-`p`/`q` と Rust threshold acceptance report が使った値がそれぞれ一致しなければならない。
-clean-room regeneration の主張は、この serializer が G3 で完成するまで行わない。digest は
-監査用に含めてもよいが、semantic identity として使わない。
+`BooleanInterval`、target の解決失敗、resolved target の欠落や複数生成、target identity、
+residual modulus、threshold report の `p`/`q` の不一致は certificate 生成を拒否する。
+直接 Rust run と Source から再構成した run の report field と決定的な core counter は一致しなければ
+ならない。これは statement source の audit であり、`Source.json` が全 bundle object を運べるという
+意味ではない。digest は監査用に含めてもよいが、semantic identity の代わりにはしない。
 
 ### 6.3 実行へ適用するための外部条件
 
@@ -252,7 +263,7 @@ certificate は `InputContract` や `SamplerContract` を満たす値が無条�
 
 ### 6.4 Lean acceptance 後にも必要な命題
 
-固定 acceptance module が生成された `OperationalClaim checkedCert` を検査した後は、noise の
+固定 acceptance module が生成された `TallSemantics.Security0Accepted` を検査した後は、noise の
 狭義不等式、family selector の domain、modulus と ring の整合性、certificate validity は
 証明済みであり、仮定として残らない。residual root の引数についての仮定もない。
 
@@ -260,18 +271,18 @@ accepted operational theorem を実際の一回の実行に適用するとき、
 仮定が残る。
 
 ```text
-InputContract checkedCert inputs
-SamplerContract checkedCert inputs samplers
-HonestTerminalCongruence checkedCert run
-RecordedCoefficientCoverage checkedCert run
+InputContract document inputs
+SamplerContract document inputs samplers
+HonestTerminalCongruence document run
+RecordedCoefficientCoverage document run
 ```
 
 実際の一回の実行へ結び付けるには、さらに Lean claim の外で次の三命題を確認する。
 
 ```text
-DeploymentMatches(run, checkedCert)
+DeploymentMatches(run, document)
   := run が使った bundle、request、source revision、evaluator revision の
-     canonical source が、checkedCert と対で受理した Source.json と等しい
+     canonical source が、document と history と対で受理した Source.json と等しい
 
 InputsInstantiate(run, inputs)
   := residual proof closure 内のすべての SourceAccess a について、
@@ -353,9 +364,9 @@ claim と別の finite claim が共存する場合だけである。このとき
 direct-survivor / sum-after-survivor として認識した fold chain から得た空の exact result でなければ
 ならない。それ以外の nonfactor multiplicity は、proof reference が event 単位の claim を指定する
 ため theorem-load-bearing ではない。特に singleton coefficient-finite claim と nonempty
-exact-finite claim は CP2 の semantic `Result` / `Transfer` proof の obligation として残す。決定的な
-semantic-owner statistics file は、この検査に使った event 単位の claim、frame start、summary、
-frame-root predecessor binding を記録する。
+exact-finite claim は semantic `Result` / `Transfer` proof の obligation として残す。この判定に
+必要な owner、claim、frame、predecessor の identity は生成される typed proof row として保持し、
+別の統計用意味論や whole-workload ledger は作らない。
 
 CP1 では役割を分離する。`Env` を参照するのは factor owner だけであり、`ValueClaim` は event
 単位の statement のままである。`ExactClaimAt` は、その claim と、それが解釈する正確な owner、
@@ -377,30 +388,17 @@ transfer は fact-store authority、program-family-fact authority、operator aut
 sampler 条件を満たすことを表す。root の引数は実行者から受け取らず、certificate に記録された
 closed root または family domain から内部的に決める。
 
-固定 Lean module は次の型を定義する。生成コードがこれらを再定義してはならない。
+固定 Lean module は、この vertical slice の ABI である `TallSemantics` を定義する。生成コードが
+これを再定義したり、Tall の acceptance path を generic certificate interpreter に置き換えたり
+してはならない。最終 endpoint は固定 `TallSemantics.Security0Accepted` である。これは audited
+Tall document と immutable event history を、final Result、PreFold、InvocationEnd、residual
+function、そして直接の `2 * p * noise < q` に結び付ける。Security0 と Security128 は同じ endpoint
+shape を使い、profile parameter と生成 row だけが異なる。
 
-```lean
-structure CheckedCert where
-  val : Cert
-  valid : val.Valid
-
-def OperationalClaim (cert : CheckedCert) : Prop :=
-  ∀ (samplers : SamplerAssignment) (inputs : InputAssignment),
-    InputContract cert inputs →
-    SamplerContract cert inputs samplers →
-    match cert.val.residualRoot with
-    | .closed root =>
-        2 * cert.val.plaintextModulus *
-            maxCenteredCoefficientNorm
-              (evalClosedResidual samplers inputs cert root) <
-          cert.val.ciphertextModulus
-    | .family family domain =>
-        ∀ (selector : Nat), domain.Contains selector →
-          2 * cert.val.plaintextModulus *
-              maxCenteredCoefficientNorm
-                (evalFamilyResidual samplers inputs cert family selector) <
-            cert.val.ciphertextModulus
-```
+生成 output は `Cert/`、`Proof/`、`Semantic/` の sharded file に分ける。小さな固定 acceptance
+module がこれらを import し、完全修飾した `Security0Accepted` の theorem application を kernel に
+検査させる。Tall の acceptance path は一つの固定 endpoint と到達した residual semantics だけを
+扱う。
 
 `ResidualRoot` は現在の Rust と同じ二種類だけを持つ。
 
@@ -413,7 +411,7 @@ closed root は引数なしで評価する。family selector は `Nat` だけで
 対して記号的に bound を証明する。root 引数はこの検査済み構造から内部的に決め、
 型のない外部 list として受け取らない。
 
-`OperationalClaim` は、各対象 residual の最大 centered coefficient norm を `noise` としたとき、
+`Security0Accepted` は、各対象 residual の最大 centered coefficient norm を `noise` としたとき、
 
 ```text
 2 * p * noise < q
@@ -436,13 +434,13 @@ closed root は引数なしで評価する。family selector は `Nat` だけで
 trusted canonical projection が取り出す。生成 proof の data が別の値を選ぶことはできない。runtime decode は
 この theorem の対象外である。
 
-`OperationalClaim` は certificate 固有の数学的な最終地点である。closed root なら狭義不等式を
+`Security0Accepted` は certificate 固有の数学的な最終地点である。closed root なら狭義不等式を
 一つ、family root なら正確な非負半開区間内の全 selector に対して同じ不等式を証明する。
 等号は不合格であり、整数除算を使う弱い条件へ書き換えてはならない。
 
 固定 acceptance module は、生成 proof の型が完全修飾された
-`OperationalClaim checkedCert` と一致することを検査する。runtime decode 結果は導出も検査も
-しない。wrapper theorem に `#print axioms` を実行し、許可しない axiom が混入していないことも
+`TallSemantics.Security0Accepted` と一致することを検査する。runtime decode 結果は導出も検査も
+しない。acceptance theorem に `#print axioms` を実行し、許可しない axiom が混入していないことも
 確認する。
 
 G1 でレビュー済みの Lean 標準 axiom の許可リストは `propext` と `Quot.sound` の二つだけである。
@@ -657,6 +655,12 @@ B * K(i) = T(i)
 hash tag、scale factor、comparison、固定 descriptor は、整数であっても index
 consumer ではない。
 
+各登録済み use について、`IndexUsePlan.index : ExprId` が Lean へ射影する唯一の計算 root
+である。projection は既存の typed expression table をたどり、Rust の
+`evaluate_typed_index` と同じ `Add`、`Sub`、`Mul`、`Div`、`Rem`、`Negate` semantics を使う。
+typed expression table が index 計算の唯一の表現であり、未対応の expression または演算は推測せず
+fail closed とする。
+
 ある index 計算が依存する有限入力の集合を `frontier` と呼ぶ。異なる scope にある frontier は
 型付き `ScopedExpressionRef` と、合成済みの明示的 `ProgramCall` substitution で表す。
 
@@ -667,7 +671,7 @@ consumer ではない。
 
 - owner と canonical consumer
 - 対象 operand と use kind
-- index 計算の root
+- 正確な `ExprId` index 計算 root
 - 出力が入るべき domain
 - 固定 parameter と optional group
 - 順序付き frontier identity と各 domain
@@ -679,9 +683,11 @@ consumer ごとの要求 domain は次のとおりである。
 - dynamic row start/end: `[0, input.rows + 1)`
 - dynamic column start/end: `[0, input.columns + 1)`
 
-Rust は固定 evaluator の意味論で frontier の有限直積を完全に列挙する。frontier が空の closed
-computation では、0 個の軸の直積を要素数 1 とし、row を一つだけ持つ。LUT が別の LUT 出力に
-依存する場合は、dependency DAG の topological order で出力する。
+Rust は記録した frontier の順序と domain、および固定 evaluator の意味論で有限直積を完全に
+列挙する。frontier が空の closed computation では、0 個の軸の直積を要素数 1 とし、row を
+一つだけ持つ。各 raw tuple と output は、出力前に同じ Rust typed-index evaluator と完全一致
+することを検査する。LUT が別の LUT 出力に依存する場合は、dependency DAG の topological
+order で出力する。
 
 domain の欠落や競合、dependency cycle、integer conversion の overflow、0 除算、evaluator の
 panic、評価失敗が一つでもあれば certificate 生成を拒否する。
@@ -695,10 +701,12 @@ consumer range 内であることを検査する。production table 全体を一
 同時に証明する。
 
 一つの LUT の row 数は、frontier の各 domain cardinality の積である。row 数、bytes、時間、
-domain による意味上の cutoff を設けず、表の一部だけを証明済みとして扱わない。storage は
-lossless streaming、厳密な deduplication、compression を利用してよいが、評価する tuple を
-変えてはならない。出力 domain は LUT の全 row の proof から得る。検査していない trusted
-range や、別の index-expression AST を根拠の代用にしない。
+domain による意味上の cutoff を設けず、表の一部だけを証明済みとして扱わない。Lean は typed
+`ExprId` から各 row を再構成し、raw tuple/output の対応と consumer range を検査する。storage
+は lossless streaming、厳密な deduplication、compression を利用してよいが、評価する tuple を
+変えてはならない。`IndexedSlice` の四つの動的 index は同じ frontier を持つ
+`IndexedSliceLutGroup` に残し、順序と extent を一緒に検査する。検査していない trusted range や
+別の index-expression 表現を根拠の代用にしない。
 
 ## 12. Rust の計算を Lean で再生する方法
 
@@ -724,7 +732,7 @@ Lean へ serialize せず、certificate に別の step graph や plan interprete
 3. 正負の multiplicity が一致する項を厳密に相殺する。
 4. 相殺後に残った bounded term と、その根拠に必要な subexpression だけを評価する。
 5. matrix の well-formedness を使い、`MatrixModEq` をまたいで bound を移す。
-6. `2 * p * noise < q` を直接検査し、`OperationalClaim` を完了する。
+6. `2 * p * noise < q` を直接検査し、`TallSemantics.Security0Accepted` を完了する。
 
 ### 12.2 Recorder が保持する情報
 
@@ -740,14 +748,14 @@ recorder は各 `have` を生成できるだけの次の情報を保持する。
 0 ではない term の factor 列は nonempty とする。factor のない非零 term を作ったり、zero matrix
 や架空の汎用 identity matrix を乗算単位として使ったりしない。
 
-### 12.3 Cache hit の扱い
+### 12.3 Cache と frame lifecycle
 
-Rust が normalization や specialization の cache を再利用しても、Lean proof に必要な履歴を失って
-はならない。cache hit ごとに、実際の consuming owner と expression に対する relation/gadget
-application、有限 survivor fold、暗黙の coefficient merge を正確な時系列で再出力する。
-
-owner の異なる記録を proof renderer が移植したり、Lean 側で再度 normalization search を行ったり
-しない。必要な owner-local event が不足する場合は certificate 生成を失敗させる。
+honest run の frame lifecycle は、frame の生成、owner-local cache state、event history、frame の
+終了を時系列どおり記録し、対応する Rust run と照合する。現在の Tall profile では specialization
+cache hit は 0 件であるため、汎用 specialization-cache replay や cache の owner 間移植を実装
+する必要はない。将来到達した cache reuse についても、その consuming frame 自身の relation、fold、
+merge evidence を出力し、別 owner の記録を移植したり Lean 側で normalization search を行ったり
+しない。owner-local の lifecycle event が不足する場合は certificate 生成を失敗させる。
 
 ### 12.4 Noise bound
 
@@ -821,17 +829,12 @@ decomposition を正確な closed scope または program scope で含み、expr
 reference だけを保持する。これにより expression、program、source、event の count は一つの authority
 に従い、runtime acceptance と通常 checker 経路は変わらない。
 
-G3 で canonical frozen-bundle serializer が完成した後は、その完全な出力である `Source.json`
-だけから clean-room regeneration を実行できなければならない。`Source.json` は canonical な
-frozen bundle、正確な request、pinned version identity だけを持ち、target や environment の
-重複 field、normal form、LUT output、bound ledger、proof は持たない。regenerator は checker run を
-再構築し、residual proof closure 内の全 row と proof を再計算し、decoder-only data を省く。新しい
-`Cert.lean` と `Proof.lean` は committed file と byte 単位で比較する。`Source.json` に未知の
-derived field があれば拒否する。
-
-初回 publish では output directory と source revision を明示的に受け取る。同期済み staging
-directory から atomic publish し、symlink、nonempty target、artifact 名の不一致を拒否する。dirty
-worktree の `HEAD` から revision を推測しない。
+clean-room regeneration は、同じ commit にある `Source.json` recipe から、独立した完全生成を
+二回実行する。各 run は request、Rust report、typed residual closure、`Cert/`、`Proof/`、
+`Semantic/` の全生成 file を再構築し、path-relative に byte 単位で比較する。比較の前に、
+直接 Rust run と Source 再構成 run の report field と決定的な core counter が一致することを確認する。
+`Source.json` に derived な normal form、LUT output、bound ledger、proof を入れず、recipe が
+statement の入力を一意に決める。
 
 G3 の pre-serialization/render gate では、constant-polynomial fact と polynomial-support fact を
 authoritative な owner/source/family-selected fact から再導出し、記録された値と一致しなければ拒否する。
@@ -869,78 +872,61 @@ O(N + T + L)
 
 各 gate は、その段階を通過するまで次段階へ進まないための受入条件である。
 
-### G0: 設計の実現可能性（G2/G3 の前提となる hard gate）
+### G0: 既存の構造境界
 
-完全な Lean certificate を生成する前に、security-0 と正確な security-128 Tall source の両方で
-次を計算または測定する。
-
-- 正確な `N`
-- 各 frontier の cardinality 積
-- 正確な `L` とその payload
-- 許可された論理 item 数、canonical byte 数、artifact が存在する場合の実 artifact byte 数、
-  recorder/generator の論理 retained item peak の見積り
-
-加えて、residual-closure coverage matrix、zero-axis LUT test、synchronized-slice LUT test、
-fuel-stable `have` と balanced row-local validity の kernel spike を完了する。
-
-security-0 では G3 に、artifact が存在する範囲で許可された量を実測し、security-128 では G4 に
-同じ量を正確に実測する。`size_of`、RSS、elapsed time、benchmark estimation、runtime/GPU
-estimate、現在の checker との benchmark 比較は実測対象ではない。
-
-production 規模で実現不可能なら設計 review に戻る。runtime cutoff、LUT の切り捨て、別の意味論
-への暗黙の変更で通過させない。
+既存 Rust 通常経路、SchemaV1、G0 の index-use 列挙は変更しない。opt-in projection は typed
+`ExprId`、frontier の順序と domain、SliceGroup row を保持し、raw LUT の tuple/output を
+Rust evaluator と完全一致させる。
 
 ### G1: 固定 Lean core
 
-新規配置は次の通りとする。
+次の固定 module と toy fixture を build し、axiom scan を通す。
 
-- `lean/lean-toolchain`
-- `lean/lakefile.toml`
 - `lean/Mxx/Certificate/OperationalNoise/Core.lean`
 - `lean/Mxx/Certificate/OperationalNoise/Fixtures.lean`
 
-closed な小規模 certificate、異なる index で異なる sampler 値を使う family-root certificate、
-狭義不等式、axiom 検査、malformed certificate の拒否、独立した設計 review を完了する。gate は
-`cd lean && lake build Mxx.Certificate.OperationalNoise.Fixtures` と axiom scan である。
-`AcceptedCertificates` は G3 まで不要である。
+closed certificate、index ごとに異なる sampler 値を持つ family-root certificate、狭義不等式、
+malformed data の拒否を検査する。gate は `cd lean && lake build
+Mxx.Certificate.OperationalNoise.Fixtures` と axiom scan である。
 
-を完了する。
+### G2: 到達した semantic replay
 
-### G2: Replay library
+選択した run の residual closure に現れた semantic theorem だけを、Lean compile が指摘した順に
+追加する。対象は Add/Sub/Product/Tensor merge、relation の prefix/source/suffix 再構成、
+`BoundTransfer`、`SurvivorFold`、`PreFoldPolynomial → InvocationEnd` である。未到達 variant の
+lemma、全体 coverage matrix、completeness ledger は作らない。到達したが未対応の操作、bound、
+side condition は fail closed とする。
 
-G0 の coverage matrix の全 row に、検査済み lemma または明示的な拒否を対応付ける。現在の Rust
-bound を過大評価せず再現し、未対応ケースは fail closed とする。
+### Security0 fixed acceptance
 
-### G3: Security 0
+同じ generator から `Cert/`、`Proof/`、`Semantic/` を生成し、直接 Rust run と Source 再構成 run
+の report/core-counter parity、到達 residual closure の identity/relation/bound/frame evidence、
+固定 `TallSemantics.Security0Accepted` の kernel compile、許可された axiom を確認する。
 
-- opt-in recorder と決定的 generator
-- recording off/on で同一の Rust 意味論と report
-- owner-local で完全な cache-hit replay
-- byte-identical な clean-room regeneration
-- 固定 Lean acceptance module の compile
-- canonical frozen-bundle serializer の完全な `Source.json` 出力
+### Security128
 
-を完了する。
+同じ generator と ABI を Security128 に適用し、fixed acceptance compile、正確な deterministic
+count/byte metrics、二回の完全生成の path-relative byte equality を確認する。elapsed time、RSS、
+`size_of`、benchmark estimate、runtime/GPU estimate は記録対象外である。
 
-### G4: Security 128
-
-security-128 の全生成と kernel checking を完了し、許可された論理 item 数、canonical byte 数、
-実生成 artifact byte 数、論理 retained item peak、正確な LUT row 数、Rust と Lean の differential
-result を記録する。elapsed time、RSS、`size_of`、benchmark estimate、runtime/GPU estimate は
-除外する。最後に trust inventory の独立 review を受ける。
-
-Rust の compile や unit test だけでは certificate を受理したことにならない。また、条件付き Lean
-theorem の成立だけでは、特定の runtime 実行が第6.3節の外部条件を満たしたことにはならない。
+現在は Security0/Security128 の最終 evidence gate に近い実装途中である。構造 replay、固定 Lean
+semantics、到達 semantic replay、generator ABI は実装済みで、fresh parity、exact metrics、
+clean-room evidence を完了確認として残す。Rust compile や unit test だけでは certificate の受理に
+ならず、条件付き Lean theorem だけでも特定 runtime の外部条件を証明しない。
 
 ## 16. 完了条件
 
 この設計の実装が完了したと言えるのは、少なくとも次をすべて満たしたときである。
 
-1. 既存 Rust checker の意味論、受理判定、通常時性能が変わっていない。
-2. security-128 certificate が固定 Lean acceptance module で kernel check を通る。
-3. 証明の axiom inventory が許可範囲内である。
-4. source だけから生成物を再現でき、byte 単位で一致する。
-5. residual proof closure 内の全 index use、relation、bound rule、cache hit が scope と
-   identity を保ったまま証明される。
-6. 許可された論理 item 数、canonical byte 数、実生成 artifact byte 数、論理 retained item peak が
-   G0 の実現可能性判断と整合する。
+1. 既存 Rust checker の意味論、受理判定、通常時性能、SchemaV1 が変わっていない。recording
+   off/on の Rust report と決定的 core counter も一致する。
+2. Security0 と Security128 の generator が、同じ固定 ABI と profile recipe から生成できる。
+3. 両 profile の fixed `TallSemantics.Security0Accepted` が Lean kernel で compile し、axiom
+   inventory が `propext` と `Quot.sound` の許可範囲内である。
+4. 同じ commit の `Source.json` recipe から独立した完全生成を二回行い、全 generated path の
+   bytes が一致する。生成された約 720 MB の Lean artifact は commit 不要である。
+5. reached residual closure の全 index use、LHS/RHS、owner invocation、event、relation、bound、
+   frame lifecycle が typed identity を保って Lean proof に接続される。specialization cache hit
+   は実測 0 件であり、汎用 cache support は要求しない。
+6. exact row/file/count/byte metrics と Rust–Source parity が記録され、elapsed time、RSS、
+   `size_of`、benchmark estimate、runtime/GPU estimate に依存しない。

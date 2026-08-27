@@ -2,8 +2,9 @@
 
 ## 1. Status and authority
 
-This is a design specification. Implementation is authorized by the current task, subject to the
-gates below and review of every change.
+This is the implementation specification for the current Tall vertical slice. Implementation is
+authorized by the current task, subject to the gates below and review of every change. The current
+status is implementation in progress, near the final Security0/Security128 evidence gates.
 
 The operational-noise Rust implementation at the pinned source revision is the semantic and
 performance authority. In particular, the behavior of `arena.rs`, `program.rs`, `lower.rs`,
@@ -16,13 +17,16 @@ semantic and performance authority.
 If this document and the pinned Rust core disagree, certificate emission fails until the
 certificate or Lean replay is corrected. It must not silently reinterpret the Rust result.
 
-The first target is one accepted tall-BGG nested-RNS operational-noise parameter set. Rerunning the
-pinned checker must resolve the request to exactly one `ResolvedAcceptanceTarget` whose kind is
-`ResolvedDecoderKind::Threshold`. Canonical projection takes the plaintext modulus `p` from that
-kind, the ciphertext modulus `q` from `ResolvedAcceptanceTarget.ciphertext_modulus`, and the
-residual root from `ProductionRoots.residual`. The certificate proves the strict operational-noise
-condition; it does not specify or prove any runtime decoder output. Parameter-family theorems are
-out of scope.
+The first target is one accepted Tall-BGG nested-RNS operational-noise parameter set. The pinned
+checker must resolve the request to exactly one `ResolvedAcceptanceTarget` whose kind is
+`ResolvedDecoderKind::Threshold`. The canonical source recipe records the fixed Tall constructor,
+the exact `OperationalCheckRequest`, and the pinned source/evaluator identities. The projection
+recomputes the target, takes `p` from the threshold kind, `q` from
+`ResolvedAcceptanceTarget.ciphertext_modulus`, and the residual root from
+`ProductionRoots.residual`. A direct Rust run and a run reconstructed from `Source.json` must have
+the same report and deterministic core counters. The certificate proves the strict operational
+noise condition; it does not specify or prove a runtime decoder output. Parameter-family theorems
+are out of scope.
 
 ## 2. Required guarantees
 
@@ -32,9 +36,9 @@ The design must provide all of the following:
 2. Lean checks the residual semantics, exact cancellations, surviving-noise bound, and strict
    operational inequality `2 * p * noise < q` with the kernel.
 3. `native_decide`, `sorry`, generated axioms, protocol-specific trusted code, node-number
-   shortcuts, debug-string identity, and fixture-specific cases are forbidden.
-4. Statement data is deterministically projected from a canonical frozen protocol bundle and
-   request. Proof schedules and proof terms cannot change the statement.
+   shortcuts, debug-string identity, and fixture-value shortcuts are forbidden.
+4. Statement data is deterministically projected from the fixed source recipe, exact request, and
+   pinned audited Tall constructor. Proof schedules and proof terms cannot change the statement.
 5. Within the residual proof closure, the certificate preserves the existing Rust checker's typed
    identities, scoped event occurrences, exact relation applicability, and bound-transfer rules.
 6. Certificate generation adds no work to normal checking when emission is disabled.
@@ -72,14 +76,22 @@ not additional semantic data structures.
 The trusted code is deliberately small and protocol-independent:
 
 - Lean matrix, scalar, and value semantics;
-- the Lean expression/program interpreter;
+- the fixed Tall expression/program semantics for the reached residual closure;
 - the tagged input and sampler contracts;
 - `RowTable`, `Cert.Valid`, `Cert.wellFormed`, and their shared reflection lemmas;
-- the fixed operational claim;
-- the additive Rust source-identity sidecar, canonical projection, and serializer.
+- the fixed `TallSemantics.Security0Accepted` endpoint;
+- the additive Rust source-identity sidecar and canonical source projection.
 
 The existing Rust normalizer, relation search, bound search, proof schedule, and proof renderer are
 untrusted proof producers. A mistake in them must fail Lean proof checking.
+
+Three terms used below describe the semantic boundary. A `ValueClaim` is an event-local statement
+about one recorded result: it says that the result is congruent to recorded terms and has the
+recorded bound. It is not a global value assigned to every event carrying the same owner. A
+`Witness` supplies the concrete environment, sampler contracts, relation congruences, and honest
+terminal bridge needed to instantiate those event-local claims. `ExactClaimAt` ties a claim to one
+specific event, owner invocation, terms, summary, and history row. Thus Lean can check each theorem
+application without assuming that all rows with one owner have the same payload.
 
 Statement-bearing certificate rows can change the theorem subject. The source-selection and
 source-to-certificate projection boundary is therefore audited trusted code; kernel checking alone
@@ -97,22 +109,23 @@ unchanged. Benchmark estimates are not a deliverable of this specification.
 
 ### 4.2 Protocol-dependent audited data
 
-The canonical source artifact contains exactly the complete output of the single canonical
-frozen-bundle serializer introduced for this feature, the exact `OperationalCheckRequest`, and the
-pinned source/evaluator versions. This serializer is a wire-format boundary, not a second execution
-semantics for `ProtocolDecl` or `ClosedProtocolBundle`; it may represent their data without
-reimplementing their behavior. The request already
-contains `target_id` and the parameter environment, so neither is duplicated as another source
-field. Canonical projection reruns the pinned checker and requires exactly one successfully
-resolved `ResolvedAcceptanceTarget`. Its kind must be
+`Source.json` is a canonical fixed-profile recipe, not a complete frozen-bundle serialization. It
+contains the exact `OperationalCheckRequest`, the fixed audited Tall constructor parameters, and
+the pinned source/evaluator identities needed to reconstruct that profile. It does not duplicate
+the bundle's execution semantics, generated certificate rows, proof terms, normal forms, LUT
+outputs, or bound ledger. The constructor is audited as the source of the profile; it is not a
+generic protocol decoder.
+
+Canonical projection reconstructs the pinned checker run from this recipe and requires exactly one
+successfully resolved `ResolvedAcceptanceTarget`. Its kind must be
 `ResolvedDecoderKind::Threshold { plaintext_modulus }`; this value is `p`, its
 `ciphertext_modulus` is `q`, and `ProductionRoots.residual` is the residual root. A
-`BooleanInterval` target, target-resolution failure, missing or multiple resolved targets, or any
-of the following mismatches rejects certificate emission: the resolved `target_id` differs from
-the request's `target_id`; the projected `q` differs from the residual ring modulus; or the
-projected `p` or `q` differs from the values used by the Rust threshold acceptance report. The
-clean-room claim below is not available until this serializer is complete at G3. A digest may be
-included as an audit aid but is never semantic identity.
+`BooleanInterval` target, target-resolution failure, missing or multiple resolved targets, a
+request/target identity mismatch, a residual modulus mismatch, or a threshold-report `p`/`q`
+mismatch rejects emission. The direct Rust run and the Source-reconstructed run must have identical
+semantic report fields and deterministic core counters. This direct-vs-Source parity is the
+statement-source audit; it is not a claim that `Source.json` is a portable serialization of every
+bundle object. A digest may be included as audit evidence but is never semantic identity.
 
 ### 4.3 External applicability obligations
 
@@ -141,27 +154,27 @@ the runtime, a separate probability theorem must bound the chance of leaving the
 ### 4.4 Exact premises remaining after Lean acceptance
 
 Once the fixed acceptance module has checked the generated proof of
-`OperationalClaim checkedCert`, the operational inequality, family-selector domains, modulus/ring
-agreement, and certificate validity are proved facts, not remaining assumptions. There is also no
-residual-root argument premise.
+`TallSemantics.Security0Accepted`, the operational inequality, family-selector domains,
+modulus/ring agreement, and certificate validity are proved facts, not remaining assumptions. There
+is also no residual-root argument premise.
 
 Applying the accepted operational theorem to a concrete run leaves the following contract and
 modeling premises:
 
 ```text
-InputContract checkedCert inputs
-SamplerContract checkedCert inputs samplers
-HonestTerminalCongruence checkedCert run
-RecordedCoefficientCoverage checkedCert run
+InputContract document inputs
+SamplerContract document inputs samplers
+HonestTerminalCongruence document run
+RecordedCoefficientCoverage document run
 ```
 
 For a real execution, the operator must additionally establish the following bridge outside the
 Lean claim:
 
 ```text
-DeploymentMatches(run, checkedCert)
+DeploymentMatches(run, document)
   := canonicalSource(run.bundle, run.request, run.sourceRevision, run.evaluatorRevision)
-     = the accepted Source.json paired with checkedCert
+     = the accepted Source.json paired with document and history
 
 InputsInstantiate(run, inputs)
   := for every SourceAccess a in the residual proof closure,
@@ -215,59 +228,41 @@ statement-bearing certificate rows, including the uniquely resolved `p`, `q`, an
 without changing their meaning. These are trust-boundary obligations, not hypotheses that a
 generated proof may introduce.
 
-## 5. Fixed theorem types
+## 5. Fixed Tall theorem types
 
-The fixed Lean module defines the complete types below. Generated code cannot redefine them.
+The fixed `TallSemantics` module defines the ABI used by this vertical slice. Generated code cannot
+redefine it or replace it with a generic certificate interpreter. The fixed acceptance endpoint is
+`TallSemantics.Security0Accepted`. It binds the audited Tall document and immutable event history
+to the final Result, PreFold, InvocationEnd, residual function, and direct strict inequality
+`2 * p * noise < q`. Security0 and Security128 use this same fixed endpoint shape; the profile
+parameters and generated rows differ, not the theorem's meaning.
 
-```lean
-structure CheckedCert where
-  val : Cert
-  valid : val.Valid
-
-def OperationalClaim (cert : CheckedCert) : Prop :=
-  ∀ (samplers : SamplerAssignment) (inputs : InputAssignment),
-    InputContract cert inputs →
-    SamplerContract cert inputs samplers →
-    match cert.val.residualRoot with
-    | .closed root =>
-        2 * cert.val.plaintextModulus *
-            maxCenteredCoefficientNorm
-              (evalClosedResidual samplers inputs cert root) <
-          cert.val.ciphertextModulus
-    | .family family domain =>
-        ∀ (selector : Nat), domain.Contains selector →
-          2 * cert.val.plaintextModulus *
-              maxCenteredCoefficientNorm
-                (evalFamilyResidual samplers inputs cert family selector) <
-            cert.val.ciphertextModulus
-```
+The generated files are deliberately sharded: `Cert/` contains statement rows and local validity
+proofs, `Proof/` contains the ordinary theorem applications and replay history, and `Semantic/`
+contains the reached semantic theorem applications and their final composition. A small fixed
+acceptance module imports these shards and checks the fully qualified `Security0Accepted` type;
+the Tall acceptance path has one fixed endpoint and only the reached residual semantics.
 
 `ResidualRoot` mirrors the Rust root classification exactly: it is either a closed matrix
 expression or a one-argument matrix family. Rust's `FamilyDomain` is an exact half-open interval
 with `u64` endpoints; Lean stores the same endpoints as `Nat`. A family selector is only a `Nat`
-and must satisfy `domain.Contains selector`. A closed root has no caller-supplied arguments, and a
-family root is bounded for every selector in this exact domain. Root arguments are derived from
-this checked root structure rather than supplied as an untyped external list.
+and must satisfy the exact lower and upper bounds. A closed root has no caller-supplied arguments,
+and a family root is bounded for every selector in this domain. Root arguments are derived from
+the checked root structure rather than supplied as an untyped external list.
 
-`Cert` stores `plaintextModulus` and `ciphertextModulus` directly. `Cert.wellFormed` requires
-`plaintextModulus > 0`, `ciphertextModulus > 0`, and a closed matrix or matrix-family residual over
-exactly `R_q` and the certificate ring dimension. The trusted canonical projection takes `p` from
-`ResolvedDecoderKind::Threshold`, `q` from `ResolvedAcceptanceTarget.ciphertext_modulus`, and the
-root from `ProductionRoots.residual`; generated proof data cannot choose them. Runtime decoding is
-outside the theorem.
-
-`OperationalClaim` is the only certificate-specific mathematical endpoint. For a closed root it
-proves one strict inequality. For a family root it proves the same inequality symbolically for
-every selector contained in the exact half-open domain. Equality is rejected, and the direct product
-inequality must not be replaced with a condition involving truncated integer division.
+`Cert` stores `plaintextModulus` and `ciphertextModulus` directly. Its validity requires positive
+moduli and a closed matrix or matrix-family residual over exactly `R_q` and the certificate ring
+dimension. The trusted projection takes `p` from `ResolvedDecoderKind::Threshold`, `q` from
+`ResolvedAcceptanceTarget.ciphertext_modulus`, and the root from `ProductionRoots.residual`;
+generated proof data cannot choose them. Runtime decoding is outside the theorem.
 
 The fixed theorem `Cert.Valid.wellFormed` derives `Cert.wellFormed cert = true` without reducing
 the entire production table. `Cert.Valid` and `Cert.wellFormed` are two proof interfaces to the
 same fixed row predicates; they must not be maintained as independent validation rule sets.
 
 A fixed acceptance module checks the generated proof at the fully qualified type
-`OperationalClaim checkedCert` and runs `#print axioms` on its wrapper theorem. It does not derive
-or check a runtime decode result.
+`TallSemantics.Security0Accepted` and runs `#print axioms` on its acceptance theorem. It does not
+derive or check a runtime decode result.
 
 For G1, the reviewed Lean-standard axiom allowlist is exactly `propext` and `Quot.sound`, which
 are kernel-library foundations rather than certificate-specific trust assumptions. `#print axioms`
@@ -469,21 +464,28 @@ index: family lookup, `ExplicitElement` operand 0, and the four dynamic `Indexed
 coordinates. Integer-looking nodes are never found by a heuristic scan. Hash tags, scale factors,
 comparisons and fixed descriptors are not consumers merely because they are integers.
 
+For each registered use, `IndexUsePlan.index : ExprId` is the sole computation root projected to
+Lean. The projection follows the existing typed expression table and uses exactly the same
+`evaluate_typed_index` semantics as Rust for `Add`, `Sub`, `Mul`, `Div`, `Rem`, and `Negate`.
+The projection uses the typed expression table as the sole expression representation. An
+unsupported expression or operation fails closed.
+
 The required domains are the exact nonnegative `FamilyDomain` for family lookup, the exact branch domain for
 `ExplicitElement`, `[0, input.rows + 1)` for both dynamic row endpoints, and
 `[0, input.columns + 1)` for both dynamic column endpoints.
 
 Every finite integer computation that reaches a registered consumer is projected to one
-`IndexUseLut`. Its identity contains owner, canonical consumer, operand, use kind, computation
-root, required output domain, fixed parameters, optional group, and ordered frontier identities
-and domains. Cross-scope frontiers use a typed `ScopedExpressionRef` and an explicit composed
-`ProgramCall` substitution; flattening them into caller ownership is forbidden.
+`IndexUseLut`. Its identity contains owner, canonical consumer, operand, use kind, the exact
+`ExprId` computation root, required output domain, fixed parameters, optional group, and ordered
+frontier identities and domains. Cross-scope frontiers use a typed `ScopedExpressionRef` and an
+explicit composed `ProgramCall` substitution; flattening them into caller ownership is forbidden.
 
-Rust enumerates the complete finite Cartesian frontier with the pinned evaluator semantics. A
-closed computation has zero axes, whose Cartesian product has cardinality one and exactly one
-row. Prior LUT outputs form a topologically emitted dependency DAG. Missing or conflicting
-domains, cycles, conversion overflow, division by zero, evaluator panic, or evaluation failure
-reject emission.
+Rust enumerates the complete finite Cartesian frontier in the recorded frontier order and domains
+with the pinned evaluator semantics. A closed computation has zero axes, whose Cartesian product
+has cardinality one and exactly one row. Every raw tuple and output is checked against the same
+Rust typed-index evaluator before emission; a mismatch rejects generation. Prior LUT outputs form
+a topologically emitted dependency DAG. Missing or conflicting domains, cycles, conversion
+overflow, division by zero, evaluator panic, or evaluation failure reject emission.
 
 Lean checks exact cardinality, reconstructs mixed-radix input tuples, proves the actual tuple is
 in-domain, and composes bounded row/subtree proofs that every output satisfies the consumer range.
@@ -494,11 +496,13 @@ proves order and exact output extents for every row; four independent in-range s
 insufficient.
 
 This costs `Theta(product(frontier-domain cardinalities))` per distinct index use. There is no row,
-byte, time, or domain cutoff, no partial table, no trusted output range, and no AST fallback.
-Lossless streaming, exact deduplication, or compression may change storage but not the evaluated
-tuples. A registered use may enumerate every selector in its own dependency frontier; unrelated
+byte, time, or domain cutoff, no partial table, and no trusted output range. Lean reconstructs each
+row from the typed `ExprId` expression and checks the raw tuple/output correspondence. A
+registered use may enumerate every selector in its own dependency frontier; unrelated
 uses and selectors are not cross-multiplied. Family values and parallel-loop bodies remain
 symbolic and are never duplicated per lane.
+Lossless streaming, exact deduplication, or compression may change storage but not the evaluated
+tuples.
 
 ## 10. Exact semantic and bound replay
 
@@ -512,7 +516,8 @@ graph, plan validator, or plan interpreter.
 3. Cancel exact signed multiplicities.
 4. Bound only surviving bounded terms and the subexpressions needed to justify them.
 5. Transfer the bound across `MatrixModEq` using matrix well-formedness.
-6. Check the direct strict inequality `2 * p * noise < q`; this closes `OperationalClaim`.
+6. Check the direct strict inequality `2 * p * noise < q`; this closes
+   `TallSemantics.Security0Accepted`.
 
 The recorder must retain enough context to render every local have: exact predecessor
 polynomials, additive and multiplicative prefix/suffix context, frozen rule identity and
@@ -520,11 +525,13 @@ parameters, cancellation coefficients and survivors, coefficient merges, survivo
 pre-fold final polynomial. Exact terms use a nonempty factor fold; a nonzero term with no factors
 rejects. No zero matrix or invented generic identity matrix may serve as a multiplicative unit.
 
-Cache reuse must remain replay-complete. On every normalization or specialization cache hit, the
-recorder re-emits the relation/gadget applications, finite survivor folds, and implicit coefficient
-merges for the exact consuming owner and expression, in chronological order. Renderer-side rule
-transplantation across owners and Lean-side normalization search are forbidden because they are
-sign- and scope-unsafe. Missing owner-local events make certificate generation fail closed.
+The honest frame lifecycle is replay-complete: frame creation, owner-local cache state, event
+history, and frame finalization are recorded in order and are checked against the corresponding
+Rust run. The current Tall profiles have zero specialization-cache hits, so no generic
+specialization-cache replay or cache-transplant mechanism is part of this design. Any future
+reached cache reuse must still emit the consuming frame's own relation, fold, and merge evidence;
+renderer-side transplantation across owners and Lean-side normalization search remain forbidden.
+Missing owner-local lifecycle events make certificate generation fail closed.
 
 The Lean bound lemmas must reproduce, not approximate, the pinned Rust rules used by the accepted
 run. This includes `ExactZero` annihilation, `Large`/missing rejection, scalar broadcast,
@@ -539,14 +546,14 @@ is one. A surviving nonzero coefficient magnitude is applied by a separate follo
 event. The unrestricted factor of the internal Rust product helper is not part of the certificate
 API; every accepted G0 `MonomialProduct` call site uses factor one.
 
-At G0, the generator derives one private residual coverage row from every `ObservedCoverage` row
-in the exact residual proof closure. It neither performs semantic lookup nor changes the ordinary
-checker path. Each row preserves the kind, exact count, and sorted unique sites; adds a stable,
-repository-relative Rust item; and is tagged `CheckedLean`, `G2LeanObligation`, or
-`RejectBeforeGeneration`. `CheckedLean` is used only when the exact compiled Lean semantics and
-transfer lemmas already exist. All remaining reachable operator, transform, sampler, relation, and
-bound cases stay explicit G2 obligations. Regular and small gadget decomposition, and plain,
-decomposed, and small-decomposed hash sampling, have distinct rows.
+Semantic replay is reached-only. The generator emits theorem applications for the rows actually
+present in the residual proof closure, and a Lean compile failure identifies the next missing
+semantic case. G2 therefore covers only the encountered Add/Sub/Product/Tensor merges, relation
+prefix/source/suffix reconstruction, bound transfer, survivor folds, and
+`PreFoldPolynomial → InvocationEnd` chain needed by the selected Tall run. It does not maintain a
+whole-workload coverage matrix, a completeness ledger, or lemmas for unreached cases. The
+generator remains a proof producer: Lean checks every ordinary theorem application and rejects an
+unsupported reached case.
 
 `ThresholdDecode`, `BoundAuthority::Unavailable`, and raw `EventKind::Trapdoor` are rejected before
 matrix generation or canonical event projection. Decoder-only expressions are not part of the
@@ -586,27 +593,27 @@ include each reached gadget decomposition in its exact closed or program scope; 
 stores only the corresponding event reference. This keeps the expression, program, source, and
 event counts under one authority without changing runtime acceptance or the ordinary checker path.
 
-The committed artifacts are:
+The generator emits the following sharded artifacts into an explicit output directory:
 
-- `Source.json`: the complete output of the single canonical frozen-bundle serializer, exact
-  request, and pinned version identities; no duplicated target/environment fields, normal form,
-  LUT output, bound ledger, or proof. This serializer is added at G3 and is not a second execution
-  semantics for the existing bundle types;
-- `Cert.lean`: statement data and local compositional validity witnesses;
-- `Proof.lean`: ordinary `have` declarations ending in the proof term at the fixed
-  `OperationalClaim`; and
-- the fixed acceptance module introduced at G3.
+- `Source.json`: the canonical fixed-profile recipe, exact request identity, fixed audited Tall
+  constructor parameters, and pinned source/evaluator identities. It is not a complete frozen-bundle
+  serialization and contains no normal form, LUT output, bound ledger, or proof;
+- `Cert/`: statement rows and local compositional validity witnesses;
+- `Proof/`: immutable history and ordinary theorem applications; and
+- `Semantic/`: reached semantic theorem applications and the final fixed acceptance composition.
 
-After G3, clean-room regeneration receives only the complete `Source.json` emitted by the canonical
-frozen-bundle serializer. It reconstructs the current checker run,
-recomputes every row and proof in the residual proof closure, omits decoder-only data, and
-byte-compares fresh `Cert.lean` and `Proof.lean` with the committed files. Unknown derived fields in
-`Source.json` reject regeneration. First-run publication requires an explicit output directory and
-explicit source revision, uses a synchronized staging directory and atomic publish, and rejects
-symlinks, nonempty targets, and name mismatches. It never infers a dirty worktree's revision from
-`HEAD`.
+The generated Lean output is a build artifact. Its size (approximately 720 MB for the current
+profiles) does not require committing the generated files. The fixed `TallSemantics.Security0Accepted`
+definition and the generator are the durable ABI; generated shards are recreated from the source
+recipe.
 
-The G3 pre-serialization/render gate must re-derive constant-polynomial and polynomial-support facts
+Clean-room regeneration performs two independent complete generations from the same committed
+`Source.json` recipe and compares every path-relative generated file byte-for-byte. Both runs must
+reconstruct the same request, report, typed residual closure, and fixed acceptance input. Direct
+Rust-versus-Source report/core-counter parity is checked before this equality comparison. A digest
+is optional audit evidence and never replaces the byte comparison or typed identity checks.
+
+The pre-serialization/render gate must re-derive constant-polynomial and polynomial-support facts
 from the authoritative owner/source/family-selected facts and reject any mismatch; recorded facts
 are not trusted merely because the recorder emitted them.
 
@@ -615,55 +622,46 @@ or non-standard axioms reported by `#print axioms`.
 
 ## 12. Complexity and implementation gates
 
-Let `N` be the exact logical item count of expression/program/source/event rows in the residual
-proof closure, `T` the exact emitted proof/context payload logical-item count, and `L` the exact
-size of exhaustive index-use tables in that closure. The allowed size views are these logical
-counts, canonical encoded byte lengths, actual generated-artifact byte lengths where artifacts
-exist, and recorder/generator logical peak retained items (optionally canonical retained bytes).
-`T` includes every serialized predecessor polynomial, prefix/suffix
-context, rule parameter, coefficient merge, survivor fold, and final polynomial, not merely the
-number of `have` declarations. Certificate recording and rendering are `O(N + T + L)` time and
-space, apart from the unchanged Rust checker work. No matrix-family or parallel-loop cardinality
-is included in `N`. For each LUT, its row count is exactly the product of its finite
-frontier-domain cardinalities, and `L` includes the serialized tuple and proof payload per row.
+Let `N` be the exact logical item count of expression/program/source/event rows in the reached
+residual proof closure, `T` the exact emitted proof/context payload logical-item count, and `L` the
+exact size of the exhaustive index-use tables in that closure. `T` includes predecessor
+polynomials, prefix/suffix context, rule parameters, coefficient merges, survivor folds, and the
+final polynomial, not merely the number of `have` declarations. Recording and rendering are
+`O(N + T + L)` apart from unchanged Rust checker work. Matrix-family elements and parallel-loop
+lanes are not expanded into `N`; each LUT has exactly the product of its recorded frontier-domain
+cardinalities as its row count.
 
-Before implementation, G0 computes or estimates, without full Lean certificate generation, the
-exact `N`, every frontier product, and exact `L` payload for both the security-0 and exact
-security-128 Tall sources. It estimates only logical proof-payload items and canonical encoded
-bytes, actual generated-artifact byte lengths where artifacts exist, and recorder/generator
-logical peak retained items (optionally canonical retained bytes). G3 and G4 measure these
-quantities exactly where the corresponding artifacts exist. `size_of`, RSS, elapsed time,
-benchmark estimation, runtime/GPU estimates, and current-checker benchmark comparison are
-explicitly excluded. If the
-production estimate is infeasible, the design returns to review; the implementation must not add
-a runtime cutoff, truncate a table, or silently select another semantics.
+Completion evidence uses deterministic exact counts and bytes: Rust report/core-counter parity,
+reached closure row counts, relation/bound/frame evidence counts, exact LUT row counts, generated
+file counts, canonical encoded bytes, and actual generated-artifact bytes where artifacts exist.
+Elapsed time, RSS, `size_of`, benchmark estimates, and runtime/GPU estimates are not deliverables.
+The implementation must not add a runtime cutoff, truncate a table, or silently change semantics
+to meet a metric.
 
-The phases are:
+The gates are:
 
-1. **G0, design feasibility:** a hard gate before any further G2 or G3 work; complete
-   residual-closure coverage matrix, exact `N`, `L`, and
-   frontier products, estimates of the allowed logical items/canonical bytes/artifact bytes/logical
-   retained items, zero-axis and synchronized-slice
-   LUT tests, and kernel spikes for fuel-stable haves and balanced row-local validity. Failure
-   returns the design to review before trusted code is built.
-2. **G1, fixed Lean core:** place the new project under `lean/lean-toolchain`,
-   `lean/lakefile.toml`, `lean/Mxx/Certificate/OperationalNoise/Core.lean`, and
-   `lean/Mxx/Certificate/OperationalNoise/Fixtures.lean`. Hand-prove toy closed and family-root
-   certificates with different sampler values at different indices, exact strict inequalities,
-   clean axioms, malformed-data rejection, and independent design review. The gate is
-   `cd lean && lake build Mxx.Certificate.OperationalNoise.Fixtures` followed by the axiom scan.
-   `AcceptedCertificates` is not required before G3.
-3. **G2, replay library:** every G0 coverage row has a checked lemma or deliberate rejection;
-   exact current Rust bounds are reproduced without overestimation; unsupported cases fail closed.
-4. **G3, security 0:** opt-in recorder and deterministic generator complete; recording on/off is
-   Rust-semantics-identical; cache-hit replay is owner-local and complete; clean-room regeneration
-   is byte-identical; fixed Lean acceptance compiles.
-5. **G4, security 128:** full generation and
-   kernel checking complete; the allowed logical-item counts, canonical bytes, generated artifact
-   byte lengths, logical retained-item peaks, exact LUT counts, and Rust-versus-Lean differential
-   results are recorded; elapsed time, RSS, `size_of`, benchmark estimates, and runtime/GPU
-   estimates are excluded; the trust inventory receives
-   independent review.
+1. **G0, existing structural boundary:** keep the existing Rust path, SchemaV1, and G0 index-use
+   enumeration unchanged. The opt-in projection preserves typed `ExprId`, frontier order, domains,
+   and SliceGroup rows, with exact Rust raw-row validation.
+2. **G1, fixed Lean core:** build `Core.lean` and `Fixtures.lean` under
+   `lean/Mxx/Certificate/OperationalNoise/`, including the toy fixture and the axiom scan.
+3. **G2, reached semantic replay:** apply only the semantic theorem families reached by the selected
+   run: Add/Sub/Product/Tensor merge, relation prefix/source/suffix reconstruction,
+   `BoundTransfer`, `SurvivorFold`, and `PreFoldPolynomial → InvocationEnd`. A missing reached
+   theorem is fixed after the Lean compile identifies it; unreached variants and a whole coverage
+   ledger are not required.
+4. **Security0 fixed acceptance:** generate sharded `Cert/`, `Proof/`, and `Semantic/` outputs from
+   the canonical recipe; verify direct-vs-Source report/core-counter parity, reached residual
+   closure identity/relation/bound/frame evidence, and compile the fixed
+   `TallSemantics.Security0Accepted` endpoint with the allowed axioms.
+5. **Security128:** apply the same generator and fixed ABI, then require full generation, fixed
+   acceptance compilation, exact deterministic metrics, and two-run clean-room byte equality.
+
+The current status is near the final Security0/Security128 evidence gates: the structural replay,
+fixed Lean semantics, reached semantic replay, and generator ABI are implemented, while the final
+fresh-generation parity, exact metrics, and clean-room evidence remain completion checks. Passing a
+Rust compile or unit-test gate alone is not certificate acceptance. Passing the conditional Lean
+theorem alone does not establish the external execution-instantiation obligations in §4.3.
 
 Passing a Rust compile or unit-test gate is not certificate acceptance. Passing the conditional
 Lean theorem is not by itself evidence that one runtime execution satisfied the external

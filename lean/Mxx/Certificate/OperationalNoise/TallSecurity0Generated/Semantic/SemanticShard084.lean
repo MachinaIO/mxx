@@ -1,0 +1,722 @@
+import Mxx.Certificate.OperationalNoise.TallSemantics
+import Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Proof.History
+
+set_option autoImplicit false
+set_option relaxedAutoImplicit false
+
+namespace Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Semantic.SemanticShard084
+
+open Mxx.Certificate.OperationalNoise
+open TallSecurity0ABI
+open TallSemantics
+
+def shardIndex : Nat := 84
+def shardStartEvent : Nat := 21504
+def shardEndEvent : Nat := 21760
+def rawSemanticCount : Nat := 153
+def rawBoundTransferCount : Nat := 77
+def rawResultCount : Nat := 66
+def rawRelationCount : Nat := 3
+def rawSurvivorFoldCount : Nat := 3
+def rawPreFoldCount : Nat := 2
+def rawInvocationEndCount : Nat := 2
+def canonicalWork : Nat := 23
+
+namespace Operation0
+def selectedEvent : Nat := 21506
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨5558⟩⟩
+def leftRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩] } }]
+def rightRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩] } }]
+def outputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩] } }]
+def left : Polynomial Owner := leftRaw.map Term.toExact
+def right : Polynomial Owner := rightRaw.map Term.toExact
+def output : Polynomial Owner := outputRaw.map Term.toExact
+def leftOwner : Owner := ⟨.program ⟨214⟩, ⟨5557⟩⟩
+def rightOwner : Owner := ⟨.program ⟨214⟩, ⟨6⟩⟩
+def leftSummary : Bound := .exactZero
+def rightSummary : Bound := .exactZero
+def outputSummary : Bound := .exactZero
+def selectedRawWork : Nat := 1
+def selectedSumRuleEvent : Nat := 21504
+def selectedLeftResultEvent : Nat := 21290
+def selectedRightResultEvent : Nat := 6550
+def selectedResultEvent : Nat := 21506
+def leftScalar : Bool := true
+def rightScalar : Bool := false
+
+theorem resultAgreement : CanonicalAgreement output (productPoly left right leftScalar rightScalar) := by
+  decide +kernel
+
+theorem resultSound (env : Env Owner) :
+    evalPolynomial env output = evalPolynomial env left * evalPolynomial env right := by
+  exact productCanonicalResultSound env left right output leftScalar rightScalar resultAgreement
+
+theorem selectedLeftResultAt : (history.lookup selectedLeftResultEvent).map AnnotatedEvent.event = some (.resultExact leftOwner leftRaw leftSummary) := by
+  rfl
+
+theorem selectedRightResultAt : (history.lookup selectedRightResultEvent).map AnnotatedEvent.event = some (.resultExact rightOwner rightRaw rightSummary) := by
+  rfl
+
+theorem selectedResultAt : (history.lookup selectedResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner outputRaw outputSummary) := by
+  rfl
+
+theorem selectedRuleAt : (history.lookup selectedSumRuleEvent).map AnnotatedEvent.event = some (.boundTransfer selectedOwner (.product (.predecessor 0 21502 .coefficient) (.predecessor 1 21503 .coefficient) ⟨false, false, none, none, none⟩)) := by
+  rfl
+
+end Operation0
+
+namespace Operation1
+def selectedEvent : Nat := 21564
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨20261⟩⟩
+def leftRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩] } }]
+def rightRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨20260⟩⟩] } }]
+def outputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩] } }]
+def left : Polynomial Owner := leftRaw.map Term.toExact
+def right : Polynomial Owner := rightRaw.map Term.toExact
+def output : Polynomial Owner := outputRaw.map Term.toExact
+def leftOwner : Owner := ⟨.program ⟨214⟩, ⟨6⟩⟩
+def rightOwner : Owner := ⟨.program ⟨214⟩, ⟨20260⟩⟩
+def leftSummary : Bound := .exactZero
+def rightSummary : Bound := .exactZero
+def outputSummary : Bound := .exactZero
+def selectedRawWork : Nat := 1
+def selectedSumRuleEvent : Nat := 21562
+def selectedLeftResultEvent : Nat := 21559
+def selectedRightResultEvent : Nat := 21557
+def selectedResultEvent : Nat := 21564
+def leftScalar : Bool := false
+def rightScalar : Bool := false
+
+theorem resultAgreement : CanonicalAgreement output (productPoly left right leftScalar rightScalar) := by
+  decide +kernel
+
+theorem resultSound (env : Env Owner) :
+    evalPolynomial env output = evalPolynomial env left * evalPolynomial env right := by
+  exact productCanonicalResultSound env left right output leftScalar rightScalar resultAgreement
+
+theorem selectedLeftResultAt : (history.lookup selectedLeftResultEvent).map AnnotatedEvent.event = some (.resultExact leftOwner leftRaw leftSummary) := by
+  rfl
+
+theorem selectedRightResultAt : (history.lookup selectedRightResultEvent).map AnnotatedEvent.event = some (.resultExact rightOwner rightRaw rightSummary) := by
+  rfl
+
+theorem selectedResultAt : (history.lookup selectedResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner outputRaw outputSummary) := by
+  rfl
+
+theorem selectedRuleAt : (history.lookup selectedSumRuleEvent).map AnnotatedEvent.event = some (.boundTransfer selectedOwner (.product (.predecessor 0 21560 .coefficient) (.predecessor 1 21561 .coefficient) ⟨false, false, none, none, none⟩)) := by
+  rfl
+
+end Operation1
+
+namespace Operation2
+def selectedEvent : Nat := 21598
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨13375⟩⟩
+def leftRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩], orderedFactors := [] } }]
+def rightRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [] } }]
+def outputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [] } }]
+def left : Polynomial Owner := leftRaw.map Term.toExact
+def right : Polynomial Owner := rightRaw.map Term.toExact
+def output : Polynomial Owner := outputRaw.map Term.toExact
+def leftOwner : Owner := ⟨.program ⟨214⟩, ⟨10360⟩⟩
+def rightOwner : Owner := ⟨.program ⟨214⟩, ⟨13374⟩⟩
+def leftSummary : Bound := .exactZero
+def rightSummary : Bound := .exactZero
+def outputSummary : Bound := .exactZero
+def selectedRawWork : Nat := 1
+def selectedSumRuleEvent : Nat := 21596
+def selectedLeftResultEvent : Nat := 21593
+def selectedRightResultEvent : Nat := 21590
+def selectedResultEvent : Nat := 21598
+def leftScalar : Bool := false
+def rightScalar : Bool := false
+
+theorem resultAgreement : CanonicalAgreement output (productPoly left right leftScalar rightScalar) := by
+  decide +kernel
+
+theorem resultSound (env : Env Owner) :
+    evalPolynomial env output = evalPolynomial env left * evalPolynomial env right := by
+  exact productCanonicalResultSound env left right output leftScalar rightScalar resultAgreement
+
+theorem selectedLeftResultAt : (history.lookup selectedLeftResultEvent).map AnnotatedEvent.event = some (.resultExact leftOwner leftRaw leftSummary) := by
+  rfl
+
+theorem selectedRightResultAt : (history.lookup selectedRightResultEvent).map AnnotatedEvent.event = some (.resultExact rightOwner rightRaw rightSummary) := by
+  rfl
+
+theorem selectedResultAt : (history.lookup selectedResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner outputRaw outputSummary) := by
+  rfl
+
+theorem selectedRuleAt : (history.lookup selectedSumRuleEvent).map AnnotatedEvent.event = some (.boundTransfer selectedOwner (.product (.predecessor 0 21594 .coefficient) (.predecessor 1 21595 .coefficient) ⟨true, true, none, some 1, some 1⟩)) := by
+  rfl
+
+end Operation2
+
+namespace Operation3
+def selectedEvent : Nat := 21628
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨13460⟩⟩
+def leftRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def rightRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [] } }]
+def outputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def left : Polynomial Owner := leftRaw.map Term.toExact
+def right : Polynomial Owner := rightRaw.map Term.toExact
+def output : Polynomial Owner := outputRaw.map Term.toExact
+def leftOwner : Owner := ⟨.program ⟨214⟩, ⟨6544⟩⟩
+def rightOwner : Owner := ⟨.program ⟨214⟩, ⟨13459⟩⟩
+def leftSummary : Bound := .exactZero
+def rightSummary : Bound := .exactZero
+def outputSummary : Bound := .exactZero
+def selectedRawWork : Nat := 1
+def selectedSumRuleEvent : Nat := 21626
+def selectedLeftResultEvent : Nat := 21623
+def selectedRightResultEvent : Nat := 21621
+def selectedResultEvent : Nat := 21628
+def leftScalar : Bool := false
+def rightScalar : Bool := false
+
+theorem resultAgreement : CanonicalAgreement output (productPoly left right leftScalar rightScalar) := by
+  decide +kernel
+
+theorem resultSound (env : Env Owner) :
+    evalPolynomial env output = evalPolynomial env left * evalPolynomial env right := by
+  exact productCanonicalResultSound env left right output leftScalar rightScalar resultAgreement
+
+theorem selectedLeftResultAt : (history.lookup selectedLeftResultEvent).map AnnotatedEvent.event = some (.resultExact leftOwner leftRaw leftSummary) := by
+  rfl
+
+theorem selectedRightResultAt : (history.lookup selectedRightResultEvent).map AnnotatedEvent.event = some (.resultExact rightOwner rightRaw rightSummary) := by
+  rfl
+
+theorem selectedResultAt : (history.lookup selectedResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner outputRaw outputSummary) := by
+  rfl
+
+theorem selectedRuleAt : (history.lookup selectedSumRuleEvent).map AnnotatedEvent.event = some (.boundTransfer selectedOwner (.product (.predecessor 0 21624 .coefficient) (.predecessor 1 21625 .coefficient) ⟨false, false, none, none, none⟩)) := by
+  rfl
+
+end Operation3
+
+namespace Operation4
+def selectedEvent : Nat := 21651
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨7884⟩⟩
+def leftRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩] } }]
+def rightRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨7882⟩⟩] } }]
+def outputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩] } }]
+def left : Polynomial Owner := leftRaw.map Term.toExact
+def right : Polynomial Owner := rightRaw.map Term.toExact
+def output : Polynomial Owner := outputRaw.map Term.toExact
+def leftOwner : Owner := ⟨.program ⟨214⟩, ⟨6770⟩⟩
+def rightOwner : Owner := ⟨.program ⟨214⟩, ⟨7883⟩⟩
+def leftSummary : Bound := .exactZero
+def rightSummary : Bound := .exactZero
+def outputSummary : Bound := .exactZero
+def selectedRawWork : Nat := 1
+def selectedSumRuleEvent : Nat := 21649
+def selectedLeftResultEvent : Nat := 21646
+def selectedRightResultEvent : Nat := 21643
+def selectedResultEvent : Nat := 21651
+def leftScalar : Bool := false
+def rightScalar : Bool := false
+
+theorem resultAgreement : CanonicalAgreement output (productPoly left right leftScalar rightScalar) := by
+  decide +kernel
+
+theorem resultSound (env : Env Owner) :
+    evalPolynomial env output = evalPolynomial env left * evalPolynomial env right := by
+  exact productCanonicalResultSound env left right output leftScalar rightScalar resultAgreement
+
+theorem selectedLeftResultAt : (history.lookup selectedLeftResultEvent).map AnnotatedEvent.event = some (.resultExact leftOwner leftRaw leftSummary) := by
+  rfl
+
+theorem selectedRightResultAt : (history.lookup selectedRightResultEvent).map AnnotatedEvent.event = some (.resultExact rightOwner rightRaw rightSummary) := by
+  rfl
+
+theorem selectedResultAt : (history.lookup selectedResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner outputRaw outputSummary) := by
+  rfl
+
+theorem selectedRuleAt : (history.lookup selectedSumRuleEvent).map AnnotatedEvent.event = some (.boundTransfer selectedOwner (.product (.predecessor 0 21647 .coefficient) (.predecessor 1 21648 .coefficient) ⟨false, false, none, none, none⟩)) := by
+  rfl
+
+end Operation4
+
+namespace Operation5
+def selectedEvent : Nat := 21655
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨13461⟩⟩
+def leftRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩] } }]
+def rightRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def outputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def left : Polynomial Owner := leftRaw.map Term.toExact
+def right : Polynomial Owner := rightRaw.map Term.toExact
+def output : Polynomial Owner := outputRaw.map Term.toExact
+def leftOwner : Owner := ⟨.program ⟨214⟩, ⟨7884⟩⟩
+def rightOwner : Owner := ⟨.program ⟨214⟩, ⟨13460⟩⟩
+def leftSummary : Bound := .exactZero
+def rightSummary : Bound := .exactZero
+def outputSummary : Bound := .exactZero
+def selectedRawWork : Nat := 1
+def selectedSumRuleEvent : Nat := 21654
+def selectedLeftResultEvent : Nat := 21651
+def selectedRightResultEvent : Nat := 21628
+def selectedResultEvent : Nat := 21655
+
+theorem resultAgreement : CanonicalAgreement output (subtract left right) := by
+  decide +kernel
+
+theorem resultSound (env : Env Owner) :
+    evalPolynomial env output = evalPolynomial env left - evalPolynomial env right := by
+  exact subCanonicalResultSound env left right output resultAgreement
+
+theorem selectedLeftResultAt : (history.lookup selectedLeftResultEvent).map AnnotatedEvent.event = some (.resultExact leftOwner leftRaw leftSummary) := by
+  rfl
+
+theorem selectedRightResultAt : (history.lookup selectedRightResultEvent).map AnnotatedEvent.event = some (.resultExact rightOwner rightRaw rightSummary) := by
+  rfl
+
+theorem selectedResultAt : (history.lookup selectedResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner outputRaw outputSummary) := by
+  rfl
+
+theorem selectedRuleAt : (history.lookup selectedSumRuleEvent).map AnnotatedEvent.event = some (.boundTransfer selectedOwner (.sum [.predecessor 0 21652 .coefficient, .predecessor 1 21653 .coefficient])) := by
+  rfl
+
+end Operation5
+
+namespace Operation6
+def selectedEvent : Nat := 21663
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨25776⟩⟩
+def leftRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def rightRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨25773⟩⟩] } }]
+def outputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }]
+def left : Polynomial Owner := leftRaw.map Term.toExact
+def right : Polynomial Owner := rightRaw.map Term.toExact
+def output : Polynomial Owner := outputRaw.map Term.toExact
+def leftOwner : Owner := ⟨.program ⟨214⟩, ⟨13461⟩⟩
+def rightOwner : Owner := ⟨.program ⟨214⟩, ⟨25773⟩⟩
+def leftSummary : Bound := .exactZero
+def rightSummary : Bound := .exactZero
+def outputSummary : Bound := .exactZero
+def selectedRawWork : Nat := 2
+def selectedSumRuleEvent : Nat := 21658
+def selectedLeftResultEvent : Nat := 21655
+def selectedRightResultEvent : Nat := 21612
+def selectedResultEvent : Nat := 21663
+open EventReplay
+def leftScalar : Bool := false
+def rightScalar : Bool := false
+def expected0 : Polynomial Owner := productPoly left right leftScalar rightScalar
+def sourceKey0 : MonomialKey Owner := ⟨[⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩]⟩
+def lhsKey0 : MonomialKey Owner := ⟨[], [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩]⟩
+def relationRhs0Raw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }]
+def relationRhs0 : Polynomial Owner := relationRhs0Raw.map Term.toExact
+def relationContext0 : MonomialContext Owner := relationContext sourceKey0 sourceKey0.centralFactors 0 2
+def expected1 : Polynomial Owner := relationPoly expected0 sourceKey0 relationContext0 (-1) relationRhs0
+
+theorem productAgreement : CanonicalAgreement expected0 (productPoly left right leftScalar rightScalar) := by
+  decide +kernel
+
+theorem resultAgreement : CanonicalAgreement output expected1 := by
+  decide +kernel
+
+theorem resultSound (env : Env Owner)
+    (baseRelation0 : evalMonomial env lhsKey0 % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 = evalPolynomial env relationRhs0 % Int.ofNat 100418593683253592432016548326729029359133068138294319235841)
+    : evalPolynomial env output % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 =
+      (evalPolynomial env left * evalPolynomial env right) % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 := by
+  have productSound := productCanonicalResultSound env left right expected0 leftScalar rightScalar productAgreement
+  have relationSound0 := relationCanonicalResultSound 100418593683253592432016548326729029359133068138294319235841 env expected0 sourceKey0 lhsKey0 sourceKey0.centralFactors 0 2 (-1) relationRhs0 expected1 (by decide +kernel) baseRelation0 (by decide +kernel)
+  have outputSound := canonicalAgreement_eval env output expected1 resultAgreement
+  calc
+    evalPolynomial env output % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 = evalPolynomial env expected1 % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 := by rw [outputSound]
+    _ = evalPolynomial env expected0 % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 := relationSound0
+    _ = (evalPolynomial env left * evalPolynomial env right) % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 := by rw [productSound]
+
+theorem selectedLeftResultAt : (history.lookup selectedLeftResultEvent).map AnnotatedEvent.event = some (.resultExact leftOwner leftRaw leftSummary) := by
+  rfl
+
+theorem selectedRightResultAt : (history.lookup selectedRightResultEvent).map AnnotatedEvent.event = some (.resultExact rightOwner rightRaw rightSummary) := by
+  rfl
+
+theorem selectedResultAt : (history.lookup selectedResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner outputRaw outputSummary) := by
+  rfl
+
+theorem selectedRuleAt : (history.lookup selectedSumRuleEvent).map AnnotatedEvent.event = some (.boundTransfer selectedOwner (.product (.predecessor 0 21656 .coefficient) (.predecessor 1 21657 .coefficient) ⟨false, false, none, none, none⟩)) := by
+  rfl
+
+end Operation6
+
+namespace Operation7
+def selectedEvent : Nat := 21671
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨17025⟩⟩
+def leftRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def rightRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [] } }]
+def outputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def left : Polynomial Owner := leftRaw.map Term.toExact
+def right : Polynomial Owner := rightRaw.map Term.toExact
+def output : Polynomial Owner := outputRaw.map Term.toExact
+def leftOwner : Owner := ⟨.program ⟨214⟩, ⟨6544⟩⟩
+def rightOwner : Owner := ⟨.program ⟨214⟩, ⟨17023⟩⟩
+def leftSummary : Bound := .exactZero
+def rightSummary : Bound := .exactZero
+def outputSummary : Bound := .exactZero
+def selectedRawWork : Nat := 1
+def selectedSumRuleEvent : Nat := 21669
+def selectedLeftResultEvent : Nat := 21623
+def selectedRightResultEvent : Nat := 21666
+def selectedResultEvent : Nat := 21671
+def leftScalar : Bool := false
+def rightScalar : Bool := false
+
+theorem resultAgreement : CanonicalAgreement output (productPoly left right leftScalar rightScalar) := by
+  decide +kernel
+
+theorem resultSound (env : Env Owner) :
+    evalPolynomial env output = evalPolynomial env left * evalPolynomial env right := by
+  exact productCanonicalResultSound env left right output leftScalar rightScalar resultAgreement
+
+theorem selectedLeftResultAt : (history.lookup selectedLeftResultEvent).map AnnotatedEvent.event = some (.resultExact leftOwner leftRaw leftSummary) := by
+  rfl
+
+theorem selectedRightResultAt : (history.lookup selectedRightResultEvent).map AnnotatedEvent.event = some (.resultExact rightOwner rightRaw rightSummary) := by
+  rfl
+
+theorem selectedResultAt : (history.lookup selectedResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner outputRaw outputSummary) := by
+  rfl
+
+theorem selectedRuleAt : (history.lookup selectedSumRuleEvent).map AnnotatedEvent.event = some (.boundTransfer selectedOwner (.product (.predecessor 0 21667 .coefficient) (.predecessor 1 21668 .coefficient) ⟨false, true, none, none, some 1⟩)) := by
+  rfl
+
+end Operation7
+
+namespace Operation8
+def selectedEvent : Nat := 21678
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨17026⟩⟩
+def leftRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }]
+def rightRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def outputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def left : Polynomial Owner := leftRaw.map Term.toExact
+def right : Polynomial Owner := rightRaw.map Term.toExact
+def output : Polynomial Owner := outputRaw.map Term.toExact
+def leftOwner : Owner := ⟨.program ⟨214⟩, ⟨6707⟩⟩
+def rightOwner : Owner := ⟨.program ⟨214⟩, ⟨17025⟩⟩
+def leftSummary : Bound := .exactZero
+def rightSummary : Bound := .exactZero
+def outputSummary : Bound := .exactZero
+def selectedRawWork : Nat := 1
+def selectedSumRuleEvent : Nat := 21677
+def selectedLeftResultEvent : Nat := 21674
+def selectedRightResultEvent : Nat := 21671
+def selectedResultEvent : Nat := 21678
+
+theorem resultAgreement : CanonicalAgreement output (subtract left right) := by
+  decide +kernel
+
+theorem resultSound (env : Env Owner) :
+    evalPolynomial env output = evalPolynomial env left - evalPolynomial env right := by
+  exact subCanonicalResultSound env left right output resultAgreement
+
+theorem selectedLeftResultAt : (history.lookup selectedLeftResultEvent).map AnnotatedEvent.event = some (.resultExact leftOwner leftRaw leftSummary) := by
+  rfl
+
+theorem selectedRightResultAt : (history.lookup selectedRightResultEvent).map AnnotatedEvent.event = some (.resultExact rightOwner rightRaw rightSummary) := by
+  rfl
+
+theorem selectedResultAt : (history.lookup selectedResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner outputRaw outputSummary) := by
+  rfl
+
+theorem selectedRuleAt : (history.lookup selectedSumRuleEvent).map AnnotatedEvent.event = some (.boundTransfer selectedOwner (.sum [.predecessor 0 21675 .coefficient, .predecessor 1 21676 .coefficient])) := by
+  rfl
+
+end Operation8
+
+namespace Operation9
+def selectedEvent : Nat := 21682
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨25777⟩⟩
+def leftRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def rightRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }]
+def outputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def left : Polynomial Owner := leftRaw.map Term.toExact
+def right : Polynomial Owner := rightRaw.map Term.toExact
+def output : Polynomial Owner := outputRaw.map Term.toExact
+def leftOwner : Owner := ⟨.program ⟨214⟩, ⟨17026⟩⟩
+def rightOwner : Owner := ⟨.program ⟨214⟩, ⟨25776⟩⟩
+def leftSummary : Bound := .exactZero
+def rightSummary : Bound := .exactZero
+def outputSummary : Bound := .exactZero
+def selectedRawWork : Nat := 4
+def selectedSumRuleEvent : Nat := 21681
+def selectedLeftResultEvent : Nat := 21678
+def selectedRightResultEvent : Nat := 21663
+def selectedResultEvent : Nat := 21682
+
+theorem resultAgreement : CanonicalAgreement output (subtract left right) := by
+  decide +kernel
+
+theorem resultSound (env : Env Owner) :
+    evalPolynomial env output = evalPolynomial env left - evalPolynomial env right := by
+  exact subCanonicalResultSound env left right output resultAgreement
+
+theorem selectedLeftResultAt : (history.lookup selectedLeftResultEvent).map AnnotatedEvent.event = some (.resultExact leftOwner leftRaw leftSummary) := by
+  rfl
+
+theorem selectedRightResultAt : (history.lookup selectedRightResultEvent).map AnnotatedEvent.event = some (.resultExact rightOwner rightRaw rightSummary) := by
+  rfl
+
+theorem selectedResultAt : (history.lookup selectedResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner outputRaw outputSummary) := by
+  rfl
+
+theorem selectedRuleAt : (history.lookup selectedSumRuleEvent).map AnnotatedEvent.event = some (.boundTransfer selectedOwner (.sum [.predecessor 0 21679 .coefficient, .predecessor 1 21680 .coefficient])) := by
+  rfl
+
+end Operation9
+
+namespace Relation0
+def selectedEvent : Nat := 21661
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨25776⟩⟩
+open EventReplay
+def accumulatorRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }]
+def relationRhsRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }]
+def relationOutputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }]
+def accumulator : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }]
+def sourceKey : MonomialKey Owner := ⟨[⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩]⟩
+def lhsKey : MonomialKey Owner := ⟨[], [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩]⟩
+def relationRhs : Polynomial Owner := relationRhsRaw.map Term.toExact
+def relationOutput : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }]
+def relationExpected : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }]
+def relationContext0 : MonomialContext Owner := relationContext sourceKey sourceKey.centralFactors 0 2
+
+theorem relationShape : relationPoly accumulator sourceKey relationContext0 (-1) relationRhs = relationExpected := by rfl
+
+theorem relationAgreement : CanonicalAgreement relationOutput (relationPoly accumulator sourceKey relationContext0 (-1) relationRhs) := by decide +kernel
+
+theorem relationSound (env : Env Owner)
+    (baseRelation : evalMonomial env lhsKey % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 =
+      evalPolynomial env relationRhs % Int.ofNat 100418593683253592432016548326729029359133068138294319235841) :
+    evalPolynomial env relationOutput % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 =
+      evalPolynomial env accumulator % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 := by
+  exact relationCanonicalResultSound 100418593683253592432016548326729029359133068138294319235841 env accumulator sourceKey lhsKey
+    sourceKey.centralFactors 0 2 (-1) relationRhs relationOutput
+    (by decide +kernel) baseRelation relationAgreement
+
+def relationRhsEvent : Nat := 21609
+def relationRhsOwner : Owner := ⟨.program ⟨214⟩, ⟨23422⟩⟩
+def relationRhsSummary : Bound := .exactZero
+def relationOutputEvent : Nat := 21662
+theorem selectedRelationAt : (history.lookup selectedEvent).map AnnotatedEvent.event = some (.appliedRelation selectedOwner (⟨[⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩]⟩) (-1) 0 2 (.gadget (⟨.program ⟨214⟩, ⟨6544⟩⟩) (⟨.program ⟨214⟩, ⟨25773⟩⟩) ⟨23422⟩ 21609)) := by
+  rfl
+
+theorem selectedRhsResultAt : (history.lookup relationRhsEvent).map AnnotatedEvent.event = some (.resultExact relationRhsOwner relationRhsRaw relationRhsSummary) := by
+  rfl
+
+theorem selectedRelationOutputAt : (history.lookup relationOutputEvent).map AnnotatedEvent.event = some (.coefficientMerge (⟨⟨.program ⟨214⟩, ⟨25776⟩⟩, .relation 21661 0, ⟨[⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], [⟨.program ⟨214⟩, ⟨23422⟩⟩]⟩, (-1)⟩)) := by
+  rfl
+
+end Relation0
+
+namespace Relation1
+def selectedEvent : Nat := 21686
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨20263⟩⟩
+open EventReplay
+def accumulatorRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩] } }]
+def relationRhsRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def relationOutputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def accumulator : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩] } }]
+def sourceKey : MonomialKey Owner := ⟨[⟨.program ⟨214⟩, ⟨5517⟩⟩], [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩]⟩
+def lhsKey : MonomialKey Owner := ⟨[], [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩]⟩
+def relationRhs : Polynomial Owner := relationRhsRaw.map Term.toExact
+def relationOutput : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def relationExpected : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩] } }, { coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def relationContext0 : MonomialContext Owner := relationContext sourceKey sourceKey.centralFactors 0 2
+
+theorem relationShape : relationPoly accumulator sourceKey relationContext0 (1) relationRhs = relationExpected := by rfl
+
+theorem relationAgreement : CanonicalAgreement relationOutput (relationPoly accumulator sourceKey relationContext0 (1) relationRhs) := by decide +kernel
+
+theorem relationSound (env : Env Owner)
+    (baseRelation : evalMonomial env lhsKey % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 =
+      evalPolynomial env relationRhs % Int.ofNat 100418593683253592432016548326729029359133068138294319235841) :
+    evalPolynomial env relationOutput % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 =
+      evalPolynomial env accumulator % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 := by
+  exact relationCanonicalResultSound 100418593683253592432016548326729029359133068138294319235841 env accumulator sourceKey lhsKey
+    sourceKey.centralFactors 0 2 (1) relationRhs relationOutput
+    (by decide +kernel) baseRelation relationAgreement
+
+def relationRhsEvent : Nat := 21684
+def relationRhsOwner : Owner := ⟨.program ⟨214⟩, ⟨25777⟩⟩
+def relationRhsSummary : Bound := .exactZero
+def relationOutputEvent : Nat := 21690
+theorem selectedRelationAt : (history.lookup selectedEvent).map AnnotatedEvent.event = some (.appliedRelation selectedOwner (⟨[⟨.program ⟨214⟩, ⟨5517⟩⟩], [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩]⟩) (1) 0 2 (.universal 21685 (⟨[], [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩]⟩) (none) 21684)) := by
+  rfl
+
+theorem selectedRhsResultAt : (history.lookup relationRhsEvent).map AnnotatedEvent.event = some (.invocationEndExact relationRhsOwner 21683 relationRhsRaw relationRhsSummary) := by
+  rfl
+
+theorem selectedRelationOutputAt : (history.lookup relationOutputEvent).map AnnotatedEvent.event = some (.coefficientMerge (⟨⟨.program ⟨214⟩, ⟨20263⟩⟩, .relation 21686 3, ⟨[⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], [⟨.program ⟨214⟩, ⟨6544⟩⟩]⟩, (-1)⟩)) := by
+  rfl
+
+end Relation1
+
+namespace Relation2
+def selectedEvent : Nat := 21706
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨30185⟩⟩
+open EventReplay
+def accumulatorRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩] } }]
+def relationRhsRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨24801⟩⟩] } }]
+def relationOutputRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨24801⟩⟩] } }]
+def accumulator : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩] } }]
+def sourceKey : MonomialKey Owner := ⟨[⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩]⟩
+def lhsKey : MonomialKey Owner := ⟨[], [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩]⟩
+def relationRhs : Polynomial Owner := relationRhsRaw.map Term.toExact
+def relationOutput : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨24801⟩⟩] } }]
+def relationExpected : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩] } }, { coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨24801⟩⟩] } }]
+def relationContext0 : MonomialContext Owner := relationContext sourceKey sourceKey.centralFactors 0 2
+
+theorem relationShape : relationPoly accumulator sourceKey relationContext0 (-1) relationRhs = relationExpected := by rfl
+
+theorem relationAgreement : CanonicalAgreement relationOutput (relationPoly accumulator sourceKey relationContext0 (-1) relationRhs) := by decide +kernel
+
+theorem relationSound (env : Env Owner)
+    (baseRelation : evalMonomial env lhsKey % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 =
+      evalPolynomial env relationRhs % Int.ofNat 100418593683253592432016548326729029359133068138294319235841) :
+    evalPolynomial env relationOutput % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 =
+      evalPolynomial env accumulator % Int.ofNat 100418593683253592432016548326729029359133068138294319235841 := by
+  exact relationCanonicalResultSound 100418593683253592432016548326729029359133068138294319235841 env accumulator sourceKey lhsKey
+    sourceKey.centralFactors 0 2 (-1) relationRhs relationOutput
+    (by decide +kernel) baseRelation relationAgreement
+
+def relationRhsEvent : Nat := 21402
+def relationRhsOwner : Owner := ⟨.program ⟨214⟩, ⟨24801⟩⟩
+def relationRhsSummary : Bound := .exactZero
+def relationOutputEvent : Nat := 21707
+theorem selectedRelationAt : (history.lookup selectedEvent).map AnnotatedEvent.event = some (.appliedRelation selectedOwner (⟨[⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], [⟨.program ⟨214⟩, ⟨6544⟩⟩, ⟨.program ⟨214⟩, ⟨30183⟩⟩]⟩) (-1) 0 2 (.gadget (⟨.program ⟨214⟩, ⟨6544⟩⟩) (⟨.program ⟨214⟩, ⟨30183⟩⟩) ⟨24801⟩ 21402)) := by
+  rfl
+
+theorem selectedRhsResultAt : (history.lookup relationRhsEvent).map AnnotatedEvent.event = some (.resultExact relationRhsOwner relationRhsRaw relationRhsSummary) := by
+  rfl
+
+theorem selectedRelationOutputAt : (history.lookup relationOutputEvent).map AnnotatedEvent.event = some (.coefficientMerge (⟨⟨.program ⟨214⟩, ⟨30185⟩⟩, .relation 21706 0, ⟨[⟨.program ⟨214⟩, ⟨5517⟩⟩, ⟨.program ⟨214⟩, ⟨17023⟩⟩], [⟨.program ⟨214⟩, ⟨24801⟩⟩]⟩, (-1)⟩)) := by
+  rfl
+
+end Relation2
+
+namespace Bound0
+def selectedEvent : Nat := 21566
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨20261⟩⟩
+def rootResultEvent : Nat := 21564
+def prefoldEvent : Nat := 21565
+def endEvent : Nat := 21566
+def survivorEvents : List Nat := [21550]
+def rootRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩] } }]
+def prefoldRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩] } }]
+def endRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩] } }]
+def rootTerms : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩] } }]
+def prefoldTerms : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩] } }]
+def endTerms : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6⟩⟩, ⟨.program ⟨214⟩, ⟨20260⟩⟩] } }]
+def rootSummary : Bound := .exactZero
+def prefoldSummary : Bound := .exactZero
+def endSummary : Bound := .exactZero
+def rootBound : Nat := 0
+def prefoldBound : Nat := 0
+def survivorContributionsChunk0 : List Nat := [1]
+def survivorBoundsChunk0 : List Nat := [21549]
+theorem survivorBoundsSoundChunk0 : List.Forall₂ (fun actual bound => actual ≤ bound) survivorContributionsChunk0 survivorBoundsChunk0 :=
+by
+  constructor
+  · omega
+  ·
+    exact List.Forall₂.nil
+
+def survivorContributions : List Nat := survivorContributionsChunk0
+def survivorBounds : List Nat := survivorBoundsChunk0
+theorem survivorBoundsSound : List.Forall₂ (fun actual bound => actual ≤ bound) survivorContributions survivorBounds := by
+  exact survivorBoundsSoundChunk0
+
+theorem prefoldResult : prefoldTerms = rootTerms := by rfl
+
+theorem prefoldBoundSound : rootBound ≤ prefoldBound := by decide +kernel
+
+
+theorem prefoldSound :
+  preFoldBound rootBound prefoldBound survivorContributions survivorBounds := by
+  exact (preFoldSound rootTerms prefoldTerms prefoldResult prefoldBoundSound survivorBoundsSound).2
+
+theorem endResult : endTerms = prefoldTerms := by rfl
+
+theorem endSummaryResult : endSummary = prefoldSummary := by rfl
+
+theorem endSound :
+  endTerms = prefoldTerms ∧ endSummary = prefoldSummary := by
+  exact ⟨endResult, endSummaryResult⟩
+
+theorem invocationEndClaimSound (env : Env Owner) (actual : Int)
+    (claim : ValueClaim.Interprets 100418593683253592432016548326729029359133068138294319235841 env actual (.exact rootTerms rootSummary)) :
+    ValueClaim.Interprets 100418593683253592432016548326729029359133068138294319235841 env actual (.exact endTerms endSummary) := by
+  exact invocationEndSound 100418593683253592432016548326729029359133068138294319235841 env actual rootTerms endTerms rootSummary endSummary
+    claim endResult endSummaryResult
+
+theorem selectedRootResultAt : (history.lookup rootResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner rootRaw rootSummary) := by
+  rfl
+
+theorem selectedPreFoldAt : (history.lookup prefoldEvent).map AnnotatedEvent.event = some (.preFoldPolynomial rootResultEvent prefoldRaw prefoldSummary (none)) := by
+  rfl
+
+theorem selectedInvocationEndAt : (history.lookup endEvent).map AnnotatedEvent.event = some (.invocationEndExact selectedOwner prefoldEvent endRaw endSummary) := by
+  rfl
+
+end Bound0
+
+namespace Bound1
+def selectedEvent : Nat := 21684
+def selectedOwner : Owner := ⟨.program ⟨214⟩, ⟨25777⟩⟩
+def rootResultEvent : Nat := 21682
+def prefoldEvent : Nat := 21683
+def endEvent : Nat := 21684
+def survivorEvents : List Nat := []
+def rootRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def prefoldRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def endRaw : List Term := [{ coefficient := (1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }, { coefficient := (-1), monomial := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def rootTerms : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def prefoldTerms : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def endTerms : Polynomial Owner := [{ coefficient := (1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6707⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [], orderedFactors := [⟨.program ⟨214⟩, ⟨6770⟩⟩, ⟨.program ⟨214⟩, ⟨7882⟩⟩, ⟨.program ⟨214⟩, ⟨25773⟩⟩] } }, { coefficient := (1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨10360⟩⟩, ⟨.program ⟨214⟩, ⟨13374⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨23422⟩⟩] } }, { coefficient := (-1), key := { centralFactors := [⟨.program ⟨214⟩, ⟨17023⟩⟩], orderedFactors := [⟨.program ⟨214⟩, ⟨6544⟩⟩] } }]
+def rootSummary : Bound := .exactZero
+def prefoldSummary : Bound := .exactZero
+def endSummary : Bound := .exactZero
+def rootBound : Nat := 0
+def prefoldBound : Nat := 0
+def survivorContributions : List Nat := []
+def survivorBounds : List Nat := []
+theorem survivorBoundsSound : List.Forall₂ (fun actual bound => actual ≤ bound) survivorContributions survivorBounds := by
+  exact List.Forall₂.nil
+
+theorem prefoldResult : prefoldTerms = rootTerms := by rfl
+
+theorem prefoldBoundSound : rootBound ≤ prefoldBound := by decide +kernel
+
+
+theorem prefoldSound :
+  preFoldBound rootBound prefoldBound survivorContributions survivorBounds := by
+  exact (preFoldSound rootTerms prefoldTerms prefoldResult prefoldBoundSound survivorBoundsSound).2
+
+theorem endResult : endTerms = prefoldTerms := by rfl
+
+theorem endSummaryResult : endSummary = prefoldSummary := by rfl
+
+theorem endSound :
+  endTerms = prefoldTerms ∧ endSummary = prefoldSummary := by
+  exact ⟨endResult, endSummaryResult⟩
+
+theorem invocationEndClaimSound (env : Env Owner) (actual : Int)
+    (claim : ValueClaim.Interprets 100418593683253592432016548326729029359133068138294319235841 env actual (.exact rootTerms rootSummary)) :
+    ValueClaim.Interprets 100418593683253592432016548326729029359133068138294319235841 env actual (.exact endTerms endSummary) := by
+  exact invocationEndSound 100418593683253592432016548326729029359133068138294319235841 env actual rootTerms endTerms rootSummary endSummary
+    claim endResult endSummaryResult
+
+theorem selectedRootResultAt : (history.lookup rootResultEvent).map AnnotatedEvent.event = some (.resultExact selectedOwner rootRaw rootSummary) := by
+  rfl
+
+theorem selectedPreFoldAt : (history.lookup prefoldEvent).map AnnotatedEvent.event = some (.preFoldPolynomial rootResultEvent prefoldRaw prefoldSummary (none)) := by
+  rfl
+
+theorem selectedInvocationEndAt : (history.lookup endEvent).map AnnotatedEvent.event = some (.invocationEndExact selectedOwner prefoldEvent endRaw endSummary) := by
+  rfl
+
+end Bound1
+
+def theoremCount : Nat := 102
+
+end Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Semantic.SemanticShard084

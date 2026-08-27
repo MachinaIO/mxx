@@ -573,7 +573,7 @@ mod tests {
             .expect("online graph");
         let decoder_node = online.graph.outputs()["decoded"].value.node;
 
-        let mut protocol = crate::toy_example::protocol();
+        let mut protocol = crate::protocol_example::protocol();
         protocol.bundle.workflow.stages = vec![
             ProtocolStage {
                 id: StageId("encrypt".to_owned()),
@@ -918,8 +918,8 @@ mod tests {
 
     #[test]
     fn real_production_roots_reach_the_report_bridge() {
-        let protocol = crate::toy_example::protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
         let adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -956,7 +956,7 @@ mod tests {
     fn cross_stage_artifact_lineage_cancels_deterministic_hash_product() {
         for recompute_h in [false, true] {
             let protocol = cross_stage_artifact_lineage_protocol(recompute_h);
-            let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("lineage plan");
+            let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("lineage plan");
             let adapter = ProductionAdapter::new(
                 &protocol,
                 &plan,

@@ -315,7 +315,7 @@ mod tests {
     use super::*;
 
     fn valid_protocol() -> ProtocolDecl {
-        crate::toy_example::protocol()
+        crate::protocol_example::protocol()
     }
 
     #[test]

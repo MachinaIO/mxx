@@ -6909,14 +6909,14 @@ mod tests {
 
     #[test]
     fn closed_target_rejects_a_same_modulus_decoder_that_does_not_consume_the_residual() {
-        let protocol = crate::toy_example::protocol();
+        let protocol = crate::protocol_example::protocol();
         let request = super::super::OperationalCheckRequest {
             environment: vec![(
                 "cutoff".to_owned(),
                 super::super::OperationalParameterValue::Integer(1.into()),
             )],
             layouts: Vec::new(),
-            target_id: "toy-threshold".to_owned(),
+            target_id: "example-threshold".to_owned(),
         };
         let mut emit = |_| {};
         let mut control = SimulationControl::new(&mut emit);
@@ -6927,7 +6927,7 @@ mod tests {
             OperationalSimulationError::Target(TargetError::DecoderInputDoesNotConsumeResidual {
                 target_id,
                 ..
-            }) if target_id == "toy-threshold"
+            }) if target_id == "example-threshold"
         ));
     }
 

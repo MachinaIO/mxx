@@ -102,16 +102,6 @@ for `Security128`, where the LUT dominates. Proof canonical payload bytes remain
 expression/program namespace correction did not alter the chronological proof payload in these
 two fixed profiles.
 
-The Rust-only fixed-size Lean kernel spike also passed:
-
-```text
-cargo test -p mxx-correctness --lib \
-  operational_noise::g0_kernel_spikes::g0_kernel_spikes_compile_exact_sizes \
-  -- --ignored --exact --nocapture
-```
-
-Result: PASS with `balanced_rows=5000` and `fuel_haves=1000`; 1 passed.
-
 The repository-authoritative Lean target passed:
 
 ```text

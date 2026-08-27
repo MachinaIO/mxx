@@ -14,9 +14,8 @@ use mxx_ir_core::{
     artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
 };
 
-pub const PROTOCOL_NAME: &str = "toy-example";
 pub const DECODED_ENDPOINT: &str = "decoded-endpoint";
-pub const RESIDUAL_ANCHOR: &str = "toy.decoder.residual";
+pub const RESIDUAL_ANCHOR: &str = "example.decoder.residual";
 pub fn protocol() -> ProtocolDecl {
     let ring = Ring::new(256, 1);
     let message = ring.bool_input("message");
@@ -41,20 +40,20 @@ pub fn protocol() -> ProtocolDecl {
                 ("carrier".to_owned(), carrier_wire),
             ],
         )
-        .expect("mechanical Toy Boolean-carrier attachment");
+        .expect("mechanical example Boolean-carrier attachment");
     let ciphertext = encoded.clone() +
         ring.gaussian((1, 1), RealExpr::from_integer(1), IntExpr::Var("cutoff".to_owned()));
     let residual = (ciphertext.clone() - encoded)
         .semantic_anchor(RESIDUAL_ANCHOR)
-        .expect("Toy decoder residual anchor");
-    let encrypt = DslContext::new("toy-example-encrypt")
+        .expect("example decoder residual anchor");
+    let encrypt = DslContext::new("example-protocol-encrypt")
         .int_parameter("cutoff")
         .public_output("ciphertext", ciphertext)
         .expect("unique output")
         .private_output("operational-residual", residual)
         .expect("unique operational residual output")
         .build()
-        .expect("toy encryption graph");
+        .expect("example encryption graph");
 
     let placeholder = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
     let ciphertext =
@@ -66,21 +65,21 @@ pub fn protocol() -> ProtocolDecl {
         .expect("one decoded bit")
         .semantic_anchor(DECODED_ENDPOINT)
         .expect("decoded endpoint label");
-    let decrypt = DslContext::new("toy-example-decrypt")
+    let decrypt = DslContext::new("example-protocol-decrypt")
         .int_parameter("cutoff")
         .bool_output("decoded", decoded)
         .expect("unique output")
         .build()
-        .expect("toy decryption graph");
+        .expect("example decryption graph");
     let decoder_node = decrypt.graph.outputs()["decoded"].value.node;
 
     let ideal = IdealSpec::new(
-        DslContext::new("toy-example-ideal")
+        DslContext::new("example-protocol-ideal")
             .int_parameter("cutoff")
             .bool_output("result", ring.bool_input("message"))
             .expect("unique output")
             .build()
-            .expect("toy ideal graph"),
+            .expect("example ideal graph"),
     )
     .expect("sampler-free ideal");
 
@@ -137,7 +136,7 @@ pub fn protocol() -> ProtocolDecl {
                 }],
             },
             operational_decoder_targets: vec![OperationalDecoderTarget {
-                target_id: "toy-threshold".to_owned(),
+                target_id: "example-threshold".to_owned(),
                 residual_stage: StageId("encrypt".to_owned()),
                 residual_output: "operational-residual".to_owned(),
                 decoder_stage: StageId("decrypt".to_owned()),
@@ -167,7 +166,7 @@ pub fn protocol() -> ProtocolDecl {
             precondition_spec: ProtocolPreconditionSpec::default(),
         },
     })
-    .expect("toy example protocol is valid")
+    .expect("example protocol is valid")
 }
 
 #[cfg(test)]
@@ -175,7 +174,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toy_protocol_is_a_closed_bundle_with_a_decoded_endpoint() {
+    fn example_protocol_is_a_closed_bundle_with_a_decoded_endpoint() {
         let protocol = protocol();
         assert_eq!(protocol.bundle.endpoint_specs, vec![EndpointSpecId::ThresholdDecode]);
         assert_eq!(protocol.bundle.endpoints.entries[0].semantic_anchor, DECODED_ENDPOINT);
@@ -190,7 +189,7 @@ mod tests {
     fn direct_comparator_wiring_must_name_the_registered_endpoint_outputs() {
         let mut protocol = protocol();
         let ComparatorSpec::Equality { endpoints } = &mut protocol.bundle.comparator else {
-            unreachable!("toy uses direct equality")
+            unreachable!("example uses direct equality")
         };
         endpoints[0].actual_input = "unrelated".to_owned();
         assert_eq!(
@@ -205,7 +204,7 @@ mod tests {
         let OperationalDecoderKind::ThresholdDecode { plaintext_modulus } =
             &mut protocol.bundle.operational_decoder_targets[0].kind
         else {
-            unreachable!("toy target is threshold decoding")
+            unreachable!("example target is threshold decoding")
         };
         *plaintext_modulus = IntExpr::constant(3);
         assert_eq!(

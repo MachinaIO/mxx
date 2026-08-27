@@ -1061,9 +1061,9 @@ mod tests {
 
     #[test]
     fn builds_a_real_protocol_target_plan() {
-        let protocol = crate::toy_example::protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
-        assert_eq!(plan.target().target_id, "toy-threshold");
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
+        assert_eq!(plan.target().target_id, "example-threshold");
         assert!(!plan.nodes().is_empty());
         assert_eq!(plan.target().residual.occurrence.path, 0);
         assert_eq!(plan.target().decoder.occurrence.path, 0);
@@ -1071,9 +1071,9 @@ mod tests {
 
     #[test]
     fn real_plan_records_structural_alias_and_output_mapping() {
-        let mut protocol = crate::toy_example::protocol();
+        let mut protocol = crate::protocol_example::protocol();
         protocol.bundle.workflow.stages[0].graph = structural_encrypt_graph();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("structural plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("structural plan");
         assert!(!plan.aliases().is_empty());
         assert!(!plan.output_mappings().is_empty());
         assert_eq!(plan.counters().occurrences, 2);
@@ -1085,9 +1085,9 @@ mod tests {
 
     #[test]
     fn real_sequential_loop_maps_all_carried_outputs_simultaneously() {
-        let mut protocol = crate::toy_example::protocol();
+        let mut protocol = crate::protocol_example::protocol();
         protocol.bundle.workflow.stages[0].graph = sequential_two_carried_graph();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("sequential plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("sequential plan");
         let sequential_mappings = plan.output_mappings().iter().collect::<Vec<_>>();
         assert_eq!(sequential_mappings.len(), 2);
         assert!(sequential_mappings.iter().any(|mapping| mapping.parent.wire.port == Port(0)));
@@ -1098,9 +1098,9 @@ mod tests {
 
     #[test]
     fn real_selector_plan_marks_only_dynamic_get_arg1_and_select_arg0() {
-        let mut protocol = crate::toy_example::protocol();
+        let mut protocol = crate::protocol_example::protocol();
         protocol.bundle.workflow.stages[0].graph = selector_graph();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("selector plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("selector plan");
         assert_eq!(plan.selector_dependencies().len(), 2);
         for selector in plan.selector_dependencies() {
             assert!(matches!(
@@ -1112,9 +1112,9 @@ mod tests {
 
     #[test]
     fn real_artifact_producer_and_effects_are_stable_across_repeated_plans() {
-        let protocol = crate::toy_example::protocol();
-        let first = ProtocolPlan::build(&protocol, "toy-threshold").unwrap();
-        let second = ProtocolPlan::build(&protocol, "toy-threshold").unwrap();
+        let protocol = crate::protocol_example::protocol();
+        let first = ProtocolPlan::build(&protocol, "example-threshold").unwrap();
+        let second = ProtocolPlan::build(&protocol, "example-threshold").unwrap();
         assert!(!first.artifact_producers().is_empty());
         assert_eq!(first.artifact_producers(), second.artifact_producers());
         assert_eq!(first.effects(), second.effects());
@@ -1167,12 +1167,13 @@ mod tests {
             .name("protocol-plan-deep".to_owned())
             .stack_size(64 * 1024 * 1024)
             .spawn(|| {
-                let mut baseline_protocol = crate::toy_example::protocol();
+                let mut baseline_protocol = crate::protocol_example::protocol();
                 baseline_protocol.bundle.workflow.stages[0].graph = deep_structural_graph(0);
-                let baseline = ProtocolPlan::build(&baseline_protocol, "toy-threshold").unwrap();
-                let mut protocol = crate::toy_example::protocol();
+                let baseline =
+                    ProtocolPlan::build(&baseline_protocol, "example-threshold").unwrap();
+                let mut protocol = crate::protocol_example::protocol();
                 protocol.bundle.workflow.stages[0].graph = deep_structural_graph(4_096);
-                let plan = ProtocolPlan::build(&protocol, "toy-threshold").unwrap();
+                let plan = ProtocolPlan::build(&protocol, "example-threshold").unwrap();
                 assert_eq!(plan.counters().occurrences - baseline.counters().occurrences, 4_096);
                 assert_eq!(plan.counters().aliases - baseline.counters().aliases, 4_096);
                 assert_eq!(plan.output_mappings().len() - baseline.output_mappings().len(), 4_096);

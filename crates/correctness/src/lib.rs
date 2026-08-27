@@ -10,7 +10,7 @@ pub mod operational_noise;
 pub mod operational_protocol;
 pub mod protocol;
 #[cfg(test)]
-mod toy_example;
+mod protocol_example;
 
 pub use bundle::*;
 pub use operational_protocol::{

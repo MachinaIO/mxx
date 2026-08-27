@@ -4602,7 +4602,7 @@ fn real_descriptor(value: &RealExpr) -> Result<String, ProductionAdapterError> {
 }
 
 /// Builds the singleton-preimage protocol, optionally adding the fixed-sigma Gaussian residual
-/// used by the opt-in toy certificate slice.
+/// used by the opt-in certificate slice tests.
 pub(crate) fn singleton_preimage_protocol(
     gaussian_max_coefficient_bound: Option<BigUint>,
 ) -> crate::ProtocolDecl {
@@ -5109,7 +5109,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn compact_tall_gaussian_protocol() -> crate::ProtocolDecl {
+    fn compact_gaussian_protocol() -> crate::ProtocolDecl {
         use crate::{
             ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
             EndpointSemanticBinding, EndpointSpecId, OperationalDecoderKind,
@@ -5137,7 +5137,7 @@ pub(crate) mod tests {
         let digit_count = 40;
         let columns = secret_size * digit_count;
         let mask_source = ring.input("diagonal-mask-source", (secret_size, columns));
-        let producer = DslContext::new("compact-tall-gaussian-producer")
+        let producer = DslContext::new("compact-gaussian-producer")
             .public_output("diagonal-mask", mask_source)
             .expect("diagonal-mask output")
             .build()
@@ -5146,7 +5146,7 @@ pub(crate) mod tests {
         let family_schema =
             MatFamilyType { element: ring.matrix_type((1, columns)), count: count.clone() };
         let kernel = Subgraph::<(Vec<Family<Mat>>, Vec<Mat>), Family<Mat>>::try_define(
-            "compact-tall-gaussian-kernel",
+            "compact-gaussian-kernel",
             (
                 vec![
                     family_schema.clone(),
@@ -5228,7 +5228,7 @@ pub(crate) mod tests {
                     .ok_or(mxx_dsl::DslError::Schema)
             },
         )
-        .expect("compact Tall Gaussian kernel");
+        .expect("compact Gaussian kernel");
 
         let x = ring.input_family("x", count.clone(), (1, columns));
         let y = ring.input_family("y", count.clone(), (1, columns));
@@ -5245,10 +5245,10 @@ pub(crate) mod tests {
                 vec![x.clone(), x.clone(), secret.clone()],
                 vec![input_public_key.clone(), diagonal_mask.clone()],
             ))
-            .expect("first compact Tall call");
+            .expect("first compact Gaussian call");
         let second = kernel
             .call((vec![x, y, secret], vec![input_public_key, diagonal_mask]))
-            .expect("second compact Tall call");
+            .expect("second compact Gaussian call");
         let residual = first.get_static(0) - second.get_static(0);
         let decoded = residual
             .clone()
@@ -5256,9 +5256,9 @@ pub(crate) mod tests {
             .into_iter()
             .next()
             .expect("decoder output")
-            .semantic_anchor("compact-tall-gaussian.decoder")
+            .semantic_anchor("compact-gaussian.decoder")
             .expect("decoder anchor");
-        let consumer = DslContext::new("compact-tall-gaussian-consumer")
+        let consumer = DslContext::new("compact-gaussian-consumer")
             .private_output("operational-residual", residual)
             .expect("residual output")
             .bool_output("decoded", decoded)
@@ -5275,7 +5275,7 @@ pub(crate) mod tests {
             &BTreeMap::new(),
             |bundle| {
                 bundle.ideal = IdealSpec::new(
-                    DslContext::new("compact-tall-gaussian-ideal")
+                    DslContext::new("compact-gaussian-ideal")
                         .bool_output("decoded", Bool::constant(false))
                         .expect("ideal decoder output")
                         .build()
@@ -5295,7 +5295,7 @@ pub(crate) mod tests {
                     entries: vec![EndpointAnchor {
                         spec: endpoint,
                         stage: decoder_stage.clone(),
-                        semantic_anchor: "compact-tall-gaussian.decoder".to_owned(),
+                        semantic_anchor: "compact-gaussian.decoder".to_owned(),
                         semantics: EndpointSemanticBinding::ThresholdDecode,
                         workflow_output: OutputRef {
                             stage: decoder_stage.clone(),
@@ -5305,7 +5305,7 @@ pub(crate) mod tests {
                     }],
                 };
                 bundle.operational_decoder_targets = vec![OperationalDecoderTarget {
-                    target_id: "compact-tall-gaussian".to_owned(),
+                    target_id: "compact-gaussian".to_owned(),
                     residual_stage: decoder_stage.clone(),
                     residual_output: "operational-residual".to_owned(),
                     decoder_stage,
@@ -5317,7 +5317,7 @@ pub(crate) mod tests {
                 bundle.endpoint_specs = vec![endpoint];
             },
         )
-        .expect("compact Tall operational protocol")
+        .expect("compact Gaussian operational protocol")
     }
 
     pub(crate) fn singleton_preimage_protocol() -> crate::ProtocolDecl {
@@ -5342,12 +5342,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn compact_tall_gaussian_calls_preserve_occurrence_and_shared_input_identity() {
+    fn compact_gaussian_calls_preserve_occurrence_and_shared_input_identity() {
         use crate::{ArtifactName, ProtocolInputId};
         use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef, node::NodeKind};
 
-        let protocol = compact_tall_gaussian_protocol();
-        let plan = ProtocolPlan::build(&protocol, "compact-tall-gaussian").expect("protocol plan");
+        let protocol = compact_gaussian_protocol();
+        let plan = ProtocolPlan::build(&protocol, "compact-gaussian").expect("protocol plan");
         let consumer_stage = protocol
             .stages()
             .iter()
@@ -5368,9 +5368,8 @@ pub(crate) mod tests {
         };
         let shared_secret = root_input("shared-secret");
         let shared_artifact = root_input("diagonal-mask");
-        let named_definition = FrozenGraphScopeId::Subgraph {
-            canonical_name: "compact-tall-gaussian-kernel".to_owned(),
-        };
+        let named_definition =
+            FrozenGraphScopeId::Subgraph { canonical_name: "compact-gaussian-kernel".to_owned() };
         let outer_occurrences = plan
             .nodes()
             .keys()
@@ -5577,7 +5576,7 @@ pub(crate) mod tests {
             .build()
             .unwrap();
 
-        let mut protocol = crate::toy_example::protocol();
+        let mut protocol = crate::protocol_example::protocol();
         let encrypt_stage = protocol
             .bundle
             .workflow
@@ -5641,7 +5640,7 @@ pub(crate) mod tests {
             .build()
             .unwrap();
 
-        let mut protocol = crate::toy_example::protocol();
+        let mut protocol = crate::protocol_example::protocol();
         let encrypt_stage = protocol
             .bundle
             .workflow
@@ -5762,7 +5761,7 @@ pub(crate) mod tests {
         let decoder_node = local_certificate_target
             .then(|| encrypt.graph.outputs()["certificate-decoded"].value.node);
 
-        let mut protocol = crate::toy_example::protocol();
+        let mut protocol = crate::protocol_example::protocol();
         let encrypt_stage = protocol
             .bundle
             .workflow
@@ -5837,7 +5836,7 @@ pub(crate) mod tests {
             endpoint.workflow_output.output = "certificate-decoded".to_owned();
             let crate::ComparatorSpec::Equality { endpoints } = &mut protocol.bundle.comparator
             else {
-                unreachable!("toy fixture uses direct equality")
+                unreachable!("example fixture uses direct equality")
             };
             endpoints[0].actual_input = "certificate-decoded".to_owned();
             protocol.bundle.operational_decoder_targets = vec![OperationalDecoderTarget {
@@ -5884,7 +5883,7 @@ pub(crate) mod tests {
             .build()
             .unwrap();
 
-        let mut protocol = crate::toy_example::protocol();
+        let mut protocol = crate::protocol_example::protocol();
         let encrypt_stage = protocol
             .bundle
             .workflow
@@ -5970,7 +5969,7 @@ pub(crate) mod tests {
             .expect("residual output")
             .build()
             .expect("sequential graph");
-        let mut protocol = crate::toy_example::protocol();
+        let mut protocol = crate::protocol_example::protocol();
         let encrypt_stage = protocol
             .bundle
             .workflow
@@ -6082,7 +6081,7 @@ pub(crate) mod tests {
         )
         .expect("deep real graph freeze")
         .0;
-        let mut protocol = crate::toy_example::protocol();
+        let mut protocol = crate::protocol_example::protocol();
         let encrypt_stage = protocol
             .bundle
             .workflow
@@ -6140,8 +6139,8 @@ pub(crate) mod tests {
 
     #[test]
     fn decomposed_hash_lowering_preserves_exact_source_and_encoding_groups() {
-        let protocol = crate::toy_example::protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
         let mut adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -6239,8 +6238,8 @@ pub(crate) mod tests {
 
     #[test]
     fn small_decomposition_contract_requires_exact_zero_input() {
-        let protocol = crate::toy_example::protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
         let mut adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -6328,8 +6327,8 @@ pub(crate) mod tests {
                 .expect("polynomial constant")
         }
 
-        let protocol = crate::toy_example::protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
         let mut adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -6537,24 +6536,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn real_toy_plan_reaches_the_production_boundary() {
-        let protocol = crate::toy_example::protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+    fn real_example_plan_reaches_the_production_boundary() {
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
         let adapter = ProductionAdapter::new(
             &protocol,
             &plan,
             BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
         );
-        assert!(adapter.is_ok(), "real Graph/ProtocolPlan adapter rejected toy plan");
+        assert!(adapter.is_ok(), "real Graph/ProtocolPlan adapter rejected example plan");
         let adapter = adapter.expect("adapter construction");
         assert!(adapter.job.facts().ranges_finalized(), "range prepass must finalize before lower");
-        let (job, roots) = adapter.lower().expect("toy lowering");
+        let (job, roots) = adapter.lower().expect("example lowering");
         let mut job = job;
         let report = super::super::report::analyze_roots(
             &mut job,
             &roots,
             &super::super::report::ReportTarget {
-                target_id: "toy-production".to_owned(),
+                target_id: "example-production".to_owned(),
                 plaintext_modulus: 2_u8.into(),
                 ciphertext_modulus: 257_u16.into(),
                 boolean_interval: false,
@@ -6571,7 +6570,7 @@ pub(crate) mod tests {
     #[test]
     fn real_graph_parallel_scopes_do_not_share_global_binder_ranges() {
         let protocol = parallel_range_protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("parallel plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("parallel plan");
         let adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -6598,7 +6597,7 @@ pub(crate) mod tests {
     #[test]
     fn production_adapter_preserves_cross_domain_gather_range_without_explicit_cases() {
         let protocol = generated_gather_protocol(7);
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("gather plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("gather plan");
         let adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -6646,7 +6645,7 @@ pub(crate) mod tests {
         assert!(saw_indexed_slice, "dynamic slice must remain an IndexedSlice semantic atom");
 
         let protocol = generated_gather_protocol(6);
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("reject plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("reject plan");
         let adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -6659,7 +6658,7 @@ pub(crate) mod tests {
         );
 
         let protocol = generated_slice_protocol(7, GeneratedSliceCase::Static, false);
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("static slice plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("static slice plan");
         let adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -6679,7 +6678,7 @@ pub(crate) mod tests {
     #[test]
     fn relation_family_provenance_is_not_overwritten_by_opaque_wrapper() {
         let protocol = generated_gather_protocol(7);
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("gather plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("gather plan");
         let mut adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -6710,7 +6709,7 @@ pub(crate) mod tests {
     #[test]
     fn relation_family_operands_are_lifted_and_rewritten_when_preimage_is_internal() {
         let protocol = generated_gather_protocol(7);
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("gather plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("gather plan");
         let mut adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -6886,7 +6885,7 @@ pub(crate) mod tests {
     #[test]
     fn relation_lift_keeps_preimage_opaque_but_reduces_synthesized_public_sampler() {
         let protocol = generated_gather_protocol(7);
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("gather plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("gather plan");
         let mut adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -6999,7 +6998,7 @@ pub(crate) mod tests {
     fn production_adapter_rejects_invalid_dynamic_slice_geometry() {
         for case in [GeneratedSliceCase::OutOfBounds, GeneratedSliceCase::NonAffine] {
             let protocol = generated_slice_protocol(7, case, false);
-            let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("slice plan");
+            let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("slice plan");
             let adapter = ProductionAdapter::new(
                 &protocol,
                 &plan,
@@ -7024,7 +7023,7 @@ pub(crate) mod tests {
     #[test]
     fn nested_parallel_families_resume_without_recursive_resolution() {
         let protocol = captured_nested_parallel_protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("parallel plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("parallel plan");
         let adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -7040,7 +7039,8 @@ pub(crate) mod tests {
     fn sequential_production_frames_handle_zero_one_and_n_simultaneous_updates() {
         for count in [0, 1, 7] {
             let protocol = sequential_scan_protocol(count, false);
-            let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("sequential plan");
+            let plan =
+                ProtocolPlan::build(&protocol, "example-threshold").expect("sequential plan");
             let adapter = ProductionAdapter::new(
                 &protocol,
                 &plan,
@@ -7056,7 +7056,7 @@ pub(crate) mod tests {
     #[test]
     fn sequential_body_can_resume_nested_parallel_without_stack_growth() {
         let protocol = sequential_scan_protocol(4, true);
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("nested plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("nested plan");
         let adapter = ProductionAdapter::new(
             &protocol,
             &plan,
@@ -7075,7 +7075,7 @@ pub(crate) mod tests {
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let protocol = deep_real_graph_protocol();
-                let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("deep plan");
+                let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("deep plan");
                 assert!(plan.counters().occurrences >= 4_096);
                 assert!(plan.nodes().len() >= 20_000);
                 let adapter = ProductionAdapter::new(
@@ -7095,8 +7095,8 @@ pub(crate) mod tests {
 
     #[test]
     fn opt_in_feasibility_lowering_preserves_ordinary_shape_and_records_one_marker() {
-        let protocol = crate::toy_example::protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
         let parameters = BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]);
         let (ordinary_job, ordinary_roots) =
             ProductionAdapter::new(&protocol, &plan, parameters.clone())
@@ -7134,7 +7134,7 @@ pub(crate) mod tests {
     #[test]
     fn packed_integer_constants_retain_add_summary_only_for_opt_in_normalization() {
         let protocol = packed_integer_residual_protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("packed plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("packed plan");
         let parameters = BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]);
         let (mut ordinary_job, ordinary_roots) =
             ProductionAdapter::new(&protocol, &plan, parameters.clone())
@@ -7217,8 +7217,8 @@ pub(crate) mod tests {
     fn opt_in_constant_helpers_capture_scalar_and_matrix_descriptors() {
         use mxx_ir_core::{IntExpr, node::ConstantMatrix, types::MatrixType};
 
-        let protocol = crate::toy_example::protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
         let mut adapter = ProductionAdapter::<FeasibilityTrace>::new_with_feasibility(
             &protocol,
             &plan,
@@ -7253,7 +7253,7 @@ pub(crate) mod tests {
     #[test]
     fn opt_in_input_sources_keep_declared_and_unbound_occurrence_identity() {
         let protocol = captured_nested_parallel_protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("captured plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("captured plan");
         let (_, _, trace) =
             ProductionAdapter::new_with_feasibility(&protocol, &plan, BTreeMap::new())
                 .expect("opt-in adapter")
@@ -7444,9 +7444,9 @@ pub(crate) mod tests {
 
     #[test]
     fn opt_in_sampler_events_keep_typed_operations_and_occurrence_owners() {
-        let protocol = compact_tall_gaussian_protocol();
+        let protocol = compact_gaussian_protocol();
         let plan =
-            ProtocolPlan::build(&protocol, "compact-tall-gaussian").expect("compact Gaussian plan");
+            ProtocolPlan::build(&protocol, "compact-gaussian").expect("compact Gaussian plan");
         let (_, _, mut trace) =
             ProductionAdapter::new_with_feasibility(&protocol, &plan, BTreeMap::new())
                 .expect("opt-in adapter")
@@ -7483,9 +7483,9 @@ pub(crate) mod tests {
 
     #[test]
     fn compact_gaussian_event_rows_are_owner_distinct_and_residual_only() {
-        let protocol = compact_tall_gaussian_protocol();
+        let protocol = compact_gaussian_protocol();
         let plan =
-            ProtocolPlan::build(&protocol, "compact-tall-gaussian").expect("compact Gaussian plan");
+            ProtocolPlan::build(&protocol, "compact-gaussian").expect("compact Gaussian plan");
         let (_, _, mut trace) =
             ProductionAdapter::new_with_feasibility(&protocol, &plan, BTreeMap::new())
                 .expect("opt-in adapter")
@@ -7529,7 +7529,7 @@ pub(crate) mod tests {
     #[test]
     fn opt_in_family_and_select_index_uses_keep_typed_kinds_and_frontiers() {
         let protocol = parallel_range_protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("parallel plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("parallel plan");
         let (_, _, trace) = ProductionAdapter::new_with_feasibility(
             &protocol,
             &plan,
@@ -7547,7 +7547,7 @@ pub(crate) mod tests {
 
         let dynamic_protocol = generated_gather_protocol(7);
         let dynamic_plan =
-            ProtocolPlan::build(&dynamic_protocol, "toy-threshold").expect("dynamic plan");
+            ProtocolPlan::build(&dynamic_protocol, "example-threshold").expect("dynamic plan");
         let (_, _, dynamic_trace) = ProductionAdapter::new_with_feasibility(
             &dynamic_protocol,
             &dynamic_plan,
@@ -7588,7 +7588,7 @@ pub(crate) mod tests {
     #[test]
     fn parallel_zip_output_uses_one_extracted_coefficient_axis_as_a_leaf() {
         let protocol = parallel_range_protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("parallel plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("parallel plan");
         let (job, roots, trace) = ProductionAdapter::new_with_feasibility(
             &protocol,
             &plan,
@@ -7668,7 +7668,7 @@ pub(crate) mod tests {
     #[test]
     fn extracted_coefficient_axis_rejects_a_narrower_family_consumer() {
         let protocol = parallel_range_protocol_with_selector_upper(6);
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("parallel plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("parallel plan");
         let result = ProductionAdapter::new_with_feasibility(
             &protocol,
             &plan,
@@ -7681,8 +7681,8 @@ pub(crate) mod tests {
 
     #[test]
     fn opt_in_expression_select_records_typed_plan_and_residual_filter() {
-        let protocol = crate::toy_example::protocol();
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
         let parameters = BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]);
         let (ordinary_job, ordinary_roots) =
             ProductionAdapter::new(&protocol, &plan, parameters.clone())
@@ -7732,7 +7732,7 @@ pub(crate) mod tests {
     #[test]
     fn opt_in_indexed_slice_registers_one_shared_four_role_group() {
         let protocol = generated_gather_protocol(7);
-        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("slice plan");
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("slice plan");
         let (ordinary_job, ordinary_roots) = ProductionAdapter::new(
             &protocol,
             &plan,

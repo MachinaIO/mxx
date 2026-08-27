@@ -217,119 +217,121 @@ namespace Mxx.Certificate.OperationalNoise.EventReplay
 
 open Mxx.Certificate.OperationalNoise
 
-def toyContext : MonomialContext :=
+def exampleContext : MonomialContext :=
   { exteriorCentral := [1], prefixFactors := [10], suffixFactors := [20] }
 
-def toyRhsKeyA : MonomialKey := { centralFactors := [3], orderedFactors := [40] }
-def toyRhsKeyB : MonomialKey := { centralFactors := [4], orderedFactors := [50] }
-def toyRhs : Polynomial :=
-  [ { coefficient := 3, key := toyRhsKeyA }, { coefficient := -1, key := toyRhsKeyB } ]
+def exampleRhsKeyA : MonomialKey := { centralFactors := [3], orderedFactors := [40] }
+def exampleRhsKeyB : MonomialKey := { centralFactors := [4], orderedFactors := [50] }
+def exampleRhs : Polynomial :=
+  [ { coefficient := 3, key := exampleRhsKeyA }, { coefficient := -1, key := exampleRhsKeyB } ]
 
-def toyContextualA : MonomialKey := toyContext.plug toyRhsKeyA
-def toyContextualB : MonomialKey := toyContext.plug toyRhsKeyB
-def toyReplacement : Polynomial := relationReplacement toyContext 2 toyRhs
+def exampleContextualA : MonomialKey := exampleContext.plug exampleRhsKeyA
+def exampleContextualB : MonomialKey := exampleContext.plug exampleRhsKeyB
+def exampleReplacement : Polynomial := relationReplacement exampleContext 2 exampleRhs
 
-def toyProductLeft : ExactTerm :=
+def exampleProductLeft : ExactTerm :=
   { coefficient := -2, key := { centralFactors := [], orderedFactors := [10] } }
-def toyProductRight : ExactTerm :=
+def exampleProductRight : ExactTerm :=
   { coefficient := 3, key := { centralFactors := [1, 3], orderedFactors := [40, 20] } }
-def toyCancellation : Polynomial := [productMerge_contribution toyProductLeft toyProductRight]
-def toyFolded : Polynomial := add toyReplacement toyCancellation
-def toySubtracted : Polynomial := subtract toyReplacement toyCancellation
+def exampleCancellation : Polynomial := [productMerge_contribution exampleProductLeft exampleProductRight]
+def exampleFolded : Polynomial := add exampleReplacement exampleCancellation
+def exampleSubtracted : Polynomial := subtract exampleReplacement exampleCancellation
 
-def toySurvivorMonomialActual : Nat := 4
-def toySurvivorMonomialBound : Nat := 5
-def toySurvivorCoefficient : Nat := (coefficient toyContextualB toyFolded).natAbs
-def toyResolvedActual : Nat := toySurvivorCoefficient * toySurvivorMonomialActual
-def toyResolvedBound : Nat := toySurvivorCoefficient * toySurvivorMonomialBound
-def toyResolvedContributions : List Nat := [toyResolvedActual]
-def toyResolvedBounds : List Nat := [toyResolvedBound]
-def toySummaryActual : Nat := 7
-def toySummaryBound : Nat := 9
+def exampleSurvivorMonomialActual : Nat := 4
+def exampleSurvivorMonomialBound : Nat := 5
+def exampleSurvivorCoefficient : Nat := (coefficient exampleContextualB exampleFolded).natAbs
+def exampleResolvedActual : Nat := exampleSurvivorCoefficient * exampleSurvivorMonomialActual
+def exampleResolvedBound : Nat := exampleSurvivorCoefficient * exampleSurvivorMonomialBound
+def exampleResolvedContributions : List Nat := [exampleResolvedActual]
+def exampleResolvedBounds : List Nat := [exampleResolvedBound]
+def exampleSummaryActual : Nat := 7
+def exampleSummaryBound : Nat := 9
 
-theorem toy_contextual_sources :
-    toyContextualA = toyContext.plug toyRhsKeyA ∧
-      toyContextualB = toyContext.plug toyRhsKeyB := by
+theorem example_contextual_sources :
+    exampleContextualA = exampleContext.plug exampleRhsKeyA ∧
+      exampleContextualB = exampleContext.plug exampleRhsKeyB := by
   exact ⟨rfl, rfl⟩
 
-theorem toy_replacement_shape :
-    toyReplacement =
+theorem example_replacement_shape :
+    exampleReplacement =
       [ { coefficient := 6,
           key := { centralFactors := [1, 3], orderedFactors := [10, 40, 20] } },
         { coefficient := -2,
           key := { centralFactors := [1, 4], orderedFactors := [10, 50, 20] } } ] := by
   decide
 
-theorem toy_product_cancellation :
-    productMerge_contribution toyProductLeft toyProductRight =
-      { coefficient := -6, key := toyContextualA } := by
+theorem example_product_cancellation :
+    productMerge_contribution exampleProductLeft exampleProductRight =
+      { coefficient := -6, key := exampleContextualA } := by
   decide
 
-theorem toy_add_cancellation : coefficient toyContextualA toyFolded = 0 := by decide
+theorem example_add_cancellation : coefficient exampleContextualA exampleFolded = 0 := by decide
 
-theorem toy_add_survivor : coefficient toyContextualB toyFolded = -2 := by decide
+theorem example_add_survivor : coefficient exampleContextualB exampleFolded = -2 := by decide
 
-theorem toy_sub_contribution : coefficient toyContextualA toySubtracted = 12 := by decide
+theorem example_sub_contribution : coefficient exampleContextualA exampleSubtracted = 12 := by decide
 
-theorem toy_survivor_magnitude : toySurvivorCoefficient = 2 := by
-  unfold toySurvivorCoefficient
-  rw [show coefficient toyContextualB toyFolded = -2 from toy_add_survivor]
+theorem example_survivor_magnitude : exampleSurvivorCoefficient = 2 := by
+  unfold exampleSurvivorCoefficient
+  rw [show coefficient exampleContextualB exampleFolded = -2 from example_add_survivor]
   decide
 
-theorem toy_monomial_bound : toySurvivorMonomialActual ≤ toySurvivorMonomialBound := by decide
+theorem example_monomial_bound : exampleSurvivorMonomialActual ≤ exampleSurvivorMonomialBound := by decide
 
-theorem toy_resolved_transfer : toyResolvedActual ≤ toyResolvedBound := by
-  unfold toyResolvedActual toyResolvedBound
-  exact boundTransfer_scale toy_monomial_bound
+theorem example_resolved_transfer : exampleResolvedActual ≤ exampleResolvedBound := by
+  unfold exampleResolvedActual exampleResolvedBound
+  exact boundTransfer_scale example_monomial_bound
 
-theorem toy_resolved_transfer_values :
-    toyResolvedActual = 8 ∧ toyResolvedBound = 10 := by
-  unfold toyResolvedActual toyResolvedBound toySurvivorCoefficient
-  rw [toy_add_survivor]
+theorem example_resolved_transfer_values :
+    exampleResolvedActual = 8 ∧ exampleResolvedBound = 10 := by
+  unfold exampleResolvedActual exampleResolvedBound exampleSurvivorCoefficient
+  rw [example_add_survivor]
   decide
 
-theorem toy_resolved_transfer_list :
+theorem example_resolved_transfer_list :
     List.Forall₂ (fun value bound => value ≤ bound)
-      toyResolvedContributions toyResolvedBounds := by
+      exampleResolvedContributions exampleResolvedBounds := by
   constructor
-  · exact toy_resolved_transfer
+  · exact example_resolved_transfer
   · exact List.Forall₂.nil
 
-theorem toy_summary_bound : toySummaryActual ≤ toySummaryBound := by decide
+theorem example_summary_bound : exampleSummaryActual ≤ exampleSummaryBound := by decide
 
-theorem toy_prefold_invocation_end : 7 + 8 ≤ 9 + 10 := by
+theorem example_prefold_invocation_end : 7 + 8 ≤ 9 + 10 := by
   have hfinal := preFold_to_invocationEnd
-    (summaryActual := toySummaryActual) (summaryBound := toySummaryBound)
-    (survivorContributions := toyResolvedContributions)
-    (survivorBounds := toyResolvedBounds) toy_summary_bound toy_resolved_transfer_list
-  change toySummaryActual + toyResolvedContributions.sum ≤ toySummaryBound + toyResolvedBounds.sum
+    (summaryActual := exampleSummaryActual) (summaryBound := exampleSummaryBound)
+    (survivorContributions := exampleResolvedContributions)
+    (survivorBounds := exampleResolvedBounds) example_summary_bound example_resolved_transfer_list
+  change exampleSummaryActual + exampleResolvedContributions.sum ≤
+    exampleSummaryBound + exampleResolvedBounds.sum
   exact hfinal
 
-theorem toy_event_replay :
-    toyContextualA = toyContext.plug toyRhsKeyA ∧
-      toyContextualB = toyContext.plug toyRhsKeyB ∧
-      toyReplacement =
+theorem example_event_replay :
+    exampleContextualA = exampleContext.plug exampleRhsKeyA ∧
+      exampleContextualB = exampleContext.plug exampleRhsKeyB ∧
+      exampleReplacement =
         [ { coefficient := 6,
             key := { centralFactors := [1, 3], orderedFactors := [10, 40, 20] } },
           { coefficient := -2,
             key := { centralFactors := [1, 4], orderedFactors := [10, 50, 20] } } ] ∧
-      productMerge_contribution toyProductLeft toyProductRight =
-        { coefficient := -6, key := toyContextualA } ∧
-      coefficient toyContextualA toyFolded = 0 ∧
-      coefficient toyContextualB toyFolded = -2 ∧
-      coefficient toyContextualA toySubtracted = 12 ∧
-      toySurvivorCoefficient = 2 ∧
-      toySurvivorMonomialActual ≤ toySurvivorMonomialBound ∧
-      (toyResolvedActual = 8 ∧ toyResolvedBound = 10) ∧
-      toyResolvedActual ≤ toyResolvedBound ∧
-      toySummaryActual ≤ toySummaryBound ∧
+      productMerge_contribution exampleProductLeft exampleProductRight =
+        { coefficient := -6, key := exampleContextualA } ∧
+      coefficient exampleContextualA exampleFolded = 0 ∧
+      coefficient exampleContextualB exampleFolded = -2 ∧
+      coefficient exampleContextualA exampleSubtracted = 12 ∧
+      exampleSurvivorCoefficient = 2 ∧
+      exampleSurvivorMonomialActual ≤ exampleSurvivorMonomialBound ∧
+      (exampleResolvedActual = 8 ∧ exampleResolvedBound = 10) ∧
+      exampleResolvedActual ≤ exampleResolvedBound ∧
+      exampleSummaryActual ≤ exampleSummaryBound ∧
       7 + 8 ≤ 9 + 10 := by
-  exact ⟨toy_contextual_sources.1, toy_contextual_sources.2, toy_replacement_shape,
-    toy_product_cancellation, toy_add_cancellation, toy_add_survivor, toy_sub_contribution,
-    toy_survivor_magnitude, toy_monomial_bound, toy_resolved_transfer_values,
-    toy_resolved_transfer, toy_summary_bound, toy_prefold_invocation_end⟩
+  exact ⟨example_contextual_sources.1, example_contextual_sources.2, example_replacement_shape,
+    example_product_cancellation, example_add_cancellation, example_add_survivor,
+    example_sub_contribution, example_survivor_magnitude, example_monomial_bound,
+    example_resolved_transfer_values, example_resolved_transfer, example_summary_bound,
+    example_prefold_invocation_end⟩
 
-#print axioms toy_event_replay
+#print axioms example_event_replay
 #print axioms survivorFold_sound
 #print axioms preFold_to_invocationEnd
 

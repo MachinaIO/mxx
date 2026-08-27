@@ -306,6 +306,20 @@ def fixtureState1 : ReplayState := ⟨1, [⟨closedOwner 0, 0⟩]⟩
 def fixtureState5 : ReplayState :=
   ⟨5, [⟨closedOwner 1, 1⟩, ⟨closedOwner 0, 0⟩]⟩
 
+def fixtureState3 : ReplayState :=
+  ⟨3, [⟨closedOwner 1, 1⟩, ⟨closedOwner 0, 0⟩]⟩
+
+def fixtureState4 : ReplayState :=
+  ⟨4, [⟨closedOwner 1, 1⟩, ⟨closedOwner 0, 0⟩]⟩
+
+theorem fixture_result_exact_step :
+    stepAt fixtureDocument fixtureHistory fixtureState3 = some fixtureState4 := by
+  apply stepAt_resultExact fixtureDocument fixtureHistory fixtureState3
+    (closedOwner 1) [singletonTerm 1] .exactZero 2 .exactZero none 1
+  · rfl
+  · rfl
+  · rfl
+
 def fixtureState14 : ReplayState := ⟨16, [⟨closedOwner 0, 0⟩]⟩
 
 def fixtureState18 : ReplayState := ⟨20, [⟨closedOwner 0, 0⟩]⟩

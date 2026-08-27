@@ -16,13 +16,34 @@ use crate::operational_noise::{
 use std::fmt::Write as _;
 
 const EVENT_LEAF_SIZE: usize = 16;
-const EVENT_PACKAGE_SIZE: usize = 256;
+pub(super) const EVENT_PACKAGE_SIZE: usize = 256;
 const REPLAY_CHUNK_SIZE: usize = 4;
 
 #[derive(Clone)]
 struct FrameState {
     root: ProofPayloadOwner,
     start: usize,
+}
+
+#[derive(Clone)]
+struct ExactTermsEvent {
+    kind: ExactTermsEventKind,
+    terms: String,
+}
+
+#[derive(Clone)]
+enum ExactTermsEventKind {
+    Result(ResultReplayEvent),
+    InvocationEnd,
+}
+
+#[derive(Clone)]
+struct ResultReplayEvent {
+    owner: String,
+    coefficient_bound: String,
+    coefficient_producer: u64,
+    summary: String,
+    summary_producer: String,
 }
 
 pub(super) fn render(
@@ -33,10 +54,14 @@ pub(super) fn render(
         return Err("Security0 proof payload is empty".to_owned());
     }
     let mut rendered = Vec::with_capacity(proof.events.len());
+    let mut exact_terms_events = Vec::with_capacity(proof.events.len());
     let mut frame_starts = Vec::with_capacity(proof.events.len());
     let mut states = Vec::with_capacity(proof.events.len().div_ceil(REPLAY_CHUNK_SIZE) + 1);
+    let mut event_states = Vec::with_capacity(proof.events.len() + 1);
     let mut stack = Vec::<FrameState>::new();
-    states.push(render_state(0, &stack)?);
+    let initial_state = render_state(0, &stack)?;
+    states.push(initial_state.clone());
+    event_states.push(initial_state);
     for (index, event) in proof.events.iter().enumerate() {
         let frame_start = if matches!(event, ProofPayloadEvent::InvocationStart { .. }) {
             index
@@ -44,10 +69,45 @@ pub(super) fn render(
             stack.last().map_or(0, |frame| frame.start)
         };
         frame_starts.push(frame_start);
-        rendered.push(event_text(event)?);
+        let exact_terms = match event {
+            ProofPayloadEvent::Result {
+                owner: result_owner,
+                value:
+                    ProofPayloadValue::Exact {
+                        terms,
+                        coefficient_bound: coefficient,
+                        coefficient_producer,
+                        summary,
+                        summary_producer,
+                    },
+            } => Some(ExactTermsEvent {
+                kind: ExactTermsEventKind::Result(ResultReplayEvent {
+                    owner: owner(result_owner),
+                    coefficient_bound: coefficient_bound(coefficient)?,
+                    coefficient_producer: *coefficient_producer,
+                    summary: summary_text(summary)?,
+                    summary_producer: option(summary_producer.as_ref(), |event| {
+                        Ok(event.to_string())
+                    })?,
+                }),
+                terms: terms_text(terms)?,
+            }),
+            ProofPayloadEvent::InvocationEnd {
+                result: ProofPayloadValue::Exact { terms, .. },
+                ..
+            } => Some(ExactTermsEvent {
+                kind: ExactTermsEventKind::InvocationEnd,
+                terms: terms_text(terms)?,
+            }),
+            _ => None,
+        };
+        let exact_terms_reference = exact_terms.as_ref().map(|_| format!("exact{index}RawTerms"));
+        rendered.push(event_text_with_terms(event, exact_terms_reference.as_deref())?);
+        exact_terms_events.push(exact_terms);
         update_state(statement, index, event, &mut stack)?;
+        event_states.push(render_state(index + 1, &stack)?);
         if (index + 1) % REPLAY_CHUNK_SIZE == 0 || index + 1 == proof.events.len() {
-            states.push(render_state(index + 1, &stack)?);
+            states.push(event_states[index + 1].clone());
         }
     }
     if !stack.is_empty() {
@@ -61,7 +121,14 @@ pub(super) fn render(
         let end = (start + EVENT_PACKAGE_SIZE).min(proof.events.len());
         files.push(generated_file(
             format!("Proof/Events{package:03}.lean"),
-            render_event_package(package, start, end, &rendered, &frame_starts),
+            render_event_package(
+                package,
+                start,
+                end,
+                &rendered,
+                &exact_terms_events,
+                &frame_starts,
+            ),
         ));
     }
     files.push(generated_file(
@@ -75,7 +142,16 @@ pub(super) fn render(
         let end_chunk = end_event.div_ceil(REPLAY_CHUNK_SIZE);
         files.push(generated_file(
             format!("Proof/Replay{package:03}.lean"),
-            render_replay_package(package, start_chunk, end_chunk, &states),
+            render_replay_package(
+                package,
+                start_chunk,
+                end_chunk,
+                &states,
+                &event_states,
+                &exact_terms_events,
+                &frame_starts,
+                proof.events.len(),
+            ),
         ));
     }
     files.push(generated_file(
@@ -86,6 +162,13 @@ pub(super) fn render(
 }
 
 fn event_text(event: &ProofPayloadEvent) -> Result<String, String> {
+    event_text_with_terms(event, None)
+}
+
+fn event_text_with_terms(
+    event: &ProofPayloadEvent,
+    exact_terms_reference: Option<&str>,
+) -> Result<String, String> {
     Ok(match event {
         ProofPayloadEvent::InvocationStart { root } => {
             format!(".invocationStart ({})", owner(root))
@@ -106,7 +189,8 @@ fn event_text(event: &ProofPayloadEvent) -> Result<String, String> {
             } => format!(
                 ".resultExact ({}) {} {} {coefficient_producer} {} ({})",
                 owner(result_owner),
-                terms_text(terms)?,
+                exact_terms_reference
+                    .map_or_else(|| terms_text(terms), |value| Ok(value.to_owned()))?,
                 coefficient_bound(coefficient)?,
                 summary_text(summary)?,
                 option(summary_producer.as_ref(), |event| Ok(event.to_string()))?,
@@ -127,7 +211,8 @@ fn event_text(event: &ProofPayloadEvent) -> Result<String, String> {
             } => format!(
                 ".invocationEndExact ({}) {pre_fold_event} {} {} {coefficient_producer} {} ({})",
                 owner(root),
-                terms_text(terms)?,
+                exact_terms_reference
+                    .map_or_else(|| terms_text(terms), |value| Ok(value.to_owned()))?,
                 coefficient_bound(coefficient)?,
                 summary_text(summary)?,
                 option(summary_producer.as_ref(), |event| Ok(event.to_string()))?,
@@ -425,12 +510,28 @@ fn render_event_package(
     start: usize,
     end: usize,
     events: &[String],
+    exact_terms_events: &[Option<ExactTermsEvent>],
     frame_starts: &[usize],
 ) -> String {
     let module = format!("Events{package:03}");
     let mut source = format!(
         "import {MODULE_ROOT}.Cert.Cert\n\nset_option autoImplicit false\nset_option relaxedAutoImplicit false\n\nnamespace {NAMESPACE}.Proof.{module}\n\nopen Mxx.Certificate.OperationalNoise\nopen TallSecurity0ABI\n\n"
     );
+    for index in start..end {
+        if let Some(exact) = &exact_terms_events[index] {
+            writeln!(source, "def exact{index}RawTerms : List Term := {}\n", exact.terms)
+                .expect("writing to String cannot fail");
+            if matches!(exact.kind, ExactTermsEventKind::Result(_)) {
+                writeln!(
+                    source,
+                    "theorem exact{index}RawTermsValid :\n    exact{index}RawTerms.all (fun term => monomialValid document term.monomial) = true := by\n  decide +kernel\n"
+                )
+                .expect("writing to String cannot fail");
+            }
+        }
+        writeln!(source, "def event{index} : Event := {}\n", events[index])
+            .expect("writing to String cannot fail");
+    }
     let first_leaf = start / EVENT_LEAF_SIZE;
     let leaf_count = (end - start).div_ceil(EVENT_LEAF_SIZE);
     for local in 0..leaf_count {
@@ -439,10 +540,7 @@ fn render_event_package(
         let leaf_end = (leaf_start + EVENT_LEAF_SIZE).min(end);
         let values = (leaf_start..leaf_end)
             .map(|index| {
-                format!(
-                    "{{ event := {}\n    frameStart := {} }}",
-                    events[index], frame_starts[index]
-                )
+                format!("{{ event := event{index}\n    frameStart := {} }}", frame_starts[index])
             })
             .collect::<Vec<_>>()
             .join(",\n  ");
@@ -451,6 +549,15 @@ fn render_event_package(
     }
     writeln!(source, "end {NAMESPACE}.Proof.{module}").expect("writing to String cannot fail");
     source
+}
+
+struct HistoryTreeFact {
+    name: String,
+    leaf: usize,
+    start: usize,
+    end: usize,
+    height: usize,
+    dependencies: Vec<String>,
 }
 
 fn render_history(event_count: usize, package_count: usize) -> String {
@@ -466,30 +573,234 @@ fn render_history(event_count: usize, package_count: usize) -> String {
         writeln!(source, "open Proof.Events{package:03}").expect("writing to String cannot fail");
     }
     let leaf_count = event_count.div_ceil(EVENT_LEAF_SIZE);
-    let root = render_balanced_leaves(0, leaf_count, 0, &mut source);
+    let mut facts = Vec::new();
+    let root = render_balanced_leaves(0, leaf_count, 0, &mut facts, &mut source);
+    for leaf in 0..leaf_count {
+        let size = EVENT_LEAF_SIZE.min(event_count - leaf * EVENT_LEAF_SIZE);
+        writeln!(
+            source,
+            "\ntheorem eventLeaf{leaf}Size : eventLeaf{leaf}.size = {size} := by\n  rfl\n"
+        )
+        .expect("writing to String cannot fail");
+    }
     writeln!(
         source,
-        "\ndef historyLeaves : RowTable (Array AnnotatedEvent) := {root}\n\ndef history : EventHistory := ⟨historyLeaves, {event_count}⟩\n\nend {NAMESPACE}"
+        "\ndef historyLeaves : RowTable (Array AnnotatedEvent) := {root}\n\ndef history : EventHistory := ⟨historyLeaves, {event_count}⟩\n"
     )
     .expect("writing to String cannot fail");
+    render_history_facts(&facts, leaf_count, &mut source);
+    writeln!(source, "\nend {NAMESPACE}").expect("writing to String cannot fail");
     source
 }
 
-fn render_balanced_leaves(start: usize, end: usize, depth: usize, out: &mut String) -> String {
+fn render_balanced_leaves(
+    start: usize,
+    end: usize,
+    depth: usize,
+    facts: &mut Vec<HistoryTreeFact>,
+    out: &mut String,
+) -> String {
     if start == end {
         return ".empty".to_owned();
     }
     let middle = (start + end) / 2;
     if depth == 4 {
         let name = format!("historyTree{middle}");
-        let value = render_balanced_leaves(start, end, 0, out);
+        let dependency_start = facts.len();
+        let value = render_balanced_leaves(start, end, 0, facts, out);
+        let added = &facts[dependency_start..];
+        let nested_names =
+            added.iter().flat_map(|fact| fact.dependencies.iter()).collect::<Vec<_>>();
+        let dependencies = added
+            .iter()
+            .filter(|fact| !nested_names.iter().any(|name| *name == &fact.name))
+            .map(|fact| fact.name.clone())
+            .collect();
         writeln!(out, "def {name} : RowTable (Array AnnotatedEvent) := {value}")
             .expect("writing to String cannot fail");
+        facts.push(HistoryTreeFact {
+            name: name.clone(),
+            leaf: middle,
+            start,
+            end,
+            height: balanced_tree_height(end - start),
+            dependencies,
+        });
         return name;
     }
-    let left = render_balanced_leaves(start, middle, depth + 1, out);
-    let right = render_balanced_leaves(middle + 1, end, depth + 1, out);
+    let left = render_balanced_leaves(start, middle, depth + 1, facts, out);
+    let right = render_balanced_leaves(middle + 1, end, depth + 1, facts, out);
     format!("(.node {middle} eventLeaf{middle} {left} {right})")
+}
+
+fn render_history_facts(facts: &[HistoryTreeFact], leaf_count: usize, out: &mut String) {
+    for fact in facts {
+        let lower =
+            if fact.start == 0 { "none".to_owned() } else { format!("(some {})", fact.start - 1) };
+        let upper =
+            if fact.end == leaf_count { "none".to_owned() } else { format!("(some {})", fact.end) };
+        let dependency_facts = |suffix: &str| {
+            fact.dependencies
+                .iter()
+                .map(|dependency| format!("{dependency}{suffix}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let ordered_facts = dependency_facts("Ordered");
+        let balanced_facts = dependency_facts("Balanced");
+        let height_facts = dependency_facts("Height");
+        let node_count_facts = dependency_facts("NodeCount");
+        let all_bool_facts = dependency_facts("AllBool");
+        let event_leaf_size_fact = format!("eventLeaf{}Size", fact.leaf);
+        writeln!(
+            out,
+            "\ntheorem {name}Ordered :\n    RowTable.orderedFrom {lower} {upper} {name} = true := by\n  simp [{name}, RowTable.orderedFrom{previous}]",
+            previous = if ordered_facts.is_empty() {
+                String::new()
+            } else {
+                format!(", {ordered_facts}")
+            },
+            name = fact.name,
+        )
+        .expect("writing to String cannot fail");
+        writeln!(
+            out,
+            "\ntheorem {name}Balanced : {name}.balanced = true := by\n  simp [{name}, RowTable.balanced, RowTable.height{previous}]",
+            previous = if balanced_facts.is_empty() && height_facts.is_empty() {
+                String::new()
+            } else {
+                let facts = [balanced_facts.as_str(), height_facts.as_str()]
+                    .into_iter()
+                    .filter(|facts| !facts.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(", {facts}")
+            },
+            name = fact.name,
+        )
+        .expect("writing to String cannot fail");
+        writeln!(
+            out,
+            "\ntheorem {name}Height : RowTable.height {name} = {} := by\n  simp [{name}, RowTable.height{previous}]",
+            fact.height,
+            previous = if height_facts.is_empty() {
+                String::new()
+            } else {
+                format!(", {height_facts}")
+            },
+            name = fact.name,
+        )
+        .expect("writing to String cannot fail");
+        writeln!(
+            out,
+            "\ntheorem {name}NodeCount : rowTableNodeCount {name} = {} := by\n  simp [{name}, rowTableNodeCount{previous}]",
+            fact.end - fact.start,
+            previous = if node_count_facts.is_empty() {
+                String::new()
+            } else {
+                format!(", {node_count_facts}")
+            },
+            name = fact.name,
+        )
+        .expect("writing to String cannot fail");
+        writeln!(
+            out,
+            "\ntheorem {name}AllBool :\n    {name}.allBool (fun leaf events =>\n      decide (leaf < history.leafCount) &&\n        decide (events.size = history.expectedLeafSize leaf)) = true := by\n  simp only [{name}, RowTable.allBool]\n  {child_rewrites}\n  simp [history, EventHistory.leafCount, EventHistory.expectedLeafSize, {event_leaf_size_fact}] <;> decide +kernel",
+            child_rewrites = if all_bool_facts.is_empty() {
+                String::new()
+            } else {
+                format!("rw [{}]", all_bool_facts)
+            },
+            event_leaf_size_fact = event_leaf_size_fact,
+            name = fact.name,
+        )
+        .expect("writing to String cannot fail");
+    }
+    // Each opaque history subtree has already had its own facts checked above.
+    // The root rewrites therefore need only the facts for opaque subtrees that
+    // occur directly in the root expression.  Passing every descendant fact to
+    // every root theorem makes simp re-open the entire history tree and defeats
+    // the balanced proof decomposition.
+    let nested_names = facts.iter().flat_map(|fact| fact.dependencies.iter()).collect::<Vec<_>>();
+    let top_facts = facts
+        .iter()
+        .filter(|fact| !nested_names.iter().any(|name| *name == &fact.name))
+        .collect::<Vec<_>>();
+    let top_fact_names = |suffix: &str| {
+        top_facts
+            .iter()
+            .map(|fact| format!("{}{}", fact.name, suffix))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let root_event_leaf_sizes = (0..leaf_count)
+        .filter(|leaf| !top_facts.iter().any(|fact| fact.start <= *leaf && *leaf < fact.end))
+        .map(|leaf| format!("eventLeaf{leaf}Size"))
+        .collect::<Vec<_>>();
+    let ordered_facts = top_fact_names("Ordered");
+    let balanced_facts = top_fact_names("Balanced");
+    let height_facts = top_fact_names("Height");
+    let node_count_facts = top_fact_names("NodeCount");
+    let all_bool_facts = top_fact_names("AllBool");
+    let all_bool_facts = [all_bool_facts, root_event_leaf_sizes.join(", ")]
+        .into_iter()
+        .filter(|facts| !facts.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = |facts: &str| {
+        if facts.is_empty() { String::new() } else { format!(", {facts}") }
+    };
+    writeln!(
+        out,
+        "\ntheorem historyLeavesOrdered :\n    RowTable.orderedFrom none none historyLeaves = true := by\n  simp [historyLeaves, RowTable.orderedFrom{ordered}]",
+        ordered = suffix(&ordered_facts),
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        out,
+        "\ntheorem historyLeavesBalanced : historyLeaves.balanced = true := by\n  simp [historyLeaves, RowTable.balanced, RowTable.height{balanced}]",
+        balanced = suffix(&[balanced_facts.as_str(), height_facts.as_str()]
+            .into_iter()
+            .filter(|facts| !facts.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")),
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        out,
+        "\ntheorem historyLeavesNodeCount : rowTableNodeCount historyLeaves = {} := by\n  simp [historyLeaves, rowTableNodeCount{node_count}]",
+        leaf_count,
+        node_count = suffix(&node_count_facts),
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        out,
+        "\ntheorem historyLeavesAllBool :\n    historyLeaves.allBool (fun leaf events =>\n      decide (leaf < history.leafCount) &&\n        decide (events.size = history.expectedLeafSize leaf)) = true := by\n  simp only [historyLeaves, RowTable.allBool]\n  {child_rewrites}\n  simp [history, EventHistory.leafCount, EventHistory.expectedLeafSize{event_leaf_sizes}] <;> decide +kernel",
+        child_rewrites = if all_bool_facts.is_empty() {
+            String::new()
+        } else {
+            format!("rw [{}]", all_bool_facts)
+        },
+        event_leaf_sizes = if root_event_leaf_sizes.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", root_event_leaf_sizes.join(", "))
+        },
+    )
+    .expect("writing to String cannot fail");
+    out.push_str(
+        "\n\ntheorem historyWellFormedFact : history.wellFormed = true := by\n  rw [EventHistory.wellFormed]\n  have historyLeavesEq : history.leaves = historyLeaves := by\n    rfl\n  rw [historyLeavesEq]\n  rw [historyLeavesAllBool]\n  have leavesWellFormed : historyLeaves.wellFormed = true := by\n    rw [RowTable.wellFormed, historyLeavesOrdered, historyLeavesBalanced]\n    rfl\n  rw [leavesWellFormed, historyLeavesNodeCount]\n  simp [history, EventHistory.leafCount, eventLeafSize]\n",
+    );
+}
+
+fn balanced_tree_height(count: usize) -> usize {
+    if count == 0 {
+        0
+    } else {
+        let left = count / 2;
+        let right = count - left - 1;
+        balanced_tree_height(left).max(balanced_tree_height(right)) + 1
+    }
 }
 
 fn render_replay_package(
@@ -497,6 +808,10 @@ fn render_replay_package(
     start_chunk: usize,
     end_chunk: usize,
     states: &[String],
+    event_states: &[String],
+    exact_terms_events: &[Option<ExactTermsEvent>],
+    frame_starts: &[usize],
+    event_count: usize,
 ) -> String {
     let module = format!("Replay{package:03}");
     let mut source = format!(
@@ -512,9 +827,79 @@ fn render_replay_package(
             .strip_prefix('⟨')
             .and_then(|text| text.split_once(',').map(|pair| pair.0))
             .expect("state renderer always begins with cursor");
+        let chunk_start = chunk * REPLAY_CHUNK_SIZE;
+        let chunk_end = ((chunk + 1) * REPLAY_CHUNK_SIZE).min(exact_terms_events.len());
+        let valid_terms = (chunk_start..chunk_end)
+            .filter_map(|event| {
+                exact_terms_events[event].as_ref().and_then(|exact| {
+                    matches!(exact.kind, ExactTermsEventKind::Result(_)).then_some(event)
+                })
+            })
+            .collect::<Vec<_>>();
+        let proof = if valid_terms.is_empty() {
+            "by rfl".to_owned()
+        } else {
+            for event in chunk_start + 1..chunk_end {
+                writeln!(
+                    source,
+                    "def replayEventState{event} : ReplayState := {}",
+                    event_states[event]
+                )
+                .expect("writing to String cannot fail");
+            }
+            source.push('\n');
+            for event in chunk_start..chunk_end {
+                let next = event + 1;
+                let state = if event == chunk_start {
+                    format!("replayState{chunk}")
+                } else {
+                    format!("replayEventState{event}")
+                };
+                let next_state = if next == chunk_end {
+                    format!("replayState{}", chunk + 1)
+                } else {
+                    format!("replayEventState{next}")
+                };
+                if let Some(ExactTermsEvent { kind: ExactTermsEventKind::Result(result), .. }) =
+                    &exact_terms_events[event]
+                {
+                    let event_package = event / EVENT_PACKAGE_SIZE;
+                    writeln!(
+                        source,
+                        "theorem replayStep{event} : stepAt document history {state} = some {next_state} := by\n  apply stepAt_resultExact document history {state}\n    ({}) Proof.Events{event_package:03}.exact{event}RawTerms {} {} {} ({}) {}\n  · rfl\n  · rfl\n  · rw [Proof.Events{event_package:03}.exact{event}RawTermsValid]\n    rfl\n",
+                        result.owner,
+                        result.coefficient_bound,
+                        result.coefficient_producer,
+                        result.summary,
+                        result.summary_producer,
+                        frame_starts[event],
+                    )
+                    .expect("writing to String cannot fail");
+                } else {
+                    writeln!(
+                        source,
+                        "theorem replayStep{event} : stepAt document history {state} = some {next_state} := by\n  rfl\n"
+                    )
+                    .expect("writing to String cannot fail");
+                }
+            }
+            let mut chunk_proof = format!(
+                "by\n    unfold replayRange\n    rw [show replayState{chunk}.cursor = {chunk_start} by rfl]\n    rw [show history.size = {event_count} by rfl]\n    dsimp only\n    rw [show (decide ({chunk_start} ≤ {actual_end}) && decide ({actual_end} ≤ {event_count}) &&\n        decide ({actual_end} - {chunk_start} ≤ 4)) = true by decide]\n    simp only [if_true]\n    unfold replayBlock\n    rw [show replayState{chunk}.cursor = {chunk_start} by rfl]\n    unfold replayBlock.run\n    dsimp only\n    rw [show Nat.min ({actual_end} - {chunk_start}) 4 = {} by decide]\n    simp only [replayBlock.run, Option.bind_eq_bind]",
+                chunk_end - chunk_start,
+            );
+            for event in chunk_start..chunk_end {
+                write!(
+                    chunk_proof,
+                    "\n    rw [replayStep{event}]\n    simp only [Option.bind_some]"
+                )
+                .expect("writing to String cannot fail");
+            }
+            chunk_proof.push_str("\n    rfl");
+            chunk_proof
+        };
         writeln!(
             source,
-            "theorem replayChunk{chunk} : ReplayChain document history replayState{chunk} replayState{} :=\n  .chunk {actual_end} (by rfl)\n",
+            "theorem replayChunk{chunk} : ReplayChain document history replayState{chunk} replayState{} :=\n  .chunk {actual_end} ({proof})\n",
             chunk + 1
         )
         .expect("writing to String cannot fail");
@@ -540,8 +925,59 @@ fn balanced_chain(prefix: &str, start: usize, end: usize) -> String {
     )
 }
 
+fn render_balanced_replay_chain(
+    start: usize,
+    end: usize,
+    depth: usize,
+    package_count: usize,
+    final_leaf: usize,
+    source: &mut String,
+) -> String {
+    if end - start == 1 {
+        return format!("replayShard{start}");
+    }
+    let middle = (start + end) / 2;
+    if depth == 4 {
+        let name = format!("replayTree{start}_{end}");
+        let value = render_balanced_replay_chain(start, end, 0, package_count, final_leaf, source);
+        render_checked_replay_tree(&name, start, end, package_count, final_leaf, &value, source);
+        return name;
+    }
+    let left =
+        render_balanced_replay_chain(start, middle, depth + 1, package_count, final_leaf, source);
+    let right =
+        render_balanced_replay_chain(middle, end, depth + 1, package_count, final_leaf, source);
+    format!("(.trans {left} {right})")
+}
+
+fn render_checked_replay_tree(
+    name: &str,
+    start: usize,
+    end: usize,
+    package_count: usize,
+    final_leaf: usize,
+    value: &str,
+    source: &mut String,
+) {
+    let start_state = start * (EVENT_PACKAGE_SIZE / REPLAY_CHUNK_SIZE);
+    let end_state = if end == package_count {
+        final_leaf
+    } else {
+        end * (EVENT_PACKAGE_SIZE / REPLAY_CHUNK_SIZE)
+    };
+    let start_state_ref = format!("Proof.Replay{start:03}.replayState{start_state}");
+    let end_package = end.min(package_count - 1);
+    let end_state_ref = format!("Proof.Replay{end_package:03}.replayState{end_state}");
+    writeln!(
+        source,
+        "theorem {name} : ReplayChain document history {start_state_ref} {end_state_ref} := by\n  exact {value}\n"
+    )
+    .expect("writing to String cannot fail");
+}
+
 fn render_top(event_count: usize, package_count: usize, final_leaf: usize) -> String {
     let mut source = String::new();
+    writeln!(source, "import {MODULE_ROOT}.Proof.History").expect("writing to String cannot fail");
     for package in 0..package_count {
         writeln!(source, "import {MODULE_ROOT}.Proof.Replay{package:03}")
             .expect("writing to String cannot fail");
@@ -552,10 +988,45 @@ fn render_top(event_count: usize, package_count: usize, final_leaf: usize) -> St
     for package in 0..package_count {
         writeln!(source, "open Proof.Replay{package:03}").expect("writing to String cannot fail");
     }
-    let chain = balanced_chain("replayShard", 0, package_count);
+    let chain = if package_count > 2 {
+        let middle = package_count / 2;
+        let left =
+            render_balanced_replay_chain(0, middle, 1, package_count, final_leaf, &mut source);
+        let right = render_balanced_replay_chain(
+            middle,
+            package_count,
+            1,
+            package_count,
+            final_leaf,
+            &mut source,
+        );
+        let left_name = format!("replayHalf0_{middle}");
+        let right_name = format!("replayHalf{middle}_{package_count}");
+        render_checked_replay_tree(
+            &left_name,
+            0,
+            middle,
+            package_count,
+            final_leaf,
+            &left,
+            &mut source,
+        );
+        render_checked_replay_tree(
+            &right_name,
+            middle,
+            package_count,
+            package_count,
+            final_leaf,
+            &right,
+            &mut source,
+        );
+        format!("(.trans {left_name} {right_name})")
+    } else {
+        render_balanced_replay_chain(0, package_count, 0, package_count, final_leaf, &mut source)
+    };
     writeln!(
         source,
-        "\ntheorem historyWellFormed : history.wellFormed = true := by\n  rfl\n\ntheorem replayChain : ReplayChain document history initialState replayState{final_leaf} := by\n  exact {chain}\n\ntheorem proofValid : Valid document history := by\n  refine ⟨historyWellFormed, replayState{final_leaf}, replayChain, rfl, rfl⟩\n\ntheorem eventCount : history.size = {event_count} := by\n  rfl\n\nend {NAMESPACE}"
+        "\ntheorem historyWellFormed : history.wellFormed = true := by\n  exact {NAMESPACE}.historyWellFormedFact\n\ntheorem replayChain : ReplayChain document history initialState replayState{final_leaf} := by\n  exact {chain}\n\ntheorem proofValid : Valid document history := by\n  refine ⟨historyWellFormed, replayState{final_leaf}, replayChain, rfl, rfl⟩\n\ntheorem eventCount : history.size = {event_count} := by\n  rfl\n\nend {NAMESPACE}"
     )
     .expect("writing to String cannot fail");
     source
@@ -607,6 +1078,16 @@ mod tests {
         ProofPayloadOwner { scope: ProofPayloadScope::Program { program_row: 0 }, expression_row }
     }
 
+    fn result_replay_event() -> ResultReplayEvent {
+        ResultReplayEvent {
+            owner: "owner3".to_owned(),
+            coefficient_bound: ".large".to_owned(),
+            coefficient_producer: 2,
+            summary: ".exactZero".to_owned(),
+            summary_producer: "none".to_owned(),
+        }
+    }
+
     #[test]
     fn replay_boundary_retains_only_invocation_depth() {
         let statement = statement();
@@ -638,6 +1119,88 @@ mod tests {
         };
         assert_eq!(value_ref(&first), ".predecessor 0 3 .coefficient");
         assert_eq!(value_ref(&second), ".predecessor 0 9 .coefficient");
+    }
+
+    #[test]
+    fn event_packages_define_payloads_once_before_ordered_leaf_references() {
+        let events = vec![
+            ".invocationStart owner0".to_owned(),
+            ".resultExact owner1 exact1RawTerms .large 0 .exactZero none".to_owned(),
+            ".invocationEndExact owner2 1 exact2RawTerms .large 0 .exactZero none".to_owned(),
+        ];
+        let source = render_event_package(
+            0,
+            0,
+            events.len(),
+            &events,
+            &[
+                None,
+                Some(ExactTermsEvent {
+                    kind: ExactTermsEventKind::Result(result_replay_event()),
+                    terms: "[]".to_owned(),
+                }),
+                Some(ExactTermsEvent {
+                    kind: ExactTermsEventKind::InvocationEnd,
+                    terms: "[]".to_owned(),
+                }),
+            ],
+            &[3, 7, 7],
+        );
+
+        assert_eq!(source.matches("def event0 : Event :=").count(), 1);
+        assert_eq!(source.matches("def event1 : Event :=").count(), 1);
+        assert_eq!(source.matches(".invocationStart owner0").count(), 1);
+        assert_eq!(
+            source.matches(".resultExact owner1 exact1RawTerms .large 0 .exactZero none").count(),
+            1
+        );
+        assert_eq!(
+            source
+                .matches(".invocationEndExact owner2 1 exact2RawTerms .large 0 .exactZero none")
+                .count(),
+            1
+        );
+        assert!(!source.contains("exact0RawTerms"));
+        assert_eq!(source.matches("def exact1RawTerms : List Term := []").count(), 1);
+        assert_eq!(source.matches("def exact2RawTerms : List Term := []").count(), 1);
+        assert_eq!(source.matches("theorem exact1RawTermsValid").count(), 1);
+        assert!(!source.contains("theorem exact2RawTermsValid"));
+        let first =
+            source.find("{ event := event0\n    frameStart := 3 }").expect("first event reference");
+        let second = source
+            .find("{ event := event1\n    frameStart := 7 }")
+            .expect("second event reference");
+        assert!(first < second);
+    }
+
+    #[test]
+    fn replay_top_uses_checked_depth_four_intermediates_with_exact_endpoints() {
+        let source = render_top(32 * EVENT_PACKAGE_SIZE - 3, 32, 32 * 64);
+
+        assert!(source.contains(
+            "theorem replayTree0_2 : ReplayChain document history Proof.Replay000.replayState0 Proof.Replay002.replayState128"
+        ));
+        assert!(source.contains(
+            "theorem replayTree30_32 : ReplayChain document history Proof.Replay030.replayState1920 Proof.Replay031.replayState2048"
+        ));
+        assert!(source.contains(
+            "theorem replayHalf0_16 : ReplayChain document history Proof.Replay000.replayState0 Proof.Replay016.replayState1024"
+        ));
+        assert!(source.contains(
+            "theorem replayHalf16_32 : ReplayChain document history Proof.Replay016.replayState1024 Proof.Replay031.replayState2048"
+        ));
+        assert!(source.contains("exact (.trans replayHalf0_16 replayHalf16_32)"));
+        assert!(source.contains("exact (.trans (.trans (.trans replayTree0_2 replayTree2_4)"));
+        let tokens = source
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .collect::<Vec<_>>();
+        for package in 0..32 {
+            assert_eq!(
+                tokens.iter().filter(|token| **token == format!("replayShard{package}")).count(),
+                1
+            );
+        }
+        assert!(source.find("replayShard0").unwrap() < source.find("replayShard31").unwrap());
     }
 
     #[test]
@@ -756,7 +1319,7 @@ mod tests {
             "⟨12, []⟩".to_owned(),
             "⟨16, []⟩".to_owned(),
         ];
-        let replay = render_replay_package(0, 0, 4, &states);
+        let replay = render_replay_package(0, 0, 4, &states, &[], &vec![None; 16], &[], 16);
         assert!(replay.contains(
             "theorem replayChunk0 : ReplayChain document history replayState0 replayState1 :=\n  .chunk 4 (by rfl)"
         ));
@@ -771,9 +1334,34 @@ mod tests {
     #[test]
     fn final_partial_replay_chunk_uses_the_exact_event_cursor() {
         let states = vec!["⟨0, []⟩".to_owned(), "⟨4, []⟩".to_owned(), "⟨5, []⟩".to_owned()];
-        let replay = render_replay_package(0, 0, 2, &states);
+        let replay = render_replay_package(0, 0, 2, &states, &[], &vec![None; 8], &[], 5);
         assert!(replay.contains(".chunk 4 (by rfl)"));
         assert!(replay.contains(".chunk 5 (by rfl)"));
+    }
+
+    #[test]
+    fn replay_chunk_rewrites_the_authoritative_result_terms_validity() {
+        let states = vec!["⟨0, []⟩".to_owned(), "⟨4, []⟩".to_owned()];
+        let mut exact = vec![None; 4];
+        exact[3] = Some(ExactTermsEvent {
+            kind: ExactTermsEventKind::Result(result_replay_event()),
+            terms: "[]".to_owned(),
+        });
+        let event_states = (0..=4).map(|cursor| format!("⟨{cursor}, []⟩")).collect::<Vec<_>>();
+        let replay = render_replay_package(0, 0, 1, &states, &event_states, &exact, &[0; 4], 4);
+        assert!(replay.contains("apply stepAt_resultExact document history replayEventState3"));
+        assert!(replay.contains(
+            "theorem replayStep0 : stepAt document history replayState0 = some replayEventState1"
+        ));
+        assert!(replay.contains(
+            "theorem replayStep3 : stepAt document history replayEventState3 = some replayState1"
+        ));
+        assert!(!replay.contains("def replayEventState0"));
+        assert!(!replay.contains("def replayEventState4"));
+        assert!(replay.contains("rw [Proof.Events000.exact3RawTermsValid]"));
+        assert!(replay.contains("rw [replayStep0]"));
+        assert!(replay.contains("rw [replayStep3]"));
+        assert!(!replay.contains("rw [Proof.Events000.exact3RawTermsValid]\n    rfl)"));
     }
 
     #[test]
@@ -813,7 +1401,8 @@ mod tests {
         for chunk in 1332..=1344 {
             states[chunk] = format!("⟨{}, {frame}⟩", chunk * REPLAY_CHUNK_SIZE);
         }
-        let replay = render_replay_package(20, 1332, 1344, &states);
+        let replay =
+            render_replay_package(20, 1332, 1344, &states, &[], &vec![None; 5376], &[], 5376);
         for cursor in (5328..=5376).step_by(REPLAY_CHUNK_SIZE) {
             assert!(replay.contains(&format!("ReplayState := ⟨{cursor}, {frame}⟩")));
         }

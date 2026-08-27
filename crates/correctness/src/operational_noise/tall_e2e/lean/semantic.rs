@@ -2192,8 +2192,8 @@ fn render_left_claim_node(
     writeln!(source, "namespace LeftClaimResult{event}").expect("String write");
     writeln!(source, "def owner : Owner := {}", owner_text(node.result.owner))
         .expect("String write");
-    writeln!(source, "def rawTerms : List Term := {}", raw_terms_text(&node.result.terms))
-        .expect("String write");
+    let result_terms = result_raw_terms_reference(event)?;
+    writeln!(source, "def rawTerms : List Term := {result_terms}").expect("String write");
     writeln!(source, "def summary : Bound := {}", summary_text(&node.result.summary))
         .expect("String write");
     writeln!(source, "def resultEvent : Nat := {event}").expect("String write");
@@ -3098,7 +3098,7 @@ fn render_final_add(
         .expect("String write");
     writeln!(source, "theorem fixedSemanticSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    history.lookup resultEvent = some\n        ⟨.resultExact owner rawTerms {end_coefficient_bound} {end_coefficient_producer}\n          summary {end_summary_producer_text}, {frame_start}⟩ ∧\n      history.lookup preFoldEvent = some\n        ⟨.preFoldPolynomial resultEvent rawTerms summary\n          (some (.result resultEvent .summary)), {frame_start}⟩ ∧\n      history.lookup endEvent = some\n        ⟨.invocationEndExact owner preFoldEvent rawTerms {end_coefficient_bound}\n          {end_coefficient_producer} summary {end_summary_producer_text}, {frame_start}⟩ ∧\n      ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n        (.exact (rawTerms.map Term.toExact) summary) ∧\n      2 * {} * centeredNorm {modulus} (actual selector witness) < {modulus} := by\n  exact ⟨resultAt, preFoldAt, invocationEndAt,\n    invocationEndClaimSound selector selectorLower selectorUpper witness,\n    strictBoundSound selector selectorLower selectorUpper witness⟩\n", statement.plaintext_modulus)
         .expect("String write");
-    writeln!(source, "theorem fixedAcceptance :\n    Security0Accepted document history {} {modulus} ringDimension endEvent preFoldEvent resultEvent\n      {result_maximum} owner rawTerms {end_coefficient_bound} {end_coefficient_producer}\n      summary {end_summary_producer_text} Cert.statementResidual := by\n  refine ⟨proofValid, rfl, rfl, rfl, rfl, rfl, ⟨{frame_start}, resultAt, preFoldAt, invocationEndAt⟩, ?_⟩\n  change ∀ selector, selectorMinimum ≤ selector → selector < selectorMaximum →\n    ∀ witness : Witness document history (some selector) {modulus}, _\n  intro selector selectorLower selectorUpper witness\n  exact ⟨by\n    simpa [actual, Cert.statementResidual] using\n      invocationEndClaimSound selector selectorLower selectorUpper witness, by\n    simpa [actual, Cert.statementResidual] using\n      strictBoundSound selector selectorLower selectorUpper witness⟩\n", statement.plaintext_modulus)
+    writeln!(source, "theorem fixedAcceptance :\n    Security0Accepted document history {} {modulus} ringDimension endEvent preFoldEvent resultEvent\n      {result_maximum} owner rawTerms {end_coefficient_bound} {end_coefficient_producer}\n      summary {end_summary_producer_text} Cert.statementResidual := by\n  refine ⟨proofValid, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨rfl, ?_⟩\n  refine ⟨⟨{frame_start}, resultAt, preFoldAt, invocationEndAt⟩, ?_⟩\n  change ∀ selector, selectorMinimum ≤ selector → selector < selectorMaximum →\n    ∀ witness : Witness document history (some selector) {modulus}, _\n  intro selector selectorLower selectorUpper witness\n  exact ⟨by\n    simpa [actual, Cert.statementResidual] using\n      invocationEndClaimSound selector selectorLower selectorUpper witness, by\n    simpa [actual, Cert.statementResidual] using\n      strictBoundSound selector selectorLower selectorUpper witness⟩\n", statement.plaintext_modulus)
         .expect("String write");
     writeln!(source, "end {NAMESPACE}.Semantic.SemanticFinal").expect("String write");
     Ok(generated_file("Semantic/SemanticFinal.lean", source))
@@ -3157,14 +3157,12 @@ fn render_left_merge_deltas(
                     let right_term = right.terms.get(right_ordinal).ok_or_else(|| {
                         format!("left merge event {event} right term is out of range")
                     })?;
-                    writeln!(source, "def leftRaw : List Term := {}", raw_terms_text(&left.terms))
+                    let left_raw = result_raw_terms_reference(inputs[0].value_event)?;
+                    let right_raw = result_raw_terms_reference(inputs[1].value_event)?;
+                    writeln!(source, "def leftRaw : List Term := {left_raw}")
                         .expect("String write");
-                    writeln!(
-                        source,
-                        "def rightRaw : List Term := {}",
-                        raw_terms_text(&right.terms)
-                    )
-                    .expect("String write");
+                    writeln!(source, "def rightRaw : List Term := {right_raw}")
+                        .expect("String write");
                     writeln!(
                         source,
                         "def group : MergeGroup := .operator {} {}",
@@ -3220,8 +3218,8 @@ fn render_left_merge_deltas(
                     let rhs_term = rhs.terms.get(ordinal).ok_or_else(|| {
                         format!("left relation merge event {event} source term is out of range")
                     })?;
-                    writeln!(source, "def rhsRaw : List Term := {}", raw_terms_text(&rhs.terms))
-                        .expect("String write");
+                    let rhs_raw = result_raw_terms_reference(rhs_event)?;
+                    writeln!(source, "def rhsRaw : List Term := {rhs_raw}").expect("String write");
                     writeln!(source, "def group : MergeGroup := .relation {application}")
                         .expect("String write");
                     writeln!(source, "theorem deltaAt : MergeDeltaAt history mergeEvent frameStart owner group delta := by\n  unfold group delta\n  apply MergeDeltaAt.relation (application := {application}) (rhsResult := {rhs_event})\n    (sourceTermOrdinal := {source_term_ordinal}) (source := {})\n    (outerCoefficient := ({outer})) (orderedStart := {start})\n    (orderedEndExclusive := {end}) (rule := {}) (rhsTerms := rhsRaw)\n    (rhsTerm := {}) (output := {}) (signedContribution := ({})) <;> rfl",
@@ -3442,12 +3440,11 @@ fn render_left_merge_deltas(
                             ));
                         }
                     };
-                    writeln!(source, "def left : Polynomial Owner := {}", terms_text(&left.terms))
+                    writeln!(source, "def left : Polynomial Owner := LeftMerge{first_event}.leftRaw.map Term.toExact")
                         .expect("String write");
                     writeln!(
                         source,
-                        "def right : Polynomial Owner := {}",
-                        terms_text(&right.terms)
+                        "def right : Polynomial Owner := LeftMerge{first_event}.rightRaw.map Term.toExact"
                     )
                     .expect("String write");
                     writeln!(source, "def base : Polynomial Owner := {}", terms_text(&base))
@@ -3529,6 +3526,13 @@ fn render_left_merge_deltas(
         format!("import {NAMESPACE}.Semantic.{root}\n"),
     ));
     Ok(files)
+}
+
+fn result_raw_terms_reference(event: u64) -> Result<String, String> {
+    let event_index =
+        usize::try_from(event).map_err(|_| format!("ResultExact event {event} index overflow"))?;
+    let package = event_index / super::proof::EVENT_PACKAGE_SIZE;
+    Ok(format!("Proof.Events{package:03}.exact{event}RawTerms"))
 }
 
 fn render_left_authorities(
@@ -4011,8 +4015,8 @@ fn render_left_bound_input(
         ProofPayloadEvent::Result { owner, value: ProofPayloadValue::Coefficient { .. } } => {
             ("none".to_owned(), owner_text(*owner))
         }
-        ProofPayloadEvent::Result { owner, value: ProofPayloadValue::Exact { terms, .. } } => {
-            (format!("some ({})", raw_terms_text(terms)), owner_text(*owner))
+        ProofPayloadEvent::Result { owner, value: ProofPayloadValue::Exact { .. } } => {
+            (format!("some ({})", result_raw_terms_reference(result_event)?), owner_text(*owner))
         }
         _ => unreachable!("reached bound input identifies a Result"),
     };
@@ -4743,8 +4747,13 @@ fn render_right_root_operation(
         .expect("String write");
     writeln!(source, "def rightRaw : List Term := SemanticRightRootResult{right_event}.rawTerms")
         .expect("String write");
-    writeln!(source, "def outputRaw : List Term := {}", raw_terms_text(&operation.output.terms))
-        .expect("String write");
+    let event_package = operation.output_event as usize / super::proof::EVENT_PACKAGE_SIZE;
+    writeln!(
+        source,
+        "def outputRaw : List Term := Proof.Events{event_package:03}.exact{}RawTerms",
+        operation.output_event
+    )
+    .expect("String write");
     source.push_str(
         "def left : Polynomial Owner := leftRaw.map Term.toExact\n\
          def right : Polynomial Owner := rightRaw.map Term.toExact\n\
@@ -4915,7 +4924,7 @@ fn render_right_root_node(
     let event = node.result.event;
     writeln!(source, "namespace SemanticRightRootResult{event}\n").expect("String write");
     match &node.kind {
-        RightRootNodeKind::Terminal { producer_event, frame_start, rule, term } => {
+        RightRootNodeKind::Terminal { producer_event, frame_start, rule, term: _ } => {
             let ProofPayloadEvent::Result {
                 value:
                     ProofPayloadValue::Exact {
@@ -4936,8 +4945,8 @@ fn render_right_root_node(
             }
             writeln!(source, "def owner : Owner := {}", owner_text(node.result.owner))
                 .expect("String write");
-            writeln!(source, "def rawTerms : List Term := [{}]", raw_term_text(term))
-                .expect("String write");
+            let result_terms = result_raw_terms_reference(event)?;
+            writeln!(source, "def rawTerms : List Term := {result_terms}").expect("String write");
             source.push_str("def summary : Bound := .exactZero\n");
             writeln!(source, "def producerEvent : Nat := {producer_event}").expect("String write");
             writeln!(source, "def resultEvent : Nat := {event}").expect("String write");
@@ -5010,7 +5019,7 @@ fn render_right_root_node(
                 (0..operation_history_arity).map(|_| "by rfl").collect::<Vec<_>>().join(", ");
             writeln!(
                 source,
-                "\n    (leftClaim : ExactClaimAt history {modulus} witness.env\n      SemanticRightRootResult{left_event}.resultEvent\n      SemanticRightRootResult{left_event}.owner\n      (SemanticRightRootResult{left_event}.actual selector witness)\n      SemanticRightRootResult{left_event}.rawTerms\n      SemanticRightRootResult{left_event}.summary)\n    (rightClaim : ExactClaimAt history {modulus} witness.env\n      SemanticRightRootResult{right_event}.resultEvent\n      SemanticRightRootResult{right_event}.owner\n      (SemanticRightRootResult{right_event}.actual selector witness)\n      SemanticRightRootResult{right_event}.rawTerms\n      SemanticRightRootResult{right_event}.summary)\n    {{frameStart coefficientProducer : Nat}} {{coefficientBound : Bound}}\n    {{summaryProducer : Option Nat}}\n    (outputAt : history.lookup resultEvent = some\n      ⟨.resultExact owner rawTerms coefficientBound coefficientProducer summary summaryProducer,\n        frameStart⟩) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  refine ⟨⟨coefficientBound, coefficientProducer, summaryProducer, ?_⟩, ?_⟩\n  · rw [outputAt]\n    rfl\n  · simpa only [actual, Cert.ResidualRightResult{event}.actual, if_pos operationAt,\n      SemanticRightRootResult{left_event}.actual,\n      SemanticRightRootResult{right_event}.actual, rawTerms, outputRaw, output, summary] using\n      {theorem} {modulus} witness.env\n        (SemanticRightRootResult{left_event}.actual selector witness)\n        (SemanticRightRootResult{right_event}.actual selector witness) left right output\n        (by simpa [left, leftRaw, SemanticRightRootResult{left_event}.summary] using leftClaim.claim)\n        (by simpa [right, rightRaw, SemanticRightRootResult{right_event}.summary] using rightClaim.claim)\n        (resultSound witness.env) (by decide)",
+                "\n    (leftClaim : ExactClaimAt history {modulus} witness.env\n      SemanticRightRootResult{left_event}.resultEvent\n      SemanticRightRootResult{left_event}.owner\n      (SemanticRightRootResult{left_event}.actual selector witness)\n      SemanticRightRootResult{left_event}.rawTerms\n      SemanticRightRootResult{left_event}.summary)\n    (rightClaim : ExactClaimAt history {modulus} witness.env\n      SemanticRightRootResult{right_event}.resultEvent\n      SemanticRightRootResult{right_event}.owner\n      (SemanticRightRootResult{right_event}.actual selector witness)\n      SemanticRightRootResult{right_event}.rawTerms\n      SemanticRightRootResult{right_event}.summary)\n    {{frameStart coefficientProducer : Nat}} {{coefficientBound : Bound}}\n    {{summaryProducer : Option Nat}}\n    (outputAt : history.lookup resultEvent = some\n      ⟨.resultExact owner rawTerms coefficientBound coefficientProducer summary summaryProducer,\n        frameStart⟩) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  refine ⟨⟨coefficientBound, coefficientProducer, summaryProducer, ?_⟩, ?_⟩\n  · rw [outputAt]\n    rfl\n  · rw [actual, Cert.ResidualRightResult{event}.actual]\n    rw [if_pos operationAt]\n    simpa only [SemanticRightRootResult{left_event}.actual,\n      SemanticRightRootResult{right_event}.actual, rawTerms, outputRaw, output, summary] using\n      {theorem} {modulus} witness.env\n        (SemanticRightRootResult{left_event}.actual selector witness)\n        (SemanticRightRootResult{right_event}.actual selector witness) left right output\n        (by simpa [left, leftRaw, SemanticRightRootResult{left_event}.summary] using leftClaim.claim)\n        (by simpa [right, rightRaw, SemanticRightRootResult{right_event}.summary] using rightClaim.claim)\n        (resultSound witness.env) (by decide)",
             )
             .expect("String write");
             writeln!(
@@ -5183,6 +5192,18 @@ mod tests {
         ];
         assert!(accepted.iter().all(reached_terminal_rule));
         assert!(!reached_terminal_rule(&ProofPayloadRule::Sum { inputs: vec![value] }));
+    }
+
+    #[test]
+    fn merge_raw_terms_reference_the_exact_result_event_package() {
+        assert_eq!(
+            result_raw_terms_reference(0).expect("first ResultExact reference"),
+            "Proof.Events000.exact0RawTerms"
+        );
+        assert_eq!(
+            result_raw_terms_reference(308_200).expect("large ResultExact reference"),
+            "Proof.Events1203.exact308200RawTerms"
+        );
     }
 
     #[test]
@@ -5409,8 +5430,11 @@ mod tests {
         let mut rendered = String::new();
         render_right_root_node(&mut rendered, &node, &index, "257")
             .expect("right-root operation claim");
+        assert!(rendered.contains("def outputRaw : List Term := Proof.Events000.exact6RawTerms"));
+        assert!(!rendered.contains(&raw_terms_text(&operation.output.terms)));
         assert!(rendered.contains("operationAt : Cert.ResidualRightResult6.operationEvidence"));
-        assert!(rendered.contains("if_pos operationAt"));
+        assert!(rendered.contains("rw [if_pos operationAt]"));
+        assert!(!rendered.contains("simpa only [actual, Cert.ResidualRightResult6.actual"));
         assert!(!rendered.contains("rcases operationAt"));
     }
 

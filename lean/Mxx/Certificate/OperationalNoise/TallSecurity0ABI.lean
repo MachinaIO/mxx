@@ -675,6 +675,33 @@ def stepAt (document : TallDocument) (history : EventHistory) (state : ReplaySta
         | none => none
       else none
 
+/-- Replay one exact-result event from its recorded row and checked branch guard. -/
+theorem stepAt_resultExact
+    (document : TallDocument) (history : EventHistory) (state : ReplayState)
+    (owner : Owner) (terms : List Term) (coefficientBound : Bound)
+    (coefficientProducer : Nat) (summary : Bound) (summaryProducer : Option Nat)
+    (frameStart : Nat)
+    (entryAt : history.lookup state.cursor =
+      some ⟨.resultExact owner terms coefficientBound coefficientProducer summary summaryProducer,
+        frameStart⟩)
+    (frameAt : (frameStart != match
+        (Event.resultExact owner terms coefficientBound coefficientProducer summary summaryProducer),
+        state.frames.head? with
+      | Event.invocationStart _, _ => state.cursor
+      | _, some frame => frame.start
+      | _, none => 0) = false)
+    (guardAt : (currentScope state owner && ownerValid document owner &&
+        terms.all (fun term => monomialValid document term.monomial) &&
+        decide (coefficientBound ≠ .missing) &&
+        boundProducerValid history state owner coefficientProducer &&
+        summaryProducerValid history state owner summary summaryProducer) = true) :
+    stepAt document history state = some (append state state.frames) := by
+  simp only [stepAt, entryAt, Option.bind_eq_bind, Option.bind_some]
+  rw [frameAt]
+  simp only [Bool.false_eq_true, ↓reduceIte]
+  rw [guardAt]
+  rfl
+
 def replayBlock (document : TallDocument) (history : EventHistory) (endExclusive : Nat)
     (state : ReplayState) : Option ReplayState :=
   let steps := Nat.min (endExclusive - state.cursor) 4

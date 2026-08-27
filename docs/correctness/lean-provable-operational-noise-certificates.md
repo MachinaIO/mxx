@@ -3,8 +3,8 @@
 ## 1. Status and authority
 
 This is the implementation specification for the current Tall vertical slice. Implementation is
-authorized by the current task, subject to the gates below and review of every change. The current
-status is implementation in progress, near the final Security0/Security128 evidence gates.
+authorized by the current task, subject to the gates below and review of every change. The
+Security0 and Security128 implementation and final evidence gates are complete.
 
 The operational-noise Rust implementation at the pinned source revision is the semantic and
 performance authority. In particular, the behavior of `arena.rs`, `program.rs`, `lower.rs`,
@@ -657,12 +657,9 @@ The gates are:
 5. **Security128:** apply the same generator and fixed ABI, then require full generation, fixed
    acceptance compilation, exact deterministic metrics, and two-run clean-room byte equality.
 
-The current status is near the final Security0/Security128 evidence gates: the structural replay,
-fixed Lean semantics, reached semantic replay, and generator ABI are implemented, while the final
-fresh-generation parity, exact metrics, and clean-room evidence remain completion checks. Passing a
-Rust compile or unit-test gate alone is not certificate acceptance. Passing the conditional Lean
-theorem alone does not establish the external execution-instantiation obligations in §4.3.
-
-Passing a Rust compile or unit-test gate is not certificate acceptance. Passing the conditional
-Lean theorem is not by itself evidence that one runtime execution satisfied the external
-applicability obligations in §4.3.
+The Security0/Security128 vertical slice and its final evidence gates are complete. Fresh runs have
+direct-vs-Source report/core-counter parity; deterministic row/file/count/byte metrics and exact
+Rust-versus-generated final-bound equality are recorded; two independent complete generations from
+the same committed source recipe are byte-identical; and both Security0 and Security128 fixed
+acceptance modules pass Lean validation with the allowed axioms. Passing the conditional Lean
+theorem still does not establish the external execution-instantiation obligations in §4.3.

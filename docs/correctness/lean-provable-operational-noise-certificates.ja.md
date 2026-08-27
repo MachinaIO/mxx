@@ -4,8 +4,8 @@
 
 この文書は、mxx の Rust 実装が行う operational-noise 判定について、同じ判定根拠を
 Lean で独立に検証できる、現在の Tall vertical slice の実装仕様である。実装は許可されて
-いるが、以下の gate と各変更の review を必須とする。現在は Security0/Security128 の最終
-evidence gate に近い実装途中である。
+いるが、以下の gate と各変更の review を必須とする。Security0 と Security128 の実装および
+最終 evidence gate は完了している。
 
 対応する英語版は
 `docs/correctness/lean-provable-operational-noise-certificates.md` である。両文書は同じ要件を
@@ -909,10 +909,12 @@ side condition は fail closed とする。
 count/byte metrics、二回の完全生成の path-relative byte equality を確認する。elapsed time、RSS、
 `size_of`、benchmark estimate、runtime/GPU estimate は記録対象外である。
 
-現在は Security0/Security128 の最終 evidence gate に近い実装途中である。構造 replay、固定 Lean
-semantics、到達 semantic replay、generator ABI は実装済みで、fresh parity、exact metrics、
-clean-room evidence を完了確認として残す。Rust compile や unit test だけでは certificate の受理に
-ならず、条件付き Lean theorem だけでも特定 runtime の外部条件を証明しない。
+Security0/Security128 vertical slice と最終 evidence gate は完了している。fresh run で
+direct-vs-Source report/core-counter parity を確認し、決定的な row/file/count/byte metrics と
+Rust–generated final bound の完全一致を記録した。同じ committed source recipe から独立した完全生成を
+二回行い、全 generated path が byte 単位で一致した。Security0 と Security128 の fixed acceptance
+module は、許可された axiom だけで Lean validation を通過している。ただし、条件付き Lean theorem
+だけでは第6.3節の external execution-instantiation obligation は証明しない。
 
 ## 16. 完了条件
 

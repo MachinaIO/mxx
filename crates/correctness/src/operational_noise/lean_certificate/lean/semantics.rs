@@ -799,20 +799,33 @@ fn relation_candidates(
                         states.get(owner).map(|result| result.summary.clone()).unwrap_or_else(
                             crate::operational_noise::normal_form::BoundedSummary::zero,
                         );
-                    let accumulator = ResultRecord {
-                        event,
-                        owner: *owner,
-                        terms: accumulator_terms
-                            .iter()
-                            .filter_map(|(monomial, coefficient)| {
-                                (!coefficient.is_zero()).then_some(ProofPayloadTerm {
-                                    monomial: monomial.clone(),
-                                    coefficient: coefficient.clone(),
-                                })
-                            })
-                            .collect(),
-                        summary: accumulator_summary,
-                    };
+                    let accumulator = index
+                        .results
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.event < event &&
+                                candidate.owner == *owner &&
+                                candidate.terms.iter().map(|term| {
+                                    (term.monomial.clone(), term.coefficient.clone())
+                                }).collect::<BTreeMap<_, _>>() == accumulator_terms &&
+                                candidate.summary == accumulator_summary &&
+                                index.immediate_frames[usize::try_from(candidate.event)
+                                    .expect("indexed relation accumulator Result")] ==
+                                    Some(*frame_start)
+                        })
+                        .max_by_key(|candidate| candidate.event)
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "relation event {event} has no reached frame-local accumulator Result"
+                            )
+                        })?;
+                    if !reached_event_ids.contains(&accumulator.event) {
+                        return Err(format!(
+                            "relation event {event} accumulator Result {} is outside the reached closure",
+                            accumulator.event
+                        ));
+                    }
                     if !accumulator.terms.iter().any(|term| term.monomial == *source_monomial) {
                         return Err(format!(
                             "relation event {event} source is absent from frame-local accumulator"
@@ -1622,30 +1635,22 @@ fn result_probe_at<'a>(
                     "certificate Result {result_event} begins with unknown relation {application}"
                 )
             })?;
-            let prior = index
-                .results
-                .iter()
-                .filter(|candidate| {
-                    candidate.event < application &&
-                        candidate.owner == owner &&
-                        candidate.terms == relation.accumulator.terms &&
-                        index.immediate_frames[usize::try_from(candidate.event)
-                            .expect("indexed relation accumulator Result")] ==
-                            Some(frame)
-                })
-                .max_by_key(|candidate| candidate.event)
-                .ok_or_else(|| {
-                    format!(
-                        "certificate relation {application} has no event-indexed accumulator Result"
-                    )
-                })?;
-            if reached_event_ids.binary_search(&prior.event).is_err() {
+            if relation.owner != owner {
+                return Err(format!("certificate relation {application} has a foreign owner"));
+            }
+            if frame != relation.frame_start {
                 return Err(format!(
-                    "relation {application} references non-closure accumulator Result {}",
-                    prior.event
+                    "certificate relation {application} has mismatched frame {frame}, expected {}",
+                    relation.frame_start
                 ));
             }
-            (None, None, None, [prior.event, prior.event], 0)
+            if reached_event_ids.binary_search(&relation.accumulator.event).is_err() {
+                return Err(format!(
+                    "relation {application} references non-closure accumulator Result {}",
+                    relation.accumulator.event
+                ));
+            }
+            (None, None, None, [relation.accumulator.event, relation.accumulator.event], 0)
         }
         None => {
             if let Some(kind) = expression_kind(statement, result.owner)? &&
@@ -4573,6 +4578,13 @@ mod tests {
                     output: carried.clone(),
                     signed_contribution: BigInt::from(1),
                 }),
+                ProofPayloadEvent::Result {
+                    owner: root,
+                    value: test_exact(
+                        vec![term(source.clone(), 1), term(carried.clone(), 1)],
+                        BoundedSummary::zero(),
+                    ),
+                },
                 ProofPayloadEvent::AppliedRelation {
                     owner: root,
                     source_monomial: source.clone(),
@@ -4589,7 +4601,7 @@ mod tests {
                 ProofPayloadEvent::CoefficientMerge(ProofPayloadCoefficientMerge {
                     owner: root,
                     source: ProofPayloadCoefficientMergeSource::Relation {
-                        application: 3,
+                        application: 4,
                         source_term_ordinal: 0,
                     },
                     output: replacement.clone(),
@@ -4632,16 +4644,16 @@ mod tests {
                         ],
                         BoundedSummary::zero(),
                     ),
-                    pre_fold_event: 6,
+                    pre_fold_event: 7,
                 },
             ],
         };
         let index = PayloadIndex::new(&proof).expect("payload index");
-        let reached = (0..=7).collect::<BTreeSet<_>>();
+        let reached = (0..=8).collect::<BTreeSet<_>>();
         let probes =
-            relation_candidates(&index, &[(0, 7, root, 3)], &reached).expect("relation probe");
+            relation_candidates(&index, &[(0, 8, root, 4)], &reached).expect("relation probe");
         assert_eq!(probes.len(), 1);
-        assert_eq!(probes[0].output.event, 4);
+        assert_eq!(probes[0].output.event, 5);
         assert!(!probes[0].output.terms.iter().any(|term| term.monomial == later));
         assert!(
             probes[0]

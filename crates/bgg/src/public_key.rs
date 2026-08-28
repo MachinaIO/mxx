@@ -4,7 +4,7 @@ use crate::{boolean::BggPublicKeyFamily, encoding::BggSamplerLayout};
 use mxx_dsl::{
     Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel, Pending, Ring,
 };
-use mxx_ir_core::{IntExpr, ValueHandle, node::IndexRange};
+use mxx_ir_core::{IntExpr, ValueHandle};
 
 #[derive(Clone)]
 pub struct BggPublicKeyWire {
@@ -84,9 +84,12 @@ impl BggPublicKeyCompiler {
 
     /// Builds `lhs * G^-1(rhs)` directly in the executable core DAG.
     pub fn mul(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
-        let decomposed =
-            rhs.matrix.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat();
+        let decomposed = self.decompose(rhs);
         self.mul_with_decomposition(lhs, rhs, decomposed)
+    }
+
+    pub(crate) fn decompose(&self, input: &BggPublicKeyWire) -> Mat {
+        input.matrix.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat()
     }
 
     pub(crate) fn mul_with_decomposition(
@@ -146,7 +149,7 @@ pub struct BggPublicKeySampler {
 }
 
 impl BggPublicKeySampler {
-    /// Samples one packed public matrix and exposes a dynamically sized family of slices.
+    /// Samples a dynamically sized family of ordinary-width public matrices in parallel.
     ///
     /// Every member reveals its plaintext relation. Use [`Self::sample`] when the family size and
     /// reveal policy are both statically known while constructing the graph.
@@ -159,28 +162,18 @@ impl BggPublicKeySampler {
     ) -> Result<BggPublicKeyFamily, DslError> {
         let count = count.into();
         let columns = public_key_columns.into();
-        let packed = self.layout.ring().hash_matrix(
-            hash_key,
-            tag,
-            (
-                IntExpr::constant(self.layout.secret_dimension),
-                IntExpr::Mul(Box::new(columns.clone()), Box::new(count.clone())),
-            ),
-        );
-        let matrices = Parallel::range(count).map_values(|index| {
-            let start = IntExpr::Mul(Box::new(columns.clone()), Box::new(index.expression()));
-            packed.clone().slice(
-                None,
-                Some(IndexRange {
-                    start: start.clone(),
-                    end: IntExpr::Add(Box::new(start), Box::new(columns.clone())),
-                }),
-            )
+        let ring = self.layout.ring();
+        let base_tag = tag.into();
+        let rows = self.layout.secret_dimension;
+        let matrices = Parallel::range(count).map_values(move |index| {
+            let mut indexed_tag = base_tag.clone();
+            indexed_tag.push(index);
+            ring.hash_matrix(hash_key.clone(), indexed_tag, (rows, columns.clone()))
         })?;
         Ok(BggPublicKeyFamily { matrices, reveal_plaintext: true })
     }
 
-    /// Samples the packed public matrices once and exposes deterministic slices.
+    /// Samples ordinary-width public matrices in parallel with deterministic indexed tags.
     pub fn sample(
         &self,
         hash_key: Bytes,
@@ -189,20 +182,19 @@ impl BggPublicKeySampler {
     ) -> Vec<BggPublicKeyWire> {
         let count = reveal_plaintexts.len() + 1;
         let columns = self.layout.public_key_columns();
-        let packed = self.layout.ring().hash_matrix(
-            hash_key,
-            tag,
-            (self.layout.secret_dimension, columns * count),
-        );
+        let ring = self.layout.ring();
+        let base_tag = tag.into();
+        let rows = self.layout.secret_dimension;
+        let matrices = Parallel::range(count)
+            .map_values(move |index| {
+                let mut indexed_tag = base_tag.clone();
+                indexed_tag.push(index);
+                ring.hash_matrix(hash_key.clone(), indexed_tag, (rows, columns))
+            })
+            .expect("static public-key family layout is valid");
         (0..count)
             .map(|index| BggPublicKeyWire {
-                matrix: packed.clone().slice(
-                    None,
-                    Some(IndexRange {
-                        start: (columns * index).into(),
-                        end: (columns * (index + 1)).into(),
-                    }),
-                ),
+                matrix: matrices.get_static(index),
                 reveal_plaintext: index == 0 || reveal_plaintexts[index - 1],
             })
             .collect()

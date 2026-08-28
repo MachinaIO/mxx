@@ -428,6 +428,25 @@ impl<P: Poly> PolyCircuit<P> {
         ))
     }
 
+    pub fn slot_anchor_reduce_gate<I: Into<BatchedWire>>(
+        &mut self,
+        input: I,
+        num_blocks: usize,
+        lane_scalars: Vec<BigUint>,
+    ) -> BatchedWire {
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
+            PolyGateType::SlotTransfer {
+                src_slots: GateParamSource::Const(SlotTransferSpec::anchor_reduce(
+                    num_blocks,
+                    lane_scalars,
+                )),
+            },
+        ))
+    }
+
     pub fn slot_transfer_gate_param<I: Into<BatchedWire>>(
         &mut self,
         input: I,

@@ -104,6 +104,37 @@ pub trait PolyMatrix:
             .collect()
     }
 
+    /// Computes batches of `bias + sum(coefficient * left * right)`.
+    /// GPU implementations may fuse the products and accumulation; the
+    /// default preserves the exact ordinary-operation semantics.
+    fn multiply_accumulate_batch_out_of_place(
+        requests: Vec<(Vec<(Option<Self::P>, Arc<Self>, Arc<Self>)>, Option<Arc<Self>>)>,
+    ) -> Vec<Self> {
+        requests
+            .into_par_iter()
+            .map(|(products, bias)| {
+                let mut products = products.into_iter();
+                let (coefficient, left, right) =
+                    products.next().expect("multiply-accumulate request has a product");
+                let mut output = left.multiply_out_of_place(&right);
+                if let Some(coefficient) = coefficient {
+                    output = output.multiply_poly_out_of_place(&coefficient);
+                }
+                for (coefficient, left, right) in products {
+                    let mut product = left.multiply_out_of_place(&right);
+                    if let Some(coefficient) = coefficient {
+                        product = product.multiply_poly_out_of_place(&coefficient);
+                    }
+                    output.add_in_place(&product);
+                }
+                if let Some(bias) = bias {
+                    output.add_in_place(&bias);
+                }
+                output
+            })
+            .collect()
+    }
+
     fn negate_out_of_place(&self) -> Self {
         -self.clone()
     }

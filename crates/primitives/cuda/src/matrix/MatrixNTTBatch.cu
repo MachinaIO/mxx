@@ -4,6 +4,8 @@ namespace
         uint8_t *const *bases,
         const size_t *strides,
         const uint8_t *widths,
+        const uint64_t *twiddles,
+        const uint64_t *twiddle_shoup,
         size_t limb_count,
         uint32_t n,
         size_t poly_count)
@@ -16,11 +18,15 @@ namespace
         const uint64_t modulus = gpu_ntt_const_moduli[limb];
         const uint64_t value = matrix_load_limb_u64(
             base, blockIdx.y, coefficient, strides[limb], widths[limb]);
-        const uint64_t twist = pow_mod_u64_device(
-            gpu_ntt_const_root[limb], coefficient, modulus);
+        const size_t twiddle_index = limb * static_cast<size_t>(n) + coefficient;
+        const uint64_t twist = twiddles[twiddle_index];
         matrix_store_limb_u64(
             base, blockIdx.y, coefficient, strides[limb], widths[limb],
-            mul_mod_u64(value, twist, modulus));
+            mul_mod_shoup_u64(
+                value,
+                twist,
+                twiddle_shoup[twiddle_index],
+                modulus));
     }
 
     __global__ void batch_ntt_bit_reverse_kernel(
@@ -53,7 +59,8 @@ namespace
         uint8_t *const *bases,
         const size_t *strides,
         const uint8_t *widths,
-        const uint64_t *wlens,
+        const uint64_t *twiddles,
+        const uint64_t *twiddle_shoup,
         size_t limb_count,
         uint32_t n,
         uint32_t len,
@@ -69,12 +76,19 @@ namespace
         const uint32_t index = group * len + j;
         uint8_t *base = bases[matrix_limb];
         const uint64_t modulus = gpu_ntt_const_moduli[limb];
-        const uint64_t twiddle = pow_mod_u64_device(wlens[limb], j, modulus);
+        const uint32_t twiddle_exponent = 2U * (n / len) * j;
+        const size_t twiddle_index =
+            limb * static_cast<size_t>(n) + twiddle_exponent;
+        const uint64_t twiddle = twiddles[twiddle_index];
         const uint64_t lower = matrix_load_limb_u64(
             base, blockIdx.y, index, strides[limb], widths[limb]);
         const uint64_t upper = matrix_load_limb_u64(
             base, blockIdx.y, index + half, strides[limb], widths[limb]);
-        const uint64_t product = mul_mod_u64(upper, twiddle, modulus);
+        const uint64_t product = mul_mod_shoup_u64(
+            upper,
+            twiddle,
+            twiddle_shoup[twiddle_index],
+            modulus);
         matrix_store_limb_u64(
             base, blockIdx.y, index, strides[limb], widths[limb],
             add_mod_u64(lower, product, modulus));
@@ -115,6 +129,8 @@ namespace
         uint8_t *const *bases,
         const size_t *strides,
         const uint8_t *widths,
+        const uint64_t *twiddles,
+        const uint64_t *twiddle_shoup,
         size_t limb_count,
         uint32_t n,
         size_t poly_count)
@@ -127,12 +143,20 @@ namespace
         const uint64_t modulus = gpu_ntt_const_moduli[limb];
         const uint64_t value = matrix_load_limb_u64(
             base, blockIdx.y, coefficient, strides[limb], widths[limb]);
-        const uint64_t scaled = mul_mod_u64(value, gpu_ntt_const_n_inv[limb], modulus);
-        const uint64_t twist = pow_mod_u64_device(
-            gpu_ntt_const_inv_root[limb], coefficient, modulus);
+        const uint64_t scaled = mul_mod_shoup_u64(
+            value,
+            gpu_ntt_const_n_inv[limb],
+            gpu_ntt_const_n_inv_shoup[limb],
+            modulus);
+        const size_t twiddle_index = limb * static_cast<size_t>(n) + coefficient;
+        const uint64_t twist = twiddles[twiddle_index];
         matrix_store_limb_u64(
             base, blockIdx.y, coefficient, strides[limb], widths[limb],
-            mul_mod_u64(scaled, twist, modulus));
+            mul_mod_shoup_u64(
+                scaled,
+                twist,
+                twiddle_shoup[twiddle_index],
+                modulus));
     }
 }
 
@@ -228,10 +252,15 @@ int run_matrix_transform_batch(
     if (partition >= first->ctx->ntt_device_constants.size())
         return set_error("missing batch INTT constants");
     const auto &constants = first->ctx->ntt_device_constants[partition];
-    if (constants.device != device || constants.stage_count != log_n ||
-        constants.limb_count < limb_count || !constants.limb_wlen_inverse ||
-        !constants.limb_wlen_forward)
+    if (constants.device != device || constants.ring_dimension != n ||
+        constants.limb_count < limb_count || !constants.twiddle_inverse ||
+        !constants.twiddle_forward || !constants.twiddle_shoup_inverse ||
+        !constants.twiddle_shoup_forward)
         return set_error("incompatible batch INTT constants");
+    const uint64_t *twiddles =
+        forward ? constants.twiddle_forward : constants.twiddle_inverse;
+    const uint64_t *twiddle_shoup = forward ?
+        constants.twiddle_shoup_forward : constants.twiddle_shoup_inverse;
 
     cudaError_t error = cudaSetDevice(device);
     uint8_t **device_bases = nullptr;
@@ -276,7 +305,14 @@ int run_matrix_transform_batch(
     if (forward)
     {
         batch_ntt_twist_kernel<<<coefficient_grid, kTransformThreads, 0, stream>>>(
-            device_bases, device_strides, device_widths, limb_count, n, poly_count);
+            device_bases,
+            device_strides,
+            device_widths,
+            twiddles,
+            twiddle_shoup,
+            limb_count,
+            n,
+            poly_count);
         error = cudaGetLastError();
         if (error == cudaSuccess)
         {
@@ -295,7 +331,6 @@ int run_matrix_transform_batch(
         (n / 2 + kTransformThreads - 1) / kTransformThreads,
         static_cast<uint32_t>(poly_count),
         static_cast<uint32_t>(bases.size()));
-    uint32_t first_stage = 0;
     uint32_t first_length = 2;
     if (sources)
     {
@@ -314,16 +349,16 @@ int run_matrix_transform_batch(
             release();
             return set_error(error);
         }
-        first_stage = 1;
         first_length = 4;
     }
-    for (uint32_t stage = first_stage, len = first_length; len <= n; ++stage, len <<= 1)
+    for (uint32_t len = first_length; len <= n; len <<= 1)
     {
-        const uint64_t *wlens = (forward ? constants.limb_wlen_forward :
-            constants.limb_wlen_inverse) +
-            static_cast<size_t>(stage) * constants.limb_count;
         batch_ntt_stage_kernel<<<stage_grid, kTransformThreads, 0, stream>>>(
-            device_bases, device_strides, device_widths, wlens,
+            device_bases,
+            device_strides,
+            device_widths,
+            twiddles,
+            twiddle_shoup,
             limb_count, n, len, poly_count);
         error = cudaGetLastError();
         if (error != cudaSuccess)
@@ -341,7 +376,14 @@ int run_matrix_transform_batch(
     else
     {
         batch_ntt_scale_twist_kernel<<<coefficient_grid, kTransformThreads, 0, stream>>>(
-            device_bases, device_strides, device_widths, limb_count, n, poly_count);
+            device_bases,
+            device_strides,
+            device_widths,
+            twiddles,
+            twiddle_shoup,
+            limb_count,
+            n,
+            poly_count);
     }
     error = cudaGetLastError();
     if (error != cudaSuccess)

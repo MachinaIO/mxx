@@ -173,6 +173,12 @@ namespace
         return static_cast<uint64_t>(product % mod);
     }
 
+    uint64_t shoup_reciprocal_u64_host(uint64_t value, uint64_t modulus)
+    {
+        return static_cast<uint64_t>(
+            (static_cast<unsigned __int128>(value) << 64U) / modulus);
+    }
+
     uint64_t pow_mod_u64_host(uint64_t base, uint64_t exp, uint64_t mod)
     {
         uint64_t result = 1 % mod;
@@ -443,14 +449,19 @@ namespace
         }
     }
 
-    GpuNttDeviceConstants make_empty_ntt_device_constants(int device, size_t limb_count, uint32_t stage_count)
+    GpuNttDeviceConstants make_empty_ntt_device_constants(
+        int device,
+        size_t limb_count,
+        uint32_t ring_dimension)
     {
         GpuNttDeviceConstants out{};
         out.device = device;
         out.limb_count = limb_count;
-        out.stage_count = stage_count;
-        out.limb_wlen_forward = nullptr;
-        out.limb_wlen_inverse = nullptr;
+        out.ring_dimension = ring_dimension;
+        out.twiddle_forward = nullptr;
+        out.twiddle_inverse = nullptr;
+        out.twiddle_shoup_forward = nullptr;
+        out.twiddle_shoup_inverse = nullptr;
         return out;
     }
 
@@ -464,16 +475,14 @@ namespace
         {
             return;
         }
-        if (entry.limb_wlen_forward)
-        {
-            cudaFree(entry.limb_wlen_forward);
-            entry.limb_wlen_forward = nullptr;
-        }
-        if (entry.limb_wlen_inverse)
-        {
-            cudaFree(entry.limb_wlen_inverse);
-            entry.limb_wlen_inverse = nullptr;
-        }
+        if (entry.twiddle_forward) cudaFree(entry.twiddle_forward);
+        if (entry.twiddle_inverse) cudaFree(entry.twiddle_inverse);
+        if (entry.twiddle_shoup_forward) cudaFree(entry.twiddle_shoup_forward);
+        if (entry.twiddle_shoup_inverse) cudaFree(entry.twiddle_shoup_inverse);
+        entry.twiddle_forward = nullptr;
+        entry.twiddle_inverse = nullptr;
+        entry.twiddle_shoup_forward = nullptr;
+        entry.twiddle_shoup_inverse = nullptr;
     }
 
     void free_ntt_device_constants(std::vector<GpuNttDeviceConstants> &entries)
@@ -488,18 +497,16 @@ namespace
     void upload_ntt_small_constants_to_symbol(
         int device,
         const std::vector<uint64_t> &limb_moduli,
-        const std::vector<uint64_t> &limb_root,
-        const std::vector<uint64_t> &limb_inv_root,
-        const std::vector<uint64_t> &limb_n_inv)
+        const std::vector<uint64_t> &limb_n_inv,
+        const std::vector<uint64_t> &limb_n_inv_shoup)
     {
         const size_t limb_count = limb_moduli.size();
         if (limb_count == 0 || limb_count > GPU_RUNTIME_MAX_LIMBS)
         {
             throw std::runtime_error("invalid limb count in upload_ntt_small_constants_to_symbol");
         }
-        if (limb_root.size() != limb_count ||
-            limb_inv_root.size() != limb_count ||
-            limb_n_inv.size() != limb_count)
+        if (limb_n_inv.size() != limb_count ||
+            limb_n_inv_shoup.size() != limb_count)
         {
             throw std::runtime_error("inconsistent limb constants in upload_ntt_small_constants_to_symbol");
         }
@@ -515,18 +522,17 @@ namespace
         {
             throw std::runtime_error(cudaGetErrorString(err));
         }
-        err = cudaMemcpyToSymbol(gpu_ntt_const_root, limb_root.data(), limb_bytes, 0, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess)
-        {
-            throw std::runtime_error(cudaGetErrorString(err));
-        }
-        err =
-            cudaMemcpyToSymbol(gpu_ntt_const_inv_root, limb_inv_root.data(), limb_bytes, 0, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess)
-        {
-            throw std::runtime_error(cudaGetErrorString(err));
-        }
         err = cudaMemcpyToSymbol(gpu_ntt_const_n_inv, limb_n_inv.data(), limb_bytes, 0, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        err = cudaMemcpyToSymbol(
+            gpu_ntt_const_n_inv_shoup,
+            limb_n_inv_shoup.data(),
+            limb_bytes,
+            0,
+            cudaMemcpyHostToDevice);
         if (err != cudaSuccess)
         {
             throw std::runtime_error(cudaGetErrorString(err));
@@ -544,26 +550,31 @@ namespace
         }
     }
 
-    void upload_ntt_wlen_to_device(
+    void upload_ntt_twiddles_to_device(
         int device,
-        const std::vector<uint64_t> &limb_wlen_forward,
-        const std::vector<uint64_t> &limb_wlen_inverse,
-        uint32_t stage_count,
+        const std::vector<uint64_t> &twiddle_forward,
+        const std::vector<uint64_t> &twiddle_inverse,
+        const std::vector<uint64_t> &twiddle_shoup_forward,
+        const std::vector<uint64_t> &twiddle_shoup_inverse,
         GpuNttDeviceConstants *out_entry)
     {
         if (!out_entry)
         {
-            throw std::runtime_error("null output entry in upload_ntt_wlen_to_device");
+            throw std::runtime_error("null output entry in upload_ntt_twiddles_to_device");
         }
         const size_t limb_count = out_entry->limb_count;
-        if (limb_count == 0 || stage_count == 0)
+        const size_t ring_dimension = out_entry->ring_dimension;
+        if (limb_count == 0 || ring_dimension == 0)
         {
-            throw std::runtime_error("invalid NTT constants shape in upload_ntt_wlen_to_device");
+            throw std::runtime_error("invalid NTT constants shape in upload_ntt_twiddles_to_device");
         }
-        const size_t wlen_count = limb_count * static_cast<size_t>(stage_count);
-        if (limb_wlen_forward.size() != wlen_count || limb_wlen_inverse.size() != wlen_count)
+        const size_t twiddle_count = limb_count * ring_dimension;
+        if (twiddle_forward.size() != twiddle_count ||
+            twiddle_inverse.size() != twiddle_count ||
+            twiddle_shoup_forward.size() != twiddle_count ||
+            twiddle_shoup_inverse.size() != twiddle_count)
         {
-            throw std::runtime_error("inconsistent wlen constants in upload_ntt_wlen_to_device");
+            throw std::runtime_error("inconsistent twiddle constants in upload_ntt_twiddles_to_device");
         }
 
         cudaError_t err = cudaSetDevice(device);
@@ -572,15 +583,15 @@ namespace
             throw std::runtime_error(cudaGetErrorString(err));
         }
 
-        const size_t wlen_bytes = wlen_count * sizeof(uint64_t);
+        const size_t twiddle_bytes = twiddle_count * sizeof(uint64_t);
         auto alloc_and_copy = [&](uint64_t **dst, const uint64_t *src)
         {
-            cudaError_t local_err = cudaMalloc(reinterpret_cast<void **>(dst), wlen_bytes);
+            cudaError_t local_err = cudaMalloc(reinterpret_cast<void **>(dst), twiddle_bytes);
             if (local_err != cudaSuccess)
             {
                 throw std::runtime_error(cudaGetErrorString(local_err));
             }
-            local_err = cudaMemcpy(*dst, src, wlen_bytes, cudaMemcpyHostToDevice);
+            local_err = cudaMemcpy(*dst, src, twiddle_bytes, cudaMemcpyHostToDevice);
             if (local_err != cudaSuccess)
             {
                 throw std::runtime_error(cudaGetErrorString(local_err));
@@ -589,8 +600,10 @@ namespace
 
         try
         {
-            alloc_and_copy(&out_entry->limb_wlen_forward, limb_wlen_forward.data());
-            alloc_and_copy(&out_entry->limb_wlen_inverse, limb_wlen_inverse.data());
+            alloc_and_copy(&out_entry->twiddle_forward, twiddle_forward.data());
+            alloc_and_copy(&out_entry->twiddle_inverse, twiddle_inverse.data());
+            alloc_and_copy(&out_entry->twiddle_shoup_forward, twiddle_shoup_forward.data());
+            alloc_and_copy(&out_entry->twiddle_shoup_inverse, twiddle_shoup_inverse.data());
         }
         catch (...)
         {
@@ -686,14 +699,16 @@ extern "C"
             std::vector<size_t> decomp_counts_by_partition =
                 compute_decomp_counts_by_partition(gpu_list.size(), resolved_dnum);
 
-            const uint32_t stage_count = logN;
             std::vector<uint64_t> limb_moduli(limb_count, 0);
             std::vector<uint64_t> limb_root(limb_count, 0);
             std::vector<uint64_t> limb_inv_root(limb_count, 0);
             std::vector<uint64_t> limb_n_inv(limb_count, 0);
-            const size_t wlen_count = limb_count * static_cast<size_t>(stage_count);
-            std::vector<uint64_t> limb_wlen_forward(wlen_count, 0);
-            std::vector<uint64_t> limb_wlen_inverse(wlen_count, 0);
+            std::vector<uint64_t> limb_n_inv_shoup(limb_count, 0);
+            const size_t twiddle_count = limb_count * static_cast<size_t>(n_u64);
+            std::vector<uint64_t> twiddle_forward(twiddle_count, 0);
+            std::vector<uint64_t> twiddle_inverse(twiddle_count, 0);
+            std::vector<uint64_t> twiddle_shoup_forward(twiddle_count, 0);
+            std::vector<uint64_t> twiddle_shoup_inverse(twiddle_count, 0);
             for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
             {
                 const int primeid = limb_prime_ids[limb_idx];
@@ -710,16 +725,22 @@ extern "C"
                 limb_root[limb_idx] = root;
                 limb_inv_root[limb_idx] = inv_root;
                 limb_n_inv[limb_idx] = n_inv;
+                limb_n_inv_shoup[limb_idx] = shoup_reciprocal_u64_host(n_inv, modulus);
 
-                const uint64_t omega = mul_mod_u64_host(root, root, modulus);
-                const uint64_t inv_omega = mul_mod_u64_host(inv_root, inv_root, modulus);
-                for (uint32_t stage_idx = 0; stage_idx < stage_count; ++stage_idx)
+                uint64_t forward_power = 1;
+                uint64_t inverse_power = 1;
+                const size_t limb_offset = limb_idx * static_cast<size_t>(n_u64);
+                for (uint64_t exponent = 0; exponent < n_u64; ++exponent)
                 {
-                    const uint32_t len = static_cast<uint32_t>(1U << (stage_idx + 1U));
-                    const uint32_t exp = static_cast<uint32_t>(n_u64 / len);
-                    const size_t offset = static_cast<size_t>(stage_idx) * limb_count + limb_idx;
-                    limb_wlen_forward[offset] = pow_mod_u64_host(omega, exp, modulus);
-                    limb_wlen_inverse[offset] = pow_mod_u64_host(inv_omega, exp, modulus);
+                    const size_t offset = limb_offset + static_cast<size_t>(exponent);
+                    twiddle_forward[offset] = forward_power;
+                    twiddle_inverse[offset] = inverse_power;
+                    twiddle_shoup_forward[offset] =
+                        shoup_reciprocal_u64_host(forward_power, modulus);
+                    twiddle_shoup_inverse[offset] =
+                        shoup_reciprocal_u64_host(inverse_power, modulus);
+                    forward_power = mul_mod_u64_host(forward_power, root, modulus);
+                    inverse_power = mul_mod_u64_host(inverse_power, inv_root, modulus);
                 }
             }
 
@@ -779,14 +800,22 @@ extern "C"
             for (int device : gpu_ctx->gpu_ids)
             {
                 GpuNttDeviceConstants device_constants =
-                    make_empty_ntt_device_constants(device, limb_count, stage_count);
+                    make_empty_ntt_device_constants(
+                        device,
+                        limb_count,
+                        static_cast<uint32_t>(n_u64));
                 upload_ntt_small_constants_to_symbol(
                     device,
                     limb_moduli,
-                    limb_root,
-                    limb_inv_root,
-                    limb_n_inv);
-                upload_ntt_wlen_to_device(device, limb_wlen_forward, limb_wlen_inverse, stage_count, &device_constants);
+                    limb_n_inv,
+                    limb_n_inv_shoup);
+                upload_ntt_twiddles_to_device(
+                    device,
+                    twiddle_forward,
+                    twiddle_inverse,
+                    twiddle_shoup_forward,
+                    twiddle_shoup_inverse,
+                    &device_constants);
                 gpu_ctx->ntt_device_constants.push_back(device_constants);
             }
             *out_ctx = gpu_ctx;

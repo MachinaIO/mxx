@@ -74,6 +74,11 @@ pub enum SlotTransferSpec {
         num_blocks: u32,
         lane_scalars: Vec<Option<u32>>,
     },
+    /// Weighted reduction of each repeated lane block into its anchor lane.
+    AnchorReduce {
+        num_blocks: u32,
+        lane_scalars: Vec<BigUint>,
+    },
 }
 
 impl SlotTransferSpec {
@@ -137,6 +142,18 @@ impl SlotTransferSpec {
         Self::IdentityRepeatedLanes {
             num_blocks: u32::try_from(num_blocks)
                 .expect("identity repeated-lanes block count must fit in u32"),
+            lane_scalars,
+        }
+    }
+
+    pub fn anchor_reduce(num_blocks: usize, lane_scalars: Vec<BigUint>) -> Self {
+        assert!(num_blocks > 0, "anchor-reduce block count must be positive");
+        assert!(!lane_scalars.is_empty(), "anchor-reduce lane scalars must be nonempty");
+        let total_slots =
+            num_blocks.checked_mul(lane_scalars.len()).expect("anchor-reduce slot count overflow");
+        assert!(u32::try_from(total_slots).is_ok(), "anchor-reduce slot count must fit in u32");
+        Self::AnchorReduce {
+            num_blocks: u32::try_from(num_blocks).expect("anchor-reduce block count must fit u32"),
             lane_scalars,
         }
     }
@@ -247,6 +264,9 @@ impl SlotTransferSpec {
                     (0..num_slots).map(build).collect()
                 }
             }
+            Self::AnchorReduce { .. } => {
+                panic!("anchor reduction cannot be materialized as a slot-transfer mapping")
+            }
         }
     }
 
@@ -268,6 +288,18 @@ impl SlotTransferSpec {
             }
             Self::IdentityRepeatedLanes { lane_scalars, .. } => {
                 lane_scalars.iter().map(|scalar| scalar.unwrap_or(1)).max().unwrap_or(1)
+            }
+            Self::AnchorReduce { lane_scalars, .. } => {
+                if lane_scalars.iter().any(|scalar| u32::try_from(scalar).is_err()) {
+                    u32::MAX
+                } else {
+                    lane_scalars
+                        .iter()
+                        .map(|scalar| u32::try_from(scalar).expect("checked above"))
+                        .max()
+                        .unwrap_or(1)
+                        .max(1)
+                }
             }
         }
     }

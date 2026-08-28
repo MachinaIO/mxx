@@ -1,7 +1,6 @@
 __constant__ uint64_t gpu_ntt_const_moduli[GPU_RUNTIME_MAX_LIMBS];
-__constant__ uint64_t gpu_ntt_const_root[GPU_RUNTIME_MAX_LIMBS];
-__constant__ uint64_t gpu_ntt_const_inv_root[GPU_RUNTIME_MAX_LIMBS];
 __constant__ uint64_t gpu_ntt_const_n_inv[GPU_RUNTIME_MAX_LIMBS];
+__constant__ uint64_t gpu_ntt_const_n_inv_shoup[GPU_RUNTIME_MAX_LIMBS];
 __constant__ uint32_t gpu_ntt_const_limb_count;
 
 namespace
@@ -19,31 +18,31 @@ namespace
         return mod - (b - a);
     }
 
-    __device__ __forceinline__ uint64_t pow_mod_u64_device(uint64_t base, uint32_t exp, uint64_t mod)
+    __device__ __forceinline__ uint64_t mul_mod_shoup_u64(
+        uint64_t value,
+        uint64_t multiplier,
+        uint64_t multiplier_shoup,
+        uint64_t modulus)
     {
-        uint64_t result = 1 % mod;
-        uint64_t cur = base % mod;
-        uint32_t e = exp;
-        while (e != 0)
+        if (modulus > (UINT64_MAX >> 1U))
         {
-            if ((e & 1U) != 0)
-            {
-                result = mul_mod_u64(result, cur, mod);
-            }
-            cur = mul_mod_u64(cur, cur, mod);
-            e >>= 1;
+            return mul_mod_u64(value, multiplier, modulus);
         }
-        return result;
+        const uint64_t quotient = __umul64hi(value, multiplier_shoup);
+        uint64_t reduced = value * multiplier - quotient * modulus;
+        if (reduced >= modulus) reduced -= modulus;
+        return reduced;
     }
 
     __global__ void ntt_twist_all_limbs_kernel(
         uint8_t *const *limb_bases,
         const size_t *limb_stride_bytes,
         const uint8_t *limb_coeff_bytes,
+        const uint64_t *twiddles,
+        const uint64_t *twiddle_shoup,
         size_t limb_count,
         uint32_t n,
-        size_t poly_offset,
-        bool inverse)
+        size_t poly_offset)
     {
         const uint32_t coeff_idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (coeff_idx >= n)
@@ -63,9 +62,9 @@ namespace
         {
             return;
         }
-        const uint64_t twiddle_base = inverse ? gpu_ntt_const_inv_root[limb_idx] : gpu_ntt_const_root[limb_idx];
         const uint64_t modulus = gpu_ntt_const_moduli[limb_idx];
-        const uint64_t tw = pow_mod_u64_device(twiddle_base, coeff_idx, modulus);
+        const size_t twiddle_idx = limb_idx * static_cast<size_t>(n) + coeff_idx;
+        const uint64_t tw = twiddles[twiddle_idx];
         const uint64_t src = matrix_load_limb_u64(base, poly_idx, coeff_idx, stride_bytes, coeff_bytes);
         matrix_store_limb_u64(
             base,
@@ -73,7 +72,7 @@ namespace
             coeff_idx,
             stride_bytes,
             coeff_bytes,
-            mul_mod_u64(src, tw, modulus));
+            mul_mod_shoup_u64(src, tw, twiddle_shoup[twiddle_idx], modulus));
     }
 
     __global__ void ntt_scale_all_limbs_kernel(
@@ -111,7 +110,11 @@ namespace
             coeff_idx,
             stride_bytes,
             coeff_bytes,
-            mul_mod_u64(src, factor, modulus));
+            mul_mod_shoup_u64(
+                src,
+                factor,
+                gpu_ntt_const_n_inv_shoup[limb_idx],
+                modulus));
     }
 
     __global__ void ntt_bit_reverse_all_limbs_kernel(
@@ -153,7 +156,8 @@ namespace
         uint8_t *const *limb_bases,
         const size_t *limb_stride_bytes,
         const uint8_t *limb_coeff_bytes,
-        const uint64_t *limb_wlens,
+        const uint64_t *twiddles,
+        const uint64_t *twiddle_shoup,
         size_t limb_count,
         uint32_t n,
         uint32_t len,
@@ -182,13 +186,16 @@ namespace
         {
             return;
         }
-        const uint64_t wlen = limb_wlens[limb_idx];
         const uint64_t modulus = gpu_ntt_const_moduli[limb_idx];
-        const uint64_t w = pow_mod_u64_device(wlen, j, modulus);
+        const uint32_t twiddle_exponent = 2U * (n / len) * j;
+        const size_t twiddle_idx =
+            limb_idx * static_cast<size_t>(n) + twiddle_exponent;
+        const uint64_t w = twiddles[twiddle_idx];
         const uint64_t u = matrix_load_limb_u64(base, poly_idx, i, stride_bytes, coeff_bytes);
         const uint64_t upper =
             matrix_load_limb_u64(base, poly_idx, i + half, stride_bytes, coeff_bytes);
-        const uint64_t v = mul_mod_u64(upper, w, modulus);
+        const uint64_t v =
+            mul_mod_shoup_u64(upper, w, twiddle_shoup[twiddle_idx], modulus);
         matrix_store_limb_u64(
             base,
             poly_idx,
@@ -214,13 +221,15 @@ namespace
         uint8_t *const *limb_bases,
         const size_t *limb_stride_bytes,
         const uint8_t *limb_coeff_bytes,
+        const uint64_t *twiddles,
+        const uint64_t *twiddle_shoup,
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
-        cudaStream_t stream,
-        bool inverse)
+        cudaStream_t stream)
     {
-        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes)
+        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes ||
+            !twiddles || !twiddle_shoup)
         {
             return set_error("null metadata in launch_twist_for_all_limbs");
         }
@@ -244,10 +253,11 @@ namespace
                 limb_bases,
                 limb_stride_bytes,
                 limb_coeff_bytes,
+                twiddles,
+                twiddle_shoup,
                 limb_count,
                 n,
-                offset,
-                inverse);
+                offset);
             cudaError_t err = cudaGetLastError();
             if (err != cudaSuccess)
             {
@@ -353,14 +363,16 @@ namespace
         uint8_t *const *limb_bases,
         const size_t *limb_stride_bytes,
         const uint8_t *limb_coeff_bytes,
-        const uint64_t *limb_wlens,
+        const uint64_t *twiddles,
+        const uint64_t *twiddle_shoup,
         size_t limb_count,
         uint32_t n,
         uint32_t len,
         size_t poly_count,
         cudaStream_t stream)
     {
-        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes || !limb_wlens)
+        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes ||
+            !twiddles || !twiddle_shoup)
         {
             return set_error("null metadata in launch_stage_for_all_limbs");
         }
@@ -385,7 +397,8 @@ namespace
                 limb_bases,
                 limb_stride_bytes,
                 limb_coeff_bytes,
-                limb_wlens,
+                twiddles,
+                twiddle_shoup,
                 limb_count,
                 n,
                 len,
@@ -543,12 +556,14 @@ namespace
         {
             return set_error("insufficient NTT limb constants in run_matrix_transform_u64");
         }
-        if (device_constants.stage_count != log_n)
+        if (device_constants.ring_dimension != n)
         {
-            return set_error("NTT stage constants mismatch in run_matrix_transform_u64");
+            return set_error("NTT twiddle constants mismatch in run_matrix_transform_u64");
         }
-        if (!device_constants.limb_wlen_forward ||
-            !device_constants.limb_wlen_inverse)
+        if (!device_constants.twiddle_forward ||
+            !device_constants.twiddle_inverse ||
+            !device_constants.twiddle_shoup_forward ||
+            !device_constants.twiddle_shoup_inverse)
         {
             return set_error("null per-device NTT constants in run_matrix_transform_u64");
         }
@@ -568,8 +583,11 @@ namespace
         uint8_t **limb_bases_device = nullptr;
         size_t *limb_stride_bytes_device = nullptr;
         uint8_t *limb_coeff_bytes_device = nullptr;
-        const uint64_t *limb_wlens_base =
-            Forward ? device_constants.limb_wlen_forward : device_constants.limb_wlen_inverse;
+        const uint64_t *twiddles =
+            Forward ? device_constants.twiddle_forward : device_constants.twiddle_inverse;
+        const uint64_t *twiddle_shoup = Forward ?
+            device_constants.twiddle_shoup_forward :
+            device_constants.twiddle_shoup_inverse;
         auto cleanup = [&]()
         {
             if (dispatch_device >= 0)
@@ -658,11 +676,12 @@ namespace
                 limb_bases_device,
                 limb_stride_bytes_device,
                 limb_coeff_bytes_device,
+                twiddles,
+                twiddle_shoup,
                 limb_count,
                 n,
                 poly_count,
-                dispatch_stream,
-                false);
+                dispatch_stream);
             if (status != 0)
             {
                 cleanup();
@@ -682,15 +701,14 @@ namespace
                 cleanup();
                 return status;
             }
-            for (uint32_t stage_idx = 0, len = 2; len <= n; len <<= 1, ++stage_idx)
+            for (uint32_t len = 2; len <= n; len <<= 1)
             {
-                const uint64_t *limb_wlens_device =
-                    limb_wlens_base + static_cast<size_t>(stage_idx) * device_constants.limb_count;
                 status = launch_stage_for_all_limbs(
                     limb_bases_device,
                     limb_stride_bytes_device,
                     limb_coeff_bytes_device,
-                    limb_wlens_device,
+                    twiddles,
+                    twiddle_shoup,
                     limb_count,
                     n,
                     len,
@@ -722,15 +740,14 @@ namespace
         {
             // Input already uses OpenFHE's bit-reversed evaluation order,
             // which is exactly the ordering consumed by these DIT stages.
-            for (uint32_t stage_idx = 0, len = 2; len <= n; len <<= 1, ++stage_idx)
+            for (uint32_t len = 2; len <= n; len <<= 1)
             {
-                const uint64_t *limb_wlens_device =
-                    limb_wlens_base + static_cast<size_t>(stage_idx) * device_constants.limb_count;
                 status = launch_stage_for_all_limbs(
                     limb_bases_device,
                     limb_stride_bytes_device,
                     limb_coeff_bytes_device,
-                    limb_wlens_device,
+                    twiddles,
+                    twiddle_shoup,
                     limb_count,
                     n,
                     len,
@@ -759,11 +776,12 @@ namespace
                 limb_bases_device,
                 limb_stride_bytes_device,
                 limb_coeff_bytes_device,
+                twiddles,
+                twiddle_shoup,
                 limb_count,
                 n,
                 poly_count,
-                dispatch_stream,
-                true);
+                dispatch_stream);
             if (status != 0)
             {
                 cleanup();

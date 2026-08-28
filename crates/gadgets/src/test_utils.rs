@@ -131,6 +131,41 @@ impl SlotOperationLowering<DCRTPoly> for RuntimeLowering {
             .extend((output_entries.len()..self.wire_size).map(|_| self.ring.zero((1, 1))));
         Ok(Mat::concat(ConcatAxis::Diagonal, output_entries))
     }
+
+    fn slot_anchor_reduce(
+        &mut self,
+        input: &Mat,
+        num_blocks: u32,
+        lane_scalars: &[BigUint],
+        _gate: GateInstance<'_>,
+    ) -> Result<Mat, Infallible> {
+        let blocks = usize::try_from(num_blocks).expect("anchor block count fits usize");
+        let lanes = lane_scalars.len();
+        assert!(blocks > 0 && lanes > 0, "anchor reduction requires a nonempty layout");
+        let active_slots = blocks.checked_mul(lanes).expect("anchor slot count overflow");
+        assert!(active_slots <= self.wire_size, "anchor reduction exceeds the runtime wire size");
+        let output = (0..self.wire_size)
+            .map(|slot| {
+                if slot < active_slots && slot % lanes == 0 {
+                    (0..lanes)
+                        .map(|lane| {
+                            let source = slot + lane;
+                            let range =
+                                IndexRange { start: source.into(), end: (source + 1).into() };
+                            input.clone().slice(Some(range.clone()), Some(range)) *
+                                self.ring.polynomial([IntExpr::constant(BigInt::from(
+                                    lane_scalars[lane].clone(),
+                                ))])
+                        })
+                        .reduce(|left, right| left + right)
+                        .expect("positive lane count")
+                } else {
+                    self.ring.zero((1, 1))
+                }
+            })
+            .collect();
+        Ok(Mat::concat(ConcatAxis::Diagonal, output))
+    }
 }
 
 impl PublicLookupLowering<DCRTPoly> for RuntimeLowering {

@@ -73,9 +73,11 @@ pub use tall_encoding::{
     BggTallPlaintext, TallCompileError,
 };
 pub use tall_rotation_encoding::{
-    TallRotationDirection, TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts,
-    TallRotationEncodingCompiler, TallRotationEncodingKey, TallRotationEncodingPreprocessingWires,
-    TallRotationEncodingWires, TallRotationPublicWires, required_tall_rotation_encodings,
+    TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT, TallLinearTransformEncodingWires,
+    TallLinearTransformPublicWires, TallRotationEncodingArtifactNames,
+    TallRotationEncodingArtifacts, TallRotationEncodingCompiler, TallRotationEncodingKey,
+    TallRotationEncodingPreprocessingWires, required_tall_anchor_reduce_encoding,
+    required_tall_rotation_encodings,
 };
 pub use wee25_commitment::{
     Wee25CommitmentCompiler, Wee25CommitmentError, Wee25CommitmentTreeWire,

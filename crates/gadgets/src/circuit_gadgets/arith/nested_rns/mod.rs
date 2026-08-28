@@ -104,7 +104,7 @@ pub struct NestedRnsPoly<P: Poly> {
 ///
 /// For a coefficient-major packed value with `D` q-level lanes, coefficient `c`
 /// is available exclusively at physical slot `c * D`.  The other lanes are an
-/// implementation byproduct of the cyclic rotations and must not be consumed as
+/// implementation byproduct of the anchor reduction and must not be consumed as
 /// reconstructed coefficients.  This deliberately differs from
 /// [`NestedRnsPoly::reconstruct`], which produces a value valid in every lane.
 #[derive(Debug, Clone, Copy)]

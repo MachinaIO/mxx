@@ -11,9 +11,10 @@ use mxx_bgg::{
     BggTallSlotPublicKeyLowering, LweLookupArtifactNames, LweLookupArtifacts, LweLookupCompiler,
     LweLookupIdentity, LweLookupPreprocessingLowering, LweLookupTable,
     LweLookupTallEncodingLowering, NoSlotOperations, PolyCircuitCompiler,
-    TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts, TallRotationEncodingCompiler,
-    TallRotationEncodingKey, bind_lwe_lookup_invocations, collect_lwe_lookup_identities,
-    required_tall_rotation_encodings,
+    TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT, TallRotationEncodingArtifactNames,
+    TallRotationEncodingArtifacts, TallRotationEncodingCompiler, TallRotationEncodingKey,
+    bind_lwe_lookup_invocations, collect_lwe_lookup_identities,
+    required_tall_anchor_reduce_encoding, required_tall_rotation_encodings,
 };
 use mxx_correctness::{
     ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
@@ -34,11 +35,14 @@ use mxx_dsl::{
 };
 use mxx_gadgets::{
     circuit::{PolyCircuit, PolyGateKind},
-    circuit_gadgets::arith::{
-        CrtWindow,
-        nested_rns::{
-            NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly, minimum_p_moduli_bits,
+    circuit_gadgets::{
+        arith::{
+            CrtWindow,
+            nested_rns::{
+                NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly, minimum_p_moduli_bits,
+            },
         },
+        ntt::{forward_ntt, inverse_ntt},
     },
 };
 use mxx_ir_core::{
@@ -62,7 +66,7 @@ use mxx_primitives::{
         },
     },
     sampler::bounds::{compute_preimage_sigma, hard_cutoff_from_sigma_bound},
-    utils::gen_biguint_for_modulus,
+    utils::{gen_biguint_for_modulus, mod_inverse},
 };
 use mxx_runtime::{
     ExecutionConfig, ExecutionResult, PreimageProgressConfig, RuntimeValue,
@@ -153,11 +157,20 @@ fn process_memory_kib() -> (Option<u64>, Option<u64>) {
 #[derive(Clone, Debug)]
 struct TestConfig {
     mul_count: usize,
+    /// Number of transforms appended after the multiplication chain. Transform zero is forward
+    /// NTT, transform one is inverse NTT, and later transforms continue alternating.
+    ntt_intt_count: usize,
     min_crt_depth: usize,
     max_crt_depth: usize,
     min_log_ring_dimension: usize,
     max_log_ring_dimension: usize,
     selected_parameters: Option<(usize, usize)>,
+    /// Number of DCRT evaluation slots carried through the nested-RNS/Tall encoding. `None`
+    /// retains all slots from the ambient DCRT ring.
+    encoding_ring_dimension: Option<usize>,
+    /// Number of leading q-CRT towers carried through the nested-RNS/Tall encoding. `None`
+    /// retains the full DCRT basis.
+    encoding_crt_depth: Option<usize>,
     security_bits: u64,
     crt_modulus_bits: usize,
     /// Explicit nested-RNS p-basis width. `None` selects the smallest width supporting the
@@ -412,11 +425,14 @@ impl FixedTallG0Profile {
     fn test_config(self) -> TestConfig {
         TestConfig {
             mul_count: self.multiplication_count,
+            ntt_intt_count: 0,
             min_crt_depth: self.crt_depth,
             max_crt_depth: self.crt_depth,
             min_log_ring_dimension: self.log_ring_dimension,
             max_log_ring_dimension: self.log_ring_dimension,
             selected_parameters: Some((self.crt_depth, self.log_ring_dimension)),
+            encoding_ring_dimension: None,
+            encoding_crt_depth: None,
             security_bits: self.required_security_bits,
             crt_modulus_bits: self.crt_modulus_bits,
             p_moduli_bits: self.requested_p_moduli_bits,
@@ -501,11 +517,16 @@ impl TestConfig {
         };
         let config = Self {
             mul_count: env_usize("MXX_TALL_NESTED_RNS_MUL_COUNT", 1)?,
+            ntt_intt_count: env_usize("MXX_TALL_NESTED_RNS_NTT_INTT_COUNT", 0)?,
             min_crt_depth: env_usize("MXX_TALL_NESTED_RNS_MIN_CRT_DEPTH", 2)?,
             max_crt_depth: env_usize("MXX_TALL_NESTED_RNS_MAX_CRT_DEPTH", 40)?,
             min_log_ring_dimension: env_usize("MXX_TALL_NESTED_RNS_MIN_LOG_RING_DIMENSION", 5)?,
             max_log_ring_dimension: env_usize("MXX_TALL_NESTED_RNS_MAX_LOG_RING_DIMENSION", 16)?,
             selected_parameters,
+            encoding_ring_dimension: env_optional_usize(
+                "MXX_TALL_NESTED_RNS_ENCODING_RING_DIMENSION",
+            )?,
+            encoding_crt_depth: env_optional_usize("MXX_TALL_NESTED_RNS_ENCODING_CRT_DEPTH")?,
             // n = 8 is intentionally an execution smoke parameter and has no positive lattice
             // security estimate. A caller may request a positive target, which will reject it.
             security_bits: env_u64("MXX_TALL_NESTED_RNS_SECURITY_BITS", 100)?,
@@ -562,6 +583,8 @@ impl TestConfig {
             config.min_log_ring_dimension > config.max_log_ring_dimension ||
             u32::try_from(config.max_log_ring_dimension).is_err() ||
             1u32.checked_shl(config.max_log_ring_dimension as u32).is_none() ||
+            config.encoding_ring_dimension.is_some_and(|dimension| !dimension.is_power_of_two()) ||
+            config.encoding_crt_depth == Some(0) ||
             config.crt_modulus_bits == 0 ||
             config.gadget_base_bits == 0 ||
             config.max_unreduced_muls == 0 ||
@@ -587,6 +610,14 @@ impl TestConfig {
         {
             return Err("invalid selected Tall nested-RNS parameters".to_owned());
         }
+        let (largest_crt_depth, largest_log_ring_dimension) = config
+            .selected_parameters
+            .unwrap_or((config.max_crt_depth, config.max_log_ring_dimension));
+        let largest_ring_dimension = 1usize
+            .checked_shl(largest_log_ring_dimension as u32)
+            .ok_or_else(|| "largest available ring dimension exceeds usize".to_owned())?;
+        config.encoding_ring_dimension(largest_ring_dimension)?;
+        config.encoding_crt_depth(largest_crt_depth)?;
         Ok(config)
     }
 
@@ -598,6 +629,43 @@ impl TestConfig {
             self.max_log_ring_dimension,
             self.selected_parameters,
         )
+        .into_iter()
+        .filter(|(crt_depth, log_ring_dimension)| {
+            self.encoding_crt_depth
+                .is_none_or(|encoding_crt_depth| encoding_crt_depth <= *crt_depth) &&
+                self.encoding_ring_dimension.is_none_or(|encoding_ring_dimension| {
+                    1usize
+                        .checked_shl(*log_ring_dimension as u32)
+                        .is_some_and(|ring_dimension| encoding_ring_dimension <= ring_dimension)
+                })
+        })
+        .collect()
+    }
+
+    fn encoding_ring_dimension(&self, dcrt_ring_dimension: usize) -> Result<usize, String> {
+        let encoding_ring_dimension = self.encoding_ring_dimension.unwrap_or(dcrt_ring_dimension);
+        if !encoding_ring_dimension.is_power_of_two() {
+            return Err("encoding ring dimension must be a positive power of two".to_owned());
+        }
+        if encoding_ring_dimension > dcrt_ring_dimension {
+            return Err(format!(
+                "encoding ring dimension {encoding_ring_dimension} exceeds DCRT ring dimension {dcrt_ring_dimension}"
+            ));
+        }
+        Ok(encoding_ring_dimension)
+    }
+
+    fn encoding_crt_depth(&self, dcrt_crt_depth: usize) -> Result<usize, String> {
+        let encoding_crt_depth = self.encoding_crt_depth.unwrap_or(dcrt_crt_depth);
+        if encoding_crt_depth == 0 {
+            return Err("encoding CRT depth must be positive".to_owned());
+        }
+        if encoding_crt_depth > dcrt_crt_depth {
+            return Err(format!(
+                "encoding CRT depth {encoding_crt_depth} exceeds DCRT CRT depth {dcrt_crt_depth}"
+            ));
+        }
+        Ok(encoding_crt_depth)
     }
 }
 
@@ -724,6 +792,9 @@ struct CircuitBundle {
 
 struct PreparedCandidate {
     parameters: DCRTPolyParams,
+    encoding_ring_dimension: usize,
+    encoding_crt_depth: usize,
+    physical_slots: usize,
     circuit: PolyCircuit<DCRTPoly>,
     nested: Arc<NestedRnsPolyContext>,
     layout: BggSamplerLayout,
@@ -735,6 +806,7 @@ struct PreparedCandidate {
     runtime_manifest: RuntimeManifest,
     lookup_compilers: Vec<mxx_bgg::LweLookupCompiler>,
     rotation_offsets: Vec<u32>,
+    anchor_reduce_spec: Option<(u32, Vec<BigUint>)>,
     encoding_graph: BuiltGraph,
     operational_report: Option<OperationalSimulationReport>,
     achieved_security_bits: u64,
@@ -762,7 +834,7 @@ struct EndToEndOutputs {
     encoding_rows: Vec<GpuDCRTPolyMatrix>,
     output_plaintexts: Vec<GpuDCRTPolyMatrix>,
     residuals: Vec<GpuDCRTPolyMatrix>,
-    expected_evaluation_slots: Vec<BigUint>,
+    expected_output_slots: Vec<BigUint>,
 }
 
 fn env_usize(name: &str, default: usize) -> Result<usize, String> {
@@ -794,6 +866,7 @@ enum TallRunMode {
     ZeroNoise,
     Simulation,
     Benchmark,
+    BenchmarkSelected,
     Full,
 }
 
@@ -804,9 +877,10 @@ impl TallRunMode {
             "zero-noise" => Ok(Self::ZeroNoise),
             "simulation" => Ok(Self::Simulation),
             "benchmark" => Ok(Self::Benchmark),
+            "benchmark-selected" => Ok(Self::BenchmarkSelected),
             "full" => Ok(Self::Full),
             value => Err(format!(
-                "MXX_TALL_NESTED_RNS_MODE must be graph, zero-noise, simulation, benchmark, or full (got {value})"
+                "MXX_TALL_NESTED_RNS_MODE must be graph, zero-noise, simulation, benchmark, benchmark-selected, or full (got {value})"
             )),
         }
     }
@@ -821,8 +895,13 @@ fn validate_error_sigma(run_mode: TallRunMode, error_sigma: f64) -> Result<(), S
     if !error_sigma.is_finite() || error_sigma < 0.0 {
         return Err("MXX_TALL_NESTED_RNS_ERROR_SIGMA must be finite and nonnegative".to_owned());
     }
-    if matches!(run_mode, TallRunMode::Simulation | TallRunMode::Benchmark | TallRunMode::Full) &&
-        error_sigma == 0.0
+    if matches!(
+        run_mode,
+        TallRunMode::Simulation |
+            TallRunMode::Benchmark |
+            TallRunMode::BenchmarkSelected |
+            TallRunMode::Full
+    ) && error_sigma == 0.0
     {
         return Err(format!(
             "MXX_TALL_NESTED_RNS_ERROR_SIGMA must be greater than zero in {run_mode:?} mode; use zero-noise mode for an exact noiseless smoke test"
@@ -848,6 +927,12 @@ fn log_invocation(config: &TestConfig, selected: Option<&PreparedCandidate>) {
         ?environment,
         requested_mode = ?config.run_mode,
         configured_selected_parameters = ?config.selected_parameters,
+        configured_encoding_ring_dimension = ?config.encoding_ring_dimension,
+        configured_encoding_crt_depth = ?config.encoding_crt_depth,
+        multiplication_count = config.mul_count,
+        alternating_transform_count = config.ntt_intt_count,
+        forward_ntt_count = config.ntt_intt_count.div_ceil(2),
+        inverse_ntt_count = config.ntt_intt_count / 2,
         error_sigma = config.error_sigma,
         "Tall nested-RNS reproducibility invocation"
     );
@@ -856,6 +941,9 @@ fn log_invocation(config: &TestConfig, selected: Option<&PreparedCandidate>) {
             selected_crt_depth = selected.parameters.to_crt().2,
             selected_ring_dimension = selected.parameters.ring_dimension(),
             selected_log_ring_dimension = selected.parameters.ring_dimension().ilog2(),
+            selected_encoding_ring_dimension = selected.encoding_ring_dimension,
+            selected_encoding_crt_depth = selected.encoding_crt_depth,
+            selected_physical_slots = selected.physical_slots,
             selected_security_bits = selected.achieved_security_bits,
             selected_operational_noise_bound = ?selected
                 .operational_report
@@ -866,10 +954,11 @@ fn log_invocation(config: &TestConfig, selected: Option<&PreparedCandidate>) {
     }
 }
 
-fn build_modq_multiplication_circuit(
+fn build_modq_arithmetic_circuit(
     parameters: &DCRTPolyParams,
     config: &TestConfig,
     evaluation_slots: usize,
+    encoding_crt_depth: usize,
     p_modulus_bits: usize,
 ) -> CircuitBundle {
     let mut circuit = PolyCircuit::new();
@@ -887,7 +976,7 @@ fn build_modq_multiplication_circuit(
             NestedRnsPoly::input(
                 nested.clone(),
                 evaluation_slots,
-                CrtWindow::full(nested.q_moduli_depth),
+                CrtWindow::new(0, encoding_crt_depth, nested.q_moduli_depth),
                 &mut circuit,
             )
         })
@@ -895,7 +984,14 @@ fn build_modq_multiplication_circuit(
     let mut inputs = inputs.into_iter();
     let first = inputs.next().expect("mul_count + 1 is positive");
     let product = inputs.fold(first, |left, right| left.mul(&right, &mut circuit));
-    let output = product.reconstruct_q1_anchors(&mut circuit);
+    let transformed = (0..config.ntt_intt_count).fold(product, |current, transform_index| {
+        if transform_index.is_multiple_of(2) {
+            forward_ntt(parameters, &mut circuit, &current, evaluation_slots)
+        } else {
+            inverse_ntt(parameters, &mut circuit, &current, evaluation_slots)
+        }
+    });
+    let output = transformed.reconstruct_q1_anchors(&mut circuit);
     circuit.output([output.anchor_wire()]);
     CircuitBundle { circuit, nested }
 }
@@ -1197,7 +1293,9 @@ fn prepare_candidate(
     preparation: CandidatePreparation,
 ) -> Result<PreparedCandidate, String> {
     let ring_dimension = parameters.ring_dimension() as usize;
-    let (q_moduli, _, _) = parameters.to_crt();
+    let encoding_ring_dimension = config.encoding_ring_dimension(ring_dimension)?;
+    let (q_moduli, _, dcrt_crt_depth) = parameters.to_crt();
+    let encoding_crt_depth = config.encoding_crt_depth(dcrt_crt_depth)?;
     let p_modulus_bits = match config.p_moduli_bits {
         Some(bits) => bits,
         None => minimum_p_moduli_bits(
@@ -1206,15 +1304,18 @@ fn prepare_candidate(
         )
         .ok_or_else(|| "no nested-RNS p-modulus basis supports the selected q basis".to_owned())?,
     };
-    let CircuitBundle { circuit, nested } =
-        build_modq_multiplication_circuit(&parameters, config, ring_dimension, p_modulus_bits);
-    let scalar_circuit = build_modq_multiplication_circuit(&parameters, config, 1, p_modulus_bits);
-    if gate_kind_counts(&circuit) != gate_kind_counts(&scalar_circuit.circuit) {
-        return Err("nested-RNS gate counts depend on the coefficient slot count".to_owned());
-    }
+    let CircuitBundle { circuit, nested } = build_modq_arithmetic_circuit(
+        &parameters,
+        config,
+        encoding_ring_dimension,
+        encoding_crt_depth,
+        p_modulus_bits,
+    );
     let preprocessing_graph_started = Instant::now();
     log_graph_phase("preprocessing_construction", "start", None);
-    let physical_slots = ring_dimension * nested.q_moduli_depth;
+    let physical_slots = encoding_ring_dimension
+        .checked_mul(encoding_crt_depth)
+        .ok_or_else(|| "physical slot count exceeds usize".to_owned())?;
     let modulus = BigInt::from(parameters.modulus().as_ref().clone());
     let gadget_base = BigInt::from(1u8) << config.gadget_base_bits;
     let error_sigma_decimal = BigDecimal::from_f64(config.error_sigma)
@@ -1273,6 +1374,8 @@ fn prepare_candidate(
     );
     let rotation_keys =
         required_tall_rotation_encodings(&circuit).map_err(|error| error.to_string())?;
+    let anchor_reduce_spec =
+        required_tall_anchor_reduce_encoding(&circuit).map_err(|error| error.to_string())?;
     let rotation_offsets = rotation_keys.iter().map(|key| key.offset).collect::<Vec<_>>();
     let rotation_compiler = TallRotationEncodingCompiler {
         modulus: modulus.clone().into(),
@@ -1288,11 +1391,19 @@ fn prepare_candidate(
     let rotations = rotation_compiler
         .preprocess(hash_key.clone(), &rotation_offsets)
         .map_err(|error| error.to_string())?;
+    let anchor_reduce = anchor_reduce_spec
+        .as_ref()
+        .map(|(blocks, scalars)| {
+            rotation_compiler.preprocess_anchor_reduce(hash_key.clone(), *blocks, scalars.clone())
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let mut slot_preprocessing = BggTallSlotPublicKeyLowering {
         compiler: public_key_compiler.clone(),
         diagonal_mask_public_key: diagonal_mask_public_key.clone(),
         configured_slot_count: physical_slots,
         rotations: rotations.rotations.clone(),
+        anchor_reduce: anchor_reduce_spec.clone().zip(anchor_reduce.clone()),
     };
     let output_public_key = circuit_compiler
         .compile_public_keys_with_lowerings(
@@ -1352,6 +1463,11 @@ fn prepare_candidate(
     preprocessing_context = rotation_compiler
         .export_preprocessing(preprocessing_context, rotations)
         .map_err(|error| error.to_string())?;
+    if let Some(anchor_reduce) = anchor_reduce {
+        preprocessing_context = rotation_compiler
+            .export_anchor_reduce_preprocessing(preprocessing_context, anchor_reduce)
+            .map_err(|error| error.to_string())?;
+    }
     let preprocessing = preprocessing_context.build().map_err(|error| error.to_string())?;
     let preprocessing_graph_construction = preprocessing_graph_started.elapsed();
     log_graph_phase("preprocessing_construction", "end", Some(&preprocessing_graph_started));
@@ -1379,15 +1495,29 @@ fn prepare_candidate(
         circuit.num_input(),
         &lookup_compilers,
         rotation_keys,
+        anchor_reduce_spec.is_some(),
     )?;
     drop(validated_preprocessing);
     drop(lookup_entries);
     log_graph_phase("validated_and_lookup_drop", "end", None);
     info!(
         ring_dimension,
+        encoding_ring_dimension,
+        encoding_crt_depth,
         crt_depth = parameters.to_crt().2,
         p_modulus_bits,
         physical_slots,
+        multiplication_count = config.mul_count,
+        alternating_transform_count = config.ntt_intt_count,
+        forward_ntt_count = config.ntt_intt_count.div_ceil(2),
+        inverse_ntt_count = config.ntt_intt_count / 2,
+        final_transform = if config.ntt_intt_count == 0 {
+            "none"
+        } else if config.ntt_intt_count.is_multiple_of(2) {
+            "inverse_ntt"
+        } else {
+            "forward_ntt"
+        },
         gate_counts = ?gate_kind_counts(&circuit),
         artifact_count = runtime_manifest.artifacts.len(),
         "constructed Tall nested-RNS candidate graphs"
@@ -1402,7 +1532,9 @@ fn prepare_candidate(
         production.clone(),
         &lookup_compilers,
         &rotation_offsets,
+        anchor_reduce_spec.clone(),
         physical_slots,
+        encoding_crt_depth,
         config.error_sigma,
         true,
     )?;
@@ -1421,6 +1553,9 @@ fn prepare_candidate(
     };
     Ok(PreparedCandidate {
         parameters,
+        encoding_ring_dimension,
+        encoding_crt_depth,
+        physical_slots,
         circuit,
         nested,
         layout,
@@ -1432,6 +1567,7 @@ fn prepare_candidate(
         runtime_manifest,
         lookup_compilers,
         rotation_offsets,
+        anchor_reduce_spec,
         encoding_graph,
         operational_report,
         achieved_security_bits,
@@ -1462,6 +1598,7 @@ fn validate_tall_preprocessing_manifest(
     input_count: usize,
     lookup_compilers: &[mxx_bgg::LweLookupCompiler],
     rotations: impl IntoIterator<Item = TallRotationEncodingKey>,
+    has_anchor_reduce: bool,
 ) -> Result<(), String> {
     let forbidden = [
         "slot_transfer",
@@ -1498,6 +1635,9 @@ fn validate_tall_preprocessing_manifest(
         let names = TallRotationEncodingArtifactNames::for_key(key);
         required.extend([names.a_forward, names.a_backward]);
     }
+    if has_anchor_reduce {
+        required.push(TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT.to_owned());
+    }
     if let Some(name) = required.into_iter().find(|name| !manifest.artifacts.contains_key(name)) {
         return Err(format!("Tall preprocessing manifest omits required public artifact {name}"));
     }
@@ -1519,7 +1659,9 @@ fn build_encoding_graph(
     production: ProductionId,
     lookup_compilers: &[mxx_bgg::LweLookupCompiler],
     rotation_offsets: &[u32],
+    anchor_reduce_spec: Option<(u32, Vec<BigUint>)>,
     physical_slots: usize,
+    encoding_crt_depth: usize,
     error_sigma: f64,
     include_operational_residual: bool,
 ) -> Result<BuiltGraph, String> {
@@ -1615,18 +1757,39 @@ fn build_encoding_graph(
         slot_count: u32::try_from(physical_slots)
             .map_err(|_| "physical slot count exceeds u32".to_owned())?,
     };
+    let secret_gadget_rows = rotation_compiler
+        .secret_gadget_rows(secret_rows.clone())
+        .map_err(|error| error.to_string())?;
     let mut rotations = BTreeMap::new();
     for offset in rotation_offsets {
-        if let Some(public) = rotation_compiler
+        if let Some((key, public)) = rotation_compiler
             .import_artifacts(&rotation_artifacts, *offset)
             .map_err(|error| error.to_string())?
         {
             let rotation = rotation_compiler
-                .encode(&public, secret_rows.clone())
+                .encode_rotation(key, &public, secret_rows.clone(), secret_gadget_rows.clone())
                 .map_err(|error| error.to_string())?;
-            rotations.insert(rotation.key, rotation);
+            rotations.insert(key, rotation);
         }
     }
+    let anchor_reduce = anchor_reduce_spec
+        .map(|(blocks, scalars)| {
+            let public = rotation_compiler.import_anchor_reduce_artifact(
+                &rotation_artifacts,
+                blocks,
+                scalars.clone(),
+            )?;
+            let transform = rotation_compiler.encode_anchor_reduce(
+                &public,
+                blocks,
+                &scalars,
+                secret_rows.clone(),
+                secret_gadget_rows.clone(),
+            )?;
+            Ok::<_, mxx_bgg::TallCompileError>(((blocks, scalars), transform))
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let public_key_compiler = BggPublicKeyCompiler {
         ring: ring.clone(),
         base: layout.gadget_base.clone(),
@@ -1641,11 +1804,11 @@ fn build_encoding_graph(
         ),
         reveal_plaintext: true,
     };
-    let mut slots = BggTallSlotLowering {
-        compiler: BggTallEncodingCompiler { public_key: public_key_compiler.clone() },
+    let mut slots = BggTallSlotLowering::new(
+        BggTallEncodingCompiler { public_key: public_key_compiler.clone() },
         diagonal_mask_public_key,
-        secret_rows: secret_rows.clone(),
-        sampler: BggTallEncodingSampler {
+        secret_rows.clone(),
+        BggTallEncodingSampler {
             layout: layout.clone(),
             gaussian_sigma: Some(
                 RealExpr::from_f64_exact(error_sigma).map_err(|error| error.to_string())?,
@@ -1659,8 +1822,9 @@ fn build_encoding_graph(
             ),
         },
         rotations,
-    };
-    let output = PolyCircuitCompiler { public_key: public_key_compiler }
+        anchor_reduce,
+    );
+    let outputs = PolyCircuitCompiler { public_key: public_key_compiler }
         .compile_tall_encodings_with_lowerings(
             circuit,
             sample.encodings[0].clone(),
@@ -1668,30 +1832,39 @@ fn build_encoding_graph(
             &mut lookup,
             &mut slots,
         )
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "encoding circuit has no output".to_owned())?;
+        .map_err(|error| error.to_string())?;
+    info!(
+        repeated_lane_mask_encodings = slots.repeated_lane_mask_encoding_count(),
+        "reused Tall repeated-lane mask encodings"
+    );
+    let output =
+        outputs.into_iter().next().ok_or_else(|| "encoding circuit has no output".to_owned())?;
     let BggTallPlaintext::Diagonal(output_plaintexts) = output.plaintext else {
         return Err("nested-RNS output plaintext is hidden".to_owned());
     };
-    let crt_depth = parameters.to_crt().2;
-    let anchor_count = physical_slots.div_ceil(crt_depth);
-    // Keep the anchor selection as one generated gather family. A packed list of static gets
-    // lowers to an opaque explicit family and prevents the checker from beta-reducing the source
-    // row expression; this generated index map retains one shared mapped-index authority.
+    let (q_moduli, _, dcrt_crt_depth) = parameters.to_crt();
+    if encoding_crt_depth == 0 || encoding_crt_depth > dcrt_crt_depth {
+        return Err(format!(
+            "encoding CRT depth {encoding_crt_depth} is outside DCRT CRT depth {dcrt_crt_depth}"
+        ));
+    }
+    if physical_slots % encoding_crt_depth != 0 {
+        return Err(format!(
+            "physical slot count {physical_slots} is not coefficient-major for encoding CRT depth {encoding_crt_depth}"
+        ));
+    }
+    let anchor_count = physical_slots / encoding_crt_depth;
+    // The anchor reducer already returns one encoding row per coefficient. Only
+    // the original secret family still needs a generated gather at anchor slots.
     let anchor_index_family = Parallel::range(anchor_count)
-        .map_values(|index| index.as_int().mul(Int::constant(crt_depth)))
+        .map_values(|index| index.as_int().mul(Int::constant(encoding_crt_depth)))
         .map_err(|error| error.to_string())?;
-    let encoding_rows = output
-        .rows
-        .clone()
-        .parallel_gather(anchor_index_family.clone())
-        .map_err(|error| error.to_string())?;
-    let output_plaintexts = output_plaintexts
-        .clone()
-        .parallel_gather(anchor_index_family.clone())
-        .map_err(|error| error.to_string())?;
+    if output.rows.count() != &IntExpr::constant(anchor_count) ||
+        output_plaintexts.count() != &IntExpr::constant(anchor_count)
+    {
+        return Err("Tall anchor reduction did not shrink to one row per coefficient".to_owned());
+    }
+    let encoding_rows = output.rows;
     let residual_secret_rows = secret_rows
         .clone()
         .parallel_gather(anchor_index_family)
@@ -1729,7 +1902,7 @@ fn build_encoding_graph(
             )
             .semantic_anchor(TALL_DECODER_RESIDUAL_ANCHOR)
             .map_err(|error| error.to_string())?;
-        let q_max = parameters.to_crt().0.into_iter().max().expect("nonempty CRT basis");
+        let q_max = q_moduli.into_iter().max().expect("nonempty CRT basis");
         let decoded = decoder_input
             .threshold_decode_bools(IntExpr::constant(q_max), 1)
             .into_iter()
@@ -1790,6 +1963,8 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
         max_crt_depth = config.max_crt_depth,
         min_log_ring_dimension = config.min_log_ring_dimension,
         max_log_ring_dimension = config.max_log_ring_dimension,
+        encoding_ring_dimension = ?config.encoding_ring_dimension,
+        encoding_crt_depth = ?config.encoding_crt_depth,
         gadget_base_bits = config.gadget_base_bits,
         scale = config.scale,
         parallelism = config.parameter_simulation_parallelism,
@@ -1856,6 +2031,9 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
             info!(
                 crt_depth = *crt_depth,
                 ring_dimension = 1usize << *log_ring_dimension,
+                encoding_ring_dimension = candidate.encoding_ring_dimension,
+                encoding_crt_depth = candidate.encoding_crt_depth,
+                physical_slots = candidate.physical_slots,
                 operational_noise_bound = %operational_report.noise_bound,
                 noise_bound_log2 = (noise_bound_log2 * 10.0).round() / 10.0,
                 noise_threshold_log2 = (noise_threshold_log2 * 10.0).round() / 10.0,
@@ -1871,6 +2049,31 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
         }
     }
     Err("no configured CRT depth and ring dimension satisfy security and noise".to_owned())
+}
+
+fn prepare_selected_benchmark_candidate(config: &TestConfig) -> Result<PreparedCandidate, String> {
+    let (crt_depth, log_ring_dimension, parameters) =
+        selected_cpu_parameters(config, "selected-parameter Tall benchmark")?;
+    let achieved_security_bits = if config.security_bits == 0 {
+        0
+    } else {
+        lattice_security_bits(&parameters, config.error_sigma)?
+    };
+    if achieved_security_bits < config.security_bits {
+        return Err(format!(
+            "selected Tall benchmark parameters provide {achieved_security_bits} security bits, below the required {}",
+            config.security_bits
+        ));
+    }
+    info!(
+        crt_depth,
+        log_ring_dimension,
+        ring_dimension = parameters.ring_dimension(),
+        achieved_security_bits,
+        required_security_bits = config.security_bits,
+        "preparing previously accepted selected parameters without rerunning operational simulation"
+    );
+    prepare_candidate(parameters, config, achieved_security_bits, CandidatePreparation::RuntimeOnly)
 }
 
 fn log_cost_report(label: &str, report: &CostReport) {
@@ -1910,27 +2113,55 @@ fn benchmark_estimation(
         measured_iterations: config.benchmark_iterations,
         memory_poll_interval: Duration::from_millis(1),
     };
-    let estimator_config = EstimateConfig {
-        device_pool_size: config.max_parallel_instances,
-        per_instance_occupancy: 1,
-    };
-    let make_backend = || {
-        GpuNodeMeasurementBackend::new(
-            gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied()),
-            device_ids[0],
-            harness.clone(),
-            selected.parameters.to_crt().2,
-        )
-    };
+    let encoding_parallel_instances = config.max_parallel_instances;
+    let preprocessing_parallel_instances = config.preprocessing_parallel_instances;
+    let encoding_column_wave_size = encoding_parallel_instances.div_ceil(device_ids.len());
+    let preprocessing_column_wave_size =
+        preprocessing_parallel_instances.div_ceil(device_ids.len());
+    let estimator_config =
+        EstimateConfig { device_pool_size: encoding_parallel_instances, per_instance_occupancy: 1 };
     let preprocessing_estimator_config = EstimateConfig {
-        device_pool_size: config.preprocessing_parallel_instances,
+        device_pool_size: preprocessing_parallel_instances,
         per_instance_occupancy: 1,
     };
-    let mut preprocessing_backend = make_backend();
+    info!(
+        gpu_count = device_ids.len(),
+        measurement_workers = device_ids.len(),
+        encoding_column_wave_size,
+        preprocessing_column_wave_size,
+        encoding_parallel_instances,
+        preprocessing_parallel_instances,
+        "effective benchmark estimator parallelism"
+    );
+    let backends = device_ids
+        .iter()
+        .copied()
+        .map(|device_id| (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id))
+        .collect();
+    let mut backend = GpuNodeMeasurementBackend::new(
+        backends,
+        harness,
+        selected.parameters.to_crt().2,
+        preprocessing_column_wave_size,
+    );
+    info!("collecting unique GPU measurement shapes");
+    estimate(&preprocessing_graph, &mut backend, &preprocessing_estimator_config)
+        .map_err(|error| error.to_string())?;
+    backend.set_column_wave_size(encoding_column_wave_size);
+    estimate(&encoding_graph, &mut backend, &estimator_config)
+        .map_err(|error| error.to_string())?;
+    let measurement_started = Instant::now();
+    backend.measure_collected().map_err(|error| error.to_string())?;
+    info!(
+        elapsed = ?measurement_started.elapsed(),
+        gpu_count = device_ids.len(),
+        "parallel GPU measurement collection complete"
+    );
     let preprocessing_started = Instant::now();
     info!(subgraph = "preprocessing", "benchmark subgraph estimation begin");
+    backend.set_column_wave_size(preprocessing_column_wave_size);
     let preprocessing_report =
-        estimate(&preprocessing_graph, &mut preprocessing_backend, &preprocessing_estimator_config)
+        estimate(&preprocessing_graph, &mut backend, &preprocessing_estimator_config)
             .map_err(|error| error.to_string())?;
     info!(subgraph = "preprocessing", elapsed = ?preprocessing_started.elapsed(), "benchmark subgraph estimation complete");
     info!(
@@ -1939,10 +2170,10 @@ fn benchmark_estimation(
         "estimated lookup preimage sampling"
     );
     log_cost_report("TallBggPreprocessing", &preprocessing_report);
-    let mut encoding_backend = make_backend();
     let encoding_started = Instant::now();
     info!(subgraph = "encoding", "benchmark subgraph estimation begin");
-    let encoding_report = estimate(&encoding_graph, &mut encoding_backend, &estimator_config)
+    backend.set_column_wave_size(encoding_column_wave_size);
+    let encoding_report = estimate(&encoding_graph, &mut backend, &estimator_config)
         .map_err(|error| error.to_string())?;
     info!(subgraph = "encoding", elapsed = ?encoding_started.elapsed(), "benchmark subgraph estimation complete");
     log_cost_report("TallBggEncoding", &encoding_report);
@@ -2068,6 +2299,8 @@ fn reload_preprocessing(
 
 fn random_operands(selected: &PreparedCandidate, config: &TestConfig) -> Vec<Vec<BigUint>> {
     let modulus = selected.parameters.modulus().as_ref().clone();
+    // Keep a complete ambient-ring evaluation vector for the independent DCRT oracle. The Tall
+    // input encoder below intentionally consumes only the configured active prefix.
     (0..=config.mul_count)
         .into_par_iter()
         .map(|_| {
@@ -2075,6 +2308,180 @@ fn random_operands(selected: &PreparedCandidate, config: &TestConfig) -> Vec<Vec
                 .into_par_iter()
                 .map_init(rand::rng, |rng, _| gen_biguint_for_modulus(rng, &modulus))
                 .collect()
+        })
+        .collect()
+}
+
+fn oracle_mod_mul(left: u64, right: u64, modulus: u64) -> u64 {
+    ((left as u128 * right as u128) % modulus as u128) as u64
+}
+
+fn oracle_mod_pow(mut base: u64, mut exponent: u64, modulus: u64) -> u64 {
+    let mut result = 1u64;
+    base %= modulus;
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            result = oracle_mod_mul(result, base, modulus);
+        }
+        base = oracle_mod_mul(base, base, modulus);
+        exponent >>= 1;
+    }
+    result
+}
+
+fn oracle_primitive_root(modulus: u64, order: usize) -> u64 {
+    assert!(order.is_power_of_two());
+    let available_two_adicity = (modulus - 1).trailing_zeros();
+    let requested_two_adicity = order.trailing_zeros();
+    assert!(requested_two_adicity <= available_two_adicity);
+    let odd_part = (modulus - 1) >> available_two_adicity;
+    let maximal_root = (2..modulus)
+        .into_par_iter()
+        .find_first(|candidate| {
+            let projected = oracle_mod_pow(*candidate, odd_part, modulus);
+            projected != 1 &&
+                oracle_mod_pow(projected, 1u64 << (available_two_adicity - 1), modulus) ==
+                    modulus - 1
+        })
+        .map(|candidate| oracle_mod_pow(candidate, odd_part, modulus))
+        .expect("CRT modulus must have a maximal power-of-two root");
+    let root = oracle_mod_pow(
+        maximal_root,
+        1u64 << (available_two_adicity - requested_two_adicity),
+        modulus,
+    );
+    (0..order / 2)
+        .into_par_iter()
+        .map(|index| oracle_mod_pow(root, (2 * index + 1) as u64, modulus))
+        .min()
+        .expect("a power-of-two order has a primitive root")
+}
+
+fn oracle_bit_reverse_index(mut index: usize, bits: u32) -> usize {
+    let mut reversed = 0usize;
+    for _ in 0..bits {
+        reversed = (reversed << 1) | (index & 1);
+        index >>= 1;
+    }
+    reversed
+}
+
+fn oracle_power_table(root: u64, modulus: u64, slot_count: usize) -> Vec<u64> {
+    let bits = slot_count.trailing_zeros();
+    let mut table = vec![0u64; slot_count];
+    let mut power = 1u64;
+    for index in 0..slot_count {
+        table[oracle_bit_reverse_index(index, bits)] = power;
+        power = oracle_mod_mul(power, root, modulus);
+    }
+    table
+}
+
+/// Reference one compact transform using the same OpenFHE FTT ordering exercised by the focused
+/// NTT unit tests. This stays separate from the PolyCircuit lowering and operates on one CRT tower.
+fn oracle_transform_tower(values: &[u64], modulus: u64, inverse: bool) -> Vec<u64> {
+    let slot_count = values.len();
+    let psi = oracle_primitive_root(modulus, 2 * slot_count);
+    let root = if inverse {
+        mod_inverse(psi, modulus).expect("primitive root must be invertible")
+    } else {
+        psi
+    };
+    let table = oracle_power_table(root, modulus, slot_count);
+    let mut current = values.to_vec();
+    for stage_index in 0..slot_count.trailing_zeros() as usize {
+        let previous = current.clone();
+        if inverse {
+            let m = slot_count >> (stage_index + 1);
+            let t = 1usize << stage_index;
+            let group_len = t << 1;
+            current.par_iter_mut().enumerate().for_each(|(slot, output)| {
+                let offset = slot % group_len;
+                let group = slot / group_len;
+                let omega = table[m + group];
+                *output = if offset < t {
+                    (previous[slot] + previous[slot + t]) % modulus
+                } else {
+                    oracle_mod_mul(
+                        omega,
+                        (previous[slot - t] + modulus - previous[slot]) % modulus,
+                        modulus,
+                    )
+                };
+            });
+        } else {
+            let m = 1usize << stage_index;
+            let t = slot_count >> (stage_index + 1);
+            let group_len = t << 1;
+            current.par_iter_mut().enumerate().for_each(|(slot, output)| {
+                let offset = slot % group_len;
+                let group = slot / group_len;
+                let omega = table[m + group];
+                *output = if offset < t {
+                    (previous[slot] + oracle_mod_mul(omega, previous[slot + t], modulus)) % modulus
+                } else {
+                    (previous[slot - t] + modulus -
+                        oracle_mod_mul(omega, previous[slot], modulus)) %
+                        modulus
+                };
+            });
+        }
+    }
+    if inverse {
+        let scale = mod_inverse(slot_count as u64, modulus)
+            .expect("compact slot count must be invertible modulo each CRT modulus");
+        current.par_iter_mut().for_each(|value| {
+            *value = oracle_mod_mul(*value, scale, modulus);
+        });
+    }
+    current
+}
+
+fn oracle_crt_reconstruct(moduli: &[u64], residues: &[u64]) -> BigUint {
+    assert_eq!(moduli.len(), residues.len());
+    let modulus =
+        moduli.iter().fold(BigUint::from(1u8), |product, &q_i| product * BigUint::from(q_i));
+    moduli.iter().zip(residues).fold(BigUint::ZERO, |result, (&q_i, &residue)| {
+        let q_i_big = BigUint::from(q_i);
+        let q_hat = &modulus / &q_i_big;
+        let q_hat_mod_q_i = (&q_hat % &q_i_big).to_u64().expect("CRT residue must fit u64");
+        let inverse = mod_inverse(q_hat_mod_q_i, q_i).expect("CRT moduli must be coprime");
+        (result + BigUint::from(residue) * q_hat * BigUint::from(inverse)) % &modulus
+    })
+}
+
+fn expected_alternating_transforms(
+    parameters: &DCRTPolyParams,
+    active_crt_depth: usize,
+    slots: &[BigUint],
+    transform_count: usize,
+) -> Vec<BigUint> {
+    assert!(slots.len().is_power_of_two());
+    let active_moduli = parameters.to_crt().0[..active_crt_depth].to_vec();
+    let mut towers = active_moduli
+        .par_iter()
+        .map(|&q_i| {
+            let q_i_big = BigUint::from(q_i);
+            slots
+                .par_iter()
+                .map(|value| (value % &q_i_big).to_u64().expect("CRT residue must fit u64"))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for transform_index in 0..transform_count {
+        towers = towers
+            .into_par_iter()
+            .zip(active_moduli.par_iter().copied())
+            .map(|(tower, modulus)| {
+                oracle_transform_tower(&tower, modulus, !transform_index.is_multiple_of(2))
+            })
+            .collect();
+    }
+    (0..slots.len())
+        .into_par_iter()
+        .map(|slot| {
+            let residues = towers.iter().map(|tower| tower[slot]).collect::<Vec<_>>();
+            oracle_crt_reconstruct(&active_moduli, &residues)
         })
         .collect()
 }
@@ -2101,16 +2508,34 @@ fn encoding_inputs(
     operands: &[Vec<BigUint>],
 ) -> Result<BTreeMap<String, RuntimeValue<GpuDcrtBackend>>, String> {
     let encoded = operands
-        .iter()
-        .flat_map(|coefficients| {
-            encode_nested_rns_poly::<DCRTPoly>(
+        .par_iter()
+        .map(|evaluation_slots| {
+            // DCRT evaluation multiplication is pointwise, so the active prefix can be checked
+            // directly against the corresponding prefix of the full-ring GPU oracle.
+            let active_slots = evaluation_slots
+                .get(..selected.encoding_ring_dimension)
+                .ok_or_else(|| {
+                    format!(
+                        "DCRT operand has {} evaluation slots, fewer than the configured encoding ring dimension {}",
+                        evaluation_slots.len(),
+                        selected.encoding_ring_dimension
+                    )
+                })?;
+            Ok(encode_nested_rns_poly::<DCRTPoly>(
                 selected.nested.p_moduli_bits,
                 selected.nested.max_unreduced_muls,
                 &selected.parameters,
-                coefficients,
-                CrtWindow::full(selected.nested.q_moduli_depth),
-            )
+                active_slots,
+                CrtWindow::new(
+                    0,
+                    selected.encoding_crt_depth,
+                    selected.nested.q_moduli_depth,
+                ),
+            ))
         })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
     if encoded.len() != selected.circuit.num_input() {
         return Err(format!(
@@ -2242,7 +2667,16 @@ fn end_to_end_processing(
 
     let started = Instant::now();
     let operands = random_operands(selected, config);
-    let expected_evaluation_slots = expected_product_on_gpu(selected, gpu_parameters, &operands)?;
+    let product_slots = expected_product_on_gpu(selected, gpu_parameters, &operands)?;
+    let active_product_slots = product_slots
+        .get(..selected.encoding_ring_dimension)
+        .ok_or_else(|| "GPU product oracle omitted the compact Tall slot prefix".to_owned())?;
+    let expected_output_slots = expected_alternating_transforms(
+        &selected.parameters,
+        selected.encoding_crt_depth,
+        active_product_slots,
+        config.ntt_intt_count,
+    );
     let inputs = encoding_inputs(selected, gpu_parameters, &operands)?;
     info!(elapsed = ?started.elapsed(), "timed random plaintext generation, GPU oracle, and Tall input encoding");
     let started = Instant::now();
@@ -2253,7 +2687,9 @@ fn end_to_end_processing(
         selected.production.clone(),
         &selected.lookup_compilers,
         &selected.rotation_offsets,
-        selected.parameters.ring_dimension() as usize * selected.nested.q_moduli_depth,
+        selected.anchor_reduce_spec.clone(),
+        selected.physical_slots,
+        selected.encoding_crt_depth,
         config.error_sigma,
         true,
     )?;
@@ -2298,7 +2734,7 @@ fn end_to_end_processing(
         residuals.par_iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>();
     info!(elapsed = ?started.elapsed(), "timed output transfer");
     info!(elapsed = ?encoding_pass_started.elapsed(), "timed encoding-pass total");
-    Ok(EndToEndOutputs { encoding_rows, output_plaintexts, residuals, expected_evaluation_slots })
+    Ok(EndToEndOutputs { encoding_rows, output_plaintexts, residuals, expected_output_slots })
 }
 
 /// Verifies the executable encoding against the independently evaluated
@@ -2309,7 +2745,7 @@ fn measure_runtime_residual(
     outputs: EndToEndOutputs,
 ) -> Result<(BigUint, (usize, usize, usize)), String> {
     info!("stage 4/4: runtime verification");
-    let anchor_count = selected.parameters.ring_dimension() as usize;
+    let anchor_count = selected.encoding_ring_dimension;
     if outputs.encoding_rows.len() != anchor_count ||
         outputs.output_plaintexts.len() != anchor_count ||
         outputs.residuals.len() != anchor_count
@@ -2317,15 +2753,19 @@ fn measure_runtime_residual(
         return Err("Tall output family cardinality differs from the q1 anchor count".to_owned());
     }
     let modulus = selected.parameters.modulus().as_ref().clone();
+    let active_modulus = selected.parameters.to_crt().0[..selected.encoding_crt_depth]
+        .iter()
+        .fold(BigUint::from(1u8), |product, modulus| product * BigUint::from(*modulus));
     let half_modulus = &modulus / BigUint::from(2u8);
     let mut maximum_noise = BigUint::zero();
     let mut maximum_location = (0usize, 0usize, 0usize);
     for anchor in 0..anchor_count {
         let expected = outputs
-            .expected_evaluation_slots
+            .expected_output_slots
             .get(anchor)
             .cloned()
-            .ok_or_else(|| "GPU oracle omitted an expected evaluation slot".to_owned())?;
+            .ok_or_else(|| "GPU oracle omitted an expected output slot".to_owned())? %
+            &active_modulus;
         let expected_poly = DCRTPoly::from_biguint_to_constant(&selected.parameters, expected);
         let expected_cpu =
             DCRTPolyMatrix::from_poly_vec_row(&selected.parameters, vec![expected_poly]);
@@ -2994,6 +3434,98 @@ fn fixed_tall_g0_combined_evidence_matches_committed_golden() {
 }
 
 #[test]
+fn alternating_transform_oracle_matches_openfhe_and_round_trip() {
+    let parameters = DCRTPolyParams::new(8, 2, 17, 6);
+    let coefficients = (0u64..8).map(|value| BigUint::from(value * value + 3)).collect::<Vec<_>>();
+    let expected_forward = DCRTPoly::from_biguints(&parameters, &coefficients).eval_slots();
+    assert_eq!(expected_alternating_transforms(&parameters, 2, &coefficients, 1), expected_forward);
+
+    let modulus = parameters.modulus();
+    let expected_round_trip =
+        coefficients.iter().map(|value| value % modulus.as_ref()).collect::<Vec<_>>();
+    assert_eq!(
+        expected_alternating_transforms(&parameters, 2, &coefficients, 2),
+        expected_round_trip
+    );
+    assert_eq!(expected_alternating_transforms(&parameters, 2, &coefficients, 3), expected_forward);
+}
+
+#[test]
+fn configured_transform_count_appends_ntt_and_intt_after_multiplication() {
+    let parameters = DCRTPolyParams::new(8, 1, 17, 6);
+    let mut multiplication_only = noiseless_runtime_config();
+    multiplication_only.mul_count = 1;
+    multiplication_only.ntt_intt_count = 0;
+    let multiplication_circuit =
+        build_modq_arithmetic_circuit(&parameters, &multiplication_only, 8, 1, 10).circuit;
+
+    let mut with_round_trip = multiplication_only;
+    with_round_trip.ntt_intt_count = 2;
+    let round_trip_circuit =
+        build_modq_arithmetic_circuit(&parameters, &with_round_trip, 8, 1, 10).circuit;
+    let multiplication_counts = gate_kind_counts(&multiplication_circuit);
+    let round_trip_counts = gate_kind_counts(&round_trip_circuit);
+    assert!(
+        round_trip_counts.get(&PolyGateKind::SlotTransfer).copied().unwrap_or_default() >
+            multiplication_counts.get(&PolyGateKind::SlotTransfer).copied().unwrap_or_default()
+    );
+    assert!(
+        round_trip_counts.get(&PolyGateKind::Add).copied().unwrap_or_default() >
+            multiplication_counts.get(&PolyGateKind::Add).copied().unwrap_or_default()
+    );
+}
+
+#[test]
+fn encoding_ring_dimension_defaults_to_dcrt_and_rejects_invalid_subdimensions() {
+    let mut config = noiseless_runtime_config();
+    assert_eq!(config.encoding_ring_dimension(8), Ok(8));
+
+    config.encoding_ring_dimension = Some(4);
+    assert_eq!(config.encoding_ring_dimension(8), Ok(4));
+
+    config.encoding_ring_dimension = Some(16);
+    assert!(config.encoding_ring_dimension(8).is_err());
+
+    config.encoding_ring_dimension = Some(3);
+    assert!(config.encoding_ring_dimension(8).is_err());
+}
+
+#[test]
+fn candidate_search_excludes_dcrt_rings_smaller_than_the_encoding_ring() {
+    let mut config = noiseless_runtime_config();
+    config.selected_parameters = None;
+    config.min_log_ring_dimension = 1;
+    config.max_log_ring_dimension = 3;
+    config.encoding_ring_dimension = Some(4);
+    assert_eq!(config.candidate_dimensions(), vec![(1, 2), (1, 3)]);
+}
+
+#[test]
+fn encoding_crt_depth_defaults_to_dcrt_and_rejects_invalid_subdepths() {
+    let mut config = noiseless_runtime_config();
+    assert_eq!(config.encoding_crt_depth(8), Ok(8));
+
+    config.encoding_crt_depth = Some(4);
+    assert_eq!(config.encoding_crt_depth(8), Ok(4));
+
+    config.encoding_crt_depth = Some(0);
+    assert!(config.encoding_crt_depth(8).is_err());
+
+    config.encoding_crt_depth = Some(16);
+    assert!(config.encoding_crt_depth(8).is_err());
+}
+
+#[test]
+fn candidate_search_excludes_dcrt_depths_smaller_than_the_encoding_depth() {
+    let mut config = noiseless_runtime_config();
+    config.selected_parameters = None;
+    config.min_crt_depth = 1;
+    config.max_crt_depth = 3;
+    config.encoding_crt_depth = Some(2);
+    assert_eq!(config.candidate_dimensions(), vec![(2, 1), (3, 1)]);
+}
+
+#[test]
 fn lookup_planning_stats_match_preprocessing_for_repeated_subcircuit() {
     let parameters = DCRTPolyParams::new(8, 1, 20, 4);
     let digit_count = parameters.modulus_digits();
@@ -3098,10 +3630,18 @@ fn test_tall_bgg_nested_rns_planning_stats() -> Result<(), String> {
             "no nested-RNS p-modulus basis supports the selected q basis".to_owned()
         })?,
     };
-    let CircuitBundle { circuit, nested } =
-        build_modq_multiplication_circuit(&parameters, &config, 1, p_modulus_bits);
-    let physical_slots = (parameters.ring_dimension() as usize)
-        .checked_mul(nested.q_moduli_depth)
+    let encoding_crt_depth = config.encoding_crt_depth(actual_crt_depth)?;
+    let encoding_ring_dimension =
+        config.encoding_ring_dimension(parameters.ring_dimension() as usize)?;
+    let CircuitBundle { circuit, nested } = build_modq_arithmetic_circuit(
+        &parameters,
+        &config,
+        encoding_ring_dimension,
+        encoding_crt_depth,
+        p_modulus_bits,
+    );
+    let physical_slots = encoding_ring_dimension
+        .checked_mul(encoding_crt_depth)
         .ok_or_else(|| "physical slot count exceeds usize".to_owned())?;
     let lookup_stats = lookup_planning_stats(&circuit)?;
     info!(
@@ -3109,6 +3649,8 @@ fn test_tall_bgg_nested_rns_planning_stats() -> Result<(), String> {
         crt_depth,
         log_ring_dimension,
         ring_dimension = parameters.ring_dimension(),
+        encoding_ring_dimension,
+        encoding_crt_depth,
         q_moduli = ?q_moduli,
         q_modulus_bits = parameters.modulus().bits(),
         p_modulus_bits = nested.p_moduli_bits,
@@ -3158,7 +3700,12 @@ fn test_tall_bgg_nested_rns_security_estimation() -> Result<(), String> {
 
 #[test]
 fn noisy_modes_require_positive_error_sigma_but_zero_noise_does_not() {
-    for mode in [TallRunMode::Simulation, TallRunMode::Benchmark, TallRunMode::Full] {
+    for mode in [
+        TallRunMode::Simulation,
+        TallRunMode::Benchmark,
+        TallRunMode::BenchmarkSelected,
+        TallRunMode::Full,
+    ] {
         assert!(validate_error_sigma(mode, 0.0).is_err(), "{mode:?} must reject zero sigma");
         validate_error_sigma(mode, f64::MIN_POSITIVE).expect("positive sigma is valid");
     }
@@ -3379,11 +3926,14 @@ fn range_parameters_preserve_the_cartesian_candidate_search() {
 fn noiseless_runtime_config() -> TestConfig {
     TestConfig {
         mul_count: 1,
+        ntt_intt_count: 0,
         min_crt_depth: 1,
         max_crt_depth: 1,
         min_log_ring_dimension: 1,
         max_log_ring_dimension: 1,
         selected_parameters: Some((1, 1)),
+        encoding_ring_dimension: None,
+        encoding_crt_depth: None,
         security_bits: 0,
         crt_modulus_bits: 10,
         p_moduli_bits: None,
@@ -3460,6 +4010,9 @@ fn test_tall_bgg_nested_rns_parameter_simulation() {
     info!(
         crt_depth = selected.parameters.to_crt().2,
         ring_dimension = selected.parameters.ring_dimension(),
+        encoding_ring_dimension = selected.encoding_ring_dimension,
+        encoding_crt_depth = selected.encoding_crt_depth,
+        physical_slots = selected.physical_slots,
         operational_noise_bound = %operational_report.noise_bound,
         operational_accepted = operational_report.accepted,
         "completed Rust-only Tall parameter simulation"
@@ -3508,6 +4061,11 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
             .expect("Tall graph construction");
             (requested_config, selected)
         }
+        TallRunMode::BenchmarkSelected => {
+            let selected = prepare_selected_benchmark_candidate(&requested_config)
+                .expect("previously accepted selected parameters");
+            (requested_config, selected)
+        }
         TallRunMode::Simulation | TallRunMode::Benchmark | TallRunMode::Full => {
             let selected = select_parameters(&requested_config).expect("parameter simulation");
             (requested_config, selected)
@@ -3523,8 +4081,9 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
     info!(
         crt_depth = selected.parameters.to_crt().2,
         ring_dimension = selected.parameters.ring_dimension(),
-        physical_slots = selected.parameters.ring_dimension() as usize *
-            selected.nested.q_moduli_depth,
+        encoding_ring_dimension = selected.encoding_ring_dimension,
+        encoding_crt_depth = selected.encoding_crt_depth,
+        physical_slots = selected.physical_slots,
         achieved_security_bits = selected.achieved_security_bits,
         operational_noise_bound = ?operational_report.map(|report| &report.noise_bound),
         operational_accepted = ?operational_report.map(|report| report.accepted),
@@ -3545,8 +4104,11 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
     );
     let _reports = benchmark_estimation(&selected, &config, &gpu_parameters, &device_ids)
         .expect("benchmark estimation");
-    if requested_mode == TallRunMode::Benchmark {
-        info!("completed Tall benchmark-only mode before preprocessing execution");
+    if matches!(requested_mode, TallRunMode::Benchmark | TallRunMode::BenchmarkSelected) {
+        info!(
+            skipped_operational_simulation = requested_mode == TallRunMode::BenchmarkSelected,
+            "completed Tall benchmark-only mode before preprocessing execution"
+        );
         return;
     }
     let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)

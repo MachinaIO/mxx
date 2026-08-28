@@ -369,6 +369,16 @@ impl<P: Poly> SlotOperationLowering<P> for PublicAttributeLowering<'_> {
     ) -> Result<Mat, Self::Error> {
         unsupported(gate, "slot reduction")
     }
+
+    fn slot_anchor_reduce(
+        &mut self,
+        _input: &Mat,
+        _num_blocks: u32,
+        _lane_scalars: &[num_bigint::BigUint],
+        gate: GateInstance<'_>,
+    ) -> Result<Mat, Self::Error> {
+        unsupported(gate, "anchor reduction")
+    }
 }
 
 struct EncodedAttributeLowering<'a> {
@@ -482,6 +492,16 @@ impl<P: Poly> SlotOperationLowering<P> for EncodedAttributeLowering<'_> {
         gate: GateInstance<'_>,
     ) -> Result<AttributeEncodingWire, Self::Error> {
         unsupported(gate, "slot reduction")
+    }
+
+    fn slot_anchor_reduce(
+        &mut self,
+        _input: &AttributeEncodingWire,
+        _num_blocks: u32,
+        _lane_scalars: &[num_bigint::BigUint],
+        gate: GateInstance<'_>,
+    ) -> Result<AttributeEncodingWire, Self::Error> {
+        unsupported(gate, "anchor reduction")
     }
 }
 

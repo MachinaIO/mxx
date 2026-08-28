@@ -39,6 +39,15 @@ extern "C"
         const GpuMatrix *const *left,
         const GpuMatrix *const *right,
         size_t matrix_count);
+    int gpu_matrix_mul_accumulate_batch(
+        GpuMatrix *const *outputs,
+        const GpuMatrix *const *left,
+        const GpuMatrix *const *right,
+        const GpuMatrix *const *coefficients,
+        const GpuMatrix *const *biases,
+        const size_t *inner_dimensions,
+        size_t matrix_count,
+        size_t product_count);
     int gpu_matrix_mul_scalar_batch(
         GpuMatrix *const *outputs,
         const GpuMatrix *const *matrices,

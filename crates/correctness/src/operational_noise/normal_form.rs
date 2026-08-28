@@ -425,10 +425,10 @@ pub struct Normalizer<'a, S = NoFeasibility> {
     /// Multiply consumer. They remain bounded values; this set only delays numeric compression
     /// until that immediate boundary has either rewritten or folded them.
     retained_bounded_endpoints: BTreeSet<ExprId>,
-    /// Finite factors below a uniquely-consumed 1x1 scalar operand of a non-scalar Multiply.
-    /// Keeping this one lexical branch exact until the scalar-action boundary preserves the full
-    /// ordered Large product without introducing a third durable polynomial lane.
-    retained_bounded_scalar_factors: BTreeSet<ExprId>,
+    /// Expressions inside an operand subtree of a typed Large multiplication. A node in this
+    /// set keeps its finite output terms only until that future product; an unmarked Large product
+    /// folds its finite Cartesian candidates immediately.
+    retained_large_product_context: BTreeSet<ExprId>,
     /// Durable value-level transfer results for expressions which may be released from `cache`
     /// before the root's exact monomials are folded.
     expression_bounds: BTreeMap<ExprId, NumericContract<CoefficientBound>>,
@@ -562,7 +562,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             normalization: None,
             cache: BTreeMap::new(),
             retained_bounded_endpoints: BTreeSet::new(),
-            retained_bounded_scalar_factors: BTreeSet::new(),
+            retained_large_product_context: BTreeSet::new(),
             expression_bounds: BTreeMap::new(),
             remaining_uses: BTreeMap::new(),
             gadget_input_nfs: BTreeMap::new(),
@@ -696,13 +696,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             };
             self.clear_value_cache();
             self.retained_bounded_endpoints.clear();
-            self.retained_bounded_scalar_factors.clear();
+            self.retained_large_product_context.clear();
             self.expression_bounds.clear();
             self.remaining_uses.clear();
             self.clear_gadget_holds();
             self.counters = NormalizationCounters::default();
 
-            let reachable = self.compute_use_counts(root.expression())?;
+            let reachable = self.compute_use_counts(&scope_proof, root.expression())?;
             self.counters.nodes_total = reachable.len() as u64;
             let mut work = vec![(root.expression(), false)];
             let mut completed = BTreeSet::new();
@@ -763,7 +763,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     self.observe_pre_fold_polynomial(root, normal_form, relation_evidence.clone())?;
                     pre_fold_observed = true;
                     let mut evidence = relation_evidence.clone();
-                    self.fold_finite_no_match_terms(Some(root), normal_form, false, &mut evidence)?;
+                    self.fold_finite_no_match_terms(
+                        Some(root),
+                        normal_form,
+                        false,
+                        false,
+                        &mut evidence,
+                    )?;
                     value.coefficient_bound = rebound;
                     if normal_form.is_zero() {
                         value.coefficient_bound =
@@ -925,8 +931,8 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let scoped = self.expressions.scoped_from_proof(&proof, root)?;
         let saved_cache = std::mem::take(&mut self.cache);
         let saved_retained_bounded_endpoints = std::mem::take(&mut self.retained_bounded_endpoints);
-        let saved_retained_bounded_scalar_factors =
-            std::mem::take(&mut self.retained_bounded_scalar_factors);
+        let saved_retained_large_product_context =
+            std::mem::take(&mut self.retained_large_product_context);
         let saved_expression_bounds = std::mem::take(&mut self.expression_bounds);
         let saved_uses = std::mem::take(&mut self.remaining_uses);
         let saved_gadget_input_nfs = std::mem::take(&mut self.gadget_input_nfs);
@@ -938,7 +944,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let nested_expression_bounds = std::mem::take(&mut self.expression_bounds);
         self.cache = saved_cache;
         self.retained_bounded_endpoints = saved_retained_bounded_endpoints;
-        self.retained_bounded_scalar_factors = saved_retained_bounded_scalar_factors;
+        self.retained_large_product_context = saved_retained_large_product_context;
         self.expression_bounds = saved_expression_bounds;
         if value.is_ok() {
             self.merge_expression_bounds(nested_expression_bounds);
@@ -982,7 +988,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok((root, normal_form, target_end))
     }
 
-    fn compute_use_counts(&mut self, root: ExprId) -> Result<BTreeSet<ExprId>, NormalizeError> {
+    fn compute_use_counts(
+        &mut self,
+        scope_proof: &ScopeProof,
+        root: ExprId,
+    ) -> Result<BTreeSet<ExprId>, NormalizeError> {
         let mut reachable = BTreeSet::new();
         let mut real_consumers = BTreeMap::<ExprId, BTreeSet<ExprId>>::new();
         let mut work = vec![root];
@@ -1077,45 +1087,82 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         }
         *self.remaining_uses.entry(root).or_default() += 1;
 
-        // A `right * scalar` expression is a one-sided scalar action.  If the finite 1x1 scalar
-        // branch were collapsed before this edge, a later Large row product could not recover the
-        // exact scalar factors required by the two-lane contract.  Delay only uniquely-consumed
-        // scalar branches, and only until their immediate non-scalar Multiply.
-        let mut scalar_factor_work = Vec::new();
+        // Compute the typed value-level bounds once before exact normalization. This prepass has
+        // no monomial state: it uses the same transfer functions as ordinary evaluation solely to
+        // identify finite subtrees which will later enter a Large product.
+        // Bound calculation is also instrumented in the traced normalizer.  It is only a
+        // planning pass, so temporarily detach the sink to avoid emitting duplicate semantic
+        // events before the real exact normalization.
+        let saved_sink = self.sink.take();
+        let planned_bounds_result = (|| {
+            let mut planned_bounds = BTreeMap::<ExprId, NumericContract<CoefficientBound>>::new();
+            let mut bound_work = vec![(root, false)];
+            while let Some((expression, expanded)) = bound_work.pop() {
+                if planned_bounds.contains_key(&expression) {
+                    continue;
+                }
+                let node = self.expressions.node_arc(expression)?;
+                if !expanded {
+                    bound_work.push((expression, true));
+                    for child in &node.inputs {
+                        if !planned_bounds.contains_key(child) {
+                            bound_work.push((*child, false));
+                        }
+                    }
+                    continue;
+                }
+                let children = node
+                    .inputs
+                    .iter()
+                    .map(|child| {
+                        Ok(Arc::new(AnalyzedValue {
+                            semantic: self.expressions.scoped_from_proof(scope_proof, *child)?,
+                            exact_nf: None,
+                            coefficient_bound: planned_bounds
+                                .get(child)
+                                .cloned()
+                                .ok_or(NormalizeError::MissingCachedValue { expression: *child })?,
+                        }))
+                    })
+                    .collect::<Result<Vec<_>, NormalizeError>>()?;
+                let owner = self.expressions.scoped_from_proof(scope_proof, expression)?;
+                let bound = if matches!(
+                    self.expressions.value_type(expression)?,
+                    ResolvedValueType::Matrix(_)
+                ) {
+                    self.matrix_bound(owner, expression, node.as_ref(), &children)?
+                } else {
+                    self.nonmatrix_bound(owner, expression, node.as_ref(), &children)?
+                };
+                planned_bounds.insert(expression, bound);
+            }
+            Ok::<_, NormalizeError>(planned_bounds)
+        })();
+        self.sink = saved_sink;
+        let planned_bounds = planned_bounds_result?;
+
+        // A finite expression may be compressed only if no Large product above it will need its
+        // factor identity. Seed every typed Large multiplication operand, then walk downward once.
+        // This is independent of scalar shape and makes product association canonical: both
+        // `(b1*b2)*L` and `b1*(b2*L)` retain the ordered word `b1,b2,L`.
+        let mut large_product_context = Vec::new();
         for expression in &reachable {
             let node = self.expressions.node(*expression)?;
             if !matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Multiply)) ||
-                node.inputs.len() != 2
+                !matches!(
+                    planned_bounds.get(expression),
+                    Some(NumericContract::Known(CoefficientBound::Large))
+                )
             {
                 continue;
             }
-            let mut scalar = None;
-            let mut non_scalar = false;
-            for input in &node.inputs {
-                let ResolvedValueType::Matrix(matrix) = self.expressions.value_type(*input)? else {
-                    continue;
-                };
-                if matrix.rows == 1 && matrix.columns == 1 {
-                    scalar = Some(*input);
-                } else {
-                    non_scalar = true;
-                }
-            }
-            let Some(scalar) = scalar.filter(|_| non_scalar) else { continue };
-            if node.inputs.iter().filter(|input| **input == scalar).count() != 1 ||
-                !real_consumers.get(&scalar).is_some_and(|consumers| {
-                    consumers.len() == 1 && consumers.contains(expression)
-                })
-            {
-                continue;
-            }
-            scalar_factor_work.push(scalar);
+            large_product_context.extend(node.inputs.iter().copied());
         }
-        while let Some(expression) = scalar_factor_work.pop() {
-            if !self.retained_bounded_scalar_factors.insert(expression) {
+        while let Some(expression) = large_product_context.pop() {
+            if !self.retained_large_product_context.insert(expression) {
                 continue;
             }
-            scalar_factor_work.extend(self.expressions.node(expression)?.inputs.iter().copied());
+            large_product_context.extend(self.expressions.node(expression)?.inputs.iter().copied());
         }
 
         // A finite endpoint is retained only for one semantic input edge of one direct Multiply.
@@ -1413,6 +1460,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         owner: ScopedExprId,
         rule: BoundRule,
     ) -> Result<super::g0::EventIndex, NormalizeError> {
+        // A detached sink is used by the typed bound-planning prepass. It must not create
+        // semantic events (the exact normalization below owns the single authoritative trace).
+        if S::ENABLED && self.sink.is_none() {
+            return Ok(super::g0::EventIndex(0));
+        }
         if S::ENABLED {
             return self
                 .sink
@@ -2040,6 +2092,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                                 scope_proof,
                                 semantic,
                                 operation,
+                                semantic.expression(),
                                 node.inputs[0],
                                 node.inputs[1],
                                 left,
@@ -2476,7 +2529,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         if S::ENABLED && !input.bounded_summary.is_zero() {
             evidence = self.summary_result_ref(input_expression)?;
         }
-        self.fold_finite_no_match_terms(Some(owner), &mut result, true, &mut evidence)?;
+        self.fold_finite_no_match_terms(
+            Some(owner),
+            &mut result,
+            self.retained_large_product_context.contains(&owner.expression()),
+            true,
+            &mut evidence,
+        )?;
         Ok(result)
     }
 
@@ -2485,6 +2544,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         scope_proof: &mut ScopeProof,
         owner: ScopedExprId,
         operation: &MatrixOperation,
+        output_expression: ExprId,
         left_expression: ExprId,
         right_expression: ExprId,
         left: &PolynomialNF,
@@ -2507,13 +2567,20 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let right_type = right_type.clone();
         let left_bound = self.bound_normal_form(left)?;
         let right_bound = self.bound_normal_form(right)?;
-        if matches!(
-            left_bound,
-            NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Finite(_))
-        ) && matches!(
-            right_bound,
-            NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Finite(_))
-        ) {
+        // Retain finite factors when this tensor is inside a typed Large product. Other tensor
+        // outputs finalize their bounded terms at their own boundary.
+        let preserve_bounded_output =
+            self.retained_large_product_context.contains(&output_expression);
+        if !preserve_bounded_output &&
+            matches!(
+                left_bound,
+                NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Finite(_))
+            ) &&
+            matches!(
+                right_bound,
+                NumericContract::Known(CoefficientBound::ExactZero | CoefficientBound::Finite(_))
+            )
+        {
             let left_evidence = self.whole_summary_evidence(owner, left_expression, left)?;
             let right_evidence = self.whole_summary_evidence(owner, right_expression, right)?;
             let summary =
@@ -2586,7 +2653,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             exact_terms: terms,
             bounded_summary: BoundedSummary::from_contract(noise)?,
         };
-        self.fold_finite_no_match_terms(Some(owner), &mut result, true, &mut evidence)?;
+        self.fold_finite_no_match_terms(
+            Some(owner),
+            &mut result,
+            preserve_bounded_output,
+            true,
+            &mut evidence,
+        )?;
         Ok(result)
     }
 
@@ -2861,7 +2934,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 )?)),
             }
         }
-        self.fold_finite_no_match_terms(Some(semantic), &mut result, true, &mut evidence)?;
+        self.fold_finite_no_match_terms(Some(semantic), &mut result, false, true, &mut evidence)?;
         Ok(result)
     }
 
@@ -3540,7 +3613,15 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 }
             }
         }
-        self.fold_finite_no_match_terms(owner, &mut result, true, evidence)?;
+        self.fold_finite_no_match_terms(
+            owner,
+            &mut result,
+            owner.is_some_and(|owner| {
+                self.retained_large_product_context.contains(&owner.expression())
+            }),
+            true,
+            evidence,
+        )?;
         Ok(result)
     }
 
@@ -3595,6 +3676,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             left,
             right,
             &BigInt::from(1_u8),
+            owner.is_some_and(|owner| {
+                self.retained_large_product_context.contains(&owner.expression())
+            }),
             &mut terms,
             &mut noise,
         )?;
@@ -3651,7 +3735,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
 
     /// A bounded relation endpoint is not a Large/exact semantic term.  It is kept with identity
     /// for exactly one direct registered boundary, then folded like every other finite term.
-    fn is_retained_bounded_monomial(&self, monomial: MonomialId) -> Result<bool, NormalizeError> {
+    fn is_retained_bounded_endpoint(&self, monomial: MonomialId) -> Result<bool, NormalizeError> {
         let descriptor = self.monomials.descriptor(monomial)?;
         if descriptor.central_factors.is_empty() && descriptor.ordered_factors.len() == 1 {
             let factor = descriptor.ordered_factors[0];
@@ -3661,15 +3745,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 return Ok(true)
             }
         }
-        let mut factors =
-            descriptor.central_factors.iter().chain(descriptor.ordered_factors.iter());
-        let Some(first) = factors.next() else { return Ok(false) };
-        Ok(first.program() == self.scope &&
-            self.retained_bounded_scalar_factors.contains(&first.expression()) &&
-            factors.all(|factor| {
-                factor.program() == self.scope &&
-                    self.retained_bounded_scalar_factors.contains(&factor.expression())
-            }))
+        Ok(false)
     }
 
     fn typed_product_contract(
@@ -3937,6 +4013,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         left: &PolynomialNF,
         right: &PolynomialNF,
         weight: &BigInt,
+        preserve_bounded_output: bool,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
     ) -> Result<(), NormalizeError> {
@@ -3958,6 +4035,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             left,
             right,
             weight,
+            preserve_bounded_output,
             terms,
             noise,
             &mut evidence,
@@ -3978,6 +4056,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         left: &PolynomialNF,
         right: &PolynomialNF,
         weight: &BigInt,
+        preserve_bounded_output: bool,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
@@ -4021,6 +4100,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                             left_coefficient,
                             right_coefficient,
                             weight,
+                            preserve_bounded_output,
                             Some([
                                 RecordedTermRef {
                                     value_event: left_event,
@@ -4045,6 +4125,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     left,
                     right,
                     weight,
+                    preserve_bounded_output,
                     terms,
                     noise,
                     evidence,
@@ -4058,6 +4139,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 left,
                 right,
                 weight,
+                preserve_bounded_output,
                 terms,
                 noise,
                 evidence,
@@ -4074,6 +4156,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         left: &PolynomialNF,
         right: &PolynomialNF,
         weight: &BigInt,
+        preserve_bounded_output: bool,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
@@ -4089,6 +4172,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     left_coefficient,
                     right_coefficient,
                     weight,
+                    preserve_bounded_output,
                     None,
                     terms,
                     noise,
@@ -4109,6 +4193,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         left_coefficient: &BigInt,
         right_coefficient: &BigInt,
         weight: &BigInt,
+        preserve_bounded_output: bool,
         mut source_refs: Option<[RecordedTermRef; 2]>,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
@@ -4133,6 +4218,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         // instead of the full product cardinality.
         self.drain_product_worklist(
             owner,
+            preserve_bounded_output,
             terms,
             noise,
             evidence,
@@ -4145,6 +4231,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
     fn drain_product_worklist<A: ExactTermAccumulator>(
         &mut self,
         owner: Option<ScopedExprId>,
+        preserve_bounded_output: bool,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
@@ -4255,6 +4342,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     monomial,
                     coefficient,
                     term_sources,
+                    preserve_bounded_output,
                     terms,
                     noise,
                     evidence,
@@ -4277,16 +4365,17 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         Ok(())
     }
 
-    /// Merge one fully gadget-closed product candidate.  Relation closure happens before numeric
-    /// erasure, then every all-finite result is absorbed immediately into the single noise
-    /// summary.  A Large/Missing result keeps its complete ordered monomial identity, including
-    /// every bounded factor, so only an identical full matrix product can cancel it later.
+    /// Merge one fully gadget-closed product candidate. Relation closure happens before numeric
+    /// erasure. An unmarked output absorbs every all-finite result immediately into the one noise
+    /// summary; an output needed by an ancestor Large product retains it until that boundary.
+    /// Large/Missing results always keep their complete ordered monomial identity.
     fn merge_product_result_early<A: ExactTermAccumulator>(
         &mut self,
         owner: Option<ScopedExprId>,
         monomial: MonomialId,
         coefficient: BigInt,
         source_refs: Option<[RecordedTermRef; 2]>,
+        preserve_bounded_output: bool,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
@@ -4307,6 +4396,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 coefficient,
                 initial_bound,
                 source_refs,
+                preserve_bounded_output,
                 terms,
                 noise,
                 evidence,
@@ -4345,6 +4435,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 rewritten_coefficient,
                 bound,
                 if preserve_source_refs { source_refs.take() } else { None },
+                preserve_bounded_output,
                 terms,
                 noise,
                 evidence,
@@ -4360,6 +4451,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         coefficient: BigInt,
         bound: NumericContract<CoefficientBound>,
         source_refs: Option<[RecordedTermRef; 2]>,
+        preserve_bounded_output: bool,
         terms: &mut A,
         noise: &mut NumericContract<CoefficientBound>,
         evidence: &mut Option<BoundValueRef>,
@@ -4374,7 +4466,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 Ok(())
             }
             NumericContract::Known(bound @ CoefficientBound::Finite(_)) => {
-                if self.is_retained_bounded_monomial(monomial)? {
+                if preserve_bounded_output || self.is_retained_bounded_endpoint(monomial)? {
                     if S::ENABLED {
                         if let Some(sources) = source_refs {
                             self.observe_product_merge(
@@ -4988,6 +5080,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         &mut self,
         owner: Option<ScopedExprId>,
         normal_form: &mut PolynomialNF,
+        preserve_bounded_output: bool,
         preserve_relation_endpoints: bool,
         evidence: &mut Option<BoundValueRef>,
     ) -> Result<(), NormalizeError> {
@@ -5010,7 +5103,10 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     }
                 }
                 NumericContract::Known(bound @ CoefficientBound::Finite(_)) => {
-                    if preserve_relation_endpoints && self.is_retained_bounded_monomial(monomial)? {
+                    if preserve_bounded_output ||
+                        (preserve_relation_endpoints &&
+                            self.is_retained_bounded_endpoint(monomial)?)
+                    {
                         retained.insert(monomial, coefficient);
                         continue;
                     }
@@ -8099,6 +8195,7 @@ mod tests {
                     &left_nf,
                     &right_nf,
                     &BigInt::from(1_u8),
+                    false,
                     &mut terms,
                     &mut noise,
                 )
@@ -8129,6 +8226,7 @@ mod tests {
                     &left_nf,
                     &right_nf,
                     &BigInt::from(1_u8),
+                    false,
                     &mut terms,
                     &mut noise,
                 )
@@ -8805,6 +8903,114 @@ mod tests {
     }
 
     #[test]
+    fn finite_factors_retain_one_product_identity_across_association_with_large() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let first = gaussian_factor(&mut expressions, scalar.clone(), 95_018, 3);
+        let second = gaussian_factor(&mut expressions, scalar.clone(), 95_019, 5);
+        let large = source_with(&mut expressions, scalar, 95_020);
+        let finite_product = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[first, second])
+            .unwrap();
+        let left_associated = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[finite_product, large])
+            .unwrap();
+        let large_product = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[second, large])
+            .unwrap();
+        let right_associated = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[first, large_product])
+            .unwrap();
+        let root = expressions
+            .intern_matrix_transform(
+                MatrixOperation::Subtract,
+                &[left_associated, right_associated],
+            )
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+
+        assert!(value.exact_nf.unwrap().is_zero());
+    }
+
+    #[test]
+    fn finite_addend_in_large_product_distributes_without_a_mixed_summary() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let first_large = source_with(&mut expressions, scalar.clone(), 95_022);
+        let finite = gaussian_factor(&mut expressions, scalar.clone(), 95_023, 3);
+        let second_large = source_with(&mut expressions, scalar, 95_024);
+        let mixed = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[first_large, finite])
+            .unwrap();
+        let unexpanded = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[mixed, second_large])
+            .unwrap();
+        let large_product = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[first_large, second_large])
+            .unwrap();
+        let finite_product = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[finite, second_large])
+            .unwrap();
+        let expanded = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[large_product, finite_product])
+            .unwrap();
+        let root = expressions
+            .intern_matrix_transform(MatrixOperation::Subtract, &[unexpanded, expanded])
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+
+        assert!(value.exact_nf.unwrap().is_zero());
+    }
+
+    #[test]
+    fn unmarked_large_product_folds_finite_cartesian_terms_at_its_boundary() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let large = source_with(&mut expressions, scalar.clone(), 95_025);
+        let bounded_left = (0..4)
+            .map(|offset| gaussian_factor(&mut expressions, scalar.clone(), 95_026 + offset, 3))
+            .collect::<Vec<_>>();
+        let bounded_right = (0..3)
+            .map(|offset| gaussian_factor(&mut expressions, scalar.clone(), 95_030 + offset, 5))
+            .collect::<Vec<_>>();
+        let left = bounded_left.iter().copied().fold(large, |sum, term| {
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[sum, term]).unwrap()
+        });
+        let right = bounded_right.iter().copied().reduce(|sum, term| {
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[sum, term]).unwrap()
+        });
+        let root = expressions
+            .intern_matrix_transform(
+                MatrixOperation::Multiply,
+                &[left, right.expect("nonempty bounded sum")],
+            )
+            .unwrap();
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let value = normalizer.normalize(semantic).unwrap();
+        let normal_form = value.exact_nf.unwrap();
+
+        assert_eq!(normal_form.exact_terms.len(), bounded_right.len());
+        assert!(matches!(
+            normal_form.bounded_summary.coefficient_bound(),
+            NumericContract::Known(CoefficientBound::Finite(_))
+        ));
+        assert!(normalizer.counters.bounded_fold_count >= 12);
+    }
+
+    #[test]
     fn large_times_compressed_summary_fails_before_product_mutation() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -8839,6 +9045,7 @@ mod tests {
                 &summary,
                 &exact_large,
                 &BigInt::from(1_u8),
+                false,
                 &mut terms,
                 &mut noise,
             )
@@ -13490,7 +13697,13 @@ mod tests {
             Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
         let mut ordinary_evidence = None;
         ordinary
-            .fold_finite_no_match_terms(None, &mut normal_form, false, &mut ordinary_evidence)
+            .fold_finite_no_match_terms(
+                None,
+                &mut normal_form,
+                false,
+                false,
+                &mut ordinary_evidence,
+            )
             .unwrap();
         assert!(normal_form.exact_terms.is_empty());
         drop(ordinary);
@@ -13514,6 +13727,7 @@ mod tests {
             traced.fold_finite_no_match_terms(
                 Some(semantic),
                 &mut malformed,
+                false,
                 false,
                 &mut traced_evidence,
             ),

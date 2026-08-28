@@ -454,6 +454,7 @@ dependencies = [
  "mxx-runtime",
  "num-bigint",
  "num-traits",
+ "rayon",
  "serde",
  "thiserror",
  "tracing",

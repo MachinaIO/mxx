@@ -643,36 +643,31 @@ mod tests {
             ]),
         );
 
-        let packed = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
-            &parameters,
-            key,
-            tag,
-            layout.secret_dimension,
-            layout.public_key_columns() * public_keys.len(),
-            DistType::FinRingDist,
-        );
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
-        let encoded_plaintexts = DCRTPolyMatrix::from_poly_vec_row(
-            &parameters,
-            vec![
-                DCRTPoly::const_one(&parameters),
-                plaintext_values[0].entry(0, 0),
-                plaintext_values[1].entry(0, 0),
-            ],
-        );
-        let vectors = secret_value.clone() * packed.clone() -
-            encoded_plaintexts.tensor(&(secret_value * gadget));
+        let secret_gadget = secret_value.clone() * gadget;
+        let encoded_plaintexts = [
+            DCRTPoly::const_one(&parameters),
+            plaintext_values[0].entry(0, 0),
+            plaintext_values[1].entry(0, 0),
+        ];
         for index in 0..public_keys.len() {
-            let start = layout.public_key_columns() * index;
-            let end = layout.public_key_columns() * (index + 1);
-            assert_eq!(
-                matrix_output(&result, &format!("public-{index}")),
-                &packed.slice_columns(start, end)
+            let mut indexed_tag = tag.to_vec();
+            indexed_tag.extend_from_slice(&(index as u64).to_le_bytes());
+            let public = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
+                &parameters,
+                key,
+                &indexed_tag,
+                layout.secret_dimension,
+                layout.public_key_columns(),
+                DistType::FinRingDist,
             );
-            assert_eq!(
-                matrix_output(&result, &format!("vector-{index}")),
-                &vectors.slice_columns(start, end)
+            let plaintext = DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![encoded_plaintexts[index].clone()],
             );
+            let vector = secret_value.clone() * public.clone() - plaintext.tensor(&secret_gadget);
+            assert_eq!(matrix_output(&result, &format!("public-{index}")), &public);
+            assert_eq!(matrix_output(&result, &format!("vector-{index}")), &vector);
         }
         assert!(encodings[0].plaintext.is_some());
         assert!(encodings[1].plaintext.is_none());

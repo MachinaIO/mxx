@@ -1,8 +1,8 @@
 use crate::{
     artifact::{ArtifactKey, ArtifactPayload, ArtifactStore},
     backend::{
-        Backend, IndexRange as RuntimeIndexRange, PreimageRequest, RuntimeValue,
-        SampleRange as RuntimeSampleRange,
+        Backend, IndexRange as RuntimeIndexRange, MatrixMulAccumulateRequest, PreimageRequest,
+        RuntimeValue, SampleRange as RuntimeSampleRange,
     },
     session::{ArtifactHandle, SessionDescriptor, SessionStore},
     transcript::{DrawSite, RecordedValue, SamplingMode, TranscriptError},
@@ -677,7 +677,10 @@ where
     ) -> Result<bool, ExecutionError> {
         if !matches!(
             node.kind,
-            NodeKind::MatrixBinary(_) | NodeKind::MatrixNegate | NodeKind::MatrixScale { .. }
+            NodeKind::MatrixBinary(_) |
+                NodeKind::MatrixMulAccumulate { .. } |
+                NodeKind::MatrixNegate |
+                NodeKind::MatrixScale { .. }
         ) {
             return Ok(false);
         }
@@ -718,6 +721,30 @@ where
                     MatrixBinaryOp::Multiply => self.backend.multiply_batch(inputs),
                 }
                 .map_err(Self::backend_error)?
+            }
+            NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
+                let mut requests = Vec::with_capacity(indices.len());
+                for index in indices {
+                    let env = &envs[*index];
+                    let instance = &mut values[*index];
+                    let mut products = Vec::with_capacity(coefficients.len());
+                    for (product, coefficient) in coefficients.iter().enumerate() {
+                        products.push((
+                            coefficient
+                                .evaluate(env)
+                                .map_err(|error| self.expression_error(node.id, error))?,
+                            self.matrix(instance, node.args[2 * product])?,
+                            self.matrix(instance, node.args[2 * product + 1])?,
+                        ));
+                    }
+                    let bias = if *has_bias {
+                        Some(self.matrix(instance, node.args[2 * coefficients.len()])?)
+                    } else {
+                        None
+                    };
+                    requests.push(MatrixMulAccumulateRequest { products, bias });
+                }
+                self.backend.matrix_mul_accumulate_batch(requests).map_err(Self::backend_error)?
             }
             NodeKind::MatrixNegate => {
                 let mut inputs = Vec::with_capacity(indices.len());
@@ -1364,6 +1391,28 @@ where
                     MatrixBinaryOp::Multiply => self.backend.multiply(&left, &right),
                 }
                 .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
+            NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
+                let mut products = Vec::with_capacity(coefficients.len());
+                for (product, coefficient) in coefficients.iter().enumerate() {
+                    products.push((
+                        coefficient
+                            .evaluate(env)
+                            .map_err(|error| self.expression_error(node.id, error))?,
+                        self.matrix(values, node.args[2 * product])?,
+                        self.matrix(values, node.args[2 * product + 1])?,
+                    ));
+                }
+                let bias = if *has_bias {
+                    Some(self.matrix(values, node.args[2 * coefficients.len()])?)
+                } else {
+                    None
+                };
+                let output = self
+                    .backend
+                    .matrix_mul_accumulate(MatrixMulAccumulateRequest { products, bias })
+                    .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::MatrixNegate => {

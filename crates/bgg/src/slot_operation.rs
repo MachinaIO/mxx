@@ -486,6 +486,19 @@ mod public_key {
             });
             Ok(output)
         }
+
+        fn slot_anchor_reduce(
+            &mut self,
+            _input: &Self::Wire,
+            _num_blocks: u32,
+            _lane_scalars: &[num_bigint::BigUint],
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            Err(CircuitCompileError::Unsupported {
+                gate: gate.local_gate().index(),
+                feature: "anchor reduction in preimage-based slot lowering",
+            })
+        }
     }
 
     pub(crate) fn gate_token(gate: GateInstance<'_>) -> String {
@@ -1874,8 +1887,8 @@ mod tall {
         BggPublicKeyWire, CircuitCompileError,
         tall_encoding::{BggTallEncodingCompiler, BggTallEncodingSampler, BggTallEncodingWire},
         tall_rotation_encoding::{
-            TallRotationDirection, TallRotationEncodingKey, TallRotationEncodingWires,
-            TallRotationPublicWires,
+            TallLinearTransformEncodingWires, TallLinearTransformPublicWires,
+            TallRotationEncodingKey,
         },
     };
     use mxx_dsl::{Family, Int, Mat, Parallel};
@@ -1883,7 +1896,7 @@ mod tall {
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
-    use mxx_ir_core::IntExpr;
+    use mxx_ir_core::{IntExpr, ValueHandle};
     use std::collections::BTreeMap;
 
     /// Public-key slot lowering for the secret-transfer-free Tall subset.
@@ -1901,7 +1914,10 @@ mod tall {
         /// Exact physical Tall slot count.
         pub configured_slot_count: usize,
         /// Exact preprocessed public matrices for cyclic rotations.
-        pub rotations: BTreeMap<TallRotationEncodingKey, TallRotationPublicWires>,
+        pub rotations: BTreeMap<TallRotationEncodingKey, TallLinearTransformPublicWires>,
+        /// The sole CRT reconstruction spec and its generic fixed linear transform.
+        pub anchor_reduce:
+            Option<((u32, Vec<num_bigint::BigUint>), TallLinearTransformPublicWires)>,
     }
 
     impl CircuitLoweringTypes for BggTallSlotPublicKeyLowering {
@@ -1938,6 +1954,35 @@ mod tall {
             })
         }
 
+        fn slot_anchor_reduce(
+            &mut self,
+            input: &Self::Wire,
+            num_blocks: u32,
+            lane_scalars: &[num_bigint::BigUint],
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            let (_, transform) = self
+                .anchor_reduce
+                .as_ref()
+                .filter(|((blocks, scalars), _)| {
+                    *blocks == num_blocks && scalars.as_slice() == lane_scalars
+                })
+                .ok_or(CircuitCompileError::Unsupported {
+                    gate: gate.local_gate().index(),
+                    feature: "missing Tall anchor-reduction encoding",
+                })?;
+            let tall = BggTallEncodingCompiler { public_key: self.compiler.clone() };
+            let helper_public = tall.linear_transform_public_key(
+                input,
+                &transform.left_matrix,
+                &transform.right_matrix,
+            );
+            let scalar = self.compiler.ring.polynomial([mxx_ir_core::IntExpr::constant(
+                num_bigint::BigInt::from(lane_scalars[0].clone()),
+            )]);
+            Ok(self.compiler.add(&self.compiler.large_scalar_mul(input, &scalar), &helper_public))
+        }
+
         fn slot_rotation(
             &mut self,
             input: &Self::Wire,
@@ -1961,20 +2006,18 @@ mod tall {
                     gate: gate.local_gate().index(),
                 });
             }
-            let rotation = self.rotations.get(&key).ok_or(
+            let transform = self.rotations.get(&key).ok_or(
                 CircuitCompileError::MissingTallRotationEncoding {
                     num_slots: key.num_slots,
                     offset: key.offset,
                 },
             )?;
-            let base = self.compiler.base.clone();
-            let digits = self.compiler.digit_count.clone();
-            let step1 = rotation.a_forward.clone() *
-                input.matrix.clone().decompose(base.clone(), digits.clone()).as_mat();
-            Ok(BggPublicKeyWire {
-                matrix: step1 * rotation.a_backward.clone().decompose(base, digits).as_mat(),
-                reveal_plaintext: input.reveal_plaintext,
-            })
+            Ok(BggTallEncodingCompiler { public_key: self.compiler.clone() }
+                .linear_transform_public_key(
+                    input,
+                    &transform.left_matrix,
+                    &transform.right_matrix,
+                ))
         }
 
         fn slot_identity_repeated_lanes(
@@ -2009,20 +2052,55 @@ mod tall {
     #[derive(Clone)]
     pub struct BggTallSlotLowering {
         /// Tall arithmetic compiler.
-        pub compiler: BggTallEncodingCompiler,
+        compiler: BggTallEncodingCompiler,
         /// Public key used for every per-row diagonal mask.
-        pub diagonal_mask_public_key: BggPublicKeyWire,
+        diagonal_mask_public_key: BggPublicKeyWire,
         /// The one fresh Tall secret-row family owned by the online graph.
-        pub secret_rows: Family<Mat>,
+        secret_rows: Family<Mat>,
         /// Error configuration for direct diagonal-mask encodings.
-        pub sampler: BggTallEncodingSampler,
+        sampler: BggTallEncodingSampler,
         /// Direct tall-rotation encodings keyed by `(num_slots, normalized_offset)`.
-        pub rotations: BTreeMap<TallRotationEncodingKey, TallRotationEncodingWires>,
+        rotations: BTreeMap<TallRotationEncodingKey, TallLinearTransformEncodingWires>,
+        anchor_reduce: Option<((u32, Vec<num_bigint::BigUint>), TallLinearTransformEncodingWires)>,
+        /// Reusable encodings of compact repeated-lane masks, keyed by their canonical scalars.
+        ///
+        /// The configured slot count fixes the repetition count, so the short lane pattern is a
+        /// complete semantic key. `None` and `Some(1)` are both canonicalized to `1`.
+        repeated_lane_mask_encodings: BTreeMap<Vec<u32>, BggTallEncodingWire>,
+        /// Decomposition shared by consecutive masks applied to the same Tall input.
+        cached_rhs_decomposition: Option<(ValueHandle, Mat)>,
     }
 
     impl BggTallSlotLowering {
+        pub fn new(
+            compiler: BggTallEncodingCompiler,
+            diagonal_mask_public_key: BggPublicKeyWire,
+            secret_rows: Family<Mat>,
+            sampler: BggTallEncodingSampler,
+            rotations: BTreeMap<TallRotationEncodingKey, TallLinearTransformEncodingWires>,
+            anchor_reduce: Option<(
+                (u32, Vec<num_bigint::BigUint>),
+                TallLinearTransformEncodingWires,
+            )>,
+        ) -> Self {
+            Self {
+                compiler,
+                diagonal_mask_public_key,
+                secret_rows,
+                sampler,
+                rotations,
+                anchor_reduce,
+                repeated_lane_mask_encodings: BTreeMap::new(),
+                cached_rhs_decomposition: None,
+            }
+        }
+
+        pub fn repeated_lane_mask_encoding_count(&self) -> usize {
+            self.repeated_lane_mask_encodings.len()
+        }
+
         fn transfer(
-            &self,
+            &mut self,
             input: &BggTallEncodingWire,
             source_slots: &[(u32, Option<u32>)],
             gate: GateInstance<'_>,
@@ -2040,7 +2118,7 @@ mod tall {
                 self.diagonal_mask_public_key.clone(),
                 masks,
             )?;
-            Ok(self.compiler.simd_mul(&mask, input)?)
+            self.multiply_mask(&mask, input)
         }
 
         fn configured_slot_count(&self) -> usize {
@@ -2052,8 +2130,28 @@ mod tall {
             }
         }
 
+        fn multiply_mask(
+            &mut self,
+            mask: &BggTallEncodingWire,
+            input: &BggTallEncodingWire,
+        ) -> Result<BggTallEncodingWire, CircuitCompileError> {
+            let input_handle = input.pubkey.matrix.value_handle();
+            let decomposition = match &self.cached_rhs_decomposition {
+                Some((cached_handle, decomposition)) if cached_handle == input_handle => {
+                    decomposition.clone()
+                }
+                _ => {
+                    let decomposition = self.compiler.public_key.decompose(&input.pubkey);
+                    self.cached_rhs_decomposition =
+                        Some((input_handle.clone(), decomposition.clone()));
+                    decomposition
+                }
+            };
+            Ok(self.compiler.simd_mul_with_decomposition(mask, input, decomposition)?)
+        }
+
         fn transfer_identity_repeated_lanes(
-            &self,
+            &mut self,
             input: &BggTallEncodingWire,
             num_blocks: u32,
             lane_scalars: &[Option<u32>],
@@ -2065,17 +2163,24 @@ mod tall {
                 self.configured_slot_count(),
                 gate,
             )?;
-            let masks = identity_repeated_lane_masks(
-                &self.sampler.layout.ring(),
-                total_slots,
-                lane_scalars,
-            )?;
-            let mask = self.sampler.sample_diagonal(
-                self.secret_rows.clone(),
-                self.diagonal_mask_public_key.clone(),
-                masks,
-            )?;
-            Ok(self.compiler.simd_mul(&mask, input)?)
+            let key = canonical_lane_scalar_pattern(lane_scalars);
+            let mask = if let Some(mask) = self.repeated_lane_mask_encodings.get(&key) {
+                mask.clone()
+            } else {
+                let masks = identity_repeated_lane_masks(
+                    &self.sampler.layout.ring(),
+                    total_slots,
+                    lane_scalars,
+                )?;
+                let mask = self.sampler.sample_diagonal(
+                    self.secret_rows.clone(),
+                    self.diagonal_mask_public_key.clone(),
+                    masks,
+                )?;
+                self.repeated_lane_mask_encodings.insert(key, mask.clone());
+                mask
+            };
+            self.multiply_mask(&mask, input)
         }
     }
 
@@ -2107,6 +2212,26 @@ mod tall {
             })
         }
 
+        fn slot_anchor_reduce(
+            &mut self,
+            input: &Self::Wire,
+            num_blocks: u32,
+            lane_scalars: &[num_bigint::BigUint],
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            let ((blocks, scalars), transform) = self
+                .anchor_reduce
+                .as_ref()
+                .filter(|((blocks, scalars), _)| {
+                    *blocks == num_blocks && scalars.as_slice() == lane_scalars
+                })
+                .ok_or(CircuitCompileError::Unsupported {
+                    gate: gate.local_gate().index(),
+                    feature: "missing Tall anchor-reduction encoding",
+                })?;
+            self.compiler.anchor_reduce(input, *blocks, scalars, transform).map_err(Into::into)
+        }
+
         fn slot_rotation(
             &mut self,
             input: &Self::Wire,
@@ -2130,15 +2255,13 @@ mod tall {
             else {
                 return Ok(input.clone());
             };
-            let rotation = self.rotations.get(&key).ok_or(
+            let transform = self.rotations.get(&key).ok_or(
                 CircuitCompileError::MissingTallRotationEncoding {
                     num_slots: key.num_slots,
                     offset: key.offset,
                 },
             )?;
-            self.compiler
-                .rotate(input, rotation, TallRotationDirection::Forward)
-                .map_err(Into::into)
+            self.compiler.rotate(input, key, transform).map_err(Into::into)
         }
 
         fn slot_identity_repeated_lanes(
@@ -2208,6 +2331,20 @@ mod tall {
                     .collect(),
             )
         })
+    }
+
+    fn canonical_lane_scalar_pattern(lane_scalars: &[Option<u32>]) -> Vec<u32> {
+        let scalars = lane_scalars.iter().map(|scalar| scalar.unwrap_or(1)).collect::<Vec<_>>();
+        let period = (1..=scalars.len())
+            .find(|period| {
+                scalars.len() % period == 0 &&
+                    scalars
+                        .iter()
+                        .enumerate()
+                        .all(|(index, scalar)| scalar == &scalars[index % period])
+            })
+            .expect("a scalar pattern always repeats over its full length");
+        scalars[..period].to_vec()
     }
 
     #[cfg(test)]

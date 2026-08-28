@@ -1,6 +1,6 @@
-//! Tall rotation encoding preprocessing and artifact definitions.
+//! Fixed linear-transform encodings used by Tall slot operations.
 
-use crate::tall_encoding::{TallCompileError, rotate_family, same_matrix_type};
+use crate::tall_encoding::{TallCompileError, anchor_matrix_rows, rotate_family, same_matrix_type};
 use mxx_dsl::{Bytes, DslContext, Family, HashTag, Mat, Ring};
 use mxx_gadgets::{
     Poly,
@@ -10,6 +10,7 @@ use mxx_ir_core::{
     IntExpr, RealExpr,
     artifact::{ArtifactConfidentiality, ProductionId},
 };
+use num_bigint::BigUint;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Stable identity of one directly provisioned rotation pair.
@@ -30,15 +31,6 @@ impl TallRotationEncodingKey {
         let offset = offset % num_slots;
         Ok((offset != 0).then_some(Self { num_slots, offset }))
     }
-}
-
-/// Direction in which a provisioned cyclic rotation pair is applied.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TallRotationDirection {
-    /// Applies `P_r`, so output row `j` receives input row `j-r`.
-    Forward,
-    /// Applies `P_r^-1`, so output row `j` receives input row `j+r`.
-    Backward,
 }
 
 /// Deterministic artifact names for one rotation pair.
@@ -70,38 +62,36 @@ pub struct TallRotationEncodingArtifacts {
     pub slot_count: u32,
 }
 
-/// Four graph wires forming one directly provisioned rotation pair.
+/// Public matrices for one fixed linear Tall transform `L * X * R`.
 #[derive(Clone)]
-pub struct TallRotationEncodingWires {
-    /// Pair identity.
-    pub key: TallRotationEncodingKey,
-    /// Public matrix for `P_r`.
-    pub a_forward: Mat,
-    /// Public matrix for `P_r^-1`.
-    pub a_backward: Mat,
-    /// Encoding rows for `P_r`.
-    pub c_forward: Family<Mat>,
-    /// Encoding rows for `P_r^-1`.
-    pub c_backward: Family<Mat>,
+pub struct TallLinearTransformPublicWires {
+    /// Public matrix applied on the left.
+    pub left_matrix: Mat,
+    /// Public matrix applied on the right.
+    pub right_matrix: Mat,
 }
 
-/// Public half of one rotation pair, produced before the online secret exists.
+/// Online fixed-matrix encodings for one linear Tall transform `L * X * R`.
 #[derive(Clone)]
-pub struct TallRotationPublicWires {
-    /// Pair identity.
-    pub key: TallRotationEncodingKey,
-    /// Public matrix for `P_r`.
-    pub a_forward: Mat,
-    /// Public matrix for `P_r^-1`.
-    pub a_backward: Mat,
+pub struct TallLinearTransformEncodingWires {
+    /// Public matrix applied on the left.
+    pub left_matrix: Mat,
+    /// Public matrix applied on the right.
+    pub right_matrix: Mat,
+    /// Secret-dependent encoding rows for the left matrix.
+    pub left_rows: Family<Mat>,
+    /// Secret-dependent encoding rows for the right matrix.
+    pub right_rows: Family<Mat>,
 }
 
 /// Public preprocessing wires for every offset handled by one compiler instance.
 #[derive(Clone, Default)]
 pub struct TallRotationEncodingPreprocessingWires {
     /// Directly provisioned nonidentity pairs.
-    pub rotations: BTreeMap<TallRotationEncodingKey, TallRotationPublicWires>,
+    pub rotations: BTreeMap<TallRotationEncodingKey, TallLinearTransformPublicWires>,
 }
+
+pub const TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT: &str = "bgg_tall_anchor_reduce_matrix";
 
 /// Compiler for tall rotation encoding preprocessing and artifact import.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,6 +125,67 @@ pub fn required_tall_rotation_encodings<P: Poly>(
     let mut required = BTreeSet::new();
     collect_tall_rotation_encodings(circuit, &[], &mut required)?;
     Ok(required)
+}
+
+/// Returns the graph's sole anchor-reduction specification, if present.
+pub fn required_tall_anchor_reduce_encoding<P: Poly>(
+    circuit: &PolyCircuit<P>,
+) -> Result<Option<(u32, Vec<BigUint>)>, TallCompileError> {
+    let mut required = None;
+    collect_tall_anchor_reduce_encoding(circuit, &[], &mut required)?;
+    Ok(required)
+}
+
+fn collect_tall_anchor_reduce_encoding<P: Poly>(
+    circuit: &PolyCircuit<P>,
+    bindings: &[SubCircuitParamValue],
+    required: &mut Option<(u32, Vec<BigUint>)>,
+) -> Result<(), TallCompileError> {
+    let mut visited_calls = BTreeSet::new();
+    let mut visited_summed_calls = BTreeSet::new();
+    for (_, gate) in circuit.gates_in_id_order() {
+        match &gate.gate_type {
+            PolyGateType::SlotTransfer { src_slots } => {
+                let spec = match src_slots {
+                    GateParamSource::Const(spec) => spec,
+                    GateParamSource::Param(parameter) => match bindings.get(*parameter) {
+                        Some(SubCircuitParamValue::SlotTransfer(spec)) => spec,
+                        _ => continue,
+                    },
+                };
+                if let SlotTransferSpec::AnchorReduce { num_blocks, lane_scalars } = spec {
+                    let candidate = (*num_blocks, lane_scalars.clone());
+                    if required.as_ref().is_some_and(|current| current != &candidate) {
+                        return Err(TallCompileError::ConflictingAnchorReduceEncoding);
+                    }
+                    *required = Some(candidate);
+                }
+            }
+            PolyGateType::SubCircuitOutput { call_id, .. } if visited_calls.insert(*call_id) => {
+                let info = circuit.sub_circuit_call_info(*call_id);
+                collect_tall_anchor_reduce_encoding(
+                    circuit.registered_sub_circuit_ref(info.sub_circuit_id).as_ref(),
+                    info.param_bindings.as_ref(),
+                    required,
+                )?;
+            }
+            PolyGateType::SummedSubCircuitOutput { summed_call_id, .. }
+                if visited_summed_calls.insert(*summed_call_id) =>
+            {
+                let info = circuit.summed_sub_circuit_call_info(*summed_call_id);
+                let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
+                for call_bindings in &info.param_bindings {
+                    collect_tall_anchor_reduce_encoding(
+                        child.as_ref(),
+                        call_bindings.as_ref(),
+                        required,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn collect_tall_rotation_encodings<P: Poly>(
@@ -193,6 +244,92 @@ fn collect_tall_rotation_encodings<P: Poly>(
 }
 
 impl TallRotationEncodingCompiler {
+    /// Computes the one `S * G` family shared by every rotation offset and direction.
+    pub fn secret_gadget_rows(
+        &self,
+        secret_rows: Family<Mat>,
+    ) -> Result<Family<Mat>, TallCompileError> {
+        self.validate_secret_rows(&secret_rows)?;
+        let gadget =
+            self.ring().gadget(self.secret_size, self.gadget_base.clone(), self.digit_count);
+        Ok(secret_rows.parallel_map(move |_, secret| secret * gadget.clone())?)
+    }
+
+    pub fn preprocess_anchor_reduce(
+        &self,
+        hash_key: Bytes,
+        num_blocks: u32,
+        lane_scalars: Vec<BigUint>,
+    ) -> Result<TallLinearTransformPublicWires, TallCompileError> {
+        self.validate_anchor_reduce(num_blocks, &lane_scalars)?;
+        let matrix = self.ring().hash_matrix(
+            hash_key,
+            HashTag::from(b"bgg_tall_anchor_reduce_matrix".as_slice()),
+            (self.secret_size, self.gadget_columns()),
+        );
+        Ok(TallLinearTransformPublicWires { left_matrix: matrix.clone(), right_matrix: matrix })
+    }
+
+    pub fn encode_anchor_reduce(
+        &self,
+        public: &TallLinearTransformPublicWires,
+        num_blocks: u32,
+        lane_scalars: &[BigUint],
+        secret_rows: Family<Mat>,
+        secret_gadget_rows: Family<Mat>,
+    ) -> Result<TallLinearTransformEncodingWires, TallCompileError> {
+        self.validate_anchor_reduce(num_blocks, lane_scalars)?;
+        self.validate_secret_rows(&secret_rows)?;
+        if secret_gadget_rows.count() != &IntExpr::constant(self.slot_count) {
+            return Err(TallCompileError::InvalidAnchorReduceLayout);
+        }
+        let transformed = anchor_matrix_rows(
+            &secret_gadget_rows,
+            usize::try_from(num_blocks).map_err(|_| TallCompileError::InvalidAnchorReduceLayout)?,
+            lane_scalars,
+            &self.ring(),
+        )?;
+        let ring = self.ring();
+        let matrix = public.left_matrix.clone();
+        let sigma = self.error_sigma.clone();
+        let bound = self.error_max_coefficient_bound.clone();
+        let columns = self.gadget_columns();
+        let rows = secret_rows.parallel_zip(transformed, move |_, secret, shifted| {
+            secret * matrix.clone() - shifted +
+                ring.gaussian((1, columns), sigma.clone(), bound.clone())
+        })?;
+        Ok(TallLinearTransformEncodingWires {
+            left_matrix: public.left_matrix.clone(),
+            right_matrix: public.right_matrix.clone(),
+            left_rows: rows.clone(),
+            right_rows: rows,
+        })
+    }
+
+    pub fn export_anchor_reduce_preprocessing(
+        &self,
+        context: DslContext,
+        public: TallLinearTransformPublicWires,
+    ) -> Result<DslContext, TallCompileError> {
+        Ok(context.public_output(TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT, public.left_matrix)?)
+    }
+
+    pub fn import_anchor_reduce_artifact(
+        &self,
+        artifacts: &TallRotationEncodingArtifacts,
+        num_blocks: u32,
+        lane_scalars: Vec<BigUint>,
+    ) -> Result<TallLinearTransformPublicWires, TallCompileError> {
+        self.validate_anchor_reduce(num_blocks, &lane_scalars)?;
+        let matrix = self.ring().artifact_input(
+            artifacts.production_id.clone(),
+            TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT,
+            (self.secret_size, self.gadget_columns()),
+            ArtifactConfidentiality::Public,
+        );
+        Ok(TallLinearTransformPublicWires { left_matrix: matrix.clone(), right_matrix: matrix })
+    }
+
     /// Builds the public matrices for all directly requested nonidentity rotation pairs.
     pub fn preprocess(
         &self,
@@ -217,35 +354,40 @@ impl TallRotationEncodingCompiler {
         for key in keys {
             let a_forward = self.tall_rotation_public_matrix(&hash_key, key, false);
             let a_backward = self.tall_rotation_public_matrix(&hash_key, key, true);
-            rotations.insert(key, TallRotationPublicWires { key, a_forward, a_backward });
+            rotations.insert(
+                key,
+                TallLinearTransformPublicWires { left_matrix: a_forward, right_matrix: a_backward },
+            );
         }
         Ok(TallRotationEncodingPreprocessingWires { rotations })
     }
 
     /// Constructs the secret-dependent rotation rows inside the online graph.
-    pub fn encode(
+    pub fn encode_rotation(
         &self,
-        public: &TallRotationPublicWires,
+        key: TallRotationEncodingKey,
+        public: &TallLinearTransformPublicWires,
         secret_rows: Family<Mat>,
-    ) -> Result<TallRotationEncodingWires, TallCompileError> {
-        self.validate_online_layout(public, &secret_rows)?;
+        secret_gadget_rows: Family<Mat>,
+    ) -> Result<TallLinearTransformEncodingWires, TallCompileError> {
+        self.validate_online_layout(key, public, &secret_rows, &secret_gadget_rows)?;
         let ring = self.ring();
-        let gadget = ring.gadget(self.secret_size, self.gadget_base.clone(), self.digit_count);
-        let forward_offset = usize::try_from(public.key.offset)
+        let forward_offset =
+            usize::try_from(key.offset).map_err(|_| TallCompileError::InvalidRotationLayout)?;
+        let backward_offset = usize::try_from((key.num_slots - key.offset) % key.num_slots)
             .map_err(|_| TallCompileError::InvalidRotationLayout)?;
-        let backward_offset =
-            usize::try_from((public.key.num_slots - public.key.offset) % public.key.num_slots)
-                .map_err(|_| TallCompileError::InvalidRotationLayout)?;
-        let shifted_forward = rotate_family(&secret_rows, forward_offset, self.slot_count)?;
-        let shifted_backward = rotate_family(&secret_rows, backward_offset, self.slot_count)?;
+        // `(P_r S) G = P_r (S G)`: rotate the shared product rather than
+        // recomputing it for every offset and direction.
+        let shifted_forward = rotate_family(&secret_gadget_rows, forward_offset, self.slot_count)?;
+        let shifted_backward =
+            rotate_family(&secret_gadget_rows, backward_offset, self.slot_count)?;
         let c_forward = secret_rows.clone().parallel_zip(shifted_forward, {
             let ring = ring.clone();
-            let a_forward = public.a_forward.clone();
-            let gadget = gadget.clone();
+            let a_forward = public.left_matrix.clone();
             let sigma = self.error_sigma.clone();
             let columns = self.gadget_columns();
-            move |_, current, shifted| {
-                current * a_forward.clone() - shifted * gadget.clone() +
+            move |_, current, shifted_gadget| {
+                current * a_forward.clone() - shifted_gadget +
                     ring.gaussian(
                         (1, columns),
                         sigma.clone(),
@@ -255,12 +397,11 @@ impl TallRotationEncodingCompiler {
         })?;
         let c_backward = secret_rows.parallel_zip(shifted_backward, {
             let ring = ring.clone();
-            let a_backward = public.a_backward.clone();
-            let gadget = gadget.clone();
+            let a_backward = public.right_matrix.clone();
             let sigma = self.error_sigma.clone();
             let columns = self.gadget_columns();
-            move |_, current, shifted| {
-                current * a_backward.clone() - shifted * gadget.clone() +
+            move |_, current, shifted_gadget| {
+                current * a_backward.clone() - shifted_gadget +
                     ring.gaussian(
                         (1, columns),
                         sigma.clone(),
@@ -268,12 +409,11 @@ impl TallRotationEncodingCompiler {
                     )
             }
         })?;
-        Ok(TallRotationEncodingWires {
-            key: public.key,
-            a_forward: public.a_forward.clone(),
-            a_backward: public.a_backward.clone(),
-            c_forward,
-            c_backward,
+        Ok(TallLinearTransformEncodingWires {
+            left_matrix: public.left_matrix.clone(),
+            right_matrix: public.right_matrix.clone(),
+            left_rows: c_forward,
+            right_rows: c_backward,
         })
     }
 
@@ -286,8 +426,8 @@ impl TallRotationEncodingCompiler {
         for (key, rotation) in wires.rotations {
             let names = TallRotationEncodingArtifactNames::for_key(key);
             context = context
-                .public_output(names.a_forward, rotation.a_forward)?
-                .public_output(names.a_backward, rotation.a_backward)?;
+                .public_output(names.a_forward, rotation.left_matrix)?
+                .public_output(names.a_backward, rotation.right_matrix)?;
         }
         Ok(context)
     }
@@ -297,7 +437,8 @@ impl TallRotationEncodingCompiler {
         &self,
         artifacts: &TallRotationEncodingArtifacts,
         offset: u32,
-    ) -> Result<Option<TallRotationPublicWires>, TallCompileError> {
+    ) -> Result<Option<(TallRotationEncodingKey, TallLinearTransformPublicWires)>, TallCompileError>
+    {
         let expected_slots =
             u32::try_from(self.slot_count).map_err(|_| TallCompileError::InvalidRotationLayout)?;
         if artifacts.slot_count != expected_slots {
@@ -308,21 +449,23 @@ impl TallRotationEncodingCompiler {
         };
         let names = TallRotationEncodingArtifactNames::for_key(key);
         let ring = self.ring();
-        Ok(Some(TallRotationPublicWires {
+        Ok(Some((
             key,
-            a_forward: ring.artifact_input(
-                artifacts.production_id.clone(),
-                names.a_forward,
-                (self.secret_size, self.gadget_columns()),
-                ArtifactConfidentiality::Public,
-            ),
-            a_backward: ring.artifact_input(
-                artifacts.production_id.clone(),
-                names.a_backward,
-                (self.secret_size, self.gadget_columns()),
-                ArtifactConfidentiality::Public,
-            ),
-        }))
+            TallLinearTransformPublicWires {
+                left_matrix: ring.artifact_input(
+                    artifacts.production_id.clone(),
+                    names.a_forward,
+                    (self.secret_size, self.gadget_columns()),
+                    ArtifactConfidentiality::Public,
+                ),
+                right_matrix: ring.artifact_input(
+                    artifacts.production_id.clone(),
+                    names.a_backward,
+                    (self.secret_size, self.gadget_columns()),
+                    ArtifactConfidentiality::Public,
+                ),
+            },
+        )))
     }
 
     fn validate_public_layout(&self) -> Result<(), TallCompileError> {
@@ -332,27 +475,59 @@ impl TallRotationEncodingCompiler {
         Ok(())
     }
 
-    fn validate_online_layout(
+    fn validate_anchor_reduce(
         &self,
-        public: &TallRotationPublicWires,
-        secret_rows: &Family<Mat>,
+        num_blocks: u32,
+        lane_scalars: &[BigUint],
     ) -> Result<(), TallCompileError> {
         self.validate_public_layout()?;
-        if public.key.num_slots !=
+        let blocks =
+            usize::try_from(num_blocks).map_err(|_| TallCompileError::InvalidAnchorReduceLayout)?;
+        if blocks == 0 ||
+            lane_scalars.is_empty() ||
+            blocks.checked_mul(lane_scalars.len()) != Some(self.slot_count)
+        {
+            return Err(TallCompileError::InvalidAnchorReduceLayout);
+        }
+        Ok(())
+    }
+
+    fn validate_online_layout(
+        &self,
+        key: TallRotationEncodingKey,
+        public: &TallLinearTransformPublicWires,
+        secret_rows: &Family<Mat>,
+        secret_gadget_rows: &Family<Mat>,
+    ) -> Result<(), TallCompileError> {
+        self.validate_secret_rows(secret_rows)?;
+        if key.num_slots !=
             u32::try_from(self.slot_count)
                 .map_err(|_| TallCompileError::InvalidRotationLayout)? ||
-            secret_rows.count() != &IntExpr::constant(self.slot_count) ||
+            secret_gadget_rows.count() != &IntExpr::constant(self.slot_count) ||
+            !same_matrix_type(
+                secret_gadget_rows.element_type(),
+                &self.ring().matrix_type((1, self.gadget_columns())),
+            ) ||
+            !same_matrix_type(
+                public.left_matrix.matrix_type(),
+                &self.ring().matrix_type((self.secret_size, self.gadget_columns())),
+            ) ||
+            !same_matrix_type(
+                public.right_matrix.matrix_type(),
+                &self.ring().matrix_type((self.secret_size, self.gadget_columns())),
+            )
+        {
+            return Err(TallCompileError::InvalidLayout);
+        }
+        Ok(())
+    }
+
+    fn validate_secret_rows(&self, secret_rows: &Family<Mat>) -> Result<(), TallCompileError> {
+        self.validate_public_layout()?;
+        if secret_rows.count() != &IntExpr::constant(self.slot_count) ||
             !same_matrix_type(
                 secret_rows.element_type(),
                 &self.ring().matrix_type((1, self.secret_size)),
-            ) ||
-            !same_matrix_type(
-                public.a_forward.matrix_type(),
-                &self.ring().matrix_type((self.secret_size, self.gadget_columns())),
-            ) ||
-            !same_matrix_type(
-                public.a_backward.matrix_type(),
-                &self.ring().matrix_type((self.secret_size, self.gadget_columns())),
             )
         {
             return Err(TallCompileError::InvalidLayout);

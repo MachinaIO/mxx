@@ -12,11 +12,9 @@ use super::{
         ScalarOperation, SemanticFamilySourceIdentity, SemanticSourceIdentity, TrapdoorOperation,
         TrustedIndexRange, TypedConstant, ValueOperator, ValueTransformOperation,
     },
-    facts::{
-        CoefficientBound, MatrixFacts, MatrixMetadata, NumericContract, PolynomialFacts, ValueFacts,
-    },
+    facts::{CoefficientBound, MatrixFacts, MatrixMetadata, NumericContract, PolynomialFacts},
     job::{CandidateToken, CheckerJob, JobError},
-    normal_form::CompactShellPlan,
+    normal_form::{CompactShellPlan, authorized_gadget_pair_rule_from},
     program::{
         BetaReason, FamilyValueId, ProgramDiagnosticCounters, SelectionSelector, ValueProgramId,
     },
@@ -2084,6 +2082,7 @@ impl<'a> ProductionAdapter<'a> {
         let mut plan = CompactShellPlan::default();
         let mut authorized_scalars = BTreeSet::<ExprId>::new();
         let mut other_scalar_parents = BTreeSet::<ExprId>::new();
+        let mut ordinary_gadget_pairs = BTreeSet::<(ExprId, ExprId)>::new();
         let mut index_projector = IndexRangeProjector::new(self);
         let root_key = CompactCompilerStateKey {
             expression: root,
@@ -2510,17 +2509,7 @@ impl<'a> ProductionAdapter<'a> {
                     )?;
                     reducible_expansions = reducible_expansions.saturating_add(1);
                 }
-                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
-                    output: decomposition_type,
-                    base,
-                    small,
-                    digit_count,
-                }) => {
-                    if binding_subtree {
-                        return Err(
-                            "compact binding subtree contains a gadget plan occurrence".to_owned()
-                        );
-                    }
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose { .. }) => {
                     if node.inputs.len() != 1 ||
                         !matches!(output, ResolvedValueType::Matrix(_)) ||
                         !matches!(
@@ -2531,139 +2520,123 @@ impl<'a> ProductionAdapter<'a> {
                         return Err("gadget decomposition type or arity mismatch".to_owned());
                     }
                     let input = node.inputs[0];
-                    let input_node = match self.job.expressions().node(input) {
-                        Ok(node) => node,
-                        Err(_) => return Err("invalid gadget input authority".to_owned()),
+                    let planned_rule = if !binding_subtree {
+                        parent.and_then(|(parent_expression, is_right_child)| {
+                            if !is_right_child {
+                                return None;
+                            }
+                            let parent_node =
+                                self.job.expressions().node(parent_expression).ok()?;
+                            if !matches!(
+                                parent_node.operator,
+                                ValueOperator::Matrix(MatrixOperation::Multiply)
+                            ) || parent_node.inputs.len() != 2 ||
+                                parent_node.inputs[1] != expression
+                            {
+                                return None;
+                            }
+                            let gadget = parent_node.inputs[0];
+                            let (input, rule) = authorized_gadget_pair_rule_from(
+                                self.job.expressions(),
+                                self.job.facts(),
+                                Some(self.job.gadget_recompositions()),
+                                gadget,
+                                expression,
+                                false,
+                            )
+                            .ok()??;
+                            Some((input, rule))
+                        })
+                    } else {
+                        None
                     };
-                    if !matches!(
-                        input_node.operator,
-                        ValueOperator::Constant(_) |
-                            ValueOperator::Source(_) |
-                            ValueOperator::Sample { .. } |
-                            ValueOperator::Sampler { .. } |
-                            ValueOperator::DeterministicHash(_) |
-                            ValueOperator::OpaqueFamilyElement { .. } |
-                            ValueOperator::ExplicitElement { .. } |
-                            ValueOperator::Trapdoor(_)
-                    ) {
-                        return Err("gadget decomposition input is not a concrete leaf".to_owned());
-                    }
-                    match self.job.expressions().is_closed(input) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            return Err("gadget decomposition input is binder-dependent".to_owned())
+                    if let Some((input, rule)) = planned_rule {
+                        let input_node = self
+                            .job
+                            .expressions()
+                            .node(input)
+                            .map_err(|_| "invalid gadget input authority".to_owned())?;
+                        if !matches!(
+                            input_node.operator,
+                            ValueOperator::Constant(_) |
+                                ValueOperator::Source(_) |
+                                ValueOperator::Sample { .. } |
+                                ValueOperator::Sampler { .. } |
+                                ValueOperator::DeterministicHash(_) |
+                                ValueOperator::OpaqueFamilyElement { .. } |
+                                ValueOperator::ExplicitElement { .. } |
+                                ValueOperator::Trapdoor(_)
+                        ) {
+                            return Err(
+                                "gadget decomposition input is not a concrete leaf".to_owned()
+                            );
                         }
-                        Err(_) => return Err("invalid gadget input closedness".to_owned()),
-                    }
-                    let Some(ResolvedValueType::Matrix(input_type)) =
-                        self.job.expressions().value_type(input).ok()
-                    else {
-                        return Err("gadget decomposition input type mismatch".to_owned());
-                    };
-                    let decomposition_layout =
-                        self.job.facts().facts(expression).ok().and_then(|facts| match facts {
-                            ValueFacts::Matrix(facts) => Some(facts.metadata.layout.clone()),
-                            _ => None,
+                        if !self.job.expressions().is_closed(input).unwrap_or(false) {
+                            return Err("gadget decomposition input is binder-dependent".to_owned());
+                        }
+                        state_plan_delta = Some(CompactCompilerPlanDelta::Gadget {
+                            shell: expression,
+                            input,
+                            rule,
                         });
-                    let input_layout =
-                        self.job.facts().facts(input).ok().and_then(|facts| match facts {
-                            ValueFacts::Matrix(facts) => Some(facts.metadata.layout.clone()),
-                            _ => None,
-                        });
-                    if !self.job.gadget_recompositions().allows_decomposition_half_unfrozen(
-                        *base,
-                        *small,
-                        *digit_count,
-                        decomposition_type,
-                        &input_type,
-                        decomposition_layout.as_ref(),
-                        input_layout.as_ref(),
-                    ) {
-                        return Err("gadget decomposition contract is uncertain".to_owned());
+                        let child_key = CompactCompilerStateKey {
+                            expression: input,
+                            owner,
+                            binding_environment: state_key.binding_environment,
+                            parent: CompactCompilerParent::Ordinary,
+                            under_planned_shell: true,
+                            scalar_call_context,
+                            binding_context,
+                            binding_subtree,
+                        };
+                        enqueue_compact_compiler_state(
+                            child_key,
+                            Some(state_index),
+                            &mut states,
+                            &mut state_ids,
+                            &active,
+                            &mut work,
+                        )?;
+                    } else {
+                        // An ordinary decomposition still uses the existing concrete transform
+                        // evaluator.  A virtual matrix child cannot supply the concrete semantic
+                        // input that evaluator requires, so reject this shape before the freeze
+                        // barrier rather than discovering it during compact normalization.
+                        let input_node = self
+                            .job
+                            .expressions()
+                            .node(input)
+                            .map_err(|_| "invalid gadget input authority".to_owned())?;
+                        if matches!(input_node.operator, ValueOperator::Matrix(_)) {
+                            return Err(
+                                "gadget decomposition input is not a concrete leaf".to_owned()
+                            );
+                        }
+                        ordinary_gadget_pairs.insert((expression, input));
+                        let child_key = CompactCompilerStateKey {
+                            expression: input,
+                            owner,
+                            binding_environment: state_key.binding_environment,
+                            parent: self.compact_parent_capability(
+                                expression,
+                                0,
+                                input,
+                                &valid_fixed_slices,
+                            ),
+                            under_planned_shell,
+                            scalar_call_context,
+                            binding_context,
+                            binding_subtree,
+                        };
+                        enqueue_compact_compiler_state(
+                            child_key,
+                            Some(state_index),
+                            &mut states,
+                            &mut state_ids,
+                            &active,
+                            &mut work,
+                        )?;
                     }
-                    let Some((parent_expression, is_right_child)) = parent else {
-                        return Err(
-                            "gadget decomposition has no authorized product consumer".to_owned()
-                        );
-                    };
-                    let parent_node = self
-                        .job
-                        .expressions()
-                        .node(parent_expression)
-                        .map_err(|_| "invalid gadget consumer parent".to_owned())?;
-                    if !matches!(
-                        parent_node.operator,
-                        ValueOperator::Matrix(MatrixOperation::Multiply)
-                    ) || !is_right_child ||
-                        parent_node.inputs.len() != 2 ||
-                        parent_node.inputs[1] != expression ||
-                        !self
-                            .is_gadget_product_operand(parent_node.inputs[0])
-                            .map_err(|_| "invalid gadget product operand".to_owned())?
-                    {
-                        return Err(
-                            "gadget decomposition has no authorized product consumer".to_owned()
-                        );
-                    }
-                    let ResolvedValueType::Matrix(decomposition_type) = self
-                        .job
-                        .expressions()
-                        .value_type(expression)
-                        .map_err(|_| "compact decomposition type is missing".to_owned())?
-                    else {
-                        return Err("compact decomposition is not a matrix".to_owned());
-                    };
-                    let gadget_type = ResolvedMatrixType::new(
-                        input_type.modulus.clone(),
-                        input_type.ring_dimension,
-                        input_type.rows,
-                        decomposition_type.rows,
-                    )
-                    .map_err(|_| "compact gadget type is invalid".to_owned())?;
-                    let gadget_layout = MatrixLayout::row_major(
-                        input_type.rows,
-                        input_type.rows.saturating_mul(*digit_count as usize),
-                    );
-                    let Some(rule) = self.job.gadget_recompositions().matching_rule_unfrozen(
-                        *base,
-                        *small,
-                        *digit_count,
-                        &gadget_type,
-                        decomposition_type,
-                        &input_type,
-                        &input_type,
-                        Some(&gadget_layout),
-                        decomposition_layout.as_ref(),
-                        input_layout.as_ref(),
-                    ) else {
-                        return Err("compact gadget rule is missing or ambiguous".to_owned());
-                    };
-                    if !self
-                        .gadget_operand_matches(parent_node.inputs[0], &rule)
-                        .map_err(|_| "invalid gadget product consumer".to_owned())?
-                    {
-                        return Err("gadget decomposition consumer rule mismatch".to_owned());
-                    }
-                    state_plan_delta =
-                        Some(CompactCompilerPlanDelta::Gadget { shell: expression, input, rule });
-                    let child_key = CompactCompilerStateKey {
-                        expression: input,
-                        owner,
-                        binding_environment: state_key.binding_environment,
-                        parent: CompactCompilerParent::Ordinary,
-                        under_planned_shell: true,
-                        scalar_call_context,
-                        binding_context,
-                        binding_subtree,
-                    };
-                    enqueue_compact_compiler_state(
-                        child_key,
-                        Some(state_index),
-                        &mut states,
-                        &mut state_ids,
-                        &active,
-                        &mut work,
-                    )?;
                 }
                 ValueOperator::Matrix(MatrixOperation::IndexedSlice {
                     output: slice_output,
@@ -3188,6 +3161,18 @@ impl<'a> ProductionAdapter<'a> {
         }
         if virtual_nodes == 0 {
             return Err("no virtual matrix algebra".to_owned());
+        }
+        let planned_gadget_pairs = states
+            .iter()
+            .filter_map(|state| match &state.plan_delta {
+                Some(CompactCompilerPlanDelta::Gadget { shell, input, .. }) => {
+                    Some((*shell, *input))
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if planned_gadget_pairs.iter().any(|pair| ordinary_gadget_pairs.contains(pair)) {
+            return Err("compact gadget shell has mixed planned and ordinary uses".to_owned());
         }
         if authorized_scalars.iter().any(|expression| other_scalar_parents.contains(expression)) {
             return Err("scalar compact factor has mixed consumer parents".to_owned());
@@ -3739,67 +3724,6 @@ impl<'a> ProductionAdapter<'a> {
             _ => return Err("indexed scalar consumer is not Multiply or Tensor".to_owned()),
         }
         Ok(())
-    }
-
-    fn is_gadget_product_operand(&self, root: ExprId) -> Result<bool, ProductionAdapterError> {
-        let mut work = vec![root];
-        while let Some(expression) = work.pop() {
-            let node = self.job.expressions().node(expression)?;
-            if matches!(
-                node.operator,
-                ValueOperator::Source(super::arena::SemanticSourceIdentity {
-                    matrix_constant: Some(MatrixConstantKind::Gadget { .. }),
-                    ..
-                })
-            ) {
-                continue;
-            }
-            if matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Add)) &&
-                node.inputs.len() == 2
-            {
-                work.extend(node.inputs.iter().copied());
-                continue;
-            }
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    fn gadget_operand_matches(
-        &self,
-        root: ExprId,
-        rule: &GadgetRecompositionRule,
-    ) -> Result<bool, ProductionAdapterError> {
-        let mut work = vec![root];
-        while let Some(expression) = work.pop() {
-            let node = self.job.expressions().node(expression)?;
-            let ValueOperator::Source(source) = &node.operator else {
-                if matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Add)) &&
-                    node.inputs.len() == 2
-                {
-                    work.extend(node.inputs.iter().copied());
-                    continue;
-                }
-                return Ok(false);
-            };
-            if !matches!(
-                source.matrix_constant,
-                Some(MatrixConstantKind::Gadget { base, small })
-                    if base == rule.base && small == rule.small
-            ) || self.job.expressions().value_type(expression)? !=
-                &ResolvedValueType::Matrix(rule.gadget_type.clone())
-            {
-                return Ok(false);
-            }
-            let layout = self.job.facts().facts(expression).ok().and_then(|facts| match facts {
-                ValueFacts::Matrix(facts) => Some(facts.metadata.layout.clone()),
-                _ => None,
-            });
-            if layout.as_ref() != rule.gadget_layout.as_ref() {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     /// Defensively revalidate and eagerly intern only the exact closed gadget shells admitted by
@@ -10471,6 +10395,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum GeneratedGadgetProductCase {
         Single,
+        Ordinary,
+        VirtualOrdinary,
         Sum,
         Shared,
         Mixed,
@@ -10491,14 +10417,24 @@ mod tests {
             node::{ConstantMatrix, MatrixBinaryOp, NodeKind},
             types::{MatrixType, WireType},
         };
+        let ordinary = matches!(
+            case,
+            GeneratedGadgetProductCase::Ordinary | GeneratedGadgetProductCase::VirtualOrdinary
+        );
         let input_matrix = MatrixType {
             modulus: IntExpr::constant(256),
             ring_dimension: IntExpr::constant(1),
-            rows: IntExpr::constant(2),
+            rows: IntExpr::constant(if ordinary { 1 } else { 2 }),
             columns: IntExpr::constant(4),
         };
         let gadget_matrix = MatrixType {
-            rows: if reverse { IntExpr::constant(4) } else { IntExpr::constant(2) },
+            rows: if reverse {
+                IntExpr::constant(4)
+            } else if ordinary {
+                IntExpr::constant(1)
+            } else {
+                IntExpr::constant(2)
+            },
             columns: IntExpr::constant(4),
             ..input_matrix.clone()
         };
@@ -10514,41 +10450,85 @@ mod tests {
             input_matrix.clone()
         };
         let (body, _) = with_new_construction_scope(|scope| {
-            let input = NodeHandle::new(
-                NodeKind::UniformResidueSample { matrix_type: input_matrix.clone() },
-                Vec::new(),
-                vec![WireType::Matrix(input_matrix.clone())],
-            )
-            .output(0)
-            .expect("gadget input");
+            let input = if matches!(case, GeneratedGadgetProductCase::VirtualOrdinary) {
+                let scalar = NodeHandle::new(
+                    NodeKind::UniformResidueSample {
+                        matrix_type: MatrixType {
+                            rows: IntExpr::constant(1),
+                            columns: IntExpr::constant(1),
+                            ..input_matrix.clone()
+                        },
+                    },
+                    Vec::new(),
+                    vec![WireType::Matrix(MatrixType {
+                        rows: IntExpr::constant(1),
+                        columns: IntExpr::constant(1),
+                        ..input_matrix.clone()
+                    })],
+                )
+                .output(0)
+                .expect("ordinary virtual scalar input");
+                let row = NodeHandle::new(
+                    NodeKind::UniformResidueSample { matrix_type: input_matrix.clone() },
+                    Vec::new(),
+                    vec![WireType::Matrix(input_matrix.clone())],
+                )
+                .output(0)
+                .expect("ordinary virtual row input");
+                NodeHandle::new(
+                    NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
+                    vec![scalar, row],
+                    vec![WireType::Matrix(input_matrix.clone())],
+                )
+                .output(0)
+                .expect("ordinary virtual gadget input")
+            } else {
+                NodeHandle::new(
+                    NodeKind::UniformResidueSample { matrix_type: input_matrix.clone() },
+                    Vec::new(),
+                    vec![WireType::Matrix(input_matrix.clone())],
+                )
+                .output(0)
+                .expect("gadget input")
+            };
             let decomposition = NodeHandle::new(
                 NodeKind::GadgetDecompose {
                     base: IntExpr::constant(4),
                     small: false,
-                    digit_count: IntExpr::constant(2),
+                    digit_count: IntExpr::constant(if ordinary { 4 } else { 2 }),
                 },
                 vec![input],
                 vec![WireType::Preimage(decomposition_matrix.clone())],
             )
             .output(0)
             .expect("gadget decomposition");
-            let gadget = NodeHandle::new(
-                NodeKind::ConstantMatrix {
-                    matrix_type: gadget_matrix.clone(),
-                    value: ConstantMatrix::Gadget {
-                        base: if matches!(case, GeneratedGadgetProductCase::Mismatch) {
-                            IntExpr::constant(8)
-                        } else {
-                            IntExpr::constant(4)
+            let gadget = if ordinary {
+                NodeHandle::new(
+                    NodeKind::UniformResidueSample { matrix_type: gadget_matrix.clone() },
+                    Vec::new(),
+                    vec![WireType::Matrix(gadget_matrix.clone())],
+                )
+                .output(0)
+                .expect("ordinary row source")
+            } else {
+                NodeHandle::new(
+                    NodeKind::ConstantMatrix {
+                        matrix_type: gadget_matrix.clone(),
+                        value: ConstantMatrix::Gadget {
+                            base: if matches!(case, GeneratedGadgetProductCase::Mismatch) {
+                                IntExpr::constant(8)
+                            } else {
+                                IntExpr::constant(4)
+                            },
+                            small: false,
                         },
-                        small: false,
                     },
-                },
-                Vec::new(),
-                vec![WireType::Matrix(gadget_matrix.clone())],
-            )
-            .output(0)
-            .expect("gadget source");
+                    Vec::new(),
+                    vec![WireType::Matrix(gadget_matrix.clone())],
+                )
+                .output(0)
+                .expect("gadget source")
+            };
             let gadget_sum = if matches!(case, GeneratedGadgetProductCase::Sum) {
                 let gadget_two = NodeHandle::new(
                     NodeKind::ConstantMatrix {
@@ -10583,6 +10563,8 @@ mod tests {
             };
             let product = if matches!(case, GeneratedGadgetProductCase::Standalone) {
                 decomposition.clone()
+            } else if ordinary {
+                make_product(gadget, decomposition)
             } else if reverse {
                 make_product(decomposition, gadget)
             } else if let Some(sum) = gadget_sum {
@@ -10727,6 +10709,8 @@ mod tests {
             "ciphertext",
             if reverse || matches!(case, GeneratedGadgetProductCase::Standalone) {
                 (4, 4)
+            } else if ordinary {
+                (1, 4)
             } else {
                 (2, 4)
             },
@@ -13573,7 +13557,7 @@ mod tests {
     }
 
     #[test]
-    fn production_extract_binding_gadget_body_rejects_plan_before_freeze() {
+    fn production_extract_binding_gadget_body_uses_ordinary_decomposition() {
         fn build(adapter: &mut ProductionAdapter<'_>) -> Value {
             let residual = adapter
                 .resolve(adapter.plan.target().residual.clone(), Rc::new(BTreeMap::new()))
@@ -13636,10 +13620,7 @@ mod tests {
         let plan = ProtocolPlan::build(&protocol, "toy-threshold").unwrap();
         let mut adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).unwrap();
         let value = build(&mut adapter);
-        assert_eq!(
-            adapter.compact_residual_preflight(&value).as_deref(),
-            Some("compact binding subtree contains a gadget plan occurrence")
-        );
+        assert_eq!(adapter.compact_residual_preflight(&value).as_deref(), None);
         assert!(!adapter.job.relations().is_frozen());
 
         let mut eager = ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).unwrap();
@@ -13795,7 +13776,7 @@ mod tests {
     }
 
     #[test]
-    fn production_binder_dependent_gadget_family_falls_back_before_freeze() {
+    fn production_binder_dependent_gadget_family_uses_ordinary_decomposition() {
         let protocol = generated_indexed_family_protocol(4, true, false, 1);
         let plan = ProtocolPlan::build(&protocol, "indexed-family-production")
             .expect("binder-dependent family protocol plan");
@@ -13804,17 +13785,14 @@ mod tests {
         let residual = preflight
             .resolve(plan.target().residual.clone(), Rc::new(BTreeMap::new()))
             .expect("binder-dependent family residual");
-        let reason = preflight
-            .compact_residual_preflight(&residual)
-            .expect("binder-dependent gadget must reject compact family");
-        assert_eq!(reason, "gadget decomposition input is not a concrete leaf");
+        assert!(preflight.compact_residual_preflight(&residual).is_none());
         assert!(!preflight.job.relations().is_frozen());
 
         let adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new())
             .expect("binder-dependent eager adapter");
         let (mut job, roots) = adapter.lower().expect("binder-dependent eager fallback lowering");
-        let ProductionRoot::Family(_) = roots.residual else {
-            panic!("binder-dependent family must retain ordinary family marker")
+        let ProductionRoot::CompactFamily(_) = roots.residual else {
+            panic!("binder-dependent family must retain compact family marker")
         };
         let target = super::super::report::ReportTarget {
             target_id: "indexed-family-production".to_owned(),
@@ -13823,13 +13801,13 @@ mod tests {
             boolean_interval: false,
         };
         let eager = super::super::report::analyze_roots(&mut job, &roots, &target)
-            .expect("binder-dependent eager family report");
+            .expect("binder-dependent compact family report");
         assert_eq!(eager.residual.exact_term_count, 0);
         assert_ne!(eager.residual.bound, super::super::report::BoundClass::Missing);
     }
 
     #[test]
-    fn production_binder_dependent_explicit_gadget_family_falls_back_before_freeze() {
+    fn production_binder_dependent_explicit_gadget_family_uses_ordinary_decomposition() {
         let protocol = generated_indexed_family_protocol(4, false, true, 1);
         let plan = ProtocolPlan::build(&protocol, "indexed-family-production")
             .expect("binder-dependent explicit family protocol plan");
@@ -13838,16 +13816,13 @@ mod tests {
         let residual = preflight
             .resolve(plan.target().residual.clone(), Rc::new(BTreeMap::new()))
             .expect("binder-dependent explicit family residual");
-        assert_eq!(
-            preflight.compact_residual_preflight(&residual).as_deref(),
-            Some("gadget decomposition input is binder-dependent")
-        );
+        assert!(preflight.compact_residual_preflight(&residual).is_none());
         assert!(!preflight.job.relations().is_frozen());
 
         let adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new())
             .expect("binder-dependent explicit eager adapter");
         let (mut job, roots) = adapter.lower().expect("binder-dependent explicit eager fallback");
-        assert!(matches!(roots.residual, ProductionRoot::Family(_)));
+        assert!(matches!(roots.residual, ProductionRoot::CompactFamily(_)));
         let target = super::super::report::ReportTarget {
             target_id: "indexed-family-production".to_owned(),
             plaintext_modulus: 2_u8.into(),
@@ -13855,7 +13830,7 @@ mod tests {
             boolean_interval: false,
         };
         let eager = super::super::report::analyze_roots(&mut job, &roots, &target)
-            .expect("binder-dependent explicit eager family report");
+            .expect("binder-dependent explicit compact family report");
         assert_eq!(eager.residual.exact_term_count, 0);
         assert_ne!(eager.residual.bound, super::super::report::BoundClass::Missing);
     }
@@ -15648,6 +15623,8 @@ mod tests {
         let ProductionRoot::Closed(eager_root) = eager_roots.residual else { unreachable!() };
         let eager = eager_job.normalize_closed_root(eager_root).unwrap();
         assert_eq!(compact_evidence, full_nf_descriptor_map(&eager_job, &eager.value));
+        assert_eq!(compact.counters.relation_applied, eager.counters.relation_applied);
+        assert_eq!(compact.counters.relation_remaining, eager.counters.relation_remaining);
     }
 
     #[test]
@@ -15838,8 +15815,195 @@ mod tests {
         let reverse_plan = ProtocolPlan::build(&reverse_protocol, "toy-threshold").unwrap();
         let reverse_adapter =
             ProductionAdapter::new(&reverse_protocol, &reverse_plan, BTreeMap::new()).unwrap();
-        let (_reverse_job, reverse_roots) = reverse_adapter.lower().unwrap();
-        assert!(matches!(reverse_roots.residual, ProductionRoot::Closed(_)));
+        let (mut reverse_job, reverse_roots) = reverse_adapter.lower().unwrap();
+        let ProductionRoot::Compact(reverse_root) = reverse_roots.residual else {
+            panic!("ordinary reverse gadget product should remain compact")
+        };
+        let reverse = reverse_job
+            .normalize_compact_closed_root(reverse_root)
+            .expect("ordinary reverse gadget product normalization");
+        assert!(!reverse.value.exact_nf.as_ref().unwrap().is_zero());
+        assert_eq!(reverse.counters.compact_planned_unique_shells, 0);
+        assert_eq!(reverse.counters.compact_shell_holds_released, 0);
+        assert_eq!(reverse.counters.compact_shell_holds_unmatched, 0);
+        let reverse_eager_adapter =
+            ProductionAdapter::new(&reverse_protocol, &reverse_plan, BTreeMap::new()).unwrap();
+        let (mut reverse_eager_job, reverse_eager_roots) =
+            reverse_eager_adapter.lower_force_eager().unwrap();
+        let ProductionRoot::Closed(reverse_eager_root) = reverse_eager_roots.residual else {
+            unreachable!()
+        };
+        let reverse_eager = reverse_eager_job.normalize_closed_root(reverse_eager_root).unwrap();
+        assert_eq!(
+            full_nf_descriptor_map(&reverse_job, &reverse.value),
+            full_nf_descriptor_map(&reverse_eager_job, &reverse_eager.value)
+        );
+    }
+
+    #[test]
+    fn production_ordinary_row_times_decomposition_large_preserves_order_and_eager_parity() {
+        let protocol =
+            generated_gadget_product_protocol(false, GeneratedGadgetProductCase::Ordinary);
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").unwrap();
+        let adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).unwrap();
+        let (mut compact_job, compact_roots) = adapter.lower().unwrap();
+        let ProductionRoot::Compact(compact_root) = compact_roots.residual else {
+            panic!("ordinary decomposition product must remain compact")
+        };
+        let root_expression = compact_root.expression();
+        let product_expression =
+            match compact_job.expressions().node(root_expression).unwrap().operator {
+                ValueOperator::ProgramCall { program } => {
+                    let family = compact_job.programs().family_for_program(program).unwrap();
+                    compact_job.programs().family_body(family).unwrap()
+                }
+                _ => root_expression,
+            };
+        let product = compact_job.expressions().node(product_expression).unwrap();
+        assert!(matches!(product.operator, ValueOperator::Matrix(MatrixOperation::Multiply)));
+        let [row, decomposition] = product.inputs.as_ref() else { unreachable!() };
+        let expected_ordered = vec![
+            stable_expression_fingerprint(&compact_job, *row),
+            stable_expression_fingerprint(&compact_job, *decomposition),
+        ];
+        let compact = compact_job.normalize_compact_closed_root(compact_root).unwrap();
+        let compact_evidence = full_nf_descriptor_map(&compact_job, &compact.value);
+        assert!(compact_evidence.0.keys().any(|(_, ordered)| ordered == &expected_ordered));
+        assert_eq!(compact_evidence.2, NumericContract::Known(CoefficientBound::Large));
+        assert_eq!(compact.counters.compact_planned_unique_shells, 0);
+        assert_eq!(compact.counters.compact_planned_shell_occurrences, 0);
+        assert_eq!(compact.counters.compact_shell_holds_released, 0);
+        assert_eq!(compact.counters.compact_shell_holds_unmatched, 0);
+
+        let eager_adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).unwrap();
+        let (mut eager_job, eager_roots) = eager_adapter.lower_force_eager().unwrap();
+        let ProductionRoot::Closed(eager_root) = eager_roots.residual else { unreachable!() };
+        let eager = eager_job.normalize_closed_root(eager_root).unwrap();
+        assert_eq!(compact_evidence, full_nf_descriptor_map(&eager_job, &eager.value));
+        assert_eq!(compact.counters.relation_applied, eager.counters.relation_applied);
+        assert_eq!(compact.counters.relation_remaining, eager.counters.relation_remaining);
+    }
+
+    #[test]
+    fn production_ordinary_row_times_decomposition_bounded_folds_with_eager_parity() {
+        let protocol =
+            generated_gadget_product_protocol(false, GeneratedGadgetProductCase::Ordinary);
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").unwrap();
+        let adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new())
+            .unwrap()
+            .with_test_sampler_fact_bound(2);
+        let (mut compact_job, compact_roots) = adapter.lower().unwrap();
+        let ProductionRoot::Compact(compact_root) = compact_roots.residual else {
+            panic!("bounded ordinary decomposition product must remain compact")
+        };
+        let compact = compact_job.normalize_compact_closed_root(compact_root).unwrap();
+        assert!(compact.value.exact_nf.as_ref().unwrap().exact_terms.is_empty());
+        let compact_evidence = full_nf_descriptor_map(&compact_job, &compact.value);
+        assert!(matches!(compact_evidence.2, NumericContract::Known(CoefficientBound::Finite(_))));
+        assert_ne!(
+            compact.value.exact_nf.as_ref().unwrap().bounded_summary.coefficient_bound(),
+            NumericContract::Known(CoefficientBound::ExactZero)
+        );
+        assert_eq!(compact.counters.compact_planned_unique_shells, 0);
+        assert_eq!(compact.counters.compact_shell_holds_unmatched, 0);
+
+        let eager_adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new())
+            .unwrap()
+            .with_test_sampler_fact_bound(2);
+        let (mut eager_job, eager_roots) = eager_adapter.lower_force_eager().unwrap();
+        let ProductionRoot::Closed(eager_root) = eager_roots.residual else { unreachable!() };
+        let eager = eager_job.normalize_closed_root(eager_root).unwrap();
+        assert_eq!(compact_evidence, full_nf_descriptor_map(&eager_job, &eager.value));
+        assert_eq!(compact.counters.relation_applied, eager.counters.relation_applied);
+        assert_eq!(compact.counters.relation_remaining, eager.counters.relation_remaining);
+    }
+
+    #[test]
+    fn production_ordinary_decomposition_with_virtual_input_falls_back_before_freeze() {
+        let protocol = generated_gather_protocol(1);
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").unwrap();
+        let mut adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).unwrap();
+        let matrix = ResolvedMatrixType::new(256_u16.into(), 1, 1, 1).unwrap();
+        let sample = |adapter: &mut ProductionAdapter<'_>, event| {
+            adapter
+                .job
+                .expressions_mut()
+                .intern(
+                    ValueOperator::Sampler {
+                        event: SampleEventId(event),
+                        operation: SamplerOperation::UniformResidue { output: matrix.clone() },
+                    },
+                    Box::new([]),
+                )
+                .unwrap()
+        };
+        let left = sample(&mut adapter, 98_001);
+        let right = sample(&mut adapter, 98_002);
+        let virtual_input = adapter
+            .job
+            .expressions_mut()
+            .intern(ValueOperator::Matrix(MatrixOperation::Multiply), [left, right].into())
+            .unwrap();
+        let decomposition = adapter
+            .job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    output: matrix.clone(),
+                    base: 2,
+                    small: false,
+                    digit_count: 1,
+                }),
+                [virtual_input].into(),
+            )
+            .unwrap();
+        let family =
+            adapter.generated_family(FamilyDomain::new(0, 1).unwrap(), decomposition).unwrap();
+        let index = adapter.intern_index_constant(BigInt::ZERO).unwrap();
+        let root = adapter
+            .call_family_in_program_scope_deferred_generated(
+                family,
+                index,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            adapter.compact_residual_preflight(&Value::Expr(root)).as_deref(),
+            Some("gadget decomposition input is not a concrete leaf")
+        );
+        assert!(!adapter.job.relations().is_frozen());
+    }
+
+    #[test]
+    fn production_lower_routes_virtual_ordinary_decomposition_to_eager_parity() {
+        let protocol =
+            generated_gadget_product_protocol(false, GeneratedGadgetProductCase::VirtualOrdinary);
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").unwrap();
+        let mut preflight = ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).unwrap();
+        let residual =
+            preflight.resolve(plan.target().residual.clone(), Rc::new(BTreeMap::new())).unwrap();
+        assert_eq!(
+            preflight.compact_residual_preflight(&residual).as_deref(),
+            Some("gadget decomposition input is not a concrete leaf")
+        );
+        assert!(!preflight.job.relations().is_frozen());
+        let adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).unwrap();
+        let (mut job, roots) = adapter.lower().unwrap();
+        let ProductionRoot::Closed(root) = roots.residual else {
+            panic!("virtual ordinary decomposition must select eager root")
+        };
+        let eager = job.normalize_closed_root(root).unwrap();
+        let eager_evidence = full_nf_descriptor_map(&job, &eager.value);
+        assert!(!eager_evidence.0.is_empty());
+        assert_eq!(eager_evidence.2, NumericContract::Known(CoefficientBound::Large));
+
+        let eager_adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).unwrap();
+        let (mut eager_job, eager_roots) = eager_adapter.lower_force_eager().unwrap();
+        let ProductionRoot::Closed(eager_root) = eager_roots.residual else { unreachable!() };
+        let forced = eager_job.normalize_closed_root(eager_root).unwrap();
+        assert_eq!(eager_evidence, full_nf_descriptor_map(&eager_job, &forced.value));
+        assert_eq!(eager.counters.relation_applied, forced.counters.relation_applied);
+        assert_eq!(eager.counters.relation_remaining, forced.counters.relation_remaining);
     }
 
     #[test]
@@ -15960,12 +16124,12 @@ mod tests {
             adapter.resolve(plan.target().residual.clone(), Rc::new(BTreeMap::new())).unwrap();
         assert_eq!(
             adapter.compact_residual_preflight(&residual).as_deref(),
-            Some("gadget decomposition has no authorized product consumer")
+            Some("no virtual matrix algebra")
         );
         let Value::Expr(root) = residual else { unreachable!() };
         assert_eq!(
             adapter.build_compact_shell_plan(&Value::Expr(root)).unwrap_err(),
-            "gadget decomposition has no authorized product consumer"
+            "no virtual matrix algebra"
         );
         assert!(!adapter.job.relations().is_frozen());
     }
@@ -16031,12 +16195,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             preflight_adapter.compact_residual_preflight(&residual).as_deref(),
-            Some("gadget decomposition has no authorized product consumer")
+            Some("compact gadget shell has mixed planned and ordinary uses")
         );
         let Value::Expr(root) = residual else { unreachable!() };
         assert_eq!(
             preflight_adapter.build_compact_shell_plan(&Value::Expr(root)).unwrap_err(),
-            "gadget decomposition has no authorized product consumer"
+            "compact gadget shell has mixed planned and ordinary uses"
         );
         assert!(!preflight_adapter.job.relations().is_frozen());
 
@@ -16051,7 +16215,7 @@ mod tests {
     }
 
     #[test]
-    fn production_gadget_rule_mismatch_is_eager_before_freeze() {
+    fn production_gadget_rule_mismatch_uses_ordinary_decomposition() {
         let protocol =
             generated_gadget_product_protocol(false, GeneratedGadgetProductCase::Mismatch);
         let plan = ProtocolPlan::build(&protocol, "toy-threshold").unwrap();
@@ -16060,25 +16224,28 @@ mod tests {
         let residual = preflight_adapter
             .resolve(plan.target().residual.clone(), Rc::new(BTreeMap::new()))
             .unwrap();
-        assert_eq!(
-            preflight_adapter.compact_residual_preflight(&residual).as_deref(),
-            Some("gadget decomposition consumer rule mismatch")
-        );
+        assert_eq!(preflight_adapter.compact_residual_preflight(&residual).as_deref(), None);
         let Value::Expr(root) = residual else { unreachable!() };
-        assert_eq!(
-            preflight_adapter.build_compact_shell_plan(&Value::Expr(root)).unwrap_err(),
-            "gadget decomposition consumer rule mismatch"
-        );
+        assert!(preflight_adapter.build_compact_shell_plan(&Value::Expr(root)).is_ok());
         assert!(!preflight_adapter.job.relations().is_frozen());
 
         let adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).unwrap();
         let (mut job, roots) = adapter.lower().unwrap();
-        assert!(matches!(roots.residual, ProductionRoot::Closed(_)));
-        let ProductionRoot::Closed(root) = roots.residual else { unreachable!() };
-        let eager = job.normalize_closed_root(root).unwrap();
+        let ProductionRoot::Compact(root) = roots.residual else {
+            panic!("ordinary mismatched gadget product should remain compact")
+        };
+        let eager = job.normalize_compact_closed_root(root).unwrap();
         let evidence = full_nf_descriptor_map(&job, &eager.value);
         assert!(!evidence.0.is_empty());
         assert!(!matches!(evidence.2, NumericContract::Missing));
+        assert_eq!(eager.counters.compact_planned_unique_shells, 0);
+        assert_eq!(eager.counters.compact_shell_holds_released, 0);
+        assert_eq!(eager.counters.compact_shell_holds_unmatched, 0);
+        let eager_adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).unwrap();
+        let (mut eager_job, eager_roots) = eager_adapter.lower_force_eager().unwrap();
+        let ProductionRoot::Closed(eager_root) = eager_roots.residual else { unreachable!() };
+        let eager = eager_job.normalize_closed_root(eager_root).unwrap();
+        assert_eq!(evidence, full_nf_descriptor_map(&eager_job, &eager.value));
     }
 
     #[test]

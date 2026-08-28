@@ -188,14 +188,18 @@ enum ProductWorkItem {
     GadgetSplice(ProductGadgetSplice),
 }
 
-fn authorized_gadget_pair_input_from(
+/// Match the complete typed gadget/decomposition pair used by both compact preflight and
+/// runtime rewriting. `require_frozen` is true for runtime use and false while compiling the
+/// private plan, before the relation registry freeze barrier.
+pub(crate) fn authorized_gadget_pair_rule_from(
     expressions: &ExprArena,
     facts: &FactStore,
     registry: Option<&GadgetRecompositionRegistry>,
-    gadget: ScopedExprId,
-    decomposition: ScopedExprId,
-) -> Result<Option<ExprId>, NormalizeError> {
-    let decomposition_node = expressions.node(decomposition.expression())?;
+    gadget: ExprId,
+    decomposition: ExprId,
+    require_frozen: bool,
+) -> Result<Option<(ExprId, GadgetRecompositionRule)>, NormalizeError> {
+    let decomposition_node = expressions.node(decomposition)?;
     let ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
         base,
         small,
@@ -205,15 +209,6 @@ fn authorized_gadget_pair_input_from(
     else {
         return Ok(None);
     };
-    let gadget_node = expressions.node(gadget.expression())?;
-    let Some(super::arena::MatrixConstantKind::Gadget { base: gadget_base, small: gadget_small }) =
-        gadget_node.operator.source_matrix_constant()
-    else {
-        return Ok(None);
-    };
-    if gadget_base != base || gadget_small != small {
-        return Ok(None);
-    }
     let Some(input) = decomposition_node.inputs.first().copied() else {
         return Ok(None);
     };
@@ -225,8 +220,8 @@ fn authorized_gadget_pair_input_from(
     };
     let (Some(input_type), Some(gadget_type), Some(decomposition_type), Some(output_type)) = (
         matrix_type(input)?,
-        matrix_type(gadget.expression())?,
-        matrix_type(decomposition.expression())?,
+        matrix_type(gadget)?,
+        matrix_type(decomposition)?,
         matrix_type(input)?,
     ) else {
         return Ok(None);
@@ -236,8 +231,14 @@ fn authorized_gadget_pair_input_from(
         _ => None,
     };
     let Some(registry) = registry else { return Ok(None) };
-    Ok(registry
-        .allows(
+    let gadget_layout = MatrixLayout::row_major(
+        input_type.rows,
+        input_type.rows.saturating_mul(*digit_count as usize),
+    );
+    let decomposition_layout = layout(decomposition);
+    let input_layout = layout(input);
+    let Some(rule) = (if require_frozen {
+        registry.matching_rule(
             *base,
             *small,
             *digit_count,
@@ -245,11 +246,59 @@ fn authorized_gadget_pair_input_from(
             decomposition_type,
             input_type,
             output_type,
-            layout(gadget.expression()).as_ref(),
-            layout(decomposition.expression()).as_ref(),
-            layout(input).as_ref(),
+            Some(&gadget_layout),
+            decomposition_layout.as_ref(),
+            input_layout.as_ref(),
         )
-        .then_some(input))
+    } else {
+        registry.matching_rule_unfrozen(
+            *base,
+            *small,
+            *digit_count,
+            gadget_type,
+            decomposition_type,
+            input_type,
+            output_type,
+            Some(&gadget_layout),
+            decomposition_layout.as_ref(),
+            input_layout.as_ref(),
+        )
+    }) else {
+        return Ok(None);
+    };
+    let mut work = vec![gadget];
+    while let Some(expression) = work.pop() {
+        let node = expressions.node(expression)?;
+        if let Some(super::arena::MatrixConstantKind::Gadget {
+            base: gadget_base,
+            small: gadget_small,
+        }) = node.operator.source_matrix_constant()
+        {
+            if *gadget_base != rule.base ||
+                *gadget_small != rule.small ||
+                expressions.value_type(expression)? !=
+                    &ResolvedValueType::Matrix(rule.gadget_type.clone())
+            {
+                return Ok(None);
+            }
+            let layout = match facts.facts(expression) {
+                Ok(ValueFacts::Matrix(facts)) => Some(facts.metadata.layout.clone()),
+                _ => None,
+            };
+            if layout.as_ref() != rule.gadget_layout.as_ref() {
+                return Ok(None);
+            }
+            continue;
+        }
+        if matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Add)) &&
+            node.inputs.len() == 2
+        {
+            work.extend(node.inputs.iter().copied());
+            continue;
+        }
+        return Ok(None);
+    }
+    Ok(Some((input, rule)))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2003,9 +2052,21 @@ impl<'a> Normalizer<'a> {
                         ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
                             ..
                         }) => {
-                            frames.push(CompactFrame::CombineGadget {
-                                expression,
-                                node: Arc::new(node.clone()),
+                            let planned = node.inputs.first().is_some_and(|input| {
+                                self.compact_plan.as_ref().is_some_and(|plan| {
+                                    plan.gadget_shells.contains_key(&(expression, *input))
+                                })
+                            });
+                            frames.push(if planned {
+                                CompactFrame::CombineGadget {
+                                    expression,
+                                    node: Arc::new(node.clone()),
+                                }
+                            } else {
+                                CompactFrame::CombineConcrete {
+                                    expression,
+                                    node: Arc::new(node.clone()),
+                                }
                             });
                             for input in node.inputs.iter().rev() {
                                 frames.push(CompactFrame::Visit {
@@ -5102,13 +5163,15 @@ impl<'a> Normalizer<'a> {
         gadget: ScopedExprId,
         decomposition: ScopedExprId,
     ) -> Result<Option<ExprId>, NormalizeError> {
-        authorized_gadget_pair_input_from(
+        Ok(authorized_gadget_pair_rule_from(
             self.expressions,
             self.facts,
             self.gadget_recompositions,
-            gadget,
-            decomposition,
-        )
+            gadget.expression(),
+            decomposition.expression(),
+            true,
+        )?
+        .map(|(input, _)| input))
     }
 
     fn product_monomials(

@@ -14,7 +14,10 @@ use mxx_ir_core::{
     expr::IntExpr,
     node::{LoopInputMode, NodeKind},
 };
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+};
 use thiserror::Error;
 
 /// One occurrence of a frozen program.  A named subgraph can be called more than once, so its
@@ -120,7 +123,7 @@ pub(crate) struct PlannedTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProtocolPlan {
     target: PlannedTarget,
-    nodes: BTreeMap<PlannedWire, PlannedNode>,
+    nodes: BTreeMap<PlannedWire, Arc<PlannedNode>>,
     aliases: BTreeSet<WireAlias>,
     alias_by_child: BTreeMap<PlannedWire, PlannedWire>,
     output_mappings: BTreeSet<OutputMapping>,
@@ -204,7 +207,7 @@ impl ProtocolPlan {
     pub(crate) fn target(&self) -> &PlannedTarget {
         &self.target
     }
-    pub(crate) fn nodes(&self) -> &BTreeMap<PlannedWire, PlannedNode> {
+    pub(crate) fn nodes(&self) -> &BTreeMap<PlannedWire, Arc<PlannedNode>> {
         &self.nodes
     }
     pub(crate) fn aliases(&self) -> &BTreeSet<WireAlias> {
@@ -289,11 +292,11 @@ impl ProtocolPlan {
             .ok_or_else(|| ProtocolPlanError::MissingArguments { wire: wire.clone() })?;
         self.nodes.insert(
             wire.clone(),
-            PlannedNode {
+            Arc::new(PlannedNode {
                 kind: node.kind().clone(),
                 arguments: arguments.clone().into_boxed_slice(),
                 output_type,
-            },
+            }),
         );
 
         if let NodeKind::Input { name, artifact: Some(_), .. } = node.kind() {
@@ -1067,6 +1070,18 @@ mod tests {
         assert!(!plan.nodes().is_empty());
         assert_eq!(plan.target().residual.occurrence.path, 0);
         assert_eq!(plan.target().decoder.occurrence.path, 0);
+    }
+
+    #[test]
+    fn planned_nodes_keep_authoritative_key_order_and_share_immutable_values() {
+        let protocol = crate::toy_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let keys = plan.nodes().keys().cloned().collect::<Vec<_>>();
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let node = plan.nodes().values().next().expect("planned node");
+        let retained = Arc::clone(node);
+        assert!(Arc::ptr_eq(node, &retained));
     }
 
     #[test]

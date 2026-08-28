@@ -19,10 +19,11 @@ use super::{
         ValueFacts,
     },
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
-    program::{ArenaError, ProgramArena, ValueProgramId},
+    program::{ArenaError, BetaReason, FamilyValueId, ProgramArena, ValueProgramId},
     relation::{
-        CanonicalLhsKey, GadgetRecompositionRegistry, NormalizationCache, RelationRegistry,
-        RelationRegistryError, RuntimeSpecializationKey, UniversalRelationRegistration,
+        CanonicalLhsKey, GadgetRecompositionRegistry, GadgetRecompositionRule, NormalizationCache,
+        RelationRegistry, RelationRegistryError, RuntimeSpecializationKey,
+        UniversalRelationRegistration,
     },
 };
 use mxx_ir_core::types::ConcreteMatrixType;
@@ -33,6 +34,7 @@ use std::{
     fmt,
     sync::Arc,
 };
+use tracing::info;
 
 const MONOMIAL_GC_ALLOCATION_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 const MONOMIAL_GC_ALLOCATION_THRESHOLD_ENV: &str = "MXX_OPERATIONAL_MONOMIAL_GC_THRESHOLD_BYTES";
@@ -253,6 +255,9 @@ fn authorized_gadget_pair_input_from(
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NormalizationCounters {
     pub nodes_processed: u64,
+    /// Ordinary roots count each reachable DAG node once. Compact roots report completed runtime
+    /// Visit work, including nested semantic-binding visits; the separate preflight occurrence
+    /// count lives only in the private compact plan.
     pub nodes_total: u64,
     /// Number of exact terms retained by the final normalized root.
     pub final_exact_term_count: u64,
@@ -266,6 +271,41 @@ pub struct NormalizationCounters {
     /// Number of finite exact terms folded into the bounded summary.
     pub bounded_fold_count: u64,
     pub peak_cached_values: u64,
+    pub compact_virtual_calls: u64,
+    pub compact_algebra_nodes: u64,
+    pub compact_max_frames: u64,
+    /// Compact evaluation does not retain a global memo for shared virtual DAGs; these counters
+    /// therefore remain zero while each occurrence is evaluated independently.
+    pub compact_memo_entries: u64,
+    pub compact_peak_memo_entries: u64,
+    pub compact_memo_term_refs: u64,
+    pub compact_memo_bytes: u64,
+    pub compact_live_frames: u64,
+    pub compact_peak_live_frames: u64,
+    pub compact_live_values: u64,
+    pub compact_peak_live_values: u64,
+    pub compact_logical_add_sub: u64,
+    pub compact_logical_scale: u64,
+    pub compact_strict_products: u64,
+    pub compact_concrete_shell_nodes: u64,
+    pub compact_max_virtual_frames: u64,
+    pub compact_max_virtual_values: u64,
+    /// Number of compact gadget-shell occurrences admitted by the lowering plan.
+    pub compact_planned_shell_occurrences: u64,
+    /// Number of distinct compact gadget shell identities admitted by the lowering plan.
+    pub compact_planned_unique_shells: u64,
+    pub compact_shell_allocated: u64,
+    pub compact_shell_hits: u64,
+    pub compact_shell_new: u64,
+    pub compact_shell_holds_current: u64,
+    pub compact_shell_holds_peak: u64,
+    pub compact_shell_holds_released: u64,
+    pub compact_shell_holds_unmatched: u64,
+    pub compact_scalar_consumers: u64,
+    pub compact_scalar_holds_current: u64,
+    pub compact_scalar_holds_peak: u64,
+    pub compact_scalar_holds_released: u64,
+    pub compact_scalar_holds_unmatched: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -320,6 +360,227 @@ enum ScalarActionNormalization {
     Exact(PolynomialNF),
 }
 
+struct CompactValue {
+    semantic: Option<ScopedExprId>,
+    exact_nf: Option<Arc<PolynomialNF>>,
+    coefficient_bound: NumericContract<CoefficientBound>,
+    resolved_type: ResolvedValueType,
+    hold: Option<ExprId>,
+}
+
+#[derive(Clone)]
+struct CompactGadgetHold {
+    normal_form: Arc<PolynomialNF>,
+    remaining: u64,
+    /// Shell identities with one ready product-consumer token each.  The product splice consumes
+    /// the token for its exact shell; a generic lookup cannot release another shell's hold.
+    consumers: BTreeMap<ExprId, u64>,
+}
+
+#[derive(Default)]
+struct CompactProductContext {
+    used_shells: BTreeSet<(ExprId, ExprId)>,
+}
+
+/// Private lowering witness for a compact root.  Expression IDs are deliberately retained in the
+/// plan: the root normalizer must consume the exact shell/input pair that preflight inspected,
+/// never a same-shaped replacement discovered after freezing.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompactShellPlan {
+    pub(crate) gadget_shells: BTreeMap<(ExprId, ExprId), CompactGadgetPlan>,
+    pub(crate) scalar_factors: BTreeMap<ExprId, CompactScalarPlan>,
+    /// Exact one-sided scalar ProgramCall authorizations. The side is part of the key because
+    /// scalar-left and scalar-right products have different ordered semantics.
+    pub(crate) scalar_program_calls: BTreeMap<(ExprId, ExprId, bool), CompactScalarProgramCallPlan>,
+    /// Number of expression occurrences visited by the structural preflight traversal. Shared DAG
+    /// edges count once per incoming occurrence; this is not a compact runtime work counter.
+    pub(crate) preflight_node_occurrences: u64,
+    pub(crate) shell_allocated: u64,
+    pub(crate) shell_hits: u64,
+    pub(crate) shell_new: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompactGadgetPlan {
+    pub(crate) rule: GadgetRecompositionRule,
+    pub(crate) occurrences: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompactScalarPlan {
+    pub(crate) value_type: ResolvedMatrixType,
+    pub(crate) occurrences: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompactScalarProgramCallPlan {
+    pub(crate) value_type: ResolvedMatrixType,
+    pub(crate) occurrences: u64,
+}
+
+impl CompactShellPlan {
+    pub(crate) fn insert_gadget(
+        &mut self,
+        shell: ExprId,
+        input: ExprId,
+        rule: GadgetRecompositionRule,
+    ) -> bool {
+        self.insert_gadget_count(shell, input, rule, 1)
+    }
+
+    pub(crate) fn insert_gadget_count(
+        &mut self,
+        shell: ExprId,
+        input: ExprId,
+        rule: GadgetRecompositionRule,
+        occurrences: u64,
+    ) -> bool {
+        let mut compatible = true;
+        self.gadget_shells
+            .entry((shell, input))
+            .and_modify(|entry| {
+                if entry.rule == rule {
+                    if let Some(total) = entry.occurrences.checked_add(occurrences) {
+                        entry.occurrences = total;
+                    } else {
+                        compatible = false;
+                    }
+                } else {
+                    compatible = false;
+                }
+            })
+            .or_insert(CompactGadgetPlan { rule, occurrences });
+        compatible
+    }
+
+    pub(crate) fn gadget_occurrences(&self) -> u64 {
+        self.gadget_shells.values().map(|entry| entry.occurrences).sum()
+    }
+
+    pub(crate) fn insert_scalar(
+        &mut self,
+        expression: ExprId,
+        value_type: ResolvedMatrixType,
+    ) -> bool {
+        self.insert_scalar_count(expression, value_type, 1)
+    }
+
+    pub(crate) fn insert_scalar_count(
+        &mut self,
+        expression: ExprId,
+        value_type: ResolvedMatrixType,
+        occurrences: u64,
+    ) -> bool {
+        let mut compatible = true;
+        self.scalar_factors
+            .entry(expression)
+            .and_modify(|entry| {
+                if entry.value_type == value_type {
+                    if let Some(total) = entry.occurrences.checked_add(occurrences) {
+                        entry.occurrences = total;
+                    } else {
+                        compatible = false;
+                    }
+                } else {
+                    compatible = false;
+                }
+            })
+            .or_insert(CompactScalarPlan { value_type, occurrences });
+        compatible
+    }
+
+    pub(crate) fn scalar_occurrences(&self) -> u64 {
+        self.scalar_factors.values().map(|entry| entry.occurrences).sum::<u64>() +
+            self.scalar_program_calls.values().map(|entry| entry.occurrences).sum::<u64>()
+    }
+
+    pub(crate) fn insert_scalar_program_call(
+        &mut self,
+        consumer: ExprId,
+        call: ExprId,
+        scalar_is_right: bool,
+        value_type: ResolvedMatrixType,
+    ) -> bool {
+        self.insert_scalar_program_call_count(consumer, call, scalar_is_right, value_type, 1)
+    }
+
+    pub(crate) fn insert_scalar_program_call_count(
+        &mut self,
+        consumer: ExprId,
+        call: ExprId,
+        scalar_is_right: bool,
+        value_type: ResolvedMatrixType,
+        occurrences: u64,
+    ) -> bool {
+        let mut compatible = true;
+        self.scalar_program_calls
+            .entry((consumer, call, scalar_is_right))
+            .and_modify(|entry| {
+                if entry.value_type == value_type {
+                    if let Some(total) = entry.occurrences.checked_add(occurrences) {
+                        entry.occurrences = total;
+                    } else {
+                        compatible = false;
+                    }
+                } else {
+                    compatible = false;
+                }
+            })
+            .or_insert(CompactScalarProgramCallPlan { value_type, occurrences });
+        compatible
+    }
+}
+
+impl CompactValue {
+    fn from_analyzed(value: AnalyzedValue, resolved_type: ResolvedValueType) -> Self {
+        Self {
+            semantic: Some(value.semantic),
+            exact_nf: value.exact_nf,
+            coefficient_bound: value.coefficient_bound,
+            resolved_type,
+            hold: None,
+        }
+    }
+
+    fn as_analyzed(&self) -> Result<AnalyzedValue, NormalizeError> {
+        Ok(AnalyzedValue {
+            semantic: self.semantic.ok_or(NormalizeError::InvalidExactPlan {
+                reason: "eliminable virtual value reached concrete operator",
+            })?,
+            exact_nf: self.exact_nf.clone(),
+            coefficient_bound: self.coefficient_bound.clone(),
+        })
+    }
+}
+
+enum CompactFrame {
+    Visit { expression: ExprId, bindings: Vec<ScopedExprId> },
+    CombineMatrix { expression: ExprId, node: Arc<ExprNode> },
+    CombineGadget { expression: ExprId, node: Arc<ExprNode> },
+    CombineCall { expression: ExprId, node: Arc<ExprNode> },
+    CombineConcrete { expression: ExprId, node: Arc<ExprNode> },
+}
+
+enum CompactRootSource {
+    Closed(ScopedExprId),
+    Family(super::program::FamilyValueId),
+}
+
+#[derive(Clone, Copy)]
+enum CompactProgressSource {
+    Closed,
+    Family,
+}
+
+impl CompactProgressSource {
+    const fn stage(self) -> &'static str {
+        match self {
+            Self::Closed => "normalize_compact_root",
+            Self::Family => "normalize_compact_family",
+        }
+    }
+}
+
 /// The Stage 3 exact normaliser.  One instance is scoped to one finalized value program and one
 /// job-owned monomial arena.  All traversal state is iterative and is released at last use.
 pub struct Normalizer<'a> {
@@ -345,21 +606,51 @@ pub struct Normalizer<'a> {
     expression_bounds: BTreeMap<ExprId, NumericContract<CoefficientBound>>,
     remaining_uses: BTreeMap<ExprId, usize>,
     /// Normalized inputs retained by the structural gadget-recomposition hold.
-    gadget_input_nfs: BTreeMap<ExprId, Arc<PolynomialNF>>,
+    gadget_input_nfs: BTreeMap<ExprId, CompactGadgetHold>,
+    /// Finite scalar leaves retained until their exact scalar-action consumer has run.
+    compact_scalar_holds: BTreeMap<ExprId, u64>,
+    compact_plan: Option<CompactShellPlan>,
+    compact_plan_remaining: Option<CompactShellPlan>,
     counters: NormalizationCounters,
     normalization_depth: u32,
     relation_rewriting_enabled: bool,
+    suppress_product_relation_closure: bool,
     fold_final_no_match: bool,
     /// Slots below this outer-call high-water are externally observable and remain pinned even
     /// when no current normalization owner references them.
     protected_monomial_prefix: usize,
     monomial_gc_allocation_threshold_bytes: u64,
     gadget_splice_batch_terms: usize,
+    compact_mode: bool,
+    compact_product_contexts: Vec<CompactProductContext>,
+    compact_progress_source: CompactProgressSource,
 }
 
 impl<'a> Normalizer<'a> {
     fn clear_value_cache(&mut self) {
         self.cache.clear();
+    }
+
+    fn log_compact_progress(&self) {
+        let processed = self.counters.nodes_processed;
+        if processed == 0 || !(processed.is_power_of_two() || processed % 1_000_000 == 0) {
+            return;
+        }
+        let preflight =
+            self.compact_plan.as_ref().map_or(0, |plan| plan.preflight_node_occurrences);
+        info!(
+            target: "mxx_correctness::operational_noise",
+            stage = self.compact_progress_source.stage(),
+            event = "progress",
+            nodes_processed = processed,
+            preflight_node_occurrences = preflight,
+            frames = self.counters.compact_live_frames,
+            values = self.counters.compact_live_values,
+            exact_terms = self.counters.final_exact_term_count,
+            shell_holds = self.counters.compact_shell_holds_current,
+            scalar_holds = self.counters.compact_scalar_holds_current,
+            "compact normalization progress"
+        );
     }
 
     fn insert_value_cache(&mut self, expression: ExprId, value: Arc<AnalyzedValue>) {
@@ -378,8 +669,262 @@ impl<'a> Normalizer<'a> {
         self.gadget_input_nfs.clear();
     }
 
-    fn insert_gadget_hold(&mut self, expression: ExprId, normal_form: Arc<PolynomialNF>) {
-        self.gadget_input_nfs.insert(expression, normal_form);
+    fn insert_gadget_hold(
+        &mut self,
+        expression: ExprId,
+        normal_form: Arc<PolynomialNF>,
+        shell: Option<ExprId>,
+    ) {
+        let entry = self.gadget_input_nfs.entry(expression).or_insert_with(|| CompactGadgetHold {
+            normal_form: normal_form.clone(),
+            remaining: 0,
+            consumers: BTreeMap::new(),
+        });
+        entry.remaining = entry.remaining.saturating_add(1);
+        entry.normal_form = normal_form;
+        if let Some(shell) = shell {
+            *entry.consumers.entry(shell).or_default() += 1;
+        }
+        if !self.compact_mode {
+            return;
+        }
+        if self.compact_plan.is_none() {
+            self.counters.compact_planned_shell_occurrences =
+                self.counters.compact_planned_shell_occurrences.saturating_add(1);
+        }
+        self.counters.compact_shell_holds_current =
+            self.counters.compact_shell_holds_current.saturating_add(1);
+        self.counters.compact_shell_holds_peak =
+            self.counters.compact_shell_holds_peak.max(self.counters.compact_shell_holds_current);
+    }
+
+    fn consume_compact_shell_plan(
+        &mut self,
+        shell: ExprId,
+        input: ExprId,
+    ) -> Result<(), NormalizeError> {
+        let Some(plan) = self.compact_plan_remaining.as_mut() else { return Ok(()) };
+        let Some(entry) = plan.gadget_shells.get_mut(&(shell, input)) else {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "compact gadget shell was not preflighted",
+            });
+        };
+        if entry.occurrences == 0 {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "compact gadget shell occurrence over-consumed",
+            });
+        }
+        entry.occurrences -= 1;
+        Ok(())
+    }
+
+    /// Release one exact decomposition-input token after its authorized product boundary has
+    /// completed. The entry itself is removed at its final direct consumer so a later accidental
+    /// lookup cannot silently resurrect a consumed hold.
+    fn release_compact_gadget_hold(
+        &mut self,
+        shell: ExprId,
+        input: ExprId,
+    ) -> Result<(), NormalizeError> {
+        let remove = {
+            let hold =
+                self.gadget_input_nfs.get_mut(&input).ok_or(NormalizeError::InvalidExactPlan {
+                    reason: "compact gadget hold disappeared",
+                })?;
+            let token = hold.consumers.get_mut(&shell).ok_or(NormalizeError::InvalidExactPlan {
+                reason: "compact gadget consumer token disappeared",
+            })?;
+            if *token == 0 || hold.remaining == 0 {
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "compact gadget consumer token over-consumed",
+                });
+            }
+            *token -= 1;
+            hold.remaining -= 1;
+            if *token == 0 {
+                hold.consumers.remove(&shell);
+            }
+            hold.remaining == 0
+        };
+        if remove {
+            self.gadget_input_nfs.remove(&input);
+        }
+        self.counters.compact_shell_holds_current =
+            self.counters.compact_shell_holds_current.saturating_sub(1);
+        self.counters.compact_shell_holds_released =
+            self.counters.compact_shell_holds_released.saturating_add(1);
+        Ok(())
+    }
+
+    fn exact_compact_gadget_rule(
+        &self,
+        shell: ExprId,
+        input: ExprId,
+    ) -> Result<GadgetRecompositionRule, NormalizeError> {
+        let node = self.expressions.node(shell)?;
+        let ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+            base,
+            small,
+            digit_count,
+            ..
+        }) = &node.operator
+        else {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "compact shell operator changed",
+            });
+        };
+        if node.inputs.as_ref() != [input] {
+            return Err(NormalizeError::InvalidExactPlan { reason: "compact shell input changed" });
+        }
+        let ResolvedValueType::Matrix(input_type) = self.expressions.value_type(input)? else {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "compact shell input type changed",
+            });
+        };
+        let ResolvedValueType::Matrix(decomposition_type) = self.expressions.value_type(shell)?
+        else {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "compact shell output type changed",
+            });
+        };
+        let gadget_type = ResolvedMatrixType::new(
+            input_type.modulus.clone(),
+            input_type.ring_dimension,
+            input_type.rows,
+            decomposition_type.rows,
+        )?;
+        let layout = |expression| match self.facts.facts(expression) {
+            Ok(ValueFacts::Matrix(facts)) => Some(facts.metadata.layout.clone()),
+            _ => None,
+        };
+        let gadget_layout = MatrixLayout::row_major(
+            input_type.rows,
+            input_type.rows.saturating_mul(*digit_count as usize),
+        );
+        self.gadget_recompositions
+            .ok_or(NormalizeError::InvalidExactPlan { reason: "compact gadget registry missing" })?
+            .matching_rule(
+                *base,
+                *small,
+                *digit_count,
+                &gadget_type,
+                decomposition_type,
+                input_type,
+                input_type,
+                Some(&gadget_layout),
+                layout(shell).as_ref(),
+                layout(input).as_ref(),
+            )
+            .ok_or(NormalizeError::InvalidExactPlan {
+                reason: "compact gadget rule missing or ambiguous",
+            })
+    }
+
+    fn retain_compact_scalar_hold(
+        &mut self,
+        expression: ExprId,
+        value_type: &ResolvedValueType,
+        bound: &NumericContract<CoefficientBound>,
+    ) -> Option<ExprId> {
+        let ResolvedValueType::Matrix(matrix) = value_type else { return None };
+        if matrix.rows != 1 ||
+            matrix.columns != 1 ||
+            !matches!(bound, NumericContract::Known(CoefficientBound::Finite(_)))
+        {
+            return None;
+        }
+        if self.compact_mode {
+            let planned = self.compact_plan_remaining.as_ref().is_some_and(|plan| {
+                plan.scalar_factors
+                    .get(&expression)
+                    .is_some_and(|entry| entry.value_type == *matrix && entry.occurrences > 0)
+            });
+            if !planned {
+                return None;
+            }
+        }
+        *self.compact_scalar_holds.entry(expression).or_default() += 1;
+        self.retained_bounded_scalar_factors.insert(expression);
+        if !self.compact_mode {
+            self.counters.compact_scalar_consumers =
+                self.counters.compact_scalar_consumers.saturating_add(1);
+        }
+        self.counters.compact_scalar_holds_current =
+            self.counters.compact_scalar_holds_current.saturating_add(1);
+        self.counters.compact_scalar_holds_peak =
+            self.counters.compact_scalar_holds_peak.max(self.counters.compact_scalar_holds_current);
+        Some(expression)
+    }
+
+    fn release_compact_scalar_hold(&mut self, expression: ExprId) -> Result<(), NormalizeError> {
+        let Some(remaining) = self.compact_scalar_holds.get_mut(&expression) else {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "compact scalar hold was over-released",
+            });
+        };
+        if *remaining == 0 {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "compact scalar hold count was exhausted",
+            });
+        }
+        *remaining -= 1;
+        self.counters.compact_scalar_holds_current =
+            self.counters.compact_scalar_holds_current.saturating_sub(1);
+        self.counters.compact_scalar_holds_released =
+            self.counters.compact_scalar_holds_released.saturating_add(1);
+        if *remaining == 0 {
+            self.compact_scalar_holds.remove(&expression);
+            self.retained_bounded_scalar_factors.remove(&expression);
+        }
+        Ok(())
+    }
+
+    fn consume_compact_scalar_plan(
+        &mut self,
+        expression: ExprId,
+        value_type: &ResolvedMatrixType,
+    ) -> Result<(), NormalizeError> {
+        let plan = self
+            .compact_plan_remaining
+            .as_mut()
+            .ok_or(NormalizeError::InvalidExactPlan { reason: "compact scalar plan is missing" })?;
+        let entry =
+            plan.scalar_factors.get_mut(&expression).ok_or(NormalizeError::InvalidExactPlan {
+                reason: "compact scalar consumer is unplanned",
+            })?;
+        if entry.value_type != *value_type || entry.occurrences == 0 {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "compact scalar consumer count is inconsistent",
+            });
+        }
+        entry.occurrences -= 1;
+        Ok(())
+    }
+
+    fn consume_compact_scalar_program_call(
+        &mut self,
+        consumer: ExprId,
+        expression: ExprId,
+        scalar_is_right: bool,
+        value_type: &ResolvedMatrixType,
+    ) -> Result<(), NormalizeError> {
+        let plan = self
+            .compact_plan_remaining
+            .as_mut()
+            .ok_or(NormalizeError::InvalidExactPlan { reason: "compact scalar plan is missing" })?;
+        let entry = plan
+            .scalar_program_calls
+            .get_mut(&(consumer, expression, scalar_is_right))
+            .ok_or(NormalizeError::InvalidExactPlan {
+                reason: "compact scalar ProgramCall consumer is unplanned",
+            })?;
+        if entry.value_type != *value_type || entry.occurrences == 0 {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "compact scalar ProgramCall consumer count is inconsistent",
+            });
+        }
+        entry.occurrences -= 1;
+        Ok(())
     }
 
     /// Run only after a depth-one node has been fully committed to every durable owner. Product
@@ -399,7 +944,7 @@ impl<'a> Normalizer<'a> {
         let gadget_roots = self
             .gadget_input_nfs
             .values()
-            .flat_map(|normal_form| normal_form.exact_terms.keys().copied());
+            .flat_map(|hold| hold.normal_form.exact_terms.keys().copied());
         let canonical_roots =
             self.normalization.as_deref().into_iter().flat_map(NormalizationCache::monomial_roots);
         let arena = self.monomials.token();
@@ -441,13 +986,20 @@ impl<'a> Normalizer<'a> {
             expression_bounds: BTreeMap::new(),
             remaining_uses: BTreeMap::new(),
             gadget_input_nfs: BTreeMap::new(),
+            compact_scalar_holds: BTreeMap::new(),
+            compact_plan: None,
+            compact_plan_remaining: None,
             counters: NormalizationCounters::default(),
             normalization_depth: 0,
             relation_rewriting_enabled: true,
+            suppress_product_relation_closure: false,
             fold_final_no_match: true,
             protected_monomial_prefix,
             monomial_gc_allocation_threshold_bytes: monomial_gc_allocation_threshold_bytes(),
             gadget_splice_batch_terms: PARALLEL_GADGET_SPLICE_BATCH_TERMS,
+            compact_mode: false,
+            compact_product_contexts: Vec::new(),
+            compact_progress_source: CompactProgressSource::Closed,
         })
     }
 
@@ -466,6 +1018,11 @@ impl<'a> Normalizer<'a> {
         gadget_recompositions: &'a GadgetRecompositionRegistry,
     ) -> Self {
         self.gadget_recompositions = Some(gadget_recompositions);
+        self
+    }
+
+    pub(crate) fn with_compact_shell_plan(mut self, plan: CompactShellPlan) -> Self {
+        self.compact_plan = Some(plan);
         self
     }
 
@@ -651,15 +1208,17 @@ impl<'a> Normalizer<'a> {
         let preimage_root =
             self.specialize_family_plan(registration.lhs.preimage_plan, index, index_range)?;
         // These plans are part of the concrete authority even though neither contributes a factor.
-        let trapdoor = self.programs.beta_reduce(
+        let trapdoor = self.programs.beta_reduce_materialized_with_reason(
             self.expressions,
             registration.lhs.trapdoor_plan,
             &[index.expression()],
+            BetaReason::NormalizerSpecialization,
         )?;
-        let pairing = self.programs.beta_reduce(
+        let pairing = self.programs.beta_reduce_materialized_with_reason(
             self.expressions,
             registration.lhs.public_pairing,
             &[index.expression()],
+            BetaReason::NormalizerSpecialization,
         )?;
         if self.expressions.value_type(trapdoor)? != &registration.lhs.validation.trapdoor_type ||
             self.expressions.value_type(pairing)? != &registration.lhs.validation.public_type
@@ -703,11 +1262,12 @@ impl<'a> Normalizer<'a> {
         index_range: super::arena::TrustedIndexRange,
     ) -> Result<ExprId, NormalizeError> {
         self.programs
-            .call_family_in_range(
+            .call_family_in_range_with_reason(
                 self.expressions,
                 super::program::FamilyValueId::from_program(plan),
                 index.expression(),
                 index_range,
+                BetaReason::NormalizerSpecialization,
             )
             .map_err(Into::into)
     }
@@ -728,9 +1288,17 @@ impl<'a> Normalizer<'a> {
         let saved_expression_bounds = std::mem::take(&mut self.expression_bounds);
         let saved_uses = std::mem::take(&mut self.remaining_uses);
         let saved_gadget_input_nfs = std::mem::take(&mut self.gadget_input_nfs);
+        let saved_compact_scalar_holds = std::mem::take(&mut self.compact_scalar_holds);
         let saved_counters = self.counters;
         let saved_fold_final_no_match = self.fold_final_no_match;
+        let saved_compact_mode = self.compact_mode;
+        let saved_suppress_product_relation_closure = self.suppress_product_relation_closure;
         self.fold_final_no_match = false;
+        // Relation specialization is an isolated ordinary normalization.  In particular, its
+        // product may contain the same gadget/scalar-shaped children as the outer compact root,
+        // but it has no private lowering plan or hold tokens to consume.
+        self.compact_mode = false;
+        self.suppress_product_relation_closure = saved_suppress_product_relation_closure;
 
         let value = self.normalize_with_existing_scope_proof(scoped, proof);
         let nested_expression_bounds = std::mem::take(&mut self.expression_bounds);
@@ -743,8 +1311,11 @@ impl<'a> Normalizer<'a> {
         }
         self.remaining_uses = saved_uses;
         self.gadget_input_nfs = saved_gadget_input_nfs;
+        self.compact_scalar_holds = saved_compact_scalar_holds;
         self.counters = saved_counters;
         self.fold_final_no_match = saved_fold_final_no_match;
+        self.compact_mode = saved_compact_mode;
+        self.suppress_product_relation_closure = saved_suppress_product_relation_closure;
         value
     }
 
@@ -752,10 +1323,13 @@ impl<'a> Normalizer<'a> {
         &mut self,
         root: ExprId,
     ) -> Result<AnalyzedValue, NormalizeError> {
-        let previous = self.relation_rewriting_enabled;
+        let previous_relation_rewriting = self.relation_rewriting_enabled;
+        let previous_suppress_product_relation_closure = self.suppress_product_relation_closure;
         self.relation_rewriting_enabled = false;
+        self.suppress_product_relation_closure = true;
         let value = self.normalize_specialized_root(root);
-        self.relation_rewriting_enabled = previous;
+        self.relation_rewriting_enabled = previous_relation_rewriting;
+        self.suppress_product_relation_closure = previous_suppress_product_relation_closure;
         value
     }
 
@@ -764,7 +1338,12 @@ impl<'a> Normalizer<'a> {
         plan: ValueProgramId,
         index: ScopedExprId,
     ) -> Result<(ExprId, Arc<PolynomialNF>), NormalizeError> {
-        let root = self.programs.beta_reduce(self.expressions, plan, &[index.expression()])?;
+        let root = self.programs.beta_reduce_materialized_with_reason(
+            self.expressions,
+            plan,
+            &[index.expression()],
+            BetaReason::NormalizerSpecialization,
+        )?;
         let value = self.normalize_specialized_root(root)?;
         let normal_form =
             value.exact_nf.clone().ok_or_else(|| NormalizeError::UnsupportedOperator {
@@ -1027,10 +1606,51 @@ impl<'a> Normalizer<'a> {
 
     fn gadget_input_nf(
         &mut self,
+        shell: ExprId,
         expression: ExprId,
     ) -> Result<Option<Arc<PolynomialNF>>, NormalizeError> {
-        if let Some(normal_form) = self.gadget_input_nfs.get(&expression).cloned() {
+        if self.gadget_input_nfs.contains_key(&expression) {
+            let (normal_form, has_token) = {
+                let hold = self.gadget_input_nfs.get(&expression).ok_or(
+                    NormalizeError::InvalidExactPlan { reason: "compact gadget hold disappeared" },
+                )?;
+                (hold.normal_form.clone(), hold.consumers.get(&shell).copied().unwrap_or(0) != 0)
+            };
+            if self.compact_mode {
+                if !has_token {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "compact gadget consumer token missing",
+                    });
+                }
+                let expected_rule = self
+                    .compact_plan
+                    .as_ref()
+                    .and_then(|plan| plan.gadget_shells.get(&(shell, expression)))
+                    .map(|entry| entry.rule.clone())
+                    .ok_or(NormalizeError::InvalidExactPlan {
+                        reason: "compact gadget consumer plan missing",
+                    })?;
+                if self.exact_compact_gadget_rule(shell, expression)? != expected_rule {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "compact gadget rule identity changed",
+                    });
+                }
+                if let Some(context) = self.compact_product_contexts.last_mut() {
+                    context.used_shells.insert((shell, expression));
+                    return Ok(Some(normal_form));
+                }
+                // A compact plan may be consumed only by the exact product boundary that
+                // preflight authorized. A relation pass or standalone lookup has no such token.
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "compact gadget lookup outside product boundary",
+                });
+            }
             return Ok(Some(normal_form));
+        }
+        if self.compact_mode {
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "compact gadget shell hold missing",
+            });
         }
         let value = match self.child_value(expression) {
             Ok(value) => value,
@@ -1040,8 +1660,79 @@ impl<'a> Normalizer<'a> {
         let Some(normal_form) = value.exact_nf.clone() else {
             return Ok(None);
         };
-        self.insert_gadget_hold(expression, normal_form.clone());
+        self.insert_gadget_hold(expression, normal_form.clone(), None);
         Ok(Some(normal_form))
+    }
+
+    fn compact_product_nf(
+        &mut self,
+        scope_proof: &ScopeProof,
+        left_type: &ResolvedMatrixType,
+        right_type: &ResolvedMatrixType,
+        left: &PolynomialNF,
+        right: &PolynomialNF,
+    ) -> Result<PolynomialNF, NormalizeError> {
+        self.with_compact_product_context(|normalizer| {
+            normalizer.product_nf(scope_proof, left_type, right_type, left, right)
+        })
+    }
+
+    /// Evaluate one compact product boundary with shell-use tracking. The frame is always
+    /// removed before propagating the evaluator result; shell plan/hold counts are committed only
+    /// after a successful product, so an error cannot release a prefix or leave a stale context.
+    fn with_compact_product_context<T>(
+        &mut self,
+        evaluate: impl FnOnce(&mut Self) -> Result<T, NormalizeError>,
+    ) -> Result<T, NormalizeError> {
+        self.compact_product_contexts.push(CompactProductContext::default());
+        let result = evaluate(self);
+        let context =
+            self.compact_product_contexts.pop().ok_or(NormalizeError::InvalidExactPlan {
+                reason: "compact product context disappeared",
+            })?;
+        let result = result?;
+        self.commit_compact_product_context(context.used_shells)?;
+        Ok(result)
+    }
+
+    fn commit_compact_product_context(
+        &mut self,
+        used_shells: BTreeSet<(ExprId, ExprId)>,
+    ) -> Result<(), NormalizeError> {
+        if used_shells.is_empty() {
+            return Ok(());
+        }
+        // Validate every token and plan count before mutating either side.  This keeps a
+        // malformed boundary fail-closed instead of releasing only a prefix of its shells.
+        for (shell, input) in &used_shells {
+            let available = self
+                .gadget_input_nfs
+                .get(input)
+                .and_then(|hold| hold.consumers.get(shell))
+                .copied()
+                .unwrap_or(0);
+            if available == 0 {
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "compact gadget consumer token over-consumed",
+                });
+            }
+            let planned = self
+                .compact_plan_remaining
+                .as_ref()
+                .and_then(|plan| plan.gadget_shells.get(&(*shell, *input)))
+                .map(|entry| entry.occurrences)
+                .unwrap_or(0);
+            if planned == 0 {
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "compact gadget plan occurrence over-consumed",
+                });
+            }
+        }
+        for (shell, input) in used_shells {
+            self.consume_compact_shell_plan(shell, input)?;
+            self.release_compact_gadget_hold(shell, input)?;
+        }
+        Ok(())
     }
 
     fn evaluate_node(
@@ -1078,6 +1769,1072 @@ impl<'a> Normalizer<'a> {
             }
         }
         Ok(value)
+    }
+
+    /// Normalize a root selected by the lowering preflight.  Reducible generated calls are
+    /// interpreted as a compact algebraic island; concrete leaves are converted to atoms only at
+    /// their own boundary.  The work stack is explicit so a 20k-node generated chain cannot
+    /// overflow the Rust call stack.
+    pub(crate) fn normalize_compact_root(
+        &mut self,
+        root: ScopedExprId,
+    ) -> Result<AnalyzedValue, NormalizeError> {
+        self.normalize_compact_source(CompactRootSource::Closed(root))
+    }
+
+    pub(crate) fn normalize_compact_family_root(
+        &mut self,
+        family: FamilyValueId,
+    ) -> Result<AnalyzedValue, NormalizeError> {
+        self.normalize_compact_source(CompactRootSource::Family(family))
+    }
+
+    fn normalize_compact_source(
+        &mut self,
+        source: CompactRootSource,
+    ) -> Result<AnalyzedValue, NormalizeError> {
+        self.compact_progress_source = match source {
+            CompactRootSource::Closed(_) => CompactProgressSource::Closed,
+            CompactRootSource::Family(_) => CompactProgressSource::Family,
+        };
+        let (mut proof, body, bindings, result_semantic) = match source {
+            CompactRootSource::Closed(root) => {
+                if root.program() != self.scope {
+                    return Err(NormalizeError::InvalidScope {
+                        expected: self.scope,
+                        actual: root.program(),
+                    });
+                }
+                let proof = self.expressions.scope_proof(root.program(), root.expression())?;
+                let mut root_expression = root.expression();
+                let mut root_node = self.expressions.node(root_expression)?.clone();
+                let ValueOperator::ProgramCall { mut program } = root_node.operator else {
+                    // A finalized zero-argument wrapper may canonicalize an already-concrete root.
+                    // The lowering marker is conservative, so retaining the
+                    // ordinary evaluator here is semantically safe and
+                    // preserves the eager-path error ordering.
+                    return self.normalize(root);
+                };
+                // `normalize_compact_closed_root` wraps a closed expression in a private
+                // zero-argument program.  Unwrap that transport shell while
+                // retaining the shell's scope proof; the selected residual itself
+                // is the inner generated family call.
+                if self.programs.family_for_program(program).is_none() {
+                    let wrapper_signature = self.programs.program_signature(program)?;
+                    if !wrapper_signature.inputs.is_empty() {
+                        return self.normalize(root);
+                    }
+                    root_expression = self.programs.program(program)?.root;
+                    root_node = self.expressions.node(root_expression)?.clone();
+                    let ValueOperator::ProgramCall { program: inner } = root_node.operator else {
+                        return self.normalize(root);
+                    };
+                    program = inner;
+                }
+                let family = self.programs.family_for_program(program).ok_or(
+                    NormalizeError::InvalidExactPlan { reason: "compact root family authority" },
+                )?;
+                if !self.programs.family_is_reducible(family)? {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "compact root is opaque",
+                    });
+                }
+                let signature = self.programs.program_signature(program)?;
+                if root_node.inputs.len() != signature.inputs.len() {
+                    return Err(NormalizeError::InvalidExactPlan { reason: "compact root arity" });
+                }
+                let mut bindings = Vec::with_capacity(root_node.inputs.len());
+                for (input, expected) in root_node.inputs.iter().zip(signature.inputs.iter()) {
+                    if self.expressions.value_type(*input)? != &expected.value_type {
+                        return Err(NormalizeError::InvalidExactPlan {
+                            reason: "compact root input type",
+                        });
+                    }
+                    if !self.expressions.is_closed(*input)? {
+                        return Err(NormalizeError::InvalidExactPlan {
+                            reason: "compact root input is open",
+                        });
+                    }
+                    bindings.push(self.expressions.scoped_from_proof(&proof, *input)?);
+                }
+                let body = self.programs.family_body(family)?;
+                if self.expressions.value_type(body)? != &signature.output {
+                    return Err(NormalizeError::InvalidExactPlan { reason: "compact root output" });
+                }
+                (proof, body, bindings, root)
+            }
+            CompactRootSource::Family(family) => {
+                if family.program() != self.scope || !self.programs.family_is_reducible(family)? {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "compact family authority",
+                    });
+                }
+                let domain = self.programs.family_domain(family)?;
+                let signature = self.programs.program_signature(family.program())?.clone();
+                let element_type = self.programs.family_element_type(family)?;
+                if signature.inputs.len() != 1 ||
+                    signature.inputs[0].value_type != ResolvedValueType::Int ||
+                    signature.inputs[0].trusted_index_range !=
+                        Some(super::arena::TrustedIndexRange {
+                            minimum: domain.minimum,
+                            maximum_exclusive: domain.maximum_exclusive,
+                        }) ||
+                    signature.output != element_type
+                {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "compact family signature",
+                    });
+                }
+                let body = self.programs.family_body(family)?;
+                if self.expressions.value_type(body)? != &signature.output {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "compact family output",
+                    });
+                }
+                let free_arguments = self.expressions.free_arguments(body)?;
+                if free_arguments.iter().any(|(position, value_type)| {
+                    *position != 0 || *value_type != ResolvedValueType::Int
+                }) {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "compact family formal argument",
+                    });
+                }
+                let proof = self.expressions.scope_proof(family.program(), body)?;
+                let argument = self.expressions.intern_argument(0, ResolvedValueType::Int)?;
+                let bindings = if free_arguments.contains(&(0, ResolvedValueType::Int)) {
+                    vec![self.expressions.scoped_from_proof(&proof, argument)?]
+                } else {
+                    Vec::new()
+                };
+                let result_semantic = self.expressions.scoped_from_proof(&proof, body)?;
+                (proof, body, bindings, result_semantic)
+            }
+        };
+        self.counters.compact_virtual_calls = self.counters.compact_virtual_calls.saturating_add(1);
+        let mut frames = vec![CompactFrame::Visit { expression: body, bindings }];
+        let mut values = Vec::<CompactValue>::new();
+        let mut max_frames = frames.len() as u64;
+        self.gadget_input_nfs.clear();
+        self.compact_scalar_holds.clear();
+        self.retained_bounded_scalar_factors.clear();
+        self.compact_plan_remaining = self.compact_plan.clone();
+        if let Some(plan) = self.compact_plan.as_ref() {
+            self.counters.compact_planned_shell_occurrences = plan.gadget_occurrences();
+            self.counters.compact_planned_unique_shells = plan.gadget_shells.len() as u64;
+            self.counters.compact_shell_allocated = plan.shell_allocated;
+            self.counters.compact_shell_hits = plan.shell_hits;
+            self.counters.compact_shell_new = plan.shell_new;
+            self.counters.compact_scalar_consumers = plan.scalar_occurrences();
+        }
+        self.compact_mode = true;
+        self.counters.compact_shell_holds_current = 0;
+        self.counters.compact_scalar_holds_current = 0;
+        while let Some(frame) = frames.pop() {
+            match frame {
+                CompactFrame::Visit { expression, bindings } => {
+                    self.counters.nodes_processed = self.counters.nodes_processed.saturating_add(1);
+                    self.log_compact_progress();
+                    let node = self.expressions.node(expression)?.clone();
+                    // Closed concrete leaves already have their canonical identity.  Preserve
+                    // that identity directly; only matrix leaves cross the atom boundary.  An
+                    // open transform/call is handled below after its arguments are substituted.
+                    let virtual_node = matches!(
+                        node.operator,
+                        ValueOperator::Matrix(
+                            MatrixOperation::Add |
+                                MatrixOperation::Subtract |
+                                MatrixOperation::Negate |
+                                MatrixOperation::Scale |
+                                MatrixOperation::Multiply |
+                                MatrixOperation::Tensor { .. }
+                        )
+                    ) || matches!(
+                        node.operator,
+                        ValueOperator::ProgramCall { program }
+                            if self
+                                .programs
+                                .family_for_program(program)
+                                .map(|family| self.programs.family_is_reducible(family))
+                                .transpose()?
+                                .unwrap_or(false)
+                    );
+                    if !matches!(node.operator, ValueOperator::Argument { .. }) &&
+                        !virtual_node &&
+                        node.inputs.is_empty()
+                    {
+                        if let Ok(semantic) = self.expressions.scoped_from_proof(&proof, expression)
+                        {
+                            let coefficient_bound = if matches!(
+                                node.operator,
+                                ValueOperator::Constant(super::arena::TypedConstant {
+                                    value: super::arena::ConstantValue::Int(_),
+                                    ..
+                                })
+                            ) {
+                                self.nonmatrix_bound(expression, &node, &[])?
+                            } else {
+                                self.factor_bound(expression)?
+                            };
+                            let resolved_type = self.expressions.value_type(expression)?.clone();
+                            let hold = self.retain_compact_scalar_hold(
+                                expression,
+                                &resolved_type,
+                                &coefficient_bound,
+                            );
+                            let exact = if matches!(
+                                self.expressions.value_type(semantic.expression())?,
+                                ResolvedValueType::Matrix(_)
+                            ) {
+                                Some(Arc::new(self.atom_nf(&proof, semantic)?))
+                            } else {
+                                None
+                            };
+                            values.push(CompactValue {
+                                semantic: Some(semantic),
+                                exact_nf: exact,
+                                coefficient_bound,
+                                resolved_type,
+                                hold,
+                            });
+                            continue;
+                        }
+                    }
+                    match node.operator {
+                        ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                            ..
+                        }) => {
+                            frames.push(CompactFrame::CombineGadget {
+                                expression,
+                                node: Arc::new(node.clone()),
+                            });
+                            for input in node.inputs.iter().rev() {
+                                frames.push(CompactFrame::Visit {
+                                    expression: *input,
+                                    bindings: bindings.clone(),
+                                });
+                            }
+                        }
+                        ValueOperator::Argument { position, value_type } => {
+                            let semantic = *bindings.get(position as usize).ok_or(
+                                NormalizeError::InvalidExactPlan {
+                                    reason: "compact argument binding",
+                                },
+                            )?;
+                            if self.expressions.value_type(semantic.expression())? != &value_type {
+                                return Err(NormalizeError::InvalidExactPlan {
+                                    reason: "compact argument type",
+                                });
+                            }
+                            let exact = if matches!(value_type, ResolvedValueType::Matrix(_)) {
+                                Some(Arc::new(self.atom_nf(&proof, semantic)?))
+                            } else {
+                                None
+                            };
+                            let coefficient_bound = if exact.is_some() {
+                                self.authoritative_source_bound(semantic.expression())?
+                            } else if matches!(value_type, ResolvedValueType::Int) &&
+                                self.direct_integer_constant(semantic.expression()).is_some()
+                            {
+                                self.nonmatrix_bound(
+                                    semantic.expression(),
+                                    self.expressions.node(semantic.expression())?,
+                                    &[],
+                                )?
+                            } else {
+                                NumericContract::Missing
+                            };
+                            let hold = self.retain_compact_scalar_hold(
+                                semantic.expression(),
+                                &value_type,
+                                &coefficient_bound,
+                            );
+                            values.push(CompactValue {
+                                semantic: Some(semantic),
+                                exact_nf: exact,
+                                coefficient_bound,
+                                resolved_type: value_type,
+                                hold,
+                            });
+                        }
+                        ValueOperator::ProgramCall { program } => {
+                            let family = self.programs.family_for_program(program);
+                            let reducible = family
+                                .map(|family| self.programs.family_is_reducible(family))
+                                .transpose()?
+                                .unwrap_or(false);
+                            if reducible {
+                                let mut nested = Vec::with_capacity(node.inputs.len());
+                                for input in node.inputs.iter().copied() {
+                                    nested.push(self.compact_semantic_iterative(
+                                        &mut proof, input, &bindings,
+                                    )?);
+                                }
+                                let family = family.ok_or(NormalizeError::InvalidExactPlan {
+                                    reason: "compact call family authority",
+                                })?;
+                                frames.push(CompactFrame::Visit {
+                                    expression: self.programs.family_body(family)?,
+                                    bindings: nested,
+                                });
+                                self.counters.compact_virtual_calls =
+                                    self.counters.compact_virtual_calls.saturating_add(1);
+                                continue;
+                            }
+                            frames.push(CompactFrame::CombineCall {
+                                expression,
+                                node: Arc::new(node.clone()),
+                            });
+                            for input in node.inputs.iter().rev() {
+                                frames.push(CompactFrame::Visit {
+                                    expression: *input,
+                                    bindings: bindings.clone(),
+                                });
+                            }
+                        }
+                        ValueOperator::Matrix(
+                            MatrixOperation::Add |
+                            MatrixOperation::Subtract |
+                            MatrixOperation::Negate |
+                            MatrixOperation::Scale |
+                            MatrixOperation::Multiply |
+                            MatrixOperation::Tensor { .. },
+                        ) => {
+                            self.counters.compact_algebra_nodes =
+                                self.counters.compact_algebra_nodes.saturating_add(1);
+                            match node.operator {
+                                ValueOperator::Matrix(
+                                    MatrixOperation::Add | MatrixOperation::Subtract,
+                                ) => {
+                                    self.counters.compact_logical_add_sub =
+                                        self.counters.compact_logical_add_sub.saturating_add(1)
+                                }
+                                ValueOperator::Matrix(MatrixOperation::Scale) => {
+                                    self.counters.compact_logical_scale =
+                                        self.counters.compact_logical_scale.saturating_add(1)
+                                }
+                                ValueOperator::Matrix(MatrixOperation::Multiply) => {
+                                    self.counters.compact_strict_products =
+                                        self.counters.compact_strict_products.saturating_add(1)
+                                }
+                                _ => {}
+                            }
+                            frames.push(CompactFrame::CombineMatrix {
+                                expression,
+                                node: Arc::new(node.clone()),
+                            });
+                            for input in node.inputs.iter().rev() {
+                                frames.push(CompactFrame::Visit {
+                                    expression: *input,
+                                    bindings: bindings.clone(),
+                                });
+                            }
+                        }
+                        _ => {
+                            frames.push(CompactFrame::CombineConcrete {
+                                expression,
+                                node: Arc::new(node.clone()),
+                            });
+                            for input in node.inputs.iter().rev() {
+                                frames.push(CompactFrame::Visit {
+                                    expression: *input,
+                                    bindings: bindings.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                CompactFrame::CombineMatrix { expression, node } => {
+                    let count = node.inputs.len();
+                    if values.len() < count {
+                        return Err(NormalizeError::InvalidExactPlan {
+                            reason: "compact value stack",
+                        });
+                    }
+                    let start = values.len() - count;
+                    let children = values.split_off(start);
+                    let child_holds =
+                        children.iter().filter_map(|child| child.hold).collect::<Vec<_>>();
+                    let bounds = children
+                        .iter()
+                        .map(|child| child.coefficient_bound.clone())
+                        .collect::<Vec<_>>();
+                    let bound = self.matrix_operation_bound(
+                        match &node.operator {
+                            ValueOperator::Matrix(operation) => operation,
+                            _ => unreachable!(),
+                        },
+                        &node,
+                        &bounds,
+                    )?;
+                    let exact = match node.operator {
+                        ValueOperator::Matrix(MatrixOperation::Add) => Some(self.add_nf(
+                            children[0].exact_nf.as_deref().ok_or(
+                                NormalizeError::InvalidExactPlan { reason: "compact add child" },
+                            )?,
+                            children[1].exact_nf.as_deref().ok_or(
+                                NormalizeError::InvalidExactPlan { reason: "compact add child" },
+                            )?,
+                            false,
+                        )?),
+                        ValueOperator::Matrix(MatrixOperation::Subtract) => Some(self.add_nf(
+                            children[0].exact_nf.as_deref().ok_or(
+                                NormalizeError::InvalidExactPlan {
+                                    reason: "compact subtract child",
+                                },
+                            )?,
+                            children[1].exact_nf.as_deref().ok_or(
+                                NormalizeError::InvalidExactPlan {
+                                    reason: "compact subtract child",
+                                },
+                            )?,
+                            true,
+                        )?),
+                        ValueOperator::Matrix(MatrixOperation::Negate) => {
+                            Some(self.negate_nf(children[0].exact_nf.as_deref().ok_or(
+                                NormalizeError::InvalidExactPlan { reason: "compact negate child" },
+                            )?))
+                        }
+                        ValueOperator::Matrix(MatrixOperation::Scale) => {
+                            let scale = self.direct_integer_constant(node.inputs[1]).ok_or(
+                                NormalizeError::InvalidExactPlan {
+                                    reason: "compact scale coefficient",
+                                },
+                            )?;
+                            Some(self.scale_nf(
+                                children[0].exact_nf.as_deref().ok_or(
+                                    NormalizeError::InvalidExactPlan {
+                                        reason: "compact scale child",
+                                    },
+                                )?,
+                                &scale,
+                            ))
+                        }
+                        ValueOperator::Matrix(MatrixOperation::Multiply) => {
+                            let ResolvedValueType::Matrix(left_type) =
+                                self.expressions.value_type(node.inputs[0])?
+                            else {
+                                return Err(NormalizeError::InvalidExactPlan {
+                                    reason: "compact product left type",
+                                });
+                            };
+                            let ResolvedValueType::Matrix(right_type) =
+                                self.expressions.value_type(node.inputs[1])?
+                            else {
+                                return Err(NormalizeError::InvalidExactPlan {
+                                    reason: "compact product right type",
+                                });
+                            };
+                            let left_type = left_type.clone();
+                            let right_type = right_type.clone();
+                            let left_nf = children[0].exact_nf.as_deref().ok_or(
+                                NormalizeError::InvalidExactPlan { reason: "compact product left" },
+                            )?;
+                            let right_nf = children[1].exact_nf.as_deref().ok_or(
+                                NormalizeError::InvalidExactPlan {
+                                    reason: "compact product right",
+                                },
+                            )?;
+                            let left_scalar = left_type.rows == 1 && left_type.columns == 1;
+                            let right_scalar = right_type.rows == 1 && right_type.columns == 1;
+                            let one_sided_scalar = left_scalar ^ right_scalar;
+                            let both_scalar = left_scalar && right_scalar;
+                            if one_sided_scalar || both_scalar {
+                                let output_type = match self.expressions.value_type(expression)? {
+                                    ResolvedValueType::Matrix(output_type) => output_type.clone(),
+                                    _ => {
+                                        return Err(NormalizeError::InvalidExactPlan {
+                                            reason: "compact scalar action output type",
+                                        })
+                                    }
+                                };
+                                let left_bound = children[0].coefficient_bound.clone();
+                                let right_bound = children[1].coefficient_bound.clone();
+                                let mut value = match self.scalar_action_nf_typed(
+                                    &proof,
+                                    &output_type,
+                                    &left_type,
+                                    &right_type,
+                                    &left_bound,
+                                    &right_bound,
+                                    left_nf,
+                                    right_nf,
+                                )? {
+                                    ScalarActionNormalization::Exact(value) => Some(value),
+                                    _ => {
+                                        return Err(NormalizeError::InvalidExactPlan {
+                                            reason: "compact scalar action was not exact",
+                                        })
+                                    }
+                                };
+                                // A fully finite scalar action follows the eager bounded-only
+                                // contract: retain its summary but do not publish an exact atom.
+                                // The authorized scalar token is consumed only after the typed
+                                // action above returns Exact.
+                                if matches!(
+                                    bound,
+                                    NumericContract::Known(
+                                        CoefficientBound::ExactZero | CoefficientBound::Finite(_)
+                                    )
+                                ) {
+                                    value = Some(PolynomialNF {
+                                        exact_terms: BTreeMap::new(),
+                                        bounded_summary: BoundedSummary::from_contract(
+                                            bound.clone(),
+                                        )?,
+                                    });
+                                }
+                                if one_sided_scalar {
+                                    let (scalar_expression, scalar_type) = if left_scalar {
+                                        (node.inputs[0], &left_type)
+                                    } else {
+                                        (node.inputs[1], &right_type)
+                                    };
+                                    let scalar_is_right = right_scalar;
+                                    if matches!(
+                                        self.expressions.node(scalar_expression)?.operator,
+                                        ValueOperator::ProgramCall { .. }
+                                    ) {
+                                        self.consume_compact_scalar_program_call(
+                                            expression,
+                                            scalar_expression,
+                                            scalar_is_right,
+                                            scalar_type,
+                                        )?;
+                                    } else {
+                                        self.consume_compact_scalar_plan(
+                                            scalar_expression,
+                                            scalar_type,
+                                        )?;
+                                    }
+                                }
+                                value
+                            } else {
+                                Some(self.compact_product_nf(
+                                    &proof,
+                                    &left_type,
+                                    &right_type,
+                                    left_nf,
+                                    right_nf,
+                                )?)
+                            }
+                        }
+                        ValueOperator::Matrix(MatrixOperation::Tensor { .. }) => {
+                            let ResolvedValueType::Matrix(left_type) =
+                                self.expressions.value_type(node.inputs[0])?
+                            else {
+                                return Err(NormalizeError::InvalidExactPlan {
+                                    reason: "compact tensor left type",
+                                });
+                            };
+                            let ResolvedValueType::Matrix(right_type) =
+                                self.expressions.value_type(node.inputs[1])?
+                            else {
+                                return Err(NormalizeError::InvalidExactPlan {
+                                    reason: "compact tensor right type",
+                                });
+                            };
+                            let left_type = left_type.clone();
+                            let right_type = right_type.clone();
+                            let left_nf = children[0].exact_nf.as_deref().ok_or(
+                                NormalizeError::InvalidExactPlan { reason: "compact tensor left" },
+                            )?;
+                            let right_nf = children[1].exact_nf.as_deref().ok_or(
+                                NormalizeError::InvalidExactPlan { reason: "compact tensor right" },
+                            )?;
+                            let mut value = match self.tensor_scalar_action_nf(
+                                &proof,
+                                match &node.operator {
+                                    ValueOperator::Matrix(operation) => operation,
+                                    _ => unreachable!(),
+                                },
+                                expression,
+                                node.inputs[0],
+                                node.inputs[1],
+                                left_nf,
+                                right_nf,
+                            )? {
+                                ScalarActionNormalization::Exact(value) => value,
+                                _ => {
+                                    return Err(NormalizeError::InvalidExactPlan {
+                                        reason: "compact tensor scalar action was not exact",
+                                    })
+                                }
+                            };
+                            if matches!(
+                                bound,
+                                NumericContract::Known(
+                                    CoefficientBound::ExactZero | CoefficientBound::Finite(_)
+                                )
+                            ) {
+                                value = PolynomialNF {
+                                    exact_terms: BTreeMap::new(),
+                                    bounded_summary: BoundedSummary::from_contract(bound.clone())?,
+                                };
+                            }
+                            let scalar_is_right = right_type.rows == 1 && right_type.columns == 1;
+                            let scalar_expression =
+                                if scalar_is_right { node.inputs[1] } else { node.inputs[0] };
+                            if matches!(
+                                self.expressions.node(scalar_expression)?.operator,
+                                ValueOperator::ProgramCall { .. }
+                            ) {
+                                self.consume_compact_scalar_program_call(
+                                    expression,
+                                    scalar_expression,
+                                    scalar_is_right,
+                                    if scalar_is_right { &right_type } else { &left_type },
+                                )?;
+                            } else {
+                                return Err(NormalizeError::InvalidExactPlan {
+                                    reason: "compact tensor scalar factor is not planned",
+                                });
+                            }
+                            Some(value)
+                        }
+                        _ => unreachable!(),
+                    };
+                    for hold in child_holds {
+                        self.release_compact_scalar_hold(hold)?;
+                    }
+                    values.push(CompactValue {
+                        // This value is an eliminable virtual algebra result.  It deliberately
+                        // carries no semantic expression; the original root identity is restored
+                        // only once, after the complete compact value has been produced.
+                        semantic: None,
+                        exact_nf: exact.map(Arc::new),
+                        coefficient_bound: bound,
+                        resolved_type: self.expressions.value_type(expression)?.clone(),
+                        hold: None,
+                    });
+                }
+                CompactFrame::CombineGadget { expression, node } => {
+                    if node.inputs.len() != 1 || self.compact_plan.is_none() {
+                        return Err(NormalizeError::InvalidExactPlan {
+                            reason: "compact gadget frame is not preflighted",
+                        });
+                    }
+                    let start =
+                        values.len().checked_sub(1).ok_or(NormalizeError::InvalidExactPlan {
+                            reason: "compact gadget stack",
+                        })?;
+                    let children = values.split_off(start);
+                    let child =
+                        children.into_iter().next().ok_or(NormalizeError::InvalidExactPlan {
+                            reason: "compact gadget child",
+                        })?;
+                    let input = node.inputs[0];
+                    let plan_entry = self
+                        .compact_plan
+                        .as_ref()
+                        .and_then(|plan| plan.gadget_shells.get(&(expression, input)))
+                        .ok_or(NormalizeError::InvalidExactPlan {
+                            reason: "compact gadget shell was not preflighted",
+                        })?;
+                    let rule = self.exact_compact_gadget_rule(expression, input)?;
+                    if rule != plan_entry.rule {
+                        return Err(NormalizeError::InvalidExactPlan {
+                            reason: "compact gadget rule identity changed",
+                        });
+                    }
+                    let input_nf = child.exact_nf.ok_or(NormalizeError::InvalidExactPlan {
+                        reason: "compact gadget input has no exact normal form",
+                    })?;
+                    let bound = child.coefficient_bound.clone();
+                    if let Some(child_hold) = child.hold {
+                        self.release_compact_scalar_hold(child_hold)?;
+                    }
+                    let semantic = self.expressions.intern_scoped_transform(
+                        &mut proof,
+                        node.operator.clone(),
+                        &[child.semantic.ok_or(NormalizeError::InvalidExactPlan {
+                            reason: "compact gadget input semantic missing",
+                        })?],
+                    )?;
+                    self.insert_gadget_hold(input, input_nf, Some(expression));
+                    let resolved_type = self.expressions.value_type(expression)?.clone();
+                    let exact_nf = Some(Arc::new(self.atom_nf(&proof, semantic)?));
+                    values.push(CompactValue {
+                        semantic: Some(semantic),
+                        exact_nf,
+                        coefficient_bound: bound,
+                        resolved_type,
+                        hold: None,
+                    });
+                }
+                CompactFrame::CombineCall { expression, node } => {
+                    let count = node.inputs.len();
+                    if values.len() < count {
+                        return Err(NormalizeError::InvalidExactPlan {
+                            reason: "compact call stack",
+                        });
+                    }
+                    let start = values.len() - count;
+                    let children = values.split_off(start);
+                    let child_holds =
+                        children.iter().filter_map(|child| child.hold).collect::<Vec<_>>();
+                    let semantics = children
+                        .iter()
+                        .map(|child| child.semantic)
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or(NormalizeError::InvalidExactPlan {
+                            reason: "eliminable virtual call input",
+                        })?;
+                    let semantic = self.expressions.intern_scoped_transform(
+                        &mut proof,
+                        node.operator.clone(),
+                        &semantics,
+                    )?;
+                    let child_values = children
+                        .iter()
+                        .map(CompactValue::as_analyzed)
+                        .map(|value| value.map(Arc::new))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut value = if matches!(
+                        self.expressions.value_type(semantic.expression())?,
+                        ResolvedValueType::Matrix(_)
+                    ) {
+                        self.evaluate_matrix(
+                            &mut proof,
+                            semantic,
+                            expression,
+                            &node,
+                            &child_values,
+                        )?
+                    } else {
+                        self.evaluate_nonmatrix(semantic, expression, &node, &child_values)?
+                    };
+                    // Generated body facts may remain `Missing` even when this compact
+                    // traversal has exact finite child transfers locally. Derive the operation
+                    // bound from those children without a second graph traversal.
+                    if value.coefficient_bound.is_missing() {
+                        if let ValueOperator::Matrix(operation) = &node.operator {
+                            let child_bounds = child_values
+                                .iter()
+                                .map(|child| child.coefficient_bound.clone())
+                                .collect::<Vec<_>>();
+                            value.coefficient_bound =
+                                self.matrix_operation_bound(operation, &node, &child_bounds)?;
+                        }
+                    }
+                    let resolved_type = self.expressions.value_type(expression)?.clone();
+                    let hold = self.retain_compact_scalar_hold(
+                        value.semantic.expression(),
+                        &resolved_type,
+                        &value.coefficient_bound,
+                    );
+                    let mut compact_value = CompactValue::from_analyzed(value, resolved_type);
+                    compact_value.hold = hold;
+                    for child_hold in child_holds {
+                        self.release_compact_scalar_hold(child_hold)?;
+                    }
+                    values.push(compact_value);
+                }
+                CompactFrame::CombineConcrete { expression, node } => {
+                    self.counters.compact_concrete_shell_nodes =
+                        self.counters.compact_concrete_shell_nodes.saturating_add(1);
+                    let count = node.inputs.len();
+                    if values.len() < count {
+                        return Err(NormalizeError::InvalidExactPlan {
+                            reason: "compact concrete stack",
+                        });
+                    }
+                    let start = values.len() - count;
+                    let children = values.split_off(start);
+                    let child_holds =
+                        children.iter().filter_map(|child| child.hold).collect::<Vec<_>>();
+                    let semantics = children
+                        .iter()
+                        .map(|child| child.semantic)
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or(NormalizeError::InvalidExactPlan {
+                            reason: "eliminable virtual concrete input",
+                        })?;
+                    let semantic = self.expressions.intern_scoped_transform(
+                        &mut proof,
+                        node.operator.clone(),
+                        &semantics,
+                    )?;
+                    let child_values = children
+                        .iter()
+                        .map(CompactValue::as_analyzed)
+                        .map(|value| value.map(Arc::new))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let value = if matches!(
+                        self.expressions.value_type(semantic.expression())?,
+                        ResolvedValueType::Matrix(_)
+                    ) {
+                        self.evaluate_matrix(
+                            &mut proof,
+                            semantic,
+                            expression,
+                            &node,
+                            &child_values,
+                        )?
+                    } else {
+                        self.evaluate_nonmatrix(semantic, expression, &node, &child_values)?
+                    };
+                    let resolved_type = self.expressions.value_type(expression)?.clone();
+                    let hold = self.retain_compact_scalar_hold(
+                        value.semantic.expression(),
+                        &resolved_type,
+                        &value.coefficient_bound,
+                    );
+                    let mut compact_value = CompactValue::from_analyzed(value, resolved_type);
+                    compact_value.hold = hold;
+                    for child_hold in child_holds {
+                        self.release_compact_scalar_hold(child_hold)?;
+                    }
+                    values.push(compact_value);
+                }
+            }
+            let live_frames = frames.len() as u64;
+            let live_values = values.len() as u64;
+            self.counters.compact_live_frames = live_frames;
+            self.counters.compact_live_values = live_values;
+            self.counters.compact_peak_live_frames =
+                self.counters.compact_peak_live_frames.max(live_frames);
+            self.counters.compact_peak_live_values =
+                self.counters.compact_peak_live_values.max(live_values);
+            max_frames = max_frames.max(live_frames);
+            self.counters.compact_max_virtual_frames =
+                self.counters.compact_max_virtual_frames.max(live_frames);
+            self.counters.compact_max_virtual_values =
+                self.counters.compact_max_virtual_values.max(live_values);
+        }
+        self.counters.compact_max_frames = max_frames;
+        let result_value = values
+            .pop()
+            .ok_or(NormalizeError::InvalidExactPlan { reason: "compact root value" })?;
+        let mut result = AnalyzedValue {
+            semantic: result_semantic,
+            exact_nf: result_value.exact_nf,
+            coefficient_bound: result_value.coefficient_bound,
+        };
+        self.counters.compact_live_frames = 0;
+        self.counters.compact_live_values = 0;
+        result.semantic = result_semantic;
+        if let Some(exact_nf) = result.exact_nf.as_mut() {
+            if self.relations.is_some() {
+                let normal_form = Arc::make_mut(exact_nf);
+                self.rewrite_relations(normal_form)?;
+                result.coefficient_bound = self.bound_normal_form(normal_form)?;
+                if self.fold_final_no_match {
+                    self.fold_finite_no_match_terms(normal_form, false)?;
+                }
+                if normal_form.is_zero() {
+                    result.coefficient_bound = NumericContract::Known(CoefficientBound::ExactZero);
+                    normal_form.bounded_summary = BoundedSummary::zero();
+                }
+            }
+            self.counters.relation_remaining = self.count_relation_remaining(exact_nf) as u64;
+            self.counters.final_exact_term_count = exact_nf.exact_terms.len() as u64;
+        }
+        let (gadget_plan_unmatched, scalar_plan_unmatched) = self
+            .compact_plan_remaining
+            .as_ref()
+            .map(|plan| {
+                (
+                    plan.gadget_shells.values().map(|entry| entry.occurrences).sum::<u64>(),
+                    plan.scalar_occurrences(),
+                )
+            })
+            .unwrap_or((0, 0));
+        let shell_holds = self.gadget_input_nfs.values().map(|hold| hold.remaining).sum::<u64>();
+        let scalar_holds = self.compact_scalar_holds.values().copied().sum::<u64>();
+        self.counters.compact_shell_holds_unmatched =
+            gadget_plan_unmatched.saturating_add(shell_holds);
+        self.counters.compact_scalar_holds_unmatched =
+            scalar_plan_unmatched.saturating_add(scalar_holds);
+        if gadget_plan_unmatched != 0 ||
+            scalar_plan_unmatched != 0 ||
+            shell_holds != 0 ||
+            scalar_holds != 0
+        {
+            self.compact_mode = false;
+            return Err(NormalizeError::InvalidExactPlan {
+                reason: "compact plan or hold was not fully consumed",
+            });
+        }
+        // Compact runtime work is the actual evaluator Visit count. The structural preflight
+        // occurrence count remains private plan diagnostics and is deliberately not equated with
+        // this completed runtime total.
+        self.counters.nodes_total = self.counters.nodes_processed;
+        self.compact_plan_remaining = None;
+        self.compact_mode = false;
+        Ok(result)
+    }
+
+    /// Build the semantic identity of a call's ordered binding with a local environment stack.
+    /// Reducible calls
+    /// are beta-entered here, so nested index bindings have the same scoped identity as eager
+    /// evaluation without a bare-expression cache or domain materialization.
+    fn compact_semantic_iterative(
+        &mut self,
+        proof: &mut ScopeProof,
+        expression: ExprId,
+        bindings: &[ScopedExprId],
+    ) -> Result<ScopedExprId, NormalizeError> {
+        enum Frame {
+            Visit {
+                expression: ExprId,
+                environment: usize,
+            },
+            Build {
+                expression: ExprId,
+                environment: usize,
+            },
+            EnterCall {
+                expression: ExprId,
+                environment: usize,
+                body: ExprId,
+                body_environment: usize,
+            },
+            FinishCall {
+                expression: ExprId,
+                environment: usize,
+                body: ExprId,
+                body_environment: usize,
+            },
+        }
+
+        let mut environments = vec![bindings.to_vec()];
+        let mut values = BTreeMap::<(ExprId, usize), ScopedExprId>::new();
+        let mut active = BTreeSet::<(ExprId, usize)>::new();
+        let mut frames = vec![Frame::Visit { expression, environment: 0 }];
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Visit { expression, environment } => {
+                    self.counters.nodes_processed = self.counters.nodes_processed.saturating_add(1);
+                    self.log_compact_progress();
+                    let key = (expression, environment);
+                    if values.contains_key(&key) {
+                        continue;
+                    }
+                    if !active.insert(key) {
+                        return Err(NormalizeError::InvalidExactPlan {
+                            reason: "compact semantic binding cycle",
+                        });
+                    }
+                    let node = self.expressions.node(expression)?.clone();
+                    if let ValueOperator::Argument { position, .. } = node.operator {
+                        let value = *environments
+                            .get(environment)
+                            .and_then(|bindings| bindings.get(position as usize))
+                            .ok_or(NormalizeError::InvalidExactPlan {
+                                reason: "compact argument binding",
+                            })?;
+                        values.insert(key, value);
+                        active.remove(&key);
+                        continue;
+                    }
+                    if let ValueOperator::ProgramCall { program } = node.operator {
+                        let family = self.programs.family_for_program(program);
+                        let reducible = family
+                            .map(|family| self.programs.family_is_reducible(family))
+                            .transpose()?
+                            .unwrap_or(false);
+                        if reducible {
+                            let family = family.ok_or(NormalizeError::InvalidExactPlan {
+                                reason: "compact call family authority",
+                            })?;
+                            let signature = self.programs.program_signature(program)?.clone();
+                            if node.inputs.len() != signature.inputs.len() {
+                                return Err(NormalizeError::InvalidExactPlan {
+                                    reason: "compact call arity",
+                                });
+                            }
+                            for (input, expected) in node.inputs.iter().zip(signature.inputs.iter())
+                            {
+                                if self.expressions.value_type(*input)? != &expected.value_type {
+                                    return Err(NormalizeError::InvalidExactPlan {
+                                        reason: "compact call input type",
+                                    });
+                                }
+                            }
+                            let body = self.programs.family_body(family)?;
+                            if self.expressions.value_type(body)? != &signature.output {
+                                return Err(NormalizeError::InvalidExactPlan {
+                                    reason: "compact call output type",
+                                });
+                            }
+                            let body_environment = environments.len();
+                            environments.push(Vec::with_capacity(node.inputs.len()));
+                            frames.push(Frame::EnterCall {
+                                expression,
+                                environment,
+                                body,
+                                body_environment,
+                            });
+                            for input in node.inputs.iter().rev() {
+                                frames.push(Frame::Visit { expression: *input, environment });
+                            }
+                            continue;
+                        }
+                    }
+                    if let Ok(value) = self.expressions.scoped_from_proof(proof, expression) {
+                        values.insert(key, value);
+                        active.remove(&key);
+                        continue;
+                    }
+                    frames.push(Frame::Build { expression, environment });
+                    for input in node.inputs.iter().rev() {
+                        frames.push(Frame::Visit { expression: *input, environment });
+                    }
+                }
+                Frame::Build { expression, environment } => {
+                    let key = (expression, environment);
+                    let node = self.expressions.node(expression)?.clone();
+                    let inputs = node
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            values.get(&(*input, environment)).copied().ok_or(
+                                NormalizeError::InvalidExactPlan {
+                                    reason: "compact semantic binding",
+                                },
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let value =
+                        self.expressions.intern_scoped_transform(proof, node.operator, &inputs)?;
+                    values.insert(key, value);
+                    active.remove(&key);
+                }
+                Frame::EnterCall { expression, environment, body, body_environment } => {
+                    let call_node = self.expressions.node(expression)?.clone();
+                    let inputs = call_node
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            values.get(&(*input, environment)).copied().ok_or(
+                                NormalizeError::InvalidExactPlan {
+                                    reason: "compact semantic call input",
+                                },
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    environments[body_environment] = inputs;
+                    frames.push(Frame::FinishCall {
+                        expression,
+                        environment,
+                        body,
+                        body_environment,
+                    });
+                    frames.push(Frame::Visit { expression: body, environment: body_environment });
+                }
+                Frame::FinishCall { expression, environment, body, body_environment } => {
+                    let body_value = values.get(&(body, body_environment)).copied().ok_or(
+                        NormalizeError::InvalidExactPlan { reason: "compact semantic call body" },
+                    )?;
+                    values.insert((expression, environment), body_value);
+                    active.remove(&(expression, environment));
+                }
+            }
+        }
+        values
+            .get(&(expression, 0))
+            .copied()
+            .ok_or(NormalizeError::InvalidExactPlan { reason: "compact semantic root" })
     }
 
     fn evaluate_matrix(
@@ -1929,15 +3686,45 @@ impl<'a> Normalizer<'a> {
             return Ok(ScalarActionNormalization::NotApplicable);
         };
         let right_type = right_type.clone();
+        let left_bound = self.bound_exact_terms(left)?;
+        let right_bound = self.bound_exact_terms(right)?;
+        self.scalar_action_nf_typed(
+            scope_proof,
+            &output_type,
+            &left_type,
+            &right_type,
+            &left_bound,
+            &right_bound,
+            left,
+            right,
+        )
+    }
+
+    /// Apply scalar action using already-resolved typed operands. Compact algebra values may have
+    /// no semantic parent expression, so this helper never consults a parent ExprId.
+    fn scalar_action_nf_typed(
+        &mut self,
+        scope_proof: &ScopeProof,
+        output_type: &ResolvedMatrixType,
+        left_type: &ResolvedMatrixType,
+        right_type: &ResolvedMatrixType,
+        left_bound: &NumericContract<CoefficientBound>,
+        right_bound: &NumericContract<CoefficientBound>,
+        left: &PolynomialNF,
+        right: &PolynomialNF,
+    ) -> Result<ScalarActionNormalization, NormalizeError> {
+        // Keep these bounds in the typed contract for callers which have already proved them;
+        // exact algebra itself remains valid when an ordinary eager caller has no bound fact.
+        let _ = (left_bound, right_bound);
         let left_scalar = left_type.rows == 1 && left_type.columns == 1;
         let right_scalar = right_type.rows == 1 && right_type.columns == 1;
         if !left_scalar && !right_scalar {
             return Ok(ScalarActionNormalization::NotApplicable);
         }
-        let expected_output = if left_scalar { &right_type } else { &left_type };
+        let expected_output = if left_scalar { right_type } else { left_type };
         if left_type.modulus != right_type.modulus ||
             left_type.ring_dimension != right_type.ring_dimension ||
-            &output_type != expected_output
+            output_type != expected_output
         {
             return Ok(ScalarActionNormalization::Opaque);
         }
@@ -1953,8 +3740,10 @@ impl<'a> Normalizer<'a> {
             // commutativity of the scalar result. The product is centralized only after every
             // surviving ordered factor is proven to have the declared 1x1 output type. In the
             // reversed order no relation applies, so both typed scalar factors remain present.
-            let product = self.product_nf(scope_proof, &left_type, &right_type, left, right)?;
-            if !self.scalar_nf_ordered_factors_match_type(&product, &output_type)? {
+            let product = self.with_compact_product_context(|normalizer| {
+                normalizer.product_nf(scope_proof, &left_type, &right_type, left, right)
+            })?;
+            if !self.scalar_nf_ordered_factors_match_type(&product, output_type)? {
                 return Ok(ScalarActionNormalization::Opaque);
             }
             Some(product)
@@ -3095,7 +4884,8 @@ impl<'a> Normalizer<'a> {
             initial_bound,
             NumericContract::Known(CoefficientBound::Large) | NumericContract::Missing
         ) && self.relations.is_some() &&
-            self.normalization_depth == 1;
+            self.normalization_depth == 1 &&
+            !self.suppress_product_relation_closure;
         if !needs_relation_closure {
             return self.merge_product_term(monomial, coefficient, initial_bound, terms, noise)
         }
@@ -3153,7 +4943,16 @@ impl<'a> Normalizer<'a> {
             else {
                 continue;
             };
-            let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
+            let Some(input_nf) =
+                self.gadget_input_nf(ordered_factors[index + 1].expression(), input)?
+            else {
+                if self.compact_mode {
+                    return Err(NormalizeError::InvalidExactPlan {
+                        reason: "compact gadget shell hold missing",
+                    });
+                }
+                return Ok(None);
+            };
             let has_left_context = !central_factors.is_empty() || index != 0;
             let has_suffix_context = index + 2 != ordered_factors.len();
             if !input_nf.bounded_summary.is_zero() && (has_left_context || has_suffix_context) {
@@ -3234,7 +5033,16 @@ impl<'a> Normalizer<'a> {
         // `D(A)` itself is an atom in the child NF, but the identity exposes the already
         // normalized polynomial NF of `A`, not the raw input expression. The use-count hold
         // installed during traversal keeps this memo entry alive until this splice.
-        let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
+        let Some(input_nf) =
+            self.gadget_input_nf(ordered_factors[index + 1].expression(), input)?
+        else {
+            if self.compact_mode {
+                return Err(NormalizeError::InvalidExactPlan {
+                    reason: "compact gadget shell hold missing",
+                });
+            }
+            return Ok(None);
+        };
         let has_left_context = !central_factors.is_empty() || index != 0;
         let has_suffix_context = index + 2 != ordered_factors.len();
         if !input_nf.bounded_summary.is_zero() && (has_left_context || has_suffix_context) {
@@ -3875,6 +5683,13 @@ impl<'a> Normalizer<'a> {
         }
         let node = self.expressions.node(expression)?;
         let derived = match &node.operator {
+            ValueOperator::Matrix(
+                MatrixOperation::Slice { .. } | MatrixOperation::IndexedSlice { .. },
+            ) => node
+                .inputs
+                .first()
+                .copied()
+                .map_or(Ok(NumericContract::Missing), |input| self.factor_bound(input))?,
             ValueOperator::Sampler { operation, .. } => sampler_bound(operation),
             ValueOperator::DeterministicHash(_) => NumericContract::Known(CoefficientBound::Large),
             ValueOperator::Transform(operation) => transform_bound(operation),
@@ -3950,7 +5765,9 @@ impl<'a> Normalizer<'a> {
         children: &[Arc<AnalyzedValue>],
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
         if let Some(bound) = self.fact_bound(expression)? {
-            return Ok(bound);
+            if !bound.is_missing() {
+                return Ok(bound);
+            }
         }
         let child_bounds =
             children.iter().map(|value| value.coefficient_bound.clone()).collect::<Vec<_>>();
@@ -3988,7 +5805,12 @@ impl<'a> Normalizer<'a> {
             MatrixOperation::Slice { .. } |
             MatrixOperation::IndexedSlice { .. } |
             MatrixOperation::View { .. } => {
-                Ok(bounds.first().cloned().unwrap_or(NumericContract::Missing))
+                let bound = bounds.first().cloned().unwrap_or(NumericContract::Missing);
+                if bound.is_missing() && matches!(operation, MatrixOperation::Slice { .. }) {
+                    self.factor_bound(node.inputs[0])
+                } else {
+                    Ok(bound)
+                }
             }
             MatrixOperation::Scale => product_bounds(bounds),
             MatrixOperation::Multiply => self.matrix_product_bound(node, bounds),
@@ -4161,6 +5983,18 @@ impl<'a> Normalizer<'a> {
                 _ => return None,
             }
         }
+    }
+
+    fn direct_integer_constant(&self, expression: ExprId) -> Option<BigInt> {
+        let node = self.expressions.node(expression).ok()?;
+        let ValueOperator::Constant(super::arena::TypedConstant {
+            value: super::arena::ConstantValue::Int(value),
+            ..
+        }) = &node.operator
+        else {
+            return None;
+        };
+        Some(value.clone())
     }
 }
 
@@ -4510,15 +6344,16 @@ mod tests {
     use super::*;
     use crate::operational_noise::{
         arena::{
-            ArenaToken, HashVariant, MatrixLayout, MatrixOperation, ProgramInput, ProgramSignature,
-            ResolvedMatrixType, SampleEventId, SamplerOperation, SemanticFamilySourceIdentity,
-            SemanticSourceIdentity, TrustedIndexRange,
+            ArenaToken, FamilyDomain, HashVariant, MatrixLayout, MatrixOperation, ProgramInput,
+            ProgramSignature, ResolvedMatrixType, SampleEventId, SamplerOperation,
+            SemanticFamilySourceIdentity, SemanticSourceIdentity, TrustedIndexRange,
         },
         facts::{MatrixFacts, MatrixMetadata, ValueFacts},
         relation::{
-            FactorOrderContract, GadgetRecompositionRegistry, GadgetRecompositionRule,
-            RelationRegistry, RelationValidationAuthority, SamplerSourceContract, StaticLhsKey,
-            TrapdoorSourceContract, UniversalDispatchKey, UniversalRelationRegistration,
+            CanonicalLhsKey, CanonicalRhsId, FactorOrderContract, GadgetRecompositionRegistry,
+            GadgetRecompositionRule, RelationRegistry, RelationValidationAuthority,
+            SamplerSourceContract, StaticLhsKey, TrapdoorSourceContract, UniversalDispatchKey,
+            UniversalRelationRegistration,
         },
     };
     use std::time::{Duration, Instant};
@@ -4992,6 +6827,515 @@ mod tests {
         assert_eq!(specialized.coefficient_bound, public.coefficient_bound);
     }
 
+    #[test]
+    fn specialized_relation_suppression_restores_after_error() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let body = source_with(&mut expressions, matrix_type(), 712);
+        let (facts, mut monomials, _semantic) = setup(&mut expressions, &mut programs, body);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let invalid = ExprId::new(ArenaToken::fresh(), 1);
+        assert!(normalizer.normalize_specialized_root_without_relations(invalid).is_err());
+        assert!(!normalizer.suppress_product_relation_closure);
+    }
+
+    #[test]
+    fn universal_specialization_isolated_from_outer_compact_gadget_holds() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let domain = FamilyDomain::new(0, 1).unwrap();
+        let range = TrustedIndexRange::new(0, 1).unwrap();
+        let input_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
+        let gadget_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 3).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 3, 1).unwrap();
+        let gadget = matrix_source(
+            &mut expressions,
+            "specialized-gadget-1",
+            gadget_type.clone(),
+            Some((2, false)),
+        );
+        let gadget_two = matrix_source(
+            &mut expressions,
+            "specialized-gadget-2",
+            gadget_type.clone(),
+            Some((2, false)),
+        );
+        let input = matrix_source(&mut expressions, "specialized-input", input_type.clone(), None);
+        let decomposition = expressions
+            .intern(
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose {
+                    output: decomposition_type.clone(),
+                    base: 2,
+                    small: false,
+                    digit_count: 3,
+                }),
+                Box::new([input]),
+            )
+            .unwrap();
+        let gadget_sum = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[gadget, gadget_two])
+            .unwrap();
+        let public_root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[gadget_sum, decomposition])
+            .unwrap();
+        let public_family =
+            programs.generated_family_from_body(&mut expressions, domain, public_root).unwrap();
+        let preimage_family =
+            programs.generated_family_from_body(&mut expressions, domain, input).unwrap();
+        let target_body =
+            matrix_source(&mut expressions, "specialized-target", input_type.clone(), None);
+        let target_family =
+            programs.generated_family_from_body(&mut expressions, domain, target_body).unwrap();
+        let trapdoor_root = expressions
+            .intern(
+                ValueOperator::Trapdoor(super::super::arena::TrapdoorOperation::Generate {
+                    descriptor: "specialized-gadget-trapdoor".to_owned(),
+                    parameters: Box::new([]),
+                    paired_public_event: SampleEventId(991),
+                    paired_public_output_role: "value".to_owned(),
+                }),
+                Box::new([]),
+            )
+            .unwrap();
+        let trapdoor_family =
+            programs.generated_family_from_body(&mut expressions, domain, trapdoor_root).unwrap();
+        let index = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let scope_root = expressions
+            .intern(ValueOperator::Matrix(MatrixOperation::Scale), Box::new([public_root, index]))
+            .unwrap();
+        let scope_family =
+            programs.generated_family_from_body(&mut expressions, domain, scope_root).unwrap();
+        let scope = scope_family.program();
+        let source =
+            SamplerSourceContract { expression: programs.family_body(preimage_family).unwrap() };
+        let trapdoor = TrapdoorSourceContract { expression: trapdoor_root };
+        let dispatch = UniversalDispatchKey {
+            preimage_family,
+            preimage_source: source.clone(),
+            matrix_type: input_type.clone(),
+            trapdoor_source: trapdoor.clone(),
+        };
+        let validation = || RelationValidationAuthority {
+            source: source.clone(),
+            trapdoor_source: trapdoor.clone(),
+            matrix_type: input_type.clone(),
+            public_type: ResolvedValueType::Matrix(input_type.clone()),
+            preimage_type: ResolvedValueType::Matrix(input_type.clone()),
+            target_type: ResolvedValueType::Matrix(input_type.clone()),
+            trapdoor_type: ResolvedValueType::Trapdoor,
+            layout: None,
+            factor_order: FactorOrderContract::ordered_public_preimage(),
+            domain,
+            index_range: range,
+            gadget: None,
+            decomposition: None,
+        };
+        let registration = UniversalRelationRegistration {
+            dispatch: dispatch.clone(),
+            lhs: StaticLhsKey {
+                domain,
+                public_plan: public_family.program(),
+                preimage_plan: preimage_family.program(),
+                trapdoor_plan: trapdoor_family.program(),
+                public_pairing: public_family.program(),
+                layout: None,
+                factor_order: FactorOrderContract::ordered_public_preimage(),
+                validation: validation(),
+            },
+            target_plan: target_family.program(),
+        };
+        let mut relations = RelationRegistry::new();
+        relations.register_universal(registration).unwrap();
+        relations.freeze();
+        let registry = recomposition_registry(
+            gadget_type.clone(),
+            decomposition_type.clone(),
+            input_type.clone(),
+            false,
+            3,
+        );
+        let mut facts = FactStore::new(&expressions);
+        facts.finalize_ranges();
+        let mut monomials = MonomialArena::new(&expressions, &programs, scope).unwrap();
+        let mut cache = NormalizationCache::new();
+        let index = programs.scoped(&expressions, scope, index).unwrap();
+        let outer_proof = expressions.scope_proof(scope, scope_root).unwrap();
+        let outer_input = expressions.scoped_from_proof(&outer_proof, input).unwrap();
+        let outer_rule = registry
+            .matching_rule(
+                2,
+                false,
+                3,
+                &gadget_type,
+                &decomposition_type,
+                &input_type,
+                &input_type,
+                Some(&MatrixLayout::row_major(gadget_type.rows, gadget_type.columns)),
+                Some(&MatrixLayout::row_major(decomposition_type.rows, decomposition_type.columns)),
+                Some(&MatrixLayout::row_major(input_type.rows, input_type.columns)),
+            )
+            .unwrap();
+        let mut outer_plan = CompactShellPlan::default();
+        outer_plan.preflight_node_occurrences = 3;
+        outer_plan
+            .gadget_shells
+            .insert((decomposition, input), CompactGadgetPlan { rule: outer_rule, occurrences: 1 });
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_relations(&relations, &mut cache)
+            .with_gadget_recompositions(&registry);
+        normalizer.compact_mode = true;
+        normalizer.compact_plan = Some(outer_plan);
+        let outer_input_nf = normalizer.atom_nf(&outer_proof, outer_input).unwrap();
+        normalizer.gadget_input_nfs.insert(
+            input,
+            CompactGadgetHold {
+                normal_form: Arc::new(outer_input_nf),
+                remaining: 1,
+                consumers: BTreeMap::from([(decomposition, 1)]),
+            },
+        );
+        let outer_plan_before = (
+            normalizer.compact_plan.as_ref().unwrap().preflight_node_occurrences,
+            normalizer
+                .compact_plan
+                .as_ref()
+                .unwrap()
+                .gadget_shells
+                .iter()
+                .map(|((shell, held_input), plan)| {
+                    (*shell, *held_input, plan.rule.clone(), plan.occurrences)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let outer_hold_before = normalizer
+            .gadget_input_nfs
+            .get(&input)
+            .map(|hold| (hold.remaining, hold.consumers.clone()));
+        let specialized = normalizer
+            .specialize_universal(&dispatch, index, range)
+            .expect("specialized relation with gadget product");
+        assert!(!specialized.is_empty());
+        assert!(!normalizer.suppress_product_relation_closure);
+        assert!(normalizer.compact_mode);
+        assert_eq!(
+            normalizer.compact_plan.as_ref().map(|plan| (
+                plan.preflight_node_occurrences,
+                plan.gadget_shells
+                    .iter()
+                    .map(|((shell, held_input), plan)| {
+                        (*shell, *held_input, plan.rule.clone(), plan.occurrences)
+                    })
+                    .collect::<Vec<_>>()
+            )),
+            Some(outer_plan_before.clone())
+        );
+        assert_eq!(
+            normalizer
+                .gadget_input_nfs
+                .get(&input)
+                .map(|hold| (hold.remaining, hold.consumers.clone())),
+            outer_hold_before
+        );
+        assert!(normalizer.compact_scalar_holds.is_empty());
+        assert_eq!(normalizer.counters, NormalizationCounters::default());
+        let rejected = normalizer.specialize_universal(
+            &dispatch,
+            index,
+            TrustedIndexRange::new(1, 2).unwrap(),
+        );
+        assert!(matches!(
+            rejected,
+            Err(NormalizeError::Relation(RelationRegistryError::IndexOutOfDomain))
+        ));
+        assert!(!normalizer.suppress_product_relation_closure);
+        assert!(normalizer.compact_mode);
+        assert_eq!(
+            normalizer.compact_plan.as_ref().map(|plan| (
+                plan.preflight_node_occurrences,
+                plan.gadget_shells
+                    .iter()
+                    .map(|((shell, held_input), plan)| {
+                        (*shell, *held_input, plan.rule.clone(), plan.occurrences)
+                    })
+                    .collect::<Vec<_>>()
+            )),
+            Some(outer_plan_before)
+        );
+        assert_eq!(
+            normalizer
+                .gadget_input_nfs
+                .get(&input)
+                .map(|hold| (hold.remaining, hold.consumers.clone())),
+            outer_hold_before
+        );
+        drop(normalizer);
+
+        let (compact_lhs_signature, compact_rhs_signatures) = {
+            let factor_signature = |factor: ScopedExprId| {
+                (
+                    factor.expression(),
+                    format!("{:?}", expressions.node(factor.expression()).unwrap().operator),
+                    format!("{:?}", expressions.value_type(factor.expression()).unwrap()),
+                )
+            };
+            let lhs_signature = |map: &BTreeMap<CanonicalLhsKey, BTreeSet<CanonicalRhsId>>,
+                                 arena: &MonomialArena| {
+                map.keys()
+                    .map(|key| {
+                        let descriptor = arena.descriptor(key.monomial).unwrap();
+                        (
+                            BigInt::from(1_u8),
+                            descriptor
+                                .central_factors
+                                .iter()
+                                .copied()
+                                .map(factor_signature)
+                                .collect::<Vec<_>>(),
+                            descriptor
+                                .ordered_factors
+                                .iter()
+                                .copied()
+                                .map(factor_signature)
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let polynomial_signature = |normal_form: &PolynomialNF, arena: &MonomialArena| {
+                (
+                    normal_form
+                        .exact_terms
+                        .iter()
+                        .map(|(monomial, coefficient)| {
+                            let descriptor = arena.descriptor(*monomial).unwrap();
+                            (
+                                coefficient.clone(),
+                                descriptor
+                                    .central_factors
+                                    .iter()
+                                    .copied()
+                                    .map(factor_signature)
+                                    .collect::<Vec<_>>(),
+                                descriptor
+                                    .ordered_factors
+                                    .iter()
+                                    .copied()
+                                    .map(factor_signature)
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    normal_form.bounded_summary.clone(),
+                )
+            };
+            let lhs = lhs_signature(&specialized, &monomials);
+            let rhs = specialized
+                .values()
+                .flatten()
+                .map(|rhs| polynomial_signature(cache.get(*rhs).unwrap(), &monomials))
+                .collect::<Vec<_>>();
+            (lhs, rhs)
+        };
+        let mut eager_monomials = MonomialArena::new(&expressions, &programs, scope).unwrap();
+        let mut eager_cache = NormalizationCache::new();
+        let mut eager = Normalizer::new(&mut expressions, &programs, &facts, &mut eager_monomials)
+            .unwrap()
+            .with_relations(&relations, &mut eager_cache)
+            .with_gadget_recompositions(&registry);
+        let eager_specialized = eager
+            .specialize_universal(&dispatch, index, range)
+            .expect("forced-eager specialized relation with gadget product");
+        let eager_relation_applied = eager.counters.relation_applied;
+        drop(eager);
+        let (eager_lhs_signature, eager_rhs_signatures) = {
+            let factor_signature = |factor: ScopedExprId| {
+                (
+                    factor.expression(),
+                    format!("{:?}", expressions.node(factor.expression()).unwrap().operator),
+                    format!("{:?}", expressions.value_type(factor.expression()).unwrap()),
+                )
+            };
+            let lhs_signature = |map: &BTreeMap<CanonicalLhsKey, BTreeSet<CanonicalRhsId>>,
+                                 arena: &MonomialArena| {
+                map.keys()
+                    .map(|key| {
+                        let descriptor = arena.descriptor(key.monomial).unwrap();
+                        (
+                            BigInt::from(1_u8),
+                            descriptor
+                                .central_factors
+                                .iter()
+                                .copied()
+                                .map(factor_signature)
+                                .collect::<Vec<_>>(),
+                            descriptor
+                                .ordered_factors
+                                .iter()
+                                .copied()
+                                .map(factor_signature)
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let polynomial_signature = |normal_form: &PolynomialNF, arena: &MonomialArena| {
+                (
+                    normal_form
+                        .exact_terms
+                        .iter()
+                        .map(|(monomial, coefficient)| {
+                            let descriptor = arena.descriptor(*monomial).unwrap();
+                            (
+                                coefficient.clone(),
+                                descriptor
+                                    .central_factors
+                                    .iter()
+                                    .copied()
+                                    .map(factor_signature)
+                                    .collect::<Vec<_>>(),
+                                descriptor
+                                    .ordered_factors
+                                    .iter()
+                                    .copied()
+                                    .map(factor_signature)
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    normal_form.bounded_summary.clone(),
+                )
+            };
+            let lhs = lhs_signature(&eager_specialized, &eager_monomials);
+            let rhs = eager_specialized
+                .values()
+                .flatten()
+                .map(|rhs| polynomial_signature(eager_cache.get(*rhs).unwrap(), &eager_monomials))
+                .collect::<Vec<_>>();
+            (lhs, rhs)
+        };
+        assert_eq!(specialized.len(), eager_specialized.len());
+        assert_eq!(compact_lhs_signature, eager_lhs_signature);
+        assert_eq!(compact_rhs_signatures, eager_rhs_signatures);
+        assert_eq!(eager_relation_applied, 0);
+    }
+
+    #[test]
+    fn compact_runtime_counts_nested_program_call_visits_separately_from_preflight() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let domain = FamilyDomain::new(0, 1).unwrap();
+        // Families are intentionally one-index programs.  The shared input below is the same
+        // Argument(0) expression on both reducible nested calls; compact semantic binding must
+        // account for each actual Visit even though the argument is shared.
+        let inner_body = source_with(&mut expressions, matrix.clone(), 720);
+        let inner_family =
+            programs.generated_family_from_body(&mut expressions, domain, inner_body).unwrap();
+        let outer_argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let first_call =
+            programs.call(&mut expressions, inner_family.program(), &[outer_argument]).unwrap();
+        let second_call =
+            programs.call(&mut expressions, inner_family.program(), &[outer_argument]).unwrap();
+        let outer_body = expressions
+            .intern_matrix_transform(MatrixOperation::Add, &[first_call, second_call])
+            .unwrap();
+        let outer_family =
+            programs.generated_family_from_body(&mut expressions, domain, outer_body).unwrap();
+        let shared_input = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let root_call =
+            programs.call(&mut expressions, outer_family.program(), &[shared_input]).unwrap();
+        let wrapper = programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([]),
+                    output: programs.family_element_type(outer_family).unwrap(),
+                },
+                root_call,
+            )
+            .unwrap();
+        let scoped = programs.root(&expressions, wrapper).unwrap();
+        let facts = FactStore::new(&expressions);
+        let mut monomials = MonomialArena::new(&expressions, &programs, wrapper).unwrap();
+        let mut plan = CompactShellPlan::default();
+        // The preflight count includes each incoming edge to the two nested calls and their
+        // shared Argument(0), while runtime counts every evaluator Visit, including the nested
+        // semantic-binding walks.  Keep this structural count private and deliberately separate.
+        plan.preflight_node_occurrences = 7;
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_compact_shell_plan(plan);
+        normalizer.compact_mode = true;
+        let value = normalizer.normalize_compact_root(scoped).unwrap();
+        let counters = normalizer.counters();
+        assert!(counters.nodes_processed > 0);
+        assert_eq!(counters.nodes_total, counters.nodes_processed);
+        assert_eq!(normalizer.compact_plan.as_ref().unwrap().preflight_node_occurrences, 7);
+        assert_eq!(counters.compact_live_frames, 0);
+        assert_eq!(counters.compact_live_values, 0);
+        assert!(value.exact_nf.is_some());
+    }
+
+    #[test]
+    fn compact_shared_diamond_revisits_occurrences_with_depth_bounded_live_state() {
+        const DEPTH: usize = 16;
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let mut root = source_with(&mut expressions, matrix_type(), 721);
+        for level in 0..DEPTH {
+            let left_leaf = source_with(&mut expressions, matrix_type(), 10_000 + level as u64 * 2);
+            let right_leaf =
+                source_with(&mut expressions, matrix_type(), 10_001 + level as u64 * 2);
+            let left = expressions
+                .intern_matrix_transform(MatrixOperation::Add, &[root, left_leaf])
+                .unwrap();
+            let right = expressions
+                .intern_matrix_transform(MatrixOperation::Add, &[root, right_leaf])
+                .unwrap();
+            root =
+                expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        }
+        let (facts, mut monomials, semantic) = setup(&mut expressions, &mut programs, root);
+        let family = programs.family_for_program(semantic.program()).unwrap();
+        let mut plan = CompactShellPlan::default();
+        plan.preflight_node_occurrences = 6 * (1_u64 << DEPTH) - 5;
+        let planned_occurrences = plan.preflight_node_occurrences;
+        let mut compact = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_compact_shell_plan(plan);
+        compact.compact_mode = true;
+        let compact_value = compact.normalize_compact_family_root(family).unwrap();
+        let compact_counters = compact.counters();
+        assert_eq!(compact_counters.compact_memo_entries, 0);
+        assert_eq!(compact_counters.compact_peak_memo_entries, 0);
+        assert_eq!(compact_counters.nodes_processed, planned_occurrences);
+        assert!(
+            compact_counters.compact_peak_live_frames <= 4 * DEPTH as u64 + 1,
+            "peak frames={} depth={DEPTH}",
+            compact_counters.compact_peak_live_frames
+        );
+        assert!(
+            compact_counters.compact_peak_live_values <= 4 * DEPTH as u64 + 1,
+            "peak values={} depth={DEPTH}",
+            compact_counters.compact_peak_live_values
+        );
+        assert_eq!(compact_counters.compact_live_frames, 0);
+        assert_eq!(compact_counters.compact_live_values, 0);
+        assert_eq!(compact_counters.nodes_total, compact_counters.nodes_processed);
+        drop(compact);
+
+        let eager_value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        assert_eq!(compact_value.exact_nf, eager_value.exact_nf);
+        assert_eq!(compact_value.coefficient_bound, eager_value.coefficient_bound);
+    }
+
     fn gaussian_factor(
         expressions: &mut ExprArena,
         output: ResolvedMatrixType,
@@ -5372,6 +7716,201 @@ mod tests {
             normalizer.normalize(root).unwrap().exact_nf.unwrap().as_ref().clone()
         };
         (exact_nf, monomials)
+    }
+
+    #[test]
+    fn compact_shell_plan_deduplicates_rule_and_counts_shared_occurrences() {
+        let input_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
+        let decomposition_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 3, 1).unwrap();
+        let gadget_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 3).unwrap();
+        let rule = GadgetRecompositionRule {
+            base: 2,
+            small: false,
+            digit_count: 3,
+            gadget_type,
+            decomposition_type,
+            input_type: input_type.clone(),
+            output_type: input_type,
+            gadget_layout: Some(MatrixLayout::row_major(1, 3)),
+            decomposition_layout: Some(MatrixLayout::row_major(3, 1)),
+            input_layout: Some(MatrixLayout::row_major(1, 1)),
+        };
+        let mut plan = CompactShellPlan::default();
+        assert!(plan.insert_gadget(
+            ExprId::new(ArenaToken::fresh(), 1),
+            ExprId::new(ArenaToken::fresh(), 2),
+            rule.clone()
+        ));
+        // Same shell/input identity is one interned rule with two direct product consumers.
+        let shell = plan.gadget_shells.keys().next().unwrap().0;
+        let input = plan.gadget_shells.keys().next().unwrap().1;
+        assert!(plan.insert_gadget(shell, input, rule));
+        assert_eq!(plan.gadget_shells.len(), 1);
+        assert_eq!(plan.gadget_occurrences(), 2);
+    }
+
+    #[test]
+    fn compact_scalar_plan_rejects_unmatched_and_overconsumed_tokens() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let scalar = source_with(&mut expressions, scalar_type.clone(), 401);
+        let large = source(&mut expressions);
+        let product = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[large, scalar])
+            .unwrap();
+        let (mut facts, mut monomials, _root) = setup(&mut expressions, &mut programs, product);
+        let mut scalar_facts = MatrixFacts::new(
+            scalar_type.clone(),
+            MatrixMetadata::new(MatrixLayout::row_major(1, 1)),
+        );
+        scalar_facts.coefficient_bound =
+            NumericContract::Known(CoefficientBound::finite(BigUint::from(1_u8)));
+        facts.insert(&expressions, scalar, ValueFacts::Matrix(scalar_facts)).unwrap();
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let mut plan = CompactShellPlan::default();
+        assert!(plan.insert_scalar(scalar, scalar_type.clone()));
+        normalizer.compact_plan_remaining = Some(plan);
+        normalizer.compact_mode = true;
+        assert!(normalizer.consume_compact_scalar_plan(scalar, &scalar_type).is_ok());
+        assert!(matches!(
+            normalizer.consume_compact_scalar_plan(scalar, &scalar_type),
+            Err(NormalizeError::InvalidExactPlan { .. })
+        ));
+        assert!(matches!(
+            normalizer.release_compact_scalar_hold(scalar),
+            Err(NormalizeError::InvalidExactPlan { .. })
+        ));
+
+        // Consumer identity is part of the private token: a call shared by two
+        // product kinds cannot be consumed through a different product or side.
+        let mut program_plan = CompactShellPlan::default();
+        assert!(program_plan.insert_scalar_program_call(
+            product,
+            scalar,
+            false,
+            scalar_type.clone()
+        ));
+        normalizer.compact_plan_remaining = Some(program_plan);
+        assert!(matches!(
+            normalizer.consume_compact_scalar_program_call(large, scalar, false, &scalar_type),
+            Err(NormalizeError::InvalidExactPlan {
+                reason: "compact scalar ProgramCall consumer is unplanned"
+            })
+        ));
+        assert!(matches!(
+            normalizer.consume_compact_scalar_program_call(product, scalar, true, &scalar_type),
+            Err(NormalizeError::InvalidExactPlan {
+                reason: "compact scalar ProgramCall consumer is unplanned"
+            })
+        ));
+        assert_eq!(
+            normalizer
+                .compact_plan_remaining
+                .as_ref()
+                .unwrap()
+                .scalar_program_calls
+                .get(&(product, scalar, false))
+                .unwrap()
+                .occurrences,
+            1
+        );
+        assert!(
+            normalizer
+                .consume_compact_scalar_program_call(product, scalar, false, &scalar_type)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn compact_both_scalar_action_rejects_non_exact_child_without_scalar_hold() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let left_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 2).unwrap();
+        let right_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 2, 1).unwrap();
+        let scalar_type = ResolvedMatrixType::new(BigUint::from(17_u8), 4, 1, 1).unwrap();
+        let left = source_with(&mut expressions, left_type, 1401);
+        let right = source_with(&mut expressions, right_type, 1402);
+        let non_exact_scalar =
+            expressions.intern_matrix_transform(MatrixOperation::Multiply, &[left, right]).unwrap();
+        let scalar = source_with(&mut expressions, scalar_type, 1403);
+        let body = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[non_exact_scalar, scalar])
+            .unwrap();
+        let family = programs
+            .generated_family_from_body(&mut expressions, FamilyDomain::new(0, 1).unwrap(), body)
+            .unwrap();
+        let facts = FactStore::new(&expressions);
+        let mut monomials = MonomialArena::new(&expressions, &programs, family.program()).unwrap();
+        let mut normalizer = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .with_compact_shell_plan(CompactShellPlan::default());
+        normalizer.compact_mode = true;
+        let error = normalizer
+            .normalize_compact_family_root(family)
+            .expect_err("non-scalar factors cannot enter both-scalar centralization");
+        assert!(matches!(
+            error,
+            NormalizeError::InvalidExactPlan { reason: "compact scalar action was not exact" }
+        ));
+        assert_eq!(normalizer.counters.compact_scalar_consumers, 0);
+        assert_eq!(normalizer.counters.compact_scalar_holds_released, 0);
+        assert_eq!(normalizer.counters.compact_scalar_holds_unmatched, 0);
+    }
+
+    #[test]
+    fn compact_product_context_records_each_shell_once_per_boundary() {
+        let shell = ExprId::new(ArenaToken::fresh(), 1);
+        let input = ExprId::new(ArenaToken::fresh(), 2);
+        let mut context = CompactProductContext::default();
+        assert!(context.used_shells.insert((shell, input)));
+        assert!(!context.used_shells.insert((shell, input)));
+        assert_eq!(context.used_shells.len(), 1);
+    }
+
+    #[test]
+    fn compact_product_context_error_pops_without_committing_shells() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let input_type = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
+        let input = source_with(&mut expressions, input_type.clone(), 1501);
+        let product = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[input, input])
+            .unwrap();
+        let (facts, mut monomials, _) = setup(&mut expressions, &mut programs, product);
+        let mut normalizer =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut monomials).unwrap();
+        let shell = ExprId::new(ArenaToken::fresh(), 1);
+        let held_input = ExprId::new(ArenaToken::fresh(), 2);
+        normalizer.compact_mode = true;
+        normalizer.compact_plan_remaining = Some(CompactShellPlan::default());
+        let plan_shape = |plan: &CompactShellPlan| {
+            (
+                plan.gadget_shells.len(),
+                plan.scalar_factors.len(),
+                plan.scalar_program_calls.len(),
+                plan.preflight_node_occurrences,
+            )
+        };
+        let before_plan = normalizer.compact_plan_remaining.as_ref().map(plan_shape);
+        let error: Result<(), NormalizeError> =
+            normalizer.with_compact_product_context(|normalizer| {
+                normalizer
+                    .compact_product_contexts
+                    .last_mut()
+                    .unwrap()
+                    .used_shells
+                    .insert((shell, held_input));
+                Err(NormalizeError::InvalidExactPlan { reason: "injected product failure" })
+            });
+        assert!(matches!(
+            error,
+            Err(NormalizeError::InvalidExactPlan { reason: "injected product failure" })
+        ));
+        assert!(normalizer.compact_product_contexts.is_empty());
+        assert_eq!(normalizer.compact_plan_remaining.as_ref().map(plan_shape), before_plan);
+        assert_eq!(normalizer.counters.compact_shell_holds_released, 0);
     }
 
     #[test]

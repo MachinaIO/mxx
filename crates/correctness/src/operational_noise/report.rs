@@ -186,6 +186,17 @@ fn analyze_root(
                 counters: analysis.counters,
             }
         }
+        ProductionRoot::Compact(root) => {
+            let analysis = job.normalize_compact_closed_root(*root)?;
+            RootAnalysis {
+                value: analyzed_root(&analysis.value, analysis.exact_term_diagnostics),
+                counters: analysis.counters,
+            }
+        }
+        ProductionRoot::CompactFamily(family) => {
+            let result = job.analyze_compact_family_root(*family)?;
+            RootAnalysis { value: analyzed_family_root(&result), counters: result.counters }
+        }
         ProductionRoot::Family(root) => {
             let result = job.analyze_family_root(*root)?;
             RootAnalysis { value: analyzed_family_root(&result), counters: result.counters }
@@ -219,6 +230,75 @@ fn add_counters(
         relation_remaining: left.relation_remaining.saturating_add(right.relation_remaining),
         bounded_fold_count: left.bounded_fold_count.saturating_add(right.bounded_fold_count),
         peak_cached_values: left.peak_cached_values.max(right.peak_cached_values),
+        compact_virtual_calls: left
+            .compact_virtual_calls
+            .saturating_add(right.compact_virtual_calls),
+        compact_algebra_nodes: left
+            .compact_algebra_nodes
+            .saturating_add(right.compact_algebra_nodes),
+        compact_max_frames: left.compact_max_frames.max(right.compact_max_frames),
+        compact_memo_entries: left.compact_memo_entries.saturating_add(right.compact_memo_entries),
+        compact_peak_memo_entries: left
+            .compact_peak_memo_entries
+            .max(right.compact_peak_memo_entries),
+        compact_memo_term_refs: left
+            .compact_memo_term_refs
+            .saturating_add(right.compact_memo_term_refs),
+        compact_memo_bytes: left.compact_memo_bytes.saturating_add(right.compact_memo_bytes),
+        compact_live_frames: right.compact_live_frames,
+        compact_peak_live_frames: left.compact_peak_live_frames.max(right.compact_peak_live_frames),
+        compact_live_values: right.compact_live_values,
+        compact_peak_live_values: left.compact_peak_live_values.max(right.compact_peak_live_values),
+        compact_logical_add_sub: left
+            .compact_logical_add_sub
+            .saturating_add(right.compact_logical_add_sub),
+        compact_logical_scale: left
+            .compact_logical_scale
+            .saturating_add(right.compact_logical_scale),
+        compact_strict_products: left
+            .compact_strict_products
+            .saturating_add(right.compact_strict_products),
+        compact_concrete_shell_nodes: left
+            .compact_concrete_shell_nodes
+            .saturating_add(right.compact_concrete_shell_nodes),
+        compact_max_virtual_frames: left
+            .compact_max_virtual_frames
+            .max(right.compact_max_virtual_frames),
+        compact_max_virtual_values: left
+            .compact_max_virtual_values
+            .max(right.compact_max_virtual_values),
+        compact_planned_shell_occurrences: left
+            .compact_planned_shell_occurrences
+            .saturating_add(right.compact_planned_shell_occurrences),
+        compact_planned_unique_shells: left
+            .compact_planned_unique_shells
+            .saturating_add(right.compact_planned_unique_shells),
+        compact_shell_allocated: left
+            .compact_shell_allocated
+            .saturating_add(right.compact_shell_allocated),
+        compact_shell_hits: left.compact_shell_hits.saturating_add(right.compact_shell_hits),
+        compact_shell_new: left.compact_shell_new.saturating_add(right.compact_shell_new),
+        compact_shell_holds_current: right.compact_shell_holds_current,
+        compact_shell_holds_peak: left.compact_shell_holds_peak.max(right.compact_shell_holds_peak),
+        compact_shell_holds_released: left
+            .compact_shell_holds_released
+            .saturating_add(right.compact_shell_holds_released),
+        compact_shell_holds_unmatched: left
+            .compact_shell_holds_unmatched
+            .saturating_add(right.compact_shell_holds_unmatched),
+        compact_scalar_consumers: left
+            .compact_scalar_consumers
+            .saturating_add(right.compact_scalar_consumers),
+        compact_scalar_holds_current: right.compact_scalar_holds_current,
+        compact_scalar_holds_peak: left
+            .compact_scalar_holds_peak
+            .max(right.compact_scalar_holds_peak),
+        compact_scalar_holds_released: left
+            .compact_scalar_holds_released
+            .saturating_add(right.compact_scalar_holds_released),
+        compact_scalar_holds_unmatched: left
+            .compact_scalar_holds_unmatched
+            .saturating_add(right.compact_scalar_holds_unmatched),
     }
 }
 
@@ -275,12 +355,12 @@ fn classify_root(
     root: &ProductionRoot,
 ) -> Result<(), ReportError> {
     let actual = match root {
-        ProductionRoot::Closed(root) => job
+        ProductionRoot::Closed(root) | ProductionRoot::Compact(root) => job
             .expressions()
             .value_type(root.expression())
             .map_err(|error| ReportError::Job(JobError::Arena(error)))?
             .clone(),
-        ProductionRoot::Family(family) => job
+        ProductionRoot::Family(family) | ProductionRoot::CompactFamily(family) => job
             .programs()
             .family_element_type(*family)
             .map_err(|error| ReportError::Job(JobError::Arena(error)))?,
@@ -781,6 +861,37 @@ mod tests {
                 relation_remaining: 0,
                 bounded_fold_count: 3,
                 peak_cached_values: 4,
+                compact_virtual_calls: 0,
+                compact_algebra_nodes: 0,
+                compact_max_frames: 0,
+                compact_memo_entries: 0,
+                compact_peak_memo_entries: 0,
+                compact_memo_term_refs: 0,
+                compact_memo_bytes: 0,
+                compact_live_frames: 0,
+                compact_peak_live_frames: 0,
+                compact_live_values: 0,
+                compact_peak_live_values: 0,
+                compact_logical_add_sub: 0,
+                compact_logical_scale: 0,
+                compact_strict_products: 0,
+                compact_concrete_shell_nodes: 0,
+                compact_max_virtual_frames: 0,
+                compact_max_virtual_values: 0,
+                compact_planned_shell_occurrences: 0,
+                compact_planned_unique_shells: 0,
+                compact_shell_allocated: 0,
+                compact_shell_hits: 0,
+                compact_shell_new: 0,
+                compact_shell_holds_current: 0,
+                compact_shell_holds_peak: 0,
+                compact_shell_holds_released: 0,
+                compact_shell_holds_unmatched: 0,
+                compact_scalar_consumers: 0,
+                compact_scalar_holds_current: 0,
+                compact_scalar_holds_peak: 0,
+                compact_scalar_holds_released: 0,
+                compact_scalar_holds_unmatched: 0,
             },
         };
         let first = report_analyzed_roots(target.clone(), &residual, &decoder, counters).unwrap();

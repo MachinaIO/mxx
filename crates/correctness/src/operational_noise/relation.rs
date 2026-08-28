@@ -168,6 +168,93 @@ impl GadgetRecompositionRegistry {
                 rule.input_layout.as_ref() == input_layout
         }))
     }
+
+    /// Preflight variant used before relation resources are frozen. Registration has already
+    /// completed at this point, but the normalizer must still decide whether the compact root is
+    /// safe before the freeze boundary.
+    pub(crate) fn allows_decomposition_half_unfrozen(
+        &self,
+        base: u64,
+        small: bool,
+        digit_count: u32,
+        decomposition_type: &ResolvedMatrixType,
+        input_type: &ResolvedMatrixType,
+        decomposition_layout: Option<&MatrixLayout>,
+        input_layout: Option<&MatrixLayout>,
+    ) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.base == base &&
+                rule.small == small &&
+                rule.digit_count == digit_count &&
+                &rule.decomposition_type == decomposition_type &&
+                &rule.input_type == input_type &&
+                rule.decomposition_layout.as_ref() == decomposition_layout &&
+                rule.input_layout.as_ref() == input_layout
+        })
+    }
+
+    /// Return the complete registered rule for a preflighted decomposition.  This is used by
+    /// the private compact plan so that the plan carries the exact contract, rather than only a
+    /// shape or half-rule predicate.  Registration is still mutable at this point; the caller
+    /// installs the resulting plan before freezing the job.
+    pub(crate) fn matching_rule_unfrozen(
+        &self,
+        base: u64,
+        small: bool,
+        digit_count: u32,
+        gadget_type: &ResolvedMatrixType,
+        decomposition_type: &ResolvedMatrixType,
+        input_type: &ResolvedMatrixType,
+        output_type: &ResolvedMatrixType,
+        gadget_layout: Option<&MatrixLayout>,
+        decomposition_layout: Option<&MatrixLayout>,
+        input_layout: Option<&MatrixLayout>,
+    ) -> Option<GadgetRecompositionRule> {
+        self.rules
+            .iter()
+            .find(|rule| {
+                rule.base == base &&
+                    rule.small == small &&
+                    rule.digit_count == digit_count &&
+                    &rule.gadget_type == gadget_type &&
+                    &rule.decomposition_type == decomposition_type &&
+                    &rule.input_type == input_type &&
+                    &rule.output_type == output_type &&
+                    rule.gadget_layout.as_ref() == gadget_layout &&
+                    rule.decomposition_layout.as_ref() == decomposition_layout &&
+                    rule.input_layout.as_ref() == input_layout
+            })
+            .cloned()
+    }
+
+    pub(crate) fn matching_rule(
+        &self,
+        base: u64,
+        small: bool,
+        digit_count: u32,
+        gadget_type: &ResolvedMatrixType,
+        decomposition_type: &ResolvedMatrixType,
+        input_type: &ResolvedMatrixType,
+        output_type: &ResolvedMatrixType,
+        gadget_layout: Option<&MatrixLayout>,
+        decomposition_layout: Option<&MatrixLayout>,
+        input_layout: Option<&MatrixLayout>,
+    ) -> Option<GadgetRecompositionRule> {
+        self.frozen.then(|| {
+            self.matching_rule_unfrozen(
+                base,
+                small,
+                digit_count,
+                gadget_type,
+                decomposition_type,
+                input_type,
+                output_type,
+                gadget_layout,
+                decomposition_layout,
+                input_layout,
+            )
+        })?
+    }
 }
 
 impl FactorOrderContract {

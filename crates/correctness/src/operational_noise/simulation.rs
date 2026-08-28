@@ -307,21 +307,27 @@ pub fn check_operational_noise_candidate_with_progress(
             super::OperationalParameterValue::Rational { .. } => None,
         })
         .collect::<BTreeMap<_, _>>();
+    let lower_started = control.begin_phase(CheckerPhase::Lower)?;
     let plan = ProtocolPlan::build(protocol, &request.target_id).map_err(|error| {
         OperationalSimulationError::from(super::error::ProductionError::internal(
             super::error::ProductionPhase::Adapter,
             error.to_string(),
         ))
     })?;
-    let (mut job, roots) = ProductionAdapter::new(protocol, &plan, parameters)
-        .map_err(|error| {
-            OperationalSimulationError::from(super::error::ProductionError::from(error))
-        })?
-        .lower()
-        .map_err(|error| {
-            OperationalSimulationError::from(super::error::ProductionError::from(error))
-        })?;
-    let report = analyze_roots(
+    control.work(1, Some(3), None)?;
+    let adapter = ProductionAdapter::new(protocol, &plan, parameters).map_err(|error| {
+        OperationalSimulationError::from(super::error::ProductionError::from(error))
+    })?;
+    control.work(1, Some(3), None)?;
+    let (mut job, roots) = adapter.lower().map_err(|error| {
+        OperationalSimulationError::from(super::error::ProductionError::from(error))
+    })?;
+    control.work(1, Some(3), None)?;
+    let lowering_elapsed = control.complete_phase(lower_started, Some(3), None)?;
+    control.diagnostics.lowering_milliseconds = lowering_elapsed.as_millis() as u64;
+
+    let normalization_started = control.begin_phase(CheckerPhase::Normalize)?;
+    let mut report = analyze_roots(
         &mut job,
         &roots,
         &ReportTarget {
@@ -339,6 +345,14 @@ pub fn check_operational_noise_candidate_with_progress(
     .map_err(|error| {
         OperationalSimulationError::from(super::error::ProductionError::from(error))
     })?;
+    control.work(1, Some(1), None)?;
+    let normalization_elapsed = normalization_started.elapsed();
+    control.diagnostics = report.diagnostics.clone();
+    control.diagnostics.lowering_milliseconds = lowering_elapsed.as_millis() as u64;
+    control.diagnostics.normalization_milliseconds = normalization_elapsed.as_millis() as u64;
+    control.complete_phase(normalization_started, Some(1), None)?;
+    control.diagnostics.total_milliseconds = control.started.elapsed().as_millis() as u64;
+    report.diagnostics = control.diagnostics.clone();
     Ok(report.into_simulation_report())
 }
 
@@ -893,5 +907,38 @@ mod tests {
         assert!(control.reserve_owned_elements(usize::MAX).is_ok());
         assert!(control.reserve_owned_elements(3).is_ok());
         assert_eq!(control.owned_elements.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    fn phase_boundaries_are_reported_in_order_with_current_diagnostics() {
+        let mut events = Vec::new();
+        {
+            let mut emit = |event| events.push(event);
+            let mut control = SimulationControl::new(&mut emit);
+            let target_started = control.begin_phase(CheckerPhase::Target).unwrap();
+            control.complete_phase(target_started, None, None).unwrap();
+            let lower_started = control.begin_phase(CheckerPhase::Lower).unwrap();
+            control.work(3, Some(3), None).unwrap();
+            control.complete_phase(lower_started, Some(3), None).unwrap();
+            let normalization_started = control.begin_phase(CheckerPhase::Normalize).unwrap();
+            control.diagnostics.normalization_node_count = 7;
+            control.work(1, Some(1), None).unwrap();
+            control.complete_phase(normalization_started, Some(1), None).unwrap();
+        }
+
+        assert_eq!(
+            events.iter().map(|event| (event.phase, event.event)).collect::<Vec<_>>(),
+            vec![
+                (CheckerPhase::Target, ProgressEventKind::Start),
+                (CheckerPhase::Target, ProgressEventKind::Complete),
+                (CheckerPhase::Lower, ProgressEventKind::Start),
+                (CheckerPhase::Lower, ProgressEventKind::Complete),
+                (CheckerPhase::Normalize, ProgressEventKind::Start),
+                (CheckerPhase::Normalize, ProgressEventKind::Complete),
+            ]
+        );
+        assert_eq!(events.last().unwrap().normalization_nodes_processed, 7);
+        assert_eq!(events[3].processed, 3);
+        assert_eq!(events[5].processed, 1);
     }
 }

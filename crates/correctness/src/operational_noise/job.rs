@@ -14,9 +14,10 @@ use super::{
     facts::{FactStore, IndexFacts, MatrixFacts, ScalarFacts, TrapdoorFacts, ValueFacts},
     monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
     normal_form::{
-        AnalyzedValue, BoundedSummary, NormalizationCounters, NormalizeError, Normalizer,
+        AnalyzedValue, BoundedSummary, CompactShellPlan, NormalizationCounters, NormalizeError,
+        Normalizer,
     },
-    program::{FamilyValueId, ProgramArena},
+    program::{BetaReason, FamilyValueId, ProgramArena},
     relation::{
         FrozenGeneration, GadgetRecompositionRegistry, GadgetRecompositionRule, NormalizationCache,
         RelationRegistry, RelationRegistryError, UniversalRelationRegistration,
@@ -439,6 +440,7 @@ pub struct CheckerJob {
     active_candidate: Option<CandidateToken>,
     candidate_baseline: Option<CandidateResourceCounters>,
     frozen_resources: Option<CandidateResourceCounters>,
+    compact_shell_plan: Option<CompactShellPlan>,
 }
 
 impl Default for CheckerJob {
@@ -463,6 +465,7 @@ impl CheckerJob {
             active_candidate: None,
             candidate_baseline: None,
             frozen_resources: None,
+            compact_shell_plan: None,
         }
     }
 
@@ -484,6 +487,11 @@ impl CheckerJob {
 
     pub fn facts(&self) -> &FactStore {
         &self.facts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_candidate_token(&self) -> CandidateToken {
+        self.active_candidate.expect("test job candidate remains active")
     }
 
     pub fn declare_trusted_range(
@@ -587,6 +595,17 @@ impl CheckerJob {
 
     pub(crate) fn gadget_recompositions(&self) -> &GadgetRecompositionRegistry {
         &self.gadget_recompositions
+    }
+
+    pub(crate) fn set_compact_shell_plan(
+        &mut self,
+        plan: CompactShellPlan,
+    ) -> Result<(), JobError> {
+        if self.relations.is_frozen() {
+            return Err(JobError::CandidateAlreadyFrozen);
+        }
+        self.compact_shell_plan = Some(plan);
+        Ok(())
     }
 
     pub fn normalization(&self) -> &NormalizationCache {
@@ -903,9 +922,24 @@ impl CheckerJob {
         index: super::arena::ExprId,
         range: TrustedIndexRange,
     ) -> Result<super::arena::ExprId, ArenaError> {
-        let expression =
-            self.programs.call_family_in_range(&mut self.expressions, family, index, range)?;
-        if self.expressions.free_arguments(expression)?.is_empty() {
+        self.call_family_in_program_scope_with_reason(family, index, range, BetaReason::Other)
+    }
+
+    pub(crate) fn call_family_in_program_scope_with_reason(
+        &mut self,
+        family: FamilyValueId,
+        index: super::arena::ExprId,
+        range: TrustedIndexRange,
+        reason: BetaReason,
+    ) -> Result<super::arena::ExprId, ArenaError> {
+        let expression = self.programs.call_family_in_range_with_reason(
+            &mut self.expressions,
+            family,
+            index,
+            range,
+            reason,
+        )?;
+        if self.expressions.is_closed(expression)? {
             if let Some(facts) = self.programs.family_matrix_facts(family)?.cloned() {
                 self.facts
                     .insert(&self.expressions, expression, ValueFacts::Matrix(facts))
@@ -918,6 +952,69 @@ impl CheckerJob {
         Ok(expression)
     }
 
+    pub(crate) fn call_family_in_program_scope_deferred_generated(
+        &mut self,
+        family: FamilyValueId,
+        index: super::arena::ExprId,
+        range: TrustedIndexRange,
+    ) -> Result<super::arena::ExprId, ArenaError> {
+        self.call_family_in_program_scope_deferred_generated_with_reason(
+            family,
+            index,
+            range,
+            BetaReason::Other,
+        )
+    }
+
+    pub(crate) fn call_family_in_program_scope_deferred_generated_with_reason(
+        &mut self,
+        family: FamilyValueId,
+        index: super::arena::ExprId,
+        range: TrustedIndexRange,
+        reason: BetaReason,
+    ) -> Result<super::arena::ExprId, ArenaError> {
+        let expression = self.programs.call_family_in_range_deferred_generated_with_reason(
+            &mut self.expressions,
+            family,
+            index,
+            range,
+            reason,
+        )?;
+        // A deferred call has the same value as the eager family access. Preserve the producer's
+        // authoritative element summary on closed source/explicit calls; generated reducible
+        // families deliberately carry no such summary.
+        if self.expressions.is_closed(expression)? {
+            if let Some(facts) = self.programs.family_matrix_facts(family)?.cloned() {
+                self.facts
+                    .insert(&self.expressions, expression, ValueFacts::Matrix(facts))
+                    .map_err(|error| ArenaError::FactTransferRejected {
+                        expression,
+                        reason: error.to_string(),
+                    })?;
+            }
+        }
+        Ok(expression)
+    }
+
+    pub(crate) fn materialize_reducible_generated_calls(
+        &mut self,
+        root: super::arena::ExprId,
+    ) -> Result<super::arena::ExprId, ArenaError> {
+        self.materialize_reducible_generated_calls_with_reason(root, BetaReason::Other)
+    }
+
+    pub(crate) fn materialize_reducible_generated_calls_with_reason(
+        &mut self,
+        root: super::arena::ExprId,
+        reason: BetaReason,
+    ) -> Result<super::arena::ExprId, ArenaError> {
+        self.programs.materialize_reducible_generated_calls_with_reason(
+            &mut self.expressions,
+            root,
+            reason,
+        )
+    }
+
     pub(crate) fn transfer_explicit_matrix_facts(
         &mut self,
         branches: &[super::arena::ExprId],
@@ -927,7 +1024,7 @@ impl CheckerJob {
         // are facts about closed values; the finalized selected family (or an exact family call)
         // is the authority that can receive the summary later. Do not turn a temporary open DAG
         // wrapper into a global fact insertion failure.
-        if !self.expressions.free_arguments(expression)?.is_empty() {
+        if !self.expressions.is_closed(expression)? {
             return Ok(());
         }
         let summary =
@@ -985,15 +1082,33 @@ impl CheckerJob {
                 return Err(JobError::RelationProgramContractMismatch { plan });
             }
         }
-        let preimage_root =
-            self.programs.program(registration.lhs.preimage_plan).map_err(JobError::Arena)?.root;
+        let preimage_root = self
+            .programs
+            .materialize_reducible_generated_calls_with_reason(
+                &mut self.expressions,
+                self.programs
+                    .program(registration.lhs.preimage_plan)
+                    .map_err(JobError::Arena)?
+                    .root,
+                BetaReason::JobRelationValidation,
+            )
+            .map_err(JobError::Arena)?;
         if registration.dispatch.preimage_source.expression != preimage_root ||
             registration.lhs.validation.source != registration.dispatch.preimage_source
         {
             return Err(JobError::RelationSourceMismatch);
         }
-        let trapdoor_root =
-            self.programs.program(registration.lhs.trapdoor_plan).map_err(JobError::Arena)?.root;
+        let trapdoor_root = self
+            .programs
+            .materialize_reducible_generated_calls_with_reason(
+                &mut self.expressions,
+                self.programs
+                    .program(registration.lhs.trapdoor_plan)
+                    .map_err(JobError::Arena)?
+                    .root,
+                BetaReason::JobRelationValidation,
+            )
+            .map_err(JobError::Arena)?;
         if registration.dispatch.trapdoor_source.expression != trapdoor_root ||
             registration.lhs.validation.trapdoor_source != registration.dispatch.trapdoor_source
         {
@@ -1007,7 +1122,7 @@ impl CheckerJob {
                         paired_public_output_role,
                         ..
                     },
-                ) => (*paired_public_event, paired_public_output_role.as_str()),
+                ) => (*paired_public_event, paired_public_output_role.clone()),
                 _ => return Err(JobError::RelationTrapdoorMismatch),
             };
         match self.facts.facts(trapdoor_root) {
@@ -1019,8 +1134,17 @@ impl CheckerJob {
         if registration.lhs.public_pairing != registration.lhs.public_plan {
             return Err(JobError::RelationPairingMismatch);
         }
-        let public_root =
-            self.programs.program(registration.lhs.public_pairing).map_err(JobError::Arena)?.root;
+        let public_root = self
+            .programs
+            .materialize_reducible_generated_calls_with_reason(
+                &mut self.expressions,
+                self.programs
+                    .program(registration.lhs.public_pairing)
+                    .map_err(JobError::Arena)?
+                    .root,
+                BetaReason::JobRelationValidation,
+            )
+            .map_err(JobError::Arena)?;
         let public_identity =
             match &self.expressions.node(public_root).map_err(JobError::Arena)?.operator {
                 super::arena::ValueOperator::Source(source) => {
@@ -1030,16 +1154,19 @@ impl CheckerJob {
                 super::arena::ValueOperator::Sampler { event, .. } => Some((*event, "value")),
                 _ => None,
             };
-        if public_identity != Some((paired_public_event, paired_public_output_role)) {
+        if public_identity != Some((paired_public_event, paired_public_output_role.as_str())) {
             return Err(JobError::RelationPairingMismatch);
         }
         if let Some(expected_layout) = registration.lhs.layout.as_ref() {
-            for plan in [
-                registration.lhs.public_plan,
-                registration.lhs.preimage_plan,
-                registration.target_plan,
-            ] {
-                let root = self.programs.program(plan).map_err(JobError::Arena)?.root;
+            let target_root = self
+                .programs
+                .materialize_reducible_generated_calls_with_reason(
+                    &mut self.expressions,
+                    self.programs.program(registration.target_plan).map_err(JobError::Arena)?.root,
+                    BetaReason::JobRelationValidation,
+                )
+                .map_err(JobError::Arena)?;
+            for root in [public_root, preimage_root, target_root] {
                 if !matches!(self.facts.facts(root),
                     Ok(super::facts::ValueFacts::Matrix(facts)) if &facts.metadata.layout == expected_layout)
                 {
@@ -1096,8 +1223,86 @@ impl CheckerJob {
         Ok(ClosedRootAnalysis { value, counters, exact_term_diagnostics })
     }
 
+    /// Analyze a lowering-selected compact residual.  The marker is private to the production
+    /// lowering/report boundary; callers cannot request compact interpretation for arbitrary IR.
+    pub(crate) fn normalize_compact_closed_root(
+        &mut self,
+        root: ClosedExprId,
+    ) -> Result<ClosedRootAnalysis, JobError> {
+        self.validate_frozen_resources()?;
+        let expression = root.expression();
+        let output = self.expressions.value_type(expression).map_err(JobError::Arena)?.clone();
+        let program = self
+            .programs
+            .finalize(
+                &mut self.expressions,
+                ProgramSignature { inputs: Box::new([]), output },
+                expression,
+            )
+            .map_err(JobError::Arena)?;
+        let scoped = self.programs.root(&self.expressions, program).map_err(JobError::Arena)?;
+        self.frozen_resources = Some(self.current_resource_counters());
+        let (value, counters) = self.normalize_compact(scoped)?;
+        info!(
+            target: "mxx_correctness::operational_noise",
+            stage = "normalize_compact_root",
+            event = "complete",
+            nodes_processed = counters.nodes_processed,
+            nodes_total = counters.nodes_total,
+            final_exact_terms = counters.final_exact_term_count,
+            bounded_folds = counters.bounded_fold_count,
+            relation_applied = counters.relation_applied,
+            relation_remaining = counters.relation_remaining,
+            compact_virtual_calls = counters.compact_virtual_calls,
+            compact_algebra_nodes = counters.compact_algebra_nodes,
+            compact_concrete_shell_nodes = counters.compact_concrete_shell_nodes,
+            planned_shell_occurrences = counters.compact_planned_shell_occurrences,
+            planned_scalar_occurrences = counters.compact_scalar_consumers,
+            shell_holds_unmatched = counters.compact_shell_holds_unmatched,
+            scalar_holds_unmatched = counters.compact_scalar_holds_unmatched,
+            peak_frames = counters.compact_peak_live_frames,
+            peak_values = counters.compact_peak_live_values,
+            "compact normalization summary"
+        );
+        let exact_term_diagnostics = value.exact_nf.as_ref().map_or_else(
+            || Ok::<Box<[ExactTermDiagnostic]>, JobError>(Box::new([])),
+            |normal_form| self.exact_term_diagnostics(program, &normal_form.exact_terms),
+        )?;
+        Ok(ClosedRootAnalysis { value, counters, exact_term_diagnostics })
+    }
+
     /// Analyze one finalized family symbolically at its existing formal `Argument(0)`. No lane
     /// is enumerated and no caller-provided scope or reached-LHS capability is accepted.
+    pub(crate) fn analyze_compact_family_root(
+        &mut self,
+        family: FamilyValueId,
+    ) -> Result<ProofAnalysisResult, JobError> {
+        self.validate_frozen_resources()?;
+        let _domain = self.validate_compact_family_authority(family)?;
+        let checkpoint = self.normalization.checkpoint();
+        let normalized = self.normalize_compact_family(family);
+        self.normalization.rollback(checkpoint);
+        self.normalization.clear_runtime();
+        let (analyzed, counters) = normalized?;
+        let Some(exact) = analyzed.exact_nf.as_ref() else {
+            return Ok(ProofAnalysisResult {
+                bounded_summary: BoundedSummary::from_contract(analyzed.coefficient_bound)
+                    .map_err(JobError::Normalize)?,
+                exact_term_count: 0,
+                counters,
+                exact_term_diagnostics: Box::new([]),
+            });
+        };
+        let exact_term_diagnostics =
+            self.exact_term_diagnostics(family.program(), &exact.exact_terms)?;
+        Ok(ProofAnalysisResult {
+            bounded_summary: exact.bounded_summary.clone(),
+            exact_term_count: exact.term_count() as u64,
+            counters,
+            exact_term_diagnostics,
+        })
+    }
+
     pub fn analyze_family_root(
         &mut self,
         family: FamilyValueId,
@@ -1121,8 +1326,19 @@ impl CheckerJob {
         {
             return Err(JobError::Relation(RelationRegistryError::IndexOutOfDomain));
         }
-        let root =
+        let compact_root =
             self.programs.root(&self.expressions, family.program()).map_err(JobError::Arena)?;
+        let materialized = self
+            .materialize_reducible_generated_calls_with_reason(
+                compact_root.expression(),
+                BetaReason::JobRelationValidation,
+            )
+            .map_err(JobError::Arena)?;
+        let root = self
+            .programs
+            .detached_scoped(&self.expressions, family.program(), materialized)
+            .map_err(JobError::Arena)?;
+        self.frozen_resources = Some(self.current_resource_counters());
         self.analyze_family_root_in_context(family, domain, element_type, root)
     }
 
@@ -1369,6 +1585,138 @@ impl CheckerJob {
         let counters = normalizer.counters();
         self.frozen_resources = Some(self.current_resource_counters());
         Ok((value, counters))
+    }
+
+    pub(crate) fn normalize_compact(
+        &mut self,
+        root: super::arena::ScopedExprId,
+    ) -> Result<(AnalyzedValue, NormalizationCounters), JobError> {
+        self.validate_frozen_resources()?;
+        let scope = root.program();
+        let (
+            expressions,
+            programs,
+            facts,
+            monomials,
+            relations,
+            gadget_recompositions,
+            normalization,
+        ) = (
+            &mut self.expressions,
+            &self.programs,
+            &self.facts,
+            &mut self.monomials,
+            &self.relations,
+            &self.gadget_recompositions,
+            &mut self.normalization,
+        );
+        let monomial_arena =
+            monomials.ensure(expressions, programs, scope).map_err(JobError::Monomial)?;
+        let mut normalizer = Normalizer::new(expressions, programs, facts, monomial_arena)
+            .map_err(JobError::Normalize)?
+            .with_relations(relations, normalization)
+            .with_gadget_recompositions(gadget_recompositions);
+        if let Some(plan) = self.compact_shell_plan.clone() {
+            normalizer = normalizer.with_compact_shell_plan(plan);
+        }
+        let value = normalizer.normalize_compact_root(root).map_err(JobError::Normalize)?;
+        let counters = normalizer.counters();
+        self.frozen_resources = Some(self.current_resource_counters());
+        Ok((value, counters))
+    }
+
+    pub(crate) fn normalize_compact_family(
+        &mut self,
+        family: FamilyValueId,
+    ) -> Result<(AnalyzedValue, NormalizationCounters), JobError> {
+        self.validate_frozen_resources()?;
+        let domain = self.validate_compact_family_authority(family)?;
+        let scope = family.program();
+        let (
+            expressions,
+            programs,
+            facts,
+            monomials,
+            relations,
+            gadget_recompositions,
+            normalization,
+        ) = (
+            &mut self.expressions,
+            &self.programs,
+            &self.facts,
+            &mut self.monomials,
+            &self.relations,
+            &self.gadget_recompositions,
+            &mut self.normalization,
+        );
+        let monomial_arena =
+            monomials.ensure(expressions, programs, scope).map_err(JobError::Monomial)?;
+        let mut normalizer = Normalizer::new(expressions, programs, facts, monomial_arena)
+            .map_err(JobError::Normalize)?
+            .with_relations(relations, normalization)
+            .with_gadget_recompositions(gadget_recompositions);
+        if let Some(plan) = self.compact_shell_plan.clone() {
+            normalizer = normalizer.with_compact_shell_plan(plan);
+        }
+        let value =
+            normalizer.normalize_compact_family_root(family).map_err(JobError::Normalize)?;
+        let counters = normalizer.counters();
+        info!(
+            target: "mxx_correctness::operational_noise",
+            stage = "normalize_compact_family",
+            event = "complete",
+            family_program = ?family.program(),
+            domain_minimum = domain.minimum,
+            domain_maximum_exclusive = domain.maximum_exclusive,
+            nodes_processed = counters.nodes_processed,
+            nodes_total = counters.nodes_total,
+            final_exact_terms = counters.final_exact_term_count,
+            bounded_folds = counters.bounded_fold_count,
+            relation_applied = counters.relation_applied,
+            relation_remaining = counters.relation_remaining,
+            compact_virtual_calls = counters.compact_virtual_calls,
+            compact_algebra_nodes = counters.compact_algebra_nodes,
+            compact_concrete_shell_nodes = counters.compact_concrete_shell_nodes,
+            planned_shell_occurrences = counters.compact_planned_shell_occurrences,
+            planned_scalar_occurrences = counters.compact_scalar_consumers,
+            shell_holds_unmatched = counters.compact_shell_holds_unmatched,
+            scalar_holds_unmatched = counters.compact_scalar_holds_unmatched,
+            peak_frames = counters.compact_peak_live_frames,
+            peak_values = counters.compact_peak_live_values,
+            "compact family normalization summary"
+        );
+        self.frozen_resources = Some(self.current_resource_counters());
+        Ok((value, counters))
+    }
+
+    /// Validate the private compact-family authority once at the job boundary.  The family
+    /// remains a normal indexed-family value; this only proves that its existing unary Int
+    /// signature and trusted range are exactly the family domain before the shared evaluator is
+    /// allowed to inspect its body.
+    fn validate_compact_family_authority(
+        &self,
+        family: FamilyValueId,
+    ) -> Result<FamilyDomain, JobError> {
+        let domain = self.programs.family_domain(family).map_err(JobError::Arena)?;
+        let element_type = self.programs.family_element_type(family).map_err(JobError::Arena)?;
+        if !matches!(element_type, ResolvedValueType::Matrix(_)) {
+            return Err(JobError::RelationTypeMismatch);
+        }
+        let expected_range = TrustedIndexRange {
+            minimum: domain.minimum,
+            maximum_exclusive: domain.maximum_exclusive,
+        };
+        let program = self.programs.program(family.program()).map_err(JobError::Arena)?;
+        if !self.programs.family_is_reducible(family).map_err(JobError::Arena)? ||
+            !self.facts.ranges_finalized() ||
+            program.signature.inputs.len() != 1 ||
+            program.signature.inputs[0].value_type != ResolvedValueType::Int ||
+            program.signature.inputs[0].trusted_index_range != Some(expected_range) ||
+            program.signature.output != element_type
+        {
+            return Err(JobError::Relation(RelationRegistryError::IndexOutOfDomain));
+        }
+        Ok(domain)
     }
 
     /// Return the scope-local monomial arena, creating it after the scope has been finalized.
@@ -1679,7 +2027,7 @@ mod tests {
         let call = job
             .call_family_in_program_scope(family, index, TrustedIndexRange::new(0, 3).unwrap())
             .unwrap();
-        let ValueFacts::Matrix(facts) = job.facts.facts(call).unwrap() else {
+        let ValueFacts::Matrix(facts) = job.facts.facts(call).unwrap().clone() else {
             panic!("explicit family call did not receive matrix facts")
         };
         assert!(facts.metadata.is_constant_polynomial);
@@ -1689,6 +2037,22 @@ mod tests {
                 super::super::facts::CoefficientBound::finite(7_u64)
             )
         );
+
+        let deferred_index = job
+            .expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .unwrap();
+        let deferred = job
+            .call_family_in_program_scope_deferred_generated(
+                family,
+                deferred_index,
+                TrustedIndexRange::new(0, 3).unwrap(),
+            )
+            .unwrap();
+        let ValueFacts::Matrix(deferred_facts) = job.facts.facts(deferred).unwrap() else {
+            panic!("deferred explicit family call did not receive matrix facts")
+        };
+        assert_eq!(deferred_facts, &facts);
 
         let open_index = job.expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
         let open_call = job

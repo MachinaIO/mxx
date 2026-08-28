@@ -10,7 +10,11 @@ pub use super::arena::{
     ProgramSignature, ResolvedValueType, SemanticFamilySourceIdentity, TrustedIndexRange,
     ValueOperator, ValueProgram, ValueProgramId,
 };
-use std::collections::BTreeMap;
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
 
 pub use super::arena::ScopedExprId;
 use super::{
@@ -81,6 +85,86 @@ struct ProgramKey {
     root: ExprId,
 }
 
+type RootValidationFacts = BTreeSet<(u32, ResolvedValueType)>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub(crate) enum BetaReason {
+    ScalarFamilyGet,
+    SelectorRangeExposure,
+    MatrixFactObservation,
+    GadgetFactFallback,
+    ExplicitFamilyFactSummary,
+    FamilySelectBranch,
+    RelationLiftEndpoint,
+    ResidualRoot,
+    DecoderRoot,
+    JobRelationValidation,
+    NormalizerSpecialization,
+    Other,
+}
+
+pub(crate) const BETA_REASON_COUNT: usize = 12;
+
+impl BetaReason {
+    pub(crate) const ALL: [Self; BETA_REASON_COUNT] = [
+        Self::ScalarFamilyGet,
+        Self::SelectorRangeExposure,
+        Self::MatrixFactObservation,
+        Self::GadgetFactFallback,
+        Self::ExplicitFamilyFactSummary,
+        Self::FamilySelectBranch,
+        Self::RelationLiftEndpoint,
+        Self::ResidualRoot,
+        Self::DecoderRoot,
+        Self::JobRelationValidation,
+        Self::NormalizerSpecialization,
+        Self::Other,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::ScalarFamilyGet => "scalar-family-get",
+            Self::SelectorRangeExposure => "selector-range-exposure",
+            Self::MatrixFactObservation => "matrix-fact-observation",
+            Self::GadgetFactFallback => "gadget-fact-fallback",
+            Self::ExplicitFamilyFactSummary => "explicit-family-fact-summary",
+            Self::FamilySelectBranch => "family-select-branch",
+            Self::RelationLiftEndpoint => "relation-lift-endpoint",
+            Self::ResidualRoot => "residual-root",
+            Self::DecoderRoot => "decoder-root",
+            Self::JobRelationValidation => "job-relation-validation",
+            Self::NormalizerSpecialization => "normalizer-specialization",
+            Self::Other => "other",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProgramDiagnosticCounters {
+    pub family_calls: u64,
+    pub beta_program_call_sidecar_hits: u64,
+    pub beta_program_call_sidecar_misses: u64,
+    pub beta_program_call_sidecar_entries: u64,
+    pub beta_program_call_early_source_hits: u64,
+    pub beta_program_call_early_source_input_skips: u64,
+    pub beta_identity_shortcuts: u64,
+    pub beta_nodes_visited: u64,
+    pub beta_closed_subtrees_reused: u64,
+    pub root_validation_facts_hits: u64,
+    pub root_validation_facts_misses: u64,
+    pub root_validation_facts_entries: u64,
+    pub root_validation_nodes_visited: u64,
+    pub root_validation_cached_subroot_skips: u64,
+    pub beta_reason_misses: [u64; BETA_REASON_COUNT],
+    pub beta_reason_visits: [u64; BETA_REASON_COUNT],
+    pub beta_reason_expr_allocations: [u64; BETA_REASON_COUNT],
+}
+
 /// The single job-local authority for finalized value programs and indexed families.
 ///
 /// Families are views over ordinary one-argument programs.  They do not introduce another
@@ -93,6 +177,11 @@ pub struct ProgramArena {
     families: BTreeMap<FamilyValueId, FamilyRecord>,
     family_intern: BTreeMap<FamilyKey, FamilyValueId>,
     expression_token: Option<ArenaToken>,
+    /// Presence records both successful ownership validation and the exact sorted free arguments.
+    /// Expression nodes are immutable and this arena binds to one expression authority.
+    root_validation_facts: BTreeMap<ExprId, RootValidationFacts>,
+    diagnostic_counters_enabled: bool,
+    diagnostic_counters: Cell<ProgramDiagnosticCounters>,
 }
 
 impl Default for ProgramArena {
@@ -110,6 +199,12 @@ impl ProgramArena {
             families: BTreeMap::new(),
             family_intern: BTreeMap::new(),
             expression_token: None,
+            root_validation_facts: BTreeMap::new(),
+            diagnostic_counters_enabled: tracing::enabled!(
+                target: "mxx_correctness::operational_noise",
+                tracing::Level::INFO
+            ),
+            diagnostic_counters: Cell::new(ProgramDiagnosticCounters::default()),
         }
     }
 
@@ -119,6 +214,62 @@ impl ProgramArena {
 
     pub fn len(&self) -> usize {
         self.programs.len()
+    }
+
+    pub(crate) fn diagnostic_counters(&self) -> ProgramDiagnosticCounters {
+        self.diagnostic_counters.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_diagnostic_counters(&mut self) {
+        self.diagnostic_counters_enabled = true;
+    }
+
+    fn update_diagnostic_counters(&self, update: impl FnOnce(&mut ProgramDiagnosticCounters)) {
+        if !self.diagnostic_counters_enabled {
+            return;
+        }
+        let mut counters = self.diagnostic_counters.get();
+        update(&mut counters);
+        self.diagnostic_counters.set(counters);
+    }
+
+    pub(crate) fn beta_reason_counters(
+        &self,
+    ) -> ([u64; BETA_REASON_COUNT], [u64; BETA_REASON_COUNT], [u64; BETA_REASON_COUNT]) {
+        let counters = self.diagnostic_counters.get();
+        (
+            counters.beta_reason_misses,
+            counters.beta_reason_visits,
+            counters.beta_reason_expr_allocations,
+        )
+    }
+
+    fn record_beta_miss(&self, reason: BetaReason) {
+        self.update_diagnostic_counters(|counters| {
+            counters.beta_reason_misses[reason.index()] =
+                counters.beta_reason_misses[reason.index()].saturating_add(1);
+        });
+    }
+
+    fn record_beta_visit(&self, reason: BetaReason, visits: u64) {
+        self.update_diagnostic_counters(|counters| {
+            counters.beta_reason_visits[reason.index()] =
+                counters.beta_reason_visits[reason.index()].saturating_add(visits);
+        });
+    }
+
+    fn record_expr_allocations(&self, reason: BetaReason, before: usize, after: usize) {
+        let allocations = after.saturating_sub(before) as u64;
+        self.update_diagnostic_counters(|counters| {
+            counters.beta_reason_expr_allocations[reason.index()] =
+                counters.beta_reason_expr_allocations[reason.index()].saturating_add(allocations);
+        });
+    }
+
+    #[cfg(test)]
+    fn root_validation_facts_len(&self) -> usize {
+        self.root_validation_facts.len()
     }
 
     #[cfg(test)]
@@ -134,15 +285,15 @@ impl ProgramArena {
     ) -> Result<ValueProgramId, ArenaError> {
         expressions.check_id(root)?;
         self.bind_expressions(expressions)?;
-        self.validate_program_ownership(expressions, root)?;
-        if expressions.value_type(root)? != &signature.output {
-            return Err(ArenaError::ProgramOutputMismatch);
-        }
-        self.validate_free_arguments(expressions, &signature, root)?;
+        let new_validation_facts =
+            self.validate_root_for_finalization(expressions, &signature, root)?;
         let key = ProgramKey { signature: signature.clone(), root };
         if let Some(slot) = self.interner.get(&key).copied() {
             let id = ValueProgramId::new(self.token, slot);
             expressions.register_program_signature(id, signature)?;
+            if let Some(facts) = new_validation_facts {
+                self.record_root_validation_facts(root, facts)?;
+            }
             return Ok(id);
         }
         let slot =
@@ -151,6 +302,9 @@ impl ProgramArena {
         self.programs.push(ValueProgram { signature: signature.clone(), root });
         self.interner.insert(key, slot);
         expressions.register_program_signature(id, signature)?;
+        if let Some(facts) = new_validation_facts {
+            self.record_root_validation_facts(root, facts)?;
+        }
         Ok(id)
     }
 
@@ -359,6 +513,119 @@ impl ProgramArena {
         Ok(())
     }
 
+    fn validate_root_for_finalization(
+        &self,
+        expressions: &ExprArena,
+        signature: &ProgramSignature,
+        root: ExprId,
+    ) -> Result<Option<RootValidationFacts>, ArenaError> {
+        let new_facts = if self.root_validation_facts.get(&root).is_some() {
+            self.update_diagnostic_counters(|counters| {
+                counters.root_validation_facts_hits =
+                    counters.root_validation_facts_hits.saturating_add(1);
+            });
+            None
+        } else {
+            self.update_diagnostic_counters(|counters| {
+                counters.root_validation_facts_misses =
+                    counters.root_validation_facts_misses.saturating_add(1);
+            });
+            Some(self.collect_root_validation_facts(expressions, root)?)
+        };
+        let facts = new_facts
+            .as_ref()
+            .or_else(|| self.root_validation_facts.get(&root))
+            .expect("cached or newly computed root validation facts");
+        if expressions.value_type(root)? != &signature.output {
+            return Err(ArenaError::ProgramOutputMismatch);
+        }
+        self.validate_free_argument_facts(signature, facts)?;
+        Ok(new_facts)
+    }
+
+    fn record_root_validation_facts(
+        &mut self,
+        root: ExprId,
+        facts: RootValidationFacts,
+    ) -> Result<(), ArenaError> {
+        if let Some(existing) = self.root_validation_facts.get(&root) {
+            if existing != &facts {
+                return Err(ArenaError::ProgramSignatureMismatch);
+            }
+        } else {
+            self.root_validation_facts.insert(root, facts);
+        }
+        self.update_diagnostic_counters(|counters| {
+            counters.root_validation_facts_entries = self.root_validation_facts.len() as u64;
+        });
+        Ok(())
+    }
+
+    fn collect_root_validation_facts(
+        &self,
+        expressions: &ExprArena,
+        root: ExprId,
+    ) -> Result<RootValidationFacts, ArenaError> {
+        let mut seen = HashSet::new();
+        let mut work = vec![root];
+        let mut free_arguments = BTreeSet::new();
+        let mut nodes_visited = 0_u64;
+        let mut cached_subroot_skips = 0_u64;
+        while let Some(id) = work.pop() {
+            if !seen.insert(id.slot()) {
+                continue;
+            }
+            if let Some(cached_facts) = self.root_validation_facts.get(&id) {
+                free_arguments.extend(cached_facts.iter().cloned());
+                cached_subroot_skips = cached_subroot_skips.saturating_add(1);
+                continue;
+            }
+            nodes_visited = nodes_visited.saturating_add(1);
+            let node = expressions.node(id)?;
+            if let ValueOperator::ProgramCall { program } = node.operator {
+                if program.arena != self.token {
+                    return Err(ArenaError::ForeignProgram {
+                        expected: self.token,
+                        actual: program.arena,
+                    });
+                }
+                self.program(program)?;
+            }
+            if let ValueOperator::Argument { position, ref value_type } = node.operator {
+                free_arguments.insert((position, value_type.clone()));
+            }
+            work.extend(node.inputs.iter().copied());
+        }
+        self.update_diagnostic_counters(|counters| {
+            counters.root_validation_nodes_visited =
+                counters.root_validation_nodes_visited.saturating_add(nodes_visited);
+            counters.root_validation_cached_subroot_skips =
+                counters.root_validation_cached_subroot_skips.saturating_add(cached_subroot_skips);
+        });
+        Ok(free_arguments)
+    }
+
+    fn validate_free_argument_facts(
+        &self,
+        signature: &ProgramSignature,
+        free_arguments: &RootValidationFacts,
+    ) -> Result<(), ArenaError> {
+        for (position, actual) in free_arguments {
+            let Some(input) = signature.inputs.get(*position as usize) else {
+                return Err(ArenaError::FreeArgumentEscapes { position: *position });
+            };
+            if actual != &input.value_type {
+                return Err(ArenaError::TypeMismatch {
+                    operator: "ProgramSignature".to_owned(),
+                    position: *position as usize,
+                    expected: input.value_type.clone(),
+                    actual: actual.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// A program may call only programs finalized by this exact authority.  The token check is
     /// performed on every reachable call, rather than only on the root, so a foreign callee
     /// cannot hide below an otherwise valid DAG.
@@ -522,16 +789,16 @@ impl ProgramArena {
     ) -> Result<ValueProgramId, ArenaError> {
         expressions.check_id(root)?;
         self.bind_expressions(expressions)?;
-        self.validate_program_ownership(expressions, root)?;
-        if expressions.value_type(root)? != &signature.output {
-            return Err(ArenaError::ProgramOutputMismatch);
-        }
-        self.validate_free_arguments(expressions, &signature, root)?;
+        let new_validation_facts =
+            self.validate_root_for_finalization(expressions, &signature, root)?;
         let slot =
             u32::try_from(self.programs.len()).map_err(|_| ArenaError::ProgramArenaExhausted)?;
         let id = ValueProgramId::new(self.token, slot);
         self.programs.push(ValueProgram { signature: signature.clone(), root });
         expressions.register_program_signature(id, signature)?;
+        if let Some(facts) = new_validation_facts {
+            self.record_root_validation_facts(root, facts)?;
+        }
         Ok(id)
     }
 
@@ -618,7 +885,30 @@ impl ProgramArena {
                 });
             }
         }
-        let explicit_matrix_facts = self.explicit_matrix_summary(expressions, facts, &values)?;
+        // Fact views are derived from each exact compact value under this ProgramArena's
+        // authority. Callers cannot pair an unrelated same-typed expression with a value merely
+        // to lend it facts. A fact-bearing wrapper remains its own observation root; otherwise
+        // reducible generated calls are transitively materialized only for summary inspection.
+        let fact_values = if matches!(element_type, ResolvedValueType::Matrix(_)) {
+            values
+                .iter()
+                .map(|value| {
+                    if matches!(facts.facts(*value), Ok(ValueFacts::Matrix(_))) {
+                        Ok(*value)
+                    } else {
+                        self.materialize_reducible_generated_calls_with_reason(
+                            expressions,
+                            *value,
+                            BetaReason::ExplicitFamilyFactSummary,
+                        )
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let explicit_matrix_facts =
+            self.explicit_matrix_summary(expressions, facts, &fact_values)?;
         let argument = expressions.intern_argument(0, ResolvedValueType::Int)?;
         let mut body_inputs = Vec::with_capacity(values.len() + 1);
         body_inputs.push(argument);
@@ -740,6 +1030,23 @@ impl ProgramArena {
         index: ExprId,
         index_range: TrustedIndexRange,
     ) -> Result<ExprId, ArenaError> {
+        self.call_family_in_range_with_reason(
+            expressions,
+            family,
+            index,
+            index_range,
+            BetaReason::Other,
+        )
+    }
+
+    pub(crate) fn call_family_in_range_with_reason(
+        &self,
+        expressions: &mut ExprArena,
+        family: FamilyValueId,
+        index: ExprId,
+        index_range: TrustedIndexRange,
+        reason: BetaReason,
+    ) -> Result<ExprId, ArenaError> {
         let record = self.family(family)?;
         if !record.domain.contains(index_range) {
             return Err(ArenaError::InvalidRange {
@@ -755,12 +1062,118 @@ impl ProgramArena {
                 actual: expressions.value_type(index)?.clone(),
             });
         }
+        let node_count = expressions.node_count();
         let call = self.call(expressions, family.program(), &[index])?;
+        self.record_expr_allocations(reason, node_count, expressions.node_count());
+        self.update_diagnostic_counters(|counters| {
+            counters.family_calls = counters.family_calls.saturating_add(1);
+        });
         if record.reducible {
-            self.beta_reduce_family_call(expressions, family, index, call)
+            self.reduce_validated_family_call_with_reason(expressions, family, index, call, reason)
         } else {
-            Ok(call)
+            self.materialize_reducible_generated_calls_with_reason(expressions, call, reason)
         }
+    }
+
+    /// Build a validated family call without eagerly expanding a reducible generated family.
+    /// This is private composition machinery for binder-open nested parallel bodies. A compact
+    /// body containing this call may be finalized as another generated family; callers must fully
+    /// materialize it only before semantic exposure to relation validation, family analysis, or
+    /// normalization.
+    pub(crate) fn call_family_in_range_deferred_generated(
+        &self,
+        expressions: &mut ExprArena,
+        family: FamilyValueId,
+        index: ExprId,
+        index_range: TrustedIndexRange,
+    ) -> Result<ExprId, ArenaError> {
+        self.call_family_in_range_deferred_generated_with_reason(
+            expressions,
+            family,
+            index,
+            index_range,
+            BetaReason::Other,
+        )
+    }
+
+    pub(crate) fn call_family_in_range_deferred_generated_with_reason(
+        &self,
+        expressions: &mut ExprArena,
+        family: FamilyValueId,
+        index: ExprId,
+        index_range: TrustedIndexRange,
+        reason: BetaReason,
+    ) -> Result<ExprId, ArenaError> {
+        let record = self.family(family)?;
+        if !record.domain.contains(index_range) {
+            return Err(ArenaError::InvalidRange {
+                minimum: index_range.minimum,
+                maximum_exclusive: index_range.maximum_exclusive,
+            });
+        }
+        if expressions.value_type(index)? != &ResolvedValueType::Int {
+            return Err(ArenaError::TypeMismatch {
+                operator: "FamilyCall".to_owned(),
+                position: 0,
+                expected: ResolvedValueType::Int,
+                actual: expressions.value_type(index)?.clone(),
+            });
+        }
+        let node_count = expressions.node_count();
+        let call = self.call(expressions, family.program(), &[index])?;
+        self.record_expr_allocations(reason, node_count, expressions.node_count());
+        self.update_diagnostic_counters(|counters| {
+            counters.family_calls = counters.family_calls.saturating_add(1);
+        });
+        Ok(call)
+    }
+
+    fn reduce_validated_family_call(
+        &self,
+        expressions: &mut ExprArena,
+        family: FamilyValueId,
+        index: ExprId,
+        call: ExprId,
+    ) -> Result<ExprId, ArenaError> {
+        self.reduce_validated_family_call_with_reason(
+            expressions,
+            family,
+            index,
+            call,
+            BetaReason::Other,
+        )
+    }
+
+    fn reduce_validated_family_call_with_reason(
+        &self,
+        expressions: &mut ExprArena,
+        family: FamilyValueId,
+        index: ExprId,
+        call: ExprId,
+        reason: BetaReason,
+    ) -> Result<ExprId, ArenaError> {
+        if let Some(reduced) = expressions.program_call_reduction(call)? {
+            self.update_diagnostic_counters(|counters| {
+                counters.beta_program_call_sidecar_hits =
+                    counters.beta_program_call_sidecar_hits.saturating_add(1);
+            });
+            return Ok(reduced);
+        }
+        self.update_diagnostic_counters(|counters| {
+            counters.beta_program_call_sidecar_misses =
+                counters.beta_program_call_sidecar_misses.saturating_add(1);
+        });
+        self.record_beta_miss(reason);
+        let reduced =
+            self.beta_reduce_family_call_with_reason(expressions, family, index, call, reason)?;
+        let reduced =
+            self.materialize_reducible_generated_calls_with_reason(expressions, reduced, reason)?;
+        expressions.record_program_call_reduction(call, reduced)?;
+        let entries = expressions.program_call_reduction_count() as u64;
+        self.update_diagnostic_counters(|counters| {
+            counters.beta_program_call_sidecar_entries = entries;
+        });
+        Ok(reduced)
     }
 
     pub fn family_domain(&self, family: FamilyValueId) -> Result<FamilyDomain, ArenaError> {
@@ -778,12 +1191,242 @@ impl ProgramArena {
         Ok(self.family(family)?.body)
     }
 
+    pub(crate) fn family_is_reducible(&self, family: FamilyValueId) -> Result<bool, ArenaError> {
+        Ok(self.family(family)?.reducible)
+    }
+
+    pub(crate) fn program_signature(
+        &self,
+        program: ValueProgramId,
+    ) -> Result<&ProgramSignature, ArenaError> {
+        Ok(&self.program(program)?.signature)
+    }
+
     /// Return the family view for an already-finalized program, if that program is an indexed
     /// family in this arena.  The caller must not synthesize a new family around a program call:
     /// preserving this exact handle is what keeps relation provenance attached to the producer.
     pub fn family_for_program(&self, program: ValueProgramId) -> Option<FamilyValueId> {
         let family = FamilyValueId(program);
         self.families.contains_key(&family).then_some(family)
+    }
+
+    fn reducible_family_for_program(&self, program: ValueProgramId) -> Option<FamilyValueId> {
+        let family = FamilyValueId(program);
+        self.families.get(&family).is_some_and(|record| record.reducible).then_some(family)
+    }
+
+    /// Fully expand reducible generated-family calls in one not-yet-finalized composition body.
+    /// Opaque/nonreducible callees remain folded, while their input expressions are still fully
+    /// materialized before the opaque call is rebuilt.
+    pub(crate) fn materialize_reducible_generated_calls(
+        &self,
+        expressions: &mut ExprArena,
+        root: ExprId,
+    ) -> Result<ExprId, ArenaError> {
+        self.materialize_reducible_generated_calls_with_reason(expressions, root, BetaReason::Other)
+    }
+
+    pub(crate) fn materialize_reducible_generated_calls_with_reason(
+        &self,
+        expressions: &mut ExprArena,
+        root: ExprId,
+        reason: BetaReason,
+    ) -> Result<ExprId, ArenaError> {
+        expressions.value_type(root)?;
+        let mut memo = HashMap::<ExprId, ExprId>::new();
+        let mut work = vec![MaterializeFrame::Visit(root)];
+        while let Some(frame) = work.pop() {
+            match frame {
+                MaterializeFrame::Visit(id) => {
+                    if memo.contains_key(&id) {
+                        continue;
+                    }
+                    let node = expressions.node_arc(id)?;
+                    if let ValueOperator::ProgramCall { program } = node.operator {
+                        if self.reducible_family_for_program(program).is_some() {
+                            if let Some(materialized) = expressions.program_call_reduction(id)? {
+                                if materialized == id ||
+                                    expressions.value_type(materialized)? !=
+                                        expressions.value_type(id)?
+                                {
+                                    return Err(ArenaError::ProgramSignatureMismatch);
+                                }
+                                self.update_diagnostic_counters(|counters| {
+                                    counters.beta_program_call_early_source_hits = counters
+                                        .beta_program_call_early_source_hits
+                                        .saturating_add(1);
+                                    counters.beta_program_call_early_source_input_skips = counters
+                                        .beta_program_call_early_source_input_skips
+                                        .saturating_add(node.inputs.len() as u64);
+                                });
+                                memo.insert(id, materialized);
+                                continue;
+                            }
+                        }
+                    }
+                    work.push(MaterializeFrame::Rebuild { id, node: Arc::clone(&node) });
+                    for input in node.inputs.iter().rev() {
+                        if !memo.contains_key(input) {
+                            work.push(MaterializeFrame::Visit(*input));
+                        }
+                    }
+                }
+                MaterializeFrame::Rebuild { id, node } => {
+                    if memo.contains_key(&id) {
+                        continue;
+                    }
+                    let inputs = node
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            memo.get(input)
+                                .copied()
+                                .ok_or(ArenaError::InvalidSlot { slot: input.slot() })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if let ValueOperator::ProgramCall { program } = node.operator &&
+                        let Some(family) = self.reducible_family_for_program(program)
+                    {
+                        let Some(&index) = inputs.first() else {
+                            return Err(ArenaError::ProgramSignatureMismatch);
+                        };
+                        let node_count = expressions.node_count();
+                        let call = expressions.intern(
+                            ValueOperator::ProgramCall { program },
+                            inputs.into_boxed_slice(),
+                        )?;
+                        self.record_expr_allocations(reason, node_count, expressions.node_count());
+                        if let Some(materialized) = expressions.program_call_reduction(call)? {
+                            self.update_diagnostic_counters(|counters| {
+                                counters.beta_program_call_sidecar_hits =
+                                    counters.beta_program_call_sidecar_hits.saturating_add(1);
+                            });
+                            memo.insert(id, materialized);
+                            continue;
+                        }
+                        self.update_diagnostic_counters(|counters| {
+                            counters.beta_program_call_sidecar_misses =
+                                counters.beta_program_call_sidecar_misses.saturating_add(1);
+                        });
+                        self.record_beta_miss(reason);
+                        let reduced = self.beta_reduce_family_call_with_reason(
+                            expressions,
+                            family,
+                            index,
+                            call,
+                            reason,
+                        )?;
+                        if reduced == id {
+                            return Err(ArenaError::ProgramSignatureMismatch);
+                        }
+                        work.push(MaterializeFrame::FinishReduced {
+                            source: id,
+                            reduced,
+                            canonical_call: call,
+                        });
+                        if !memo.contains_key(&reduced) {
+                            work.push(MaterializeFrame::Visit(reduced));
+                        }
+                    } else {
+                        let node_count = expressions.node_count();
+                        let value =
+                            expressions.intern(node.operator.clone(), inputs.into_boxed_slice())?;
+                        self.record_expr_allocations(reason, node_count, expressions.node_count());
+                        memo.insert(id, value);
+                    }
+                }
+                MaterializeFrame::FinishReduced { source, reduced, canonical_call } => {
+                    let value = memo
+                        .get(&reduced)
+                        .copied()
+                        .ok_or(ArenaError::InvalidSlot { slot: reduced.slot() })?;
+                    if source != canonical_call {
+                        if let Some(existing) = expressions.program_call_reduction(source)? {
+                            if existing != value {
+                                return Err(ArenaError::ProgramSignatureMismatch);
+                            }
+                        }
+                    }
+                    expressions.record_program_call_reduction(canonical_call, value)?;
+                    if source != canonical_call {
+                        expressions.record_program_call_reduction(source, value)?;
+                    }
+                    let entries = expressions.program_call_reduction_count() as u64;
+                    self.update_diagnostic_counters(|counters| {
+                        counters.beta_program_call_sidecar_entries = entries;
+                    });
+                    memo.insert(source, value);
+                }
+            }
+        }
+        let materialized =
+            memo.get(&root).copied().ok_or(ArenaError::InvalidSlot { slot: root.slot() })?;
+        self.ensure_no_reducible_generated_calls(expressions, materialized)?;
+        Ok(materialized)
+    }
+
+    pub(crate) fn ensure_no_reducible_generated_calls(
+        &self,
+        expressions: &ExprArena,
+        root: ExprId,
+    ) -> Result<(), ArenaError> {
+        expressions.value_type(root)?;
+        let mut seen = BTreeSet::new();
+        let mut work = vec![root];
+        while let Some(id) = work.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let node = expressions.node(id)?;
+            if let ValueOperator::ProgramCall { program } = node.operator {
+                if self.reducible_family_for_program(program).is_some() {
+                    return Err(ArenaError::ProgramSignatureMismatch);
+                }
+            }
+            work.extend(node.inputs.iter().copied());
+        }
+        Ok(())
+    }
+
+    /// Beta-reduce one validated program application and transitively materialize every
+    /// reducible generated-family call exposed by the result. Nonreducible callees remain opaque,
+    /// while their already-evaluated input expressions are still rebuilt and checked.
+    pub(crate) fn beta_reduce_materialized(
+        &self,
+        expressions: &mut ExprArena,
+        program: ValueProgramId,
+        arguments: &[ExprId],
+    ) -> Result<ExprId, ArenaError> {
+        self.beta_reduce_materialized_with_reason(
+            expressions,
+            program,
+            arguments,
+            BetaReason::Other,
+        )
+    }
+
+    pub(crate) fn beta_reduce_materialized_with_reason(
+        &self,
+        expressions: &mut ExprArena,
+        program: ValueProgramId,
+        arguments: &[ExprId],
+        reason: BetaReason,
+    ) -> Result<ExprId, ArenaError> {
+        let reduced = self.beta_reduce_with_reason(expressions, program, arguments, reason)?;
+        self.materialize_reducible_generated_calls_with_reason(expressions, reduced, reason)
+    }
+
+    /// Validate and issue a scoped view for a materialized expression derived from, but not
+    /// necessarily reachable by ordinary edges from, the compact finalized program root.
+    pub(crate) fn detached_scoped(
+        &self,
+        expressions: &ExprArena,
+        program: ValueProgramId,
+        root: ExprId,
+    ) -> Result<ScopedExprId, ArenaError> {
+        self.validate_detached_expression(expressions, program, root)?;
+        let proof = expressions.scope_proof(program, root)?;
+        expressions.scoped_from_proof(&proof, root)
     }
 
     /// Compose two equal-domain families by constructing one ordinary operator body.
@@ -1029,7 +1672,13 @@ impl ProgramArena {
                     return Err(ArenaError::ProgramSignatureMismatch);
                 }
                 let selector_root = selector_program.root;
+                let node_count = expressions.node_count();
                 let selector = self.call(expressions, program, &[argument])?;
+                self.record_expr_allocations(
+                    BetaReason::FamilySelectBranch,
+                    node_count,
+                    expressions.node_count(),
+                );
                 (selector, selector_root, Some(output_range))
             }
         };
@@ -1067,11 +1716,12 @@ impl ProgramArena {
         let mut body_inputs = Vec::with_capacity(families.len() + 1);
         body_inputs.push(selector);
         for family in families {
-            body_inputs.push(self.call_family_in_range(
+            body_inputs.push(self.call_family_in_range_with_reason(
                 expressions,
                 *family,
                 argument,
                 family_range,
+                BetaReason::FamilySelectBranch,
             )?);
         }
         let body = expressions.intern(
@@ -1107,6 +1757,16 @@ impl ProgramArena {
         program: ValueProgramId,
         arguments: &[ExprId],
     ) -> Result<ExprId, ArenaError> {
+        self.beta_reduce_with_reason(expressions, program, arguments, BetaReason::Other)
+    }
+
+    fn beta_reduce_with_reason(
+        &self,
+        expressions: &mut ExprArena,
+        program: ValueProgramId,
+        arguments: &[ExprId],
+        reason: BetaReason,
+    ) -> Result<ExprId, ArenaError> {
         let value_program = self.program(program)?;
         if arguments.len() != value_program.signature.inputs.len() {
             return Err(ArenaError::InvalidArity {
@@ -1128,7 +1788,46 @@ impl ProgramArena {
                 });
             }
         }
-        substitute_iterative(expressions, value_program.root, arguments)
+        expressions.value_type(value_program.root)?;
+        let identity = arguments.iter().zip(&value_program.signature.inputs).enumerate().try_fold(
+            true,
+            |identity, (position, (argument, input))| {
+                let node = expressions.node(*argument)?;
+                Ok::<_, ArenaError>(
+                    identity &&
+                        matches!(
+                            &node.operator,
+                            ValueOperator::Argument { position: actual, value_type }
+                                if u32::try_from(position).ok() == Some(*actual) &&
+                                    value_type == &input.value_type
+                        ),
+                )
+            },
+        )?;
+        if identity {
+            self.update_diagnostic_counters(|counters| {
+                counters.beta_identity_shortcuts =
+                    counters.beta_identity_shortcuts.saturating_add(1);
+            });
+            return Ok(value_program.root);
+        }
+        let nodes_before = expressions.node_count();
+        let (reduced, substitution) = substitute_iterative(
+            expressions,
+            value_program.root,
+            arguments,
+            self.diagnostic_counters_enabled,
+        )?;
+        self.update_diagnostic_counters(|counters| {
+            counters.beta_nodes_visited =
+                counters.beta_nodes_visited.saturating_add(substitution.nodes_visited);
+            counters.beta_closed_subtrees_reused = counters
+                .beta_closed_subtrees_reused
+                .saturating_add(substitution.closed_subtrees_reused);
+        });
+        self.record_beta_visit(reason, substitution.nodes_visited);
+        self.record_expr_allocations(reason, nodes_before, expressions.node_count());
+        Ok(reduced)
     }
 
     fn beta_reduce_family_call(
@@ -1138,13 +1837,30 @@ impl ProgramArena {
         index: ExprId,
         opaque_call: ExprId,
     ) -> Result<ExprId, ArenaError> {
+        self.beta_reduce_family_call_with_reason(
+            expressions,
+            family,
+            index,
+            opaque_call,
+            BetaReason::Other,
+        )
+    }
+
+    fn beta_reduce_family_call_with_reason(
+        &self,
+        expressions: &mut ExprArena,
+        family: FamilyValueId,
+        index: ExprId,
+        opaque_call: ExprId,
+        reason: BetaReason,
+    ) -> Result<ExprId, ArenaError> {
         let record = self.family(family)?;
         // Generated bodies are reduced from their body, not from the already interned call.  A
         // source/explicit call therefore stays one compact opaque ProgramCall.
         if !record.reducible {
             return Ok(opaque_call);
         }
-        self.beta_reduce(expressions, family.program(), &[index])
+        self.beta_reduce_with_reason(expressions, family.program(), &[index], reason)
     }
 
     fn family(&self, family: FamilyValueId) -> Result<&FamilyRecord, ArenaError> {
@@ -1309,45 +2025,86 @@ impl NonemptyRange for TrustedIndexRange {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SubstitutionDiagnostics {
+    nodes_visited: u64,
+    closed_subtrees_reused: u64,
+}
+
+enum SubstituteFrame {
+    Visit(ExprId),
+    Rebuild { id: ExprId, node: Arc<super::arena::ExprNode> },
+}
+
+enum MaterializeFrame {
+    Visit(ExprId),
+    Rebuild { id: ExprId, node: Arc<super::arena::ExprNode> },
+    FinishReduced { source: ExprId, reduced: ExprId, canonical_call: ExprId },
+}
+
 fn substitute_iterative(
     expressions: &mut ExprArena,
     root: ExprId,
     arguments: &[ExprId],
-) -> Result<ExprId, ArenaError> {
+    collect_diagnostics: bool,
+) -> Result<(ExprId, SubstitutionDiagnostics), ArenaError> {
     expressions.value_type(root)?;
     let mut memo = BTreeMap::<u32, ExprId>::new();
-    let mut work = vec![(root, false)];
-    while let Some((id, expanded)) = work.pop() {
-        if memo.contains_key(&id.slot()) {
-            continue;
-        }
-        let node = expressions.node(id)?.clone();
-        if !expanded {
-            if let ValueOperator::Argument { position, .. } = node.operator {
-                let Some(replacement) = arguments.get(position as usize).copied() else {
-                    return Err(ArenaError::FreeArgumentEscapes { position });
-                };
-                memo.insert(id.slot(), replacement);
-                continue;
-            }
-            work.push((id, true));
-            for child in node.inputs.iter().rev() {
-                if !memo.contains_key(&child.slot()) {
-                    work.push((*child, false));
+    let mut diagnostics = SubstitutionDiagnostics::default();
+    let mut work = vec![SubstituteFrame::Visit(root)];
+    while let Some(frame) = work.pop() {
+        match frame {
+            SubstituteFrame::Visit(id) => {
+                if memo.contains_key(&id.slot()) {
+                    continue;
+                }
+                if collect_diagnostics {
+                    diagnostics.nodes_visited = diagnostics.nodes_visited.saturating_add(1);
+                }
+                let (node, closed) = expressions.node_arc_and_closed(id)?;
+                if let ValueOperator::Argument { position, .. } = &node.operator {
+                    let position = *position;
+                    let Some(replacement) = arguments.get(position as usize).copied() else {
+                        return Err(ArenaError::FreeArgumentEscapes { position });
+                    };
+                    memo.insert(id.slot(), replacement);
+                    continue;
+                }
+                if closed {
+                    memo.insert(id.slot(), id);
+                    if collect_diagnostics {
+                        diagnostics.closed_subtrees_reused =
+                            diagnostics.closed_subtrees_reused.saturating_add(1);
+                    }
+                    continue;
+                }
+                work.push(SubstituteFrame::Rebuild { id, node: Arc::clone(&node) });
+                for child in node.inputs.iter().rev() {
+                    if !memo.contains_key(&child.slot()) {
+                        work.push(SubstituteFrame::Visit(*child));
+                    }
                 }
             }
-            continue;
+            SubstituteFrame::Rebuild { id, node } => {
+                if memo.contains_key(&id.slot()) {
+                    continue;
+                }
+                let mut inputs = Vec::with_capacity(node.inputs.len());
+                for child in node.inputs.iter() {
+                    inputs.push(
+                        memo.get(&child.slot())
+                            .copied()
+                            .ok_or(ArenaError::InvalidSlot { slot: child.slot() })?,
+                    );
+                }
+                let value = expressions.intern(node.operator.clone(), inputs.into_boxed_slice())?;
+                memo.insert(id.slot(), value);
+            }
         }
-        let mut inputs = Vec::with_capacity(node.inputs.len());
-        for child in node.inputs {
-            inputs.push(
-                *memo.get(&child.slot()).ok_or(ArenaError::InvalidSlot { slot: child.slot() })?,
-            );
-        }
-        let value = expressions.intern(node.operator, inputs.into_boxed_slice())?;
-        memo.insert(id.slot(), value);
     }
-    memo.get(&root.slot()).copied().ok_or(ArenaError::InvalidSlot { slot: root.slot() })
+    let reduced =
+        memo.get(&root.slot()).copied().ok_or(ArenaError::InvalidSlot { slot: root.slot() })?;
+    Ok((reduced, diagnostics))
 }
 
 #[cfg(test)]
@@ -1424,6 +2181,286 @@ mod tests {
     }
 
     #[test]
+    fn substitution_reuses_deep_closed_branch_along_open_spine() {
+        const CLOSED_DEPTH: usize = 4_096;
+        const OPEN_DEPTH: usize = 256;
+
+        let mut expressions = ExprArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let mut closed = one;
+        for _ in 0..CLOSED_DEPTH {
+            closed = expressions
+                .intern_slice(
+                    ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                    &[closed, one],
+                )
+                .unwrap();
+        }
+        assert!(expressions.is_closed(closed).unwrap());
+
+        let mut root = argument;
+        for _ in 0..OPEN_DEPTH {
+            root = expressions
+                .intern_slice(
+                    ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                    &[root, closed],
+                )
+                .unwrap();
+        }
+        let replacement = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(7)), Box::new([]))
+            .unwrap();
+
+        let (reduced, diagnostics) =
+            substitute_iterative(&mut expressions, root, &[replacement], true).unwrap();
+        assert_eq!(diagnostics.nodes_visited, OPEN_DEPTH as u64 + 2);
+        assert_eq!(diagnostics.closed_subtrees_reused, 1);
+
+        let mut expected = replacement;
+        for _ in 0..OPEN_DEPTH {
+            expected = expressions
+                .intern_slice(
+                    ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                    &[expected, closed],
+                )
+                .unwrap();
+        }
+        assert_eq!(reduced, expected);
+    }
+
+    #[test]
+    fn substitution_rebuilds_shared_open_dag_once_with_canonical_ids() {
+        let mut expressions = ExprArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let shared = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[argument, one],
+            )
+            .unwrap();
+        let root = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[shared, shared],
+            )
+            .unwrap();
+        let replacement = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(7)), Box::new([]))
+            .unwrap();
+        let nodes_before = expressions.node_count();
+
+        let (reduced, diagnostics) =
+            substitute_iterative(&mut expressions, root, &[replacement], true).unwrap();
+        assert_eq!(expressions.node_count() - nodes_before, 2);
+        assert_eq!(diagnostics.nodes_visited, 4);
+        assert_eq!(diagnostics.closed_subtrees_reused, 1);
+
+        let expected_shared = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[replacement, one],
+            )
+            .unwrap();
+        let expected = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[expected_shared, expected_shared],
+            )
+            .unwrap();
+        assert_eq!(reduced, expected);
+        assert_eq!(expressions.node_count() - nodes_before, 2);
+    }
+
+    #[test]
+    fn beta_reduce_keeps_arity_before_argument_validation_error_order() {
+        let mut expressions = ExprArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let mut programs = ProgramArena::new();
+        let program = programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: None,
+                    }]),
+                    output: ResolvedValueType::Int,
+                },
+                argument,
+            )
+            .unwrap();
+        let boolean = expressions.intern_argument(0, ResolvedValueType::Bool).unwrap();
+        let mut foreign_expressions = ExprArena::new();
+        let foreign = foreign_expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+
+        assert!(matches!(
+            programs.beta_reduce(&mut expressions, program, &[foreign, foreign]),
+            Err(ArenaError::InvalidArity { expected: 1, actual: 2, .. })
+        ));
+        assert!(matches!(
+            programs.beta_reduce(&mut expressions, program, &[foreign]),
+            Err(ArenaError::ForeignExpression { .. })
+        ));
+        assert!(matches!(
+            programs.beta_reduce(&mut expressions, program, &[boolean]),
+            Err(ArenaError::TypeMismatch { position: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn canonical_argument_identity_shortcuts_deep_open_dag_without_allocation() {
+        const DEPTH: usize = 4_096;
+
+        let mut expressions = ExprArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let mut root = argument;
+        for _ in 0..DEPTH {
+            root = expressions
+                .intern_slice(
+                    ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                    &[root, one],
+                )
+                .unwrap();
+        }
+        let signature = ProgramSignature {
+            inputs: Box::new([ProgramInput {
+                value_type: ResolvedValueType::Int,
+                trusted_index_range: None,
+            }]),
+            output: ResolvedValueType::Int,
+        };
+        let mut programs = ProgramArena::new();
+        programs.diagnostic_counters_enabled = true;
+        let program = programs.finalize(&mut expressions, signature, root).unwrap();
+        let nodes_before = expressions.node_count();
+
+        let reduced = programs.beta_reduce(&mut expressions, program, &[argument]).unwrap();
+        assert_eq!(reduced, root);
+        assert_eq!(expressions.node_count(), nodes_before);
+        let diagnostics = programs.diagnostic_counters();
+        assert_eq!(diagnostics.beta_identity_shortcuts, 1);
+        assert_eq!(diagnostics.beta_nodes_visited, 0);
+        assert_eq!(diagnostics.beta_closed_subtrees_reused, 0);
+    }
+
+    #[test]
+    fn multiargument_identity_requires_each_exact_position_and_type() {
+        let mut expressions = ExprArena::new();
+        let first = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let second = expressions.intern_argument(1, ResolvedValueType::Int).unwrap();
+        let root = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[first, second],
+            )
+            .unwrap();
+        let mut programs = ProgramArena::new();
+        programs.diagnostic_counters_enabled = true;
+        let program = programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([
+                        ProgramInput {
+                            value_type: ResolvedValueType::Int,
+                            trusted_index_range: None,
+                        },
+                        ProgramInput {
+                            value_type: ResolvedValueType::Int,
+                            trusted_index_range: None,
+                        },
+                    ]),
+                    output: ResolvedValueType::Int,
+                },
+                root,
+            )
+            .unwrap();
+
+        assert_eq!(
+            programs.beta_reduce(&mut expressions, program, &[first, second]).unwrap(),
+            root
+        );
+        assert_eq!(programs.diagnostic_counters().beta_identity_shortcuts, 1);
+
+        let swapped = programs.beta_reduce(&mut expressions, program, &[second, first]).unwrap();
+        assert_ne!(swapped, root);
+        assert_eq!(programs.diagnostic_counters().beta_identity_shortcuts, 1);
+
+        let one_input_program = programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: None,
+                    }]),
+                    output: ResolvedValueType::Int,
+                },
+                first,
+            )
+            .unwrap();
+        assert_eq!(
+            programs.beta_reduce(&mut expressions, one_input_program, &[second]).unwrap(),
+            second
+        );
+        let constant = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(7)), Box::new([]))
+            .unwrap();
+        assert_eq!(
+            programs.beta_reduce(&mut expressions, one_input_program, &[constant]).unwrap(),
+            constant
+        );
+        assert_eq!(programs.diagnostic_counters().beta_identity_shortcuts, 1);
+    }
+
+    #[test]
+    fn zero_argument_identity_shortcut_validates_local_root_and_rejects_foreign_arena() {
+        let mut expressions = ExprArena::new();
+        let root = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(7)), Box::new([]))
+            .unwrap();
+        let mut programs = ProgramArena::new();
+        programs.diagnostic_counters_enabled = true;
+        let program = programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature { inputs: Box::new([]), output: ResolvedValueType::Int },
+                root,
+            )
+            .unwrap();
+
+        assert_eq!(programs.beta_reduce(&mut expressions, program, &[]).unwrap(), root);
+        let counters_before = programs.diagnostic_counters();
+        assert_eq!(counters_before.beta_identity_shortcuts, 1);
+        assert_eq!(counters_before.beta_nodes_visited, 0);
+
+        let mut foreign_expressions = ExprArena::new();
+        let foreign_argument = foreign_expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        assert!(matches!(
+            programs.beta_reduce(&mut foreign_expressions, program, &[foreign_argument]),
+            Err(ArenaError::InvalidArity { expected: 0, actual: 1, .. })
+        ));
+        assert!(matches!(
+            programs.beta_reduce(&mut foreign_expressions, program, &[]),
+            Err(ArenaError::ForeignExpression { .. })
+        ));
+        let counters_after = programs.diagnostic_counters();
+        assert_eq!(counters_after.beta_identity_shortcuts, counters_before.beta_identity_shortcuts);
+        assert_eq!(counters_after.beta_nodes_visited, counters_before.beta_nodes_visited);
+    }
+
+    #[test]
     fn alpha_equivalent_programs_intern_by_argument_position() {
         let mut expressions = ExprArena::new();
         let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
@@ -1444,6 +2481,322 @@ mod tests {
         let first = programs.finalize(&mut expressions, signature.clone(), root).unwrap();
         let second = programs.finalize(&mut expressions, signature, root).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn successful_root_facts_cache_preserves_interned_and_fresh_program_ids() {
+        let mut expressions = ExprArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let mut programs = ProgramArena::new();
+        let unbounded = ProgramSignature {
+            inputs: Box::new([ProgramInput {
+                value_type: ResolvedValueType::Int,
+                trusted_index_range: None,
+            }]),
+            output: ResolvedValueType::Int,
+        };
+        let bounded = family_signature(domain(), ResolvedValueType::Int);
+
+        let first = programs.finalize(&mut expressions, unbounded.clone(), argument).unwrap();
+        let repeated = programs.finalize(&mut expressions, unbounded, argument).unwrap();
+        let different_signature =
+            programs.finalize(&mut expressions, bounded.clone(), argument).unwrap();
+        let fresh_first =
+            programs.finalize_fresh(&mut expressions, bounded.clone(), argument).unwrap();
+        let fresh_second = programs.finalize_fresh(&mut expressions, bounded, argument).unwrap();
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, different_signature);
+        assert_ne!(fresh_first, fresh_second);
+        assert_eq!(programs.root_validation_facts_len(), 1);
+    }
+
+    #[test]
+    fn root_validation_facts_reuse_earliest_root_past_legacy_fifo_bound() {
+        const ROOTS: u64 = 65_537;
+        let mut expressions = ExprArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let mut programs = ProgramArena::new();
+        programs.enable_diagnostic_counters();
+        let signature = ProgramSignature {
+            inputs: Box::new([ProgramInput {
+                value_type: ResolvedValueType::Int,
+                trusted_index_range: None,
+            }]),
+            output: ResolvedValueType::Int,
+        };
+        let mut first = None;
+        for value in 0..ROOTS {
+            let constant = expressions
+                .intern(ValueOperator::Constant(TypedConstant::int(value)), Box::new([]))
+                .unwrap();
+            let root = expressions
+                .intern_slice(
+                    ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                    &[argument, constant],
+                )
+                .unwrap();
+            let program = programs.finalize(&mut expressions, signature.clone(), root).unwrap();
+            if value == 0 {
+                first = Some((root, program));
+            }
+        }
+        let (first_root, first_program) = first.unwrap();
+        let before = programs.diagnostic_counters();
+        let nodes_before = expressions.node_count();
+        let repeated = programs.finalize(&mut expressions, signature.clone(), first_root).unwrap();
+        let after = programs.diagnostic_counters();
+        assert_eq!(repeated, first_program);
+        assert_eq!(expressions.node_count(), nodes_before);
+        assert_eq!(after.root_validation_facts_hits, before.root_validation_facts_hits + 1);
+        assert_eq!(after.root_validation_facts_misses, before.root_validation_facts_misses);
+        assert_eq!(after.root_validation_facts_entries, ROOTS);
+        assert_eq!(programs.root_validation_facts_len() as u64, ROOTS);
+
+        assert_eq!(
+            programs.finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: signature.inputs.clone(),
+                    output: ResolvedValueType::Bool,
+                },
+                first_root,
+            ),
+            Err(ArenaError::ProgramOutputMismatch)
+        );
+        assert!(matches!(
+            programs.finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Bool,
+                        trusted_index_range: None,
+                    }]),
+                    output: ResolvedValueType::Int,
+                },
+                first_root,
+            ),
+            Err(ArenaError::TypeMismatch { position: 0, .. })
+        ));
+        assert_eq!(programs.root_validation_facts_len() as u64, ROOTS);
+        assert_eq!(expressions.node_count(), nodes_before);
+
+        let original_facts = programs.root_validation_facts.get(&first_root).unwrap().clone();
+        let conflicting_facts = BTreeSet::from([(0, ResolvedValueType::Bool)]);
+        assert_eq!(
+            programs.record_root_validation_facts(first_root, conflicting_facts),
+            Err(ArenaError::ProgramSignatureMismatch)
+        );
+        assert_eq!(programs.root_validation_facts.get(&first_root), Some(&original_facts));
+        assert_eq!(programs.root_validation_facts_len() as u64, ROOTS);
+    }
+
+    #[test]
+    fn root_validation_reuses_cached_subroots_with_full_collector_facts() {
+        const LAYERS: u32 = 32;
+        let mut expressions = ExprArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let signature = ProgramSignature {
+            inputs: Box::new([ProgramInput {
+                value_type: ResolvedValueType::Int,
+                trusted_index_range: None,
+            }]),
+            output: ResolvedValueType::Int,
+        };
+        let mut programs = ProgramArena::new();
+        programs.enable_diagnostic_counters();
+        programs.finalize(&mut expressions, signature.clone(), one).unwrap();
+
+        let mut root = argument;
+        for _ in 0..LAYERS {
+            root = expressions
+                .intern_slice(
+                    ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                    &[root, one],
+                )
+                .unwrap();
+            programs.finalize(&mut expressions, signature.clone(), root).unwrap();
+        }
+
+        let optimized_counters = programs.diagnostic_counters();
+        let optimized_facts = programs.root_validation_facts.get(&root).cloned().unwrap();
+        assert_eq!(optimized_facts, BTreeSet::from([(0, ResolvedValueType::Int)]));
+        assert_eq!(optimized_counters.root_validation_nodes_visited, u64::from(LAYERS) + 2);
+        assert_eq!(
+            optimized_counters.root_validation_cached_subroot_skips,
+            u64::from(2 * LAYERS - 1)
+        );
+
+        let full_programs = ProgramArena::new();
+        let full_facts = full_programs.collect_root_validation_facts(&expressions, root).unwrap();
+        assert_eq!(full_facts, optimized_facts);
+    }
+
+    #[test]
+    fn root_validation_cached_sibling_does_not_hide_foreign_call_or_publish() {
+        let mut expressions = ExprArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let signature = ProgramSignature {
+            inputs: Box::new([ProgramInput {
+                value_type: ResolvedValueType::Int,
+                trusted_index_range: None,
+            }]),
+            output: ResolvedValueType::Int,
+        };
+        let mut programs = ProgramArena::new();
+        programs.finalize(&mut expressions, signature.clone(), argument).unwrap();
+
+        let mut foreign_programs = ProgramArena::new();
+        let foreign = foreign_programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature { inputs: Box::new([]), output: ResolvedValueType::Int },
+                one,
+            )
+            .unwrap();
+        let foreign_call = foreign_programs.call(&mut expressions, foreign, &[]).unwrap();
+        let root = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[foreign_call, argument],
+            )
+            .unwrap();
+        let entries_before = programs.root_validation_facts_len();
+
+        assert!(matches!(
+            programs.finalize(&mut expressions, signature, root),
+            Err(ArenaError::ForeignProgram { .. })
+        ));
+        assert_eq!(programs.root_validation_facts_len(), entries_before);
+    }
+
+    #[test]
+    fn failed_finalization_keeps_error_priority_and_does_not_cache_root_facts() {
+        let mut expressions = ExprArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let mut programs = ProgramArena::new();
+        assert_eq!(
+            programs.finalize(
+                &mut expressions,
+                ProgramSignature { inputs: Box::new([]), output: ResolvedValueType::Bool },
+                argument,
+            ),
+            Err(ArenaError::ProgramOutputMismatch)
+        );
+        assert_eq!(programs.root_validation_facts_len(), 0);
+        assert_eq!(
+            programs.finalize(
+                &mut expressions,
+                ProgramSignature { inputs: Box::new([]), output: ResolvedValueType::Int },
+                argument,
+            ),
+            Err(ArenaError::FreeArgumentEscapes { position: 0 })
+        );
+        assert_eq!(programs.root_validation_facts_len(), 0);
+        programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: None,
+                    }]),
+                    output: ResolvedValueType::Int,
+                },
+                argument,
+            )
+            .unwrap();
+        assert_eq!(programs.root_validation_facts_len(), 1);
+    }
+
+    #[test]
+    fn root_facts_cache_is_expression_typed_and_rejects_foreign_authority() {
+        let mut expressions = ExprArena::new();
+        let int_argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(
+                ValueOperator::Constant(super::super::arena::TypedConstant::int(1)),
+                Box::new([]),
+            )
+            .unwrap();
+        let shared = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[int_argument, one],
+            )
+            .unwrap();
+        let int_root = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[shared, shared],
+            )
+            .unwrap();
+        let bool_root = expressions.intern_argument(0, ResolvedValueType::Bool).unwrap();
+        let mut programs = ProgramArena::new();
+        programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: None,
+                    }]),
+                    output: ResolvedValueType::Int,
+                },
+                int_root,
+            )
+            .unwrap();
+        programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Bool,
+                        trusted_index_range: None,
+                    }]),
+                    output: ResolvedValueType::Bool,
+                },
+                bool_root,
+            )
+            .unwrap();
+        assert_eq!(programs.root_validation_facts_len(), 2);
+
+        let mut foreign_expressions = ExprArena::new();
+        let foreign_root = foreign_expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        assert!(matches!(
+            programs.finalize(
+                &mut expressions,
+                family_signature(domain(), ResolvedValueType::Int),
+                foreign_root,
+            ),
+            Err(ArenaError::ForeignExpression { .. })
+        ));
+        assert_eq!(programs.root_validation_facts_len(), 2);
+
+        let mut foreign_programs = ProgramArena::new();
+        let foreign_program = foreign_programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature { inputs: Box::new([]), output: ResolvedValueType::Int },
+                one,
+            )
+            .unwrap();
+        let foreign_call = foreign_programs.call(&mut expressions, foreign_program, &[]).unwrap();
+        assert!(matches!(
+            programs.finalize(
+                &mut expressions,
+                ProgramSignature { inputs: Box::new([]), output: ResolvedValueType::Int },
+                foreign_call,
+            ),
+            Err(ArenaError::ForeignProgram { .. })
+        ));
+        assert_eq!(programs.root_validation_facts_len(), 2);
     }
 
     #[test]
@@ -1610,6 +2963,50 @@ mod tests {
         );
         let opaque = programs.source_family(&mut expressions, source("opaque"), None).unwrap();
         assert!(programs.family_matrix_facts(opaque).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_family_derives_authoritative_fact_views_without_replacing_compact_values() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let mut facts = FactStore::new(&expressions);
+        let value = matrix_expression(&mut expressions, 77);
+        let expected_facts = matrix_facts(Some(5), true, MatrixLayout::row_major(1, 2));
+        facts.insert(&expressions, value, ValueFacts::Matrix(expected_facts.clone())).unwrap();
+        let unrelated = matrix_expression(&mut expressions, 78);
+        facts
+            .insert(
+                &expressions,
+                unrelated,
+                ValueFacts::Matrix(matrix_facts(Some(99), true, MatrixLayout::row_major(1, 2))),
+            )
+            .unwrap();
+        let domain = FamilyDomain::new(0, 1).unwrap();
+        let generated =
+            programs.generated_family_from_body(&mut expressions, domain, value).unwrap();
+        let index = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let compact = programs
+            .call_family_in_range_deferred_generated(
+                &mut expressions,
+                generated,
+                index,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        assert_ne!(compact, value);
+        let materialized =
+            programs.materialize_reducible_generated_calls(&mut expressions, compact).unwrap();
+        assert_eq!(materialized, value);
+
+        let packed = programs
+            .explicit_family(&mut expressions, &facts, domain, Box::new([compact]))
+            .unwrap();
+        assert!(programs.family_body(packed).is_ok_and(|body| {
+            expressions.node(body).is_ok_and(|node| node.inputs.contains(&compact))
+        }));
+        assert_eq!(programs.family_matrix_facts(packed).unwrap(), Some(&expected_facts));
     }
 
     #[test]
@@ -1987,6 +3384,435 @@ mod tests {
         assert_eq!(first, reused);
         assert_ne!(first, different);
         assert_ne!(programs.family_body(first).unwrap(), programs.family_body(different).unwrap());
+    }
+
+    #[test]
+    fn deferred_nested_offset_extract_materializes_to_eager_structure_before_finalization() {
+        let inner_domain = FamilyDomain::new(0, 5).unwrap();
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_expression(&mut expressions, 700);
+        let matrix_family =
+            programs.generated_family_from_body(&mut expressions, inner_domain, matrix).unwrap();
+        let inner_argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let inner_range = TrustedIndexRange { minimum: 0, maximum_exclusive: 5 };
+
+        let eager_matrix = programs
+            .call_family_in_range(&mut expressions, matrix_family, inner_argument, inner_range)
+            .unwrap();
+        let eager_extract = expressions.intern_extract_coefficient(eager_matrix, 0, None).unwrap();
+        let deferred_matrix = programs
+            .call_family_in_range_deferred_generated(
+                &mut expressions,
+                matrix_family,
+                inner_argument,
+                inner_range,
+            )
+            .unwrap();
+        let deferred_extract =
+            expressions.intern_extract_coefficient(deferred_matrix, 0, None).unwrap();
+        assert_eq!(
+            programs.ensure_no_reducible_generated_calls(&expressions, deferred_extract),
+            Err(ArenaError::ProgramSignatureMismatch)
+        );
+        let materialized_extract = programs
+            .materialize_reducible_generated_calls(&mut expressions, deferred_extract)
+            .unwrap();
+        assert_eq!(materialized_extract, eager_extract);
+        let coefficient_family = programs
+            .generated_family_from_body(&mut expressions, inner_domain, materialized_extract)
+            .unwrap();
+
+        let outer_argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let mapped = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[outer_argument, one],
+            )
+            .unwrap();
+        let mapped_range = TrustedIndexRange { minimum: 1, maximum_exclusive: 5 };
+        let eager = programs
+            .call_family_in_range(&mut expressions, coefficient_family, mapped, mapped_range)
+            .unwrap();
+        let deferred = programs
+            .call_family_in_range_deferred_generated(
+                &mut expressions,
+                coefficient_family,
+                mapped,
+                mapped_range,
+            )
+            .unwrap();
+        assert!(matches!(
+            expressions.node(deferred).unwrap().operator,
+            ValueOperator::ProgramCall { .. }
+        ));
+        let materialized =
+            programs.materialize_reducible_generated_calls(&mut expressions, deferred).unwrap();
+        assert_eq!(materialized, eager);
+        programs.ensure_no_reducible_generated_calls(&expressions, materialized).unwrap();
+    }
+
+    #[test]
+    fn deferred_family_call_preserves_validation_errors_and_opaque_identity() {
+        let domain = FamilyDomain::new(0, 4).unwrap();
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        programs.enable_diagnostic_counters();
+        let matrix = matrix_expression(&mut expressions, 701);
+        let reducible =
+            programs.generated_family_from_body(&mut expressions, domain, matrix).unwrap();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let range = TrustedIndexRange { minimum: 0, maximum_exclusive: 4 };
+        let boolean = expressions.intern_argument(0, ResolvedValueType::Bool).unwrap();
+        assert_eq!(
+            programs.call_family_in_range_deferred_generated(
+                &mut expressions,
+                reducible,
+                boolean,
+                range,
+            ),
+            programs.call_family_in_range(&mut expressions, reducible, boolean, range)
+        );
+        let invalid_range = TrustedIndexRange { minimum: 3, maximum_exclusive: 5 };
+        assert_eq!(
+            programs.call_family_in_range_deferred_generated(
+                &mut expressions,
+                reducible,
+                argument,
+                invalid_range,
+            ),
+            programs.call_family_in_range(&mut expressions, reducible, argument, invalid_range,)
+        );
+
+        let opaque =
+            programs.opaque_generated_family_from_body(&mut expressions, domain, matrix).unwrap();
+        let opaque_call = programs
+            .call_family_in_range_deferred_generated(&mut expressions, opaque, argument, range)
+            .unwrap();
+        expressions.record_program_call_reduction(opaque_call, matrix).unwrap();
+        let early_source_hits_before =
+            programs.diagnostic_counters().beta_program_call_early_source_hits;
+        assert_eq!(
+            programs.materialize_reducible_generated_calls(&mut expressions, opaque_call).unwrap(),
+            opaque_call
+        );
+        assert_eq!(
+            programs.diagnostic_counters().beta_program_call_early_source_hits,
+            early_source_hits_before
+        );
+        assert!(matches!(
+            expressions.node(opaque_call).unwrap().operator,
+            ValueOperator::ProgramCall { program } if program == opaque.program()
+        ));
+        programs.ensure_no_reducible_generated_calls(&expressions, opaque_call).unwrap();
+    }
+
+    #[test]
+    fn materialization_reuses_source_reduction_before_visiting_inputs() {
+        let domain = FamilyDomain::new(0, 8).unwrap();
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        programs.enable_diagnostic_counters();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let shifted = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[argument, one],
+            )
+            .unwrap();
+        let inner = programs.generated_family_from_body(&mut expressions, domain, shifted).unwrap();
+        let inner_call = programs
+            .call_family_in_range_deferred_generated(
+                &mut expressions,
+                inner,
+                argument,
+                TrustedIndexRange { minimum: 0, maximum_exclusive: 8 },
+            )
+            .unwrap();
+        let two = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .unwrap();
+        let outer_body = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[argument, two],
+            )
+            .unwrap();
+        let outer =
+            programs.generated_family_from_body(&mut expressions, domain, outer_body).unwrap();
+        let outer_call = programs
+            .call_family_in_range_deferred_generated(
+                &mut expressions,
+                outer,
+                inner_call,
+                TrustedIndexRange { minimum: 0, maximum_exclusive: 8 },
+            )
+            .unwrap();
+
+        let first = programs
+            .materialize_reducible_generated_calls_with_reason(
+                &mut expressions,
+                outer_call,
+                BetaReason::ResidualRoot,
+            )
+            .unwrap();
+        let node_count = expressions.node_count();
+        let before = programs.diagnostic_counters();
+        let second =
+            programs.materialize_reducible_generated_calls(&mut expressions, outer_call).unwrap();
+        let after = programs.diagnostic_counters();
+
+        assert_eq!(second, first);
+        assert_eq!(expressions.node_count(), node_count);
+        assert_eq!(after.beta_nodes_visited, before.beta_nodes_visited);
+        assert_eq!(after.beta_reason_misses, before.beta_reason_misses);
+        assert_eq!(after.beta_reason_visits, before.beta_reason_visits);
+        assert_eq!(
+            after.beta_program_call_early_source_hits,
+            before.beta_program_call_early_source_hits + 1
+        );
+        assert!(
+            after.beta_program_call_early_source_input_skips >
+                before.beta_program_call_early_source_input_skips
+        );
+        assert_eq!(
+            after.beta_reason_misses.iter().sum::<u64>(),
+            after.beta_program_call_sidecar_misses
+        );
+        assert_eq!(after.beta_reason_visits.iter().sum::<u64>(), after.beta_nodes_visited);
+        assert!(after.beta_reason_misses[BetaReason::ResidualRoot as usize] > 0);
+        assert!(after.beta_reason_visits[BetaReason::ResidualRoot as usize] > 0);
+        assert!(after.beta_reason_expr_allocations[BetaReason::ResidualRoot as usize] > 0);
+        programs.ensure_no_reducible_generated_calls(&expressions, second).unwrap();
+    }
+
+    #[test]
+    fn materialization_waits_for_late_reducible_family_classification() {
+        let domain = FamilyDomain::new(0, 4).unwrap();
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        programs.enable_diagnostic_counters();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let body = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[argument, one],
+            )
+            .unwrap();
+        let program = programs
+            .finalize(&mut expressions, family_signature(domain, ResolvedValueType::Int), body)
+            .unwrap();
+        let call = programs.call(&mut expressions, program, &[argument]).unwrap();
+        expressions.record_program_call_reduction(call, body).unwrap();
+        let before = programs.diagnostic_counters();
+        assert_eq!(
+            programs.materialize_reducible_generated_calls(&mut expressions, call).unwrap(),
+            call
+        );
+        let after_opaque = programs.diagnostic_counters();
+        assert_eq!(
+            after_opaque.beta_program_call_early_source_hits,
+            before.beta_program_call_early_source_hits
+        );
+
+        let _family = programs.generated_family_from_body(&mut expressions, domain, body).unwrap();
+        let materialized =
+            programs.materialize_reducible_generated_calls(&mut expressions, call).unwrap();
+        assert_eq!(materialized, body);
+        assert_eq!(
+            programs.diagnostic_counters().beta_program_call_early_source_hits,
+            after_opaque.beta_program_call_early_source_hits + 1
+        );
+    }
+
+    #[test]
+    fn materialization_rebuilds_opaque_call_index_without_unfolding_opaque_body() {
+        let domain = FamilyDomain::new(0, 8).unwrap();
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let shifted = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[argument, one],
+            )
+            .unwrap();
+        let index_family =
+            programs.generated_family_from_body(&mut expressions, domain, shifted).unwrap();
+        let deferred_index = programs
+            .call_family_in_range_deferred_generated(
+                &mut expressions,
+                index_family,
+                argument,
+                TrustedIndexRange { minimum: 0, maximum_exclusive: 7 },
+            )
+            .unwrap();
+        let opaque_body = matrix_expression(&mut expressions, 702);
+        let opaque = programs
+            .opaque_generated_family_from_body(&mut expressions, domain, opaque_body)
+            .unwrap();
+        let opaque_call = programs
+            .call_family_in_range_deferred_generated(
+                &mut expressions,
+                opaque,
+                deferred_index,
+                TrustedIndexRange { minimum: 1, maximum_exclusive: 8 },
+            )
+            .unwrap();
+
+        let materialized =
+            programs.materialize_reducible_generated_calls(&mut expressions, opaque_call).unwrap();
+        let node = expressions.node(materialized).unwrap();
+        assert!(matches!(
+            node.operator,
+            ValueOperator::ProgramCall { program } if program == opaque.program()
+        ));
+        assert_eq!(node.inputs.as_ref(), &[shifted]);
+        programs.ensure_no_reducible_generated_calls(&expressions, materialized).unwrap();
+        assert_eq!(
+            programs
+                .call_family_in_range(
+                    &mut expressions,
+                    opaque,
+                    deferred_index,
+                    TrustedIndexRange { minimum: 1, maximum_exclusive: 8 },
+                )
+                .unwrap(),
+            materialized
+        );
+    }
+
+    #[test]
+    fn layered_deferred_zip_offsets_grow_linearly_and_materialize_to_eager_result() {
+        const LAYERS: u64 = 64;
+        struct Run {
+            construction_nodes: u64,
+            construction_visits: u64,
+            exposure_nodes: u64,
+            exposure_visits: u64,
+            fingerprint: String,
+        }
+
+        fn fingerprint(
+            programs: &ProgramArena,
+            expressions: &ExprArena,
+            expression: ExprId,
+        ) -> String {
+            let node = expressions.node(expression).unwrap();
+            let operator = match node.operator {
+                ValueOperator::ProgramCall { program } => {
+                    let family = programs.family_for_program(program).unwrap();
+                    let body = programs.family_body(family).unwrap();
+                    format!("OpaqueCall({:?})", expressions.node(body).unwrap().operator)
+                }
+                ref operator => format!("{operator:?}"),
+            };
+            let inputs = node
+                .inputs
+                .iter()
+                .map(|input| fingerprint(programs, expressions, *input))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{operator}({inputs})")
+        }
+
+        fn run(compact: bool) -> Run {
+            let mut expressions = ExprArena::new();
+            let mut programs = ProgramArena::new();
+            programs.diagnostic_counters_enabled = true;
+            let base_domain = FamilyDomain::new(0, LAYERS + 2).unwrap();
+            let source = SemanticFamilySourceIdentity {
+                stable_definition: "layered-matrix-source".to_owned(),
+                invocation: "invocation".to_owned(),
+                element_type: ResolvedValueType::Matrix(matrix_type()),
+                domain: base_domain,
+                artifact: None,
+            };
+            let mut family = programs.source_family(&mut expressions, source, None).unwrap();
+            let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+            let one = expressions
+                .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+                .unwrap();
+            let mapped = expressions
+                .intern_slice(
+                    ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                    &[argument, one],
+                )
+                .unwrap();
+            let construction_nodes_before = expressions.node_count() as u64;
+            let construction_visits_before = programs.diagnostic_counters().beta_nodes_visited;
+            for depth in 1..=LAYERS {
+                let previous_maximum = LAYERS + 3 - depth;
+                let range = TrustedIndexRange { minimum: 1, maximum_exclusive: previous_maximum };
+                let value = if compact {
+                    programs
+                        .call_family_in_range_deferred_generated(
+                            &mut expressions,
+                            family,
+                            mapped,
+                            range,
+                        )
+                        .unwrap()
+                } else {
+                    programs.call_family_in_range(&mut expressions, family, mapped, range).unwrap()
+                };
+                family = programs
+                    .generated_family_from_body(
+                        &mut expressions,
+                        FamilyDomain::new(0, previous_maximum - 1).unwrap(),
+                        value,
+                    )
+                    .unwrap();
+            }
+            let construction_nodes = expressions.node_count() as u64 - construction_nodes_before;
+            let construction_visits =
+                programs.diagnostic_counters().beta_nodes_visited - construction_visits_before;
+            let exposure_nodes_before = expressions.node_count() as u64;
+            let exposure_visits_before = programs.diagnostic_counters().beta_nodes_visited;
+            let result = programs
+                .call_family_in_range(
+                    &mut expressions,
+                    family,
+                    argument,
+                    TrustedIndexRange {
+                        minimum: 0,
+                        maximum_exclusive: base_domain.maximum_exclusive - LAYERS,
+                    },
+                )
+                .unwrap();
+            let exposure_nodes = expressions.node_count() as u64 - exposure_nodes_before;
+            let exposure_visits =
+                programs.diagnostic_counters().beta_nodes_visited - exposure_visits_before;
+            programs.ensure_no_reducible_generated_calls(&expressions, result).unwrap();
+            Run {
+                construction_nodes,
+                construction_visits,
+                exposure_nodes,
+                exposure_visits,
+                fingerprint: fingerprint(&programs, &expressions, result),
+            }
+        }
+
+        let eager = run(false);
+        let compact = run(true);
+        assert!(eager.construction_visits >= LAYERS * (LAYERS + 1) / 2);
+        assert_eq!(compact.construction_visits, 0);
+        assert!(compact.construction_nodes <= 4 * LAYERS);
+        assert!(compact.exposure_visits <= 8 * LAYERS);
+        assert!(compact.exposure_nodes <= 8 * LAYERS);
+        assert_eq!(compact.fingerprint, eager.fingerprint);
     }
 
     #[test]
@@ -2489,6 +4315,98 @@ mod tests {
         facts.finalize_ranges();
         let reduced = programs.call_family(&mut expressions, &facts, family, index).unwrap();
         assert_eq!(expressions.value_type(reduced).unwrap(), &ResolvedValueType::Int);
+        let repeated = programs.call_family(&mut expressions, &facts, family, index).unwrap();
+        assert_eq!(repeated, reduced);
+    }
+
+    #[test]
+    fn canonical_program_call_reductions_do_not_thrash_past_legacy_fifo_bound() {
+        const CALLS: u64 = 65_537;
+        let mut expressions = ExprArena::new();
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let one = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([]))
+            .unwrap();
+        let body = expressions
+            .intern_slice(
+                ValueOperator::Scalar(super::super::arena::ScalarOperation::Add),
+                &[argument, one],
+            )
+            .unwrap();
+        let mut programs = ProgramArena::new();
+        programs.enable_diagnostic_counters();
+        let family = programs
+            .generated_family(
+                &mut expressions,
+                family_signature(FamilyDomain::new(0, CALLS).unwrap(), ResolvedValueType::Int),
+                body,
+            )
+            .unwrap();
+        let mut first = None;
+        for value in 0..CALLS {
+            let index = expressions
+                .intern(ValueOperator::Constant(TypedConstant::int(value)), Box::new([]))
+                .unwrap();
+            let output = programs
+                .call_family_in_range(
+                    &mut expressions,
+                    family,
+                    index,
+                    TrustedIndexRange::new(value, value + 1).unwrap(),
+                )
+                .unwrap();
+            if value == 0 {
+                first = Some((index, output));
+            }
+        }
+        let before = programs.diagnostic_counters();
+        let nodes_before = expressions.node_count();
+        let (first_index, first_output) = first.unwrap();
+        let repeated = programs
+            .call_family_in_range(
+                &mut expressions,
+                family,
+                first_index,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        let after = programs.diagnostic_counters();
+        assert_eq!(repeated, first_output);
+        assert_eq!(expressions.node_count(), nodes_before);
+        assert_eq!(after.beta_nodes_visited, before.beta_nodes_visited);
+        assert_eq!(after.beta_program_call_sidecar_hits, before.beta_program_call_sidecar_hits + 1);
+        assert_eq!(after.beta_program_call_sidecar_misses, CALLS);
+        assert_eq!(after.beta_program_call_sidecar_entries, CALLS);
+
+        let call = programs.call(&mut expressions, family.program(), &[first_index]).unwrap();
+        assert_eq!(expressions.program_call_reduction(call), Ok(Some(first_output)));
+        assert_eq!(
+            expressions.record_program_call_reduction(call, call),
+            Err(ArenaError::ProgramSignatureMismatch)
+        );
+        let two = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(2)), Box::new([]))
+            .unwrap();
+        assert_eq!(
+            expressions.record_program_call_reduction(call, two),
+            Err(ArenaError::ProgramSignatureMismatch)
+        );
+        let boolean = expressions
+            .intern(ValueOperator::Constant(TypedConstant::bool(true)), Box::new([]))
+            .unwrap();
+        assert_eq!(
+            expressions.record_program_call_reduction(call, boolean),
+            Err(ArenaError::ProgramSignatureMismatch)
+        );
+        assert_eq!(expressions.program_call_reduction(call), Ok(Some(first_output)));
+        let mut foreign = ExprArena::new();
+        let foreign_one =
+            foreign.intern(ValueOperator::Constant(TypedConstant::int(1)), Box::new([])).unwrap();
+        assert!(matches!(
+            expressions.record_program_call_reduction(call, foreign_one),
+            Err(ArenaError::ForeignExpression { .. })
+        ));
+        assert_eq!(expressions.program_call_reduction(call), Ok(Some(first_output)));
     }
 
     #[test]

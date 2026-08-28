@@ -375,6 +375,7 @@ impl From<ProductionAdapterError> for ProductionError {
         match error {
             ProductionAdapterError::MissingStage { .. } => Self::MissingStage,
             ProductionAdapterError::MissingWire { .. } => Self::MissingWire,
+            ProductionAdapterError::InvalidPlanWireId { .. } => Self::MissingWire,
             ProductionAdapterError::UnsupportedNode { kind, .. } => Self::UnsupportedNode { kind },
             ProductionAdapterError::UnsupportedWireType { wire_type, .. } => {
                 Self::UnsupportedWireType { actual: wire_type }

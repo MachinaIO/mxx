@@ -6,7 +6,7 @@
 use num_bigint::{BigInt, BigUint};
 use num_traits::{Signed, Zero};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     sync::{
         Arc,
@@ -583,7 +583,7 @@ impl ValueOperator {
 }
 
 /// One immutable DAG node.  Inputs are IDs, never recursively-owned nodes.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct ExprNode {
     pub operator: ValueOperator,
     pub inputs: Box<[ExprId]>,
@@ -715,7 +715,13 @@ pub struct ExprArena {
     token: ArenaToken,
     nodes: Vec<Arc<ExprNode>>,
     types: Vec<ResolvedValueType>,
-    interner: BTreeMap<Arc<ExprNode>, u32>,
+    has_free_arguments: Vec<bool>,
+    /// Fully materialized results for canonical `ProgramCall` nodes. Both endpoints are arena
+    /// slots already kept alive by this append-only arena; this sidecar retains no expression,
+    /// normal form, relation, or exact-term payload.
+    program_call_reductions: Vec<Option<ExprId>>,
+    program_call_reduction_count: usize,
+    interner: HashMap<Arc<ExprNode>, u32>,
     index_definitions: BTreeMap<IndexFunctionDefinitionId, IndexFunctionDefinition>,
     index_evaluators: BTreeMap<IndexFunctionDefinitionId, Arc<IndexEvaluator>>,
     program_signatures: BTreeMap<ValueProgramId, ProgramSignature>,
@@ -736,7 +742,10 @@ impl ExprArena {
             token: ArenaToken::fresh(),
             nodes: Vec::new(),
             types: Vec::new(),
-            interner: BTreeMap::new(),
+            has_free_arguments: Vec::new(),
+            program_call_reductions: Vec::new(),
+            program_call_reduction_count: 0,
+            interner: HashMap::new(),
             index_definitions: BTreeMap::new(),
             index_evaluators: BTreeMap::new(),
             program_signatures: BTreeMap::new(),
@@ -904,6 +913,54 @@ impl ExprArena {
         Ok(Arc::clone(&self.nodes[slot]))
     }
 
+    pub(crate) fn node_arc_and_closed(
+        &self,
+        id: ExprId,
+    ) -> Result<(Arc<ExprNode>, bool), ArenaError> {
+        let slot = self.check_id(id)?;
+        Ok((Arc::clone(&self.nodes[slot]), !self.has_free_arguments[slot]))
+    }
+
+    pub(crate) fn program_call_reduction(
+        &self,
+        call: ExprId,
+    ) -> Result<Option<ExprId>, ArenaError> {
+        let slot = self.check_id(call)?;
+        if !matches!(self.nodes[slot].operator, ValueOperator::ProgramCall { .. }) {
+            return Err(ArenaError::ProgramSignatureMismatch);
+        }
+        Ok(self.program_call_reductions[slot])
+    }
+
+    pub(crate) fn record_program_call_reduction(
+        &mut self,
+        call: ExprId,
+        reduced: ExprId,
+    ) -> Result<(), ArenaError> {
+        let call_slot = self.check_id(call)?;
+        let reduced_slot = self.check_id(reduced)?;
+        if !matches!(self.nodes[call_slot].operator, ValueOperator::ProgramCall { .. }) ||
+            self.types[call_slot] != self.types[reduced_slot] ||
+            call == reduced
+        {
+            return Err(ArenaError::ProgramSignatureMismatch);
+        }
+        match self.program_call_reductions[call_slot] {
+            Some(existing) if existing != reduced => Err(ArenaError::ProgramSignatureMismatch),
+            Some(_) => Ok(()),
+            None => {
+                self.program_call_reductions[call_slot] = Some(reduced);
+                self.program_call_reduction_count =
+                    self.program_call_reduction_count.saturating_add(1);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn program_call_reduction_count(&self) -> usize {
+        self.program_call_reduction_count
+    }
+
     pub fn value_type(&self, id: ExprId) -> Result<&ResolvedValueType, ArenaError> {
         let slot = self.check_id(id)?;
         Ok(&self.types[slot])
@@ -926,6 +983,8 @@ impl ExprArena {
             self.check_id(*input)?;
         }
         let output_type = self.validate_operator(&operator, &inputs)?;
+        let has_free_arguments = matches!(operator, ValueOperator::Argument { .. }) ||
+            inputs.iter().any(|input| self.has_free_arguments[input.slot as usize]);
         let node = Arc::new(ExprNode { operator, inputs });
         if let Some(slot) = self.interner.get(node.as_ref()).copied() {
             return Ok(ExprId::new(self.token, slot));
@@ -934,8 +993,16 @@ impl ExprArena {
             u32::try_from(self.nodes.len()).map_err(|_| ArenaError::ExpressionArenaExhausted)?;
         self.nodes.try_reserve(1).map_err(|_| ArenaError::ExpressionAllocationFailed)?;
         self.types.try_reserve(1).map_err(|_| ArenaError::ExpressionAllocationFailed)?;
+        self.has_free_arguments
+            .try_reserve(1)
+            .map_err(|_| ArenaError::ExpressionAllocationFailed)?;
+        self.program_call_reductions
+            .try_reserve(1)
+            .map_err(|_| ArenaError::ExpressionAllocationFailed)?;
         self.nodes.push(Arc::clone(&node));
         self.types.push(output_type);
+        self.has_free_arguments.push(has_free_arguments);
+        self.program_call_reductions.push(None);
         self.interner.insert(node, slot);
         Ok(ExprId::new(self.token, slot))
     }
@@ -1189,11 +1256,18 @@ impl ExprArena {
     }
 
     pub fn close(&self, expression: ExprId) -> Result<ClosedExprId, ArenaError> {
-        self.check_id(expression)?;
-        if let Some((position, _)) = self.free_arguments(expression)?.first().cloned() {
+        let slot = self.check_id(expression)?;
+        if self.has_free_arguments[slot] &&
+            let Some((position, _)) = self.free_arguments(expression)?.first().cloned()
+        {
             return Err(ArenaError::FreeArgumentEscapes { position });
         }
         Ok(ClosedExprId { expression })
+    }
+
+    pub(crate) fn is_closed(&self, expression: ExprId) -> Result<bool, ArenaError> {
+        let slot = self.check_id(expression)?;
+        Ok(!self.has_free_arguments[slot])
     }
 
     pub fn free_arguments(
@@ -3273,5 +3347,26 @@ mod tests {
             ),
             Err(ArenaError::TypeMismatch { position: 0, .. })
         ));
+    }
+
+    #[test]
+    fn closedness_cache_tracks_arguments_through_interned_dag_nodes() {
+        let mut arena = ExprArena::new();
+        let closed =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(7)), Box::new([])).unwrap();
+        let argument = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let open = arena
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), Box::new([closed, argument]))
+            .unwrap();
+        assert_eq!(arena.is_closed(closed), Ok(true));
+        assert_eq!(arena.is_closed(argument), Ok(false));
+        assert_eq!(arena.is_closed(open), Ok(false));
+        assert!(matches!(arena.close(open), Err(ArenaError::FreeArgumentEscapes { position: 0 })));
+
+        let reused = arena
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), Box::new([closed, argument]))
+            .unwrap();
+        assert_eq!(reused, open);
+        assert_eq!(arena.is_closed(reused), Ok(false));
     }
 }

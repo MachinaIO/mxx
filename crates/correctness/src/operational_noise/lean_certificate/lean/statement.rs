@@ -624,6 +624,7 @@ fn render_packages<T>(
 }
 
 fn render_top(document: &CertificateDocumentV1) -> Result<String, String> {
+    let ciphertext_modulus = super::semantics::ciphertext_modulus_text(document)?;
     let tables = [
         ("Expression", "CertificateABI.ExpressionRow", document.expressions.len()),
         ("Program", "SchemaV1.ProgramRow", document.programs.len()),
@@ -677,11 +678,11 @@ fn render_top(document: &CertificateDocumentV1) -> Result<String, String> {
         .expect("writing to String cannot fail");
     writeln!(
         source,
-        "def document : CertificateDocument :=\n  {{ schemaId := {}\n    schemaVersion := {}\n    plaintextModulus := {}\n    ciphertextModulus := {}\n    ringDimension := {}\n    expressions := ExpressionRows\n    programs := ProgramRows\n    sources := SourceRows\n    events := EventRows\n    indexUses := IndexUseRows\n    sliceGroups := SliceGroupRows\n    residualRoot := {residual} }}\n\nend {NAMESPACE}",
+        "def document : CertificateDocument :=\n  {{ schemaId := {}\n    schemaVersion := {}\n    plaintextModulus := {}\n    ciphertextModulus := toString {}\n    ringDimension := {}\n    expressions := ExpressionRows\n    programs := ProgramRows\n    sources := SourceRows\n    events := EventRows\n    indexUses := IndexUseRows\n    sliceGroups := SliceGroupRows\n    residualRoot := {residual} }}\n\nend {NAMESPACE}",
         quoted(document.schema_id)?,
         document.schema_version,
         quoted(&document.plaintext_modulus)?,
-        quoted(&document.ciphertext_modulus)?,
+        ciphertext_modulus,
         document.ring_dimension,
     )
     .expect("writing to String cannot fail");
@@ -1360,6 +1361,35 @@ fn residual_root(value: &CertificateResidualRootV1) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_document(ciphertext_modulus: &str) -> CertificateDocumentV1 {
+        CertificateDocumentV1 {
+            schema_id: "mxx.operational-noise.certificate",
+            schema_version: 1,
+            plaintext_modulus: "2".to_owned(),
+            ciphertext_modulus: ciphertext_modulus.to_owned(),
+            ring_dimension: 1,
+            expressions: Vec::new(),
+            programs: Vec::new(),
+            sources: Vec::new(),
+            events: Vec::new(),
+            index_uses: Vec::new(),
+            slice_groups: Vec::new(),
+            residual_root: CertificateResidualRootV1::Family {
+                program: 0,
+                domain: CertificateRange { minimum: 0, maximum_exclusive: 1 },
+            },
+        }
+    }
+
+    #[test]
+    fn render_top_rejects_noncanonical_ciphertext_modulus() {
+        let source = render_top(&minimal_document("257")).expect("canonical modulus renders");
+        assert!(source.contains("ciphertextModulus := toString 257"));
+        for value in ["0257", "0", "not-a-decimal"] {
+            assert!(render_top(&minimal_document(value)).is_err(), "accepted {value:?}");
+        }
+    }
 
     fn lut_row(tuple: &[&str], output: &str) -> IndexLutRow {
         IndexLutRow {

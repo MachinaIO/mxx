@@ -4047,9 +4047,9 @@ fn render_bounds(
     Ok(files)
 }
 
-fn ciphertext_modulus_text(statement: &CertificateDocumentV1) -> Result<String, String> {
+pub(super) fn ciphertext_modulus_text(statement: &CertificateDocumentV1) -> Result<String, String> {
     BigUint::parse_bytes(statement.ciphertext_modulus.as_bytes(), 10)
-        .filter(|value| !value.is_zero())
+        .filter(|value| !value.is_zero() && value.to_string() == statement.ciphertext_modulus)
         .map(|value| value.to_string())
         .ok_or_else(|| {
             format!(
@@ -4649,6 +4649,8 @@ mod tests {
         let error = ciphertext_modulus_text(&statement).expect_err("invalid modulus must fail");
         assert!(error.contains("positive decimal ciphertext modulus"));
         statement.ciphertext_modulus = "0".to_owned();
+        assert!(ciphertext_modulus_text(&statement).is_err());
+        statement.ciphertext_modulus = "0257".to_owned();
         assert!(ciphertext_modulus_text(&statement).is_err());
     }
 

@@ -1173,7 +1173,6 @@ theorem canonical_relation_fixture :
 #print axioms finite_add_exact_zero_fixture
 #print axioms CertificateSemantics.exactValueClaim_product_finite_left
 #print axioms CertificateSemantics.operatorProductFiniteMergeClaim
-#print axioms CertificateSemantics.operatorProductFiniteMergeClaimAt
 #print axioms finite_product_exact_zero_fixture
 #print axioms CertificateSemantics.exactFiniteValueClaim_of_eval_mod
 #print axioms finite_relation_rewrite_fixture

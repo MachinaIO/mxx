@@ -64,9 +64,9 @@ struct RelationProbe {
     outer: num_bigint::BigInt,
     start: u32,
     end: u32,
-    accumulator: ResultRecord,
+    accumulator_terms: Vec<ProofPayloadTerm>,
     rhs: ResultRecord,
-    output: ResultRecord,
+    output: Vec<ProofPayloadTerm>,
     kind: RelationRuleKind,
     output_merges: Vec<(u64, ProofPayloadCoefficientMerge)>,
 }
@@ -80,7 +80,7 @@ struct PendingRelation {
     outer: num_bigint::BigInt,
     start: u32,
     end: u32,
-    accumulator: ResultRecord,
+    accumulator_terms: Vec<ProofPayloadTerm>,
     rhs: ResultRecord,
     terms: BTreeMap<ProofPayloadMonomial, num_bigint::BigInt>,
     output_merges: Vec<(u64, ProofPayloadCoefficientMerge)>,
@@ -664,27 +664,22 @@ fn finalize_relations(
     candidates: &mut Vec<RelationProbe>,
 ) -> Result<(), String> {
     for relation in pending.drain(..) {
-        let output_event = relation.last_merge_event.ok_or_else(|| {
+        relation.last_merge_event.ok_or_else(|| {
             format!(
                 "relation application {} has no typed Relation coefficient merge",
                 relation.event
             )
         })?;
-        let output = ResultRecord {
-            event: output_event,
-            owner: relation.owner,
-            terms: relation
-                .terms
-                .iter()
-                .filter_map(|(monomial, coefficient)| {
-                    (!coefficient.is_zero()).then_some(ProofPayloadTerm {
-                        monomial: monomial.clone(),
-                        coefficient: coefficient.clone(),
-                    })
+        let output = relation
+            .terms
+            .iter()
+            .filter_map(|(monomial, coefficient)| {
+                (!coefficient.is_zero()).then_some(ProofPayloadTerm {
+                    monomial: monomial.clone(),
+                    coefficient: coefficient.clone(),
                 })
-                .collect(),
-            summary: relation.accumulator.summary.clone(),
-        };
+            })
+            .collect();
         candidates.push(RelationProbe {
             event: relation.event,
             owner: relation.owner,
@@ -694,7 +689,7 @@ fn finalize_relations(
             outer: relation.outer,
             start: relation.start,
             end: relation.end,
-            accumulator: relation.accumulator,
+            accumulator_terms: relation.accumulator_terms,
             rhs: relation.rhs,
             output,
             kind: relation.kind,
@@ -711,7 +706,6 @@ fn relation_candidates(
 ) -> Result<Vec<RelationProbe>, String> {
     let mut candidates = Vec::new();
     for (frame_start, frame_end, _, _) in ranges {
-        let mut states = BTreeMap::<ProofPayloadOwner, ResultRecord>::new();
         let mut working =
             BTreeMap::<ProofPayloadOwner, BTreeMap<ProofPayloadMonomial, num_bigint::BigInt>>::new(
             );
@@ -747,15 +741,8 @@ fn relation_candidates(
             match index.event(event)? {
                 ProofPayloadEvent::Result {
                     owner,
-                    value: ProofPayloadValue::Exact { terms, summary, .. },
+                    value: ProofPayloadValue::Exact { terms, .. },
                 } => {
-                    let result = ResultRecord {
-                        event,
-                        owner: *owner,
-                        terms: terms.clone(),
-                        summary: summary.clone(),
-                    };
-                    states.insert(*owner, result);
                     working.insert(
                         *owner,
                         terms
@@ -766,16 +753,9 @@ fn relation_candidates(
                 }
                 ProofPayloadEvent::InvocationEnd {
                     root,
-                    result: ProofPayloadValue::Exact { terms, summary, .. },
+                    result: ProofPayloadValue::Exact { terms, .. },
                     ..
                 } => {
-                    let record = ResultRecord {
-                        event,
-                        owner: *root,
-                        terms: terms.clone(),
-                        summary: summary.clone(),
-                    };
-                    states.insert(*root, record);
                     working.insert(
                         *root,
                         terms
@@ -795,38 +775,16 @@ fn relation_candidates(
                     let accumulator_terms = working.get(owner).cloned().ok_or_else(|| {
                         format!("relation event {event} has no frame-local owner polynomial")
                     })?;
-                    let accumulator_summary =
-                        states.get(owner).map(|result| result.summary.clone()).unwrap_or_else(
-                            crate::operational_noise::normal_form::BoundedSummary::zero,
-                        );
-                    let accumulator = index
-                        .results
+                    let accumulator_terms = accumulator_terms
                         .iter()
-                        .filter(|candidate| {
-                            candidate.event < event &&
-                                candidate.owner == *owner &&
-                                candidate.terms.iter().map(|term| {
-                                    (term.monomial.clone(), term.coefficient.clone())
-                                }).collect::<BTreeMap<_, _>>() == accumulator_terms &&
-                                candidate.summary == accumulator_summary &&
-                                index.immediate_frames[usize::try_from(candidate.event)
-                                    .expect("indexed relation accumulator Result")] ==
-                                    Some(*frame_start)
+                        .filter_map(|(monomial, coefficient)| {
+                            (!coefficient.is_zero()).then_some(ProofPayloadTerm {
+                                monomial: monomial.clone(),
+                                coefficient: coefficient.clone(),
+                            })
                         })
-                        .max_by_key(|candidate| candidate.event)
-                        .cloned()
-                        .ok_or_else(|| {
-                            format!(
-                                "relation event {event} has no reached frame-local accumulator Result"
-                            )
-                        })?;
-                    if !reached_event_ids.contains(&accumulator.event) {
-                        return Err(format!(
-                            "relation event {event} accumulator Result {} is outside the reached closure",
-                            accumulator.event
-                        ));
-                    }
-                    if !accumulator.terms.iter().any(|term| term.monomial == *source_monomial) {
+                        .collect::<Vec<_>>();
+                    if !accumulator_terms.iter().any(|term| term.monomial == *source_monomial) {
                         return Err(format!(
                             "relation event {event} source is absent from frame-local accumulator"
                         ));
@@ -850,8 +808,7 @@ fn relation_candidates(
                         ),
                     };
                     let rhs = index.result(rhs_event)?;
-                    let mut terms = accumulator
-                        .terms
+                    let mut terms = accumulator_terms
                         .iter()
                         .map(|term| (term.monomial.clone(), term.coefficient.clone()))
                         .collect::<BTreeMap<_, _>>();
@@ -865,7 +822,7 @@ fn relation_candidates(
                         outer: outer_coefficient.clone(),
                         start: *ordered_start,
                         end: *ordered_end_exclusive,
-                        accumulator,
+                        accumulator_terms,
                         rhs,
                         terms,
                         output_merges: Vec::new(),
@@ -1629,28 +1586,10 @@ fn result_probe_at<'a>(
                 1,
             )
         }
-        Some((_, MergeGroupKey::Relation { frame, owner, application })) => {
-            let relation = relation_by_event.get(&application).ok_or_else(|| {
-                format!(
-                    "certificate Result {result_event} begins with unknown relation {application}"
-                )
-            })?;
-            if relation.owner != owner {
-                return Err(format!("certificate relation {application} has a foreign owner"));
-            }
-            if frame != relation.frame_start {
-                return Err(format!(
-                    "certificate relation {application} has mismatched frame {frame}, expected {}",
-                    relation.frame_start
-                ));
-            }
-            if reached_event_ids.binary_search(&relation.accumulator.event).is_err() {
-                return Err(format!(
-                    "relation {application} references non-closure accumulator Result {}",
-                    relation.accumulator.event
-                ));
-            }
-            (None, None, None, [relation.accumulator.event, relation.accumulator.event], 0)
+        Some((_, MergeGroupKey::Relation { application, .. })) => {
+            return Err(format!(
+                "certificate Result {result_event} reaches unsupported relation-first application {application}"
+            ));
         }
         None => {
             if let Some(kind) = expression_kind(statement, result.owner)? &&
@@ -1939,12 +1878,7 @@ fn render_result_claim(
     writeln!(source, "def summary : Bound := {}", summary_text(&result.summary))
         .expect("String write");
     writeln!(source, "def resultEvent : Nat := {event}").expect("String write");
-    if false {
-        source.push_str(&format!(
-                "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualResult{}.actual selector witness\n\ntheorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  simpa [resultEvent, owner, rawTerms, summary, actual,\n    Cert.ResidualResult{}.actual] using\n    SemanticResult.resultClaimSound selector selectorLower selectorUpper witness\n",
-                event, event
-            ));
-    } else if let Some(producer_event) = terminal_producer {
+    if let Some(producer_event) = terminal_producer {
         let frame = index.immediate_frames
             [usize::try_from(event).map_err(|_| "left terminal event index overflow")?]
         .ok_or_else(|| format!("left terminal Result {event} has no frame"))?;
@@ -1973,21 +1907,6 @@ fn render_result_claim(
         writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualResult{event}.actual selector witness").expect("String write");
         writeln!(source, "theorem terminalAt (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum) :\n    TerminalExactAt document history (some selector) producerEvent resultEvent owner rawTerms := by\n  refine ⟨by decide, ?_, ?_⟩\n  · simp only [selectorMinimum] at selectorLower\n    simp only [selectorMaximum] at selectorUpper\n    simp [ownerAtSelector, document, owner, selectorLower, selectorUpper]\n  · refine ⟨{}, {frame}, {}, {}, ?_, ?_⟩\n    · rfl\n    · rfl", reached_terminal_rule_text(rule)?, recorded_bound_text(coefficient_bound), reached_terminal_constructor(rule)?).expect("String write");
         writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  exact terminalExactClaimAt witness (terminalAt selector selectorLower selectorUpper)").expect("String write");
-    } else if let Some(relation) = relations.first() {
-        let first_relation = relation.event;
-        let result_event = relation.accumulator.event;
-        writeln!(source, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  Cert.ResidualResult{event}.actual selector witness")
-                .expect("String write");
-        writeln!(source, "theorem mergeClaim (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact LeftRelationMerge{first_relation}.accumulator summary) := by\n  simpa [actual, summary, LeftRelationMerge{first_relation}.accumulator] using\n    (LeftClaimResult{result_event}.claimSound selector selectorLower selectorUpper witness).claim")
-                .expect("String write");
-        render_relation_claim_chain(
-            source,
-            relation_by_event,
-            result,
-            relations,
-            &format!("LeftRelationMerge{first_relation}.accumulator"),
-            modulus,
-        )?;
     } else {
         let node = operation
             .ok_or_else(|| format!("certificate Result {event} has no operation context"))?;
@@ -2190,11 +2109,11 @@ fn render_result_claim(
                     let right_scalar = if scalar_flags.1 { "true" } else { "false" };
                     writeln!(
                             source,
-                            "def computedSummary : Bound :=\n  coeffClassToBound\n    (EventReplay.productWithFactor {factor}\n      (.finite ⟨{left_maximum}, by decide⟩)\n      (.finite ⟨{right_summary_maximum}, by decide⟩))"
+                            "def computedSummary : Bound :=\n  boundOfCoeffClass\n    (EventReplay.productWithFactor {factor}\n      (.finite ⟨{left_maximum}, by decide⟩)\n      (.finite ⟨{right_summary_maximum}, by decide⟩))"
                         )
                         .expect("String write");
-                    writeln!(source, "theorem computedMergeClaim (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact LeftOperatorMerge{first_merge_event}.working computedSummary) := by\n  apply operatorProductFiniteMergeClaim\n    (document := document) (history := history) (modulus := {modulus})\n    (selector := some selector) (witness := witness) (frameStart := LeftOperatorMerge{first_merge_event}.frameStart)\n    (owner := owner) (leftOwner := LeftClaimResult{left_result}.owner)\n    (rightOwner := LeftClaimResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftActual := LeftClaimResult{left_result}.actual selector witness)\n    (rightActual := LeftClaimResult{right_result}.actual selector witness)\n    (leftRaw := LeftClaimResult{left_result}.rawTerms)\n    (rightRaw := LeftClaimResult{right_result}.rawTerms)\n    (working := LeftOperatorMerge{first_merge_event}.working)\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (coefficientTransfer := {transfer_event}) (summaryTransfer := {summary_transfer})\n    (rightCoefficientProducer := {right_coefficient_transfer})\n    (rightSummaryTransfer := {summary_right})\n    (leftMaximum := ⟨{left_maximum}, by decide⟩)\n    (rightProducerMaximum := ⟨{right_producer_maximum}, by decide⟩)\n    (rightRecordedMaximum := {right_maximum})\n    (rightSummaryMaximum := ⟨{right_summary_maximum}, by decide⟩)\n    (leftScalar := {left_scalar}) (rightScalar := {right_scalar}) (factor := {factor})\n    (valueType := {value_type}) (base := LeftOperatorMerge{first_merge_event}.base)\n    (coefficientFacts := {coefficient_facts}) (summaryFacts := {summary_facts})\n    (rightMagnitude := {right_producer_namespace}.actual selector witness)\n    (summaryMagnitude := LeftBound{summary_transfer}.actual selector witness)\n    (reconstruction := LeftOperatorMerge{first_merge_event}.reconstruction)\n    (rightResultAt := by rfl)\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · exact LeftClaimResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftClaimResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · exact .resultExactCoefficient (by rfl)\n      (by dsimp [{right_dependencies}, addKnownList, EventReplay.addKnown, EventReplay.productWithFactor,\n        EventReplay.scaleMagnitude, EventReplay.scaleValue, EventReplay.productNonempty,\n        RecordedBoundRefines] <;> decide)\n      ({right_producer_namespace}.derived selector witness)\n  · dsimp [RecordedBoundRefines]\n    decide\n  · decide\n  · exact LeftOperatorMerge{first_merge_event}.operationAgreement\n  · exact LeftBound{summary_transfer}.derived selector witness\n  · decide\n  · decide").expect("String write");
-                    writeln!(source, "theorem mergeClaim (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact LeftOperatorMerge{first_merge_event}.working summary) := by\n  have claim := computedMergeClaim selector selectorLower selectorUpper witness\n  have summaryEq : computedSummary = summary := by decide\n  simpa only [summaryEq] using claim")
+                    writeln!(source, "theorem computedMergeClaim (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact LeftOperatorMerge{first_merge_event}.working computedSummary) := by\n  apply operatorProductFiniteMergeClaim\n    (document := document) (history := history) (modulus := {modulus})\n    (selector := some selector) (witness := witness) (frameStart := LeftOperatorMerge{first_merge_event}.frameStart)\n    (owner := owner) (leftOwner := SemanticResult{left_result}.owner)\n    (rightOwner := SemanticResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftActual := SemanticResult{left_result}.actual selector witness)\n    (rightActual := SemanticResult{right_result}.actual selector witness)\n    (leftRaw := SemanticResult{left_result}.rawTerms)\n    (rightRaw := SemanticResult{right_result}.rawTerms)\n    (working := LeftOperatorMerge{first_merge_event}.working)\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (coefficientTransfer := {transfer_event}) (summaryTransfer := {summary_transfer})\n    (rightCoefficientProducer := {right_coefficient_transfer})\n    (rightSummaryTransfer := {summary_right})\n    (leftMaximum := ⟨{left_maximum}, by decide⟩)\n    (rightProducerMaximum := ⟨{right_producer_maximum}, by decide⟩)\n    (rightRecordedMaximum := {right_maximum})\n    (rightSummaryMaximum := ⟨{right_summary_maximum}, by decide⟩)\n    (leftScalar := {left_scalar}) (rightScalar := {right_scalar}) (factor := {factor})\n    (valueType := {value_type}) (base := LeftOperatorMerge{first_merge_event}.base)\n    (coefficientFacts := {coefficient_facts}) (summaryFacts := {summary_facts})\n    (rightMagnitude := {right_producer_namespace}.actual selector witness)\n    (summaryMagnitude := LeftBound{summary_transfer}.actual selector witness)\n    (reconstruction := LeftOperatorMerge{first_merge_event}.reconstruction)\n    (rightResultAt := by rfl)\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · exact SemanticResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact SemanticResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · exact .resultExactCoefficient (by rfl)\n      (by dsimp [{right_dependencies}, addKnownList, EventReplay.addKnown, EventReplay.productWithFactor,\n        EventReplay.scaleMagnitude, EventReplay.scaleValue, EventReplay.productNonempty,\n        RecordedBoundRefines] <;> decide)\n      ({right_producer_namespace}.derived selector witness)\n  · dsimp [RecordedBoundRefines]\n    decide\n  · decide\n  · exact LeftOperatorMerge{first_merge_event}.operationAgreement\n  · exact LeftBound{summary_transfer}.derived selector witness\n  · decide\n  · decide").expect("String write");
+                    writeln!(source, "theorem mergeClaim (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact LeftOperatorMerge{first_merge_event}.working summary) := by\n  have claim := computedMergeClaim selector selectorLower selectorUpper witness\n  have summaryEq : computedSummary = summary := by\n    dsimp [computedSummary, summary, boundOfCoeffClass, EventReplay.productWithFactor]\n  simpa only [summaryEq] using claim")
                             .expect("String write");
                     render_relation_claim_chain(
                         source,
@@ -2248,7 +2167,14 @@ fn render_result_claim(
                             "certificate finite Subtract Result {event} does not preserve the left maximum"
                         ));
                     }
-                    writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply operatorSubFiniteLeftMergeClaimAt\n    (document := document) (history := history) (env := witness.env)\n    (modulus := {modulus}) (frameStart := LeftOperatorMerge{first_merge_event}.frameStart)\n    (coefficientTransfer := {transfer_event}) (resultEvent := resultEvent)\n    (owner := owner) (leftOwner := LeftClaimResult{left_result}.owner)\n    (rightOwner := LeftClaimResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftActual := LeftClaimResult{left_result}.actual selector witness)\n    (rightActual := LeftClaimResult{right_result}.actual selector witness)\n    (leftRaw := LeftClaimResult{left_result}.rawTerms)\n    (rightRaw := LeftClaimResult{right_result}.rawTerms)\n    (outputRaw := rawTerms) (leftMaximum := {left_maximum})\n    (valueType := {value_type})\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (base := LeftOperatorMerge{first_merge_event}.base)\n    (reconstruction := LeftOperatorMerge{first_merge_event}.reconstruction)\n  · rfl\n  · rfl\n  · rfl\n  · exact LeftClaimResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftClaimResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftOperatorMerge{first_merge_event}.operationAgreement\n  · rfl\n  · decide").expect("String write");
+                    let coefficient_bound = match index.event(event)? {
+                        ProofPayloadEvent::Result {
+                            value: ProofPayloadValue::Exact { coefficient_bound, .. },
+                            ..
+                        } => recorded_bound_text(coefficient_bound),
+                        _ => unreachable!("reached finite Subtract result was checked above"),
+                    };
+                    writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply operatorSubFiniteLeftMergeClaimAt\n    (document := document) (history := history) (env := witness.env)\n    (modulus := {modulus}) (frameStart := LeftOperatorMerge{first_merge_event}.frameStart)\n    (coefficientBound := {coefficient_bound}) (coefficientTransfer := {transfer_event}) (resultEvent := resultEvent)\n    (owner := owner) (leftOwner := SemanticResult{left_result}.owner)\n    (rightOwner := SemanticResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftActual := SemanticResult{left_result}.actual selector witness)\n    (rightActual := SemanticResult{right_result}.actual selector witness)\n    (leftRaw := SemanticResult{left_result}.rawTerms)\n    (rightRaw := SemanticResult{right_result}.rawTerms)\n    (outputRaw := rawTerms) (leftMaximum := {left_maximum})\n    (valueType := {value_type})\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (base := LeftOperatorMerge{first_merge_event}.base)\n    (reconstruction := LeftOperatorMerge{first_merge_event}.reconstruction)\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · exact SemanticResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact SemanticResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftOperatorMerge{first_merge_event}.operationAgreement\n  · rfl\n  · decide").expect("String write");
                 } else {
                     if !matches!(kind, OperationKind::Add | OperationKind::Subtract) {
                         return Err(format!(
@@ -2299,7 +2225,7 @@ fn render_result_claim(
                         "{theorem}\n    (document := document) (history := history) \
                              (env := witness.env)"
                     );
-                    writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply {theorem}\n    (modulus := {modulus}) (frameStart := LeftOperatorMerge{first_merge_event}.frameStart)\n    (resultEvent := resultEvent) (owner := owner)\n    (leftOwner := LeftClaimResult{left_result}.owner)\n    (rightOwner := LeftClaimResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftActual := LeftClaimResult{left_result}.actual selector witness)\n    (rightActual := LeftClaimResult{right_result}.actual selector witness)\n    (leftRaw := LeftClaimResult{left_result}.rawTerms)\n    (rightRaw := LeftClaimResult{right_result}.rawTerms)\n    (outputRaw := rawTerms) (leftMaximum := {left_maximum})\n    (rightMaximum := {right_maximum}) (valueType := {value_type})\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (coefficientTransfer := {transfer_event}) (summaryTransfer := {summary_transfer})\n    (base := LeftOperatorMerge{first_merge_event}.base)\n    (reconstruction := LeftOperatorMerge{first_merge_event}.reconstruction)\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · exact LeftClaimResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftClaimResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftOperatorMerge{first_merge_event}.operationAgreement\n  · rfl\n  · decide").expect("String write");
+                    writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply {theorem}\n    (modulus := {modulus}) (frameStart := LeftOperatorMerge{first_merge_event}.frameStart)\n    (resultEvent := resultEvent) (owner := owner)\n    (leftOwner := SemanticResult{left_result}.owner)\n    (rightOwner := SemanticResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftActual := SemanticResult{left_result}.actual selector witness)\n    (rightActual := SemanticResult{right_result}.actual selector witness)\n    (leftRaw := SemanticResult{left_result}.rawTerms)\n    (rightRaw := SemanticResult{right_result}.rawTerms)\n    (outputRaw := rawTerms) (leftMaximum := {left_maximum})\n    (rightMaximum := {right_maximum}) (valueType := {value_type})\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (coefficientTransfer := {transfer_event}) (summaryTransfer := {summary_transfer})\n    (base := LeftOperatorMerge{first_merge_event}.base)\n    (reconstruction := LeftOperatorMerge{first_merge_event}.reconstruction)\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · exact SemanticResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact SemanticResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftOperatorMerge{first_merge_event}.operationAgreement\n  · rfl\n  · decide").expect("String write");
                 }
             } else {
                 let theorem = match kind {
@@ -2382,7 +2308,19 @@ fn render_result_claim(
                         ));
                     }
                 };
-                writeln!(source, "theorem mergeClaim (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact LeftOperatorMerge{first_merge_event}.working .exactZero) := by\n  apply {theorem}\n    (frameStart := LeftOperatorMerge{first_merge_event}.frameStart)\n    (transferEvent := {transfer_event}) (owner := owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (working := LeftOperatorMerge{first_merge_event}.working)\n    (reconstruction := LeftOperatorMerge{first_merge_event}.reconstruction)\n{rule_arguments}  · rfl\n  · rfl\n  · exact LeftClaimResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftClaimResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftOperatorMerge{first_merge_event}.operationAgreement\n  · decide\n\ntheorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply exactClaimAt_of_mergeClaim\n    (mergeClaim selector selectorLower selectorUpper witness)\n  · decide +kernel\n  · rfl").expect("String write");
+                writeln!(source, "theorem mergeClaim (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ValueClaim.Interprets {modulus} witness.env (actual selector witness)\n      (.exact LeftOperatorMerge{first_merge_event}.working .exactZero) := by\n  apply {theorem}\n    (frameStart := LeftOperatorMerge{first_merge_event}.frameStart)\n    (transferEvent := {transfer_event}) (owner := owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (working := LeftOperatorMerge{first_merge_event}.working)\n    (reconstruction := LeftOperatorMerge{first_merge_event}.reconstruction)\n{rule_arguments}  · rfl\n  · rfl\n  · exact SemanticResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact SemanticResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftOperatorMerge{first_merge_event}.operationAgreement\n  · decide").expect("String write");
+                if relations.is_empty() {
+                    writeln!(source, "\ntheorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply exactClaimAt_of_mergeClaim\n    (mergeClaim selector selectorLower selectorUpper witness)\n  · decide +kernel\n  · rfl").expect("String write");
+                } else {
+                    render_relation_claim_chain(
+                        source,
+                        relation_by_event,
+                        result,
+                        relations,
+                        &format!("LeftOperatorMerge{first_merge_event}.working"),
+                        modulus,
+                    )?;
+                }
             }
         } else {
             if !matches!(kind, OperationKind::Add | OperationKind::Subtract) {
@@ -2410,7 +2348,7 @@ fn render_result_claim(
                     "{theorem}\n    (document := document) (history := history) \
                          (env := witness.env)"
                 );
-                writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply {theorem}\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (transferEvent := {transfer_event})\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · exact LeftClaimResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftClaimResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · rfl\n  · decide +kernel\n  · decide").expect("String write");
+                writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply {theorem}\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (transferEvent := {transfer_event})\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · exact SemanticResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact SemanticResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · rfl\n  · decide +kernel\n  · decide").expect("String write");
             } else if kind == OperationKind::Add && left_zero && right_zero {
                 let finite_maximum = match result.summary.coefficient_bound() {
                     crate::operational_noise::facts::NumericContract::Known(
@@ -2535,7 +2473,7 @@ fn render_result_claim(
                 .ok_or_else(|| format!("certificate Result {event} has no invocation frame"))?;
                 let survivor_namespace =
                     left_bound_namespace(survivor_node.event, survivor_node.rule);
-                writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply operatorAddSingletonSurvivorFoldClaimAt\n    (document := document) (history := history) (modulus := {modulus})\n    (witness := witness) (frameStart := {frame_start})\n    (valueType := {value_type})\n    (coefficientTransfer := {transfer_event}) (survivorTransfer := {survivor_transfer})\n    (survivorEvent := {survivor_event}) (resultEvent := resultEvent)\n    (rightCoefficientProducer := {right_coefficient_producer})\n    (owner := owner) (leftOwner := LeftClaimResult{left_result}.owner)\n    (rightOwner := LeftClaimResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (leftActual := LeftClaimResult{left_result}.actual selector witness)\n    (rightActual := LeftClaimResult{right_result}.actual selector witness)\n    (leftRaw := LeftClaimResult{left_result}.rawTerms)\n    (survivorMonomial := {}) (maximum := ⟨{finite_maximum}, by decide⟩)\n    (rightMagnitude := {right_producer_namespace}.actual selector witness)\n    (survivorMagnitude := {survivor_namespace}.actual selector witness)\n  · decide +kernel\n  · rfl\n  · rfl\n  · rfl\n  · exact LeftClaimResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftClaimResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · rfl\n  · exact .resultExactCoefficient (by rfl)\n      (by dsimp [{right_producer_namespace}.bound, RecordedBoundRefines] <;> decide)\n      ({right_producer_namespace}.derived selector witness)\n  · exact {survivor_namespace}.derived selector witness\n  · rfl\n  · rfl\n  · decide", monomial_text(monomial)).expect("String write");
+                writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply operatorAddSingletonSurvivorFoldClaimAt\n    (document := document) (history := history) (modulus := {modulus})\n    (witness := witness) (frameStart := {frame_start})\n    (valueType := {value_type})\n    (coefficientTransfer := {transfer_event}) (survivorTransfer := {survivor_transfer})\n    (survivorEvent := {survivor_event}) (resultEvent := resultEvent)\n    (rightCoefficientProducer := {right_coefficient_producer})\n    (owner := owner) (leftOwner := SemanticResult{left_result}.owner)\n    (rightOwner := SemanticResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (leftActual := SemanticResult{left_result}.actual selector witness)\n    (rightActual := SemanticResult{right_result}.actual selector witness)\n    (leftRaw := SemanticResult{left_result}.rawTerms)\n    (survivorMonomial := {}) (maximum := ⟨{finite_maximum}, by decide⟩)\n    (rightMagnitude := {right_producer_namespace}.actual selector witness)\n    (survivorMagnitude := {survivor_namespace}.actual selector witness)\n  · decide +kernel\n  · rfl\n  · rfl\n  · rfl\n  · exact SemanticResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact SemanticResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · rfl\n  · exact .resultExactCoefficient (by rfl)\n      (by dsimp [{right_producer_namespace}.bound, RecordedBoundRefines] <;> decide)\n      ({right_producer_namespace}.derived selector witness)\n  · exact {survivor_namespace}.derived selector witness\n  · rfl\n  · rfl\n  · decide", monomial_text(monomial)).expect("String write");
             } else {
                 let theorem = match (kind, left_zero, right_zero) {
                     (OperationKind::Add, false, false) => "operatorAddNoMergeClaim",
@@ -2568,11 +2506,11 @@ fn render_result_claim(
                     };
                 let left_maximum = finite_maximum(&left)?;
                 let right_maximum = finite_maximum(&right)?;
-                writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply {theorem}\n    (modulus := {modulus}) (frameStart := {frame_start})\n    (resultEvent := resultEvent) (owner := owner)\n    (leftOwner := LeftClaimResult{left_result}.owner)\n    (rightOwner := LeftClaimResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftActual := LeftClaimResult{left_result}.actual selector witness)\n    (rightActual := LeftClaimResult{right_result}.actual selector witness)\n    (leftRaw := LeftClaimResult{left_result}.rawTerms)\n    (rightRaw := LeftClaimResult{right_result}.rawTerms)\n    (outputRaw := rawTerms) (leftMaximum := {left_maximum})\n    (rightMaximum := {right_maximum}) (valueType := {value_type})\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (transferEvent := {transfer_event}) (summaryTransferEvent := {summary_transfer})\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · exact LeftClaimResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftClaimResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · rfl\n  · decide +kernel\n  · decide").expect("String write");
+                writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply {theorem}\n    (modulus := {modulus}) (frameStart := {frame_start})\n    (resultEvent := resultEvent) (owner := owner)\n    (leftOwner := SemanticResult{left_result}.owner)\n    (rightOwner := SemanticResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftActual := SemanticResult{left_result}.actual selector witness)\n    (rightActual := SemanticResult{right_result}.actual selector witness)\n    (leftRaw := SemanticResult{left_result}.rawTerms)\n    (rightRaw := SemanticResult{right_result}.rawTerms)\n    (outputRaw := rawTerms) (leftMaximum := {left_maximum})\n    (rightMaximum := {right_maximum}) (valueType := {value_type})\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (transferEvent := {transfer_event}) (summaryTransferEvent := {summary_transfer})\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · rfl\n  · exact SemanticResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact SemanticResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · rfl\n  · decide +kernel\n  · decide").expect("String write");
             }
         }
     }
-    writeln!(source, "end LeftClaimResult{event}\n").expect("String write");
+    writeln!(source, "end SemanticResult{event}\n").expect("String write");
     Ok(())
 }
 
@@ -2624,7 +2562,7 @@ fn render_claims(
     let mut files = Vec::new();
     let mut dependency_shards = BTreeMap::<u64, Vec<u64>>::new();
     for event in result_events {
-        let (node, relations, _) = result_probe_at(
+        let (node, _, _) = result_probe_at(
             statement,
             index,
             &grouped,
@@ -2635,8 +2573,6 @@ fn render_claims(
         let dependencies = if let Some(node) = &node {
             let [left, right] = node.input_events;
             if left == right { vec![left] } else { vec![left, right] }
-        } else if let Some(relation) = relations.first() {
-            vec![relation.accumulator.event]
         } else {
             Vec::new()
         };
@@ -2669,7 +2605,7 @@ fn render_claims(
             "open Mxx.Certificate.OperationalNoise\nopen CertificateABI\nopen CertificateSemantics\n\n",
         );
         for event in shard {
-            let (node, relations, terminal) = result_probe_at(
+            let (node, _, terminal) = result_probe_at(
                 statement,
                 index,
                 &grouped,
@@ -2681,11 +2617,7 @@ fn render_claims(
             writeln!(residual, "namespace ResidualResult{event}").expect("String write");
             if terminal.is_some() {
                 writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  witness.honestTerminalActual {event}")
-            } else if let Some(relation) = relations.first() {
-                let prior = relation.accumulator.event;
-                writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  ResidualResult{prior}.actual selector witness")
-            } else {
-                let node = node.as_ref().ok_or_else(|| format!("certificate Result {event} has no operation context"))?;
+            } else if let Some(node) = node.as_ref() {
                 let [left_result, right_result] = node.input_events;
                 let operator = match node.kind {
                     OperationKind::Add => "+",
@@ -2694,6 +2626,8 @@ fn render_claims(
                     OperationKind::Direct => unreachable!(),
                 };
                 writeln!(residual, "def actual (selector : Nat)\n    (witness : Witness document history (some selector) {modulus}) : Int :=\n  ResidualResult{left_result}.actual selector witness {operator}\n    ResidualResult{right_result}.actual selector witness")
+            } else {
+                return Err(format!("certificate Result {event} has no operation context"));
             }
             .expect("String write");
             writeln!(residual, "end ResidualResult{event}\n").expect("String write");
@@ -3257,7 +3191,7 @@ fn render_merge_deltas(
                     writeln!(
                         source,
                         "def accumulator : Polynomial Owner := {}",
-                        terms_text(&relation.accumulator.terms)
+                        terms_text(&relation.accumulator_terms)
                     )
                     .expect("String write");
                     writeln!(
@@ -3281,7 +3215,7 @@ fn render_merge_deltas(
                     writeln!(
                         source,
                         "def working : Polynomial Owner := {}",
-                        terms_text(&relation.output.terms)
+                        terms_text(&relation.output)
                     )
                     .expect("String write");
                     source.push_str("def reconstruction : MergeReconstructionAt history frameStart owner group base working :=\n  { deltas := deltas\n    rows := rows\n    agreement := by decide +kernel }\n");
@@ -4546,7 +4480,7 @@ mod tests {
     }
 
     #[test]
-    fn relation_snapshot_uses_working_merges_after_stale_result() {
+    fn relation_accumulator_uses_working_merges_after_stale_result() {
         let root = owner(7);
         let source = ProofPayloadMonomial { central_factors: vec![], ordered_factors: vec![root] };
         let carried = ProofPayloadMonomial { central_factors: vec![root], ordered_factors: vec![] };
@@ -4578,13 +4512,6 @@ mod tests {
                     output: carried.clone(),
                     signed_contribution: BigInt::from(1),
                 }),
-                ProofPayloadEvent::Result {
-                    owner: root,
-                    value: test_exact(
-                        vec![term(source.clone(), 1), term(carried.clone(), 1)],
-                        BoundedSummary::zero(),
-                    ),
-                },
                 ProofPayloadEvent::AppliedRelation {
                     owner: root,
                     source_monomial: source.clone(),
@@ -4601,7 +4528,7 @@ mod tests {
                 ProofPayloadEvent::CoefficientMerge(ProofPayloadCoefficientMerge {
                     owner: root,
                     source: ProofPayloadCoefficientMergeSource::Relation {
-                        application: 4,
+                        application: 3,
                         source_term_ordinal: 0,
                     },
                     output: replacement.clone(),
@@ -4644,25 +4571,23 @@ mod tests {
                         ],
                         BoundedSummary::zero(),
                     ),
-                    pre_fold_event: 7,
+                    pre_fold_event: 6,
                 },
             ],
         };
         let index = PayloadIndex::new(&proof).expect("payload index");
-        let reached = (0..=8).collect::<BTreeSet<_>>();
+        let reached = (0..=7).collect::<BTreeSet<_>>();
         let probes =
-            relation_candidates(&index, &[(0, 8, root, 4)], &reached).expect("relation probe");
+            relation_candidates(&index, &[(0, 7, root, 3)], &reached).expect("relation probe");
         assert_eq!(probes.len(), 1);
-        assert_eq!(probes[0].output.event, 5);
-        assert!(!probes[0].output.terms.iter().any(|term| term.monomial == later));
+        assert!(!probes[0].output.iter().any(|term| term.monomial == later));
         assert!(
             probes[0]
-                .accumulator
-                .terms
+                .accumulator_terms
                 .iter()
                 .any(|term| term.monomial.ordered_factors == vec![root])
         );
-        assert!(probes[0].accumulator.terms.iter().any(|term| term.monomial == carried));
+        assert!(probes[0].accumulator_terms.iter().any(|term| term.monomial == carried));
     }
 
     #[test]

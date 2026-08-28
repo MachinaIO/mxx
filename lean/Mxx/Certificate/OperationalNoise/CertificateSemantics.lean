@@ -3203,7 +3203,7 @@ structure Witness (document : CertificateDocument) (history : EventHistory) (sel
       (honestTerminalActual resultEvent - evalPolynomial env (rawTerms.map Term.toExact)) %
         Int.ofNat modulus = 0
 
-/-- The reached Result6329 path adds two exact-zero children without merge rows, then folds the
+/-- A reached addition path adds two exact-zero children without merge rows, then folds the
     right singleton survivor into a finite summary.  The singleton monomial is shared by the
     right Result and its monomial-product transfer; the Result keeps exactly the left terms. -/
 theorem operatorAddSingletonSurvivorFoldClaimAt
@@ -3370,74 +3370,6 @@ theorem operatorProductFiniteMergeClaim
     leftClaim.claim rightClaim.claim outputEval rightRecordedCovers rightMaximumLe
     factorPositive modulusPositive
   simpa [productWithFactor, Nat.ne_of_gt factorPositive, boundOfCoeffClass] using claim
-
-/-- The final reached finite Multiply wrapper binds the accumulator claim to its exact Result. -/
-theorem operatorProductFiniteMergeClaimAt
-    {document : CertificateDocument} {history : EventHistory} {selector : Option Nat} {modulus : Nat}
-    {witness : Witness document history selector modulus}
-    {frameStart coefficientTransfer summaryTransfer rightCoefficientProducer rightSummaryTransfer
-      resultEvent : Nat}
-    {owner leftOwner rightOwner : Owner} {leftResult rightResult : Nat}
-    {leftBinding rightBinding leftInputPosition rightInputPosition : Nat}
-    {leftExpression rightExpression : ExpressionRef}
-    {leftActual rightActual : Int} {leftRaw rightRaw outputRaw : List Term}
-    {leftMaximum rightProducerMaximum rightSummaryMaximum : { value : Nat // 0 < value }}
-    {rightRecordedMaximum : Nat}
-    {leftScalar rightScalar : Bool} {base : Polynomial Owner}
-    {valueType : ValueType} {coefficientBound : Bound}
-    {coefficientFacts summaryFacts : CertificateABI.ProductFacts}
-    {rightMagnitude summaryMagnitude factor : Nat}
-    (_operationAt :
-      (document.expressions.lookup owner.expression.row).map
-        CertificateABI.ExpressionRow.descriptor =
-        some (.operation (.stable (.matrix .multiply)) valueType))
-    (_leftPredecessorAt : history.lookup leftBinding = some
-      ⟨.predecessor owner leftInputPosition leftExpression leftResult, frameStart⟩)
-    (_rightPredecessorAt : history.lookup rightBinding = some
-      ⟨.predecessor owner rightInputPosition rightExpression rightResult, frameStart⟩)
-    (_coefficientTransferAt : history.lookup coefficientTransfer = some
-      ⟨.boundTransfer owner
-        (.product (.predecessor leftInputPosition leftBinding .coefficient)
-          (.predecessor rightInputPosition rightBinding .coefficient) coefficientFacts),
-        frameStart⟩)
-    (leftClaim : ExactClaimAt history modulus witness.env leftResult leftOwner leftActual leftRaw
-      (.finite leftMaximum.val))
-    (rightClaim : ExactClaimAt history modulus witness.env rightResult rightOwner rightActual
-      rightRaw .exactZero)
-    (rightResultAt : history.lookup rightResult = some
-      ⟨.resultExact rightOwner rightRaw (.finite rightRecordedMaximum) rightCoefficientProducer
-        .exactZero none, frameStart⟩)
-    (rightProjection : ProjectedBoundAt history rightResult rightOwner (some rightRaw)
-      .coefficient (.finite rightProducerMaximum) rightMagnitude)
-    (rightRefines : RecordedBoundRefines (.finite rightRecordedMaximum)
-      (.finite rightProducerMaximum))
-    (rightMaximumLe : rightRecordedMaximum ≤ rightSummaryMaximum.val)
-    (reconstruction : MergeReconstructionAt history frameStart owner
-      (.operator leftResult rightResult) base (outputRaw.map Term.toExact))
-    (productAgreement : CanonicalAgreement (add base reconstruction.deltas)
-      (productPoly (leftRaw.map Term.toExact) (rightRaw.map Term.toExact)
-        leftScalar rightScalar))
-    (_summaryDerived : BoundDerivedAt history summaryTransfer frameStart owner
-      (.product (.result leftResult .summary) (.transfer rightSummaryTransfer) summaryFacts)
-      (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum))
-      summaryMagnitude)
-    (resultAt : history.lookup resultEvent = some
-      ⟨.resultExact owner outputRaw coefficientBound coefficientTransfer
-        (boundOfCoeffClass
-          (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum)))
-        (some summaryTransfer), frameStart⟩)
-    (factorPositive : 0 < factor) (modulusPositive : 0 < modulus) :
-    ExactClaimAt history modulus witness.env resultEvent owner (leftActual * rightActual) outputRaw
-      (boundOfCoeffClass
-        (productWithFactor factor (.finite leftMaximum) (.finite rightSummaryMaximum))) := by
-  have claim := operatorProductFiniteMergeClaim _operationAt _leftPredecessorAt
-    _rightPredecessorAt _coefficientTransferAt leftClaim rightClaim rightResultAt
-    rightProjection rightRefines rightMaximumLe reconstruction productAgreement _summaryDerived
-    factorPositive modulusPositive
-  refine ⟨⟨coefficientBound, coefficientTransfer, some summaryTransfer, ?_⟩, ?_⟩
-  · rw [resultAt]
-    rfl
-  · exact claim
 
 /-- One reached universal relation rewrite starts from an interpreted accumulator claim, checks
     the exact application through the witness, and routes the recorded Result through its

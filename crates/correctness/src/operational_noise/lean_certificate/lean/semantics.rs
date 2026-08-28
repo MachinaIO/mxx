@@ -19,6 +19,32 @@ use std::{
     fmt::Write as _,
 };
 
+const CHUNK_SIZE: usize = 16;
+
+fn render_balanced_import_tree(
+    files: &mut Vec<super::super::GeneratedLeanFile>,
+    mut import_level: Vec<String>,
+    module_prefix: &str,
+    empty_error: &str,
+) -> Result<String, String> {
+    let mut depth = 0;
+    while import_level.len() > 1 {
+        let mut next = Vec::with_capacity(import_level.len().div_ceil(CHUNK_SIZE));
+        for (position, chunk) in import_level.chunks(CHUNK_SIZE).enumerate() {
+            let module = format!("{module_prefix}{depth:02}_{position:03}");
+            let mut source = String::new();
+            for dependency in chunk {
+                writeln!(source, "import {NAMESPACE}.Semantic.{dependency}").expect("String write");
+            }
+            files.push(generated_file(format!("Semantic/{module}.lean"), source));
+            next.push(module);
+        }
+        import_level = next;
+        depth += 1;
+    }
+    import_level.pop().ok_or_else(|| empty_error.to_owned())
+}
+
 #[derive(Clone)]
 struct ResultRecord {
     event: u64,
@@ -2524,7 +2550,6 @@ fn render_claims(
     root_event: u64,
     reached_event_ids: &[u64],
 ) -> Result<Vec<super::super::GeneratedLeanFile>, String> {
-    const CHUNK_SIZE: usize = 16;
     let replayed_bounds = replay_left_bound_classes(statement, index, data)?;
     let relation_by_event =
         relation_probes.iter().map(|relation| (relation.event, relation)).collect();
@@ -2682,26 +2707,14 @@ fn render_claims(
         writeln!(source, "end {NAMESPACE}.Semantic").expect("String write");
         files.push(generated_file(format!("Semantic/{module}.lean"), source));
     }
-    let mut import_level = (0..result_events.len().div_ceil(CHUNK_SIZE))
-        .map(|shard| format!("SemanticResultShard{shard:03}"))
-        .collect::<Vec<_>>();
-    let mut depth = 0;
-    while import_level.len() > 1 {
-        let mut next = Vec::with_capacity(import_level.len().div_ceil(CHUNK_SIZE));
-        for (position, chunk) in import_level.chunks(CHUNK_SIZE).enumerate() {
-            let module = format!("SemanticResultImport{depth:02}_{position:03}");
-            let mut source = String::new();
-            for dependency in chunk {
-                writeln!(source, "import {NAMESPACE}.Semantic.{dependency}").expect("String write");
-            }
-            files.push(generated_file(format!("Semantic/{module}.lean"), source));
-            next.push(module);
-        }
-        import_level = next;
-        depth += 1;
-    }
-    let root =
-        import_level.first().ok_or_else(|| "certificate left claim closure is empty".to_owned())?;
+    let root = render_balanced_import_tree(
+        &mut files,
+        (0..result_events.len().div_ceil(CHUNK_SIZE))
+            .map(|shard| format!("SemanticResultShard{shard:03}"))
+            .collect(),
+        "SemanticResultImport",
+        "certificate left claim closure is empty",
+    )?;
     files.push(generated_file(
         "Semantic/SemanticResult.lean",
         format!(
@@ -2842,7 +2855,6 @@ fn render_merge_deltas(
     data: &RenderData<'_>,
     relation_probes: &[RelationProbe],
 ) -> Result<Vec<super::super::GeneratedLeanFile>, String> {
-    const CHUNK_SIZE: usize = 16;
     let mut files = Vec::new();
     let relation_by_event = relation_probes
         .iter()
@@ -3228,26 +3240,14 @@ fn render_merge_deltas(
         writeln!(source, "end {NAMESPACE}.Semantic").expect("String write");
         files.push(generated_file(format!("Semantic/{module}.lean"), source));
     }
-    let mut import_level = (0..groups.len().div_ceil(CHUNK_SIZE))
-        .map(|shard| format!("SemanticMergeTreeShard{shard:03}"))
-        .collect::<Vec<_>>();
-    let mut depth = 0;
-    while import_level.len() > 1 {
-        let mut next = Vec::with_capacity(import_level.len().div_ceil(CHUNK_SIZE));
-        for (position, chunk) in import_level.chunks(CHUNK_SIZE).enumerate() {
-            let module = format!("SemanticMergeTreeImport{depth:02}_{position:03}");
-            let mut source = String::new();
-            for dependency in chunk {
-                writeln!(source, "import {NAMESPACE}.Semantic.{dependency}").expect("String write");
-            }
-            files.push(generated_file(format!("Semantic/{module}.lean"), source));
-            next.push(module);
-        }
-        import_level = next;
-        depth += 1;
-    }
-    let root =
-        import_level.first().ok_or_else(|| "certificate left merge tree is empty".to_owned())?;
+    let root = render_balanced_import_tree(
+        &mut files,
+        (0..groups.len().div_ceil(CHUNK_SIZE))
+            .map(|shard| format!("SemanticMergeTreeShard{shard:03}"))
+            .collect(),
+        "SemanticMergeTreeImport",
+        "certificate left merge tree is empty",
+    )?;
     files.push(generated_file(
         "Semantic/SemanticMergeTree.lean",
         format!("import {NAMESPACE}.Semantic.{root}\n"),
@@ -3267,7 +3267,6 @@ fn render_authorities(
     data: &RenderData<'_>,
     modulus: &str,
 ) -> Result<Vec<super::super::GeneratedLeanFile>, String> {
-    const CHUNK_SIZE: usize = 16;
     let authorities = data
         .bounds
         .iter()
@@ -3336,27 +3335,14 @@ fn render_authorities(
         writeln!(source, "end {NAMESPACE}.Semantic").expect("String write");
         files.push(generated_file(format!("Semantic/{module}.lean"), source));
     }
-    let shard_count = authorities.len().div_ceil(CHUNK_SIZE);
-    let mut import_level = (0..shard_count)
-        .map(|shard| format!("SemanticAuthorityShard{shard:03}"))
-        .collect::<Vec<_>>();
-    let mut depth = 0;
-    while import_level.len() > 1 {
-        let mut next = Vec::with_capacity(import_level.len().div_ceil(CHUNK_SIZE));
-        for (position, chunk) in import_level.chunks(CHUNK_SIZE).enumerate() {
-            let module = format!("SemanticAuthorityImport{depth:02}_{position:03}");
-            let mut source = String::new();
-            for dependency in chunk {
-                writeln!(source, "import {NAMESPACE}.Semantic.{dependency}").expect("String write");
-            }
-            files.push(generated_file(format!("Semantic/{module}.lean"), source));
-            next.push(module);
-        }
-        import_level = next;
-        depth += 1;
-    }
-    let root =
-        import_level.first().ok_or_else(|| "certificate authority closure is empty".to_owned())?;
+    let root = render_balanced_import_tree(
+        &mut files,
+        (0..authorities.len().div_ceil(CHUNK_SIZE))
+            .map(|shard| format!("SemanticAuthorityShard{shard:03}"))
+            .collect(),
+        "SemanticAuthorityImport",
+        "certificate authority closure is empty",
+    )?;
     files.push(generated_file(
         "Semantic/SemanticAuthority.lean",
         format!("import {NAMESPACE}.Semantic.{root}\n"),
@@ -3868,7 +3854,6 @@ fn render_bounds(
     data: &RenderData<'_>,
     modulus: &str,
 ) -> Result<Vec<super::super::GeneratedLeanFile>, String> {
-    const CHUNK_SIZE: usize = 16;
     let replayed = replay_left_bound_classes(statement, index, data)?;
     let nodes = data
         .bounds
@@ -4082,26 +4067,14 @@ fn render_bounds(
         writeln!(source, "end {NAMESPACE}.Semantic").expect("String write");
         files.push(generated_file(format!("Semantic/{module}.lean"), source));
     }
-    let shard_count = nodes.len().div_ceil(CHUNK_SIZE);
-    let mut import_level =
-        (0..shard_count).map(|shard| format!("SemanticBoundShard{shard:03}")).collect::<Vec<_>>();
-    let mut depth = 0;
-    while import_level.len() > 1 {
-        let mut next = Vec::with_capacity(import_level.len().div_ceil(CHUNK_SIZE));
-        for (position, chunk) in import_level.chunks(CHUNK_SIZE).enumerate() {
-            let module = format!("SemanticBoundImport{depth:02}_{position:03}");
-            let mut source = String::new();
-            for dependency in chunk {
-                writeln!(source, "import {NAMESPACE}.Semantic.{dependency}").expect("String write");
-            }
-            files.push(generated_file(format!("Semantic/{module}.lean"), source));
-            next.push(module);
-        }
-        import_level = next;
-        depth += 1;
-    }
-    let root =
-        import_level.first().ok_or_else(|| "certificate left bound closure is empty".to_owned())?;
+    let root = render_balanced_import_tree(
+        &mut files,
+        (0..nodes.len().div_ceil(CHUNK_SIZE))
+            .map(|shard| format!("SemanticBoundShard{shard:03}"))
+            .collect(),
+        "SemanticBoundImport",
+        "certificate left bound closure is empty",
+    )?;
     files.push(generated_file(
         "Semantic/SemanticBound.lean",
         format!("import {NAMESPACE}.Semantic.{root}\n"),
@@ -4507,6 +4480,27 @@ mod tests {
             summary,
             summary_producer,
         }
+    }
+
+    #[test]
+    fn balanced_import_tree_preserves_leaf_order_and_module_names() {
+        let mut files = Vec::new();
+        let root = render_balanced_import_tree(
+            &mut files,
+            vec!["Leaf000".to_owned(), "Leaf001".to_owned()],
+            "SemanticTestImport",
+            "empty test tree",
+        )
+        .expect("balanced import tree");
+
+        assert_eq!(root, "SemanticTestImport00_000");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, "Semantic/SemanticTestImport00_000.lean");
+        assert_eq!(
+            files[0].bytes,
+            format!("import {NAMESPACE}.Semantic.Leaf000\nimport {NAMESPACE}.Semantic.Leaf001\n")
+                .into_bytes()
+        );
     }
 
     #[test]

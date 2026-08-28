@@ -1763,7 +1763,15 @@ fn result_probe_at<'a>(
                     finite_maximum(&left).is_some() &&
                     input_is_zero(&right) &&
                     finite_maximum(result).is_some();
-                if !additive_finite && !reached_product_finite {
+                let reached_subtract_finite_left_exact_zero = kind == OperationKind::Subtract &&
+                    finite_maximum(&left)
+                        .zip(finite_maximum(result))
+                        .is_some_and(|(left, output)| left == output) &&
+                    input_is_zero(&right);
+                if !additive_finite &&
+                    !reached_product_finite &&
+                    !reached_subtract_finite_left_exact_zero
+                {
                     return Err(format!(
                         "{kind:?}: operator Result {} (first merge {first_merge_event}) reaches unsupported summary transition {:?}, {:?} -> {:?}",
                         result.event, left.summary, right.summary, result.summary
@@ -2191,6 +2199,51 @@ fn render_result_claim(
                         &format!("LeftOperatorMerge{first_merge_event}.working"),
                         modulus,
                     )?;
+                } else if kind == OperationKind::Subtract &&
+                    !left_zero &&
+                    right_zero &&
+                    !output_zero
+                {
+                    let ProofPayloadEvent::BoundTransfer {
+                        rule: ProofPayloadRule::Sum { inputs },
+                        ..
+                    } = index.event(transfer_event)?
+                    else {
+                        return Err(format!(
+                            "certificate finite Subtract Result {event} has no Sum row"
+                        ));
+                    };
+                    let [left_ref, right_ref] = inputs.as_slice() else {
+                        return Err(format!(
+                            "certificate finite Subtract Result {event} Sum is not binary"
+                        ));
+                    };
+                    let (left_binding, left_position, left_expression) =
+                        predecessor_ref_data(index, result.owner, left_ref, left_result)?;
+                    let (right_binding, right_position, right_expression) =
+                        predecessor_ref_data(index, result.owner, right_ref, right_result)?;
+                    let left_maximum = match left.summary.coefficient_bound() {
+                        crate::operational_noise::facts::NumericContract::Known(
+                            crate::operational_noise::facts::CoefficientBound::Finite(bound),
+                        ) => bound.maximum_absolute_coefficient.clone(),
+                        _ => {
+                            return Err(format!(
+                                "certificate finite Subtract Result {event} has a non-finite left input"
+                            ));
+                        }
+                    };
+                    let output_maximum = match result.summary.coefficient_bound() {
+                        crate::operational_noise::facts::NumericContract::Known(
+                            crate::operational_noise::facts::CoefficientBound::Finite(bound),
+                        ) => bound.maximum_absolute_coefficient.clone(),
+                        _ => unreachable!("reached finite Subtract result was checked above"),
+                    };
+                    if output_maximum != left_maximum {
+                        return Err(format!(
+                            "certificate finite Subtract Result {event} does not preserve the left maximum"
+                        ));
+                    }
+                    writeln!(source, "theorem claimSound (selector : Nat) (selectorLower : selectorMinimum ≤ selector)\n    (selectorUpper : selector < selectorMaximum)\n    (witness : Witness document history (some selector) {modulus}) :\n    ExactClaimAt history {modulus} witness.env resultEvent owner\n      (actual selector witness) rawTerms summary := by\n  apply operatorSubFiniteLeftMergeClaimAt\n    (document := document) (history := history) (env := witness.env)\n    (modulus := {modulus}) (frameStart := LeftOperatorMerge{first_merge_event}.frameStart)\n    (coefficientTransfer := {transfer_event}) (resultEvent := resultEvent)\n    (owner := owner) (leftOwner := LeftClaimResult{left_result}.owner)\n    (rightOwner := LeftClaimResult{right_result}.owner)\n    (leftResult := {left_result}) (rightResult := {right_result})\n    (leftActual := LeftClaimResult{left_result}.actual selector witness)\n    (rightActual := LeftClaimResult{right_result}.actual selector witness)\n    (leftRaw := LeftClaimResult{left_result}.rawTerms)\n    (rightRaw := LeftClaimResult{right_result}.rawTerms)\n    (outputRaw := rawTerms) (leftMaximum := {left_maximum})\n    (valueType := {value_type})\n    (leftBinding := {left_binding}) (rightBinding := {right_binding})\n    (leftInputPosition := {left_position}) (rightInputPosition := {right_position})\n    (leftExpression := ⟨{left_expression}⟩) (rightExpression := ⟨{right_expression}⟩)\n    (base := LeftOperatorMerge{first_merge_event}.base)\n    (reconstruction := LeftOperatorMerge{first_merge_event}.reconstruction)\n  · rfl\n  · rfl\n  · rfl\n  · exact LeftClaimResult{left_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftClaimResult{right_result}.claimSound selector selectorLower selectorUpper witness\n  · exact LeftOperatorMerge{first_merge_event}.operationAgreement\n  · rfl\n  · decide").expect("String write");
                 } else {
                     if !matches!(kind, OperationKind::Add | OperationKind::Subtract) {
                         return Err(format!(

@@ -1611,6 +1611,23 @@ mutual
         BoundDerivedAt history transferEvent transferFrame owner (.product left right facts)
           (productWithFactor factor leftBound rightBound)
           (factor * leftActual * rightActual)
+    | tensor {transferEvent transferFrame : Nat} {owner : Owner}
+        {left right : ValueRef} {leftConstantPolynomial rightConstantPolynomial : Bool}
+        {ringDimension : Nat} {leftBound rightBound : CoeffClass}
+        {leftActual rightActual : Nat}
+        (transferRow : history.lookup transferEvent = some
+          ⟨.boundTransfer owner
+            (.tensor left right leftConstantPolynomial rightConstantPolynomial), transferFrame⟩)
+        (leftChild : BoundInputAt history owner left leftBound leftActual)
+        (rightChild : BoundInputAt history owner right rightBound rightActual) :
+        BoundDerivedAt history transferEvent transferFrame owner
+          (.tensor left right leftConstantPolynomial rightConstantPolynomial)
+          (tensorWithFacts ringDimension
+            ⟨leftConstantPolynomial, rightConstantPolynomial, none, none, none⟩
+              leftBound rightBound)
+          (tensorFactor ringDimension
+            ⟨leftConstantPolynomial, rightConstantPolynomial, none, none, none⟩ *
+            leftActual * rightActual)
 end
 
 theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {owner : Owner}
@@ -1629,7 +1646,7 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
   · intros
     assumption
   · intros
@@ -1668,6 +1685,8 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
     apply productNonempty_sound <;> assumption
   · intros
     exact (productWithFacts_sound (by assumption) (by assumption) (by assumption)).2
+  · intros
+    exact tensorWithFacts_sound (by assumption) (by assumption)
 
 theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFrame : Nat}
     {owner : Owner} {rule : BoundRule} {bound : CoeffClass} {actualMagnitude : Nat}
@@ -1684,7 +1703,7 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
   · intros
     assumption
   · intros
@@ -1723,6 +1742,8 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
     apply productNonempty_sound <;> assumption
   · intros
     exact (productWithFacts_sound (by assumption) (by assumption) (by assumption)).2
+  · intros
+    exact tensorWithFacts_sound (by assumption) (by assumption)
 
 theorem boundTransfer_to_resultCoefficient
     {history : EventHistory} {producerEvent resultEvent frameStart : Nat} {owner : Owner}

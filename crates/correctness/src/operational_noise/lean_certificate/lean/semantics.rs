@@ -1018,7 +1018,8 @@ fn reached_left_bound_rule(rule: &ProofPayloadRule) -> bool {
             ProofPayloadRule::Sum { .. } |
             ProofPayloadRule::Scale { .. } |
             ProofPayloadRule::MonomialProduct { .. } |
-            ProofPayloadRule::Product { .. }
+            ProofPayloadRule::Product { .. } |
+            ProofPayloadRule::Tensor { .. }
     )
 }
 
@@ -1060,7 +1061,8 @@ fn reached_bound_references(rule: &ProofPayloadRule) -> Vec<&ProofPayloadValueRe
         ProofPayloadRule::MonomialProduct { factors, .. } => {
             factors.iter().map(|factor| &factor.bound).collect()
         }
-        ProofPayloadRule::Product { left, right, .. } => vec![left, right],
+        ProofPayloadRule::Product { left, right, .. } |
+        ProofPayloadRule::Tensor { left, right, .. } => vec![left, right],
         _ => Vec::new(),
     }
 }
@@ -3396,6 +3398,7 @@ fn left_rule_text(rule: &ProofPayloadRule) -> Result<String, String> {
             factors.iter().map(left_factor_text).collect::<Vec<_>>().join(", ")
         ),
         ProofPayloadRule::Product { .. } => rule_text(rule),
+        ProofPayloadRule::Tensor { .. } => rule_text(rule),
         _ => return Err(format!("unsupported reached left bound rule {rule:?}")),
     })
 }
@@ -3562,6 +3565,27 @@ fn reached_product_shape(
     Ok((left_rows, left_columns, right_rows, right_columns, ring_dimension, factor))
 }
 
+fn reached_tensor_ring_dimension(
+    statement: &CertificateDocumentV1,
+    owner: ProofPayloadOwner,
+) -> Result<usize, String> {
+    let row = statement
+        .expressions
+        .get(usize::try_from(owner.expression_row).map_err(|_| "tensor owner row overflow")?)
+        .ok_or_else(|| format!("tensor owner {} has no expression row", owner_text(owner)))?;
+    let CanonicalExpressionDescriptor::Operation { value_type, .. } = &row.descriptor else {
+        return Err(format!("tensor owner {} is not an operation", owner_text(owner)));
+    };
+    let crate::operational_noise::g0::StableValueType::Matrix { ring_dimension, .. } = value_type
+    else {
+        return Err(format!("tensor owner {} is not matrix-typed", owner_text(owner)));
+    };
+    if *ring_dimension == 0 {
+        return Err(format!("tensor owner {} has zero ring dimension", owner_text(owner)));
+    }
+    Ok(*ring_dimension)
+}
+
 fn left_bound_source<'a>(
     index: &PayloadIndex,
     data: &'a RenderData<'_>,
@@ -3706,6 +3730,19 @@ fn replay_left_bound_classes(
                 ProofPayloadRule::Product { facts, .. } => {
                     let (_, _, _, _, _, factor) =
                         reached_product_shape(statement, node.owner, facts)?;
+                    product_bounds_with_factor(&inputs, &factor.into())
+                }
+                ProofPayloadRule::Tensor {
+                    left_is_constant_polynomial,
+                    right_is_constant_polynomial,
+                    ..
+                } => {
+                    let ring_dimension = reached_tensor_ring_dimension(statement, node.owner)?;
+                    let factor = if *left_is_constant_polynomial || *right_is_constant_polynomial {
+                        1
+                    } else {
+                        ring_dimension
+                    };
                     product_bounds_with_factor(&inputs, &factor.into())
                 }
                 _ => unreachable!("filtered reached bound replay rule"),
@@ -3869,7 +3906,8 @@ fn render_bounds(
                 ProofPayloadRule::MonomialProduct { factors, .. } => {
                     factors.iter().map(|factor| &factor.bound).collect()
                 }
-                ProofPayloadRule::Product { left, right, .. } => vec![left, right],
+                ProofPayloadRule::Product { left, right, .. } |
+                ProofPayloadRule::Tensor { left, right, .. } => vec![left, right],
                 _ => unreachable!("filtered reached compositional rule"),
             };
             let inputs = references
@@ -3958,6 +3996,32 @@ fn render_bounds(
                              (ringDimension := {ring_dimension}) (factor := {factor}) (by rfl) \
                              (by decide) (input0 selector witness) (input1 selector witness)"
                         ),
+                    )
+                }
+                ProofPayloadRule::Tensor {
+                    left_is_constant_polynomial,
+                    right_is_constant_polynomial,
+                    ..
+                } => {
+                    let ring_dimension =
+                        reached_tensor_ring_dimension(statement, node.owner)?;
+                    let facts = format!(
+                        "⟨{}, {}, none, none, none⟩",
+                        super::bool_text(*left_is_constant_polynomial),
+                        super::bool_text(*right_is_constant_polynomial),
+                    );
+                    (
+                        format!(
+                            "tensorWithFacts {ring_dimension} {facts} {} {}",
+                            child_bounds[0], child_bounds[1]
+                        ),
+                        format!(
+                            "tensorFactor {ring_dimension} {facts} * ({}) * ({})",
+                            child_actuals[0], child_actuals[1]
+                        ),
+                        "refine .tensor (by rfl) (input0 selector witness) \
+                         (input1 selector witness)"
+                            .to_owned(),
                     )
                 }
                 _ => unreachable!("filtered reached compositional rule"),

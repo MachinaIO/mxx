@@ -1,0 +1,116 @@
+import Mxx.Certificate.OperationalNoise.CertificateSemantics
+import Mxx.Certificate.OperationalNoise.TallSecurity128Generated.Proof.History
+import Mxx.Certificate.OperationalNoise.TallSecurity128Generated.Cert.ResidualShard148
+import Mxx.Certificate.OperationalNoise.TallSecurity128Generated.Cert.ResidualShard2064
+
+set_option autoImplicit false
+set_option relaxedAutoImplicit false
+
+namespace Mxx.Certificate.OperationalNoise.TallSecurity128Generated.Cert
+
+open Mxx.Certificate.OperationalNoise
+open CertificateABI
+open CertificateSemantics
+
+namespace ResidualResult295606
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  ResidualResult295596.actual selector witness *
+    ResidualResult17611.actual selector witness
+end ResidualResult295606
+
+namespace ResidualResult295612
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  ResidualResult295606.actual selector witness +
+    ResidualResult295576.actual selector witness
+end ResidualResult295612
+
+namespace ResidualResult295622
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  ResidualResult295612.actual selector witness *
+    ResidualResult295548.actual selector witness
+end ResidualResult295622
+
+namespace ResidualResult295625
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  witness.honestTerminalActual 295625
+end ResidualResult295625
+
+namespace ResidualResult295629
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  witness.honestTerminalActual 295629
+end ResidualResult295629
+
+namespace ResidualResult295683
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  witness.honestTerminalActual 295683
+end ResidualResult295683
+
+namespace ResidualResult295686
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  witness.honestTerminalActual 295686
+end ResidualResult295686
+
+namespace ResidualResult295691
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  ResidualResult295686.actual selector witness *
+    ResidualResult295683.actual selector witness
+end ResidualResult295691
+
+namespace ResidualResult295702
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  witness.honestTerminalActual 295702
+end ResidualResult295702
+
+namespace ResidualResult295705
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  witness.honestTerminalActual 295705
+end ResidualResult295705
+
+namespace ResidualResult295714
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  witness.honestTerminalActual 295714
+end ResidualResult295714
+
+namespace ResidualResult295716
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  witness.honestTerminalActual 295716
+end ResidualResult295716
+
+namespace ResidualResult295721
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  ResidualResult295716.actual selector witness *
+    ResidualResult295714.actual selector witness
+end ResidualResult295721
+
+namespace ResidualResult295726
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  witness.honestTerminalActual 295726
+end ResidualResult295726
+
+namespace ResidualResult295732
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  witness.honestTerminalActual 295732
+end ResidualResult295732
+
+namespace ResidualResult295736
+def actual (selector : Nat)
+    (witness : Witness document history (some selector) 2596118388884299782786442882919966202757356512598865539416966488295494748974456019701577684907109706420296806278632487222012309918168506832951461416943272286629018402817) : Int :=
+  witness.honestTerminalActual 295736
+end ResidualResult295736
+
+end Mxx.Certificate.OperationalNoise.TallSecurity128Generated.Cert

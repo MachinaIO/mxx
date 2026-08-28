@@ -1,0 +1,2018 @@
+import Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Proof.History
+
+set_option autoImplicit false
+set_option relaxedAutoImplicit false
+
+namespace Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Proof.Replay375
+
+open Mxx.Certificate.OperationalNoise
+open CertificateABI
+open Mxx.Certificate.OperationalNoise.TallSecurity0Generated
+
+def replayState24000 : ReplayState := ⟨96000, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24001 : ReplayState := ⟨96004, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24002 : ReplayState := ⟨96008, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24003 : ReplayState := ⟨96012, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24004 : ReplayState := ⟨96016, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24005 : ReplayState := ⟨96020, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24006 : ReplayState := ⟨96024, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24007 : ReplayState := ⟨96028, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24008 : ReplayState := ⟨96032, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24009 : ReplayState := ⟨96036, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24010 : ReplayState := ⟨96040, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24011 : ReplayState := ⟨96044, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24012 : ReplayState := ⟨96048, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24013 : ReplayState := ⟨96052, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24014 : ReplayState := ⟨96056, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24015 : ReplayState := ⟨96060, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24016 : ReplayState := ⟨96064, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24017 : ReplayState := ⟨96068, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24018 : ReplayState := ⟨96072, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24019 : ReplayState := ⟨96076, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24020 : ReplayState := ⟨96080, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24021 : ReplayState := ⟨96084, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24022 : ReplayState := ⟨96088, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24023 : ReplayState := ⟨96092, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24024 : ReplayState := ⟨96096, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24025 : ReplayState := ⟨96100, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24026 : ReplayState := ⟨96104, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24027 : ReplayState := ⟨96108, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24028 : ReplayState := ⟨96112, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24029 : ReplayState := ⟨96116, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24030 : ReplayState := ⟨96120, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24031 : ReplayState := ⟨96124, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24032 : ReplayState := ⟨96128, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24033 : ReplayState := ⟨96132, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24034 : ReplayState := ⟨96136, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24035 : ReplayState := ⟨96140, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24036 : ReplayState := ⟨96144, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24037 : ReplayState := ⟨96148, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24038 : ReplayState := ⟨96152, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24039 : ReplayState := ⟨96156, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24040 : ReplayState := ⟨96160, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24041 : ReplayState := ⟨96164, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24042 : ReplayState := ⟨96168, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24043 : ReplayState := ⟨96172, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24044 : ReplayState := ⟨96176, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24045 : ReplayState := ⟨96180, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24046 : ReplayState := ⟨96184, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24047 : ReplayState := ⟨96188, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24048 : ReplayState := ⟨96192, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24049 : ReplayState := ⟨96196, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24050 : ReplayState := ⟨96200, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24051 : ReplayState := ⟨96204, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24052 : ReplayState := ⟨96208, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24053 : ReplayState := ⟨96212, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24054 : ReplayState := ⟨96216, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24055 : ReplayState := ⟨96220, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24056 : ReplayState := ⟨96224, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24057 : ReplayState := ⟨96228, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24058 : ReplayState := ⟨96232, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24059 : ReplayState := ⟨96236, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24060 : ReplayState := ⟨96240, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24061 : ReplayState := ⟨96244, [⟨⟨.program ⟨214⟩, ⟨25441⟩⟩, 96241⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24062 : ReplayState := ⟨96248, [⟨⟨.program ⟨214⟩, ⟨25441⟩⟩, 96241⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24063 : ReplayState := ⟨96252, [⟨⟨.program ⟨214⟩, ⟨25441⟩⟩, 96241⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayState24064 : ReplayState := ⟨96256, [⟨⟨.program ⟨214⟩, ⟨25441⟩⟩, 96241⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+def replayEventState96001 : ReplayState := ⟨96001, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96002 : ReplayState := ⟨96002, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96003 : ReplayState := ⟨96003, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96000 : stepAt document history replayState24000 = some replayEventState96001 := by
+  rfl
+
+theorem replayStep96001 : stepAt document history replayEventState96001 = some replayEventState96002 := by
+  rfl
+
+theorem replayStep96002 : stepAt document history replayEventState96002 = some replayEventState96003 := by
+  rfl
+
+theorem replayStep96003 : stepAt document history replayEventState96003 = some replayState24001 := by
+  apply stepAt_resultExact document history replayEventState96003
+    (⟨.program ⟨214⟩, ⟨12738⟩⟩) Proof.Events375.exact96003RawTerms (.finite 46) 96002 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96003RawTermsValid]
+    rfl
+
+theorem replayChunk24000 : ReplayChain document history replayState24000 replayState24001 :=
+  .chunk 96004 (by
+    unfold replayRange
+    rw [show replayState24000.cursor = 96000 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96000 ≤ 96004) && decide (96004 ≤ 107567) &&
+        decide (96004 - 96000 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24000.cursor = 96000 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96004 - 96000) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96000]
+    simp only [Option.bind_some]
+    rw [replayStep96001]
+    simp only [Option.bind_some]
+    rw [replayStep96002]
+    simp only [Option.bind_some]
+    rw [replayStep96003]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96005 : ReplayState := ⟨96005, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96006 : ReplayState := ⟨96006, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96007 : ReplayState := ⟨96007, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96004 : stepAt document history replayState24001 = some replayEventState96005 := by
+  rfl
+
+theorem replayStep96005 : stepAt document history replayEventState96005 = some replayEventState96006 := by
+  rfl
+
+theorem replayStep96006 : stepAt document history replayEventState96006 = some replayEventState96007 := by
+  apply stepAt_resultExact document history replayEventState96006
+    (⟨.program ⟨214⟩, ⟨10015⟩⟩) Proof.Events375.exact96006RawTerms (.finite 46) 96005 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96006RawTermsValid]
+    rfl
+
+theorem replayStep96007 : stepAt document history replayEventState96007 = some replayState24002 := by
+  rfl
+
+theorem replayChunk24001 : ReplayChain document history replayState24001 replayState24002 :=
+  .chunk 96008 (by
+    unfold replayRange
+    rw [show replayState24001.cursor = 96004 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96004 ≤ 96008) && decide (96008 ≤ 107567) &&
+        decide (96008 - 96004 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24001.cursor = 96004 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96008 - 96004) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96004]
+    simp only [Option.bind_some]
+    rw [replayStep96005]
+    simp only [Option.bind_some]
+    rw [replayStep96006]
+    simp only [Option.bind_some]
+    rw [replayStep96007]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96009 : ReplayState := ⟨96009, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96010 : ReplayState := ⟨96010, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96011 : ReplayState := ⟨96011, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96008 : stepAt document history replayState24002 = some replayEventState96009 := by
+  rfl
+
+theorem replayStep96009 : stepAt document history replayEventState96009 = some replayEventState96010 := by
+  rfl
+
+theorem replayStep96010 : stepAt document history replayEventState96010 = some replayEventState96011 := by
+  rfl
+
+theorem replayStep96011 : stepAt document history replayEventState96011 = some replayState24003 := by
+  apply stepAt_resultExact document history replayEventState96011
+    (⟨.program ⟨214⟩, ⟨12739⟩⟩) Proof.Events375.exact96011RawTerms (.finite 2116) 96009 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96011RawTermsValid]
+    rfl
+
+theorem replayChunk24002 : ReplayChain document history replayState24002 replayState24003 :=
+  .chunk 96012 (by
+    unfold replayRange
+    rw [show replayState24002.cursor = 96008 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96008 ≤ 96012) && decide (96012 ≤ 107567) &&
+        decide (96012 - 96008 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24002.cursor = 96008 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96012 - 96008) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96008]
+    simp only [Option.bind_some]
+    rw [replayStep96009]
+    simp only [Option.bind_some]
+    rw [replayStep96010]
+    simp only [Option.bind_some]
+    rw [replayStep96011]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24003 : ReplayChain document history replayState24003 replayState24004 :=
+  .chunk 96016 (by rfl)
+
+def replayEventState96017 : ReplayState := ⟨96017, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96018 : ReplayState := ⟨96018, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96019 : ReplayState := ⟨96019, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96016 : stepAt document history replayState24004 = some replayEventState96017 := by
+  rfl
+
+theorem replayStep96017 : stepAt document history replayEventState96017 = some replayEventState96018 := by
+  apply stepAt_resultExact document history replayEventState96017
+    (⟨.program ⟨214⟩, ⟨16623⟩⟩) Proof.Events375.exact96017RawTerms (.finite 46) 96016 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96017RawTermsValid]
+    rfl
+
+theorem replayStep96018 : stepAt document history replayEventState96018 = some replayEventState96019 := by
+  rfl
+
+theorem replayStep96019 : stepAt document history replayEventState96019 = some replayState24005 := by
+  rfl
+
+theorem replayChunk24004 : ReplayChain document history replayState24004 replayState24005 :=
+  .chunk 96020 (by
+    unfold replayRange
+    rw [show replayState24004.cursor = 96016 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96016 ≤ 96020) && decide (96020 ≤ 107567) &&
+        decide (96020 - 96016 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24004.cursor = 96016 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96020 - 96016) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96016]
+    simp only [Option.bind_some]
+    rw [replayStep96017]
+    simp only [Option.bind_some]
+    rw [replayStep96018]
+    simp only [Option.bind_some]
+    rw [replayStep96019]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24005 : ReplayChain document history replayState24005 replayState24006 :=
+  .chunk 96024 (by rfl)
+
+theorem replayChunk24006 : ReplayChain document history replayState24006 replayState24007 :=
+  .chunk 96028 (by rfl)
+
+def replayEventState96029 : ReplayState := ⟨96029, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96030 : ReplayState := ⟨96030, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96031 : ReplayState := ⟨96031, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96028 : stepAt document history replayState24007 = some replayEventState96029 := by
+  apply stepAt_resultExact document history replayState24007
+    (⟨.program ⟨214⟩, ⟨24594⟩⟩) Proof.Events375.exact96028RawTerms .large 96027 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96028RawTermsValid]
+    rfl
+
+theorem replayStep96029 : stepAt document history replayEventState96029 = some replayEventState96030 := by
+  rfl
+
+theorem replayStep96030 : stepAt document history replayEventState96030 = some replayEventState96031 := by
+  rfl
+
+theorem replayStep96031 : stepAt document history replayEventState96031 = some replayState24008 := by
+  apply stepAt_resultExact document history replayEventState96031
+    (⟨.program ⟨214⟩, ⟨29350⟩⟩) Proof.Events375.exact96031RawTerms (.finite 8192) 96030 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96031RawTermsValid]
+    rfl
+
+theorem replayChunk24007 : ReplayChain document history replayState24007 replayState24008 :=
+  .chunk 96032 (by
+    unfold replayRange
+    rw [show replayState24007.cursor = 96028 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96028 ≤ 96032) && decide (96032 ≤ 107567) &&
+        decide (96032 - 96028 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24007.cursor = 96028 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96032 - 96028) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96028]
+    simp only [Option.bind_some]
+    rw [replayStep96029]
+    simp only [Option.bind_some]
+    rw [replayStep96030]
+    simp only [Option.bind_some]
+    rw [replayStep96031]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24008 : ReplayChain document history replayState24008 replayState24009 :=
+  .chunk 96036 (by rfl)
+
+theorem replayChunk24009 : ReplayChain document history replayState24009 replayState24010 :=
+  .chunk 96040 (by rfl)
+
+def replayEventState96041 : ReplayState := ⟨96041, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96042 : ReplayState := ⟨96042, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96043 : ReplayState := ⟨96043, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96040 : stepAt document history replayState24010 = some replayEventState96041 := by
+  apply stepAt_resultExact document history replayState24010
+    (⟨.program ⟨214⟩, ⟨16701⟩⟩) Proof.Events375.exact96040RawTerms (.finite 46) 96039 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96040RawTermsValid]
+    rfl
+
+theorem replayStep96041 : stepAt document history replayEventState96041 = some replayEventState96042 := by
+  rfl
+
+theorem replayStep96042 : stepAt document history replayEventState96042 = some replayEventState96043 := by
+  apply stepAt_resultExact document history replayEventState96042
+    (⟨.program ⟨214⟩, ⟨6544⟩⟩) Proof.Events375.exact96042RawTerms .large 96041 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96042RawTermsValid]
+    rfl
+
+theorem replayStep96043 : stepAt document history replayEventState96043 = some replayState24011 := by
+  rfl
+
+theorem replayChunk24010 : ReplayChain document history replayState24010 replayState24011 :=
+  .chunk 96044 (by
+    unfold replayRange
+    rw [show replayState24010.cursor = 96040 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96040 ≤ 96044) && decide (96044 ≤ 107567) &&
+        decide (96044 - 96040 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24010.cursor = 96040 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96044 - 96040) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96040]
+    simp only [Option.bind_some]
+    rw [replayStep96041]
+    simp only [Option.bind_some]
+    rw [replayStep96042]
+    simp only [Option.bind_some]
+    rw [replayStep96043]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96045 : ReplayState := ⟨96045, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96046 : ReplayState := ⟨96046, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96047 : ReplayState := ⟨96047, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96044 : stepAt document history replayState24011 = some replayEventState96045 := by
+  rfl
+
+theorem replayStep96045 : stepAt document history replayEventState96045 = some replayEventState96046 := by
+  rfl
+
+theorem replayStep96046 : stepAt document history replayEventState96046 = some replayEventState96047 := by
+  rfl
+
+theorem replayStep96047 : stepAt document history replayEventState96047 = some replayState24012 := by
+  apply stepAt_resultExact document history replayEventState96047
+    (⟨.program ⟨214⟩, ⟨16702⟩⟩) Proof.Events375.exact96047RawTerms .large 96045 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96047RawTermsValid]
+    rfl
+
+theorem replayChunk24011 : ReplayChain document history replayState24011 replayState24012 :=
+  .chunk 96048 (by
+    unfold replayRange
+    rw [show replayState24011.cursor = 96044 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96044 ≤ 96048) && decide (96048 ≤ 107567) &&
+        decide (96048 - 96044 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24011.cursor = 96044 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96048 - 96044) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96044]
+    simp only [Option.bind_some]
+    rw [replayStep96045]
+    simp only [Option.bind_some]
+    rw [replayStep96046]
+    simp only [Option.bind_some]
+    rw [replayStep96047]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96049 : ReplayState := ⟨96049, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96050 : ReplayState := ⟨96050, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96051 : ReplayState := ⟨96051, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96048 : stepAt document history replayState24012 = some replayEventState96049 := by
+  rfl
+
+theorem replayStep96049 : stepAt document history replayEventState96049 = some replayEventState96050 := by
+  rfl
+
+theorem replayStep96050 : stepAt document history replayEventState96050 = some replayEventState96051 := by
+  apply stepAt_resultExact document history replayEventState96050
+    (⟨.program ⟨214⟩, ⟨6704⟩⟩) Proof.Events375.exact96050RawTerms .large 96049 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96050RawTermsValid]
+    rfl
+
+theorem replayStep96051 : stepAt document history replayEventState96051 = some replayState24013 := by
+  rfl
+
+theorem replayChunk24012 : ReplayChain document history replayState24012 replayState24013 :=
+  .chunk 96052 (by
+    unfold replayRange
+    rw [show replayState24012.cursor = 96048 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96048 ≤ 96052) && decide (96052 ≤ 107567) &&
+        decide (96052 - 96048 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24012.cursor = 96048 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96052 - 96048) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96048]
+    simp only [Option.bind_some]
+    rw [replayStep96049]
+    simp only [Option.bind_some]
+    rw [replayStep96050]
+    simp only [Option.bind_some]
+    rw [replayStep96051]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96053 : ReplayState := ⟨96053, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96054 : ReplayState := ⟨96054, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96055 : ReplayState := ⟨96055, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96052 : stepAt document history replayState24013 = some replayEventState96053 := by
+  rfl
+
+theorem replayStep96053 : stepAt document history replayEventState96053 = some replayEventState96054 := by
+  rfl
+
+theorem replayStep96054 : stepAt document history replayEventState96054 = some replayEventState96055 := by
+  apply stepAt_resultExact document history replayEventState96054
+    (⟨.program ⟨214⟩, ⟨16703⟩⟩) Proof.Events375.exact96054RawTerms .large 96053 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96054RawTermsValid]
+    rfl
+
+theorem replayStep96055 : stepAt document history replayEventState96055 = some replayState24014 := by
+  rfl
+
+theorem replayChunk24013 : ReplayChain document history replayState24013 replayState24014 :=
+  .chunk 96056 (by
+    unfold replayRange
+    rw [show replayState24013.cursor = 96052 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96052 ≤ 96056) && decide (96056 ≤ 107567) &&
+        decide (96056 - 96052 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24013.cursor = 96052 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96056 - 96052) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96052]
+    simp only [Option.bind_some]
+    rw [replayStep96053]
+    simp only [Option.bind_some]
+    rw [replayStep96054]
+    simp only [Option.bind_some]
+    rw [replayStep96055]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24014 : ReplayChain document history replayState24014 replayState24015 :=
+  .chunk 96060 (by rfl)
+
+def replayEventState96061 : ReplayState := ⟨96061, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96062 : ReplayState := ⟨96062, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96063 : ReplayState := ⟨96063, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96060 : stepAt document history replayState24015 = some replayEventState96061 := by
+  rfl
+
+theorem replayStep96061 : stepAt document history replayEventState96061 = some replayEventState96062 := by
+  rfl
+
+theorem replayStep96062 : stepAt document history replayEventState96062 = some replayEventState96063 := by
+  apply stepAt_resultExact document history replayEventState96062
+    (⟨.program ⟨214⟩, ⟨29351⟩⟩) Proof.Events375.exact96062RawTerms .large 96057 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96062RawTermsValid]
+    rfl
+
+theorem replayStep96063 : stepAt document history replayEventState96063 = some replayState24016 := by
+  rfl
+
+theorem replayChunk24015 : ReplayChain document history replayState24015 replayState24016 :=
+  .chunk 96064 (by
+    unfold replayRange
+    rw [show replayState24015.cursor = 96060 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96060 ≤ 96064) && decide (96064 ≤ 107567) &&
+        decide (96064 - 96060 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24015.cursor = 96060 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96064 - 96060) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96060]
+    simp only [Option.bind_some]
+    rw [replayStep96061]
+    simp only [Option.bind_some]
+    rw [replayStep96062]
+    simp only [Option.bind_some]
+    rw [replayStep96063]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96065 : ReplayState := ⟨96065, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96066 : ReplayState := ⟨96066, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96067 : ReplayState := ⟨96067, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96064 : stepAt document history replayState24016 = some replayEventState96065 := by
+  rfl
+
+theorem replayStep96065 : stepAt document history replayEventState96065 = some replayEventState96066 := by
+  apply stepAt_resultExact document history replayEventState96065
+    (⟨.program ⟨214⟩, ⟨16672⟩⟩) Proof.Events375.exact96065RawTerms (.finite 63) 96064 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96065RawTermsValid]
+    rfl
+
+theorem replayStep96066 : stepAt document history replayEventState96066 = some replayEventState96067 := by
+  rfl
+
+theorem replayStep96067 : stepAt document history replayEventState96067 = some replayState24017 := by
+  rfl
+
+theorem replayChunk24016 : ReplayChain document history replayState24016 replayState24017 :=
+  .chunk 96068 (by
+    unfold replayRange
+    rw [show replayState24016.cursor = 96064 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96064 ≤ 96068) && decide (96068 ≤ 107567) &&
+        decide (96068 - 96064 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24016.cursor = 96064 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96068 - 96064) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96064]
+    simp only [Option.bind_some]
+    rw [replayStep96065]
+    simp only [Option.bind_some]
+    rw [replayStep96066]
+    simp only [Option.bind_some]
+    rw [replayStep96067]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96069 : ReplayState := ⟨96069, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96070 : ReplayState := ⟨96070, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96071 : ReplayState := ⟨96071, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96068 : stepAt document history replayState24017 = some replayEventState96069 := by
+  rfl
+
+theorem replayStep96069 : stepAt document history replayEventState96069 = some replayEventState96070 := by
+  rfl
+
+theorem replayStep96070 : stepAt document history replayEventState96070 = some replayEventState96071 := by
+  apply stepAt_resultExact document history replayEventState96070
+    (⟨.program ⟨214⟩, ⟨16673⟩⟩) Proof.Events375.exact96070RawTerms .large 96068 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96070RawTermsValid]
+    rfl
+
+theorem replayStep96071 : stepAt document history replayEventState96071 = some replayState24018 := by
+  rfl
+
+theorem replayChunk24017 : ReplayChain document history replayState24017 replayState24018 :=
+  .chunk 96072 (by
+    unfold replayRange
+    rw [show replayState24017.cursor = 96068 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96068 ≤ 96072) && decide (96072 ≤ 107567) &&
+        decide (96072 - 96068 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24017.cursor = 96068 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96072 - 96068) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96068]
+    simp only [Option.bind_some]
+    rw [replayStep96069]
+    simp only [Option.bind_some]
+    rw [replayStep96070]
+    simp only [Option.bind_some]
+    rw [replayStep96071]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96073 : ReplayState := ⟨96073, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96074 : ReplayState := ⟨96074, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96075 : ReplayState := ⟨96075, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96072 : stepAt document history replayState24018 = some replayEventState96073 := by
+  rfl
+
+theorem replayStep96073 : stepAt document history replayEventState96073 = some replayEventState96074 := by
+  apply stepAt_resultExact document history replayEventState96073
+    (⟨.program ⟨214⟩, ⟨6737⟩⟩) Proof.Events375.exact96073RawTerms .large 96072 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96073RawTermsValid]
+    rfl
+
+theorem replayStep96074 : stepAt document history replayEventState96074 = some replayEventState96075 := by
+  rfl
+
+theorem replayStep96075 : stepAt document history replayEventState96075 = some replayState24019 := by
+  rfl
+
+theorem replayChunk24018 : ReplayChain document history replayState24018 replayState24019 :=
+  .chunk 96076 (by
+    unfold replayRange
+    rw [show replayState24018.cursor = 96072 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96072 ≤ 96076) && decide (96076 ≤ 107567) &&
+        decide (96076 - 96072 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24018.cursor = 96072 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96076 - 96072) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96072]
+    simp only [Option.bind_some]
+    rw [replayStep96073]
+    simp only [Option.bind_some]
+    rw [replayStep96074]
+    simp only [Option.bind_some]
+    rw [replayStep96075]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96077 : ReplayState := ⟨96077, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96078 : ReplayState := ⟨96078, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96079 : ReplayState := ⟨96079, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96076 : stepAt document history replayState24019 = some replayEventState96077 := by
+  rfl
+
+theorem replayStep96077 : stepAt document history replayEventState96077 = some replayEventState96078 := by
+  apply stepAt_resultExact document history replayEventState96077
+    (⟨.program ⟨214⟩, ⟨16674⟩⟩) Proof.Events375.exact96077RawTerms .large 96076 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96077RawTermsValid]
+    rfl
+
+theorem replayStep96078 : stepAt document history replayEventState96078 = some replayEventState96079 := by
+  rfl
+
+theorem replayStep96079 : stepAt document history replayEventState96079 = some replayState24020 := by
+  rfl
+
+theorem replayChunk24019 : ReplayChain document history replayState24019 replayState24020 :=
+  .chunk 96080 (by
+    unfold replayRange
+    rw [show replayState24019.cursor = 96076 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96076 ≤ 96080) && decide (96080 ≤ 107567) &&
+        decide (96080 - 96076 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24019.cursor = 96076 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96080 - 96076) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96076]
+    simp only [Option.bind_some]
+    rw [replayStep96077]
+    simp only [Option.bind_some]
+    rw [replayStep96078]
+    simp only [Option.bind_some]
+    rw [replayStep96079]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96081 : ReplayState := ⟨96081, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96082 : ReplayState := ⟨96082, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96083 : ReplayState := ⟨96083, [⟨⟨.program ⟨214⟩, ⟨29355⟩⟩, 95992⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96080 : stepAt document history replayState24020 = some replayEventState96081 := by
+  rfl
+
+theorem replayStep96081 : stepAt document history replayEventState96081 = some replayEventState96082 := by
+  apply stepAt_resultExact document history replayEventState96081
+    (⟨.program ⟨214⟩, ⟨29355⟩⟩) Proof.Events375.exact96081RawTerms .large 96080 .exactZero (none) 95992
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96081RawTermsValid]
+    rfl
+
+theorem replayStep96082 : stepAt document history replayEventState96082 = some replayEventState96083 := by
+  rfl
+
+theorem replayStep96083 : stepAt document history replayEventState96083 = some replayState24021 := by
+  rfl
+
+theorem replayChunk24020 : ReplayChain document history replayState24020 replayState24021 :=
+  .chunk 96084 (by
+    unfold replayRange
+    rw [show replayState24020.cursor = 96080 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96080 ≤ 96084) && decide (96084 ≤ 107567) &&
+        decide (96084 - 96080 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24020.cursor = 96080 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96084 - 96080) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96080]
+    simp only [Option.bind_some]
+    rw [replayStep96081]
+    simp only [Option.bind_some]
+    rw [replayStep96082]
+    simp only [Option.bind_some]
+    rw [replayStep96083]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24021 : ReplayChain document history replayState24021 replayState24022 :=
+  .chunk 96088 (by rfl)
+
+def replayEventState96089 : ReplayState := ⟨96089, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96090 : ReplayState := ⟨96090, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96091 : ReplayState := ⟨96091, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96088 : stepAt document history replayState24022 = some replayEventState96089 := by
+  rfl
+
+theorem replayStep96089 : stepAt document history replayEventState96089 = some replayEventState96090 := by
+  rfl
+
+theorem replayStep96090 : stepAt document history replayEventState96090 = some replayEventState96091 := by
+  apply stepAt_resultExact document history replayEventState96090
+    (⟨.program ⟨214⟩, ⟨22400⟩⟩) Proof.Events375.exact96090RawTerms .large 95946 (.finite 1811303510016) (some (95948)) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96090RawTermsValid]
+    rfl
+
+theorem replayStep96091 : stepAt document history replayEventState96091 = some replayState24023 := by
+  rfl
+
+theorem replayChunk24022 : ReplayChain document history replayState24022 replayState24023 :=
+  .chunk 96092 (by
+    unfold replayRange
+    rw [show replayState24022.cursor = 96088 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96088 ≤ 96092) && decide (96092 ≤ 107567) &&
+        decide (96092 - 96088 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24022.cursor = 96088 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96092 - 96088) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96088]
+    simp only [Option.bind_some]
+    rw [replayStep96089]
+    simp only [Option.bind_some]
+    rw [replayStep96090]
+    simp only [Option.bind_some]
+    rw [replayStep96091]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24023 : ReplayChain document history replayState24023 replayState24024 :=
+  .chunk 96096 (by rfl)
+
+def replayEventState96097 : ReplayState := ⟨96097, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96098 : ReplayState := ⟨96098, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96099 : ReplayState := ⟨96099, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96096 : stepAt document history replayState24024 = some replayEventState96097 := by
+  rfl
+
+theorem replayStep96097 : stepAt document history replayEventState96097 = some replayEventState96098 := by
+  apply stepAt_resultExact document history replayEventState96097
+    (⟨.program ⟨214⟩, ⟨29353⟩⟩) Proof.Events375.exact96097RawTerms .large 96093 (.finite 1292382248169874534400) (some (96096)) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96097RawTermsValid]
+    rfl
+
+theorem replayStep96098 : stepAt document history replayEventState96098 = some replayEventState96099 := by
+  rfl
+
+theorem replayStep96099 : stepAt document history replayEventState96099 = some replayState24025 := by
+  rfl
+
+theorem replayChunk24024 : ReplayChain document history replayState24024 replayState24025 :=
+  .chunk 96100 (by
+    unfold replayRange
+    rw [show replayState24024.cursor = 96096 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96096 ≤ 96100) && decide (96100 ≤ 107567) &&
+        decide (96100 - 96096 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24024.cursor = 96096 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96100 - 96096) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96096]
+    simp only [Option.bind_some]
+    rw [replayStep96097]
+    simp only [Option.bind_some]
+    rw [replayStep96098]
+    simp only [Option.bind_some]
+    rw [replayStep96099]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24025 : ReplayChain document history replayState24025 replayState24026 :=
+  .chunk 96104 (by rfl)
+
+def replayEventState96105 : ReplayState := ⟨96105, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96106 : ReplayState := ⟨96106, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96107 : ReplayState := ⟨96107, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96104 : stepAt document history replayState24026 = some replayEventState96105 := by
+  apply stepAt_resultExact document history replayState24026
+    (⟨.program ⟨214⟩, ⟨24531⟩⟩) Proof.Events375.exact96104RawTerms .large 96103 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96104RawTermsValid]
+    rfl
+
+theorem replayStep96105 : stepAt document history replayEventState96105 = some replayEventState96106 := by
+  rfl
+
+theorem replayStep96106 : stepAt document history replayEventState96106 = some replayEventState96107 := by
+  rfl
+
+theorem replayStep96107 : stepAt document history replayEventState96107 = some replayState24027 := by
+  apply stepAt_resultExact document history replayEventState96107
+    (⟨.program ⟨214⟩, ⟨29133⟩⟩) Proof.Events375.exact96107RawTerms (.finite 8192) 96106 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96107RawTermsValid]
+    rfl
+
+theorem replayChunk24026 : ReplayChain document history replayState24026 replayState24027 :=
+  .chunk 96108 (by
+    unfold replayRange
+    rw [show replayState24026.cursor = 96104 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96104 ≤ 96108) && decide (96108 ≤ 107567) &&
+        decide (96108 - 96104 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24026.cursor = 96104 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96108 - 96104) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96104]
+    simp only [Option.bind_some]
+    rw [replayStep96105]
+    simp only [Option.bind_some]
+    rw [replayStep96106]
+    simp only [Option.bind_some]
+    rw [replayStep96107]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24027 : ReplayChain document history replayState24027 replayState24028 :=
+  .chunk 96112 (by rfl)
+
+def replayEventState96113 : ReplayState := ⟨96113, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96114 : ReplayState := ⟨96114, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96115 : ReplayState := ⟨96115, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96112 : stepAt document history replayState24028 = some replayEventState96113 := by
+  rfl
+
+theorem replayStep96113 : stepAt document history replayEventState96113 = some replayEventState96114 := by
+  rfl
+
+theorem replayStep96114 : stepAt document history replayEventState96114 = some replayEventState96115 := by
+  apply stepAt_resultExact document history replayEventState96114
+    (⟨.program ⟨214⟩, ⟨23242⟩⟩) Proof.Events375.exact96114RawTerms .large 96113 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96114RawTermsValid]
+    rfl
+
+theorem replayStep96115 : stepAt document history replayEventState96115 = some replayState24029 := by
+  rfl
+
+theorem replayChunk24028 : ReplayChain document history replayState24028 replayState24029 :=
+  .chunk 96116 (by
+    unfold replayRange
+    rw [show replayState24028.cursor = 96112 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96112 ≤ 96116) && decide (96116 ≤ 107567) &&
+        decide (96116 - 96112 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24028.cursor = 96112 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96116 - 96112) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96112]
+    simp only [Option.bind_some]
+    rw [replayStep96113]
+    simp only [Option.bind_some]
+    rw [replayStep96114]
+    simp only [Option.bind_some]
+    rw [replayStep96115]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96117 : ReplayState := ⟨96117, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96118 : ReplayState := ⟨96118, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96119 : ReplayState := ⟨96119, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96116 : stepAt document history replayState24029 = some replayEventState96117 := by
+  rfl
+
+theorem replayStep96117 : stepAt document history replayEventState96117 = some replayEventState96118 := by
+  apply stepAt_resultExact document history replayEventState96117
+    (⟨.program ⟨214⟩, ⟨25437⟩⟩) Proof.Events375.exact96117RawTerms (.finite 8192) 96116 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96117RawTermsValid]
+    rfl
+
+theorem replayStep96118 : stepAt document history replayEventState96118 = some replayEventState96119 := by
+  rfl
+
+theorem replayStep96119 : stepAt document history replayEventState96119 = some replayState24030 := by
+  rfl
+
+theorem replayChunk24029 : ReplayChain document history replayState24029 replayState24030 :=
+  .chunk 96120 (by
+    unfold replayRange
+    rw [show replayState24029.cursor = 96116 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96116 ≤ 96120) && decide (96120 ≤ 107567) &&
+        decide (96120 - 96116 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24029.cursor = 96116 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96120 - 96116) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96116]
+    simp only [Option.bind_some]
+    rw [replayStep96117]
+    simp only [Option.bind_some]
+    rw [replayStep96118]
+    simp only [Option.bind_some]
+    rw [replayStep96119]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96121 : ReplayState := ⟨96121, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96122 : ReplayState := ⟨96122, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96123 : ReplayState := ⟨96123, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96120 : stepAt document history replayState24030 = some replayEventState96121 := by
+  rfl
+
+theorem replayStep96121 : stepAt document history replayEventState96121 = some replayEventState96122 := by
+  rfl
+
+theorem replayStep96122 : stepAt document history replayEventState96122 = some replayEventState96123 := by
+  apply stepAt_resultExact document history replayEventState96122
+    (⟨.program ⟨214⟩, ⟨12545⟩⟩) Proof.Events375.exact96122RawTerms .large 96120 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96122RawTermsValid]
+    rfl
+
+theorem replayStep96123 : stepAt document history replayEventState96123 = some replayState24031 := by
+  rfl
+
+theorem replayChunk24030 : ReplayChain document history replayState24030 replayState24031 :=
+  .chunk 96124 (by
+    unfold replayRange
+    rw [show replayState24030.cursor = 96120 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96120 ≤ 96124) && decide (96124 ≤ 107567) &&
+        decide (96124 - 96120 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24030.cursor = 96120 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96124 - 96120) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96120]
+    simp only [Option.bind_some]
+    rw [replayStep96121]
+    simp only [Option.bind_some]
+    rw [replayStep96122]
+    simp only [Option.bind_some]
+    rw [replayStep96123]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96125 : ReplayState := ⟨96125, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96126 : ReplayState := ⟨96126, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96127 : ReplayState := ⟨96127, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96124 : stepAt document history replayState24031 = some replayEventState96125 := by
+  rfl
+
+theorem replayStep96125 : stepAt document history replayEventState96125 = some replayEventState96126 := by
+  rfl
+
+theorem replayStep96126 : stepAt document history replayEventState96126 = some replayEventState96127 := by
+  rfl
+
+theorem replayStep96127 : stepAt document history replayEventState96127 = some replayState24032 := by
+  apply stepAt_resultExact document history replayEventState96127
+    (⟨.program ⟨214⟩, ⟨7123⟩⟩) Proof.Events375.exact96127RawTerms .large 96125 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96127RawTermsValid]
+    rfl
+
+theorem replayChunk24031 : ReplayChain document history replayState24031 replayState24032 :=
+  .chunk 96128 (by
+    unfold replayRange
+    rw [show replayState24031.cursor = 96124 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96124 ≤ 96128) && decide (96128 ≤ 107567) &&
+        decide (96128 - 96124 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24031.cursor = 96124 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96128 - 96124) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96124]
+    simp only [Option.bind_some]
+    rw [replayStep96125]
+    simp only [Option.bind_some]
+    rw [replayStep96126]
+    simp only [Option.bind_some]
+    rw [replayStep96127]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96129 : ReplayState := ⟨96129, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96130 : ReplayState := ⟨96130, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96131 : ReplayState := ⟨96131, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96128 : stepAt document history replayState24032 = some replayEventState96129 := by
+  rfl
+
+theorem replayStep96129 : stepAt document history replayEventState96129 = some replayEventState96130 := by
+  rfl
+
+theorem replayStep96130 : stepAt document history replayEventState96130 = some replayEventState96131 := by
+  rfl
+
+theorem replayStep96131 : stepAt document history replayEventState96131 = some replayState24033 := by
+  apply stepAt_resultExact document history replayEventState96131
+    (⟨.program ⟨214⟩, ⟨12546⟩⟩) Proof.Events375.exact96131RawTerms .large 96130 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96131RawTermsValid]
+    rfl
+
+theorem replayChunk24032 : ReplayChain document history replayState24032 replayState24033 :=
+  .chunk 96132 (by
+    unfold replayRange
+    rw [show replayState24032.cursor = 96128 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96128 ≤ 96132) && decide (96132 ≤ 107567) &&
+        decide (96132 - 96128 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24032.cursor = 96128 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96132 - 96128) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96128]
+    simp only [Option.bind_some]
+    rw [replayStep96129]
+    simp only [Option.bind_some]
+    rw [replayStep96130]
+    simp only [Option.bind_some]
+    rw [replayStep96131]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24033 : ReplayChain document history replayState24033 replayState24034 :=
+  .chunk 96136 (by rfl)
+
+def replayEventState96137 : ReplayState := ⟨96137, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96138 : ReplayState := ⟨96138, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96139 : ReplayState := ⟨96139, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96136 : stepAt document history replayState24034 = some replayEventState96137 := by
+  rfl
+
+theorem replayStep96137 : stepAt document history replayEventState96137 = some replayEventState96138 := by
+  apply stepAt_resultExact document history replayEventState96137
+    (⟨.program ⟨214⟩, ⟨12547⟩⟩) Proof.Events375.exact96137RawTerms .large 96134 (.finite 26) (some (96135)) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96137RawTermsValid]
+    rfl
+
+theorem replayStep96138 : stepAt document history replayEventState96138 = some replayEventState96139 := by
+  rfl
+
+theorem replayStep96139 : stepAt document history replayEventState96139 = some replayState24035 := by
+  rfl
+
+theorem replayChunk24034 : ReplayChain document history replayState24034 replayState24035 :=
+  .chunk 96140 (by
+    unfold replayRange
+    rw [show replayState24034.cursor = 96136 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96136 ≤ 96140) && decide (96140 ≤ 107567) &&
+        decide (96140 - 96136 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24034.cursor = 96136 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96140 - 96136) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96136]
+    simp only [Option.bind_some]
+    rw [replayStep96137]
+    simp only [Option.bind_some]
+    rw [replayStep96138]
+    simp only [Option.bind_some]
+    rw [replayStep96139]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24035 : ReplayChain document history replayState24035 replayState24036 :=
+  .chunk 96144 (by rfl)
+
+def replayEventState96145 : ReplayState := ⟨96145, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96146 : ReplayState := ⟨96146, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96147 : ReplayState := ⟨96147, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96144 : stepAt document history replayState24036 = some replayEventState96145 := by
+  rfl
+
+theorem replayStep96145 : stepAt document history replayEventState96145 = some replayEventState96146 := by
+  apply stepAt_resultExact document history replayEventState96145
+    (⟨.program ⟨214⟩, ⟨12548⟩⟩) Proof.Events375.exact96145RawTerms .large 96140 (.finite 34944) (some (96142)) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96145RawTermsValid]
+    rfl
+
+theorem replayStep96146 : stepAt document history replayEventState96146 = some replayEventState96147 := by
+  rfl
+
+theorem replayStep96147 : stepAt document history replayEventState96147 = some replayState24037 := by
+  rfl
+
+theorem replayChunk24036 : ReplayChain document history replayState24036 replayState24037 :=
+  .chunk 96148 (by
+    unfold replayRange
+    rw [show replayState24036.cursor = 96144 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96144 ≤ 96148) && decide (96148 ≤ 107567) &&
+        decide (96148 - 96144 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24036.cursor = 96144 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96148 - 96144) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96144]
+    simp only [Option.bind_some]
+    rw [replayStep96145]
+    simp only [Option.bind_some]
+    rw [replayStep96146]
+    simp only [Option.bind_some]
+    rw [replayStep96147]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96149 : ReplayState := ⟨96149, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96150 : ReplayState := ⟨96150, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96151 : ReplayState := ⟨96151, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96148 : stepAt document history replayState24037 = some replayEventState96149 := by
+  rfl
+
+theorem replayStep96149 : stepAt document history replayEventState96149 = some replayEventState96150 := by
+  rfl
+
+theorem replayStep96150 : stepAt document history replayEventState96150 = some replayEventState96151 := by
+  apply stepAt_resultExact document history replayEventState96150
+    (⟨.program ⟨214⟩, ⟨9911⟩⟩) Proof.Events375.exact96150RawTerms .large 96148 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96150RawTermsValid]
+    rfl
+
+theorem replayStep96151 : stepAt document history replayEventState96151 = some replayState24038 := by
+  rfl
+
+theorem replayChunk24037 : ReplayChain document history replayState24037 replayState24038 :=
+  .chunk 96152 (by
+    unfold replayRange
+    rw [show replayState24037.cursor = 96148 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96148 ≤ 96152) && decide (96152 ≤ 107567) &&
+        decide (96152 - 96148 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24037.cursor = 96148 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96152 - 96148) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96148]
+    simp only [Option.bind_some]
+    rw [replayStep96149]
+    simp only [Option.bind_some]
+    rw [replayStep96150]
+    simp only [Option.bind_some]
+    rw [replayStep96151]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96153 : ReplayState := ⟨96153, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96154 : ReplayState := ⟨96154, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96155 : ReplayState := ⟨96155, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96152 : stepAt document history replayState24038 = some replayEventState96153 := by
+  rfl
+
+theorem replayStep96153 : stepAt document history replayEventState96153 = some replayEventState96154 := by
+  rfl
+
+theorem replayStep96154 : stepAt document history replayEventState96154 = some replayEventState96155 := by
+  rfl
+
+theorem replayStep96155 : stepAt document history replayEventState96155 = some replayState24039 := by
+  apply stepAt_resultExact document history replayEventState96155
+    (⟨.program ⟨214⟩, ⟨7103⟩⟩) Proof.Events375.exact96155RawTerms .large 96153 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96155RawTermsValid]
+    rfl
+
+theorem replayChunk24038 : ReplayChain document history replayState24038 replayState24039 :=
+  .chunk 96156 (by
+    unfold replayRange
+    rw [show replayState24038.cursor = 96152 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96152 ≤ 96156) && decide (96156 ≤ 107567) &&
+        decide (96156 - 96152 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24038.cursor = 96152 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96156 - 96152) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96152]
+    simp only [Option.bind_some]
+    rw [replayStep96153]
+    simp only [Option.bind_some]
+    rw [replayStep96154]
+    simp only [Option.bind_some]
+    rw [replayStep96155]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96157 : ReplayState := ⟨96157, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96158 : ReplayState := ⟨96158, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96159 : ReplayState := ⟨96159, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96156 : stepAt document history replayState24039 = some replayEventState96157 := by
+  rfl
+
+theorem replayStep96157 : stepAt document history replayEventState96157 = some replayEventState96158 := by
+  rfl
+
+theorem replayStep96158 : stepAt document history replayEventState96158 = some replayEventState96159 := by
+  rfl
+
+theorem replayStep96159 : stepAt document history replayEventState96159 = some replayState24040 := by
+  apply stepAt_resultExact document history replayEventState96159
+    (⟨.program ⟨214⟩, ⟨9912⟩⟩) Proof.Events375.exact96159RawTerms .large 96158 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96159RawTermsValid]
+    rfl
+
+theorem replayChunk24039 : ReplayChain document history replayState24039 replayState24040 :=
+  .chunk 96160 (by
+    unfold replayRange
+    rw [show replayState24039.cursor = 96156 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96156 ≤ 96160) && decide (96160 ≤ 107567) &&
+        decide (96160 - 96156 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24039.cursor = 96156 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96160 - 96156) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96156]
+    simp only [Option.bind_some]
+    rw [replayStep96157]
+    simp only [Option.bind_some]
+    rw [replayStep96158]
+    simp only [Option.bind_some]
+    rw [replayStep96159]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24040 : ReplayChain document history replayState24040 replayState24041 :=
+  .chunk 96164 (by rfl)
+
+def replayEventState96165 : ReplayState := ⟨96165, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96166 : ReplayState := ⟨96166, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96167 : ReplayState := ⟨96167, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96164 : stepAt document history replayState24041 = some replayEventState96165 := by
+  rfl
+
+theorem replayStep96165 : stepAt document history replayEventState96165 = some replayEventState96166 := by
+  apply stepAt_resultExact document history replayEventState96165
+    (⟨.program ⟨214⟩, ⟨9913⟩⟩) Proof.Events375.exact96165RawTerms .large 96162 (.finite 26) (some (96163)) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96165RawTermsValid]
+    rfl
+
+theorem replayStep96166 : stepAt document history replayEventState96166 = some replayEventState96167 := by
+  rfl
+
+theorem replayStep96167 : stepAt document history replayEventState96167 = some replayState24042 := by
+  rfl
+
+theorem replayChunk24041 : ReplayChain document history replayState24041 replayState24042 :=
+  .chunk 96168 (by
+    unfold replayRange
+    rw [show replayState24041.cursor = 96164 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96164 ≤ 96168) && decide (96168 ≤ 107567) &&
+        decide (96168 - 96164 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24041.cursor = 96164 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96168 - 96164) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96164]
+    simp only [Option.bind_some]
+    rw [replayStep96165]
+    simp only [Option.bind_some]
+    rw [replayStep96166]
+    simp only [Option.bind_some]
+    rw [replayStep96167]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24042 : ReplayChain document history replayState24042 replayState24043 :=
+  .chunk 96172 (by rfl)
+
+def replayEventState96173 : ReplayState := ⟨96173, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96174 : ReplayState := ⟨96174, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96175 : ReplayState := ⟨96175, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96172 : stepAt document history replayState24043 = some replayEventState96173 := by
+  rfl
+
+theorem replayStep96173 : stepAt document history replayEventState96173 = some replayEventState96174 := by
+  rfl
+
+theorem replayStep96174 : stepAt document history replayEventState96174 = some replayEventState96175 := by
+  rfl
+
+theorem replayStep96175 : stepAt document history replayEventState96175 = some replayState24044 := by
+  apply stepAt_resultExact document history replayEventState96175
+    (⟨.program ⟨214⟩, ⟨9914⟩⟩) Proof.Events375.exact96175RawTerms .large 96168 (.finite 95420416) (some (96170)) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96175RawTermsValid]
+    rfl
+
+theorem replayChunk24043 : ReplayChain document history replayState24043 replayState24044 :=
+  .chunk 96176 (by
+    unfold replayRange
+    rw [show replayState24043.cursor = 96172 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96172 ≤ 96176) && decide (96176 ≤ 107567) &&
+        decide (96176 - 96172 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24043.cursor = 96172 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96176 - 96172) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96172]
+    simp only [Option.bind_some]
+    rw [replayStep96173]
+    simp only [Option.bind_some]
+    rw [replayStep96174]
+    simp only [Option.bind_some]
+    rw [replayStep96175]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24044 : ReplayChain document history replayState24044 replayState24045 :=
+  .chunk 96180 (by rfl)
+
+def replayEventState96181 : ReplayState := ⟨96181, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96182 : ReplayState := ⟨96182, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96183 : ReplayState := ⟨96183, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96180 : stepAt document history replayState24045 = some replayEventState96181 := by
+  rfl
+
+theorem replayStep96181 : stepAt document history replayEventState96181 = some replayEventState96182 := by
+  apply stepAt_resultExact document history replayEventState96181
+    (⟨.program ⟨214⟩, ⟨12549⟩⟩) Proof.Events375.exact96181RawTerms .large 96178 (.finite 95455360) (some (96180)) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96181RawTermsValid]
+    rfl
+
+theorem replayStep96182 : stepAt document history replayEventState96182 = some replayEventState96183 := by
+  rfl
+
+theorem replayStep96183 : stepAt document history replayEventState96183 = some replayState24046 := by
+  rfl
+
+theorem replayChunk24045 : ReplayChain document history replayState24045 replayState24046 :=
+  .chunk 96184 (by
+    unfold replayRange
+    rw [show replayState24045.cursor = 96180 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96180 ≤ 96184) && decide (96184 ≤ 107567) &&
+        decide (96184 - 96180 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24045.cursor = 96180 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96184 - 96180) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96180]
+    simp only [Option.bind_some]
+    rw [replayStep96181]
+    simp only [Option.bind_some]
+    rw [replayStep96182]
+    simp only [Option.bind_some]
+    rw [replayStep96183]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24046 : ReplayChain document history replayState24046 replayState24047 :=
+  .chunk 96188 (by rfl)
+
+def replayEventState96189 : ReplayState := ⟨96189, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96190 : ReplayState := ⟨96190, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96191 : ReplayState := ⟨96191, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96188 : stepAt document history replayState24047 = some replayEventState96189 := by
+  rfl
+
+theorem replayStep96189 : stepAt document history replayEventState96189 = some replayEventState96190 := by
+  rfl
+
+theorem replayStep96190 : stepAt document history replayEventState96190 = some replayEventState96191 := by
+  rfl
+
+theorem replayStep96191 : stepAt document history replayEventState96191 = some replayState24048 := by
+  apply stepAt_resultExact document history replayEventState96191
+    (⟨.program ⟨214⟩, ⟨25438⟩⟩) Proof.Events375.exact96191RawTerms .large 96184 (.finite 350322698485760) (some (96186)) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96191RawTermsValid]
+    rfl
+
+theorem replayChunk24047 : ReplayChain document history replayState24047 replayState24048 :=
+  .chunk 96192 (by
+    unfold replayRange
+    rw [show replayState24047.cursor = 96188 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96188 ≤ 96192) && decide (96192 ≤ 107567) &&
+        decide (96192 - 96188 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24047.cursor = 96188 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96192 - 96188) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96188]
+    simp only [Option.bind_some]
+    rw [replayStep96189]
+    simp only [Option.bind_some]
+    rw [replayStep96190]
+    simp only [Option.bind_some]
+    rw [replayStep96191]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96193 : ReplayState := ⟨96193, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96194 : ReplayState := ⟨96194, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96195 : ReplayState := ⟨96195, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96192 : stepAt document history replayState24048 = some replayEventState96193 := by
+  rfl
+
+theorem replayStep96193 : stepAt document history replayEventState96193 = some replayEventState96194 := by
+  rfl
+
+theorem replayStep96194 : stepAt document history replayEventState96194 = some replayEventState96195 := by
+  apply stepAt_resultExact document history replayEventState96194
+    (⟨.program ⟨214⟩, ⟨19949⟩⟩) Proof.Events375.exact96194RawTerms (.finite 136065468) 96193 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96194RawTermsValid]
+    rfl
+
+theorem replayStep96195 : stepAt document history replayEventState96195 = some replayState24049 := by
+  rfl
+
+theorem replayChunk24048 : ReplayChain document history replayState24048 replayState24049 :=
+  .chunk 96196 (by
+    unfold replayRange
+    rw [show replayState24048.cursor = 96192 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96192 ≤ 96196) && decide (96196 ≤ 107567) &&
+        decide (96196 - 96192 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24048.cursor = 96192 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96196 - 96192) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96192]
+    simp only [Option.bind_some]
+    rw [replayStep96193]
+    simp only [Option.bind_some]
+    rw [replayStep96194]
+    simp only [Option.bind_some]
+    rw [replayStep96195]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96197 : ReplayState := ⟨96197, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96198 : ReplayState := ⟨96198, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96199 : ReplayState := ⟨96199, [⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96196 : stepAt document history replayState24049 = some replayEventState96197 := by
+  rfl
+
+theorem replayStep96197 : stepAt document history replayEventState96197 = some replayEventState96198 := by
+  rfl
+
+theorem replayStep96198 : stepAt document history replayEventState96198 = some replayEventState96199 := by
+  apply stepAt_resultExact document history replayEventState96198
+    (⟨.program ⟨214⟩, ⟨19951⟩⟩) Proof.Events375.exact96198RawTerms (.finite 136065468) 96197 .exactZero (none) 0
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96198RawTermsValid]
+    rfl
+
+theorem replayStep96199 : stepAt document history replayEventState96199 = some replayState24050 := by
+  rfl
+
+theorem replayChunk24049 : ReplayChain document history replayState24049 replayState24050 :=
+  .chunk 96200 (by
+    unfold replayRange
+    rw [show replayState24049.cursor = 96196 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96196 ≤ 96200) && decide (96200 ≤ 107567) &&
+        decide (96200 - 96196 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24049.cursor = 96196 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96200 - 96196) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96196]
+    simp only [Option.bind_some]
+    rw [replayStep96197]
+    simp only [Option.bind_some]
+    rw [replayStep96198]
+    simp only [Option.bind_some]
+    rw [replayStep96199]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24050 : ReplayChain document history replayState24050 replayState24051 :=
+  .chunk 96204 (by rfl)
+
+theorem replayChunk24051 : ReplayChain document history replayState24051 replayState24052 :=
+  .chunk 96208 (by rfl)
+
+theorem replayChunk24052 : ReplayChain document history replayState24052 replayState24053 :=
+  .chunk 96212 (by rfl)
+
+theorem replayChunk24053 : ReplayChain document history replayState24053 replayState24054 :=
+  .chunk 96216 (by rfl)
+
+def replayEventState96217 : ReplayState := ⟨96217, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96218 : ReplayState := ⟨96218, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96219 : ReplayState := ⟨96219, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96216 : stepAt document history replayState24054 = some replayEventState96217 := by
+  apply stepAt_resultExact document history replayState24054
+    (⟨.program ⟨214⟩, ⟨12542⟩⟩) Proof.Events375.exact96216RawTerms (.finite 42) 96215 .exactZero (none) 96205
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96216RawTermsValid]
+    rfl
+
+theorem replayStep96217 : stepAt document history replayEventState96217 = some replayEventState96218 := by
+  rfl
+
+theorem replayStep96218 : stepAt document history replayEventState96218 = some replayEventState96219 := by
+  rfl
+
+theorem replayStep96219 : stepAt document history replayEventState96219 = some replayState24055 := by
+  apply stepAt_resultExact document history replayEventState96219
+    (⟨.program ⟨214⟩, ⟨9910⟩⟩) Proof.Events375.exact96219RawTerms (.finite 42) 96218 .exactZero (none) 96205
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96219RawTermsValid]
+    rfl
+
+theorem replayChunk24054 : ReplayChain document history replayState24054 replayState24055 :=
+  .chunk 96220 (by
+    unfold replayRange
+    rw [show replayState24054.cursor = 96216 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96216 ≤ 96220) && decide (96220 ≤ 107567) &&
+        decide (96220 - 96216 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24054.cursor = 96216 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96220 - 96216) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96216]
+    simp only [Option.bind_some]
+    rw [replayStep96217]
+    simp only [Option.bind_some]
+    rw [replayStep96218]
+    simp only [Option.bind_some]
+    rw [replayStep96219]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24055 : ReplayChain document history replayState24055 replayState24056 :=
+  .chunk 96224 (by rfl)
+
+def replayEventState96225 : ReplayState := ⟨96225, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96226 : ReplayState := ⟨96226, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96227 : ReplayState := ⟨96227, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96224 : stepAt document history replayState24056 = some replayEventState96225 := by
+  rfl
+
+theorem replayStep96225 : stepAt document history replayEventState96225 = some replayEventState96226 := by
+  apply stepAt_resultExact document history replayEventState96225
+    (⟨.program ⟨214⟩, ⟨12543⟩⟩) Proof.Events375.exact96225RawTerms (.finite 1764) 96222 (.finite 1764) (some (96223)) 96205
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96225RawTermsValid]
+    rfl
+
+theorem replayStep96226 : stepAt document history replayEventState96226 = some replayEventState96227 := by
+  rfl
+
+theorem replayStep96227 : stepAt document history replayEventState96227 = some replayState24057 := by
+  rfl
+
+theorem replayChunk24056 : ReplayChain document history replayState24056 replayState24057 :=
+  .chunk 96228 (by
+    unfold replayRange
+    rw [show replayState24056.cursor = 96224 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96224 ≤ 96228) && decide (96228 ≤ 107567) &&
+        decide (96228 - 96224 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24056.cursor = 96224 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96228 - 96224) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96224]
+    simp only [Option.bind_some]
+    rw [replayStep96225]
+    simp only [Option.bind_some]
+    rw [replayStep96226]
+    simp only [Option.bind_some]
+    rw [replayStep96227]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96229 : ReplayState := ⟨96229, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96230 : ReplayState := ⟨96230, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96231 : ReplayState := ⟨96231, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96228 : stepAt document history replayState24057 = some replayEventState96229 := by
+  rfl
+
+theorem replayStep96229 : stepAt document history replayEventState96229 = some replayEventState96230 := by
+  rfl
+
+theorem replayStep96230 : stepAt document history replayEventState96230 = some replayEventState96231 := by
+  rfl
+
+theorem replayStep96231 : stepAt document history replayEventState96231 = some replayState24058 := by
+  apply stepAt_resultExact document history replayEventState96231
+    (⟨.program ⟨214⟩, ⟨19949⟩⟩) Proof.Events375.exact96231RawTerms (.finite 136065468) 96230 .exactZero (none) 96205
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96231RawTermsValid]
+    rfl
+
+theorem replayChunk24057 : ReplayChain document history replayState24057 replayState24058 :=
+  .chunk 96232 (by
+    unfold replayRange
+    rw [show replayState24057.cursor = 96228 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96228 ≤ 96232) && decide (96232 ≤ 107567) &&
+        decide (96232 - 96228 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24057.cursor = 96228 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96232 - 96228) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96228]
+    simp only [Option.bind_some]
+    rw [replayStep96229]
+    simp only [Option.bind_some]
+    rw [replayStep96230]
+    simp only [Option.bind_some]
+    rw [replayStep96231]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96233 : ReplayState := ⟨96233, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96234 : ReplayState := ⟨96234, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96235 : ReplayState := ⟨96235, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96232 : stepAt document history replayState24058 = some replayEventState96233 := by
+  rfl
+
+theorem replayStep96233 : stepAt document history replayEventState96233 = some replayEventState96234 := by
+  apply stepAt_resultExact document history replayEventState96233
+    (⟨.program ⟨214⟩, ⟨6⟩⟩) Proof.Events375.exact96233RawTerms .large 96232 .exactZero (none) 96205
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96233RawTermsValid]
+    rfl
+
+theorem replayStep96234 : stepAt document history replayEventState96234 = some replayEventState96235 := by
+  rfl
+
+theorem replayStep96235 : stepAt document history replayEventState96235 = some replayState24059 := by
+  rfl
+
+theorem replayChunk24058 : ReplayChain document history replayState24058 replayState24059 :=
+  .chunk 96236 (by
+    unfold replayRange
+    rw [show replayState24058.cursor = 96232 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96232 ≤ 96236) && decide (96236 ≤ 107567) &&
+        decide (96236 - 96232 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24058.cursor = 96232 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96236 - 96232) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96232]
+    simp only [Option.bind_some]
+    rw [replayStep96233]
+    simp only [Option.bind_some]
+    rw [replayStep96234]
+    simp only [Option.bind_some]
+    rw [replayStep96235]
+    simp only [Option.bind_some]
+    rfl)
+
+def replayEventState96237 : ReplayState := ⟨96237, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96238 : ReplayState := ⟨96238, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96239 : ReplayState := ⟨96239, [⟨⟨.program ⟨214⟩, ⟨19950⟩⟩, 96205⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96236 : stepAt document history replayState24059 = some replayEventState96237 := by
+  rfl
+
+theorem replayStep96237 : stepAt document history replayEventState96237 = some replayEventState96238 := by
+  rfl
+
+theorem replayStep96238 : stepAt document history replayEventState96238 = some replayEventState96239 := by
+  apply stepAt_resultExact document history replayEventState96238
+    (⟨.program ⟨214⟩, ⟨19950⟩⟩) Proof.Events375.exact96238RawTerms .large 96236 .exactZero (none) 96205
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96238RawTermsValid]
+    rfl
+
+theorem replayStep96239 : stepAt document history replayEventState96239 = some replayState24060 := by
+  rfl
+
+theorem replayChunk24059 : ReplayChain document history replayState24059 replayState24060 :=
+  .chunk 96240 (by
+    unfold replayRange
+    rw [show replayState24059.cursor = 96236 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96236 ≤ 96240) && decide (96240 ≤ 107567) &&
+        decide (96240 - 96236 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24059.cursor = 96236 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96240 - 96236) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96236]
+    simp only [Option.bind_some]
+    rw [replayStep96237]
+    simp only [Option.bind_some]
+    rw [replayStep96238]
+    simp only [Option.bind_some]
+    rw [replayStep96239]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayChunk24060 : ReplayChain document history replayState24060 replayState24061 :=
+  .chunk 96244 (by rfl)
+
+theorem replayChunk24061 : ReplayChain document history replayState24061 replayState24062 :=
+  .chunk 96248 (by rfl)
+
+theorem replayChunk24062 : ReplayChain document history replayState24062 replayState24063 :=
+  .chunk 96252 (by rfl)
+
+def replayEventState96253 : ReplayState := ⟨96253, [⟨⟨.program ⟨214⟩, ⟨25441⟩⟩, 96241⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96254 : ReplayState := ⟨96254, [⟨⟨.program ⟨214⟩, ⟨25441⟩⟩, 96241⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+def replayEventState96255 : ReplayState := ⟨96255, [⟨⟨.program ⟨214⟩, ⟨25441⟩⟩, 96241⟩, ⟨⟨.program ⟨214⟩, ⟨30220⟩⟩, 0⟩]⟩
+
+theorem replayStep96252 : stepAt document history replayState24063 = some replayEventState96253 := by
+  apply stepAt_resultExact document history replayState24063
+    (⟨.program ⟨214⟩, ⟨12542⟩⟩) Proof.Events375.exact96252RawTerms (.finite 42) 96251 .exactZero (none) 96241
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96252RawTermsValid]
+    rfl
+
+theorem replayStep96253 : stepAt document history replayEventState96253 = some replayEventState96254 := by
+  rfl
+
+theorem replayStep96254 : stepAt document history replayEventState96254 = some replayEventState96255 := by
+  rfl
+
+theorem replayStep96255 : stepAt document history replayEventState96255 = some replayState24064 := by
+  apply stepAt_resultExact document history replayEventState96255
+    (⟨.program ⟨214⟩, ⟨9910⟩⟩) Proof.Events375.exact96255RawTerms (.finite 42) 96254 .exactZero (none) 96241
+  · rfl
+  · rfl
+  · rw [Proof.Events375.exact96255RawTermsValid]
+    rfl
+
+theorem replayChunk24063 : ReplayChain document history replayState24063 replayState24064 :=
+  .chunk 96256 (by
+    unfold replayRange
+    rw [show replayState24063.cursor = 96252 by rfl]
+    rw [show history.size = 107567 by rfl]
+    dsimp only
+    rw [show (decide (96252 ≤ 96256) && decide (96256 ≤ 107567) &&
+        decide (96256 - 96252 ≤ 4)) = true by decide]
+    simp only [if_true]
+    unfold replayBlock
+    rw [show replayState24063.cursor = 96252 by rfl]
+    unfold replayBlock.run
+    dsimp only
+    rw [show Nat.min (96256 - 96252) 4 = 4 by decide]
+    simp only [replayBlock.run, Option.bind_eq_bind]
+    rw [replayStep96252]
+    simp only [Option.bind_some]
+    rw [replayStep96253]
+    simp only [Option.bind_some]
+    rw [replayStep96254]
+    simp only [Option.bind_some]
+    rw [replayStep96255]
+    simp only [Option.bind_some]
+    rfl)
+
+theorem replayShard375 : ReplayChain document history replayState24000 replayState24064 :=
+  (.trans (.trans (.trans (.trans (.trans (.trans replayChunk24000 replayChunk24001) (.trans replayChunk24002 replayChunk24003)) (.trans (.trans replayChunk24004 replayChunk24005) (.trans replayChunk24006 replayChunk24007))) (.trans (.trans (.trans replayChunk24008 replayChunk24009) (.trans replayChunk24010 replayChunk24011)) (.trans (.trans replayChunk24012 replayChunk24013) (.trans replayChunk24014 replayChunk24015)))) (.trans (.trans (.trans (.trans replayChunk24016 replayChunk24017) (.trans replayChunk24018 replayChunk24019)) (.trans (.trans replayChunk24020 replayChunk24021) (.trans replayChunk24022 replayChunk24023))) (.trans (.trans (.trans replayChunk24024 replayChunk24025) (.trans replayChunk24026 replayChunk24027)) (.trans (.trans replayChunk24028 replayChunk24029) (.trans replayChunk24030 replayChunk24031))))) (.trans (.trans (.trans (.trans (.trans replayChunk24032 replayChunk24033) (.trans replayChunk24034 replayChunk24035)) (.trans (.trans replayChunk24036 replayChunk24037) (.trans replayChunk24038 replayChunk24039))) (.trans (.trans (.trans replayChunk24040 replayChunk24041) (.trans replayChunk24042 replayChunk24043)) (.trans (.trans replayChunk24044 replayChunk24045) (.trans replayChunk24046 replayChunk24047)))) (.trans (.trans (.trans (.trans replayChunk24048 replayChunk24049) (.trans replayChunk24050 replayChunk24051)) (.trans (.trans replayChunk24052 replayChunk24053) (.trans replayChunk24054 replayChunk24055))) (.trans (.trans (.trans replayChunk24056 replayChunk24057) (.trans replayChunk24058 replayChunk24059)) (.trans (.trans replayChunk24060 replayChunk24061) (.trans replayChunk24062 replayChunk24063))))))
+
+end Mxx.Certificate.OperationalNoise.TallSecurity0Generated.Proof.Replay375

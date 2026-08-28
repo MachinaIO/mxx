@@ -4349,7 +4349,8 @@ fn reached_terminal_rule(rule: &ProofPayloadRule) -> bool {
         ProofPayloadRule::Authority(
             ProofPayloadAuthority::FactStore |
                 ProofPayloadAuthority::ProgramFamilyFact |
-                ProofPayloadAuthority::Operator
+                ProofPayloadAuthority::Operator |
+                ProofPayloadAuthority::RelationPreimageSource { .. }
         ) | ProofPayloadRule::Identity { .. } |
             ProofPayloadRule::Scale { .. }
     )
@@ -4366,6 +4367,9 @@ fn reached_terminal_constructor(rule: &ProofPayloadRule) -> Result<String, Strin
         }
         ProofPayloadRule::Authority(ProofPayloadAuthority::Operator) => {
             ".authorityOperator".to_owned()
+        }
+        ProofPayloadRule::Authority(ProofPayloadAuthority::RelationPreimageSource { source }) => {
+            format!(".authorityRelationPreimageSource ⟨{source}⟩")
         }
         ProofPayloadRule::Identity { input } => {
             format!(".identity ({})", value_ref_text(input))
@@ -4399,6 +4403,9 @@ fn reached_terminal_rule_text(rule: &ProofPayloadRule) -> Result<String, String>
         }
         ProofPayloadRule::Authority(ProofPayloadAuthority::Operator) => {
             ".authority (.operator)".to_owned()
+        }
+        ProofPayloadRule::Authority(ProofPayloadAuthority::RelationPreimageSource { source }) => {
+            format!(".authority (.relationPreimageSource ⟨{source}⟩)")
         }
         ProofPayloadRule::Identity { input } => {
             format!(".identity ({})", value_ref_text(input))

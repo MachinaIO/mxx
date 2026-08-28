@@ -489,6 +489,36 @@ fn producer_events(
             }
         }
     }
+    let mut producers = Vec::new();
+    if let ProofPayloadEvent::Result {
+        value: ProofPayloadValue::Exact { coefficient_producer, summary_producer, .. },
+        ..
+    } = index.event(result_event)?
+    {
+        for (label, producer) in [
+            ("coefficient", *coefficient_producer),
+            ("summary", summary_producer.unwrap_or(*coefficient_producer)),
+        ] {
+            if label == "summary" && summary_producer.is_none() {
+                continue;
+            }
+            require_prior(producer, result_event, &format!("{label} producer"))?;
+            index.require_same_frame(result_event, producer)?;
+            let ProofPayloadEvent::BoundTransfer { owner: producer_owner, .. } =
+                index.event(producer)?
+            else {
+                return Err(format!(
+                    "{label} producer {producer} for Result {result_event} is not a BoundTransfer"
+                ));
+            };
+            if *producer_owner != owner {
+                return Err(format!(
+                    "{label} producer {producer} for Result {result_event} has a different owner"
+                ));
+            }
+            producers.push(producer);
+        }
+    }
     let frame = index.frame(result_event)?.start;
     let previous_result = index.events[..event_index(result_event)?]
         .iter()
@@ -517,23 +547,29 @@ fn producer_events(
         }
     }
     if !merges.is_empty() {
-        return Ok(merges);
+        producers.extend(merges);
+    } else {
+        let transfers = index.events[event_index(frame)? .. event_index(result_event)?]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, event)| {
+                let id = frame + u64::try_from(offset).ok()?;
+                matches!(event, ProofPayloadEvent::BoundTransfer { owner: candidate, .. } if *candidate == owner)
+                    .then_some(id)
+            })
+            .collect::<Vec<_>>();
+        if let Some(transfer) = transfers.last().copied() {
+            producers.push(transfer);
+        }
     }
-    let transfers = index.events[event_index(frame)? .. event_index(result_event)?]
-        .iter()
-        .enumerate()
-        .filter_map(|(offset, event)| {
-            let id = frame + u64::try_from(offset).ok()?;
-            matches!(event, ProofPayloadEvent::BoundTransfer { owner: candidate, .. } if *candidate == owner)
-                .then_some(id)
-        })
-        .collect::<Vec<_>>();
-    let Some(transfer) = transfers.last().copied() else {
+    producers.sort_unstable();
+    producers.dedup();
+    if producers.is_empty() {
         return Err(format!(
             "Result {result_event} owner has no producer transfer or coefficient merge"
         ));
-    };
-    Ok(vec![transfer])
+    }
+    Ok(producers)
 }
 
 fn collect_event(index: &Index<'_>, event_id: u64, work: &mut Vec<u64>) -> Result<(), String> {
@@ -827,6 +863,10 @@ mod tests {
     }
 
     fn exact() -> ProofPayloadValue {
+        exact_with_producer(0)
+    }
+
+    fn exact_with_producer(coefficient_producer: u64) -> ProofPayloadValue {
         let summary = BoundedSummary::zero();
         ProofPayloadValue::Exact {
             terms: vec![ProofPayloadTerm {
@@ -834,7 +874,7 @@ mod tests {
                 coefficient: BigInt::from(1),
             }],
             coefficient_bound: summary.coefficient_bound(),
-            coefficient_producer: 0,
+            coefficient_producer,
             summary,
             summary_producer: None,
         }
@@ -859,7 +899,11 @@ mod tests {
                     owner: input,
                     rule: ProofPayloadRule::Authority(ProofPayloadAuthority::Operator),
                 },
-                ProofPayloadEvent::Result { owner: input, value: exact() },
+                ProofPayloadEvent::Result { owner: input, value: exact_with_producer(1) },
+                ProofPayloadEvent::BoundTransfer {
+                    owner: root,
+                    rule: ProofPayloadRule::Authority(ProofPayloadAuthority::Operator),
+                },
                 ProofPayloadEvent::CoefficientMerge(
                     crate::operational_noise::simulation::ProofPayloadCoefficientMerge {
                         owner: root,
@@ -882,29 +926,33 @@ mod tests {
                         signed_contribution: BigInt::from(1),
                     },
                 ),
-                ProofPayloadEvent::Result { owner: root, value: exact() },
+                ProofPayloadEvent::Result { owner: root, value: exact_with_producer(3) },
                 ProofPayloadEvent::PreFoldPolynomial(
                     crate::operational_noise::simulation::ProofPayloadPreFoldPolynomial {
-                        result_event: 4,
+                        result_event: 5,
                         terms: vec![],
                         summary: BoundedSummary::zero(),
                         summary_evidence: Some(ProofPayloadValueRef::Result {
-                            event: 4,
+                            event: 5,
                             projection: crate::operational_noise::g0::BoundProjection::Summary,
                         }),
                     },
                 ),
-                ProofPayloadEvent::InvocationEnd { root, result: exact(), pre_fold_event: 5 },
+                ProofPayloadEvent::InvocationEnd {
+                    root,
+                    result: exact_with_producer(3),
+                    pre_fold_event: 6,
+                },
             ],
         };
-        let closure = collect(&proof, 6, root).expect("collect certificate final closure");
-        assert_eq!(closure.final_end_event, 6);
-        assert_eq!(closure.event_ids, vec![0, 1, 2, 3, 4, 5, 6]);
+        let closure = collect(&proof, 7, root).expect("collect certificate final closure");
+        assert_eq!(closure.final_end_event, 7);
+        assert_eq!(closure.event_ids, vec![0, 1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(closure.event_counts[&ClosureEventKind::CoefficientMergeOperator], 1);
-        assert_eq!(closure.bound_rule_counts[&ClosureBoundRuleKind::AuthorityOperator], 1);
+        assert_eq!(closure.bound_rule_counts[&ClosureBoundRuleKind::AuthorityOperator], 2);
         assert_eq!(
             collect_event_closure(&proof, 4).expect("collect exact Result closure"),
-            vec![0, 1, 2, 3, 4]
+            vec![0, 1, 2, 4]
         );
     }
 
@@ -914,7 +962,7 @@ mod tests {
         let proof = OperationalProofPayload {
             events: vec![
                 ProofPayloadEvent::InvocationStart { root },
-                ProofPayloadEvent::Result { owner: root, value: exact() },
+                ProofPayloadEvent::Result { owner: root, value: exact_with_producer(4) },
                 ProofPayloadEvent::PreFoldPolynomial(
                     crate::operational_noise::simulation::ProofPayloadPreFoldPolynomial {
                         result_event: 1,
@@ -951,7 +999,7 @@ mod tests {
                     owner: root,
                     rule: ProofPayloadRule::Authority(ProofPayloadAuthority::Operator),
                 },
-                ProofPayloadEvent::Result { owner: root, value: exact() },
+                ProofPayloadEvent::Result { owner: root, value: exact_with_producer(4) },
                 ProofPayloadEvent::PreFoldPolynomial(
                     crate::operational_noise::simulation::ProofPayloadPreFoldPolynomial {
                         result_event: 5,

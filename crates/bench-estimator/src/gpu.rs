@@ -1082,6 +1082,18 @@ impl GpuNodeMeasurementBackend {
                     )
                     .map_err(backend_error)
             }
+            NodeKind::RingAutomorphism { index } => {
+                let index = evaluate_usize(index)?;
+                backend
+                    .ring_automorphism_batch(
+                        (0..batch_size).map(|_| Ok((matrix_arc(0)?, index))).collect::<Result<
+                            Vec<_>,
+                            GpuMeasurementError,
+                        >>(
+                        )?,
+                    )
+                    .map_err(backend_error)
+            }
             NodeKind::Transpose => (0..batch_size)
                 .map(|_| backend.transpose(matrix(0)?).map_err(backend_error))
                 .collect(),

@@ -774,6 +774,76 @@ theorem bound_identity_fixture :
   · exact .result rfl (.resultExactCoefficient (rule := .sum []) (by rfl)
       (by simp [RecordedBoundRefines]) (.sum (by rfl) .nil))
 
+def ringAutomorphismFixtureHistory : EventHistory :=
+  smallHistory #[
+    annotated (.boundTransfer boundFixtureOwner (.sum [])) 7,
+    annotated (.resultCoefficient boundFixtureOwner .exactZero) 7,
+    annotated (.boundTransfer boundFixtureOwner
+      (.ringAutomorphism boundFixtureReference 5 4)) 7]
+
+def ringAutomorphismValid4_5 : RingAutomorphismIndexValid 4 5 :=
+  ringAutomorphismIndexValidOfInverse 4 5 1
+    (by decide) (by decide) (by decide) (by decide) (by decide) (by decide)
+
+def ringAutomorphismZeroInput : Coefficients 4 := fun _ => 0
+
+def ringAutomorphismWrongOutput : Coefficients 4 := fun _ => 1
+
+def ringAutomorphismZeroReplay : RingAutomorphismReplay ringAutomorphismValid4_5 0 0 where
+  input := ringAutomorphismZeroInput
+  output := ringAutomorphismCoefficients ringAutomorphismValid4_5 ringAutomorphismZeroInput
+  outputEquation := rfl
+  inputHasMagnitude := by
+    constructor
+    · intro coefficient
+      simp [ringAutomorphismZeroInput]
+    · exact ⟨⟨0, by decide⟩, by simp [ringAutomorphismZeroInput]⟩
+  outputHasMagnitude := by
+    constructor
+    · intro coefficient
+      simp [ringAutomorphismCoefficients, ringAutomorphismSignedValue,
+        ringAutomorphismZeroInput]
+    · exact ⟨⟨0, by decide⟩, by
+        simp [ringAutomorphismCoefficients, ringAutomorphismSignedValue,
+          ringAutomorphismZeroInput]⟩
+
+theorem ring_automorphism_unrelated_output_rejected :
+    ringAutomorphismWrongOutput ≠
+      ringAutomorphismCoefficients ringAutomorphismValid4_5 ringAutomorphismZeroInput := by
+  intro unrelated
+  have atZero := congrFun unrelated (⟨0, by decide⟩ : Fin 4)
+  simp [ringAutomorphismWrongOutput, ringAutomorphismCoefficients,
+    ringAutomorphismSignedValue, ringAutomorphismZeroInput] at atZero
+
+theorem generated_ring_automorphism_evidence_fixture
+    {document : CertificateDocument} {history : EventHistory} {selector : Option Nat}
+    {modulus : Nat} {owner : Owner} {reference : ValueRef} {bound : CoeffClass}
+    {inputMagnitude : Nat}
+    (witness : Witness document history selector modulus)
+    (row : history.lookup 2 = some
+      ⟨.boundTransfer owner (.ringAutomorphism reference 5 4), 7⟩)
+    (child : BoundInputAt history owner reference bound inputMagnitude) :
+    BoundDerivedAt history 2 7 owner (.ringAutomorphism reference 5 4) bound
+      (witness.ringAutomorphismOutputMagnitude 2) := by
+  let valid := ringAutomorphismValid4_5
+  exact .ringAutomorphism row child (valid := valid)
+    (replay := witness.ringAutomorphismReplay row child valid)
+
+/-- An accepted certificate rule for the exact signed permutation `X ↦ X⁵` in
+    `ℤ[X]/(X⁴ + 1)`. The child bound is preserved rather than reclassified as identity. -/
+theorem bound_ring_automorphism_fixture :
+    BoundDerivedAt ringAutomorphismFixtureHistory 2 7 boundFixtureOwner
+      (.ringAutomorphism boundFixtureReference 5 4) .exactZero 0 := by
+  exact BoundDerivedAt.ringAutomorphism
+    (valid := ringAutomorphismValid4_5) (replay := ringAutomorphismZeroReplay)
+    rfl (.result rfl (.resultCoefficient rfl rfl (.sum rfl .nil)))
+
+theorem ring_automorphism_preserves_bound_fixture
+    (input : Coefficients 4) (bound : CoeffClass) :
+    bound.Bounds (ringAutomorphismCoefficients ringAutomorphismValid4_5 input) ↔
+      bound.Bounds input :=
+  ringAutomorphismCoefficients_bounds_iff ringAutomorphismValid4_5 input bound
+
 theorem bound_transfer_input_fixture :
     BoundInputAt boundFixtureHistory boundFixtureOwner (.transfer 2) .exactZero 0 := by
   exact boundDerived_to_transferInput bound_identity_fixture
@@ -1163,6 +1233,10 @@ theorem canonical_relation_fixture :
 #print axioms CertificateSemantics.gadgetRelationMergeClaim
 #print axioms CertificateSemantics.exactClaimAt_of_mergeClaim
 #print axioms bound_transfer_input_fixture
+#print axioms bound_ring_automorphism_fixture
+#print axioms ring_automorphism_preserves_bound_fixture
+#print axioms ring_automorphism_unrelated_output_rejected
+#print axioms generated_ring_automorphism_evidence_fixture
 #print axioms bound_identity_projection_fixture
 #print axioms bound_summary_projection_fixture
 #print axioms bound_result_summary_input_fixture

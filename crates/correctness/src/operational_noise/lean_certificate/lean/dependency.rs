@@ -39,6 +39,7 @@ pub(crate) enum ClosureBoundRuleKind {
     AuthorityRelationPreimageSource,
     AuthorityUnavailable,
     Identity,
+    RingAutomorphism,
     Sum,
     Maximum,
     Scale,
@@ -315,6 +316,7 @@ fn bound_rule_kind(rule: &ProofPayloadRule) -> ClosureBoundRuleKind {
             ProofPayloadAuthority::Unavailable => ClosureBoundRuleKind::AuthorityUnavailable,
         },
         ProofPayloadRule::Identity { .. } => ClosureBoundRuleKind::Identity,
+        ProofPayloadRule::RingAutomorphism { .. } => ClosureBoundRuleKind::RingAutomorphism,
         ProofPayloadRule::Sum { .. } => ClosureBoundRuleKind::Sum,
         ProofPayloadRule::Maximum { .. } => ClosureBoundRuleKind::Maximum,
         ProofPayloadRule::Scale { .. } => ClosureBoundRuleKind::Scale,
@@ -404,7 +406,7 @@ fn collect_rule(
 ) -> Result<(), String> {
     match rule {
         ProofPayloadRule::Authority(_) => {}
-        ProofPayloadRule::Identity { input } => {
+        ProofPayloadRule::Identity { input } | ProofPayloadRule::RingAutomorphism { input, .. } => {
             collect_value_ref(index, current, owner, input, work)?
         }
         ProofPayloadRule::Sum { inputs } |

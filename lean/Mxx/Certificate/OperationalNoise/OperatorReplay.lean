@@ -165,4 +165,136 @@ theorem routesCoefficients_bound {inputCount outputCount : Nat}
   · rw [outputSelected]
     exact inputBound inputIndex
 
+/-- The exact validity evidence for `X ↦ X^index` on the negacyclic coefficient basis. -/
+structure RingAutomorphismIndexValid (ringDimension index : Nat) where
+  ringPositive : 0 < ringDimension
+  indexPositive : 0 < index
+  indexBelowTwiceRing : index < 2 * ringDimension
+  indexOdd : index % 2 = 1
+  inverse : Fin ringDimension → Fin ringDimension
+  inverseTarget : ∀ source,
+    inverse (⟨(source.val * index) % ringDimension,
+      Nat.mod_lt _ ringPositive⟩ : Fin ringDimension) = source
+  targetInverse : ∀ target,
+    (⟨((inverse target).val * index) % ringDimension,
+      Nat.mod_lt _ ringPositive⟩ : Fin ringDimension) = target
+
+/-- Constructs automorphism evidence from a checked modular inverse. Certificate generators emit
+    only the two closed inverse equations; the permutation laws are proved here for every index. -/
+def ringAutomorphismIndexValidOfInverse (ringDimension index inverseIndex : Nat)
+    (ringPositive : 0 < ringDimension) (indexPositive : 0 < index)
+    (indexBelowTwiceRing : index < 2 * ringDimension) (indexOdd : index % 2 = 1)
+    (rightInverse : (index * inverseIndex) % ringDimension = 1)
+    (leftInverse : (inverseIndex * index) % ringDimension = 1) :
+    RingAutomorphismIndexValid ringDimension index where
+  ringPositive := ringPositive
+  indexPositive := indexPositive
+  indexBelowTwiceRing := indexBelowTwiceRing
+  indexOdd := indexOdd
+  inverse := fun target =>
+    ⟨(target.val * inverseIndex) % ringDimension, Nat.mod_lt _ ringPositive⟩
+  inverseTarget := by
+    intro source
+    apply Fin.ext
+    calc
+      (((source.val * index) % ringDimension) * inverseIndex) % ringDimension =
+          (source.val * (index * inverseIndex)) % ringDimension := by
+            rw [Nat.mod_mul_mod, Nat.mul_assoc]
+      _ = (source.val * ((index * inverseIndex) % ringDimension)) % ringDimension := by
+            rw [Nat.mul_mod_mod]
+      _ = source.val := by
+            rw [rightInverse, Nat.mul_one, Nat.mod_eq_of_lt source.isLt]
+  targetInverse := by
+    intro target
+    apply Fin.ext
+    calc
+      (((target.val * inverseIndex) % ringDimension) * index) % ringDimension =
+          (target.val * (inverseIndex * index)) % ringDimension := by
+            rw [Nat.mod_mul_mod, Nat.mul_assoc]
+      _ = (target.val * ((inverseIndex * index) % ringDimension)) % ringDimension := by
+            rw [Nat.mul_mod_mod]
+      _ = target.val := by
+            rw [leftInverse, Nat.mul_one, Nat.mod_eq_of_lt target.isLt]
+
+def ringAutomorphismTarget {ringDimension : Nat} (index : Nat)
+    (ringPositive : 0 < ringDimension) (source : Fin ringDimension) : Fin ringDimension :=
+  ⟨(source.val * index) % ringDimension, Nat.mod_lt _ ringPositive⟩
+
+def ringAutomorphismSignedValue {ringDimension : Nat} (index : Nat)
+    (input : Coefficients ringDimension) (source : Fin ringDimension) : Int :=
+  if (source.val * index) % (2 * ringDimension) < ringDimension then input source
+  else -input source
+
+/-- Exact signed coefficient permutation implemented by the raw ring automorphism. -/
+def ringAutomorphismCoefficients {ringDimension index : Nat}
+    (valid : RingAutomorphismIndexValid ringDimension index)
+    (input : Coefficients ringDimension) : Coefficients ringDimension :=
+  fun target =>
+    let source := valid.inverse target
+    ringAutomorphismSignedValue index input source
+
+theorem ringAutomorphismCoefficients_target {ringDimension index : Nat}
+    (valid : RingAutomorphismIndexValid ringDimension index)
+    (input : Coefficients ringDimension) (source : Fin ringDimension) :
+    ringAutomorphismCoefficients valid input
+        (ringAutomorphismTarget index valid.ringPositive source) =
+      ringAutomorphismSignedValue index input source := by
+  unfold ringAutomorphismCoefficients
+  rw [show valid.inverse (ringAutomorphismTarget index valid.ringPositive source) = source by
+    exact valid.inverseTarget source]
+
+/-- A valid raw automorphism preserves and reflects the maximum coefficient bound exactly. -/
+theorem ringAutomorphismCoefficients_bounds_iff {ringDimension index : Nat}
+    (valid : RingAutomorphismIndexValid ringDimension index)
+    (input : Coefficients ringDimension) (bound : CoeffClass) :
+    bound.Bounds (ringAutomorphismCoefficients valid input) ↔ bound.Bounds input := by
+  constructor
+  · intro outputBound source
+    have selected := outputBound (ringAutomorphismTarget index valid.ringPositive source)
+    rw [ringAutomorphismCoefficients_target valid input source] at selected
+    by_cases positive : (source.val * index) % (2 * ringDimension) < ringDimension
+    · simpa [ringAutomorphismSignedValue, positive] using selected
+    · simpa [ringAutomorphismSignedValue, positive] using selected
+  · intro inputBound target
+    let source := valid.inverse target
+    have selected := inputBound source
+    by_cases positive : (source.val * index) % (2 * ringDimension) < ringDimension
+    · simpa [ringAutomorphismCoefficients, source, ringAutomorphismSignedValue, positive]
+        using selected
+    · simpa [ringAutomorphismCoefficients, source, ringAutomorphismSignedValue, positive]
+        using selected
+
+/-- `magnitude` is the attained maximum absolute coefficient, not merely an upper bound. -/
+def CoefficientsHaveMagnitude {count : Nat} (coefficients : Coefficients count)
+    (magnitude : Nat) : Prop :=
+  (∀ coefficient, (coefficients coefficient).natAbs ≤ magnitude) ∧
+    ∃ coefficient, (coefficients coefficient).natAbs = magnitude
+
+/-- Semantic replay evidence for one concrete raw automorphism operation. The output coefficients
+    are tied to the signed permutation, so an unrelated value cannot justify the transfer. -/
+structure RingAutomorphismReplay {ringDimension index : Nat}
+    (valid : RingAutomorphismIndexValid ringDimension index)
+    (inputMagnitude outputMagnitude : Nat) where
+  input : Coefficients ringDimension
+  output : Coefficients ringDimension
+  outputEquation : output = ringAutomorphismCoefficients valid input
+  inputHasMagnitude : CoefficientsHaveMagnitude input inputMagnitude
+  outputHasMagnitude : CoefficientsHaveMagnitude output outputMagnitude
+
+theorem RingAutomorphismReplay.bound {ringDimension index : Nat}
+    {valid : RingAutomorphismIndexValid ringDimension index}
+    {inputMagnitude outputMagnitude : Nat} {bound : CoeffClass}
+    (replay : RingAutomorphismReplay valid inputMagnitude outputMagnitude)
+    (inputBound : bound.Interprets inputMagnitude) :
+    bound.Interprets outputMagnitude := by
+  have coefficientsBound : bound.Bounds replay.input := by
+    intro coefficient
+    exact CoeffClass.Interprets.mono (replay.inputHasMagnitude.1 coefficient) inputBound
+  have outputBound : bound.Bounds replay.output := by
+    rw [replay.outputEquation]
+    exact (ringAutomorphismCoefficients_bounds_iff valid replay.input bound).2 coefficientsBound
+  rcases replay.outputHasMagnitude.2 with ⟨coefficient, exactMagnitude⟩
+  rw [← exactMagnitude]
+  exact outputBound coefficient
+
 end Mxx.Certificate.OperationalNoise.EventReplay

@@ -313,7 +313,8 @@ impl PayloadIndex {
                     return Err(format!("transfer reference {event} owner mismatch"));
                 }
                 match rule {
-                    ProofPayloadRule::Identity { input } => {
+                    ProofPayloadRule::Identity { input } |
+                    ProofPayloadRule::RingAutomorphism { input, .. } => {
                         self.value_ref_seen(owner, input, seen_transfers)
                     }
                     ProofPayloadRule::Sum { inputs } if inputs.len() == 1 => {
@@ -1011,6 +1012,7 @@ fn reached_left_bound_rule(rule: &ProofPayloadRule) -> bool {
                 ProofPayloadAuthority::Operator |
                 ProofPayloadAuthority::RelationPreimageSource { .. }
         ) | ProofPayloadRule::Identity { .. } |
+            ProofPayloadRule::RingAutomorphism { .. } |
             ProofPayloadRule::Sum { .. } |
             ProofPayloadRule::Scale { .. } |
             ProofPayloadRule::MonomialProduct { .. } |
@@ -1023,7 +1025,9 @@ fn rule_references_transfer(rule: &ProofPayloadRule, transfer: u64) -> bool {
     let reference_matches = |reference: &ProofPayloadValueRef| matches!(reference, ProofPayloadValueRef::Transfer(event) if *event == transfer);
     match rule {
         ProofPayloadRule::Authority(_) => false,
-        ProofPayloadRule::Identity { input } => reference_matches(input),
+        ProofPayloadRule::Identity { input } | ProofPayloadRule::RingAutomorphism { input, .. } => {
+            reference_matches(input)
+        }
         ProofPayloadRule::Sum { inputs } |
         ProofPayloadRule::Maximum { inputs } |
         ProofPayloadRule::WeightedSum { inputs } => inputs.iter().any(reference_matches),
@@ -1044,7 +1048,9 @@ fn rule_references_transfer(rule: &ProofPayloadRule, transfer: u64) -> bool {
 fn reached_bound_references(rule: &ProofPayloadRule) -> Vec<&ProofPayloadValueRef> {
     match rule {
         ProofPayloadRule::Authority(_) => Vec::new(),
-        ProofPayloadRule::Identity { input } => vec![input],
+        ProofPayloadRule::Identity { input } | ProofPayloadRule::RingAutomorphism { input, .. } => {
+            vec![input]
+        }
         ProofPayloadRule::Sum { inputs } => inputs.iter().collect(),
         ProofPayloadRule::Scale { value, scale } => {
             let mut references = vec![value];
@@ -3374,6 +3380,9 @@ fn left_rule_text(rule: &ProofPayloadRule) -> Result<String, String> {
         ProofPayloadRule::Identity { input } => {
             format!(".identity ({})", value_ref_text(input))
         }
+        ProofPayloadRule::RingAutomorphism { input, index, ring_dimension } => {
+            format!(".ringAutomorphism ({}) {index} {ring_dimension}", value_ref_text(input))
+        }
         ProofPayloadRule::Sum { inputs } => {
             format!(".sum [{}]", inputs.iter().map(value_ref_text).collect::<Vec<_>>().join(", "))
         }
@@ -3398,6 +3407,54 @@ fn left_rule_text(rule: &ProofPayloadRule) -> Result<String, String> {
         ProofPayloadRule::Tensor { .. } => rule_text(rule),
         _ => return Err(format!("unsupported reached left bound rule {rule:?}")),
     })
+}
+
+fn ring_automorphism_valid_text(index: u64, ring_dimension: usize) -> Result<String, String> {
+    if ring_dimension == 0 ||
+        !ring_dimension.is_power_of_two() ||
+        index == 0 ||
+        u128::from(index) >= ring_dimension as u128 * 2 ||
+        index % 2 == 0
+    {
+        return Err("invalid ring automorphism evidence".to_owned());
+    }
+    let modulus = i128::try_from(ring_dimension)
+        .map_err(|_| "ring dimension does not fit certificate inverse arithmetic")?;
+    let mut old_r = i128::from(index);
+    let mut r = modulus;
+    let mut old_s = 1_i128;
+    let mut s = 0_i128;
+    while r != 0 {
+        let quotient = old_r / r;
+        (old_r, r) = (r, old_r - quotient * r);
+        (old_s, s) = (s, old_s - quotient * s);
+    }
+    if old_r != 1 {
+        return Err("ring automorphism index is not invertible modulo ring dimension".to_owned());
+    }
+    let inverse = old_s.rem_euclid(modulus);
+    Ok(format!(
+        "ringAutomorphismIndexValidOfInverse {ring_dimension} {index} {inverse} \
+         (by decide) (by decide) (by decide) (by decide) (by decide) (by decide)"
+    ))
+}
+
+fn ring_automorphism_semantic_text(
+    index: u64,
+    ring_dimension: usize,
+    producer_event: u64,
+) -> Result<(String, String), String> {
+    let valid = ring_automorphism_valid_text(index, ring_dimension)?;
+    Ok((
+        format!("witness.ringAutomorphismOutputMagnitude {producer_event}"),
+        format!(
+            "let valid := {valid}\n  refine .ringAutomorphism (by rfl) \
+             (input0 selector witness) \
+             (valid := valid) \
+             (replay := witness.ringAutomorphismReplay (by rfl) \
+               (input0 selector witness) valid)"
+        ),
+    ))
 }
 
 fn reached_product_shape(
@@ -3713,7 +3770,9 @@ fn replay_left_bound_classes(
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             match node.rule {
-                ProofPayloadRule::Identity { .. } => inputs[0].clone(),
+                ProofPayloadRule::Identity { .. } | ProofPayloadRule::RingAutomorphism { .. } => {
+                    inputs[0].clone()
+                }
                 ProofPayloadRule::Sum { .. } => add_bounds(&inputs),
                 ProofPayloadRule::Scale {
                     scale: crate::operational_noise::simulation::ProofPayloadScale::Magnitude(value),
@@ -3912,7 +3971,8 @@ fn render_bounds(
                 .expect("String write");
 
             let references = match node.rule {
-                ProofPayloadRule::Identity { input } => vec![input],
+                ProofPayloadRule::Identity { input } |
+                ProofPayloadRule::RingAutomorphism { input, .. } => vec![input],
                 ProofPayloadRule::Sum { inputs } => inputs.iter().collect(),
                 ProofPayloadRule::Scale { value, scale } => {
                     let mut values = vec![value];
@@ -3951,6 +4011,11 @@ fn render_bounds(
                     child_actuals[0].clone(),
                     "refine .identity (by rfl) (input0 selector witness)".to_owned(),
                 ),
+                ProofPayloadRule::RingAutomorphism { index, ring_dimension, .. } => {
+                    let (actual, proof) =
+                        ring_automorphism_semantic_text(*index, *ring_dimension, node.event)?;
+                    (child_bounds[0].clone(), actual, proof)
+                }
                 ProofPayloadRule::Sum { .. } => {
                     let children = (0..inputs.len()).rev().fold(".nil".to_owned(), |tail, ordinal| {
                         format!(".cons (input{ordinal} selector witness) ({tail})")
@@ -4379,6 +4444,7 @@ fn reached_terminal_rule(rule: &ProofPayloadRule) -> bool {
                 ProofPayloadAuthority::Operator |
                 ProofPayloadAuthority::RelationPreimageSource { .. }
         ) | ProofPayloadRule::Identity { .. } |
+            ProofPayloadRule::RingAutomorphism { .. } |
             ProofPayloadRule::Scale { .. }
     )
 }
@@ -4400,6 +4466,9 @@ fn reached_terminal_constructor(rule: &ProofPayloadRule) -> Result<String, Strin
         }
         ProofPayloadRule::Identity { input } => {
             format!(".identity ({})", value_ref_text(input))
+        }
+        ProofPayloadRule::RingAutomorphism { input, index, ring_dimension } => {
+            format!(".ringAutomorphism ({}) {index} {ring_dimension}", value_ref_text(input))
         }
         ProofPayloadRule::Scale { value, scale } => {
             format!(".scale ({}) ({})", value_ref_text(value), terminal_scale_text(scale))
@@ -4437,6 +4506,9 @@ fn reached_terminal_rule_text(rule: &ProofPayloadRule) -> Result<String, String>
         ProofPayloadRule::Identity { input } => {
             format!(".identity ({})", value_ref_text(input))
         }
+        ProofPayloadRule::RingAutomorphism { input, index, ring_dimension } => {
+            format!(".ringAutomorphism ({}) {index} {ring_dimension}", value_ref_text(input))
+        }
         ProofPayloadRule::Scale { value, scale } => {
             format!(".scale ({}) ({})", value_ref_text(value), terminal_scale_text(scale))
         }
@@ -4447,6 +4519,19 @@ fn reached_terminal_rule_text(rule: &ProofPayloadRule) -> Result<String, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ring_automorphism_evidence_uses_closed_inverse_equations_without_native_axioms() {
+        let evidence = ring_automorphism_valid_text(5, 4).expect("valid odd automorphism");
+        assert!(evidence.contains("ringAutomorphismIndexValidOfInverse 4 5 1"));
+        assert!(!evidence.contains("native_decide"));
+        let (actual, proof) =
+            ring_automorphism_semantic_text(5, 4, 17).expect("semantic automorphism replay");
+        assert_eq!(actual, "witness.ringAutomorphismOutputMagnitude 17");
+        assert!(proof.contains("witness.ringAutomorphismReplay"));
+        assert!(proof.contains("valid := valid"));
+        assert!(ring_automorphism_valid_text(3, 6).is_err());
+    }
     use crate::operational_noise::{
         normal_form::BoundedSummary,
         simulation::{

@@ -354,6 +354,9 @@ fn rule_text(value: &ProofPayloadRule) -> Result<String, String> {
             format!(".authority ({})", authority_text(authority)?)
         }
         ProofPayloadRule::Identity { input } => format!(".identity ({})", value_ref(input)),
+        ProofPayloadRule::RingAutomorphism { input, index, ring_dimension } => {
+            format!(".ringAutomorphism ({}) {index} {ring_dimension}", value_ref(input))
+        }
         ProofPayloadRule::Sum { inputs } => format!(".sum {}", refs(inputs)?),
         ProofPayloadRule::Scale { value, scale } => {
             format!(".scale ({}) ({})", value_ref(value), scale_text(scale))

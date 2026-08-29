@@ -213,6 +213,7 @@ deriving DecidableEq, Repr
 
 inductive MatrixOperation where
   | add | subtract | multiply | negate | scale | transpose
+  | ringAutomorphism (index : Nat)
   | slice (rowStart rowEndExclusive columnStart columnEndExclusive : Nat) (layout : Layout)
   | indexedSlice (output : ValueType) (layout : Layout)
   | view (output : ValueType) (layout : Layout)

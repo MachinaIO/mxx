@@ -216,6 +216,7 @@ private def decodeMatrixOperation (json : Json) : Except String MatrixOperation 
   | "multiply" => pure .multiply
   | "negate" => pure .negate
   | "scale" => pure .scale
+  | "ring_automorphism" => pure <| .ringAutomorphism (← natField json "index")
   | "transpose" => pure .transpose
   | kind => throw s!"small v1 fixture does not contain matrix operation {kind}"
 

@@ -347,6 +347,11 @@ pub(crate) enum ProofPayloadRule {
     Identity {
         input: ProofPayloadValueRef,
     },
+    RingAutomorphism {
+        input: ProofPayloadValueRef,
+        index: u64,
+        ring_dimension: usize,
+    },
     Sum {
         inputs: Vec<ProofPayloadValueRef>,
     },
@@ -465,6 +470,7 @@ pub(crate) enum ObservedMatrixKind {
     Multiply,
     Negate,
     Scale,
+    RingAutomorphism,
     Transpose,
     Slice,
     IndexedSlice,
@@ -546,6 +552,7 @@ pub(crate) enum ObservedRelationKind {
 pub(crate) enum ObservedBoundKind {
     Authority(ObservedAuthorityKind),
     Identity,
+    RingAutomorphism,
     Sum,
     Maximum,
     Scale,
@@ -752,6 +759,7 @@ impl LogicalItems for ObservedBoundKind {
             match self {
                 Self::Authority(kind) => kind.logical_items()?,
                 Self::Identity |
+                Self::RingAutomorphism |
                 Self::Sum |
                 Self::Maximum |
                 Self::Scale |
@@ -1169,6 +1177,7 @@ impl LogicalItems for ProofPayloadRule {
         match self {
             Self::Authority(authority) => checked_add(1, authority.logical_items()?),
             Self::Identity { input } => checked_add(1, input.logical_items()?),
+            Self::RingAutomorphism { input, .. } => checked_add(3, input.logical_items()?),
             Self::Sum { inputs } | Self::Maximum { inputs } | Self::WeightedSum { inputs } => {
                 checked_add(1, inputs.logical_items()?)
             }
@@ -1592,6 +1601,12 @@ impl CanonicalPayloadWriter {
             ProofPayloadRule::Identity { input } => {
                 self.u8(1);
                 self.value_ref(input);
+            }
+            ProofPayloadRule::RingAutomorphism { input, index, ring_dimension } => {
+                self.u8(9);
+                self.value_ref(input);
+                self.u64(*index);
+                self.usize(*ring_dimension)?;
             }
             ProofPayloadRule::Sum { inputs } => {
                 self.u8(2);
@@ -2291,6 +2306,7 @@ fn observed_matrix_kind(operation: &MatrixOperation) -> ObservedMatrixKind {
         MatrixOperation::Multiply => ObservedMatrixKind::Multiply,
         MatrixOperation::Negate => ObservedMatrixKind::Negate,
         MatrixOperation::Scale => ObservedMatrixKind::Scale,
+        MatrixOperation::RingAutomorphism { .. } => ObservedMatrixKind::RingAutomorphism,
         MatrixOperation::Transpose => ObservedMatrixKind::Transpose,
         MatrixOperation::Slice { .. } => ObservedMatrixKind::Slice,
         MatrixOperation::IndexedSlice { .. } => ObservedMatrixKind::IndexedSlice,
@@ -2400,6 +2416,7 @@ fn observed_bound_kind(rule: &ProofPayloadRule) -> ObservedBoundKind {
             ProofPayloadAuthority::Unavailable => ObservedAuthorityKind::Unavailable,
         }),
         ProofPayloadRule::Identity { .. } => ObservedBoundKind::Identity,
+        ProofPayloadRule::RingAutomorphism { .. } => ObservedBoundKind::RingAutomorphism,
         ProofPayloadRule::Sum { .. } => ObservedBoundKind::Sum,
         ProofPayloadRule::Maximum { .. } => ObservedBoundKind::Maximum,
         ProofPayloadRule::Scale { .. } => ObservedBoundKind::Scale,
@@ -2573,6 +2590,7 @@ fn matrix_coverage_classification(kind: ObservedMatrixKind) -> ResidualCoverageC
         ObservedMatrixKind::Multiply |
         ObservedMatrixKind::Negate |
         ObservedMatrixKind::Scale |
+        ObservedMatrixKind::RingAutomorphism |
         ObservedMatrixKind::Transpose |
         ObservedMatrixKind::Slice |
         ObservedMatrixKind::IndexedSlice |
@@ -2722,6 +2740,7 @@ fn bound_coverage_classification(kind: ObservedBoundKind) -> ResidualCoverageCla
             "authority-provided coefficient bound",
         ),
         ObservedBoundKind::Identity |
+        ObservedBoundKind::RingAutomorphism |
         ObservedBoundKind::Sum |
         ObservedBoundKind::Maximum |
         ObservedBoundKind::Scale |
@@ -3455,7 +3474,9 @@ impl<'a> ProofPayloadProjector<'a> {
         };
         let output = match rule {
             BoundRule::Authority(_) => return Err(G0Error::UnsupportedBoundTransfer),
-            BoundRule::Identity { input } => reference(input, visiting)?,
+            BoundRule::Identity { input } | BoundRule::RingAutomorphism { input, .. } => {
+                reference(input, visiting)?
+            }
             BoundRule::Sum { inputs } => super::facts::add_bounds(
                 &inputs
                     .iter()
@@ -4202,6 +4223,13 @@ impl<'a> ProofPayloadProjector<'a> {
                 ProofPayloadRule::Authority(payload_projection(self.authority(authority))?)
             }
             BoundRule::Identity { input } => ProofPayloadRule::Identity { input: value(input)? },
+            BoundRule::RingAutomorphism { input, index, ring_dimension } => {
+                ProofPayloadRule::RingAutomorphism {
+                    input: value(input)?,
+                    index: *index,
+                    ring_dimension: *ring_dimension,
+                }
+            }
             BoundRule::Sum { inputs } => ProofPayloadRule::Sum {
                 inputs: inputs.iter().map(value).collect::<Result<Vec<_>, _>>()?,
             },
@@ -5420,6 +5448,15 @@ fn resolve_target(
                 break;
             }
         }
+    } else {
+        // Cross-stage decoder inputs are represented by an explicit artifact
+        // binding rather than by a same-graph wire edge.  Treat that binding
+        // as the generic provenance edge; do not infer it from names or
+        // matrix shape alone.
+        consumes_residual = decoder_stage.bindings.iter().any(|binding| {
+            binding.producer_stage == target.residual_stage &&
+                binding.producer_output == crate::ArtifactName(target.residual_output.clone())
+        });
     }
     if !consumes_residual {
         return Err(OperationalSimulationError::Target(
@@ -6377,7 +6414,8 @@ mod tests {
         let value = |value: &ProofPayloadValueRef| matches!(value, ProofPayloadValueRef::Transfer(candidate) if *candidate as usize == event);
         match rule {
             ProofPayloadRule::Authority(_) => false,
-            ProofPayloadRule::Identity { input } => value(input),
+            ProofPayloadRule::Identity { input } |
+            ProofPayloadRule::RingAutomorphism { input, .. } => value(input),
             ProofPayloadRule::Sum { inputs } |
             ProofPayloadRule::Maximum { inputs } |
             ProofPayloadRule::WeightedSum { inputs } => inputs.iter().any(value),
@@ -6405,7 +6443,8 @@ mod tests {
             let value = |reference: &ProofPayloadValueRef| value_ref_before(reference, before);
             match rule {
                 ProofPayloadRule::Authority(_) => {}
-                ProofPayloadRule::Identity { input } => value(input),
+                ProofPayloadRule::Identity { input } |
+                ProofPayloadRule::RingAutomorphism { input, .. } => value(input),
                 ProofPayloadRule::Sum { inputs } |
                 ProofPayloadRule::Maximum { inputs } |
                 ProofPayloadRule::WeightedSum { inputs } => inputs.iter().for_each(value),

@@ -1560,6 +1560,16 @@ mutual
         (child : BoundInputAt history owner reference bound actualMagnitude) :
         BoundDerivedAt history transferEvent transferFrame owner (.identity reference)
           bound actualMagnitude
+    | ringAutomorphism {transferEvent transferFrame : Nat} {owner : Owner}
+        {reference : ValueRef} {index ringDimension : Nat}
+        {bound : CoeffClass} {inputMagnitude outputMagnitude : Nat}
+        (transferRow : history.lookup transferEvent = some
+          ⟨.boundTransfer owner (.ringAutomorphism reference index ringDimension), transferFrame⟩)
+        (child : BoundInputAt history owner reference bound inputMagnitude)
+        (valid : EventReplay.RingAutomorphismIndexValid ringDimension index)
+        (replay : EventReplay.RingAutomorphismReplay valid inputMagnitude outputMagnitude) :
+        BoundDerivedAt history transferEvent transferFrame owner
+          (.ringAutomorphism reference index ringDimension) bound outputMagnitude
     | sum {transferEvent transferFrame : Nat} {owner : Owner}
         {references : List ValueRef} {bounds : List CoeffClass} {actuals : List Nat}
         (transferRow : history.lookup transferEvent = some
@@ -1646,7 +1656,7 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ projected
   · intros
     assumption
   · intros
@@ -1673,6 +1683,8 @@ theorem ProjectedBoundAt.sound {history : EventHistory} {resultEvent : Nat} {own
     apply AuthorityWitness.authorityBound <;> assumption
   · intros
     assumption
+  · intros
+    exact EventReplay.RingAutomorphismReplay.bound (by assumption) (by assumption)
   · intros
     apply addKnownList_sound
     assumption
@@ -1703,7 +1715,7 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
       List.Forall₂ (fun childBound childActual => childBound.Interprets childActual)
         bounds actuals)
     (motive_6 := fun _ _ _ _ bound actual _ => bound.Interprets actual)
-    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
+    ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ derived
   · intros
     assumption
   · intros
@@ -1730,6 +1742,8 @@ theorem BoundDerivedAt.sound {history : EventHistory} {transferEvent transferFra
     apply AuthorityWitness.authorityBound <;> assumption
   · intros
     assumption
+  · intros
+    exact EventReplay.RingAutomorphismReplay.bound (by assumption) (by assumption)
   · intros
     apply addKnownList_sound
     assumption
@@ -2592,6 +2606,8 @@ inductive TerminalBoundRule : BoundRule → Prop where
   | authorityRelationPreimageSource (source : ExpressionRef) :
       TerminalBoundRule (.authority (.relationPreimageSource source))
   | identity (input : ValueRef) : TerminalBoundRule (.identity input)
+  | ringAutomorphism (input : ValueRef) (index ringDimension : Nat) :
+      TerminalBoundRule (.ringAutomorphism input index ringDimension)
   | scale (value : ValueRef) (factor : Scale) : TerminalBoundRule (.scale value factor)
 
 /-- An interpreted exact claim tied to the precise `Result` row at one history index. -/
@@ -3178,6 +3194,16 @@ def TerminalExactAt (document : CertificateDocument) (history : EventHistory)
 /-- Honest primitive contracts and all reached relation congruences for one selector. -/
 structure Witness (document : CertificateDocument) (history : EventHistory) (selector : Option Nat)
     (modulus : Nat) extends AuthorityWitness history where
+  ringAutomorphismOutputMagnitude : Nat → Nat
+  ringAutomorphismReplay : ∀ {transferEvent transferFrame : Nat} {owner : Owner}
+      {reference : ValueRef} {index ringDimension : Nat} {bound : CoeffClass}
+      {inputMagnitude : Nat},
+    history.lookup transferEvent = some
+        ⟨.boundTransfer owner (.ringAutomorphism reference index ringDimension), transferFrame⟩ →
+      BoundInputAt history owner reference bound inputMagnitude →
+      (valid : EventReplay.RingAutomorphismIndexValid ringDimension index) →
+      EventReplay.RingAutomorphismReplay valid inputMagnitude
+        (ringAutomorphismOutputMagnitude transferEvent)
   env : Env Owner
   recordedCoefficientCovers : ∀ resultEvent frameStart owner actual rawTerms maximum
       coefficientProducer summary summaryProducer,

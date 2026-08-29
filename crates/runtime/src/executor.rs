@@ -680,7 +680,8 @@ where
             NodeKind::MatrixBinary(_) |
                 NodeKind::MatrixMulAccumulate { .. } |
                 NodeKind::MatrixNegate |
-                NodeKind::MatrixScale { .. }
+                NodeKind::MatrixScale { .. } |
+                NodeKind::RingAutomorphism { .. }
         ) {
             return Ok(false);
         }
@@ -766,6 +767,18 @@ where
                     inputs.push((value, scalar));
                 }
                 self.backend.scale_integer_batch(inputs).map_err(Self::backend_error)?
+            }
+            NodeKind::RingAutomorphism { index } => {
+                let mut inputs = Vec::with_capacity(indices.len());
+                for instance_index in indices {
+                    let env = &envs[*instance_index];
+                    let instance = &mut values[*instance_index];
+                    inputs.push((
+                        self.matrix(instance, node.args[0])?,
+                        self.eval_usize(node.id, index, env)?,
+                    ));
+                }
+                self.backend.ring_automorphism_batch(inputs).map_err(Self::backend_error)?
             }
             _ => unreachable!("matrix batch kind checked by caller"),
         };
@@ -1426,6 +1439,13 @@ where
                     scalar.evaluate(env).map_err(|error| self.expression_error(node.id, error))?;
                 let output =
                     self.backend.scale_integer(&input, &scalar).map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
+            NodeKind::RingAutomorphism { index } => {
+                let input = self.matrix(values, node.args[0])?;
+                let index = self.eval_usize(node.id, index, env)?;
+                let output =
+                    self.backend.ring_automorphism(&input, index).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::Transpose => {
@@ -3521,6 +3541,37 @@ mod tests {
         ));
         progress.record(1);
         assert!(progress.finish().is_ok());
+    }
+
+    #[test]
+    fn cpu_executor_applies_raw_ring_automorphisms_with_signed_coefficients() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let input = ring.input("input", (1, 1));
+        let graph = DslContext::new("runtime-ring-automorphism")
+            .output("sigma3", input.clone().ring_automorphism(3))
+            .unwrap()
+            .output("sigma5", input.ring_automorphism(5))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let value = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![DCRTPoly::const_rotate_poly(&parameters, 1)],
+        );
+        let result = execute(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::from([("input".to_owned(), RuntimeValue::matrix(value.clone()))]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        assert_eq!(matrix_output(&result, "sigma3"), &value.ring_automorphism_out_of_place(3));
+        assert_eq!(matrix_output(&result, "sigma5"), &value.ring_automorphism_out_of_place(5));
     }
 
     #[test]

@@ -198,6 +198,17 @@ unsafe extern "C" {
         inputs: *const *const GpuMatrixOpaque,
         matrix_count: usize,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_ring_automorphism_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        inputs: *const *const GpuMatrixOpaque,
+        indices: *const usize,
+        matrix_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_validate_ring_automorphism(
+        ring_dimension: usize,
+        indices: *const usize,
+        matrix_count: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_mul_batch(
         outputs: *const *mut GpuMatrixOpaque,
         left: *const *const GpuMatrixOpaque,

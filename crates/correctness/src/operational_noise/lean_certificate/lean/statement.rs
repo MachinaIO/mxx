@@ -1170,6 +1170,7 @@ fn matrix(value: &StableMatrixOperation) -> Result<String, String> {
         O::Multiply => ".multiply".to_owned(),
         O::Negate => ".negate".to_owned(),
         O::Scale => ".scale".to_owned(),
+        O::RingAutomorphism { index } => format!(".ringAutomorphism {index}"),
         O::Transpose => ".transpose".to_owned(),
         O::Slice {
             row_start,

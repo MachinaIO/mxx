@@ -790,6 +790,13 @@ impl Mat {
         &self.matrix_type
     }
 
+    /// Applies the raw negacyclic automorphism `sigma_k: X -> X^k` entrywise.
+    #[track_caller]
+    pub fn ring_automorphism(self, index: impl Into<IntExpr>) -> Self {
+        let ty = self.matrix_type.clone();
+        Self::from_node(NodeKind::RingAutomorphism { index: index.into() }, vec![self], ty)
+    }
+
     pub fn value_handle(&self) -> &ValueHandle {
         &self.value
     }
@@ -5314,5 +5321,32 @@ mod tests {
             ),
             Err(DslError::CanonicalInputUpperNonMatrix)
         ));
+    }
+
+    #[test]
+    fn ring_automorphism_is_stable_and_validates_odd_index_range() {
+        let ring = Ring::new(17, 8);
+        let build = |name: &str, index: usize| {
+            DslContext::new(name)
+                .output("output", ring.input("input", (2, 3)).ring_automorphism(index))
+                .unwrap()
+                .build()
+                .unwrap()
+        };
+        let valid = build("valid-ring-automorphism", 9);
+        valid.validate(&ParamEnv::default()).expect("odd k in 1..2n is valid");
+        let encoded = serde_json::to_vec(&valid.graph).expect("serialize automorphism graph");
+        let decoded: Graph = serde_json::from_slice(&encoded).expect("deserialize graph");
+        assert_eq!(valid.graph, decoded);
+
+        assert!(build("even-ring-automorphism", 2).validate(&ParamEnv::default()).is_err());
+        assert!(build("range-ring-automorphism", 17).validate(&ParamEnv::default()).is_err());
+        let non_cyclotomic = Ring::new(17, 6);
+        let invalid_dimension = DslContext::new("non-power-of-two-ring-automorphism")
+            .output("output", non_cyclotomic.input("input", (1, 1)).ring_automorphism(5))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(invalid_dimension.validate(&ParamEnv::default()).is_err());
     }
 }

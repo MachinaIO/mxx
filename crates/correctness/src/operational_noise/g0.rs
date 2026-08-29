@@ -411,6 +411,11 @@ pub(crate) enum BoundRule {
     Identity {
         input: BoundValueRef,
     },
+    RingAutomorphism {
+        input: BoundValueRef,
+        index: u64,
+        ring_dimension: usize,
+    },
     Sum {
         inputs: Box<[BoundValueRef]>,
     },
@@ -1927,6 +1932,7 @@ fn logical_bound_rule(rule: &BoundRule) -> Result<u64, G0Error> {
             _ => 1,
         },
         BoundRule::Identity { input } => logical_value_ref(input),
+        BoundRule::RingAutomorphism { input, .. } => logical_add(logical_value_ref(input), 2)?,
         BoundRule::Sum { inputs } |
         BoundRule::Maximum { inputs } |
         BoundRule::WeightedSum { inputs } => {
@@ -3404,7 +3410,9 @@ impl FeasibilitySink for FeasibilityTrace {
 fn visit_bound_rule_transfers(rule: &BoundRule, mut visit: impl FnMut(EventIndex)) {
     match rule {
         BoundRule::Authority(_) => {}
-        BoundRule::Identity { input } => visit_value_ref_transfer(input, &mut visit),
+        BoundRule::Identity { input } | BoundRule::RingAutomorphism { input, .. } => {
+            visit_value_ref_transfer(input, &mut visit)
+        }
         BoundRule::Sum { inputs } |
         BoundRule::Maximum { inputs } |
         BoundRule::WeightedSum { inputs } => {
@@ -3939,7 +3947,9 @@ impl FeasibilityTrace {
                 return Err(G0Error::UnsupportedBoundTransfer)
             }
             BoundRule::Authority(_) => {}
-            BoundRule::Identity { input } => refs.push(input),
+            BoundRule::Identity { input } | BoundRule::RingAutomorphism { input, .. } => {
+                refs.push(input)
+            }
             BoundRule::Sum { inputs } |
             BoundRule::Maximum { inputs } |
             BoundRule::WeightedSum { inputs } => refs.extend(inputs.iter()),
@@ -4242,6 +4252,9 @@ pub(crate) enum StableMatrixOperation {
     Multiply,
     Negate,
     Scale,
+    RingAutomorphism {
+        index: u64,
+    },
     Transpose,
     Slice {
         row_start: usize,
@@ -5657,6 +5670,9 @@ fn stable_matrix_operation(value: &MatrixOperation) -> StableMatrixOperation {
         MatrixOperation::Multiply => StableMatrixOperation::Multiply,
         MatrixOperation::Negate => StableMatrixOperation::Negate,
         MatrixOperation::Scale => StableMatrixOperation::Scale,
+        MatrixOperation::RingAutomorphism { index } => {
+            StableMatrixOperation::RingAutomorphism { index: *index }
+        }
         MatrixOperation::Transpose => StableMatrixOperation::Transpose,
         MatrixOperation::Slice {
             row_start,
@@ -6800,6 +6816,7 @@ mod tests {
             BoundRule::Authority(BoundAuthority::RelationPreimageSource { .. }) => 2,
             BoundRule::Authority(_) => 1,
             BoundRule::Identity { input } => oracle_value_ref(input),
+            BoundRule::RingAutomorphism { input, .. } => oracle_value_ref(input) + 2,
             BoundRule::Sum { inputs } |
             BoundRule::Maximum { inputs } |
             BoundRule::WeightedSum { inputs } => {

@@ -1901,6 +1901,18 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     Ok(self.atom_nf(scope_proof, semantic)?)
                 }
             }
+            MatrixOperation::RingAutomorphism { .. } => {
+                let Some(input) = children.first().and_then(|value| value.exact_nf.as_ref()) else {
+                    return Ok(self.atom_nf(scope_proof, semantic)?);
+                };
+                self.transform_nf(
+                    scope_proof,
+                    semantic,
+                    node.inputs[0],
+                    input,
+                    ValueOperator::Matrix(operation.clone()),
+                )
+            }
             MatrixOperation::Multiply => {
                 let left = children.first().and_then(|value| value.exact_nf.as_ref());
                 let right = children.get(1).and_then(|value| value.exact_nf.as_ref());
@@ -5902,6 +5914,28 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                         owner,
                         BoundRule::Identity {
                             input: Self::predecessor_ref(0, BoundProjection::Coefficient)?,
+                        },
+                    )?;
+                }
+                Ok(bound)
+            }
+            MatrixOperation::RingAutomorphism { index } => {
+                let bound = bounds.first().cloned().unwrap_or(NumericContract::Missing);
+                if S::ENABLED {
+                    if bound.is_missing() {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    }
+                    let ResolvedValueType::Matrix(matrix) =
+                        self.expressions.value_type(owner.expression())?.clone()
+                    else {
+                        return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
+                    };
+                    self.observe_bound_transfer(
+                        owner,
+                        BoundRule::RingAutomorphism {
+                            input: Self::predecessor_ref(0, BoundProjection::Coefficient)?,
+                            index: *index,
+                            ring_dimension: matrix.ring_dimension,
                         },
                     )?;
                 }
@@ -12664,6 +12698,7 @@ mod tests {
             match rule {
                 BoundRule::Authority(_) => false,
                 BoundRule::Identity { input } => value_ref_contains(input, event),
+                BoundRule::RingAutomorphism { input, .. } => value_ref_contains(input, event),
                 BoundRule::Sum { inputs } |
                 BoundRule::Maximum { inputs } |
                 BoundRule::WeightedSum { inputs } => {
@@ -16087,6 +16122,7 @@ mod tests {
         match rule {
             BoundRule::Authority(_) => false,
             BoundRule::Identity { input } => value_has(input),
+            BoundRule::RingAutomorphism { input, .. } => value_has(input),
             BoundRule::Sum { inputs } |
             BoundRule::Maximum { inputs } |
             BoundRule::WeightedSum { inputs } => inputs.iter().any(value_has),

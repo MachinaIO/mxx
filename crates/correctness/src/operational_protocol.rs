@@ -9,6 +9,7 @@ use crate::{
 };
 use mxx_dsl::{BuiltGraph, DslContext, IdealSpec};
 use mxx_ir_core::{WireType, node::NodeKind, types::MatrixType};
+use num_bigint::BigInt;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -66,6 +67,10 @@ fn exact_input_contract(
     input: &ProtocolInputId,
 ) -> Result<InputValueContract, OperationalProtocolError> {
     match wire_type {
+        WireType::Int => Ok(InputValueContract::IntegerRange {
+            lower: mxx_ir_core::IntExpr::from(BigInt::from(-1_i8) << 63usize),
+            upper: mxx_ir_core::IntExpr::from(BigInt::from(1_u8) << 63usize),
+        }),
         WireType::Matrix(matrix_type) => Ok(InputValueContract::MatrixExact {
             matrix_type: matrix_type.clone(),
             canonical_coefficient_exclusive_upper_bound: matrix_metadata
@@ -591,6 +596,33 @@ mod tests {
                     element.as_ref(),
                     InputValueContract::Trapdoor { public_input, .. } if public_input == &metadata.public_input
                 )
+        ));
+    }
+
+    #[test]
+    fn scalar_integer_inputs_receive_the_generic_integer_range_contract() {
+        let contract =
+            exact_input_contract(&WireType::Int, None, None, &ProtocolInputId::from("i")).unwrap();
+        assert!(matches!(contract, InputValueContract::IntegerRange { .. }));
+    }
+
+    #[test]
+    fn integer_family_inputs_recurse_through_the_generic_family_contract() {
+        let contract = exact_input_contract(
+            &WireType::IndexedFamily {
+                count: IntExpr::constant(4),
+                element: Box::new(WireType::Int),
+            },
+            None,
+            None,
+            &ProtocolInputId::from("indices"),
+        )
+        .unwrap();
+        assert!(matches!(
+            contract,
+            InputValueContract::Family { count, element }
+                if count == IntExpr::constant(4) &&
+                    matches!(element.as_ref(), InputValueContract::IntegerRange { .. })
         ));
     }
 }

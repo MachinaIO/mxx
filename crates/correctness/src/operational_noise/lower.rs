@@ -256,6 +256,7 @@ fn classify_node_kind(kind: &NodeKind) -> NodeKindClass {
         NodeKind::MatrixMulAccumulate { .. } |
         NodeKind::MatrixNegate |
         NodeKind::MatrixScale { .. } |
+        NodeKind::RingAutomorphism { .. } |
         NodeKind::Transpose |
         NodeKind::Slice { .. } |
         NodeKind::Tensor |
@@ -675,6 +676,26 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         expression: ExprId,
         wire: &PlannedWire,
     ) -> Result<Option<TrustedIndexRange>, ProductionAdapterError> {
+        // A structural family lookup may be nested under more than one loop
+        // binder.  Derive the range of the complete affine expression from
+        // all active integer binders instead of selecting one binder and
+        // treating the others as unknown.  This is protocol-agnostic range
+        // propagation for ordinary DSL indices; it does not add scheme
+        // semantics to the correctness checker.
+        if let Some((minimum, maximum_exclusive)) =
+            self.open_affine_index_range(expression, &wire.occurrence)?
+        {
+            let Some(minimum) = minimum.to_u64() else {
+                return Err(ProductionAdapterError::MissingSelectorRange { wire: wire.clone() });
+            };
+            let Some(maximum_exclusive) = maximum_exclusive.to_u64() else {
+                return Err(ProductionAdapterError::MissingSelectorRange { wire: wire.clone() });
+            };
+            if minimum < maximum_exclusive {
+                return Ok(Some(TrustedIndexRange { minimum, maximum_exclusive }));
+            }
+            return Err(ProductionAdapterError::MissingSelectorRange { wire: wire.clone() });
+        }
         for ((occurrence, argument), range) in &self.active_loop_argument_ranges {
             if occurrence != &wire.occurrence {
                 continue;
@@ -696,6 +717,69 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
             return Ok(Some(TrustedIndexRange { minimum, maximum_exclusive }));
         }
         Ok(None)
+    }
+
+    fn open_affine_index_range(
+        &self,
+        expression: ExprId,
+        occurrence: &ProgramOccurrence,
+    ) -> Result<Option<(BigInt, BigInt)>, ProductionAdapterError> {
+        let node = self.job.expressions().node(expression)?;
+        match &node.operator {
+            ValueOperator::Argument { position, value_type }
+                if *value_type == ResolvedValueType::Int =>
+            {
+                let Some(argument) = self.active_loop_arguments.get(position) else {
+                    return Ok(None);
+                };
+                Ok(self.active_loop_argument_ranges.get(&(occurrence.clone(), *argument)).map(
+                    |range| (BigInt::from(range.minimum), BigInt::from(range.maximum_exclusive)),
+                ))
+            }
+            ValueOperator::Constant(TypedConstant { value: ConstantValue::Int(value), .. }) => {
+                Ok(Some((value.clone(), value + BigInt::from(1_u8))))
+            }
+            ValueOperator::ProgramCall { program } => {
+                let Some(family) = self.job.programs().family_for_program(*program) else {
+                    return Ok(None);
+                };
+                if self.job.programs().family_element_type(family)? != ResolvedValueType::Int {
+                    return Ok(None);
+                }
+                let domain = self.job.programs().family_domain(family)?;
+                Ok(Some((BigInt::from(domain.minimum), BigInt::from(domain.maximum_exclusive))))
+            }
+            ValueOperator::Scalar(operation) => {
+                let [left_id, right_id] = node.inputs.as_ref() else { return Ok(None) };
+                let (Some((left_min, left_max)), Some((right_min, right_max))) = (
+                    self.open_affine_index_range(*left_id, occurrence)?,
+                    self.open_affine_index_range(*right_id, occurrence)?,
+                ) else {
+                    return Ok(None);
+                };
+                let one = BigInt::from(1_u8);
+                let result = match operation {
+                    ScalarOperation::Add => {
+                        (left_min + right_min, (&left_max - &one) + (&right_max - &one) + &one)
+                    }
+                    ScalarOperation::Subtract => {
+                        (left_min - (&right_max - &one), (&left_max - &one) - right_min + &one)
+                    }
+                    ScalarOperation::Multiply => {
+                        if let Some(factor) = self.closed_integer(*right_id) {
+                            multiply_open_range(left_min, left_max, factor)
+                        } else if let Some(factor) = self.closed_integer(*left_id) {
+                            multiply_open_range(right_min, right_max, factor)
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                    _ => return Ok(None),
+                };
+                Ok(Some(result))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn affine_open_index_range(
@@ -2755,6 +2839,27 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     true,
                 )?)
             }
+            NodeKind::RingAutomorphism { index } => Value::Expr(
+                self.intern_node_operator(
+                    wire,
+                    output,
+                    ValueOperator::Matrix(MatrixOperation::RingAutomorphism {
+                        index: self.eval_u64(index)?,
+                    }),
+                    inputs
+                        .iter()
+                        .map(|value| match value {
+                            Value::Expr(id) => Ok(*id),
+                            Value::Family(_) => Err(ProductionAdapterError::UnsupportedNode {
+                                kind: "family ring automorphism".to_owned(),
+                                wire: wire.clone(),
+                            }),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_boxed_slice(),
+                    true,
+                )?,
+            ),
             NodeKind::Transpose => {
                 expr(self, ValueOperator::Matrix(MatrixOperation::Transpose), inputs)?
             }

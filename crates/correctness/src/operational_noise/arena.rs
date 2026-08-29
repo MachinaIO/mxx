@@ -389,6 +389,10 @@ pub enum MatrixOperation {
     Multiply,
     Negate,
     Scale,
+    /// Norm-preserving signed coefficient permutation in the negacyclic ring.
+    RingAutomorphism {
+        index: u64,
+    },
     Transpose,
     Slice {
         row_start: usize,
@@ -1841,6 +1845,18 @@ impl ExprArena {
             MatrixOperation::Negate => {
                 arity(1)?;
                 Ok(ResolvedValueType::Matrix(matrices[0].clone().clone()))
+            }
+            MatrixOperation::RingAutomorphism { index } => {
+                arity(1)?;
+                let matrix = matrices[0];
+                if !matrix.ring_dimension.is_power_of_two() ||
+                    *index == 0 ||
+                    *index >= 2 * matrix.ring_dimension as u64 ||
+                    index % 2 == 0
+                {
+                    return Err(ArenaError::ProgramOutputMismatch);
+                }
+                Ok(ResolvedValueType::Matrix(matrix.clone()))
             }
             MatrixOperation::Scale => {
                 arity(2)?;

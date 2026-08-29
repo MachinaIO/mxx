@@ -18,14 +18,17 @@ impl CppMatrix {
     }
 
     pub(crate) fn nrow(&self) -> usize {
+        let _native = crate::openfhe_guard::native_guard();
         GetMatrixRows(&self.inner)
     }
 
     pub(crate) fn ncol(&self) -> usize {
+        let _native = crate::openfhe_guard::native_guard();
         GetMatrixCols(&self.inner)
     }
 
     pub(crate) fn entry(&self, i: usize, j: usize) -> DCRTPoly {
+        let _native = crate::openfhe_guard::native_guard();
         DCRTPoly::new(GetMatrixElement(&self.inner, i, j))
     }
 }

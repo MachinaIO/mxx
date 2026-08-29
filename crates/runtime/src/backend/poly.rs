@@ -628,6 +628,17 @@ where
         Ok(M::multiply_polys_batch_out_of_place(prepared))
     }
 
+    fn ring_automorphism(&mut self, value: &M, index: usize) -> Result<M, Self::Error> {
+        Ok(value.ring_automorphism_out_of_place(index))
+    }
+
+    fn ring_automorphism_batch(
+        &mut self,
+        inputs: Vec<(Arc<M>, usize)>,
+    ) -> Result<Vec<M>, Self::Error> {
+        Ok(M::ring_automorphism_batch_out_of_place(inputs))
+    }
+
     fn transpose(&mut self, value: &M) -> Result<M, Self::Error> {
         Ok(value.transpose())
     }

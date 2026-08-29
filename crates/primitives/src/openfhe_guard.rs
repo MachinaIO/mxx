@@ -13,6 +13,11 @@ struct OpenFheParamsKey {
 }
 
 static NTT_WARMED: OnceLock<Mutex<HashSet<OpenFheParamsKey>>> = OnceLock::new();
+static OPENFHE_NATIVE: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(crate) fn native_guard() -> std::sync::MutexGuard<'static, ()> {
+    OPENFHE_NATIVE.get_or_init(|| Mutex::new(())).lock().expect("OpenFHE native lock poisoned")
+}
 
 fn warmup_ntt_tables(key: OpenFheParamsKey) {
     let _ = ffi::DCRTPolyGenFromDug(key.ring_dimension, key.crt_depth, key.crt_bits);
@@ -26,6 +31,7 @@ pub(crate) fn ensure_openfhe_warmup_params(ring_dimension: u32, crt_depth: usize
         // OpenFHE's NTT initialization does not support n=1 (ReverseBits msbb=0).
         return;
     }
+    let _native = native_guard();
     let key = OpenFheParamsKey { ring_dimension, crt_depth, crt_bits };
     let warmed = NTT_WARMED.get_or_init(|| Mutex::new(HashSet::new()));
     let mut guard = warmed.lock().expect("NTT warmup lock poisoned");

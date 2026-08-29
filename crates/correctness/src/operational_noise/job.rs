@@ -306,6 +306,9 @@ fn matrix_operation_name(operation: &super::arena::MatrixOperation) -> String {
         super::arena::MatrixOperation::Multiply => "multiply".to_owned(),
         super::arena::MatrixOperation::Negate => "negate".to_owned(),
         super::arena::MatrixOperation::Scale => "scale".to_owned(),
+        super::arena::MatrixOperation::RingAutomorphism { index } => {
+            format!("ring-automorphism(index={index})")
+        }
         super::arena::MatrixOperation::Transpose => "transpose".to_owned(),
         super::arena::MatrixOperation::Slice {
             row_start,

@@ -157,6 +157,9 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::BitExtract { bit: index } => {
                     nonnegative(&mut constraints, index, format!("{prefix}: index"));
                 }
+                NodeKind::RingAutomorphism { index } => {
+                    positive(&mut constraints, index, format!("{prefix}: automorphism index"));
+                }
                 NodeKind::ParallelLoop(loop_spec) => {
                     nonnegative(
                         &mut constraints,

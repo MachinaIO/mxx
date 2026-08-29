@@ -199,6 +199,17 @@ pub trait Backend {
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(value, scalar)| self.scale_integer(&value, &scalar)).collect()
     }
+    fn ring_automorphism(
+        &mut self,
+        value: &Self::Matrix,
+        index: usize,
+    ) -> Result<Self::Matrix, Self::Error>;
+    fn ring_automorphism_batch(
+        &mut self,
+        inputs: Vec<(Arc<Self::Matrix>, usize)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        inputs.into_iter().map(|(value, index)| self.ring_automorphism(&value, index)).collect()
+    }
     fn transpose(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error>;
     fn slice(
         &mut self,

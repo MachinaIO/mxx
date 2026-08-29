@@ -1,11 +1,19 @@
-use crate::poly::{Poly, PolyParams};
+use crate::{
+    element::PolyElem,
+    poly::{Poly, PolyParams},
+};
 use rayon::prelude::*;
 use std::{
     fmt::Debug,
     ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
 };
+
+// OpenFHE's coefficient export/import path lazily touches process-global NTT
+// state. The automorphism implementation must read coefficients and construct
+// fresh polynomials, so serialize that native interval across graph threads.
+static RING_AUTOMORPHISM_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub mod base;
 pub(crate) mod cpp_matrix;
@@ -149,6 +157,53 @@ pub trait PolyMatrix:
         inputs
             .into_par_iter()
             .map(|(matrix, scalar)| matrix.multiply_poly_out_of_place(&scalar))
+            .collect()
+    }
+
+    /// Applies `sigma_k: X -> X^k` in `Z_q[X]/(X^n + 1)` entrywise.
+    fn ring_automorphism_out_of_place(&self, index: usize) -> Self {
+        let _guard = RING_AUTOMORPHISM_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("ring automorphism lock poisoned");
+        let n = self.params().ring_dimension() as usize;
+        assert!(n.is_power_of_two(), "ring automorphism requires a power-of-two ring dimension");
+        assert!(index > 0 && index < 2 * n && index % 2 == 1, "invalid ring automorphism index");
+        let (rows, columns) = self.size();
+        let entries = (0..rows)
+            .into_par_iter()
+            .map(|row| {
+                (0..columns)
+                    .map(|column| {
+                        let mut output = vec![
+                            <<Self as PolyMatrix>::P as Poly>::Elem::zero(
+                                &self.params().modulus(),
+                            );
+                            n
+                        ];
+                        for (source, coefficient) in
+                            self.entry(row, column).coeffs().into_iter().enumerate()
+                        {
+                            let exponent =
+                                ((source as u128 * index as u128) % (2 * n) as u128) as usize;
+                            if exponent < n {
+                                output[exponent] = coefficient;
+                            } else {
+                                output[exponent - n] = -coefficient;
+                            }
+                        }
+                        Self::P::from_coeffs(self.params(), &output)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::from_poly_vec(self.params(), entries)
+    }
+
+    fn ring_automorphism_batch_out_of_place(inputs: Vec<(Arc<Self>, usize)>) -> Vec<Self> {
+        inputs
+            .into_par_iter()
+            .map(|(matrix, index)| matrix.ring_automorphism_out_of_place(index))
             .collect()
     }
 

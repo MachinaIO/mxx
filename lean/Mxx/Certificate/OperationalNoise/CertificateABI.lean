@@ -234,6 +234,7 @@ deriving DecidableEq, Repr
 inductive BoundRule where
   | authority (authority : Authority)
   | identity (input : ValueRef)
+  | ringAutomorphism (input : ValueRef) (index ringDimension : Nat)
   | sum (inputs : List ValueRef)
   | scale (value : ValueRef) (scale : Scale)
   | monomialProduct (monomial : Monomial) (factors : List FactorEvidence)
@@ -489,6 +490,9 @@ def ruleValid (document : CertificateDocument) (history : EventHistory) (state :
       preimageSourceValid document source
   | .authority _ => true
   | .identity input => valueRefValid history state owner input
+  | .ringAutomorphism input index ringDimension =>
+      valueRefValid history state owner input && decide (0 < ringDimension) &&
+        decide (0 < index) && decide (index < 2 * ringDimension) && decide (index % 2 = 1)
   | .sum inputs => inputs.all (valueRefValid history state owner)
   | .scale value scale =>
       valueRefValid history state owner value && scaleValid history state owner scale

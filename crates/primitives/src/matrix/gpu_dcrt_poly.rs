@@ -23,11 +23,11 @@ use crate::{
                 gpu_matrix_mul_batch, gpu_matrix_mul_scalar, gpu_matrix_mul_scalar_batch,
                 gpu_matrix_mul_vertical_pair, gpu_matrix_negate_batch, gpu_matrix_ntt_all,
                 gpu_matrix_ntt_batch, gpu_matrix_preimage_add_correction,
-                gpu_matrix_preimage_residual, gpu_matrix_sample_distribution,
-                gpu_matrix_sample_distribution_columns, gpu_matrix_sample_p1_full_cached,
-                gpu_matrix_store_compact_bytes, gpu_matrix_store_compact_bytes_batch,
-                gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
-                gpu_matrix_wait,
+                gpu_matrix_preimage_residual, gpu_matrix_ring_automorphism_batch,
+                gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_columns,
+                gpu_matrix_sample_p1_full_cached, gpu_matrix_store_compact_bytes,
+                gpu_matrix_store_compact_bytes_batch, gpu_matrix_store_const_coeff_batch,
+                gpu_matrix_store_rns_batch, gpu_matrix_sub, gpu_matrix_wait,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -1199,7 +1199,8 @@ impl GpuDCRTPolyMatrix {
         }
         let total = self.nrow.saturating_mul(self.ncol);
         let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        self.store_rns_bytes(&mut bytes, bytes_per_poly, GPU_POLY_FORMAT_EVAL);
+        let format = if self.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
+        self.store_rns_bytes(&mut bytes, bytes_per_poly, format);
         let level = self.level;
         let n = cpu_params.ring_dimension() as usize;
         let expected_len = (level + 1).saturating_mul(n);
@@ -1217,7 +1218,7 @@ impl GpuDCRTPolyMatrix {
                 }
                 debug_assert_eq!(flat.len(), expected_len, "RNS flat length mismatch");
 
-                let mut eval_slots = Vec::with_capacity(n);
+                let mut values = Vec::with_capacity(n);
                 for i in 0..n {
                     let mut acc = BigUint::zero();
                     for limb in 0..=level {
@@ -1225,9 +1226,13 @@ impl GpuDCRTPolyMatrix {
                         acc += &reconstruct_coeffs[limb] * BigUint::from(residue);
                     }
                     acc %= &*modulus_level;
-                    eval_slots.push(acc);
+                    values.push(acc);
                 }
-                DCRTPoly::from_biguints_eval(&cpu_params, &eval_slots)
+                if self.is_ntt {
+                    DCRTPoly::from_biguints_eval(&cpu_params, &values)
+                } else {
+                    DCRTPoly::from_biguints(&cpu_params, &values)
+                }
             })
             .collect::<Vec<_>>();
 
@@ -1447,6 +1452,86 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
     fn sub_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
         Self::binary_batch(inputs, 1)
+    }
+
+    fn ring_automorphism_out_of_place(&self, index: usize) -> Self {
+        Self::ring_automorphism_batch_out_of_place(vec![(Arc::new(self.clone()), index)])
+            .pop()
+            .expect("one automorphism output")
+    }
+
+    fn ring_automorphism_batch_out_of_place(inputs: Vec<(Arc<Self>, usize)>) -> Vec<Self> {
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+        let n = inputs[0].0.params.ring_dimension() as usize;
+        assert!(
+            n.is_power_of_two() &&
+                inputs.iter().all(|(matrix, index)| {
+                    matrix.params == inputs[0].0.params &&
+                        matrix.level == inputs[0].0.level &&
+                        matrix.is_ntt == inputs[0].0.is_ntt &&
+                        matrix.size() == inputs[0].0.size() &&
+                        *index > 0 &&
+                        *index < 2 * n &&
+                        *index % 2 == 1
+                }),
+            "ring automorphism batch must be homogeneous with valid odd indices"
+        );
+        let was_ntt = inputs[0].0.is_ntt;
+        let coefficient_inputs = if was_ntt {
+            let mut converted = inputs
+                .iter()
+                .map(|(matrix, _)| {
+                    Self::new_empty_with_state(
+                        &matrix.params,
+                        matrix.nrow,
+                        matrix.ncol,
+                        matrix.level,
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let outputs = converted.iter_mut().map(|matrix| matrix.raw).collect::<Vec<_>>();
+            let sources =
+                inputs.iter().map(|(matrix, _)| matrix.raw as *const _).collect::<Vec<_>>();
+            let status = unsafe {
+                gpu_matrix_intt_out_of_place_batch(outputs.as_ptr(), sources.as_ptr(), inputs.len())
+            };
+            check_status(status, "gpu_matrix_intt_out_of_place_batch(automorphism)");
+            converted.into_iter().map(Arc::new).collect::<Vec<_>>()
+        } else {
+            inputs.iter().map(|(matrix, _)| matrix.clone()).collect::<Vec<_>>()
+        };
+        let mut outputs = coefficient_inputs
+            .iter()
+            .map(|matrix| {
+                Self::new_empty_with_state(
+                    &matrix.params,
+                    matrix.nrow,
+                    matrix.ncol,
+                    matrix.level,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let output_pointers = outputs.iter_mut().map(|matrix| matrix.raw).collect::<Vec<_>>();
+        let input_pointers =
+            coefficient_inputs.iter().map(|matrix| matrix.raw as *const _).collect::<Vec<_>>();
+        let indices = inputs.iter().map(|(_, index)| *index).collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_ring_automorphism_batch(
+                output_pointers.as_ptr(),
+                input_pointers.as_ptr(),
+                indices.as_ptr(),
+                outputs.len(),
+            )
+        };
+        check_status(status, "gpu_matrix_ring_automorphism_batch");
+        if was_ntt {
+            Self::ntt_batch_in_place(&mut outputs);
+        }
+        outputs
     }
 
     fn multiply_out_of_place(&self, rhs: &Self) -> Self {
@@ -2828,6 +2913,52 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_ring_automorphism_matches_cpu_signed_permutation_in_both_domains() {
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 4);
+        let gpu_params = gpu_params_from_cpu(&cpu_params);
+        let cpu = random_cpu_matrix(&cpu_params, 2, 3, &mut rng());
+        let indices = [1usize, 3, 17, 33, 63];
+        let expected = indices
+            .iter()
+            .map(|index| cpu.ring_automorphism_out_of_place(*index))
+            .collect::<Vec<_>>();
+        for coefficient_domain in [false, true] {
+            let gpu = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &cpu);
+            let gpu = if coefficient_domain { gpu.into_coeff_domain() } else { gpu };
+            let actual = GpuDCRTPolyMatrix::ring_automorphism_batch_out_of_place(
+                indices.iter().map(|index| (Arc::new(gpu.clone()), *index)).collect(),
+            )
+            .into_iter()
+            .map(|matrix| matrix.to_cpu_matrix())
+            .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "domain={coefficient_domain:?}");
+        }
+    }
+
+    #[test]
+    fn test_cuda_ring_automorphism_boundary_rejects_non_power_of_two_dimension() {
+        let valid_indices = [1usize, 3, 15];
+        let valid = unsafe {
+            crate::poly::dcrt::gpu::gpu_matrix_validate_ring_automorphism(
+                8,
+                valid_indices.as_ptr(),
+                valid_indices.len(),
+            )
+        };
+        assert_eq!(valid, 0);
+        let invalid = unsafe {
+            crate::poly::dcrt::gpu::gpu_matrix_validate_ring_automorphism(
+                6,
+                valid_indices.as_ptr(),
+                valid_indices.len(),
+            )
+        };
+        assert_ne!(invalid, 0);
     }
 
     #[test]

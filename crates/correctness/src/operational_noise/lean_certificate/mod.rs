@@ -118,6 +118,7 @@ enum ReachedAuthorityKind {
 enum ReachedBoundKind {
     Authority(ReachedAuthorityKind),
     Identity,
+    RingAutomorphism,
     Sum,
     Scale,
     MonomialProduct,
@@ -331,6 +332,7 @@ fn reached_bound_kind(rule: &ProofPayloadRule) -> Result<ReachedBoundKind, Strin
             }
         }),
         ProofPayloadRule::Identity { .. } => ReachedBoundKind::Identity,
+        ProofPayloadRule::RingAutomorphism { .. } => ReachedBoundKind::RingAutomorphism,
         ProofPayloadRule::Sum { .. } => ReachedBoundKind::Sum,
         ProofPayloadRule::Maximum { .. } => {
             return Err("unsupported maximum bound in certificate trace".to_owned());

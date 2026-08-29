@@ -661,6 +661,27 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
         }
+        NodeKind::RingAutomorphism { index } => {
+            require_arity(scope, node, 1)?;
+            let input = matrix_argument(scope, values, node, 0)?;
+            if !input.ring_dimension.is_power_of_two() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "ring automorphism requires a power-of-two ring dimension",
+                );
+            }
+            let index = index.evaluate(env)?;
+            let upper = BigInt::from(input.ring_dimension) * BigInt::from(2_u8);
+            if index <= BigInt::from(0_u8) || index >= upper || (&index % 2_u8).is_zero() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "ring automorphism index must be odd and lie in 1..2*ring_dimension",
+                );
+            }
+            vec![ConcreteWireType::Matrix(input)]
+        }
         NodeKind::Transpose => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;

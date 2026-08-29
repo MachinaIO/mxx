@@ -52,6 +52,11 @@ pub enum NodeKind {
     MatrixScale {
         scalar: IntExpr,
     },
+    /// Applies the raw negacyclic ring automorphism `sigma_k: X -> X^k` entrywise.
+    /// Concrete validation requires `0 < k < 2n` and odd `k`.
+    RingAutomorphism {
+        index: IntExpr,
+    },
     Transpose,
     Slice {
         rows: Option<IndexRange>,

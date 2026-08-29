@@ -395,6 +395,7 @@ impl PolyMatrix for DCRTPolyMatrix {
 
 impl DCRTPolyMatrix {
     pub(crate) fn to_cpp_matrix_ptr(&self) -> CppMatrix {
+        let _native = crate::openfhe_guard::native_guard();
         let nrow = self.nrow;
         let ncol = self.ncol;
         let mut matrix_ptr = MatrixGen(
@@ -429,13 +430,16 @@ impl DCRTPolyMatrix {
 
     pub(crate) fn gadget_vector(params: &DCRTPolyParams) -> DCRTPolyMatrix {
         let base = 1 << params.base_bits();
-        let g_vec_cpp = DCRTPolyGadgetVector(
-            params.ring_dimension(),
-            params.crt_depth(),
-            params.crt_bits(),
-            params.modulus_digits(),
-            base,
-        );
+        let g_vec_cpp = {
+            let _native = crate::openfhe_guard::native_guard();
+            DCRTPolyGadgetVector(
+                params.ring_dimension(),
+                params.crt_depth(),
+                params.crt_bits(),
+                params.modulus_digits(),
+                base,
+            )
+        };
         DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(g_vec_cpp))
     }
 
@@ -591,6 +595,21 @@ mod tests {
     use num_bigint::BigUint;
     use rand::{Rng, rng};
     use std::sync::Arc;
+
+    #[test]
+    fn test_negacyclic_multiplication_and_ring_automorphism_sign() {
+        let params = DCRTPolyParams::new(4, 2, 17, 3);
+        let x = DCRTPoly::const_rotate_poly(&params, 1);
+        let x_to_n_minus_one = DCRTPoly::const_rotate_poly(&params, 3);
+        assert_eq!(x_to_n_minus_one * x, DCRTPoly::const_minus_one(&params));
+
+        let matrix = DCRTPolyMatrix::from_poly_vec_row(
+            &params,
+            vec![DCRTPoly::const_rotate_poly(&params, 1)],
+        );
+        let transformed = matrix.ring_automorphism_out_of_place(5);
+        assert_eq!(transformed.entry(0, 0), -DCRTPoly::const_rotate_poly(&params, 1));
+    }
 
     #[test]
     fn test_matrix_gadget_matrix() {

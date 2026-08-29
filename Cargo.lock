@@ -577,6 +577,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mxx-power-lut"
+version = "0.1.0"
+dependencies = [
+ "mxx-bgg",
+ "mxx-correctness",
+ "mxx-dsl",
+ "mxx-ir-core",
+ "mxx-primitives",
+ "mxx-runtime",
+ "num-bigint",
+ "num-traits",
+ "rand 0.9.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "mxx-primitives"
 version = "0.1.0"
 dependencies = [

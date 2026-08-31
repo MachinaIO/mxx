@@ -1811,7 +1811,7 @@ where
                 let child = self.validated.source.scope(&child_id).ok_or_else(|| {
                     ExecutionError::MissingSubgraph { node: node.id, name: call.definition.clone() }
                 })?;
-                let child_env = self.child_env(env, &call.bindings, None, node.id)?;
+                let child_env = self.child_env(env, &call.bindings, std::iter::empty(), node.id)?;
                 let child_inputs = self.child_inputs(child, node, values)?;
                 let mut child_path = path.to_vec();
                 child_path.push(InstantiationFrame { call: node.id, loop_index: None });
@@ -1863,7 +1863,7 @@ where
                     let child_env = self.child_env(
                         env,
                         &loop_node.bindings,
-                        Some((loop_node.index_slot, index)),
+                        [(loop_node.index_slot, index)],
                         node.id,
                     )?;
                     let child_inputs = input_names
@@ -2166,37 +2166,73 @@ where
                 let mut outputs = (0..child.outputs().len())
                     .map(|_| Vec::with_capacity(count))
                     .collect::<Vec<_>>();
-                for lane in 0..count {
-                    let coordinates = row_major_coordinates(lane, &shape);
-                    let mut child_env = self.child_env(env, &grid.bindings, None, node.id)?;
-                    for (slot, coordinate) in
-                        grid.index_slots.iter().zip(coordinates.iter().copied())
-                    {
-                        child_env.loop_indices.insert(*slot, BigInt::from(coordinate));
+                let parent_placement = self.backend.active_placement();
+                let placement_count = self.backend.placement_count();
+                if placement_count == 0 {
+                    return Err(ExecutionError::BackendPlacement { placement: 0, count: 0 });
+                }
+                // A grid denotes one independent body evaluation per row-major lane. Execute
+                // consecutive lanes together so body operations can use backend batch APIs while
+                // the configured wave size bounds their simultaneously live intermediate values.
+                for wave_start in (0..count).step_by(self.config.max_parallel_instances.get()) {
+                    let wave_end = count
+                        .min(wave_start.saturating_add(self.config.max_parallel_instances.get()));
+                    let wave_len = wave_end - wave_start;
+                    let mut child_envs = Vec::with_capacity(wave_len);
+                    let mut child_paths = Vec::with_capacity(wave_len);
+                    let mut child_inputs = Vec::with_capacity(wave_len);
+                    let mut placements = Vec::with_capacity(wave_len);
+                    for lane in wave_start..wave_end {
+                        let coordinates = row_major_coordinates(lane, &shape);
+                        let child_env = self.child_env(
+                            env,
+                            &grid.bindings,
+                            grid.index_slots.iter().copied().zip(coordinates.iter().copied()),
+                            node.id,
+                        )?;
+                        let mut child_path = path.to_vec();
+                        child_path.push(InstantiationFrame {
+                            call: node.id,
+                            loop_index: Some(lane as u64),
+                        });
+                        // Round-robin assignment starts at the parent's placement, preserving
+                        // locality for the first lane while distributing larger waves.
+                        let placement = (parent_placement + lane) % placement_count;
+                        self.set_placement(placement)?;
+                        let inputs = self.grid_child_inputs(
+                            scope_id,
+                            child,
+                            node,
+                            values,
+                            &grid.input_modes,
+                            &coordinates,
+                            &child_env,
+                        )?;
+                        let inputs = inputs
+                            .into_iter()
+                            .map(|(name, value)| {
+                                Ok((name, self.value_for_placement(value, placement)?))
+                            })
+                            .collect::<Result<_, ExecutionError>>()?;
+                        child_envs.push(child_env);
+                        child_paths.push(child_path);
+                        child_inputs.push(inputs);
+                        placements.push(placement);
                     }
-                    let mut child_path = path.to_vec();
-                    child_path
-                        .push(InstantiationFrame { call: node.id, loop_index: Some(lane as u64) });
-                    let child_inputs = self.grid_child_inputs(
-                        scope_id,
-                        child,
-                        node,
-                        values,
-                        &grid.input_modes,
-                        &coordinates,
-                        &child_env,
-                    )?;
-                    let instance = self.execute_instance(
+                    let instances = self.execute_instances_batch(
                         &child_id,
-                        &child_env,
-                        child_path,
+                        child_envs,
+                        child_paths,
                         child_inputs,
-                        self.backend.active_placement(),
+                        placements,
                     )?;
-                    for (port, value) in instance.outputs.into_iter().enumerate() {
-                        outputs[port].push(value);
+                    for instance in instances {
+                        for (port, value) in instance.outputs.into_iter().enumerate() {
+                            outputs[port].push(value);
+                        }
                     }
                 }
+                self.set_placement(parent_placement)?;
                 for (port, output) in outputs.into_iter().enumerate() {
                     self.put(values, node.id, port as u32, RuntimeValue::Family(output));
                 }
@@ -3288,11 +3324,11 @@ where
         &self,
         parent: &ParamEnv,
         bindings: &[(String, mxx_ir_core::IntExpr)],
-        loop_index: Option<(u32, usize)>,
+        loop_indices: impl IntoIterator<Item = (u32, usize)>,
         node: NodeId,
     ) -> Result<ParamEnv, ExecutionError> {
         let mut env = parent.clone();
-        if let Some((slot, index)) = loop_index {
+        for (slot, index) in loop_indices {
             env.loop_indices.insert(slot, BigInt::from(index));
         }
         let expression_env = env.clone();
@@ -3720,9 +3756,10 @@ mod tests {
         parallel_zip,
     };
     use mxx_ir_core::{
-        Graph, GraphOutput, IntExpr, NodeHandle, RealExpr, ValueHandle, WireType,
+        Graph, GraphOutput, IntExpr, NodeHandle, RealExpr, SubgraphHandle, ValueHandle, WireType,
         artifact::ArtifactConfidentiality,
-        node::{IntBinaryOp, IntCompareOp, NodeKind, RealBinaryOp},
+        node::{IntBinaryOp, IntCompareOp, NodeKind, ParallelGrid, RealBinaryOp},
+        with_new_construction_scope,
     };
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -3868,6 +3905,71 @@ mod tests {
         };
         assert_eq!(values.len(), 3);
         result.cleanup_staged(&mut store).expect("staged cleanup");
+    }
+
+    #[test]
+    fn parallel_grid_bindings_can_use_the_grid_loop_index() {
+        let body = with_new_construction_scope(|scope| {
+            let output = NodeHandle::new(
+                NodeKind::EvaluateInt(IntExpr::Var("bound_lane".to_owned())),
+                Vec::new(),
+                vec![WireType::ConstantInt],
+            )
+            .output(0)
+            .expect("body output");
+            SubgraphHandle::new("grid-binding-body", scope, Vec::new(), vec![output])
+                .expect("grid body")
+        });
+        let values = NodeHandle::parallel_grid(
+            body,
+            Vec::new(),
+            vec![WireType::Family {
+                element: Box::new(WireType::ConstantInt),
+                shape: vec![IntExpr::constant(3)],
+            }],
+            ParallelGrid {
+                shape: vec![IntExpr::constant(3)],
+                index_slots: vec![7],
+                bindings: vec![("bound_lane".to_owned(), IntExpr::LoopIndex(7))],
+                input_modes: Vec::new(),
+            },
+        )
+        .output(0)
+        .expect("grid output");
+        let (graph, _) = Graph::freeze(
+            "runtime-grid-loop-index-binding",
+            Vec::new(),
+            BTreeMap::from([(
+                "values".to_owned(),
+                GraphOutput { value: values, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("build graph");
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
+        let result = execute_with_config(
+            &validated,
+            &mut cpu_backend([DCRTPolyParams::default()]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(2).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("execution");
+        let RuntimeValue::Family(values) = &result.outputs["values"] else {
+            panic!("grid output is not a family")
+        };
+        assert_eq!(values.len(), 3);
+        for (expected, value) in values.iter().enumerate() {
+            assert!(
+                matches!(value, RuntimeValue::Int(actual) if actual == &BigInt::from(expected))
+            );
+        }
     }
 
     #[test]

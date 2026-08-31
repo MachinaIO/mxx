@@ -20,6 +20,7 @@ use mxx_runtime::{ExecutionConfig, artifact::MemoryArtifactStore};
 use mxx_we::diamond::{
     DiamondGpuMeasurementBackend, DiamondParameterSearch, DiamondWeRuntime, estimate_diamond_cost,
 };
+use num_traits::Signed;
 use std::{env, num::NonZeroUsize, time::Instant};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -198,8 +199,8 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
             "completed GPU Diamond WE encryption"
         );
         let decrypt_started = Instant::now();
-        let decoded = runtime
-            .decrypt(&circuit, &instance, &witness, &ciphertext)
+        let decryption = runtime
+            .decrypt_with_diagnostics(&circuit, &instance, &witness, &ciphertext)
             .expect("GPU Diamond WE decryption");
         info!(
             iteration,
@@ -207,7 +208,34 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
             runtime_elapsed_seconds = runtime_started.elapsed().as_secs_f64(),
             "completed GPU Diamond WE decryption"
         );
-        assert_eq!(decoded, message, "GPU Diamond WE round trip must preserve the message");
+        assert_eq!(
+            decryption.decoded, message,
+            "GPU Diamond WE round trip must preserve the message"
+        );
+        let modulus = num_bigint::BigInt::from(selected.modulus.clone());
+        let ideal_constant = if message { &modulus / 2 } else { num_bigint::BigInt::from(0) };
+        let observed_noise = decryption
+            .noisy_plaintext_coefficients
+            .iter()
+            .enumerate()
+            .map(|(position, coefficient)| {
+                let ideal = if position == 0 { ideal_constant.clone() } else { 0.into() };
+                let direct_distance = (coefficient - ideal).abs();
+                direct_distance.clone().min(&modulus - direct_distance)
+            })
+            .max()
+            .expect("the noisy plaintext polynomial has coefficients");
+        assert!(
+            observed_noise <= num_bigint::BigInt::from(selected.noise_bound.clone()),
+            "observed noise {observed_noise} exceeds simulated bound {}",
+            selected.noise_bound
+        );
+        info!(
+            iteration,
+            observed_noise = %observed_noise,
+            simulated_noise_bound = %selected.noise_bound,
+            "verified observed Diamond WE noise against the simulator bound"
+        );
     }
     info!(
         elapsed_seconds = total_started.elapsed().as_secs_f64(),

@@ -85,12 +85,14 @@ struct PendingMeasurement {
     scale: f64,
     remainder: Option<RepresentativeMeasurement>,
     preimage_sample: bool,
+    operation_batch_size: usize,
 }
 
 struct RepresentativeMeasurement {
     kind: NodeKind,
     concrete_argument_types: Vec<ConcreteWireType>,
     concrete_output_types: Vec<ConcreteWireType>,
+    operation_batch_size: usize,
 }
 
 fn family_leaf_type(wire_type: &ConcreteWireType) -> &ConcreteWireType {
@@ -98,6 +100,26 @@ fn family_leaf_type(wire_type: &ConcreteWireType) -> &ConcreteWireType {
         ConcreteWireType::Family { element, .. } => family_leaf_type(element),
         _ => wire_type,
     }
+}
+
+fn operation_batch_size(node: &MeasurementNode<'_>) -> Result<usize, GpuMeasurementError> {
+    if !matches!(node.kind, NodeKind::FamilyPreimageSample { .. }) {
+        return Ok(1);
+    }
+    node.concrete_output_types
+        .first()
+        .and_then(|ty| match ty {
+            ConcreteWireType::Family { shape, .. } => {
+                shape.iter().try_fold(1usize, |count, extent| count.checked_mul(*extent))
+            }
+            _ => None,
+        })
+        .filter(|count| *count > 0)
+        .ok_or_else(|| {
+            GpuMeasurementError(
+                "family preimage output cardinality is zero or overflows usize".to_owned(),
+            )
+        })
 }
 
 fn extrapolate_column_waves(
@@ -918,6 +940,7 @@ impl GpuNodeMeasurementBackend {
             kind: request.kind.clone(),
             concrete_argument_types: request.concrete_argument_types.clone(),
             concrete_output_types: request.concrete_output_types.clone(),
+            operation_batch_size: request.operation_batch_size,
         };
         let measured = Self::measure_representative(
             worker,
@@ -990,21 +1013,26 @@ impl GpuNodeMeasurementBackend {
         let prepared = Self::prepare(&mut worker.backend, &node, bindings)?;
         let probe = GpuMemoryProbe { device_id: worker.device_id };
         let mut operation_error = None;
-        let measured = measure_batch_operation(harness, &probe, 1, |representative_batch| {
-            if operation_error.is_some() {
-                return;
-            }
-            match Self::run_node(
-                &mut worker.backend,
-                &node,
-                bindings,
-                representative_batch,
-                &prepared,
-            ) {
-                Ok(outputs) => outputs.iter().for_each(GpuDCRTPolyMatrix::wait_until_ready),
-                Err(error) => operation_error = Some(error),
-            }
-        })
+        let measured = measure_batch_operation(
+            harness,
+            &probe,
+            representative.operation_batch_size,
+            |operation_batch| {
+                if operation_error.is_some() {
+                    return;
+                }
+                match Self::run_node(
+                    &mut worker.backend,
+                    &node,
+                    bindings,
+                    operation_batch,
+                    &prepared,
+                ) {
+                    Ok(outputs) => outputs.iter().for_each(GpuDCRTPolyMatrix::wait_until_ready),
+                    Err(error) => operation_error = Some(error),
+                }
+            },
+        )
         .map_err(|error| GpuMeasurementError(error.to_string()))?;
         if let Some(error) = operation_error {
             return Err(error);
@@ -1089,6 +1117,46 @@ impl GpuNodeMeasurementBackend {
                     .map(|_| Ok((matrix_arc(0)?, matrix_arc(1)?)))
                     .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
                 backend.multiply_batch(inputs).map_err(backend_error)
+            }
+            NodeKind::PreimageBinary(operation) => {
+                let inputs = (0..batch_size)
+                    .map(|_| Ok((matrix_arc(0)?, matrix_arc(1)?)))
+                    .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
+                match operation {
+                    mxx_ir_core::node::PreimageBinaryOp::Add => backend.add_batch(inputs),
+                    mxx_ir_core::node::PreimageBinaryOp::RightMultiplyExact |
+                    mxx_ir_core::node::PreimageBinaryOp::ComposeExactDecomposition => {
+                        backend.multiply_batch(inputs)
+                    }
+                }
+                .map_err(backend_error)
+            }
+            NodeKind::PreimageConcatColumns => (0..batch_size)
+                .map(|_| {
+                    let inputs = prepared
+                        .arguments
+                        .iter()
+                        .map(|value| {
+                            value.as_deref().ok_or_else(|| {
+                                GpuMeasurementError("preimage concat input is not a matrix".into())
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    backend.concat(&inputs, ConcatAxis::Columns).map_err(backend_error)
+                })
+                .collect(),
+            NodeKind::DecompositionEntry { row, column } => {
+                let row = evaluate_usize(row)?;
+                let column = evaluate_usize(column)?;
+                let rows = IndexRange { start: row, end: row + 1 };
+                let columns = IndexRange { start: column, end: column + 1 };
+                (0..batch_size)
+                    .map(|_| {
+                        backend
+                            .slice(matrix(0)?, Some(&rows), Some(&columns))
+                            .map_err(backend_error)
+                    })
+                    .collect()
             }
             NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
                 let mut requests = Vec::with_capacity(batch_size);
@@ -1424,6 +1492,7 @@ impl GpuNodeMeasurementBackend {
             NodeKind::EvaluateInt(_) |
             NodeKind::ConstantReal(_) |
             NodeKind::ConstantBool(_) |
+            NodeKind::MaterializePreimageExact |
             NodeKind::TrapdoorPublic |
             NodeKind::IntBinary(_) |
             NodeKind::IntCompare(_) |
@@ -1512,10 +1581,16 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
                 node.scope, node.id
             )));
         }
+        let operation_batch_size = operation_batch_size(node)?;
         let remainder = remainder_columns.map(|columns| {
             let (kind, concrete_argument_types, concrete_output_types, _, _) =
                 Self::representative_node(node, self.crt_depth, columns);
-            RepresentativeMeasurement { kind, concrete_argument_types, concrete_output_types }
+            RepresentativeMeasurement {
+                kind,
+                concrete_argument_types,
+                concrete_output_types,
+                operation_batch_size,
+            }
         });
         self.pending.entry(measurement_key).or_insert_with(|| PendingMeasurement {
             key: measurement_key,
@@ -1531,6 +1606,7 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
                 node.kind,
                 NodeKind::PreimageSample { .. } | NodeKind::FamilyPreimageSample { .. }
             ),
+            operation_batch_size,
         });
         Ok(NodeMeasurement::default())
     }
@@ -1569,7 +1645,9 @@ fn matrix_bytes(matrix: &ConcreteMatrixType, crt_depth: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuNodeMeasurementBackend, extrapolate_column_waves, matrix_bytes};
+    use super::{
+        GpuNodeMeasurementBackend, extrapolate_column_waves, matrix_bytes, operation_batch_size,
+    };
     use crate::{MeasurementNode, NodeMeasurement};
     use mxx_ir_core::{
         FrozenGraphScopeId, IntExpr, ParamEnv,
@@ -2081,5 +2159,39 @@ mod tests {
         assert_eq!((output.rows, output.columns), (82, 12));
         assert_eq!(scale, 6.0);
         assert_eq!(remainder_columns, Some(8));
+    }
+
+    #[test]
+    fn family_preimage_measurement_preserves_the_runtime_batch_cardinality() {
+        let kind = NodeKind::FamilyPreimageSample {
+            matrix_type: MatrixType {
+                rows: IntExpr::constant(3),
+                columns: IntExpr::constant(1),
+                ring_dimension: IntExpr::constant(32),
+                modulus: IntExpr::constant(257),
+            },
+            max_coefficient_bound: IntExpr::constant(100),
+        };
+        let scope = FrozenGraphScopeId::Root;
+        let node = MeasurementNode {
+            scope: &scope,
+            id: NodeId(1),
+            kind: &kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: vec![],
+            concrete_output_types: vec![ConcreteWireType::Family {
+                element: Box::new(ConcreteWireType::Preimage(ConcreteMatrixType {
+                    rows: 3,
+                    columns: 1,
+                    ring_dimension: 32,
+                    modulus: BigInt::from(257u16),
+                })),
+                shape: vec![2, 3],
+            }],
+        };
+        assert_eq!(operation_batch_size(&node).unwrap(), 6);
     }
 }

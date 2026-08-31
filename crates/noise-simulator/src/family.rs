@@ -61,6 +61,14 @@ pub(crate) fn join(
         (AbstractValue::Trapdoor(left), AbstractValue::Trapdoor(right)) if left == right => {
             Ok(AbstractValue::Trapdoor(left.clone()))
         }
+        (AbstractValue::Family(left), AbstractValue::Family(right))
+            if left.shape == right.shape =>
+        {
+            Ok(AbstractValue::Family(FamilyState::new(
+                left.shape.clone(),
+                join(left.element.as_ref(), right.element.as_ref())?,
+            )?))
+        }
         (
             AbstractValue::TypedBlob { type_name, schema_hash },
             AbstractValue::TypedBlob { type_name: other, schema_hash: other_hash },

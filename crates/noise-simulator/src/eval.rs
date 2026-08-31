@@ -146,8 +146,8 @@ pub(crate) fn run(request: &SimulationRequest) -> Result<crate::SimulationReport
         next_source: 0,
         preimages: HashMap::new(),
         states: HashMap::new(),
-        selector_wires: HashMap::new(),
-        next_selector: 0,
+        selector_views: HashMap::new(),
+        next_selector: plan.interners.selectors.len() as u32,
         planned: plan.wires.len(),
         transfers: 0,
         dropped: Vec::new(),
@@ -207,10 +207,10 @@ struct Evaluator<'a> {
     next_source: u32,
     preimages: HashMap<crate::FamilyViewId, RightPreimage>,
     states: HashMap<crate::FamilyViewId, MatrixState>,
-    /// Runtime selector identity is exact wire provenance, never an interval
-    /// equality. Equal ranges from distinct wires remain uncorrelated.
-    selector_wires:
-        HashMap<(crate::StageId, FrozenGraphScopeId, Vec<String>, WireRef), crate::SelectorId>,
+    /// Runtime selector identity follows the normalized semantic family view.
+    /// Reusing one family through the same map is correlated across structural
+    /// scopes, while unrelated wires and different maps remain distinct.
+    selector_views: HashMap<crate::FamilyViewId, crate::SelectorId>,
     next_selector: u32,
     planned: usize,
     transfers: u64,
@@ -479,31 +479,13 @@ impl<'a> Evaluator<'a> {
         source
     }
 
-    fn selector_for(
-        &mut self,
-        stage: &crate::StageId,
-        scope: &FrozenGraphScopeId,
-        occurrence: &[String],
-        wire: WireRef,
-    ) -> crate::SelectorId {
-        let key = (stage.clone(), scope.clone(), occurrence.to_vec(), wire);
-        if let Some(id) = self.selector_wires.get(&key) {
+    fn selector_for(&mut self, view: crate::FamilyViewId) -> crate::SelectorId {
+        if let Some(id) = self.selector_views.get(&view) {
             return *id;
         }
-        let value_key = crate::identity::ValueKey {
-            stage: stage.clone(),
-            scope: scope.clone(),
-            occurrence: occurrence.to_vec(),
-            wire,
-        };
-        let value = self.interners.values.get(&value_key).copied().unwrap_or_else(|| {
-            let value = crate::ValueId(self.interners.values.len() as u32);
-            self.interners.values.insert(value_key, value);
-            value
-        });
-        let id = self.interners.intern_selector(vec![value]);
-        self.next_selector = self.next_selector.max(id.0.saturating_add(1));
-        self.selector_wires.insert(key, id);
+        let id = crate::SelectorId(self.next_selector);
+        self.next_selector = self.next_selector.saturating_add(1);
+        self.selector_views.insert(view, id);
         id
     }
 
@@ -877,7 +859,7 @@ impl<'a> Evaluator<'a> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut out = self
-                .node(stage, graph, sid, occurrence, &scope, &args, n, node.kind(), &inputs, &env)
+                .node(stage, graph, sid, occurrence, &scope, n, node.kind(), &inputs, &env)
                 .map_err(|error| SimulationError::InvalidGraph {
                     message: format!("stage {:?}, node {n} ({:?}): {error}", stage, node.kind()),
                     site: Some(DiagnosticSite {
@@ -1052,7 +1034,6 @@ impl<'a> Evaluator<'a> {
         sid: &FrozenGraphScopeId,
         occurrence: &[String],
         scope: &GraphScope,
-        arg_wires: &[WireRef],
         n: usize,
         kind: &NodeKind,
         xs: &[Info],
@@ -1821,6 +1802,10 @@ impl<'a> Evaluator<'a> {
                             site: site(),
                         }
                     })?;
+                // The relation contract applies to the actual public source
+                // received by the sampler. Keep that identity registered even
+                // when the grouped representation below interns a normalized
+                // source for the preimage family.
                 // FamilyPreimageSample consumes a group-indexed public
                 // source.  Its output adds only the final preimage branch
                 // axis, so retain the group's canonical source function and
@@ -2377,9 +2362,9 @@ impl<'a> Evaluator<'a> {
                 for (axis, selector) in xs[1..].iter().enumerate() {
                     validate_index(selector, f.shape[axis], site())?;
                 }
-                let selectors = arg_wires[1..]
+                let selectors = xs[1..]
                     .iter()
-                    .map(|wire| self.selector_for(stage, sid, occurrence, *wire))
+                    .map(|selector| self.selector_for(selector.view))
                     .collect::<Vec<_>>();
                 let concrete_indices = xs[1..]
                     .iter()
@@ -2482,9 +2467,9 @@ impl<'a> Evaluator<'a> {
                         e,
                     )?)
                 };
-                let selectors = arg_wires[1..]
+                let selectors = xs[1..]
                     .iter()
-                    .map(|wire| self.selector_for(stage, sid, occurrence, *wire))
+                    .map(|selector| self.selector_for(selector.view))
                     .collect::<Vec<_>>();
                 let mut relation =
                     xs[0].relation.clone().map(|r| specialize_relation(r, &selectors));
@@ -2681,9 +2666,9 @@ impl<'a> Evaluator<'a> {
                     shape.clone(),
                     family_element(&xs[0]).ok_or_else(|| bad("family required"))?,
                 )?);
-                let selectors = arg_wires[1..]
+                let selectors = xs[1..]
                     .iter()
-                    .map(|wire| self.selector_for(stage, sid, occurrence, *wire))
+                    .map(|selector| self.selector_for(selector.view))
                     .collect::<Vec<_>>();
                 let selector_views = xs[1..].iter().map(|selector| selector.view);
                 let mut relation = xs[0].relation.clone();
@@ -2752,7 +2737,7 @@ impl<'a> Evaluator<'a> {
                     xs[1].clone()
                 };
                 if let Some(relation) = selected.relation.take() {
-                    let selector_id = self.selector_for(stage, sid, occurrence, arg_wires[0]);
+                    let selector_id = self.selector_for(xs[0].view);
                     selected.relation = Some(specialize_relation(relation, &[selector_id]));
                 }
                 if selector.minimum != selector.maximum_inclusive {
@@ -2966,113 +2951,211 @@ impl<'a> Evaluator<'a> {
                     site: None,
                 });
             }
-            // A grid body is one symbolic structural occurrence.  Numeric
-            // bounds are uniform, so evaluating every lane would both scale
-            // resources with cardinality and destroy occurrence identity.
-            let mut grid_env = env.clone();
-            for slot in &spec.index_slots {
-                grid_env.loop_indices.insert(*slot, BigInt::zero());
-            }
-            grid_env = apply_bindings(grid_env, &spec.bindings)?;
-            let preload = cs
-                .inputs()
-                .iter()
-                .copied()
-                .zip(xs.iter().cloned())
-                .enumerate()
-                .map(|(arg, (wire, value))| {
-                    let mapped = match spec.input_modes.get(arg) {
-                        Some(mxx_ir_core::node::GridInputMode::Reindex { map }) => {
-                            let coordinates = map
-                                .input_indices
-                                .iter()
-                                .map(|expr| eval_grid_index(expr, &grid_env, &spec.index_slots))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let family_shape = match &value.value {
-                                AbstractValue::Family(family) => family.shape.clone(),
-                                _ => unreachable!(),
-                            };
-                            if coordinates.len() != family_shape.len() ||
-                                coordinates
-                                    .iter()
-                                    .enumerate()
-                                    .any(|(axis, coordinate)| *coordinate >= family_shape[axis])
-                            {
-                                return Err(SimulationError::SelectorOutOfRange {
-                                    message: "parallel-grid reindex is outside its input family"
-                                        .into(),
-                                    site: None,
-                                });
-                            }
-                            let mut mapped = value;
-                            let mapped_view = self.interners.intern_composed_view(
-                                vec![mapped.view],
-                                Vec::new(),
-                                std::slice::from_ref(map),
-                            );
-                            mapped.view = mapped_view;
-                            if let Some(relation) = mapped.relation.as_mut() {
-                                relation.view = Some(mapped_view);
-                            }
-                            mapped.paired_public = mapped.paired_public.map(|paired| {
-                                self.interners.intern_composed_view(
-                                    vec![paired],
-                                    Vec::new(),
-                                    std::slice::from_ref(map),
-                                )
-                            });
-                            let family_element = match &mapped.value {
-                                AbstractValue::Family(family) => family.element.as_ref().clone(),
-                                _ => unreachable!(),
-                            };
-                            mapped.value = family_element;
-                            let relation_source = mapped.relation.as_ref().map(|r| r.source);
-                            remap_carriers(&mut mapped.value, |source| {
-                                self.mapped_source_for(
-                                    source,
-                                    map,
-                                    grid_shape.clone(),
-                                    Some(&grid_env),
-                                )
-                            });
-                            if let Some(source) = relation_source {
-                                let mapped_source = self.mapped_source_for(
-                                    source,
-                                    map,
-                                    grid_shape.clone(),
-                                    Some(&grid_env),
-                                );
-                                if let Some(relation) = mapped.relation.as_mut() {
-                                    relation.source = mapped_source;
-                                }
-                            }
-                            if let Some(relation) = mapped.relation.as_mut() {
-                                let old_target = relation.target;
-                                let target = self.interners.intern_composed_view(
-                                    vec![relation.target],
-                                    grid_shape.clone(),
-                                    std::slice::from_ref(map),
-                                );
-                                if let Some(state) = self.remap_target_with_map(
-                                    old_target,
-                                    map,
-                                    grid_shape.clone(),
-                                    Some(&grid_env),
-                                ) {
-                                    self.states.insert(target, state);
-                                }
-                                relation.target = target;
-                            }
-                            mapped
-                        }
-                        _ => value,
-                    };
-                    Ok((wire, mapped))
-                })
-                .collect::<Result<HashMap<_, _>, SimulationError>>()?;
             let mut child_occurrence = occurrence.to_vec();
             child_occurrence.push(format!("node:{n}/grid"));
-            let vals = self.scope(stage, graph, &child, &child_occurrence, grid_env, preload)?;
+            let lane_count = grid_shape
+                .iter()
+                .try_fold(1usize, |count, extent| count.checked_mul(*extent))
+                .filter(|count| *count > 0)
+                .ok_or_else(|| SimulationError::InvalidGraph {
+                    message: "parallel grid cardinality is zero or overflows usize".into(),
+                    site: None,
+                })?;
+            let mut joined_outputs: Vec<Option<Info>> = vec![None; cs.outputs().len()];
+            let mut joined_target_states: Vec<Option<MatrixState>> = vec![None; cs.outputs().len()];
+            let base_preimages = self.preimages.clone();
+            let base_states = self.states.clone();
+            let mut representative_preimages = None;
+            let mut representative_states = None;
+            for lane in 0..lane_count {
+                if lane > 0 {
+                    // Every lane executes the same frozen body occurrence but
+                    // with different loop-index values. Restore its incoming
+                    // relation tables so lane-local producers cannot collide
+                    // with or consume facts left by the preceding lane.
+                    self.preimages = base_preimages.clone();
+                    self.states = base_states.clone();
+                }
+                let mut remainder = lane;
+                let mut coordinates = vec![0usize; grid_shape.len()];
+                for axis in (0..grid_shape.len()).rev() {
+                    coordinates[axis] = remainder % grid_shape[axis];
+                    remainder /= grid_shape[axis];
+                }
+                let mut grid_env = env.clone();
+                for (slot, coordinate) in spec.index_slots.iter().zip(coordinates) {
+                    grid_env.loop_indices.insert(*slot, coordinate.into());
+                }
+                grid_env = apply_bindings(grid_env, &spec.bindings)?;
+                let preload = cs
+                    .inputs()
+                    .iter()
+                    .copied()
+                    .zip(xs.iter().cloned())
+                    .enumerate()
+                    .map(|(arg, (wire, value))| {
+                        let mapped = match spec.input_modes.get(arg) {
+                            Some(mxx_ir_core::node::GridInputMode::Reindex { map }) => {
+                                let coordinates = map
+                                    .input_indices
+                                    .iter()
+                                    .map(|expr| eval_grid_index(expr, &grid_env, &spec.index_slots))
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let family_shape = match &value.value {
+                                    AbstractValue::Family(family) => family.shape.clone(),
+                                    _ => unreachable!(),
+                                };
+                                if coordinates.len() != family_shape.len() ||
+                                    coordinates.iter().enumerate().any(|(axis, coordinate)| {
+                                        *coordinate >= family_shape[axis]
+                                    })
+                                {
+                                    return Err(SimulationError::SelectorOutOfRange {
+                                        message:
+                                            "parallel-grid reindex is outside its input family"
+                                                .into(),
+                                        site: None,
+                                    });
+                                }
+                                let mut mapped = value;
+                                let mapped_view = self.interners.intern_composed_view(
+                                    vec![mapped.view],
+                                    Vec::new(),
+                                    std::slice::from_ref(map),
+                                );
+                                mapped.view = mapped_view;
+                                if let Some(relation) = mapped.relation.as_mut() {
+                                    relation.view = Some(mapped_view);
+                                }
+                                mapped.paired_public = mapped.paired_public.map(|paired| {
+                                    self.interners.intern_composed_view(
+                                        vec![paired],
+                                        Vec::new(),
+                                        std::slice::from_ref(map),
+                                    )
+                                });
+                                let family_element = match &mapped.value {
+                                    AbstractValue::Family(family) => {
+                                        family.element.as_ref().clone()
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                mapped.value = family_element;
+                                let relation_source = mapped.relation.as_ref().map(|r| r.source);
+                                remap_carriers(&mut mapped.value, |source| {
+                                    self.mapped_source_for(
+                                        source,
+                                        map,
+                                        grid_shape.clone(),
+                                        Some(&grid_env),
+                                    )
+                                });
+                                if let Some(source) = relation_source {
+                                    let mapped_source = self.mapped_source_for(
+                                        source,
+                                        map,
+                                        grid_shape.clone(),
+                                        Some(&grid_env),
+                                    );
+                                    if let Some(relation) = mapped.relation.as_mut() {
+                                        relation.source = mapped_source;
+                                    }
+                                }
+                                if let Some(relation) = mapped.relation.as_mut() {
+                                    let old_target = relation.target;
+                                    let target = self.interners.intern_composed_view(
+                                        vec![relation.target],
+                                        grid_shape.clone(),
+                                        std::slice::from_ref(map),
+                                    );
+                                    if let Some(state) = self.remap_target_with_map(
+                                        old_target,
+                                        map,
+                                        grid_shape.clone(),
+                                        Some(&grid_env),
+                                    ) {
+                                        self.states.insert(target, state);
+                                    }
+                                    relation.target = target;
+                                }
+                                mapped
+                            }
+                            _ => value,
+                        };
+                        Ok((wire, mapped))
+                    })
+                    .collect::<Result<HashMap<_, _>, SimulationError>>()?;
+                let vals =
+                    self.scope(stage, graph, &child, &child_occurrence, grid_env, preload)?;
+                if lane == 0 {
+                    representative_preimages = Some(self.preimages.clone());
+                    representative_states = Some(self.states.clone());
+                }
+                for (port, wire) in cs.outputs().iter().enumerate() {
+                    let info =
+                        vals.get(wire).cloned().ok_or_else(|| SimulationError::InvalidGraph {
+                            message: "missing parallel-grid output".into(),
+                            site: None,
+                        })?;
+                    if let Some(state) = info
+                        .relation
+                        .as_ref()
+                        .and_then(|relation| self.states.get(&relation.target))
+                        .cloned()
+                    {
+                        joined_target_states[port] =
+                            Some(match joined_target_states[port].take() {
+                                Some(previous) => {
+                                    let representative_carrier = previous.right_carrier.clone();
+                                    let AbstractValue::Matrix(joined) = crate::family::join(
+                                        &AbstractValue::Matrix(previous),
+                                        &AbstractValue::Matrix(state),
+                                    )?
+                                    else {
+                                        unreachable!("joining matrix states returns a matrix")
+                                    };
+                                    MatrixState { right_carrier: representative_carrier, ..joined }
+                                }
+                                None => state,
+                            });
+                    }
+                    joined_outputs[port] = Some(match joined_outputs[port].take() {
+                        Some(previous) => {
+                            let ty = previous.ty.clone().or_else(|| info.ty.clone());
+                            let joined = self.join_uniform_with_diagnostics(
+                                previous.clone(),
+                                info,
+                                ty.as_ref(),
+                                None,
+                            )?;
+                            let mut joined_value = joined.value;
+                            preserve_grid_carriers(&previous.value, &mut joined_value);
+                            // Bounds are uniform across the frozen family, but
+                            // relation/view identity is the one symbolic grid
+                            // occurrence. Keep the representative provenance
+                            // while replacing only its joined abstract value.
+                            Info { value: joined_value, ty: joined.ty, ..previous }
+                        }
+                        None => info,
+                    });
+                }
+            }
+            self.preimages = representative_preimages.expect("positive grid cardinality");
+            self.states = representative_states.expect("positive grid cardinality");
+            let vals = cs
+                .outputs()
+                .iter()
+                .enumerate()
+                .map(|(port, wire)| {
+                    let info = joined_outputs[port].clone().expect("positive grid cardinality");
+                    if let (Some(relation), Some(state)) =
+                        (&info.relation, joined_target_states[port].clone())
+                    {
+                        self.states.insert(relation.target, state);
+                    }
+                    (*wire, info)
+                })
+                .collect::<HashMap<_, _>>();
             cs.outputs()
                 .iter()
                 .map(|wire| {
@@ -3295,6 +3378,12 @@ fn join_uniform(
             AbstractValue::Boolean(left.join(*right))
         }
         (AbstractValue::Bytes, AbstractValue::Bytes) => AbstractValue::Bytes,
+        (AbstractValue::Trapdoor(left), AbstractValue::Trapdoor(right)) if left == right => {
+            AbstractValue::Trapdoor(left.clone())
+        }
+        (AbstractValue::Family(_), AbstractValue::Family(_)) => {
+            crate::family::join(&a.value, &b.value)?
+        }
         (
             AbstractValue::TypedBlob { type_name, schema_hash },
             AbstractValue::TypedBlob { type_name: other, schema_hash: other_hash },
@@ -3328,6 +3417,20 @@ fn matrix_state_mut(x: &mut AbstractValue) -> Option<&mut MatrixState> {
         AbstractValue::Matrix(x) => Some(x),
         AbstractValue::Family(f) => matrix_state_mut(f.element.as_mut()),
         _ => None,
+    }
+}
+
+fn preserve_grid_carriers(representative: &AbstractValue, joined: &mut AbstractValue) {
+    match (representative, joined) {
+        (AbstractValue::Matrix(representative), AbstractValue::Matrix(joined)) => {
+            joined.right_carrier = representative.right_carrier.clone();
+        }
+        (AbstractValue::Family(representative), AbstractValue::Family(joined))
+            if representative.shape == joined.shape =>
+        {
+            preserve_grid_carriers(representative.element.as_ref(), joined.element.as_mut());
+        }
+        _ => {}
     }
 }
 
@@ -3657,8 +3760,8 @@ fn specialize_relation(
     mut relation: RightPreimage,
     selectors: &[crate::SelectorId],
 ) -> RightPreimage {
-    // Selector identity is exact runtime-wire provenance. Numeric interval
-    // equality is intentionally not used as evidence of correlation.
+    // Selector identity is the normalized semantic family view. Numeric
+    // interval equality is intentionally not used as evidence of correlation.
     relation.selector = selectors.first().copied();
     relation
 }
@@ -4709,6 +4812,120 @@ mod tests {
     }
 
     #[test]
+    fn parallel_grid_joins_loop_index_dependent_lanes() {
+        let matrix = MatrixType {
+            modulus: mxx_ir_core::IntExpr::constant(97),
+            ring_dimension: mxx_ir_core::IntExpr::constant(1),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
+        };
+        let noisy = NodeHandle::new(
+            NodeKind::Input {
+                name: "noisy".into(),
+                wire_type: WireType::Matrix(matrix.clone()),
+                artifact: None,
+            },
+            vec![],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let body = with_new_construction_scope(|scope| {
+            let body_noisy = NodeHandle::new(
+                NodeKind::Input {
+                    name: "body-noisy".into(),
+                    wire_type: WireType::Matrix(matrix.clone()),
+                    artifact: None,
+                },
+                vec![],
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .unwrap();
+            let zero = NodeHandle::new(
+                NodeKind::ConstantMatrix {
+                    matrix_type: matrix.clone(),
+                    value: ConstantMatrix::Zero,
+                },
+                vec![],
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .unwrap();
+            let selector = NodeHandle::new(
+                NodeKind::EvaluateInt(mxx_ir_core::IntExpr::LoopIndex(0)),
+                vec![],
+                vec![WireType::ConstantInt],
+            )
+            .output(0)
+            .unwrap();
+            let selected = NodeHandle::new(
+                NodeKind::Select { count: mxx_ir_core::IntExpr::constant(2) },
+                vec![selector, zero, body_noisy.clone()],
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("loop-index-select-body", scope, vec![body_noisy], vec![selected])
+                .unwrap()
+        });
+        let family_type = WireType::Family {
+            element: Box::new(WireType::Matrix(matrix)),
+            shape: vec![mxx_ir_core::IntExpr::constant(2)],
+        };
+        let output = NodeHandle::parallel_grid(
+            body,
+            vec![noisy],
+            vec![family_type],
+            mxx_ir_core::node::ParallelGrid {
+                shape: vec![mxx_ir_core::IntExpr::constant(2)],
+                index_slots: vec![0],
+                bindings: vec![],
+                input_modes: vec![mxx_ir_core::node::GridInputMode::Broadcast],
+            },
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "loop-index-select-grid",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: output, confidentiality: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let environment = ParamEnv::default();
+        let stage = crate::StageId("loop-index-select-grid".into());
+        let report = run(&SimulationRequest {
+            program: crate::SimulationProgram {
+                stages: vec![crate::SimulationStage {
+                    id: stage.clone(),
+                    production_id: ProductionId {
+                        spec_hash: spec_hash(&graph, &environment).unwrap(),
+                        execution_nonce: [0; 32],
+                    },
+                    graph,
+                }],
+            },
+            environment,
+            roots: vec![crate::SimulationRoot { stage: stage.clone(), output: "out".into() }],
+            external_inputs: vec![crate::ExternalInputFact {
+                stage,
+                input: "noisy".into(),
+                value: crate::ExternalInputValue::Matrix {
+                    maximum_absolute_coefficient_error: 7u8.into(),
+                    maximum_absolute_coefficient_value: Some(7u8.into()),
+                    is_constant_polynomial: true,
+                },
+            }],
+            limits: crate::SimulationLimits::default(),
+        })
+        .unwrap();
+        assert_eq!(report.roots[0].maximum_absolute_coefficient_error, 7u8.into());
+    }
+
+    #[test]
     fn scalar_grid_source_reindex_matches_shared_preimage_group_source() {
         let request = SimulationRequest {
             program: crate::SimulationProgram { stages: Vec::new() },
@@ -4731,7 +4948,7 @@ mod tests {
             next_source: 0,
             preimages: HashMap::new(),
             states: HashMap::new(),
-            selector_wires: HashMap::new(),
+            selector_views: HashMap::new(),
             next_selector: 0,
             planned: 0,
             transfers: 0,
@@ -4840,6 +5057,32 @@ mod tests {
             vec![2],
         );
         assert_eq!(selected, group);
+
+        // Opaque selectors over an ordinary non-uniform family remain
+        // distinct even when they descend from the same family root. Only a
+        // source explicitly consumed by FamilyPreimageSample receives the
+        // index-independent relation contract used by grid-lane joining.
+        let opaque_left = evaluator.gathered_source_for(
+            bases,
+            vec![crate::SelectorId(10), crate::SelectorId(11)],
+            Vec::new(),
+        );
+        let opaque_right = evaluator.gathered_source_for(
+            bases,
+            vec![crate::SelectorId(12), crate::SelectorId(13)],
+            Vec::new(),
+        );
+        assert_ne!(opaque_left, opaque_right);
+        assert_eq!(
+            evaluator.selector_for(crate::FamilyViewId(10)),
+            evaluator.selector_for(crate::FamilyViewId(10)),
+            "one normalized semantic view must retain one selector identity"
+        );
+        assert_ne!(
+            evaluator.selector_for(crate::FamilyViewId(10)),
+            evaluator.selector_for(crate::FamilyViewId(11)),
+            "different semantic views must remain uncorrelated"
+        );
 
         // A transition target may retain a final preimage-branch axis while
         // its public carrier is B[level + 1, state].  After the branch is

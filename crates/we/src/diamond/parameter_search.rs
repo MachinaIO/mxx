@@ -44,6 +44,9 @@ pub struct DiamondSelectedParameters {
     pub modulus: BigUint,
     pub modulus_bits: usize,
     pub achieved_security_bits: u64,
+    /// Simulator upper bound for the absolute coefficient error of the
+    /// decryption graph's noisy plaintext output.
+    pub noise_bound: BigUint,
 }
 
 #[derive(Debug, Error)]
@@ -317,6 +320,7 @@ impl DiamondParameterSearch {
                 modulus: modulus.as_ref().clone(),
                 modulus_bits: modulus.bits() as usize,
                 achieved_security_bits,
+                noise_bound: noise_bound.clone(),
             },
             correct,
         })

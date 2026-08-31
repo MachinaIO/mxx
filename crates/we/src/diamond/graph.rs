@@ -15,7 +15,7 @@ use mxx_gadgets::{
     input_injector::{DiamondInputInjector, DiamondInputParams, DiamondInputPreprocessError},
 };
 use mxx_ir_core::{
-    IntExpr, ParamEnv,
+    IndexExpr, IndexMap, IntExpr, ParamEnv,
     artifact::{ArtifactConfidentiality, ProductionId},
     node::{ConcatAxis, IndexRange},
 };
@@ -355,11 +355,16 @@ impl DiamondWeProtocolFamily {
         let one_sample = one_trapdoor
             .sample_preimage(one_target, (state_columns.clone(), public_columns.clone()));
         let one_preimage = one_sample;
-        let witness_indices =
-            Parallel::range(witness_size).map_values(|bit| bit.as_int().add(Int::constant(1)))?;
-        let witness_trapdoors =
-            input_preprocessing.final_trapdoors.clone().parallel_gather(witness_indices.clone())?;
-        let witness_public_keys = public_keys.matrices.clone().parallel_gather(witness_indices)?;
+        let witness_source_map = IndexMap::new([IndexExpr::Add(
+            Box::new(IndexExpr::Axis(0)),
+            Box::new(IndexExpr::constant(1)),
+        )]);
+        let witness_trapdoors = input_preprocessing
+            .final_trapdoors
+            .clone()
+            .reindex(vec![witness_size.clone()], witness_source_map.clone())?;
+        let witness_public_keys =
+            public_keys.matrices.clone().reindex(vec![witness_size.clone()], witness_source_map)?;
         let witness_targets = witness_public_keys.parallel_map_values({
             let top_row = top_row.clone();
             let bottom_row = bottom_row.clone();
@@ -534,19 +539,24 @@ impl DiamondWeProtocolFamily {
             (state_columns.clone(), public_columns.clone()),
             ArtifactConfidentiality::Public,
         );
-        let witness_state_indices = Parallel::range(witness_size.clone())
-            .map_values(|bit| bit.as_int().add(Int::constant(1)))?;
-        let witness_states = states.parallel_gather(witness_state_indices)?;
+        // This is a static coordinate map, not a runtime selector. Reusing the
+        // exact map preserves the source relation across the artifact boundary
+        // without asking the generic checker to prove arithmetic expressions
+        // from two stages equivalent.
+        let witness_source_map = IndexMap::new([IndexExpr::Add(
+            Box::new(IndexExpr::Axis(0)),
+            Box::new(IndexExpr::constant(1)),
+        )]);
+        let witness_states =
+            states.reindex(vec![witness_size.clone()], witness_source_map.clone())?;
         // Witness states are projected by explicit ApplyPreimage operations;
         // the preimage artifact is consumed on the right of each state row.
         let witness_vectors = parallel_zip_bundle_result(
             (witness_states, witness_preimages),
             |_, (state, preimage)| Ok::<_, DslError>(state.apply_preimage(preimage)),
         )?;
-        let witness_public_indices = Parallel::range(witness_size.clone())
-            .map_values(|bit| bit.as_int().add(Int::constant(1)))?;
         let witness_public_keys =
-            public_keys.matrices.clone().parallel_gather(witness_public_indices)?;
+            public_keys.matrices.clone().reindex(vec![witness_size.clone()], witness_source_map)?;
         let witness_zero_plaintexts =
             Parallel::range(witness_size.clone()).map_values(|_| ring.zero((1, 1)))?;
         let witness_one_plaintexts =

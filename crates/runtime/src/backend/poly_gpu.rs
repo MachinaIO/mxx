@@ -1,7 +1,8 @@
 use super::{
     Backend, PreimageRequest,
-    poly::{CrtRecomposeMatrix, PolyBackend, PolyBackendError},
+    poly::{CrtRecomposeMatrix, PolyBackend, PolyBackendError, RingKey},
 };
+use mxx_ir_core::types::ConcreteMatrixType;
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 
@@ -64,6 +65,38 @@ pub type GpuDcrtBackend = PolyBackend<
     GpuDCRTPolyHashSampler<keccak_asm::Keccak256>,
     GpuDCRTPolyTrapdoorSampler,
 >;
+
+impl<M, U, H, T> PolyBackend<M, U, H, T>
+where
+    M: PolyMatrix,
+{
+    pub(crate) fn new_with_placements(placements: Vec<Vec<<M::P as Poly>::Params>>) -> Self {
+        assert!(!placements.is_empty(), "a backend needs at least one placement");
+        let mut backend = Self::default();
+        backend.parameters = (0..placements.len()).map(|_| Default::default()).collect();
+        for (placement, parameters) in placements.into_iter().enumerate() {
+            for parameters in parameters {
+                backend.register_at(placement, parameters);
+            }
+        }
+        backend
+    }
+
+    pub(super) fn parameters_at(
+        &self,
+        placement: usize,
+        matrix_type: &ConcreteMatrixType,
+    ) -> Result<&<M::P as Poly>::Params, PolyBackendError> {
+        let key = RingKey {
+            modulus: matrix_type.modulus.clone(),
+            ring_dimension: matrix_type.ring_dimension,
+        };
+        self.parameters
+            .get(placement)
+            .and_then(|parameters| parameters.get(&key))
+            .ok_or(PolyBackendError::MissingParameters(key))
+    }
+}
 
 pub fn gpu_backend(parameters: impl IntoIterator<Item = GpuDCRTPolyParams>) -> GpuDcrtBackend {
     let parameters = parameters.into_iter().collect::<Vec<_>>();

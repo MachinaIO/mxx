@@ -22,8 +22,6 @@ pub mod public_key;
 pub mod refresh;
 pub mod refresh_setup;
 pub mod rhs;
-mod utils;
-
 use rhs::PowerRhsPackageError;
 
 pub use encoding::{PowerLutEncodingCompiler, flattened_lut_index};
@@ -54,19 +52,15 @@ pub enum PowerLutError {
     #[error(transparent)]
     /// A shared Power-LUT program failed validation or lowering.
     Program(#[from] program::ProgramValidationError),
-    #[error("ClearCoeff width must be a power of two dividing the ring dimension")]
-    /// The requested coefficient-sieve width is not supported by the ring.
-    InvalidClearCoeffWidth,
     #[error("LUT dimensions, output exponents, or RHS width are invalid")]
     /// A table, exponent, or matrix shape is inconsistent with the operation.
     InvalidLut,
-    #[error("automorphism helper does not match the requested sieve round")]
-    /// An automorphism helper does not match the requested round, index, or
-    /// matrix shape.
-    InvalidAutomorphismHelper,
     #[error("sparse-LWR block layout or package count is invalid")]
     /// A sparse-LWR block has no valid public/package pairing.
     InvalidSparseLwrBlock,
+    #[error("the final scalar LUT requires an explicitly supplied helper set")]
+    /// Rounding helpers are setup artifacts and cannot be inferred from bucket helpers.
+    MissingRoundingHelpers,
 }
 
 /// Rejects any encoding wire that exposes plaintext metadata at a Power-LUT

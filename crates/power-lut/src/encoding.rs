@@ -1,26 +1,29 @@
-//! Power-LUT operations over plain BGG+ encoding wires.
+//! Private Power-LUT evaluation over ordinary `BggEncodingWire` values.
 //!
-//! This module owns the application-level orchestration: fixed-secret
-//! automorphism alignment, ClearCoeff, and generic LUT evaluation.
-//! The algebraic BGG primitives (addition and gadget products) remain in
-//! `mxx-bgg`; this module supplies Power-LUT routing around them.
+//! This module implements only the setup-fixed RHS interface. A fixed GSW
+//! ciphertext is gadget-decomposed once and multiplied by the input vector;
+//! no encoding of individual GSW digits is constructed. LUT evaluation uses
+//! the flat specialization: one setup-fixed switch and one reusable mask
+//! alignment per canonical automorphism branch, followed by a balanced sum.
 //!
-//! A normal operation consumes and returns [`BggEncodingWire`] values. The
-//! public counterpart lives in
-//! [`crate::public_key`]; its methods deliberately mirror the formulas here while
-//! accepting public matrices, public package projections, and
-//! [`crate::public_key::AutomorphismPublicHelper`] values. One-hot families are
-//! supplied as explicit
-//! selector packages paired with public scalar values; the sparse-LWR
-//! application builds those bindings without exposing them in this core.
+//! With `c = s A - μ t G + e` and a fixed GSW ciphertext satisfying
+//! `t C = y v G + e_C`, setup-fixed Fuse computes
+//! `D = G^{-1}(C)` and `cD = s(A D) - μ y v G + e'`. For unary table `f`,
+//! branch `j` uses `sigma_j = 1 + j(2n/W)` and
+//! `D_{sigma_j,L} = W^{-1} sum_k L(k) X^{-k sigma_j}` (a scalar output uses
+//! the constant polynomial `L(k)`, while a monomial output uses `X^{L(k)}`).
+//! The branch is mask-aligned and the `W` branches are added; this is the
+//! meaning of the `sigma`, `coefficient`, `decomposed`, and balanced-family
+//! values below.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     PowerLutError,
     program::{
-        FamilyRange, PowerLutProgram, ProgramBindings, ProgramFamilyRanges, ProgramInputId,
-        ProgramLoweringBackend, ProgramWireId, RhsInputId, lower_program,
+        FamilyRange, LutOutputForm, LutTable, PowerLutProgram, ProgramBindings,
+        ProgramFamilyRanges, ProgramInputId, ProgramLoweringBackend, ProgramWireId, RhsInputId,
+        lower_program,
     },
     rhs::{
         ManifestSecretMetadata, PowerRhsPackage, PowerRhsPackageArtifactNames, PowerRhsPackageError,
@@ -30,374 +33,335 @@ use mxx_bgg::{BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPub
 use mxx_dsl::{Bytes, DslError, Family, HashTag, Mat, Parallel};
 use mxx_ir_core::{
     IntExpr, ParamEnv,
-    node::{ConcatAxis, IndexRange},
+    node::{ConcatAxis, ConstantMatrix, IndexRange},
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Validated key-switch and mask material for one non-trivial ring
-/// automorphism used by `ClearCoeff`.
+/// A setup-fixed mask-alignment branch, reusable across LUT tables.
 #[derive(Clone)]
-pub struct AutomorphismHelper {
-    index: usize,
-    switch: PowerRhsPackage,
+pub struct FlatLutMaskBank {
+    branches: Arc<Vec<FlatLutMaskBranch>>,
+}
+
+#[derive(Clone)]
+struct FlatLutMaskBranch {
+    sigma: usize,
     mask: BggEncodingWire,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Public artifact names needed to import an [`AutomorphismHelper`].
-pub struct AutomorphismHelperArtifactNames {
-    /// Private key-switch RHS package.
-    pub switch: PowerRhsPackageArtifactNames,
-    /// Producer-bound mask encoding for this automorphism.
-    pub mask: BggEncodingArtifactNames,
+/// Public projections of a reusable [`FlatLutMaskBank`].
+#[derive(Clone)]
+pub struct FlatLutPublicMaskBank {
+    branches: Vec<(usize, Mat)>,
 }
 
-impl AutomorphismHelper {
-    /// Internal constructor. Setup callers should use manifest-bound import so
-    /// that the switch transition and mask dimensions are checked together.
+impl FlatLutMaskBank {
+    fn single(sigma: usize, mask: BggEncodingWire) -> Self {
+        Self { branches: Arc::new(vec![FlatLutMaskBranch { sigma, mask }]) }
+    }
+
+    pub(crate) fn index_for_sigma(&self, sigma: usize) -> Option<usize> {
+        self.branches.iter().position(|branch| branch.sigma == sigma)
+    }
+
+    fn branch(&self, index: usize) -> Option<&FlatLutMaskBranch> {
+        self.branches.get(index)
+    }
+
+    /// Returns the ordered odd automorphisms covered by this bank.
+    pub fn sigmas(&self) -> impl Iterator<Item = usize> + '_ {
+        self.branches.iter().map(|branch| branch.sigma)
+    }
+}
+
+impl FlatLutPublicMaskBank {
+    pub(crate) fn from_branches(branches: Vec<(usize, Mat)>) -> Self {
+        Self { branches }
+    }
+
+    pub(crate) fn single(sigma: usize, matrix: Mat) -> Self {
+        Self { branches: vec![(sigma, matrix)] }
+    }
+
+    pub(crate) fn index_for_sigma(&self, sigma: usize) -> Option<usize> {
+        self.branches.iter().position(|(branch_sigma, _)| *branch_sigma == sigma)
+    }
+
+    pub(crate) fn matrix(&self, index: usize) -> Option<&Mat> {
+        self.branches.get(index).map(|(_, matrix)| matrix)
+    }
+}
+
+/// Constructs the shared domain for one canonical mask branch. Both private
+/// and public samplers feed this exact tag to the BGG public-key sampler.
+pub(crate) fn canonical_flat_mask_branch_tag(root: &HashTag, sigma: usize) -> HashTag {
+    let mut tag = root.clone();
+    tag.push("power-lut-flat-mask-bank-v1");
+    tag.push("mask");
+    tag.push(IntExpr::constant(sigma));
+    tag
+}
+
+/// Setup-fixed helper for one flat LUT branch.
+#[derive(Clone)]
+pub struct FlatLutHelper {
+    sigma: usize,
+    switch: PowerRhsPackage,
+    mask_bank: Arc<FlatLutMaskBank>,
+    mask_index: usize,
+}
+
+/// All setup-fixed branches for one concrete LUT table.
+///
+/// The commitment is metadata for artifact binding only; it is never carried
+/// by a BGG encoding wire or used as a cryptographic provenance check during
+/// ordinary lowering.
+#[derive(Clone)]
+pub struct FlatLutHelperSet {
+    table_commitment: [u8; 32],
+    width: usize,
+    helpers: Vec<FlatLutHelper>,
+}
+
+impl FlatLutHelperSet {
+    pub fn new(
+        table: &crate::program::LutTable,
+        helpers: Vec<FlatLutHelper>,
+    ) -> Result<Self, PowerLutError> {
+        if table.values().len() != helpers.len() {
+            return Err(PowerLutError::InvalidLut);
+        }
+        Ok(Self { table_commitment: table.commitment(), width: helpers.len(), helpers })
+    }
+
+    pub(crate) fn from_parts(
+        table_commitment: [u8; 32],
+        width: usize,
+        helpers: Vec<FlatLutHelper>,
+    ) -> Result<Self, PowerLutError> {
+        if width == 0 || width != helpers.len() {
+            return Err(PowerLutError::InvalidLut);
+        }
+        Ok(Self { table_commitment, width, helpers })
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        table: &crate::program::LutTable,
+    ) -> Result<&[FlatLutHelper], PowerLutError> {
+        if self.width != table.values().len() || self.table_commitment != table.commitment() {
+            return Err(PowerLutError::InvalidLut);
+        }
+        Ok(&self.helpers)
+    }
+
+    pub(crate) fn as_slice(&self) -> &[FlatLutHelper] {
+        &self.helpers
+    }
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, FlatLutHelper> {
+        self.helpers.iter()
+    }
+    pub(crate) fn metadata(&self) -> ([u8; 32], usize) {
+        (self.table_commitment, self.width)
+    }
+}
+
+impl FlatLutHelper {
     pub(crate) fn new(
-        index: usize,
+        sigma: usize,
         switch: PowerRhsPackage,
         mask: BggEncodingWire,
     ) -> Result<Self, PowerLutError> {
         crate::ensure_ciphertext_only(&mask)?;
-        let n = mask
-            .pubkey
-            .matrix
-            .matrix_type()
-            .ring_dimension
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|v| v.to_usize())
-            .ok_or(PowerLutError::InvalidAutomorphismHelper)?;
-        if index == 0 || index >= 2 * n || index % 2 == 0 {
-            return Err(PowerLutError::InvalidAutomorphismHelper);
+        if sigma == 0 || sigma % 2 == 0 {
+            return Err(PowerLutError::InvalidLut);
         }
-        let mask_type = mask.pubkey.matrix.matrix_type();
-        let vector_type = mask.vector.matrix_type();
-        // A BGG encoding stores a row vector with the same number of columns
-        // as its public matrix. The public matrix rows are the secret
-        // dimension; they are not the vector width. Checking the latter
-        // relation is the fail-closed shape invariant used by the helper.
-        if mask_type.modulus.canonicalize() != vector_type.modulus.canonicalize() ||
-            mask_type.ring_dimension.canonicalize() != vector_type.ring_dimension.canonicalize() ||
-            mask_type.columns.canonicalize() != vector_type.columns.canonicalize() ||
-            vector_type.rows.evaluate(&ParamEnv::default()).ok().and_then(|v| v.to_usize()) !=
-                Some(1)
-        {
-            return Err(PowerLutError::InvalidAutomorphismHelper);
-        }
-        Ok(Self { index, switch, mask })
+        Self::with_mask_bank(sigma, switch, Arc::new(FlatLutMaskBank::single(sigma, mask)))
     }
-
+    pub(crate) fn with_mask_bank(
+        sigma: usize,
+        switch: PowerRhsPackage,
+        mask_bank: Arc<FlatLutMaskBank>,
+    ) -> Result<Self, PowerLutError> {
+        let mask_index = mask_bank.index_for_sigma(sigma).ok_or(PowerLutError::InvalidLut)?;
+        Ok(Self { sigma, switch, mask_bank, mask_index })
+    }
+    pub(crate) fn sigma(&self) -> usize {
+        self.sigma
+    }
     pub(crate) fn switch(&self) -> &PowerRhsPackage {
         &self.switch
     }
     pub(crate) fn mask(&self) -> &BggEncodingWire {
-        &self.mask
+        &self.mask_bank.branch(self.mask_index).expect("validated mask index").mask
     }
-    pub(crate) fn index(&self) -> usize {
-        self.index
-    }
+}
 
-    /// Imports and validates helper artifacts for `index` from `manifest`.
-    /// Validation checks production, role, secret transition, and shapes
-    /// before returning any runtime wires.
-    pub fn artifact_input(
-        production_id: mxx_ir_core::artifact::ProductionId,
-        manifest: &mxx_ir_core::artifact::Manifest,
-        index: usize,
-        names: AutomorphismHelperArtifactNames,
-    ) -> Result<Self, PowerLutError> {
-        let expected_role = serde_json::json!({
-            "AutomorphismSwitch": { "index": index }
-        });
-        let actual_role = manifest
-            .artifacts
-            .get(&names.switch.gsw_ciphertext)
-            .and_then(|artifact| artifact.layout.as_deref())
-            .and_then(|layout| serde_json::from_str::<serde_json::Value>(layout).ok())
-            .and_then(|document| document.get("role").cloned())
-            .ok_or(PowerLutError::InvalidAutomorphismHelper)?;
-        if actual_role != expected_role {
-            return Err(PowerLutError::InvalidAutomorphismHelper);
+/// Names of independently stored flat helper components.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlatLutHelperArtifactNames {
+    pub switch: PowerRhsPackageArtifactNames,
+    pub mask: BggEncodingArtifactNames,
+}
+
+/// A helper registry keyed by the program LUT identity. The registry prevents
+/// a fixed switch generated for one table from being accidentally reused for
+/// another table while keeping the evaluator free of provenance wrappers.
+#[derive(Clone, Default)]
+pub struct FlatLutHelperRegistry {
+    helpers: BTreeMap<crate::program::LutId, FlatLutHelperSet>,
+}
+
+/// Runtime helper bindings keyed by the exact LUT identity used by a gate.
+pub type FlatLutHelperMap = BTreeMap<crate::program::LutId, FlatLutHelperSet>;
+
+impl FlatLutHelperRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert(
+        &mut self,
+        lut: crate::program::LutId,
+        helpers: FlatLutHelperSet,
+    ) -> Result<(), PowerLutError> {
+        if self.helpers.insert(lut, helpers).is_some() {
+            return Err(PowerLutError::InvalidLut);
         }
-        let switch_name = names.switch.gsw_ciphertext.clone();
-        let target_identity = manifest
-            .artifacts
-            .get(&switch_name)
-            .and_then(|artifact| artifact.layout.as_deref())
-            .and_then(|layout| serde_json::from_str::<serde_json::Value>(layout).ok())
-            .and_then(|document| document.get("target").cloned())
-            .and_then(|target| target.get("identity").cloned())
-            .ok_or(PowerLutError::InvalidAutomorphismHelper)?;
-        let switch =
-            PowerRhsPackage::artifact_input(production_id.clone(), manifest, names.switch)?;
-        let expected_mask_role = serde_json::json!({
-            "AutomorphismMask": {
-                "index": index,
-                "source_secret": target_identity,
-            }
-        });
-        let mask = artifact_input_with_role(
-            production_id,
-            manifest,
-            names.mask,
-            Some(&expected_mask_role),
-        )?;
-        Self::new(index, switch, mask)
+        Ok(())
+    }
+    pub fn get(&self, lut: crate::program::LutId) -> Option<&[FlatLutHelper]> {
+        self.helpers.get(&lut).map(FlatLutHelperSet::as_slice)
     }
 }
 
-/// Compiler for Power-LUT encoding graphs.
-///
-/// This wrapper composes generic BGG primitives with Power-LUT Fuse,
-/// automorphism, and LUT routing checks. Setup/layout identities are validated
-/// only while importing independently stored artifacts; runtime wires remain
-/// plain BGG values. It stores the configured generic
-/// compiler directly; public-key projection is provided separately by
-/// [`crate::PowerLutPublicKeyCompiler`].
-pub struct PowerLutEncodingCompiler {
-    /// Generic BGG encoding operations used by Power-LUT graph construction.
-    pub bgg: BggEncodingCompiler,
-}
-
-/// Errors raised while constructing setup-time Power-LUT input/helper data.
+/// Errors raised while constructing setup-time Power-LUT inputs and helpers.
 #[derive(Debug, Error)]
 pub enum PowerLutSamplingError {
     #[error(transparent)]
-    /// The underlying BGG sampler rejected a shape or Gaussian configuration.
     Bgg(#[from] mxx_bgg::BggSampleError),
     #[error(transparent)]
-    /// DSL family/hash construction failed.
     Dsl(#[from] DslError),
     #[error(transparent)]
-    /// The canonical automorphism helper invariant was violated.
     PowerLut(#[from] PowerLutError),
     #[error(transparent)]
-    /// The constructed RHS package had invalid material or companion shape.
     Rhs(#[from] PowerRhsPackageError),
     #[error("invalid Power-LUT sampler configuration: {0}")]
-    /// Setup inputs are incompatible with the selected BGG layout.
     InvalidConfiguration(&'static str),
 }
 
-/// Setup-time sampler for ordinary Power-LUT input encodings and reusable
-/// automorphism helpers.
-///
-/// Public matrices are generated by [`mxx_bgg::BggPublicKeySampler`] from the
-/// caller's public hash input and domain-separated tags. Private matrix rows
-/// and BGG errors are sampled through the existing uniform/Gaussian DSL
-/// samplers; no secret or private randomness is derived from a public hash.
-/// `max_lut_width` controls only the number of sign-flag helper indices and is
-/// independent of [`PowerLutProgram`].
+/// Setup sampler for input encodings and flat LUT helpers.
 #[derive(Clone)]
 pub struct PowerLutEncodingSampler {
-    /// BGG dimensions and gadget parameters shared by all generated wires.
     pub layout: mxx_bgg::BggSamplerLayout,
-    /// Optional BGG Gaussian error distribution. Both fields must be present
-    /// together; when both are absent, the sampler emits zero error.
     pub gaussian_sigma: Option<mxx_ir_core::RealExpr>,
-    /// Explicit coefficient cutoff required when Gaussian errors are enabled.
     pub gaussian_max_coefficient_bound: Option<IntExpr>,
 }
 
-struct CrossSecretRhsPublicKeys {
-    by_column: Vec<Vec<BggPublicKeyWire>>,
-    companions: Vec<Mat>,
+/// Compiler for private Power-LUT graphs over ordinary BGG+ wires.
+pub struct PowerLutEncodingCompiler {
+    pub bgg: BggEncodingCompiler,
 }
 
 impl PowerLutEncodingSampler {
-    /// Samples the global BGG secret with the conventional augmented-secret
-    /// shape `(s_bar, 1)`. The non-constant prefix is sampled from the
-    /// private uniform interval sampler; it is deliberately not derived from
-    /// the public hash key. Callers that already own a setup secret may pass
-    /// it directly to the other methods instead.
+    /// Samples an augmented secret `(s_bar,1)` using private randomness.
     pub fn sample_secret(&self) -> Result<Mat, PowerLutSamplingError> {
         if self.layout.secret_dimension < 2 {
             return Err(PowerLutSamplingError::InvalidConfiguration(
-                "secret dimension must be at least two for an augmented secret",
+                "secret dimension must be at least two",
             ));
         }
+        // `s_bar = (s,1)` is the augmented BGG+ secret: small random entries
+        // form `s`, and the final identity column supplies the affine constant.
         let ring = self.layout.ring();
-        let prefix = ring.uniform_interval((1, self.layout.secret_dimension - 1), -1, 1);
-        Ok(Mat::concat(ConcatAxis::Columns, vec![prefix, ring.identity(1)]))
+        Ok(Mat::concat(
+            ConcatAxis::Columns,
+            vec![
+                ring.uniform_interval((1, self.layout.secret_dimension - 1), -1, 1),
+                ring.identity(1),
+            ],
+        ))
     }
 
-    /// Samples public-key matrices and one ordinary input encoding.
-    ///
-    /// The returned encoding is the second member of the existing BGG packed
-    /// sample: the first member is the conventional constant encoding needed
-    /// by [`mxx_bgg::BggEncodingSampler`]. The returned wire is always
-    /// ciphertext-only: transient sampling plaintext is never retained.
-    pub fn sample_input_encoding(
+    /// Samples a ciphertext-only batch of inputs from one indexed public-key
+    /// family, then delegates the actual BGG+ construction to the common
+    /// public-matrix core.
+    pub fn sample_input_encodings(
         &self,
-        secret: Mat,
+        mask_secret: Mat,
+        payload_secret: Option<Mat>,
         hash_key: Bytes,
-        tag: impl Into<HashTag>,
-        plaintext: Mat,
-    ) -> Result<BggEncodingWire, PowerLutSamplingError> {
-        let public_keys = mxx_bgg::BggPublicKeySampler { layout: self.layout.clone() }.sample(
+        base_tag: impl Into<HashTag>,
+        plaintexts: &[Mat],
+    ) -> Result<Vec<BggEncodingWire>, PowerLutSamplingError> {
+        if plaintexts.is_empty() {
+            return Err(PowerLutSamplingError::InvalidConfiguration(
+                "input-encoding count must be positive",
+            ));
+        }
+        let keys = mxx_bgg::BggPublicKeySampler { layout: self.layout.clone() }.sample(
             hash_key,
-            tag,
-            &[false],
+            base_tag,
+            &vec![false; plaintexts.len()],
         );
-        let encodings = self.sample_encodings(secret, &public_keys, &[plaintext])?;
-        encodings
-            .into_iter()
-            .nth(1)
-            .ok_or(PowerLutSamplingError::InvalidConfiguration("BGG input sample is empty"))
+        let public_keys = keys.into_iter().skip(1).collect::<Vec<_>>();
+        self.sample_encodings_for_public_matrices(
+            mask_secret,
+            payload_secret,
+            &public_keys,
+            plaintexts,
+        )
     }
 
-    /// Samples one ordinary BGG encoding under an independently supplied
-    /// public matrix. The generic packed sampler includes the conventional
-    /// constant column; this entry point supplies a zero constant public key
-    /// and returns only the requested plaintext encoding.
-    ///
-    /// The supplied key is intentionally required to be ciphertext-only. The
-    /// returned wire is also ciphertext-only, even though the underlying BGG
-    /// sampler accepts revealable public keys for general callers.
-    pub fn sample_encoding_for_public_matrix(
+    /// Samples under existing public matrices, with an optional payload
+    /// secret for the separate-secret BGG+ relation. The leading constant
+    /// public key required by the packed BGG+ sampler is supplied internally.
+    pub fn sample_encodings_for_public_matrices(
         &self,
-        secret: Mat,
-        public_key: BggPublicKeyWire,
-        plaintext: Mat,
-    ) -> Result<BggEncodingWire, PowerLutSamplingError> {
-        self.validate_secret(&secret)?;
-        if public_key.reveal_plaintext {
+        mask_secret: Mat,
+        payload_secret: Option<Mat>,
+        public_keys: &[BggPublicKeyWire],
+        plaintexts: &[Mat],
+    ) -> Result<Vec<BggEncodingWire>, PowerLutSamplingError> {
+        if public_keys.is_empty() || public_keys.len() != plaintexts.len() {
             return Err(PowerLutSamplingError::InvalidConfiguration(
-                "supplied public key must not reveal plaintext",
+                "public-key and plaintext counts must be equal and positive",
+            ));
+        }
+        if public_keys.iter().any(|key| key.reveal_plaintext) {
+            return Err(PowerLutSamplingError::InvalidConfiguration(
+                "public keys must be ciphertext-only",
             ));
         }
         let ring = self.layout.ring();
-        let expected_public =
-            ring.matrix_type((self.layout.secret_dimension, self.layout.public_key_columns()));
-        let expected_plaintext = ring.matrix_type((1, 1));
-        if public_key.matrix.matrix_type() != &expected_public {
-            return Err(PowerLutSamplingError::InvalidConfiguration(
-                "supplied public key has the wrong BGG matrix shape",
-            ));
-        }
-        if plaintext.matrix_type() != &expected_plaintext {
-            return Err(PowerLutSamplingError::InvalidConfiguration(
-                "plaintext must be one ring element",
-            ));
-        }
         let constant = BggPublicKeyWire {
             matrix: ring.zero((self.layout.secret_dimension, self.layout.public_key_columns())),
             reveal_plaintext: false,
         };
-        let encodings = mxx_bgg::BggEncodingSampler {
+        let mut all_public_keys = Vec::with_capacity(public_keys.len() + 1);
+        all_public_keys.push(constant);
+        all_public_keys.extend(public_keys.iter().cloned());
+        let values = mxx_bgg::BggEncodingSampler {
             layout: self.layout.clone(),
             gaussian_sigma: self.gaussian_sigma.clone(),
             gaussian_max_coefficient_bound: self.gaussian_max_coefficient_bound.clone(),
         }
-        .sample(secret, &[constant, public_key], &[plaintext])?;
-        let encoding = encodings
-            .into_iter()
-            .nth(1)
-            .ok_or(PowerLutSamplingError::InvalidConfiguration("BGG input sample is empty"))?;
-        if encoding.plaintext.is_some() || encoding.pubkey.reveal_plaintext {
-            return Err(PowerLutSamplingError::InvalidConfiguration(
-                "BGG sampler returned plaintext metadata",
-            ));
-        }
-        Ok(encoding)
+        .sample(mask_secret, payload_secret, &all_public_keys, plaintexts)?;
+        Ok(values.into_iter().skip(1).collect())
     }
 
-    /// Reuses the ordinary BGG encoding sampler for a caller-supplied public
-    /// key set and plaintext set. This is the generic entry point for input
-    /// families and keeps public matrix derivation in the BGG sampler.
-    fn sample_encodings(
+    /// Samples the reusable mask-alignment bank for the largest supported LUT.
+    /// Mask branches are keyed only by their canonical automorphism, so the
+    /// same bank can serve every smaller compatible LUT width.
+    pub fn sample_flat_mask_bank(
         &self,
-        secret: Mat,
-        public_keys: &[BggPublicKeyWire],
-        plaintexts: &[Mat],
-    ) -> Result<Vec<BggEncodingWire>, PowerLutSamplingError> {
-        Ok(mxx_bgg::BggEncodingSampler {
-            layout: self.layout.clone(),
-            gaussian_sigma: self.gaussian_sigma.clone(),
-            gaussian_max_coefficient_bound: self.gaussian_max_coefficient_bound.clone(),
-        }
-        .sample(secret, public_keys, plaintexts)?)
-    }
-
-    /// Samples a packed row of BGG encodings in one relation.
-    ///
-    /// `plaintexts` contains all companion digits for one target GSW column
-    /// as a `1 x count` row. Keeping that row intact means the caller never
-    /// slices a `GadgetDecompose` result merely to recover individual digits;
-    /// the packed BGG relation performs the same canonical column packing as
-    /// [`mxx_bgg::BggEncodingSampler`]. Returned wires are ordinary
-    /// `BggEncodingWire` values obtained only by slicing the packed arithmetic
-    /// result. The public-key list has one additional leading key for the
-    /// conventional constant encoding, so `public_keys.len() == count + 1`;
-    /// the remaining `count == source_dimension * digit_count` keys are the
-    /// packed row's canonical tower-major limbs.
-    fn sample_packed_encodings(
-        &self,
-        secret: Mat,
-        public_keys: &[BggPublicKeyWire],
-        plaintexts: &Mat,
-    ) -> Result<Vec<BggEncodingWire>, PowerLutSamplingError> {
-        if public_keys.len() !=
-            plaintexts
-                .matrix_type()
-                .columns
-                .evaluate(&ParamEnv::default())
-                .ok()
-                .and_then(|value| value.to_usize())
-                .map(|count| count + 1)
-                .unwrap_or(0)
-        {
-            return Err(PowerLutSamplingError::InvalidConfiguration(
-                "packed BGG plaintext count does not match public keys",
-            ));
-        }
-        let columns = self.layout.public_key_columns();
-        let all_public_keys = Mat::concat(
-            ConcatAxis::Columns,
-            public_keys.iter().map(|key| key.matrix.clone()).collect(),
-        );
-        let encoded_plaintexts = Mat::concat(
-            ConcatAxis::Columns,
-            vec![self.layout.ring().identity(1), plaintexts.clone()],
-        );
-        let gadget = self.layout.ring().gadget(
-            self.layout.secret_dimension,
-            self.layout.gadget_base.clone(),
-            self.layout.digit_count,
-        );
-        let error = self.sample_error((1, columns * public_keys.len()))?;
-        let packed_vector =
-            secret.clone() * all_public_keys - encoded_plaintexts.tensor(secret * gadget) + error;
-        Ok(public_keys
-            .iter()
-            .enumerate()
-            .map(|(index, key)| BggEncodingWire {
-                vector: packed_vector.clone().slice(
-                    None,
-                    Some(IndexRange {
-                        start: (columns * index).into(),
-                        end: (columns * (index + 1)).into(),
-                    }),
-                ),
-                pubkey: key.clone(),
-                plaintext: None,
-            })
-            .collect())
-    }
-
-    /// Returns the canonical ClearCoeff helper indices required for a maximum
-    /// LUT width. The sequence is exactly
-    /// `2*n/2^(i+1) + 1`, in sieve round order.
-    pub fn automorphism_helper_indices(
-        &self,
-        max_lut_width: usize,
-    ) -> Result<Vec<usize>, PowerLutSamplingError> {
+        mask_secret: Mat,
+        hash_key: Bytes,
+        max_width: usize,
+        tag: impl Into<HashTag>,
+    ) -> Result<Arc<FlatLutMaskBank>, PowerLutSamplingError> {
         let n = self
             .layout
             .ring_dimension
@@ -405,118 +369,189 @@ impl PowerLutEncodingSampler {
             .ok()
             .and_then(|value| value.to_usize())
             .ok_or(PowerLutSamplingError::InvalidConfiguration(
-                "ring dimension must be a concrete positive integer",
+                "ring dimension must be concrete",
             ))?;
-        if max_lut_width == 0 ||
-            !max_lut_width.is_power_of_two() ||
-            max_lut_width > n ||
-            n % max_lut_width != 0
-        {
+        if max_width == 0 || !max_width.is_power_of_two() || max_width > n || n % max_width != 0 {
             return Err(PowerLutSamplingError::InvalidConfiguration(
-                "maximum LUT width must be a power of two dividing the ring dimension",
+                "mask-bank width must be a power of two dividing the ring dimension",
             ));
         }
-        Ok((0..max_lut_width.trailing_zeros() as usize)
-            .map(|round| (2 * n / (1usize << (round + 1))) + 1)
-            .collect())
+        let bank_tag = tag.into();
+        let mut branches = Vec::with_capacity(max_width);
+        for j in 0..max_width {
+            let sigma = 1usize
+                .checked_add(
+                    j.checked_mul(2 * n / max_width)
+                        .ok_or(PowerLutSamplingError::InvalidConfiguration("sigma overflow"))?,
+                )
+                .ok_or(PowerLutSamplingError::InvalidConfiguration("sigma overflow"))?;
+            let mask_tag = canonical_flat_mask_branch_tag(&bank_tag, sigma);
+            let mask_key = mxx_bgg::BggPublicKeySampler { layout: self.layout.clone() }
+                .sample(hash_key.clone(), mask_tag, &[false])
+                .into_iter()
+                .nth(1)
+                .ok_or(PowerLutSamplingError::InvalidConfiguration("mask sample is empty"))?;
+            let mask_sigma = mask_secret.clone().ring_automorphism(sigma);
+            let constant = BggPublicKeyWire {
+                matrix: self
+                    .layout
+                    .ring()
+                    .zero((self.layout.secret_dimension, self.layout.public_key_columns())),
+                reveal_plaintext: false,
+            };
+            let mask = mxx_bgg::BggEncodingSampler {
+                layout: self.layout.clone(),
+                gaussian_sigma: self.gaussian_sigma.clone(),
+                gaussian_max_coefficient_bound: self.gaussian_max_coefficient_bound.clone(),
+            }
+            .sample(
+                mask_secret.clone(),
+                Some(mask_sigma),
+                &[constant, mask_key],
+                &[self.layout.ring().identity(1)],
+            )?
+            .into_iter()
+            .nth(1)
+            .ok_or(PowerLutSamplingError::InvalidConfiguration("mask sample is empty"))?;
+            branches.push(FlatLutMaskBranch { sigma, mask });
+        }
+        Ok(Arc::new(FlatLutMaskBank { branches: Arc::new(branches) }))
     }
 
-    /// Samples and returns the reusable helper packages for all ClearCoeff
-    /// rounds up to `max_lut_width`.
+    /// Samples setup-fixed helpers for a complete LUT declaration using an
+    /// explicitly shared mask bank. The bank must cover every canonical sigma
+    /// required by this table; it is never sampled implicitly here.
     ///
-    /// The helper switch is sampled as a cross-secret GSW relation
-    /// `t_k C_k = s G + E`, where `t_k = sigma_k(s)`. Companion public
-    /// matrices use domain-separated BGG hash-sampler tags. The mask row is
-    /// sampled directly as `s D_k - t_k G + e_h`, with `D_k` public and all
-    /// private rows/errors coming from the appropriate private samplers.
-    pub fn sample_automorphism_helpers(
+    /// The declaration, including its output form, is the source of truth for
+    /// both helper commitments and the branch coefficient.  A scalar table
+    /// therefore receives constant-polynomial coefficients, while a monomial
+    /// table receives the corresponding rotations.
+    pub fn sample_flat_helpers_for_lut(
         &self,
-        secret: Mat,
+        mask_secret: Mat,
+        payload_secret: Option<Mat>,
         hash_key: Bytes,
+        table: &LutTable,
+        mask_bank: &FlatLutMaskBank,
         tag: impl Into<HashTag>,
-        max_lut_width: usize,
-    ) -> Result<Vec<AutomorphismHelper>, PowerLutSamplingError> {
-        self.validate_secret(&secret)?;
-        let indices = self.automorphism_helper_indices(max_lut_width)?;
-        let mut helpers = Vec::with_capacity(indices.len());
-        let mut base_tag = tag.into();
-        base_tag.push("power-lut-automorphism");
-        for index in indices {
-            let source = secret.clone().ring_automorphism(index);
-            let switch_tag = canonical_switch_companion_tag(&base_tag, index);
-            let switch = self.sample_cross_secret_rhs(
-                source.clone(),
-                secret.clone(),
-                self.layout.ring().identity(1),
-                hash_key.clone(),
-                switch_tag,
+    ) -> Result<Vec<FlatLutHelper>, PowerLutSamplingError> {
+        let width = table.values().len();
+        let n = self
+            .layout
+            .ring_dimension
+            .evaluate(&ParamEnv::default())
+            .ok()
+            .and_then(|value| value.to_usize())
+            .ok_or(PowerLutSamplingError::InvalidConfiguration(
+                "ring dimension must be concrete",
+            ))?;
+        if width == 0 ||
+            !width.is_power_of_two() ||
+            table.input_width() != width ||
+            width > n ||
+            n % width != 0 ||
+            table.values().iter().any(|value| *value >= n)
+        {
+            return Err(PowerLutSamplingError::InvalidConfiguration(
+                "LUT width or output exponent is invalid",
+            ));
+        }
+        let payload = payload_secret.unwrap_or_else(|| mask_secret.clone());
+        let shared_mask_bank = Arc::new(mask_bank.clone());
+        let mut tag = tag.into();
+        tag.push("power-lut-flat-v1");
+        let mut helpers = Vec::with_capacity(width);
+        for j in 0..width {
+            // `j` chooses one Fourier branch; `sigma` is odd so its ring
+            // automorphism is invertible and follows the canonical LUT order.
+            let sigma = 1usize
+                .checked_add(
+                    j.checked_mul(2 * n / width)
+                        .ok_or(PowerLutSamplingError::InvalidConfiguration("sigma overflow"))?,
+                )
+                .ok_or(PowerLutSamplingError::InvalidConfiguration("sigma overflow"))?;
+            let coefficient = lut_coefficient(
+                &self.layout.ring(),
+                n,
+                width,
+                sigma,
+                table.values(),
+                table.output_form(),
             )?;
-
-            let mask_tag = canonical_mask_tag(&base_tag, index);
-            let mut mask_public = mxx_bgg::BggPublicKeySampler { layout: self.layout.clone() }
-                .sample(hash_key.clone(), mask_tag, &[])
-                .into_iter()
-                .next()
-                .ok_or(PowerLutSamplingError::InvalidConfiguration("mask key sample is empty"))?;
-            // BGG reserves the leading member of every sampled family for its
-            // conventional constant relation and marks it as revealed.  The
-            // Power-LUT helper mask is a ciphertext-only wire, so retain the
-            // sampled matrix while clearing that metadata at this API
-            // boundary.  This does not change the mask relation.
-            mask_public.reveal_plaintext = false;
-            let mask_error = self.sample_error((1, self.layout.public_key_columns()))?;
-            let gadget = self.layout.ring().gadget(
-                self.layout.secret_dimension,
-                self.layout.gadget_base.clone(),
-                self.layout.digit_count,
-            );
-            let mask = BggEncodingWire {
-                vector: secret.clone() * mask_public.matrix.clone() - source.clone() * gadget +
-                    mask_error,
-                pubkey: mask_public,
-                plaintext: None,
-            };
-            helpers.push(AutomorphismHelper::new(index, switch, mask)?);
+            // The switch encrypts the rotated payload relation; the separate
+            // mask encoding supplies the compensating public alignment.
+            // The fixed switch is generated under the payload secret after
+            // automorphism. The mask alignment is a separate encoding under
+            // the mask secret and its automorphed image.
+            let payload_sigma = payload.clone().ring_automorphism(sigma);
+            let switch = self.sample_fixed_rhs(
+                payload_sigma,
+                payload.clone(),
+                coefficient,
+                hash_key.clone(),
+                {
+                    let mut t = tag.clone();
+                    t.push("switch");
+                    t.push(IntExpr::constant(j));
+                    t
+                },
+            )?;
+            if mask_bank.index_for_sigma(sigma).is_none() {
+                return Err(PowerLutSamplingError::InvalidConfiguration(
+                    "mask bank does not cover LUT canonical sigma",
+                ));
+            }
+            helpers.push(FlatLutHelper::with_mask_bank(sigma, switch, shared_mask_bank.clone())?);
         }
         Ok(helpers)
     }
 
-    fn validate_secret(&self, secret: &Mat) -> Result<(), PowerLutSamplingError> {
-        let expected = self.layout.ring().matrix_type((1, self.layout.secret_dimension));
-        let actual = secret.matrix_type();
-        if actual.modulus.canonicalize() != expected.modulus.canonicalize() ||
-            actual.ring_dimension.canonicalize() != expected.ring_dimension.canonicalize() ||
-            actual.rows.canonicalize() != expected.rows.canonicalize() ||
-            actual.columns.canonicalize() != expected.columns.canonicalize()
-        {
-            return Err(PowerLutSamplingError::InvalidConfiguration(
-                "secret must have the BGG sampler layout shape",
-            ));
-        }
-        Ok(())
-    }
-
-    fn sample_error(&self, shape: impl mxx_dsl::IntoShape) -> Result<Mat, PowerLutSamplingError> {
-        match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
-            (Some(sigma), Some(bound)) => {
-                Ok(self.layout.ring().gaussian(shape, sigma.clone(), bound.clone()))
+    fn sample_fixed_rhs(
+        &self,
+        source: Mat,
+        target: Mat,
+        payload: Mat,
+        hash_key: Bytes,
+        tag: HashTag,
+    ) -> Result<PowerRhsPackage, PowerLutSamplingError> {
+        let ring = self.layout.ring();
+        let columns = self.layout.public_key_columns();
+        // For mask secret `s`, payload secret `t`, and scalar `y`, construct
+        // `C = [R; y*t*G - s*R + e_C]`, so `[s,1]C = y*t*G + e_C`.
+        let mut top_tag = tag.clone();
+        top_tag.push("power-lut/fixed-rhs/top/v1");
+        let top = ring.hash_matrix(
+            hash_key.clone(),
+            top_tag,
+            (self.layout.secret_dimension - 1, columns),
+        );
+        let source_prefix = source.clone().slice(
+            None,
+            Some(IndexRange { start: 0.into(), end: (self.layout.secret_dimension - 1).into() }),
+        );
+        let error = match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
+            (Some(sigma), Some(bound)) => ring.gaussian((1, columns), sigma.clone(), bound.clone()),
+            (None, None) => ring.zero((1, columns)),
+            _ => {
+                return Err(PowerLutSamplingError::InvalidConfiguration(
+                    "Gaussian sigma and cutoff must be paired",
+                ))
             }
-            (None, None) => Ok(self.layout.ring().zero(shape)),
-            _ => Err(PowerLutSamplingError::InvalidConfiguration(
-                "Gaussian sigma and coefficient bound must be supplied together",
-            )),
-        }
+        };
+        let gadget = ring.gadget(
+            self.layout.secret_dimension,
+            self.layout.gadget_base.clone(),
+            self.layout.digit_count,
+        );
+        let last = payload * (target * gadget) - source_prefix * top.clone() + error;
+        let ciphertext = Mat::concat(ConcatAxis::Rows, vec![top, last]);
+        PowerRhsPackage::new(ciphertext).map_err(Into::into)
     }
 
-    /// Samples a ciphertext-assisted RHS package for an arbitrary hidden
-    /// payload `y`, satisfying `source * C = y * target * G + E`.
-    ///
-    /// The payload is used only in the private GSW relation. Companion public
-    /// matrices are derived exclusively from `hash_key` and `tag`, so the same
-    /// setup namespace produces an identical public projection for every
-    /// payload. Returned packages retain neither `payload` nor plaintext
-    /// metadata; evaluator-side Fuse sees only ciphertext matrices.
-    pub fn sample_cross_secret_rhs(
+    /// Samples one fixed RHS ciphertext for the PBC selector producer.
+    /// The selector value is setup-fixed payload data, not an encoded digit
+    /// family, so this returns the ciphertext package directly.
+    pub(crate) fn sample_cross_secret_rhs(
         &self,
         source: Mat,
         target: Mat,
@@ -524,462 +559,91 @@ impl PowerLutEncodingSampler {
         hash_key: Bytes,
         tag: impl Into<HashTag>,
     ) -> Result<PowerRhsPackage, PowerLutSamplingError> {
-        let public_keys = self.sample_cross_secret_rhs_public_keys(hash_key, tag.into())?;
-        self.sample_cross_secret_rhs_with_public_keys(source, target, payload, &public_keys)
-    }
-
-    fn sample_cross_secret_rhs_public_keys(
-        &self,
-        hash_key: Bytes,
-        tag: HashTag,
-    ) -> Result<CrossSecretRhsPublicKeys, PowerLutSamplingError> {
-        let target_columns = self.layout.public_key_columns();
-        let sampler = mxx_bgg::BggPublicKeySampler { layout: self.layout.clone() };
-        let by_column = (0..target_columns)
-            .map(|column| {
-                let mut column_tag = tag.clone();
-                column_tag.push(IntExpr::constant(column));
-                sampler.sample(hash_key.clone(), column_tag, &vec![false; target_columns])
-            })
-            .collect::<Vec<_>>();
-        let mut companions = Vec::with_capacity(self.layout.secret_dimension * target_columns);
-        for row in 0..self.layout.secret_dimension {
-            for column in 0..target_columns {
-                let start = row * self.layout.digit_count;
-                let end = start + self.layout.digit_count;
-                companions.push(Mat::concat(
-                    ConcatAxis::Columns,
-                    by_column[column][start + 1..end + 1]
-                        .iter()
-                        .map(|key| key.matrix.clone())
-                        .collect(),
-                ));
-            }
-        }
-        Ok(CrossSecretRhsPublicKeys { by_column, companions })
-    }
-
-    fn sample_cross_secret_rhs_with_public_keys(
-        &self,
-        source: Mat,
-        target: Mat,
-        payload: Mat,
-        public_keys: &CrossSecretRhsPublicKeys,
-    ) -> Result<PowerRhsPackage, PowerLutSamplingError> {
-        let ring = self.layout.ring();
-        let source_dimension = self.layout.secret_dimension;
-        if source_dimension < 2 {
-            return Err(PowerLutSamplingError::InvalidConfiguration(
-                "cross-secret RHS sampling requires at least two secret coordinates",
-            ));
-        }
-        self.validate_secret(&source)?;
-        self.validate_secret(&target)?;
-        if payload.matrix_type() != &ring.matrix_type((1, 1)) {
-            return Err(PowerLutSamplingError::InvalidConfiguration(
-                "RHS payload must be one ring element",
-            ));
-        }
-        let target_columns = self.layout.public_key_columns();
-        if public_keys.by_column.len() != target_columns ||
-            public_keys.by_column.iter().any(|keys| keys.len() != target_columns + 1) ||
-            public_keys.companions.len() != source_dimension * target_columns
-        {
-            return Err(PowerLutSamplingError::InvalidConfiguration(
-                "cross-secret RHS public-key set has the wrong shape",
-            ));
-        }
-        let top = ring.uniform_residue((source_dimension - 1, target_columns));
-        // The augmented secret's final coordinate is the public constant one,
-        // so only its private prefix participates in this product. Slice that
-        // prefix once before the matrix multiply instead of creating one
-        // source/top slice per row.
-        let source_prefix = source
-            .clone()
-            .slice(None, Some(IndexRange { start: 0.into(), end: (source_dimension - 1).into() }));
-        let source_product = source_prefix * top.clone();
-        let error = self.sample_error((1, target_columns))?;
-        let gadget =
-            ring.gadget(source_dimension, self.layout.gadget_base.clone(), self.layout.digit_count);
-        let last = payload * (target * gadget) - source_product + error;
-        let gsw = Mat::concat(ConcatAxis::Rows, vec![top, last]);
-
-        let mut column_companions = Vec::with_capacity(target_columns);
-        for column in 0..target_columns {
-            // Restrict the original GSW relation to one target column before
-            // decomposing it. The complete tower-major decomposition is then
-            // transposed and passed to one packed BGG relation; no Slice node
-            // consumes the GadgetDecompose output.
-            let decomposed_column = gsw
-                .clone()
-                .slice(None, Some(IndexRange { start: column.into(), end: (column + 1).into() }))
-                .decompose(self.layout.gadget_base.clone(), self.layout.digit_count)
-                .as_mat();
-            let encodings = self.sample_packed_encodings(
-                source.clone(),
-                &public_keys.by_column[column],
-                &decomposed_column.transpose(),
-            )?;
-            column_companions.push(encodings.into_iter().skip(1).collect::<Vec<_>>());
-        }
-        // The package ABI is source-row/target-column/digit major. Sampling
-        // above is target-column major so each target column can be sliced
-        // and decomposed independently. Reorder only the already packed BGG
-        // wires, never the decomposition expression itself.
-        let mut companions = Vec::with_capacity(source_dimension * target_columns);
-        for row in 0..source_dimension {
-            for column in 0..target_columns {
-                let start = row * self.layout.digit_count;
-                let end = start + self.layout.digit_count;
-                let limbs = &column_companions[column][start..end];
-                let vector = Mat::concat(
-                    ConcatAxis::Columns,
-                    limbs.iter().map(|limb| limb.vector.clone()).collect(),
-                );
-                let public_matrix = public_keys.companions[row * target_columns + column].clone();
-                companions.push(crate::rhs::PowerRhsCompanionBlock { vector, public_matrix });
-            }
-        }
-        debug_assert_eq!(companions.len(), source_dimension * target_columns);
-        PowerRhsPackage::new(gsw, companions).map_err(PowerLutSamplingError::from)
-    }
-}
-
-/// Builds the canonical public hash domain for switch companion matrices.
-/// Both setup paths must use this exact sequence so their independently
-/// lowered public-key projections are byte-for-byte identical.
-fn canonical_switch_companion_tag(root: &HashTag, index: usize) -> HashTag {
-    let mut tag = root.clone();
-    tag.push("switch");
-    tag.push(IntExpr::constant(index));
-    tag.push("companions");
-    tag
-}
-
-/// Builds the canonical public hash domain for an automorphism mask matrix.
-fn canonical_mask_tag(root: &HashTag, index: usize) -> HashTag {
-    let mut tag = root.clone();
-    tag.push("mask");
-    tag.push(IntExpr::constant(index));
-    tag
-}
-
-/// Family-level private RHS material used by a structural
-/// [`ProgramGate::OneHot`](crate::program::ProgramGate::OneHot).
-///
-/// A family element is a complete `PowerRhsPackage`, represented by parallel
-/// DSL families for its GSW matrix and packed companion blocks. Each block is
-/// one `(source_row, target_column)` relation whose columns contain all
-/// tower-major CRT digits. Keeping the components parallel lets the compiler
-/// build one reusable family body; it never allocates one graph node per
-/// configured bucket, cell, or CRT limb.
-#[derive(Clone)]
-pub struct EncodingSelectorFamily {
-    gsw: Family<Mat>,
-    companions: Vec<(Family<Mat>, Family<Mat>)>,
-}
-
-impl EncodingSelectorFamily {
-    /// Creates a structural family from parallel GSW/vector/public families.
-    pub fn new(
-        gsw: Family<Mat>,
-        companions: Vec<(Family<Mat>, Family<Mat>)>,
-    ) -> Result<Self, PowerLutError> {
-        if companions.is_empty() ||
-            companions.iter().any(|(vector, public)| {
-                vector.count() != gsw.count() || public.count() != gsw.count()
-            })
-        {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        Ok(Self { gsw, companions })
-    }
-
-    fn count(&self) -> &mxx_ir_core::IntExpr {
-        self.gsw.count()
-    }
-
-    /// Returns the canonical flat family order used by structural label
-    /// loops: GSW first, then each vector/public companion pair.
-    pub(crate) fn flattened(&self) -> Vec<Family<Mat>> {
-        let mut flat = Vec::with_capacity(1 + self.companions.len() * 2);
-        flat.push(self.gsw.clone());
-        for (vector, public) in &self.companions {
-            flat.push(vector.clone());
-            flat.push(public.clone());
-        }
-        flat
-    }
-
-    /// Rebuilds a selector family from its canonical flat representation.
-    /// The arity, family count, and public matrix domain are checked before
-    /// the representation becomes usable by a lowering body.
-    pub(crate) fn from_flattened(flat: Vec<Family<Mat>>) -> Result<Self, PowerLutError> {
-        if flat.len() < 3 || flat.len() % 2 == 0 {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        let gsw = flat[0].clone();
-        let gsw_type = gsw.element_type();
-        if flat.iter().any(|family| {
-            family.count() != gsw.count() ||
-                family.element_type().modulus.canonicalize() != gsw_type.modulus.canonicalize() ||
-                family.element_type().ring_dimension.canonicalize() !=
-                    gsw_type.ring_dimension.canonicalize()
-        }) {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        let companions =
-            flat[1..].chunks_exact(2).map(|pair| (pair[0].clone(), pair[1].clone())).collect();
-        Self::new(gsw, companions)
+        self.sample_fixed_rhs(source, target, payload, hash_key, tag.into())
     }
 }
 
 impl PowerLutEncodingCompiler {
-    /// Creates a compiler from a fully configured generic BGG compiler.
     pub fn new(bgg: BggEncodingCompiler) -> Self {
         Self { bgg }
     }
-
-    /// Creates a compiler from public BGG parameters at a setup boundary.
     pub fn from_public_key(public_key: BggPublicKeyCompiler) -> Self {
         Self::new(BggEncodingCompiler { public_key })
     }
 
-    /// Lowers a validated program using plain BGG wires and explicit private
-    /// RHS inputs. One-hot selector families and their public weighting values
-    /// are explicit runtime bindings. The returned map contains every program
-    /// wire.
     pub fn compile_program(
         &self,
         program: &PowerLutProgram,
         inputs: &BTreeMap<ProgramInputId, BggEncodingWire>,
-        rhs_inputs: &BTreeMap<RhsInputId, PowerRhsPackage>,
-        one_hot_selectors: &BTreeMap<crate::program::RhsFamilyId, EncodingSelectorFamily>,
-        public_values: &BTreeMap<crate::program::PublicValueFamilyId, Family<Mat>>,
-        helpers: &[AutomorphismHelper],
+        rhs: &BTreeMap<RhsInputId, PowerRhsPackage>,
+        selectors: &BTreeMap<crate::program::RhsFamilyId, EncodingSelectorFamily>,
+        values: &BTreeMap<crate::program::PublicValueFamilyId, Family<Mat>>,
+        helpers: &FlatLutHelperMap,
     ) -> Result<BTreeMap<ProgramWireId, BggEncodingWire>, PowerLutError> {
         let mut ranges = ProgramFamilyRanges::new();
-        for (id, family) in one_hot_selectors {
-            let range = FamilyRange::full(family.count().clone())
-                .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-            ranges.selector(*id, range);
+        for (id, family) in selectors {
+            ranges.selector(
+                *id,
+                FamilyRange::full(family.count().clone())
+                    .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?,
+            );
         }
-        for (id, family) in public_values {
-            let range = FamilyRange::full(family.count().clone())
-                .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-            ranges.public_values(*id, range);
+        for (id, family) in values {
+            ranges.public_values(
+                *id,
+                FamilyRange::full(family.count().clone())
+                    .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?,
+            );
         }
-        self.compile_program_with_ranges(
-            program,
-            inputs,
-            rhs_inputs,
-            one_hot_selectors,
-            public_values,
-            &ranges,
-            helpers,
-        )
+        let bindings = ProgramBindings::new(inputs, rhs, selectors, values, helpers);
+        lower_program(program, &bindings, &ranges, self)
     }
 
-    /// Lowers a program with explicit contiguous views into flattened
-    /// selector/value families. A PBC bucket can bind only its own range,
-    /// while the same structural body remains reusable for every bucket.
     pub fn compile_program_with_ranges(
         &self,
         program: &PowerLutProgram,
         inputs: &BTreeMap<ProgramInputId, BggEncodingWire>,
-        rhs_inputs: &BTreeMap<RhsInputId, PowerRhsPackage>,
-        one_hot_selectors: &BTreeMap<crate::program::RhsFamilyId, EncodingSelectorFamily>,
-        public_values: &BTreeMap<crate::program::PublicValueFamilyId, Family<Mat>>,
-        family_ranges: &ProgramFamilyRanges,
-        helpers: &[AutomorphismHelper],
+        rhs: &BTreeMap<RhsInputId, PowerRhsPackage>,
+        selectors: &BTreeMap<crate::program::RhsFamilyId, EncodingSelectorFamily>,
+        values: &BTreeMap<crate::program::PublicValueFamilyId, Family<Mat>>,
+        ranges: &ProgramFamilyRanges,
+        helpers: &FlatLutHelperMap,
     ) -> Result<BTreeMap<ProgramWireId, BggEncodingWire>, PowerLutError> {
-        for input in inputs.values() {
-            crate::ensure_ciphertext_only(input)?;
-        }
-        let bindings =
-            ProgramBindings::new(inputs, rhs_inputs, one_hot_selectors, public_values, helpers);
-        lower_program(program, &bindings, family_ranges, self)
+        let bindings = ProgramBindings::new(inputs, rhs, selectors, values, helpers);
+        lower_program(program, &bindings, ranges, self)
     }
-}
 
-/// Returns the row-major exponent index `u + lhs_width * v` used by a
-/// rectangular flattened LUT.
-pub fn flattened_lut_index(
-    u: usize,
-    v: usize,
-    lhs_width: usize,
-    rhs_width: usize,
-) -> Option<usize> {
-    (lhs_width > 0 && rhs_width > 0 && u < lhs_width && v < rhs_width).then(|| u + lhs_width * v)
-}
-
-impl PowerLutEncodingCompiler {
-    /// Performs ciphertext-assisted multiplication with a typed RHS package.
-    ///
-    /// The program/lowering caller is responsible for binding an RHS package
-    /// to the corresponding input. Secret identities stored in an imported
-    /// package are checked at import time, not carried by this wire value.
+    /// Performs setup-fixed Fuse: `c * G^{-1}(C)`.
     pub fn fuse(
         &self,
         lhs: &BggEncodingWire,
         rhs: &PowerRhsPackage,
     ) -> Result<BggEncodingWire, PowerLutError> {
         crate::ensure_ciphertext_only(lhs)?;
-        let digits = self
-            .bgg
-            .public_key
-            .digit_count
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|v| v.to_usize())
-            .ok_or(PowerLutError::InvalidLut)?;
-        let base = self.bgg.public_key.base.clone();
-        let lhs_decomp = lhs.pubkey.matrix.clone().decompose(base.clone(), digits).as_mat();
-        let source_dimension = lhs
-            .pubkey
-            .matrix
-            .matrix_type()
-            .rows
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_usize())
-            .ok_or(PowerLutError::InvalidLut)?;
-        let target_columns = rhs
+        // `decomposed = G^{-1}(C)` is applied to both the vector and public
+        // matrix, preserving the BGG relation while switching the payload.
+        let decomposed = rhs
             .gsw_ciphertext()
-            .matrix_type()
-            .columns
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_usize())
-            .ok_or(PowerLutError::InvalidLut)?;
-        let vector = crate::utils::fuse_columns(
-            Some(&lhs.vector),
-            &lhs_decomp,
-            Some(rhs.gsw_ciphertext()),
-            source_dimension,
-            target_columns,
-            digits,
-            &self.bgg.public_key.ring,
-            &base,
-            |row, column| rhs.companion_block(row, column, target_columns),
-        )?;
-        let public_matrix =
-            crate::public_key::PowerLutPublicKeyCompiler::new(self.bgg.public_key.clone())
-                .fuse_public_with_decomposition(
-                    &lhs.pubkey.matrix,
-                    &lhs_decomp,
-                    &rhs.public_projection(),
-                )?;
-        Ok(BggEncodingWire {
-            vector,
-            pubkey: mxx_bgg::BggPublicKeyWire { matrix: public_matrix, reveal_plaintext: false },
-            plaintext: None,
-        })
-    }
-
-    /// Applies a setup-time automorphism helper and returns an encoding under
-    /// the original secret. The helper's switch and mask are reused, but their
-    /// identities and matrix shapes are checked against this input first.
-    pub fn automorphism(
-        &self,
-        input: &BggEncodingWire,
-        helper: &AutomorphismHelper,
-    ) -> Result<BggEncodingWire, PowerLutError> {
-        crate::ensure_ciphertext_only(input)?;
-        let raw = BggEncodingWire {
-            vector: input.vector.clone().ring_automorphism(helper.index()),
-            pubkey: mxx_bgg::BggPublicKeyWire {
-                matrix: input.pubkey.matrix.clone().ring_automorphism(helper.index()),
-                reveal_plaintext: false,
-            },
-            plaintext: None,
-        };
-        let switched = self.fuse(&raw, helper.switch())?;
-        let decomposition = switched
-            .pubkey
-            .matrix
             .clone()
             .decompose(self.bgg.public_key.base.clone(), self.bgg.public_key.digit_count.clone())
             .as_mat();
-        let mask = helper.mask();
-        let vector = mask.vector.clone() * decomposition.clone() + switched.vector.clone();
-        // The switched vector is added to cancel the transformed-secret term,
-        // but its public matrix is not part of the resulting BGG key.  With
-        // `h = s*D - t*G` and `r = t*B - mu*s*G`, the output is
-        // `h*D(B) + r = s*(D*D(B)) - mu*s*G`; the `t*B` term is consumed by
-        // cancellation.  Keeping `+B` in the public matrix would make the
-        // declared key one extra `s*B` larger than its vector relation.
-        let public_matrix = mask.pubkey.matrix.clone() * decomposition;
+        let public = lhs.pubkey.matrix.clone() * decomposed.clone();
         Ok(BggEncodingWire {
-            vector,
-            pubkey: mxx_bgg::BggPublicKeyWire { matrix: public_matrix, reveal_plaintext: false },
+            vector: lhs.vector.clone() * decomposed,
+            pubkey: BggPublicKeyWire { matrix: public, reveal_plaintext: false },
             plaintext: None,
         })
     }
 
-    /// Keeps only coefficients in the zero residue class modulo `width`.
-    ///
-    /// The helper at round `i` is the automorphism
-    /// `r_i = 2n / 2^(i + 1) + 1`. Adding the transformed state cancels the
-    /// odd quotient residue classes and doubles the survivors. After the
-    /// required `log2(width)` rounds, only positions divisible by `width`
-    /// remain, with amplitude `width`. This method intentionally returns that
-    /// unnormalised result; [`Self::single_input_lut`] sums all branches first
-    /// and applies one final gadget normalization.
-    ///
-    /// `helpers` must contain the prevalidated automorphism rounds in exactly
-    /// the order above. Reordering them changes the sieve and is rejected.
-    pub fn clear_coeff(
-        &self,
-        input: &BggEncodingWire,
-        width: usize,
-        helpers: &[AutomorphismHelper],
-    ) -> Result<BggEncodingWire, PowerLutError> {
-        crate::ensure_ciphertext_only(input)?;
-        let n = input
-            .pubkey
-            .matrix
-            .matrix_type()
-            .ring_dimension
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|v| v.to_usize())
-            .ok_or(PowerLutError::InvalidClearCoeffWidth)?;
-        if width == 0 ||
-            !width.is_power_of_two() ||
-            width > n ||
-            n % width != 0 ||
-            helpers.len() != width.trailing_zeros() as usize
-        {
-            return Err(PowerLutError::InvalidClearCoeffWidth);
-        }
-        let mut state = input.clone();
-        for (round, helper) in helpers.iter().enumerate() {
-            let expected = (2 * n / (1usize << (round + 1))) + 1;
-            if helper.index() != expected {
-                return Err(PowerLutError::InvalidAutomorphismHelper);
-            }
-            let transformed = self.automorphism(&state, helper)?;
-            state = self.bgg.add(&state, &transformed)?;
-        }
-        Ok(state)
-    }
-
-    /// Evaluates a public single-input LUT over exponent-encoded values.
-    ///
-    /// Each candidate is sieved without normalization, all rotated branches
-    /// are added, and one final `width^-1` gadget product normalizes the sum.
+    /// Evaluates one LUT with the flat helper set. Helpers are in canonical
+    /// `sigma_j = 1 + j * (2n/W)` order.
     pub fn single_input_lut(
         &self,
         input: &BggEncodingWire,
         table: &[usize],
-        helpers: &[AutomorphismHelper],
+        helpers: &[FlatLutHelper],
     ) -> Result<BggEncodingWire, PowerLutError> {
-        crate::ensure_ciphertext_only(input)?;
         let width = table.len();
-        if width == 0 || !width.is_power_of_two() {
-            return Err(PowerLutError::InvalidLut);
-        }
         let n = input
             .pubkey
             .matrix
@@ -987,75 +651,124 @@ impl PowerLutEncodingCompiler {
             .ring_dimension
             .evaluate(&ParamEnv::default())
             .ok()
-            .and_then(|v| v.to_usize())
+            .and_then(|value| value.to_usize())
             .ok_or(PowerLutError::InvalidLut)?;
-        let ring = self.bgg.public_key.ring.clone();
-        let shifts = Family::pack(
-            (0..width)
-                .map(|candidate| {
-                    crate::utils::rotation_power(&ring, (2 * n - candidate % (2 * n)) % (2 * n), n)
-                })
-                .collect(),
-        )
-        .map_err(|_| PowerLutError::InvalidLut)?;
-        let output_rotations = Family::pack(
-            table
-                .iter()
-                .copied()
-                .map(|output| crate::utils::rotation_power(&ring, output, n))
-                .collect(),
-        )
-        .map_err(|_| PowerLutError::InvalidLut)?;
-        let input = input.clone();
-        let input_for_loop = input.clone();
-        let helpers = helpers.to_vec();
-        let (branch_vectors, branch_publics) = Family::try_parallel_zip_many_values(
-            vec![shifts, output_rotations],
-            move |_index, items| {
-                let mut items = items.into_iter();
-                let shift = items.next().ok_or(DslError::Schema)?;
-                let output_rotation = items.next().ok_or(DslError::Schema)?;
-                let shifted = self.bgg.small_scalar_mul(&input_for_loop, &shift);
-                let selected =
-                    self.clear_coeff(&shifted, width, &helpers).map_err(|_| DslError::Schema)?;
-                let branch = self.bgg.small_scalar_mul(&selected, &output_rotation);
-                Ok((branch.vector, branch.pubkey.matrix))
-            },
-        )
-        .map_err(|_| PowerLutError::InvalidLut)?;
-        let sum = BggEncodingWire {
-            vector: balanced_sum_family(branch_vectors)?,
-            pubkey: BggPublicKeyWire {
-                matrix: balanced_sum_family(branch_publics)?,
-                reveal_plaintext: false,
-            },
-            plaintext: None,
-        };
+        let table = LutTable::unary(width, n, table.to_vec()).map_err(PowerLutError::from)?;
+        self.single_input_lut_table(input, &table, helpers)
+    }
 
-        // ClearCoeff leaves a factor `width` on every surviving coefficient.
-        // Conceptually normalize once with `G^-1(width^-1 G)`: the explicit
-        // `G` preserves the canonical payload because
-        // `G G^-1(width^-1 G) = width^-1 G`. The BGG large-scalar helper
-        // inserts that gadget internally, so the scalar passed below is only
-        // `width^-1`; this emits exactly one gadget decomposition and avoids
-        // direct large-inverse amplification.
-        let modulus = input
+    /// Lowers a complete unary table, preserving its monomial/scalar output
+    /// form.  The public slice API above is intentionally monomial-only.
+    pub(crate) fn single_input_lut_table(
+        &self,
+        input: &BggEncodingWire,
+        table: &LutTable,
+        helpers: &[FlatLutHelper],
+    ) -> Result<BggEncodingWire, PowerLutError> {
+        crate::ensure_ciphertext_only(input)?;
+        let width = table.values().len();
+        let n = input
             .pubkey
             .matrix
             .matrix_type()
-            .modulus
+            .ring_dimension
             .evaluate(&ParamEnv::default())
-            .map_err(|_| PowerLutError::InvalidLut)?;
-        let inverse = modular_inverse(&(BigInt::from(width) % &modulus), &modulus)
+            .ok()
+            .and_then(|value| value.to_usize())
             .ok_or(PowerLutError::InvalidLut)?;
-        let ring = self.bgg.public_key.ring.clone();
-        let inverse_scalar = ring.polynomial([inverse.into()]);
-        Ok(self.bgg.large_scalar_mul(&sum, &inverse_scalar))
+        if width == 0 ||
+            !width.is_power_of_two() ||
+            width > n ||
+            n % width != 0 ||
+            helpers.len() != width ||
+            table.values().iter().any(|value| *value >= n)
+        {
+            return Err(PowerLutError::InvalidLut);
+        }
+        // `raw_vectors[j]` and `raw_publics[j]` are the two input components
+        // after `X -> X^{\sigma_j}`, before applying branch `C_j` and its mask.
+        let raw_vectors = Family::pack(
+            helpers
+                .iter()
+                .enumerate()
+                .map(|(j, helper)| {
+                    let expected = canonical_sigma(j, n, width).ok_or(PowerLutError::InvalidLut)?;
+                    if helper.sigma() != expected {
+                        return Err(PowerLutError::InvalidLut);
+                    }
+                    Ok(input.vector.clone().ring_automorphism(expected))
+                })
+                .collect::<Result<Vec<_>, PowerLutError>>()?,
+        )
+        .map_err(|_| PowerLutError::InvalidLut)?;
+        let raw_publics = Family::pack(
+            helpers
+                .iter()
+                .enumerate()
+                .map(|(j, helper)| {
+                    let expected = canonical_sigma(j, n, width).ok_or(PowerLutError::InvalidLut)?;
+                    if helper.sigma() != expected {
+                        return Err(PowerLutError::InvalidLut);
+                    }
+                    Ok(input.pubkey.matrix.clone().ring_automorphism(expected))
+                })
+                .collect::<Result<Vec<_>, PowerLutError>>()?,
+        )
+        .map_err(|_| PowerLutError::InvalidLut)?;
+        let switches = Family::pack(
+            helpers.iter().map(|helper| helper.switch().gsw_ciphertext().clone()).collect(),
+        )
+        .map_err(|_| PowerLutError::InvalidLut)?;
+        let mask_vectors =
+            Family::pack(helpers.iter().map(|helper| helper.mask().vector.clone()).collect())
+                .map_err(|_| PowerLutError::InvalidLut)?;
+        let mask_publics = Family::pack(
+            helpers.iter().map(|helper| helper.mask().pubkey.matrix.clone()).collect(),
+        )
+        .map_err(|_| PowerLutError::InvalidLut)?;
+        let (vectors, publics) = Family::try_parallel_zip_many_values(
+            vec![raw_vectors, raw_publics, switches, mask_vectors, mask_publics],
+            move |_index, mut items| {
+                let mask_public = items.pop().ok_or(DslError::Schema)?;
+                let mask_vector = items.pop().ok_or(DslError::Schema)?;
+                let switch = items.pop().ok_or(DslError::Schema)?;
+                let raw_public = items.pop().ok_or(DslError::Schema)?;
+                let raw_vector = items.pop().ok_or(DslError::Schema)?;
+                let rhs = PowerRhsPackage::new(switch).map_err(|_| DslError::Schema)?;
+                // The same digit matrix is used in both components of Fuse.
+                let c_decomposition = rhs
+                    .gsw_ciphertext()
+                    .clone()
+                    .decompose(
+                        self.bgg.public_key.base.clone(),
+                        self.bgg.public_key.digit_count.clone(),
+                    )
+                    .as_mat();
+                let switched_vector = raw_vector * c_decomposition.clone();
+                let switched_public = raw_public * c_decomposition;
+                let a_decomposition = switched_public
+                    .decompose(
+                        self.bgg.public_key.base.clone(),
+                        self.bgg.public_key.digit_count.clone(),
+                    )
+                    .as_mat();
+                Ok((
+                    mask_vector * a_decomposition.clone() + switched_vector,
+                    mask_public * a_decomposition,
+                ))
+            },
+        )
+        .map_err(|_| PowerLutError::InvalidLut)?;
+        Ok(BggEncodingWire {
+            vector: balanced_sum_family(vectors)?,
+            pubkey: BggPublicKeyWire {
+                matrix: balanced_sum_family(publics)?,
+                reveal_plaintext: false,
+            },
+            plaintext: None,
+        })
     }
 
-    /// Fuses a private RHS monomial and evaluates a flattened two-input LUT.
-    /// The RHS exponent is `u + lhs_width*v`; no overlapping exponent encoding
-    /// is used for rectangular tables.
     pub fn two_input_lut(
         &self,
         lhs: &BggEncodingWire,
@@ -1063,19 +776,33 @@ impl PowerLutEncodingCompiler {
         lhs_width: usize,
         rhs_width: usize,
         table: &[usize],
-        helpers: &[AutomorphismHelper],
+        helpers: &[FlatLutHelper],
     ) -> Result<BggEncodingWire, PowerLutError> {
-        crate::ensure_ciphertext_only(lhs)?;
         if lhs_width == 0 ||
             rhs_width == 0 ||
-            !lhs_width.is_power_of_two() ||
-            !rhs_width.is_power_of_two() ||
             table.len() != lhs_width.checked_mul(rhs_width).ok_or(PowerLutError::InvalidLut)?
         {
             return Err(PowerLutError::InvalidLut);
         }
+        self.single_input_lut(&self.fuse(lhs, rhs)?, table, helpers)
+    }
+
+    fn two_input_lut_table(
+        &self,
+        lhs: &BggEncodingWire,
+        rhs: &PowerRhsPackage,
+        table: &LutTable,
+        helpers: &[FlatLutHelper],
+    ) -> Result<BggEncodingWire, PowerLutError> {
+        let rhs_width = table.rhs_width().ok_or(PowerLutError::InvalidLut)?;
+        if table.input_width() == 0 ||
+            rhs_width == 0 ||
+            table.output_form() != LutOutputForm::Monomial
+        {
+            return Err(PowerLutError::InvalidLut);
+        }
         let fused = self.fuse(lhs, rhs)?;
-        self.single_input_lut(&fused, table, helpers)
+        self.single_input_lut_table(&fused, table, helpers)
     }
 }
 
@@ -1084,17 +811,27 @@ impl ProgramLoweringBackend for PowerLutEncodingCompiler {
     type Rhs = PowerRhsPackage;
     type SelectorFamily = EncodingSelectorFamily;
     type PublicValueFamily = Family<Mat>;
-    type Helper = AutomorphismHelper;
+    type Helper = FlatLutHelper;
+    type HelperSet = FlatLutHelperSet;
 
+    fn resolve_helpers<'a>(
+        &self,
+        helpers: &'a Self::HelperSet,
+        table: &crate::program::LutTable,
+    ) -> Result<&'a [Self::Helper], PowerLutError> {
+        helpers.resolve(table)
+    }
     fn unary(
         &self,
         input: Self::Wire,
         table: &crate::program::LutTable,
         helpers: &[Self::Helper],
     ) -> Result<Self::Wire, PowerLutError> {
-        self.single_input_lut(&input, table.values(), helpers)
+        if table.rhs_width().is_some() {
+            return Err(PowerLutError::InvalidLut);
+        }
+        self.single_input_lut_table(&input, table, helpers)
     }
-
     fn binary(
         &self,
         lhs: Self::Wire,
@@ -1102,16 +839,8 @@ impl ProgramLoweringBackend for PowerLutEncodingCompiler {
         table: &crate::program::LutTable,
         helpers: &[Self::Helper],
     ) -> Result<Self::Wire, PowerLutError> {
-        self.two_input_lut(
-            &lhs,
-            rhs,
-            table.input_width(),
-            table.rhs_width().expect("shared traversal validates binary LUT"),
-            table.values(),
-            helpers,
-        )
+        self.two_input_lut_table(&lhs, rhs, table, helpers)
     }
-
     fn one_hot(
         &self,
         lhs: Self::Wire,
@@ -1122,17 +851,15 @@ impl ProgramLoweringBackend for PowerLutEncodingCompiler {
         table: &crate::program::LutTable,
         helpers: &[Self::Helper],
     ) -> Result<Self::Wire, PowerLutError> {
-        if selectors.count() != public_values.count() ||
-            selector_range != public_value_range ||
-            !selector_range.is_within(selectors.count())
-        {
-            return Err(crate::program::ProgramValidationError::WidthMismatch.into());
+        // For selector entries `C_i` and public values `v_i`, compute
+        // `sum_i m_i * Fuse(lhs,C_i) * v_i`; `indices` and `masks` relocate
+        // the logical selector range into one-hot coefficients.
+        if table.rhs_width().is_some() {
+            return Err(PowerLutError::InvalidSparseLwrBlock);
         }
-
-        // Use a fixed structural loop capacity. The logical range may be
-        // shorter for a sparse bucket, but its inactive tail is masked before
-        // weighting. This keeps all indexed-family wire types independent of
-        // the enclosing bucket-loop binder and excludes padding RHS material.
+        if selector_range != public_value_range || selectors.count() != public_values.count() {
+            return Err(PowerLutError::InvalidSparseLwrBlock);
+        }
         let capacity = selector_range
             .capacity()
             .evaluate(&ParamEnv::default())
@@ -1141,91 +868,129 @@ impl ProgramLoweringBackend for PowerLutEncodingCompiler {
             .ok_or(PowerLutError::InvalidSparseLwrBlock)?;
         let count = mxx_dsl::Int::evaluate(selector_range.count().clone());
         let start = mxx_dsl::Int::evaluate(selector_range.start().clone());
-        let mask_type = public_values.element_type().clone();
-        let (safe_indices, active_masks) =
-            one_hot_indices_and_masks(capacity, count, start, mask_type)
+        let (indices, masks) =
+            one_hot_indices_and_masks(capacity, count, start, public_values.element_type().clone())
                 .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-        let gsw = selectors
-            .gsw
+        let cs = selectors
+            .gsw()
             .clone()
-            .parallel_gather(safe_indices.clone())
+            .parallel_gather(indices.clone())
             .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-        let companions = selectors
-            .companions
-            .iter()
-            .map(|(vector, public)| {
-                Ok((
-                    vector
-                        .clone()
-                        .parallel_gather(safe_indices.clone())
-                        .map_err(|_| DslError::Schema)?,
-                    public
-                        .clone()
-                        .parallel_gather(safe_indices.clone())
-                        .map_err(|_| DslError::Schema)?,
-                ))
-            })
-            .collect::<Result<Vec<_>, DslError>>()
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-        let values = public_values
+        let vals = public_values
             .clone()
-            .parallel_gather(safe_indices)
+            .parallel_gather(indices)
             .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-        let lhs_vector = lhs.vector.clone();
-        let lhs_matrix = lhs.pubkey.matrix.clone();
-        let compiler = Self { bgg: self.bgg.clone() };
-        let mut zipped = vec![gsw];
-        for (vector, public) in companions {
-            zipped.push(vector);
-            zipped.push(public);
-        }
-        zipped.push(values);
-        zipped.push(active_masks);
-        let weighted =
-            Family::<Mat>::try_parallel_zip_many_values(zipped, move |_index, mut zipped| {
-                let active = zipped.pop().ok_or(DslError::Schema)?;
-                let value = zipped.pop().ok_or(DslError::Schema)?;
-                let gsw = zipped.remove(0);
-                let mut rhs_companions = Vec::with_capacity(zipped.len() / 2);
-                for pair in zipped.chunks_exact(2) {
-                    rhs_companions.push(crate::rhs::PowerRhsCompanionBlock {
-                        vector: pair[0].clone(),
-                        public_matrix: pair[1].clone(),
-                    });
-                }
-                let lhs = BggEncodingWire {
-                    vector: lhs_vector.clone(),
-                    pubkey: BggPublicKeyWire {
-                        matrix: lhs_matrix.clone(),
-                        reveal_plaintext: false,
-                    },
-                    plaintext: None,
-                };
-                let rhs =
-                    PowerRhsPackage::new(gsw, rhs_companions).map_err(|_| DslError::Schema)?;
-                let fused = compiler.fuse(&lhs, &rhs).map_err(|_| DslError::Schema)?;
-                let weighted = compiler.bgg.small_scalar_mul(&fused, &(value * active));
-                Ok((weighted.vector, weighted.pubkey.matrix))
-            })
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-
-        // Reduce the fixed-capacity weighted family with the existing static
-        // balanced reduction. Inactive terms are zero, so the result equals
-        // the requested logical range without any parent-dependent family.
-        let (vector, public) = (balanced_sum_family(weighted.0)?, balanced_sum_family(weighted.1)?);
-        let selected = BggEncodingWire {
-            vector,
-            pubkey: mxx_bgg::BggPublicKeyWire { matrix: public, reveal_plaintext: false },
-            plaintext: None,
-        };
-        self.single_input_lut(&selected, table.values(), helpers)
+        let weighted = Family::try_parallel_zip_many_values(
+            vec![cs, vals, masks],
+            move |_index, mut items| {
+                let mask = items.pop().ok_or(DslError::Schema)?;
+                let value = items.pop().ok_or(DslError::Schema)?;
+                let c = items.pop().ok_or(DslError::Schema)?;
+                let rhs = PowerRhsPackage::new(c).map_err(|_| DslError::Schema)?;
+                let fused = self.fuse(&lhs, &rhs).map_err(|_| DslError::Schema)?;
+                let weighted = value * mask;
+                Ok((fused.vector * weighted.clone(), fused.pubkey.matrix * weighted))
+            },
+        )
+        .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+        let (vectors, publics) = weighted;
+        let vector = balanced_sum_family(vectors)?;
+        let public = balanced_sum_family(publics)?;
+        self.single_input_lut_table(
+            &BggEncodingWire {
+                vector,
+                pubkey: BggPublicKeyWire { matrix: public, reveal_plaintext: false },
+                plaintext: None,
+            },
+            table,
+            helpers,
+        )
     }
 }
 
-/// Builds fixed-capacity one-hot indices and masks for a logical family range.
-///
-/// Every lane gathers from the logical range, including inactive capacity
-/// lanes, and the corresponding mask removes those inactive contributions.
+/// Family of fixed GSW ciphertexts used by the one-hot lowering.
+#[derive(Clone)]
+pub struct EncodingSelectorFamily {
+    gsw: Family<Mat>,
+}
+impl EncodingSelectorFamily {
+    pub fn new(gsw: Family<Mat>) -> Result<Self, PowerLutError> {
+        if *gsw.count() == IntExpr::constant(0) {
+            Err(PowerLutError::InvalidSparseLwrBlock)
+        } else {
+            Ok(Self { gsw })
+        }
+    }
+    pub(crate) fn gsw(&self) -> &Family<Mat> {
+        &self.gsw
+    }
+    pub(crate) fn count(&self) -> &IntExpr {
+        self.gsw.count()
+    }
+    pub(crate) fn flattened(&self) -> Vec<Family<Mat>> {
+        vec![self.gsw.clone()]
+    }
+    pub(crate) fn from_flattened(mut values: Vec<Family<Mat>>) -> Result<Self, PowerLutError> {
+        if values.len() != 1 {
+            return Err(PowerLutError::InvalidSparseLwrBlock);
+        }
+        Self::new(values.remove(0))
+    }
+}
+
+pub fn flattened_lut_index(
+    u: usize,
+    v: usize,
+    lhs_width: usize,
+    rhs_width: usize,
+) -> Option<usize> {
+    (lhs_width > 0 && rhs_width > 0 && u < lhs_width && v < rhs_width).then(|| u + lhs_width * v)
+}
+
+/// Returns the canonical odd automorphism used by flat branch `j`.
+pub(crate) fn canonical_sigma(j: usize, ring_dimension: usize, width: usize) -> Option<usize> {
+    (width != 0 && width.is_power_of_two() && ring_dimension % width == 0 && j < width)
+        .then(|| 1 + j * (2 * ring_dimension / width))
+}
+
+fn rotation_power(ring: &mxx_dsl::Ring, exponent: usize, ring_dimension: usize) -> Mat {
+    // In R_q = Z_q[X]/(X^n+1), `X^k` is a signed permutation. Reducing the
+    // exponent modulo `2n` records the sign flip for exponents crossing n.
+    let exponent = exponent % (2 * ring_dimension);
+    let reduced = exponent % ring_dimension;
+    let rotation = ring.constant((1, 1), ConstantMatrix::Rotation { exponent: reduced.into() });
+    if exponent < ring_dimension { rotation } else { -rotation }
+}
+
+fn lut_coefficient(
+    ring: &mxx_dsl::Ring,
+    n: usize,
+    width: usize,
+    sigma: usize,
+    table: &[usize],
+    output_form: LutOutputForm,
+) -> Result<Mat, PowerLutSamplingError> {
+    // The inverse `W^{-1}` is in `Z_q`; the output form decides whether each
+    // table entry contributes a scalar or a monomial rotation.
+    let modulus =
+        ring.zero((1, 1)).matrix_type().modulus.evaluate(&ParamEnv::default()).map_err(|_| {
+            PowerLutSamplingError::InvalidConfiguration("ring modulus must be concrete")
+        })?;
+    let inverse = modular_inverse(&(BigInt::from(width) % &modulus), &modulus)
+        .ok_or(PowerLutSamplingError::InvalidConfiguration("LUT width is not invertible"))?;
+    let mut result = ring.zero((1, 1));
+    for (k, output) in table.iter().copied().enumerate() {
+        let left = match output_form {
+            LutOutputForm::Monomial => rotation_power(ring, output, n),
+            LutOutputForm::Scalar => ring.polynomial([IntExpr::constant(output)]),
+        };
+        let neg_k = (2 * n - k % (2 * n)) % (2 * n);
+        let right = rotation_power(ring, (neg_k * sigma) % (2 * n), n);
+        result = result + left * right;
+    }
+    Ok(ring.polynomial([inverse.into()]) * result)
+}
+
 pub(crate) fn one_hot_indices_and_masks(
     capacity: usize,
     count: mxx_dsl::Int,
@@ -1235,9 +1000,8 @@ pub(crate) fn one_hot_indices_and_masks(
     Parallel::range(capacity).try_map_values(|index| {
         let offset = index.as_int();
         let active = offset.clone().less_equal(count.clone().sub(mxx_dsl::Int::constant(1)));
-        let selected = offset.rem(count.clone());
         Ok((
-            start.clone().add(selected),
+            start.clone().add(offset.clone().rem(count.clone())),
             active.to_int().lift_to_constant_polynomial(mask_type.clone()),
         ))
     })
@@ -1257,12 +1021,8 @@ pub(crate) fn modular_inverse(value: &BigInt, modulus: &BigInt) -> Option<BigInt
     (old_r == BigInt::one()).then(|| ((old_s % modulus) + modulus) % modulus)
 }
 
-/// Sums a positive family through logarithmically many structural
-/// parallel rounds. The family elements are never host-unrolled into one
-/// graph expression per LUT branch; each round contains one reusable loop
-/// body that adds adjacent elements.
 pub(crate) fn balanced_sum_family(family: Family<Mat>) -> Result<Mat, PowerLutError> {
-    let mut count = family
+    let count = family
         .count()
         .evaluate(&ParamEnv::default())
         .ok()
@@ -1272,117 +1032,86 @@ pub(crate) fn balanced_sum_family(family: Family<Mat>) -> Result<Mat, PowerLutEr
         return Err(PowerLutError::InvalidLut);
     }
     let mut current = family;
+    let mut count = count;
     while count > 1 {
-        let source = current.clone();
-        let next_count = count.div_ceil(2);
-        let odd = count % 2 == 1;
-        let last_pair = mxx_dsl::Int::constant(next_count - 1);
-        let left_indices = Parallel::range(next_count)
-            .map_values(|index| index.as_int().mul(mxx_dsl::Int::constant(2)))
+        let next = count.div_ceil(2);
+        let left = current
+            .clone()
+            .parallel_gather(
+                Parallel::range(next)
+                    .map_values(|i| i.as_int().mul(mxx_dsl::Int::constant(2)))
+                    .map_err(|_| PowerLutError::InvalidLut)?,
+            )
             .map_err(|_| PowerLutError::InvalidLut)?;
-        let right_indices = Parallel::range(next_count)
-            .map_values(|index| {
-                let index_value = index.as_int();
-                let candidate = index_value
-                    .clone()
-                    .mul(mxx_dsl::Int::constant(2))
-                    .add(mxx_dsl::Int::constant(1));
-                if odd { candidate.rem(mxx_dsl::Int::constant(count)) } else { candidate }
-            })
+        let right = current
+            .clone()
+            .parallel_gather(
+                Parallel::range(next)
+                    .map_values(|i| {
+                        i.as_int()
+                            .mul(mxx_dsl::Int::constant(2))
+                            .add(mxx_dsl::Int::constant(1))
+                            .rem(mxx_dsl::Int::constant(count))
+                    })
+                    .map_err(|_| PowerLutError::InvalidLut)?,
+            )
             .map_err(|_| PowerLutError::InvalidLut)?;
-        let left =
-            source.clone().parallel_gather(left_indices).map_err(|_| PowerLutError::InvalidLut)?;
-        let right = source.parallel_gather(right_indices).map_err(|_| PowerLutError::InvalidLut)?;
         current =
             Family::try_parallel_zip_many_values(vec![left, right], move |index, mut items| {
-                let left = items.remove(0);
-                let right = items.remove(0);
-                if odd {
-                    let odd_last = index.as_int().equal(last_pair.clone()).to_int();
-                    odd_last.select(vec![left.clone() + right, left])
+                let l = items.pop().ok_or(DslError::Schema)?;
+                let r = items.pop().ok_or(DslError::Schema)?;
+                if count % 2 == 1 {
+                    let last = index.as_int().equal(mxx_dsl::Int::constant(next - 1)).to_int();
+                    last.select(vec![l.clone() + r, l])
                 } else {
-                    Ok(left + right)
+                    Ok(l + r)
                 }
             })
             .map_err(|_| PowerLutError::InvalidLut)?;
-        count = next_count;
+        count = next;
     }
     Ok(current.get_static(0))
 }
 
-// -------------------------------------------------------------------------
-// Artifact import boundary
-// -------------------------------------------------------------------------
-
-/// Names of the private vector and public matrix artifacts for one encoding.
-#[derive(Clone, Debug, Eq, PartialEq)]
+// Artifact import boundary for ordinary encoding wires.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BggEncodingArtifactNames {
-    /// Artifact containing the private encoding vector.
     pub vector: String,
-    /// Artifact containing the public key matrix paired with the vector.
     pub public_matrix: String,
 }
-
 #[derive(Debug, Error, Eq, PartialEq)]
-/// Reasons why a Power-LUT encoding or package cannot be imported.
 pub enum PowerArtifactImportError {
-    #[error("artifact manifest production does not match the requested production")]
-    /// Manifest belongs to another production.
+    #[error("artifact production mismatch")]
     ProductionMismatch,
-    #[error("required Power-LUT artifact is missing")]
-    /// A named artifact is absent from the manifest.
+    #[error("artifact missing")]
     MissingArtifact,
-    #[error("Power-LUT artifact has the wrong confidentiality")]
-    /// Public/private confidentiality does not match the expected role.
+    #[error("artifact confidentiality mismatch")]
     ConfidentialityMismatch,
-    #[error("Power-LUT artifact has the wrong matrix type")]
-    /// Artifact matrix dimensions or modulus are incompatible.
+    #[error("artifact matrix type mismatch")]
     MatrixTypeMismatch,
-    #[error("Power-LUT artifact is missing canonical provenance metadata")]
-    /// Required serialized provenance metadata is absent or malformed.
+    #[error("artifact metadata invalid")]
     InvalidMetadata,
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ManifestEncodingMetadata {
     secret: ManifestSecretMetadata,
     role: serde_json::Value,
 }
-
-/// Imports a state encoding after validating its manifest metadata and shapes.
 pub fn artifact_input(
     production_id: mxx_ir_core::artifact::ProductionId,
     manifest: &mxx_ir_core::artifact::Manifest,
     names: BggEncodingArtifactNames,
 ) -> Result<BggEncodingWire, PowerArtifactImportError> {
-    artifact_input_with_role::<serde_json::Value>(production_id, manifest, names, None)
+    artifact_input_with_role(production_id, manifest, names, None::<&serde_json::Value>)
 }
-
 pub(crate) fn artifact_input_with_role<R: Serialize>(
     production_id: mxx_ir_core::artifact::ProductionId,
     manifest: &mxx_ir_core::artifact::Manifest,
     names: BggEncodingArtifactNames,
     expected_role: Option<&R>,
 ) -> Result<BggEncodingWire, PowerArtifactImportError> {
-    artifact_input_with_columns(production_id, manifest, names, expected_role, None)
-}
-
-/// Imports an encoding whose columns are a packed sequence of ordinary BGG
-/// columns. The packed companion relation uses this to carry all CRT digits
-/// in one artifact while retaining the same secret/layout metadata checks as
-/// an ordinary encoding.
-pub(crate) fn artifact_input_with_columns<R: Serialize>(
-    production_id: mxx_ir_core::artifact::ProductionId,
-    manifest: &mxx_ir_core::artifact::Manifest,
-    names: BggEncodingArtifactNames,
-    expected_role: Option<&R>,
-    columns: Option<usize>,
-) -> Result<BggEncodingWire, PowerArtifactImportError> {
     if manifest.production_id != production_id {
         return Err(PowerArtifactImportError::ProductionMismatch);
-    }
-    if names.vector == names.public_matrix {
-        return Err(PowerArtifactImportError::InvalidMetadata);
     }
     let vector =
         manifest.artifacts.get(&names.vector).ok_or(PowerArtifactImportError::MissingArtifact)?;
@@ -1402,66 +1131,57 @@ pub(crate) fn artifact_input_with_columns<R: Serialize>(
         .map(serde_json::to_value)
         .transpose()
         .map_err(|_| PowerArtifactImportError::InvalidMetadata)?
-        .is_some_and(|expected_role| {
-            metadata.role != expected_role || public_metadata.role != expected_role
-        }) ||
-        metadata.secret.identity != public_metadata.secret.identity ||
-        metadata.secret.modulus != public_metadata.secret.modulus ||
-        metadata.secret.ring_dimension != public_metadata.secret.ring_dimension ||
-        metadata.secret.secret_dimension != public_metadata.secret.secret_dimension ||
-        metadata.secret.digit_count != public_metadata.secret.digit_count ||
-        metadata.secret.gadget_base != public_metadata.secret.gadget_base
+        .is_some_and(|role| metadata.role != role || public_metadata.role != role) ||
+        metadata.secret.identity != public_metadata.secret.identity
     {
         return Err(PowerArtifactImportError::InvalidMetadata);
     }
     let layout = metadata.secret.sampler();
-    let columns = columns.unwrap_or_else(|| layout.public_key_columns());
     let modulus = layout
         .modulus
-        .evaluate(&Default::default())
+        .evaluate(&ParamEnv::default())
         .map_err(|_| PowerArtifactImportError::MatrixTypeMismatch)?;
-    let ring_dimension = layout
+    let n = layout
         .ring_dimension
-        .evaluate(&Default::default())
-        .map_err(|_| PowerArtifactImportError::MatrixTypeMismatch)?
-        .to_usize()
+        .evaluate(&ParamEnv::default())
+        .ok()
+        .and_then(|value| value.to_usize())
         .ok_or(PowerArtifactImportError::MatrixTypeMismatch)?;
-    let vector_type =
-        mxx_ir_core::artifact::ArtifactType::Matrix(mxx_ir_core::types::ConcreteMatrixType {
-            modulus: modulus.clone(),
-            ring_dimension: ring_dimension.clone(),
-            rows: 1,
-            columns,
-        });
-    let public_type =
-        mxx_ir_core::artifact::ArtifactType::Matrix(mxx_ir_core::types::ConcreteMatrixType {
-            modulus,
-            ring_dimension,
-            rows: layout.secret_dimension,
-            columns,
-        });
     if vector.confidentiality != mxx_ir_core::artifact::ArtifactConfidentiality::Private ||
         public.confidentiality != mxx_ir_core::artifact::ArtifactConfidentiality::Public ||
-        vector.family_count.is_some() ||
-        public.family_count.is_some() ||
-        vector.artifact_type != vector_type ||
-        public.artifact_type != public_type
+        vector.artifact_type !=
+            mxx_ir_core::artifact::ArtifactType::Matrix(
+                mxx_ir_core::types::ConcreteMatrixType {
+                    modulus: modulus.clone(),
+                    ring_dimension: n,
+                    rows: 1,
+                    columns: layout.public_key_columns(),
+                },
+            ) ||
+        public.artifact_type !=
+            mxx_ir_core::artifact::ArtifactType::Matrix(
+                mxx_ir_core::types::ConcreteMatrixType {
+                    modulus,
+                    ring_dimension: n,
+                    rows: layout.secret_dimension,
+                    columns: layout.public_key_columns(),
+                },
+            )
     {
         return Err(PowerArtifactImportError::MatrixTypeMismatch);
     }
-    let ring = layout.ring();
     Ok(BggEncodingWire {
-        vector: ring.artifact_input(
+        vector: layout.ring().artifact_input(
             production_id.clone(),
             names.vector,
-            (1, columns),
+            (1, layout.public_key_columns()),
             mxx_ir_core::artifact::ArtifactConfidentiality::Private,
         ),
-        pubkey: mxx_bgg::BggPublicKeyWire {
-            matrix: ring.artifact_input(
+        pubkey: BggPublicKeyWire {
+            matrix: layout.ring().artifact_input(
                 production_id,
                 names.public_matrix,
-                (layout.secret_dimension, columns),
+                (layout.secret_dimension, layout.public_key_columns()),
                 mxx_ir_core::artifact::ArtifactConfidentiality::Public,
             ),
             reveal_plaintext: false,
@@ -1469,1201 +1189,502 @@ pub(crate) fn artifact_input_with_columns<R: Serialize>(
         plaintext: None,
     })
 }
-
-/// Serializes canonical provenance metadata for an encoding artifact.
-#[cfg(test)]
-pub(crate) fn power_encoding_artifact_layout<R: Serialize>(
-    sampler: &mxx_bgg::BggSamplerLayout,
-    identity: [u8; 32],
-    role: R,
-) -> String {
-    serde_json::to_string(&ManifestEncodingMetadata {
-        secret: ManifestSecretMetadata {
-            modulus: sampler.modulus.clone(),
-            ring_dimension: sampler.ring_dimension.clone(),
-            secret_dimension: sampler.secret_dimension,
-            digit_count: sampler.digit_count,
-            gadget_base: sampler.gadget_base.clone(),
-            identity,
-        },
-        role: serde_json::to_value(role).expect("Power-LUT encoding role serialization"),
-    })
-    .expect("Power-LUT encoding metadata serialization")
-}
 #[cfg(test)]
 mod tests {
-    use super::{AutomorphismHelper, EncodingSelectorFamily, flattened_lut_index, modular_inverse};
-    use crate::{
-        PowerLutEncodingCompiler, PowerLutError, PowerLutPublicKeyCompiler,
-        program::{FamilyRange, ProgramFamilyRanges},
-        public_key::PowerLutPublicKeySampler,
-        rhs::{PowerRhsCompanionBlock, PowerRhsPackage},
+    use super::{
+        FlatLutHelper, FlatLutHelperSet, PowerLutEncodingCompiler, PowerLutEncodingSampler,
+        canonical_sigma,
     };
+    use crate::{program::LutTable, public_key::PowerLutPublicKeySampler, rhs::PowerRhsPackage};
     use mxx_bgg::{BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire};
-    use mxx_dsl::{DslContext, Ring};
-    use mxx_ir_core::{ParamEnv, node::NodeKind, types::WireType};
-    use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{
-            Poly, PolyParams,
-            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        },
-    };
+    use mxx_dsl::{DslContext, HashTag, Ring};
+    use mxx_ir_core::ParamEnv;
+    use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
     use mxx_runtime::{
         RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
         transcript::SamplingMode,
     };
     use num_bigint::BigInt;
-    use num_traits::ToPrimitive;
-    use serial_test::serial;
     use std::collections::BTreeMap;
 
     #[test]
-    fn clear_coeff_scale_uses_an_exact_modular_inverse() {
-        let modulus = BigInt::from(257u32);
-        assert_eq!(modular_inverse(&BigInt::from(4u32), &modulus), Some(BigInt::from(193u32)));
-        assert_eq!(modular_inverse(&BigInt::from(0u32), &modulus), None);
+    fn canonical_sigma_has_expected_order() {
+        assert_eq!(
+            (0..4).filter_map(|j| canonical_sigma(j, 16, 4)).collect::<Vec<_>>(),
+            [1, 9, 17, 25]
+        );
+        assert!(canonical_sigma(4, 16, 4).is_none());
+        assert!(canonical_sigma(0, 12, 4).is_some());
+        assert!(canonical_sigma(0, 10, 4).is_none());
     }
 
     #[test]
-    fn flattened_two_input_index_is_row_major_for_all_power_of_two_widths() {
-        for width in [2usize, 4, 8] {
-            for u in 0..width {
-                for v in 0..width {
-                    assert_eq!(flattened_lut_index(u, v, width, width), Some(u + width * v));
-                }
-            }
-            assert_eq!(flattened_lut_index(width, 0, width, width), None);
-        }
-    }
-
-    struct RuntimeFixture {
-        parameters: DCRTPolyParams,
-        ring: Ring,
-        compiler: PowerLutEncodingCompiler,
-    }
-
-    impl RuntimeFixture {
-        fn new() -> Self {
-            Self::with_dimension(4)
-        }
-
-        fn with_dimension(ring_dimension: u32) -> Self {
-            let parameters = DCRTPolyParams::new(ring_dimension, 1, 17, 17);
-            let modulus = BigInt::from(parameters.modulus().as_ref().clone());
-            let ring = Ring::new(modulus.clone(), ring_dimension as usize);
-            let compiler = PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 131_072.into(),
-                digit_count: 1.into(),
-            });
-            Self { parameters, ring, compiler }
-        }
-
-        fn bound(&self, vector: mxx_dsl::Mat, public: mxx_dsl::Mat) -> BggEncodingWire {
-            BggEncodingWire {
-                vector,
-                pubkey: BggPublicKeyWire { matrix: public, reveal_plaintext: false },
-                plaintext: None,
-            }
-        }
-
-        fn helper(&self, index: usize) -> AutomorphismHelper {
-            // Nonzero companion/mask vectors exercise the RHS and mask paths;
-            // zero public projections keep the expected value a signed
-            // automorphism, making the permutation observable directly.
-            let zero = self.ring.zero((1, 1));
-            let nonzero = self.ring.polynomial([1.into()]);
-            let switch = PowerRhsPackage::new(
-                self.ring.polynomial([1.into()]),
-                vec![crate::rhs::PowerRhsCompanionBlock {
-                    vector: nonzero.clone(),
-                    public_matrix: zero.clone(),
-                }],
-            )
-            .unwrap();
-            AutomorphismHelper::new(index, switch, self.bound(nonzero, zero)).unwrap()
-        }
-
-        fn run(&self, name: &str, value: mxx_dsl::Mat) -> DCRTPolyMatrix {
-            let graph = DslContext::new(name).output("result", value).unwrap().build().unwrap();
-            let graph = graph
-                .validate(&ParamEnv::default())
-                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
-            let result = execute(
-                &graph,
-                &mut cpu_backend([self.parameters.clone()]),
-                std::collections::BTreeMap::new(),
-                &mut MemoryArtifactStore::default(),
-                SamplingMode::Fresh,
-            )
-            .unwrap();
-            let RuntimeValue::Matrix(value) = &result.outputs["result"] else { panic!("matrix") };
-            value.as_ref().clone()
-        }
-    }
-
-    #[test]
-    #[serial(dcrt_runtime)]
-    fn concrete_clear_coeff_and_single_lut_match_authoritative_polynomial_values() {
-        let fixture = RuntimeFixture::new();
-        let input = fixture.bound(
-            fixture.ring.polynomial([1.into(), 2.into(), 3.into(), 4.into()]),
-            fixture.ring.zero((1, 1)),
-        );
-        for (width, indices, table) in [
-            (2usize, vec![5usize], vec![0usize, 1]),
-            (4usize, vec![5usize, 3], vec![0usize, 1, 2, 3]),
-        ] {
-            let helpers =
-                indices.iter().copied().map(|index| fixture.helper(index)).collect::<Vec<_>>();
-            let cleared = fixture.compiler.clear_coeff(&input, width, &helpers).unwrap();
-            let actual = fixture.run("power-lut-clear-coeff-runtime", cleared.vector.clone());
-            let mut expected = DCRTPolyMatrix::from_poly_vec_row(
-                &fixture.parameters,
-                vec![DCRTPoly::from_u32s(&fixture.parameters, &[1, 2, 3, 4])],
-            );
-            for index in indices {
-                let transformed = expected.ring_automorphism_out_of_place(index);
-                expected = expected + transformed;
-            }
-            assert_eq!(actual, expected, "unnormalised ClearCoeff width {width}");
-            let lut_input =
-                fixture.bound(fixture.ring.polynomial([1.into()]), fixture.ring.zero((1, 1)));
-            let lut = fixture.compiler.single_input_lut(&lut_input, &table, &helpers).unwrap();
-            let actual = fixture.run("power-lut-single-lut-runtime", lut.vector.clone());
-            let expected = DCRTPolyMatrix::from_poly_vec_row(
-                &fixture.parameters,
-                vec![DCRTPoly::const_rotate_poly(&fixture.parameters, table[0])],
-            );
-            assert_eq!(actual, expected, "single-input LUT width {width}");
-        }
-    }
-
-    #[test]
-    #[serial(dcrt_runtime)]
-    fn fixed_secret_automorphism_alignment_matches_public_projection_and_runtime_value() {
-        let fixture = RuntimeFixture::new();
-        let input = fixture.bound(
-            fixture.ring.polynomial([1.into(), 2.into(), 3.into(), 4.into()]),
-            fixture.ring.zero((1, 1)),
-        );
-        let helper = fixture.helper(5);
-        let aligned = fixture.compiler.automorphism(&input, &helper).unwrap();
-        let public_helper = crate::public_key::AutomorphismPublicHelper::new(
-            helper.index(),
-            helper.switch().public_projection(),
-            helper.mask().pubkey.matrix.clone(),
-        );
-        let public = PowerLutPublicKeyCompiler::new(fixture.compiler.bgg.public_key.clone())
-            .automorphism(&input.pubkey.matrix, &public_helper)
-            .unwrap();
-        let graph = DslContext::new("power-lut-automorphism-runtime")
-            .output("vector", aligned.vector.clone())
-            .unwrap()
-            .output("public-derived", aligned.pubkey.matrix.clone())
-            .unwrap()
-            .output("public-only", public)
-            .unwrap()
-            .build()
-            .unwrap();
-        let graph = graph.validate(&ParamEnv::default()).unwrap();
-        let result = execute(
-            &graph,
-            &mut cpu_backend([fixture.parameters.clone()]),
-            std::collections::BTreeMap::new(),
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let RuntimeValue::Matrix(vector) = &result.outputs["vector"] else { panic!("matrix") };
-        let expected = DCRTPolyMatrix::from_poly_vec_row(
-            &fixture.parameters,
-            vec![DCRTPoly::from_u32s(&fixture.parameters, &[1, 2, 3, 4])],
-        )
-        .ring_automorphism_out_of_place(5);
-        assert_eq!(vector.as_ref(), &expected);
-        let RuntimeValue::Matrix(public_derived) = &result.outputs["public-derived"] else {
-            panic!("matrix")
-        };
-        let RuntimeValue::Matrix(public_only) = &result.outputs["public-only"] else {
-            panic!("matrix")
-        };
-        assert_eq!(public_derived, public_only, "public automorphism projection diverged");
-    }
-
-    #[test]
-    fn structural_one_hot_graph_does_not_unroll_family_elements() {
-        fn graph_node_count(family_count: usize) -> usize {
-            let ring = mxx_dsl::Ring::new(257, 4);
-            let compiler = PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 2.into(),
-                digit_count: 1.into(),
-            });
-            let mut builder = crate::program::PowerLutProgramBuilder::new();
-            let input = builder.input(1).unwrap();
-            let selector_family = builder.rhs_family(1).unwrap();
-            let public_value_family = builder.public_value_family(1).unwrap();
-            let lut = builder.lut(crate::program::LutTable::unary(1, 1, vec![0]).unwrap()).unwrap();
-            let selected = builder
-                .one_hot(
-                    builder.input_wire(input).unwrap(),
-                    selector_family,
-                    public_value_family,
-                    lut,
-                )
-                .unwrap();
-            builder.output(selected).unwrap();
-            let program = builder.build().unwrap();
-
-            let gsw = ring.input_family("structural-gsw", family_count, (1, 1));
-            let vectors = ring.input_family("structural-vectors", family_count, (1, 1));
-            let publics = ring.input_family("structural-publics", family_count, (1, 1));
-            let selectors = EncodingSelectorFamily::new(gsw, vec![(vectors, publics)]).unwrap();
-            let values = ring.input_family("structural-values", family_count, (1, 1));
-            let mut ranges = ProgramFamilyRanges::new();
-            let range = FamilyRange::full(family_count).unwrap();
-            ranges.selector(selector_family, range.clone());
-            ranges.public_values(public_value_family, range);
-            let lhs = BggEncodingWire {
-                vector: ring.input("structural-lhs-vector", (1, 1)),
-                pubkey: BggPublicKeyWire {
-                    matrix: ring.input("structural-lhs-public", (1, 1)),
-                    reveal_plaintext: false,
-                },
-                plaintext: None,
-            };
-            let wires = compiler
-                .compile_program_with_ranges(
-                    &program,
-                    &BTreeMap::from([(input, lhs)]),
-                    &BTreeMap::new(),
-                    &BTreeMap::from([(selector_family, selectors)]),
-                    &BTreeMap::from([(public_value_family, values)]),
-                    &ranges,
-                    &[],
-                )
-                .unwrap();
-            let output = wires.get(&selected).unwrap();
-            DslContext::new(format!("power-lut-structural-one-hot-{family_count}"))
-                .output("vector", output.vector.clone())
-                .unwrap()
-                .build()
-                .unwrap()
-                .graph
-                .root_scope()
-                .nodes()
-                .len()
-        }
-
-        let small = graph_node_count(1);
-        for count in [2, 3, 5, 6, 8] {
-            let nodes = graph_node_count(count);
-            assert!(nodes >= small, "structural reduction must build for count {count}");
-        }
-        let large = graph_node_count(64);
-        assert!(
-            large < small * 8,
-            "family cardinality should add structural rounds, not one graph node per element"
-        );
-    }
-
-    #[test]
-    fn one_hot_nonuniform_bucket_range_gathers_before_fuse() {
-        let ring = mxx_dsl::Ring::new(257, 4);
-        let compiler = PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
-            ring: ring.clone(),
-            base: 2.into(),
-            digit_count: 1.into(),
-        });
-        let mut builder = crate::program::PowerLutProgramBuilder::new();
-        let input = builder.input(1).unwrap();
-        let selector_family = builder.rhs_family(1).unwrap();
-        let public_value_family = builder.public_value_family(1).unwrap();
-        let lut = builder.lut(crate::program::LutTable::unary(1, 1, vec![0]).unwrap()).unwrap();
-        let selected = builder
-            .one_hot(builder.input_wire(input).unwrap(), selector_family, public_value_family, lut)
-            .unwrap();
-        builder.output(selected).unwrap();
-        let program = builder.build().unwrap();
-
-        let family_count = 16;
-        let production = mxx_ir_core::artifact::ProductionId {
-            spec_hash: mxx_ir_core::artifact::SpecHash([1; 32]),
-            execution_nonce: [2; 32],
-        };
-        let gsw = ring.family_artifact_input(
-            production.clone(),
-            "nonuniform-gsw",
-            family_count,
-            (1, 1),
-            mxx_ir_core::artifact::ArtifactConfidentiality::Private,
-        );
-        let vectors = ring.family_artifact_input(
-            production.clone(),
-            "nonuniform-vectors",
-            family_count,
-            (1, 1),
-            mxx_ir_core::artifact::ArtifactConfidentiality::Public,
-        );
-        let publics = ring.family_artifact_input(
-            production.clone(),
-            "nonuniform-publics",
-            family_count,
-            (1, 1),
-            mxx_ir_core::artifact::ArtifactConfidentiality::Public,
-        );
-        let selectors = EncodingSelectorFamily::new(gsw, vec![(vectors, publics)]).unwrap();
-        let values = ring.family_artifact_input(
-            production,
-            "nonuniform-values",
-            family_count,
-            (1, 1),
-            mxx_ir_core::artifact::ArtifactConfidentiality::Public,
-        );
-        let mut ranges = ProgramFamilyRanges::new();
-        let range = FamilyRange::bounded(2usize, 3usize, 8).unwrap();
-        ranges.selector(selector_family, range.clone());
-        ranges.public_values(public_value_family, range);
-        let lhs = BggEncodingWire {
-            vector: ring.input("nonuniform-lhs-vector", (1, 1)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input("nonuniform-lhs-public", (1, 1)),
-                reveal_plaintext: false,
+    fn encoding_sampler_batches_and_core_rejects_invalid_bindings() {
+        let ring = Ring::new(97, 4);
+        let sampler = PowerLutEncodingSampler {
+            layout: mxx_bgg::BggSamplerLayout {
+                modulus: 97.into(),
+                ring_dimension: 4.into(),
+                secret_dimension: 2,
+                digit_count: 2,
+                gadget_base: 4.into(),
             },
-            plaintext: None,
-        };
-        let wires = compiler
-            .compile_program_with_ranges(
-                &program,
-                &BTreeMap::from([(input, lhs)]),
-                &BTreeMap::new(),
-                &BTreeMap::from([(selector_family, selectors)]),
-                &BTreeMap::from([(public_value_family, values)]),
-                &ranges,
-                &[],
-            )
-            .unwrap();
-        let graph = DslContext::new("power-lut-nonuniform-encoding-one-hot")
-            .output("result", wires[&selected].vector.clone())
-            .unwrap()
-            .build()
-            .unwrap();
-        let all_nodes =
-            graph.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
-        let parallel_loops = graph
-            .graph
-            .root_scope()
-            .nodes()
-            .iter()
-            .filter(|node| matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(_)))
-            .count();
-        assert!(parallel_loops >= 2, "range gathers and Fuse must remain structural loops");
-        assert!(graph.graph.root_scope().nodes().iter().any(|node| matches!(
-            node.kind(),
-            mxx_ir_core::node::NodeKind::ParallelLoop(spec)
-                if spec.count == mxx_ir_core::IntExpr::constant(8)
-        )));
-        assert!(all_nodes.iter().any(|node| matches!(
-            node.kind(),
-            mxx_ir_core::node::NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Remainder)
-        )));
-        assert!(all_nodes.iter().any(|node| matches!(
-            node.kind(),
-            mxx_ir_core::node::NodeKind::LiftIntegerToConstantPolynomial { .. }
-        )));
-        let weighted_loop_has_no_singleton_pack = graph
-            .graph
-            .root_scope()
-            .nodes()
-            .iter()
-            .filter_map(|node| match node.kind() {
-                mxx_ir_core::node::NodeKind::ParallelLoop(spec)
-                    if spec.count == mxx_ir_core::IntExpr::constant(8) &&
-                        spec.input_modes
-                            .iter()
-                            .position(|mode| {
-                                matches!(mode, mxx_ir_core::node::LoopInputMode::Broadcast)
-                            })
-                            .is_some_and(|first_broadcast| {
-                                spec.input_modes[..first_broadcast].iter().all(|mode| {
-                                    matches!(mode, mxx_ir_core::node::LoopInputMode::Zip)
-                                }) && spec.input_modes[first_broadcast..].iter().all(|mode| {
-                                    matches!(mode, mxx_ir_core::node::LoopInputMode::Broadcast)
-                                })
-                            }) =>
-                {
-                    graph.graph.root_scope().node_id(node).and_then(|id| {
-                        graph
-                            .graph
-                            .child_scope_id(&mxx_ir_core::graph::FrozenGraphScopeId::Root, id)
-                    })
-                }
-                _ => None,
-            })
-            .any(|scope_id| {
-                graph.graph.scope(&scope_id).unwrap().nodes().iter().all(|node| {
-                    !matches!(
-                        node.kind(),
-                        mxx_ir_core::node::NodeKind::FamilyPack { count }
-                            if *count == mxx_ir_core::IntExpr::constant(1)
-                    )
-                })
-            });
-        assert!(weighted_loop_has_no_singleton_pack);
-    }
-
-    #[test]
-    #[serial(dcrt_runtime)]
-    fn variable_width_one_hot_indices_wrap_and_mask_inactive_lanes() {
-        let parameters = DCRTPolyParams::new(4, 1, 17, 4);
-        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
-        let ring = Ring::new(modulus, 4);
-        let (indices, masks) = super::one_hot_indices_and_masks(
-            8,
-            mxx_dsl::Int::constant(3),
-            mxx_dsl::Int::constant(2),
-            ring.matrix_type((1, 1)),
-        )
-        .unwrap();
-        let mut context = DslContext::new("power-lut-variable-width-one-hot-indices")
-            .int_family_output("indices", indices)
-            .unwrap();
-        for offset in 0..8 {
-            context = context.output(format!("mask-{offset}"), masks.get_static(offset)).unwrap();
-        }
-        let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
-        let result = execute(
-            &graph,
-            &mut cpu_backend([parameters.clone()]),
-            BTreeMap::new(),
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let RuntimeValue::IndexedFamily(indexes) = &result.outputs["indices"] else {
-            panic!("one-hot indices output must be a family")
-        };
-        let indexes = indexes
-            .iter()
-            .map(|value| {
-                let RuntimeValue::Int(value) = value else { panic!("one-hot index must be int") };
-                value.to_usize().unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(indexes, vec![2, 3, 4, 2, 3, 4, 2, 3]);
-        assert!(indexes.iter().all(|&index| (2..5).contains(&index)));
-
-        let zero = DCRTPolyMatrix::zero(&parameters, 1, 1);
-        for offset in 3..8 {
-            let mask = &result.outputs[&format!("mask-{offset}")];
-            let RuntimeValue::Matrix(mask) = mask else { panic!("one-hot mask must be matrix") };
-            assert_eq!(mask.as_ref(), &zero, "inactive offset {offset} must be masked");
-        }
-    }
-
-    #[test]
-    fn clear_coeff_rejects_helpers_in_the_wrong_round_order() {
-        let fixture = RuntimeFixture::new();
-        let input = fixture.bound(
-            fixture.ring.polynomial([1.into(), 2.into(), 3.into(), 4.into()]),
-            fixture.ring.zero((1, 1)),
-        );
-        let first = fixture.helper(5);
-        let second = fixture.helper(3);
-        assert!(matches!(
-            fixture.compiler.clear_coeff(&input, 4, &[second, first]),
-            Err(PowerLutError::InvalidAutomorphismHelper)
-        ));
-    }
-
-    #[test]
-    fn automorphism_helper_rejects_incompatible_mask_shapes() {
-        let ring = Ring::new(257, 4);
-        let zero = ring.zero((1, 1));
-        let switch = PowerRhsPackage::new(
-            zero.clone(),
-            vec![crate::rhs::PowerRhsCompanionBlock {
-                vector: zero.clone(),
-                public_matrix: zero.clone(),
-            }],
-        )
-        .unwrap();
-
-        let mismatched_width = BggEncodingWire {
-            vector: ring.zero((1, 2)),
-            pubkey: BggPublicKeyWire { matrix: ring.zero((1, 1)), reveal_plaintext: false },
-            plaintext: None,
-        };
-        assert!(matches!(
-            AutomorphismHelper::new(5, switch.clone(), mismatched_width),
-            Err(PowerLutError::InvalidAutomorphismHelper)
-        ));
-
-        let mismatched_rows = BggEncodingWire {
-            vector: ring.zero((2, 1)),
-            pubkey: BggPublicKeyWire { matrix: ring.zero((1, 1)), reveal_plaintext: false },
-            plaintext: None,
-        };
-        assert!(matches!(
-            AutomorphismHelper::new(5, switch, mismatched_rows),
-            Err(PowerLutError::InvalidAutomorphismHelper)
-        ));
-    }
-
-    #[test]
-    fn sampler_reuses_canonical_helper_indices_and_builds_private_material() {
-        let layout = mxx_bgg::BggSamplerLayout {
-            modulus: 257.into(),
-            ring_dimension: 4.into(),
-            secret_dimension: 2,
-            digit_count: 2,
-            gadget_base: 2.into(),
-        };
-        let ring = layout.ring();
-        let sampler = super::PowerLutEncodingSampler {
-            layout,
             gaussian_sigma: None,
             gaussian_max_coefficient_bound: None,
         };
-        assert_eq!(sampler.automorphism_helper_indices(4).unwrap(), vec![5, 3]);
-        let helpers = sampler
-            .sample_automorphism_helpers(
-                ring.input("global-secret", (1, 2)),
-                ring.bytes_input("public-hash-key", 32),
-                &b"helper-sampler"[..],
-                4,
+        let mask = ring.input("batch-mask", (1, 2));
+        let plaintexts = [ring.identity(1), ring.polynomial([1.into()])];
+        let hash_key = ring.bytes_input("batch-hash", 32);
+        let batch = sampler
+            .sample_input_encodings(
+                mask.clone(),
+                None,
+                hash_key.clone(),
+                b"batch-inputs".as_slice(),
+                &plaintexts,
             )
             .unwrap();
-        assert_eq!(helpers.iter().map(AutomorphismHelper::index).collect::<Vec<_>>(), vec![5, 3]);
-        let mut context = DslContext::new("power-lut-helper-sampler-shapes");
-        for (round, helper) in helpers.iter().enumerate() {
-            context = context
-                .output(format!("mask-{round}"), helper.mask().vector.clone())
-                .unwrap()
-                .output(format!("switch-{round}"), helper.switch().gsw_ciphertext().clone())
-                .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(batch.iter().all(|encoding| encoding.plaintext.is_none()));
+        let public_keys = mxx_bgg::BggPublicKeySampler { layout: sampler.layout.clone() }
+            .sample(hash_key.clone(), b"batch-inputs".as_slice(), &[false, false])
+            .into_iter()
+            .skip(1)
+            .collect::<Vec<_>>();
+        let independently_bound = sampler
+            .sample_encodings_for_public_matrices(mask, None, &public_keys, &plaintexts)
+            .unwrap();
+        assert_eq!(
+            batch[0].pubkey.matrix.matrix_type(),
+            independently_bound[0].pubkey.matrix.matrix_type()
+        );
+        let public_keys_again = PowerLutPublicKeySampler { layout: sampler.layout.clone() }
+            .sample_input_keys(hash_key, b"batch-inputs".as_slice(), 2)
+            .unwrap();
+        for index in 0..2 {
+            assert_eq!(
+                batch[index].pubkey.matrix.value_handle().node().kind(),
+                independently_bound[index].pubkey.matrix.value_handle().node().kind()
+            );
+            assert_eq!(
+                batch[index].pubkey.matrix.value_handle().node().kind(),
+                public_keys_again[index].matrix.value_handle().node().kind()
+            );
         }
-        context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+        assert!(
+            sampler
+                .sample_encodings_for_public_matrices(
+                    ring.input("mismatch-mask", (1, 2)),
+                    None,
+                    &public_keys,
+                    &plaintexts[..1],
+                )
+                .is_err()
+        );
+        let revealing_key = mxx_bgg::BggPublicKeySampler { layout: sampler.layout.clone() }
+            .sample(ring.bytes_input("reveal-hash", 32), b"reveal".as_slice(), &[true])
+            .into_iter()
+            .nth(1)
+            .unwrap();
+        assert!(
+            sampler
+                .sample_encodings_for_public_matrices(
+                    ring.input("reveal-mask", (1, 2)),
+                    None,
+                    std::slice::from_ref(&revealing_key),
+                    std::slice::from_ref(&plaintexts[0]),
+                )
+                .is_err()
+        );
     }
 
     #[test]
-    #[serial(dcrt_runtime)]
-    fn private_and_public_samplers_produce_the_same_public_setup_matrices() {
-        let parameters = DCRTPolyParams::new(4, 1, 17, 17);
+    fn input_batch_public_matrices_match_in_runtime_order() {
+        let parameters = DCRTPolyParams::new(4, 1, 20, 4);
+        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let layout = mxx_bgg::BggSamplerLayout {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()).into(),
+            modulus: modulus.into(),
             ring_dimension: 4.into(),
             secret_dimension: 2,
             digit_count: 2,
-            gadget_base: 2.into(),
+            gadget_base: 16.into(),
         };
         let ring = layout.ring();
-        let hash_key = ring.bytes_input("sampler-public-key", 32);
-        let secret = ring.input("sampler-secret", (1, 2));
-        let encoding_sampler = super::PowerLutEncodingSampler {
+        let sampler = PowerLutEncodingSampler {
             layout: layout.clone(),
             gaussian_sigma: None,
             gaussian_max_coefficient_bound: None,
         };
-        let private_input = encoding_sampler
-            .sample_input_encoding(
-                secret.clone(),
+        let public_sampler = PowerLutPublicKeySampler { layout };
+        let hash_key = ring.bytes_input("batch-runtime-hash", 32);
+        let plaintexts = [ring.polynomial([1.into()]), ring.polynomial([2.into()])];
+        let mask_secret = ring.input("batch-runtime-mask", (1, 2));
+        let encoded = sampler
+            .sample_input_encodings(
+                mask_secret,
+                None,
                 hash_key.clone(),
-                &b"input-setup"[..],
-                ring.polynomial([5.into()]),
+                b"batch-runtime".as_slice(),
+                &plaintexts,
             )
             .unwrap();
-        let private_helpers = encoding_sampler
-            .sample_automorphism_helpers(secret, hash_key.clone(), &b"helper-setup"[..], 4)
-            .unwrap();
-        assert!(private_input.plaintext.is_none());
-        assert!(!private_input.pubkey.reveal_plaintext);
-        for helper in &private_helpers {
-            assert!(helper.mask().plaintext.is_none());
-            assert!(!helper.mask().pubkey.reveal_plaintext);
-            for companion in 0..helper.switch().companion_count() {
-                assert!(
-                    helper.switch().companion(0, companion, layout.public_key_columns()).is_some()
-                );
-            }
-        }
-        let public_sampler = PowerLutPublicKeySampler { layout: layout.clone() };
-        let public_input =
-            public_sampler.sample_input_key(hash_key.clone(), &b"input-setup"[..]).unwrap();
-        assert!(!public_input.reveal_plaintext);
-        let public_helpers =
-            public_sampler.sample_automorphism_helpers(hash_key, &b"helper-setup"[..], 4).unwrap();
-
-        let columns = layout.public_key_columns();
-        let mut context = DslContext::new("power-lut-sampler-public-setup-equality")
-            .output("private-input", private_input.pubkey.matrix)
-            .unwrap()
-            .output("public-input", public_input.matrix)
-            .unwrap();
-        for (round, (private, public)) in
-            private_helpers.iter().zip(public_helpers.iter()).enumerate()
-        {
+        let public =
+            public_sampler.sample_input_keys(hash_key, b"batch-runtime".as_slice(), 2).unwrap();
+        let mut context = DslContext::new("batch-runtime-public-equivalence");
+        for index in 0..2 {
             context = context
-                .output(format!("private-mask-{round}"), private.mask().pubkey.matrix.clone())
+                .output(format!("encoded-{index}"), encoded[index].pubkey.matrix.clone())
                 .unwrap()
-                .output(format!("public-mask-{round}"), public.mask().clone())
-                .unwrap()
-                .output(
-                    format!("private-switch-{round}"),
-                    private.switch().companion(0, 0, columns).unwrap().public_matrix.clone(),
-                )
-                .unwrap()
-                .output(
-                    format!("public-switch-{round}"),
-                    public.switch().companion(0, 0, columns).unwrap().clone(),
-                )
+                .output(format!("public-{index}"), public[index].matrix.clone())
                 .unwrap();
-            for row in 0..layout.secret_dimension {
-                for column in 0..columns {
-                    let private_block = private.switch().companion(row, column, columns).unwrap();
-                    let public_block = public.switch().companion(row, column, columns).unwrap();
-                    let mut block_context = DslContext::new(format!(
-                        "power-lut-sampler-public-setup-block-{round}-{row}-{column}"
-                    ));
-                    block_context = block_context
-                        .output("private", private_block.public_matrix.clone())
-                        .unwrap()
-                        .output("public", public_block.clone())
-                        .unwrap();
-                    let block_graph =
-                        block_context.build().unwrap().validate(&ParamEnv::default()).unwrap();
-                    let block_result = execute(
-                        &block_graph,
-                        &mut cpu_backend([parameters.clone()]),
-                        BTreeMap::from([(
-                            "sampler-public-key".to_owned(),
-                            RuntimeValue::Bytes(vec![0x42; 32]),
-                        )]),
-                        &mut MemoryArtifactStore::default(),
-                        SamplingMode::Fresh,
-                    )
-                    .unwrap();
-                    let RuntimeValue::Matrix(private_value) = &block_result.outputs["private"]
-                    else {
-                        panic!("private switch companion")
-                    };
-                    let RuntimeValue::Matrix(public_value) = &block_result.outputs["public"] else {
-                        panic!("public switch companion")
-                    };
-                    assert_eq!(private_value, public_value);
-                }
-            }
         }
         let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
         let result = execute(
             &graph,
             &mut cpu_backend([parameters]),
             BTreeMap::from([(
-                "sampler-public-key".to_owned(),
-                RuntimeValue::Bytes(vec![0x42; 32]),
+                "batch-runtime-hash".to_owned(),
+                RuntimeValue::Bytes(vec![0x63; 32]),
             )]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
         )
         .unwrap();
-        for name in ["input", "mask-0", "mask-1", "switch-0", "switch-1"] {
-            let RuntimeValue::Matrix(private) = &result.outputs[&format!("private-{name}")] else {
-                panic!("private sampler output is not a matrix")
+        for index in 0..2 {
+            let RuntimeValue::Matrix(encoded_matrix) = &result.outputs[&format!("encoded-{index}")]
+            else {
+                panic!("encoded matrix output")
             };
-            let RuntimeValue::Matrix(public) = &result.outputs[&format!("public-{name}")] else {
-                panic!("public sampler output is not a matrix")
+            let RuntimeValue::Matrix(public_matrix) = &result.outputs[&format!("public-{index}")]
+            else {
+                panic!("public matrix output")
             };
             assert_eq!(
-                private.as_ref(),
-                public.as_ref(),
-                "sampler public matrix mismatch for {name}"
+                encoded_matrix.as_ref(),
+                public_matrix.as_ref(),
+                "batch member {index} differs"
             );
         }
     }
 
     #[test]
-    fn rhs_sampling_and_fuse_never_slice_a_decomposition_result() {
-        let layout = mxx_bgg::BggSamplerLayout {
-            modulus: 257.into(),
-            ring_dimension: 4.into(),
-            secret_dimension: 2,
-            digit_count: 2,
-            gadget_base: 2.into(),
-        };
-        let ring = layout.ring();
-        let sampler = super::PowerLutEncodingSampler {
-            layout,
+    fn fixed_rhs_top_is_domain_separated_and_hash_derived() {
+        let ring = Ring::new(97, 4);
+        let sampler = PowerLutEncodingSampler {
+            layout: mxx_bgg::BggSamplerLayout {
+                modulus: 97.into(),
+                ring_dimension: 4.into(),
+                secret_dimension: 2,
+                digit_count: 2,
+                gadget_base: 4.into(),
+            },
             gaussian_sigma: None,
             gaussian_max_coefficient_bound: None,
         };
-        let helpers = sampler
-            .sample_automorphism_helpers(
-                ring.input("shape-secret", (1, 2)),
-                ring.bytes_input("shape-hash", 32),
-                &b"shape-test"[..],
-                2,
+        let secret = ring.input("fixed-rhs-secret", (1, 2));
+        let target = ring.input("fixed-rhs-target", (1, 2));
+        let payload = ring.input("fixed-rhs-payload", (1, 2));
+        let hash_key = ring.bytes_input("fixed-rhs-hash", 32);
+        let first = sampler
+            .sample_cross_secret_rhs(
+                secret.clone(),
+                target.clone(),
+                payload.clone(),
+                hash_key.clone(),
+                b"fixed-rhs-test".as_slice(),
             )
             .unwrap();
-        let mut context = DslContext::new("power-lut-no-decomposition-slices");
-        for helper in &helpers {
-            context = context
-                .output("switch-gsw", helper.switch().gsw_ciphertext().clone())
-                .unwrap()
-                .output(
-                    "switch-companion",
-                    helper.switch().companion(0, 0, 4).unwrap().vector.clone(),
-                )
-                .unwrap();
-        }
-        let graph = context.build().unwrap();
-        let slices_over_decomposition =
-            graph.graph.scopes().values().flat_map(|scope| scope.nodes()).any(|node| {
-                matches!(node.kind(), NodeKind::Slice { .. }) &&
-                    node.arguments().iter().any(|argument| {
-                        matches!(argument.node().kind(), NodeKind::GadgetDecompose { .. })
-                    })
-            });
-        assert!(!slices_over_decomposition);
+        let repeated = sampler
+            .sample_cross_secret_rhs(
+                secret.clone(),
+                target.clone(),
+                payload.clone(),
+                hash_key.clone(),
+                b"fixed-rhs-test".as_slice(),
+            )
+            .unwrap();
+        let different_tag = sampler
+            .sample_cross_secret_rhs(
+                secret,
+                target,
+                payload,
+                hash_key.clone(),
+                b"fixed-rhs-other".as_slice(),
+            )
+            .unwrap();
+        let top_kind = |rhs: &PowerRhsPackage| {
+            rhs.gsw_ciphertext()
+                .value_handle()
+                .node()
+                .arguments()
+                .first()
+                .expect("fixed-RHS top row")
+                .node()
+                .kind()
+                .clone()
+        };
+        let mut expected_tag = HashTag::from(b"fixed-rhs-test".as_slice());
+        expected_tag.push("power-lut/fixed-rhs/top/v1");
+        let expected = ring.hash_matrix(
+            hash_key,
+            expected_tag,
+            (sampler.layout.secret_dimension - 1, sampler.layout.public_key_columns()),
+        );
+        assert_eq!(top_kind(&first), expected.value_handle().node().kind().clone());
+        assert_eq!(top_kind(&first), top_kind(&repeated));
+        assert_ne!(top_kind(&first), top_kind(&different_tag));
     }
 
     #[test]
-    fn private_fuse_shares_one_lhs_public_decomposition() {
-        let ring = Ring::new(257, 4);
+    fn fixed_fuse_uses_one_c_decomposition_for_vector_and_public_matrix() {
+        let ring = Ring::new(97, 4);
         let compiler = PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
             ring: ring.clone(),
-            base: 8.into(),
+            base: 4.into(),
             digit_count: 2.into(),
         });
         let lhs = BggEncodingWire {
-            vector: ring.input("fuse-lhs-vector", (1, 2)),
+            vector: ring.zero((1, 2)),
+            pubkey: BggPublicKeyWire { matrix: ring.zero((2, 2)), reveal_plaintext: false },
+            plaintext: None,
+        };
+        let rhs = PowerRhsPackage::new(ring.zero((2, 2))).unwrap();
+        let output = compiler.fuse(&lhs, &rhs).unwrap();
+        let c_decomposition = rhs.gsw_ciphertext().clone().decompose(4, 2).as_mat();
+        assert_eq!(
+            output.vector.matrix_type(),
+            (ring.zero((1, 2)) * c_decomposition.clone()).matrix_type()
+        );
+        assert_eq!(
+            output.pubkey.matrix.matrix_type(),
+            (ring.zero((2, 2)) * c_decomposition).matrix_type()
+        );
+        assert!(matches!(
+            output.vector.value_handle().node().kind(),
+            mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply)
+        ));
+        assert!(matches!(
+            output.pubkey.matrix.value_handle().node().kind(),
+            mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply)
+        ));
+    }
+
+    #[test]
+    fn helper_set_rejects_a_different_lut_table() {
+        let ring = Ring::new(97, 4);
+        let rhs = PowerRhsPackage::new(ring.zero((2, 2))).unwrap();
+        let mask = BggEncodingWire {
+            vector: ring.zero((1, 2)),
+            pubkey: BggPublicKeyWire { matrix: ring.zero((2, 2)), reveal_plaintext: false },
+            plaintext: None,
+        };
+        let helper = FlatLutHelper::new(1, rhs, mask).unwrap();
+        let table = LutTable::unary(1, 2, vec![0]).unwrap();
+        let other = LutTable::unary(1, 2, vec![1]).unwrap();
+        let same_values_scalar = LutTable::unary_scalar(1, 2, vec![0]).unwrap();
+        let set = FlatLutHelperSet::new(&table, vec![helper]).unwrap();
+        assert!(set.resolve(&table).is_ok());
+        assert!(set.resolve(&other).is_err());
+        // The output algebra is part of the commitment: a scalar helper set
+        // must never be accepted for an otherwise identical monomial table.
+        assert!(set.resolve(&same_values_scalar).is_err());
+    }
+
+    #[test]
+    fn flat_sampler_supports_shared_and_distinct_payload_secrets() {
+        let ring = Ring::new(97, 4);
+        let sampler = super::PowerLutEncodingSampler {
+            layout: mxx_bgg::BggSamplerLayout {
+                modulus: 97.into(),
+                ring_dimension: 4.into(),
+                secret_dimension: 2,
+                digit_count: 2,
+                gadget_base: 4.into(),
+            },
+            gaussian_sigma: None,
+            gaussian_max_coefficient_bound: None,
+        };
+        let mask = ring.input("flat-mask", (1, 2));
+        let payload = ring.input("flat-payload", (1, 2));
+        let hash_key = ring.bytes_input("flat-hash", 32);
+        let table = LutTable::unary(2, 4, vec![0, 1]).unwrap();
+        let bank = sampler
+            .sample_flat_mask_bank(mask.clone(), hash_key.clone(), 2, b"flat-bank".as_slice())
+            .unwrap();
+        let shared = sampler
+            .sample_flat_helpers_for_lut(
+                mask.clone(),
+                None,
+                hash_key.clone(),
+                &table,
+                bank.as_ref(),
+                b"shared".as_slice(),
+            )
+            .unwrap();
+        let distinct = sampler
+            .sample_flat_helpers_for_lut(
+                mask,
+                Some(payload),
+                hash_key,
+                &table,
+                bank.as_ref(),
+                b"distinct".as_slice(),
+            )
+            .unwrap();
+        assert_eq!(shared.len(), 2);
+        assert_eq!(distinct.len(), 2);
+        assert_ne!(
+            shared[0].switch().gsw_ciphertext().value_handle().node(),
+            distinct[0].switch().gsw_ciphertext().value_handle().node()
+        );
+    }
+
+    #[test]
+    fn flat_mask_bank_reuses_branches_across_lut_widths() {
+        let ring = Ring::new(97, 16);
+        let sampler = super::PowerLutEncodingSampler {
+            layout: mxx_bgg::BggSamplerLayout {
+                modulus: 97.into(),
+                ring_dimension: 16.into(),
+                secret_dimension: 2,
+                digit_count: 2,
+                gadget_base: 4.into(),
+            },
+            gaussian_sigma: None,
+            gaussian_max_coefficient_bound: None,
+        };
+        let mask = ring.input("mask-bank-secret", (1, 2));
+        let hash_key = ring.bytes_input("mask-bank-hash", 32);
+        let bank = sampler
+            .sample_flat_mask_bank(mask.clone(), hash_key.clone(), 4, b"mask-bank".as_slice())
+            .unwrap();
+        assert_eq!(bank.sigmas().collect::<Vec<_>>(), [1, 9, 17, 25]);
+        let public_bank = PowerLutPublicKeySampler { layout: sampler.layout.clone() }
+            .sample_flat_mask_bank(hash_key.clone(), 4, b"mask-bank".as_slice())
+            .unwrap();
+        for (index, sigma) in bank.sigmas().enumerate() {
+            let private_matrix = &bank.branch(index).unwrap().mask.pubkey.matrix;
+            let public_matrix = public_bank.matrix(index).unwrap();
+            assert_eq!(
+                private_matrix.value_handle().node().kind(),
+                public_matrix.value_handle().node().kind()
+            );
+            assert_eq!(private_matrix.matrix_type(), public_matrix.matrix_type());
+            assert_eq!(sigma, bank.branch(index).unwrap().sigma);
+        }
+        let wide = LutTable::unary(4, 16, vec![0, 1, 2, 3]).unwrap();
+        let same_width = LutTable::unary(4, 16, vec![3, 2, 1, 0]).unwrap();
+        let narrow = LutTable::unary(2, 16, vec![0, 1]).unwrap();
+        let wide_helpers = sampler
+            .sample_flat_helpers_for_lut(
+                mask.clone(),
+                None,
+                hash_key.clone(),
+                &wide,
+                bank.as_ref(),
+                b"wide".as_slice(),
+            )
+            .unwrap();
+        let same_width_helpers = sampler
+            .sample_flat_helpers_for_lut(
+                mask.clone(),
+                None,
+                hash_key.clone(),
+                &same_width,
+                bank.as_ref(),
+                b"same-width".as_slice(),
+            )
+            .unwrap();
+        let narrow_helpers = sampler
+            .sample_flat_helpers_for_lut(
+                mask,
+                None,
+                hash_key,
+                &narrow,
+                bank.as_ref(),
+                b"narrow".as_slice(),
+            )
+            .unwrap();
+        assert_eq!(
+            wide_helpers[0].mask().pubkey.matrix.value_handle().node(),
+            narrow_helpers[0].mask().pubkey.matrix.value_handle().node()
+        );
+        assert_eq!(
+            wide_helpers[2].mask().pubkey.matrix.value_handle().node(),
+            narrow_helpers[1].mask().pubkey.matrix.value_handle().node()
+        );
+        assert_eq!(
+            wide_helpers[0].mask().pubkey.matrix.value_handle().node(),
+            same_width_helpers[0].mask().pubkey.matrix.value_handle().node()
+        );
+        assert_ne!(
+            wide_helpers[0].switch().gsw_ciphertext().value_handle().node(),
+            same_width_helpers[0].switch().gsw_ciphertext().value_handle().node()
+        );
+        let wide_set = FlatLutHelperSet::new(&wide, wide_helpers).unwrap();
+        let same_width_set = FlatLutHelperSet::new(&same_width, same_width_helpers).unwrap();
+        assert_ne!(wide_set.metadata().0, same_width_set.metadata().0);
+        assert_ne!(
+            wide_set.metadata().0,
+            FlatLutHelperSet::new(&narrow, narrow_helpers).unwrap().metadata().0
+        );
+    }
+
+    #[test]
+    fn flat_lut_branches_are_lowered_in_one_structural_parallel_loop() {
+        let ring = Ring::new(97, 4);
+        let compiler = PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
+            ring: ring.clone(),
+            base: 4.into(),
+            digit_count: 2.into(),
+        });
+        let input = BggEncodingWire {
+            vector: ring.input("flat-input-vector", (1, 2)),
             pubkey: BggPublicKeyWire {
-                matrix: ring.input("fuse-lhs-public", (1, 2)),
+                matrix: ring.input("flat-input-public", (2, 2)),
                 reveal_plaintext: false,
             },
             plaintext: None,
         };
-        let rhs = PowerRhsPackage::new(
-            ring.input("fuse-gsw", (1, 2)),
-            vec![
-                PowerRhsCompanionBlock {
-                    vector: ring.input("fuse-companion-vector", (1, 4)),
-                    public_matrix: ring.input("fuse-companion-public", (1, 4)),
+        let make_helper = |sigma| {
+            FlatLutHelper::new(
+                sigma,
+                PowerRhsPackage::new(ring.zero((2, 2))).unwrap(),
+                BggEncodingWire {
+                    vector: ring.zero((1, 2)),
+                    pubkey: BggPublicKeyWire { matrix: ring.zero((2, 2)), reveal_plaintext: false },
+                    plaintext: None,
                 },
-                PowerRhsCompanionBlock {
-                    vector: ring.input("fuse-companion-vector-1", (1, 4)),
-                    public_matrix: ring.input("fuse-companion-public-1", (1, 4)),
-                },
-            ],
-        )
-        .unwrap();
-        let fused = compiler.fuse(&lhs, &rhs).unwrap();
-        let graph = DslContext::new("power-lut-private-fuse-shared-decomposition")
-            .output("vector", fused.vector)
+            )
             .unwrap()
-            .output("public", fused.pubkey.matrix)
+        };
+        let output =
+            compiler.single_input_lut(&input, &[0, 1], &[make_helper(1), make_helper(5)]).unwrap();
+        let graph = DslContext::new("flat-lut-structural-loop")
+            .output("vector", output.vector)
             .unwrap()
             .build()
             .unwrap();
-        let nodes =
-            graph.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
-        let decompositions = nodes
-            .iter()
-            .filter(|node| matches!(node.kind(), NodeKind::GadgetDecompose { .. }))
-            .collect::<Vec<_>>();
-        let lhs_decompositions = decompositions
-            .iter()
-            .filter(|node| {
-                node.arguments().first().is_some_and(|argument| {
-                    matches!(argument.node().kind(), NodeKind::Input { name, .. } if name == "fuse-lhs-public")
-                })
-            })
-            .count();
-        let gsw_decompositions = decompositions
-            .iter()
-            .filter(|node| {
-                node.arguments().first().is_some_and(|argument| {
-                    matches!(argument.node().kind(), NodeKind::Slice { .. })
-                })
-            })
-            .count();
-        assert_eq!(decompositions.len(), 2, "one lhs and one structural GSW decomposition");
-        assert_eq!(lhs_decompositions, 1, "private vector and public ancestry share D(lhs)");
-        assert_eq!(gsw_decompositions, 1, "the loop body decomposes its selected GSW column once");
-        assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::Tensor)));
-        let lhs_decomposition = decompositions
-            .iter()
-            .find(|node| {
-                node.arguments().first().is_some_and(|argument| {
-                    matches!(argument.node().kind(), NodeKind::Input { name, .. } if name == "fuse-lhs-public")
-                })
-            })
-            .expect("complete lhs decomposition");
-        assert!(!nodes.iter().any(|node| {
-            matches!(node.kind(), NodeKind::Slice { .. }) &&
-                node.arguments().iter().any(|argument| {
-                    argument.node() == **lhs_decomposition ||
-                        (matches!(argument.node().kind(), NodeKind::MatrixScale { .. }) &&
-                            argument
-                                .node()
-                                .arguments()
-                                .iter()
-                                .any(|nested| nested.node() == **lhs_decomposition))
-                })
-        }));
-        let column_loops = graph
-            .graph
-            .root_scope()
-            .nodes()
-            .iter()
-            .filter(|node| {
-                matches!(node.kind(), NodeKind::ParallelLoop(spec)
-                    if spec.output_mode == mxx_ir_core::node::ParallelOutputMode::CollectColumns)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            column_loops.len(),
-            2,
-            "private Fuse has one ordered column sink per vector/public projection"
-        );
-        for column_loop in column_loops {
-            let column_loop_id = graph.graph.root_scope().node_id(column_loop).unwrap();
-            let body_id = graph
-                .graph
-                .child_scope_id(&mxx_ir_core::graph::FrozenGraphScopeId::Root, column_loop_id)
-                .unwrap();
-            let body = graph.graph.scope(&body_id).unwrap();
-            assert!(
-                !body.nodes().iter().any(|node| {
-                    matches!(node.kind(), NodeKind::Tensor | NodeKind::Concat { .. })
-                })
-            );
-            assert!(matches!(body.outputs().first().and_then(|wire| body.node(wire.node))
-                .and_then(|node| node.output_types().first()), Some(WireType::Matrix(matrix))
-                if matrix.columns == 1.into()));
-            assert!(matches!(column_loop.output_types().first(), Some(WireType::Matrix(matrix))
-                if matrix.columns == 2.into()));
-        }
-    }
-
-    /// Small runtime harness for checking the BGG relation itself. All
-    /// public matrices in this harness come from the independent public
-    /// compiler; no expected key is copied from an encoding result.
-    struct NoiselessFixture {
-        parameters: DCRTPolyParams,
-        ring: Ring,
-        compiler: PowerLutEncodingCompiler,
-        public_compiler: PowerLutPublicKeyCompiler,
-        sampler: super::PowerLutEncodingSampler,
-        public_sampler: PowerLutPublicKeySampler,
-        secret: mxx_dsl::Mat,
-        hash_key: mxx_dsl::Bytes,
-    }
-
-    impl NoiselessFixture {
-        fn new() -> Self {
-            // Keep two gadget digits per CRT tower, while using the largest
-            // base that still satisfies ceil(crt_bits / base_bits) == 2.
-            let parameters = DCRTPolyParams::new(4, 1, 17, 9);
-            let modulus = BigInt::from(parameters.modulus().as_ref().clone());
-            let ring = Ring::new(modulus.clone(), 4);
-            let layout = mxx_bgg::BggSamplerLayout {
-                modulus: modulus.into(),
-                ring_dimension: 4.into(),
-                secret_dimension: 2,
-                digit_count: 2,
-                gadget_base: 512.into(),
-            };
-            let bgg = BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: layout.gadget_base.clone(),
-                digit_count: layout.digit_count.into(),
-            };
-            Self {
-                parameters,
-                ring: ring.clone(),
-                compiler: PowerLutEncodingCompiler::from_public_key(bgg.clone()),
-                public_compiler: PowerLutPublicKeyCompiler::new(bgg),
-                sampler: super::PowerLutEncodingSampler {
-                    layout: layout.clone(),
-                    gaussian_sigma: None,
-                    gaussian_max_coefficient_bound: None,
-                },
-                public_sampler: PowerLutPublicKeySampler { layout },
-                secret: ring.input("noiseless-secret", (1, 2)),
-                hash_key: ring.bytes_input("noiseless-hash", 32),
+        let nodes = graph.graph.scopes().values().flat_map(|scope| scope.nodes());
+        let mut parallel_loops = 0;
+        let mut collected_columns = 0;
+        for node in nodes {
+            match node.kind() {
+                mxx_ir_core::node::NodeKind::ParallelLoop(spec)
+                    if spec.output_mode == mxx_ir_core::node::ParallelOutputMode::Family =>
+                {
+                    parallel_loops += 1;
+                }
+                mxx_ir_core::node::NodeKind::ParallelLoop(spec)
+                    if spec.output_mode ==
+                        mxx_ir_core::node::ParallelOutputMode::CollectColumns =>
+                {
+                    collected_columns += 1;
+                }
+                _ => {}
             }
         }
-
-        fn rotation(&self, exponent: usize) -> mxx_dsl::Mat {
-            self.ring.constant(
-                (1, 1),
-                mxx_ir_core::node::ConstantMatrix::Rotation { exponent: exponent.into() },
-            )
-        }
-
-        fn input(&self, tag: &[u8], exponent: usize) -> BggEncodingWire {
-            self.sampler
-                .sample_input_encoding(
-                    self.secret.clone(),
-                    self.hash_key.clone(),
-                    tag,
-                    self.rotation(exponent),
-                )
-                .expect("noiseless sampled input")
-        }
-
-        fn public_input(&self, tag: &[u8]) -> BggPublicKeyWire {
-            self.public_sampler
-                .sample_input_key(self.hash_key.clone(), tag)
-                .expect("noiseless public input")
-        }
-
-        fn helpers(&self, tag: &[u8], width: usize) -> Vec<AutomorphismHelper> {
-            self.sampler
-                .sample_automorphism_helpers(self.secret.clone(), self.hash_key.clone(), tag, width)
-                .expect("noiseless sampled helpers")
-        }
-
-        fn public_helpers(
-            &self,
-            tag: &[u8],
-            width: usize,
-        ) -> Vec<crate::public_key::AutomorphismPublicHelper> {
-            self.public_sampler
-                .sample_automorphism_helpers(self.hash_key.clone(), tag, width)
-                .expect("noiseless public helpers")
-        }
-
-        /// Independently evaluates the public operation and checks both
-        /// required assertions: public-key equality and the noiseless BGG
-        /// equation `c = s*A - mu*(s*G)`.
-        fn assert_relation(
-            &self,
-            name: &str,
-            encoded: BggEncodingWire,
-            expected_public: mxx_dsl::Mat,
-            expected_mu: mxx_dsl::Mat,
-        ) {
-            let gadget = self.ring.gadget(2, 512, 2);
-            let expected_vector = self.secret.clone() * expected_public.clone() -
-                expected_mu * (self.secret.clone() * gadget);
-            let context = DslContext::new(name)
-                .output("encoded-vector", encoded.vector)
-                .unwrap()
-                .output("encoded-public", encoded.pubkey.matrix)
-                .unwrap()
-                .output("expected-public", expected_public.clone())
-                .unwrap()
-                .output("expected-vector", expected_vector)
-                .unwrap();
-            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
-            let result = execute(
-                &graph,
-                &mut cpu_backend([self.parameters.clone()]),
-                BTreeMap::from([
-                    (
-                        "noiseless-secret".to_owned(),
-                        RuntimeValue::matrix(DCRTPolyMatrix::from_poly_vec(
-                            &self.parameters,
-                            vec![vec![
-                                DCRTPoly::from_u32s(&self.parameters, &[2, 1, 0, 0]),
-                                DCRTPoly::from_usize_to_constant(&self.parameters, 1),
-                            ]],
-                        )),
-                    ),
-                    ("noiseless-hash".to_owned(), RuntimeValue::Bytes(vec![0x91; 32])),
-                ]),
-                &mut MemoryArtifactStore::default(),
-                SamplingMode::Fresh,
-            )
-            .unwrap();
-            let RuntimeValue::Matrix(encoded_vector) = &result.outputs["encoded-vector"] else {
-                panic!("encoded vector")
-            };
-            let RuntimeValue::Matrix(expected_vector) = &result.outputs["expected-vector"] else {
-                panic!("expected vector")
-            };
-            let RuntimeValue::Matrix(encoded_public) = &result.outputs["encoded-public"] else {
-                panic!("encoded public")
-            };
-            let RuntimeValue::Matrix(expected_public) = &result.outputs["expected-public"] else {
-                panic!("expected public")
-            };
-            assert_eq!(encoded_public, expected_public, "{name}: public key mismatch");
-            assert_eq!(encoded_vector, expected_vector, "{name}: noiseless BGG relation");
-        }
-    }
-
-    #[test]
-    #[serial(dcrt_runtime)]
-    fn noiseless_sampled_input_and_automorphism_satisfy_bgg_relation() {
-        let fixture = NoiselessFixture::new();
-        let input = fixture.input(&b"sampled-input"[..], 1);
-        let public_input = fixture.public_input(&b"sampled-input"[..]);
-        fixture.assert_relation(
-            "power-lut-noiseless-sampled-input",
-            input,
-            public_input.matrix,
-            fixture.rotation(1),
-        );
-
-        let independent_public = fixture.public_input(&b"independent-public-matrix"[..]);
-        let independently_sampled = fixture
-            .sampler
-            .sample_encoding_for_public_matrix(
-                fixture.secret.clone(),
-                independent_public.clone(),
-                fixture.rotation(1),
-            )
-            .expect("independently supplied public matrix");
-        fixture.assert_relation(
-            "power-lut-noiseless-independent-public-matrix",
-            independently_sampled,
-            independent_public.matrix,
-            fixture.rotation(1),
-        );
-
-        let helpers = fixture.helpers(&b"sampled-helper"[..], 2);
-        let public_helpers = fixture.public_helpers(&b"sampled-helper"[..], 2);
-        let transformed = fixture
-            .compiler
-            .automorphism(&fixture.input(&b"auto-input"[..], 1), &helpers[0])
-            .unwrap();
-        let public = fixture
-            .public_compiler
-            .automorphism(&fixture.public_input(&b"auto-input"[..]).matrix, &public_helpers[0])
-            .unwrap();
-        fixture.assert_relation(
-            "power-lut-noiseless-automorphism",
-            transformed,
-            public,
-            fixture.rotation(1).ring_automorphism(helpers[0].index()),
-        );
-    }
-
-    #[test]
-    #[serial(dcrt_runtime)]
-    fn noiseless_sampled_automorphism_helper_material_has_its_declared_relations() {
-        let fixture = NoiselessFixture::new();
-        let helper = &fixture.helpers(&b"helper-relation"[..], 2)[0];
-        let gadget = fixture.ring.gadget(2, 512, 2);
-        let source = fixture.secret.clone().ring_automorphism(helper.index());
-        let switch_left = source.clone() * helper.switch().gsw_ciphertext().clone();
-        let switch_right = fixture.secret.clone() * gadget.clone();
-        let mask_expected =
-            fixture.secret.clone() * helper.mask().pubkey.matrix.clone() - source * gadget;
-        let graph = DslContext::new("power-lut-noiseless-helper-material")
-            .output("switch-left", switch_left)
-            .unwrap()
-            .output("switch-right", switch_right)
-            .unwrap()
-            .output("mask", helper.mask().vector.clone())
-            .unwrap()
-            .output("mask-expected", mask_expected)
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default())
-            .unwrap();
-        let result = execute(
-            &graph,
-            &mut cpu_backend([fixture.parameters.clone()]),
-            BTreeMap::from([
-                (
-                    "noiseless-secret".to_owned(),
-                    RuntimeValue::matrix(DCRTPolyMatrix::from_poly_vec(
-                        &fixture.parameters,
-                        vec![vec![
-                            DCRTPoly::from_u32s(&fixture.parameters, &[2, 1, 0, 0]),
-                            DCRTPoly::from_usize_to_constant(&fixture.parameters, 1),
-                        ]],
-                    )),
-                ),
-                ("noiseless-hash".to_owned(), RuntimeValue::Bytes(vec![0x91; 32])),
-            ]),
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let RuntimeValue::Matrix(switch_left) = &result.outputs["switch-left"] else {
-            panic!("sampled switch relation left")
-        };
-        let RuntimeValue::Matrix(switch_right) = &result.outputs["switch-right"] else {
-            panic!("sampled switch relation right")
-        };
-        assert_eq!(switch_left, switch_right, "sampled switch relation");
-        let RuntimeValue::Matrix(mask) = &result.outputs["mask"] else { panic!("sampled mask") };
-        let RuntimeValue::Matrix(mask_expected) = &result.outputs["mask-expected"] else {
-            panic!("sampled mask relation")
-        };
-        assert_eq!(mask, mask_expected, "sampled mask relation");
-    }
-
-    #[test]
-    #[serial(dcrt_runtime)]
-    fn balanced_sum_family_runtime_handles_ragged_counts() {
-        let parameters = DCRTPolyParams::new(4, 1, 17, 9);
-        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
-        let ring = Ring::new(modulus, 4);
-        for count in [1usize, 2, 3, 5, 6, 7, 9] {
-            let values = ring.input_family(format!("balanced-values-{count}"), count, (1, 1));
-            let sum = super::balanced_sum_family(values).unwrap();
-            let graph = DslContext::new(format!("balanced-runtime-{count}"))
-                .output("sum", sum)
-                .unwrap()
-                .build()
-                .unwrap();
-            let validated = graph.validate(&ParamEnv::default()).unwrap();
-            let matrix = |value: u32| {
-                RuntimeValue::matrix(DCRTPolyMatrix::from_poly_vec_row(
-                    &parameters,
-                    vec![DCRTPoly::from_u32s(&parameters, &[value, 0, 0, 0])],
-                ))
-            };
-            let input = RuntimeValue::IndexedFamily((1..=count as u32).map(matrix).collect());
-            let result = execute(
-                &validated,
-                &mut cpu_backend([parameters.clone()]),
-                BTreeMap::from([(format!("balanced-values-{count}"), input)]),
-                &mut MemoryArtifactStore::default(),
-                SamplingMode::Fresh,
-            )
-            .unwrap();
-            let RuntimeValue::Matrix(actual) = &result.outputs["sum"] else { panic!("matrix") };
-            let expected = DCRTPolyMatrix::from_poly_vec_row(
-                &parameters,
-                vec![DCRTPoly::from_u32s(
-                    &parameters,
-                    &[(count * (count + 1) / 2) as u32, 0, 0, 0],
-                )],
-            );
-            assert_eq!(actual.as_ref(), &expected, "count {count}");
-            if count % 2 == 1 && count > 1 {
-                let nodes = graph
-                    .graph
-                    .scopes()
-                    .values()
-                    .flat_map(|scope| scope.nodes())
-                    .collect::<Vec<_>>();
-                assert!(nodes.iter().any(|node| matches!(
-                    node.kind(),
-                    mxx_ir_core::node::NodeKind::IntBinary(
-                        mxx_ir_core::node::IntBinaryOp::Remainder
-                    ) if node.arguments().get(1).is_some_and(|divisor| matches!(
-                        divisor.node().kind(),
-                        mxx_ir_core::node::NodeKind::ConstantInt(value)
-                            if value == &BigInt::from(count)
-                    ))
-                )));
-                assert!(!nodes.iter().any(|node| matches!(
-                    node.kind(),
-                    mxx_ir_core::node::NodeKind::IntBinary(
-                        mxx_ir_core::node::IntBinaryOp::Subtract
-                    )
-                )));
-            }
-        }
+        assert!(parallel_loops >= 1, "flat branches must use a structural family loop");
+        assert_eq!(collected_columns, 0, "flat LUT must not collect dynamic columns");
     }
 }

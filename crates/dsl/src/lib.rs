@@ -999,6 +999,10 @@ impl Mat {
     }
 
     #[track_caller]
+    /// Reconstructs a one-row matrix from plaintext levels.  Runtime
+    /// evaluation rounds every coefficient of level `i` to
+    /// `round(p_i * y / q) mod p_i` before applying its reconstruction
+    /// coefficient, so callers can model the exact CRT transfer relation.
     pub fn crt_recompose(
         values: Vec<Mat>,
         plaintext_moduli: Vec<IntExpr>,
@@ -1095,6 +1099,9 @@ impl Trapdoor {
         self.public.clone()
     }
 
+    /// Samples a preimage `K` for `target` under this trapdoor's public matrix.
+    /// The runtime guarantees the exact relation `B * K = target`; the
+    /// configured bound only determines which sampled candidate is accepted.
     #[track_caller]
     pub fn sample_preimage(&self, target: Mat, shape: impl IntoShape) -> Preimage {
         let shape = shape.into_shape();

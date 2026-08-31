@@ -10,6 +10,13 @@
 //! The program builders below describe one structural bucket body. They carry
 //! no sparse support, schedule, selected slot, selector bit, or private RHS
 //! material; those values are supplied only through explicit lowering bindings.
+//!
+//! For a bucket with public factors `X^{a_i}`, selector ciphertexts `C_i`, and
+//! one-hot bits `b_i`, the accumulator update is
+//! `z' = z + sum_i b_i Fuse(z, C_i) * X^{a_i}`. The public projection performs
+//! the same update on matrices `A`, consuming only concrete public `C_i` and
+//! `X^{a_i}`. After all buckets, scalar LWR rounding is applied once as
+//! `floor(p * z / Q_L)` (with the centered representative used by the ring).
 
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
@@ -17,18 +24,22 @@ use mxx_bgg::{BggEncodingWire, BggPublicKeyWire};
 use mxx_dsl::{Bool, Family, Int, LoopIndex, Mat, Parallel, Sequential};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
     PowerLutEncodingCompiler, PowerLutError,
-    encoding::{AutomorphismHelper, EncodingSelectorFamily},
+    encoding::{EncodingSelectorFamily, FlatLutHelper, FlatLutHelperMap, FlatLutHelperSet},
     program::{
         FamilyRange, LutTable, PowerLutProgram, PowerLutProgramBuilder, PowerLutProgramId,
         ProgramFamilyRanges, ProgramInputId, ProgramValidationError, ProgramWireId,
         PublicValueFamilyId, RhsFamilyId,
     },
-    public_key::{AutomorphismPublicHelper, PowerLutPublicKeyCompiler, PublicSelectorFamily},
-    rhs::{PowerLutPublicRhsPackage, PowerRhsCompanionBlock, PowerRhsPackage},
+    public_key::{
+        FlatLutPublicHelper, FlatLutPublicHelperMap, FlatLutPublicHelperSet,
+        PowerLutPublicKeyCompiler, PublicSelectorFamily,
+    },
+    rhs::PowerRhsPackage,
 };
 
 /// Trusted, public description of the refresh PRF batch order.
@@ -148,6 +159,10 @@ impl RefreshPrfBatchInputs {
     }
 
     /// Returns the stable input name used for this deferred public family.
+    ///
+    /// Runtime values for this input are ring matrices containing the
+    /// monomial `X^a` for each host residue `a`; they are not constant
+    /// polynomials with coefficient `a`.
     pub fn public_input_name(&self) -> String {
         format!(
             "pbc-public-values-{:x}",
@@ -241,6 +256,11 @@ fn public_vector_identity(
 
 /// Declares the batch's deferred label-major public-value family. The runtime
 /// payload provider is intentionally outside this graph-construction layer.
+/// Host PBC materialization remains residue-valued, while each runtime family
+/// element bound to this DSL input must be the corresponding ring monomial
+/// `X^a`. This distinction is part of the one-hot gate's public-factor
+/// contract and is therefore documented at the single family declaration
+/// boundary used by both private and public-key lowering.
 fn batch_public_values_family(
     batch: &RefreshPrfBatchInputs,
     ring: &mxx_dsl::Ring,
@@ -363,9 +383,10 @@ pub struct SparseLwrBucketProgram {
 
 /// A complete sparse-LWR PRF program for one structural bucket iteration.
 ///
-/// The mandatory reduction table is an ordinary unary LUT gate following the
-/// shared one-hot selection. The mandatory rounding table is a second
-/// ordinary program applied once after the bucket scan and never per bucket.
+/// The mandatory reduction table is the one-hot gate's single unary LUT. The
+/// mandatory rounding table is a second shared program applied once after the
+/// bucket scan and never per bucket. Its terminal LUT has the raw-scalar form,
+/// so the result is a constant polynomial rather than a monomial encoding.
 #[derive(Clone, Debug)]
 pub struct SparseLwrPrfProgram {
     /// Canonical program shared by private and public-key lowering.
@@ -387,10 +408,12 @@ pub struct SparseLwrPrfProgram {
     pub bucket_width: usize,
     /// Concrete profile from which both mandatory LUTs were derived.
     profile: SparseLwrPrfProfile,
-    /// Ordinary shared program for the final LWR rounding operation.
+    /// Shared program for the final LWR rounding operation. Its output is a
+    /// raw scalar terminal, not an ordinary monomial PRF value.
     pub rounding_program: PowerLutProgram,
     /// Composite identity of the bucket and final-rounding programs.
     composite_id: PowerLutProgramId,
+    /// Input declaration used when invoking the final-rounding program.
     rounding_input: ProgramInputId,
     rounding_output: ProgramWireId,
     /// The final table is cached only as immutable lowering data. Its
@@ -422,6 +445,20 @@ impl SparseLwrPrfProgram {
     /// Returns the ordinary shared program used for the final rounding step.
     pub const fn rounding_program(&self) -> &PowerLutProgram {
         &self.rounding_program
+    }
+
+    /// Returns the final-rounding program's declared input identifier.
+    pub const fn rounding_input(&self) -> ProgramInputId {
+        self.rounding_input
+    }
+
+    /// Returns the output wire of the scalar terminal program.
+    ///
+    /// Refresh setup commits this wire together with the composite program
+    /// identity.  This prevents an output from an intermediate bucket body
+    /// from being accepted as the raw-scalar PRF result.
+    pub const fn terminal_output_wire(&self) -> ProgramWireId {
+        self.rounding_output
     }
 
     /// Returns the immutable final rounding table derived from the profile.
@@ -486,8 +523,45 @@ impl SparseLwrPrfProgram {
         input: BggEncodingWire,
         selectors: BTreeMap<RhsFamilyId, EncodingSelectorFamily>,
         public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
-        helpers: &[AutomorphismHelper],
+        helpers: &FlatLutHelperMap,
         label: &[u8],
+    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
+        self.compile_encoding_inner(compiler, input, selectors, public_values, helpers, label, None)
+    }
+
+    /// Private lowering entry point with the separately sampled terminal
+    /// rounding helper set.  Bucket helpers and rounding helpers are kept as
+    /// distinct arguments because their local LUT identifiers are independent.
+    pub fn compile_encoding_with_rounding_helpers(
+        &self,
+        compiler: &PowerLutEncodingCompiler,
+        input: BggEncodingWire,
+        selectors: BTreeMap<RhsFamilyId, EncodingSelectorFamily>,
+        public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
+        helpers: &FlatLutHelperMap,
+        rounding_helpers: &FlatLutHelperSet,
+        label: &[u8],
+    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
+        self.compile_encoding_inner(
+            compiler,
+            input,
+            selectors,
+            public_values,
+            helpers,
+            label,
+            Some(rounding_helpers),
+        )
+    }
+
+    fn compile_encoding_inner(
+        &self,
+        compiler: &PowerLutEncodingCompiler,
+        input: BggEncodingWire,
+        selectors: BTreeMap<RhsFamilyId, EncodingSelectorFamily>,
+        public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
+        helpers: &FlatLutHelperMap,
+        label: &[u8],
+        rounding_helpers: Option<&FlatLutHelperSet>,
     ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
         self.validate_widths(concrete_ring_dimension(&input)?)?;
         let outputs = compiler.compile_program(
@@ -499,7 +573,7 @@ impl SparseLwrPrfProgram {
             helpers,
         )?;
         let output = outputs.get(&self.output).cloned().ok_or(PowerLutError::InvalidLut)?;
-        let output = self.apply_final_rounding_encoding(compiler, output, helpers)?;
+        let output = self.apply_final_rounding_encoding(compiler, output, rounding_helpers)?;
         let descriptor = self.bind_output(label)?;
         Ok((output, descriptor))
     }
@@ -516,8 +590,52 @@ impl SparseLwrPrfProgram {
         input: BggPublicKeyWire,
         selectors: BTreeMap<RhsFamilyId, PublicSelectorFamily>,
         public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
-        helpers: &[AutomorphismPublicHelper],
+        helpers: &FlatLutPublicHelperMap,
         label: &[u8],
+    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
+        self.compile_public_key_inner(
+            compiler,
+            input,
+            selectors,
+            public_values,
+            helpers,
+            label,
+            None,
+        )
+    }
+
+    /// Public-key lowering entry point with the setup-fixed terminal helper
+    /// set supplied separately from bucket helper material.
+    pub fn compile_public_key_with_rounding_helpers(
+        &self,
+        compiler: &PowerLutPublicKeyCompiler,
+        input: BggPublicKeyWire,
+        selectors: BTreeMap<RhsFamilyId, PublicSelectorFamily>,
+        public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
+        helpers: &FlatLutPublicHelperMap,
+        rounding_helpers: &FlatLutPublicHelperSet,
+        label: &[u8],
+    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
+        self.compile_public_key_inner(
+            compiler,
+            input,
+            selectors,
+            public_values,
+            helpers,
+            label,
+            Some(rounding_helpers),
+        )
+    }
+
+    fn compile_public_key_inner(
+        &self,
+        compiler: &PowerLutPublicKeyCompiler,
+        input: BggPublicKeyWire,
+        selectors: BTreeMap<RhsFamilyId, PublicSelectorFamily>,
+        public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
+        helpers: &FlatLutPublicHelperMap,
+        label: &[u8],
+        rounding_helpers: Option<&FlatLutPublicHelperSet>,
     ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
         self.validate_widths(concrete_ring_dimension_public(&input)?)?;
         let outputs = compiler.compile_program(
@@ -529,7 +647,7 @@ impl SparseLwrPrfProgram {
             helpers,
         )?;
         let output = outputs.get(&self.output).cloned().ok_or(PowerLutError::InvalidLut)?;
-        let output = self.apply_final_rounding_public(compiler, output, helpers)?;
+        let output = self.apply_final_rounding_public(compiler, output, rounding_helpers)?;
         Ok((output, self.bind_output(label)?))
     }
 
@@ -553,8 +671,62 @@ impl SparseLwrPrfProgram {
             (EncodingSelectorFamily, Family<Mat>, FamilyRange),
             PowerLutError,
         >,
-        helpers: &[AutomorphismHelper],
+        helpers: &FlatLutHelperMap,
         label: &[u8],
+    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
+        self.compile_encoding_sequential_inner(
+            compiler,
+            input,
+            bucket_count,
+            bucket_bindings,
+            helpers,
+            label,
+            None,
+        )
+    }
+
+    /// Structural sequential lowering with the explicitly supplied terminal
+    /// scalar-rounding helper set.
+    pub fn compile_encoding_sequential_with_rounding_helpers(
+        &self,
+        compiler: &PowerLutEncodingCompiler,
+        input: BggEncodingWire,
+        bucket_count: impl Into<mxx_ir_core::IntExpr>,
+        bucket_bindings: impl FnOnce(
+            LoopIndex,
+        ) -> Result<
+            (EncodingSelectorFamily, Family<Mat>, FamilyRange),
+            PowerLutError,
+        >,
+        helpers: &FlatLutHelperMap,
+        rounding_helpers: &FlatLutHelperSet,
+        label: &[u8],
+    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
+        self.compile_encoding_sequential_inner(
+            compiler,
+            input,
+            bucket_count,
+            bucket_bindings,
+            helpers,
+            label,
+            Some(rounding_helpers),
+        )
+    }
+
+    fn compile_encoding_sequential_inner(
+        &self,
+        compiler: &PowerLutEncodingCompiler,
+        input: BggEncodingWire,
+        bucket_count: impl Into<mxx_ir_core::IntExpr>,
+        bucket_bindings: impl FnOnce(
+            LoopIndex,
+        ) -> Result<
+            (EncodingSelectorFamily, Family<Mat>, FamilyRange),
+            PowerLutError,
+        >,
+        helpers: &FlatLutHelperMap,
+        label: &[u8],
+        rounding_helpers: Option<&FlatLutHelperSet>,
     ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
         self.validate_widths(concrete_ring_dimension(&input)?)?;
         let lowering_error = RefCell::new(None);
@@ -590,7 +762,7 @@ impl SparseLwrPrfProgram {
             .map_err(|_| {
                 lowering_error.into_inner().unwrap_or(PowerLutError::InvalidSparseLwrBlock)
             })?;
-        let output = self.apply_final_rounding_encoding(compiler, final_state, helpers)?;
+        let output = self.apply_final_rounding_encoding(compiler, final_state, rounding_helpers)?;
         let descriptor = self.bind_output(label)?;
         Ok((output, descriptor))
     }
@@ -608,8 +780,9 @@ impl SparseLwrPrfProgram {
         selector_flat_count: usize,
         capacity: usize,
         invariants: Vec<Family<Mat>>,
-        helpers: &[AutomorphismHelper],
+        helpers: &FlatLutHelperMap,
         label: &[u8],
+        rounding_helpers: Option<&FlatLutHelperSet>,
     ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
         self.validate_widths(concrete_ring_dimension(&input)?)?;
         let lowering_error = RefCell::new(None);
@@ -662,7 +835,7 @@ impl SparseLwrPrfProgram {
             .map_err(|_| {
                 lowering_error.into_inner().unwrap_or(PowerLutError::InvalidSparseLwrBlock)
             })?;
-        let output = self.apply_final_rounding_encoding(compiler, final_state, helpers)?;
+        let output = self.apply_final_rounding_encoding(compiler, final_state, rounding_helpers)?;
         let descriptor = self.bind_output(label)?;
         Ok((output, descriptor))
     }
@@ -684,9 +857,66 @@ impl SparseLwrPrfProgram {
             (PublicSelectorFamily, Family<Mat>, FamilyRange),
             PowerLutError,
         >,
-        helpers: &[AutomorphismPublicHelper],
+        helpers: &FlatLutPublicHelperMap,
         label: &[u8],
     ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
+        self.compile_public_key_sequential_inner(
+            compiler,
+            input,
+            bucket_count,
+            bucket_bindings,
+            helpers,
+            label,
+            None,
+        )
+    }
+
+    /// Public structural sequential lowering with the setup-fixed terminal
+    /// rounding helpers supplied separately from bucket helpers.
+    pub fn compile_public_key_sequential_with_rounding_helpers(
+        &self,
+        compiler: &PowerLutPublicKeyCompiler,
+        input: BggPublicKeyWire,
+        bucket_count: impl Into<mxx_ir_core::IntExpr>,
+        bucket_bindings: impl FnOnce(
+            LoopIndex,
+        ) -> Result<
+            (PublicSelectorFamily, Family<Mat>, FamilyRange),
+            PowerLutError,
+        >,
+        helpers: &FlatLutPublicHelperMap,
+        rounding_helpers: &FlatLutPublicHelperSet,
+        label: &[u8],
+    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
+        self.compile_public_key_sequential_inner(
+            compiler,
+            input,
+            bucket_count,
+            bucket_bindings,
+            helpers,
+            label,
+            Some(rounding_helpers),
+        )
+    }
+
+    fn compile_public_key_sequential_inner(
+        &self,
+        compiler: &PowerLutPublicKeyCompiler,
+        input: BggPublicKeyWire,
+        bucket_count: impl Into<mxx_ir_core::IntExpr>,
+        bucket_bindings: impl FnOnce(
+            LoopIndex,
+        ) -> Result<
+            (PublicSelectorFamily, Family<Mat>, FamilyRange),
+            PowerLutError,
+        >,
+        helpers: &FlatLutPublicHelperMap,
+        label: &[u8],
+        rounding_helpers: Option<&FlatLutPublicHelperSet>,
+    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
+        // Public lowering carries only A. Each selected concrete C_i applies
+        // `A^\sigma G^{-1}(C_i)`, and the public factor `X^{a'_{b}[i]}` updates
+        // the same accumulator exponent as in the private recurrence.
         self.validate_widths(concrete_ring_dimension_public(&input)?)?;
         let lowering_error = RefCell::new(None);
         let final_state = Sequential::range(bucket_count)
@@ -721,7 +951,7 @@ impl SparseLwrPrfProgram {
             .map_err(|_| {
                 lowering_error.into_inner().unwrap_or(PowerLutError::InvalidSparseLwrBlock)
             })?;
-        let output = self.apply_final_rounding_public(compiler, final_state, helpers)?;
+        let output = self.apply_final_rounding_public(compiler, final_state, rounding_helpers)?;
         Ok((output, self.bind_output(label)?))
     }
 
@@ -738,8 +968,9 @@ impl SparseLwrPrfProgram {
         selector_flat_count: usize,
         capacity: usize,
         invariants: Vec<Family<Mat>>,
-        helpers: &[AutomorphismPublicHelper],
+        helpers: &FlatLutPublicHelperMap,
         label: &[u8],
+        rounding_helpers: Option<&FlatLutPublicHelperSet>,
     ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
         self.validate_widths(concrete_ring_dimension_public(&input)?)?;
         let lowering_error = RefCell::new(None);
@@ -792,105 +1023,8 @@ impl SparseLwrPrfProgram {
             .map_err(|_| {
                 lowering_error.into_inner().unwrap_or(PowerLutError::InvalidSparseLwrBlock)
             })?;
-        let output = self.apply_final_rounding_public(compiler, final_state, helpers)?;
+        let output = self.apply_final_rounding_public(compiler, final_state, rounding_helpers)?;
         Ok((output, self.bind_output(label)?))
-    }
-
-    /// Evaluates a flattened PBC selector/value family over all layout
-    /// buckets.  The active cells of a bucket are contiguous in the
-    /// canonical [`crate::pbc::PbcActiveCellIndex`] order, but their offsets
-    /// and counts may differ.  We therefore derive public lookup expressions
-    /// for both quantities and bind one exact `FamilyRange` inside the single
-    /// outer sequential loop.
-    ///
-    /// The interpolation metadata is host-side and contains no secret
-    /// schedule.  Its size is quadratic in the public bucket count; Power-LUT
-    /// parameter sets keep this count small.  Padding is outside every range,
-    /// so no hidden RHS package is allocated for it.
-    #[cfg(test)]
-    pub(crate) fn compile_pbc_encoding(
-        &self,
-        compiler: &PowerLutEncodingCompiler,
-        input: BggEncodingWire,
-        layout: &crate::pbc::PbcPublicLayout,
-        public_vector: &crate::pbc::PbcPublicVectorFamilyBinding,
-        selectors: EncodingSelectorFamily,
-        public_values: Family<Mat>,
-        helpers: &[AutomorphismHelper],
-        label: &[u8],
-    ) -> Result<PbcSparseLwrEncodingOutput, PowerLutError> {
-        if self.bucket_width != layout.bucket_width ||
-            self.program.inputs().get(&self.input) != Some(&self.lut_width) ||
-            self.program.rhs_family_width(self.selector_family) != Some(self.lut_width) ||
-            self.program.public_value_family_width(self.public_value_family) !=
-                Some(self.lut_width)
-        {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        public_vector.validate(layout).map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-        self.compile_pbc_encoding_with_family(
-            compiler,
-            input,
-            layout,
-            selectors,
-            public_values,
-            helpers,
-            label,
-        )
-    }
-
-    /// Internal structural implementation for [`Self::compile_pbc_encoding`].
-    ///
-    /// The family must have been declared from the validated
-    /// [`crate::pbc::PbcPublicVectorFamilyBinding`] by the public wrapper.
-    /// Keeping this raw-family operation crate-private prevents callers from
-    /// accidentally pairing an unrelated family with a PBC layout.
-    #[cfg(test)]
-    pub(crate) fn compile_pbc_encoding_with_family(
-        &self,
-        compiler: &PowerLutEncodingCompiler,
-        input: BggEncodingWire,
-        layout: &crate::pbc::PbcPublicLayout,
-        selectors: EncodingSelectorFamily,
-        public_values: Family<Mat>,
-        helpers: &[AutomorphismHelper],
-        label: &[u8],
-    ) -> Result<PbcSparseLwrEncodingOutput, PowerLutError> {
-        if self.bucket_width != layout.bucket_width ||
-            self.program.inputs().get(&self.input) != Some(&self.lut_width) ||
-            self.program.rhs_family_width(self.selector_family) != Some(self.lut_width) ||
-            self.program.public_value_family_width(self.public_value_family) !=
-                Some(self.lut_width)
-        {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        let active = crate::pbc::PbcActiveCellIndex::build(layout)
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-        ensure_family_count(&public_values, active.len())?;
-        let widths = active.bucket_active_widths().collect::<Vec<_>>();
-        let mut offsets = Vec::with_capacity(widths.len());
-        let mut offset = 0usize;
-        for width in widths.iter().copied() {
-            offsets.push(offset);
-            offset = offset.checked_add(width).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
-        }
-        let bucket_count = layout.parameters.bucket_count;
-        let (encoding, descriptor) = self.compile_encoding_sequential(
-            compiler,
-            input,
-            bucket_count,
-            move |bucket| {
-                let index = bucket.expression();
-                let start = interpolate_lookup(&offsets, index.clone())?;
-                let count = interpolate_lookup(&widths, index)?;
-                let range = FamilyRange::bounded(start, count, layout.bucket_width)
-                    .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-                Ok((selectors.clone(), public_values.clone(), range))
-            },
-            helpers,
-            label,
-        )?;
-        Ok(PbcSparseLwrEncodingOutput::new(encoding, descriptor, layout.layout_id))
     }
 
     /// Lowers a family of independent PBC labels through one outer
@@ -901,9 +1035,8 @@ impl SparseLwrPrfProgram {
     /// canonical label-major, active-cell order, and each bucket iteration
     /// selects only its own contiguous active-cell range.
     ///
-    /// This is the batch counterpart of [`Self::compile_pbc_encoding`].  It
-    /// deliberately returns families rather than a host vector of wires, so
-    /// callers can continue routing and reducing the labels structurally.
+    /// It deliberately returns families rather than a host vector of wires,
+    /// so callers can continue routing and reducing the labels structurally.
     pub(crate) fn compile_pbc_encoding_family(
         &self,
         compiler: &PowerLutEncodingCompiler,
@@ -911,8 +1044,55 @@ impl SparseLwrPrfProgram {
         input_public_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: EncodingSelectorFamily,
-        helpers: &[AutomorphismHelper],
+        helpers: &FlatLutHelperMap,
     ) -> Result<(Family<Mat>, Family<Mat>), PowerLutError> {
+        self.compile_pbc_encoding_family_inner(
+            compiler,
+            input_vectors,
+            input_public_keys,
+            batch,
+            selectors,
+            helpers,
+            None,
+        )
+    }
+
+    /// Batched PBC lowering with one explicit terminal rounding helper set.
+    pub(crate) fn compile_pbc_encoding_family_with_rounding_helpers(
+        &self,
+        compiler: &PowerLutEncodingCompiler,
+        input_vectors: Family<Mat>,
+        input_public_keys: Family<Mat>,
+        batch: &RefreshPrfBatchInputs,
+        selectors: EncodingSelectorFamily,
+        helpers: &FlatLutHelperMap,
+        rounding_helpers: &FlatLutHelperSet,
+    ) -> Result<(Family<Mat>, Family<Mat>), PowerLutError> {
+        self.compile_pbc_encoding_family_inner(
+            compiler,
+            input_vectors,
+            input_public_keys,
+            batch,
+            selectors,
+            helpers,
+            Some(rounding_helpers),
+        )
+    }
+
+    fn compile_pbc_encoding_family_inner(
+        &self,
+        compiler: &PowerLutEncodingCompiler,
+        input_vectors: Family<Mat>,
+        input_public_keys: Family<Mat>,
+        batch: &RefreshPrfBatchInputs,
+        selectors: EncodingSelectorFamily,
+        helpers: &FlatLutHelperMap,
+        rounding_helpers: Option<&FlatLutHelperSet>,
+    ) -> Result<(Family<Mat>, Family<Mat>), PowerLutError> {
+        // For label `ell`, public values are
+        // `(X^{a'_{\ell}[0]},...,X^{a'_{\ell}[m-1]})`. The nested bucket scan keeps
+        // `X^acc` as state; OneHot selects C_i and updates it by
+        // `X^{(acc+a'_{\ell}[i]) mod Q}` before applying the bucket LUT.
         let label_count = batch.len();
         if label_count == 0 ||
             input_vectors.count().evaluate(&mxx_ir_core::ParamEnv::default()).ok() !=
@@ -941,10 +1121,20 @@ impl SparseLwrPrfProgram {
         let selector_flat = selectors.flattened();
         let selector_flat_count = selector_flat.len();
         let (helper_flat, helper_arities) = flatten_private_helper_families(helpers)?;
+        let (rounding_flat, rounding_arities) = if let Some(rounding_helpers) = rounding_helpers {
+            flatten_private_helper_families(&FlatLutHelperMap::from([(
+                crate::program::LutId::from_index(0),
+                rounding_helpers.clone(),
+            )]))?
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut broadcasts = selector_flat;
         broadcasts.push(public_values);
         let helper_flat_count = helper_flat.len();
         broadcasts.extend(helper_flat);
+        let rounding_flat_count = rounding_flat.len();
+        broadcasts.extend(rounding_flat);
         let lowering_error = Rc::new(RefCell::new(None));
         let lowering_error_for_loop = lowering_error.clone();
         let outputs = Family::<Mat>::parallel_zip_many_with_broadcast_values(
@@ -952,14 +1142,27 @@ impl SparseLwrPrfProgram {
             broadcasts,
             move |label, mut inputs, mut broadcasts| {
                 let helper_start = selector_flat_count + 1;
-                if broadcasts.len() != helper_start + helper_flat_count {
+                if broadcasts.len() != helper_start + helper_flat_count + rounding_flat_count {
                     return Err(mxx_dsl::DslError::Schema);
                 }
-                let helper_broadcasts = broadcasts.split_off(helper_start);
+                let mut helper_broadcasts = broadcasts.split_off(helper_start);
+                let rounding_broadcasts = helper_broadcasts.split_off(helper_flat_count);
                 let label_values = broadcasts.pop().ok_or(mxx_dsl::DslError::Schema)?;
                 let selectors = EncodingSelectorFamily::from_flattened(broadcasts)
                     .map_err(|_| mxx_dsl::DslError::Schema)?;
                 let helpers = rebuild_private_helper_families(helper_broadcasts, &helper_arities)?;
+                let rounding_map = if rounding_arities.is_empty() {
+                    None
+                } else {
+                    Some(rebuild_private_helper_families(rounding_broadcasts, &rounding_arities)?)
+                };
+                let rounding_helpers = rounding_map
+                    .as_ref()
+                    .map(|map| {
+                        map.get(&crate::program::LutId::from_index(0))
+                            .ok_or(mxx_dsl::DslError::Schema)
+                    })
+                    .transpose()?;
                 let public_offset = mxx_ir_core::IntExpr::Mul(
                     Box::new(label.expression()),
                     Box::new(mxx_ir_core::IntExpr::constant(active_count)),
@@ -995,6 +1198,7 @@ impl SparseLwrPrfProgram {
                         },
                         &helpers,
                         &[],
+                        rounding_helpers,
                     )
                     .map_err(|error| {
                         *lowering_error_for_loop.borrow_mut() = Some(error);
@@ -1017,7 +1221,7 @@ impl SparseLwrPrfProgram {
         input_public_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: EncodingSelectorFamily,
-        helpers: &[AutomorphismHelper],
+        helpers: &FlatLutHelperMap,
     ) -> Result<PbcSparseLwrEncodingOutputs, PowerLutError> {
         if batch.layout_id != batch.layout.layout_id || batch.profile != self.profile {
             return Err(PowerLutError::InvalidSparseLwrBlock);
@@ -1039,6 +1243,40 @@ impl SparseLwrPrfProgram {
         ))
     }
 
+    /// Typed batched private lowering with the setup-fixed terminal rounding
+    /// helpers.  The resulting family has the scalar terminal operation
+    /// already executed in the structural label loop.
+    pub fn compile_pbc_encoding_family_typed_with_batch_and_rounding_helpers(
+        &self,
+        compiler: &PowerLutEncodingCompiler,
+        input_vectors: Family<Mat>,
+        input_public_keys: Family<Mat>,
+        batch: &RefreshPrfBatchInputs,
+        selectors: EncodingSelectorFamily,
+        helpers: &FlatLutHelperMap,
+        rounding_helpers: &FlatLutHelperSet,
+    ) -> Result<PbcSparseLwrEncodingOutputs, PowerLutError> {
+        if batch.layout_id != batch.layout.layout_id || batch.profile != self.profile {
+            return Err(PowerLutError::InvalidSparseLwrBlock);
+        }
+        let (vectors, public_keys) = self.compile_pbc_encoding_family_with_rounding_helpers(
+            compiler,
+            input_vectors,
+            input_public_keys,
+            batch,
+            selectors,
+            helpers,
+            rounding_helpers,
+        )?;
+        Ok(PbcSparseLwrEncodingOutputs::new(
+            vectors,
+            public_keys,
+            self.id(),
+            self.rounding_output,
+            batch,
+        ))
+    }
+
     /// Public-key counterpart of [`Self::compile_pbc_encoding_family`].  The
     /// label inputs, public values, selector projections, and helper masks
     /// are all public; no private selector or schedule can enter this path.
@@ -1048,7 +1286,41 @@ impl SparseLwrPrfProgram {
         input_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: PublicSelectorFamily,
-        helpers: &[AutomorphismPublicHelper],
+        helpers: &FlatLutPublicHelperMap,
+    ) -> Result<Family<Mat>, PowerLutError> {
+        self.compile_pbc_public_key_family_inner(
+            compiler, input_keys, batch, selectors, helpers, None,
+        )
+    }
+
+    /// Public batched PBC lowering with explicit terminal rounding helpers.
+    pub(crate) fn compile_pbc_public_key_family_with_rounding_helpers(
+        &self,
+        compiler: &PowerLutPublicKeyCompiler,
+        input_keys: Family<Mat>,
+        batch: &RefreshPrfBatchInputs,
+        selectors: PublicSelectorFamily,
+        helpers: &FlatLutPublicHelperMap,
+        rounding_helpers: &FlatLutPublicHelperSet,
+    ) -> Result<Family<Mat>, PowerLutError> {
+        self.compile_pbc_public_key_family_inner(
+            compiler,
+            input_keys,
+            batch,
+            selectors,
+            helpers,
+            Some(rounding_helpers),
+        )
+    }
+
+    fn compile_pbc_public_key_family_inner(
+        &self,
+        compiler: &PowerLutPublicKeyCompiler,
+        input_keys: Family<Mat>,
+        batch: &RefreshPrfBatchInputs,
+        selectors: PublicSelectorFamily,
+        helpers: &FlatLutPublicHelperMap,
+        rounding_helpers: Option<&FlatLutPublicHelperSet>,
     ) -> Result<Family<Mat>, PowerLutError> {
         let label_count = batch.len();
         if label_count == 0 ||
@@ -1075,10 +1347,20 @@ impl SparseLwrPrfProgram {
         let selector_flat = selectors.flattened();
         let selector_flat_count = selector_flat.len();
         let (helper_flat, helper_arities) = flatten_public_helper_families(helpers)?;
+        let (rounding_flat, rounding_arities) = if let Some(rounding_helpers) = rounding_helpers {
+            flatten_public_helper_families(&FlatLutPublicHelperMap::from([(
+                crate::program::LutId::from_index(0),
+                rounding_helpers.clone(),
+            )]))?
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut broadcasts = selector_flat;
         broadcasts.push(public_values);
         let helper_flat_count = helper_flat.len();
         broadcasts.extend(helper_flat);
+        let rounding_flat_count = rounding_flat.len();
+        broadcasts.extend(rounding_flat);
         let lowering_error = Rc::new(RefCell::new(None));
         let lowering_error_for_loop = lowering_error.clone();
         let outputs = Family::<Mat>::parallel_zip_many_with_broadcast_values(
@@ -1086,14 +1368,27 @@ impl SparseLwrPrfProgram {
             broadcasts,
             move |label, mut inputs, mut broadcasts| {
                 let helper_start = selector_flat_count + 1;
-                if broadcasts.len() != helper_start + helper_flat_count {
+                if broadcasts.len() != helper_start + helper_flat_count + rounding_flat_count {
                     return Err(mxx_dsl::DslError::Schema);
                 }
-                let helper_broadcasts = broadcasts.split_off(helper_start);
+                let mut helper_broadcasts = broadcasts.split_off(helper_start);
+                let rounding_broadcasts = helper_broadcasts.split_off(helper_flat_count);
                 let label_values = broadcasts.pop().ok_or(mxx_dsl::DslError::Schema)?;
                 let selectors = PublicSelectorFamily::from_flattened(broadcasts)
                     .map_err(|_| mxx_dsl::DslError::Schema)?;
                 let helpers = rebuild_public_helper_families(helper_broadcasts, &helper_arities)?;
+                let rounding_map = if rounding_arities.is_empty() {
+                    None
+                } else {
+                    Some(rebuild_public_helper_families(rounding_broadcasts, &rounding_arities)?)
+                };
+                let rounding_helpers = rounding_map
+                    .as_ref()
+                    .map(|map| {
+                        map.get(&crate::program::LutId::from_index(0))
+                            .ok_or(mxx_dsl::DslError::Schema)
+                    })
+                    .transpose()?;
                 let public_offset = mxx_ir_core::IntExpr::Mul(
                     Box::new(label.expression()),
                     Box::new(mxx_ir_core::IntExpr::constant(active_count)),
@@ -1124,6 +1419,7 @@ impl SparseLwrPrfProgram {
                         },
                         &helpers,
                         &[],
+                        rounding_helpers,
                     )
                     .map_err(|error| {
                         *lowering_error_for_loop.borrow_mut() = Some(error);
@@ -1148,12 +1444,36 @@ impl SparseLwrPrfProgram {
         input_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: PublicSelectorFamily,
-        helpers: &[AutomorphismPublicHelper],
+        helpers: &FlatLutPublicHelperMap,
     ) -> Result<Family<Mat>, PowerLutError> {
         if batch.layout_id != batch.layout.layout_id || batch.profile != self.profile {
             return Err(PowerLutError::InvalidSparseLwrBlock);
         }
         self.compile_pbc_public_key_family(compiler, input_keys, batch, selectors, helpers)
+    }
+
+    /// Typed public batched lowering with the explicit terminal rounding
+    /// helper family supplied by setup.
+    pub fn compile_pbc_public_key_family_with_batch_and_rounding_helpers(
+        &self,
+        compiler: &PowerLutPublicKeyCompiler,
+        input_keys: Family<Mat>,
+        batch: &RefreshPrfBatchInputs,
+        selectors: PublicSelectorFamily,
+        helpers: &FlatLutPublicHelperMap,
+        rounding_helpers: &FlatLutPublicHelperSet,
+    ) -> Result<Family<Mat>, PowerLutError> {
+        if batch.layout_id != batch.layout.layout_id || batch.profile != self.profile {
+            return Err(PowerLutError::InvalidSparseLwrBlock);
+        }
+        self.compile_pbc_public_key_family_with_rounding_helpers(
+            compiler,
+            input_keys,
+            batch,
+            selectors,
+            helpers,
+            rounding_helpers,
+        )
     }
 
     /// Applies the mandatory LWR rounding table once to the completed bucket
@@ -1164,17 +1484,27 @@ impl SparseLwrPrfProgram {
         &self,
         compiler: &PowerLutEncodingCompiler,
         state: BggEncodingWire,
-        helpers: &[AutomorphismHelper],
+        rounding_helpers: Option<&FlatLutHelperSet>,
     ) -> Result<BggEncodingWire, PowerLutError> {
+        let rounding_helpers = rounding_helpers.ok_or(PowerLutError::MissingRoundingHelpers)?;
+        let table = self
+            .rounding_program
+            .lut(crate::program::LutId::from_index(0))
+            .ok_or(PowerLutError::InvalidLut)?;
+        let helpers = FlatLutHelperMap::from([(
+            crate::program::LutId::from_index(0),
+            rounding_helpers.clone(),
+        )]);
+        rounding_helpers.resolve(table)?;
         let outputs = compiler.compile_program(
             &self.rounding_program,
             &BTreeMap::from([(self.rounding_input, state)]),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            helpers,
+            &helpers,
         )?;
-        outputs.get(&self.rounding_output).cloned().ok_or(PowerLutError::InvalidSparseLwrBlock)
+        outputs.get(&self.rounding_output).cloned().ok_or(PowerLutError::InvalidLut)
     }
 
     /// Public-key counterpart of [`Self::apply_final_rounding_encoding`].
@@ -1182,17 +1512,27 @@ impl SparseLwrPrfProgram {
         &self,
         compiler: &PowerLutPublicKeyCompiler,
         state: BggPublicKeyWire,
-        helpers: &[AutomorphismPublicHelper],
+        rounding_helpers: Option<&FlatLutPublicHelperSet>,
     ) -> Result<BggPublicKeyWire, PowerLutError> {
+        let rounding_helpers = rounding_helpers.ok_or(PowerLutError::MissingRoundingHelpers)?;
+        let table = self
+            .rounding_program
+            .lut(crate::program::LutId::from_index(0))
+            .ok_or(PowerLutError::InvalidLut)?;
+        let helpers = FlatLutPublicHelperMap::from([(
+            crate::program::LutId::from_index(0),
+            rounding_helpers.clone(),
+        )]);
+        rounding_helpers.resolve(table)?;
         let outputs = compiler.compile_program(
             &self.rounding_program,
             &BTreeMap::from([(self.rounding_input, state)]),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            helpers,
+            &helpers,
         )?;
-        outputs.get(&self.rounding_output).cloned().ok_or(PowerLutError::InvalidSparseLwrBlock)
+        outputs.get(&self.rounding_output).cloned().ok_or(PowerLutError::InvalidLut)
     }
 }
 
@@ -1233,32 +1573,21 @@ fn ensure_family_count(family: &Family<Mat>, expected: usize) -> Result<(), Powe
 /// Lifts imported scalar helper artifacts into singleton families so an
 /// outer label loop can receive every executable graph value explicitly.
 fn flatten_private_helper_families(
-    helpers: &[AutomorphismHelper],
-) -> Result<(Vec<Family<Mat>>, Vec<(usize, usize)>), PowerLutError> {
+    helpers: &FlatLutHelperMap,
+) -> Result<(Vec<Family<Mat>>, Vec<(crate::program::LutId, [u8; 32], Vec<usize>)>), PowerLutError> {
     let mut flat = Vec::new();
     let mut arities = Vec::with_capacity(helpers.len());
-    for helper in helpers {
-        let switch = helper.switch();
-        let mut companions = Vec::new();
-        while let Some(companion) = switch.companion_at(companions.len()) {
-            companions.push(companion);
-        }
-        if companions.is_empty() {
-            return Err(PowerLutError::InvalidAutomorphismHelper);
-        }
-        arities.push((helper.index(), companions.len()));
-        let mut matrices = Vec::with_capacity(1 + companions.len() * 2 + 2);
-        matrices.push(switch.gsw_ciphertext().clone());
-        for companion in companions {
-            matrices.push(companion.vector.clone());
-            matrices.push(companion.public_matrix.clone());
-        }
-        matrices.push(helper.mask().vector.clone());
-        matrices.push(helper.mask().pubkey.matrix.clone());
-        for matrix in matrices {
-            flat.push(
-                Family::pack(vec![matrix]).map_err(|_| PowerLutError::InvalidAutomorphismHelper)?,
-            );
+    for (lut, lut_helpers) in helpers {
+        let (commitment, _width) = lut_helpers.metadata();
+        arities.push((*lut, commitment, lut_helpers.iter().map(|h| h.sigma()).collect()));
+        for helper in lut_helpers.iter() {
+            for matrix in [
+                helper.switch().gsw_ciphertext().clone(),
+                helper.mask().vector.clone(),
+                helper.mask().pubkey.matrix.clone(),
+            ] {
+                flat.push(Family::pack(vec![matrix]).map_err(|_| PowerLutError::InvalidLut)?);
+            }
         }
     }
     Ok((flat, arities))
@@ -1266,66 +1595,62 @@ fn flatten_private_helper_families(
 
 fn rebuild_private_helper_families(
     flat: Vec<Family<Mat>>,
-    arities: &[(usize, usize)],
-) -> Result<Vec<AutomorphismHelper>, mxx_dsl::DslError> {
-    let expected = arities.iter().try_fold(0usize, |total, (_, count)| {
-        total.checked_add(1 + count * 2 + 2).ok_or(mxx_dsl::DslError::Schema)
+    arities: &[(crate::program::LutId, [u8; 32], Vec<usize>)],
+) -> Result<FlatLutHelperMap, mxx_dsl::DslError> {
+    let expected = arities.iter().try_fold(0usize, |total, (_, _, sigmas)| {
+        total
+            .checked_add(sigmas.len().checked_mul(3).ok_or(mxx_dsl::DslError::Schema)?)
+            .ok_or(mxx_dsl::DslError::Schema)
     })?;
     if flat.len() != expected {
         return Err(mxx_dsl::DslError::Schema);
     }
     let mut cursor = 0usize;
-    let mut rebuilt = Vec::with_capacity(arities.len());
-    for (helper_index, companion_count) in arities.iter().copied() {
-        let take = |cursor: &mut usize| -> Result<Mat, mxx_dsl::DslError> {
-            let family = flat.get(*cursor).ok_or(mxx_dsl::DslError::Schema)?;
-            *cursor += 1;
-            Ok(family.get_static(0))
-        };
-        let gsw = take(&mut cursor)?;
-        let companions = (0..companion_count)
-            .map(|_| {
-                Ok(PowerRhsCompanionBlock {
-                    vector: take(&mut cursor)?,
-                    public_matrix: take(&mut cursor)?,
-                })
-            })
-            .collect::<Result<Vec<_>, mxx_dsl::DslError>>()?;
-        let mask_vector = take(&mut cursor)?;
-        let mask_public = take(&mut cursor)?;
-        let switch =
-            PowerRhsPackage::new(gsw, companions).map_err(|_| mxx_dsl::DslError::Schema)?;
-        let mask = BggEncodingWire {
-            vector: mask_vector,
-            pubkey: BggPublicKeyWire { matrix: mask_public, reveal_plaintext: false },
-            plaintext: None,
-        };
-        // The loop preserves the imported helper order; indexes are the
-        // trusted metadata attached to those artifacts, not loop-derived data.
-        rebuilt.push(
-            AutomorphismHelper::new(helper_index, switch, mask)
-                .map_err(|_| mxx_dsl::DslError::Schema)?,
-        );
+    let mut rebuilt = FlatLutHelperMap::new();
+    for (lut, commitment, sigmas) in arities.iter() {
+        let mut lut_helpers = Vec::with_capacity(sigmas.len());
+        for sigma in sigmas {
+            let take = |cursor: &mut usize| -> Result<Mat, mxx_dsl::DslError> {
+                let family = flat.get(*cursor).ok_or(mxx_dsl::DslError::Schema)?;
+                *cursor += 1;
+                Ok(family.get_static(0))
+            };
+            let gsw = take(&mut cursor)?;
+            let mask_vector = take(&mut cursor)?;
+            let mask_public = take(&mut cursor)?;
+            let switch = PowerRhsPackage::new(gsw).map_err(|_| mxx_dsl::DslError::Schema)?;
+            let mask = BggEncodingWire {
+                vector: mask_vector,
+                pubkey: BggPublicKeyWire { matrix: mask_public, reveal_plaintext: false },
+                plaintext: None,
+            };
+            // The loop preserves the imported helper order; indexes are the
+            // trusted metadata attached to those artifacts, not loop-derived data.
+            let helper =
+                FlatLutHelper::new(*sigma, switch, mask).map_err(|_| mxx_dsl::DslError::Schema)?;
+            lut_helpers.push(helper);
+        }
+        let set = FlatLutHelperSet::from_parts(*commitment, sigmas.len(), lut_helpers)
+            .map_err(|_| mxx_dsl::DslError::Schema)?;
+        rebuilt.insert(*lut, set);
     }
     Ok(rebuilt)
 }
 
 fn flatten_public_helper_families(
-    helpers: &[AutomorphismPublicHelper],
-) -> Result<(Vec<Family<Mat>>, Vec<(usize, usize)>), PowerLutError> {
+    helpers: &FlatLutPublicHelperMap,
+) -> Result<(Vec<Family<Mat>>, Vec<(crate::program::LutId, [u8; 32], Vec<usize>)>), PowerLutError> {
     let mut flat = Vec::new();
     let mut arities = Vec::with_capacity(helpers.len());
-    for helper in helpers {
-        let companions = helper.switch().companions();
-        if companions.is_empty() {
-            return Err(PowerLutError::InvalidAutomorphismHelper);
-        }
-        arities.push((helper.index(), companions.len()));
-        for matrix in companions.iter().chain(std::iter::once(helper.mask())) {
-            flat.push(
-                Family::pack(vec![matrix.clone()])
-                    .map_err(|_| PowerLutError::InvalidAutomorphismHelper)?,
-            );
+    for (lut, lut_helpers) in helpers {
+        // Public and private helper sets use the same table commitment. The
+        // public set exposes only the fixed matrices, never plaintext data.
+        let commitment = lut_helpers.table_commitment();
+        arities.push((*lut, commitment, lut_helpers.iter().map(|h| h.sigma()).collect()));
+        for helper in lut_helpers.iter() {
+            for matrix in [helper.switch().gsw_ciphertext().clone(), helper.mask().clone()] {
+                flat.push(Family::pack(vec![matrix]).map_err(|_| PowerLutError::InvalidLut)?);
+            }
         }
     }
     Ok((flat, arities))
@@ -1333,28 +1658,34 @@ fn flatten_public_helper_families(
 
 fn rebuild_public_helper_families(
     flat: Vec<Family<Mat>>,
-    arities: &[(usize, usize)],
-) -> Result<Vec<AutomorphismPublicHelper>, mxx_dsl::DslError> {
-    let expected = arities.iter().try_fold(0usize, |total, (_, count)| {
-        total.checked_add(count + 1).ok_or(mxx_dsl::DslError::Schema)
+    arities: &[(crate::program::LutId, [u8; 32], Vec<usize>)],
+) -> Result<FlatLutPublicHelperMap, mxx_dsl::DslError> {
+    let expected = arities.iter().try_fold(0usize, |total, (_, _, sigmas)| {
+        total
+            .checked_add(sigmas.len().checked_mul(2).ok_or(mxx_dsl::DslError::Schema)?)
+            .ok_or(mxx_dsl::DslError::Schema)
     })?;
     if flat.len() != expected {
         return Err(mxx_dsl::DslError::Schema);
     }
     let mut cursor = 0usize;
-    let mut rebuilt = Vec::with_capacity(arities.len());
-    for (helper_index, companion_count) in arities.iter().copied() {
-        let take = |cursor: &mut usize| -> Result<Mat, mxx_dsl::DslError> {
-            let family = flat.get(*cursor).ok_or(mxx_dsl::DslError::Schema)?;
-            *cursor += 1;
-            Ok(family.get_static(0))
-        };
-        let companions =
-            (0..companion_count).map(|_| take(&mut cursor)).collect::<Result<_, _>>()?;
-        let mask = take(&mut cursor)?;
-        let switch =
-            PowerLutPublicRhsPackage::new(companions).map_err(|_| mxx_dsl::DslError::Schema)?;
-        rebuilt.push(AutomorphismPublicHelper::new(helper_index, switch, mask));
+    let mut rebuilt = FlatLutPublicHelperMap::new();
+    for (lut, commitment, sigmas) in arities.iter() {
+        let mut lut_helpers = Vec::with_capacity(sigmas.len());
+        for sigma in sigmas {
+            let take = |cursor: &mut usize| -> Result<Mat, mxx_dsl::DslError> {
+                let family = flat.get(*cursor).ok_or(mxx_dsl::DslError::Schema)?;
+                *cursor += 1;
+                Ok(family.get_static(0))
+            };
+            let switch =
+                PowerRhsPackage::new(take(&mut cursor)?).map_err(|_| mxx_dsl::DslError::Schema)?;
+            let mask = take(&mut cursor)?;
+            lut_helpers.push(FlatLutPublicHelper::new(*sigma, switch, mask));
+        }
+        let set = FlatLutPublicHelperSet::from_parts(*commitment, sigmas.len(), lut_helpers)
+            .map_err(|_| mxx_dsl::DslError::Schema)?;
+        rebuilt.insert(*lut, set);
     }
     Ok(rebuilt)
 }
@@ -1413,12 +1744,14 @@ fn build_bucket_program(
     let input = builder.input(lut_width)?;
     let selector_family = builder.rhs_family(lut_width)?;
     let public_value_family = builder.public_value_family(lut_width)?;
-    let select_lut =
-        builder.lut(LutTable::unary(lut_width, lut_width, (0..lut_width).collect())?)?;
     let input_wire = builder.input_wire(input)?;
-    let selected = builder.one_hot(input_wire, selector_family, public_value_family, select_lut)?;
     let reduction = builder.lut(LutTable::unary(lut_width, lut_width, reduction_lut.to_vec())?)?;
-    let output = builder.unary(selected, reduction)?;
+    // The public family already supplies the selected ring factor.  Applying
+    // the reduction table directly in `one_hot` keeps the single LUT's
+    // monomial output bound to the bucket's modulo-Q semantics; an identity
+    // LUT followed by a second unary gate would rebind the factor and obscure
+    // that contract.
+    let output = builder.one_hot(input_wire, selector_family, public_value_family, reduction)?;
     builder.output(output)?;
     let program = builder.build()?;
     Ok(SparseLwrBucketProgram { program, input, selector_family, public_value_family, output })
@@ -1427,12 +1760,16 @@ fn build_bucket_program(
 /// Builds the final scalar LUT that rounds a reduced sparse-LWR value.
 fn build_rounding_program(
     lut_width: usize,
+    output_width: usize,
     rounding_lut: &[usize],
 ) -> Result<(PowerLutProgram, ProgramInputId, ProgramWireId), ProgramValidationError> {
     let mut builder = PowerLutProgramBuilder::new();
     let input = builder.input(lut_width)?;
     let input_wire = builder.input_wire(input)?;
-    let lut = builder.lut(LutTable::unary(lut_width, lut_width, rounding_lut.to_vec())?)?;
+    // Rounding produces a scalar digit, not a ring monomial.  The terminal
+    // output form is committed in the program and disallows further gates.
+    let lut =
+        builder.lut(LutTable::unary_scalar(lut_width, output_width, rounding_lut.to_vec())?)?;
     let output = builder.unary(input_wire, lut)?;
     builder.output(output)?;
     Ok((builder.build()?, input, output))
@@ -1484,7 +1821,7 @@ impl SparseLwrPrfProgram {
         let bucket =
             build_bucket_program(w, bucket_width, &reduction_lut).map_err(PowerLutError::from)?;
         let (rounding_program, rounding_input, rounding_output) =
-            build_rounding_program(w, &rounding_lut).map_err(PowerLutError::from)?;
+            build_rounding_program(w, profile.p, &rounding_lut).map_err(PowerLutError::from)?;
         let composite_id = composite_prf_id(&profile, &bucket.program, &rounding_program);
         Ok(Self {
             program: bucket.program,
@@ -1504,86 +1841,19 @@ impl SparseLwrPrfProgram {
     }
 }
 
-/// Generic one-hot fixture retained only for crate tests. Production callers
-/// must use [`SparseLwrPrfProgram::new`]. This type intentionally contains no
-/// sparse-LWR profile or output identity, so generic OneHot/LUT tests cannot
-/// bypass the production PRF invariants.
-#[cfg(test)]
-pub(crate) struct TestOneHotProgram {
-    pub(crate) program: PowerLutProgram,
-    pub(crate) input: ProgramInputId,
-    pub(crate) selector_family: RhsFamilyId,
-    pub(crate) public_value_family: PublicValueFamilyId,
-    pub(crate) output: ProgramWireId,
-    lut_width: usize,
-    bucket_width: usize,
-    rounding_lut: Vec<usize>,
-}
-
-#[cfg(test)]
-impl TestOneHotProgram {
-    fn lut_width(&self) -> usize {
-        self.lut_width
-    }
-
-    fn bucket_width(&self) -> usize {
-        self.bucket_width
-    }
-
-    fn rounding_lut(&self) -> &[usize] {
-        &self.rounding_lut
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_one_hot_fixture(
-    lut_width: usize,
-    bucket_width: usize,
-    reduction_lut: Option<Vec<usize>>,
-    rounding_lut: Option<Vec<usize>>,
-) -> Result<TestOneHotProgram, ProgramValidationError> {
-    let mut builder = PowerLutProgramBuilder::new();
-    let input = builder.input(lut_width)?;
-    let selector_family = builder.rhs_family(lut_width)?;
-    let public_value_family = builder.public_value_family(lut_width)?;
-    let select_lut =
-        builder.lut(LutTable::unary(lut_width, lut_width, (0..lut_width).collect())?)?;
-    let selected = builder.one_hot(
-        builder.input_wire(input)?,
-        selector_family,
-        public_value_family,
-        select_lut,
-    )?;
-    let output = if let Some(values) = reduction_lut {
-        let lut = builder.lut(LutTable::unary(lut_width, lut_width, values)?)?;
-        builder.unary(selected, lut)?
-    } else {
-        selected
-    };
-    builder.output(output)?;
-    let program = builder.build()?;
-    let rounding_lut = rounding_lut.unwrap_or_else(|| vec![0; lut_width]);
-    Ok(TestOneHotProgram {
-        program,
-        input,
-        selector_family,
-        public_value_family,
-        output,
-        lut_width,
-        bucket_width,
-        rounding_lut,
-    })
-}
-
-/// Creates the smallest valid production sparse-LWR program for tests that
-/// exercise refresh output identities. Unlike [`test_one_hot_fixture`], this
-/// path uses the checked profile constructor and the mandatory PRF LUTs.
-#[cfg(test)]
-pub(crate) fn test_sparse_lwr_program(
-    bucket_width: usize,
-    ring_dimension: usize,
-) -> Result<SparseLwrPrfProgram, PowerLutError> {
-    SparseLwrPrfProgram::new(SparseLwrPrfProfile::new(2, 2, 4, ring_dimension)?, bucket_width)
+/// Algebraic contract of a sparse-LWR PRF descriptor.
+///
+/// Ordinary Power-LUT gates return monomial encodings. The sparse-LWR
+/// rounding terminal is intentionally different: it returns the integer
+/// rounding value as a constant ring polynomial. Keeping this distinction in
+/// the descriptor prevents a caller from treating a raw scalar as a normal
+/// monomial PRF output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SparseLwrPrfTerminalForm {
+    /// A conventional PRF value represented by the monomial `X^v`.
+    Monomial,
+    /// The sparse-LWR terminal represented by the constant `v`.
+    RawScalar,
 }
 
 /// Typed identity of one sparse-LWR PRF result.
@@ -1597,6 +1867,7 @@ pub struct SparseLwrPrfOutput {
     program_id: PowerLutProgramId,
     label_digest: [u8; 32],
     output_wire: ProgramWireId,
+    terminal_form: SparseLwrPrfTerminalForm,
 }
 
 /// Opaque output of the real private PBC lowering.
@@ -1693,6 +1964,7 @@ impl PbcSparseLwrEncodingOutputs {
             program_id: self.program_id,
             label_digest: digest,
             output_wire: self.output_wire,
+            terminal_form: SparseLwrPrfTerminalForm::RawScalar,
         };
         Ok(PbcSparseLwrEncodingOutput::new(encoding, descriptor, self.layout_id))
     }
@@ -1735,7 +2007,12 @@ impl SparseLwrPrfOutput {
         digest.update(b"mxx-power-lut/sparse-lwr/prf-label/v1");
         digest.update((label.len() as u64).to_le_bytes());
         digest.update(label);
-        Ok(Self { program_id, label_digest: digest.finalize().into(), output_wire })
+        Ok(Self {
+            program_id,
+            label_digest: digest.finalize().into(),
+            output_wire,
+            terminal_form: SparseLwrPrfTerminalForm::RawScalar,
+        })
     }
 
     /// Returns the shared program identity.
@@ -1752,508 +2029,83 @@ impl SparseLwrPrfOutput {
     pub const fn output_wire(&self) -> ProgramWireId {
         self.output_wire
     }
+
+    /// Returns the algebraic form promised by this descriptor.
+    pub const fn terminal_form(&self) -> SparseLwrPrfTerminalForm {
+        self.terminal_form
+    }
+
+    /// Returns whether this is the raw-scalar sparse-LWR terminal contract.
+    pub const fn is_raw_scalar(&self) -> bool {
+        matches!(self.terminal_form, SparseLwrPrfTerminalForm::RawScalar)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::program::ProgramGate;
+    use mxx_bgg::BggPublicKeyCompiler;
+    use mxx_dsl::Ring;
 
     #[test]
-    fn typed_prf_output_binds_program_label_and_output_wire() {
-        let program =
-            SparseLwrPrfProgram::new(SparseLwrPrfProfile::new(2, 2, 4, 4).unwrap(), 2).unwrap();
-        let output = program.bind_output(b"label").unwrap();
-        assert_eq!(output.program_id(), program.id());
-        assert_eq!(output.output_wire(), program.rounding_output);
-        assert_ne!(output.output_wire(), program.output);
-        assert_ne!(output.label_digest(), program.bind_output(b"other").unwrap().label_digest());
-    }
-
-    #[test]
-    fn typed_prf_output_uses_composite_final_program_identity() {
-        let program =
-            SparseLwrPrfProgram::new(SparseLwrPrfProfile::new(2, 2, 4, 4).unwrap(), 2).unwrap();
-        let output = program.bind_output(b"label").unwrap();
-        assert_eq!(output.program_id(), program.id());
-        assert_eq!(output.output_wire(), program.rounding_output);
-    }
-
-    #[test]
-    fn bucket_program_has_one_shared_one_hot_body() {
-        let body = test_one_hot_fixture(4, 4, Some(vec![0, 1, 2, 3]), None).unwrap();
-        assert_eq!(body.program.outputs(), &[body.output]);
-        assert!(matches!(
-            body.program.gates().first(),
-            Some(ProgramGate::OneHot { selector_family, public_value_family, .. })
-                if *selector_family == body.selector_family
-                   && *public_value_family == body.public_value_family
-        ));
-        assert!(matches!(body.program.gates().get(1), Some(ProgramGate::Unary { .. })));
-    }
-
-    #[test]
-    fn bucket_program_id_is_independent_of_private_schedule() {
-        let first = test_one_hot_fixture(4, 4, None, None).unwrap();
-        let second = test_one_hot_fixture(4, 4, None, None).unwrap();
-        assert_eq!(first.program.id(), second.program.id());
-        assert_eq!(first.program.gates().len(), 1);
-    }
-
-    #[test]
-    fn prf_program_keeps_selection_and_rounding_in_one_description() {
-        let body =
-            test_one_hot_fixture(4, 4, Some(vec![0, 1, 2, 3]), Some(vec![0, 0, 1, 1])).unwrap();
-        assert_eq!(body.program.outputs(), &[body.output]);
-        assert_eq!(body.program.gates().len(), 2);
-        assert_eq!(body.rounding_lut(), [0, 0, 1, 1]);
-        assert!(body.program.gates().iter().any(|gate| matches!(gate, ProgramGate::OneHot { .. })));
-    }
-
-    #[test]
-    fn lut_width_is_independent_of_rectangular_bucket_width() {
-        let body = test_one_hot_fixture(2, 7, Some(vec![0, 1]), Some(vec![0, 1])).unwrap();
-        assert_eq!(body.lut_width(), 2);
-        assert_eq!(body.bucket_width(), 7);
-        assert_eq!(body.program.inputs().get(&body.input), Some(&2));
-        assert_eq!(body.program.rhs_family_width(body.selector_family), Some(2));
-        assert_eq!(body.program.public_value_family_width(body.public_value_family), Some(2));
-        assert_eq!(body.program.gates().len(), 2);
-        assert_eq!(body.rounding_lut(), [0, 1]);
-    }
-
-    #[test]
-    fn concrete_profile_checks_all_reviewed_invariants() {
-        let profile = SparseLwrPrfProfile::new(2, 2, 4, 8).unwrap();
-        assert_eq!(profile.q_l(), 2);
-        assert_eq!(profile.p(), 2);
-        assert_eq!(profile.lut_width(), 4);
-        assert_eq!(profile.ring_dimension(), 8);
-        for invalid in [
-            (0, 2, 4, 8),
-            (2, 1, 4, 8),
-            (2, 3, 4, 8),
-            (2, 2, 3, 8),
-            (2, 2, 16, 8),
-            (2, 2, 8, 6),
-            (2, 2, 8, 0),
-            (3, 2, 2, 8),
-        ] {
-            assert!(
-                SparseLwrPrfProfile::new(invalid.0, invalid.1, invalid.2, invalid.3).is_err(),
-                "invalid profile {invalid:?} was accepted"
-            );
-        }
-        assert!(SparseLwrPrfProfile::new(3, 2, 8, 8).is_ok());
-        assert!(SparseLwrPrfProfile::new(3, 2, 4, 8).is_err());
-    }
-
-    #[test]
-    fn constructor_derives_mandatory_reduction_and_final_rounding_programs() {
-        let profile = SparseLwrPrfProfile::new(2, 2, 4, 8).unwrap();
-        let body = SparseLwrPrfProgram::new(profile, 7).unwrap();
-        assert_eq!(body.program.gates().len(), 2);
-        assert_eq!(body.rounding_program().gates().len(), 1);
-        let reduction = match body.program.gates()[1] {
-            ProgramGate::Unary { lut, .. } => body.program.lut(lut).unwrap().values(),
-            _ => panic!("missing mandatory reduction gate"),
-        };
-        assert_eq!(reduction, &[0, 1, 0, 1]);
-        let rounding = match body.rounding_program().gates()[0] {
-            ProgramGate::Unary { lut, .. } => body.rounding_program().lut(lut).unwrap().values(),
-            _ => panic!("missing mandatory rounding gate"),
-        };
-        assert_eq!(rounding, &[0, 1, 0, 1]);
-        assert_ne!(body.id(), body.program.id());
-    }
-
-    #[test]
-    fn refresh_fixture_uses_the_checked_profile_for_both_lut_stages() {
-        // This is the concrete profile used by the small refresh fixtures.
-        // Keeping the assertion at the fixture constructor catches accidental
-        // reintroduction of a bucket-width-only or optional LUT path.
-        let body = test_sparse_lwr_program(2, 4).unwrap();
-        assert_eq!(body.profile().q_l(), 2);
-        assert_eq!(body.profile().p(), 2);
-        assert_eq!(body.profile().lut_width(), 4);
-        assert_eq!(body.profile().ring_dimension(), 4);
-        assert_eq!(body.rounding_lut(), [0, 1, 0, 1]);
-        let reduction = match body.program.gates()[1] {
-            ProgramGate::Unary { lut, .. } => body.program.lut(lut).unwrap().values(),
-            _ => panic!("missing mandatory per-bucket reduction gate"),
-        };
-        assert_eq!(reduction, &[0, 1, 0, 1]);
-    }
-
-    #[test]
-    fn refresh_batch_derives_immutable_public_identities_in_canonical_order() {
-        let parameters = crate::pbc::PbcParameters::custom(4, 1, 2, 2, 1, None);
-        let layout =
-            crate::pbc::PbcPublicLayout::build(&parameters, crate::pbc::PbcLayoutSeed([9; 32]), 0)
-                .unwrap();
-        let profile = SparseLwrPrfProfile::new(3, 2, 8, 8).unwrap();
-        let labels = crate::refresh::RefreshPrfLabelIndex::new([3; 32], 1, 1, 1, 2).unwrap();
-        let first = RefreshPrfBatchInputs::new(&layout, profile.clone(), &labels).unwrap();
-        let second = RefreshPrfBatchInputs::new(&layout, profile, &labels).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first.len(), labels.len());
-        assert!(matches!(labels.label(0), Some(crate::refresh::RefreshPrfLabel::Mask { .. })));
-        assert!(matches!(
-            labels.label(2),
-            Some(crate::refresh::RefreshPrfLabel::FreshError { .. })
-        ));
-        assert!(first.label_digest(0).is_some());
-        assert!(first.public_vector_identity(0).is_some());
-
-        // A different refresh identity changes both the canonical label
-        // bytes and the derived public vector, while preserving the same
-        // structural index order.
-        let other_labels = crate::refresh::RefreshPrfLabelIndex::new([4; 32], 1, 1, 1, 2).unwrap();
-        let other = RefreshPrfBatchInputs::new(
-            &layout,
-            SparseLwrPrfProfile::new(3, 2, 8, 8).unwrap(),
-            &other_labels,
+    fn bucket_program_uses_one_reduction_lut_in_one_hot() {
+        let program = SparseLwrPrfProgram::new(
+            SparseLwrPrfProfile::new(2, 2, 4, 4).expect("test profile"),
+            1,
         )
-        .unwrap();
-        assert_ne!(first.label_digest(0), other.label_digest(0));
-        assert_ne!(first.public_vector_identity(0), other.public_vector_identity(0));
-        assert_ne!(first.batch_id, other.batch_id);
+        .expect("test PRF program");
+
+        assert!(program.program.lut(crate::program::LutId::from_index(0)).is_some());
+        assert!(program.program.lut(crate::program::LutId::from_index(1)).is_none());
+        assert_eq!(program.program.gates().len(), 1);
+        assert!(matches!(
+            program.program.gates()[0],
+            crate::program::ProgramGate::OneHot { lut, .. }
+                if lut == crate::program::LutId::from_index(0)
+        ));
     }
 
     #[test]
-    fn batch_public_values_are_flattened_label_major_in_active_cell_order() {
-        let parameters = crate::pbc::PbcParameters::custom(4, 1, 2, 2, 1, None);
-        let layout =
-            crate::pbc::PbcPublicLayout::build(&parameters, crate::pbc::PbcLayoutSeed([17; 32]), 0)
-                .unwrap();
-        let profile = SparseLwrPrfProfile::new(2, 2, 4, 4).unwrap();
-        let labels = crate::refresh::RefreshPrfLabelIndex::new([5; 32], 1, 1, 1, 2).unwrap();
-        let batch = RefreshPrfBatchInputs::new(&layout, profile, &labels).unwrap();
-        let ring = mxx_dsl::Ring::new(17, 4);
-        let family = batch_public_values_family(&batch, &ring).unwrap();
-
-        let mxx_ir_core::node::NodeKind::Input { name, wire_type, .. } =
-            family.value_handle().node().kind()
-        else {
-            panic!("the helper must produce one runtime public-value family")
-        };
-        assert_eq!(name, &batch.public_input_name());
-        assert_eq!(
-            wire_type,
-            &mxx_ir_core::types::WireType::IndexedFamily {
-                element: Box::new(mxx_ir_core::types::WireType::Matrix(ring.matrix_type((1, 1)))),
-                count: mxx_ir_core::IntExpr::constant(batch.value_count()),
-            }
-        );
-        assert!(!family.value_handle().node().arguments().iter().any(|argument| matches!(
-            argument.node().kind(),
-            mxx_ir_core::node::NodeKind::ConstantMatrix { .. }
-        )));
-    }
-
-    #[test]
-    fn interpolation_lookup_is_exact_for_irregular_bucket_metadata() {
-        let values = [0usize, 3, 1, 4, 2];
-        let expression = interpolate_lookup(&values, mxx_ir_core::IntExpr::LoopIndex(7)).unwrap();
-        for (index, expected) in values.iter().copied().enumerate() {
-            let environment = mxx_ir_core::ParamEnv {
-                loop_indices: std::collections::BTreeMap::from([(7u32, BigInt::from(index))]),
-                ..mxx_ir_core::ParamEnv::default()
-            };
-            assert_eq!(expression.evaluate(&environment).unwrap(), BigInt::from(expected));
-        }
-    }
-
-    #[test]
-    fn batched_pbc_lowering_uses_one_outer_label_loop() {
-        let layout = crate::pbc::PbcPublicLayout::build(
-            &crate::pbc::PbcParameters::custom(1, 1, 2, 2, 1, None),
-            crate::pbc::PbcLayoutSeed([31; 32]),
-            0,
-        )
-        .unwrap();
-        let ring = mxx_dsl::Ring::new(17, 4);
-        let compiler = PowerLutEncodingCompiler::from_public_key(mxx_bgg::BggPublicKeyCompiler {
+    fn terminal_rounding_rejects_a_helper_set_bound_to_another_table() {
+        let ring = Ring::new(97, 4);
+        let compiler = PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
             ring: ring.clone(),
             base: 2.into(),
             digit_count: 2.into(),
         });
-        let input_vectors = Family::pack(
-            (0..2).map(|index| ring.input(format!("batch-vector-{index}"), (1, 4))).collect(),
+        let program = SparseLwrPrfProgram::new(
+            SparseLwrPrfProfile::new(2, 2, 4, 4).expect("test profile"),
+            1,
         )
-        .unwrap();
-        let input_public_keys = Family::pack(
-            (0..2).map(|index| ring.input(format!("batch-public-{index}"), (2, 4))).collect(),
-        )
-        .unwrap();
-        let selector_count = crate::pbc::PbcActiveCellIndex::build(&layout).unwrap().len();
-        let gsw = Family::pack(
-            (0..selector_count)
-                .map(|index| ring.input(format!("batch-gsw-{index}"), (2, 4)))
-                .collect(),
-        )
-        .unwrap();
-        let companions = (0..8)
+        .expect("test PRF program");
+        let wrong_table = LutTable::unary(4, 4, vec![0, 1, 2, 3]).expect("wrong LUT");
+        let helpers = (0..4)
             .map(|index| {
-                (
-                    Family::pack(
-                        (0..selector_count)
-                            .map(|item| {
-                                ring.input(format!("batch-companion-v-{index}-{item}"), (1, 8))
-                            })
-                            .collect(),
-                    )
-                    .unwrap(),
-                    Family::pack(
-                        (0..selector_count)
-                            .map(|item| {
-                                ring.input(format!("batch-companion-p-{index}-{item}"), (2, 8))
-                            })
-                            .collect(),
-                    )
-                    .unwrap(),
+                FlatLutHelper::new(
+                    1 + index * 2,
+                    PowerRhsPackage::new(ring.zero((2, 2))).expect("test RHS"),
+                    BggEncodingWire {
+                        vector: ring.zero((1, 2)),
+                        pubkey: BggPublicKeyWire {
+                            matrix: ring.zero((2, 2)),
+                            reveal_plaintext: false,
+                        },
+                        plaintext: None,
+                    },
                 )
+                .expect("test helper")
             })
             .collect();
-        let selectors = EncodingSelectorFamily::new(gsw, companions).unwrap();
-        // The production body includes the mandatory W = 4 coefficient
-        // reduction LUT.  Its lowering therefore needs the two sampled
-        // automorphism rounds used by ClearCoeff, even though this test does
-        // not declare an explicit automorphism gate of its own.
-        let sampler = crate::encoding::PowerLutEncodingSampler {
-            layout: mxx_bgg::BggSamplerLayout {
-                modulus: 17.into(),
-                ring_dimension: 4.into(),
-                secret_dimension: 2,
-                digit_count: 2,
-                gadget_base: 2.into(),
-            },
-            gaussian_sigma: None,
-            gaussian_max_coefficient_bound: None,
-        };
-        let helpers = sampler
-            .sample_automorphism_helpers(
-                ring.zero((1, 2)),
-                ring.bytes_input("batch-helper-key", 32),
-                &b"batch-helpers"[..],
-                4,
-            )
-            .unwrap();
-        assert_eq!(helpers.len(), 2);
-        let body = test_sparse_lwr_program(layout.bucket_width, 4).unwrap();
-        let labels = crate::refresh::RefreshPrfLabelIndex::new([3; 32], 0, 1, 1, 2).unwrap();
-        let batch = RefreshPrfBatchInputs::new(&layout, body.profile().clone(), &labels).unwrap();
-        let wrong_input_vectors =
-            Family::pack(vec![ring.input("wrong-batch-vector", (1, 4))]).unwrap();
-        assert!(
-            body.compile_pbc_encoding_family_typed_with_batch(
-                &compiler,
-                wrong_input_vectors,
-                input_public_keys.clone(),
-                &batch,
-                selectors.clone(),
-                &helpers,
-            )
-            .is_err()
-        );
-        let outputs = body
-            .compile_pbc_encoding_family_typed_with_batch(
-                &compiler,
-                input_vectors,
-                input_public_keys,
-                &batch,
-                selectors,
-                &helpers,
-            )
-            .unwrap();
-        let projected = outputs.project(0).unwrap();
-        assert_eq!(projected.descriptor().program_id(), body.id());
-        assert_eq!(projected.descriptor().output_wire(), body.rounding_output);
-        assert_eq!(projected.layout_id(), layout.layout_id);
-        assert_eq!(outputs.public_vector_identity(0), batch.public_vector_identity(0));
-        assert!(outputs.project(2).is_err());
-        let built = mxx_dsl::DslContext::new("batched-pbc-labels")
-            .output("vector", projected.encoding().vector.clone())
-            .unwrap()
-            .build()
-            .unwrap();
-        // Mandatory reduction and final-rounding LUTs add structural nodes;
-        // keep the assertion focused on preventing per-cell graph expansion.
-        assert!(built.graph.root_scope().nodes().len() < 512);
-        let (outer_position, outer_node) = built
-            .graph
-            .root_scope()
-            .nodes()
-            .iter()
-            .enumerate()
-            .find(|(_, node)| {
-                matches!(
-                    node.kind(),
-                    mxx_ir_core::node::NodeKind::ParallelLoop(spec)
-                        if spec.count == mxx_ir_core::IntExpr::constant(2)
-                )
-            })
-            .expect("outer label loop");
-        let mxx_ir_core::node::NodeKind::ParallelLoop(outer_spec) = outer_node.kind() else {
-            unreachable!()
-        };
-        assert_eq!(
-            outer_spec.input_modes[0..2],
-            [mxx_ir_core::node::LoopInputMode::Zip, mxx_ir_core::node::LoopInputMode::Zip,]
-        );
-        assert!(
-            outer_spec.input_modes[2..]
-                .iter()
-                .all(|mode| *mode == mxx_ir_core::node::LoopInputMode::Broadcast)
-        );
-        let outer_body_id = built
-            .graph
-            .child_scope_id(
-                &mxx_ir_core::FrozenGraphScopeId::Root,
-                mxx_ir_core::NodeId(outer_position as u64),
-            )
-            .expect("outer label body");
-        let outer_body = built.graph.scope(&outer_body_id).expect("outer body scope");
-        let (bucket_position, _bucket_node) = outer_body
-            .nodes()
-            .iter()
-            .enumerate()
-            .find(|(_, node)| matches!(node.kind(), mxx_ir_core::node::NodeKind::SequentialLoop(_)))
-            .expect("nested sequential bucket loop");
-        let bucket_body_id = built
-            .graph
-            .child_scope_id(&outer_body_id, mxx_ir_core::NodeId(bucket_position as u64))
-            .expect("bucket body");
-        assert!(
-            built
-                .graph
-                .scope(&bucket_body_id)
-                .expect("bucket body scope")
-                .nodes()
-                .iter()
-                .any(|node| matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(_)))
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(dcrt_runtime)]
-    fn nested_label_loop_executes_on_cpu_with_bounded_waves() {
-        use mxx_ir_core::ParamEnv;
-        use mxx_primitives::{
-            matrix::dcrt_poly::DCRTPolyMatrix,
-            poly::{PolyParams, dcrt::params::DCRTPolyParams},
-        };
-        use mxx_runtime::{
-            RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
-            execute_with_config, executor::ExecutionConfig, transcript::SamplingMode,
-        };
-        use std::num::NonZeroUsize;
-
-        let parameters = DCRTPolyParams::new(4, 2, 17, 1);
-        let ring = mxx_dsl::Ring::new(
-            BigInt::from_biguint(num_bigint::Sign::Plus, parameters.modulus().as_ref().clone()),
-            4,
-        );
-        let labels = ring.input_family("runtime-labels", 2, (1, 1));
-        let cells = ring.input_family("runtime-cells", 2, (1, 1));
-        let output = Family::<Mat>::parallel_zip_many_with_broadcast_values(
-            vec![labels],
-            vec![cells],
-            |_label, mut zipped, mut broadcast| {
-                let state = zipped.pop().ok_or(mxx_dsl::DslError::Schema)?;
-                let cells = broadcast.pop().ok_or(mxx_dsl::DslError::Schema)?;
-                Sequential::range(2).scan(state, cells, |bucket, state, cells| {
-                    let mapped = cells.parallel_map_values(|_, value| value);
-                    let index = Family::<mxx_dsl::Int>::pack(vec![bucket.as_int()])?;
-                    Ok(state + mapped?.parallel_gather(index)?.get_static(0))
-                })
-            },
-        )
-        .unwrap();
-        let built = mxx_dsl::DslContext::new("nested-label-runtime")
-            .output("result", output.get_static(0))
-            .unwrap()
-            .build()
-            .unwrap();
-        let graph = built.validate(&ParamEnv::default()).unwrap();
-        let zero = DCRTPolyMatrix::zero(&parameters, 1, 1);
-        let inputs = std::collections::BTreeMap::from([
-            (
-                "runtime-labels".to_owned(),
-                RuntimeValue::IndexedFamily(vec![
-                    RuntimeValue::matrix(zero.clone()),
-                    RuntimeValue::matrix(zero.clone()),
-                ]),
-            ),
-            (
-                "runtime-cells".to_owned(),
-                RuntimeValue::IndexedFamily(vec![
-                    RuntimeValue::matrix(zero.clone()),
-                    RuntimeValue::matrix(zero),
-                ]),
-            ),
-        ]);
-        for cap in [1, 2] {
-            let result = execute_with_config(
-                &graph,
-                &mut cpu_backend([parameters.clone()]),
-                inputs.clone(),
-                &mut MemoryArtifactStore::default(),
-                SamplingMode::Fresh,
-                ExecutionConfig {
-                    max_parallel_instances: NonZeroUsize::new(cap).unwrap(),
-                    ..ExecutionConfig::default()
-                },
-            )
-            .unwrap();
-            assert!(matches!(result.outputs.get("result"), Some(RuntimeValue::Matrix(_))));
-        }
-    }
-
-    #[test]
-    fn pbc_compiler_rejects_a_family_not_bound_to_the_public_vector() {
-        let parameters = crate::pbc::PbcParameters::custom(2, 1, 2, 2, 1, None);
-        let layout =
-            crate::pbc::PbcPublicLayout::build(&parameters, crate::pbc::PbcLayoutSeed([19; 32]), 0)
-                .expect("toy PBC layout");
-        let encoded = crate::pbc::PbcEncodedPublicVector::route_usize(&layout, &[3, 5], 17)
-            .expect("route public vector");
-        let binding = crate::pbc::PbcPublicVectorFamilyBinding::from_encoded(&layout, &encoded)
-            .expect("bind public vector");
-        let ring = mxx_dsl::Ring::new(17, 4);
-        let wrong_family =
-            ring.input_family("unrelated-pbc-values", binding.family_count - 1, (1, 1));
-        let selectors = EncodingSelectorFamily::new(
-            ring.input_family("selector-gsw", 1, (1, 1)),
-            vec![(
-                ring.input_family("selector-vector", 1, (1, 1)),
-                ring.input_family("selector-public", 1, (1, 1)),
-            )],
-        )
-        .expect("toy selector family");
-        let body = test_sparse_lwr_program(layout.bucket_width, 4).expect("toy sparse-LWR program");
-        let public_key_compiler = mxx_bgg::BggPublicKeyCompiler {
-            ring: ring.clone(),
-            base: mxx_ir_core::IntExpr::constant(2),
-            digit_count: mxx_ir_core::IntExpr::constant(2),
-        };
-        let compiler = PowerLutEncodingCompiler::from_public_key(public_key_compiler);
-        let input = BggEncodingWire {
-            vector: ring.zero((1, 1)),
-            pubkey: BggPublicKeyWire { matrix: ring.zero((1, 1)), reveal_plaintext: false },
+        let wrong_set = FlatLutHelperSet::new(&wrong_table, helpers).expect("wrong helper set");
+        let state = BggEncodingWire {
+            vector: ring.zero((1, 2)),
+            pubkey: BggPublicKeyWire { matrix: ring.zero((2, 2)), reveal_plaintext: false },
             plaintext: None,
         };
 
-        let result = body.compile_pbc_encoding(
-            &compiler,
-            input,
-            &layout,
-            &binding,
-            selectors,
-            wrong_family,
-            &[],
-            b"binding-test",
-        );
-        assert!(matches!(result, Err(PowerLutError::InvalidSparseLwrBlock)));
+        assert!(matches!(
+            program.apply_final_rounding_encoding(&compiler, state, Some(&wrong_set)),
+            Err(PowerLutError::InvalidLut)
+        ));
     }
 }

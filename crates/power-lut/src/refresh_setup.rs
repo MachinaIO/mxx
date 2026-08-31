@@ -1,4 +1,4 @@
-//! Trusted Section-7 refresh setup and artifact boundary.
+//! RNS refresh setup and artifact boundary.
 //!
 //! This module owns the setup-only half of refresh: it samples the public and
 //! private preprocessing material, builds the preprocessing graph, records an
@@ -8,20 +8,29 @@
 //! [`crate::prf`] and [`crate::pbc`]. Keeping these layers separate is
 //! important: setup may hold secrets and trapdoors, but the public program and
 //! graph declarations must not contain private support or selector choices.
+//!
+//! Setup material is organized per CRT slot `t`. With `mu_t=q/q_t`, the
+//! producer constructs `A_{sum,t} = A_t + A_{m,t} + A_{e,t}`, then the preimage
+//! target `T_t = A_{sum,t} - mu_t A'` and a matrix `K_t` satisfying `B K_t=T_t`.
+//! The decoder base `b_t` yields `d_t=b_t K_t`; imported declarations retain
+//! these exact graph relations while keeping secrets and plaintext out of the
+//! public identity.
 
 use crate::{
     PowerLutEncodingCompiler, PowerLutError,
-    encoding::{EncodingSelectorFamily, PowerLutEncodingSampler},
+    encoding::{EncodingSelectorFamily, FlatLutHelperSet, PowerLutEncodingSampler},
     pbc::{
         PbcSelectorArtifactNames, PbcSelectorArtifacts, PbcTrustedSelectorBits,
         build_structural_selector_families,
     },
-    prf::{RefreshPrfBatchInputs, SparseLwrPrfProfile, SparseLwrPrfProgram},
+    prf::{
+        RefreshPrfBatchInputs, SparseLwrPrfProfile, SparseLwrPrfProgram, SparseLwrPrfTerminalForm,
+    },
     program::PowerLutProgramId,
     refresh::{
         RefreshCompiler, RefreshError, RefreshFreshErrorMaterial, RefreshMaskMaterial,
-        RefreshPrfCoverage, RefreshSetupManifest, aggregate_refresh_fresh_error,
-        aggregate_refresh_mask,
+        RefreshPrfContract, RefreshPrfCoverage, RefreshSetupManifest,
+        aggregate_refresh_fresh_error, aggregate_refresh_mask,
     },
 };
 use bigdecimal::BigDecimal;
@@ -40,6 +49,7 @@ use mxx_ir_core::{
 use num_bigint::ToBigInt;
 use num_traits::{FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -83,7 +93,7 @@ pub enum RefreshSetupError {
 #[derive(Clone)]
 /// Public dimensions and identities used to build one refresh setup.
 ///
-/// The fields describe both the BGG sampler and the Section-7 CRT refresh.
+/// The fields describe both the BGG sampler and the CRT refresh.
 /// `lut_width` is the Power-LUT coefficient-sieve width; it is independent of
 /// any PBC bucket width. The constructor sets the authoritative decoder bound
 /// policy, and validation is repeated at every producer/import boundary.
@@ -239,7 +249,7 @@ impl RefreshSetupParameters {
 pub struct RefreshPrfInputs {
     masks: Vec<RefreshMaskMaterial>,
     fresh_error: RefreshFreshErrorMaterial,
-    program_id: PowerLutProgramId,
+    contract: RefreshPrfContract,
     layout_id: crate::pbc::PbcLayoutId,
 }
 
@@ -249,11 +259,13 @@ impl RefreshPrfInputs {
     /// coverage are checked before any material is retained.
     pub fn from_pbc_outputs(
         parameters: &RefreshSetupParameters,
-        program_id: PowerLutProgramId,
+        expected_program: &SparseLwrPrfProgram,
         masks_by_slot: Vec<Vec<crate::refresh::RefreshMaskPrfOutput>>,
         fresh_error: Vec<crate::refresh::RefreshFreshErrorPrfOutput>,
     ) -> Result<Self, RefreshSetupError> {
         parameters.validate()?;
+        let contract = RefreshPrfContract::from_program(expected_program);
+        contract.validate_for(parameters)?;
         let coverage = RefreshPrfCoverage::new(
             parameters.refresh_id,
             parameters.component_count,
@@ -267,7 +279,7 @@ impl RefreshPrfInputs {
         let mut layout_id = None;
         let mut masks = Vec::with_capacity(slot_count);
         for (slot, outputs) in masks_by_slot.into_iter().enumerate() {
-            let material = RefreshMaskMaterial::new(coverage.clone(), slot, program_id, outputs)?;
+            let material = RefreshMaskMaterial::new(coverage.clone(), slot, contract, outputs)?;
             if let Some(expected) = layout_id {
                 if material.layout_id() != expected {
                     return Err(RefreshSetupError::Refresh(RefreshError::PrfOutputMismatch));
@@ -278,11 +290,11 @@ impl RefreshPrfInputs {
             masks.push(material);
         }
         let layout_id = layout_id.ok_or(RefreshSetupError::Refresh(RefreshError::InvalidLayout))?;
-        let fresh_error = RefreshFreshErrorMaterial::new(coverage, program_id, fresh_error)?;
+        let fresh_error = RefreshFreshErrorMaterial::new(coverage, contract, fresh_error)?;
         if fresh_error.layout_id() != layout_id {
             return Err(RefreshSetupError::Refresh(RefreshError::PrfOutputMismatch));
         }
-        let inputs = Self { masks, fresh_error, program_id, layout_id };
+        let inputs = Self { masks, fresh_error, contract, layout_id };
         inputs.validate_for(parameters)?;
         Ok(inputs)
     }
@@ -293,6 +305,7 @@ impl RefreshPrfInputs {
         parameters: &RefreshSetupParameters,
     ) -> Result<(), RefreshSetupError> {
         parameters.validate()?;
+        self.contract.validate_for(parameters)?;
         let coverage = RefreshPrfCoverage::new(
             parameters.refresh_id,
             parameters.component_count,
@@ -304,7 +317,7 @@ impl RefreshPrfInputs {
         }
         for (slot, material) in self.masks.iter().enumerate() {
             if material.slot() != slot ||
-                material.program_id() != self.program_id ||
+                material.contract() != self.contract ||
                 material.layout_id() != self.layout_id ||
                 !material.coverage_matches(&coverage)
             {
@@ -312,7 +325,7 @@ impl RefreshPrfInputs {
             }
             material.validate()?;
         }
-        if self.fresh_error.program_id() != self.program_id ||
+        if self.fresh_error.contract() != self.contract ||
             self.fresh_error.layout_id() != self.layout_id ||
             !self.fresh_error.coverage_matches(&coverage)
         {
@@ -407,6 +420,18 @@ pub struct RefreshPreprocessingDeclaration {
     pub refresh_id: [u8; 32],
     /// Sparse-LWR/Power-LUT program identity.
     pub program_id: PowerLutProgramId,
+    /// Plaintext modulus bound to the sparse-LWR PRF terminal.
+    pub prf_q_l: usize,
+    /// Raw scalar output modulus bound to the sparse-LWR PRF terminal.
+    pub prf_p: usize,
+    /// Logical LUT width bound to the sparse-LWR PRF program.
+    pub prf_lut_width: usize,
+    /// Ring dimension bound to the sparse-LWR PRF program.
+    pub prf_ring_dimension: usize,
+    /// Algebraic form promised by the PRF terminal.
+    pub prf_terminal_form: SparseLwrPrfTerminalForm,
+    /// Output wire promised by the PRF terminal.
+    pub prf_output_wire: crate::program::ProgramWireId,
     /// Canonical names and roles of all produced artifacts.
     pub names: RefreshPreprocessingArtifactNames,
     /// Number of CRT slots.
@@ -530,6 +555,8 @@ impl RefreshPreprocessingProducer {
             .iter()
             .map(|m| aggregate_refresh_mask(&request.compiler, p.base_p, m))
             .collect::<Result<Vec<_>, _>>()?;
+        // `A'` is the public random matrix used in every slot target
+        // `T_t = A_{sum,t} - mu_t A'`; its domain tag binds it to this refresh.
         let a_prime = ring.hash_matrix(
             request.hash_key.clone(),
             HashTag::from(
@@ -554,6 +581,8 @@ impl RefreshPreprocessingProducer {
         let mut bases = Vec::new();
         let mut scales = Vec::new();
         for slot in 0..masks.len() {
+            // `scale = mu_t = q/q_t` is the scalar represented by the
+            // setup-fixed RNS scaling LUT for CRT slot t.
             let scale = ring.polynomial([p.refresh.scale_expression(slot)?]);
             let base = BggEncodingWire {
                 vector: request.secret.clone() * public_b.clone(),
@@ -567,8 +596,10 @@ impl RefreshPreprocessingProducer {
             Family::pack(masks.iter().map(|mask| mask.pubkey.matrix.clone()).collect())?;
         let scale_family = Family::pack(scales)?;
         // Build every slot target in one structural loop, then sample all
-        // preimages in a second structural loop. The latter marks the target
-        // family as Zip and the captured single trapdoor as Broadcast.
+        // preimages in a second structural loop. Each family element computes
+        // `T_t = A_t + A_{m,t} + A_{e,t} - mu_t A'`; the slot index is structural,
+        // never plaintext. The target family is Zip and the trapdoor is
+        // captured once as a Broadcast input.
         let target_family = Family::<Mat>::parallel_zip_many_values(
             vec![mask_public_family, scale_family],
             |_, mut items| {
@@ -582,19 +613,21 @@ impl RefreshPreprocessingProducer {
         )?;
         let targets =
             (0..masks.len()).map(|slot| target_family.get_static(slot)).collect::<Vec<_>>();
+        // Sample one preimage K_t per target; the trapdoor is captured once
+        // and broadcast, so the resulting relation is `B K_t = T_t`.
         let preimage_family = target_family.parallel_map(|_, target| {
             trapdoor.sample_preimage(target, (b_columns, p.layout.public_key_columns())).as_mat()
         })?;
         let ks = (0..masks.len()).map(|slot| preimage_family.get_static(slot)).collect();
         let names = canonical_names(
             p,
-            request.prf.program_id,
+            &request.prf.contract,
             request.prf.layout_id,
             &decoder_preimage_bound,
         );
         let declaration = make_declaration(
             p,
-            request.prf.program_id,
+            &request.prf.contract,
             names.clone(),
             mxx_ir_core::artifact::SpecHash([0; 32]),
             request.prf.layout_id,
@@ -628,7 +661,7 @@ impl RefreshPreprocessingProducer {
             .map_err(|_| RefreshSetupError::InvalidManifest)?;
         let declaration = make_declaration(
             p,
-            request.prf.program_id,
+            &request.prf.contract,
             names,
             producer_spec_hash.clone(),
             request.prf.layout_id,
@@ -662,6 +695,7 @@ impl RefreshPreprocessingProducer {
     pub fn attestation(&self) -> &RefreshProducerAttestation {
         &self.attestation
     }
+
     /// Returns the public declaration describing this producer's artifacts.
     pub fn declaration(&self) -> &RefreshPreprocessingDeclaration {
         &self.declaration
@@ -677,14 +711,14 @@ impl RefreshPreprocessingProducer {
         if self.declaration.identity !=
             identity_digest(
                 p,
-                self.request.prf.program_id,
+                &self.request.prf.contract,
                 self.request.prf.layout_id,
                 &decoder_preimage_bound,
             ) ||
             self.declaration.names !=
                 canonical_names(
                     p,
-                    self.request.prf.program_id,
+                    &self.request.prf.contract,
                     self.request.prf.layout_id,
                     &decoder_preimage_bound,
                 )
@@ -746,6 +780,9 @@ impl RefreshPreprocessingProducer {
             {
                 return Err(RefreshSetupError::InvalidManifest);
             }
+            // Reconstruct the same `mu_t = q/q_t` scaling used to define
+            // `T_t`; this check prevents a preimage from being paired with a
+            // target from another CRT modulus.
             let scale = p.layout.ring().polynomial([p.refresh.scale_expression(slot)?]);
             let combined = self.request.compiler.bgg.add(
                 &self
@@ -775,10 +812,34 @@ impl RefreshPreprocessingProducer {
     }
 }
 impl RefreshPreprocessingDeclaration {
+    /// Rejects declarations that cannot represent the supported CRT refresh
+    /// layout. This check is repeated at every declaration boundary so a
+    /// depth-one manifest cannot enter through direct import.
+    fn validate_slot_count(&self) -> Result<(), RefreshSetupError> {
+        if self.slot_count < 2 {
+            return Err(RefreshSetupError::InvalidManifest);
+        }
+        Ok(())
+    }
+
+    fn validate_prf_contract(
+        &self,
+        parameters: &RefreshSetupParameters,
+    ) -> Result<(), RefreshSetupError> {
+        declaration_contract(self).validate_for(parameters)?;
+        if self.prf_terminal_form != SparseLwrPrfTerminalForm::RawScalar ||
+            self.program_id == PowerLutProgramId::from_digest([0; 32])
+        {
+            return Err(RefreshSetupError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_built(
         &self,
         w: &RefreshPreprocessingWires,
     ) -> Result<(), RefreshSetupError> {
+        self.validate_slot_count()?;
         if self.identity != w.declaration.identity ||
             self.names != w.names ||
             self.slot_count != w.masks.len() ||
@@ -800,18 +861,20 @@ impl RefreshPreprocessingDeclaration {
         parameters: &RefreshSetupParameters,
     ) -> Result<(), RefreshSetupError> {
         parameters.validate()?;
+        self.validate_slot_count()?;
+        self.validate_prf_contract(parameters)?;
         let decoder_preimage_bound = parameters.resolve_decoder_preimage_bound()?;
         if self.identity !=
             identity_digest(
                 parameters,
-                self.program_id,
+                &declaration_contract(self),
                 self.pbc_layout_id,
                 &decoder_preimage_bound,
             ) ||
             self.names !=
                 canonical_names(
                     parameters,
-                    self.program_id,
+                    &declaration_contract(self),
                     self.pbc_layout_id,
                     &decoder_preimage_bound,
                 ) ||
@@ -829,8 +892,8 @@ impl RefreshPreprocessingDeclaration {
         &self,
         attestation: &RefreshProducerAttestation,
     ) -> Result<(), RefreshSetupError> {
-        if self.slot_count == 0 ||
-            self.component_count == 0 ||
+        self.validate_slot_count()?;
+        if self.component_count == 0 ||
             self.coefficient_count == 0 ||
             self.digit_count == 0 ||
             self.slot_scales.len() != self.slot_count ||
@@ -874,7 +937,15 @@ impl RefreshPreprocessingDeclaration {
             expected_outputs
                 .insert(self.names.preimages[slot].clone(), ArtifactConfidentiality::Private);
         }
-        if graph.outputs().len() != expected_outputs.len() ||
+        let artifact_output_count = graph
+            .outputs()
+            .iter()
+            .filter(|(name, output)| {
+                expected_outputs.contains_key(*name) && output.confidentiality.is_some()
+            })
+            .count();
+        if artifact_output_count != expected_outputs.len() ||
+            graph.outputs().iter().any(|(name, _)| !expected_outputs.contains_key(name)) ||
             expected_outputs.iter().any(|(name, confidentiality)| {
                 graph.outputs().get(name).and_then(|output| output.confidentiality) !=
                     Some(*confidentiality)
@@ -1048,13 +1119,15 @@ impl ImportedRefreshSetup {
         manifest: &Manifest,
     ) -> Result<Self, RefreshSetupError> {
         parameters.validate()?;
+        declaration.validate_slot_count()?;
+        declaration.validate_prf_contract(&parameters)?;
         let decoder_preimage_bound = parameters.resolve_decoder_preimage_bound()?;
         if manifest.production_id != production_id ||
             manifest.production_id.spec_hash != declaration.producer_spec_hash ||
             declaration.identity !=
                 identity_digest(
                     &parameters,
-                    declaration.program_id,
+                    &declaration_contract(&declaration),
                     declaration.pbc_layout_id,
                     &decoder_preimage_bound,
                 ) ||
@@ -1065,7 +1138,7 @@ impl ImportedRefreshSetup {
             declaration.names !=
                 canonical_names(
                     &parameters,
-                    declaration.program_id,
+                    &declaration_contract(&declaration),
                     declaration.pbc_layout_id,
                     &decoder_preimage_bound,
                 )
@@ -1256,11 +1329,11 @@ impl RefreshCompiler {
 /// exchange two mask, decoder-base, or preimage artifacts.
 fn canonical_names(
     p: &RefreshSetupParameters,
-    id: PowerLutProgramId,
+    contract: &RefreshPrfContract,
     pbc_layout_id: crate::pbc::PbcLayoutId,
     decoder_preimage_bound: &mxx_ir_core::IntExpr,
 ) -> RefreshPreprocessingArtifactNames {
-    let d = identity_digest(p, id, pbc_layout_id, decoder_preimage_bound);
+    let d = identity_digest(p, contract, pbc_layout_id, decoder_preimage_bound);
     let n = |r: &str, i: usize| format!("mxx-refresh-{}-{r}-{i}", hex(&d));
     let s = p.refresh.crt_plaintext_moduli.len();
     RefreshPreprocessingArtifactNames {
@@ -1283,18 +1356,24 @@ fn canonical_names(
 /// Constructs the declaration committed by a preprocessing producer.
 fn make_declaration(
     p: &RefreshSetupParameters,
-    id: PowerLutProgramId,
+    contract: &RefreshPrfContract,
     n: RefreshPreprocessingArtifactNames,
     producer_spec_hash: mxx_ir_core::artifact::SpecHash,
     pbc_layout_id: crate::pbc::PbcLayoutId,
     decoder_preimage_bound: &mxx_ir_core::IntExpr,
 ) -> RefreshPreprocessingDeclaration {
     RefreshPreprocessingDeclaration {
-        identity: identity_digest(p, id, pbc_layout_id, decoder_preimage_bound),
+        identity: identity_digest(p, contract, pbc_layout_id, decoder_preimage_bound),
         producer_spec_hash,
         pbc_layout_id,
         refresh_id: p.refresh_id,
-        program_id: id,
+        program_id: contract.program_id(),
+        prf_q_l: contract.q_l(),
+        prf_p: contract.p(),
+        prf_lut_width: contract.lut_width(),
+        prf_ring_dimension: contract.ring_dimension(),
+        prf_terminal_form: contract.terminal_form(),
+        prf_output_wire: contract.output_wire(),
         names: n,
         slot_count: p.refresh.crt_plaintext_moduli.len(),
         component_count: p.component_count,
@@ -1310,6 +1389,22 @@ fn make_declaration(
         layout_ring_dimension: p.layout.ring_dimension.clone(),
         layout_gadget_base: p.layout.gadget_base.clone(),
     }
+}
+
+/// Reconstructs the committed PRF contract from an imported declaration.
+///
+/// This is used only to recompute the declaration identity; runtime output
+/// validation still originates from the independently constructed program.
+fn declaration_contract(declaration: &RefreshPreprocessingDeclaration) -> RefreshPrfContract {
+    RefreshPrfContract::from_parts(
+        declaration.program_id,
+        declaration.prf_output_wire,
+        declaration.prf_terminal_form,
+        declaration.prf_q_l,
+        declaration.prf_p,
+        declaration.prf_lut_width,
+        declaration.prf_ring_dimension,
+    )
 }
 
 fn masks_len(wires: &RefreshPreprocessingWires) -> usize {
@@ -1368,6 +1463,8 @@ fn add_setup_outputs(
     names: &RefreshPreprocessingArtifactNames,
     attached_b: Mat,
 ) -> Result<DslContext, RefreshSetupError> {
+    // Private vectors and K_t remain private artifacts; A', B, and the public
+    // projections are exported with the declaration's canonical roles.
     context = context
         .private_output(names.state_vector.clone(), wires.state.vector.clone())?
         .public_output(names.state_public_matrix.clone(), wires.state.pubkey.matrix.clone())?
@@ -1459,6 +1556,7 @@ fn validate_relation_graph(
     };
     let target_loop_args = root.arguments(target_loop).ok_or(RefreshSetupError::InvalidManifest)?;
     if relation.target.wire.port.0 != 0 ||
+        target_family.port.0 != 0 ||
         !matches!(
             target_selector.kind(),
             mxx_ir_core::node::NodeKind::FamilyGetStatic { index }
@@ -1562,31 +1660,37 @@ fn validate_relation_graph(
     {
         return Err(RefreshSetupError::InvalidManifest);
     }
-    let preimage_family = relation.preimage.wire;
-    let loop_node = node(&relation.preimage).ok_or(RefreshSetupError::InvalidManifest)?;
-    let mxx_ir_core::node::NodeKind::ParallelLoop(loop_spec) = loop_node.kind() else {
+    let preimage_loop = node(&relation.preimage).ok_or(RefreshSetupError::InvalidManifest)?;
+    let mxx_ir_core::node::NodeKind::ParallelLoop(preimage_loop_spec) = preimage_loop.kind() else {
         return Err(RefreshSetupError::InvalidManifest);
     };
-    let loop_args = root.arguments(loop_node).ok_or(RefreshSetupError::InvalidManifest)?;
+    let preimage_loop_args =
+        root.arguments(preimage_loop).ok_or(RefreshSetupError::InvalidManifest)?;
     if relation.preimage.wire.port.0 != 0 ||
-        loop_spec.count != mxx_ir_core::IntExpr::constant(declaration.slot_count) ||
-        loop_spec.input_modes !=
+        preimage_loop_spec.count != mxx_ir_core::IntExpr::constant(declaration.slot_count) ||
+        preimage_loop_spec.input_modes !=
             [
                 mxx_ir_core::node::LoopInputMode::Zip,
                 mxx_ir_core::node::LoopInputMode::Broadcast,
                 mxx_ir_core::node::LoopInputMode::Broadcast,
             ] ||
-        loop_args.len() != 3 ||
-        loop_args[0] != target_family ||
-        loop_args[1] != public_b.wire ||
-        loop_args[2] != trapdoor.wire
+        preimage_loop_args.len() != 3 ||
+        preimage_loop_args[0] != target_family ||
+        preimage_loop_args[1] != public_b.wire ||
+        preimage_loop_args[2] != trapdoor.wire
     {
         return Err(RefreshSetupError::InvalidManifest);
     }
-    let body_id = graph
-        .child_scope_id(&FrozenGraphScopeId::Root, preimage_family.node)
+    let preimage_body_id = graph
+        .child_scope_id(
+            &FrozenGraphScopeId::Root,
+            root.node_id(preimage_loop).ok_or(RefreshSetupError::InvalidManifest)?,
+        )
         .ok_or(RefreshSetupError::InvalidManifest)?;
-    let body = graph.scope(&body_id).ok_or(RefreshSetupError::InvalidManifest)?;
+    let body = graph.scope(&preimage_body_id).ok_or(RefreshSetupError::InvalidManifest)?;
+    if body.inputs().len() != 3 {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
     let preimage_nodes = body
         .nodes()
         .iter()
@@ -1594,11 +1698,15 @@ fn validate_relation_graph(
             matches!(candidate.kind(), mxx_ir_core::node::NodeKind::PreimageSample { .. })
         })
         .collect::<Vec<_>>();
-    if body.inputs().len() != 3 || preimage_nodes.len() != 1 {
+    if preimage_nodes.len() != 1 {
         return Err(RefreshSetupError::InvalidManifest);
     }
     let preimage_node = preimage_nodes[0];
     let preimage_args = body.arguments(preimage_node).ok_or(RefreshSetupError::InvalidManifest)?;
+    let preimage_wire = mxx_ir_core::WireRef {
+        node: body.node_id(preimage_node).ok_or(RefreshSetupError::InvalidManifest)?,
+        port: mxx_ir_core::types::Port(0),
+    };
     if !matches!(
         preimage_node.kind(),
         mxx_ir_core::node::NodeKind::PreimageSample { matrix_type, max_coefficient_bound }
@@ -1607,7 +1715,30 @@ fn validate_relation_graph(
     ) || preimage_args.len() != 3 ||
         preimage_args[0] != body.inputs()[1] ||
         preimage_args[1] != body.inputs()[2] ||
-        preimage_args[2] != body.inputs()[0]
+        preimage_args[2] != body.inputs()[0] ||
+        body.outputs().len() != 1 ||
+        {
+            match body.outputs().first().and_then(|output| body.node(output.node)) {
+                Some(output_node) => {
+                    let output_args = body.arguments(output_node);
+                    !matches!(
+                        (output_node.kind(), output_args.as_deref()),
+                        (
+                            mxx_ir_core::node::NodeKind::MatrixScale { scalar },
+                            Some([argument])
+                        ) if scalar == &mxx_ir_core::IntExpr::constant(1) &&
+                            *argument == preimage_wire &&
+                            matches!(
+                                output_node.output_types().first(),
+                                Some(WireType::Matrix(matrix_type))
+                                    if matrix_type.rows == b_columns.into() &&
+                                        matrix_type.columns == packed.into()
+                            )
+                    )
+                }
+                None => true,
+            }
+        }
     {
         return Err(RefreshSetupError::InvalidManifest);
     }
@@ -1660,11 +1791,12 @@ fn is_large_scale_node(
 
 /// Computes the canonical public identity for refresh preprocessing setup.
 ///
-/// The digest includes dimensions, CRT data, PRF identity, and decoder policy;
-/// private vectors and sampled values are deliberately excluded.
+/// The digest includes dimensions, CRT data, PRF identity, decoder policy,
+/// and public artifact schema; private vectors, support, schedules, and
+/// plaintext values are deliberately excluded.
 fn identity_digest(
     p: &RefreshSetupParameters,
-    id: PowerLutProgramId,
+    contract: &RefreshPrfContract,
     pbc_layout_id: crate::pbc::PbcLayoutId,
     decoder_preimage_bound: &mxx_ir_core::IntExpr,
 ) -> [u8; 32] {
@@ -1687,6 +1819,12 @@ fn identity_digest(
         schema: &'static str,
         refresh_id: [u8; 32],
         program_id: PowerLutProgramId,
+        prf_q_l: usize,
+        prf_p: usize,
+        prf_lut_width: usize,
+        prf_ring_dimension: usize,
+        prf_terminal_form: SparseLwrPrfTerminalForm,
+        prf_output_wire: crate::program::ProgramWireId,
         pbc_layout_id: crate::pbc::PbcLayoutId,
         name: &'a str,
         base_p: usize,
@@ -1702,7 +1840,13 @@ fn identity_digest(
     let payload = Payload {
         schema: "mxx-power-lut/refresh-setup/v4",
         refresh_id: p.refresh_id,
-        program_id: id,
+        program_id: contract.program_id(),
+        prf_q_l: contract.q_l(),
+        prf_p: contract.p(),
+        prf_lut_width: contract.lut_width(),
+        prf_ring_dimension: contract.ring_dimension(),
+        prf_terminal_form: contract.terminal_form(),
+        prf_output_wire: contract.output_wire(),
         pbc_layout_id,
         name: &p.name,
         base_p: p.base_p,
@@ -1837,7 +1981,8 @@ pub struct RefreshVerification {
 }
 
 impl RefreshVerification {
-    /// The exact residual `c - sA + mu*(sG)`.
+    /// The exact residual `c - sA + mu*(tG)`, where `s` is the mask secret
+    /// and `t` is the payload secret.
     pub fn residual(&self) -> &Mat {
         &self.residual
     }
@@ -1914,12 +2059,15 @@ impl RefreshVerification {
     }
 }
 
-/// Builds the noiseless Section-7 verification residual and threshold decoder.
+/// Builds the noiseless refresh verification residual and threshold decoder.
 ///
 /// The expected plaintext is explicit and is never read from
 /// `BggEncodingWire::plaintext`.  All arithmetic is ordinary matrix
-/// multiplication, matching the packed BGG relation used by the existing
-/// exact tests.
+/// multiplication, matching the separate-secret BGG+ relation
+/// `c' = sA' - X^w*(tG) + e'`: the mask secret `s` is used for the public-key
+/// term and the payload secret `t` is used for the gadget term. The supplied
+/// `expected_plaintext` is the scalar/monomial `X^w` multiplier in that
+/// residual, so the noiseless check is `c' - sA' + X^w(tG) = 0`.
 ///
 /// Threshold decoding is scalar-only.  Since a BGG+ residual has one row and
 /// one column per public-key column, this function slices each concrete
@@ -1928,7 +2076,8 @@ impl RefreshVerification {
 /// value means that the corresponding residual decoded as nonzero.
 pub fn build_refresh_verification(
     encoding: &BggEncodingWire,
-    secret: &Mat,
+    mask_secret: &Mat,
+    payload_secret: &Mat,
     expected_plaintext: &Mat,
     gadget_base: impl Into<mxx_ir_core::IntExpr>,
     digit_count: usize,
@@ -1941,25 +2090,28 @@ pub fn build_refresh_verification(
         return Err(RefreshSetupError::InvalidParameters("expected plaintext must be 1x1"));
     }
     let gadget = encoding.pubkey.matrix.matrix_type();
-    if secret.matrix_type().columns.evaluate(&ParamEnv::default()).ok() !=
-        gadget.rows.evaluate(&ParamEnv::default()).ok()
-    {
-        return Err(RefreshSetupError::InvalidParameters("secret/key dimensions do not match"));
-    }
-    let s_a = secret.clone() * encoding.pubkey.matrix.clone();
     let expected_vector = mxx_ir_core::types::MatrixType {
         modulus: gadget.modulus.clone(),
         ring_dimension: gadget.ring_dimension.clone(),
         rows: 1.into(),
         columns: gadget.columns.clone(),
     };
+    let secret_shape_matches = |secret: &Mat| {
+        secret.matrix_type().rows == 1.into() &&
+            secret.matrix_type().columns.evaluate(&ParamEnv::default()).ok() ==
+                gadget.rows.evaluate(&ParamEnv::default()).ok() &&
+            secret.matrix_type().modulus.evaluate(&ParamEnv::default()).ok() ==
+                gadget.modulus.evaluate(&ParamEnv::default()).ok() &&
+            secret.matrix_type().ring_dimension.evaluate(&ParamEnv::default()).ok() ==
+                gadget.ring_dimension.evaluate(&ParamEnv::default()).ok()
+    };
     if !same_matrix_type(encoding.vector.matrix_type(), &expected_vector) ||
-        secret.matrix_type().modulus.evaluate(&ParamEnv::default()).ok() !=
-            gadget.modulus.evaluate(&ParamEnv::default()).ok() ||
-        secret.matrix_type().ring_dimension.evaluate(&ParamEnv::default()).ok() !=
-            gadget.ring_dimension.evaluate(&ParamEnv::default()).ok()
+        !secret_shape_matches(mask_secret) ||
+        !secret_shape_matches(payload_secret)
     {
-        return Err(RefreshSetupError::InvalidParameters("incompatible verification shapes"));
+        return Err(RefreshSetupError::InvalidParameters(
+            "mask and payload secrets must both be 1 x gadget-row matrices compatible with the encoding",
+        ));
     }
     let public_key_columns = encoding
         .pubkey
@@ -1984,9 +2136,9 @@ pub fn build_refresh_verification(
         encoding.pubkey.matrix.matrix_type().modulus.clone(),
         encoding.pubkey.matrix.matrix_type().ring_dimension.clone(),
     );
-    let g = ring.gadget(secret.matrix_type().columns.clone(), gadget_base, digit_count);
-    let residual =
-        encoding.vector.clone() - s_a + expected_plaintext.clone() * (secret.clone() * g);
+    let g = ring.gadget(mask_secret.matrix_type().columns.clone(), gadget_base, digit_count);
+    let residual = encoding.vector.clone() - mask_secret.clone() * encoding.pubkey.matrix.clone() +
+        expected_plaintext.clone() * (payload_secret.clone() * g);
     let plaintext_modulus = plaintext_modulus.into();
     let mut decoder_residuals = Vec::with_capacity(public_key_columns);
     let mut decoded = Vec::with_capacity(decoded_count);
@@ -2045,7 +2197,7 @@ pub struct RefreshSimulationDecoderTarget {
     pub plaintext_modulus: mxx_ir_core::IntExpr,
 }
 
-/// Opaque request for the honest Section-7 parameter-search construction.
+/// Opaque request for the honest parameter-search construction.
 ///
 /// The trusted key provider supplies the validated setup, sparse-LWR profile,
 /// generated PBC layout, and key identity.  Sampling, selector construction,
@@ -2162,9 +2314,16 @@ impl RefreshParameterSimulationRequest {
             setup.layout.public_key_columns(),
         )
         .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let selector_artifacts =
-            PbcSelectorArtifacts::from_structural(&layout, self.key_instance_id, selector_names)
-                .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
+        let selector_artifacts = PbcSelectorArtifacts::from_structural(
+            &layout,
+            self.key_instance_id,
+            selector_names,
+            &sampler.layout,
+            self.key_instance_id,
+            &sampler.layout,
+            self.key_instance_id,
+        )
+        .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
         let structural = build_structural_selector_families(
             &sampler,
             selector_bits.family().clone(),
@@ -2218,7 +2377,7 @@ impl RefreshParameterSimulationRequest {
         let (gsw_matrix, gsw_count) = resolve_selector_output_matrix(
             &selector_graph,
             &gsw_name,
-            ArtifactConfidentiality::Private,
+            ArtifactConfidentiality::Public,
             true,
             &ring.matrix_type((setup.layout.secret_dimension, setup.layout.public_key_columns())),
             Some(package_count),
@@ -2230,90 +2389,68 @@ impl RefreshParameterSimulationRequest {
             gsw_name,
             gsw_count.clone().ok_or(RefreshSetupError::InvalidManifest)?,
             (gsw_matrix.rows.clone(), gsw_matrix.columns.clone()),
-            ArtifactConfidentiality::Private,
+            ArtifactConfidentiality::Public,
         );
-        let companion_count = setup.layout.secret_dimension * setup.layout.public_key_columns();
-        let companions = (0..companion_count)
-            .map(|index| {
-                let vector_name = crate::pbc::selector_family_artifact_name(
-                    &selector_artifacts,
-                    &format!("vector-{index}"),
-                );
-                let (vector_matrix, vector_count) = resolve_selector_output_matrix(
-                    &selector_graph,
-                    &vector_name,
-                    ArtifactConfidentiality::Private,
-                    true,
-                    &ring.matrix_type((
-                        1,
-                        setup.layout.public_key_columns() * setup.layout.digit_count,
-                    )),
-                    Some(package_count),
-                )?;
-                let vector_ring = mxx_dsl::Ring::new(
-                    vector_matrix.modulus.clone(),
-                    vector_matrix.ring_dimension.clone(),
-                );
-                let vector = vector_ring.family_artifact_input(
-                    selector_production.clone(),
-                    vector_name,
-                    vector_count.ok_or(RefreshSetupError::InvalidManifest)?,
-                    (vector_matrix.rows.clone(), vector_matrix.columns.clone()),
-                    ArtifactConfidentiality::Private,
-                );
-                let public_name = crate::pbc::selector_family_artifact_name(
-                    &selector_artifacts,
-                    &format!("public-{index}"),
-                );
-                let (public_matrix, public_count) = resolve_selector_output_matrix(
-                    &selector_graph,
-                    &public_name,
-                    ArtifactConfidentiality::Public,
-                    true,
-                    &ring.matrix_type((
-                        setup.layout.secret_dimension,
-                        setup.layout.public_key_columns() * setup.layout.digit_count,
-                    )),
-                    Some(package_count),
-                )?;
-                let public_ring = mxx_dsl::Ring::new(
-                    public_matrix.modulus.clone(),
-                    public_matrix.ring_dimension.clone(),
-                );
-                let public = public_ring.family_artifact_input(
-                    selector_production.clone(),
-                    public_name,
-                    public_count.ok_or(RefreshSetupError::InvalidManifest)?,
-                    (public_matrix.rows.clone(), public_matrix.columns.clone()),
-                    ArtifactConfidentiality::Public,
-                );
-                Ok((vector, public))
-            })
-            .collect::<Result<Vec<_>, RefreshSetupError>>()?;
-        let selectors = EncodingSelectorFamily::new(gsw, companions)?;
+        let selectors = EncodingSelectorFamily::new(gsw)?;
         let compiler = PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
             ring: ring.clone(),
             base: setup.layout.gadget_base.clone(),
             digit_count: setup.layout.digit_count.into(),
         });
-        let state = sampler.sample_input_encoding(
+        let input_encodings = sampler.sample_input_encodings(
             secret_input.clone(),
+            None,
             hash_key.clone(),
-            b"refresh-parameter-search-state".as_slice(),
-            ring.zero((1, 1)),
+            b"refresh-parameter-search-inputs".as_slice(),
+            &[ring.zero((1, 1)), ring.zero((1, 1))],
         )?;
-        let fresh = sampler.sample_input_encoding(
-            secret_input.clone(),
-            hash_key.clone(),
-            b"refresh-parameter-search-fresh".as_slice(),
-            ring.zero((1, 1)),
-        )?;
-        let helpers = sampler.sample_automorphism_helpers(
-            secret_input.clone(),
-            hash_key.clone(),
-            b"refresh-parameter-search-helpers".as_slice(),
+        let state = input_encodings[0].clone();
+        let fresh = input_encodings[1].clone();
+        let reduction_table =
+            (0..setup.lut_width).map(|value| value % self.profile.q_l()).collect::<Vec<_>>();
+        let reduction_lut = crate::program::LutTable::unary(
             setup.lut_width,
+            setup.lut_width,
+            reduction_table.clone(),
+        )
+        .map_err(|_| RefreshSetupError::InvalidParameters("invalid reduction LUT"))?;
+        let program = SparseLwrPrfProgram::new(self.profile.clone(), layout.bucket_width)?;
+        let rounding_lut = program
+            .rounding_program()
+            .lut(crate::program::LutId::from_index(0))
+            .ok_or(RefreshSetupError::InvalidParameters("missing rounding LUT"))?;
+        if program.rounding_lut() != rounding_lut.values() {
+            return Err(RefreshSetupError::InvalidParameters("rounding program mismatch"));
+        }
+        let mask_bank = sampler.sample_flat_mask_bank(
+            secret.clone(),
+            hash_key.clone(),
+            setup.lut_width.max(rounding_lut.values().len()),
+            b"refresh-parameter-search-mask-bank".as_slice(),
         )?;
+        let helpers = BTreeMap::from([(
+            crate::program::LutId::from_index(0),
+            FlatLutHelperSet::new(
+                &reduction_lut,
+                sampler.sample_flat_helpers_for_lut(
+                    secret.clone(),
+                    None,
+                    hash_key.clone(),
+                    &reduction_lut,
+                    mask_bank.as_ref(),
+                    b"refresh-parameter-search-reduce".as_slice(),
+                )?,
+            )?,
+        )]);
+        let rounding_helpers = sampler.sample_flat_helpers_for_lut(
+            secret.clone(),
+            None,
+            hash_key.clone(),
+            rounding_lut,
+            mask_bank.as_ref(),
+            b"refresh-parameter-search-rounding".as_slice(),
+        )?;
+        let rounding_helpers = FlatLutHelperSet::new(rounding_lut, rounding_helpers)?;
         let labels = crate::refresh::RefreshPrfLabelIndex::new(
             setup.refresh_id,
             setup.refresh.crt_plaintext_moduli.len(),
@@ -2321,7 +2458,6 @@ impl RefreshParameterSimulationRequest {
             setup.coefficient_count,
             setup.digit_count,
         )?;
-        let program = SparseLwrPrfProgram::new(self.profile.clone(), layout.bucket_width)?;
         let batch = RefreshPrfBatchInputs::new(&layout, self.profile, &labels)?;
         let mask_count = setup.refresh.crt_plaintext_moduli.len() *
             setup.component_count *
@@ -2329,7 +2465,7 @@ impl RefreshParameterSimulationRequest {
             setup.digit_count;
         let fresh_count = setup.component_count * setup.coefficient_count * setup.digit_count;
         let total = mask_count + fresh_count;
-        let outputs = program.compile_pbc_encoding_family_typed_with_batch(
+        let outputs = program.compile_pbc_encoding_family_typed_with_batch_and_rounding_helpers(
             &compiler,
             Family::pack(
                 (0..total)
@@ -2352,6 +2488,7 @@ impl RefreshParameterSimulationRequest {
             &batch,
             selectors,
             &helpers,
+            &rounding_helpers,
         )?;
         let mut masks =
             (0..setup.refresh.crt_plaintext_moduli.len()).map(|_| Vec::new()).collect::<Vec<_>>();
@@ -2390,7 +2527,7 @@ impl RefreshParameterSimulationRequest {
                 digit,
             )?);
         }
-        let prf = RefreshPrfInputs::from_pbc_outputs(&setup, program.id(), masks, fresh_error)?;
+        let prf = RefreshPrfInputs::from_pbc_outputs(&setup, &program, masks, fresh_error)?;
         let producer = RefreshPreprocessingProducer::build(RefreshPreprocessingRequest {
             parameters: setup.clone(),
             prf,
@@ -2421,6 +2558,9 @@ impl RefreshParameterSimulationRequest {
                 artifact.content_hash = Some([0x5a; 32]);
             }
         }
+        selector_artifacts
+            .finalize_export_manifest(&mut selector_manifest)
+            .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
         let producer_validated = producer
             .built
             .validate_with_manifests(
@@ -2459,6 +2599,7 @@ impl RefreshParameterSimulationRequest {
         let refreshed = setup.refresh.refresh(&compiler, &manifest)?;
         let verification = build_refresh_verification(
             refreshed.encoding(),
+            &secret_input,
             &secret_input,
             &self.expected_plaintext,
             setup.layout.gadget_base.clone(),
@@ -2803,1184 +2944,270 @@ fn decoder_targets(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    use crate::{
-        encoding::{EncodingSelectorFamily, PowerLutEncodingSampler},
-        pbc::{
-            PbcEncodedPublicVector, PbcParameters, PbcPublicVectorFamilyBinding, PbcRootSeed,
-            PbcSelectorArtifactNames, PbcSelectorArtifacts, PbcTrustedSelectorBits,
-            build_structural_selector_families, generate_key_layout,
-        },
-        prf::test_sparse_lwr_program,
-        program::PowerLutProgramId,
-        refresh::{RefreshFreshErrorPrfOutput, RefreshMaskPrfOutput, RefreshPrfLabel},
-    };
-    use mxx_bgg::{BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout};
-    use mxx_dsl::{DslContext, Family};
-    use mxx_ir_core::IntExpr;
-    use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-    use num_bigint::BigInt;
+    use mxx_bgg::BggEncodingCompiler;
+    use mxx_ir_core::artifact::SpecHash;
 
-    #[allow(dead_code)]
-    pub(crate) struct Fixture {
-        pub(crate) parameters: RefreshSetupParameters,
-        pub(crate) compiler: PowerLutEncodingCompiler,
-        pub(crate) request: RefreshPreprocessingRequest,
-        pub(crate) program_id: PowerLutProgramId,
-        pub(crate) selector_graph: mxx_dsl::BuiltGraph,
-        pub(crate) selector_production: mxx_ir_core::artifact::ProductionId,
-        pub(crate) selector_bit_input_name: String,
-        pub(crate) selector_bit_values: Vec<u8>,
+    struct RelationFixture {
+        graph: Graph,
+        roles: BTreeMap<String, ScopedWireRef>,
+        relation: RefreshPreimageRelationAttestation,
+        wrong_target: ScopedWireRef,
+        wrong_preimage: ScopedWireRef,
+        public_b: ScopedWireRef,
+        trapdoor: ScopedWireRef,
+        declaration: RefreshPreprocessingDeclaration,
     }
 
-    pub(crate) fn fixture() -> Fixture {
-        fixture_with_ring(4)
-    }
-
-    pub(crate) fn fixture_with_ring(ring_dimension: u32) -> Fixture {
-        fixture_with_ring_and_crt(ring_dimension, 1)
-    }
-
-    pub(crate) fn fixture_with_ring_and_crt(ring_dimension: u32, crt_depth: usize) -> Fixture {
-        let dcrt = DCRTPolyParams::new(ring_dimension, crt_depth, 17, 16);
-        assert_eq!(dcrt.crt_depth(), crt_depth);
-        assert_eq!(dcrt.crt_bits().div_ceil(dcrt.base_bits() as usize), 2);
-        // Each 17-bit CRT tower needs ceil(17 / 16) = 2 gadget digits. Keep
-        // the layout tied to the DCRT parameter's authoritative total rather
-        // than duplicating a fixture-only digit count.
-        let digit_count = dcrt.modulus_digits();
-        assert_eq!(digit_count, 2 * crt_depth);
-        let (crt_moduli, _, _) = dcrt.to_crt();
-        let modulus = BigInt::from(dcrt.modulus().as_ref().clone());
-        let layout = BggSamplerLayout {
-            modulus: modulus.clone().into(),
-            ring_dimension: (ring_dimension as usize).into(),
-            secret_dimension: 2,
-            digit_count,
-            gadget_base: (BigInt::from(1u64) << 16usize).into(),
-        };
-        let ring = layout.ring();
-        let sampler = PowerLutEncodingSampler {
-            layout: layout.clone(),
-            gaussian_sigma: None,
-            gaussian_max_coefficient_bound: None,
-        };
-        let sampled_secret = sampler.sample_secret().unwrap();
-        let zero = ring.polynomial([0.into()]);
-        let hash_key = ring.bytes_input("refresh-hash-key", 32);
-        let pbc_parameters = PbcParameters::custom(1, 1, 2, 2, 1, None);
-        let generated = generate_key_layout(&pbc_parameters, PbcRootSeed([7; 32]), &[0]).unwrap();
-        let selector_bits =
-            PbcTrustedSelectorBits::from_schedule(&generated, &ring, [8; 32]).unwrap();
-        let selector_count =
-            crate::pbc::PbcActiveCellIndex::build(&generated.public_layout).unwrap().len();
-        let structural_selectors = build_structural_selector_families(
-            &sampler,
-            selector_bits.family().clone(),
-            sampled_secret.clone(),
-            sampled_secret.clone(),
-            hash_key.clone(),
-            &generated.public_layout,
-            [8; 32],
-        )
-        .unwrap();
-        let selector_names = PbcSelectorArtifactNames::canonicalize_schema(
-            &generated.public_layout,
-            [8; 32],
-            layout.secret_dimension,
-            layout.public_key_columns(),
-        )
-        .unwrap();
-        let selector_artifacts = PbcSelectorArtifacts::from_structural(
-            &generated.public_layout,
-            [8; 32],
-            selector_names,
-        )
-        .unwrap();
-        let selector_gsw_name =
-            crate::pbc::selector_family_artifact_name(&selector_artifacts, "gsw");
-        let selector_vector_name = |index| {
-            crate::pbc::selector_family_artifact_name(
-                &selector_artifacts,
-                &format!("vector-{index}"),
-            )
-        };
-        let selector_public_name = |index| {
-            crate::pbc::selector_family_artifact_name(
-                &selector_artifacts,
-                &format!("public-{index}"),
-            )
-        };
-        let public_vector =
-            PbcEncodedPublicVector::route_usize(&generated.public_layout, &[1], 17).unwrap();
-        let public_binding =
-            PbcPublicVectorFamilyBinding::from_encoded(&generated.public_layout, &public_vector)
-                .unwrap();
-        let public_values_raw = public_binding.values_usize().unwrap();
-        // Materialize the real sampled selector packages through a separate
-        // artifact-producing graph. The refresh producer consumes only the
-        // resulting artifact-backed families, so its runtime path exercises
-        // the same persistence boundary as an external key-generation job.
-        let mut selector_context = selector_artifacts
-            .add_structural_family_outputs(
-                DslContext::new("refresh-selector-artifacts"),
-                &generated.public_layout,
-                structural_selectors,
-            )
-            .unwrap();
-        selector_context = selector_context
-            .private_output("refresh-secret", sampled_secret.clone())
-            .unwrap()
-            .public_family_output(
-                "refresh-public-values",
-                Family::pack(
-                    public_values_raw
-                        .iter()
-                        .map(|value| ring.polynomial([(*value).into()]))
-                        .collect(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let selector_graph = selector_context.build().unwrap();
-        let selector_spec_hash =
-            mxx_ir_core::encoding::spec_hash(&selector_graph.graph, &Default::default()).unwrap();
-        let family_production = mxx_ir_core::artifact::ProductionId {
-            spec_hash: selector_spec_hash,
-            execution_nonce: [55; 32],
-        };
-        let secret = ring.artifact_input(
-            family_production.clone(),
-            "refresh-secret",
-            (1, layout.secret_dimension),
-            ArtifactConfidentiality::Private,
-        );
-        let gsw = ring.family_artifact_input(
-            family_production.clone(),
-            selector_gsw_name,
-            selector_count,
-            (layout.secret_dimension, layout.public_key_columns()),
-            ArtifactConfidentiality::Private,
-        );
-        let companions = (0..layout.secret_dimension * layout.public_key_columns())
-            .map(|index| {
-                let vectors = ring.family_artifact_input(
-                    family_production.clone(),
-                    selector_vector_name(index),
-                    selector_count,
-                    (1, layout.public_key_columns() * layout.digit_count),
-                    ArtifactConfidentiality::Private,
-                );
-                let publics = ring.family_artifact_input(
-                    family_production.clone(),
-                    selector_public_name(index),
-                    selector_count,
-                    (2, layout.public_key_columns() * layout.digit_count),
-                    ArtifactConfidentiality::Public,
-                );
-                (vectors, publics)
-            })
-            .collect();
-        let selectors = EncodingSelectorFamily::new(gsw, companions).unwrap();
-        let body =
-            test_sparse_lwr_program(generated.public_layout.bucket_width, ring_dimension as usize)
-                .unwrap();
-        let compiler = PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
-            ring: ring.clone(),
-            base: layout.gadget_base.clone(),
-            digit_count: layout.digit_count.into(),
-        });
-        let state = sampler
-            .sample_input_encoding(
-                secret.clone(),
-                hash_key.clone(),
-                b"refresh-state".as_slice(),
-                zero.clone(),
-            )
-            .unwrap();
-        let fresh = sampler
-            .sample_input_encoding(
-                secret.clone(),
-                hash_key.clone(),
-                b"refresh-fresh".as_slice(),
-                zero.clone(),
-            )
-            .unwrap();
-        let helpers = sampler
-            .sample_automorphism_helpers(
-                secret.clone(),
-                hash_key.clone(),
-                b"refresh-helpers".as_slice(),
-                4,
-            )
-            .unwrap();
-        let refresh_id = [9; 32];
-        let label_index = crate::refresh::RefreshPrfLabelIndex::new(
-            refresh_id,
-            crt_moduli.len(),
-            layout.secret_dimension,
-            1,
-            layout.digit_count,
-        )
-        .unwrap();
-        let mask_count = crt_moduli.len() * layout.secret_dimension * layout.digit_count;
-        let fresh_count = layout.secret_dimension * layout.digit_count;
-        let total_count = mask_count + fresh_count;
-        let batch = crate::prf::RefreshPrfBatchInputs::new(
-            &generated.public_layout,
-            body.profile().clone(),
-            &label_index,
-        )
-        .unwrap();
-        let combined_outputs = body
-            .compile_pbc_encoding_family_typed_with_batch(
-                &compiler,
-                Family::pack(
-                    (0..total_count)
-                        .map(|index| {
-                            if index < mask_count {
-                                state.vector.clone()
-                            } else {
-                                fresh.vector.clone()
-                            }
-                        })
-                        .collect(),
-                )
-                .unwrap(),
-                Family::pack(
-                    (0..total_count)
-                        .map(|index| {
-                            if index < mask_count {
-                                state.pubkey.matrix.clone()
-                            } else {
-                                fresh.pubkey.matrix.clone()
-                            }
-                        })
-                        .collect(),
-                )
-                .unwrap(),
-                &batch,
-                selectors.clone(),
-                &helpers,
-            )
-            .unwrap();
-        let mut masks_by_slot = (0..crt_moduli.len()).map(|_| Vec::new()).collect::<Vec<_>>();
-        for flat in 0..mask_count {
-            let label = label_index.label(flat).expect("mask label coverage");
-            let RefreshPrfLabel::Mask { slot, component, coefficient, digit, .. } = label else {
-                panic!("mask label index entered fresh-error group")
-            };
-            masks_by_slot[slot].push(
-                RefreshMaskPrfOutput::from_pbc_evaluation(
-                    combined_outputs.project(flat).unwrap(),
-                    refresh_id,
-                    slot,
-                    component,
-                    coefficient,
-                    digit,
-                )
-                .unwrap(),
-            );
-        }
-        let fresh_error = (0..fresh_count)
-            .map(|offset| {
-                let flat = mask_count + offset;
-                let label = label_index.label(flat).expect("fresh label coverage");
-                let RefreshPrfLabel::FreshError { component, coefficient, digit, .. } = label
-                else {
-                    panic!("fresh label index entered mask group")
-                };
-                RefreshFreshErrorPrfOutput::from_pbc_evaluation(
-                    combined_outputs.project(flat).unwrap(),
-                    refresh_id,
-                    component,
-                    coefficient,
-                    digit,
-                )
-                .unwrap()
-            })
-            .collect();
-        let refresh = RefreshCompiler {
-            full_modulus: modulus.clone().into(),
-            crt_plaintext_moduli: crt_moduli
-                .iter()
-                .map(|value| BigInt::from(*value).into())
-                .collect(),
-            reconstruction_coefficients: dcrt
-                .reconst_coeffs()
-                .into_iter()
-                .map(|value| BigInt::from_biguint(num_bigint::Sign::Plus, value).into())
-                .collect(),
-        };
-        let parameters = RefreshSetupParameters {
-            refresh_id,
-            base_p: 2,
-            component_count: layout.secret_dimension,
-            coefficient_count: 1,
-            digit_count: layout.digit_count,
-            lut_width: 4,
-            layout,
-            refresh,
-            decoder_sigma: 1.into(),
-            decoder_preimage_bound: mxx_bgg::PreimageCoefficientBound::Official,
-            name: "acceptance".to_owned(),
-        };
-        let program_id = body.id();
-        let prf =
-            RefreshPrfInputs::from_pbc_outputs(&parameters, program_id, masks_by_slot, fresh_error)
-                .unwrap();
-        let request_parameters = parameters.clone();
-        Fixture {
-            parameters,
-            compiler,
-            request: RefreshPreprocessingRequest {
-                parameters: request_parameters,
-                prf,
-                compiler: PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
-                    ring: ring.clone(),
-                    base: (BigInt::from(1u64) << 16usize).into(),
-                    digit_count: digit_count.into(),
-                }),
-                state,
-                secret,
-                hash_key,
+    fn relation_fixture() -> RelationFixture {
+        let ring = mxx_dsl::Ring::new(97, 4);
+        let bgg = BggEncodingCompiler {
+            public_key: BggPublicKeyCompiler {
+                ring: ring.clone(),
+                base: 2.into(),
+                digit_count: 2.into(),
             },
-            program_id,
-            selector_graph,
-            selector_production: family_production,
-            selector_bit_input_name: selector_bits.input_name().to_owned(),
-            selector_bit_values: selector_bits.runtime_bits().to_vec(),
-        }
-    }
-
-    pub(crate) fn request_clone(
-        request: &RefreshPreprocessingRequest,
-    ) -> RefreshPreprocessingRequest {
-        RefreshPreprocessingRequest {
-            parameters: request.parameters.clone(),
-            prf: request.prf.clone(),
-            compiler: PowerLutEncodingCompiler::from_public_key(
-                request.compiler.bgg.public_key.clone(),
-            ),
-            state: request.state.clone(),
-            secret: request.secret.clone(),
-            hash_key: request.hash_key.clone(),
-        }
-    }
-
-    fn static_validated_fixture() -> (
-        Fixture,
-        RefreshPreprocessingProducer,
-        mxx_ir_core::artifact::ProductionId,
-        mxx_ir_core::artifact::Manifest,
-    ) {
-        let fixture = fixture();
-        let producer =
-            RefreshPreprocessingProducer::build(request_clone(&fixture.request)).unwrap();
-        let selector = fixture.selector_graph.validate(&ParamEnv::default()).unwrap();
-        let mut selector_manifest = mxx_ir_core::artifact::export_validated_manifest(
-            fixture.selector_production.clone(),
-            &selector,
-        )
-        .unwrap();
-        for artifact in selector_manifest.artifacts.values_mut() {
-            if artifact.confidentiality == ArtifactConfidentiality::Public {
-                artifact.content_hash = Some([0x5au8; 32]);
-            }
-        }
-        let validated = producer
-            .built()
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &std::collections::BTreeMap::from([(
-                    fixture.selector_production.clone(),
-                    selector_manifest,
-                )]),
-            )
-            .unwrap();
-        let spec_hash =
-            mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings).unwrap();
-        let production_id =
-            mxx_ir_core::artifact::ProductionId { spec_hash, execution_nonce: [77; 32] };
-        let mut manifest =
-            mxx_ir_core::artifact::export_validated_manifest(production_id.clone(), &validated)
-                .unwrap();
-        for artifact in manifest.artifacts.values_mut() {
-            if artifact.confidentiality == ArtifactConfidentiality::Public {
-                artifact.content_hash = Some([0xabu8; 32]);
-            }
-        }
-        producer.finalize_export_manifest(&mut manifest).unwrap();
-        (fixture, producer, production_id, manifest)
-    }
-
-    #[test]
-    fn producer_graph_has_exact_refresh_setup_relations() {
-        let fixture = fixture();
-        let producer = RefreshPreprocessingProducer::build(fixture.request).unwrap();
-        producer.validate_built().unwrap();
-        let names = &producer.declaration().names;
-        let ring = fixture.parameters.layout.ring();
-        assert_eq!(producer.wires.public_b.matrix_type(), &ring.matrix_type((2, 8)));
-        assert_eq!(producer.wires.targets[0].matrix_type(), &ring.matrix_type((2, 4)));
-        assert_eq!(producer.wires.preimages[0].matrix_type(), &ring.matrix_type((8, 4)));
-        assert_eq!(producer.wires.decoder_bases[0].vector.matrix_type(), &ring.matrix_type((1, 8)));
-        assert_eq!(producer.declaration().slot_count, 1);
-        assert_eq!(producer.built().graph.outputs().len(), 10);
-        assert_eq!(producer.attestation().relations.len(), 1);
-        assert!(producer.built().graph.outputs().contains_key(&names.a_prime));
-        assert!(producer.built().graph.outputs().contains_key(&names.public_matrix_b));
-        assert!(producer.built().graph.outputs().contains_key(&names.state_vector));
-        assert!(producer.built().graph.outputs().contains_key(&names.fresh_vector));
-        let outputs = producer.built().graph.outputs();
-        for name in [&names.state_vector, &names.fresh_vector] {
-            assert_eq!(outputs[name].confidentiality, Some(ArtifactConfidentiality::Private));
-        }
-        for name in [
-            &names.state_public_matrix,
-            &names.a_prime,
-            &names.public_matrix_b,
-            &names.fresh_public_matrix,
-        ] {
-            assert_eq!(outputs[name].confidentiality, Some(ArtifactConfidentiality::Public));
-        }
-        assert_eq!(names.masks.len(), 1);
-        assert_eq!(names.decoder_base_vectors.len(), 1);
-        assert_eq!(names.preimages.len(), 1);
-        for slot in 0..1 {
-            assert!(producer.built().graph.outputs().contains_key(&names.masks[slot].vector));
-            assert!(producer.built().graph.outputs().contains_key(&names.preimages[slot]));
-            assert_eq!(
-                outputs[&names.masks[slot].vector].confidentiality,
-                Some(ArtifactConfidentiality::Private)
-            );
-            assert_eq!(
-                outputs[&names.masks[slot].public_matrix].confidentiality,
-                Some(ArtifactConfidentiality::Public)
-            );
-            assert_eq!(
-                outputs[&names.decoder_base_vectors[slot]].confidentiality,
-                Some(ArtifactConfidentiality::Private)
-            );
-            assert_eq!(
-                outputs[&names.preimages[slot]].confidentiality,
-                Some(ArtifactConfidentiality::Private)
-            );
-            assert!(producer.attestation().relations.iter().any(|relation| relation.slot == slot));
-        }
-        assert!(
-            producer
-                .built()
-                .graph
-                .outputs()
-                .keys()
-                .all(|name| !name.contains("decoder-base-public"))
-        );
-        assert!(producer.attestation().attachment.roles.iter().any(|(name, _)| name == "trapdoor"));
-
-        let root = producer.built().graph.root_scope();
-        assert_eq!(
-            root.nodes()
-                .iter()
-                .filter(|node| matches!(
-                    node.kind(),
-                    mxx_ir_core::node::NodeKind::PreimageSample { .. }
-                ))
-                .count(),
-            0,
-            "preimage sampling must be inside the structural loop body"
-        );
-        let loops = root
-            .nodes()
-            .iter()
-            .filter(|node| matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(_)))
-            .collect::<Vec<_>>();
-        let preimage_loops = loops
-            .iter()
-            .filter_map(|candidate| {
-                let id = root.node_id(candidate)?;
-                let body_id =
-                    producer.built().graph.child_scope_id(&FrozenGraphScopeId::Root, id)?;
-                let body = producer.built().graph.scope(&body_id)?;
-                body.nodes()
-                    .iter()
-                    .any(|node| {
-                        matches!(node.kind(), mxx_ir_core::node::NodeKind::PreimageSample { .. })
-                    })
-                    .then_some(id)
-            })
-            .into_iter()
-            .collect::<Vec<_>>();
-        assert_eq!(preimage_loops.len(), 1, "setup uses one structural preimage loop");
-        let loop_id = preimage_loops[0];
-        let body_id =
-            producer.built().graph.child_scope_id(&FrozenGraphScopeId::Root, loop_id).unwrap();
-        let body = producer.built().graph.scope(&body_id).unwrap();
-        assert_eq!(
-            body.nodes()
-                .iter()
-                .filter(|node| matches!(
-                    node.kind(),
-                    mxx_ir_core::node::NodeKind::PreimageSample { .. }
-                ))
-                .count(),
-            1,
-            "the loop body contains one symbolic preimage sample"
-        );
-    }
-
-    #[test]
-    fn selector_producer_artifacts_retain_exact_types_and_confidentiality() {
-        let fixture = fixture();
-        let generated = generate_key_layout(
-            &PbcParameters::custom(1, 1, 2, 2, 1, None),
-            PbcRootSeed([7; 32]),
-            &[0],
-        )
-        .unwrap();
-        let layout = generated.public_layout;
-        let names = PbcSelectorArtifactNames::canonicalize_schema(
-            &layout,
-            [8; 32],
-            fixture.parameters.layout.secret_dimension,
-            fixture.parameters.layout.public_key_columns(),
-        )
-        .unwrap();
-        let artifacts = PbcSelectorArtifacts::from_structural(&layout, [8; 32], names).unwrap();
-        let ring = fixture.parameters.layout.ring();
-        let package_count = layout.parameters.universe_size * layout.parameters.hash_count +
-            layout.parameters.bucket_count;
-        let assert_concrete_matrix =
-            |actual: &mxx_ir_core::types::MatrixType, expected: &mxx_ir_core::types::MatrixType| {
-                assert_eq!(
-                    actual.modulus.evaluate(&ParamEnv::default()).unwrap(),
-                    expected.modulus.evaluate(&ParamEnv::default()).unwrap()
-                );
-                assert_eq!(
-                    actual.ring_dimension.evaluate(&ParamEnv::default()).unwrap(),
-                    expected.ring_dimension.evaluate(&ParamEnv::default()).unwrap()
-                );
-                assert_eq!(
-                    actual.rows.evaluate(&ParamEnv::default()).unwrap(),
-                    expected.rows.evaluate(&ParamEnv::default()).unwrap()
-                );
-                assert_eq!(
-                    actual.columns.evaluate(&ParamEnv::default()).unwrap(),
-                    expected.columns.evaluate(&ParamEnv::default()).unwrap()
-                );
-            };
-        let (secret, secret_count) = resolve_selector_output_matrix(
-            &fixture.selector_graph,
-            "refresh-secret",
-            ArtifactConfidentiality::Private,
-            false,
-            &ring.matrix_type((1, fixture.parameters.layout.secret_dimension)),
-            None,
-        )
-        .unwrap();
-        assert!(secret_count.is_none());
-        assert_concrete_matrix(
-            &secret,
-            &ring.matrix_type((1, fixture.parameters.layout.secret_dimension)),
-        );
-        let gsw_name = crate::pbc::selector_family_artifact_name(&artifacts, "gsw");
-        let (gsw, gsw_count) = resolve_selector_output_matrix(
-            &fixture.selector_graph,
-            &gsw_name,
-            ArtifactConfidentiality::Private,
-            true,
-            &ring.matrix_type((
-                fixture.parameters.layout.secret_dimension,
-                fixture.parameters.layout.public_key_columns(),
-            )),
-            Some(package_count),
-        )
-        .unwrap();
-        assert_eq!(
-            gsw_count
-                .as_ref()
-                .and_then(|count| count.evaluate(&ParamEnv::default()).ok())
-                .and_then(|count| count.to_usize()),
-            Some(package_count)
-        );
-        assert_concrete_matrix(
-            &gsw,
-            &ring.matrix_type((
-                fixture.parameters.layout.secret_dimension,
-                fixture.parameters.layout.public_key_columns(),
-            )),
-        );
-        for index in 0..fixture.parameters.layout.secret_dimension *
-            fixture.parameters.layout.public_key_columns()
-        {
-            let vector_name =
-                crate::pbc::selector_family_artifact_name(&artifacts, &format!("vector-{index}"));
-            let public_name =
-                crate::pbc::selector_family_artifact_name(&artifacts, &format!("public-{index}"));
-            let (vector, vector_count) = resolve_selector_output_matrix(
-                &fixture.selector_graph,
-                &vector_name,
-                ArtifactConfidentiality::Private,
-                true,
-                &ring.matrix_type((
-                    1,
-                    fixture.parameters.layout.public_key_columns() *
-                        fixture.parameters.layout.digit_count,
-                )),
-                Some(package_count),
-            )
-            .unwrap();
-            assert_eq!(
-                vector_count
-                    .as_ref()
-                    .and_then(|count| count.evaluate(&ParamEnv::default()).ok())
-                    .and_then(|count| count.to_usize()),
-                Some(package_count)
-            );
-            assert_concrete_matrix(
-                &vector,
-                &ring.matrix_type((
-                    1,
-                    fixture.parameters.layout.public_key_columns() *
-                        fixture.parameters.layout.digit_count,
-                )),
-            );
-            let (public, public_count) = resolve_selector_output_matrix(
-                &fixture.selector_graph,
-                &public_name,
-                ArtifactConfidentiality::Public,
-                true,
-                &ring.matrix_type((
-                    fixture.parameters.layout.secret_dimension,
-                    fixture.parameters.layout.public_key_columns() *
-                        fixture.parameters.layout.digit_count,
-                )),
-                Some(package_count),
-            )
-            .unwrap();
-            assert_eq!(
-                public_count
-                    .as_ref()
-                    .and_then(|count| count.evaluate(&ParamEnv::default()).ok())
-                    .and_then(|count| count.to_usize()),
-                Some(package_count)
-            );
-            assert_concrete_matrix(
-                &public,
-                &ring.matrix_type((
-                    fixture.parameters.layout.secret_dimension,
-                    fixture.parameters.layout.public_key_columns() *
-                        fixture.parameters.layout.digit_count,
-                )),
-            );
-        }
-    }
-
-    #[test]
-    fn simulation_builder_consumes_frozen_selector_artifact_types() {
-        let fixture = fixture();
-        let generated = generate_key_layout(
-            &PbcParameters::custom(1, 1, 2, 2, 1, None),
-            PbcRootSeed([7; 32]),
-            &[0],
-        )
-        .unwrap();
-        let profile = test_sparse_lwr_program(
-            generated.public_layout.bucket_width,
-            fixture
-                .parameters
-                .layout
-                .ring_dimension
-                .evaluate(&ParamEnv::default())
-                .unwrap()
-                .to_usize()
-                .unwrap(),
-        )
-        .unwrap()
-        .profile()
-        .clone();
-        let ring = fixture.parameters.layout.ring();
-        let request = RefreshParameterSimulationRequest::new(
-            fixture.parameters.clone(),
-            profile,
-            generated,
-            [8; 32],
-            1.into(),
-            fixture.parameters.decoder_sigma.clone(),
-            ring.zero((1, 1)),
-            1,
-        )
-        .unwrap();
-        let bundle = request.build().unwrap();
-        assert!(bundle.selector_graph().graph.outputs().contains_key("refresh-secret"));
-        assert!(!bundle.preprocessing_graph().graph.outputs().is_empty());
-        assert!(!bundle.verification_graph().graph.outputs().is_empty());
-    }
-
-    #[test]
-    fn simulation_refresh_crosses_the_preprocessing_artifact_boundary() {
-        let fixture = fixture();
-        let ring = fixture.parameters.layout.ring();
-        let generated = crate::pbc::generate_key_layout(
-            &crate::pbc::PbcParameters::custom(1, 1, 2, 2, 1, None),
-            crate::pbc::PbcRootSeed([7; 32]),
-            &[0],
-        )
-        .unwrap();
-        let profile = fixture.parameters.sparse_lwr_profile(2).unwrap();
-        let request = RefreshParameterSimulationRequest::new(
-            fixture.parameters.clone(),
-            profile,
-            generated,
-            [8; 32],
-            1.into(),
-            fixture.parameters.decoder_sigma.clone(),
-            ring.zero((1, 1)),
-            1,
-        )
-        .unwrap();
-        let bundle = request.build().unwrap();
-
-        let preprocessing_outputs = bundle
-            .preprocessing_graph()
-            .graph
-            .outputs()
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut imported = std::collections::BTreeMap::new();
-        let mut has_live_sampling = false;
-        for scope in bundle.verification_graph().graph.scopes().values() {
-            for node in scope.nodes() {
-                has_live_sampling |= matches!(
-                    node.kind(),
-                    mxx_ir_core::node::NodeKind::TrapdoorSample { .. } |
-                        mxx_ir_core::node::NodeKind::PreimageSample { .. }
-                );
-                if let mxx_ir_core::node::NodeKind::Input { artifact: Some(artifact), .. } =
-                    node.kind()
-                {
-                    imported.insert(artifact.artifact_name.clone(), artifact.production_id.clone());
-                }
-            }
-        }
-        assert!(!has_live_sampling);
-        assert!(preprocessing_outputs.iter().all(|name| imported.contains_key(name)));
-        let producer_id = preprocessing_outputs
-            .iter()
-            .find_map(|name| imported.get(name))
-            .expect("preprocessing artifact inputs");
-        assert!(preprocessing_outputs.iter().all(|name| imported.get(name) == Some(producer_id)));
-        let selector_id = imported.get("refresh-secret").expect("selector secret artifact");
-        assert_ne!(selector_id, producer_id);
-    }
-
-    #[test]
-    fn verification_decodes_each_public_key_column_in_order() {
-        let ring = mxx_dsl::Ring::new(323, 4);
-        let encoding = BggEncodingWire {
-            vector: ring.input("verification-vector", (1, 4)),
+        };
+        let state = BggEncodingWire {
+            vector: ring.input("state-vector", (1, 4)),
             pubkey: BggPublicKeyWire {
-                matrix: ring.input("verification-public-key", (2, 4)),
+                matrix: ring.input("state-public", (2, 4)),
                 reveal_plaintext: false,
             },
             plaintext: None,
         };
-        let secret = ring.input("verification-secret", (1, 2));
-        let expected_plaintext = ring.zero((1, 1));
-        let verification =
-            build_refresh_verification(&encoding, &secret, &expected_plaintext, 2, 2, 17, 2)
-                .unwrap();
-
-        assert_eq!(verification.decoder_residuals().len(), 4);
-        verification.validate_decoder_residuals(verification.decoder_residuals()).unwrap();
-
-        // Four public-key columns and two decoded Boolean failure indicators
-        // per scalar must produce eight outputs in column-major/coefficient
-        // order.
-        assert_eq!(verification.decoded().len(), 4 * 2);
-        let graph = verification
-            .add_outputs(DslContext::new("verification-multi-column"), "residual", "decoded")
-            .unwrap()
-            .build()
-            .unwrap();
-        assert_eq!(graph.graph.outputs().len(), 1 + 4 + 4 * 2);
-        let decoded_outputs = (0..8)
-            .map(|index| graph.graph.outputs()[&format!("decoded_{index}")].value)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            decoded_outputs.iter().map(|output| output.port.0).collect::<Vec<_>>(),
-            vec![0, 1, 0, 1, 0, 1, 0, 1]
-        );
-        for pair in decoded_outputs.chunks_exact(2) {
-            assert_eq!(pair[0].node, pair[1].node);
-        }
-        assert_ne!(decoded_outputs[0].node, decoded_outputs[2].node);
-        assert_ne!(decoded_outputs[2].node, decoded_outputs[4].node);
-        assert_ne!(decoded_outputs[4].node, decoded_outputs[6].node);
-
-        // Each threshold decoder must consume the exact scalar residual wire
-        // exported by the verification object, in the same column order.
-        for column in 0..4 {
-            let residual_name = format!("refresh-decoder-residual-{column}");
-            let residual_output = graph.graph.outputs().get(&residual_name).unwrap();
-            let decoded = decoded_outputs[column * 2];
-            let decoder = graph.graph.root_scope().node(decoded.node).unwrap();
-            match decoder.kind() {
-                mxx_ir_core::node::NodeKind::ThresholdDecode { output_bool, .. } => {
-                    assert!(*output_bool, "refresh verification must decode Boolean indicators");
-                }
-                other => panic!("expected threshold decoder, got {other:?}"),
-            }
-            assert!(matches!(
-                decoder.output_types().get(decoded.port.0 as usize),
-                Some(mxx_ir_core::types::WireType::Bool)
-            ));
-            let arguments = graph.graph.root_scope().arguments(decoder).unwrap();
-            let expected = graph
-                .graph
-                .root_scope()
-                .wire_ref(verification.decoder_residuals()[column].value_handle())
-                .unwrap();
-            assert_eq!(residual_output.value, expected);
-            assert_eq!(arguments, vec![expected]);
-        }
-        assert_ne!(
-            graph.graph.outputs()["refresh-decoder-residual-0"].value,
-            graph.graph.outputs()["refresh-decoder-residual-1"].value,
-            "distinct columns must not share a residual output wire"
-        );
-        assert_ne!(
-            graph.graph.outputs()["refresh-decoder-residual-0"].value,
-            graph.graph.outputs()["residual"].value,
-            "the aggregate residual must not stand in for a scalar target"
-        );
-
-        // Simulation metadata coalesces the checker registry without
-        // changing the verification graph or dropping any decoder outputs.
-        let node_count = graph.graph.root_scope().nodes().len();
-        let output_names = graph.graph.outputs().keys().cloned().collect::<Vec<_>>();
-        let targets = decoder_targets(&graph, &verification, 2, 17.into()).unwrap();
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].residual_output_name, "residual");
-        assert_eq!(targets[0].decoded_output_name, "decoded_0");
-        assert_eq!(targets[0].decoder_node, graph.graph.outputs()["decoded_0"].value.node);
-        assert_eq!(
-            targets[0].residual,
-            ScopedWireRef {
-                scope: FrozenGraphScopeId::Root,
-                wire: graph.graph.outputs()["residual"].value,
-            }
-        );
-        assert_eq!(graph.graph.root_scope().nodes().len(), node_count);
-        assert_eq!(graph.graph.outputs().keys().cloned().collect::<Vec<_>>(), output_names);
-
-        let wrong = ring.zero((1, 1));
-        assert!(matches!(
-            verification.validate_decoder_residuals(&[wrong]),
-            Err(RefreshSetupError::DecoderResidualMismatch)
-        ));
-        graph.validate(&ParamEnv::default()).unwrap();
-    }
-
-    #[test]
-    fn producer_graph_keeps_multiple_slots_in_one_preimage_loop() {
-        let fixture = fixture_with_ring_and_crt(4, 2);
-        let producer = RefreshPreprocessingProducer::build(fixture.request).unwrap();
-        assert_eq!(producer.declaration().slot_count, 2);
-        let root = producer.built().graph.root_scope();
-        assert_eq!(
-            root.nodes()
-                .iter()
-                .filter(|node| matches!(
-                    node.kind(),
-                    mxx_ir_core::node::NodeKind::PreimageSample { .. }
-                ))
-                .count(),
-            0
-        );
-        let preimage_loops = root
-            .nodes()
-            .iter()
-            .filter_map(|candidate| {
-                let id = root.node_id(candidate)?;
-                let body_id =
-                    producer.built().graph.child_scope_id(&FrozenGraphScopeId::Root, id)?;
-                let body = producer.built().graph.scope(&body_id)?;
-                body.nodes()
-                    .iter()
-                    .any(|node| {
-                        matches!(node.kind(), mxx_ir_core::node::NodeKind::PreimageSample { .. })
-                    })
-                    .then_some(id)
+        let fresh = BggEncodingWire {
+            vector: ring.input("fresh-vector", (1, 4)),
+            pubkey: BggPublicKeyWire {
+                matrix: ring.input("fresh-public", (2, 4)),
+                reveal_plaintext: false,
+            },
+            plaintext: None,
+        };
+        let a_prime = ring.input("a-prime", (2, 4));
+        let mask_public = ring.input("mask-public", (2, 4));
+        let wrong_mask_public = ring.input("wrong-mask-public", (2, 4));
+        let trapdoor = ring.sample_trapdoor(2, 1, 2, 2, 100);
+        let public_b = trapdoor.public_matrix();
+        let masks = Family::pack(vec![mask_public.clone()]).expect("mask family");
+        let scales = Family::pack(vec![ring.polynomial([1.into()])]).expect("scale family");
+        let target_family =
+            Family::<Mat>::parallel_zip_many_values(vec![masks, scales.clone()], |_, mut items| {
+                let mask = items.remove(0);
+                let scale = items.remove(0);
+                bgg.large_scalar_mul(&state, &scale).pubkey.matrix +
+                    mask +
+                    bgg.large_scalar_mul(&fresh, &scale).pubkey.matrix -
+                    scale * a_prime.clone()
             })
-            .collect::<Vec<_>>();
-        assert_eq!(preimage_loops.len(), 1);
-    }
-
-    #[test]
-    fn import_rejects_relation_and_spec_tampering() {
-        let (fixture, producer, production_id, manifest) = static_validated_fixture();
-        let import = |declaration, attestation, manifest| {
-            ImportedRefreshSetup::import(
-                production_id.clone(),
-                fixture.parameters.clone(),
-                declaration,
-                &attestation,
-                &manifest,
-            )
-        };
-        let mut relation = producer.attestation().clone();
-        relation.relations[0].target = relation.relations[0].preimage.clone();
-        assert!(import(producer.declaration().clone(), relation, manifest.clone()).is_err());
-
-        let mut graph_json = serde_json::to_value(&producer.attestation().graph).unwrap();
-        let root_scope = graph_json["scopes"]
-            .as_array_mut()
-            .unwrap()
-            .iter_mut()
-            .find(|scope| scope["id"] == serde_json::json!(FrozenGraphScopeId::Root))
-            .unwrap();
-        let preimage_node = producer.attestation().relations[0].preimage.wire.node.0 as usize;
-        let wrong_target = producer
-            .attestation()
-            .attachment
-            .roles
-            .iter()
-            .find(|(name, _)| name == "a-prime")
-            .unwrap()
-            .1
-            .wire;
-        let loop_node = root_scope["scope"]["nodes"][preimage_node]["arguments"][0]["node"]
-            .as_u64()
-            .unwrap() as usize;
-        root_scope["scope"]["nodes"][loop_node]["arguments"][1] =
-            serde_json::to_value(wrong_target).unwrap();
-        let mut graph_attestation = producer.attestation().clone();
-        graph_attestation.graph = serde_json::from_value(graph_json).unwrap();
-        assert!(
-            import(producer.declaration().clone(), graph_attestation, manifest.clone()).is_err()
-        );
-
-        let mut declaration = producer.declaration().clone();
-        declaration.producer_spec_hash = mxx_ir_core::artifact::SpecHash([1; 32]);
-        assert!(import(declaration, producer.attestation().clone(), manifest.clone()).is_err());
-
-        let mut manifest_id = manifest;
-        manifest_id.production_id.spec_hash = mxx_ir_core::artifact::SpecHash([2; 32]);
-        assert!(
-            import(producer.declaration().clone(), producer.attestation().clone(), manifest_id,)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn import_rejects_manifest_tampering() {
-        let (fixture, producer, production_id, manifest) = static_validated_fixture();
-        let import = |manifest| {
-            ImportedRefreshSetup::import(
-                production_id.clone(),
-                fixture.parameters.clone(),
-                producer.declaration().clone(),
-                producer.attestation(),
-                &manifest,
-            )
-        };
-        let names = &producer.declaration().names;
-        let mut missing_public_hash = manifest.clone();
-        missing_public_hash.artifacts.get_mut(&names.a_prime).unwrap().content_hash = None;
-        assert!(import(missing_public_hash).is_err());
-
-        let mut private_hash = manifest.clone();
-        private_hash.artifacts.get_mut(&names.state_vector).unwrap().content_hash = Some([3; 32]);
-        assert!(import(private_hash).is_err());
-
-        let mut wrong_confidentiality = manifest.clone();
-        wrong_confidentiality.artifacts.get_mut(&names.a_prime).unwrap().confidentiality =
-            ArtifactConfidentiality::Private;
-        assert!(import(wrong_confidentiality).is_err());
-
-        let mut wrong_b_confidentiality = manifest.clone();
-        wrong_b_confidentiality
-            .artifacts
-            .get_mut(&names.public_matrix_b)
-            .unwrap()
-            .confidentiality = ArtifactConfidentiality::Private;
-        assert!(import(wrong_b_confidentiality).is_err());
-
-        let mut wrong_type = manifest.clone();
-        wrong_type.artifacts.get_mut(&names.a_prime).unwrap().artifact_type =
-            wrong_type.artifacts[&names.state_vector].artifact_type.clone();
-        assert!(import(wrong_type).is_err());
-
-        let mut wrong_count = manifest.clone();
-        wrong_count.artifacts.get_mut(&names.a_prime).unwrap().family_count = Some(1);
-        assert!(import(wrong_count).is_err());
-
-        let mut wrong_k_type = manifest.clone();
-        wrong_k_type.artifacts.get_mut(&names.preimages[0]).unwrap().artifact_type =
-            wrong_k_type.artifacts[&names.state_vector].artifact_type.clone();
-        assert!(import(wrong_k_type).is_err());
-
-        let mut wrong_base_count = manifest.clone();
-        wrong_base_count.artifacts.get_mut(&names.decoder_base_vectors[0]).unwrap().family_count =
-            Some(1);
-        assert!(import(wrong_base_count).is_err());
-
-        let mut wrong_name = manifest.clone();
-        let a_prime_artifact = wrong_name.artifacts.remove(&names.a_prime).unwrap();
-        wrong_name.artifacts.insert("mxx-refresh-tampered-a-prime".to_owned(), a_prime_artifact);
-        assert!(import(wrong_name).is_err());
-
-        let mut removed = manifest;
-        removed.artifacts.remove(&names.a_prime);
-        assert!(import(removed).is_err());
-    }
-
-    #[test]
-    fn setup_identity_is_canonical_and_public_only() {
-        let private_fixture = fixture();
-        let fixture = fixture();
-        let pbc_layout_id = fixture.request.prf.layout_id;
-        let official_producer = RefreshPreprocessingProducer::build(fixture.request).unwrap();
-        let declaration = official_producer.declaration().clone();
-        let encoded = serde_json::to_vec(&declaration).unwrap();
-        let decoded: RefreshPreprocessingDeclaration = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(decoded, declaration);
-        let fixture_bound = fixture.parameters.resolve_decoder_preimage_bound().unwrap();
-
-        let mut equivalent = fixture.parameters.clone();
-        equivalent.layout.modulus =
-            IntExpr::Add(Box::new(IntExpr::constant(8)), Box::new(IntExpr::constant(131033)));
-        equivalent.refresh.full_modulus = equivalent.layout.modulus.clone();
-        assert_eq!(
-            identity_digest(&fixture.parameters, fixture.program_id, pbc_layout_id, &fixture_bound,),
-            identity_digest(
-                &equivalent,
-                fixture.program_id,
-                pbc_layout_id,
-                &equivalent.resolve_decoder_preimage_bound().unwrap(),
-            ),
-        );
-
-        let mut explicit = fixture.parameters.clone();
-        explicit.decoder_preimage_bound =
-            mxx_bgg::PreimageCoefficientBound::Explicit(fixture_bound.clone());
-        let explicit_bound = explicit.resolve_decoder_preimage_bound().unwrap();
-        assert_eq!(fixture_bound, explicit_bound);
-        assert_eq!(
-            identity_digest(&fixture.parameters, fixture.program_id, pbc_layout_id, &fixture_bound),
-            identity_digest(&explicit, fixture.program_id, pbc_layout_id, &explicit_bound),
-        );
-        let mut explicit_request = request_clone(&private_fixture.request);
-        explicit_request.parameters.decoder_preimage_bound =
-            mxx_bgg::PreimageCoefficientBound::Explicit(fixture_bound.clone());
-        let explicit_producer = RefreshPreprocessingProducer::build(explicit_request).unwrap();
-        assert_eq!(
-            explicit_producer.declaration().producer_spec_hash,
-            official_producer.declaration().producer_spec_hash,
-        );
-        assert_eq!(
-            explicit_producer.declaration().identity,
-            official_producer.declaration().identity
-        );
-        assert_eq!(explicit_producer.declaration().names, official_producer.declaration().names);
-        explicit.decoder_preimage_bound =
-            mxx_bgg::PreimageCoefficientBound::Explicit(mxx_ir_core::IntExpr::constant(
-                fixture_bound.evaluate(&ParamEnv::default()).unwrap() + 1usize,
-            ));
-        let changed_bound = explicit.resolve_decoder_preimage_bound().unwrap();
-        assert_ne!(
-            identity_digest(&fixture.parameters, fixture.program_id, pbc_layout_id, &fixture_bound),
-            identity_digest(&explicit, fixture.program_id, pbc_layout_id, &changed_bound),
-        );
-
-        let mut public_change = fixture.parameters.clone();
-        public_change.name.push('x');
-        assert_ne!(
-            identity_digest(&fixture.parameters, fixture.program_id, pbc_layout_id, &fixture_bound),
-            identity_digest(
-                &public_change,
-                fixture.program_id,
-                pbc_layout_id,
-                &public_change.resolve_decoder_preimage_bound().unwrap(),
-            ),
-        );
-        let mut lut_width_change = fixture.parameters.clone();
-        lut_width_change.lut_width = 1;
-        assert_ne!(
-            identity_digest(&fixture.parameters, fixture.program_id, pbc_layout_id, &fixture_bound),
-            identity_digest(
-                &lut_width_change,
-                fixture.program_id,
-                pbc_layout_id,
-                &lut_width_change.resolve_decoder_preimage_bound().unwrap(),
-            ),
-        );
-        assert_eq!(
-            identity_digest(&fixture.parameters, fixture.program_id, pbc_layout_id, &fixture_bound),
-            identity_digest(&fixture.parameters, fixture.program_id, pbc_layout_id, &fixture_bound)
-        );
-        let other_identity = RefreshPreprocessingProducer::build(private_fixture.request)
-            .unwrap()
-            .declaration()
-            .identity;
-        assert_eq!(other_identity, declaration.identity);
-    }
-
-    fn official_bound_parameters() -> RefreshSetupParameters {
-        RefreshSetupParameters::new(
-            [3; 32],
-            2,
-            2,
-            1,
-            4,
-            2,
-            BggSamplerLayout {
-                modulus: 323.into(),
-                ring_dimension: 4.into(),
-                secret_dimension: 2,
-                digit_count: 4,
-                gadget_base: (1usize << 16).into(),
+            .expect("target family");
+        let preimage_family = target_family
+            .clone()
+            .parallel_map(|_, target| trapdoor.sample_preimage(target, (8, 4)).as_mat())
+            .expect("preimage family");
+        let wrong_masks = Family::pack(vec![wrong_mask_public.clone()]).expect("wrong mask family");
+        let wrong_target_family = Family::<Mat>::parallel_zip_many_values(
+            vec![wrong_masks, scales.clone()],
+            |_, mut items| {
+                let mask = items.remove(0);
+                let scale = items.remove(0);
+                bgg.large_scalar_mul(&state, &scale).pubkey.matrix +
+                    mask +
+                    bgg.large_scalar_mul(&fresh, &scale).pubkey.matrix -
+                    scale * a_prime.clone()
             },
-            crate::refresh::RefreshCompiler {
-                full_modulus: 323.into(),
-                crt_plaintext_moduli: vec![17.into(), 19.into()],
-                reconstruction_coefficients: vec![1.into(), 1.into()],
+        )
+        .expect("wrong target family");
+        let wrong_preimage_family = wrong_target_family
+            .parallel_map(|_, target| trapdoor.sample_preimage(target, (8, 4)).as_mat())
+            .expect("wrong preimage family");
+        let target = target_family.get_static(0);
+        let wrong_target = target_family.get_static(1);
+        let k_as_mat = preimage_family.get_static(0);
+        let wrong_k_as_mat = wrong_preimage_family.get_static(0);
+        let decoder_base = state.vector.clone() * public_b.clone();
+        let mut context = DslContext::new("refresh-setup-attestation-test");
+        context = context
+            .output("target", target.clone())
+            .expect("target output")
+            .output("wrong-target", wrong_target.clone())
+            .expect("wrong target output")
+            .output("preimage", k_as_mat.clone())
+            .expect("preimage output")
+            .output("wrong-preimage", wrong_k_as_mat)
+            .expect("wrong preimage output")
+            .output("public-b", public_b.clone())
+            .expect("public B output")
+            .output("state-public", state.pubkey.matrix.clone())
+            .expect("state public output")
+            .output("fresh-public", fresh.pubkey.matrix.clone())
+            .expect("fresh public output")
+            .output("a-prime", a_prime.clone())
+            .expect("a-prime output")
+            .output("mask-public", mask_public.clone())
+            .expect("mask public output")
+            .output("state-vector", state.vector.clone())
+            .expect("state vector output")
+            .output("decoder-base-vector", decoder_base)
+            .expect("decoder base output")
+            .private_trapdoor_output("trapdoor", trapdoor.clone())
+            .expect("trapdoor output");
+        let graph = context.build().expect("attestation graph").graph;
+        let root = graph.root_scope();
+        let output = |name: &str| ScopedWireRef {
+            scope: FrozenGraphScopeId::Root,
+            wire: graph.outputs().get(name).expect("test output").value,
+        };
+        let target = output("target");
+        let wrong_target = output("wrong-target");
+        let k_as_mat = output("preimage");
+        let wrong_k_as_mat = output("wrong-preimage");
+        let public_b = output("public-b");
+        let trapdoor = output("trapdoor");
+        let preimage_node = root.node(k_as_mat.wire.node).expect("preimage output node");
+        let preimage = ScopedWireRef {
+            scope: FrozenGraphScopeId::Root,
+            wire: root.arguments(preimage_node).expect("preimage output arguments")[0],
+        };
+        let wrong_preimage_node =
+            root.node(wrong_k_as_mat.wire.node).expect("wrong preimage output node");
+        let wrong_preimage = ScopedWireRef {
+            scope: FrozenGraphScopeId::Root,
+            wire: root.arguments(wrong_preimage_node).expect("wrong preimage output arguments")[0],
+        };
+        let mut roles = BTreeMap::from([
+            ("state-public".to_owned(), output("state-public")),
+            ("fresh-public".to_owned(), output("fresh-public")),
+            ("a-prime".to_owned(), output("a-prime")),
+            ("public-b".to_owned(), public_b.clone()),
+            ("trapdoor".to_owned(), trapdoor.clone()),
+            ("secret".to_owned(), output("state-vector")),
+        ]);
+        roles.insert("slot-0-mask-public".to_owned(), output("mask-public"));
+        roles.insert("slot-0-decoder-base-vector".to_owned(), output("decoder-base-vector"));
+        let declaration = RefreshPreprocessingDeclaration {
+            identity: [0; 32],
+            producer_spec_hash: SpecHash([0; 32]),
+            pbc_layout_id: crate::pbc::PbcLayoutId([0; 32]),
+            refresh_id: [0; 32],
+            program_id: PowerLutProgramId::from_digest([1; 32]),
+            prf_q_l: 2,
+            prf_p: 2,
+            prf_lut_width: 4,
+            prf_ring_dimension: 4,
+            prf_terminal_form: SparseLwrPrfTerminalForm::RawScalar,
+            prf_output_wire: crate::program::ProgramWireId::from_index(0),
+            names: RefreshPreprocessingArtifactNames {
+                state_vector: String::new(),
+                state_public_matrix: String::new(),
+                a_prime: String::new(),
+                public_matrix_b: String::new(),
+                fresh_vector: String::new(),
+                fresh_public_matrix: String::new(),
+                masks: Vec::new(),
+                decoder_base_vectors: Vec::new(),
+                preimages: Vec::new(),
             },
-            1.into(),
-            "official-bound-test",
+            slot_count: 1,
+            component_count: 2,
+            coefficient_count: 1,
+            digit_count: 2,
+            decoder_sigma: 1.into(),
+            decoder_preimage_bound: 100.into(),
+            trapdoor_digit_count: 2,
+            slot_scales: vec![1.into()],
+            layout_modulus: 97.into(),
+            layout_ring_dimension: 4.into(),
+            layout_gadget_base: 2.into(),
+        };
+        let relation = RefreshPreimageRelationAttestation {
+            slot: 0,
+            target,
+            preimage,
+            k_as_mat,
+            decoder_base_vector: public_b.clone(),
+        };
+        RelationFixture {
+            graph,
+            roles,
+            relation,
+            wrong_target,
+            wrong_preimage,
+            public_b,
+            trapdoor,
+            declaration,
+        }
+    }
+
+    fn validate_fixture(
+        fixture: &RelationFixture,
+        relation: &RefreshPreimageRelationAttestation,
+    ) -> Result<(), RefreshSetupError> {
+        let role =
+            |name: &str| fixture.roles.get(name).cloned().ok_or(RefreshSetupError::InvalidManifest);
+        validate_relation_graph(
+            &fixture.graph,
+            &role,
+            relation,
+            &fixture.public_b,
+            &fixture.trapdoor,
+            &fixture.declaration,
         )
     }
 
     #[test]
-    fn official_preimage_bound_matches_authoritative_cutoff() {
-        assert_eq!(
-            mxx_bgg::PreimageCoefficientBound::default(),
-            mxx_bgg::PreimageCoefficientBound::Official,
-        );
-        let parameters = official_bound_parameters();
-        assert_eq!(
-            parameters.resolve_decoder_preimage_bound().unwrap(),
-            mxx_ir_core::IntExpr::constant(10_110_248usize),
-        );
+    fn relation_attestation_accepts_two_separate_structural_loops() {
+        let fixture = relation_fixture();
+        validate_fixture(&fixture, &fixture.relation).expect("valid two-loop attestation");
     }
 
     #[test]
-    fn preimage_bound_policy_rejects_invalid_values() {
-        let mut parameters = official_bound_parameters();
-        parameters.decoder_preimage_bound =
-            mxx_bgg::PreimageCoefficientBound::Explicit(0usize.into());
-        assert!(parameters.resolve_decoder_preimage_bound().is_err());
+    fn relation_attestation_rejects_wrong_target_family() {
+        let fixture = relation_fixture();
+        let mut relation = fixture.relation.clone();
+        relation.target = relation.k_as_mat.clone();
+        assert!(validate_fixture(&fixture, &relation).is_err());
+    }
 
-        parameters.decoder_preimage_bound = mxx_bgg::PreimageCoefficientBound::Explicit(
-            mxx_ir_core::IntExpr::Var("unbound".to_owned()),
-        );
-        assert!(parameters.resolve_decoder_preimage_bound().is_err());
+    #[test]
+    fn relation_attestation_rejects_wrong_target_index() {
+        let fixture = relation_fixture();
+        let mut relation = fixture.relation.clone();
+        relation.target = fixture.wrong_target.clone();
+        assert!(validate_fixture(&fixture, &relation).is_err());
+    }
 
-        parameters.decoder_preimage_bound = mxx_bgg::PreimageCoefficientBound::Official;
-        parameters.decoder_sigma = 0.into();
-        assert!(parameters.resolve_decoder_preimage_bound().is_err());
+    #[test]
+    fn relation_attestation_rejects_wrong_preimage_loop_output() {
+        let fixture = relation_fixture();
+        let mut relation = fixture.relation.clone();
+        relation.preimage = relation.k_as_mat.clone();
+        assert!(validate_fixture(&fixture, &relation).is_err());
+    }
+
+    #[test]
+    fn relation_attestation_rejects_wrong_preimage_target() {
+        let fixture = relation_fixture();
+        let mut relation = fixture.relation.clone();
+        relation.preimage = fixture.wrong_preimage.clone();
+        assert!(validate_fixture(&fixture, &relation).is_err());
+    }
+
+    #[test]
+    fn relation_attestation_rejects_wrong_preimage_loop_input_mode() {
+        let fixture = relation_fixture();
+        let mut relation = fixture.relation.clone();
+        relation.preimage = relation.target.clone();
+        assert!(validate_fixture(&fixture, &relation).is_err());
+    }
+
+    #[test]
+    fn preprocessing_declaration_rejects_single_crt_slot() {
+        let fixture = relation_fixture();
+        assert!(matches!(
+            fixture.declaration.validate_slot_count(),
+            Err(RefreshSetupError::InvalidManifest)
+        ));
     }
 }

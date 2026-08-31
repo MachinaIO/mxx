@@ -486,9 +486,13 @@ impl NaiveBggPublicKeyVecSampler {
 }
 
 impl NaiveBggEncodingVecSampler {
+    /// Samples per-slot BGG+ vectors using separate secrets for the public-key
+    /// mask and the plaintext gadget payload. `None` for `payload_secret`
+    /// reuses `mask_secret`, preserving the ordinary one-secret construction.
     pub fn sample(
         &self,
-        secret: Mat,
+        mask_secret: Mat,
+        payload_secret: Option<Mat>,
         public_keys: &[NaiveBggPublicKeyVecWire],
         plaintexts: &[Family<Mat>],
     ) -> Result<Vec<NaiveBggEncodingVecWire>, BggSampleError> {
@@ -503,16 +507,21 @@ impl NaiveBggEncodingVecSampler {
         }
         let layout = &self.scalar.layout;
         let ring = layout.ring();
-        if !same_matrix_type(secret.matrix_type(), &ring.matrix_type((1, layout.secret_dimension))) ||
-            public_keys.par_iter().any(|key| {
-                !same_matrix_type(
-                    key.matrices.element_type(),
-                    &ring.matrix_type((layout.secret_dimension, layout.public_key_columns())),
-                )
-            }) ||
-            plaintexts
-                .par_iter()
-                .any(|value| !same_matrix_type(value.element_type(), &ring.matrix_type((1, 1))))
+        let payload_secret = payload_secret.unwrap_or_else(|| mask_secret.clone());
+        if !same_matrix_type(
+            mask_secret.matrix_type(),
+            &ring.matrix_type((1, layout.secret_dimension)),
+        ) || !same_matrix_type(
+            payload_secret.matrix_type(),
+            &ring.matrix_type((1, layout.secret_dimension)),
+        ) || public_keys.par_iter().any(|key| {
+            !same_matrix_type(
+                key.matrices.element_type(),
+                &ring.matrix_type((layout.secret_dimension, layout.public_key_columns())),
+            )
+        }) || plaintexts
+            .par_iter()
+            .any(|value| !same_matrix_type(value.element_type(), &ring.matrix_type((1, 1))))
         {
             return Err(BggSampleError::MatrixTypeMismatch);
         }
@@ -521,12 +530,14 @@ impl NaiveBggEncodingVecSampler {
                 let vectors = if output == 0 {
                     public_keys[0].matrices.clone().parallel_map({
                         let sampler = self.scalar.clone();
-                        let secret = secret.clone();
+                        let mask_secret = mask_secret.clone();
+                        let payload_secret = payload_secret.clone();
                         let reveal = public_keys[0].reveal_plaintext;
                         move |_, one_key| {
                             sampler
                                 .sample(
-                                    secret.clone(),
+                                    mask_secret.clone(),
+                                    Some(payload_secret.clone()),
                                     &[BggPublicKeyWire {
                                         matrix: one_key,
                                         reveal_plaintext: reveal,
@@ -547,13 +558,15 @@ impl NaiveBggEncodingVecSampler {
                         ),
                         {
                             let sampler = self.scalar.clone();
-                            let secret = secret.clone();
+                            let mask_secret = mask_secret.clone();
+                            let payload_secret = payload_secret.clone();
                             let one_reveal = public_keys[0].reveal_plaintext;
                             let reveal = public_keys[output].reveal_plaintext;
                             move |_, (one_key, key, plaintext)| {
                                 sampler
                                     .sample(
-                                        secret.clone(),
+                                        mask_secret.clone(),
+                                        Some(payload_secret.clone()),
                                         &[
                                             BggPublicKeyWire {
                                                 matrix: one_key,
@@ -854,7 +867,12 @@ mod tests {
                 gaussian_max_coefficient_bound: None,
             },
         }
-        .sample(ring.input("secret", (1, layout.secret_dimension)), &public_keys, &[plaintexts])
+        .sample(
+            ring.input("mask-secret", (1, layout.secret_dimension)),
+            Some(ring.input("payload-secret", (1, layout.secret_dimension))),
+            &public_keys,
+            &[plaintexts],
+        )
         .unwrap();
         let mut context = DslContext::new("naive-bgg-sampler-runtime");
         for output in 0..public_keys.len() {
@@ -873,14 +891,26 @@ mod tests {
             }
         }
         let graph = context.build().unwrap();
-        let secret_value = secret(&parameters, layout.secret_dimension);
+        let mask_secret_value = secret(&parameters, layout.secret_dimension);
+        let payload_secret_value = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            (0..layout.secret_dimension)
+                .map(|index| {
+                    DCRTPoly::const_rotate_poly(
+                        &parameters,
+                        (index + 1) % parameters.ring_dimension() as usize,
+                    )
+                })
+                .collect(),
+        );
         let plaintext_values = [scalar(&parameters, 2), scalar(&parameters, 5)];
         let result = execute_graph(
             graph,
             parameters.clone(),
             BTreeMap::from([
                 ("key".to_owned(), RuntimeValue::Bytes(key.to_vec())),
-                ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
+                ("mask-secret".to_owned(), RuntimeValue::matrix(mask_secret_value.clone())),
+                ("payload-secret".to_owned(), RuntimeValue::matrix(payload_secret_value.clone())),
                 ("plaintext-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
                 ("plaintext-1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
             ]),
@@ -916,8 +946,8 @@ mod tests {
                 } else {
                     plaintext_values[slot].clone()
                 };
-                let expected_vector = secret_value.clone() * expected_public -
-                    plaintext.tensor(&(secret_value.clone() * gadget.clone()));
+                let expected_vector = mask_secret_value.clone() * expected_public -
+                    plaintext.tensor(&(payload_secret_value.clone() * gadget.clone()));
                 assert_eq!(
                     matrix_output(&result, &format!("vector-{output}-{slot}")),
                     &expected_vector
@@ -926,5 +956,91 @@ mod tests {
         }
         assert!(public_keys.iter().all(|key| key.reveal_plaintext));
         assert!(encodings.iter().all(|encoding| encoding.plaintexts.is_some()));
+    }
+
+    #[test]
+    fn naive_sampler_payload_secret_none_matches_explicit_shared_secret() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let layout = concrete_layout(&parameters, 2);
+        let ring = layout.ring();
+        let public_keys =
+            NaiveBggPublicKeyVecSampler { layout: layout.clone(), slot_count: 2.into() }
+                .sample(ring.bytes_input("key", 32), b"naive-shared-secret", &[true])
+                .unwrap();
+        let plaintexts =
+            Family::pack((0..2).map(|slot| ring.input(format!("plain-{slot}"), (1, 1))).collect())
+                .unwrap();
+        let plaintext_values = [scalar(&parameters, 2), scalar(&parameters, 5)];
+        let sampler = NaiveBggEncodingVecSampler {
+            scalar: BggEncodingSampler {
+                layout,
+                gaussian_sigma: None,
+                gaussian_max_coefficient_bound: None,
+            },
+        };
+        let shared = sampler
+            .sample(ring.input("shared-secret", (1, 2)), None, &public_keys, &[plaintexts.clone()])
+            .unwrap();
+        let explicit = sampler
+            .sample(
+                ring.input("explicit-mask-secret", (1, 2)),
+                Some(ring.input("explicit-payload-secret", (1, 2))),
+                &public_keys,
+                &[plaintexts],
+            )
+            .unwrap();
+        let mut context = DslContext::new("naive-shared-secret-fallback");
+        for slot in 0..2 {
+            context = context
+                .output(format!("shared-{slot}"), shared[1].vectors.get_static(slot))
+                .unwrap()
+                .output(format!("explicit-{slot}"), explicit[1].vectors.get_static(slot))
+                .unwrap();
+        }
+        let graph = context.build().unwrap();
+        let secret_value = secret(&parameters, 2);
+        let result = execute_graph(
+            graph,
+            parameters.clone(),
+            BTreeMap::from([
+                ("key".to_owned(), RuntimeValue::Bytes([9u8; 32].to_vec())),
+                ("shared-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
+                ("explicit-mask-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
+                ("explicit-payload-secret".to_owned(), RuntimeValue::matrix(secret_value)),
+                ("plain-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
+                ("plain-1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
+            ]),
+        );
+        for slot in 0..2 {
+            assert_eq!(
+                matrix_output(&result, &format!("shared-{slot}")),
+                matrix_output(&result, &format!("explicit-{slot}")),
+            );
+        }
+    }
+
+    #[test]
+    fn naive_sampler_rejects_payload_secret_with_wrong_shape() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let layout = concrete_layout(&parameters, 2);
+        let ring = layout.ring();
+        let public_keys =
+            NaiveBggPublicKeyVecSampler { layout: layout.clone(), slot_count: 1.into() }
+                .sample(ring.bytes_input("key", 32), b"naive-shape", &[])
+                .unwrap();
+        let sampler = NaiveBggEncodingVecSampler {
+            scalar: BggEncodingSampler {
+                layout,
+                gaussian_sigma: None,
+                gaussian_max_coefficient_bound: None,
+            },
+        };
+        let result = sampler.sample(
+            ring.input("mask-secret", (1, 2)),
+            Some(ring.input("wrong-payload-secret", (1, 3))),
+            &public_keys,
+            &[],
+        );
+        assert!(matches!(result, Err(BggSampleError::MatrixTypeMismatch)));
     }
 }

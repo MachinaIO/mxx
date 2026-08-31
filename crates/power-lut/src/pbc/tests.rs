@@ -1,9 +1,9 @@
 use super::{
-    matching::deterministic_matching,
-    schedule::{ValidatedSupport, schedule, schedule_from_owners},
+    schedule::{ValidatedSupport, deterministic_matching, schedule, schedule_from_owners},
     *,
 };
-use serial_test::serial;
+use mxx_bgg::BggSamplerLayout;
+use mxx_ir_core::artifact::{Manifest, ProductionId};
 
 fn seed(byte: u8) -> PbcRootSeed {
     PbcRootSeed([byte; 32])
@@ -390,11 +390,7 @@ fn selector_names_are_layout_and_key_namespace_bound_but_schedule_independent() 
                                 key_instance_id,
                                 bucket,
                                 slot,
-                                b"gsw",
-                                0,
-                                0,
                             ),
-                            companions: Vec::new(),
                         },
                     })
                 })
@@ -437,8 +433,26 @@ fn selector_artifact_import_rejects_production_mismatch() {
         production_id: ProductionId { spec_hash: SpecHash([3; 32]), execution_nonce: [4; 32] },
         artifacts: Default::default(),
     };
+    let sampler_layout = BggSamplerLayout {
+        modulus: 257.into(),
+        ring_dimension: 4.into(),
+        secret_dimension: 2,
+        digit_count: 1,
+        gadget_base: 2.into(),
+    };
     assert!(
-        PbcSelectorArtifacts::import(expected, &layout, [4; 32], &wrong_manifest, names,).is_err()
+        PbcSelectorArtifacts::import(
+            expected,
+            &layout,
+            [4; 32],
+            &wrong_manifest,
+            names,
+            &sampler_layout,
+            [4; 32],
+            &sampler_layout,
+            [4; 32],
+        )
+        .is_err()
     );
 }
 
@@ -585,8 +599,16 @@ fn selector_sampling_uses_one_structural_loop_and_runtime_bits() {
         sampler_layout.public_key_columns(),
     )
     .unwrap();
-    let artifacts =
-        PbcSelectorArtifacts::from_structural(&first.public_layout, [7; 32], names).unwrap();
+    let artifacts = PbcSelectorArtifacts::from_structural(
+        &first.public_layout,
+        [7; 32],
+        names,
+        &sampler_layout,
+        [7; 32],
+        &sampler_layout,
+        [7; 32],
+    )
+    .unwrap();
     let context = artifacts
         .add_structural_family_outputs(
             DslContext::new("trusted-selector-structural-loop"),
@@ -609,10 +631,10 @@ fn selector_sampling_uses_one_structural_loop_and_runtime_bits() {
     });
     assert_eq!(bit_inputs.count(), 1);
 
-    // A different private schedule changes only runtime values.  Rebuilding
-    // the same graph namespace therefore yields the same graph specification;
-    // in particular public companion matrix expressions do not depend on the
-    // hidden schedule choice.
+    // A different private schedule still produces the same structural graph
+    // schema.  Concrete fixed-C family contents are runtime artifacts and may
+    // differ with the sampled RHS inputs; this assertion concerns only the
+    // graph shape and public namespace, not matrix-value invariance.
     let second_bits = PbcTrustedSelectorBits::from_schedule(&second, &ring, [7; 32]).unwrap();
     let second_families = build_structural_selector_families(
         &sampler,
@@ -631,9 +653,16 @@ fn selector_sampling_uses_one_structural_loop_and_runtime_bits() {
         sampler_layout.public_key_columns(),
     )
     .unwrap();
-    let second_artifacts =
-        PbcSelectorArtifacts::from_structural(&second.public_layout, [7; 32], second_names)
-            .unwrap();
+    let second_artifacts = PbcSelectorArtifacts::from_structural(
+        &second.public_layout,
+        [7; 32],
+        second_names,
+        &sampler_layout,
+        [7; 32],
+        &sampler_layout,
+        [7; 32],
+    )
+    .unwrap();
     let second_context = second_artifacts
         .add_structural_family_outputs(
             DslContext::new("trusted-selector-structural-loop"),
@@ -647,278 +676,318 @@ fn selector_sampling_uses_one_structural_loop_and_runtime_bits() {
         mxx_ir_core::encoding::spec_hash(&second_built.graph, &Default::default()).unwrap();
     assert_eq!(first_hash, second_hash);
 }
-
 #[test]
-#[serial(dcrt_runtime)]
-fn selector_import_accepts_a_repository_valid_manifest() {
-    use crate::{
-        BggEncodingWire, BggPublicKeyWire,
-        encoding::{BggEncodingArtifactNames, power_encoding_artifact_layout},
-        pbc::compiler::PbcSelectorFamilyInputs,
-        rhs::{
-            ManifestSecretMetadata, PowerRhsCompanionArtifactName, PowerRhsPackageArtifactNames,
-            power_rhs_artifact_layout,
-        },
-    };
-    use mxx_bgg::BggSamplerLayout;
-    use mxx_dsl::{DslContext, Int};
-    use mxx_ir_core::{
-        artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
-        },
-        types::ConcreteMatrixType,
-    };
-    use mxx_primitives::{
-        matrix::PolyMatrix,
-        poly::{Poly, PolyParams},
-    };
-    use mxx_runtime::{
-        RuntimeValue,
-        artifact::{ArtifactKey, ArtifactPayload, ArtifactStore},
-        backend::{Backend, poly::cpu_backend},
-        execute,
-        transcript::SamplingMode,
-    };
-    use num_bigint::BigInt;
-    use std::collections::BTreeMap;
-
-    let parameters = PbcParameters::custom(1, 1, 2, 2, 1, None);
-    let generated = generate_key_layout(&parameters, seed(14), &[0]).unwrap();
-    let layout = &generated.public_layout;
-    let key_instance_id = [8; 32];
-    let production_id = ProductionId { spec_hash: SpecHash([9; 32]), execution_nonce: [10; 32] };
-    let parameters = mxx_primitives::poly::dcrt::params::DCRTPolyParams::new(4, 1, 17, 17);
-    let modulus = BigInt::from(parameters.modulus().as_ref().clone());
-    let sampler = BggSamplerLayout {
-        modulus: modulus.clone().into(),
+fn fixed_rhs_selector_schema_exposes_only_gsw_component() {
+    let parameters = PbcParameters::custom(7, 2, 2, 3, 1, None);
+    let layout = PbcPublicLayout::build(&parameters, derive_attempt_seed(seed(14), 0), 0).unwrap();
+    let names = PbcSelectorArtifactNames::canonicalize_schema(&layout, [8; 32], 1, 1).unwrap();
+    assert_eq!(
+        names.selector_packages.len(),
+        parameters.universe_size * parameters.hash_count + parameters.bucket_count
+    );
+    assert!(
+        names
+            .selector_packages
+            .iter()
+            .all(|package| !package.package.gsw_ciphertext.contains("selected"))
+    );
+    assert!(
+        names
+            .selector_packages
+            .iter()
+            .all(|package| !package.package.gsw_ciphertext.contains("support"))
+    );
+    let sampler_layout = BggSamplerLayout {
+        modulus: 257.into(),
         ring_dimension: 4.into(),
-        secret_dimension: 1,
+        secret_dimension: 2,
         digit_count: 1,
         gadget_base: 2.into(),
     };
-    let identity = [11; 32];
-    let secret_metadata = ManifestSecretMetadata {
-        modulus: sampler.modulus.clone(),
-        ring_dimension: sampler.ring_dimension.clone(),
-        secret_dimension: sampler.secret_dimension,
-        digit_count: sampler.digit_count,
-        gadget_base: sampler.gadget_base.clone(),
-        identity,
+    let artifacts = PbcSelectorArtifacts::from_structural(
+        &layout,
+        [8; 32],
+        names.clone(),
+        &sampler_layout,
+        [8; 32],
+        &sampler_layout,
+        [8; 32],
+    )
+    .unwrap();
+    let family_name = selector_family_artifact_name(&artifacts, "gsw");
+    assert!(!family_name.is_empty());
+}
+
+fn selector_family_manifest_fixture() -> (
+    PbcSelectorArtifacts,
+    PbcPublicLayout,
+    PbcSelectorArtifactNames,
+    BggSamplerLayout,
+    ProductionId,
+    Manifest,
+    [u8; 32],
+    [u8; 32],
+    [u8; 32],
+) {
+    use mxx_ir_core::{
+        artifact::{ArtifactConfidentiality, ArtifactType, ManifestArtifact, SpecHash},
+        types::ConcreteMatrixType,
     };
-    let ring = sampler.ring();
-    let matrix = ArtifactType::Matrix(ConcreteMatrixType {
-        modulus: modulus.clone(),
-        ring_dimension: 4,
-        rows: 1,
-        columns: 1,
-    });
-    let descriptor =
-        |artifact_type: ArtifactType, confidentiality: ArtifactConfidentiality, layout: String| {
-            ManifestArtifact {
-                artifact_type,
-                family_count: None,
-                confidentiality,
-                content_hash: None,
-                layout: Some(layout),
-            }
-        };
-    let mut package_names = Vec::new();
-    let mut artifacts = BTreeMap::new();
-    for (bucket, row) in layout.cells.iter().enumerate() {
-        for (slot, cell) in row.iter().enumerate() {
-            if matches!(cell, PbcCell::Padding) {
-                continue;
-            }
-            let coordinate = match cell {
-                PbcCell::Real { coordinate, .. } => Some(*coordinate),
-                PbcCell::Dummy => None,
-                PbcCell::Padding => unreachable!(),
-            };
-            let role = serde_json::json!({
-                "PbcSelectorBit": {
-                    "layout": layout.layout_id.0,
-                    "bucket": bucket,
-                    "slot": slot,
-                    "coordinate": coordinate,
-                }
-            });
-            let gsw_name = canonical_component_name(
-                layout.layout_id,
-                key_instance_id,
-                bucket,
-                slot,
-                b"gsw",
-                0,
-                0,
-            );
-            let vector_name = canonical_component_name(
-                layout.layout_id,
-                key_instance_id,
-                bucket,
-                slot,
-                b"vector",
-                0,
-                0,
-            );
-            let public_name = canonical_component_name(
-                layout.layout_id,
-                key_instance_id,
-                bucket,
-                slot,
-                b"public",
-                0,
-                0,
-            );
-            artifacts.insert(
-                gsw_name.clone(),
-                descriptor(
-                    matrix.clone(),
-                    ArtifactConfidentiality::Private,
-                    power_rhs_artifact_layout(&secret_metadata, &secret_metadata, role.clone()),
-                ),
-            );
-            let companion_role = crate::rhs::RhsCompanionArtifactRole::RhsCompanion {
-                gsw_artifact: gsw_name.clone(),
-                source_row: 0,
-                target_column: 0,
-            };
-            artifacts.insert(
-                vector_name.clone(),
-                descriptor(
-                    matrix.clone(),
-                    ArtifactConfidentiality::Private,
-                    power_encoding_artifact_layout(&sampler, identity, companion_role.clone()),
-                ),
-            );
-            artifacts.insert(
-                public_name.clone(),
-                descriptor(
-                    matrix.clone(),
-                    ArtifactConfidentiality::Public,
-                    power_encoding_artifact_layout(&sampler, identity, companion_role),
-                ),
-            );
-            package_names.push(PbcSelectorPackageArtifactNames {
-                bucket,
-                slot,
-                package: PowerRhsPackageArtifactNames {
-                    gsw_ciphertext: gsw_name,
-                    companions: vec![PowerRhsCompanionArtifactName {
-                        source_row: 0,
-                        target_column: 0,
-                        encoding: BggEncodingArtifactNames {
-                            vector: vector_name,
-                            public_matrix: public_name,
-                        },
-                    }],
-                },
-            });
-        }
-    }
-    let names =
-        PbcSelectorArtifactNames::canonicalize(layout, key_instance_id, package_names).unwrap();
-    let manifest = Manifest {
+    use std::collections::BTreeMap;
+
+    let parameters = PbcParameters::custom(5, 1, 2, 2, 1, None);
+    let layout = PbcPublicLayout::build(&parameters, derive_attempt_seed(seed(17), 0), 0).unwrap();
+    let sampler = BggSamplerLayout {
+        modulus: 97.into(),
+        ring_dimension: 4.into(),
+        secret_dimension: 2,
+        digit_count: 1,
+        gadget_base: 4.into(),
+    };
+    let key_instance_id = [4; 32];
+    let source_identity = [5; 32];
+    let target_identity = [6; 32];
+    let names = PbcSelectorArtifactNames::canonicalize_schema(
+        &layout,
+        key_instance_id,
+        sampler.secret_dimension,
+        sampler.public_key_columns(),
+    )
+    .unwrap();
+    let artifacts = PbcSelectorArtifacts::from_structural(
+        &layout,
+        key_instance_id,
+        names.clone(),
+        &sampler,
+        source_identity,
+        &sampler,
+        target_identity,
+    )
+    .unwrap();
+    let family_name = selector_family_artifact_name(&artifacts, "gsw");
+    let active_count = names.selector_packages.len();
+    let mut manifest = Manifest {
         ir_version: mxx_ir_core::encoding::IR_VERSION,
-        production_id: production_id.clone(),
-        artifacts,
-    };
-    let mut manifest = manifest;
-    let package_count = names.selector_packages.len();
-    for (role, confidentiality, content_hash) in [
-        ("gsw".to_owned(), ArtifactConfidentiality::Private, None),
-        ("vector-0".to_owned(), ArtifactConfidentiality::Private, None),
-        ("public-0".to_owned(), ArtifactConfidentiality::Public, Some([31; 32])),
-    ] {
-        manifest.artifacts.insert(
-            selector_family_artifact_name_from_names(&layout, &names, key_instance_id, &role),
+        production_id: ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [8; 32] },
+        artifacts: BTreeMap::from([(
+            family_name,
             ManifestArtifact {
-                artifact_type: matrix.clone(),
-                family_count: Some(package_count),
-                confidentiality,
-                content_hash,
+                artifact_type: ArtifactType::Matrix(ConcreteMatrixType {
+                    modulus: 97.into(),
+                    ring_dimension: 4,
+                    rows: sampler.secret_dimension,
+                    columns: sampler.public_key_columns(),
+                }),
+                family_count: Some(active_count),
+                confidentiality: ArtifactConfidentiality::Public,
+                content_hash: Some([9; 32]),
                 layout: None,
             },
-        );
-    }
-    let gsw_family =
-        selector_family_artifact_name_from_names(&layout, &names, key_instance_id, "gsw");
-    let imported = PbcSelectorArtifacts::import(
-        production_id.clone(),
-        layout,
-        key_instance_id,
-        &manifest,
-        names.clone(),
-    )
-    .unwrap();
-    let _initial = BggEncodingWire {
-        vector: ring.zero((1, 1)),
-        pubkey: BggPublicKeyWire { matrix: ring.zero((1, 1)), reveal_plaintext: false },
-        plaintext: None,
-    };
-    let family_context = DslContext::new("pbc-imported-family-test");
-    let selector_families =
-        PbcSelectorFamilyInputs::from_artifacts(&ring, layout, &imported, &sampler).unwrap();
-    let built = family_context
-        .output("gsw", selector_families.gsw().get(Int::constant(0)))
-        .unwrap()
-        .build()
-        .unwrap();
-    assert!(built.graph.root_scope().nodes().iter().any(|node| matches!(
-        node.kind(),
-        mxx_ir_core::node::NodeKind::Input { artifact: Some(_), .. }
-    )));
-    let validated = built
-        .validate_with_manifests(
-            &mxx_ir_core::ParamEnv::default(),
-            &BTreeMap::from([(production_id.clone(), manifest.clone())]),
-        )
-        .unwrap();
-    let zero = mxx_primitives::matrix::dcrt_poly::DCRTPolyMatrix::zero(&parameters, 1, 1);
-    let mut backend = cpu_backend([parameters.clone()]);
-    let payload = ArtifactPayload::Matrix(backend.matrix_to_bytes(&zero));
-    let family_name = selector_family_artifact_name(&imported, "gsw");
-    let mut store = mxx_runtime::artifact::MemoryArtifactStore::default();
-    store.store_manifest(manifest.clone()).unwrap();
-    for index in 0..package_count {
-        store
-            .insert(
-                ArtifactKey {
-                    production: production_id.clone(),
-                    name: family_name.clone(),
-                    index: Some(index),
-                },
-                matrix.clone(),
-                ArtifactConfidentiality::Private,
-                payload.clone(),
-            )
-            .unwrap();
-    }
-    let wrong = mxx_primitives::matrix::dcrt_poly::DCRTPolyMatrix::from_poly_vec_row(
-        &parameters,
-        vec![mxx_primitives::poly::dcrt::poly::DCRTPoly::const_rotate_poly(&parameters, 1)],
-    );
-    let result = execute(
-        &validated,
-        &mut backend,
-        BTreeMap::from([(
-            family_name.clone(),
-            RuntimeValue::IndexedFamily(
-                (0..package_count).map(|_| RuntimeValue::matrix(wrong.clone())).collect(),
-            ),
         )]),
-        &mut store,
-        SamplingMode::Fresh,
+    };
+    artifacts.finalize_export_manifest(&mut manifest).unwrap();
+    (
+        artifacts,
+        layout,
+        names,
+        sampler,
+        manifest.production_id.clone(),
+        manifest,
+        key_instance_id,
+        source_identity,
+        target_identity,
+    )
+}
+
+#[test]
+fn selector_family_finalization_preserves_runtime_descriptor() {
+    let (artifacts, _, _, _, _, mut manifest, _, _, _) = selector_family_manifest_fixture();
+    let before = manifest.clone();
+    artifacts.finalize_export_manifest(&mut manifest).unwrap();
+    assert_eq!(manifest, before);
+    assert!(manifest.artifacts.values().all(|descriptor| descriptor.layout.is_none()));
+}
+
+#[test]
+fn selector_family_import_round_trip_validates_rhs_layouts_and_identities() {
+    let (_, layout, names, sampler, production_id, manifest, key_id, source_id, target_id) =
+        selector_family_manifest_fixture();
+    let imported = PbcSelectorArtifacts::import(
+        production_id,
+        &layout,
+        key_id,
+        &manifest,
+        names,
+        &sampler,
+        source_id,
+        &sampler,
+        target_id,
     )
     .unwrap();
-    let RuntimeValue::Matrix(value) = &result.outputs["gsw"] else {
-        panic!("artifact family output must be a matrix")
+    assert_eq!(imported.layout_id(), layout.layout_id);
+    assert_eq!(imported.key_instance_id(), key_id);
+    assert_eq!(imported.package_count(), layout.parameters.universe_size * 2 + 2);
+}
+
+#[test]
+fn selector_family_import_rejects_wrong_rhs_bindings_and_family_schema() {
+    use mxx_ir_core::{artifact::ArtifactType, types::ConcreteMatrixType};
+
+    let (_, layout, names, sampler, production_id, manifest, key_id, source_id, target_id) =
+        selector_family_manifest_fixture();
+    let import = |manifest: &Manifest,
+                  names: PbcSelectorArtifactNames,
+                  layout: &PbcPublicLayout,
+                  key_id: [u8; 32],
+                  source: &BggSamplerLayout,
+                  source_id: [u8; 32],
+                  target: &BggSamplerLayout,
+                  target_id: [u8; 32]| {
+        PbcSelectorArtifacts::import(
+            production_id.clone(),
+            layout,
+            key_id,
+            manifest,
+            names,
+            source,
+            source_id,
+            target,
+            target_id,
+        )
     };
-    assert_eq!(value.as_ref(), &zero);
-    let mut tampered = manifest.clone();
-    tampered.artifacts.get_mut(&gsw_family).unwrap().content_hash = Some([1; 32]);
+
+    let mut wrong_source = sampler.clone();
+    wrong_source.gadget_base = 8.into();
     assert!(
-        PbcSelectorArtifacts::import(production_id, layout, key_instance_id, &tampered, names,)
+        import(
+            &manifest,
+            names.clone(),
+            &layout,
+            key_id,
+            &wrong_source,
+            source_id,
+            &sampler,
+            target_id
+        )
+        .is_err()
+    );
+    assert!(
+        import(&manifest, names.clone(), &layout, key_id, &sampler, [10; 32], &sampler, target_id)
             .is_err()
+    );
+    let mut wrong_target = sampler.clone();
+    wrong_target.digit_count = 2;
+    assert!(
+        import(
+            &manifest,
+            names.clone(),
+            &layout,
+            key_id,
+            &sampler,
+            source_id,
+            &wrong_target,
+            target_id
+        )
+        .is_err()
+    );
+    assert!(
+        import(
+            &manifest,
+            names.clone(),
+            &layout,
+            [11; 32],
+            &sampler,
+            source_id,
+            &sampler,
+            target_id
+        )
+        .is_err()
+    );
+
+    let mut wrong_count = manifest.clone();
+    let family_name = selector_family_artifact_name(
+        &PbcSelectorArtifacts::from_structural(
+            &layout,
+            key_id,
+            names.clone(),
+            &sampler,
+            source_id,
+            &sampler,
+            target_id,
+        )
+        .unwrap(),
+        "gsw",
+    );
+    wrong_count.artifacts.get_mut(&family_name).unwrap().family_count = Some(1);
+    assert!(
+        import(
+            &wrong_count,
+            names.clone(),
+            &layout,
+            key_id,
+            &sampler,
+            source_id,
+            &sampler,
+            target_id
+        )
+        .is_err()
+    );
+
+    let mut wrong_type = manifest.clone();
+    wrong_type.artifacts.get_mut(&family_name).unwrap().artifact_type =
+        ArtifactType::Matrix(ConcreteMatrixType {
+            modulus: 97.into(),
+            ring_dimension: 4,
+            rows: 2,
+            columns: 1,
+        });
+    assert!(
+        import(
+            &wrong_type,
+            names.clone(),
+            &layout,
+            key_id,
+            &sampler,
+            source_id,
+            &sampler,
+            target_id
+        )
+        .is_err()
+    );
+
+    let mut wrong_metadata = manifest.clone();
+    let descriptor = wrong_metadata.artifacts.get_mut(&family_name).unwrap();
+    // The runtime owns the generic descriptor layout and persists it as
+    // `None`.  A PBC-specific layout payload is therefore malformed rather
+    // than a second source of metadata that import would have to reconcile.
+    descriptor.layout = Some("unexpected-pbc-metadata".to_owned());
+    assert!(
+        import(
+            &wrong_metadata,
+            names.clone(),
+            &layout,
+            key_id,
+            &sampler,
+            source_id,
+            &sampler,
+            target_id
+        )
+        .is_err()
+    );
+
+    let mut wrong_order_names = names;
+    wrong_order_names.selector_packages.swap(0, 1);
+    assert!(
+        import(
+            &manifest,
+            wrong_order_names,
+            &layout,
+            key_id,
+            &sampler,
+            source_id,
+            &sampler,
+            target_id
+        )
+        .is_err()
     );
 }

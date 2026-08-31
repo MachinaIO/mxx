@@ -1,7 +1,7 @@
-//! The direct section 7 RNS refresh protocol.
+//! The direct RNS refresh protocol.
 //!
 //! This is deliberately separate from mxx_bgg::noise_refresh: it operates
-//! on scalar BGG encodings and models the manuscript order
+//! on scalar BGG encodings and follows the defined order
 //! scaled state + mask + fresh error - combined decoder before CRT
 //! recomposition. Sparse-LWR PRF evaluation produces the mask and fresh-error
 //! wires consumed here; this module owns only CRT routing, scaling, and
@@ -9,11 +9,23 @@
 //! is intentionally not modeled by this protocol declaration: the generic
 //! operational-noise checker analyzes the actual graph, while this module
 //! checks only structural equations and identities.
+//!
+//! For CRT slot `t`, let `q_t` be its plaintext modulus and `mu_t=q/q_t`.
+//! Refresh scales an encoding with `u_t = c G^{-1}(mu_t G)` and its public
+//! matrix with `A_t = A G^{-1}(mu_t G)`. It forms
+//! `A_{sum,t} = A_t + A_{m,t} + A_{e,t}`, asks for `K_t` satisfying
+//! `B K_t = A_{sum,t} - mu_t A'`, and sets the decoder target `d_t = b K_t`.
+//! The final scalar relation is `s A' - X^w t G + e'`; the implementation
+//! below keeps these operations in CRT-slot order and recombines only after
+//! each slot has been decoded.
 
 use crate::{
     PowerLutEncodingCompiler, PowerLutError,
     pbc::PbcLayoutId,
-    prf::{PbcSparseLwrEncodingOutput, SparseLwrPrfOutput},
+    prf::{
+        PbcSparseLwrEncodingOutput, SparseLwrPrfOutput, SparseLwrPrfProgram,
+        SparseLwrPrfTerminalForm,
+    },
 };
 use mxx_bgg::{BggEncodingWire, BggPublicKeyWire};
 use mxx_dsl::{BuiltGraph, DerivationAttachmentValue, Family, FrozenDerivationAttachment, Mat};
@@ -29,7 +41,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Debug, Error, Eq, PartialEq)]
-/// Validation and graph-linkage failures in the Section 7 refresh protocol.
+/// Validation and graph-linkage failures in the RNS refresh protocol.
 pub enum RefreshError {
     #[error("refresh CRT layout is empty or inconsistent")]
     /// CRT slots or reconstruction coefficients are empty or inconsistent.
@@ -260,6 +272,115 @@ pub struct RefreshPrfOutput {
     layout_id: PbcLayoutId,
 }
 
+/// Immutable sparse-LWR contract expected by one refresh setup.
+///
+/// The contract is derived from an independently constructed
+/// [`SparseLwrPrfProgram`], rather than from the outputs being validated.  It
+/// therefore prevents a producer from making its own program identity or
+/// terminal form authoritative after the fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RefreshPrfContract {
+    program_id: crate::program::PowerLutProgramId,
+    output_wire: crate::program::ProgramWireId,
+    terminal_form: SparseLwrPrfTerminalForm,
+    q_l: usize,
+    p: usize,
+    lut_width: usize,
+    ring_dimension: usize,
+}
+
+impl RefreshPrfContract {
+    /// Derives the contract from the expected canonical sparse-LWR program.
+    pub(crate) fn from_program(program: &SparseLwrPrfProgram) -> Self {
+        let profile = program.profile();
+        Self {
+            program_id: program.id(),
+            output_wire: program.terminal_output_wire(),
+            terminal_form: SparseLwrPrfTerminalForm::RawScalar,
+            q_l: profile.q_l(),
+            p: profile.p(),
+            lut_width: profile.lut_width(),
+            ring_dimension: profile.ring_dimension(),
+        }
+    }
+
+    pub(crate) const fn from_parts(
+        program_id: crate::program::PowerLutProgramId,
+        output_wire: crate::program::ProgramWireId,
+        terminal_form: SparseLwrPrfTerminalForm,
+        q_l: usize,
+        p: usize,
+        lut_width: usize,
+        ring_dimension: usize,
+    ) -> Self {
+        Self { program_id, output_wire, terminal_form, q_l, p, lut_width, ring_dimension }
+    }
+
+    /// Validates the contract against the refresh setup dimensions.
+    pub(crate) fn validate_for(
+        &self,
+        parameters: &crate::refresh_setup::RefreshSetupParameters,
+    ) -> Result<(), RefreshError> {
+        let ring_dimension = parameters
+            .layout
+            .ring_dimension
+            .evaluate(&Default::default())
+            .map_err(|_| RefreshError::InvalidLayout)?
+            .to_usize()
+            .ok_or(RefreshError::InvalidLayout)?;
+        if self.terminal_form != SparseLwrPrfTerminalForm::RawScalar ||
+            self.q_l == 0 ||
+            self.q_l > self.lut_width ||
+            self.p < 2 ||
+            self.p != parameters.base_p ||
+            self.lut_width != parameters.lut_width ||
+            self.ring_dimension != ring_dimension
+        {
+            return Err(RefreshError::PrfOutputMismatch);
+        }
+        Ok(())
+    }
+
+    /// Checks that one output descriptor is exactly the contracted terminal.
+    pub(crate) fn validate_output(&self, output: &SparseLwrPrfOutput) -> Result<(), RefreshError> {
+        if output.program_id() != self.program_id ||
+            output.output_wire() != self.output_wire ||
+            output.terminal_form() != self.terminal_form
+        {
+            return Err(RefreshError::PrfOutputMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn program_id(&self) -> crate::program::PowerLutProgramId {
+        self.program_id
+    }
+
+    pub(crate) const fn q_l(&self) -> usize {
+        self.q_l
+    }
+
+    pub(crate) const fn p(&self) -> usize {
+        self.p
+    }
+
+    pub(crate) const fn lut_width(&self) -> usize {
+        self.lut_width
+    }
+
+    pub(crate) const fn ring_dimension(&self) -> usize {
+        self.ring_dimension
+    }
+
+    pub(crate) const fn output_wire(&self) -> crate::program::ProgramWireId {
+        self.output_wire
+    }
+
+    pub(crate) const fn terminal_form(&self) -> SparseLwrPrfTerminalForm {
+        self.terminal_form
+    }
+}
+
 impl RefreshPrfOutput {
     /// Binds the wire and descriptor returned by the real PBC lowering.
     ///
@@ -274,7 +395,9 @@ impl RefreshPrfOutput {
         let encoding = output.encoding().clone();
         let descriptor = output.descriptor();
         crate::ensure_ciphertext_only(&encoding).map_err(RefreshError::Power)?;
-        if descriptor.label_digest() != &refresh_prf_label_digest(label) {
+        if !descriptor.is_raw_scalar() ||
+            descriptor.label_digest() != &refresh_prf_label_digest(label)
+        {
             return Err(RefreshError::PrfOutputMismatch);
         }
         Ok(Self { descriptor, encoding, label, layout_id: output.layout_id() })
@@ -318,7 +441,12 @@ impl RefreshMaskPrfOutput {
         Ok(Self(RefreshPrfOutput::from_pbc_evaluation(output, label)?))
     }
 
-    fn encoding(&self) -> &BggEncodingWire {
+    pub(crate) fn output(&self) -> &RefreshPrfOutput {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encoding(&self) -> &BggEncodingWire {
         self.0.encoding()
     }
 }
@@ -340,7 +468,12 @@ impl RefreshFreshErrorPrfOutput {
         Ok(Self(RefreshPrfOutput::from_pbc_evaluation(output, label)?))
     }
 
-    fn encoding(&self) -> &BggEncodingWire {
+    pub(crate) fn output(&self) -> &RefreshPrfOutput {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encoding(&self) -> &BggEncodingWire {
         self.0.encoding()
     }
 }
@@ -379,7 +512,7 @@ impl RefreshPrfCoverage {
 pub struct RefreshMaskMaterial {
     coverage: RefreshPrfCoverage,
     slot: usize,
-    program_id: crate::program::PowerLutProgramId,
+    contract: RefreshPrfContract,
     layout_id: PbcLayoutId,
     outputs: Vec<RefreshMaskPrfOutput>,
 }
@@ -389,15 +522,15 @@ impl RefreshMaskMaterial {
     pub(crate) fn new(
         coverage: RefreshPrfCoverage,
         slot: usize,
-        program_id: crate::program::PowerLutProgramId,
+        contract: RefreshPrfContract,
         outputs: Vec<RefreshMaskPrfOutput>,
     ) -> Result<Self, RefreshError> {
-        validate_mask_coverage(&coverage, slot, program_id, &outputs)?;
+        validate_mask_coverage(&coverage, slot, contract, &outputs)?;
         let layout_id = outputs.first().ok_or(RefreshError::PrfOutputMismatch)?.0.layout_id();
         if outputs.iter().any(|output| output.0.layout_id() != layout_id) {
             return Err(RefreshError::PrfOutputMismatch);
         }
-        Ok(Self { coverage, slot, program_id, layout_id, outputs })
+        Ok(Self { coverage, slot, contract, layout_id, outputs })
     }
 
     pub(crate) fn layout_id(&self) -> PbcLayoutId {
@@ -409,7 +542,11 @@ impl RefreshMaskMaterial {
     }
 
     pub(crate) fn program_id(&self) -> crate::program::PowerLutProgramId {
-        self.program_id
+        self.contract.program_id()
+    }
+
+    pub(crate) const fn contract(&self) -> RefreshPrfContract {
+        self.contract
     }
 
     pub(crate) fn coverage_matches(&self, coverage: &RefreshPrfCoverage) -> bool {
@@ -417,7 +554,7 @@ impl RefreshMaskMaterial {
     }
 
     pub(crate) fn validate(&self) -> Result<(), RefreshError> {
-        validate_mask_coverage(&self.coverage, self.slot, self.program_id, &self.outputs)?;
+        validate_mask_coverage(&self.coverage, self.slot, self.contract, &self.outputs)?;
         if self.outputs.iter().any(|output| output.0.layout_id() != self.layout_id) {
             return Err(RefreshError::PrfOutputMismatch);
         }
@@ -430,7 +567,7 @@ impl RefreshMaskMaterial {
 #[derive(Clone)]
 pub struct RefreshFreshErrorMaterial {
     coverage: RefreshPrfCoverage,
-    program_id: crate::program::PowerLutProgramId,
+    contract: RefreshPrfContract,
     layout_id: PbcLayoutId,
     outputs: Vec<RefreshFreshErrorPrfOutput>,
 }
@@ -439,19 +576,23 @@ pub struct RefreshFreshErrorMaterial {
 impl RefreshFreshErrorMaterial {
     pub(crate) fn new(
         coverage: RefreshPrfCoverage,
-        program_id: crate::program::PowerLutProgramId,
+        contract: RefreshPrfContract,
         outputs: Vec<RefreshFreshErrorPrfOutput>,
     ) -> Result<Self, RefreshError> {
-        validate_fresh_error_coverage(&coverage, program_id, &outputs)?;
+        validate_fresh_error_coverage(&coverage, contract, &outputs)?;
         let layout_id = outputs.first().ok_or(RefreshError::PrfOutputMismatch)?.0.layout_id();
         if outputs.iter().any(|output| output.0.layout_id() != layout_id) {
             return Err(RefreshError::PrfOutputMismatch);
         }
-        Ok(Self { coverage, program_id, layout_id, outputs })
+        Ok(Self { coverage, contract, layout_id, outputs })
     }
 
     pub(crate) fn program_id(&self) -> crate::program::PowerLutProgramId {
-        self.program_id
+        self.contract.program_id()
+    }
+
+    pub(crate) const fn contract(&self) -> RefreshPrfContract {
+        self.contract
     }
 
     pub(crate) fn layout_id(&self) -> PbcLayoutId {
@@ -463,7 +604,7 @@ impl RefreshFreshErrorMaterial {
     }
 
     pub(crate) fn validate(&self) -> Result<(), RefreshError> {
-        validate_fresh_error_coverage(&self.coverage, self.program_id, &self.outputs)?;
+        validate_fresh_error_coverage(&self.coverage, self.contract, &self.outputs)?;
         if self.outputs.iter().any(|output| output.0.layout_id() != self.layout_id) {
             return Err(RefreshError::PrfOutputMismatch);
         }
@@ -483,7 +624,7 @@ fn expected_coverage_size(coverage: &RefreshPrfCoverage) -> Option<usize> {
 fn validate_mask_coverage(
     coverage: &RefreshPrfCoverage,
     slot: usize,
-    program_id: crate::program::PowerLutProgramId,
+    contract: RefreshPrfContract,
     outputs: &[RefreshMaskPrfOutput],
 ) -> Result<(), RefreshError> {
     let expected = expected_coverage_size(coverage).ok_or(RefreshError::InvalidLayout)?;
@@ -492,9 +633,7 @@ fn validate_mask_coverage(
     }
     let mut labels = BTreeMap::new();
     for output in outputs {
-        if output.0.descriptor().program_id() != program_id {
-            return Err(RefreshError::PrfOutputMismatch);
-        }
+        contract.validate_output(&output.0.descriptor())?;
         let RefreshPrfLabel::Mask { refresh_id, slot: output_slot, component, coefficient, digit } =
             output.0.label()
         else {
@@ -519,7 +658,7 @@ fn validate_mask_coverage(
 #[allow(dead_code)]
 fn validate_fresh_error_coverage(
     coverage: &RefreshPrfCoverage,
-    program_id: crate::program::PowerLutProgramId,
+    contract: RefreshPrfContract,
     outputs: &[RefreshFreshErrorPrfOutput],
 ) -> Result<(), RefreshError> {
     let expected = expected_coverage_size(coverage).ok_or(RefreshError::InvalidLayout)?;
@@ -528,9 +667,7 @@ fn validate_fresh_error_coverage(
     }
     let mut labels = BTreeMap::new();
     for output in outputs {
-        if output.0.descriptor().program_id() != program_id {
-            return Err(RefreshError::PrfOutputMismatch);
-        }
+        contract.validate_output(&output.0.descriptor())?;
         let RefreshPrfLabel::FreshError { refresh_id, component, coefficient, digit } =
             output.0.label()
         else {
@@ -554,54 +691,48 @@ fn validate_fresh_error_coverage(
 fn aggregate_prf_digits(
     compiler: &PowerLutEncodingCompiler,
     base_p: usize,
-    values: impl IntoIterator<Item = (usize, usize, usize, BggEncodingWire)>,
+    contract: RefreshPrfContract,
+    values: impl IntoIterator<Item = (usize, usize, usize, RefreshPrfOutput)>,
 ) -> Result<BggEncodingWire, RefreshError> {
     let values = values.into_iter().collect::<Vec<_>>();
     let first = values.first().ok_or(RefreshError::InvalidLayout)?;
     if values.iter().any(|(_, _, _, value)| {
-        value.vector.matrix_type() != first.3.vector.matrix_type() ||
-            value.pubkey.matrix.matrix_type() != first.3.pubkey.matrix.matrix_type()
+        value.encoding().vector.matrix_type() != first.3.encoding().vector.matrix_type() ||
+            value.encoding().pubkey.matrix.matrix_type() !=
+                first.3.encoding().pubkey.matrix.matrix_type()
     }) {
         return Err(RefreshError::InvalidLayout);
     }
     for (_, _, _, value) in &values {
-        crate::ensure_ciphertext_only(value).map_err(RefreshError::Power)?;
+        contract.validate_output(&value.descriptor)?;
+        crate::ensure_ciphertext_only(value.encoding()).map_err(RefreshError::Power)?;
     }
 
-    // Route every label in one reusable structural body. The route matrices
+    // Route every label in one reusable structural body. For label
+    // `(digit, coefficient, component)`, the route is
+    // `p^digit X^coefficient u_2 delta_component^T`; this realizes the
+    // corresponding term of the base-p PRF expansion before summing.
+    // The route matrices
     // are public constants in canonical label order; no per-label addition
     // chain or host-side wire aggregation is emitted.
-    let vectors =
-        Family::pack(values.iter().map(|(_, _, _, value)| value.vector.clone()).collect())
-            .map_err(|_| RefreshError::InvalidLayout)?;
+    let routed_values = values
+        .iter()
+        .map(|(digit, coefficient, component, value)| {
+            route_prf_digit(compiler, value, base_p, *digit, *coefficient, *component)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let vectors = Family::pack(routed_values.iter().map(|value| value.vector.clone()).collect())
+        .map_err(|_| RefreshError::InvalidLayout)?;
     let public_keys =
-        Family::pack(values.iter().map(|(_, _, _, value)| value.pubkey.matrix.clone()).collect())
+        Family::pack(routed_values.iter().map(|value| value.pubkey.matrix.clone()).collect())
             .map_err(|_| RefreshError::InvalidLayout)?;
-    let routes = Family::pack(
-        values
-            .iter()
-            .map(|(digit, coefficient, component, value)| {
-                prf_route_matrix(value, base_p, *digit, *coefficient, *component)
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    )
-    .map_err(|_| RefreshError::InvalidLayout)?;
-    let routed = Family::<Mat>::parallel_zip_many_values(
-        vec![vectors, public_keys, routes],
-        |_index, mut items| {
-            let route = items.pop().expect("route family element");
+    let routed =
+        Family::<Mat>::parallel_zip_many_values(vec![vectors, public_keys], |_index, mut items| {
             let public_key = items.pop().expect("public-key family element");
             let vector = items.pop().expect("vector family element");
-            let value = BggEncodingWire {
-                vector,
-                pubkey: BggPublicKeyWire { matrix: public_key, reveal_plaintext: false },
-                plaintext: None,
-            };
-            let routed = compiler.bgg.matrix_mul(&value, &route);
-            (routed.vector, routed.pubkey.matrix)
-        },
-    )
-    .map_err(|_| RefreshError::InvalidLayout)?;
+            (vector, public_key)
+        })
+        .map_err(|_| RefreshError::InvalidLayout)?;
     Ok(BggEncodingWire {
         vector: crate::encoding::balanced_sum_family(routed.0).map_err(RefreshError::Power)?,
         pubkey: BggPublicKeyWire {
@@ -624,7 +755,7 @@ pub(crate) fn aggregate_refresh_mask(
     validate_mask_coverage(
         &material.coverage,
         material.slot,
-        material.program_id,
+        material.contract,
         &material.outputs,
     )?;
     if material.outputs.iter().any(|output| output.0.layout_id() != material.layout_id) {
@@ -635,11 +766,12 @@ pub(crate) fn aggregate_refresh_mask(
         let RefreshPrfLabel::Mask { component, coefficient, digit, .. } = output.0.label() else {
             unreachable!("validated mask coverage")
         };
-        ordered.insert((component, coefficient, digit), output.encoding().clone());
+        ordered.insert((component, coefficient, digit), output.output().clone());
     }
     aggregate_prf_digits(
         compiler,
         base_p,
+        material.contract,
         ordered
             .into_iter()
             .map(|((component, coefficient, digit), value)| (digit, coefficient, component, value)),
@@ -648,14 +780,14 @@ pub(crate) fn aggregate_refresh_mask(
 
 /// Aggregates the one shared fresh-error digit set. The returned plain BGG
 /// wire is intended to be cloned into every CRT slot package, preserving one
-/// graph handle for the Section 7 evaluator's single per-slot scale.
+/// graph handle for the evaluator's single per-slot scale.
 #[allow(dead_code)]
 pub(crate) fn aggregate_refresh_fresh_error(
     compiler: &PowerLutEncodingCompiler,
     base_p: usize,
     material: &RefreshFreshErrorMaterial,
 ) -> Result<BggEncodingWire, RefreshError> {
-    validate_fresh_error_coverage(&material.coverage, material.program_id, &material.outputs)?;
+    validate_fresh_error_coverage(&material.coverage, material.contract, &material.outputs)?;
     if material.outputs.iter().any(|output| output.0.layout_id() != material.layout_id) {
         return Err(RefreshError::PrfOutputMismatch);
     }
@@ -665,11 +797,12 @@ pub(crate) fn aggregate_refresh_fresh_error(
         else {
             unreachable!("validated fresh-error coverage")
         };
-        ordered.insert((component, coefficient, digit), output.encoding().clone());
+        ordered.insert((component, coefficient, digit), output.output().clone());
     }
     aggregate_prf_digits(
         compiler,
         base_p,
+        material.contract,
         ordered
             .into_iter()
             .map(|((component, coefficient, digit), value)| (digit, coefficient, component, value)),
@@ -686,7 +819,7 @@ fn refresh_prf_label_digest(label: RefreshPrfLabel) -> [u8; 32] {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-/// Protocol declaration used to validate a Section 7 refresh graph.
+/// Protocol declaration used to validate an RNS refresh graph.
 pub struct RefreshDeclaration {
     /// Stable declaration identity.
     pub identity: [u8; 32],
@@ -745,7 +878,7 @@ impl PowerLutProtocolDeclaration {
         Ok(Self { refreshes })
     }
 
-    /// Validates all Section 7 attachments in a built graph.
+    /// Validates all refresh attachments in a built graph.
     pub fn validate(&self, built: &BuiltGraph) -> Result<(), RefreshError> {
         let matching = built
             .derivation_attachments
@@ -907,7 +1040,7 @@ impl RefreshDeclaration {
         {
             return Err(RefreshError::GraphLink("output matrix shape"));
         }
-        // Section 7 slot arithmetic is built once in an indexed ParallelLoop.
+        // Slot arithmetic is built once in an indexed ParallelLoop.
         // Each declared level must be a static projection of the one loop's
         // sole output.  This is deliberately checked before inspecting the
         // arithmetic so a second loop, a swapped projection, or a nonzero
@@ -1282,11 +1415,6 @@ impl RefreshAnchor {
         let target = b.clone() * k.clone();
         Self { equation: Some(RefreshAnchorEquation { target }) }
     }
-
-    #[cfg(test)]
-    fn equation(&self) -> Option<&RefreshAnchorEquation> {
-        self.equation.as_ref()
-    }
 }
 
 /// One scalar decoder preimage bound to an anchor equation and target matrix.
@@ -1336,7 +1464,7 @@ impl RefreshDecoderPreimage {
     }
 }
 
-/// Typed per-slot package for the Section 7 refresh equation.
+/// Typed per-slot package for the RNS refresh equation.
 ///
 /// The package keeps the old state, scaled state target, mask, fresh-error
 /// source, and decoder preimage together with their graph identities. Mask and
@@ -1511,7 +1639,7 @@ impl RefreshCompiler {
     ///
     /// The imported decoder bases and preimages are deliberately plain wires
     /// at this boundary.  This helper is the only crate-internal adapter that
-    /// turns them back into the typed Section-7 packages: each target is
+    /// turns them back into the typed per-slot packages: each target is
     /// recomputed from the imported state/mask/fresh material and the exact
     /// decoder is rebuilt as `base.vector * K`.
     #[allow(clippy::too_many_arguments)]
@@ -1536,6 +1664,8 @@ impl RefreshCompiler {
         {
             return Err(RefreshError::InvalidLayout);
         }
+        // `public_b` is the common trapdoor public matrix B. Every slot below
+        // must use the same B handle; only the target and preimage K_t vary.
         let base_handle = public_b.value_handle().clone();
         let mut packages = Vec::with_capacity(masks.len());
         for (slot, ((mask, base), k)) in
@@ -1546,6 +1676,8 @@ impl RefreshCompiler {
             if base.pubkey.reveal_plaintext || base.pubkey.matrix.value_handle() != &base_handle {
                 return Err(RefreshError::TargetMismatch);
             }
+            // `scale = mu_t = q/q_t`; multiplying by its gadget decomposition
+            // implements `u_t=c G^{-1}(mu_t G)` and `A_t=A G^{-1}(mu_t G)`.
             let scale = mxx_dsl::Ring::new(
                 state.vector.matrix_type().modulus.clone(),
                 state.vector.matrix_type().ring_dimension.clone(),
@@ -1555,8 +1687,12 @@ impl RefreshCompiler {
             let scaled_fresh = compiler.bgg.large_scalar_mul(&fresh, &scale);
             let combined =
                 compiler.bgg.add(&compiler.bgg.add(&scaled_state, &mask)?, &scaled_fresh)?;
+            // Aggregate the scaled state, mask, and fresh-error public terms:
+            // `A_{sum,t} = A_t + A_{m,t} + A_{e,t}`.
             let a_sum_t = combined.pubkey.matrix;
             let target = a_sum_t.clone() - scale.clone() * a_prime.clone();
+            // `target = A_{sum,t} - mu_t A'`; the imported preimage K_t must
+            // satisfy `B K_t = target` and is checked by RefreshDecoderPreimage.
             let decoder = BggEncodingWire {
                 vector: base.vector * k.clone(),
                 pubkey: BggPublicKeyWire { matrix: target.clone(), reveal_plaintext: false },
@@ -1764,7 +1900,9 @@ impl RefreshCompiler {
     }
     /// Validates CRT divisibility and coefficient count.
     pub fn validate_layout(&self) -> Result<(), RefreshError> {
-        if self.crt_plaintext_moduli.is_empty() ||
+        // CRT-backed refresh requires at least two plaintext-modulus slots;
+        // a single slot is not a supported CRT layout.
+        if self.crt_plaintext_moduli.len() < 2 ||
             self.crt_plaintext_moduli.len() != self.reconstruction_coefficients.len()
         {
             return Err(RefreshError::InvalidLayout);
@@ -1985,25 +2123,28 @@ impl RefreshCompiler {
 
 /// Routes one PRF base-`p` digit to one coefficient and public-key component.
 ///
-/// In the Section 7 shorthand, `p^c X^j u_2 delta_k^T` means the following
+/// In the route shorthand, `p^c X^j u_2 delta_k^T` means the following
 /// concrete matrix product: `p^c` is the digit scale, `X^j` is the negacyclic
 /// rotation by `coefficient`, `u_2` is the unit column selecting the final
 /// secret coordinate, and `delta_k^T` is the unit row selecting `component`.
 /// The implementation multiplies this route into `value`, preserving the
 /// BGG encoding shape. CRT scaling is deliberately not part of this route;
-/// Section 7 applies the exact `q / q_t` factor once to the aggregated fresh
+/// The refresh evaluator applies the exact `q / q_t` factor once to the aggregated fresh
 /// error in its evaluator.
 pub fn route_prf_digit(
     compiler: &PowerLutEncodingCompiler,
-    value: &BggEncodingWire,
+    value: &RefreshPrfOutput,
     base_p: usize,
     digit: usize,
     coefficient: usize,
     component: usize,
 ) -> Result<BggEncodingWire, RefreshError> {
-    crate::ensure_ciphertext_only(value).map_err(RefreshError::Power)?;
-    let route = prf_route_matrix(value, base_p, digit, coefficient, component)?;
-    Ok(compiler.bgg.matrix_mul(value, &route))
+    if !value.descriptor.is_raw_scalar() {
+        return Err(RefreshError::PrfOutputMismatch);
+    }
+    crate::ensure_ciphertext_only(&value.encoding).map_err(RefreshError::Power)?;
+    let route = prf_route_matrix(&value.encoding, base_p, digit, coefficient, component)?;
+    Ok(compiler.bgg.matrix_mul(&value.encoding, &route))
 }
 
 fn prf_route_matrix(
@@ -2092,1457 +2233,14 @@ fn hex_identity(identity: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        encoding::{AutomorphismHelper, EncodingSelectorFamily, PowerLutEncodingSampler},
-        pbc::PbcSelectorArtifactNames,
-    };
-    use serial_test::serial;
 
     #[test]
-    fn refresh_prf_label_index_is_canonical_and_round_trips() {
-        let index = RefreshPrfLabelIndex::new([3; 32], 2, 2, 2, 3).unwrap();
-        assert_eq!(index.len(), (2 + 1) * 2 * 2 * 3);
-        let expected = [
-            RefreshPrfLabel::Mask {
-                refresh_id: [3; 32],
-                slot: 0,
-                component: 0,
-                coefficient: 0,
-                digit: 0,
-            },
-            RefreshPrfLabel::Mask {
-                refresh_id: [3; 32],
-                slot: 0,
-                component: 0,
-                coefficient: 0,
-                digit: 1,
-            },
-            RefreshPrfLabel::Mask {
-                refresh_id: [3; 32],
-                slot: 0,
-                component: 0,
-                coefficient: 0,
-                digit: 2,
-            },
-            RefreshPrfLabel::Mask {
-                refresh_id: [3; 32],
-                slot: 1,
-                component: 1,
-                coefficient: 1,
-                digit: 2,
-            },
-            RefreshPrfLabel::FreshError {
-                refresh_id: [3; 32],
-                component: 0,
-                coefficient: 0,
-                digit: 0,
-            },
-        ];
-        assert_eq!(index.label(0), Some(expected[0]));
-        assert_eq!(index.label(1), Some(expected[1]));
-        assert_eq!(index.label(2), Some(expected[2]));
-        assert_eq!(index.label(23), Some(expected[3]));
-        assert_eq!(index.label(24), Some(expected[4]));
-        for flat in 0..index.len() {
-            let label = index.label(flat).unwrap();
-            assert_eq!(index.index_of(label), Some(flat));
-        }
-        assert!(index.label(index.len()).is_none());
-    }
-
-    #[test]
-    fn aggregate_prf_digits_has_one_structural_routing_loop() {
-        let ring = mxx_dsl::Ring::new(17, 2);
-        let compiler = PowerLutEncodingCompiler::from_public_key(mxx_bgg::BggPublicKeyCompiler {
-            ring: ring.clone(),
-            base: 2.into(),
-            digit_count: 2.into(),
-        });
-        let values = (0..4)
-            .map(|index| {
-                let value = BggEncodingWire {
-                    vector: ring.input(format!("aggregate-vector-{index}"), (1, 4)),
-                    pubkey: BggPublicKeyWire {
-                        matrix: ring.input(format!("aggregate-public-{index}"), (2, 4)),
-                        reveal_plaintext: false,
-                    },
-                    plaintext: None,
-                };
-                (index % 2, 0, index % 2, value)
-            })
-            .collect::<Vec<_>>();
-        let aggregate = aggregate_prf_digits(&compiler, 2, values).unwrap();
-        let built = mxx_dsl::DslContext::new("refresh-aggregate-structural")
-            .output("aggregate", aggregate.vector)
-            .unwrap()
-            .build()
-            .unwrap();
-        let routing_loops = built
-            .graph
-            .root_scope()
-            .nodes()
-            .iter()
-            .filter_map(|node| match node.kind() {
-                NodeKind::ParallelLoop(spec)
-                    if spec.input_modes ==
-                        [LoopInputMode::Zip, LoopInputMode::Zip, LoopInputMode::Zip] =>
-                {
-                    Some(spec)
-                }
-                _ => None,
-            })
-            .count();
-        assert_eq!(routing_loops, 1);
-        assert!(built.graph.root_scope().nodes().len() < 64);
-    }
-
-    fn config() -> RefreshCompiler {
-        RefreshCompiler {
-            full_modulus: 323.into(),
-            crt_plaintext_moduli: vec![17.into(), 19.into()],
-            reconstruction_coefficients: vec![1.into(), 1.into()],
-        }
-    }
-
-    struct RealPbcTestContext {
-        layout: crate::pbc::PbcPublicLayout,
-        public_vector: crate::pbc::PbcPublicVectorFamilyBinding,
-        selectors: EncodingSelectorFamily,
-        values: Family<Mat>,
-        helpers: Vec<AutomorphismHelper>,
-        selector_graph: mxx_dsl::BuiltGraph,
-        selector_production: mxx_ir_core::artifact::ProductionId,
-        selector_bit_input_name: String,
-        selector_bit_values: Vec<u8>,
-    }
-
-    impl RealPbcTestContext {
-        fn new(
-            compiler: &PowerLutEncodingCompiler,
-            input: &BggEncodingWire,
-            seed: [u8; 32],
-            key_instance_id: [u8; 32],
-        ) -> Self {
-            let ring = compiler.bgg.public_key.ring.clone();
-            let pbc_parameters = crate::pbc::PbcParameters::custom(1, 1, 2, 2, 4, None);
-            let generated = crate::pbc::generate_key_layout(
-                &pbc_parameters,
-                crate::pbc::PbcRootSeed(seed),
-                &[0],
-            )
-            .unwrap();
-            let layout = generated.public_layout.clone();
-            assert_eq!(layout.bucket_width, 2);
-            let routed =
-                crate::pbc::PbcEncodedPublicVector::route_usize(&layout, &[3], 17).unwrap();
-            let public_vector =
-                crate::pbc::PbcPublicVectorFamilyBinding::from_encoded(&layout, &routed).unwrap();
-            let count = public_vector.family_count;
-            let columns = input
-                .pubkey
-                .matrix
-                .matrix_type()
-                .columns
-                .evaluate(&mxx_ir_core::ParamEnv::default())
-                .unwrap()
-                .to_usize()
-                .unwrap();
-            let rows = input
-                .pubkey
-                .matrix
-                .matrix_type()
-                .rows
-                .evaluate(&mxx_ir_core::ParamEnv::default())
-                .unwrap()
-                .to_usize()
-                .unwrap();
-            let digit_count = compiler
-                .bgg
-                .public_key
-                .digit_count
-                .evaluate(&mxx_ir_core::ParamEnv::default())
-                .unwrap()
-                .to_usize()
-                .unwrap();
-            let packed_columns = columns * digit_count;
-            let sampler = PowerLutEncodingSampler {
-                layout: mxx_bgg::BggSamplerLayout {
-                    modulus: input.pubkey.matrix.matrix_type().modulus.clone(),
-                    ring_dimension: input.pubkey.matrix.matrix_type().ring_dimension.clone(),
-                    secret_dimension: rows,
-                    digit_count,
-                    gadget_base: compiler.bgg.public_key.base.clone(),
-                },
-                gaussian_sigma: None,
-                gaussian_max_coefficient_bound: None,
-            };
-            let secret = ring.zero((1, rows));
-            let selector_key = ring.bytes_input("real-pbc-selector-key", 32);
-            let selector_bits = crate::pbc::PbcTrustedSelectorBits::from_schedule(
-                &generated,
-                &ring,
-                key_instance_id,
-            )
-            .unwrap();
-            debug_assert_eq!(selector_bits.runtime_bits().len(), count);
-            let structural_families = crate::pbc::build_structural_selector_families(
-                &sampler,
-                selector_bits.family().clone(),
-                secret.clone(),
-                secret,
-                selector_key,
-                &layout,
-                key_instance_id,
-            )
-            .unwrap();
-            let names = PbcSelectorArtifactNames::canonicalize_schema(
-                &layout,
-                key_instance_id,
-                rows,
-                columns,
-            )
-            .unwrap();
-            let artifacts =
-                crate::pbc::PbcSelectorArtifacts::from_structural(&layout, key_instance_id, names)
-                    .unwrap();
-            let selector_graph = artifacts
-                .add_structural_family_outputs(
-                    mxx_dsl::DslContext::new("real-pbc-selector-producer"),
-                    &layout,
-                    structural_families,
-                )
-                .unwrap()
-                .public_family_output(
-                    "real-pbc-values",
-                    Family::pack(
-                        public_vector
-                            .values_usize()
-                            .unwrap()
-                            .into_iter()
-                            .map(|value| ring.polynomial([value.into()]))
-                            .collect(),
-                    )
-                    .unwrap(),
-                )
-                .unwrap()
-                .build()
-                .unwrap();
-            let selector_production = mxx_ir_core::artifact::ProductionId {
-                spec_hash: mxx_ir_core::encoding::spec_hash(
-                    &selector_graph.graph,
-                    &Default::default(),
-                )
-                .unwrap(),
-                execution_nonce: [55; 32],
-            };
-            let production_id = selector_production.clone();
-            let companions = (0..rows * columns)
-                .map(|column| {
-                    (
-                        ring.family_artifact_input(
-                            production_id.clone(),
-                            crate::pbc::selector_family_artifact_name(
-                                &artifacts,
-                                &format!("vector-{column}"),
-                            ),
-                            count,
-                            (1, packed_columns),
-                            mxx_ir_core::artifact::ArtifactConfidentiality::Private,
-                        ),
-                        ring.family_artifact_input(
-                            production_id.clone(),
-                            crate::pbc::selector_family_artifact_name(
-                                &artifacts,
-                                &format!("public-{column}"),
-                            ),
-                            count,
-                            (rows, packed_columns),
-                            mxx_ir_core::artifact::ArtifactConfidentiality::Public,
-                        ),
-                    )
-                })
-                .collect();
-            let selectors = EncodingSelectorFamily::new(
-                ring.family_artifact_input(
-                    production_id.clone(),
-                    crate::pbc::selector_family_artifact_name(&artifacts, "gsw"),
-                    count,
-                    (rows, columns),
-                    mxx_ir_core::artifact::ArtifactConfidentiality::Private,
-                ),
-                companions,
-            )
-            .unwrap();
-            let values = ring.family_artifact_input(
-                production_id,
-                "real-pbc-values",
-                count,
-                (1, 1),
-                mxx_ir_core::artifact::ArtifactConfidentiality::Public,
-            );
-            let helpers = sampler
-                .sample_automorphism_helpers(
-                    ring.zero((1, rows)),
-                    ring.bytes_input("real-pbc-helper-key", 32),
-                    b"real-pbc-helpers".to_vec(),
-                    4,
-                )
-                .unwrap();
-            // The production fixture uses W = 4, so the mandatory
-            // coefficient sieve requires log2(W) = 2 helper rounds.
-            assert_eq!(helpers.len(), 2);
-            Self {
-                layout,
-                public_vector,
-                selectors,
-                values,
-                helpers,
-                selector_graph,
-                selector_production,
-                selector_bit_input_name: selector_bits.input_name().to_owned(),
-                selector_bit_values: selector_bits.runtime_bits().to_vec(),
-            }
-        }
-
-        fn lower(
-            &self,
-            compiler: &PowerLutEncodingCompiler,
-            input: BggEncodingWire,
-            body: &crate::prf::SparseLwrPrfProgram,
-            label: &[u8],
-        ) -> crate::prf::PbcSparseLwrEncodingOutput {
-            body.compile_pbc_encoding(
-                compiler,
-                input,
-                &self.layout,
-                &self.public_vector,
-                self.selectors.clone(),
-                self.values.clone(),
-                &self.helpers,
-                label,
-            )
-            .unwrap()
-        }
-    }
-
-    fn real_mask(
-        context: &RealPbcTestContext,
-        compiler: &PowerLutEncodingCompiler,
-        input: BggEncodingWire,
-        refresh_id: [u8; 32],
-        slot: usize,
-        component: usize,
-        coefficient: usize,
-        digit: usize,
-    ) -> RefreshMaskPrfOutput {
-        let label = RefreshPrfLabel::Mask { refresh_id, slot, component, coefficient, digit };
-        let body = crate::prf::test_sparse_lwr_program(context.layout.bucket_width, 4).unwrap();
-        let output = context.lower(compiler, input, &body, &label.canonical_bytes());
-        RefreshMaskPrfOutput::from_pbc_evaluation(
-            output,
-            refresh_id,
-            slot,
-            component,
-            coefficient,
-            digit,
-        )
-        .unwrap()
-    }
-
-    fn real_fresh_error(
-        context: &RealPbcTestContext,
-        compiler: &PowerLutEncodingCompiler,
-        input: BggEncodingWire,
-        refresh_id: [u8; 32],
-        component: usize,
-        coefficient: usize,
-        digit: usize,
-    ) -> RefreshFreshErrorPrfOutput {
-        let label = RefreshPrfLabel::FreshError { refresh_id, component, coefficient, digit };
-        let body = crate::prf::test_sparse_lwr_program(context.layout.bucket_width, 4).unwrap();
-        let output = context.lower(compiler, input, &body, &label.canonical_bytes());
-        RefreshFreshErrorPrfOutput::from_pbc_evaluation(
-            output,
-            refresh_id,
-            component,
-            coefficient,
-            digit,
-        )
-        .unwrap()
-    }
-
-    struct StructuralRefreshFixture {
-        declaration: RefreshDeclaration,
-        graph: Graph,
-        attachment: FrozenDerivationAttachment,
-    }
-
-    fn structural_refresh_fixture() -> StructuralRefreshFixture {
-        use mxx_primitives::poly::PolyParams;
-
-        let parameters = mxx_primitives::poly::dcrt::params::DCRTPolyParams::new(4, 2, 17, 16);
-        let q = BigInt::from(parameters.modulus().as_ref().clone());
-        let moduli = parameters.to_crt().0;
-        let ring = mxx_dsl::Ring::new(q.clone(), 4);
-        let compiler =
-            crate::PowerLutEncodingCompiler::from_public_key(mxx_bgg::BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 2.into(),
-                digit_count: 4.into(),
-            });
-        let encoding = |name: &str| BggEncodingWire {
-            vector: ring.input(format!("{name}-vector"), (1, 8)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input(format!("{name}-public"), (2, 8)),
-                reveal_plaintext: false,
-            },
-            plaintext: None,
+    fn refresh_layout_rejects_single_crt_slot() {
+        let layout = RefreshCompiler {
+            full_modulus: 97.into(),
+            crt_plaintext_moduli: vec![97.into()],
+            reconstruction_coefficients: vec![1.into()],
         };
-        let state = encoding("state");
-        let a_prime = ring.zero((2, 8));
-        let decoder_encoding = BggEncodingWire {
-            vector: ring.input("decoder-vector", (1, 8)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input("decoder-public", (2, 8)),
-                reveal_plaintext: false,
-            },
-            plaintext: None,
-        };
-        let fresh = encoding("fresh");
-        let refresh = RefreshCompiler {
-            full_modulus: q.clone().into(),
-            crt_plaintext_moduli: moduli.iter().map(|value| BigInt::from(*value).into()).collect(),
-            reconstruction_coefficients: parameters
-                .reconst_coeffs()
-                .into_iter()
-                .map(|value| BigInt::from_biguint(num_bigint::Sign::Plus, value).into())
-                .collect(),
-        };
-        let pbc_context = RealPbcTestContext::new(&compiler, &state, [19; 32], [8; 32]);
-        let pbc_context_ref = &pbc_context;
-        let shared_fresh_error =
-            real_fresh_error(pbc_context_ref, &compiler, fresh.clone(), [7; 32], 0, 0, 0);
-        let slots = moduli
-            .iter()
-            .enumerate()
-            .map(|(slot, modulus)| {
-                let scale_target = ring.polynomial([(q.clone() / BigInt::from(*modulus)).into()]);
-                let mask = encoding(&format!("mask-{slot}"));
-                let scaled_state = compiler.bgg.large_scalar_mul(&state, &scale_target);
-                let scaled_fresh = compiler.bgg.large_scalar_mul(&fresh, &scale_target);
-                let masked = compiler.bgg.add(&scaled_state, &mask).unwrap();
-                let combined = compiler.bgg.add(&masked, &scaled_fresh).unwrap();
-                let target = combined.pubkey.matrix - scale_target.clone() * a_prime.clone();
-                let decoder = BggEncodingWire {
-                    vector: decoder_encoding.vector.clone(),
-                    pubkey: BggPublicKeyWire { matrix: target.clone(), reveal_plaintext: false },
-                    plaintext: None,
-                };
-                RefreshSetupSlotArtifacts {
-                    mask: real_mask(pbc_context_ref, &compiler, mask, [7; 32], slot, 0, 0, 0),
-                    fresh_error_source: shared_fresh_error.clone(),
-                    decoder,
-                    b: ring.identity(1),
-                    k: target,
-                }
-            })
-            .collect();
-        let setup = refresh.bind_setup(&compiler, state, a_prime, slots).unwrap();
-        let result = refresh.refresh(&compiler, &setup).unwrap();
-        let built = mxx_dsl::DslContext::new("refresh-structural-negative")
-            .output("refreshed", result.encoding().vector.clone())
-            .unwrap()
-            .build()
-            .unwrap();
-        let attachment = built
-            .derivation_attachments
-            .iter()
-            .find(|attachment| attachment.namespace == "mxx-power-lut")
-            .unwrap()
-            .clone();
-        StructuralRefreshFixture {
-            declaration: result.declaration().clone(),
-            graph: built.graph,
-            attachment,
-        }
-    }
-
-    fn mutate_structural_graph(
-        fixture: &StructuralRefreshFixture,
-        mutate: impl FnOnce(&mut serde_json::Value, &Graph, &FrozenDerivationAttachment),
-    ) -> Graph {
-        let mut encoded = serde_json::to_value(&fixture.graph).unwrap();
-        mutate(&mut encoded, &fixture.graph, &fixture.attachment);
-        serde_json::from_value(encoded).unwrap()
-    }
-
-    fn root_nodes_json(encoded: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
-        scope_nodes_json(encoded, &FrozenGraphScopeId::Root)
-    }
-
-    fn scope_nodes_json<'a>(
-        encoded: &'a mut serde_json::Value,
-        scope_id: &FrozenGraphScopeId,
-    ) -> &'a mut Vec<serde_json::Value> {
-        let scope_json = serde_json::to_value(scope_id).unwrap();
-        encoded["scopes"]
-            .as_array_mut()
-            .unwrap()
-            .iter_mut()
-            .find(|entry| entry["id"] == scope_json)
-            .map(|entry| entry["scope"]["nodes"].as_array_mut().unwrap())
-            .unwrap()
-    }
-
-    fn node_role(attachment: &FrozenDerivationAttachment, name: &str) -> WireRef {
-        attachment.roles.iter().find(|(role, _)| role == name).unwrap().1.wire
-    }
-
-    fn loop_wire(graph: &Graph, attachment: &FrozenDerivationAttachment) -> WireRef {
-        let level = node_role(attachment, "slot-0-level");
-        let level_node = graph.root_scope().node(level.node).unwrap();
-        graph.root_scope().wire_ref(&level_node.arguments()[0]).unwrap()
-    }
-
-    fn body_id(graph: &Graph, attachment: &FrozenDerivationAttachment) -> FrozenGraphScopeId {
-        graph.child_scope_id(&FrozenGraphScopeId::Root, loop_wire(graph, attachment).node).unwrap()
-    }
-
-    fn expect_structural_graph_link(
-        mutate: impl FnOnce(&mut serde_json::Value, &Graph, &FrozenDerivationAttachment),
-    ) {
-        let fixture = structural_refresh_fixture();
-        let graph = mutate_structural_graph(&fixture, mutate);
-        assert!(matches!(
-            fixture.declaration.validate_graph(&fixture.attachment, &graph),
-            Err(RefreshError::GraphLink(_))
-        ));
-    }
-
-    fn shift_root_node_references(value: &mut serde_json::Value, insertion: u64) {
-        if let Some(node) = value.get("node").and_then(serde_json::Value::as_u64) {
-            if node >= insertion {
-                *value.get_mut("node").unwrap() = serde_json::json!(node + 1);
-            }
-        }
-        if let Some(array) = value.as_array_mut() {
-            for child in array {
-                shift_root_node_references(child, insertion);
-            }
-        } else if let Some(object) = value.as_object_mut() {
-            for child in object.values_mut() {
-                shift_root_node_references(child, insertion);
-            }
-        }
-    }
-
-    fn shift_attachment_root_nodes(attachment: &mut FrozenDerivationAttachment, insertion: u64) {
-        for (_, wire) in &mut attachment.roles {
-            if wire.scope == FrozenGraphScopeId::Root && wire.wire.node.0 >= insertion {
-                wire.wire.node.0 += 1;
-            }
-        }
-    }
-
-    fn replace_node_kind(nodes: &mut [serde_json::Value], node: WireRef, kind: NodeKind) {
-        nodes[node.node.0 as usize]["kind"] = serde_json::to_value(kind).unwrap();
-    }
-
-    #[test]
-    fn structural_validator_rejects_same_shaped_altered_body_arithmetic() {
-        expect_structural_graph_link(|encoded, graph, attachment| {
-            let body = graph.scope(&body_id(graph, attachment)).unwrap();
-            let output = body.outputs()[0];
-            replace_node_kind(
-                scope_nodes_json(encoded, &body_id(graph, attachment)),
-                output,
-                NodeKind::MatrixBinary(MatrixBinaryOp::Add),
-            );
-        });
-    }
-
-    #[test]
-    fn structural_validator_rejects_omitted_scaled_fresh_same_shape() {
-        expect_structural_graph_link(|encoded, graph, attachment| {
-            let body = graph.scope(&body_id(graph, attachment)).unwrap();
-            let output = body.outputs()[0];
-            let subtract = body.node(output.node).unwrap();
-            let add = body.arguments(subtract).unwrap()[0];
-            let add_node = body.node(add.node).unwrap();
-            let args = body.arguments(add_node).unwrap();
-            let nodes = scope_nodes_json(encoded, &body_id(graph, attachment));
-            nodes[add.node.0 as usize]["arguments"][1] = serde_json::to_value(args[0]).unwrap();
-        });
-    }
-
-    #[test]
-    fn structural_validator_rejects_swapped_mask_and_fresh_family_bindings() {
-        expect_structural_graph_link(|encoded, graph, attachment| {
-            let loop_ref = loop_wire(graph, attachment);
-            let nodes = root_nodes_json(encoded);
-            let args = nodes[loop_ref.node.0 as usize]["arguments"].as_array_mut().unwrap();
-            args.swap(1, 3);
-        });
-    }
-
-    #[test]
-    fn structural_validator_rejects_wrong_slot_projection_index() {
-        expect_structural_graph_link(|encoded, _graph, attachment| {
-            let level = node_role(attachment, "slot-0-level");
-            replace_node_kind(
-                root_nodes_json(encoded),
-                level,
-                NodeKind::FamilyGetStatic { index: 1.into() },
-            );
-        });
-    }
-
-    #[test]
-    fn structural_validator_rejects_mixed_same_shaped_parallel_loop_producers() {
-        let fixture = structural_refresh_fixture();
-        let graph = mutate_structural_graph(&fixture, |encoded, graph, attachment| {
-            let original = loop_wire(graph, attachment);
-            let body_scope_id = body_id(graph, attachment);
-            let level = node_role(attachment, "slot-1-level");
-            let body_json = serde_json::to_value(&body_scope_id).unwrap();
-            let duplicate_body = encoded["scopes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|entry| entry["id"] == body_json)
-                .unwrap()
-                .clone();
-            let insertion = original.node.0 + 1;
-            shift_root_node_references(&mut encoded["outputs"], insertion);
-            shift_root_node_references(&mut encoded["effect_roots"], insertion);
-            let scopes = encoded["scopes"].as_array_mut().unwrap();
-            let root_index = scopes
-                .iter()
-                .position(|entry| {
-                    let id = &entry["id"];
-                    id.as_str() == Some("Root") || id["tag"].as_str() == Some("Root")
-                })
-                .unwrap();
-            shift_root_node_references(&mut scopes[root_index]["scope"]["outputs"], insertion);
-            {
-                let root_nodes = scopes[root_index]["scope"]["nodes"].as_array_mut().unwrap();
-                for node in root_nodes.iter_mut() {
-                    let id = node["id"].as_u64().unwrap();
-                    if id >= insertion {
-                        node["id"] = serde_json::json!(id + 1);
-                    }
-                    shift_root_node_references(&mut node["arguments"], insertion);
-                }
-                let new_id = mxx_ir_core::NodeId(insertion);
-                let mut duplicate = root_nodes[original.node.0 as usize].clone();
-                duplicate["id"] = serde_json::json!(insertion);
-                root_nodes.insert(insertion as usize, duplicate);
-                root_nodes[level.node.0 as usize + 1]["arguments"][0] =
-                    serde_json::to_value(WireRef { node: new_id, port: mxx_ir_core::Port(0) })
-                        .unwrap();
-            }
-            let new_id = mxx_ir_core::NodeId(insertion);
-            let new_body_id = FrozenGraphScopeId::ParallelBody {
-                parent: Box::new(FrozenGraphScopeId::Root),
-                owner: new_id,
-            };
-            let mut duplicate_body = duplicate_body;
-            duplicate_body["id"] = serde_json::to_value(new_body_id).unwrap();
-            scopes.push(duplicate_body);
-        });
-        let mut attachment = fixture.attachment.clone();
-        shift_attachment_root_nodes(
-            &mut attachment,
-            loop_wire(&fixture.graph, &fixture.attachment).node.0 + 1,
-        );
-        assert!(matches!(
-            fixture.declaration.validate_graph(&attachment, &graph),
-            Err(RefreshError::GraphLink(_))
-        ));
-    }
-
-    #[test]
-    fn structural_validator_rejects_wrong_parallel_count_mode_and_schema() {
-        for mutate in [
-            0usize, // wrong count
-            1usize, // wrong mode
-            2usize, // wrong body schema
-        ] {
-            expect_structural_graph_link(move |encoded, graph, attachment| {
-                let loop_ref = loop_wire(graph, attachment);
-                let nodes = root_nodes_json(encoded);
-                let node = &mut nodes[loop_ref.node.0 as usize];
-                let mut kind: NodeKind = serde_json::from_value(node["kind"].clone()).unwrap();
-                let NodeKind::ParallelLoop(ref mut spec) = kind else { unreachable!() };
-                match mutate {
-                    0 => spec.count = 3.into(),
-                    1 => spec.input_modes[0] = LoopInputMode::Broadcast,
-                    _ => {
-                        spec.input_modes.pop();
-                    }
-                };
-                node["kind"] = serde_json::to_value(kind).unwrap();
-            });
-        }
-    }
-
-    #[test]
-    fn refresh_scale_is_exact_q_over_qt() {
-        let compiler = config();
-        assert_eq!(
-            compiler.scale_expression(0).unwrap().evaluate(&Default::default()).unwrap(),
-            19.into()
-        );
-        assert_eq!(
-            compiler.scale_expression(1).unwrap().evaluate(&Default::default()).unwrap(),
-            17.into()
-        );
-    }
-
-    #[test]
-    fn routed_prf_digit_has_no_rns_scale_and_refresh_body_has_one() {
-        let ring = mxx_dsl::Ring::new(257, 4);
-        let compiler = PowerLutEncodingCompiler::from_public_key(mxx_bgg::BggPublicKeyCompiler {
-            ring: ring.clone(),
-            base: 2.into(),
-            digit_count: 2.into(),
-        });
-        let value = BggEncodingWire {
-            vector: ring.input("route-vector", (1, 4)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input("route-public", (2, 4)),
-                reveal_plaintext: false,
-            },
-            plaintext: None,
-        };
-        let routed = route_prf_digit(&compiler, &value, 3, 1, 2, 1).unwrap();
-        let refresh = config();
-        let scale = ring.polynomial([refresh.scale_expression(0).unwrap()]);
-        let scaled = compiler.bgg.large_scalar_mul(&value, &scale);
-        let graph = mxx_dsl::DslContext::new("refresh-route-scale-structure")
-            .output("routed", routed.vector)
-            .unwrap()
-            .output("scaled", scaled.vector)
-            .unwrap()
-            .build()
-            .unwrap();
-        let encoded = serde_json::to_string(&graph.graph).unwrap();
-        let division_count =
-            encoded.matches("\"tag\":\"Div\"").count() + encoded.matches("\"Divide\"").count();
-        assert_eq!(division_count, 1, "only the refresh body carries q/q_t scaling");
-    }
-
-    #[test]
-    fn decoder_binds_the_actual_anchor_product_not_a_handle_label() {
-        let ring = mxx_dsl::Ring::new(257, 4);
-        let encoding = |name: &str| mxx_bgg::BggEncodingWire {
-            vector: ring.input(name, (1, 1)),
-            pubkey: mxx_bgg::BggPublicKeyWire {
-                matrix: ring.input(format!("{name}-public"), (1, 1)),
-                reveal_plaintext: false,
-            },
-            plaintext: None,
-        };
-        let b = ring.input("anchor-b", (1, 1));
-        let k = ring.input("anchor-k", (1, 1));
-        let anchor = RefreshAnchor::with_equation(b, k);
-        let target = anchor.equation().unwrap().target.clone();
-        let decoder = RefreshDecoderPreimage::bind(&anchor, encoding("decoder"), &target).unwrap();
-        let wrong_target = ring.input("wrong-target", (1, 1));
-        let different_anchor = RefreshAnchor::with_equation(
-            ring.input("different-b", (1, 1)),
-            ring.input("different-k", (1, 1)),
-        );
-        assert_eq!(
-            decoder.validate(&different_anchor, &wrong_target),
-            Err(RefreshError::AnchorMismatch)
-        );
-    }
-
-    #[test]
-    #[serial(dcrt_runtime)]
-    fn multi_slot_refresh_executes_combined_order_and_crt_recomposition() {
-        use mxx_dsl::DslContext;
-        use mxx_ir_core::ParamEnv;
-        use mxx_primitives::{
-            matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-            poly::{
-                Poly, PolyParams,
-                dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-            },
-        };
-        use mxx_runtime::{
-            RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-            execute_in_session, transcript::SamplingMode,
-        };
-
-        let parameters = DCRTPolyParams::new(4, 2, 17, 16);
-        assert_eq!(parameters.crt_depth(), 2);
-        assert_eq!(parameters.crt_bits().div_ceil(parameters.base_bits() as usize), 2);
-        assert_eq!(parameters.modulus_digits(), 4);
-        let q = BigInt::from(parameters.modulus().as_ref().clone());
-        let (moduli, _, _) = parameters.to_crt();
-        assert_eq!(moduli.len(), 2);
-        let ring = mxx_dsl::Ring::new(q.clone(), 4);
-        let compiler =
-            crate::PowerLutEncodingCompiler::from_public_key(mxx_bgg::BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 65_536.into(),
-                digit_count: 4.into(),
-            });
-        let encoding = |name: &str| mxx_bgg::BggEncodingWire {
-            vector: ring.input(format!("{name}-vector"), (1, 8)),
-            pubkey: mxx_bgg::BggPublicKeyWire {
-                matrix: ring.input(format!("{name}-public"), (2, 8)),
-                reveal_plaintext: false,
-            },
-            plaintext: None,
-        };
-        let state = encoding("state");
-        let a_prime = ring.zero((2, 8));
-        let fresh = encoding("fresh");
-        let refresh = RefreshCompiler {
-            full_modulus: q.clone().into(),
-            crt_plaintext_moduli: moduli.iter().map(|value| BigInt::from(*value).into()).collect(),
-            reconstruction_coefficients: parameters
-                .reconst_coeffs()
-                .into_iter()
-                .map(|value| BigInt::from_biguint(num_bigint::Sign::Plus, value).into())
-                .collect(),
-        };
-        let pbc_context = RealPbcTestContext::new(&compiler, &state, [19; 32], [8; 32]);
-        let pbc_context_ref = &pbc_context;
-        let shared_fresh_error =
-            real_fresh_error(pbc_context_ref, &compiler, fresh.clone(), [7; 32], 0, 0, 0);
-        let slot_artifacts = moduli
-            .iter()
-            .enumerate()
-            .map(|(slot, modulus)| {
-                let scale = q.clone() / BigInt::from(*modulus);
-                let scale_target = ring.polynomial([scale.clone().into()]);
-                let mask_wire = encoding(&format!("mask-{slot}"));
-                let scaled_state = compiler.bgg.large_scalar_mul(&state, &scale_target);
-                let scaled_fresh = compiler.bgg.large_scalar_mul(&fresh, &scale_target);
-                let masked = compiler.bgg.add(&scaled_state, &mask_wire).unwrap();
-                let combined = compiler.bgg.add(&masked, &scaled_fresh).unwrap();
-                let a_sum_t = combined.pubkey.matrix;
-                let target = a_sum_t.clone() - scale_target.clone() * a_prime.clone();
-                let b = ring.identity(1);
-                let k = target.clone();
-                let decoder = mxx_bgg::BggEncodingWire {
-                    vector: ring.input(format!("decoder-{slot}-vector"), (1, 8)),
-                    pubkey: mxx_bgg::BggPublicKeyWire { matrix: target, reveal_plaintext: false },
-                    plaintext: None,
-                };
-                assert_eq!(scale, q.clone() / BigInt::from(*modulus));
-                RefreshSetupSlotArtifacts {
-                    mask: real_mask(pbc_context_ref, &compiler, mask_wire, [7; 32], slot, 0, 0, 0),
-                    fresh_error_source: shared_fresh_error.clone(),
-                    decoder,
-                    b,
-                    k,
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut malformed = slot_artifacts.clone();
-        malformed[0].fresh_error_source =
-            real_fresh_error(&pbc_context, &compiler, encoding("anchor-fresh"), [7; 32], 0, 0, 0);
-        assert_eq!(
-            refresh.bind_setup(&compiler, state.clone(), a_prime.clone(), malformed).err(),
-            Some(RefreshError::FreshErrorMismatch),
-            "each CRT slot must use the same fresh-error source"
-        );
-        let public_invariance_slots = slot_artifacts.clone();
-        let setup =
-            refresh.bind_setup(&compiler, state.clone(), a_prime.clone(), slot_artifacts).unwrap();
-        let changed_state = encoding("anchor-state");
-        let invariant_setup = refresh
-            .bind_setup(&compiler, changed_state, a_prime.clone(), public_invariance_slots)
-            .unwrap();
-        assert_ne!(
-            setup.packages[0].target_public_matrix.value_handle(),
-            setup.packages[1].target_public_matrix.value_handle(),
-            "RNS slots must retain distinct decoder targets"
-        );
-        let refreshed = refresh.refresh(&compiler, &setup).unwrap();
-        assert_eq!(
-            refreshed.encoding().pubkey.matrix.value_handle(),
-            a_prime.value_handle(),
-            "the refreshed owner is A', not a per-slot decoder target"
-        );
-        // Build an independent sequential reference graph from the
-        // authoritative BGG primitives and CRT operation. CrtRecompose
-        // rounds t*v/q, so raw decoder constants 1 and 2 are below its
-        // quantization step and disappear. The runtime probes are therefore
-        // alpha_t*r_t, where alpha_t=q/q_t and r_t is 1 or 2.
-        let expected_levels: Vec<Mat> = setup
-            .packages
-            .iter()
-            .enumerate()
-            .map(|(slot, package)| {
-                let scale = ring.polynomial([(q.clone() / BigInt::from(moduli[slot])).into()]);
-                let scaled = compiler.bgg.large_scalar_mul(&state, &scale);
-                let scaled_fresh =
-                    compiler.bgg.large_scalar_mul(&package.fresh_error_source, &scale);
-                let combined = compiler.bgg.add(&scaled, &package.mask).unwrap();
-                let combined = compiler.bgg.add(&combined, &scaled_fresh).unwrap();
-                compiler.bgg.sub(&combined, &package.decoder.encoding).unwrap().vector
-            })
-            .collect();
-        let expected = Mat::crt_recompose(
-            expected_levels.clone(),
-            refresh.crt_plaintext_moduli.clone(),
-            refresh.reconstruction_coefficients.clone(),
-        );
-        let swapped = Mat::crt_recompose(
-            expected_levels.into_iter().rev().collect(),
-            refresh.crt_plaintext_moduli.clone(),
-            refresh.reconstruction_coefficients.clone(),
-        );
-        let context = DslContext::new("power-lut-refresh-runtime")
-            .output("refreshed", refreshed.encoding().vector.clone())
-            .unwrap()
-            .output("expected", expected)
-            .unwrap()
-            .output("swapped", swapped)
-            .unwrap();
-        let context =
-            setup.packages.iter().enumerate().fold(context, |context, (slot, package)| {
-                context
-                    .output(format!("target-{slot}"), package.target_public_matrix.clone())
-                    .unwrap()
-                    .output(format!("b-k-{slot}"), package.b.clone() * package.k.clone())
-                    .unwrap()
-            });
-        let context = invariant_setup.packages.iter().enumerate().fold(
-            context,
-            |context, (slot, package)| {
-                context
-                    .output(
-                        format!("invariant-target-{slot}"),
-                        package.target_public_matrix.clone(),
-                    )
-                    .unwrap()
-            },
-        );
-        let built = context.build().unwrap();
-        let selector_graph = pbc_context.selector_graph.validate(&ParamEnv::default()).unwrap();
-        let mut artifact_store = MemoryArtifactStore::default();
-        let selector_bits = RuntimeValue::IndexedFamily(
-            pbc_context
-                .selector_bit_values
-                .iter()
-                .map(|bit| {
-                    RuntimeValue::matrix(DCRTPolyMatrix::from_poly_vec_row(
-                        &parameters,
-                        vec![DCRTPoly::from_usize_to_constant(&parameters, *bit as usize)],
-                    ))
-                })
-                .collect(),
-        );
-        let selector_result = execute_in_session(
-            &selector_graph,
-            &mut cpu_backend([parameters.clone()]),
-            std::collections::BTreeMap::from([
-                ("real-pbc-selector-key".to_owned(), RuntimeValue::Bytes(vec![0; 32])),
-                (pbc_context.selector_bit_input_name.clone(), selector_bits),
-            ]),
-            &mut artifact_store,
-            pbc_context.selector_production.execution_nonce,
-        )
-        .unwrap();
-        assert_eq!(selector_result.production_id.as_ref(), Some(&pbc_context.selector_production));
-        let event = refreshed.declaration();
-        assert_eq!(
-            (event.owner.as_str(), event.plan.as_str(), event.value_type.as_str()),
-            ("mxx-power-lut", "section-7-refresh", "BggEncodingVector")
-        );
-        assert_eq!((event.rows, event.columns), (1, 8));
-        assert_eq!(event.slots.len(), 2);
-        let encoded = serde_json::to_vec(event).unwrap();
-        let decoded: RefreshDeclaration = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(&decoded, event, "canonical refresh ABI must round-trip");
-        let attachment = built
-            .derivation_attachments
-            .iter()
-            .find(|attachment| {
-                attachment.namespace == "mxx-power-lut" && attachment.rule == "section-7-refresh"
-            })
-            .expect("event attachment");
-        assert_eq!(event.validate_graph(attachment, &built.graph), Ok(()));
-        assert!(
-            PowerLutProtocolDeclaration::new(vec![event.clone()]).unwrap().validate(&built).is_ok()
-        );
-        let mut tampered = attachment.clone();
-        tampered.roles.pop();
-        assert!(event.validate_graph(&tampered, &built.graph).is_err());
-        let mut tampered_target = attachment.clone();
-        tampered_target.roles[3].1 = tampered_target.roles[1].1.clone();
-        assert!(
-            event.validate_graph(&tampered_target, &built.graph).is_err(),
-            "tampered B*K target must fail closed"
-        );
-        let mut tampered_output = attachment.clone();
-        tampered_output.roles[0].1 = tampered_output.roles[1].1.clone();
-        assert!(
-            event.validate_graph(&tampered_output, &built.graph).is_err(),
-            "tampered refresh output handle must fail closed"
-        );
-        let mut tampered_fresh = attachment.clone();
-        tampered_fresh.roles[5].1 = tampered_fresh.roles[4].1.clone();
-        assert!(event.validate_graph(&tampered_fresh, &built.graph).is_err());
-        let mut tampered_slots = event.clone();
-        tampered_slots.slots.swap(0, 1);
-        assert!(
-            tampered_slots.validate_graph(attachment, &built.graph).is_err(),
-            "tampered slot order must fail closed"
-        );
-        let mut tampered_coefficients = event.clone();
-        tampered_coefficients.reconstruction_coefficients[0] += 1;
-        assert!(
-            tampered_coefficients.validate_graph(attachment, &built.graph).is_err(),
-            "tampered CRT reconstruction coefficients must fail closed"
-        );
-        let selector_manifest =
-            artifact_store.manifest(&pbc_context.selector_production).cloned().unwrap();
-        let graph = built
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &std::collections::BTreeMap::from([(
-                    pbc_context.selector_production.clone(),
-                    selector_manifest,
-                )]),
-            )
-            .unwrap();
-        let decoder_one = mxx_primitives::poly::dcrt::poly::DCRTPoly::const_one(&parameters);
-        let decoder_two = &decoder_one + &decoder_one;
-        let state_polynomial = decoder_two.clone();
-        let decoder_polynomials = moduli
-            .iter()
-            .enumerate()
-            .map(|(slot, modulus)| {
-                let alpha_r = (q.clone() / BigInt::from(*modulus)) * BigInt::from(slot + 1);
-                mxx_primitives::poly::dcrt::poly::DCRTPoly::from_biguint_to_constant(
-                    &parameters,
-                    alpha_r.to_biguint().unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let state_matrix = DCRTPolyMatrix::from_poly_vec_row(
-            &parameters,
-            (0..8).map(|_| state_polynomial.clone()).collect(),
-        );
-        let zero_vector = DCRTPolyMatrix::zero(&parameters, 1, 8);
-        let zero_public = DCRTPolyMatrix::zero(&parameters, 2, 8);
-        let runtime_inputs = std::collections::BTreeMap::from([
-            ("state-vector".to_owned(), RuntimeValue::matrix(state_matrix)),
-            ("state-public".to_owned(), RuntimeValue::matrix(zero_public.clone())),
-            ("fresh-vector".to_owned(), RuntimeValue::matrix(zero_vector.clone())),
-            ("fresh-public".to_owned(), RuntimeValue::matrix(zero_public.clone())),
-            ("mask-0-vector".to_owned(), RuntimeValue::matrix(zero_vector.clone())),
-            ("mask-0-public".to_owned(), RuntimeValue::matrix(zero_public.clone())),
-            ("mask-1-vector".to_owned(), RuntimeValue::matrix(zero_vector.clone())),
-            ("mask-1-public".to_owned(), RuntimeValue::matrix(zero_public.clone())),
-            (
-                "decoder-0-vector".to_owned(),
-                RuntimeValue::matrix(DCRTPolyMatrix::from_poly_vec_row(
-                    &parameters,
-                    (0..8).map(|_| decoder_polynomials[0].clone()).collect(),
-                )),
-            ),
-            (
-                "decoder-1-vector".to_owned(),
-                RuntimeValue::matrix(DCRTPolyMatrix::from_poly_vec_row(
-                    &parameters,
-                    (0..8).map(|_| decoder_polynomials[1].clone()).collect(),
-                )),
-            ),
-            ("anchor-state-vector".to_owned(), RuntimeValue::matrix(zero_vector)),
-            ("anchor-state-public".to_owned(), RuntimeValue::matrix(zero_public)),
-            ("real-pbc-helper-key".to_owned(), RuntimeValue::Bytes(vec![0; 32])),
-        ]);
-        let result = execute(
-            &graph,
-            &mut cpu_backend([parameters.clone()]),
-            runtime_inputs,
-            &mut artifact_store,
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let RuntimeValue::Matrix(actual) = &result.outputs["refreshed"] else { panic!("matrix") };
-        let RuntimeValue::Matrix(expected) = &result.outputs["expected"] else { panic!("matrix") };
-        let RuntimeValue::Matrix(swapped) = &result.outputs["swapped"] else { panic!("matrix") };
-        assert_eq!(actual, expected, "full CRT refresh output and ordering");
-        assert_ne!(actual.as_ref(), &DCRTPolyMatrix::zero(&parameters, 1, 8));
-        assert_ne!(actual, swapped, "CRT slot order must affect recomposition");
-        for slot in 0..setup.packages.len() {
-            let RuntimeValue::Matrix(target) = &result.outputs[&format!("target-{slot}")] else {
-                panic!("target matrix")
-            };
-            let RuntimeValue::Matrix(product) = &result.outputs[&format!("b-k-{slot}")] else {
-                panic!("B*K matrix")
-            };
-            let RuntimeValue::Matrix(invariant) =
-                &result.outputs[&format!("invariant-target-{slot}")]
-            else {
-                panic!("invariant target matrix")
-            };
-            assert_eq!(product, target, "slot {slot} decoder preimage equation");
-            assert_eq!(
-                invariant, target,
-                "slot {slot} public target must be independent of the private state vector"
-            );
-        }
-    }
-
-    #[test]
-    fn refresh_rejects_non_dividing_qt_before_graph_construction() {
-        let mut compiler = config();
-        compiler.full_modulus = 320.into();
-        assert_eq!(compiler.validate_layout(), Err(RefreshError::InvalidLayout));
-    }
-
-    fn boundary_parameters() -> (
-        crate::refresh_setup::RefreshSetupParameters,
-        PowerLutEncodingCompiler,
-        crate::program::PowerLutProgramId,
-    ) {
-        let ring = mxx_dsl::Ring::new(323, 4);
-        let compiler = PowerLutEncodingCompiler::from_public_key(mxx_bgg::BggPublicKeyCompiler {
-            ring: ring.clone(),
-            base: 2.into(),
-            digit_count: 3.into(),
-        });
-        let body = crate::prf::test_sparse_lwr_program(2, 4).unwrap();
-        let refresh = config();
-        let parameters = crate::refresh_setup::RefreshSetupParameters {
-            refresh_id: [7; 32],
-            base_p: 2,
-            component_count: 2,
-            coefficient_count: 1,
-            digit_count: 3,
-            lut_width: 4,
-            layout: mxx_bgg::BggSamplerLayout {
-                modulus: 323.into(),
-                ring_dimension: 4.into(),
-                secret_dimension: 2,
-                digit_count: 3,
-                gadget_base: 2.into(),
-            },
-            refresh,
-            decoder_sigma: 1.into(),
-            decoder_preimage_bound: mxx_bgg::PreimageCoefficientBound::Official,
-            name: "pbc-boundary".to_owned(),
-        };
-        (parameters, compiler, body.id())
-    }
-
-    fn boundary_wire(compiler: &PowerLutEncodingCompiler, name: &str) -> BggEncodingWire {
-        let ring = compiler.bgg.public_key.ring.clone();
-        BggEncodingWire {
-            vector: ring.input(format!("{name}-vector"), (1, 6)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input(format!("{name}-public"), (2, 6)),
-                reveal_plaintext: false,
-            },
-            plaintext: None,
-        }
-    }
-
-    fn complete_boundary_inputs() -> (
-        crate::refresh_setup::RefreshSetupParameters,
-        crate::program::PowerLutProgramId,
-        Vec<Vec<RefreshMaskPrfOutput>>,
-        Vec<RefreshFreshErrorPrfOutput>,
-    ) {
-        let (parameters, compiler, program_id) = boundary_parameters();
-        let context = RealPbcTestContext::new(
-            &compiler,
-            &boundary_wire(&compiler, "context"),
-            [19; 32],
-            [8; 32],
-        );
-        let context_ref = &context;
-        let compiler_ref = &compiler;
-        let masks = (0..2)
-            .map(|slot| {
-                (0..2)
-                    .flat_map(|component| {
-                        (0..3).map(move |digit| {
-                            real_mask(
-                                context_ref,
-                                compiler_ref,
-                                boundary_wire(
-                                    compiler_ref,
-                                    &format!("mask-{slot}-{component}-{digit}"),
-                                ),
-                                parameters.refresh_id,
-                                slot,
-                                component,
-                                0,
-                                digit,
-                            )
-                        })
-                    })
-                    .collect()
-            })
-            .collect();
-        let fresh = (0..2)
-            .flat_map(|component| {
-                (0..3).map(move |digit| {
-                    real_fresh_error(
-                        context_ref,
-                        compiler_ref,
-                        boundary_wire(compiler_ref, &format!("fresh-{component}-{digit}")),
-                        parameters.refresh_id,
-                        component,
-                        0,
-                        digit,
-                    )
-                })
-            })
-            .collect();
-        (parameters, program_id, masks, fresh)
-    }
-
-    #[test]
-    fn refresh_prf_inputs_accepts_complete_real_pbc_coverage() {
-        let (parameters, program_id, masks, fresh) = complete_boundary_inputs();
-        assert!(
-            crate::refresh_setup::RefreshPrfInputs::from_pbc_outputs(
-                &parameters,
-                program_id,
-                masks,
-                fresh,
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn refresh_prf_inputs_rejects_wrong_refresh_id_slot_order_duplicate_and_missing() {
-        let (parameters, program_id, masks, fresh) = complete_boundary_inputs();
-        let (_, compiler, _) = boundary_parameters();
-        let context = RealPbcTestContext::new(
-            &compiler,
-            &boundary_wire(&compiler, "rejection-context"),
-            [19; 32],
-            [8; 32],
-        );
-        let wrong_id = real_mask(
-            &context,
-            &compiler,
-            boundary_wire(&compiler, "wrong-id"),
-            [8; 32],
-            0,
-            0,
-            0,
-            0,
-        );
-        let mut wrong_id_masks = masks.clone();
-        wrong_id_masks[0][0] = wrong_id;
-        assert!(
-            crate::refresh_setup::RefreshPrfInputs::from_pbc_outputs(
-                &parameters,
-                program_id,
-                wrong_id_masks,
-                fresh.clone(),
-            )
-            .is_err()
-        );
-
-        let mut wrong_slot = masks.clone();
-        wrong_slot[0][0] = real_mask(
-            &context,
-            &compiler,
-            boundary_wire(&compiler, "wrong-slot"),
-            parameters.refresh_id,
-            1,
-            0,
-            0,
-            0,
-        );
-        assert!(
-            crate::refresh_setup::RefreshPrfInputs::from_pbc_outputs(
-                &parameters,
-                program_id,
-                wrong_slot,
-                fresh.clone(),
-            )
-            .is_err()
-        );
-
-        let mut swapped = masks.clone();
-        swapped.swap(0, 1);
-        assert!(
-            crate::refresh_setup::RefreshPrfInputs::from_pbc_outputs(
-                &parameters,
-                program_id,
-                swapped,
-                fresh.clone(),
-            )
-            .is_err()
-        );
-
-        let mut duplicate = masks.clone();
-        duplicate[0][2] = duplicate[0][0].clone();
-        assert!(
-            crate::refresh_setup::RefreshPrfInputs::from_pbc_outputs(
-                &parameters,
-                program_id,
-                duplicate,
-                fresh.clone(),
-            )
-            .is_err()
-        );
-
-        let mut missing = masks;
-        missing[0].pop();
-        assert!(
-            crate::refresh_setup::RefreshPrfInputs::from_pbc_outputs(
-                &parameters,
-                program_id,
-                missing,
-                fresh,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn refresh_prf_inputs_rejects_mixed_program_and_layout() {
-        let (parameters, program_id, mut masks, fresh) = complete_boundary_inputs();
-        // Use a genuinely different, but still valid, sparse-LWR profile for
-        // the first branch.  Reusing the boundary helper here would construct
-        // the same composite program identity; the seed is intentionally kept
-        // equal so this assertion isolates program binding from layout
-        // binding.
-        let alt_ring = mxx_dsl::Ring::new(323, 8);
-        let alt_compiler =
-            PowerLutEncodingCompiler::from_public_key(mxx_bgg::BggPublicKeyCompiler {
-                ring: alt_ring.clone(),
-                base: 2.into(),
-                digit_count: 2.into(),
-            });
-        let alt_context = RealPbcTestContext::new(
-            &alt_compiler,
-            &BggEncodingWire {
-                vector: alt_ring.input("alternate-program-context-vector", (1, 4)),
-                pubkey: BggPublicKeyWire {
-                    matrix: alt_ring.input("alternate-program-context-public", (2, 4)),
-                    reveal_plaintext: false,
-                },
-                plaintext: None,
-            },
-            [19; 32],
-            [9; 32],
-        );
-        let mut alt_context = alt_context;
-        // W = 8 needs three ClearCoeff helper rounds.  The regular boundary
-        // fixture uses W = 4, so replace only this test context's helpers.
-        let alt_sampler = crate::encoding::PowerLutEncodingSampler {
-            layout: mxx_bgg::BggSamplerLayout {
-                modulus: 323.into(),
-                ring_dimension: 8.into(),
-                secret_dimension: 2,
-                digit_count: 2,
-                gadget_base: 2.into(),
-            },
-            gaussian_sigma: None,
-            gaussian_max_coefficient_bound: None,
-        };
-        alt_context.helpers = alt_sampler
-            .sample_automorphism_helpers(
-                alt_ring.zero((1, 2)),
-                alt_ring.bytes_input("alternate-program-helper-key", 32),
-                b"alternate-program-helpers".to_vec(),
-                8,
-            )
-            .unwrap();
-        let alt_body = crate::prf::SparseLwrPrfProgram::new(
-            crate::prf::SparseLwrPrfProfile::new(3, 2, 8, 8).unwrap(),
-            2,
-        )
-        .unwrap();
-        let alt_output = alt_context.lower(
-            &alt_compiler,
-            BggEncodingWire {
-                vector: alt_ring.input("alternate-program-vector", (1, 4)),
-                pubkey: BggPublicKeyWire {
-                    matrix: alt_ring.input("alternate-program-public", (2, 4)),
-                    reveal_plaintext: false,
-                },
-                plaintext: None,
-            },
-            &alt_body,
-            &RefreshPrfLabel::Mask {
-                refresh_id: parameters.refresh_id,
-                slot: 0,
-                component: 0,
-                coefficient: 0,
-                digit: 0,
-            }
-            .canonical_bytes(),
-        );
-        masks[0][0] = RefreshMaskPrfOutput::from_pbc_evaluation(
-            alt_output,
-            parameters.refresh_id,
-            0,
-            0,
-            0,
-            0,
-        )
-        .unwrap();
-        assert!(
-            crate::refresh_setup::RefreshPrfInputs::from_pbc_outputs(
-                &parameters,
-                program_id,
-                masks,
-                fresh.clone(),
-            )
-            .is_err()
-        );
-
-        let (_, layout_compiler, _) = boundary_parameters();
-        let layout_context = RealPbcTestContext::new(
-            &layout_compiler,
-            &boundary_wire(&layout_compiler, "alternate-layout-context"),
-            [20; 32],
-            [8; 32],
-        );
-        let layout_body =
-            crate::prf::test_sparse_lwr_program(layout_context.layout.bucket_width, 4).unwrap();
-        let layout_output = layout_context.lower(
-            &layout_compiler,
-            boundary_wire(&layout_compiler, "alternate-layout"),
-            &layout_body,
-            &RefreshPrfLabel::Mask {
-                refresh_id: parameters.refresh_id,
-                slot: 0,
-                component: 0,
-                coefficient: 0,
-                digit: 0,
-            }
-            .canonical_bytes(),
-        );
-        let (_, _, mut layout_masks, layout_fresh) = complete_boundary_inputs();
-        layout_masks[0][0] = RefreshMaskPrfOutput::from_pbc_evaluation(
-            layout_output,
-            parameters.refresh_id,
-            0,
-            0,
-            0,
-            0,
-        )
-        .unwrap();
-        assert!(
-            crate::refresh_setup::RefreshPrfInputs::from_pbc_outputs(
-                &parameters,
-                program_id,
-                layout_masks,
-                layout_fresh,
-            )
-            .is_err()
-        );
+        assert!(matches!(layout.validate_layout(), Err(RefreshError::InvalidLayout)));
     }
 }

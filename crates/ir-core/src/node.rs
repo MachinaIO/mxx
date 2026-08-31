@@ -104,6 +104,9 @@ pub enum NodeKind {
         digit_count: IntExpr,
         preimage_max_coefficient_bound: IntExpr,
     },
+    /// Samples a matrix `K` satisfying the exact ring relation `B * K = T`.
+    /// The bound controls rejection sampling of `K`; it does not permit an
+    /// approximate relation or alter the target.
     PreimageSample {
         matrix_type: crate::types::MatrixType,
         max_coefficient_bound: IntExpr,
@@ -127,6 +130,9 @@ pub enum NodeKind {
         length: IntExpr,
         output_bool: bool,
     },
+    /// Applies coefficient-wise nearest CRT scale-and-round to each input
+    /// level, then embeds and combines the rounded levels using the supplied
+    /// reconstruction coefficients.
     CrtRecompose {
         plaintext_moduli: Vec<IntExpr>,
         reconstruction_coefficients: Vec<IntExpr>,

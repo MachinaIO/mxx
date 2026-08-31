@@ -95,6 +95,14 @@ fn sample_bounded_candidate<M: PolyMatrix>(
 }
 
 pub(crate) trait CrtRecomposeMatrix: PolyMatrix {
+    /// Reconstructs a full-modulus matrix from one-row plaintext levels.
+    ///
+    /// Each coefficient of level `i` is first nearest-scaled from the full
+    /// modulus `q` into its plaintext modulus `p_i`:
+    /// `round(p_i * y / q) mod p_i`.  The rounded level is then embedded in
+    /// the full ring and multiplied by its reconstruction coefficient.  The
+    /// operation is coefficient-wise; it is not a polynomial-wide
+    /// approximation or a post-hoc correction.
     fn crt_recompose_levels(
         levels: &[Self],
         plaintext_moduli: &[BigInt],
@@ -135,6 +143,11 @@ pub(crate) fn crt_recompose_cpu<M: PolyMatrix>(
                     .into_iter()
                     .map(|value| {
                         let value = BigInt::from_biguint(Sign::Plus, value);
+                        // The `q / 2` term implements nearest-integer scaling
+                        // for the canonical non-negative representative `y`.
+                        // Reducing after division gives the residue in the
+                        // plaintext level, including the wrap-around case for
+                        // centered negative errors represented modulo `q`.
                         let rounded: BigInt =
                             ((plaintext_modulus * value + &q / 2) / &q) % plaintext_modulus;
                         rounded.to_biguint().ok_or(PolyBackendError::InvalidInteger)
@@ -1138,7 +1151,10 @@ pub fn cpu_backend(parameters: impl IntoIterator<Item = DCRTPolyParams>) -> CpuD
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_primitives::poly::{PolyParams, dcrt::poly::DCRTPoly};
+    use mxx_primitives::{
+        matrix::dcrt_poly::DCRTPolyMatrix,
+        poly::{PolyParams, dcrt::poly::DCRTPoly},
+    };
 
     #[test]
     fn coefficient_extraction_returns_a_canonical_index_above_half_modulus() {
@@ -1209,6 +1225,91 @@ mod tests {
 
         assert_eq!(decomposed, plain.decompose());
         assert_eq!(small_decomposed, plain.small_decompose());
+    }
+
+    #[test]
+    fn crt_recompose_rounds_each_coefficient_before_reconstruction() {
+        let parameters = DCRTPolyParams::new(8, 2, 17, 8);
+        let q = parameters.modulus().as_ref().clone();
+        let q_int = BigInt::from_biguint(Sign::Plus, q.clone());
+        let plaintext_moduli = [BigInt::from(3u8), BigInt::from(5u8)];
+        let reconstruction_coefficients = [BigInt::from(1u8), BigInt::from(-2i8)];
+
+        // These errors exercise zero, both signs, and values immediately below
+        // the nearest-rounding half interval.  A centered negative value is
+        // represented by its canonical residue modulo q, just as it is in a
+        // runtime DCRT polynomial.
+        let error = |plaintext_modulus: &BigInt, denominator: u8, negative: bool| {
+            let denominator = plaintext_modulus * denominator;
+            let magnitude = (&q_int / denominator) - 1u8;
+            if negative { -magnitude } else { magnitude }
+        };
+        let make_level = |plaintext_modulus: &BigInt| {
+            (0..2)
+                .map(|column| {
+                    (0..parameters.ring_dimension() as usize)
+                        .map(|coefficient| {
+                            let z = BigInt::from((column + coefficient) as u8) % plaintext_modulus;
+                            let signed = (&q_int * &z) / plaintext_modulus +
+                                match coefficient {
+                                    0 => BigInt::zero(),
+                                    1 => error(plaintext_modulus, 4, false),
+                                    2 => error(plaintext_modulus, 4, true),
+                                    3 => error(plaintext_modulus, 2, false),
+                                    _ => error(plaintext_modulus, 2, true),
+                                };
+                            let canonical = ((signed % &q_int) + &q_int) % &q_int;
+                            canonical.to_biguint().expect("canonical coefficient is nonnegative")
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .map(|coefficients| DCRTPoly::from_biguints(&parameters, &coefficients))
+                .collect::<Vec<_>>()
+        };
+
+        let levels = plaintext_moduli
+            .iter()
+            .map(make_level)
+            .map(|polynomials| DCRTPolyMatrix::from_poly_vec_row(&parameters, polynomials))
+            .collect::<Vec<_>>();
+
+        let expected_levels = plaintext_moduli
+            .iter()
+            .zip(&levels)
+            .map(|(plaintext_modulus, level)| {
+                let rounded = (0..level.col_size())
+                    .map(|column| {
+                        let coefficients = level
+                            .entry(0, column)
+                            .coeffs_biguints()
+                            .into_iter()
+                            .map(|value| {
+                                let value = BigInt::from_biguint(Sign::Plus, value);
+                                (((plaintext_modulus * value + &q_int / 2u8) / &q_int) %
+                                    plaintext_modulus)
+                                    .to_biguint()
+                                    .expect("rounded coefficient is nonnegative")
+                            })
+                            .collect::<Vec<_>>();
+                        DCRTPoly::from_biguints(&parameters, &coefficients)
+                    })
+                    .collect::<Vec<_>>();
+                DCRTPolyMatrix::from_poly_vec_row(&parameters, rounded)
+            })
+            .collect::<Vec<_>>();
+        let mut expected = DCRTPolyMatrix::zero(&parameters, 1, 2);
+        for (level, coefficient) in expected_levels.iter().zip(&reconstruction_coefficients) {
+            let residue = ((coefficient % &q_int) + &q_int) % &q_int;
+            let scalar = DCRTPoly::from_biguint_to_constant(
+                &parameters,
+                residue.to_biguint().expect("reconstruction residue is nonnegative"),
+            );
+            expected.add_in_place(&(level * scalar));
+        }
+
+        let actual = crt_recompose_cpu(&levels, &plaintext_moduli, &reconstruction_coefficients)
+            .expect("CRT recomposition");
+        assert_eq!(actual, expected);
     }
 }
 

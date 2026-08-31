@@ -11,11 +11,18 @@
 //! represented and validated independently of any sparse schedule. Lowerers
 //! receive explicit selector-family packages and public weighting values, so
 //! the program itself never stores private support or selected-slot data.
+//!
+//! The gate equations are: unary `y=f(x)`; binary `y=f(x,r)` after explicit
+//! RHS fusion with package `r`; and one-hot `y=sum_i m_i v_i`, where `m_i` is
+//! derived from selector packages and `v_i` is the public value family. The
+//! builder validates wire, table, family-range, and gate-order obligations
+//! before either backend performs matrix lowering.
 
 use std::collections::BTreeMap;
 
 use mxx_ir_core::IntExpr;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 macro_rules! id_type {
@@ -66,18 +73,34 @@ impl PowerLutProgramId {
     }
 }
 
+/// The algebraic representation of a LUT output.
+///
+/// Ordinary LUTs return a monomial `X^v`, while a terminal scalar LUT returns
+/// the constant polynomial `v`.  The distinction is serialized and therefore
+/// participates in the program identity and helper-artifact commitment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LutOutputForm {
+    /// Return the monomial `X^v` in the ring.
+    Monomial,
+    /// Return the constant polynomial `v`; only terminal unary gates may use it.
+    Scalar,
+}
+
 /// A LUT table with statically declared input and output widths.
 ///
-/// Entries are output exponents, indexed by the encoded input domain. A unary
-/// table has one entry for each primary input value. A binary table uses the
-/// explicit mapping `index = lhs + lhs_width * rhs`; stating the formula here
-/// avoids relying on an ambiguous meaning of “row-major” across callers.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Entries are public output values, interpreted as monomial exponents or
+/// constant coefficients according to [`LutOutputForm`], indexed by the
+/// encoded input domain. A unary table has one entry for each primary input
+/// value. A binary table uses the explicit mapping `index = lhs + lhs_width *
+/// rhs`; stating the formula here avoids relying on an ambiguous meaning of
+/// “row-major” across callers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LutTable {
     input_width: usize,
     rhs_width: Option<usize>,
     output_width: usize,
     values: Vec<usize>,
+    output_form: LutOutputForm,
 }
 
 impl LutTable {
@@ -91,7 +114,13 @@ impl LutTable {
         output_width: usize,
         values: Vec<usize>,
     ) -> Result<Self, ProgramValidationError> {
-        let table = Self { input_width, rhs_width: None, output_width, values };
+        let table = Self {
+            input_width,
+            rhs_width: None,
+            output_width,
+            values,
+            output_form: LutOutputForm::Monomial,
+        };
         validate_table(&table)?;
         Ok(table)
     }
@@ -106,8 +135,34 @@ impl LutTable {
         output_width: usize,
         values: Vec<usize>,
     ) -> Result<Self, ProgramValidationError> {
-        let table =
-            Self { input_width: lhs_width, rhs_width: Some(rhs_width), output_width, values };
+        let table = Self {
+            input_width: lhs_width,
+            rhs_width: Some(rhs_width),
+            output_width,
+            values,
+            output_form: LutOutputForm::Monomial,
+        };
+        validate_table(&table)?;
+        Ok(table)
+    }
+
+    /// Creates a unary table whose outputs are constant ring polynomials.
+    ///
+    /// Scalar outputs are intended for a terminal application operation such
+    /// as LWR rounding.  Program validation prevents such a wire from feeding
+    /// another gate, so ordinary unary and binary LUTs remain monomial-valued.
+    pub fn unary_scalar(
+        input_width: usize,
+        output_width: usize,
+        values: Vec<usize>,
+    ) -> Result<Self, ProgramValidationError> {
+        let table = Self {
+            input_width,
+            rhs_width: None,
+            output_width,
+            values,
+            output_form: LutOutputForm::Scalar,
+        };
         validate_table(&table)?;
         Ok(table)
     }
@@ -124,9 +179,53 @@ impl LutTable {
     pub const fn output_width(&self) -> usize {
         self.output_width
     }
+    /// Returns whether outputs are monomials or constant polynomials.
+    pub const fn output_form(&self) -> LutOutputForm {
+        self.output_form
+    }
     /// Returns table entries in canonical order.
     pub fn values(&self) -> &[usize] {
         &self.values
+    }
+
+    /// Returns a stable commitment to this table's public contents and shape.
+    /// Helper artifacts bind to this value, preventing accidental reuse across
+    /// different tables with the same local LUT identifier or width.
+    pub(crate) fn commitment(&self) -> [u8; 32] {
+        let bytes = serde_json::to_vec(self).expect("LutTable is serializable");
+        let mut digest = Sha256::new();
+        digest.update(b"mxx-power-lut/lut-table/v1");
+        digest.update(bytes);
+        digest.finalize().into()
+    }
+}
+
+impl<'de> Deserialize<'de> for LutTable {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct LutTableRepr {
+            input_width: usize,
+            rhs_width: Option<usize>,
+            output_width: usize,
+            values: Vec<usize>,
+            output_form: LutOutputForm,
+        }
+        let repr = LutTableRepr::deserialize(deserializer)?;
+        let table = Self {
+            input_width: repr.input_width,
+            rhs_width: repr.rhs_width,
+            output_width: repr.output_width,
+            values: repr.values,
+            output_form: repr.output_form,
+        };
+        validate_table(&table).map_err(D::Error::custom)?;
+        if table.output_form == LutOutputForm::Scalar && table.rhs_width.is_some() {
+            return Err(D::Error::custom("scalar LUT outputs must be unary"));
+        }
+        Ok(table)
     }
 }
 
@@ -242,23 +341,6 @@ impl FamilyRange {
     /// Returns the fixed structural capacity of this range.
     pub fn capacity(&self) -> &IntExpr {
         &self.capacity
-    }
-
-    /// Checks a range against a family count whenever all bounds are static.
-    pub(crate) fn is_within(&self, family_count: &IntExpr) -> bool {
-        match (
-            self.start.evaluate(&mxx_ir_core::ParamEnv::default()),
-            self.count.evaluate(&mxx_ir_core::ParamEnv::default()),
-            family_count.evaluate(&mxx_ir_core::ParamEnv::default()),
-        ) {
-            (Ok(start), Ok(count), Ok(total)) => {
-                let capacity = self.capacity.evaluate(&mxx_ir_core::ParamEnv::default()).ok();
-                start >= 0.into() &&
-                    count > 0.into() &&
-                    capacity.is_none_or(|capacity| start + capacity <= total)
-            }
-            _ => true,
-        }
     }
 }
 
@@ -379,6 +461,9 @@ pub enum ProgramValidationError {
     #[error("program builder reached an inconsistent internal state")]
     /// Internal builder maps are inconsistent.
     InvalidBuilderState,
+    #[error("serialized program identity does not match its contents")]
+    /// A serialized program was altered without recomputing its canonical identity.
+    ProgramIdentityMismatch,
     #[error("one-hot family range is empty, negative, or outside its family")]
     /// A runtime family view has invalid statically known bounds.
     InvalidFamilyRange,
@@ -398,7 +483,7 @@ pub enum ProgramValidationError {
 /// same graph description. Builder-created values are validated before being
 /// returned; callers deserializing this type should still treat untrusted data
 /// as requiring validation at its artifact boundary.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PowerLutProgram {
     id: PowerLutProgramId,
     inputs: BTreeMap<ProgramInputId, usize>,
@@ -409,6 +494,53 @@ pub struct PowerLutProgram {
     luts: BTreeMap<LutId, LutTable>,
     gates: Vec<ProgramGate>,
     outputs: Vec<ProgramWireId>,
+}
+
+#[derive(Deserialize)]
+struct PowerLutProgramRepr {
+    id: PowerLutProgramId,
+    inputs: BTreeMap<ProgramInputId, usize>,
+    input_wires: BTreeMap<ProgramInputId, ProgramWireId>,
+    rhs_inputs: BTreeMap<RhsInputId, RhsInputDeclaration>,
+    rhs_families: BTreeMap<RhsFamilyId, RhsFamilyDeclaration>,
+    public_value_families: BTreeMap<PublicValueFamilyId, PublicValueFamilyDeclaration>,
+    luts: BTreeMap<LutId, LutTable>,
+    gates: Vec<ProgramGate>,
+    outputs: Vec<ProgramWireId>,
+}
+
+impl<'de> Deserialize<'de> for PowerLutProgram {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let repr = PowerLutProgramRepr::deserialize(deserializer)?;
+        let builder = builder_from_program_parts(
+            repr.inputs.clone(),
+            repr.input_wires.clone(),
+            repr.rhs_inputs.clone(),
+            repr.rhs_families.clone(),
+            repr.public_value_families.clone(),
+            repr.luts.clone(),
+            repr.gates.clone(),
+            repr.outputs.clone(),
+        )
+        .map_err(D::Error::custom)?;
+        if repr.id != canonical_program_id(&canonical_program_bytes(&builder)) {
+            return Err(D::Error::custom(ProgramValidationError::ProgramIdentityMismatch));
+        }
+        Ok(Self {
+            id: repr.id,
+            inputs: repr.inputs,
+            input_wires: repr.input_wires,
+            rhs_inputs: repr.rhs_inputs,
+            rhs_families: repr.rhs_families,
+            public_value_families: repr.public_value_families,
+            luts: repr.luts,
+            gates: repr.gates,
+            outputs: repr.outputs,
+        })
+    }
 }
 
 impl PowerLutProgram {
@@ -639,17 +771,7 @@ impl PowerLutProgramBuilder {
             return Err(ProgramValidationError::InvalidOutput);
         }
         validate_builder(&self)?;
-        let canonical = serde_json::to_vec(&(
-            &self.inputs,
-            &self.input_wires,
-            &self.rhs_inputs,
-            &self.rhs_families,
-            &self.public_value_families,
-            &self.luts,
-            &self.gates,
-            &self.outputs,
-        ))
-        .map_err(|_| ProgramValidationError::InvalidBuilderState)?;
+        let canonical = canonical_program_bytes(&self);
         let program = PowerLutProgram {
             id: canonical_program_id(&canonical),
             inputs: self.inputs,
@@ -673,6 +795,72 @@ impl PowerLutProgramBuilder {
     }
 }
 
+fn canonical_program_bytes(builder: &PowerLutProgramBuilder) -> Vec<u8> {
+    serde_json::to_vec(&(
+        &builder.inputs,
+        &builder.input_wires,
+        &builder.rhs_inputs,
+        &builder.rhs_families,
+        &builder.public_value_families,
+        &builder.luts,
+        &builder.gates,
+        &builder.outputs,
+    ))
+    .expect("PowerLutProgram declarations are serializable")
+}
+
+fn builder_from_program_parts(
+    inputs: BTreeMap<ProgramInputId, usize>,
+    input_wires: BTreeMap<ProgramInputId, ProgramWireId>,
+    rhs_inputs: BTreeMap<RhsInputId, RhsInputDeclaration>,
+    rhs_families: BTreeMap<RhsFamilyId, RhsFamilyDeclaration>,
+    public_value_families: BTreeMap<PublicValueFamilyId, PublicValueFamilyDeclaration>,
+    luts: BTreeMap<LutId, LutTable>,
+    gates: Vec<ProgramGate>,
+    outputs: Vec<ProgramWireId>,
+) -> Result<PowerLutProgramBuilder, ProgramValidationError> {
+    if inputs.len() != input_wires.len() || outputs.is_empty() {
+        return Err(ProgramValidationError::InvalidBuilderState);
+    }
+    let mut wires = BTreeMap::new();
+    for (input, width) in &inputs {
+        if *width == 0 {
+            return Err(ProgramValidationError::WidthMismatch);
+        }
+        let wire =
+            input_wires.get(input).copied().ok_or(ProgramValidationError::InvalidBuilderState)?;
+        if wires.insert(wire, *width).is_some() {
+            return Err(ProgramValidationError::DuplicateIdentifier);
+        }
+    }
+    for gate in &gates {
+        let (output, width) = match gate {
+            ProgramGate::Unary { output, lut, .. } |
+            ProgramGate::Binary { output, lut, .. } |
+            ProgramGate::OneHot { output, lut, .. } => (
+                *output,
+                luts.get(lut).ok_or(ProgramValidationError::UndefinedLut(*lut))?.output_width(),
+            ),
+        };
+        if wires.insert(output, width).is_some() {
+            return Err(ProgramValidationError::DuplicateIdentifier);
+        }
+    }
+    let builder = PowerLutProgramBuilder {
+        inputs,
+        input_wires,
+        rhs_inputs,
+        rhs_families,
+        public_value_families,
+        luts,
+        gates,
+        wires,
+        outputs,
+    };
+    validate_builder(&builder)?;
+    Ok(builder)
+}
+
 // Program shape validation.
 
 pub(crate) fn validate_builder(
@@ -680,6 +868,19 @@ pub(crate) fn validate_builder(
 ) -> Result<(), ProgramValidationError> {
     if builder.inputs.len() != builder.input_wires.len() {
         return Err(ProgramValidationError::InvalidBuilderState);
+    }
+    if builder.outputs.is_empty() ||
+        builder.outputs.iter().any(|wire| !builder.wires.contains_key(wire)) ||
+        builder
+            .outputs
+            .iter()
+            .enumerate()
+            .any(|(index, wire)| builder.outputs[..index].contains(wire))
+    {
+        return Err(ProgramValidationError::InvalidOutput);
+    }
+    for table in builder.luts.values() {
+        validate_table(table)?;
     }
     for gate in &builder.gates {
         match gate {
@@ -724,6 +925,26 @@ pub(crate) fn validate_builder(
             }
         }
     }
+    for gate in &builder.gates {
+        let (output, table, is_unary) = match gate {
+            ProgramGate::Unary { output, lut, .. } => {
+                (*output, builder.lut_definition(*lut)?, true)
+            }
+            ProgramGate::Binary { output, lut, .. } | ProgramGate::OneHot { output, lut, .. } => {
+                (*output, builder.lut_definition(*lut)?, false)
+            }
+        };
+        if table.output_form() == LutOutputForm::Scalar {
+            let consumed_later = builder.gates.iter().any(|consumer| match consumer {
+                ProgramGate::Unary { input, .. } => *input == output,
+                ProgramGate::Binary { lhs, .. } => *lhs == output,
+                ProgramGate::OneHot { lhs, .. } => *lhs == output,
+            });
+            if !is_unary || consumed_later || !builder.outputs.contains(&output) {
+                return Err(ProgramValidationError::InvalidLutTable);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -738,6 +959,12 @@ pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationEr
         None => table.input_width(),
     };
     if expected != table.values.len() {
+        return Err(ProgramValidationError::InvalidLutTable);
+    }
+    if table.values.iter().any(|value| *value >= table.output_width) {
+        return Err(ProgramValidationError::InvalidLutTable);
+    }
+    if table.output_form == LutOutputForm::Scalar && table.rhs_width.is_some() {
         return Err(ProgramValidationError::InvalidLutTable);
     }
     Ok(())
@@ -759,7 +986,7 @@ pub(crate) struct ProgramBindings<'a, W, R, SF, VF, H> {
     pub(crate) rhs_inputs: &'a BTreeMap<RhsInputId, R>,
     pub(crate) one_hot_selectors: &'a BTreeMap<RhsFamilyId, SF>,
     pub(crate) public_values: &'a BTreeMap<PublicValueFamilyId, VF>,
-    pub(crate) helpers: &'a [H],
+    pub(crate) helpers: &'a BTreeMap<LutId, H>,
 }
 
 impl<'a, W, R, SF, VF, H> ProgramBindings<'a, W, R, SF, VF, H> {
@@ -768,7 +995,7 @@ impl<'a, W, R, SF, VF, H> ProgramBindings<'a, W, R, SF, VF, H> {
         rhs_inputs: &'a BTreeMap<RhsInputId, R>,
         one_hot_selectors: &'a BTreeMap<RhsFamilyId, SF>,
         public_values: &'a BTreeMap<PublicValueFamilyId, VF>,
-        helpers: &'a [H],
+        helpers: &'a BTreeMap<LutId, H>,
     ) -> Self {
         Self { inputs, rhs_inputs, one_hot_selectors, public_values, helpers }
     }
@@ -791,6 +1018,14 @@ pub(crate) trait ProgramLoweringBackend {
     /// Structural public-value family paired with [`Self::SelectorFamily`].
     type PublicValueFamily;
     type Helper;
+    /// Setup helper container validated against the concrete LUT table.
+    type HelperSet;
+
+    fn resolve_helpers<'a>(
+        &self,
+        helpers: &'a Self::HelperSet,
+        table: &LutTable,
+    ) -> Result<&'a [Self::Helper], PowerLutError>;
 
     fn unary(
         &self,
@@ -827,6 +1062,13 @@ pub(crate) trait ProgramLoweringBackend {
 /// formula: encoding and public-key backends implement those formulas
 /// independently. Family bindings remain DSL families so OneHot lowering can
 /// use one structural loop body rather than host-unrolling each cell.
+///
+/// For each gate, `wires` is the partial map from a declared wire id to the
+/// backend value representing that wire. Unary dispatch applies `f` to the
+/// mapped input; binary dispatch supplies the separately declared RHS `r`;
+/// OneHot gathers matching selector/value family ranges and evaluates
+/// `sum_i m_i Fuse(wire,C_i) v_i`. The output is inserted only after the
+/// backend has accepted the gate's shape and helper commitment.
 pub(crate) fn lower_program<B: ProgramLoweringBackend>(
     program: &PowerLutProgram,
     bindings: &ProgramBindings<
@@ -835,7 +1077,7 @@ pub(crate) fn lower_program<B: ProgramLoweringBackend>(
         B::Rhs,
         B::SelectorFamily,
         B::PublicValueFamily,
-        B::Helper,
+        B::HelperSet,
     >,
     family_ranges: &ProgramFamilyRanges,
     backend: &B,
@@ -859,7 +1101,9 @@ pub(crate) fn lower_program<B: ProgramLoweringBackend>(
                     .ok_or(ProgramValidationError::UndefinedWire(*input))?;
                 let table = program.lut(*lut).ok_or(ProgramValidationError::UndefinedLut(*lut))?;
                 validate_unary_table(table)?;
-                (*output, backend.unary(input, table, bindings.helpers)?)
+                let helper_set = bindings.helpers.get(lut).ok_or(PowerLutError::InvalidLut)?;
+                let helpers = backend.resolve_helpers(helper_set, table)?;
+                (*output, backend.unary(input, table, helpers)?)
             }
             ProgramGate::Binary { lhs, rhs, lut, output } => {
                 let lhs_value =
@@ -874,7 +1118,9 @@ pub(crate) fn lower_program<B: ProgramLoweringBackend>(
                     .rhs_inputs
                     .get(rhs)
                     .ok_or(ProgramValidationError::MissingRuntimeRhs(*rhs))?;
-                (*output, backend.binary(lhs_value, rhs_value, table, bindings.helpers)?)
+                let helper_set = bindings.helpers.get(lut).ok_or(PowerLutError::InvalidLut)?;
+                let helpers = backend.resolve_helpers(helper_set, table)?;
+                (*output, backend.binary(lhs_value, rhs_value, table, helpers)?)
             }
             ProgramGate::OneHot { lhs, selector_family, public_value_family, lut, output } => {
                 let lhs_value =
@@ -918,7 +1164,10 @@ pub(crate) fn lower_program<B: ProgramLoweringBackend>(
                         selector_range,
                         public_value_range,
                         table,
-                        bindings.helpers,
+                        backend.resolve_helpers(
+                            bindings.helpers.get(lut).ok_or(PowerLutError::InvalidLut)?,
+                            table,
+                        )?,
                     )?,
                 )
             }
@@ -959,7 +1208,7 @@ pub fn artifact_namespace(program: &PowerLutProgram, public_namespace: &str) -> 
 
 /// Computes the canonical identifier for a serialized program description.
 pub(crate) fn canonical_program_id(bytes: &[u8]) -> PowerLutProgramId {
-    PowerLutProgramId(crate::utils::digest(bytes))
+    PowerLutProgramId(Sha256::digest(bytes).into())
 }
 
 #[cfg(test)]
@@ -972,7 +1221,7 @@ mod tests {
         let lhs = builder.input(2).unwrap();
         let family = builder.rhs_family(2).unwrap();
         let rhs = builder.rhs_input(family, 2, 2).unwrap();
-        let lut = builder.lut(LutTable::binary(2, 2, 2, vec![0, 1, 2, 3]).unwrap()).unwrap();
+        let lut = builder.lut(LutTable::binary(2, 2, 2, vec![0, 1, 1, 0]).unwrap()).unwrap();
         let output = builder.binary(builder.input_wire(lhs).unwrap(), rhs, lut).unwrap();
         builder.output(output).unwrap();
         let first = builder.build().unwrap();
@@ -981,11 +1230,70 @@ mod tests {
         let lhs = second_builder.input(2).unwrap();
         let family = second_builder.rhs_family(2).unwrap();
         let rhs = second_builder.rhs_input(family, 2, 2).unwrap();
-        let lut = second_builder.lut(LutTable::binary(2, 2, 2, vec![0, 1, 2, 3]).unwrap()).unwrap();
+        let lut = second_builder.lut(LutTable::binary(2, 2, 2, vec![0, 1, 1, 0]).unwrap()).unwrap();
         let output =
             second_builder.binary(second_builder.input_wire(lhs).unwrap(), rhs, lut).unwrap();
         second_builder.output(output).unwrap();
         assert_eq!(first.id(), second_builder.build().unwrap().id());
         assert!(matches!(first.gates()[0], ProgramGate::Binary { rhs: RhsInputId(0), .. }));
+    }
+
+    #[test]
+    fn lut_rejects_values_outside_the_declared_output_domain() {
+        assert!(LutTable::unary(2, 2, vec![0, 2]).is_err());
+        assert!(LutTable::binary(2, 2, 2, vec![0, 1, 2, 0]).is_err());
+        assert!(LutTable::unary_scalar(2, 2, vec![1, 2]).is_err());
+    }
+
+    #[test]
+    fn deserialization_revalidates_lut_output_domain() {
+        let table = LutTable::unary(2, 3, vec![0, 2]).unwrap();
+        let mut value = serde_json::to_value(&table).unwrap();
+        value["values"][0] = serde_json::json!(3);
+        let result = serde_json::from_value::<LutTable>(value);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scalar_lut_is_terminal_and_cannot_feed_a_later_gate() {
+        let mut builder = PowerLutProgramBuilder::new();
+        let input = builder.input(2).unwrap();
+        let scalar = builder.lut(LutTable::unary_scalar(2, 2, vec![0, 1]).unwrap()).unwrap();
+        let scalar_wire = builder.unary(builder.input_wire(input).unwrap(), scalar).unwrap();
+        builder.output(scalar_wire).unwrap();
+        let ordinary = builder.lut(LutTable::unary(2, 2, vec![1, 0]).unwrap()).unwrap();
+        let later_wire = builder.unary(scalar_wire, ordinary).unwrap();
+        builder.output(later_wire).unwrap();
+        assert!(matches!(builder.build(), Err(ProgramValidationError::InvalidLutTable)));
+    }
+
+    #[test]
+    fn scalar_lut_is_accepted_when_it_is_the_terminal_output() {
+        let mut builder = PowerLutProgramBuilder::new();
+        let input = builder.input(2).unwrap();
+        let scalar = builder.lut(LutTable::unary_scalar(2, 2, vec![0, 1]).unwrap()).unwrap();
+        let output = builder.unary(builder.input_wire(input).unwrap(), scalar).unwrap();
+        builder.output(output).unwrap();
+        assert!(builder.build().is_ok());
+    }
+
+    #[test]
+    fn serialized_program_rejects_identity_or_output_form_tampering() {
+        let mut builder = PowerLutProgramBuilder::new();
+        let input = builder.input(2).unwrap();
+        let lut = builder.lut(LutTable::unary(2, 2, vec![0, 1]).unwrap()).unwrap();
+        let output = builder.unary(builder.input_wire(input).unwrap(), lut).unwrap();
+        builder.output(output).unwrap();
+        let program = builder.build().unwrap();
+
+        let mut wrong_id = serde_json::to_value(&program).unwrap();
+        wrong_id["id"] =
+            serde_json::Value::Array((0..32).map(|_| serde_json::Value::from(0u8)).collect());
+        assert!(serde_json::from_value::<PowerLutProgram>(wrong_id).is_err());
+
+        let mut wrong_form = serde_json::to_value(&program).unwrap();
+        wrong_form["luts"]["0"]["output_form"] = serde_json::json!("Scalar");
+        let error = serde_json::from_value::<PowerLutProgram>(wrong_form).unwrap_err();
+        assert!(error.to_string().contains("serialized program identity"));
     }
 }

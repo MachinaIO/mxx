@@ -356,13 +356,16 @@ pub struct BggEncodingSampler {
 }
 
 impl BggEncodingSampler {
-    /// Builds the packed relation `sA - ([1|x_1|...|x_t] tensor sG) + e`, then
-    /// exposes its column slices. This preserves the executable dataflow of the
-    /// original sampler; the symbolic layer represents Concat and Tensor
-    /// directly without changing the runtime formula.
+    /// Builds the packed BGG+ relation
+    /// `s_mask A - ([1|x_1|...|x_t] tensor (s_payload G)) + e`, then exposes
+    /// its column slices. The mask secret controls the public-key term, while
+    /// the payload secret controls the plaintext gadget term. Passing `None`
+    /// for `payload_secret` deliberately reuses the mask secret, which is the
+    /// ordinary one-secret BGG+ construction.
     pub fn sample(
         &self,
-        secret: Mat,
+        mask_secret: Mat,
+        payload_secret: Option<Mat>,
         public_keys: &[BggPublicKeyWire],
         plaintexts: &[Mat],
     ) -> Result<Vec<BggEncodingWire>, BggSampleError> {
@@ -375,7 +378,9 @@ impl BggEncodingSampler {
         let secret_type = ring.matrix_type((1, self.layout.secret_dimension));
         let public_key_type = ring.matrix_type((self.layout.secret_dimension, columns));
         let plaintext_type = ring.matrix_type((1, 1));
-        if !same_matrix_type(secret.matrix_type(), &secret_type) ||
+        let payload_secret = payload_secret.unwrap_or_else(|| mask_secret.clone());
+        if !same_matrix_type(mask_secret.matrix_type(), &secret_type) ||
+            !same_matrix_type(payload_secret.matrix_type(), &secret_type) ||
             public_keys
                 .par_iter()
                 .any(|key| !same_matrix_type(key.matrix.matrix_type(), &public_key_type)) ||
@@ -399,8 +404,8 @@ impl BggEncodingSampler {
             self.layout.gadget_base.clone(),
             self.layout.digit_count,
         );
-        let packed_vector = secret.clone() * all_public_keys -
-            encoded_plaintexts.tensor(secret.clone() * gadget) +
+        let packed_vector = mask_secret * all_public_keys -
+            encoded_plaintexts.tensor(payload_secret * gadget) +
             match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
                 (Some(sigma), Some(bound)) => {
                     ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
@@ -678,7 +683,12 @@ mod tests {
             gaussian_sigma: Some(3.into()),
             gaussian_max_coefficient_bound: Some(19.into()),
         }
-        .sample(ring.input("secret", (1, 2)), &public_keys, &[ring.input("plaintext", (1, 1))])
+        .sample(
+            ring.input("secret", (1, 2)),
+            None,
+            &public_keys,
+            &[ring.input("plaintext", (1, 1))],
+        )
         .expect("compatible sampler inputs");
         let built = DslContext::new("bgg-sampling")
             .private_output("constant", encodings[0].vector.clone())
@@ -735,7 +745,8 @@ mod tests {
             gaussian_max_coefficient_bound: None,
         }
         .sample(
-            ring.input("secret", (1, layout.secret_dimension)),
+            ring.input("mask-secret", (1, layout.secret_dimension)),
+            Some(ring.input("payload-secret", (1, layout.secret_dimension))),
             &public_keys,
             &[ring.input("plaintext-0", (1, 1)), ring.input("plaintext-1", (1, 1))],
         )
@@ -750,21 +761,33 @@ mod tests {
         }
         let graph = context.build().unwrap();
 
-        let secret_value = secret(&parameters, layout.secret_dimension);
+        let mask_secret_value = secret(&parameters, layout.secret_dimension);
+        let payload_secret_value = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            (0..layout.secret_dimension)
+                .map(|index| {
+                    DCRTPoly::const_rotate_poly(
+                        &parameters,
+                        (index + 1) % parameters.ring_dimension() as usize,
+                    )
+                })
+                .collect(),
+        );
         let plaintext_values = [scalar(&parameters, 2), scalar(&parameters, 3)];
         let result = execute_graph(
             graph,
             parameters.clone(),
             BTreeMap::from([
                 ("key".to_owned(), RuntimeValue::Bytes(key.to_vec())),
-                ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
+                ("mask-secret".to_owned(), RuntimeValue::matrix(mask_secret_value.clone())),
+                ("payload-secret".to_owned(), RuntimeValue::matrix(payload_secret_value.clone())),
                 ("plaintext-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
                 ("plaintext-1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
             ]),
         );
 
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
-        let secret_gadget = secret_value.clone() * gadget;
+        let payload_secret_gadget = payload_secret_value.clone() * gadget;
         let encoded_plaintexts = [
             DCRTPoly::const_one(&parameters),
             plaintext_values[0].entry(0, 0),
@@ -785,12 +808,59 @@ mod tests {
                 &parameters,
                 vec![encoded_plaintexts[index].clone()],
             );
-            let vector = secret_value.clone() * public.clone() - plaintext.tensor(&secret_gadget);
+            let vector = mask_secret_value.clone() * public.clone() -
+                plaintext.tensor(&payload_secret_gadget);
             assert_eq!(matrix_output(&result, &format!("public-{index}")), &public);
             assert_eq!(matrix_output(&result, &format!("vector-{index}")), &vector);
         }
         assert!(encodings[0].plaintext.is_some());
         assert!(encodings[1].plaintext.is_none());
         assert!(encodings[2].plaintext.is_some());
+    }
+
+    #[test]
+    fn payload_secret_none_reuses_the_mask_secret() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let layout = concrete_layout(&parameters, 2);
+        let ring = layout.ring();
+        let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
+            ring.bytes_input("key", 32),
+            b"bgg-shared-secret".to_vec(),
+            &[],
+        );
+        let sampler = BggEncodingSampler {
+            layout,
+            gaussian_sigma: None,
+            gaussian_max_coefficient_bound: None,
+        };
+        let shared =
+            sampler.sample(ring.input("shared-secret", (1, 2)), None, &public_keys, &[]).unwrap();
+        let explicit = sampler
+            .sample(
+                ring.input("explicit-mask-secret", (1, 2)),
+                Some(ring.input("explicit-payload-secret", (1, 2))),
+                &public_keys,
+                &[],
+            )
+            .unwrap();
+        let graph = DslContext::new("bgg-shared-secret-fallback")
+            .output("shared", shared[0].vector.clone())
+            .unwrap()
+            .output("explicit", explicit[0].vector.clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let secret_value = secret(&parameters, 2);
+        let result = execute_graph(
+            graph,
+            parameters,
+            BTreeMap::from([
+                ("key".to_owned(), RuntimeValue::Bytes([7u8; 32].to_vec())),
+                ("shared-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
+                ("explicit-mask-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
+                ("explicit-payload-secret".to_owned(), RuntimeValue::matrix(secret_value)),
+            ]),
+        );
+        assert_eq!(matrix_output(&result, "shared"), matrix_output(&result, "explicit"));
     }
 }

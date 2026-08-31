@@ -6,23 +6,17 @@
 //! cells. A [`crate::pbc::PbcPrivateSchedule`] then records which slot is
 //! selected for each bucket to realize the secret support assignment. The
 //! compiler consumes the public layout and
-//! trusted selector artifacts, while the private schedule is never serialized
+//! selector artifacts, while the private schedule is never serialized
 //! or used to name public families.
 //!
 //! The module also exposes clear oracles and diagnostics. They are reference
 //! and setup tools, not a replacement for the encrypted DSL graph.
 
 mod artifacts;
-mod compiler;
 pub mod diagnostics;
-mod encoded_vector;
-mod hash;
+mod evaluation;
 mod layout;
-mod matching;
-mod oracle;
-mod parameters;
 mod schedule;
-mod selectors;
 
 use thiserror::Error;
 
@@ -133,30 +127,25 @@ pub enum PbcError {
 
 pub use artifacts::{
     PbcSelectorArtifactNames, PbcSelectorArtifacts, PbcSelectorPackageArtifactNames,
-    canonical_component_name,
-};
-pub use compiler::{
-    PbcLayoutFamilies, public_family_artifact_name, selector_bit_family_name,
+    PbcStructuralSelectorFamilies, PbcTrustedSelectorBits, build_structural_selector_families,
+    canonical_component_name, public_family_artifact_name, selector_bit_family_name,
     selector_family_artifact_name, selector_family_artifact_name_from_names,
 };
 pub use diagnostics::{
     PERFORMANCE_CATEGORIES, PbcDiagnosticAggregator, PbcDiagnosticReport, PbcDiagnosticSample,
     measure_key_layout,
 };
-pub use encoded_vector::{PbcEncodedPublicVector, PbcPublicVectorFamilyBinding, derive_lwr_vector};
-pub use hash::{derive_attempt_seed, derive_candidate_buckets};
-pub use layout::{PbcActiveCellIndex, PbcPublicLayout};
-pub use oracle::{
-    canonical_decode, clear_pbc_inner_product, dense_binary_support, support_from_dense,
+pub use evaluation::{
+    PbcEncodedPublicVector, PbcLayoutFamilies, PbcPublicVectorFamilyBinding, derive_lwr_vector,
 };
-pub use parameters::{PbcParameters, PbcProfile};
-pub use schedule::{PbcGeneratedKeyLayout, PbcPrivateSchedule, generate_key_layout};
-pub use selectors::{
-    PbcStructuralSelectorFamilies, PbcTrustedSelectorBits, build_structural_selector_families,
+pub use layout::{
+    PbcActiveCellIndex, PbcParameters, PbcProfile, PbcPublicLayout, derive_attempt_seed,
+    derive_candidate_buckets,
+};
+pub use schedule::{
+    PbcGeneratedKeyLayout, PbcPrivateSchedule, canonical_decode, clear_pbc_inner_product,
+    dense_binary_support, generate_key_layout, support_from_dense,
 };
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(all(test, feature = "gpu"))]
-mod gpu_tests;

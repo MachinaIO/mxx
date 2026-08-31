@@ -1,14 +1,23 @@
-//! GPU-only Power-LUT regression-test module.
+//! GPU runtime coverage for the setup-fixed, flat Power-LUT evaluator.
 //!
-//! Heavy sampled-ciphertext tests belong in this file so enabling the `gpu`
-//! feature cannot accidentally place GPU-facing code in a CPU-only module.
-//! The concrete tests are kept beside the encoding fixtures and are enabled
-//! only when a CUDA-capable runtime is selected.
+//! These tests deliberately build the private encoding and public projection
+//! through separate compilers.  The expected vector is the concrete BGG+
+//! relation `s_mask * A - mu * s_payload * G`; it is not obtained from the
+//! private evaluator's output.
 
-use crate::{PowerLutEncodingCompiler, PowerLutPublicKeyCompiler, encoding::AutomorphismHelper};
+use crate::{
+    PowerLutEncodingCompiler, PowerLutPublicKeyCompiler,
+    encoding::{
+        FlatLutHelper, FlatLutHelperSet, FlatLutMaskBank, FlatLutPublicMaskBank,
+        PowerLutEncodingSampler,
+    },
+    program::{LutTable, PowerLutProgramBuilder},
+    public_key::{FlatLutPublicHelper, FlatLutPublicHelperSet, PowerLutPublicKeySampler},
+    rhs::PowerRhsPackage,
+};
 use mxx_bgg::{BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire};
 use mxx_dsl::{DslContext, Mat, Ring};
-use mxx_ir_core::ParamEnv;
+use mxx_ir_core::{ParamEnv, node::ConstantMatrix};
 use mxx_primitives::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
@@ -22,43 +31,49 @@ use mxx_runtime::{
 };
 use num_bigint::BigInt;
 use serial_test::serial;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, env};
+
+const RING_DIMENSION_ENV: &str = "MXX_POWER_LUT_GPU_RING_DIMENSION";
+const CRT_BITS_ENV: &str = "MXX_POWER_LUT_GPU_CRT_BITS";
+const BASE_BITS_ENV: &str = "MXX_POWER_LUT_GPU_BASE_BITS";
+
+fn parameter(name: &str, default: u32) -> u32 {
+    env::var(name)
+        .map(|value| value.parse().unwrap_or_else(|_| panic!("{name} must be a positive integer")))
+        .unwrap_or(default)
+}
+
+struct Fixture {
+    parameters: DCRTPolyParams,
+    gpu_parameters: GpuDCRTPolyParams,
+    ring: Ring,
+    sampler: PowerLutEncodingSampler,
+    public_sampler: PowerLutPublicKeySampler,
+    compiler: PowerLutEncodingCompiler,
+    public_compiler: PowerLutPublicKeyCompiler,
+    mask_secret: Mat,
+    payload_secret: Mat,
+    hash_key: mxx_dsl::Bytes,
+}
 
 struct Relation {
     encoded: BggEncodingWire,
     expected_public: Mat,
-    expected_mu: Mat,
+    mu: Mat,
 }
 
-/// Runtime fixture for the migrated GPU tests. Setup and expected values use
-/// the CPU polynomial type, while the single execution below evaluates every
-/// relation through the GPU backend.
-struct GpuNoiselessFixture {
-    parameters: DCRTPolyParams,
-    gpu_parameters: GpuDCRTPolyParams,
-    ring: Ring,
-    compiler: PowerLutEncodingCompiler,
-    public_compiler: PowerLutPublicKeyCompiler,
-    sampler: crate::encoding::PowerLutEncodingSampler,
-    public_sampler: crate::public_key::PowerLutPublicKeySampler,
-    secret: Mat,
-    hash_key: mxx_dsl::Bytes,
-}
-
-impl GpuNoiselessFixture {
+impl Fixture {
     fn new() -> Self {
-        Self::with_dimension(4)
-    }
-
-    fn with_dimension(ring_dimension: u32) -> Self {
-        let parameters = DCRTPolyParams::new(ring_dimension, 1, 17, 9);
-        assert_eq!(parameters.crt_depth(), 1);
-        assert_eq!(parameters.crt_bits().div_ceil(9), 2);
-        let (moduli, crt_bits, crt_depth) = parameters.to_crt();
+        let ring_dimension = parameter(RING_DIMENSION_ENV, 4);
+        let crt_bits = parameter(CRT_BITS_ENV, 17);
+        let base_bits = parameter(BASE_BITS_ENV, 9);
+        assert!(ring_dimension.is_power_of_two() && ring_dimension >= 2);
+        assert!(base_bits > 0 && base_bits < 63 && crt_bits > base_bits);
+        let parameters = DCRTPolyParams::new(ring_dimension, 1, crt_bits as usize, base_bits);
+        assert_eq!(parameters.modulus_digits(), 2, "GPU fixture requires digit_count=2");
+        let (moduli, _, crt_depth) = parameters.to_crt();
         assert_eq!(crt_depth, 1);
-        assert_eq!(crt_bits.div_ceil(9), 2);
-        let gpu_parameters =
-            GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits());
+        let gpu_parameters = GpuDCRTPolyParams::new(ring_dimension, moduli, parameters.base_bits());
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus.clone(), ring_dimension as usize);
         let layout = mxx_bgg::BggSamplerLayout {
@@ -66,7 +81,7 @@ impl GpuNoiselessFixture {
             ring_dimension: (ring_dimension as usize).into(),
             secret_dimension: 2,
             digit_count: 2,
-            gadget_base: 512.into(),
+            gadget_base: BigInt::from(1u64 << base_bits).into(),
         };
         let bgg = BggPublicKeyCompiler {
             ring: ring.clone(),
@@ -77,319 +92,364 @@ impl GpuNoiselessFixture {
             parameters,
             gpu_parameters,
             ring: ring.clone(),
-            compiler: PowerLutEncodingCompiler::from_public_key(bgg.clone()),
-            public_compiler: PowerLutPublicKeyCompiler::new(bgg),
-            sampler: crate::encoding::PowerLutEncodingSampler {
+            sampler: PowerLutEncodingSampler {
                 layout: layout.clone(),
                 gaussian_sigma: None,
                 gaussian_max_coefficient_bound: None,
             },
-            public_sampler: crate::public_key::PowerLutPublicKeySampler { layout },
-            secret: ring.input("noiseless-secret", (1, 2)),
-            hash_key: ring.bytes_input("noiseless-hash", 32),
+            public_sampler: PowerLutPublicKeySampler { layout },
+            compiler: PowerLutEncodingCompiler::from_public_key(bgg.clone()),
+            public_compiler: PowerLutPublicKeyCompiler::new(bgg),
+            mask_secret: ring.input("power-lut-gpu-mask-secret", (1, 2)),
+            payload_secret: ring.input("power-lut-gpu-payload-secret", (1, 2)),
+            hash_key: ring.bytes_input("power-lut-gpu-hash-key", 32),
         }
     }
 
     fn rotation(&self, exponent: usize) -> Mat {
-        self.ring.constant(
-            (1, 1),
-            mxx_ir_core::node::ConstantMatrix::Rotation { exponent: exponent.into() },
-        )
+        self.ring.constant((1, 1), ConstantMatrix::Rotation { exponent: exponent.into() })
     }
 
-    fn input(&self, tag: &[u8], exponent: usize) -> BggEncodingWire {
-        self.sampler
-            .sample_input_encoding(
-                self.secret.clone(),
+    fn input(&self, tag: impl Into<mxx_dsl::HashTag>, exponent: usize) -> BggEncodingWire {
+        let mut values = self
+            .sampler
+            .sample_input_encodings(
+                self.mask_secret.clone(),
+                Some(self.payload_secret.clone()),
                 self.hash_key.clone(),
                 tag,
-                self.rotation(exponent),
+                &[self.rotation(exponent)],
             )
-            .expect("noiseless sampled input")
+            .expect("ciphertext-only input sample");
+        values.pop().expect("one input encoding")
     }
 
-    fn public_input(&self, tag: &[u8]) -> BggPublicKeyWire {
-        self.public_sampler
-            .sample_input_key(self.hash_key.clone(), tag)
-            .expect("noiseless public input")
+    fn public_input(&self, tag: impl Into<mxx_dsl::HashTag>) -> BggPublicKeyWire {
+        let mut values = self
+            .public_sampler
+            .sample_input_keys(self.hash_key.clone(), tag, 1)
+            .expect("ciphertext-only public input sample");
+        values.pop().expect("one public input key")
     }
 
-    fn helpers(&self, tag: &[u8], width: usize) -> Vec<AutomorphismHelper> {
-        self.sampler
-            .sample_automorphism_helpers(self.secret.clone(), self.hash_key.clone(), tag, width)
-            .expect("noiseless sampled helpers")
-    }
-
-    fn public_helpers(
+    fn helpers(
         &self,
-        tag: &[u8],
-        width: usize,
-    ) -> Vec<crate::public_key::AutomorphismPublicHelper> {
-        self.public_sampler
-            .sample_automorphism_helpers(self.hash_key.clone(), tag, width)
-            .expect("noiseless public helpers")
+        table: &[usize],
+        tag: impl Into<mxx_dsl::HashTag>,
+    ) -> (Vec<FlatLutHelper>, Vec<FlatLutPublicHelper>) {
+        let tag = tag.into();
+        let table =
+            LutTable::unary(table.len(), self.parameters.ring_dimension() as usize, table.to_vec())
+                .expect("flat LUT table");
+        let private_bank = self
+            .sampler
+            .sample_flat_mask_bank(
+                self.mask_secret.clone(),
+                self.hash_key.clone(),
+                table.values().len(),
+                tag.clone(),
+            )
+            .expect("flat mask bank");
+        let public_bank = self
+            .public_sampler
+            .sample_flat_mask_bank(self.hash_key.clone(), table.values().len(), tag.clone())
+            .expect("public flat mask bank");
+        self.helpers_with_banks(&table, tag, private_bank.as_ref(), &public_bank)
     }
 
-    fn execute_relations(&self, name: &str, relations: Vec<Relation>) {
-        let gadget = self.ring.gadget(2, 512, 2);
+    fn helpers_with_banks(
+        &self,
+        table: &LutTable,
+        tag: impl Into<mxx_dsl::HashTag>,
+        private_bank: &FlatLutMaskBank,
+        public_bank: &std::sync::Arc<FlatLutPublicMaskBank>,
+    ) -> (Vec<FlatLutHelper>, Vec<FlatLutPublicHelper>) {
+        let tag = tag.into();
+        let private = self
+            .sampler
+            .sample_flat_helpers_for_lut(
+                self.mask_secret.clone(),
+                Some(self.payload_secret.clone()),
+                self.hash_key.clone(),
+                table,
+                private_bank,
+                tag,
+            )
+            .expect("flat setup helpers");
+        let public = private
+            .iter()
+            .map(|helper| {
+                FlatLutPublicHelper::with_mask_bank(
+                    helper.sigma(),
+                    helper.switch().public_projection(),
+                    public_bank.clone(),
+                )
+                .expect("public flat helper mask branch")
+            })
+            .collect();
+        (private, public)
+    }
+
+    fn rhs(&self, tag: impl Into<mxx_dsl::HashTag>, exponent: usize) -> PowerRhsPackage {
+        self.sampler
+            .sample_cross_secret_rhs(
+                self.payload_secret.clone(),
+                self.payload_secret.clone(),
+                self.rotation(exponent),
+                self.hash_key.clone(),
+                tag,
+            )
+            .expect("C-only RHS package")
+    }
+
+    fn execute(&self, name: &str, relations: Vec<Relation>) {
+        let gadget = self.ring.gadget(2, self.compiler.bgg.public_key.base.clone(), 2);
         let mut context = DslContext::new(name);
         for (index, relation) in relations.iter().enumerate() {
-            let expected_vector = self.secret.clone() * relation.expected_public.clone() -
-                relation.expected_mu.clone() * (self.secret.clone() * gadget.clone());
+            assert!(relation.encoded.plaintext.is_none());
+            assert!(!relation.encoded.pubkey.reveal_plaintext);
+            let expected_vector = self.mask_secret.clone() * relation.expected_public.clone() -
+                relation.mu.clone() * (self.payload_secret.clone() * gadget.clone());
             context = context
-                .output(format!("relation-{index}-vector"), relation.encoded.vector.clone())
+                .output(format!("vector-{index}"), relation.encoded.vector.clone())
                 .unwrap()
-                .output(format!("relation-{index}-public"), relation.encoded.pubkey.matrix.clone())
+                .output(format!("public-{index}"), relation.encoded.pubkey.matrix.clone())
                 .unwrap()
-                .output(
-                    format!("relation-{index}-expected-public"),
-                    relation.expected_public.clone(),
-                )
+                .output(format!("expected-vector-{index}"), expected_vector)
                 .unwrap()
-                .output(format!("relation-{index}-expected-vector"), expected_vector)
+                .output(format!("expected-public-{index}"), relation.expected_public.clone())
                 .unwrap();
         }
         let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
-        let mut secret_coefficients = vec![0; self.parameters.ring_dimension() as usize];
-        secret_coefficients[0] = 2;
-        secret_coefficients[1] = 1;
-        let secret = DCRTPolyMatrix::from_poly_vec(
-            &self.parameters,
-            vec![vec![
-                DCRTPoly::from_u32s(&self.parameters, &secret_coefficients),
-                DCRTPoly::from_usize_to_constant(&self.parameters, 1),
-            ]],
-        );
+        let mask = concrete_secret(&self.parameters, [2, 1]);
+        let payload = concrete_secret(&self.parameters, [1, 2]);
         let result = execute(
             &graph,
             &mut gpu_backend([self.gpu_parameters.clone()]),
             BTreeMap::from([
                 (
-                    "noiseless-secret".to_owned(),
+                    "power-lut-gpu-mask-secret".to_owned(),
                     RuntimeValue::matrix(GpuDCRTPolyMatrix::from_cpu_matrix(
                         &self.gpu_parameters,
-                        &secret,
+                        &mask,
                     )),
                 ),
-                ("noiseless-hash".to_owned(), RuntimeValue::Bytes(vec![0x91; 32])),
+                (
+                    "power-lut-gpu-payload-secret".to_owned(),
+                    RuntimeValue::matrix(GpuDCRTPolyMatrix::from_cpu_matrix(
+                        &self.gpu_parameters,
+                        &payload,
+                    )),
+                ),
+                ("power-lut-gpu-hash-key".to_owned(), RuntimeValue::Bytes(vec![0x91; 32])),
             ]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
         )
         .unwrap();
         for index in 0..relations.len() {
-            let RuntimeValue::Matrix(vector) = &result.outputs[&format!("relation-{index}-vector")]
-            else {
-                panic!("encoded vector")
+            let RuntimeValue::Matrix(vector) = &result.outputs[&format!("vector-{index}")] else {
+                panic!("vector output")
             };
             let RuntimeValue::Matrix(expected_vector) =
-                &result.outputs[&format!("relation-{index}-expected-vector")]
+                &result.outputs[&format!("expected-vector-{index}")]
             else {
-                panic!("expected vector")
+                panic!("expected vector output")
             };
-            let RuntimeValue::Matrix(public) = &result.outputs[&format!("relation-{index}-public")]
-            else {
-                panic!("encoded public")
+            let RuntimeValue::Matrix(public) = &result.outputs[&format!("public-{index}")] else {
+                panic!("public output")
             };
             let RuntimeValue::Matrix(expected_public) =
-                &result.outputs[&format!("relation-{index}-expected-public")]
+                &result.outputs[&format!("expected-public-{index}")]
             else {
-                panic!("expected public")
+                panic!("expected public output")
             };
-            assert_eq!(public, expected_public, "relation {index}: public key mismatch");
-            assert_eq!(vector, expected_vector, "relation {index}: noiseless BGG relation");
+            assert_eq!(vector.as_ref(), expected_vector.as_ref(), "relation {index}: vector");
+            assert_eq!(
+                public.as_ref(),
+                expected_public.as_ref(),
+                "relation {index}: public matrix"
+            );
         }
     }
 }
 
+fn concrete_secret(parameters: &DCRTPolyParams, coefficients: [u32; 2]) -> DCRTPolyMatrix {
+    let mut values = vec![0u32; parameters.ring_dimension() as usize];
+    values[..coefficients.len()].copy_from_slice(&coefficients);
+    DCRTPolyMatrix::from_poly_vec(
+        parameters,
+        vec![vec![
+            DCRTPoly::from_u32s(parameters, &values),
+            DCRTPoly::from_usize_to_constant(parameters, 1),
+        ]],
+    )
+}
+
+fn unary_table() -> Vec<usize> {
+    vec![1, 0]
+}
+
 #[test]
 #[serial(dcrt_runtime)]
-fn noiseless_clear_coeff_and_exhaustive_single_lut_use_independent_public_keys() {
-    let fixture = GpuNoiselessFixture::new();
-    let helpers = fixture.helpers(b"clear-helper", 4);
-    let public_helpers = fixture.public_helpers(b"clear-helper", 4);
-    let input = fixture.input(b"clear-input", 1);
-    let public_input = fixture.public_input(b"clear-input");
-    let clear = fixture.compiler.clear_coeff(&input, 4, &helpers).unwrap();
-    let clear_public =
-        fixture.public_compiler.clear_coeff(&public_input.matrix, 4, &public_helpers).unwrap();
-    let mut expected_mu = fixture.rotation(1);
-    for helper in [5usize, 3] {
-        expected_mu = expected_mu.clone() + expected_mu.clone().ring_automorphism(helper);
+fn test_gpu_flat_unary_exhaustive_inputs_distinct_secrets() {
+    let fixture = Fixture::new();
+    let table = unary_table();
+    let (helpers, public_helpers) = fixture.helpers(&table, b"unary-helpers".as_slice());
+    let public_input = fixture.public_input(b"unary-input".as_slice());
+    let mut relations = Vec::new();
+    for exponent in 0..table.len() {
+        let encoded = fixture
+            .compiler
+            .single_input_lut(&fixture.input(b"unary-input".as_slice(), exponent), &table, &helpers)
+            .unwrap();
+        let expected_public = fixture
+            .public_compiler
+            .single_input_lut(&public_input.matrix, &table, &public_helpers)
+            .unwrap();
+        relations.push(Relation {
+            encoded,
+            expected_public,
+            mu: fixture.rotation(table[exponent]),
+        });
     }
-    let mut relations =
-        vec![Relation { encoded: clear, expected_public: clear_public, expected_mu }];
-    let single_public_input = fixture.public_input(b"single-input");
-    for (width, table) in [(2usize, vec![1usize, 0]), (4, vec![3, 1, 0, 2])] {
-        let helpers = fixture.helpers(b"single-helper", width);
-        let public_helpers = fixture.public_helpers(b"single-helper", width);
-        for input_exponent in 0..width {
+    fixture.execute("power-lut-flat-unary-gpu", relations);
+}
+
+#[test]
+#[serial(dcrt_runtime)]
+fn test_gpu_flat_binary_all_u_plus_bv_pairs() {
+    let fixture = Fixture::new();
+    let table = LutTable::binary(2, 2, 2, vec![0, 1, 1, 0]).unwrap();
+    let (helpers, public_helpers) = fixture.helpers(table.values(), b"binary-helpers".as_slice());
+    let public_lhs = fixture.public_input(b"binary-lhs".as_slice());
+    let mut relations = Vec::new();
+    for lhs_exponent in 0..2 {
+        for rhs_exponent in 0..2 {
+            let rhs =
+                fixture.rhs(format!("binary-rhs-{rhs_exponent}").into_bytes(), 2 * rhs_exponent);
             let encoded = fixture
                 .compiler
-                .single_input_lut(&fixture.input(b"single-input", input_exponent), &table, &helpers)
+                .two_input_lut(
+                    &fixture.input(b"binary-lhs".as_slice(), lhs_exponent),
+                    &rhs,
+                    2,
+                    2,
+                    table.values(),
+                    &helpers,
+                )
                 .unwrap();
-            let public = fixture
+            let expected_public = fixture
                 .public_compiler
-                .single_input_lut(&single_public_input.matrix, &table, &public_helpers)
+                .two_input_lut(&public_lhs.matrix, &rhs, 2, 2, table.values(), &public_helpers)
                 .unwrap();
+            let index = lhs_exponent + 2 * rhs_exponent;
             relations.push(Relation {
                 encoded,
-                expected_public: public,
-                expected_mu: fixture.rotation(table[input_exponent]),
+                expected_public,
+                mu: fixture.rotation(table.values()[index]),
             });
         }
     }
-    fixture.execute_relations("power-lut-noiseless-clear-and-single-gpu", relations);
+    fixture.execute("power-lut-flat-binary-gpu", relations);
 }
 
 #[test]
 #[serial(dcrt_runtime)]
-fn noiseless_two_stage_program_uses_shared_public_projection() {
-    let fixture = GpuNoiselessFixture::new();
-    let helpers = fixture.helpers(b"stages-helper", 2);
-    let public_helpers = fixture.public_helpers(b"stages-helper", 2);
-    let first = fixture
-        .compiler
-        .single_input_lut(&fixture.input(b"stages-input", 1), &[0, 1], &helpers)
-        .unwrap();
+fn test_gpu_flat_two_stage_lut_chain() {
+    let fixture = Fixture::new();
+    let first_table = vec![0, 1];
+    let second_table = unary_table();
+    let private_bank = fixture
+        .sampler
+        .sample_flat_mask_bank(
+            fixture.mask_secret.clone(),
+            fixture.hash_key.clone(),
+            2,
+            b"chain-mask-bank".as_slice(),
+        )
+        .expect("chain private mask bank");
+    let public_bank = fixture
+        .public_sampler
+        .sample_flat_mask_bank(fixture.hash_key.clone(), 2, b"chain-mask-bank".as_slice())
+        .expect("chain public mask bank");
+    let (first_helpers, first_public_helpers) = fixture.helpers_with_banks(
+        &LutTable::unary(2, fixture.parameters.ring_dimension() as usize, first_table.clone())
+            .unwrap(),
+        b"chain-first".as_slice(),
+        private_bank.as_ref(),
+        &public_bank,
+    );
+    let (second_helpers, second_public_helpers) = fixture.helpers_with_banks(
+        &LutTable::unary(2, fixture.parameters.ring_dimension() as usize, second_table.clone())
+            .unwrap(),
+        b"chain-second".as_slice(),
+        private_bank.as_ref(),
+        &public_bank,
+    );
+    let input = fixture.input(b"chain-input".as_slice(), 1);
+    let public_input = fixture.public_input(b"chain-input".as_slice());
+    let first = fixture.compiler.single_input_lut(&input, &first_table, &first_helpers).unwrap();
     let first_public = fixture
         .public_compiler
-        .single_input_lut(&fixture.public_input(b"stages-input").matrix, &[0, 1], &public_helpers)
+        .single_input_lut(&public_input.matrix, &first_table, &first_public_helpers)
         .unwrap();
-    let second = fixture.compiler.single_input_lut(&first, &[1, 0], &helpers).unwrap();
-    let second_public =
-        fixture.public_compiler.single_input_lut(&first_public, &[1, 0], &public_helpers).unwrap();
-    fixture.execute_relations(
-        "power-lut-noiseless-two-stage-gpu",
-        vec![Relation {
-            encoded: second,
-            expected_public: second_public,
-            expected_mu: fixture.rotation(0),
-        }],
+    let second = fixture.compiler.single_input_lut(&first, &second_table, &second_helpers).unwrap();
+    let second_public = fixture
+        .public_compiler
+        .single_input_lut(&first_public, &second_table, &second_public_helpers)
+        .unwrap();
+    fixture.execute(
+        "power-lut-flat-chain-gpu",
+        vec![Relation { encoded: second, expected_public: second_public, mu: fixture.rotation(0) }],
     );
 }
 
 #[test]
 #[serial(dcrt_runtime)]
-fn noiseless_generic_program_matches_independent_public_lowering() {
-    let fixture = GpuNoiselessFixture::new();
-    let mut builder = crate::program::PowerLutProgramBuilder::new();
+fn test_gpu_flat_generic_power_lut_program() {
+    let fixture = Fixture::new();
+    let table = LutTable::unary(2, 2, unary_table()).unwrap();
+    let mut builder = PowerLutProgramBuilder::new();
     let input_id = builder.input(2).unwrap();
-    let lut = builder.lut(crate::program::LutTable::unary(2, 2, vec![1, 0]).unwrap()).unwrap();
-    let output_id = builder.unary(builder.input_wire(input_id).unwrap(), lut).unwrap();
+    let lut_id = builder.lut(table.clone()).unwrap();
+    let output_id = builder.unary(builder.input_wire(input_id).unwrap(), lut_id).unwrap();
     builder.output(output_id).unwrap();
     let program = builder.build().unwrap();
-    let private = fixture.input(b"program-input", 1);
-    let public = fixture.public_input(b"program-input");
-    let helpers = fixture.helpers(b"program-helper", 2);
-    let public_helpers = fixture.public_helpers(b"program-helper", 2);
-    let encoded = fixture
+    let (private_helpers, public_helpers) =
+        fixture.helpers(table.values(), b"program-helpers".as_slice());
+    let private_set = FlatLutHelperSet::new(&table, private_helpers).unwrap();
+    let public_set = FlatLutPublicHelperSet::new(&table, public_helpers).unwrap();
+    let encoded = fixture.input(b"program-input".as_slice(), 1);
+    let public_input = fixture.public_input(b"program-input".as_slice());
+    let actual = fixture
         .compiler
         .compile_program(
             &program,
-            &BTreeMap::from([(input_id, private)]),
+            &BTreeMap::from([(input_id, encoded)]),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &helpers,
+            &BTreeMap::from([(lut_id, private_set)]),
         )
-        .unwrap()[&output_id]
-        .clone();
-    let public = fixture
+        .unwrap();
+    let expected = fixture
         .public_compiler
         .compile_program(
             &program,
-            &BTreeMap::from([(input_id, public)]),
+            &BTreeMap::from([(input_id, public_input)]),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &public_helpers,
+            &BTreeMap::from([(lut_id, public_set)]),
         )
-        .unwrap()[&output_id]
-        .clone();
-    fixture.execute_relations(
-        "power-lut-noiseless-generic-program-gpu",
+        .unwrap();
+    fixture.execute(
+        "power-lut-flat-program-gpu",
         vec![Relation {
-            encoded,
-            expected_public: public.matrix,
-            expected_mu: fixture.rotation(0),
+            encoded: actual[&output_id].clone(),
+            expected_public: expected[&output_id].matrix.clone(),
+            mu: fixture.rotation(0),
         }],
     );
-}
-
-#[test]
-#[serial(dcrt_runtime)]
-fn noiseless_exhaustive_two_input_pairs_use_independent_public_keys() {
-    let fixture = GpuNoiselessFixture::with_dimension(16);
-    let mut relations = Vec::new();
-    for width in [2usize, 4] {
-        let flattened_width = width * width;
-        let helpers = fixture.helpers(b"binary-helper", flattened_width);
-        let public_helpers = fixture.public_helpers(b"binary-helper", flattened_width);
-        let table =
-            (0..flattened_width).map(|value| (3 * value + 1) % flattened_width).collect::<Vec<_>>();
-        let lhs_public = fixture.public_input(format!("binary-lhs-{width}").as_bytes());
-        assert!(!lhs_public.reveal_plaintext);
-        let rhs_packages = (0..width)
-            .map(|rhs_exponent| {
-                let tag = format!("binary-rhs-{width}-{rhs_exponent}");
-                fixture
-                    .sampler
-                    .sample_cross_secret_rhs(
-                        fixture.secret.clone(),
-                        fixture.secret.clone(),
-                        fixture.rotation(width * rhs_exponent),
-                        fixture.hash_key.clone(),
-                        tag.clone().into_bytes(),
-                    )
-                    .expect("noiseless binary RHS")
-            })
-            .collect::<Vec<_>>();
-        let rhs_public = (0..width)
-            .map(|rhs_exponent| {
-                fixture
-                    .public_sampler
-                    .sample_rhs_public(
-                        fixture.hash_key.clone(),
-                        format!("binary-rhs-{width}-{rhs_exponent}").into_bytes(),
-                    )
-                    .expect("noiseless public binary RHS")
-            })
-            .collect::<Vec<_>>();
-        for lhs_exponent in 0..width {
-            let lhs = fixture.input(format!("binary-lhs-{width}").as_bytes(), lhs_exponent);
-            assert!(lhs.plaintext.is_none());
-            assert!(!lhs.pubkey.reveal_plaintext);
-            for rhs_exponent in 0..width {
-                let rhs = &rhs_packages[rhs_exponent];
-                let encoded = fixture
-                    .compiler
-                    .two_input_lut(&lhs, rhs, width, width, &table, &helpers)
-                    .unwrap_or_else(|error| {
-                        panic!("two-input width {width} ({lhs_exponent},{rhs_exponent}): {error:?}")
-                    });
-                assert!(encoded.plaintext.is_none());
-                assert!(!encoded.pubkey.reveal_plaintext);
-                let public = fixture
-                    .public_compiler
-                    .two_input_lut(
-                        &lhs_public.matrix,
-                        &rhs_public[rhs_exponent],
-                        width,
-                        width,
-                        &table,
-                        &public_helpers,
-                    )
-                    .expect("binary LUT public projection");
-                let k = crate::flattened_lut_index(lhs_exponent, rhs_exponent, width, width)
-                    .expect("binary LUT index");
-                relations.push(Relation {
-                    encoded,
-                    expected_public: public,
-                    expected_mu: fixture.rotation(table[k]),
-                });
-            }
-        }
-    }
-    fixture.execute_relations("power-lut-noiseless-two-input-gpu", relations);
 }

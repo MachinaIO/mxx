@@ -9,8 +9,7 @@ use std::time::Instant;
 
 use super::{
     PbcError, PbcLayoutSeed, PbcParameters, PbcPublicLayout, PbcRootSeed, derive_attempt_seed,
-    matching::deterministic_matching,
-    schedule::{ValidatedSupport, schedule_from_owners},
+    schedule::{ValidatedSupport, deterministic_matching, schedule_from_owners},
 };
 
 /// Stable names used by [`PbcDiagnosticReport::performance_values`].

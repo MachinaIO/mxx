@@ -369,7 +369,7 @@ mod crt_tests {
             dcrt::{gpu::gpu_device_sync, params::DCRTPolyParams, poly::DCRTPoly},
         },
     };
-    use num_bigint::{BigInt, BigUint};
+    use num_bigint::{BigInt, BigUint, Sign};
 
     #[test]
     #[serial_test::serial]
@@ -431,6 +431,44 @@ mod crt_tests {
         let expected =
             crt_recompose_cpu(&cpu_levels, &plaintext_moduli, &reconstruction_coefficients)
                 .unwrap();
+
+        // Derive the expected value independently from the operation's
+        // coefficient-wise nearest-scale rule.  In particular, this covers
+        // canonical residues for negative centered errors and values close to
+        // the half-interval, rather than merely checking GPU against another
+        // implementation of the same backend dispatch.
+        let q_int = BigInt::from_biguint(Sign::Plus, q.clone());
+        let mut direct_expected = DCRTPolyMatrix::zero(&cpu_parameters, 1, 5);
+        for ((level, plaintext_modulus), reconstruction_coefficient) in
+            cpu_levels.iter().zip(&plaintext_moduli).zip(&reconstruction_coefficients)
+        {
+            let rounded = (0..level.col_size())
+                .map(|column| {
+                    let coefficients = level
+                        .entry(0, column)
+                        .coeffs_biguints()
+                        .into_iter()
+                        .map(|value| {
+                            let value = BigInt::from_biguint(Sign::Plus, value);
+                            (((plaintext_modulus * value + &q_int / 2u8) / &q_int) %
+                                plaintext_modulus)
+                                .to_biguint()
+                                .expect("rounded coefficient is nonnegative")
+                        })
+                        .collect::<Vec<_>>();
+                    DCRTPoly::from_biguints(&cpu_parameters, &coefficients)
+                })
+                .collect::<Vec<_>>();
+            let residue = ((reconstruction_coefficient % &q_int) + &q_int) % &q_int;
+            let scalar = DCRTPoly::from_biguint_to_constant(
+                &cpu_parameters,
+                residue.to_biguint().expect("reconstruction residue is nonnegative"),
+            );
+            direct_expected.add_in_place(
+                &(DCRTPolyMatrix::from_poly_vec_row(&cpu_parameters, rounded) * scalar),
+            );
+        }
+        assert_eq!(expected, direct_expected);
 
         for _ in 0..5 {
             let gpu_levels = cpu_levels

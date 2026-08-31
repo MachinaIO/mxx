@@ -1,14 +1,69 @@
-//! Private support schedules and key-layout generation.
+//! Private PBC matching/schedules and clear reference oracles.
 //!
-//! A schedule assigns every support coordinate to a distinct candidate bucket
-//! and chooses one slot per bucket; buckets without support use their dummy
-//! cell. It is deliberately non-serializable and has a redacted `Debug`
-//! implementation because selected slots are private data.
+//! Deterministic augmenting paths inject sorted support coordinates into the
+//! public candidate graph. Assigned buckets select real slots and all others
+//! select their dummy; padding is never selectable. Retry state and schedules
+//! remain private, while canonical decode and clear sums provide checks.
 
 use super::{
-    PbcCell, PbcError, PbcLayoutId, PbcParameters, PbcPublicLayout,
-    matching::deterministic_matching,
+    PbcCell, PbcError, PbcLayoutId, PbcParameters, PbcPublicLayout, PbcRetryCause,
+    PbcRetryDiagnostics, PbcRootSeed, derive_attempt_seed,
 };
+
+pub(crate) fn deterministic_matching(
+    layout: &PbcPublicLayout,
+    support: &ValidatedSupport,
+) -> Result<Vec<Option<(usize, usize)>>, PbcError> {
+    let mut owner = vec![None; layout.parameters.bucket_count];
+    for &coordinate in support.as_slice() {
+        // Insert one support coordinate at a time; a successful augmenting
+        // path leaves `owner` injective over buckets.
+        let mut seen = vec![false; layout.parameters.bucket_count];
+        if !augment(layout, coordinate, &mut owner, &mut seen, 0, support.len()) {
+            return Err(PbcError::NoPerfectSchedule);
+        }
+    }
+    Ok(owner)
+}
+
+/// Tries to place `coordinate` by recursively displacing an existing owner.
+///
+/// Candidate buckets are visited in public hash order. The owner map is
+/// private schedule material, so this helper never contributes to a public
+/// layout identity or artifact name.
+fn augment(
+    layout: &PbcPublicLayout,
+    coordinate: usize,
+    owner: &mut [Option<(usize, usize)>],
+    seen_bucket: &mut [bool],
+    depth: usize,
+    support_weight: usize,
+) -> bool {
+    if depth >= support_weight {
+        return false;
+    }
+    for (replica, &bucket) in layout.candidates[coordinate].iter().enumerate() {
+        if seen_bucket[bucket] {
+            continue;
+        }
+        seen_bucket[bucket] = true;
+        let displaced = owner[bucket].map(|(coordinate, _)| coordinate);
+        match displaced {
+            None => {
+                owner[bucket] = Some((coordinate, replica));
+                return true;
+            }
+            Some(displaced)
+                if augment(layout, displaced, owner, seen_bucket, depth + 1, support_weight) =>
+            {
+                owner[bucket] = Some((coordinate, replica));
+                return true;
+            }
+            Some(_) => {}
+        }
+    }
+    false
+}
 
 /// A sorted, range-checked sparse support used internally during one key
 /// generation or diagnostic run. Keeping the validated representation
@@ -162,6 +217,8 @@ pub(crate) fn schedule_from_owners(
     let mut selected_slots = Vec::with_capacity(layout.parameters.bucket_count);
     let mut assigned_coordinates = Vec::with_capacity(layout.parameters.bucket_count);
     for (bucket, owner) in owners.into_iter().enumerate() {
+        // A matched owner maps through the public inverse address; an empty
+        // bucket maps to its unique dummy, never to padding.
         match owner {
             Some((coordinate, replica)) => {
                 if support.as_slice().binary_search(&coordinate).is_err() {
@@ -224,8 +281,8 @@ impl PbcGeneratedKeyLayout {
 
 /// Retries deterministic seeds until layout width and support matching succeed.
 pub fn generate_key_layout(
-    parameters: &super::PbcParameters,
-    root_seed: super::PbcRootSeed,
+    parameters: &PbcParameters,
+    root_seed: PbcRootSeed,
     sparse_support: &[usize],
 ) -> Result<PbcGeneratedKeyLayout, PbcError> {
     parameters.validate()?;
@@ -234,12 +291,12 @@ pub fn generate_key_layout(
     let mut no_perfect_schedule_failures = 0;
     let mut last_public_cause = None;
     for attempt in 0..parameters.max_seed_attempts {
-        let seed = super::derive_attempt_seed(root_seed, attempt);
+        let seed = derive_attempt_seed(root_seed, attempt);
         let layout = match PbcPublicLayout::build(parameters, seed, attempt) {
             Ok(layout) => layout,
             Err(PbcError::BucketWidthExceeded) => {
                 bucket_width_failures += 1;
-                last_public_cause = Some(super::PbcRetryCause::BucketWidthExceeded);
+                last_public_cause = Some(PbcRetryCause::BucketWidthExceeded);
                 continue;
             }
             Err(error) => return Err(error),
@@ -256,10 +313,83 @@ pub fn generate_key_layout(
             Err(error) => return Err(error),
         }
     }
-    Err(PbcError::SeedAttemptsExhausted(super::PbcRetryDiagnostics {
+    Err(PbcError::SeedAttemptsExhausted(PbcRetryDiagnostics {
         attempts: parameters.max_seed_attempts,
         bucket_width_failures,
         no_perfect_schedule_failures,
         last_public_cause,
     }))
+}
+
+/// Computes the scheduled public inner product modulo `modulus`.
+///
+/// A real selected cell contributes its original coordinate; a selected dummy
+/// contributes zero. Selecting padding is malformed because padding exists
+/// only to rectangularize storage and is never a valid schedule choice.
+pub fn clear_pbc_inner_product(
+    layout: &PbcPublicLayout,
+    schedule: &PbcPrivateSchedule,
+    public_vector: &[u64],
+    modulus: u64,
+) -> Result<u64, PbcError> {
+    layout.validate()?;
+    schedule.validate(layout)?;
+    if public_vector.len() != layout.parameters.universe_size {
+        return Err(PbcError::InvalidLayout("public vector dimension mismatch".into()));
+    }
+    if modulus == 0 {
+        return Err(PbcError::InvalidParameters("modulus must be positive".into()));
+    }
+    let mut accumulator = 0u64;
+    for bucket in 0..layout.parameters.bucket_count {
+        let slot = schedule.selected_slot(bucket);
+        let contribution = match layout.cells[bucket][slot] {
+            PbcCell::Real { coordinate, .. } => public_vector[coordinate] % modulus,
+            PbcCell::Dummy => 0,
+            PbcCell::Padding => {
+                return Err(PbcError::InvalidSchedule("padding cell was selected".into()));
+            }
+        };
+        accumulator =
+            ((u128::from(accumulator) + u128::from(contribution)) % u128::from(modulus)) as u64;
+    }
+    Ok(accumulator)
+}
+
+/// Returns support coordinates in canonical assignment order.
+pub fn canonical_decode(
+    layout: &PbcPublicLayout,
+    schedule: &PbcPrivateSchedule,
+) -> Result<Vec<usize>, PbcError> {
+    layout.validate()?;
+    schedule.validate(layout)?;
+    Ok(schedule.support_assignments.iter().map(|(coordinate, _)| *coordinate).collect())
+}
+
+/// Converts a dense binary support vector into sorted coordinate indices.
+pub fn dense_binary_support(universe_size: usize, dense: &[u8]) -> Result<Vec<usize>, PbcError> {
+    if dense.len() != universe_size {
+        return Err(PbcError::InvalidSupport);
+    }
+    if dense.iter().any(|&value| value > 1) {
+        return Err(PbcError::InvalidSupport);
+    }
+    Ok(dense
+        .iter()
+        .enumerate()
+        .filter_map(|(coordinate, &value)| (value == 1).then_some(coordinate))
+        .collect())
+}
+
+/// Validates and converts a dense support representation for a PBC layout.
+pub fn support_from_dense(
+    parameters: &PbcParameters,
+    dense: &[u8],
+) -> Result<Vec<usize>, PbcError> {
+    parameters.validate()?;
+    let support = dense_binary_support(parameters.universe_size, dense)?;
+    if support.len() != parameters.support_weight {
+        return Err(PbcError::SupportSize);
+    }
+    Ok(support)
 }

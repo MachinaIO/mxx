@@ -30,6 +30,44 @@ struct Info {
     paired_public: Option<crate::FamilyViewId>,
 }
 
+/// Evaluator-private numeric provenance for one structural loop binder.
+///
+/// The public abstract domain remains an interval.  This sidecar retains only
+/// the small amount of correlation needed to refine an affine scalar on a
+/// comparison branch; expressions involving multiple binders or non-affine
+/// arithmetic simply have no provenance and continue with interval semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ScalarFacts {
+    Affine(AffineScalar),
+    Truth(TruthFacts),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AffineScalar {
+    binder: Option<u64>,
+    coefficient: BigInt,
+    offset: BigInt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BinderRefinement {
+    binder: u64,
+    range: state::IntegerState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OutcomeRefinement {
+    Impossible,
+    Unconstrained,
+    Restricted(BinderRefinement),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TruthFacts {
+    when_zero: OutcomeRefinement,
+    when_one: OutcomeRefinement,
+}
+
 fn artifact_validation_order(
     request: &SimulationRequest,
     needed: &HashSet<crate::StageId>,
@@ -149,7 +187,17 @@ pub(crate) fn run(request: &SimulationRequest) -> Result<crate::SimulationReport
             .iter()
             .map(|(name, value)| (name.clone(), state::IntegerState::singleton(value.clone())))
             .collect(),
+        abstract_integer_facts: request
+            .environment
+            .integers
+            .iter()
+            .map(|(name, value)| (name.clone(), ScalarFacts::Affine(AffineScalar::constant(value))))
+            .collect(),
         abstract_loop_indices: HashMap::new(),
+        abstract_loop_atoms: HashMap::new(),
+        binder_ranges: HashMap::new(),
+        next_binder_atom: 0,
+        scalar_facts: HashMap::new(),
         next_source: 0,
         preimages: HashMap::new(),
         states: HashMap::new(),
@@ -215,7 +263,15 @@ struct Evaluator<'a> {
     /// scope.  Parallel-grid binders are intervals, so the body is evaluated
     /// once while still covering every concrete lane.
     abstract_integers: BTreeMap<String, state::IntegerState>,
+    abstract_integer_facts: BTreeMap<String, ScalarFacts>,
     abstract_loop_indices: HashMap<u32, state::IntegerState>,
+    /// Loop slots are lexical names and may be reused by nested grids.  Each
+    /// active slot therefore maps to a fresh atom before it enters affine
+    /// provenance, preventing unrelated binders from being correlated.
+    abstract_loop_atoms: HashMap<u32, u64>,
+    binder_ranges: HashMap<u64, state::IntegerState>,
+    next_binder_atom: u64,
+    scalar_facts: HashMap<crate::FamilyViewId, ScalarFacts>,
     next_source: u32,
     preimages: HashMap<crate::FamilyViewId, RightPreimage>,
     states: HashMap<crate::FamilyViewId, MatrixState>,
@@ -249,6 +305,150 @@ struct SourceLineage {
 }
 
 impl<'a> Evaluator<'a> {
+    fn scalar_fact(&self, value: &Info) -> Option<&ScalarFacts> {
+        self.scalar_facts.get(&value.view)
+    }
+
+    fn int_binary_transfer(
+        &self,
+        operation: IntBinaryOp,
+        left: &Info,
+        right: &Info,
+    ) -> Result<(state::IntegerState, Option<ScalarFacts>), SimulationError> {
+        let a = int(left)?;
+        let b = int(right)?;
+        let left_fact = self.scalar_fact(left);
+        let right_fact = self.scalar_fact(right);
+        let ordinary = || match operation {
+            IntBinaryOp::Add => Ok(a.add(&b)),
+            IntBinaryOp::Subtract => Ok(a.subtract(&b)),
+            IntBinaryOp::Multiply => Ok(a.multiply(&b)),
+            IntBinaryOp::Divide => a.divide(&b).map_err(|error| SimulationError::InvalidGraph {
+                message: error.to_string(),
+                site: None,
+            }),
+            IntBinaryOp::Remainder => a.remainder(&b).map_err(|error| {
+                SimulationError::InvalidGraph { message: error.to_string(), site: None }
+            }),
+        };
+
+        let affine = (|| match operation {
+            IntBinaryOp::Add => affine_fact(left_fact)?.add(&affine_fact(right_fact)?),
+            IntBinaryOp::Subtract => affine_fact(left_fact)?.subtract(&affine_fact(right_fact)?),
+            IntBinaryOp::Multiply => {
+                let left = affine_fact(left_fact)?;
+                let right = affine_fact(right_fact)?;
+                if left.binder.is_none() {
+                    Some(right.multiply_constant(&left.offset))
+                } else if right.binder.is_none() {
+                    Some(left.multiply_constant(&right.offset))
+                } else {
+                    None
+                }
+            }
+            IntBinaryOp::Divide => {
+                let left = affine_fact(left_fact)?;
+                let right = affine_fact(right_fact)?;
+                if right.binder.is_none() &&
+                    !right.offset.is_zero() &&
+                    &left.coefficient % &right.offset == BigInt::zero() &&
+                    &left.offset % &right.offset == BigInt::zero()
+                {
+                    Some(AffineScalar {
+                        binder: left.binder,
+                        coefficient: left.coefficient / &right.offset,
+                        offset: left.offset / right.offset,
+                    })
+                } else {
+                    None
+                }
+            }
+            IntBinaryOp::Remainder => None,
+        })();
+        if let Some(affine) = affine {
+            return Ok((ordinary()?, Some(ScalarFacts::Affine(affine))));
+        }
+
+        if operation == IntBinaryOp::Multiply {
+            if let (Some(left), Some(right)) = (truth_fact(left_fact), truth_fact(right_fact)) {
+                let when_one = intersect_outcomes(&left.when_one, &right.when_one);
+                let when_zero = if matches!(left.when_zero, OutcomeRefinement::Impossible) &&
+                    matches!(right.when_zero, OutcomeRefinement::Impossible)
+                {
+                    OutcomeRefinement::Impossible
+                } else {
+                    OutcomeRefinement::Unconstrained
+                };
+                let minimum =
+                    if matches!(when_zero, OutcomeRefinement::Impossible) { 1 } else { 0 };
+                let maximum = if matches!(when_one, OutcomeRefinement::Impossible) { 0 } else { 1 };
+                return Ok((
+                    state::IntegerState::new(minimum.into(), maximum.into())?,
+                    Some(ScalarFacts::Truth(TruthFacts { when_zero, when_one })),
+                ));
+            }
+        }
+        Ok((ordinary()?, None))
+    }
+
+    fn derived_scalar_fact(
+        &self,
+        kind: &NodeKind,
+        inputs: &[Info],
+        env: &ParamEnv,
+    ) -> Option<ScalarFacts> {
+        match kind {
+            NodeKind::ConstantInt(value) => {
+                Some(ScalarFacts::Affine(AffineScalar::constant(value)))
+            }
+            NodeKind::EvaluateInt(expression) => {
+                eval_int_facts(expression, &self.abstract_integer_facts, &self.abstract_loop_atoms)
+            }
+            NodeKind::ConstantBool(value) => Some(ScalarFacts::Truth(TruthFacts {
+                when_zero: if *value {
+                    OutcomeRefinement::Impossible
+                } else {
+                    OutcomeRefinement::Unconstrained
+                },
+                when_one: if *value {
+                    OutcomeRefinement::Unconstrained
+                } else {
+                    OutcomeRefinement::Impossible
+                },
+            })),
+            NodeKind::IntCompare(operation) => comparison_facts(
+                *operation,
+                inputs.first().and_then(|value| self.scalar_fact(value)),
+                inputs.get(1).and_then(|value| self.scalar_fact(value)),
+                &self.binder_ranges,
+            ),
+            NodeKind::BoolToInt => {
+                inputs.first().and_then(|value| self.scalar_fact(value)).cloned()
+            }
+            NodeKind::IntBinary(operation) => {
+                let (left, right) = (inputs.first()?, inputs.get(1)?);
+                self.int_binary_transfer(*operation, left, right).ok()?.1
+            }
+            NodeKind::Select { count }
+                if eval_int_interval(
+                    count,
+                    env,
+                    &self.abstract_integers,
+                    &self.abstract_loop_indices,
+                )
+                .ok()
+                .is_some_and(|range| {
+                    range.minimum == 2.into() && range.maximum_inclusive == 2.into()
+                }) =>
+            {
+                let left = inputs.get(1).and_then(|value| self.scalar_fact(value));
+                let right = inputs.get(2).and_then(|value| self.scalar_fact(value));
+                (left == right).then(|| left.cloned()).flatten()
+            }
+            _ => None,
+        }
+    }
+
     fn integer_expression(
         &self,
         expression: &mxx_ir_core::IntExpr,
@@ -998,6 +1198,11 @@ impl<'a> Evaluator<'a> {
                     )?;
                 }
             }
+            if let Some(value) = out.first() {
+                if let Some(facts) = self.derived_scalar_fact(node.kind(), &inputs, &env) {
+                    self.scalar_facts.insert(value.view, facts);
+                }
+            }
             // Attach pair facts only after all output views are frozen.  This
             // keeps sampler pairing local and avoids any raw-wire side table.
             if matches!(
@@ -1424,15 +1629,9 @@ impl<'a> Evaluator<'a> {
                 paired_public: None,
             }]),
             NodeKind::IntBinary(op) => {
-                let a = int(&xs[0])?;
-                let b = int(&xs[1])?;
-                let z = match op {
-                    IntBinaryOp::Add => a.add(&b),
-                    IntBinaryOp::Subtract => a.subtract(&b),
-                    IntBinaryOp::Multiply => a.multiply(&b),
-                    IntBinaryOp::Divide => a.divide(&b).map_err(|e| bad(&e.to_string()))?,
-                    IntBinaryOp::Remainder => a.remainder(&b).map_err(|e| bad(&e.to_string()))?,
-                };
+                let (z, _) = self
+                    .int_binary_transfer(*op, &xs[0], &xs[1])
+                    .map_err(|error| bad(&error.to_string()))?;
                 Ok(vec![Info {
                     value: AbstractValue::Integer(z),
                     ty: None,
@@ -2844,26 +3043,46 @@ impl<'a> Evaluator<'a> {
                     return Err(bad("select branch count mismatch"));
                 }
                 validate_index(&xs[0], count, site())?;
-                // Structural loops are evaluated with a concrete binder in
-                // `env`.  Preserve that precision when the selector is a
-                // singleton; joining all branches here would manufacture
-                // impossible values (for example `slot - base` from an
-                // inactive branch) and make a later dynamic gather reject a
-                // valid loop.  Non-singleton selectors retain the sound
-                // conservative join below.
+                // A singleton selector chooses one branch directly.  For a
+                // symbolic Boolean selector, recompute an affine integer
+                // branch over the binder interval where that selector value
+                // holds before joining the alternatives.  Thus an inactive
+                // `slot - base` value cannot pollute a later dynamic gather,
+                // while selectors without such provenance use the ordinary
+                // conservative interval join.
                 let selector = int(&xs[0])?;
+                let selector_truth = truth_fact(self.scalar_fact(&xs[0]));
+                let refine_branch = |branch: &Info, outcome: &OutcomeRefinement| {
+                    let mut branch = branch.clone();
+                    let affine = affine_fact(self.scalar_fact(&branch));
+                    if let AbstractValue::Integer(range) = &mut branch.value &&
+                        let Some(affine) = affine &&
+                        let Some(refined) = affine.range_under(outcome, &self.binder_ranges)
+                    {
+                        *range = refined;
+                    }
+                    branch
+                };
+                let mut branches = xs[1..].to_vec();
+                if count == 2 &&
+                    let Some(truth) = &selector_truth
+                {
+                    branches[0] = refine_branch(&branches[0], &truth.when_zero);
+                    branches[1] = refine_branch(&branches[1], &truth.when_one);
+                }
                 let mut selected = if selector.minimum == selector.maximum_inclusive {
-                    xs[selector.minimum.to_usize().ok_or_else(|| bad("invalid select index"))? + 1]
-                        .clone()
+                    branches
+                        [selector.minimum.to_usize().ok_or_else(|| bad("invalid select index"))?]
+                    .clone()
                 } else {
-                    xs[1].clone()
+                    branches[0].clone()
                 };
                 if let Some(relation) = selected.relation.take() {
                     let selector_id = self.selector_for(xs[0].view);
                     selected.relation = Some(specialize_relation(relation, &[selector_id]));
                 }
                 if selector.minimum != selector.maximum_inclusive {
-                    for branch in &xs[2..] {
+                    for branch in &branches[1..] {
                         let type_info = selected.ty.clone();
                         selected = self.join_uniform_with_diagnostics(
                             selected,
@@ -2981,18 +3200,26 @@ impl<'a> Evaluator<'a> {
             let invariant = &xs[carried..];
             for iteration in 0..count {
                 let saved_integers = self.abstract_integers.clone();
+                let saved_integer_facts = self.abstract_integer_facts.clone();
                 let saved_loop_indices = self.abstract_loop_indices.clone();
+                let saved_loop_atoms = self.abstract_loop_atoms.clone();
                 let mut loop_env = env.clone();
                 loop_env.loop_indices.insert(spec.index_slot, iteration.into());
                 self.abstract_loop_indices
                     .insert(spec.index_slot, state::IntegerState::singleton(iteration));
+                let atom = self.next_binder_atom;
+                self.next_binder_atom += 1;
+                self.abstract_loop_atoms.insert(spec.index_slot, atom);
+                self.binder_ranges.insert(atom, state::IntegerState::singleton(iteration));
                 let binding_env = loop_env.clone();
                 loop_env = apply_bindings(loop_env, &spec.bindings)?;
                 apply_abstract_bindings(
                     &mut self.abstract_integers,
+                    &mut self.abstract_integer_facts,
                     &spec.bindings,
                     &binding_env,
                     &self.abstract_loop_indices,
+                    &self.abstract_loop_atoms,
                 )?;
                 let mut args = current.clone();
                 args.extend_from_slice(invariant);
@@ -3001,7 +3228,9 @@ impl<'a> Evaluator<'a> {
                 child_occurrence.push(format!("node:{n}/iteration:{iteration}"));
                 let result = self.scope(stage, graph, &child, &child_occurrence, loop_env, preload);
                 self.abstract_integers = saved_integers;
+                self.abstract_integer_facts = saved_integer_facts;
                 self.abstract_loop_indices = saved_loop_indices;
+                self.abstract_loop_atoms = saved_loop_atoms;
                 let vals = result?;
                 current = cs
                     .outputs()
@@ -3127,7 +3356,9 @@ impl<'a> Evaluator<'a> {
                 // concrete lane without making simulation cost depend on the
                 // family cardinality.
                 let saved_integers = self.abstract_integers.clone();
+                let saved_integer_facts = self.abstract_integer_facts.clone();
                 let saved_loop_indices = self.abstract_loop_indices.clone();
+                let saved_loop_atoms = self.abstract_loop_atoms.clone();
                 let mut grid_env = env.clone();
                 for ((slot, extent), representative) in
                     spec.index_slots.iter().zip(&grid_shape).zip(std::iter::repeat(0usize))
@@ -3137,14 +3368,23 @@ impl<'a> Evaluator<'a> {
                         *slot,
                         state::IntegerState::new(0.into(), BigInt::from(extent - 1))?,
                     );
+                    let atom = self.next_binder_atom;
+                    self.next_binder_atom += 1;
+                    self.abstract_loop_atoms.insert(*slot, atom);
+                    self.binder_ranges.insert(
+                        atom,
+                        state::IntegerState::new(0.into(), BigInt::from(extent - 1))?,
+                    );
                 }
                 let binding_env = grid_env.clone();
                 grid_env = apply_bindings(grid_env, &spec.bindings)?;
                 apply_abstract_bindings(
                     &mut self.abstract_integers,
+                    &mut self.abstract_integer_facts,
                     &spec.bindings,
                     &binding_env,
                     &self.abstract_loop_indices,
+                    &self.abstract_loop_atoms,
                 )?;
                 let preload = cs
                     .inputs()
@@ -3251,7 +3491,9 @@ impl<'a> Evaluator<'a> {
                     .collect::<Result<HashMap<_, _>, SimulationError>>()?;
                 let result = self.scope(stage, graph, &child, &child_occurrence, grid_env, preload);
                 self.abstract_integers = saved_integers;
+                self.abstract_integer_facts = saved_integer_facts;
                 self.abstract_loop_indices = saved_loop_indices;
+                self.abstract_loop_atoms = saved_loop_atoms;
                 result?
             };
             cs.outputs()
@@ -3316,6 +3558,7 @@ impl<'a> Evaluator<'a> {
                 _ => env.clone(),
             };
             let saved_integers = self.abstract_integers.clone();
+            let saved_integer_facts = self.abstract_integer_facts.clone();
             if let Some(mxx_ir_core::node::NodeKind::SubgraphCall(spec)) = graph
                 .scope(parent)
                 .and_then(|scope| scope.node(mxx_ir_core::NodeId(n as u64)))
@@ -3323,15 +3566,18 @@ impl<'a> Evaluator<'a> {
             {
                 apply_abstract_bindings(
                     &mut self.abstract_integers,
+                    &mut self.abstract_integer_facts,
                     &spec.bindings,
                     env,
                     &self.abstract_loop_indices,
+                    &self.abstract_loop_atoms,
                 )?;
             }
             let mut child_occurrence = occurrence.to_vec();
             child_occurrence.push(format!("node:{n}"));
             let result = self.scope(stage, graph, &child, &child_occurrence, child_env, preload);
             self.abstract_integers = saved_integers;
+            self.abstract_integer_facts = saved_integer_facts;
             let vals = result?;
             cs.outputs()
                 .iter()
@@ -3441,6 +3687,227 @@ fn empty_info_for_type(ty: &WireType, env: &ParamEnv) -> Result<Info, Simulation
         view: crate::FamilyViewId(u32::MAX),
         paired_public: None,
     })
+}
+
+impl AffineScalar {
+    fn constant(value: &BigInt) -> Self {
+        Self { binder: None, coefficient: BigInt::zero(), offset: value.clone() }
+    }
+
+    fn binder(binder: u64) -> Self {
+        Self { binder: Some(binder), coefficient: BigInt::one(), offset: BigInt::zero() }
+    }
+
+    fn add(&self, other: &Self) -> Option<Self> {
+        match (self.binder, other.binder) {
+            (Some(left), Some(right)) if left != right => None,
+            (binder, _) => Some(Self {
+                binder: binder.or(other.binder),
+                coefficient: &self.coefficient + &other.coefficient,
+                offset: &self.offset + &other.offset,
+            }),
+        }
+    }
+
+    fn subtract(&self, other: &Self) -> Option<Self> {
+        match (self.binder, other.binder) {
+            (Some(left), Some(right)) if left != right => None,
+            (binder, _) => Some(Self {
+                binder: binder.or(other.binder),
+                coefficient: &self.coefficient - &other.coefficient,
+                offset: &self.offset - &other.offset,
+            }),
+        }
+    }
+
+    fn multiply_constant(&self, scalar: &BigInt) -> Self {
+        Self {
+            binder: self.binder,
+            coefficient: &self.coefficient * scalar,
+            offset: &self.offset * scalar,
+        }
+    }
+
+    fn range_under(
+        &self,
+        refinement: &OutcomeRefinement,
+        binders: &HashMap<u64, state::IntegerState>,
+    ) -> Option<state::IntegerState> {
+        let Some(binder_atom) = self.binder else {
+            return Some(state::IntegerState::singleton(self.offset.clone()));
+        };
+        let mut binder = binders.get(&binder_atom)?.clone();
+        match refinement {
+            OutcomeRefinement::Impossible => return None,
+            OutcomeRefinement::Unconstrained => {}
+            OutcomeRefinement::Restricted(required) if required.binder == binder_atom => {
+                binder.minimum = binder.minimum.max(required.range.minimum.clone());
+                binder.maximum_inclusive =
+                    binder.maximum_inclusive.min(required.range.maximum_inclusive.clone());
+                if binder.minimum > binder.maximum_inclusive {
+                    return None;
+                }
+            }
+            OutcomeRefinement::Restricted(_) => return None,
+        }
+        let low = &self.coefficient * &binder.minimum + &self.offset;
+        let high = &self.coefficient * &binder.maximum_inclusive + &self.offset;
+        state::IntegerState::new(low.clone().min(high.clone()), low.max(high)).ok()
+    }
+}
+
+fn intersect_outcomes(left: &OutcomeRefinement, right: &OutcomeRefinement) -> OutcomeRefinement {
+    match (left, right) {
+        (OutcomeRefinement::Impossible, _) | (_, OutcomeRefinement::Impossible) => {
+            OutcomeRefinement::Impossible
+        }
+        (OutcomeRefinement::Unconstrained, other) | (other, OutcomeRefinement::Unconstrained) => {
+            other.clone()
+        }
+        (OutcomeRefinement::Restricted(left), OutcomeRefinement::Restricted(right))
+            if left.binder == right.binder =>
+        {
+            let minimum = left.range.minimum.clone().max(right.range.minimum.clone());
+            let maximum =
+                left.range.maximum_inclusive.clone().min(right.range.maximum_inclusive.clone());
+            if minimum > maximum {
+                OutcomeRefinement::Impossible
+            } else {
+                OutcomeRefinement::Restricted(BinderRefinement {
+                    binder: left.binder,
+                    range: state::IntegerState::new(minimum, maximum)
+                        .expect("ordered intersection"),
+                })
+            }
+        }
+        // A conjunction over different binders is outside this deliberately
+        // one-binder reduced product.  Dropping it is conservative.
+        _ => OutcomeRefinement::Unconstrained,
+    }
+}
+
+fn affine_fact(fact: Option<&ScalarFacts>) -> Option<AffineScalar> {
+    match fact {
+        Some(ScalarFacts::Affine(affine)) => Some(affine.clone()),
+        _ => None,
+    }
+}
+
+fn truth_fact(fact: Option<&ScalarFacts>) -> Option<TruthFacts> {
+    match fact {
+        Some(ScalarFacts::Truth(truth)) => Some(truth.clone()),
+        _ => None,
+    }
+}
+
+fn comparison_facts(
+    operation: mxx_ir_core::node::IntCompareOp,
+    left: Option<&ScalarFacts>,
+    right: Option<&ScalarFacts>,
+    binders: &HashMap<u64, state::IntegerState>,
+) -> Option<ScalarFacts> {
+    let difference = affine_fact(left)?.subtract(&affine_fact(right)?)?;
+    let binder_atom = difference.binder?;
+    // Unit slope is sufficient for loop-index boundary predicates and keeps
+    // integer rounding out of the trusted refinement logic.
+    if difference.coefficient != BigInt::one() && difference.coefficient != -BigInt::one() {
+        return None;
+    }
+    let binder = binders.get(&binder_atom)?;
+    let restricted = |minimum: BigInt, maximum: BigInt| {
+        let minimum = minimum.max(binder.minimum.clone());
+        let maximum = maximum.min(binder.maximum_inclusive.clone());
+        if minimum > maximum {
+            OutcomeRefinement::Impossible
+        } else {
+            OutcomeRefinement::Restricted(BinderRefinement {
+                binder: binder_atom,
+                range: state::IntegerState::new(minimum, maximum).expect("ordered refinement"),
+            })
+        }
+    };
+    let (when_zero, when_one) = match (operation, difference.coefficient.sign()) {
+        (mxx_ir_core::node::IntCompareOp::LessEqual, num_bigint::Sign::Plus) => (
+            restricted(-&difference.offset + 1, binder.maximum_inclusive.clone()),
+            restricted(binder.minimum.clone(), -&difference.offset),
+        ),
+        (mxx_ir_core::node::IntCompareOp::LessEqual, num_bigint::Sign::Minus) => (
+            restricted(binder.minimum.clone(), difference.offset.clone() - 1),
+            restricted(difference.offset.clone(), binder.maximum_inclusive.clone()),
+        ),
+        (mxx_ir_core::node::IntCompareOp::Less, num_bigint::Sign::Plus) => (
+            restricted(-&difference.offset, binder.maximum_inclusive.clone()),
+            restricted(binder.minimum.clone(), -&difference.offset - 1),
+        ),
+        (mxx_ir_core::node::IntCompareOp::Less, num_bigint::Sign::Minus) => (
+            restricted(binder.minimum.clone(), difference.offset.clone()),
+            restricted(difference.offset.clone() + 1, binder.maximum_inclusive.clone()),
+        ),
+        (mxx_ir_core::node::IntCompareOp::Equal, _) => (OutcomeRefinement::Unconstrained, {
+            let value = if difference.coefficient.is_positive() {
+                -difference.offset
+            } else {
+                difference.offset
+            };
+            restricted(value.clone(), value)
+        }),
+        _ => return None,
+    };
+    Some(ScalarFacts::Truth(TruthFacts { when_zero, when_one }))
+}
+
+fn eval_int_facts(
+    expression: &mxx_ir_core::IntExpr,
+    integers: &BTreeMap<String, ScalarFacts>,
+    loop_atoms: &HashMap<u32, u64>,
+) -> Option<ScalarFacts> {
+    use mxx_ir_core::IntExpr;
+    fn evaluate(
+        expression: &IntExpr,
+        integers: &BTreeMap<String, ScalarFacts>,
+        loop_atoms: &HashMap<u32, u64>,
+    ) -> Option<AffineScalar> {
+        match expression {
+            IntExpr::Const(value) => Some(AffineScalar::constant(value)),
+            IntExpr::Var(name) => affine_fact(integers.get(name)),
+            IntExpr::LoopIndex(slot) => Some(AffineScalar::binder(*loop_atoms.get(slot)?)),
+            IntExpr::Add(left, right) => {
+                evaluate(left, integers, loop_atoms)?.add(&evaluate(right, integers, loop_atoms)?)
+            }
+            IntExpr::Sub(left, right) => evaluate(left, integers, loop_atoms)?
+                .subtract(&evaluate(right, integers, loop_atoms)?),
+            IntExpr::Mul(left, right) => {
+                let left = evaluate(left, integers, loop_atoms)?;
+                let right = evaluate(right, integers, loop_atoms)?;
+                if left.binder.is_none() {
+                    Some(right.multiply_constant(&left.offset))
+                } else if right.binder.is_none() {
+                    Some(left.multiply_constant(&right.offset))
+                } else {
+                    None
+                }
+            }
+            IntExpr::Div(left, right) => {
+                let left = evaluate(left, integers, loop_atoms)?;
+                let right = evaluate(right, integers, loop_atoms)?;
+                if right.binder.is_some() ||
+                    right.offset.is_zero() ||
+                    &left.coefficient % &right.offset != BigInt::zero() ||
+                    &left.offset % &right.offset != BigInt::zero()
+                {
+                    None
+                } else {
+                    Some(AffineScalar {
+                        binder: left.binder,
+                        coefficient: left.coefficient / &right.offset,
+                        offset: left.offset / right.offset,
+                    })
+                }
+            }
+            IntExpr::RoundDiv(_, _) | IntExpr::Log2Ceil(_) => None,
+        }
+    }
+    evaluate(&expression.canonicalize(), integers, loop_atoms).map(ScalarFacts::Affine)
 }
 
 fn eval_int_interval(
@@ -3769,11 +4236,14 @@ fn apply_bindings(
 
 fn apply_abstract_bindings(
     integers: &mut BTreeMap<String, state::IntegerState>,
+    integer_facts: &mut BTreeMap<String, ScalarFacts>,
     bindings: &[(String, mxx_ir_core::IntExpr)],
     concrete: &ParamEnv,
     loop_indices: &HashMap<u32, state::IntegerState>,
+    loop_atoms: &HashMap<u32, u64>,
 ) -> Result<(), SimulationError> {
     let parent = integers.clone();
+    let parent_facts = integer_facts.clone();
     let evaluated = bindings
         .iter()
         .map(|(name, expression)| {
@@ -3783,6 +4253,13 @@ fn apply_abstract_bindings(
         .collect::<Result<Vec<_>, _>>()?;
     for (name, range) in evaluated {
         integers.insert(name, range);
+    }
+    for (name, expression) in bindings {
+        if let Some(facts) = eval_int_facts(expression, &parent_facts, loop_atoms) {
+            integer_facts.insert(name.clone(), facts);
+        } else {
+            integer_facts.remove(name);
+        }
     }
     Ok(())
 }
@@ -5226,7 +5703,7 @@ mod tests {
                 }],
             },
             environment,
-            roots: vec![crate::SimulationRoot { stage, output: "out".into() }],
+            roots: vec![crate::SimulationRoot { stage: stage.clone(), output: "out".into() }],
             external_inputs: vec![],
             limits: crate::SimulationLimits::default(),
         };
@@ -5253,8 +5730,15 @@ mod tests {
             BTreeMap::from([("outer".into(), state::IntegerState::singleton(9))]);
         let abstract_loop_indices =
             HashMap::from([(3, state::IntegerState::new(2.into(), 5.into()).unwrap())]);
-        apply_abstract_bindings(&mut abstract_integers, &bindings, &env, &abstract_loop_indices)
-            .unwrap();
+        apply_abstract_bindings(
+            &mut abstract_integers,
+            &mut BTreeMap::new(),
+            &bindings,
+            &env,
+            &abstract_loop_indices,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(
             abstract_integers["outer"],
             state::IntegerState::new(2.into(), 5.into()).unwrap()
@@ -5288,6 +5772,21 @@ mod tests {
             empty_info_for_type(&WireType::Real, &env).unwrap().value,
             AbstractValue::Real
         ));
+    }
+
+    #[test]
+    fn affine_provenance_distinguishes_reused_loop_slot_names() {
+        let expression = mxx_ir_core::IntExpr::LoopIndex(0);
+        let outer = eval_int_facts(&expression, &BTreeMap::new(), &HashMap::from([(0, 7)]));
+        let inner = eval_int_facts(&expression, &BTreeMap::new(), &HashMap::from([(0, 8)]));
+        assert_ne!(outer, inner, "lexically distinct binders cannot share provenance");
+        assert!(
+            affine_fact(outer.as_ref())
+                .unwrap()
+                .add(&affine_fact(inner.as_ref()).unwrap())
+                .is_none(),
+            "multi-binder arithmetic must conservatively drop affine provenance",
+        );
     }
 
     #[test]
@@ -5509,6 +6008,160 @@ mod tests {
     }
 
     #[test]
+    fn parallel_grid_refines_diamond_witness_selector_before_dynamic_gather() {
+        let matrix = MatrixType {
+            modulus: mxx_ir_core::IntExpr::constant(97),
+            ring_dimension: mxx_ir_core::IntExpr::constant(1),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
+        };
+        let family_type = WireType::Family {
+            element: Box::new(WireType::Matrix(matrix.clone())),
+            shape: vec![mxx_ir_core::IntExpr::constant(3)],
+        };
+        let packed = NodeHandle::new(
+            NodeKind::Input {
+                name: "witnesses".into(),
+                wire_type: family_type.clone(),
+                artifact: None,
+            },
+            vec![],
+            vec![family_type.clone()],
+        )
+        .output(0)
+        .unwrap();
+        let body = with_new_construction_scope(|scope| {
+            let witnesses = NodeHandle::new(
+                NodeKind::Input {
+                    name: "witness-family".into(),
+                    wire_type: family_type.clone(),
+                    artifact: None,
+                },
+                vec![],
+                vec![family_type.clone()],
+            )
+            .output(0)
+            .unwrap();
+            let integer = |kind, inputs, output_type| {
+                NodeHandle::new(kind, inputs, vec![output_type]).output(0).unwrap()
+            };
+            let slot = integer(
+                NodeKind::EvaluateInt(mxx_ir_core::IntExpr::LoopIndex(0)),
+                vec![],
+                WireType::ConstantInt,
+            );
+            let witness_end =
+                integer(NodeKind::ConstantInt(4.into()), vec![], WireType::ConstantInt);
+            let instance_width =
+                integer(NodeKind::ConstantInt(2.into()), vec![], WireType::ConstantInt);
+            let after_instance = integer(
+                NodeKind::IntCompare(mxx_ir_core::node::IntCompareOp::LessEqual),
+                vec![instance_width.clone(), slot.clone()],
+                WireType::Bool,
+            );
+            let before_end = integer(
+                NodeKind::IntCompare(mxx_ir_core::node::IntCompareOp::LessEqual),
+                vec![slot.clone(), witness_end],
+                WireType::Bool,
+            );
+            let after_instance = integer(NodeKind::BoolToInt, vec![after_instance], WireType::Int);
+            let before_end = integer(NodeKind::BoolToInt, vec![before_end], WireType::Int);
+            let witness_active = integer(
+                NodeKind::IntBinary(IntBinaryOp::Multiply),
+                vec![after_instance, before_end],
+                WireType::Int,
+            );
+            // Diamond chooses a nonnegative base before subtracting the
+            // instance width: active witness lanes select `slot`, and padded
+            // lanes select `instance_width`.  Refining the selected affine
+            // branch under `witness_active == 1` proves a final range 0..2.
+            let zero = integer(NodeKind::ConstantInt(0.into()), vec![], WireType::ConstantInt);
+            let inactive_base = integer(
+                NodeKind::IntBinary(IntBinaryOp::Add),
+                vec![instance_width.clone(), zero.clone()],
+                WireType::Int,
+            );
+            let active_base =
+                integer(NodeKind::IntBinary(IntBinaryOp::Add), vec![slot, zero], WireType::Int);
+            let selected_base = integer(
+                NodeKind::Select { count: mxx_ir_core::IntExpr::constant(2) },
+                vec![witness_active, inactive_base, active_base],
+                WireType::Int,
+            );
+            let witness_index = integer(
+                NodeKind::IntBinary(IntBinaryOp::Subtract),
+                vec![selected_base, instance_width],
+                WireType::Int,
+            );
+            let selected = NodeHandle::new(
+                NodeKind::FamilyGetDynamic { rank: 1 },
+                vec![witnesses.clone(), witness_index],
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("diamond-witness-selector", scope, vec![witnesses], vec![selected])
+                .unwrap()
+        });
+        let output = NodeHandle::parallel_grid(
+            body,
+            vec![packed],
+            vec![WireType::Family {
+                element: Box::new(WireType::Matrix(matrix)),
+                shape: vec![mxx_ir_core::IntExpr::constant(7)],
+            }],
+            mxx_ir_core::node::ParallelGrid {
+                shape: vec![mxx_ir_core::IntExpr::constant(7)],
+                index_slots: vec![0],
+                bindings: vec![],
+                input_modes: vec![mxx_ir_core::node::GridInputMode::Broadcast],
+            },
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "diamond-witness-selector",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: output, confidentiality: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let environment = ParamEnv::default();
+        let stage = crate::StageId("diamond-witness-selector".into());
+        let report = run(&SimulationRequest {
+            program: crate::SimulationProgram {
+                stages: vec![crate::SimulationStage {
+                    id: stage.clone(),
+                    production_id: ProductionId {
+                        spec_hash: spec_hash(&graph, &environment).unwrap(),
+                        execution_nonce: [0; 32],
+                    },
+                    graph,
+                }],
+            },
+            environment,
+            roots: vec![crate::SimulationRoot { stage: stage.clone(), output: "out".into() }],
+            external_inputs: vec![crate::ExternalInputFact {
+                stage: stage.clone(),
+                input: "witnesses".into(),
+                value: crate::ExternalInputValue::Family {
+                    shape: vec![3],
+                    element: Box::new(crate::ExternalInputValue::Matrix {
+                        maximum_absolute_coefficient_error: 0u8.into(),
+                        maximum_absolute_coefficient_value: Some(0u8.into()),
+                        is_constant_polynomial: true,
+                    }),
+                },
+            }],
+            limits: crate::SimulationLimits::default(),
+        })
+        .unwrap();
+        assert!(report.roots[0].maximum_absolute_coefficient_error.is_zero());
+    }
+
+    #[test]
     fn parallel_grid_rejects_nested_nonuniform_matrix_dimensions() {
         let varying = MatrixType {
             modulus: mxx_ir_core::IntExpr::constant(97),
@@ -5609,7 +6262,12 @@ mod tests {
                 "nested_rows".into(),
                 state::IntegerState::new(1.into(), 2.into()).unwrap(),
             )]),
+            abstract_integer_facts: BTreeMap::new(),
             abstract_loop_indices: HashMap::new(),
+            abstract_loop_atoms: HashMap::new(),
+            binder_ranges: HashMap::new(),
+            next_binder_atom: 0,
+            scalar_facts: HashMap::new(),
             next_source: 0,
             preimages: HashMap::new(),
             states: HashMap::new(),
@@ -5665,7 +6323,12 @@ mod tests {
             gathered_sources: HashMap::new(),
             binder_sources: HashMap::new(),
             abstract_integers: BTreeMap::new(),
+            abstract_integer_facts: BTreeMap::new(),
             abstract_loop_indices: HashMap::new(),
+            abstract_loop_atoms: HashMap::new(),
+            binder_ranges: HashMap::new(),
+            next_binder_atom: 0,
+            scalar_facts: HashMap::new(),
             next_source: 0,
             preimages: HashMap::new(),
             states: HashMap::new(),

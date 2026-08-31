@@ -20,7 +20,7 @@ use mxx_primitives::{
 use mxx_runtime::{
     Backend,
     backend::{
-        IndexRange, SampleRange,
+        IndexRange, PreimageRequest, SampleRange,
         poly_gpu::{GpuDcrtBackend, gpu_backend_on},
     },
 };
@@ -50,6 +50,7 @@ pub enum DiamondGpuMeasurementError {
 
 enum ReadyOutput {
     Matrix(GpuDCRTPolyMatrix),
+    Matrices(Vec<GpuDCRTPolyMatrix>),
     Trapdoor { public: GpuDCRTPolyMatrix, secret: GpuDCRTTrapdoor },
     Host,
 }
@@ -58,6 +59,11 @@ impl ReadyOutput {
     fn wait_until_ready(self) {
         match self {
             Self::Matrix(matrix) => matrix.wait_until_ready(),
+            Self::Matrices(matrices) => {
+                for matrix in matrices {
+                    matrix.wait_until_ready();
+                }
+            }
             Self::Trapdoor { public, secret } => {
                 public.wait_until_ready();
                 secret.wait_until_ready();
@@ -81,6 +87,20 @@ pub struct DiamondGpuMeasurementBackend {
 }
 
 impl DiamondGpuMeasurementBackend {
+    fn family_leaf_type(wire_type: &ConcreteWireType) -> &ConcreteWireType {
+        match wire_type {
+            ConcreteWireType::Family { element, .. } => Self::family_leaf_type(element),
+            _ => wire_type,
+        }
+    }
+
+    fn family_cardinality(wire_type: &ConcreteWireType) -> Option<usize> {
+        let ConcreteWireType::Family { shape, .. } = wire_type else {
+            return None;
+        };
+        shape.iter().try_fold(1usize, |count, extent| count.checked_mul(*extent))
+    }
+
     pub fn new(
         parameters: GpuDCRTPolyParams,
         device_ids: &[i32],
@@ -282,12 +302,17 @@ impl DiamondGpuMeasurementBackend {
             NodeKind::BoolToInt |
             NodeKind::RealBinary(_) |
             NodeKind::RealSqrt |
+            NodeKind::MaterializePreimageExact |
             NodeKind::TrapdoorPublic |
             NodeKind::SubgraphCall(_) |
             NodeKind::SequentialLoop(_) |
             NodeKind::FamilyPack { .. } |
             NodeKind::FamilyGetStatic { .. } |
             NodeKind::FamilyGetDynamic { .. } |
+            NodeKind::FamilySelectAxis { .. } |
+            NodeKind::FamilyReindex { .. } |
+            NodeKind::FamilyGather { .. } |
+            NodeKind::ParallelGrid(_) |
             NodeKind::Select { .. } => Ok(NodeMeasurement::default()),
             NodeKind::ConstantMatrix { value, .. } => {
                 let output = Self::matrix_output(node)?.clone();
@@ -324,6 +349,18 @@ impl DiamondGpuMeasurementBackend {
                     }
                     .map_err(Self::backend_error)?;
                     Ok(ReadyOutput::Matrix(value))
+                })
+            }
+            NodeKind::ApplyPreimage => {
+                let left = Self::matrix_argument(node, 0)?.clone();
+                let right = Self::matrix_argument(node, 1)?.clone();
+                self.measure_placements(node, bindings, |this| {
+                    let left = this.matrix(&left)?;
+                    let right = this.matrix(&right)?;
+                    this.backend
+                        .multiply(&left, &right)
+                        .map(ReadyOutput::Matrix)
+                        .map_err(Self::backend_error)
                 })
             }
             NodeKind::MatrixNegate => {
@@ -598,6 +635,71 @@ impl DiamondGpuMeasurementBackend {
                             &target,
                         )
                         .map(ReadyOutput::Matrix)
+                        .map_err(Self::backend_error)
+                })
+            }
+            NodeKind::FamilyPreimageSample { max_coefficient_bound, .. } => {
+                let output_type = node
+                    .concrete_output_types
+                    .first()
+                    .ok_or(DiamondGpuMeasurementError::MatrixArgument)?;
+                let batch_size = Self::family_cardinality(output_type).ok_or_else(|| {
+                    DiamondGpuMeasurementError::Expression(
+                        "family preimage output is not a family or its cardinality overflows usize"
+                            .to_owned(),
+                    )
+                })?;
+                let output = Self::family_leaf_type(output_type)
+                    .matrix_type()
+                    .ok_or(DiamondGpuMeasurementError::MatrixArgument)?
+                    .clone();
+                let trapdoor_type = node
+                    .argument_types
+                    .get(1)
+                    .map(Self::family_leaf_type)
+                    .ok_or(DiamondGpuMeasurementError::TrapdoorArgument)?
+                    .clone();
+                let ConcreteWireType::Trapdoor { sigma, gadget_base, digit_count, .. } =
+                    &trapdoor_type
+                else {
+                    return Err(DiamondGpuMeasurementError::TrapdoorArgument)
+                };
+                let sigma = sigma
+                    .evaluate_f64(bindings)
+                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?;
+                let gadget_base = gadget_base.clone();
+                let digit_count = *digit_count;
+                let target_type = node
+                    .argument_types
+                    .get(2)
+                    .map(Self::family_leaf_type)
+                    .and_then(ConcreteWireType::matrix_type)
+                    .ok_or(DiamondGpuMeasurementError::MatrixArgument)?
+                    .clone();
+                let bound = max_coefficient_bound
+                    .evaluate(bindings)
+                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?;
+                if batch_size == 0 {
+                    return Ok(NodeMeasurement::default())
+                }
+                self.measure_placements(node, bindings, |this| {
+                    let (public, secret) = this.trapdoor(&trapdoor_type, bindings)?;
+                    let target = this.matrix(&target_type)?;
+                    let requests = (0..batch_size)
+                        .map(|_| PreimageRequest {
+                            matrix_type: output.clone(),
+                            sigma,
+                            gadget_base: gadget_base.clone(),
+                            digit_count,
+                            max_coefficient_bound: bound.clone(),
+                            trapdoor: Arc::clone(&secret),
+                            public: Arc::clone(&public),
+                            target: Arc::clone(&target),
+                        })
+                        .collect();
+                    this.backend
+                        .sample_preimage_batch(requests)
+                        .map(ReadyOutput::Matrices)
                         .map_err(Self::backend_error)
                 })
             }

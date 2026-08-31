@@ -40,6 +40,30 @@ pub struct SampleRange {
     pub maximum: BigInt,
 }
 
+/// One independent uniform-residue sampling request.
+///
+/// The executor groups requests with the same concrete type and range before
+/// passing them to a backend.  Keeping the request explicit preserves the
+/// original order when a backend returns the sampled matrices.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UniformSampleRequest {
+    pub matrix_type: ConcreteMatrixType,
+    pub range: SampleRange,
+}
+
+/// One independent plain hash-sampling request.
+///
+/// `key` and `tag` are intentionally request data rather than batching keys:
+/// a batch must retain the scalar sampler's domain separation for every draw.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HashSampleRequest {
+    pub matrix_type: ConcreteMatrixType,
+    pub key: [u8; 32],
+    pub tag: Vec<u8>,
+    pub variant: HashVariant,
+    pub gadget_layout: Option<(BigInt, usize)>,
+}
+
 pub trait Backend {
     type Matrix: Clone + Debug + PartialEq + Send + Sync;
     type Trapdoor: Clone + Debug + Send + Sync;
@@ -227,11 +251,33 @@ pub trait Backend {
         inputs: &[&Self::Matrix],
         axis: ConcatAxis,
     ) -> Result<Self::Matrix, Self::Error>;
+    /// Writes an ordered wave of one-column matrices into an existing
+    /// row-major destination. Implementations may override this sink to keep
+    /// the final matrix allocation stable while loop waves are released.
+    fn write_columns(
+        &mut self,
+        target: &mut Self::Matrix,
+        offset: usize,
+        columns: &[Self::Matrix],
+    ) -> Result<(), Self::Error>;
     fn sample_uniform(
         &mut self,
         ty: &ConcreteMatrixType,
         range: &SampleRange,
     ) -> Result<Self::Matrix, Self::Error>;
+    /// Samples independent uniform requests in input order.
+    ///
+    /// The default is deliberately scalar so every backend remains correct
+    /// while a device backend can override this hook with one batched launch.
+    fn sample_uniform_batch(
+        &mut self,
+        requests: Vec<UniformSampleRequest>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        requests
+            .into_iter()
+            .map(|request| self.sample_uniform(&request.matrix_type, &request.range))
+            .collect()
+    }
     fn sample_gaussian(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -246,6 +292,29 @@ pub trait Backend {
         variant: HashVariant,
         gadget_layout: Option<(&BigInt, usize)>,
     ) -> Result<Self::Matrix, Self::Error>;
+    /// Samples independent hash requests in input order.
+    ///
+    /// Backends may batch only requests with a compatible concrete layout;
+    /// callers already partition by placement and static node shape.
+    fn sample_hash_batch(
+        &mut self,
+        requests: Vec<HashSampleRequest>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        requests
+            .into_iter()
+            .map(|request| {
+                let gadget_layout =
+                    request.gadget_layout.as_ref().map(|(base, digits)| (base, *digits));
+                self.sample_hash(
+                    &request.matrix_type,
+                    request.key,
+                    &request.tag,
+                    request.variant,
+                    gadget_layout,
+                )
+            })
+            .collect()
+    }
     fn sample_trapdoor(
         &mut self,
         ty: &ConcreteMatrixType,

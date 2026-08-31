@@ -1,5 +1,7 @@
 use crate::{matrix::PolyMatrix, poly::Poly};
 use num_bigint::BigUint;
+#[cfg(feature = "gpu")]
+use std::time::Instant;
 
 pub mod bounds;
 #[cfg(feature = "gpu")]
@@ -187,10 +189,17 @@ pub trait PolyTrapdoorSampler {
         Self::Trapdoor: Send + Sync + 'a,
         Self::M: 'a,
     {
-        requests
+        let batch_start = Instant::now();
+        let request_count = requests.len();
+        tracing::debug!(request_count, "preimage: start bounded batch dispatch");
+        let mut total_rounds = 0usize;
+        let outputs = requests
             .into_iter()
             .map(|request| {
+                let mut round = 0usize;
                 let out = loop {
+                    let round_start = Instant::now();
+                    let pending_before = 1usize;
                     let candidate = self.preimage(
                         request.params,
                         request.trapdoor,
@@ -201,12 +210,40 @@ pub trait PolyTrapdoorSampler {
                         &candidate,
                         &request.max_coefficient_bound,
                     ) {
+                        tracing::debug!(
+                            round,
+                            pending_before,
+                            accepted = 1usize,
+                            rejected = 0usize,
+                            pending_after = 0usize,
+                            elapsed_ms = round_start.elapsed().as_secs_f64() * 1_000.0,
+                            "preimage: rejection round"
+                        );
                         break candidate;
+                    } else {
+                        tracing::debug!(
+                            round,
+                            pending_before,
+                            accepted = 0usize,
+                            rejected = 1usize,
+                            pending_after = 1usize,
+                            elapsed_ms = round_start.elapsed().as_secs_f64() * 1_000.0,
+                            "preimage: rejection round"
+                        );
                     }
+                    round += 1;
                 };
+                total_rounds += round + 1;
                 (request.entry_idx, out)
             })
-            .collect()
+            .collect();
+        tracing::debug!(
+            request_count,
+            rounds = total_rounds,
+            elapsed_ms = batch_start.elapsed().as_secs_f64() * 1_000.0,
+            "preimage: finished bounded batch dispatch"
+        );
+        outputs
     }
 
     // Given a trapdoor of B, an extension matrix C, a target matrix U, return a preimage D s.t.

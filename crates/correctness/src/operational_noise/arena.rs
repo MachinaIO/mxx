@@ -6,6 +6,7 @@
 use num_bigint::{BigInt, BigUint};
 use num_traits::{Signed, Zero};
 use std::{
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     sync::{
@@ -593,6 +594,101 @@ pub struct ExprNode {
     pub inputs: Box<[ExprId]>,
 }
 
+/// Compact immutable summary of the exact free binders below one expression slot.
+///
+/// `Unknown` is used only for slots which have not been summarized yet.  Once a slot is
+/// visited, its entry is replaced permanently by one of the other variants because expression
+/// nodes are immutable and the arena is append-only.  The `Many` representation is sorted and
+/// deduplicated by exact [`ExprId`], rather than by the displayed binder position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FreeArgumentSummary {
+    Unknown,
+    Closed,
+    One(ExprId),
+    Many(Box<[ExprId]>),
+}
+
+impl FreeArgumentSummary {
+    fn from_sorted_ids(ids: Vec<ExprId>) -> Self {
+        match ids.as_slice() {
+            [] => Self::Closed,
+            [id] => Self::One(*id),
+            _ => Self::Many(ids.into_boxed_slice()),
+        }
+    }
+
+    fn is_known(&self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
+    fn into_ids(self) -> BTreeSet<ExprId> {
+        match self {
+            Self::Unknown | Self::Closed => BTreeSet::new(),
+            Self::One(id) => BTreeSet::from([id]),
+            Self::Many(ids) => ids.into_vec().into_iter().collect(),
+        }
+    }
+}
+
+/// Counters for the append-only free-binder summary cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FreeArgumentCounters {
+    pub queries: u64,
+    pub nodes_visited: u64,
+    pub root_hits: u64,
+    pub subtree_hits: u64,
+    pub newly_summarized: u64,
+}
+
+/// A completed exact substitution key.  The replacement pairs are canonical because callers
+/// construct them from an ordered map after validating every ID and exact source/replacement
+/// type pair.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct ExactSubstitutionKey {
+    root: ExprId,
+    replacements: Box<[(ExprId, ExprId)]>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SubstitutionScratchEntry {
+    epoch: u64,
+    value: Option<ExprId>,
+}
+
+/// Candidate-local state for exact expression substitution.
+///
+/// The completed-result cache is deliberately owned by the caller's candidate (the program
+/// arena or production lowerer), while this engine supplies the common validation, traversal,
+/// and slot-indexed scratch implementation.  Scratch entries are tagged with an invocation
+/// epoch, so repeated substitutions never clear a per-call tree map.
+pub(crate) struct ExactSubstitutionEngine {
+    completed: BTreeMap<ExactSubstitutionKey, ExprId>,
+    scratch: Vec<SubstitutionScratchEntry>,
+    epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExactSubstitutionResult {
+    pub root: ExprId,
+    pub cache_hit: bool,
+    pub binder_shortcut: bool,
+    pub skipped_subtrees: u64,
+    pub nodes_visited: u64,
+    pub nodes_reinterned: u64,
+}
+
+/// Failure information from the common substitution engine.  Keeping the failing source node,
+/// operator, output type, and rewritten input types allows production lowering to attach its
+/// existing wire/operation/type context without reimplementing the traversal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExactSubstitutionFailure {
+    pub node: ExprId,
+    pub operator: Option<ValueOperator>,
+    pub expected_output: Option<ResolvedValueType>,
+    pub actual_inputs: Box<[ResolvedValueType]>,
+    pub source: ArenaError,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArenaError {
     ForeignExpression {
@@ -724,6 +820,14 @@ pub struct ExprArena {
     index_evaluators: BTreeMap<IndexFunctionDefinitionId, Arc<IndexEvaluator>>,
     program_signatures: BTreeMap<ValueProgramId, ProgramSignature>,
     scoped_derivations: BTreeMap<ValueProgramId, HashSet<u32>>,
+    /// Free-argument summaries are immutable once an expression is interned. The slot-indexed
+    /// cache therefore grows append-only and preserves exact [`ExprId`] binder identity.
+    free_argument_cache: RefCell<Vec<FreeArgumentSummary>>,
+    free_argument_queries: Cell<u64>,
+    free_argument_nodes_visited: Cell<u64>,
+    free_argument_root_hits: Cell<u64>,
+    free_argument_subtree_hits: Cell<u64>,
+    free_argument_newly_summarized: Cell<u64>,
     #[cfg(test)]
     scope_proof_builds: std::cell::Cell<u64>,
 }
@@ -745,6 +849,12 @@ impl ExprArena {
             index_evaluators: BTreeMap::new(),
             program_signatures: BTreeMap::new(),
             scoped_derivations: BTreeMap::new(),
+            free_argument_cache: RefCell::new(Vec::new()),
+            free_argument_queries: Cell::new(0),
+            free_argument_nodes_visited: Cell::new(0),
+            free_argument_root_hits: Cell::new(0),
+            free_argument_subtree_hits: Cell::new(0),
+            free_argument_newly_summarized: Cell::new(0),
             #[cfg(test)]
             scope_proof_builds: std::cell::Cell::new(0),
         }
@@ -756,6 +866,20 @@ impl ExprArena {
 
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    pub(crate) fn free_argument_counters(&self) -> (u64, u64) {
+        (self.free_argument_queries.get(), self.free_argument_nodes_visited.get())
+    }
+
+    pub(crate) fn free_argument_counter_details(&self) -> FreeArgumentCounters {
+        FreeArgumentCounters {
+            queries: self.free_argument_queries.get(),
+            nodes_visited: self.free_argument_nodes_visited.get(),
+            root_hits: self.free_argument_root_hits.get(),
+            subtree_hits: self.free_argument_subtree_hits.get(),
+            newly_summarized: self.free_argument_newly_summarized.get(),
+        }
     }
 
     pub fn register_index_definition(
@@ -921,6 +1045,38 @@ impl ExprArena {
         self.intern(ValueOperator::Argument { position, value_type }, Box::new([]))
     }
 
+    /// Allocate an argument which is deliberately not hash-consed.
+    ///
+    /// Ordinary expressions use positional arguments and therefore may be interned.  A
+    /// generated lexical closure needs a distinct binder identity even when it reuses the same
+    /// position as an enclosing loop, so its argument is kept out of the interner.
+    pub(crate) fn fresh_argument(
+        &mut self,
+        position: u32,
+        value_type: ResolvedValueType,
+    ) -> Result<ExprId, ArenaError> {
+        let slot =
+            u32::try_from(self.nodes.len()).map_err(|_| ArenaError::ExpressionArenaExhausted)?;
+        self.nodes.try_reserve(1).map_err(|_| ArenaError::ExpressionAllocationFailed)?;
+        self.types.try_reserve(1).map_err(|_| ArenaError::ExpressionAllocationFailed)?;
+        self.nodes.push(Arc::new(ExprNode {
+            operator: ValueOperator::Argument { position, value_type: value_type.clone() },
+            inputs: Box::new([]),
+        }));
+        self.types.push(value_type);
+        self.free_argument_cache.borrow_mut().push(FreeArgumentSummary::Unknown);
+        Ok(ExprId::new(self.token, slot))
+    }
+
+    /// Report whether an expression is the canonical hash-consed node. Generated lexical
+    /// binders are deliberately absent from the interner; opaque programs cannot carry those
+    /// binders because they have no explicit capture metadata.
+    pub(crate) fn is_interned(&self, id: ExprId) -> Result<bool, ArenaError> {
+        self.check_id(id)?;
+        let slot = id.slot();
+        Ok(self.interner.get(self.nodes[slot as usize].as_ref()).copied() == Some(slot))
+    }
+
     pub fn intern(
         &mut self,
         operator: ValueOperator,
@@ -940,6 +1096,7 @@ impl ExprArena {
         self.types.try_reserve(1).map_err(|_| ArenaError::ExpressionAllocationFailed)?;
         self.nodes.push(Arc::clone(&node));
         self.types.push(output_type);
+        self.free_argument_cache.borrow_mut().push(FreeArgumentSummary::Unknown);
         self.interner.insert(node, slot);
         Ok(ExprId::new(self.token, slot))
     }
@@ -1092,6 +1249,28 @@ impl ExprArena {
         Ok(ScopedExprId { program: proof.program, expression })
     }
 
+    /// Absorb the reachable slots of a completed detached proof into an active proof for the
+    /// same finalized program.  Detached normalization may intern scoped transforms while
+    /// proving a selected branch; registering exactly those slots keeps subsequent parent-local
+    /// projections valid without broadening the program's raw expression reachability.
+    pub(crate) fn absorb_scope_proof(
+        &mut self,
+        target: &mut ScopeProof,
+        detached: ScopeProof,
+    ) -> Result<(), ArenaError> {
+        self.validate_scope_proof(target)?;
+        self.validate_scope_proof(&detached)?;
+        if target.arena != detached.arena {
+            return Err(ArenaError::InvalidScopeProof);
+        }
+        if target.program != detached.program || target.signature != detached.signature {
+            return Err(ArenaError::InvalidScopeProof);
+        }
+        target.reachable.extend(detached.reachable.iter().copied());
+        self.scoped_derivations.entry(detached.program).or_default().extend(detached.reachable);
+        Ok(())
+    }
+
     /// Project the sole immutable input edge of an already-scoped parent into the same program.
     ///
     /// The caller supplies no child ID or signature. Authority comes only from the arena-owned
@@ -1204,22 +1383,156 @@ impl ExprArena {
         &self,
         root: ExprId,
     ) -> Result<BTreeSet<(u32, ResolvedValueType)>, ArenaError> {
-        self.check_id(root)?;
-        let mut seen = BTreeSet::new();
-        let mut work = vec![root];
-        let mut free = BTreeSet::new();
-        while let Some(id) = work.pop() {
-            if !seen.insert(id.slot) {
+        Ok(self
+            .free_argument_ids(root)?
+            .into_iter()
+            .map(|id| match self.node(id).expect("validated free argument") {
+                ExprNode { operator: ValueOperator::Argument { position, value_type }, .. } => {
+                    (*position, value_type.clone())
+                }
+                _ => unreachable!("free_argument_ids returns only arguments"),
+            })
+            .collect())
+    }
+
+    /// Return the exact argument nodes reachable from an expression.
+    ///
+    /// The positional view in [`Self::free_arguments`] remains useful for closed/manual
+    /// programs.  Closure validation and beta reduction use these IDs so nested binders with the
+    /// same displayed position cannot alias one another.
+    pub(crate) fn free_argument_ids(&self, root: ExprId) -> Result<BTreeSet<ExprId>, ArenaError> {
+        self.free_argument_queries.set(self.free_argument_queries.get().saturating_add(1));
+        self.ensure_free_argument_summary(root)?;
+        let slot = self.check_id(root)?;
+        let summary = self
+            .free_argument_cache
+            .borrow()
+            .get(slot)
+            .cloned()
+            .ok_or(ArenaError::InvalidSlot { slot: root.slot() })?;
+        Ok(summary.into_ids())
+    }
+
+    /// Test whether a sorted exact-binder list intersects one cached free-argument summary.
+    /// The compact `Closed`/`One`/`Many` representation is inspected directly, so this query
+    /// performs no per-node set allocation. An unknown summary is populated by the same
+    /// bottom-up cache builder used by [`Self::free_argument_ids`].
+    pub(crate) fn free_argument_summary_intersects(
+        &self,
+        root: ExprId,
+        sorted_sources: &[ExprId],
+    ) -> Result<bool, ArenaError> {
+        self.ensure_free_argument_summary(root)?;
+        let slot = self.check_id(root)?;
+        let cache = self.free_argument_cache.borrow();
+        let summary = cache.get(slot).ok_or(ArenaError::InvalidSlot { slot: root.slot() })?;
+        Ok(match summary {
+            FreeArgumentSummary::Unknown | FreeArgumentSummary::Closed => false,
+            FreeArgumentSummary::One(id) => sorted_sources.binary_search(id).is_ok(),
+            FreeArgumentSummary::Many(ids) => {
+                let mut summary_index = 0;
+                let mut source_index = 0;
+                while summary_index < ids.len() && source_index < sorted_sources.len() {
+                    match ids[summary_index].cmp(&sorted_sources[source_index]) {
+                        std::cmp::Ordering::Less => summary_index += 1,
+                        std::cmp::Ordering::Greater => source_index += 1,
+                        std::cmp::Ordering::Equal => return Ok(true),
+                    }
+                }
+                false
+            }
+        })
+    }
+
+    fn ensure_free_argument_summary(&self, root: ExprId) -> Result<(), ArenaError> {
+        let slot = self.check_id(root)?;
+        let root_known =
+            self.free_argument_cache.borrow().get(slot).is_some_and(FreeArgumentSummary::is_known);
+        if root_known {
+            self.free_argument_root_hits.set(self.free_argument_root_hits.get().saturating_add(1));
+            return Ok(());
+        }
+
+        // The arena is a DAG, so a post-order work stack computes each unknown slot from already
+        // summarized children.  A child which was summarized by an earlier query is consumed
+        // directly, while every newly visited slot receives its own permanent cache entry.
+        let mut work = vec![(root, false)];
+        while let Some((id, expanded)) = work.pop() {
+            let id_slot = self.check_id(id)?;
+            let known = self
+                .free_argument_cache
+                .borrow()
+                .get(id_slot)
+                .is_some_and(FreeArgumentSummary::is_known);
+            if known {
+                if id != root {
+                    self.free_argument_subtree_hits
+                        .set(self.free_argument_subtree_hits.get().saturating_add(1));
+                }
                 continue;
             }
-            let node = self.node(id)?;
-            if let ValueOperator::Argument { position, ref value_type } = node.operator {
-                free.insert((position, value_type.clone()));
-            } else {
-                work.extend(node.inputs.iter().copied());
+
+            let (is_argument, inputs) = {
+                let node = self.node(id)?;
+                (matches!(node.operator, ValueOperator::Argument { .. }), node.inputs.clone())
+            };
+            if !expanded {
+                self.free_argument_nodes_visited
+                    .set(self.free_argument_nodes_visited.get().saturating_add(1));
+                if is_argument {
+                    self.store_free_argument_summary(id_slot, FreeArgumentSummary::One(id));
+                    continue;
+                }
+                work.push((id, true));
+                for child in inputs.iter().rev().copied() {
+                    let child_slot = self.check_id(child)?;
+                    if self
+                        .free_argument_cache
+                        .borrow()
+                        .get(child_slot)
+                        .is_some_and(FreeArgumentSummary::is_known)
+                    {
+                        self.free_argument_subtree_hits
+                            .set(self.free_argument_subtree_hits.get().saturating_add(1));
+                    } else {
+                        work.push((child, false));
+                    }
+                }
+                continue;
             }
+
+            let mut ids = Vec::new();
+            for child in inputs {
+                let child_slot = self.check_id(child)?;
+                let summary = self
+                    .free_argument_cache
+                    .borrow()
+                    .get(child_slot)
+                    .cloned()
+                    .ok_or(ArenaError::InvalidSlot { slot: child.slot() })?;
+                if !summary.is_known() {
+                    return Err(ArenaError::InvalidSlot { slot: child.slot() });
+                }
+                ids.extend(summary.into_ids());
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            self.store_free_argument_summary(id_slot, FreeArgumentSummary::from_sorted_ids(ids));
         }
-        Ok(free)
+        if self.free_argument_cache.borrow().get(slot).is_some_and(FreeArgumentSummary::is_known) {
+            Ok(())
+        } else {
+            Err(ArenaError::InvalidSlot { slot: root.slot() })
+        }
+    }
+
+    fn store_free_argument_summary(&self, slot: usize, summary: FreeArgumentSummary) {
+        debug_assert!(summary.is_known());
+        let mut cache = self.free_argument_cache.borrow_mut();
+        debug_assert!(matches!(cache.get(slot), Some(FreeArgumentSummary::Unknown)));
+        cache[slot] = summary;
+        self.free_argument_newly_summarized
+            .set(self.free_argument_newly_summarized.get().saturating_add(1));
     }
 
     pub fn reachable_node_count(&self, root: ExprId) -> Result<usize, ArenaError> {
@@ -1399,9 +1712,13 @@ impl ExprArena {
                         actual: types.first().cloned().unwrap_or(ResolvedValueType::Bool),
                     });
                 };
-                let count =
-                    matrix.rows.checked_mul(matrix.columns).ok_or(ArenaError::InvalidMatrixType)?;
-                if *position as usize >= count {
+                // The scalar matrix stores one polynomial, so `position` addresses a
+                // coefficient in that polynomial rather than a flattened matrix cell.
+                // Keep this contract aligned with the IR validator: extraction is valid only
+                // for a 1x1 matrix and only within the ring dimension.
+                let position =
+                    usize::try_from(*position).map_err(|_| ArenaError::ProgramOutputMismatch)?;
+                if matrix.rows != 1 || matrix.columns != 1 || position >= matrix.ring_dimension {
                     return Err(ArenaError::ProgramOutputMismatch);
                 }
                 if let Some(upper) = canonical_input_exclusive_upper {
@@ -2111,6 +2428,262 @@ impl ExprArena {
     }
 }
 
+impl ExactSubstitutionEngine {
+    pub(crate) fn new() -> Self {
+        Self { completed: BTreeMap::new(), scratch: Vec::new(), epoch: 0 }
+    }
+
+    /// Apply an exact source-to-replacement map to an immutable expression DAG.
+    ///
+    /// All IDs and source/replacement types are checked before the completed-result cache is
+    /// consulted. A cold traversal is iterative and follows child order deterministically;
+    /// unmatched arguments retain their exact node identity. Only an all-argument map may use
+    /// the free-binder disjointness shortcut, because an arbitrary source can occur below a
+    /// non-argument operator without appearing in that summary.
+    pub(crate) fn substitute(
+        &mut self,
+        expressions: &mut ExprArena,
+        root: ExprId,
+        replacements: &BTreeMap<ExprId, ExprId>,
+    ) -> Result<ExactSubstitutionResult, ExactSubstitutionFailure> {
+        expressions.check_id(root).map_err(|source| ExactSubstitutionFailure {
+            node: root,
+            operator: None,
+            expected_output: None,
+            actual_inputs: Box::new([]),
+            source,
+        })?;
+
+        // Validate every ID first. In particular, a stale or foreign replacement cannot become
+        // an accidental completed-cache hit. Exact type equality is part of this contract even
+        // when a source is not reachable from this root.
+        let mut canonical = Vec::with_capacity(replacements.len());
+        for (source_id, replacement_id) in replacements {
+            expressions
+                .check_id(*source_id)
+                .map_err(|source| self.failure_for_id(expressions, *source_id, source))?;
+            expressions
+                .check_id(*replacement_id)
+                .map_err(|source| self.failure_for_id(expressions, *source_id, source))?;
+        }
+        for (source_id, replacement_id) in replacements {
+            let source_type = expressions
+                .value_type(*source_id)
+                .map_err(|source| self.failure_for_id(expressions, *source_id, source))?;
+            let replacement_type = expressions
+                .value_type(*replacement_id)
+                .map_err(|source| self.failure_for_id(expressions, *source_id, source))?;
+            if source_type != replacement_type {
+                let source_operator =
+                    expressions.node(*source_id).ok().map(|node| node.operator.clone());
+                let source_error = ArenaError::TypeMismatch {
+                    operator: "ExactSubstitution".to_owned(),
+                    position: 0,
+                    expected: source_type.clone(),
+                    actual: replacement_type.clone(),
+                };
+                return Err(ExactSubstitutionFailure {
+                    node: *source_id,
+                    operator: source_operator,
+                    expected_output: Some(source_type.clone()),
+                    actual_inputs: Box::new([replacement_type.clone()]),
+                    source: source_error,
+                });
+            }
+            canonical.push((*source_id, *replacement_id));
+        }
+
+        let key = ExactSubstitutionKey { root, replacements: canonical.clone().into_boxed_slice() };
+        if let Some(result) = self.completed.get(&key).copied() {
+            return Ok(ExactSubstitutionResult {
+                root: result,
+                cache_hit: true,
+                binder_shortcut: false,
+                skipped_subtrees: 0,
+                nodes_visited: 0,
+                nodes_reinterned: 0,
+            });
+        }
+
+        let all_arguments = canonical.iter().all(|(source_id, _)| {
+            matches!(
+                expressions.node(*source_id).map(|node| &node.operator),
+                Ok(ValueOperator::Argument { .. })
+            )
+        });
+        let argument_sources = canonical.iter().map(|(source, _)| *source).collect::<Vec<_>>();
+        if all_arguments {
+            let free = expressions
+                .free_argument_ids(root)
+                .map_err(|source| self.failure_for_id(expressions, root, source))?;
+            if canonical.iter().all(|(source_id, _)| !free.contains(source_id)) {
+                self.completed.insert(key, root);
+                return Ok(ExactSubstitutionResult {
+                    root,
+                    cache_hit: false,
+                    binder_shortcut: true,
+                    skipped_subtrees: 0,
+                    nodes_visited: 0,
+                    nodes_reinterned: 0,
+                });
+            }
+        }
+
+        self.start_invocation();
+        let mut stack = vec![(root, false)];
+        let mut nodes_visited = 0_u64;
+        let mut nodes_reinterned = 0_u64;
+        let mut skipped_subtrees = 0_u64;
+        while let Some((id, expanded)) = stack.pop() {
+            let slot = expressions
+                .check_id(id)
+                .map_err(|source| self.failure_for_id(expressions, id, source))?;
+            if self.scratch_value(slot).is_some() {
+                continue;
+            }
+            if !expanded {
+                let (is_argument, inputs) = {
+                    let node = expressions
+                        .node(id)
+                        .map_err(|source| self.failure_for_id(expressions, id, source))?;
+                    (matches!(node.operator, ValueOperator::Argument { .. }), node.inputs.clone())
+                };
+                if let Some((_, replacement)) = canonical.iter().find(|(source, _)| *source == id) {
+                    nodes_visited = nodes_visited.saturating_add(1);
+                    self.set_scratch(slot, *replacement);
+                } else if all_arguments &&
+                    !expressions
+                        .free_argument_summary_intersects(id, &argument_sources)
+                        .map_err(|source| self.failure_for_id(expressions, id, source))?
+                {
+                    self.set_scratch(slot, id);
+                    skipped_subtrees = skipped_subtrees.saturating_add(1);
+                } else if is_argument {
+                    nodes_visited = nodes_visited.saturating_add(1);
+                    // This includes fresh lexical binders, which must never be reconstructed as
+                    // canonical positional arguments.
+                    self.set_scratch(slot, id);
+                } else {
+                    nodes_visited = nodes_visited.saturating_add(1);
+                    stack.push((id, true));
+                    for child in inputs.iter().rev().copied() {
+                        let child_slot = expressions
+                            .check_id(child)
+                            .map_err(|source| self.failure_for_id(expressions, child, source))?;
+                        if self.scratch_value(child_slot).is_none() {
+                            stack.push((child, false));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let (operator, children) = {
+                let node = expressions
+                    .node(id)
+                    .map_err(|source| self.failure_for_id(expressions, id, source))?;
+                (node.operator.clone(), node.inputs.clone())
+            };
+            let mut inputs = Vec::with_capacity(children.len());
+            for child in children {
+                let child_slot = expressions
+                    .check_id(child)
+                    .map_err(|source| self.failure_for_id(expressions, child, source))?;
+                let value = self.scratch_value(child_slot).ok_or_else(|| {
+                    self.failure_for_id(
+                        expressions,
+                        id,
+                        ArenaError::InvalidSlot { slot: child.slot() },
+                    )
+                })?;
+                inputs.push(value);
+            }
+            let expected_output = expressions
+                .value_type(id)
+                .map_err(|source| self.failure_for_id(expressions, id, source))?
+                .clone();
+            let actual_inputs = inputs
+                .iter()
+                .map(|input| expressions.value_type(*input).cloned())
+                .collect::<Result<Box<[_]>, _>>()
+                .map_err(|source| self.failure_for_id(expressions, id, source))?;
+            let rewritten = expressions
+                .intern(operator.clone(), inputs.into_boxed_slice())
+                .map_err(|source| ExactSubstitutionFailure {
+                    node: id,
+                    operator: Some(operator.clone()),
+                    expected_output: Some(expected_output.clone()),
+                    actual_inputs: actual_inputs.clone(),
+                    source,
+                })?;
+            nodes_reinterned = nodes_reinterned.saturating_add(1);
+            self.set_scratch(slot, rewritten);
+        }
+
+        let result = self
+            .scratch_value(
+                expressions
+                    .check_id(root)
+                    .map_err(|source| self.failure_for_id(expressions, root, source))?,
+            )
+            .ok_or_else(|| {
+                self.failure_for_id(
+                    expressions,
+                    root,
+                    ArenaError::InvalidSlot { slot: root.slot() },
+                )
+            })?;
+        self.completed.insert(key, result);
+        Ok(ExactSubstitutionResult {
+            root: result,
+            cache_hit: false,
+            binder_shortcut: false,
+            skipped_subtrees,
+            nodes_visited,
+            nodes_reinterned,
+        })
+    }
+
+    fn failure_for_id(
+        &self,
+        expressions: &ExprArena,
+        node: ExprId,
+        source: ArenaError,
+    ) -> ExactSubstitutionFailure {
+        ExactSubstitutionFailure {
+            node,
+            operator: expressions.node(node).ok().map(|node| node.operator.clone()),
+            expected_output: expressions.value_type(node).ok().cloned(),
+            actual_inputs: Box::new([]),
+            source,
+        }
+    }
+
+    fn start_invocation(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.epoch = 1;
+            for entry in &mut self.scratch {
+                entry.epoch = 0;
+            }
+        }
+    }
+
+    fn scratch_value(&self, slot: usize) -> Option<ExprId> {
+        self.scratch
+            .get(slot)
+            .filter(|entry| entry.epoch == self.epoch)
+            .and_then(|entry| entry.value)
+    }
+
+    fn set_scratch(&mut self, slot: usize, value: ExprId) {
+        if self.scratch.len() <= slot {
+            self.scratch.resize(slot + 1, SubstitutionScratchEntry::default());
+        }
+        self.scratch[slot] = SubstitutionScratchEntry { epoch: self.epoch, value: Some(value) };
+    }
+}
+
 /// A validated closed expression view.  It is impossible to construct one
 /// from an open expression without going through [`ExprArena::close`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -2173,6 +2746,10 @@ pub struct ProgramSignature {
 pub struct ValueProgram {
     pub signature: ProgramSignature,
     pub root: ExprId,
+    /// Exact formal argument nodes for generated lexical closures.  Ordinary programs have no
+    /// generated binder and keep this empty.
+    pub(crate) formal_arguments: Box<[ExprId]>,
+    pub(crate) generated: bool,
 }
 
 #[cfg(test)]
@@ -2190,6 +2767,10 @@ mod tests {
 
     fn matrix() -> ResolvedMatrixType {
         ResolvedMatrixType::new(BigUint::from(17_u8), 8, 2, 2).unwrap()
+    }
+
+    fn scalar_ring_matrix() -> ResolvedMatrixType {
+        ResolvedMatrixType::new(BigUint::from(17_u8), 8, 1, 1).unwrap()
     }
 
     #[test]
@@ -2372,6 +2953,52 @@ mod tests {
             .intern_slice(ValueOperator::Matrix(MatrixOperation::Multiply), &[left, right])
             .unwrap();
         assert_eq!(arena.value_type(product).unwrap(), &ResolvedValueType::Matrix(matrix()));
+    }
+
+    #[test]
+    fn value_coefficient_extraction_uses_ring_dimension_for_scalar_polynomials() {
+        let mut arena = ExprArena::new();
+        let scalar = arena
+            .intern(
+                ValueOperator::Source(SemanticSourceIdentity {
+                    stable_definition: "scalar-ring".to_owned(),
+                    invocation: "0".to_owned(),
+                    sample_event: None,
+                    output_role: "value".to_owned(),
+                    sampler: None,
+                    artifact: None,
+                    value_type: ResolvedValueType::Matrix(scalar_ring_matrix()),
+                    coordinates: Box::new([]),
+                    matrix_constant: None,
+                }),
+                Box::new([]),
+            )
+            .unwrap();
+
+        let last = arena.intern_extract_coefficient(scalar, 7, Some(BigUint::from(17_u8)));
+        assert!(last.is_ok(), "the final ring coefficient must be addressable");
+
+        let past_end = arena.intern_extract_coefficient(scalar, 8, Some(BigUint::from(17_u8)));
+        assert!(matches!(past_end, Err(ArenaError::ProgramOutputMismatch)));
+
+        let non_scalar = arena
+            .intern(
+                ValueOperator::Source(SemanticSourceIdentity {
+                    stable_definition: "non-scalar".to_owned(),
+                    invocation: "0".to_owned(),
+                    sample_event: None,
+                    output_role: "value".to_owned(),
+                    sampler: None,
+                    artifact: None,
+                    value_type: ResolvedValueType::Matrix(matrix()),
+                    coordinates: Box::new([]),
+                    matrix_constant: None,
+                }),
+                Box::new([]),
+            )
+            .unwrap();
+        let rejected = arena.intern_extract_coefficient(non_scalar, 0, Some(BigUint::from(17_u8)));
+        assert!(matches!(rejected, Err(ArenaError::ProgramOutputMismatch)));
     }
 
     #[test]
@@ -2677,8 +3304,10 @@ mod tests {
                 &[crt_left, crt_right],
             )
             .unwrap();
+        let scalar_input =
+            source(&mut arena, "scalar-input", ResolvedValueType::Matrix(scalar_ring_matrix()));
         let extracted =
-            arena.intern_extract_coefficient(input, 0, Some(BigUint::from(17_u8))).unwrap();
+            arena.intern_extract_coefficient(scalar_input, 0, Some(BigUint::from(17_u8))).unwrap();
         let scalar =
             arena.intern(ValueOperator::Constant(TypedConstant::int(3)), [].into()).unwrap();
         let lifted = arena
@@ -2812,6 +3441,69 @@ mod tests {
             ),
             Err(ArenaError::InvalidScopeProof)
         );
+    }
+
+    #[test]
+    fn absorb_scope_proof_requires_same_finalized_program_and_arena() {
+        let mut arena = ExprArena::new();
+        let argument = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let signature = ProgramSignature {
+            inputs: [ProgramInput {
+                value_type: ResolvedValueType::Int,
+                trusted_index_range: None,
+            }]
+            .into(),
+            output: ResolvedValueType::Int,
+        };
+        let mut programs = ProgramArena::new();
+        let program = programs.finalize(&mut arena, signature.clone(), argument).unwrap();
+        let mut target = arena.scope_proof(program, argument).unwrap();
+        let mut detached = arena.scope_proof(program, argument).unwrap();
+        let root = arena.scoped_from_proof(&detached, argument).unwrap();
+        let derived = arena
+            .intern_scoped_transform(
+                &mut detached,
+                ValueOperator::Scalar(ScalarOperation::Negate),
+                &[root],
+            )
+            .unwrap();
+        assert_eq!(
+            arena.scoped_from_proof(&target, derived.expression()),
+            Err(ArenaError::InvalidScopeProof)
+        );
+        arena.absorb_scope_proof(&mut target, detached).unwrap();
+        assert_eq!(arena.scoped_from_proof(&target, derived.expression()), Ok(derived));
+
+        let mut other_programs = ProgramArena::new();
+        let other = other_programs.finalize(&mut arena, signature, argument).unwrap();
+        let other_proof = arena.scope_proof(other, argument).unwrap();
+        assert_eq!(
+            arena.absorb_scope_proof(&mut target, other_proof),
+            Err(ArenaError::InvalidScopeProof)
+        );
+
+        let mut foreign_arena = ExprArena::new();
+        let foreign_argument = foreign_arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let mut foreign_programs = ProgramArena::new();
+        let foreign_program = foreign_programs
+            .finalize(
+                &mut foreign_arena,
+                ProgramSignature {
+                    inputs: [ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: None,
+                    }]
+                    .into(),
+                    output: ResolvedValueType::Int,
+                },
+                foreign_argument,
+            )
+            .unwrap();
+        let foreign_proof = foreign_arena.scope_proof(foreign_program, foreign_argument).unwrap();
+        assert!(matches!(
+            arena.absorb_scope_proof(&mut target, foreign_proof),
+            Err(ArenaError::ForeignExpression { .. })
+        ));
     }
 
     #[test]
@@ -3293,5 +3985,217 @@ mod tests {
             ),
             Err(ArenaError::TypeMismatch { position: 0, .. })
         ));
+    }
+
+    #[test]
+    fn free_argument_summaries_are_cached_by_exact_expression_slot() {
+        let mut arena = ExprArena::new();
+        let argument =
+            arena.intern_argument(0, ResolvedValueType::Int).expect("argument allocation");
+        let first = arena.free_argument_ids(argument).expect("first free-argument query");
+        let second = arena.free_argument_ids(argument).expect("cached free-argument query");
+        assert_eq!(first, second);
+        assert_eq!(arena.free_argument_counters(), (2, 1));
+    }
+
+    #[test]
+    fn free_argument_cache_summarizes_shared_descendants_and_survives_append() {
+        let mut arena = ExprArena::new();
+        let left = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let right = arena.intern_argument(1, ResolvedValueType::Int).unwrap();
+        let shared = arena
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), [left, right].into())
+            .unwrap();
+        let root = arena
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), [shared, shared].into())
+            .unwrap();
+        assert_eq!(arena.free_argument_ids(root).unwrap(), BTreeSet::from([left, right]));
+        let first = arena.free_argument_counter_details();
+        assert!(first.newly_summarized >= 4);
+        assert!(first.subtree_hits >= 1);
+
+        let appended =
+            arena.intern(ValueOperator::Scalar(ScalarOperation::Negate), [root].into()).unwrap();
+        assert_eq!(arena.free_argument_ids(root).unwrap(), BTreeSet::from([left, right]));
+        assert_eq!(arena.free_argument_ids(appended).unwrap(), BTreeSet::from([left, right]));
+        let second = arena.free_argument_counter_details();
+        assert!(second.root_hits >= first.root_hits + 1);
+        assert!(second.newly_summarized >= first.newly_summarized + 1);
+    }
+
+    #[test]
+    fn exact_substitution_preserves_distinct_fresh_binders() {
+        let mut arena = ExprArena::new();
+        let inner = arena.fresh_argument(0, ResolvedValueType::Int).unwrap();
+        let outer = arena.fresh_argument(0, ResolvedValueType::Int).unwrap();
+        assert_ne!(inner, outer);
+        let body = arena
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), [inner, outer].into())
+            .unwrap();
+        let replacement = arena.intern_argument(1, ResolvedValueType::Int).unwrap();
+        let mut engine = ExactSubstitutionEngine::new();
+        let result =
+            engine.substitute(&mut arena, body, &BTreeMap::from([(inner, replacement)])).unwrap();
+        let node = arena.node(result.root).unwrap();
+        assert_eq!(node.inputs.as_ref(), &[replacement, outer]);
+    }
+
+    #[test]
+    fn exact_substitution_cache_is_exact_and_does_not_reintern_on_hit() {
+        let mut arena = ExprArena::new();
+        let source = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let root =
+            arena.intern(ValueOperator::Scalar(ScalarOperation::Negate), [source].into()).unwrap();
+        let replacement = arena.intern_argument(1, ResolvedValueType::Int).unwrap();
+        let other_replacement = arena.intern_argument(2, ResolvedValueType::Int).unwrap();
+        let mut engine = ExactSubstitutionEngine::new();
+        let first =
+            engine.substitute(&mut arena, root, &BTreeMap::from([(source, replacement)])).unwrap();
+        let count_after_first = arena.node_count();
+        let second =
+            engine.substitute(&mut arena, root, &BTreeMap::from([(source, replacement)])).unwrap();
+        assert!(second.cache_hit);
+        assert_eq!(first.root, second.root);
+        assert_eq!(arena.node_count(), count_after_first);
+
+        let different = engine
+            .substitute(&mut arena, root, &BTreeMap::from([(source, other_replacement)]))
+            .unwrap();
+        assert_ne!(different.root, first.root);
+        let other_root =
+            arena.intern(ValueOperator::Scalar(ScalarOperation::Negate), [root].into()).unwrap();
+        let different_root = engine
+            .substitute(&mut arena, other_root, &BTreeMap::from([(source, replacement)]))
+            .unwrap();
+        assert_ne!(different_root.root, first.root);
+    }
+
+    #[test]
+    fn exact_substitution_uses_binder_shortcut_but_not_for_arbitrary_sources() {
+        let mut arena = ExprArena::new();
+        let used = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let unused = arena.intern_argument(1, ResolvedValueType::Int).unwrap();
+        let replacement = arena.intern_argument(2, ResolvedValueType::Int).unwrap();
+        let root =
+            arena.intern(ValueOperator::Scalar(ScalarOperation::Negate), [used].into()).unwrap();
+        let mut engine = ExactSubstitutionEngine::new();
+        let disjoint =
+            engine.substitute(&mut arena, root, &BTreeMap::from([(unused, replacement)])).unwrap();
+        assert!(disjoint.binder_shortcut);
+        assert_eq!(disjoint.root, root);
+
+        let source =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(11)), Box::new([])).unwrap();
+        let replacement =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(12)), Box::new([])).unwrap();
+        let ordinary =
+            engine.substitute(&mut arena, root, &BTreeMap::from([(source, replacement)])).unwrap();
+        assert!(!ordinary.binder_shortcut);
+        assert!(ordinary.nodes_visited > 0);
+    }
+
+    #[test]
+    fn exact_substitution_prunes_disjoint_binder_subtrees_and_keeps_cold_order() {
+        let mut arena = ExprArena::new();
+        let used = arena.fresh_argument(0, ResolvedValueType::Int).unwrap();
+        let disjoint = arena.fresh_argument(0, ResolvedValueType::Int).unwrap();
+        let replacement = arena.fresh_argument(1, ResolvedValueType::Int).unwrap();
+        assert_ne!(used, disjoint, "same-position fresh binders must remain exact identities");
+
+        let mut large_disjoint = disjoint;
+        for _ in 0..128 {
+            large_disjoint = arena
+                .intern(ValueOperator::Scalar(ScalarOperation::Negate), [large_disjoint].into())
+                .unwrap();
+        }
+        let root = arena
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), [used, large_disjoint].into())
+            .unwrap();
+        let reachable = arena.reachable_node_count(root).unwrap();
+        let replacements = BTreeMap::from([(used, replacement)]);
+        let mut engine = ExactSubstitutionEngine::new();
+        let first = engine.substitute(&mut arena, root, &replacements).unwrap();
+        assert!(first.skipped_subtrees > 0);
+        assert!(first.nodes_visited < reachable as u64);
+        assert_eq!(first.nodes_reinterned, 1);
+        let rewritten = arena.node(first.root).unwrap();
+        assert_eq!(rewritten.inputs.as_ref(), &[replacement, large_disjoint]);
+
+        // A repeated shared disjoint branch is skipped as one subtree, not walked once per edge.
+        let shared_parent = arena
+            .intern(
+                ValueOperator::Scalar(ScalarOperation::Add),
+                [large_disjoint, large_disjoint].into(),
+            )
+            .unwrap();
+        let shared_root = arena
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), [used, shared_parent].into())
+            .unwrap();
+        let shared = engine.substitute(&mut arena, shared_root, &replacements).unwrap();
+        assert!(shared.skipped_subtrees > 0);
+
+        // A second cold engine sees the same exact traversal and output identity.
+        let mut cold_again = ExactSubstitutionEngine::new();
+        let repeated = cold_again.substitute(&mut arena, root, &replacements).unwrap();
+        assert_eq!(repeated.root, first.root);
+        assert_eq!(repeated.nodes_visited, first.nodes_visited);
+        assert_eq!(repeated.skipped_subtrees, first.skipped_subtrees);
+    }
+
+    #[test]
+    fn exact_substitution_pruning_supports_multiple_binders_but_not_non_argument_sources() {
+        let mut arena = ExprArena::new();
+        let first = arena.fresh_argument(0, ResolvedValueType::Int).unwrap();
+        let second = arena.fresh_argument(1, ResolvedValueType::Int).unwrap();
+        let untouched = arena.fresh_argument(2, ResolvedValueType::Int).unwrap();
+        let replacement_first = arena.fresh_argument(3, ResolvedValueType::Int).unwrap();
+        let replacement_second = arena.fresh_argument(4, ResolvedValueType::Int).unwrap();
+        let used = arena
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), [first, second].into())
+            .unwrap();
+        let disjoint = arena
+            .intern(ValueOperator::Scalar(ScalarOperation::Negate), [untouched].into())
+            .unwrap();
+        let root = arena
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), [used, disjoint].into())
+            .unwrap();
+        let replacements =
+            BTreeMap::from([(first, replacement_first), (second, replacement_second)]);
+        let mut engine = ExactSubstitutionEngine::new();
+        let result = engine.substitute(&mut arena, root, &replacements).unwrap();
+        assert!(result.skipped_subtrees > 0);
+        assert!(result.nodes_visited < arena.reachable_node_count(root).unwrap() as u64);
+
+        let source =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(21)), Box::new([])).unwrap();
+        let non_argument_replacement =
+            arena.intern(ValueOperator::Constant(TypedConstant::int(22)), Box::new([])).unwrap();
+        let non_argument = engine
+            .substitute(&mut arena, root, &BTreeMap::from([(source, non_argument_replacement)]))
+            .unwrap();
+        assert_eq!(non_argument.skipped_subtrees, 0);
+        assert!(non_argument.nodes_visited > 0);
+    }
+
+    #[test]
+    fn exact_substitution_rejects_foreign_and_mismatched_pairs_before_caching() {
+        let mut arena = ExprArena::new();
+        let source = arena.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let root =
+            arena.intern(ValueOperator::Scalar(ScalarOperation::Negate), [source].into()).unwrap();
+        let mut foreign = ExprArena::new();
+        let foreign_value = foreign.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let mut engine = ExactSubstitutionEngine::new();
+        let foreign_error = engine
+            .substitute(&mut arena, root, &BTreeMap::from([(source, foreign_value)]))
+            .unwrap_err();
+        assert!(matches!(foreign_error.source, ArenaError::ForeignExpression { .. }));
+        assert!(engine.completed.is_empty());
+
+        let bytes = arena.intern_argument(0, ResolvedValueType::Bytes).unwrap();
+        let type_error =
+            engine.substitute(&mut arena, root, &BTreeMap::from([(source, bytes)])).unwrap_err();
+        assert!(matches!(type_error.source, ArenaError::TypeMismatch { .. }));
+        assert!(engine.completed.is_empty());
     }
 }

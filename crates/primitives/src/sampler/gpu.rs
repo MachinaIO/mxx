@@ -45,6 +45,21 @@ impl PolyUniformSampler for GpuDCRTPolyUniformSampler {
     }
 }
 
+impl GpuDCRTPolyUniformSampler {
+    /// Samples a homogeneous batch using one explicit RNG seed per output.
+    /// Seeds are not mixed with the batch ordinal.
+    pub fn sample_uniform_batch(
+        &self,
+        params: &GpuDCRTPolyParams,
+        nrow: usize,
+        ncol: usize,
+        dist: DistType,
+        seeds: &[GpuRngSeed],
+    ) -> Vec<GpuDCRTPolyMatrix> {
+        sample_gpu_matrix_batch_with_seeds(params, nrow, ncol, dist, seeds)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GpuDCRTPolyHashSampler<H: OutputSizeUser + digest::Digest> {
     _h: PhantomData<H>,
@@ -114,6 +129,45 @@ where
     ) -> Self::M {
         let seed = hash_seed_for_matrix::<H>(key, tag.as_ref());
         sample_gpu_matrix_with_seed(params, nrow, ncol, dist, seed).small_decompose()
+    }
+}
+
+impl<H> GpuDCRTPolyHashSampler<H>
+where
+    H: OutputSizeUser + digest::Digest + Send + Sync,
+{
+    /// Hash-samples a homogeneous batch.  Each `(key, tag)` pair derives one
+    /// seed, while the matrix sampler preserves the scalar RNG coordinates.
+    pub fn sample_hash_batch(
+        &self,
+        params: &GpuDCRTPolyParams,
+        keys: &[[u8; 32]],
+        tags: &[&[u8]],
+        nrow: usize,
+        ncol: usize,
+        dist: DistType,
+    ) -> Vec<GpuDCRTPolyMatrix> {
+        assert_eq!(keys.len(), tags.len(), "hash batch keys/tags length mismatch");
+        let seeds = keys
+            .iter()
+            .copied()
+            .zip(tags.iter().copied())
+            .map(|(key, tag)| hash_seed_for_matrix::<H>(key, tag))
+            .collect::<Vec<_>>();
+        sample_gpu_matrix_batch_with_seeds(params, nrow, ncol, dist, &seeds)
+    }
+
+    /// Hash-samples a homogeneous batch from already-derived seeds.  This is
+    /// useful to runtime backends that derive and cache transcript seeds.
+    pub fn sample_hash_batch_with_seeds(
+        &self,
+        params: &GpuDCRTPolyParams,
+        nrow: usize,
+        ncol: usize,
+        dist: DistType,
+        seeds: &[GpuRngSeed],
+    ) -> Vec<GpuDCRTPolyMatrix> {
+        sample_gpu_matrix_batch_with_seeds(params, nrow, ncol, dist, seeds)
     }
 }
 
@@ -204,6 +258,34 @@ fn sample_gpu_matrix_with_seed(
     }
 }
 
+fn sample_gpu_matrix_batch_with_seeds(
+    params: &GpuDCRTPolyParams,
+    nrow: usize,
+    ncol: usize,
+    dist: DistType,
+    seeds: &[GpuRngSeed],
+) -> Vec<GpuDCRTPolyMatrix> {
+    let (gpu_dist, sigma, max_coefficient_bound) = match dist {
+        DistType::FinRingDist => (GpuMatrixSampleDist::Uniform, 0.0, u64::MAX),
+        DistType::GaussDist { sigma, max_coefficient_bound } => (
+            GpuMatrixSampleDist::Gauss,
+            sigma,
+            gpu_coefficient_cutoff(max_coefficient_bound.as_ref()),
+        ),
+        DistType::BitDist => (GpuMatrixSampleDist::Bit, 0.0, u64::MAX),
+        DistType::TernaryDist => (GpuMatrixSampleDist::Ternary, 0.0, u64::MAX),
+    };
+    GpuDCRTPolyMatrix::sample_distribution_batch(
+        params,
+        nrow,
+        ncol,
+        gpu_dist,
+        sigma,
+        max_coefficient_bound,
+        seeds,
+    )
+}
+
 fn sample_gpu_matrix_with_seed_columns(
     params: &GpuDCRTPolyParams,
     nrow: usize,
@@ -284,6 +366,7 @@ mod tests {
     use keccak_asm::Keccak256;
     use num_bigint::BigUint;
     use serial_test::serial as sequential;
+    use std::thread;
 
     fn gpu_test_params() -> DCRTPolyParams {
         DCRTPolyParams::new(128, 2, 16, 8)
@@ -292,6 +375,141 @@ mod tests {
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
         let (moduli, _, _) = params.to_crt();
         GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
+    }
+
+    fn explicit_seed(value: u8) -> GpuRngSeed {
+        let mut bytes = [0u8; 32];
+        bytes[0] = value;
+        bytes[31] = value.wrapping_mul(17);
+        GpuRngSeed::from_bytes(bytes)
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_distribution_batch_matches_explicit_seed_scalar_outputs() {
+        gpu_device_sync();
+        let cpu_params = gpu_test_params();
+        let params = gpu_params_from_cpu(&cpu_params);
+        let seeds = [explicit_seed(3), explicit_seed(7), explicit_seed(11)];
+        let sampler = GpuDCRTPolyUniformSampler::new();
+        let batch = sampler.sample_uniform_batch(&params, 3, 4, DistType::FinRingDist, &seeds);
+        assert_eq!(batch.len(), seeds.len());
+        for (sampled, seed) in batch.into_iter().zip(seeds) {
+            assert_eq!(
+                sampled,
+                sample_gpu_matrix_with_seed(&params, 3, 4, DistType::FinRingDist, seed,)
+            );
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_distribution_batch_non_square_permuted_seeds_matches_scalar_outputs() {
+        gpu_device_sync();
+        // Three CRT limbs make the seed-to-output mapping exercise every limb,
+        // while 3x4 keeps the matrix intentionally non-square.
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 8);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let seeds = [explicit_seed(23), explicit_seed(5), explicit_seed(41), explicit_seed(13)];
+        let sampler = GpuDCRTPolyUniformSampler::new();
+        let batch = sampler.sample_uniform_batch(&params, 3, 4, DistType::FinRingDist, &seeds);
+
+        assert_eq!(batch.len(), seeds.len());
+        for (sampled, seed) in batch.into_iter().zip(seeds) {
+            assert_eq!(
+                sampled,
+                sample_gpu_matrix_with_seed(&params, 3, 4, DistType::FinRingDist, seed)
+            );
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_distribution_batch_survivor_remains_valid_after_sibling_drop_orders() {
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 8);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let sampler = GpuDCRTPolyUniformSampler::new();
+        let seeds = [explicit_seed(31), explicit_seed(37), explicit_seed(43), explicit_seed(47)];
+        let expected = sample_gpu_matrix_with_seed(&params, 3, 4, DistType::BitDist, seeds[2]);
+
+        for drop_order in [[0usize, 1, 3], [3, 0, 1], [1, 3, 0]] {
+            let outputs = sampler.sample_uniform_batch(&params, 3, 4, DistType::BitDist, &seeds);
+            let mut siblings = outputs
+                .into_iter()
+                .enumerate()
+                .map(|(index, output)| (index, Some(output)))
+                .collect::<Vec<_>>();
+            let survivor = siblings[2].1.take().expect("survivor must be present");
+
+            for index in drop_order {
+                drop(siblings[index].1.take());
+            }
+
+            assert_eq!(survivor, expected, "survivor changed after drop order {drop_order:?}");
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_distribution_batch_survivor_remains_valid_after_concurrent_sibling_drops() {
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 8);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let sampler = GpuDCRTPolyUniformSampler::new();
+        let seeds = [explicit_seed(53), explicit_seed(59), explicit_seed(61), explicit_seed(67)];
+        let expected = sample_gpu_matrix_with_seed(&params, 3, 4, DistType::TernaryDist, seeds[1]);
+        let outputs = sampler.sample_uniform_batch(&params, 3, 4, DistType::TernaryDist, &seeds);
+        let mut siblings = outputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, output)| (index, Some(output)))
+            .collect::<Vec<_>>();
+        let survivor = siblings[1].1.take().expect("survivor must be present");
+
+        thread::scope(|scope| {
+            for index in [3usize, 0, 2] {
+                let sibling = siblings[index].1.take().expect("sibling must be present");
+                scope.spawn(move || drop(sibling));
+            }
+        });
+
+        assert_eq!(survivor, expected);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_hash_batch_keeps_key_tag_domains_distinct() {
+        gpu_device_sync();
+        let cpu_params = gpu_test_params();
+        let params = gpu_params_from_cpu(&cpu_params);
+        let keys = [[1u8; 32], [2u8; 32], [3u8; 32]];
+        let tags: [&[u8]; 3] = [b"batch-a", b"batch-b", b"batch-c"];
+        let sampler = GpuDCRTPolyHashSampler::<Keccak256>::new();
+        let batch = sampler.sample_hash_batch(&params, &keys, &tags, 2, 3, DistType::FinRingDist);
+        for ((sampled, key), tag) in batch.into_iter().zip(keys).zip(tags) {
+            assert_eq!(
+                sampled,
+                sampler.sample_hash(&params, key, tag, 2, 3, DistType::FinRingDist)
+            );
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_distribution_batch_empty_and_singleton() {
+        gpu_device_sync();
+        let cpu_params = gpu_test_params();
+        let params = gpu_params_from_cpu(&cpu_params);
+        let sampler = GpuDCRTPolyUniformSampler::new();
+        assert!(sampler.sample_uniform_batch(&params, 2, 2, DistType::BitDist, &[]).is_empty());
+        let seed = explicit_seed(19);
+        let singleton = sampler.sample_uniform_batch(&params, 2, 2, DistType::BitDist, &[seed]);
+        assert_eq!(singleton.len(), 1);
+        assert_eq!(
+            singleton[0],
+            sample_gpu_matrix_with_seed(&params, 2, 2, DistType::BitDist, seed)
+        );
     }
 
     #[test]

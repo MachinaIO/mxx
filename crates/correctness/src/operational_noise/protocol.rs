@@ -33,7 +33,7 @@ pub(crate) enum OccurrenceKind {
 }
 
 impl ProgramOccurrence {
-    fn root() -> Self {
+    pub(crate) fn root() -> Self {
         Self { definition: FrozenGraphScopeId::Root, path: 0 }
     }
 
@@ -207,6 +207,10 @@ impl ProtocolPlan {
     pub(crate) fn nodes(&self) -> &BTreeMap<PlannedWire, PlannedNode> {
         &self.nodes
     }
+    #[cfg(test)]
+    pub(crate) fn nodes_mut(&mut self) -> &mut BTreeMap<PlannedWire, PlannedNode> {
+        &mut self.nodes
+    }
     pub(crate) fn aliases(&self) -> &BTreeSet<WireAlias> {
         &self.aliases
     }
@@ -301,18 +305,17 @@ impl ProtocolPlan {
         }
         if is_structural(node.kind()) {
             self.visit_structural(stage, &wire, node.kind(), &arguments, queue)?;
-        } else {
-            for (position, argument) in arguments.iter().copied().enumerate() {
-                let dependency = PlannedWire {
-                    stage: wire.stage.clone(),
-                    occurrence: wire.occurrence.clone(),
-                    wire: argument,
-                };
-                if is_selector_dependency(node.kind(), position) {
-                    self.selector_dependencies.insert(dependency.clone());
-                }
-                queue.push_back(dependency);
+        }
+        for (position, argument) in arguments.iter().copied().enumerate() {
+            let dependency = PlannedWire {
+                stage: wire.stage.clone(),
+                occurrence: wire.occurrence.clone(),
+                wire: argument,
+            };
+            if is_selector_dependency(node.kind(), position) {
+                self.selector_dependencies.insert(dependency.clone());
             }
+            queue.push_back(dependency);
         }
         Ok(())
     }
@@ -499,6 +502,54 @@ impl ProtocolPlan {
             })?;
             vec![(position, output)]
         };
+        if let NodeKind::ParallelLoop(spec) = kind {
+            if spec.output_mode == mxx_ir_core::node::ParallelOutputMode::CollectColumns {
+                if outputs.len() != 1 || child_scope.outputs().len() != 1 {
+                    return Err(ProtocolPlanError::InvalidChildOutput {
+                        wire: parent.clone(),
+                        port: parent.wire.port,
+                    });
+                }
+                let child_output = child_scope.outputs()[0];
+                let child_node = child_scope.node(child_output.node).ok_or_else(|| {
+                    ProtocolPlanError::MissingNode {
+                        stage: parent.stage.clone(),
+                        occurrence: child_occurrence.clone(),
+                        node: child_output.node,
+                    }
+                })?;
+                let child_type = child_node
+                    .output_types()
+                    .get(child_output.port.0 as usize)
+                    .ok_or_else(|| ProtocolPlanError::InvalidPort {
+                        wire: PlannedWire {
+                            stage: parent.stage.clone(),
+                            occurrence: child_occurrence.clone(),
+                            wire: child_output,
+                        },
+                    })?;
+                let WireType::Matrix(child_matrix) = child_type else {
+                    return Err(ProtocolPlanError::OutputTypeMismatch {
+                        parent: parent.clone(),
+                        child: PlannedWire {
+                            stage: parent.stage.clone(),
+                            occurrence: child_occurrence.clone(),
+                            wire: child_output,
+                        },
+                    });
+                };
+                if child_matrix.columns != IntExpr::constant(1) {
+                    return Err(ProtocolPlanError::OutputTypeMismatch {
+                        parent: parent.clone(),
+                        child: PlannedWire {
+                            stage: parent.stage.clone(),
+                            occurrence: child_occurrence.clone(),
+                            wire: child_output,
+                        },
+                    });
+                }
+            }
+        }
         for (position, output) in outputs {
             let child = PlannedWire {
                 stage: parent.stage.clone(),
@@ -523,12 +574,33 @@ impl ProtocolPlan {
                 .get(output.port.0 as usize)
                 .ok_or_else(|| ProtocolPlanError::InvalidPort { wire: child.clone() })?;
             let output_compatible = if let NodeKind::ParallelLoop(spec) = kind {
-                match parent_output_type {
-                    WireType::IndexedFamily { element, count } => {
-                        element.as_ref() == child_output_type &&
-                            family_count_covers(count, &spec.count, 0)
+                match spec.output_mode {
+                    mxx_ir_core::node::ParallelOutputMode::Family => match parent_output_type {
+                        WireType::IndexedFamily { element, count } => {
+                            element.as_ref() == child_output_type &&
+                                family_count_covers(count, &spec.count, 0)
+                        }
+                        _ => false,
+                    },
+                    mxx_ir_core::node::ParallelOutputMode::CollectColumns => {
+                        let WireType::Matrix(parent_matrix) = parent_output_type else {
+                            return Err(ProtocolPlanError::OutputTypeMismatch {
+                                parent: parent.clone(),
+                                child: child.clone(),
+                            });
+                        };
+                        let WireType::Matrix(child_matrix) = child_output_type else {
+                            return Err(ProtocolPlanError::OutputTypeMismatch {
+                                parent: parent.clone(),
+                                child: child.clone(),
+                            });
+                        };
+                        child_matrix.columns == IntExpr::constant(1) &&
+                            parent_matrix.rows == child_matrix.rows &&
+                            parent_matrix.modulus == child_matrix.modulus &&
+                            parent_matrix.ring_dimension == child_matrix.ring_dimension &&
+                            parent_matrix.columns == spec.count
                     }
-                    _ => false,
                 }
             } else {
                 parent_output_type == child_output_type
@@ -1178,7 +1250,7 @@ mod tests {
                 assert_eq!(plan.counters().aliases - baseline.counters().aliases, 4_096);
                 assert_eq!(plan.output_mappings().len() - baseline.output_mappings().len(), 4_096);
                 assert_eq!(plan.nodes().len() - baseline.nodes().len(), 8_192);
-                assert_eq!(plan.counters().work_items - baseline.counters().work_items, 12_288);
+                assert_eq!(plan.counters().work_items - baseline.counters().work_items, 16_384);
             })
             .unwrap()
             .join()

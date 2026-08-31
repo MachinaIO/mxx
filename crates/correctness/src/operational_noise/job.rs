@@ -898,9 +898,11 @@ impl CheckerJob {
     }
 
     /// Call a family while constructing a not-yet-finalized program body. The range is checked
-    /// against this particular family immediately; it is deliberately not cached by raw
-    /// expression ID because interned expressions (especially `Argument(0)`) can be reused by
-    /// independent program scopes with different domains.
+    /// against this particular family immediately. The program arena's specialization cache is
+    /// keyed by family, exact index expression, and caller-supplied occurrence-derived range:
+    /// canonical `Argument(0)` templates can therefore be shared by conceptual manual scopes
+    /// only when their complete range identity agrees, while fresh lexical binders remain
+    /// distinct expression keys.
     pub(crate) fn call_family_in_program_scope(
         &mut self,
         family: FamilyValueId,

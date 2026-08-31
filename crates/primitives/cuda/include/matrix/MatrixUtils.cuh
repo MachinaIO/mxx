@@ -26,6 +26,9 @@ int matrix_track_limb_consumer(
     int consumer_device,
     cudaStream_t consumer_stream);
 int matrix_record_limb_write(GpuMatrix *dst, const dim3 &limb_id, cudaStream_t stream);
+// Installs an already-recorded completion event as the limb's write event.
+// Ownership of `event` transfers to `dst` on success.
+int matrix_set_limb_completion_event(GpuMatrix *dst, const dim3 &limb_id, cudaEvent_t event);
 bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t bytes, void **out_ptr);
 size_t matrix_align_up_size(size_t value, size_t alignment);
 int matrix_acquire_aux_workspace(

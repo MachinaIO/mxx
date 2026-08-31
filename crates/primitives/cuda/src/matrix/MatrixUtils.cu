@@ -404,6 +404,35 @@ int matrix_record_limb_write(GpuMatrix *dst, const dim3 &limb_id, cudaStream_t s
     return 0;
 }
 
+int matrix_set_limb_completion_event(GpuMatrix *dst, const dim3 &limb_id, cudaEvent_t event)
+{
+    if (!dst || !dst->ctx || !event)
+    {
+        return set_error("invalid matrix_set_limb_completion_event arguments");
+    }
+    auto *state = matrix_limb_state(
+        dst, limb_id, "invalid limb index in matrix_set_limb_completion_event");
+    if (!state)
+    {
+        return 1;
+    }
+    cudaError_t err = cudaSetDevice(state->device);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    cudaEvent_t previous = state->write_done;
+    state->write_done = event;
+    state->write_done_valid = true;
+    if (previous && previous != event)
+    {
+        // Event destruction is asynchronous with respect to outstanding
+        // waits; it does not introduce a host-side synchronization point.
+        cudaEventDestroy(previous);
+    }
+    return 0;
+}
+
 bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t bytes, void **out_ptr)
 {
     if (!out_ptr)

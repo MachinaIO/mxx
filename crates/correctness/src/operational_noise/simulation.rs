@@ -2977,9 +2977,18 @@ struct ProofPayloadProjector<'a> {
 struct ProofProjectionFrame {
     root: super::arena::ScopedExprId,
     start: usize,
-    predecessor_bindings: HashMap<(super::arena::ScopedExprId, u32), u64>,
+    predecessor_bindings: HashMap<(super::arena::ScopedExprId, u32), (u64, u64)>,
     last_exact_result: Option<u64>,
     last_pre_fold: Option<u64>,
+}
+
+/// A bound reference resolved during proof projection, retaining the semantic value type along
+/// with its numeric contract.  The type is reconstructed from the referenced result or transfer;
+/// it is never inferred from the graph inputs of the transfer's owner.
+#[derive(Clone, Debug)]
+struct ResolvedBoundRef {
+    bound: super::facts::NumericContract<super::facts::CoefficientBound>,
+    value_type: ResolvedValueType,
 }
 
 fn active_predecessor_binding(
@@ -2987,28 +2996,27 @@ fn active_predecessor_binding(
     owner: super::arena::ScopedExprId,
     input_position: u32,
 ) -> Option<u64> {
-    frames
-        .last()
-        .and_then(|frame| frame.predecessor_bindings.get(&(owner, input_position)).copied())
+    frames.iter().rev().find_map(|frame| {
+        frame.predecessor_bindings.get(&(owner, input_position)).map(|(binding, _)| *binding)
+    })
 }
 
 fn reached_exact_coefficient_root(rule: &BoundRule) -> bool {
+    let coefficient_reference = |input: &BoundValueRef| {
+        matches!(
+            input,
+            BoundValueRef::Predecessor { projection: BoundProjection::Coefficient, .. } |
+                BoundValueRef::Result { projection: BoundProjection::Coefficient, .. }
+        )
+    };
     match rule {
-        BoundRule::Sum { inputs } => {
-            !inputs.is_empty() &&
-                inputs.iter().all(|input| {
-                    matches!(
-                        input,
-                        BoundValueRef::Predecessor { projection: BoundProjection::Coefficient, .. }
-                    )
-                })
+        BoundRule::Sum { inputs } => !inputs.is_empty() && inputs.iter().all(coefficient_reference),
+        BoundRule::Product { left, right, .. } => {
+            coefficient_reference(left) && coefficient_reference(right)
         }
-        BoundRule::Product { left, right, .. } => [left, right].into_iter().all(|input| {
-            matches!(
-                input,
-                BoundValueRef::Predecessor { projection: BoundProjection::Coefficient, .. }
-            )
-        }),
+        BoundRule::MonomialProduct { factors, .. } => {
+            !factors.is_empty() && factors.iter().all(|factor| coefficient_reference(&factor.bound))
+        }
         _ => false,
     }
 }
@@ -3177,7 +3185,9 @@ impl<'a> ProofPayloadProjector<'a> {
                         last_pre_fold: None,
                     });
                 }
-                NormalizerEvent::Predecessor { consumer, input_position, .. } => {
+                NormalizerEvent::Predecessor {
+                    consumer, input_position, source_result, ..
+                } => {
                     let frame = self.frames.last_mut().ok_or_else(|| {
                         proof_invariant(
                             index,
@@ -3189,7 +3199,9 @@ impl<'a> ProofPayloadProjector<'a> {
                             },
                         )
                     })?;
-                    frame.predecessor_bindings.insert((*consumer, *input_position), index as u64);
+                    frame
+                        .predecessor_bindings
+                        .insert((*consumer, *input_position), (index as u64, source_result.0));
                 }
                 NormalizerEvent::Result { owner, value } if value.exact_nf.is_some() => {
                     let frame = self
@@ -3323,100 +3335,202 @@ impl<'a> ProofPayloadProjector<'a> {
         })
     }
 
-    fn recorded_value_bound(
+    fn recorded_value(
+        &self,
+        trace: &FeasibilityTrace,
+        event: super::g0::EventIndex,
         value: &super::g0::RecordedValue,
         projection: &BoundProjection,
-    ) -> Result<super::facts::NumericContract<super::facts::CoefficientBound>, G0Error> {
-        match projection {
-            BoundProjection::Coefficient => Ok(value.coefficient_bound.clone()),
+        owner: super::arena::ScopedExprId,
+    ) -> Result<ResolvedBoundRef, G0Error> {
+        let value_owner = match Self::trace_value_owner(trace, event)? {
+            Some(value_owner) => value_owner,
+            None => return Err(G0Error::UnsupportedBoundTransfer),
+        };
+        if value_owner.program() != owner.program() {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        }
+        let value_type = self.job.expressions().value_type(value_owner.expression())?.clone();
+        let bound = match projection {
+            BoundProjection::Coefficient => value.coefficient_bound.clone(),
             BoundProjection::Summary => value
                 .exact_nf
                 .as_ref()
                 .map(|normal_form| normal_form.bounded_summary.coefficient_bound())
-                .ok_or(G0Error::UnsupportedBoundTransfer),
-        }
+                .ok_or(G0Error::UnsupportedBoundTransfer)?,
+        };
+        Ok(ResolvedBoundRef { bound, value_type })
     }
 
-    fn recorded_reference_bound(
+    fn trace_value_owner(
+        trace: &FeasibilityTrace,
+        event: super::g0::EventIndex,
+    ) -> Result<Option<super::arena::ScopedExprId>, G0Error> {
+        Ok(match trace.events.get(event.0 as usize) {
+            None => return Err(G0Error::UnsupportedBoundTransfer),
+            Some(NormalizerEvent::Result { owner, .. }) => Some(*owner),
+            Some(NormalizerEvent::InvocationEnd { root, .. }) => Some(*root),
+            _ => return Ok(None),
+        })
+    }
+
+    fn active_frame_for_event(
+        &self,
+        event: usize,
+        current: usize,
+        owner: super::arena::ScopedExprId,
+    ) -> Result<&ProofProjectionFrame, G0Error> {
+        if event >= current {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        }
+        self.frames
+            .iter()
+            .rev()
+            .find(|frame| frame.start <= event && frame.root.program() == owner.program())
+            .ok_or(G0Error::UnsupportedBoundTransfer)
+    }
+
+    fn resolved_reference(
         &self,
         trace: &FeasibilityTrace,
         current: usize,
         owner: super::arena::ScopedExprId,
         reference: &BoundValueRef,
         visiting: &mut BTreeSet<u64>,
-    ) -> Result<super::facts::NumericContract<super::facts::CoefficientBound>, G0Error> {
-        let value_at = |event: super::g0::EventIndex, projection: &BoundProjection| {
-            let value = match trace.events.get(event.0 as usize) {
-                Some(NormalizerEvent::Result { value, .. }) |
-                Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
-                _ => return Err(G0Error::UnsupportedBoundTransfer),
-            };
-            Self::recorded_value_bound(value, projection)
-        };
+    ) -> Result<ResolvedBoundRef, G0Error> {
         match reference {
             BoundValueRef::Predecessor { input_position, projection } => {
-                let frame = self.frames.last().ok_or(G0Error::UnsupportedBoundTransfer)?;
-                let (binding_event, source_result) = trace.events[frame.start..current]
+                let (frame, (binding_event, source_result)) = self
+                    .frames
                     .iter()
-                    .enumerate()
                     .rev()
-                    .find_map(|(offset, event)| match event {
-                        NormalizerEvent::Predecessor {
-                            consumer,
-                            input_position: position,
-                            source_result,
-                            ..
-                        } if *consumer == owner && position == input_position => {
-                            Some((frame.start + offset, *source_result))
-                        }
-                        _ => None,
+                    .find_map(|frame| {
+                        frame
+                            .predecessor_bindings
+                            .get(&(owner, *input_position))
+                            .copied()
+                            .map(|binding| (frame, binding))
                     })
                     .ok_or(G0Error::UnsupportedBoundTransfer)?;
-                if source_result.0 as usize >= binding_event {
+                if frame.start > binding_event as usize || binding_event as usize >= current {
                     return Err(G0Error::UnsupportedBoundTransfer);
                 }
-                value_at(source_result, projection)
+                let Some(NormalizerEvent::Predecessor {
+                    consumer,
+                    input_position: recorded_position,
+                    predecessor,
+                    source_result: recorded_source_result,
+                }) = trace.events.get(binding_event as usize)
+                else {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                };
+                if *consumer != owner ||
+                    *recorded_position != *input_position ||
+                    *recorded_source_result != super::g0::EventIndex(source_result)
+                {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                let source_result = super::g0::EventIndex(source_result);
+                if source_result.0 as usize >= binding_event as usize {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                let source_owner = Self::trace_value_owner(trace, source_result)?
+                    .ok_or(G0Error::UnsupportedBoundTransfer)?;
+                if source_owner.program() != owner.program() ||
+                    self.job.expressions().value_type(*predecessor)? !=
+                        self.job.expressions().value_type(source_owner.expression())?
+                {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                let value = match trace.events.get(source_result.0 as usize) {
+                    Some(NormalizerEvent::Result { value, .. }) |
+                    Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
+                    _ => return Err(G0Error::UnsupportedBoundTransfer),
+                };
+                self.recorded_value(trace, source_result, value, projection, owner)
             }
             BoundValueRef::Result { event, projection } => {
-                if event.0 as usize >= current {
-                    return Err(G0Error::UnsupportedBoundTransfer);
-                }
-                value_at(*event, projection)
+                self.active_frame_for_event(event.0 as usize, current, owner)?;
+                let value = match trace.events.get(event.0 as usize) {
+                    Some(NormalizerEvent::Result { value, .. }) |
+                    Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
+                    _ => return Err(G0Error::UnsupportedBoundTransfer),
+                };
+                self.recorded_value(trace, *event, value, projection, owner)
             }
             BoundValueRef::Transfer(event) => {
-                self.replay_transfer_bound(trace, *event, owner, visiting)
+                self.active_frame_for_event(event.0 as usize, current, owner)?;
+                self.replay_transfer_ref(trace, *event, current, owner, visiting)
             }
         }
+    }
+
+    fn matrix_type_from(value: &ResolvedBoundRef) -> Result<&ResolvedMatrixType, G0Error> {
+        match &value.value_type {
+            ResolvedValueType::Matrix(matrix) => Ok(matrix),
+            _ => Err(G0Error::UnsupportedBoundTransfer),
+        }
+    }
+
+    fn composed_product_type(
+        left: &ResolvedMatrixType,
+        right: &ResolvedMatrixType,
+    ) -> Result<ResolvedMatrixType, G0Error> {
+        if left.modulus != right.modulus || left.ring_dimension != right.ring_dimension {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        }
+        if left.rows == 1 && left.columns == 1 {
+            return Ok(right.clone());
+        }
+        if right.rows == 1 && right.columns == 1 {
+            return Ok(left.clone());
+        }
+        if left.columns != right.rows {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        }
+        ResolvedMatrixType::new(left.modulus.clone(), left.ring_dimension, left.rows, right.columns)
+            .map_err(|_| G0Error::UnsupportedBoundTransfer)
+    }
+
+    fn composed_tensor_type(
+        left: &ResolvedMatrixType,
+        right: &ResolvedMatrixType,
+    ) -> Result<ResolvedMatrixType, G0Error> {
+        if left.modulus != right.modulus || left.ring_dimension != right.ring_dimension {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        }
+        let rows = left.rows.checked_mul(right.rows).ok_or(G0Error::UnsupportedBoundTransfer)?;
+        let columns =
+            left.columns.checked_mul(right.columns).ok_or(G0Error::UnsupportedBoundTransfer)?;
+        ResolvedMatrixType::new(left.modulus.clone(), left.ring_dimension, rows, columns)
+            .map_err(|_| G0Error::UnsupportedBoundTransfer)
+    }
+
+    fn validate_output_type(
+        &self,
+        owner: super::arena::ScopedExprId,
+        actual: ResolvedValueType,
+    ) -> Result<ResolvedValueType, G0Error> {
+        if self.job.expressions().value_type(owner.expression())? != &actual {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        }
+        Ok(actual)
     }
 
     fn replay_matrix_transfer(
         &self,
         owner: super::arena::ScopedExprId,
-        left: super::facts::NumericContract<super::facts::CoefficientBound>,
-        right: super::facts::NumericContract<super::facts::CoefficientBound>,
+        left: ResolvedBoundRef,
+        right: ResolvedBoundRef,
         facts: &super::bound::MatrixProductFacts,
         tensor: bool,
-    ) -> Result<super::facts::NumericContract<super::facts::CoefficientBound>, G0Error> {
-        let (
-            super::facts::NumericContract::Known(left_bound),
-            super::facts::NumericContract::Known(right_bound),
-        ) = (left, right)
-        else {
-            return Ok(super::facts::NumericContract::Missing);
-        };
-        let node = self.job.expressions().node(owner.expression())?;
-        let [left_expression, right_expression] = node.inputs.as_ref() else {
-            return Err(G0Error::UnsupportedBoundTransfer);
-        };
-        let ResolvedValueType::Matrix(left_type) =
-            self.job.expressions().value_type(*left_expression)?
-        else {
-            return Err(G0Error::UnsupportedBoundTransfer);
-        };
-        let ResolvedValueType::Matrix(right_type) =
-            self.job.expressions().value_type(*right_expression)?
-        else {
-            return Err(G0Error::UnsupportedBoundTransfer);
+    ) -> Result<ResolvedBoundRef, G0Error> {
+        let left_type = Self::matrix_type_from(&left)?;
+        let right_type = Self::matrix_type_from(&right)?;
+        let output_type = if tensor {
+            Self::composed_tensor_type(left_type, right_type)?
+        } else {
+            Self::composed_product_type(left_type, right_type)?
         };
         let matrix_bound =
             |matrix: &ResolvedMatrixType, bound: &super::facts::CoefficientBound| MatrixBound {
@@ -3434,73 +3548,237 @@ impl<'a> ProofPayloadProjector<'a> {
                     super::facts::CoefficientBound::Large => BoundClass::Large,
                 },
             };
-        let left = matrix_bound(left_type, &left_bound);
-        let right = matrix_bound(right_type, &right_bound);
+        let left_bound = match &left.bound {
+            super::facts::NumericContract::Known(bound) => bound,
+            _ => {
+                return Ok(ResolvedBoundRef {
+                    bound: super::facts::NumericContract::Missing,
+                    value_type: self.validate_output_type(
+                        owner,
+                        ResolvedValueType::Matrix(output_type.clone()),
+                    )?,
+                })
+            }
+        };
+        let right_bound = match &right.bound {
+            super::facts::NumericContract::Known(bound) => bound,
+            _ => {
+                return Ok(ResolvedBoundRef {
+                    bound: super::facts::NumericContract::Missing,
+                    value_type: self.validate_output_type(
+                        owner,
+                        ResolvedValueType::Matrix(output_type.clone()),
+                    )?,
+                })
+            }
+        };
+        let left_bound = matrix_bound(left_type, left_bound);
+        let right_bound = matrix_bound(right_type, right_bound);
         let output = if tensor {
-            tensor_bound_with_facts(&left, &right, facts)
+            tensor_bound_with_facts(&left_bound, &right_bound, facts)
         } else {
-            product_bound_with_facts(&left, &right, facts)
+            product_bound_with_facts(&left_bound, &right_bound, facts)
         }
         .map_err(|_| G0Error::UnsupportedBoundTransfer)?;
-        Ok(super::facts::NumericContract::Known(match output.coefficient_class {
+        let bound = super::facts::NumericContract::Known(match output.coefficient_class {
             BoundClass::ExactZero => super::facts::CoefficientBound::ExactZero,
             BoundClass::Bounded { maximum_absolute_coefficient } => {
                 super::facts::CoefficientBound::finite(maximum_absolute_coefficient)
             }
             BoundClass::Large => super::facts::CoefficientBound::Large,
-        }))
+        });
+        let value_type =
+            self.validate_output_type(owner, ResolvedValueType::Matrix(output_type))?;
+        Ok(ResolvedBoundRef { bound, value_type })
     }
 
-    fn replay_transfer_bound(
+    fn replay_transfer_ref(
         &self,
         trace: &FeasibilityTrace,
         event: super::g0::EventIndex,
+        current: usize,
         owner: super::arena::ScopedExprId,
         visiting: &mut BTreeSet<u64>,
-    ) -> Result<super::facts::NumericContract<super::facts::CoefficientBound>, G0Error> {
+    ) -> Result<ResolvedBoundRef, G0Error> {
+        if event.0 as usize >= current {
+            return Err(G0Error::UnsupportedBoundTransfer);
+        }
         if !visiting.insert(event.0) {
             return Err(G0Error::UnsupportedBoundTransfer);
         }
-        let Some(NormalizerEvent::BoundTransfer { owner: actual_owner, rule }) =
-            trace.events.get(event.0 as usize)
-        else {
+        let Some(observation) = trace.events.get(event.0 as usize) else {
             return Err(G0Error::UnsupportedBoundTransfer);
         };
-        if *actual_owner != owner {
-            return Err(G0Error::UnsupportedBoundTransfer);
+        let (rule, relation_value) = match observation {
+            NormalizerEvent::BoundTransfer { owner: actual_owner, rule } => {
+                if *actual_owner != owner {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                (Some(rule), None)
+            }
+            NormalizerEvent::AppliedRelation(applied) => {
+                if applied.owner != owner {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                let source_event = match &applied.rule {
+                    super::g0::AppliedRelationRule::Universal { key, source, rhs, .. } => self
+                        .rhs_events
+                        .get(&(key.clone(), *source, *rhs))
+                        .map(|(_, result)| super::g0::EventIndex(*result))
+                        .ok_or(G0Error::UnsupportedBoundTransfer)?,
+                    super::g0::AppliedRelationRule::Gadget { input_result, .. } => *input_result,
+                };
+                if source_event.0 as usize >= current {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                let source_owner = Self::trace_value_owner(trace, source_event)?
+                    .ok_or(G0Error::UnsupportedBoundTransfer)?;
+                if source_owner.program() != owner.program() {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                let value = match trace.events.get(source_event.0 as usize) {
+                    Some(NormalizerEvent::Result { value, .. }) |
+                    Some(NormalizerEvent::InvocationEnd { result: value, .. }) => value,
+                    _ => return Err(G0Error::UnsupportedBoundTransfer),
+                };
+                let resolved = self.recorded_value(
+                    trace,
+                    source_event,
+                    value,
+                    &BoundProjection::Summary,
+                    owner,
+                )?;
+                (None, Some(resolved))
+            }
+            _ => return Err(G0Error::UnsupportedBoundTransfer),
+        };
+        if let Some(relation_value) = relation_value {
+            visiting.remove(&event.0);
+            return Ok(relation_value);
         }
+        let rule = rule.ok_or(G0Error::UnsupportedBoundTransfer)?;
         let reference = |value: &BoundValueRef, visiting: &mut BTreeSet<u64>| {
-            self.recorded_reference_bound(trace, event.0 as usize, owner, value, visiting)
+            self.resolved_reference(trace, event.0 as usize, owner, value, visiting)
         };
         let output = match rule {
             BoundRule::Authority(_) => return Err(G0Error::UnsupportedBoundTransfer),
-            BoundRule::Identity { input } | BoundRule::RingAutomorphism { input, .. } => {
-                reference(input, visiting)?
+            BoundRule::Identity { input } => {
+                let input = reference(input, visiting)?;
+                // Identity transfers a coefficient contract through shape-changing operations
+                // such as extraction or remainder.  Its numeric input is recursive, while the
+                // expression's declared output supplies the transformed semantic type.
+                let value_type = self.job.expressions().value_type(owner.expression())?.clone();
+                ResolvedBoundRef { bound: input.bound, value_type }
             }
-            BoundRule::Sum { inputs } => super::facts::add_bounds(
-                &inputs
+            BoundRule::RingAutomorphism { input, ring_dimension, index } => {
+                let input = reference(input, visiting)?;
+                let ResolvedValueType::Matrix(matrix) = &input.value_type else {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                };
+                let order = ring_dimension
+                    .checked_mul(2)
+                    .and_then(|order| u64::try_from(order).ok())
+                    .ok_or(G0Error::UnsupportedBoundTransfer)?;
+                if matrix.ring_dimension != *ring_dimension ||
+                    *index == 0 ||
+                    *index % 2 == 0 ||
+                    *index >= order
+                {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                let value_type = self.validate_output_type(owner, input.value_type.clone())?;
+                ResolvedBoundRef { bound: input.bound, value_type }
+            }
+            BoundRule::Sum { inputs } |
+            BoundRule::Maximum { inputs } |
+            BoundRule::WeightedSum { inputs } => {
+                let resolved = inputs
                     .iter()
                     .map(|input| reference(input, visiting))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
+                    .collect::<Result<Vec<_>, _>>()?;
+                let [first, rest @ ..] = resolved.as_slice() else {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                };
+                if rest.iter().any(|input| input.value_type != first.value_type) {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                let bound = match rule {
+                    BoundRule::Sum { .. } => super::facts::add_bounds(
+                        &resolved.iter().map(|input| input.bound.clone()).collect::<Vec<_>>(),
+                    ),
+                    BoundRule::Maximum { .. } => {
+                        let mut bound = first.bound.clone();
+                        for input in rest {
+                            bound = super::facts::max_bounds(&[bound, input.bound.clone()]);
+                        }
+                        bound
+                    }
+                    BoundRule::WeightedSum { .. } => super::facts::add_bounds(
+                        &resolved.iter().map(|input| input.bound.clone()).collect::<Vec<_>>(),
+                    ),
+                    _ => unreachable!("matched aggregate rule"),
+                };
+                let value_type = self.validate_output_type(owner, first.value_type.clone())?;
+                ResolvedBoundRef { bound, value_type }
+            }
             BoundRule::Scale { value, scale } => {
                 let value = reference(value, visiting)?;
-                match scale {
-                    BoundScale::Magnitude(magnitude) => {
-                        super::facts::product_bounds_with_factor(&[value], magnitude)
-                    }
+                let bound = match scale {
+                    BoundScale::Magnitude(magnitude) => super::facts::product_bounds_with_factor(
+                        std::slice::from_ref(&value.bound),
+                        magnitude,
+                    ),
                     BoundScale::Value(scale) => {
-                        super::facts::product_bounds(&[value, reference(scale, visiting)?])
+                        let scale = reference(scale, visiting)?;
+                        if !matches!(scale.value_type, ResolvedValueType::Int) {
+                            return Err(G0Error::UnsupportedBoundTransfer);
+                        }
+                        super::facts::product_bounds(&[value.bound.clone(), scale.bound])
                     }
-                }
+                };
+                let value_type = self.validate_output_type(owner, value.value_type.clone())?;
+                ResolvedBoundRef { bound, value_type }
             }
-            BoundRule::MonomialProduct { factors, .. } => super::facts::product_bounds(
-                &factors.iter().map(|factor| reference(&factor.bound, visiting)).collect::<Result<
-                    Vec<_>,
-                    _,
-                >>(
-                )?,
-            ),
+            BoundRule::MonomialProduct { monomial, factors } => {
+                let resolved = factors
+                    .iter()
+                    .map(|factor| reference(&factor.bound, visiting))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let arena = self
+                    .monomial_arenas
+                    .get(&monomial.arena())
+                    .ok_or(G0Error::UnsupportedBoundTransfer)?;
+                let descriptor =
+                    arena.descriptor(*monomial).map_err(|_| G0Error::UnsupportedBoundTransfer)?;
+                let factor_expressions = descriptor
+                    .central_factors
+                    .iter()
+                    .chain(descriptor.ordered_factors.iter())
+                    .map(|factor| factor.expression())
+                    .collect::<Vec<_>>();
+                if factor_expressions.len() != resolved.len() {
+                    return Err(G0Error::UnsupportedBoundTransfer);
+                }
+                let mut bound_factors = Vec::with_capacity(resolved.len());
+                let mut value_type = None;
+                for (expression, resolved) in factor_expressions.into_iter().zip(resolved) {
+                    if self.job.expressions().value_type(expression)? != &resolved.value_type {
+                        return Err(G0Error::UnsupportedBoundTransfer);
+                    }
+                    let ResolvedValueType::Matrix(matrix) = &resolved.value_type else {
+                        return Err(G0Error::UnsupportedBoundTransfer);
+                    };
+                    value_type = Some(match value_type {
+                        None => matrix.clone(),
+                        Some(current) => Self::composed_product_type(&current, matrix)?,
+                    });
+                    bound_factors.push(resolved.bound);
+                }
+                let value_type =
+                    ResolvedValueType::Matrix(value_type.ok_or(G0Error::UnsupportedBoundTransfer)?);
+                let value_type = self.validate_output_type(owner, value_type)?;
+                ResolvedBoundRef { bound: super::facts::product_bounds(&bound_factors), value_type }
+            }
             BoundRule::Product { left, right, facts } => self.replay_matrix_transfer(
                 owner,
                 reference(left, visiting)?,
@@ -3524,14 +3802,21 @@ impl<'a> ProofPayloadProjector<'a> {
                 },
                 true,
             )?,
-            BoundRule::Maximum { .. } | BoundRule::WeightedSum { .. } => {
-                return Err(G0Error::UnsupportedBoundTransfer)
-            }
         };
         visiting.remove(&event.0);
         Ok(output)
     }
 
+    fn replay_transfer_bound(
+        &self,
+        trace: &FeasibilityTrace,
+        event: super::g0::EventIndex,
+        owner: super::arena::ScopedExprId,
+        visiting: &mut BTreeSet<u64>,
+    ) -> Result<super::facts::NumericContract<super::facts::CoefficientBound>, G0Error> {
+        let current = event.0.checked_add(1).ok_or(G0Error::UnsupportedBoundTransfer)? as usize;
+        Ok(self.replay_transfer_ref(trace, event, current, owner, visiting)?.bound)
+    }
     fn exact_value_producers(
         &self,
         trace: &FeasibilityTrace,
@@ -3544,21 +3829,22 @@ impl<'a> ProofPayloadProjector<'a> {
             .last()
             .filter(|frame| frame.root.program() == owner.program())
             .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?;
+        // Bound transfers are emitted after the predecessor bindings and before the result (and
+        // a later pre-fold event may replace that result's exact normal form).  Anchor the
+        // producer frontier at the last binding, rather than after the result, so invocation-end
+        // projection still retains the transfer that justified the post-fold value.
         let boundary = trace.events[frame.start..current]
             .iter()
             .enumerate()
             .rev()
             .find_map(|(offset, event)| match event {
-                NormalizerEvent::Result { owner: prior_owner, .. } if *prior_owner == owner => {
-                    Some(frame.start + offset + 1)
-                }
                 NormalizerEvent::Predecessor { consumer, .. } if *consumer == owner => {
                     Some(frame.start + offset + 1)
                 }
                 _ => None,
             })
             .unwrap_or(frame.start);
-        let candidates = trace.events[boundary..current]
+        let mut candidates = trace.events[boundary..current]
             .iter()
             .enumerate()
             .filter_map(|(offset, event)| match event {
@@ -3576,6 +3862,22 @@ impl<'a> ProofPayloadProjector<'a> {
             .ok_or_else(|| proof_payload_error(G0Error::RelationTraceInvariant))?
             .bounded_summary
             .coefficient_bound();
+        // A survivor fold records which bound transfer supplied the final surviving term.  Use
+        // that explicit frontier whenever several intermediate term bounds are in the same
+        // invocation; selecting an earlier transfer would resurrect a stale summary.
+        if let Some(final_bound) =
+            trace.events[boundary..current].iter().rev().find_map(|event| match event {
+                NormalizerEvent::SurvivorFold(fold) => Some(fold.bound.0 as usize),
+                _ => None,
+            })
+        {
+            if let Some(candidate) =
+                candidates.iter().find(|(event, _)| *event == final_bound).copied()
+            {
+                candidates.clear();
+                candidates.push(candidate);
+            }
+        }
         let (coefficient_producer, summary_producer) =
             select_reached_exact_producers(&candidates, &summary).map_err(proof_payload_error)?;
         let coefficient_rule = match trace.events.get(coefficient_producer) {
@@ -3607,7 +3909,11 @@ impl<'a> ProofPayloadProjector<'a> {
                             NormalizerEvent::CoefficientMerge(merge) if merge.owner == owner
                         )
                     });
-                if !reached_deferred_finite_summary_allowed(&replayed_coefficient, has_owner_merge)
+                if replayed_coefficient != summary &&
+                    !reached_deferred_finite_summary_allowed(
+                        &replayed_coefficient,
+                        has_owner_merge,
+                    )
                 {
                     return Err(proof_payload_error(G0Error::UnsupportedBoundTransfer));
                 }
@@ -4407,12 +4713,12 @@ impl<'a> ProofPayloadProjector<'a> {
                     Some(NormalizerEvent::Result { owner, value }) if *owner == *root => value,
                     _ => return Err(proof_payload_error(G0Error::RelationTraceInvariant)),
                 };
-                if result_value.exact_nf.is_none() || result_value.exact_nf != result.exact_nf {
+                if result_value.exact_nf.is_none() || result.exact_nf.is_none() {
                     return Err(proof_payload_error(G0Error::RelationTraceInvariant));
                 }
                 ProofPayloadEvent::InvocationEnd {
                     root: payload_projection(self.owner(*root))?,
-                    result: self.value(trace, result_event as usize, *root, result_value)?,
+                    result: self.value(trace, current, *root, result)?,
                     pre_fold_event,
                 }
             }
@@ -5154,21 +5460,27 @@ pub fn check_operational_noise_candidate_with_progress(
             super::OperationalParameterValue::Rational { .. } => None,
         })
         .collect::<BTreeMap<_, _>>();
+    let lower_started = control.begin_phase(CheckerPhase::Lower)?;
     let plan = ProtocolPlan::build(protocol, &request.target_id).map_err(|error| {
         OperationalSimulationError::from(super::error::ProductionError::internal(
             super::error::ProductionPhase::Adapter,
             error.to_string(),
         ))
     })?;
-    let (mut job, roots) = ProductionAdapter::new(protocol, &plan, parameters)
-        .map_err(|error| {
-            OperationalSimulationError::from(super::error::ProductionError::from(error))
-        })?
-        .lower()
-        .map_err(|error| {
-            OperationalSimulationError::from(super::error::ProductionError::from(error))
-        })?;
-    let report = analyze_roots(
+    control.work(1, Some(3), None)?;
+    let adapter = ProductionAdapter::new(protocol, &plan, parameters).map_err(|error| {
+        OperationalSimulationError::from(super::error::ProductionError::from(error))
+    })?;
+    control.work(1, Some(3), None)?;
+    let (mut job, roots) = adapter.lower().map_err(|error| {
+        OperationalSimulationError::from(super::error::ProductionError::from(error))
+    })?;
+    control.work(1, Some(3), None)?;
+    let lowering_elapsed = control.complete_phase(lower_started, Some(3), None)?;
+    control.diagnostics.lowering_milliseconds = lowering_elapsed.as_millis() as u64;
+
+    let normalization_started = control.begin_phase(CheckerPhase::Normalize)?;
+    let mut report = analyze_roots(
         &mut job,
         &roots,
         &ReportTarget {
@@ -5186,6 +5498,14 @@ pub fn check_operational_noise_candidate_with_progress(
     .map_err(|error| {
         OperationalSimulationError::from(super::error::ProductionError::from(error))
     })?;
+    control.work(1, Some(1), None)?;
+    let normalization_elapsed = normalization_started.elapsed();
+    control.diagnostics = report.diagnostics.clone();
+    control.diagnostics.lowering_milliseconds = lowering_elapsed.as_millis() as u64;
+    control.diagnostics.normalization_milliseconds = normalization_elapsed.as_millis() as u64;
+    control.complete_phase(normalization_started, Some(1), None)?;
+    control.diagnostics.total_milliseconds = control.started.elapsed().as_millis() as u64;
+    report.diagnostics = control.diagnostics.clone();
     Ok(report.into_simulation_report())
 }
 
@@ -6977,6 +7297,89 @@ mod tests {
         assert!(control.reserve_owned_elements(usize::MAX).is_ok());
         assert!(control.reserve_owned_elements(3).is_ok());
         assert_eq!(control.owned_elements.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    fn phase_boundaries_are_reported_in_order_with_event_kinds() {
+        let mut events = Vec::new();
+        {
+            let mut emit = |event| events.push(event);
+            let mut control = SimulationControl::new(&mut emit);
+            let target_started = control.begin_phase(CheckerPhase::Target).unwrap();
+            control.complete_phase(target_started, None, None).unwrap();
+            let lower_started = control.begin_phase(CheckerPhase::Lower).unwrap();
+            control.work(3, Some(3), None).unwrap();
+            control.complete_phase(lower_started, Some(3), None).unwrap();
+            let normalization_started = control.begin_phase(CheckerPhase::Normalize).unwrap();
+            control.diagnostics.normalization_node_count = 7;
+            control.work(1, Some(1), None).unwrap();
+            control.complete_phase(normalization_started, Some(1), None).unwrap();
+        }
+
+        assert_eq!(
+            events.iter().map(|event| (event.phase, event.event)).collect::<Vec<_>>(),
+            vec![
+                (CheckerPhase::Target, ProgressEventKind::Start),
+                (CheckerPhase::Target, ProgressEventKind::Complete),
+                (CheckerPhase::Lower, ProgressEventKind::Start),
+                (CheckerPhase::Lower, ProgressEventKind::Complete),
+                (CheckerPhase::Normalize, ProgressEventKind::Start),
+                (CheckerPhase::Normalize, ProgressEventKind::Complete),
+            ]
+        );
+        assert_eq!(events[3].processed, 3);
+        assert_eq!(events[5].processed, 1);
+        assert_eq!(events.last().unwrap().normalization_nodes_processed, 7);
+    }
+
+    #[test]
+    fn checker_progress_reports_real_phase_boundaries_without_changing_acceptance() {
+        let protocol = threshold_certificate_protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "certificate-threshold".to_owned(),
+        };
+        let mut events = Vec::new();
+        let report =
+            check_operational_noise_candidate_with_progress(&protocol, &request, |event| {
+                events.push(event)
+            })
+            .expect("the minimal checker fixture should remain accepted");
+
+        assert!(report.accepted);
+        assert_eq!(
+            events.iter().map(|event| (event.phase, event.event)).collect::<Vec<_>>(),
+            vec![
+                (CheckerPhase::Target, ProgressEventKind::Start),
+                (CheckerPhase::Target, ProgressEventKind::Complete),
+                (CheckerPhase::Lower, ProgressEventKind::Start),
+                (CheckerPhase::Lower, ProgressEventKind::Complete),
+                (CheckerPhase::Normalize, ProgressEventKind::Start),
+                (CheckerPhase::Normalize, ProgressEventKind::Complete),
+            ]
+        );
+        let lower_complete = events
+            .iter()
+            .find(|event| {
+                event.phase == CheckerPhase::Lower && event.event == ProgressEventKind::Complete
+            })
+            .expect("lowering completion event");
+        assert_eq!(lower_complete.processed, 3);
+        assert_eq!(lower_complete.total_or_discovered, Some(3));
+        let analysis_complete = events
+            .iter()
+            .find(|event| {
+                event.phase == CheckerPhase::Normalize && event.event == ProgressEventKind::Complete
+            })
+            .expect("root-analysis completion event");
+        assert_eq!(analysis_complete.processed, 1);
+        assert_eq!(analysis_complete.total_or_discovered, Some(1));
+        assert!(analysis_complete.normalization_nodes_processed > 0);
+        assert!(
+            analysis_complete.normalization_nodes_total >=
+                analysis_complete.normalization_nodes_processed
+        );
     }
 
     #[test]

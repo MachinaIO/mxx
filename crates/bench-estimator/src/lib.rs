@@ -350,6 +350,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     self.config.per_instance_occupancy.max(1))
                 .max(1);
                 let active = count.min(concurrent);
+                let peak = peak.saturating_mul(active as u64);
                 Ok((
                     NodeMeasurement {
                         work_seconds: one.work_seconds * count as f64,
@@ -357,7 +358,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         workspace_bytes: one.workspace_bytes,
                     },
                     preimage_work * count as f64,
-                    peak.saturating_mul(active as u64),
+                    peak,
                     parallelism.saturating_mul(active),
                 ))
             }
@@ -538,7 +539,7 @@ fn child_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, Int, IntType, Parallel, Ring, Sequential, Subgraph};
+    use mxx_dsl::{DslContext, Family, Int, IntType, Parallel, Ring, Sequential, Subgraph};
     use std::convert::Infallible;
 
     struct UnitBackend;
@@ -558,6 +559,45 @@ mod tests {
         fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
             8
         }
+    }
+
+    struct IndexDependentBackend;
+
+    impl MeasurementBackend for IndexDependentBackend {
+        type Error = Infallible;
+
+        fn measure(
+            &mut self,
+            _graph: &str,
+            _node: &MeasurementNode<'_>,
+            _bindings: &ParamEnv,
+        ) -> Result<NodeMeasurement, Self::Error> {
+            Ok(NodeMeasurement::default())
+        }
+
+        fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
+            8
+        }
+
+        fn loop_index_invariant(&self, _graph: &str, _node: &MeasurementNode<'_>) -> bool {
+            false
+        }
+    }
+
+    fn collect_columns_graph(count: usize) -> ValidatedGraph {
+        let ring = Ring::new(17, 8);
+        let family = Parallel::range(count).map(|_| ring.zero((1, 1))).expect("source family");
+        let columns = Family::try_parallel_zip_many_columns(vec![family], |_, mut inputs| {
+            Ok(inputs.remove(0))
+        })
+        .expect("column collection");
+        DslContext::new("estimate-collect-columns")
+            .output("columns", columns)
+            .expect("output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation")
     }
 
     #[test]
@@ -630,5 +670,22 @@ mod tests {
         assert_eq!(invocation_count("SequentialBody"), 3);
         assert_eq!(invocation_count("ParallelBody"), 6);
         assert_eq!(invocation_count("Subgraph { canonical_name: \"increment\""), 9);
+    }
+
+    #[test]
+    fn collect_columns_requires_index_invariant_measurement_cost() {
+        let validated = collect_columns_graph(3);
+        assert!(matches!(
+            estimate(&validated, &mut IndexDependentBackend, &EstimateConfig::default()),
+            Err(EstimateError::LoopIndexDependentCost { .. })
+        ));
+    }
+
+    #[test]
+    fn collect_columns_nested_peak_excludes_persistent_output() {
+        let validated = collect_columns_graph(3);
+        let report =
+            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+        assert_eq!(report.peak_memory_bytes, 28, "final output is counted by outer liveness only");
     }
 }

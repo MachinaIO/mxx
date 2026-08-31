@@ -12,6 +12,7 @@ mxx-dsl                  -> mxx-ir-core
 mxx-correctness          -> mxx-ir-core, mxx-dsl
 mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
 mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core
+mxx-power-lut            -> mxx-bgg, mxx-dsl, mxx-ir-core
 mxx-we                   -> mxx-bgg, mxx-correctness, mxx-gadgets, mxx-runtime
 mxx-func-enc/io          -> lower layers when their application modules are enabled
 ```
@@ -53,13 +54,23 @@ transcripts, sessions, artifacts, and bounded parallel waves.
 
 The library validates linked workflow declarations and evaluates their operational noise bounds
 with the Rust checker. Protocol declarations remain crate-owned; there is no central protocol
-registry or parameter-check executable.
+registry or parameter-check executable. Protocol-specific declarations and replay payloads do not
+live in this crate or in `mxx-ir-core`.
 
 ### `mxx-gadgets` and `mxx-bgg`
 
 `mxx-gadgets` owns BGG-independent circuits and reusable circuit gadgets.
-`mxx-bgg` owns BGG+-specific keys, encodings, sampling, evaluation, lookup, decoding, artifacts,
-slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
+`mxx-bgg` owns only the generic BGG+ key, encoding, sampler, and safe known-value operations (plus
+the pre-existing BGG modules). It does not know Power-LUT roles, setup secret identities, RHS
+packages, Fuse, ClearCoeff, or refresh semantics. `mxx-power-lut` owns import-time setup identity
+validation, fixed-secret automorphism orchestration, LUT/sparse-LWR evaluation, the public-key-only
+projection compiler, and the manuscript §7 refresh. Evaluator values remain the plain BGG wire
+types. Its dependency is one-way:
+`mxx-power-lut -> mxx-bgg -> lower layers`.
+Power-LUT owns only the structural declaration and linkage validation for manuscript §7. The
+generic `mxx-correctness` checker derives correctness and operational-noise bounds from the actual
+lowered graph; Power-LUT does not maintain a replacement-bound replay or a parallel Lean claim.
+The legacy `mxx-bgg::noise_refresh` implementation is unrelated and remains unchanged.
 
 ### Application crates
 

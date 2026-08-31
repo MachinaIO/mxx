@@ -10,7 +10,7 @@ use mxx_ir_core::{
     graph::with_new_construction_scope,
     node::{
         ArtifactInput, ConstantMatrix, HashVariant, IndexRange, LoopInputMode, MatrixBinaryOp,
-        NodeKind, ParallelLoop, SampleRange, SequentialLoop,
+        NodeKind, ParallelLoop, ParallelOutputMode, SampleRange, SequentialLoop,
     },
     types::{MatrixType, WireType},
 };
@@ -1251,6 +1251,7 @@ impl TrapdoorFamily {
                     LoopInputMode::Broadcast,
                     LoopInputMode::Broadcast,
                 ],
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge([
@@ -1295,6 +1296,7 @@ impl TrapdoorFamily {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge([self.pending, body_value.pending().remap(&sealed.remap)]);
@@ -1343,6 +1345,7 @@ impl TrapdoorFamily {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge([
@@ -1711,6 +1714,7 @@ impl Family<Int> {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge([self.pending, body_value.pending().remap(&sealed.remap)]);
@@ -1768,6 +1772,7 @@ impl Family<Int> {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge(
@@ -1969,6 +1974,7 @@ where
             index_slot,
             bindings: Vec::new(),
             input_modes: modes,
+            output_mode: ParallelOutputMode::Family,
         },
     );
     let pending = Pending::merge([family.pending, body_value.pending().remap(&sealed.remap)]);
@@ -2046,6 +2052,7 @@ where
             index_slot,
             bindings: Vec::new(),
             input_modes: vec![LoopInputMode::Zip, LoopInputMode::Broadcast],
+            output_mode: ParallelOutputMode::Family,
         },
     );
     let pending = Pending::merge([
@@ -2194,6 +2201,7 @@ impl Family<Mat> {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: vec![LoopInputMode::Zip, LoopInputMode::Broadcast],
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge([
@@ -2256,6 +2264,7 @@ impl Family<Mat> {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge(
@@ -2266,6 +2275,147 @@ impl Family<Mat> {
         );
         let mut next_port = 0;
         body_value.parallel_families(&node, &mut next_port, &count, pending)
+    }
+
+    /// Fallible counterpart of [`Self::parallel_zip_many_values`].  The
+    /// closure is built once inside a structural loop and may reject a
+    /// schema without requiring callers to capture families as ad-hoc nodes.
+    pub fn try_parallel_zip_many_values<R: ParallelOutput>(
+        families: Vec<Self>,
+        body: impl FnOnce(LoopIndex, Vec<Mat>) -> Result<R, DslError>,
+    ) -> Result<R::Families, DslError> {
+        let Some(first) = families.first() else { return Err(DslError::Schema) };
+        let count = first.count.clone();
+        if families.iter().any(|family| family.count != count) {
+            return Err(DslError::FamilyCountMismatch);
+        }
+        let element_types =
+            families.iter().map(|f| f.element_schema.matrix_type.clone()).collect::<Vec<_>>();
+        let (index_slot, body_result) = with_loop_index(|index| {
+            with_new_construction_scope(|scope| {
+                let inputs = element_types
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, matrix_type)| {
+                        Mat::source_input(format!("try-zip-item-{index}"), matrix_type, None)
+                    })
+                    .collect::<Vec<_>>();
+                let explicit_inputs = inputs.iter().map(|input| input.value.clone()).collect();
+                body(index, inputs).map(|output| (output, explicit_inputs, scope))
+            })
+        });
+        let (body_value, explicit_inputs, scope) = body_result?;
+        let sealed = SubgraphHandle::seal(
+            "parallel-zip-many-body",
+            scope,
+            explicit_inputs,
+            body_value.flatten(),
+            CapturePolicy::BroadcastScalarsAndArtifactFamilies,
+        )?;
+        let mut arguments = families.iter().map(|family| family.value.clone()).collect::<Vec<_>>();
+        let mut modes = vec![LoopInputMode::Zip; families.len()];
+        arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
+        modes.extend((0..sealed.captures.len()).map(|_| LoopInputMode::Broadcast));
+        let family_outputs = body_value.parallel_family_types(&count)?;
+        let node = NodeHandle::parallel_loop(
+            sealed.handle,
+            arguments,
+            family_outputs,
+            ParallelLoop {
+                count: count.clone(),
+                minimum_count: 0,
+                index_slot,
+                bindings: Vec::new(),
+                input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
+            },
+        );
+        let pending = Pending::merge(
+            families
+                .into_iter()
+                .map(|family| family.pending)
+                .chain(std::iter::once(body_value.pending().remap(&sealed.remap))),
+        );
+        let mut next_port = 0;
+        body_value.parallel_families(&node, &mut next_port, &count, pending)
+    }
+
+    /// Builds one matrix whose columns are the ordered outputs of a
+    /// structural loop. The loop body is lowered once and must return an
+    /// `m x 1` matrix; iteration `j` becomes output column `j`.
+    pub fn try_parallel_zip_many_columns(
+        families: Vec<Self>,
+        body: impl FnOnce(LoopIndex, Vec<Mat>) -> Result<Mat, DslError>,
+    ) -> Result<Mat, DslError> {
+        let Some(first) = families.first() else { return Err(DslError::Schema) };
+        let count = first.count.clone();
+        if families.iter().any(|family| family.count != count) {
+            return Err(DslError::FamilyCountMismatch);
+        }
+        let element_types = families
+            .iter()
+            .map(|family| family.element_schema.matrix_type.clone())
+            .collect::<Vec<_>>();
+        let (index_slot, body_result) = with_loop_index(|index| {
+            with_new_construction_scope(|scope| {
+                let inputs = element_types
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, matrix_type)| {
+                        Mat::source_input(format!("column-item-{index}"), matrix_type, None)
+                    })
+                    .collect::<Vec<_>>();
+                let explicit_inputs = inputs.iter().map(|input| input.value.clone()).collect();
+                body(index, inputs).map(|output| (output, explicit_inputs, scope))
+            })
+        });
+        let (body_value, explicit_inputs, scope) = body_result?;
+        if body_value
+            .matrix_type
+            .columns
+            .evaluate(&ParamEnv::default())
+            .ok()
+            .map_or(true, |value| value != num_bigint::BigInt::from(1))
+        {
+            return Err(DslError::Schema);
+        }
+        let sealed = SubgraphHandle::seal(
+            "parallel-zip-many-columns-body",
+            scope,
+            explicit_inputs,
+            vec![body_value.value.clone()],
+            CapturePolicy::BroadcastScalarsAndArtifactFamilies,
+        )?;
+        let mut arguments = families.iter().map(|family| family.value.clone()).collect::<Vec<_>>();
+        let mut modes = vec![LoopInputMode::Zip; families.len()];
+        arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
+        modes.extend((0..sealed.captures.len()).map(|_| LoopInputMode::Broadcast));
+        let mut output_type = body_value.matrix_type.clone();
+        output_type.columns = count.clone();
+        let node = NodeHandle::parallel_loop(
+            sealed.handle,
+            arguments,
+            vec![WireType::Matrix(output_type.clone())],
+            ParallelLoop {
+                count: count.clone(),
+                minimum_count: 1,
+                index_slot,
+                bindings: Vec::new(),
+                input_modes: modes,
+                output_mode: ParallelOutputMode::CollectColumns,
+            },
+        );
+        let pending = Pending::merge(
+            families
+                .into_iter()
+                .map(|family| family.pending)
+                .chain(std::iter::once(body_value.pending().remap(&sealed.remap))),
+        );
+        Ok(Mat {
+            value: node.output(0).ok_or(DslError::Schema)?,
+            matrix_type: output_type,
+            pending,
+        })
     }
 
     pub fn parallel_zip_many_with_broadcast_values<R: ParallelOutput>(
@@ -2342,6 +2492,7 @@ impl Family<Mat> {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge(
@@ -2392,6 +2543,7 @@ impl Family<Mat> {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge([self.pending, body_value.pending().remap(&sealed.remap)]);
@@ -2566,6 +2718,7 @@ impl Family<Mat> {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge([
@@ -2626,6 +2779,7 @@ impl Family<Mat> {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge([
@@ -2691,6 +2845,7 @@ impl Family<Mat> {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = Pending::merge([
@@ -2724,6 +2879,7 @@ fn parallel_unary_node(
             index_slot,
             bindings: Vec::new(),
             input_modes: modes,
+            output_mode: ParallelOutputMode::Family,
         },
     )
 }
@@ -2870,6 +3026,7 @@ impl ParallelRange {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = body_value.pending().remap(&sealed.remap);
@@ -2906,6 +3063,7 @@ impl ParallelRange {
                 index_slot,
                 bindings: Vec::new(),
                 input_modes: modes,
+                output_mode: ParallelOutputMode::Family,
             },
         );
         let pending = body_value.pending().remap(&sealed.remap);
@@ -3065,6 +3223,7 @@ fn finish_parallel_zip<R: ParallelOutput>(
             index_slot,
             bindings: Vec::new(),
             input_modes: modes,
+            output_mode: ParallelOutputMode::Family,
         },
     );
     let pending = Pending::merge(
@@ -5113,6 +5272,69 @@ mod tests {
             ),
             Err(DslError::FamilyCountMismatch)
         ));
+    }
+
+    #[test]
+    fn try_parallel_zip_many_builds_one_loop_and_propagates_body_errors() {
+        let ring = Ring::new(17, 8);
+        let left =
+            Family::pack(vec![ring.input("left-0", (1, 1)), ring.input("left-1", (1, 1))]).unwrap();
+        let right =
+            Family::pack(vec![ring.input("right-0", (1, 1)), ring.input("right-1", (1, 1))])
+                .unwrap();
+        let body_calls = std::cell::Cell::new(0);
+        let (sums, products) =
+            Family::<Mat>::try_parallel_zip_many_values(vec![left, right], |_index, mut items| {
+                body_calls.set(body_calls.get() + 1);
+                assert_eq!(items.len(), 2);
+                let left = items.remove(0);
+                let right = items.remove(0);
+                Ok((left.clone() + right.clone(), left * right))
+            })
+            .unwrap();
+        assert_eq!(body_calls.get(), 1);
+        assert_eq!(sums.count(), &IntExpr::constant(2));
+        assert_eq!(products.count(), &IntExpr::constant(2));
+
+        let built = DslContext::new("try-parallel-zip-many")
+            .public_family_output("sums", sums)
+            .unwrap()
+            .public_family_output("products", products)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        assert_eq!(
+            built
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+                .count(),
+            1
+        );
+        let expected_family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(ring.matrix_type((1, 1)))),
+            count: IntExpr::constant(2),
+        };
+        for name in ["sums", "products"] {
+            let output = built.graph.outputs()[name].value;
+            let node = built.graph.root_scope().node(output.node).expect("family output node");
+            assert_eq!(
+                node.output(output.port.0).expect("family output port").wire_type(),
+                &expected_family_type
+            );
+        }
+
+        let error = Family::<Mat>::try_parallel_zip_many_values::<Mat>(
+            vec![
+                Family::pack(vec![ring.input("error-left-0", (1, 1))]).unwrap(),
+                Family::pack(vec![ring.input("error-right-0", (1, 1))]).unwrap(),
+            ],
+            |_index, _items| Err(DslError::Schema),
+        );
+        assert!(matches!(error, Err(DslError::Schema)));
     }
 
     #[test]

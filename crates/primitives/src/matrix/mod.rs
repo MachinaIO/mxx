@@ -233,6 +233,15 @@ pub trait PolyMatrix:
         }
     }
 
+    /// Copies an ordered wave of one-column matrices into consecutive columns.
+    /// CPU implementations use the ordinary block-copy primitive; device
+    /// implementations may override this with one batched native operation.
+    fn copy_columns_from(&mut self, sources: &[&Self], dst_col: usize) {
+        for (offset, source) in sources.iter().enumerate() {
+            self.copy_block_from(source, 0, dst_col + offset, 0, 0, self.row_size(), 1);
+        }
+    }
+
     fn into_compact_bytes(self) -> Vec<u8>;
     fn to_compact_bytes(&self) -> Vec<u8> {
         self.clone().into_compact_bytes()

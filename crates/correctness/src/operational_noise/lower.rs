@@ -6,11 +6,12 @@
 
 use super::{
     arena::{
-        ConstantValue, DeterministicHashDefinition, DeterministicHashDescriptor, ExprId,
-        FamilyDomain, MatrixConstantKind, MatrixLayout, MatrixOperation, ProgramInput,
-        ProgramSignature, ResolvedMatrixType, ResolvedValueType, SampleEventId, SamplerOperation,
-        ScalarOperation, SemanticFamilySourceIdentity, SemanticSourceIdentity, TrapdoorOperation,
-        TrustedIndexRange, TypedConstant, ValueOperator, ValueTransformOperation,
+        ConstantValue, DeterministicHashDefinition, DeterministicHashDescriptor,
+        ExactSubstitutionEngine, ExprId, FamilyDomain, MatrixConstantKind, MatrixLayout,
+        MatrixOperation, ProgramInput, ProgramSignature, ResolvedMatrixType, ResolvedValueType,
+        SampleEventId, SamplerOperation, ScalarOperation, SemanticFamilySourceIdentity,
+        SemanticSourceIdentity, TrapdoorOperation, TrustedIndexRange, TypedConstant, ValueOperator,
+        ValueTransformOperation,
     },
     facts::{CoefficientBound, MatrixFacts, MatrixMetadata, NumericContract, PolynomialFacts},
     g0::{
@@ -19,7 +20,7 @@ use super::{
         SliceMemberRole, SourceClass, SourceHandle, SynchronizedSliceGroup,
     },
     job::{CandidateToken, CheckerJob, JobError},
-    program::{FamilyValueId, SelectionSelector},
+    program::{FamilyValueId, ProgramArenaCounters, SelectionSelector},
     protocol::{ArtifactProducer, PlannedWire, ProgramOccurrence, ProtocolPlan},
     relation::{
         DecompositionContract, FactorOrderContract, GadgetContract, GadgetRecompositionRule,
@@ -39,10 +40,15 @@ use mxx_ir_core::{
         ConstantMatrix, HashVariant as IrHashVariant, IntBinaryOp, IntCompareOp, LoopInputMode,
         MatrixBinaryOp, NodeKind, RealBinaryOp,
     },
+    types::MatrixType,
 };
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{Signed, ToPrimitive, Zero};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 use tracing::info;
 
@@ -57,6 +63,671 @@ struct RelationCandidate {
 }
 
 type ScopedExprKey = (ProgramOccurrence, ExprId);
+
+/// Dense occurrence-aware index for the wires reached by the protocol plan.
+///
+/// `PlannedWire` remains the semantic identity and is never replaced in diagnostics or
+/// relation keys.  The slot is only an implementation index for the lowerer's memo table, so
+/// cache invalidation does not need to scan a map containing every reached wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WireSlot(usize);
+
+/// The immutable lowering record for one planned wire.  This is deliberately private to the
+/// production adapter: the protocol plan remains the semantic source of truth, while the dense
+/// records avoid cloning a `PlannedNode` and re-looking it up for every sequential iteration.
+#[derive(Clone, Debug)]
+struct CompiledPlanEntry {
+    wire: Arc<PlannedWire>,
+    kind: Option<Arc<NodeKind>>,
+    output_type: Option<Arc<WireType>>,
+    arguments: Arc<[WireSlot]>,
+    alias_target: Option<WireSlot>,
+    artifact_target: Option<WireSlot>,
+    artifact_producer: Option<ArtifactProducer>,
+    is_artifact_producer: bool,
+    output_target: Option<WireSlot>,
+    child: Option<Arc<CompiledChild>>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledChild {
+    occurrence: ProgramOccurrence,
+    inputs: Arc<[PlannedWire]>,
+    outputs: Arc<[WireRef]>,
+    output_slots: Arc<[WireSlot]>,
+}
+
+#[derive(Clone, Debug)]
+struct LoweringIndex {
+    slots: BTreeMap<PlannedWire, WireSlot>,
+    entries: Vec<CompiledPlanEntry>,
+}
+
+impl LoweringIndex {
+    fn from_plan(
+        plan: &ProtocolPlan,
+        graphs: &BTreeMap<StageId, &Graph>,
+    ) -> Result<Self, ProductionAdapterError> {
+        let mut wires = BTreeSet::new();
+        wires.extend(plan.nodes().keys().cloned());
+        for (wire, node) in plan.nodes() {
+            wires.extend(node.arguments.iter().map(|argument| PlannedWire {
+                stage: wire.stage.clone(),
+                occurrence: wire.occurrence.clone(),
+                wire: *argument,
+            }));
+        }
+        for alias in plan.aliases() {
+            wires.insert(alias.child.clone());
+            wires.insert(alias.parent.clone());
+        }
+        for mapping in plan.output_mappings() {
+            wires.insert(mapping.parent.clone());
+            wires.insert(mapping.child.clone());
+        }
+        for producer in plan.artifact_producers() {
+            wires.insert(producer.consumer.clone());
+            wires.insert(producer.producer.clone());
+        }
+        for (wire, node) in plan.nodes() {
+            if !matches!(
+                node.kind,
+                NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_)
+            ) {
+                continue;
+            }
+            let occurrence = plan.child_occurrence(wire).cloned().ok_or_else(|| {
+                ProductionAdapterError::Structural {
+                    wire: wire.clone(),
+                    reason: "missing planned child occurrence".to_owned(),
+                }
+            })?;
+            let scope = graphs
+                .get(&wire.stage)
+                .and_then(|graph| graph.scope(&occurrence.definition))
+                .ok_or_else(|| ProductionAdapterError::Structural {
+                    wire: wire.clone(),
+                    reason: "missing child scope".to_owned(),
+                })?;
+            for child_wire in scope.inputs().iter().chain(scope.outputs().iter()) {
+                wires.insert(PlannedWire {
+                    stage: wire.stage.clone(),
+                    occurrence: occurrence.clone(),
+                    wire: *child_wire,
+                });
+            }
+        }
+        wires.insert(plan.target().residual.clone());
+        wires.insert(plan.target().decoder.clone());
+        let slots: BTreeMap<PlannedWire, WireSlot> =
+            wires.iter().cloned().enumerate().map(|(slot, wire)| (wire, WireSlot(slot))).collect();
+        let entries = wires
+            .into_iter()
+            .map(|wire| {
+                let node = plan.nodes().get(&wire);
+                let source_arguments: &[WireRef] =
+                    node.map(|node| node.arguments.as_ref()).unwrap_or(&[]);
+                let arguments: Arc<[WireSlot]> = source_arguments
+                    .iter()
+                    .map(|argument| {
+                        let argument = PlannedWire {
+                            stage: wire.stage.clone(),
+                            occurrence: wire.occurrence.clone(),
+                            wire: *argument,
+                        };
+                        slots
+                            .get(&argument)
+                            .copied()
+                            .ok_or_else(|| ProductionAdapterError::MissingWire { wire: argument })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into();
+                let kind = node.map(|node| Arc::new(node.kind.clone()));
+                let child = if matches!(
+                    kind.as_deref(),
+                    Some(
+                        NodeKind::SubgraphCall(_) |
+                            NodeKind::ParallelLoop(_) |
+                            NodeKind::SequentialLoop(_)
+                    )
+                ) {
+                    let occurrence = plan.child_occurrence(&wire).cloned().ok_or_else(|| {
+                        ProductionAdapterError::Structural {
+                            wire: wire.clone(),
+                            reason: "missing planned child occurrence".to_owned(),
+                        }
+                    })?;
+                    let scope = graphs
+                        .get(&wire.stage)
+                        .and_then(|graph| graph.scope(&occurrence.definition))
+                        .ok_or_else(|| ProductionAdapterError::Structural {
+                            wire: wire.clone(),
+                            reason: "missing child scope".to_owned(),
+                        })?;
+                    let inputs: Arc<[PlannedWire]> = scope
+                        .inputs()
+                        .iter()
+                        .map(|child_wire| PlannedWire {
+                            stage: wire.stage.clone(),
+                            occurrence: occurrence.clone(),
+                            wire: *child_wire,
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
+                    let outputs: Arc<[WireRef]> = scope.outputs().to_vec().into();
+                    let output_slots = child_slots(&wire, &occurrence, &outputs, &slots)?;
+                    Some(Arc::new(CompiledChild { occurrence, inputs, outputs, output_slots }))
+                } else {
+                    None
+                };
+                Ok(CompiledPlanEntry {
+                    wire: Arc::new(wire.clone()),
+                    kind,
+                    output_type: node.map(|node| Arc::new(node.output_type.clone())),
+                    arguments,
+                    alias_target: edge_slot(
+                        plan.aliases()
+                            .iter()
+                            .find(|alias| alias.child == wire)
+                            .map(|alias| &alias.parent),
+                        &slots,
+                    )?,
+                    artifact_target: edge_slot(
+                        plan.artifact_producers()
+                            .iter()
+                            .find(|producer| producer.consumer == wire)
+                            .map(|producer| &producer.producer),
+                        &slots,
+                    )?,
+                    artifact_producer: plan
+                        .artifact_producers()
+                        .iter()
+                        .find(|producer| producer.consumer == wire)
+                        .cloned(),
+                    is_artifact_producer: plan
+                        .artifact_producers()
+                        .iter()
+                        .any(|producer| producer.producer == wire),
+                    output_target: edge_slot(
+                        plan.output_mappings()
+                            .iter()
+                            .find(|mapping| mapping.parent == wire)
+                            .map(|mapping| &mapping.child),
+                        &slots,
+                    )?,
+                    child,
+                })
+            })
+            .collect::<Result<Vec<_>, ProductionAdapterError>>()?;
+        Ok(Self { slots, entries })
+    }
+
+    fn slot(&self, wire: &PlannedWire) -> Option<WireSlot> {
+        self.slots.get(wire).copied()
+    }
+
+    fn entry(&self, slot: WireSlot) -> Option<&CompiledPlanEntry> {
+        self.entries.get(slot.0)
+    }
+}
+
+fn edge_slot(
+    target: Option<&PlannedWire>,
+    slots: &BTreeMap<PlannedWire, WireSlot>,
+) -> Result<Option<WireSlot>, ProductionAdapterError> {
+    target
+        .map(|wire| {
+            slots
+                .get(wire)
+                .copied()
+                .ok_or_else(|| ProductionAdapterError::MissingWire { wire: wire.clone() })
+        })
+        .transpose()
+}
+
+fn child_slots(
+    owner: &PlannedWire,
+    occurrence: &ProgramOccurrence,
+    wires: &[WireRef],
+    slots: &BTreeMap<PlannedWire, WireSlot>,
+) -> Result<Arc<[WireSlot]>, ProductionAdapterError> {
+    wires
+        .iter()
+        .map(|wire| {
+            let planned = PlannedWire {
+                stage: owner.stage.clone(),
+                occurrence: occurrence.clone(),
+                wire: *wire,
+            };
+            slots
+                .get(&planned)
+                .copied()
+                .ok_or(ProductionAdapterError::MissingWire { wire: planned })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Into::into)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MemoEntry {
+    /// Entries from the current generation are iteration-local. Entries marked with an invariant
+    /// invocation remain reusable while that exact sequential invocation is active.
+    generation: u64,
+    invariant_invocation: Option<u64>,
+    value: Value,
+}
+
+/// Immutable lexical override environment.  Each extension owns only its local bindings and
+/// points at its parent; resolve frames therefore pass a small `EnvId` instead of cloning the
+/// complete override map at every child edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EnvId(usize);
+
+#[derive(Clone, Debug)]
+struct ResolveEnv {
+    parent: Option<EnvId>,
+    bindings: BTreeMap<PlannedWire, Value>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ResolveEnvArena {
+    environments: Vec<ResolveEnv>,
+    #[cfg(test)]
+    peak: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LoopEnvId(usize);
+
+#[derive(Clone, Debug)]
+struct LoopEnvFrame {
+    parent: Option<LoopEnvId>,
+    slot: u32,
+    index: Option<BigInt>,
+    argument: Option<ExprId>,
+    range: Option<(ProgramOccurrence, ExprId, TrustedIndexRange)>,
+}
+
+#[derive(Clone, Debug)]
+struct LoopEnvArena {
+    frames: Vec<LoopEnvFrame>,
+    #[cfg(test)]
+    peak: usize,
+}
+
+impl LoopEnvArena {
+    fn root() -> Self {
+        // Slot zero is a permanent root sentinel. Keeping it in the arena prevents the first
+        // real frame of a later sibling loop from being confused with the root environment.
+        Self {
+            frames: vec![LoopEnvFrame {
+                parent: None,
+                slot: u32::MAX,
+                index: None,
+                argument: None,
+                range: None,
+            }],
+            #[cfg(test)]
+            peak: 1,
+        }
+    }
+
+    fn push_parallel(
+        &mut self,
+        parent: LoopEnvId,
+        slot: u32,
+        argument: ExprId,
+        owner: ProgramOccurrence,
+        range: TrustedIndexRange,
+    ) -> LoopEnvId {
+        let id = LoopEnvId(self.frames.len());
+        self.frames.push(LoopEnvFrame {
+            parent: Some(parent),
+            slot,
+            index: None,
+            argument: Some(argument),
+            range: Some((owner, argument, range)),
+        });
+        #[cfg(test)]
+        {
+            self.peak = self.peak.max(self.frames.len());
+        }
+        id
+    }
+
+    fn push_sequential(&mut self, parent: LoopEnvId, slot: u32, index: BigInt) -> LoopEnvId {
+        let id = LoopEnvId(self.frames.len());
+        self.frames.push(LoopEnvFrame {
+            parent: Some(parent),
+            slot,
+            index: Some(index),
+            argument: None,
+            range: None,
+        });
+        #[cfg(test)]
+        {
+            self.peak = self.peak.max(self.frames.len());
+        }
+        id
+    }
+
+    fn bindings(&self, mut environment: LoopEnvId) -> impl Iterator<Item = &LoopEnvFrame> {
+        std::iter::from_fn(move || {
+            let frame = self.frames.get(environment.0)?;
+            let next = frame.parent;
+            environment = next?;
+            Some(frame)
+        })
+    }
+
+    fn checkpoint(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn truncate(&mut self, checkpoint: usize) {
+        self.frames.truncate(checkpoint.max(1));
+    }
+
+    #[cfg(test)]
+    fn peak(&self) -> usize {
+        self.peak
+    }
+
+    fn slot(&self, environment: LoopEnvId, slot: u32) -> Option<&LoopEnvFrame> {
+        self.bindings(environment).find(|frame| frame.slot == slot)
+    }
+
+    fn ranges(&self, environment: LoopEnvId) -> Vec<(ScopedExprKey, TrustedIndexRange)> {
+        self.bindings(environment)
+            .filter_map(|frame| {
+                frame.range.clone().map(|(owner, expression, range)| ((owner, expression), range))
+            })
+            .collect()
+    }
+}
+
+fn node_contains_loop_index(kind: &NodeKind) -> bool {
+    match kind {
+        NodeKind::Input { wire_type, .. } => wire_type_contains_loop_index(wire_type),
+        NodeKind::ConstantInt(_) |
+        NodeKind::ConstantBool(_) |
+        NodeKind::IntToReal |
+        NodeKind::BoolToInt |
+        NodeKind::RealSqrt |
+        NodeKind::MatrixNegate |
+        NodeKind::Transpose |
+        NodeKind::Tensor |
+        NodeKind::Concat { .. } |
+        NodeKind::FamilyGetDynamic => false,
+        NodeKind::ConstantReal(value) => real_contains_loop_index(value),
+        NodeKind::EvaluateInt(expression) => contains_loop_index(expression),
+        NodeKind::ConstantMatrix { matrix_type, value } => {
+            matrix_type_contains_loop_index(matrix_type) ||
+                constant_matrix_contains_loop_index(value)
+        }
+        NodeKind::GadgetTrapdoor { matrix_type, base } => {
+            matrix_type_contains_loop_index(matrix_type) || contains_loop_index(base)
+        }
+        NodeKind::TrapdoorPublic => false,
+        NodeKind::IntBinary(_) |
+        NodeKind::IntCompare(_) |
+        NodeKind::RealBinary(_) |
+        NodeKind::MatrixBinary(_) => false,
+        NodeKind::BitExtract { bit } => contains_loop_index(bit),
+        NodeKind::MatrixMulAccumulate { coefficients, .. } => {
+            coefficients.iter().any(contains_loop_index)
+        }
+        NodeKind::MatrixScale { scalar } => contains_loop_index(scalar),
+        NodeKind::RingAutomorphism { index } => contains_loop_index(index),
+        NodeKind::Slice { rows, columns } => {
+            rows.as_ref()
+                .is_some_and(|r| contains_loop_index(&r.start) || contains_loop_index(&r.end)) ||
+                columns.as_ref().is_some_and(|r| {
+                    contains_loop_index(&r.start) || contains_loop_index(&r.end)
+                })
+        }
+        NodeKind::UniformResidueSample { matrix_type } => {
+            matrix_type_contains_loop_index(matrix_type)
+        }
+        NodeKind::UniformIntervalSample { matrix_type, range } => {
+            matrix_type_contains_loop_index(matrix_type) ||
+                contains_loop_index(&range.minimum) ||
+                contains_loop_index(&range.maximum)
+        }
+        NodeKind::GaussianSample { matrix_type, sigma, max_coefficient_bound } => {
+            matrix_type_contains_loop_index(matrix_type) ||
+                real_contains_loop_index(sigma) ||
+                contains_loop_index(max_coefficient_bound)
+        }
+        NodeKind::HashSample {
+            matrix_type,
+            tag_expressions,
+            tag_decimal_expressions,
+            tag_u64_le_expressions,
+            base,
+            digit_count,
+            ..
+        } => {
+            matrix_type_contains_loop_index(matrix_type) ||
+                tag_expressions.iter().any(contains_loop_index) ||
+                tag_decimal_expressions.iter().any(contains_loop_index) ||
+                tag_u64_le_expressions.iter().any(contains_loop_index) ||
+                base.as_ref().is_some_and(contains_loop_index) ||
+                digit_count.as_ref().is_some_and(contains_loop_index)
+        }
+        NodeKind::TrapdoorSample {
+            matrix_type,
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+            ..
+        } => {
+            matrix_type_contains_loop_index(matrix_type) ||
+                real_contains_loop_index(sigma) ||
+                contains_loop_index(gadget_base) ||
+                contains_loop_index(digit_count) ||
+                contains_loop_index(preimage_max_coefficient_bound)
+        }
+        NodeKind::PreimageSample { matrix_type, max_coefficient_bound } => {
+            matrix_type_contains_loop_index(matrix_type) ||
+                contains_loop_index(max_coefficient_bound)
+        }
+        NodeKind::GadgetDecompose { base, digit_count, .. } => {
+            contains_loop_index(base) || contains_loop_index(digit_count)
+        }
+        NodeKind::ExtractCoefficient { position, .. } => contains_loop_index(position),
+        NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
+            matrix_type_contains_loop_index(matrix_type)
+        }
+        NodeKind::ThresholdDecode { plaintext_modulus, length, .. } => {
+            contains_loop_index(plaintext_modulus) || contains_loop_index(length)
+        }
+        NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => {
+            plaintext_moduli.iter().any(contains_loop_index) ||
+                reconstruction_coefficients.iter().any(contains_loop_index)
+        }
+        NodeKind::PackPolynomialCoefficients { matrix_type, coefficient_bits } => {
+            matrix_type_contains_loop_index(matrix_type) || contains_loop_index(coefficient_bits)
+        }
+        NodeKind::SubgraphCall(call) => {
+            call.bindings.iter().any(|(_, expression)| contains_loop_index(expression))
+        }
+        NodeKind::ParallelLoop(loop_spec) => {
+            contains_loop_index(&loop_spec.count) ||
+                loop_spec.bindings.iter().any(|(_, expression)| contains_loop_index(expression))
+        }
+        NodeKind::SequentialLoop(loop_spec) => {
+            contains_loop_index(&loop_spec.count) ||
+                loop_spec.bindings.iter().any(|(_, expression)| contains_loop_index(expression))
+        }
+        NodeKind::FamilyPack { count } => contains_loop_index(count),
+        NodeKind::FamilyGetStatic { index } => contains_loop_index(index),
+        NodeKind::Select { count } => contains_loop_index(count),
+    }
+}
+
+fn constant_matrix_contains_loop_index(value: &ConstantMatrix) -> bool {
+    match value {
+        ConstantMatrix::Zero | ConstantMatrix::Identity => false,
+        ConstantMatrix::UnitRow { index } |
+        ConstantMatrix::UnitColumn { index } |
+        ConstantMatrix::Rotation { exponent: index } => contains_loop_index(index),
+        ConstantMatrix::Gadget { base, .. } => contains_loop_index(base),
+        ConstantMatrix::PowerOfBase { base, exponent } => {
+            contains_loop_index(base) || contains_loop_index(exponent)
+        }
+        ConstantMatrix::Polynomial { coefficients } => coefficients.iter().any(contains_loop_index),
+    }
+}
+
+fn real_contains_loop_index(value: &RealExpr) -> bool {
+    match value {
+        RealExpr::Rational(_) | RealExpr::Var(_) => false,
+        RealExpr::FromInt(value) => contains_loop_index(value),
+        RealExpr::Add(left, right) |
+        RealExpr::Sub(left, right) |
+        RealExpr::Mul(left, right) |
+        RealExpr::Div(left, right) => {
+            real_contains_loop_index(left) || real_contains_loop_index(right)
+        }
+        RealExpr::Sqrt(value) => real_contains_loop_index(value),
+    }
+}
+
+fn matrix_type_contains_loop_index(value: &MatrixType) -> bool {
+    contains_loop_index(&value.modulus) ||
+        contains_loop_index(&value.ring_dimension) ||
+        contains_loop_index(&value.rows) ||
+        contains_loop_index(&value.columns)
+}
+
+fn wire_type_contains_loop_index(value: &WireType) -> bool {
+    match value {
+        WireType::ConstantInt |
+        WireType::ConstantReal |
+        WireType::ConstantBool |
+        WireType::Int |
+        WireType::Real |
+        WireType::Bool |
+        WireType::TypedBlob { .. } => false,
+        WireType::Bytes { length } => contains_loop_index(length),
+        WireType::Matrix(matrix) | WireType::Preimage(matrix) => {
+            matrix_type_contains_loop_index(matrix)
+        }
+        WireType::Trapdoor {
+            matrix,
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+        } => {
+            matrix_type_contains_loop_index(matrix) ||
+                real_contains_loop_index(sigma) ||
+                contains_loop_index(gadget_base) ||
+                contains_loop_index(digit_count) ||
+                contains_loop_index(preimage_max_coefficient_bound)
+        }
+        WireType::IndexedFamily { element, count } => {
+            wire_type_contains_loop_index(element) || contains_loop_index(count)
+        }
+    }
+}
+
+fn node_has_lowering_effect(kind: &NodeKind) -> bool {
+    match kind {
+        NodeKind::GadgetTrapdoor { .. } |
+        NodeKind::UniformResidueSample { .. } |
+        NodeKind::UniformIntervalSample { .. } |
+        NodeKind::GaussianSample { .. } |
+        NodeKind::HashSample { .. } |
+        NodeKind::TrapdoorSample { .. } |
+        NodeKind::PreimageSample { .. } |
+        NodeKind::GadgetDecompose { .. } |
+        NodeKind::TrapdoorPublic => true,
+        NodeKind::Input { .. } |
+        NodeKind::ConstantInt(_) |
+        NodeKind::EvaluateInt(_) |
+        NodeKind::ConstantReal(_) |
+        NodeKind::ConstantBool(_) |
+        NodeKind::ConstantMatrix { .. } |
+        NodeKind::IntBinary(_) |
+        NodeKind::IntCompare(_) |
+        NodeKind::BitExtract { .. } |
+        NodeKind::IntToReal |
+        NodeKind::BoolToInt |
+        NodeKind::RealBinary(_) |
+        NodeKind::RealSqrt |
+        NodeKind::MatrixBinary(_) |
+        NodeKind::MatrixMulAccumulate { .. } |
+        NodeKind::MatrixNegate |
+        NodeKind::MatrixScale { .. } |
+        NodeKind::RingAutomorphism { .. } |
+        NodeKind::Transpose |
+        NodeKind::Slice { .. } |
+        NodeKind::Tensor |
+        NodeKind::Concat { .. } |
+        NodeKind::ExtractCoefficient { .. } |
+        NodeKind::LiftIntegerToConstantPolynomial { .. } |
+        NodeKind::ThresholdDecode { .. } |
+        NodeKind::CrtRecompose { .. } |
+        NodeKind::PackPolynomialCoefficients { .. } |
+        NodeKind::SubgraphCall(_) |
+        NodeKind::ParallelLoop(_) |
+        NodeKind::SequentialLoop(_) |
+        NodeKind::FamilyPack { .. } |
+        NodeKind::FamilyGetStatic { .. } |
+        NodeKind::FamilyGetDynamic |
+        NodeKind::Select { .. } => false,
+    }
+}
+
+impl ResolveEnvArena {
+    fn root() -> Self {
+        Self {
+            environments: vec![ResolveEnv { parent: None, bindings: BTreeMap::new() }],
+            #[cfg(test)]
+            peak: 1,
+        }
+    }
+
+    fn extend<I>(&mut self, parent: EnvId, bindings: I) -> EnvId
+    where
+        I: IntoIterator<Item = (PlannedWire, Value)>,
+    {
+        let id = EnvId(self.environments.len());
+        self.environments
+            .push(ResolveEnv { parent: Some(parent), bindings: bindings.into_iter().collect() });
+        #[cfg(test)]
+        {
+            self.peak = self.peak.max(self.environments.len());
+        }
+        id
+    }
+
+    fn lookup(&self, mut environment: EnvId, wire: &PlannedWire) -> Option<Value> {
+        loop {
+            let frame = self.environments.get(environment.0)?;
+            if let Some(value) = frame.bindings.get(wire).copied() {
+                return Some(value);
+            }
+            environment = frame.parent?;
+        }
+    }
+
+    fn checkpoint(&self) -> usize {
+        self.environments.len()
+    }
+
+    fn truncate(&mut self, checkpoint: usize) {
+        self.environments.truncate(checkpoint.max(1));
+    }
+
+    #[cfg(test)]
+    fn peak(&self) -> usize {
+        self.peak
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProductionRoot {
@@ -130,30 +801,158 @@ enum NodeKindClass {
     TypedUnsupported,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SelectorPrepassDiagnostics {
+    candidates: u64,
+    closed: u64,
+    skipped: u64,
+    eval_errors: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LoweringDiagnostics {
+    /// Aggregate production counters and phase logs use these fields without enabling a test
+    /// build. They describe generic lowering work only; no protocol value is recorded.
+    resolve_memo_hits: u64,
+    resolve_memo_misses: u64,
+    resolve_work_items: u64,
+    rewrite_requests: u64,
+    rewrite_cache_hits: u64,
+    rewrite_binder_shortcuts: u64,
+    rewrite_skipped_subtrees: u64,
+    rewrite_nodes_visited: u64,
+    rewrite_nodes_reinterned: u64,
+    #[cfg(test)]
+    compiled_plan_builds: u64,
+    #[cfg(test)]
+    compiled_entries_built: u64,
+    #[cfg(test)]
+    compiled_entries_reached: u64,
+    #[cfg(test)]
+    sequential_instantiations: u64,
+    #[cfg(test)]
+    generation_advances: u64,
+    #[cfg(test)]
+    invariant_cache_hits: u64,
+    #[cfg(test)]
+    invariant_invocations: u64,
+    #[cfg(test)]
+    invariant_recomputes: u64,
+    #[cfg(test)]
+    resolve_env_peak: usize,
+    #[cfg(test)]
+    loop_env_peak: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LoweringTelemetrySnapshot {
+    expression_nodes: usize,
+    programs: usize,
+    families: usize,
+    resolve_memo_hits: u64,
+    resolve_memo_misses: u64,
+    resolve_work_items: u64,
+    specialization_requests: u64,
+    specialization_hits: u64,
+    specialization_misses: u64,
+    beta_nodes_visited: u64,
+    beta_nodes_reinterned: u64,
+    substitution_requests: u64,
+    substitution_cache_hits: u64,
+    substitution_binder_shortcuts: u64,
+    substitution_skipped_subtrees: u64,
+    substitution_nodes_visited: u64,
+    substitution_nodes_reinterned: u64,
+    rewrite_requests: u64,
+    rewrite_cache_hits: u64,
+    rewrite_binder_shortcuts: u64,
+    rewrite_skipped_subtrees: u64,
+    rewrite_nodes_visited: u64,
+    rewrite_nodes_reinterned: u64,
+    free_argument_queries: u64,
+    free_argument_nodes_visited: u64,
+    free_argument_root_hits: u64,
+    free_argument_subtree_hits: u64,
+    free_argument_newly_summarized: u64,
+}
+
+impl LoweringTelemetrySnapshot {
+    fn capture<S: FeasibilitySink>(adapter: &ProductionAdapter<'_, S>) -> Self {
+        let free_argument = adapter.job.expressions().free_argument_counter_details();
+        let ProgramArenaCounters {
+            specialization_requests,
+            specialization_hits,
+            specialization_misses,
+            beta_nodes_visited,
+            beta_nodes_reinterned,
+            substitution_requests,
+            substitution_cache_hits,
+            substitution_binder_shortcuts,
+            substitution_skipped_subtrees,
+            substitution_nodes_visited,
+            substitution_nodes_reinterned,
+        } = adapter.job.programs().counters();
+        Self {
+            expression_nodes: adapter.job.expressions().node_count(),
+            programs: adapter.job.programs().len(),
+            families: adapter.job.programs().family_count(),
+            resolve_memo_hits: adapter.lowering_diagnostics.resolve_memo_hits,
+            resolve_memo_misses: adapter.lowering_diagnostics.resolve_memo_misses,
+            resolve_work_items: adapter.lowering_diagnostics.resolve_work_items,
+            specialization_requests,
+            specialization_hits,
+            specialization_misses,
+            beta_nodes_visited,
+            beta_nodes_reinterned,
+            substitution_requests,
+            substitution_cache_hits,
+            substitution_binder_shortcuts,
+            substitution_skipped_subtrees,
+            substitution_nodes_visited,
+            substitution_nodes_reinterned,
+            rewrite_requests: adapter.lowering_diagnostics.rewrite_requests,
+            rewrite_cache_hits: adapter.lowering_diagnostics.rewrite_cache_hits,
+            rewrite_binder_shortcuts: adapter.lowering_diagnostics.rewrite_binder_shortcuts,
+            rewrite_skipped_subtrees: adapter.lowering_diagnostics.rewrite_skipped_subtrees,
+            rewrite_nodes_visited: adapter.lowering_diagnostics.rewrite_nodes_visited,
+            rewrite_nodes_reinterned: adapter.lowering_diagnostics.rewrite_nodes_reinterned,
+            free_argument_queries: free_argument.queries,
+            free_argument_nodes_visited: free_argument.nodes_visited,
+            free_argument_root_hits: free_argument.root_hits,
+            free_argument_subtree_hits: free_argument.subtree_hits,
+            free_argument_newly_summarized: free_argument.newly_summarized,
+        }
+    }
+}
+
 /// State carried by the non-recursive parallel-loop continuation.  The parent arguments and
 /// child inputs are walked one at a time so a loop body can contain arbitrarily deep structural
 /// subgraphs without growing the Rust call stack.
 struct ParallelState {
     wire: PlannedWire,
+    slot: WireSlot,
     spec: mxx_ir_core::node::ParallelLoop,
-    overrides: BTreeMap<PlannedWire, Value>,
+    environment: EnvId,
     domain: FamilyDomain,
     argument: ExprId,
-    parent_args: Box<[WireRef]>,
-    child_inputs: Box<[WireRef]>,
-    child_outputs: Box<[WireRef]>,
+    parent_slots: Arc<[WireSlot]>,
+    child_inputs: Arc<[PlannedWire]>,
+    child_output_slots: Arc<[WireSlot]>,
     child_occurrence: super::protocol::ProgramOccurrence,
     next_input: usize,
-    child_overrides: BTreeMap<PlannedWire, Value>,
+    child_environment: EnvId,
     /// Loop binders that were active before entering this body.  Restoring this snapshot when
     /// the body closes keeps nested/repeated occurrences from leaking a raw slot mapping into a
     /// sibling scope.
-    saved_loop_arguments: BTreeMap<u32, ExprId>,
+    saved_loop_environment: LoopEnvId,
     /// Trusted ranges for the exact open argument expressions above.  These are occurrence-local
     /// facts: the shared prepass cannot attach a range to a raw `Argument(0)` because nested
     /// bodies reuse that position for unrelated binders.
-    saved_loop_argument_ranges: BTreeMap<ScopedExprKey, TrustedIndexRange>,
+    /// Concrete sequential indices that were active before entering this parallel body. The
+    /// body's own slot is removed on entry so a same-slot sequential value cannot leak into a
+    /// symbolic parallel descriptor.
     saved_parallel_depth: usize,
+    env_checkpoint: usize,
 }
 
 /// State carried by the non-recursive sequential-loop continuation.  `carried` is the state at
@@ -161,39 +960,40 @@ struct ParallelState {
 /// atomically, preserving simultaneous multi-carried updates.
 struct SequentialState {
     wire: PlannedWire,
+    slot: WireSlot,
     spec: mxx_ir_core::node::SequentialLoop,
-    overrides: BTreeMap<PlannedWire, Value>,
-    parent_args: Box<[WireRef]>,
-    child_inputs: Box<[WireRef]>,
-    child_outputs: Box<[WireRef]>,
-    child_occurrence: super::protocol::ProgramOccurrence,
+    environment: EnvId,
+    parent_slots: Arc<[WireSlot]>,
+    child_inputs: Arc<[PlannedWire]>,
+    child_outputs: Arc<[WireRef]>,
+    child_output_slots: Arc<[WireSlot]>,
     carried: Vec<Value>,
     invariant: Vec<Value>,
     next_outputs: Vec<Value>,
-    iteration_overrides: BTreeMap<PlannedWire, Value>,
+    iteration_environment: EnvId,
     iteration: usize,
     count: usize,
-    saved_loop_indices: BTreeMap<u32, BigInt>,
-    saved_loop_arguments: BTreeMap<u32, ExprId>,
-    saved_loop_argument_ranges: BTreeMap<ScopedExprKey, TrustedIndexRange>,
+    saved_loop_environment: LoopEnvId,
+    saved_invariant_invocation: Option<u64>,
+    invariant_invocation: u64,
+    env_checkpoint: usize,
+    loop_checkpoint: usize,
 }
 
 enum ResolveFrame {
     Resolve {
-        wire: PlannedWire,
-        overrides: BTreeMap<PlannedWire, Value>,
+        slot: WireSlot,
+        environment: EnvId,
     },
     Lower {
-        wire: PlannedWire,
-        kind: NodeKind,
-        output: WireType,
-        overrides: BTreeMap<PlannedWire, Value>,
-        arguments: Box<[WireRef]>,
+        slot: WireSlot,
+        environment: EnvId,
+        artifact_producer: bool,
         next: usize,
         inputs: Vec<Value>,
     },
     Store {
-        wire: PlannedWire,
+        slot: WireSlot,
     },
     ParallelPrepare {
         state: ParallelState,
@@ -290,28 +1090,299 @@ pub(crate) struct ProductionAdapter<'a, S: FeasibilitySink = NoFeasibility> {
     params: ParamEnv,
     pub(crate) job: CheckerJob,
     token: CandidateToken,
-    values: BTreeMap<PlannedWire, Value>,
-    aliases: BTreeMap<PlannedWire, PlannedWire>,
-    outputs: BTreeMap<PlannedWire, PlannedWire>,
-    artifacts: BTreeMap<PlannedWire, PlannedWire>,
+    lowering_index: LoweringIndex,
+    values: Vec<Option<MemoEntry>>,
+    memo_generation: u64,
+    envs: ResolveEnvArena,
+    loop_invariant_wires: BTreeMap<ProgramOccurrence, BTreeSet<PlannedWire>>,
+    next_invariant_invocation: u64,
+    active_invariant_invocation: Option<u64>,
+    lowering_diagnostics: LoweringDiagnostics,
+    resolve_progress: ResolveProgress,
     protocol_inputs: BTreeMap<(StageId, StageInputName), ProtocolInputId>,
     input_contracts: BTreeMap<ProtocolInputId, &'a InputValueContract>,
     sample_events: BTreeMap<SampleKey, SampleEventId>,
     static_indices: BTreeMap<PlannedWire, ExprId>,
-    active_loop_indices: BTreeMap<u32, BigInt>,
-    active_loop_arguments: BTreeMap<u32, ExprId>,
-    active_loop_argument_ranges: BTreeMap<ScopedExprKey, TrustedIndexRange>,
+    loop_environment: LoopEnvId,
+    loop_envs: LoopEnvArena,
     active_parallel_depth: usize,
     generated_families: BTreeMap<ScopedExprKey, FamilyValueId>,
+    /// The one fresh lexical binder allocated for each parallel-loop occurrence.  A loop can be
+    /// resolved once per output port, or revisited through aliases; all such passes must use the
+    /// same binder identity so generated families and beta reduction agree on their scope.
+    parallel_formals: BTreeMap<ProgramOccurrence, ExprId>,
     relation_candidates: Vec<RelationCandidate>,
     gadget_decompositions: BTreeMap<ExprId, (ExprId, u64, bool, u32)>,
     trapdoor_values: BTreeMap<SampleKey, ExprId>,
-    occurrence_descendants: BTreeMap<(StageId, ProgramOccurrence), BTreeSet<ProgramOccurrence>>,
-    diagnostic_budget: u16,
+    exact_substitution: ExactSubstitutionEngine,
+    #[cfg(test)]
+    selector_prepass_diagnostics: SelectorPrepassDiagnostics,
     feasibility: S,
 }
 
+/// Low-overhead progress gate for the iterative resolver. It checks the clock only at a small
+/// work-item interval and emits aggregate snapshots, so long lowers remain observable without
+/// producing a per-node trace or affecting semantic evaluation.
+struct ResolveProgress {
+    work_items: u64,
+    next_work_report: u64,
+    last_report: Instant,
+}
+
+impl ResolveProgress {
+    const WORK_REPORT_INTERVAL: u64 = 16_384;
+    const CLOCK_CHECK_INTERVAL: u64 = 4_096;
+    const TIME_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self {
+            work_items: 0,
+            next_work_report: Self::WORK_REPORT_INTERVAL,
+            last_report: Instant::now(),
+        }
+    }
+
+    fn tick(&mut self) -> bool {
+        self.work_items = self.work_items.saturating_add(1);
+        let work_due = self.work_items >= self.next_work_report;
+        let clock_due = self.work_items % Self::CLOCK_CHECK_INTERVAL == 0 &&
+            self.last_report.elapsed() >= Self::TIME_REPORT_INTERVAL;
+        if work_due || clock_due {
+            self.next_work_report = self.work_items.saturating_add(Self::WORK_REPORT_INTERVAL);
+            self.last_report = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
+    fn log_lower_phase(
+        &self,
+        phase: &'static str,
+        started: Instant,
+        before: LoweringTelemetrySnapshot,
+        failed: bool,
+    ) {
+        let after = LoweringTelemetrySnapshot::capture(self);
+        info!(
+            target: "mxx_correctness::operational_noise",
+            phase,
+            errors = u64::from(failed),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            expression_nodes_start = before.expression_nodes,
+            expression_nodes_end = after.expression_nodes,
+            programs_start = before.programs,
+            programs_end = after.programs,
+            families_start = before.families,
+            families_end = after.families,
+            resolved_work_items = after.resolve_work_items.saturating_sub(before.resolve_work_items),
+            resolve_memo_hits = after.resolve_memo_hits.saturating_sub(before.resolve_memo_hits),
+            resolve_memo_misses = after.resolve_memo_misses.saturating_sub(before.resolve_memo_misses),
+            family_specialization_requests = after.specialization_requests.saturating_sub(before.specialization_requests),
+            family_specialization_hits = after.specialization_hits.saturating_sub(before.specialization_hits),
+            family_specialization_misses = after.specialization_misses.saturating_sub(before.specialization_misses),
+            beta_reduction_nodes_visited = after.beta_nodes_visited.saturating_sub(before.beta_nodes_visited),
+            beta_reduction_nodes_reinterned = after.beta_nodes_reinterned.saturating_sub(before.beta_nodes_reinterned),
+            exact_substitution_requests = after.substitution_requests.saturating_sub(before.substitution_requests),
+            exact_substitution_cache_hits = after.substitution_cache_hits.saturating_sub(before.substitution_cache_hits),
+            exact_substitution_binder_shortcuts = after.substitution_binder_shortcuts.saturating_sub(before.substitution_binder_shortcuts),
+            exact_substitution_skipped_subtrees = after.substitution_skipped_subtrees.saturating_sub(before.substitution_skipped_subtrees),
+            exact_substitution_nodes_visited = after.substitution_nodes_visited.saturating_sub(before.substitution_nodes_visited),
+            exact_substitution_nodes_reinterned = after.substitution_nodes_reinterned.saturating_sub(before.substitution_nodes_reinterned),
+            rewrite_requests = after.rewrite_requests.saturating_sub(before.rewrite_requests),
+            rewrite_cache_hits = after.rewrite_cache_hits.saturating_sub(before.rewrite_cache_hits),
+            rewrite_binder_shortcuts = after.rewrite_binder_shortcuts.saturating_sub(before.rewrite_binder_shortcuts),
+            rewrite_skipped_subtrees = after.rewrite_skipped_subtrees.saturating_sub(before.rewrite_skipped_subtrees),
+            rewrite_nodes_visited = after.rewrite_nodes_visited.saturating_sub(before.rewrite_nodes_visited),
+            rewrite_nodes_reinterned = after.rewrite_nodes_reinterned.saturating_sub(before.rewrite_nodes_reinterned),
+            free_argument_queries = after.free_argument_queries.saturating_sub(before.free_argument_queries),
+            free_argument_nodes_visited = after.free_argument_nodes_visited.saturating_sub(before.free_argument_nodes_visited),
+            free_argument_root_hits = after.free_argument_root_hits.saturating_sub(before.free_argument_root_hits),
+            free_argument_subtree_hits = after.free_argument_subtree_hits.saturating_sub(before.free_argument_subtree_hits),
+            free_argument_newly_summarized = after.free_argument_newly_summarized.saturating_sub(before.free_argument_newly_summarized),
+            "operational checker lowering phase"
+        );
+    }
+
+    fn record_resolve_progress(&mut self, phase: &'static str, started: Instant) {
+        let report = self.resolve_progress.tick();
+        self.lowering_diagnostics.resolve_work_items = self.resolve_progress.work_items;
+        if !report {
+            return;
+        }
+        let snapshot = LoweringTelemetrySnapshot::capture(self);
+        info!(
+            target: "mxx_correctness::operational_noise",
+            phase,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            resolved_work_items = snapshot.resolve_work_items,
+            resolve_memo_hits = snapshot.resolve_memo_hits,
+            resolve_memo_misses = snapshot.resolve_memo_misses,
+            family_specialization_requests = snapshot.specialization_requests,
+            family_specialization_hits = snapshot.specialization_hits,
+            family_specialization_misses = snapshot.specialization_misses,
+            beta_reduction_nodes_visited = snapshot.beta_nodes_visited,
+            beta_reduction_nodes_reinterned = snapshot.beta_nodes_reinterned,
+            exact_substitution_requests = snapshot.substitution_requests,
+            exact_substitution_cache_hits = snapshot.substitution_cache_hits,
+            exact_substitution_binder_shortcuts = snapshot.substitution_binder_shortcuts,
+            exact_substitution_skipped_subtrees = snapshot.substitution_skipped_subtrees,
+            exact_substitution_nodes_visited = snapshot.substitution_nodes_visited,
+            exact_substitution_nodes_reinterned = snapshot.substitution_nodes_reinterned,
+            rewrite_requests = snapshot.rewrite_requests,
+            rewrite_cache_hits = snapshot.rewrite_cache_hits,
+            rewrite_binder_shortcuts = snapshot.rewrite_binder_shortcuts,
+            rewrite_skipped_subtrees = snapshot.rewrite_skipped_subtrees,
+            rewrite_nodes_visited = snapshot.rewrite_nodes_visited,
+            rewrite_nodes_reinterned = snapshot.rewrite_nodes_reinterned,
+            free_argument_queries = snapshot.free_argument_queries,
+            free_argument_nodes_visited = snapshot.free_argument_nodes_visited,
+            free_argument_root_hits = snapshot.free_argument_root_hits,
+            free_argument_subtree_hits = snapshot.free_argument_subtree_hits,
+            free_argument_newly_summarized = snapshot.free_argument_newly_summarized,
+            expression_nodes = snapshot.expression_nodes,
+            programs = snapshot.programs,
+            families = snapshot.families,
+            "operational checker resolver progress"
+        );
+    }
+
+    fn memo_get(&mut self, slot: WireSlot, environment: EnvId) -> Option<Value> {
+        let wire = &self.lowering_index.entry(slot)?.wire;
+        if let Some(value) = self.envs.lookup(environment, wire) {
+            self.lowering_diagnostics.resolve_memo_hits =
+                self.lowering_diagnostics.resolve_memo_hits.saturating_add(1);
+            return Some(value);
+        }
+        let Some(entry) = self.values.get(slot.0).and_then(Option::as_ref).copied() else {
+            self.lowering_diagnostics.resolve_memo_misses =
+                self.lowering_diagnostics.resolve_memo_misses.saturating_add(1);
+            return None;
+        };
+        #[cfg(test)]
+        if entry.invariant_invocation.is_some() &&
+            entry.invariant_invocation == self.active_invariant_invocation
+        {
+            self.lowering_diagnostics.invariant_cache_hits =
+                self.lowering_diagnostics.invariant_cache_hits.saturating_add(1);
+        }
+        let value = (entry.generation == self.memo_generation ||
+            entry.invariant_invocation.is_some() &&
+                entry.invariant_invocation == self.active_invariant_invocation)
+            .then_some(entry.value);
+        if value.is_some() {
+            self.lowering_diagnostics.resolve_memo_hits =
+                self.lowering_diagnostics.resolve_memo_hits.saturating_add(1);
+        } else {
+            self.lowering_diagnostics.resolve_memo_misses =
+                self.lowering_diagnostics.resolve_memo_misses.saturating_add(1);
+        }
+        value
+    }
+
+    fn memo_insert(&mut self, slot: WireSlot, value: Value) {
+        let Some(entry) = self.lowering_index.entry(slot) else { return };
+        let wire = &entry.wire;
+        let invariant = self
+            .loop_invariant_wires
+            .get(&wire.occurrence)
+            .is_some_and(|wires| wires.contains(wire.as_ref()));
+        #[cfg(test)]
+        if invariant {
+            if let Some(previous) = self.values[slot.0] {
+                if previous.invariant_invocation.is_some() &&
+                    previous.invariant_invocation != self.active_invariant_invocation
+                {
+                    self.lowering_diagnostics.invariant_recomputes =
+                        self.lowering_diagnostics.invariant_recomputes.saturating_add(1);
+                }
+            }
+        }
+        self.values[slot.0] = Some(MemoEntry {
+            generation: self.memo_generation,
+            invariant_invocation: invariant.then_some(self.active_invariant_invocation).flatten(),
+            value,
+        });
+    }
+
+    /// Compute a conservative fixed point of body wires independent of carried state and loop
+    /// index. This is intentionally generic: it uses only planned wire dependencies and the IR
+    /// node's serialized descriptor, and never teaches the lowerer about a protocol node.
+    fn analyze_loop_invariants(
+        plan: &ProtocolPlan,
+        graphs: &BTreeMap<StageId, &Graph>,
+    ) -> BTreeMap<ProgramOccurrence, BTreeSet<PlannedWire>> {
+        let mut result: BTreeMap<ProgramOccurrence, BTreeSet<PlannedWire>> = BTreeMap::new();
+        for (parent, node) in plan.nodes() {
+            let NodeKind::SequentialLoop(spec) = &node.kind else { continue };
+            let Some(child_occurrence) = plan.child_occurrence(parent) else { continue };
+            let Some(graph) = graphs.get(&parent.stage) else { continue };
+            let Some(scope) = graph.scope(&child_occurrence.definition) else { continue };
+            let child_inputs = scope.inputs();
+            let invariant = result.entry(child_occurrence.clone()).or_default();
+            for input in child_inputs.iter().skip(spec.carried_count) {
+                invariant.insert(PlannedWire {
+                    stage: parent.stage.clone(),
+                    occurrence: child_occurrence.clone(),
+                    wire: *input,
+                });
+            }
+            // Iterate to a fixed point because planned node ordering is by occurrence/wire, not
+            // necessarily topological order.
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for (wire, planned) in plan.nodes() {
+                    if wire.stage != parent.stage ||
+                        wire.occurrence != *child_occurrence ||
+                        invariant.contains(wire) ||
+                        classify_node_kind(&planned.kind) != NodeKindClass::Supported ||
+                        node_contains_loop_index(&planned.kind) ||
+                        wire_type_contains_loop_index(&planned.output_type) ||
+                        node_has_lowering_effect(&planned.kind)
+                    {
+                        continue;
+                    }
+                    let mut arguments = planned.arguments.iter().map(|argument| PlannedWire {
+                        stage: wire.stage.clone(),
+                        occurrence: wire.occurrence.clone(),
+                        wire: *argument,
+                    });
+                    if arguments.all(|argument| invariant.contains(&argument)) {
+                        invariant.insert(wire.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn extend_environment(&mut self, parent: EnvId, wire: PlannedWire, value: Value) -> EnvId {
+        self.envs.extend(parent, [(wire, value)])
+    }
+
+    fn next_memo_generation(&mut self) -> Result<(), ProductionAdapterError> {
+        self.memo_generation = self.memo_generation.checked_add(1).ok_or_else(|| {
+            ProductionAdapterError::Structural {
+                wire: self.plan.target().residual.clone(),
+                reason: "sequential memo generation exhausted".to_owned(),
+            }
+        })?;
+        #[cfg(test)]
+        {
+            self.lowering_diagnostics.generation_advances =
+                self.lowering_diagnostics.generation_advances.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn active_loop_ranges(&self) -> Vec<(ScopedExprKey, TrustedIndexRange)> {
+        self.loop_envs.ranges(self.loop_environment)
+    }
+
     fn record_expression_source_if_enabled<F>(
         &mut self,
         expression: ExprId,
@@ -348,11 +1419,13 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
 
     fn record_producer_artifact_if_enabled(
         &mut self,
-        wire: &PlannedWire,
+        slot: WireSlot,
         value: Value,
     ) -> Result<(), ProductionAdapterError> {
         if S::ENABLED {
-            if let Some(producer) = self.artifact_producer(wire) {
+            if let Some(producer) =
+                self.lowering_index.entry(slot).and_then(|entry| entry.artifact_producer.clone())
+            {
                 let class = SourceClass::ProducerArtifact { producer };
                 let handle = match value {
                     Value::Expr(expression) => SourceHandle::Expression(expression),
@@ -508,9 +1581,10 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
             }
             pending.extend(node.inputs.iter().copied());
         }
-        let mut axes = self
-            .active_loop_argument_ranges
+        let ranges = self.active_loop_ranges();
+        let mut axes = ranges
             .iter()
+            .map(|((owner, argument), domain)| ((owner, argument), domain))
             .filter_map(|((owner, argument), domain)| {
                 if !reachable.contains(argument) {
                     return None;
@@ -555,14 +1629,6 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         Ok(axes.into_boxed_slice())
     }
 
-    fn is_artifact_producer_wire(&self, wire: &PlannedWire) -> bool {
-        self.plan.artifact_producers().iter().any(|producer| producer.producer == *wire)
-    }
-
-    fn artifact_producer(&self, wire: &PlannedWire) -> Option<ArtifactProducer> {
-        self.plan.artifact_producers().iter().find(|producer| producer.consumer == *wire).cloned()
-    }
-
     fn declared_protocol_input(&self, wire: &PlannedWire, name: &str) -> Option<ProtocolInputId> {
         self.protocol_inputs.get(&(wire.stage.clone(), StageInputName(name.to_owned()))).cloned()
     }
@@ -585,22 +1651,27 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         let actual_inputs = inputs
             .iter()
             .map(|input| self.job.expressions().value_type(*input).cloned())
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| {
+                arena_context(
+                    wire,
+                    format!("{operator:?}"),
+                    expected_output.clone(),
+                    Box::new([]),
+                    source,
+                )
+            })?
             .into_boxed_slice();
         let operation = format!("{operator:?}");
-        let expression =
-            self.job.expressions_mut().intern(operator, inputs).map_err(|source| match source {
-                super::arena::ArenaError::IncompatibleMatrixTypes => {
-                    ProductionAdapterError::ArenaContext {
-                        wire: wire.clone(),
-                        operation: operation.clone(),
-                        expected_output: expected_output.clone(),
-                        actual_inputs: actual_inputs.clone(),
-                        source,
-                    }
-                }
-                source => ProductionAdapterError::Arena(source),
-            })?;
+        let expression = self.job.expressions_mut().intern(operator, inputs).map_err(|source| {
+            arena_context(
+                wire,
+                operation.clone(),
+                expected_output.clone(),
+                actual_inputs.clone(),
+                source,
+            )
+        })?;
         if check_output && self.job.expressions().value_type(expression)? != &expected_output {
             return Err(ProductionAdapterError::ArenaContext {
                 wire: wire.clone(),
@@ -637,8 +1708,9 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         if let Some(index_range) = self.derived_open_index_range(index, &wire)? {
             return Ok(self.job.call_family_in_program_scope(family, index, index_range)?);
         }
+        let ranges = self.active_loop_ranges();
         let Some(index_range) =
-            self.active_loop_argument_ranges.get(&(wire.occurrence.clone(), index)).copied()
+            ranges.iter().find_map(|((_, argument), range)| (*argument == index).then_some(*range))
         else {
             let extracted_range =
                 self.job.expressions().node(index).ok().and_then(|node| match &node.operator {
@@ -696,10 +1768,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
             }
             return Err(ProductionAdapterError::MissingSelectorRange { wire: wire.clone() });
         }
-        for ((occurrence, argument), range) in &self.active_loop_argument_ranges {
-            if occurrence != &wire.occurrence {
-                continue;
-            }
+        for ((_, argument), range) in &self.active_loop_ranges() {
             let Some((minimum, maximum_exclusive)) =
                 self.affine_open_index_range(expression, *argument, *range)?
             else {
@@ -726,15 +1795,20 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
     ) -> Result<Option<(BigInt, BigInt)>, ProductionAdapterError> {
         let node = self.job.expressions().node(expression)?;
         match &node.operator {
-            ValueOperator::Argument { position, value_type }
-                if *value_type == ResolvedValueType::Int =>
-            {
-                let Some(argument) = self.active_loop_arguments.get(position) else {
-                    return Ok(None);
-                };
-                Ok(self.active_loop_argument_ranges.get(&(occurrence.clone(), *argument)).map(
-                    |range| (BigInt::from(range.minimum), BigInt::from(range.maximum_exclusive)),
-                ))
+            ValueOperator::Argument { value_type, .. } if *value_type == ResolvedValueType::Int => {
+                let ranges = self.active_loop_ranges();
+                let argument = ranges
+                    .iter()
+                    .map(|((_, argument), _)| *argument)
+                    .find(|argument| *argument == expression);
+                Ok(argument.and_then(|argument| {
+                    ranges.iter().find_map(|((_, candidate), range)| {
+                        (*candidate == argument).then_some((
+                            BigInt::from(range.minimum),
+                            BigInt::from(range.maximum_exclusive),
+                        ))
+                    })
+                }))
             }
             ValueOperator::Constant(TypedConstant { value: ConstantValue::Int(value), .. }) => {
                 Ok(Some((value.clone(), value + BigInt::from(1_u8))))
@@ -881,22 +1955,113 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         occurrence: &ProgramOccurrence,
         domain: FamilyDomain,
         body: ExprId,
+        wire: &PlannedWire,
     ) -> Result<FamilyValueId, ProductionAdapterError> {
-        let family = self.job.with_arena_stores(|expressions, programs, _| {
-            programs.generated_family_from_body(expressions, domain, body)
-        })?;
+        let (expected_output, actual_inputs) = self.family_context_types(&[body])?;
+        let family = self
+            .job
+            .with_arena_stores(|expressions, programs, _| {
+                programs.generated_family_from_body(expressions, domain, body)
+            })
+            .map_err(|source| {
+                arena_context(
+                    wire,
+                    "generated family construction",
+                    expected_output.clone(),
+                    actual_inputs.clone(),
+                    source,
+                )
+            })?;
         self.generated_families.entry((occurrence.clone(), body)).or_insert(family);
         Ok(family)
+    }
+    fn generated_family_with_binding(
+        &mut self,
+        occurrence: &ProgramOccurrence,
+        domain: FamilyDomain,
+        body: ExprId,
+        formal: ExprId,
+        captures: &[ExprId],
+        wire: &PlannedWire,
+    ) -> Result<FamilyValueId, ProductionAdapterError> {
+        let (expected_output, actual_inputs) = self.family_context_types(&[body])?;
+        let family = self
+            .job
+            .with_arena_stores(|expressions, programs, _| {
+                programs.generated_family_with_captures(expressions, domain, body, formal, captures)
+            })
+            .map_err(|source| {
+                arena_context(
+                    wire,
+                    "generated family with captures",
+                    expected_output.clone(),
+                    actual_inputs.clone(),
+                    source,
+                )
+            })?;
+        self.generated_families.entry((occurrence.clone(), body)).or_insert(family);
+        Ok(family)
+    }
+
+    /// Return the exact binders currently in lexical scope. The range table retains ancestors
+    /// even when two nested Graph loops reuse the same positional `index_slot`, whereas the slot
+    /// lookup map intentionally serves only lowering of a raw `LoopIndex` descriptor.
+    fn active_lexical_arguments(&self) -> Vec<ExprId> {
+        self.active_loop_ranges()
+            .into_iter()
+            .map(|((_, argument), _)| argument)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Return the stable fresh formal for a parallel-loop occurrence, allocating it only during
+    /// the first loop setup.  The occurrence, rather than the displayed IR index slot, is the
+    /// identity key, so nested loops that reuse a slot still receive distinct binders.
+    fn parallel_formal(
+        &mut self,
+        occurrence: &ProgramOccurrence,
+        wire: &PlannedWire,
+    ) -> Result<ExprId, ProductionAdapterError> {
+        if let Some(formal) = self.parallel_formals.get(occurrence).copied() {
+            return Ok(formal);
+        }
+        let formal = self.job.expressions_mut().fresh_argument(0, ResolvedValueType::Int).map_err(
+            |source| {
+                arena_context(
+                    wire,
+                    "parallel generated formal",
+                    ResolvedValueType::Int,
+                    Box::new([]),
+                    source,
+                )
+            },
+        )?;
+        self.parallel_formals.insert(occurrence.clone(), formal);
+        Ok(formal)
     }
     fn opaque_generated_family(
         &mut self,
         occurrence: &ProgramOccurrence,
         domain: FamilyDomain,
         body: ExprId,
+        wire: &PlannedWire,
     ) -> Result<FamilyValueId, ProductionAdapterError> {
-        let family = self.job.with_arena_stores(|expressions, programs, _| {
-            programs.opaque_generated_family_from_body(expressions, domain, body)
-        })?;
+        let (expected_output, actual_inputs) = self.family_context_types(&[body])?;
+        let family = self
+            .job
+            .with_arena_stores(|expressions, programs, _| {
+                programs.opaque_generated_family_from_body(expressions, domain, body)
+            })
+            .map_err(|source| {
+                arena_context(
+                    wire,
+                    "opaque family construction",
+                    expected_output.clone(),
+                    actual_inputs.clone(),
+                    source,
+                )
+            })?;
         self.generated_families.entry((occurrence.clone(), body)).or_insert(family);
         Ok(family)
     }
@@ -904,25 +2069,92 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         &mut self,
         domain: FamilyDomain,
         values: Box<[ExprId]>,
+        wire: &PlannedWire,
     ) -> Result<FamilyValueId, ProductionAdapterError> {
-        Ok(self.job.with_arena_stores(|expressions, programs, facts| {
-            programs.explicit_family_with_scalar_summary(
-                expressions,
-                facts,
-                domain,
-                values,
-                S::ENABLED,
-            )
-        })?)
+        let (expected_output, actual_inputs) = self.family_context_types(&values)?;
+        Ok(self
+            .job
+            .with_arena_stores(|expressions, programs, facts| {
+                programs.explicit_family_with_scalar_summary(
+                    expressions,
+                    facts,
+                    domain,
+                    values,
+                    S::ENABLED,
+                )
+            })
+            .map_err(|source| {
+                arena_context(
+                    wire,
+                    "explicit family construction",
+                    expected_output,
+                    actual_inputs,
+                    source,
+                )
+            })?)
+    }
+    fn explicit_family_with_captures(
+        &mut self,
+        domain: FamilyDomain,
+        values: Box<[ExprId]>,
+        captures: &[ExprId],
+        wire: &PlannedWire,
+    ) -> Result<FamilyValueId, ProductionAdapterError> {
+        let (expected_output, actual_inputs) = self.family_context_types(&values)?;
+        Ok(self
+            .job
+            .with_arena_stores(|expressions, programs, facts| {
+                programs.explicit_family_with_captures(
+                    expressions,
+                    facts,
+                    domain,
+                    values,
+                    captures,
+                    S::ENABLED,
+                )
+            })
+            .map_err(|source| {
+                arena_context(
+                    wire,
+                    "explicit family with captures",
+                    expected_output,
+                    actual_inputs,
+                    source,
+                )
+            })?)
     }
     fn select_family(
         &mut self,
         selector: SelectionSelector,
         families: &[FamilyValueId],
+        wire: &PlannedWire,
     ) -> Result<FamilyValueId, ProductionAdapterError> {
-        Ok(self.job.with_arena_stores(|expressions, programs, facts| {
-            programs.select(expressions, facts, selector, families)
-        })?)
+        let expected_output = families
+            .first()
+            .map(|family| self.job.programs().family_element_type(*family))
+            .transpose()?
+            .unwrap_or(ResolvedValueType::Int);
+        Ok(self
+            .job
+            .with_arena_stores(|expressions, programs, facts| {
+                programs.select(expressions, facts, selector, families)
+            })
+            .map_err(|source| {
+                arena_context(wire, "family selection", expected_output, Box::new([]), source)
+            })?)
+    }
+
+    fn family_context_types(
+        &self,
+        values: &[ExprId],
+    ) -> Result<(ResolvedValueType, Box<[ResolvedValueType]>), ProductionAdapterError> {
+        let actual_inputs = values
+            .iter()
+            .map(|value| self.job.expressions().value_type(*value).cloned())
+            .collect::<Result<Vec<_>, _>>()?
+            .into_boxed_slice();
+        let expected_output = actual_inputs.first().cloned().unwrap_or(ResolvedValueType::Int);
+        Ok((expected_output, actual_inputs))
     }
     fn new_with_sink(
         protocol: &'a ProtocolDecl,
@@ -937,7 +2169,6 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
             .collect::<BTreeMap<_, _>>();
         let mut job = CheckerJob::new();
         let token = job.begin_candidate()?;
-        let occurrence_descendants = build_occurrence_descendants(plan);
         let protocol_inputs = protocol
             .bundle
             .input_bindings
@@ -959,74 +2190,240 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
             .iter()
             .map(|entry| (entry.id.clone(), &entry.value))
             .collect();
+        let lowering_index = LoweringIndex::from_plan(plan, &graphs)?;
+        let compiled_entry_count = lowering_index.entries.len();
         let adapter = Self {
             plan,
             graphs,
             params: ParamEnv { integers: parameters, ..ParamEnv::default() },
             job,
             token,
-            values: BTreeMap::new(),
-            aliases: plan
-                .aliases()
-                .iter()
-                .map(|alias| (alias.child.clone(), alias.parent.clone()))
-                .collect(),
-            outputs: plan
-                .output_mappings()
-                .iter()
-                .map(|mapping| (mapping.parent.clone(), mapping.child.clone()))
-                .collect(),
-            artifacts: plan
-                .artifact_producers()
-                .iter()
-                .map(|producer| (producer.consumer.clone(), producer.producer.clone()))
-                .collect(),
+            lowering_index,
+            values: vec![None; compiled_entry_count],
+            memo_generation: 0,
+            envs: ResolveEnvArena::root(),
+            loop_invariant_wires: BTreeMap::new(),
+            next_invariant_invocation: 0,
+            active_invariant_invocation: None,
+            loop_environment: LoopEnvId(0),
+            loop_envs: LoopEnvArena::root(),
+            lowering_diagnostics: LoweringDiagnostics::default(),
+            resolve_progress: ResolveProgress::new(),
             protocol_inputs,
             input_contracts,
             sample_events: BTreeMap::new(),
             static_indices: BTreeMap::new(),
-            active_loop_indices: BTreeMap::new(),
-            active_loop_arguments: BTreeMap::new(),
-            active_loop_argument_ranges: BTreeMap::new(),
             active_parallel_depth: 0,
             generated_families: BTreeMap::new(),
+            parallel_formals: BTreeMap::new(),
             relation_candidates: Vec::new(),
             gadget_decompositions: BTreeMap::new(),
             trapdoor_values: BTreeMap::new(),
-            occurrence_descendants,
-            diagnostic_budget: 128,
+            exact_substitution: ExactSubstitutionEngine::new(),
+            #[cfg(test)]
+            selector_prepass_diagnostics: SelectorPrepassDiagnostics::default(),
             feasibility,
         };
         let mut adapter = adapter;
-        adapter.assign_sample_events()?;
-        adapter.predeclare_trapdoors()?;
-        adapter.selector_prepass()?;
-        adapter.constant_matrix_prepass()?;
-        adapter.job.finalize_facts(adapter.token)?;
+        #[cfg(test)]
+        {
+            adapter.lowering_diagnostics.compiled_plan_builds = 1;
+            adapter.lowering_diagnostics.compiled_entries_built =
+                adapter.lowering_index.entries.len() as u64;
+        }
+        adapter.loop_invariant_wires = Self::analyze_loop_invariants(plan, &adapter.graphs);
+        let phase_started = Instant::now();
+        let result = adapter.assign_sample_events();
+        info!(
+            phase = "sample",
+            structural_nodes = adapter.plan.nodes().len(),
+            sample_events = adapter.sample_events.len(),
+            errors = u64::from(result.is_err()),
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            "operational checker adapter phase"
+        );
+        result?;
+        let phase_started = Instant::now();
+        let result = adapter.predeclare_trapdoors();
+        info!(
+            phase = "trapdoor",
+            structural_nodes = adapter.plan.nodes().len(),
+            trapdoor_values = adapter.trapdoor_values.len(),
+            errors = u64::from(result.is_err()),
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            "operational checker adapter phase"
+        );
+        result?;
+        let phase_started = Instant::now();
+        let selector_diagnostics = match adapter.selector_prepass() {
+            Ok(diagnostics) => diagnostics,
+            Err(error) => {
+                info!(
+                    phase = "selector",
+                    structural_nodes = adapter.plan.nodes().len(),
+                    candidates = 0_u64,
+                    closed = 0_u64,
+                    skipped = 0_u64,
+                    eval_errors = 1_u64,
+                    errors = 1_u64,
+                    elapsed_ms = phase_started.elapsed().as_millis() as u64,
+                    "operational checker adapter phase"
+                );
+                return Err(error);
+            }
+        };
+        info!(
+            phase = "selector",
+            structural_nodes = adapter.plan.nodes().len(),
+            candidates = selector_diagnostics.candidates,
+            closed = selector_diagnostics.closed,
+            skipped = selector_diagnostics.skipped,
+            eval_errors = selector_diagnostics.eval_errors,
+            errors = 0_u64,
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            "operational checker adapter phase"
+        );
+        #[cfg(test)]
+        {
+            adapter.selector_prepass_diagnostics = selector_diagnostics;
+        }
+        let phase_started = Instant::now();
+        let result = adapter.constant_matrix_prepass();
+        info!(
+            phase = "constant",
+            structural_nodes = adapter.plan.nodes().len(),
+            errors = u64::from(result.is_err()),
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            "operational checker adapter phase"
+        );
+        result?;
+        let phase_started = Instant::now();
+        let result = adapter.job.finalize_facts(adapter.token);
+        info!(
+            phase = "fact_finalize",
+            structural_nodes = adapter.plan.nodes().len(),
+            ranges_finalized = adapter.job.facts().ranges_finalized(),
+            errors = u64::from(result.is_err()),
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            "operational checker adapter phase"
+        );
+        result?;
         Ok(adapter)
     }
 
-    fn lower_inner(mut self) -> Result<(CheckerJob, ProductionRoots, S), ProductionAdapterError> {
-        let residual = self.resolve(self.plan.target().residual.clone(), &BTreeMap::new())?;
-        let decoder = self.resolve(self.plan.target().decoder.clone(), &BTreeMap::new())?;
-        self.register_reached_relations()?;
-        self.job.freeze_relations(self.token)?;
+    fn lower_inner(
+        mut self,
+    ) -> Result<(CheckerJob, ProductionRoots, S, LoweringDiagnostics), ProductionAdapterError> {
+        let root_environment = EnvId(0);
+        let phase_started = Instant::now();
+        let phase_before = LoweringTelemetrySnapshot::capture(&self);
+        let residual_result = (|| {
+            let residual_slot =
+                self.lowering_index.slot(&self.plan.target().residual).ok_or_else(|| {
+                    ProductionAdapterError::MissingWire {
+                        wire: self.plan.target().residual.clone(),
+                    }
+                })?;
+            self.resolve(residual_slot, root_environment, "residual_resolve", phase_started)
+        })();
+        self.log_lower_phase(
+            "residual_resolve",
+            phase_started,
+            phase_before,
+            residual_result.is_err(),
+        );
+        let residual = residual_result?;
+
+        let phase_started = Instant::now();
+        let phase_before = LoweringTelemetrySnapshot::capture(&self);
+        let decoder_result = (|| {
+            let decoder_slot =
+                self.lowering_index.slot(&self.plan.target().decoder).ok_or_else(|| {
+                    ProductionAdapterError::MissingWire { wire: self.plan.target().decoder.clone() }
+                })?;
+            self.resolve(decoder_slot, root_environment, "decoder_resolve", phase_started)
+        })();
+        self.log_lower_phase(
+            "decoder_resolve",
+            phase_started,
+            phase_before,
+            decoder_result.is_err(),
+        );
+        let decoder = decoder_result?;
+
+        let phase_started = Instant::now();
+        let phase_before = LoweringTelemetrySnapshot::capture(&self);
+        let reached_result = self.register_reached_relations();
+        self.log_lower_phase(
+            "reached_relation_registration",
+            phase_started,
+            phase_before,
+            reached_result.is_err(),
+        );
+        reached_result?;
+
+        let phase_started = Instant::now();
+        let phase_before = LoweringTelemetrySnapshot::capture(&self);
+        let freeze_result = self.job.freeze_relations(self.token);
+        self.log_lower_phase(
+            "relation_freeze",
+            phase_started,
+            phase_before,
+            freeze_result.is_err(),
+        );
+        freeze_result?;
+
+        let phase_started = Instant::now();
+        let phase_before = LoweringTelemetrySnapshot::capture(&self);
+        let residual_root_result =
+            self.close_root(residual, &self.plan.target().residual, "close residual root");
+        self.log_lower_phase(
+            "residual_root_close",
+            phase_started,
+            phase_before,
+            residual_root_result.is_err(),
+        );
+        let residual_root = residual_root_result?;
+
+        let phase_started = Instant::now();
+        let phase_before = LoweringTelemetrySnapshot::capture(&self);
+        let decoder_root_result =
+            self.close_root(decoder, &self.plan.target().decoder, "close decoder root");
+        self.log_lower_phase(
+            "decoder_root_close",
+            phase_started,
+            phase_before,
+            decoder_root_result.is_err(),
+        );
+        let decoder_root = decoder_root_result?;
         let roots = ProductionRoots {
-            residual: self.close_root(
-                residual,
-                &self.plan.target().residual,
-                "close residual root",
-            )?,
-            decoder: self.close_root(decoder, &self.plan.target().decoder, "close decoder root")?,
+            residual: residual_root,
+            decoder: decoder_root,
             occurrences: self.plan.counters().occurrences,
             samples: self.sample_events.len() as u64,
         };
-        if S::ENABLED {
-            self.feasibility.record_lowering_complete().map_err(|error| {
-                ProductionAdapterError::Descriptor { reason: error.to_string() }
-            })?;
+        let phase_started = Instant::now();
+        let phase_before = LoweringTelemetrySnapshot::capture(&self);
+        let complete_result = if S::ENABLED {
+            self.feasibility
+                .record_lowering_complete()
+                .map_err(|error| ProductionAdapterError::Descriptor { reason: error.to_string() })
+        } else {
+            Ok(())
+        };
+        self.log_lower_phase(
+            "lowering_complete",
+            phase_started,
+            phase_before,
+            complete_result.is_err(),
+        );
+        complete_result?;
+        #[cfg(test)]
+        {
+            self.lowering_diagnostics.resolve_env_peak = self.envs.peak();
+            self.lowering_diagnostics.loop_env_peak = self.loop_envs.peak();
         }
-        Ok((self.job, roots, self.feasibility))
+        Ok((self.job, roots, self.feasibility, self.lowering_diagnostics))
     }
 
     fn close_root(
@@ -1081,28 +2478,42 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         let Some(argument) = self.argument_ids(selector)?.into_iter().next() else {
             return Ok(None);
         };
-        let Some(input_range) =
-            self.active_loop_argument_ranges.get(&(wire.occurrence.clone(), argument)).copied()
+        let Some(input_range) = self
+            .active_loop_ranges()
+            .into_iter()
+            .find_map(|(key, range)| (key == (wire.occurrence.clone(), argument)).then_some(range))
         else {
             return Ok(None);
         };
         if input_range != family_range {
             return Err(ProductionAdapterError::MissingSelectorRange { wire: wire.clone() });
         }
-        let selector = self.job.with_arena_stores(|expressions, programs, _| {
-            let selector_program = programs.finalize(
-                expressions,
-                ProgramSignature {
-                    inputs: Box::new([ProgramInput {
-                        value_type: ResolvedValueType::Int,
-                        trusted_index_range: Some(family_range),
-                    }]),
-                    output: ResolvedValueType::Int,
-                },
-                selector,
-            )?;
-            programs.selector(expressions, selector_program)
-        })?;
+        let actual_inputs = Box::new([self.job.expressions().value_type(selector)?.clone()]);
+        let selector = self
+            .job
+            .with_arena_stores(|expressions, programs, _| {
+                let selector_program = programs.finalize(
+                    expressions,
+                    ProgramSignature {
+                        inputs: Box::new([ProgramInput {
+                            value_type: ResolvedValueType::Int,
+                            trusted_index_range: Some(family_range),
+                        }]),
+                        output: ResolvedValueType::Int,
+                    },
+                    selector,
+                )?;
+                programs.selector(expressions, selector_program)
+            })
+            .map_err(|source| {
+                arena_context(
+                    wire,
+                    "selector program finalization",
+                    ResolvedValueType::Int,
+                    actual_inputs,
+                    source,
+                )
+            })?;
         Ok(Some(selector))
     }
 
@@ -1155,6 +2566,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         }
         let mut replacements = BTreeMap::new();
         let mut lifted = Vec::with_capacity(candidates.len());
+        let captures = self.active_lexical_arguments();
         for (index, preimage, public, trapdoor, target) in candidates {
             let mut families = Vec::with_capacity(4);
             // The preimage family is the relation's opaque provenance anchor.  Other
@@ -1176,13 +2588,22 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                             .to_owned(),
                     });
                 }
-                let family = match self.family_for_expression(operand, domain, argument, wire)? {
-                    Some(family) => family,
-                    None if opaque_fallback => {
-                        self.opaque_generated_family(occurrence, domain, operand)?
-                    }
-                    None => self.generated_family(occurrence, domain, operand)?,
-                };
+                let bound_operand = self.bind_legacy_loop_argument(operand, argument, wire)?;
+                let family =
+                    match self.family_for_expression(bound_operand, domain, argument, wire)? {
+                        Some(family) => family,
+                        None if opaque_fallback => {
+                            self.opaque_generated_family(occurrence, domain, bound_operand, wire)?
+                        }
+                        None => self.generated_family_with_binding(
+                            occurrence,
+                            domain,
+                            bound_operand,
+                            argument,
+                            &captures,
+                            wire,
+                        )?,
+                    };
                 if reachable {
                     let call = self.call_family_in_program_scope(
                         family,
@@ -1207,7 +2628,24 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
             }
             lifted.push((index, families[0], families[1], families[2], families[3]));
         }
-        Ok((self.rewrite_expression_exact(body, &replacements)?, lifted))
+        Ok((self.rewrite_expression_exact(wire, body, &replacements)?, lifted))
+    }
+
+    /// Replace the single legacy positional argument emitted by pre-lexical graph builders with
+    /// the active loop's fresh formal.  Ancestor binders are already fresh IDs and are left
+    /// untouched, so this compatibility step cannot capture an outer closure accidentally.
+    fn bind_legacy_loop_argument(
+        &mut self,
+        expression: ExprId,
+        formal: ExprId,
+        wire: &PlannedWire,
+    ) -> Result<ExprId, ProductionAdapterError> {
+        let positional = self.job.expressions_mut().intern_argument(0, ResolvedValueType::Int)?;
+        if self.job.expressions().free_argument_ids(expression)?.contains(&positional) {
+            self.rewrite_expression_exact(wire, expression, &BTreeMap::from([(positional, formal)]))
+        } else {
+            Ok(expression)
+        }
     }
 
     fn family_for_expression(
@@ -1248,46 +2686,48 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
 
     fn rewrite_expression_exact(
         &mut self,
+        wire: &PlannedWire,
         root: ExprId,
         replacements: &BTreeMap<ExprId, ExprId>,
     ) -> Result<ExprId, ProductionAdapterError> {
-        let mut memo = BTreeMap::new();
-        let mut stack = vec![(root, false)];
-        while let Some((expression, expanded)) = stack.pop() {
-            if memo.contains_key(&expression) {
-                continue;
-            }
-            if let Some(replacement) = replacements.get(&expression).copied() {
-                memo.insert(expression, replacement);
-                continue;
-            }
-            let node = self.job.expressions().node(expression)?;
-            if !expanded {
-                stack.push((expression, true));
-                for input in node.inputs.iter().rev().copied() {
-                    if !memo.contains_key(&input) {
-                        stack.push((input, false));
-                    }
-                }
-                continue;
-            }
-            let operator = node.operator.clone();
-            let inputs = node
-                .inputs
-                .iter()
-                .map(|input| {
-                    memo.get(input).copied().ok_or_else(|| ProductionAdapterError::Structural {
-                        wire: self.plan.target().residual.clone(),
-                        reason: "expression rewrite lost a reachable child".to_owned(),
-                    })
-                })
-                .collect::<Result<Box<[_]>, _>>()?;
-            memo.insert(expression, self.job.expressions_mut().intern(operator, inputs)?);
-        }
-        memo.get(&root).copied().ok_or_else(|| ProductionAdapterError::Structural {
-            wire: self.plan.target().residual.clone(),
-            reason: "expression rewrite did not produce a root".to_owned(),
-        })
+        self.lowering_diagnostics.rewrite_requests =
+            self.lowering_diagnostics.rewrite_requests.saturating_add(1);
+        let (engine, job) = (&mut self.exact_substitution, &mut self.job);
+        let result =
+            engine.substitute(job.expressions_mut(), root, replacements).map_err(|failure| {
+                let expected_output = failure.expected_output.unwrap_or(ResolvedValueType::Int);
+                let operation = failure
+                    .operator
+                    .as_ref()
+                    .map(|operator| format!("rewrite {operator:?}"))
+                    .unwrap_or_else(|| "rewrite expression".to_owned());
+                arena_context(
+                    wire,
+                    operation,
+                    expected_output,
+                    failure.actual_inputs,
+                    failure.source,
+                )
+            })?;
+        self.lowering_diagnostics.rewrite_cache_hits = self
+            .lowering_diagnostics
+            .rewrite_cache_hits
+            .saturating_add(u64::from(result.cache_hit));
+        self.lowering_diagnostics.rewrite_binder_shortcuts = self
+            .lowering_diagnostics
+            .rewrite_binder_shortcuts
+            .saturating_add(u64::from(result.binder_shortcut));
+        self.lowering_diagnostics.rewrite_skipped_subtrees = self
+            .lowering_diagnostics
+            .rewrite_skipped_subtrees
+            .saturating_add(result.skipped_subtrees);
+        self.lowering_diagnostics.rewrite_nodes_visited =
+            self.lowering_diagnostics.rewrite_nodes_visited.saturating_add(result.nodes_visited);
+        self.lowering_diagnostics.rewrite_nodes_reinterned = self
+            .lowering_diagnostics
+            .rewrite_nodes_reinterned
+            .saturating_add(result.nodes_reinterned);
+        Ok(result.root)
     }
 
     fn expression_reaches(
@@ -1423,7 +2863,6 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
     /// argument wires are the complete source of the relation contract.
     fn register_reached_relations(&mut self) -> Result<(), ProductionAdapterError> {
         let candidates = std::mem::take(&mut self.relation_candidates);
-        let mut universal_registrations = 0usize;
         for candidate in candidates {
             let Some((preimage_family, public_family, trapdoor_family, target_family)) =
                 candidate.family_operands
@@ -1542,27 +2981,8 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 },
                 target_plan: target_family.program(),
             };
-            if self.diagnostic_budget > 0 {
-                self.diagnostic_budget -= 1;
-                let preimage_family = registration.dispatch.preimage_family;
-                info!(
-                    target: "mxx_correctness::operational_noise",
-                    "register universal relation exact preimage_family={preimage_family:?} program={:?} domain={:?} body={:?} public_family={:?} trapdoor_family={:?} target_family={:?}",
-                    preimage_family.program(),
-                    self.job.programs().family_domain(preimage_family)?,
-                    self.job.programs().family_body(preimage_family)?,
-                    registration.lhs.public_pairing,
-                    registration.lhs.trapdoor_plan,
-                    registration.target_plan,
-                );
-            }
             self.job.register_universal_relation(registration)?;
-            universal_registrations = universal_registrations.saturating_add(1);
         }
-        info!(
-            target: "mxx_correctness::operational_noise",
-            "universal registration count={universal_registrations}"
-        );
         Ok(())
     }
 
@@ -1670,7 +3090,8 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         Ok(())
     }
 
-    fn selector_prepass(&mut self) -> Result<(), ProductionAdapterError> {
+    fn selector_prepass(&mut self) -> Result<SelectorPrepassDiagnostics, ProductionAdapterError> {
+        let mut diagnostics = SelectorPrepassDiagnostics::default();
         let wires = self.plan.nodes().keys().cloned().collect::<Vec<_>>();
         for wire in wires {
             let node = &self
@@ -1680,26 +3101,42 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 .ok_or_else(|| ProductionAdapterError::MissingWire { wire: wire.clone() })?;
             let index = match node.kind {
                 NodeKind::FamilyGetStatic { ref index } => {
+                    diagnostics.candidates = diagnostics.candidates.saturating_add(1);
+                    if expression_has_loop_index(index) {
+                        diagnostics.skipped = diagnostics.skipped.saturating_add(1);
+                        continue;
+                    }
                     let Ok(value) = self.eval_int(index) else {
-                        if expression_has_loop_index(index) {
-                            continue;
-                        }
                         return Err(ProductionAdapterError::IntegerExpression {
                             expression: index.clone(),
                             reason: "static family selector did not close during prepass"
                                 .to_owned(),
                         });
                     };
+                    diagnostics.closed = diagnostics.closed.saturating_add(1);
                     self.intern_index_constant(value)?
                 }
-                NodeKind::ConstantInt(ref value) => self.intern_index_constant(value.clone())?,
+                NodeKind::ConstantInt(ref value) => {
+                    diagnostics.candidates = diagnostics.candidates.saturating_add(1);
+                    diagnostics.closed = diagnostics.closed.saturating_add(1);
+                    self.intern_index_constant(value.clone())?
+                }
                 NodeKind::EvaluateInt(ref expression) => {
-                    if expression.contains_variable("") {
+                    diagnostics.candidates = diagnostics.candidates.saturating_add(1);
+                    if expression_has_loop_index(expression) {
+                        diagnostics.skipped = diagnostics.skipped.saturating_add(1);
                         continue
                     }
                     match self.eval_int(expression) {
-                        Ok(value) => self.intern_index_constant(value)?,
-                        Err(_) => continue,
+                        Ok(value) => {
+                            diagnostics.closed = diagnostics.closed.saturating_add(1);
+                            self.intern_index_constant(value)?
+                        }
+                        Err(_) => {
+                            diagnostics.skipped = diagnostics.skipped.saturating_add(1);
+                            diagnostics.eval_errors = diagnostics.eval_errors.saturating_add(1);
+                            continue;
+                        }
                     }
                 }
                 _ => continue,
@@ -1729,7 +3166,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 self.static_indices.insert(wire, index);
             }
         }
-        Ok(())
+        Ok(diagnostics)
     }
 
     fn intern_scalar_constant(
@@ -1765,6 +3202,38 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         expression: &IntExpr,
         wire: &PlannedWire,
     ) -> Result<ExprId, ProductionAdapterError> {
+        let referenced_slots = referenced_loop_indices(expression);
+        if referenced_slots.is_empty() {
+            return self.intern_index_constant(self.eval_int(expression)?);
+        }
+
+        // Resolve every descriptor slot against the current lexical environment before
+        // constructing an arena expression. A concrete sequential iteration closes the whole
+        // descriptor, while one or more active parallel binders keep the expression open. An
+        // inactive slot is never evaluated through a stale/global map: that would silently make a
+        // malformed graph look like a valid index.
+        let mut has_open_parallel_binder = false;
+        for slot in &referenced_slots {
+            if self
+                .loop_envs
+                .slot(self.loop_environment, *slot)
+                .is_some_and(|frame| frame.argument.is_some())
+            {
+                has_open_parallel_binder = true;
+            } else if self.loop_envs.slot(self.loop_environment, *slot).is_none() {
+                return Err(ProductionAdapterError::IntegerExpression {
+                    expression: expression.clone(),
+                    reason: format!(
+                        "loop-index[{slot}] is outside the active parallel/sequential scope at {:?}",
+                        wire.occurrence
+                    ),
+                });
+            }
+        }
+        if !has_open_parallel_binder {
+            return self.intern_index_constant(self.eval_int(expression)?);
+        }
+
         match expression {
             IntExpr::Const(value) => self.intern_index_constant(value.clone()),
             IntExpr::Var(name) => {
@@ -1776,10 +3245,18 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 )?)
             }
             IntExpr::LoopIndex(slot) => {
-                if let Some(argument) = self.active_loop_arguments.get(slot).copied() {
+                if let Some(argument) = self
+                    .loop_envs
+                    .slot(self.loop_environment, *slot)
+                    .and_then(|frame| frame.argument)
+                {
                     return Ok(argument);
                 }
-                if let Some(value) = self.active_loop_indices.get(slot).cloned() {
+                if let Some(value) = self
+                    .loop_envs
+                    .slot(self.loop_environment, *slot)
+                    .and_then(|frame| frame.index.clone())
+                {
                     return self.intern_index_constant(value);
                 }
                 Err(ProductionAdapterError::IntegerExpression {
@@ -1836,55 +3313,39 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 reason: "sequential state/input schema mismatch".to_owned(),
             });
         }
-        // Child values are memoized globally for ordinary DAG wires, but a sequential body is
-        // evaluated under a fresh carried-state environment on every iteration.  Clear the
-        // complete structural subtree, not just the direct child scope: nested parallel and
-        // sequential occurrences otherwise retain expressions containing the previous iteration's
-        // loop-index environment.
-        let body_occurrences = self
-            .occurrence_descendants
-            .get(&(state.wire.stage.clone(), state.child_occurrence.clone()))
-            .cloned()
-            .unwrap_or_else(|| BTreeSet::from([state.child_occurrence.clone()]));
-        self.values.retain(|planned, _| {
-            planned.stage != state.wire.stage || !body_occurrences.contains(&planned.occurrence)
-        });
-        self.active_loop_indices = state.saved_loop_indices.clone();
-        self.active_loop_arguments = state.saved_loop_arguments.clone();
-        self.active_loop_indices.insert(state.spec.index_slot, BigInt::from(state.iteration));
+        #[cfg(test)]
+        {
+            self.lowering_diagnostics.sequential_instantiations =
+                self.lowering_diagnostics.sequential_instantiations.saturating_add(1);
+        }
+        // A fresh generation invalidates iteration-dependent entries in O(1). Root-generation
+        // entries (including loop invariants) remain available, so invariant subgraphs are not
+        // lowered once per iteration. No global memo-table scan is needed.
+        self.next_memo_generation()?;
+        self.loop_envs.truncate(state.loop_checkpoint);
+        self.loop_environment = self.loop_envs.push_sequential(
+            state.saved_loop_environment,
+            state.spec.index_slot,
+            BigInt::from(state.iteration),
+        );
         state.next_outputs.clear();
-        state.iteration_overrides.clear();
-        for (input, value) in state
+        let bindings = state
             .child_inputs
             .iter()
-            .copied()
+            .cloned()
             .zip(state.carried.iter().copied().chain(state.invariant.iter().copied()))
-        {
-            state.iteration_overrides.insert(
-                PlannedWire {
-                    stage: state.wire.stage.clone(),
-                    occurrence: state.child_occurrence.clone(),
-                    wire: input,
-                },
-                value,
-            );
-        }
-        if state.child_outputs.is_empty() {
+            .map(|(input, value)| (input.clone(), value));
+        self.envs.truncate(state.env_checkpoint);
+        state.iteration_environment = self.envs.extend(state.environment, bindings);
+        if state.child_output_slots.is_empty() {
             frames.push(ResolveFrame::SequentialCommit { state, next_state: Vec::new() });
         } else {
-            let output = state.child_outputs[0];
+            let output_slot = state.child_output_slots[0];
+            let iteration_environment = state.iteration_environment;
             frames.push(ResolveFrame::SequentialIterationOutput { state, next_output: 0 });
-            let state = match frames.last() {
-                Some(ResolveFrame::SequentialIterationOutput { state, .. }) => state,
-                _ => unreachable!(),
-            };
             frames.push(ResolveFrame::Resolve {
-                wire: PlannedWire {
-                    stage: state.wire.stage.clone(),
-                    occurrence: state.child_occurrence.clone(),
-                    wire: output,
-                },
-                overrides: state.iteration_overrides.clone(),
+                slot: output_slot,
+                environment: iteration_environment,
             });
         }
         Ok(())
@@ -1892,262 +3353,336 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
 
     fn resolve(
         &mut self,
-        wire: PlannedWire,
-        overrides: &BTreeMap<PlannedWire, Value>,
+        slot: WireSlot,
+        environment: EnvId,
+        phase: &'static str,
+        started: Instant,
     ) -> Result<Value, ProductionAdapterError> {
-        let mut frames = vec![ResolveFrame::Resolve { wire, overrides: overrides.clone() }];
+        let mut frames = vec![ResolveFrame::Resolve { slot, environment }];
         let mut result = None;
         while let Some(frame) = frames.pop() {
+            self.record_resolve_progress(phase, started);
             match frame {
-                ResolveFrame::Resolve { wire, overrides } => {
-                    let mut scheduled = false;
-                    if let Some(value) = overrides.get(&wire).copied() {
-                        result = Some(value);
-                        scheduled = true;
-                    } else if let Some(value) = self.values.get(&wire).copied() {
-                        result = Some(value);
-                        scheduled = true;
-                    } else if let Some(parent) = self.aliases.get(&wire).cloned() {
-                        frames.push(ResolveFrame::Store { wire: wire.clone() });
-                        frames.push(ResolveFrame::Resolve {
-                            wire: parent,
-                            overrides: overrides.clone(),
-                        });
-                        scheduled = true;
-                    } else if let Some(producer) = self.artifacts.get(&wire).cloned() {
-                        frames.push(ResolveFrame::Store { wire: wire.clone() });
-                        frames.push(ResolveFrame::Resolve {
-                            wire: producer,
-                            overrides: overrides.clone(),
-                        });
-                        scheduled = true;
+                ResolveFrame::Resolve { slot, environment } => {
+                    #[cfg(test)]
+                    {
+                        self.lowering_diagnostics.compiled_entries_reached =
+                            self.lowering_diagnostics.compiled_entries_reached.saturating_add(1);
                     }
-                    if scheduled {
-                        // The common completion path below transfers the value to its parent
-                        // frame; scheduled child work must not inspect the graph again.
+                    if let Some(value) = self.memo_get(slot, environment) {
+                        result = Some(value);
                     } else {
-                        let node = self
-                            .plan
-                            .nodes()
-                            .get(&wire)
-                            .ok_or_else(|| ProductionAdapterError::MissingWire {
-                                wire: wire.clone(),
-                            })?
-                            .clone();
-                        match node.kind {
-                            NodeKind::SubgraphCall(_) => {
-                                let child = self.outputs.get(&wire).cloned().ok_or_else(|| {
-                                    ProductionAdapterError::Structural {
-                                        wire: wire.clone(),
-                                        reason: "missing child output mapping".to_owned(),
-                                    }
-                                })?;
-                                frames.push(ResolveFrame::Store { wire: wire.clone() });
-                                frames.push(ResolveFrame::Resolve {
-                                    wire: child,
-                                    overrides: overrides.clone(),
-                                });
-                            }
-                            NodeKind::ParallelLoop(spec) => {
-                                let child = self.child_scope(&wire)?.clone();
-                                if node.arguments.len() != child.inputs().len() ||
-                                    node.arguments.len() != spec.input_modes.len()
-                                {
-                                    return Err(ProductionAdapterError::Structural {
-                                        wire,
-                                        reason: format!(
-                                            "parallel input arity mismatch: parent={}, child={}, modes={}",
-                                            node.arguments.len(),
-                                            child.inputs().len(),
-                                            spec.input_modes.len()
-                                        ),
+                        let (
+                            wire,
+                            kind,
+                            arguments,
+                            alias_target,
+                            artifact_target,
+                            is_artifact_producer,
+                            output_target,
+                            child,
+                        ) = {
+                            let entry = self.lowering_index.entry(slot).ok_or_else(|| {
+                                ProductionAdapterError::Structural {
+                                    wire: self.plan.target().residual.clone(),
+                                    reason: format!(
+                                        "compiled wire slot {} is out of range",
+                                        slot.0
+                                    ),
+                                }
+                            })?;
+                            (
+                                entry.wire.clone(),
+                                entry.kind.clone(),
+                                entry.arguments.clone(),
+                                entry.alias_target,
+                                entry.artifact_target,
+                                entry.is_artifact_producer,
+                                entry.output_target,
+                                entry.child.clone(),
+                            )
+                        };
+                        if let Some(parent_slot) = alias_target {
+                            frames.push(ResolveFrame::Store { slot });
+                            frames.push(ResolveFrame::Resolve { slot: parent_slot, environment });
+                        } else if let Some(producer_slot) = artifact_target {
+                            frames.push(ResolveFrame::Store { slot });
+                            frames.push(ResolveFrame::Resolve { slot: producer_slot, environment });
+                        } else {
+                            let kind = kind.as_ref().ok_or_else(|| {
+                                ProductionAdapterError::MissingWire { wire: wire.as_ref().clone() }
+                            })?;
+                            match kind.as_ref() {
+                                NodeKind::SubgraphCall(_) => {
+                                    let child_slot = output_target.ok_or_else(|| {
+                                        ProductionAdapterError::Structural {
+                                            wire: wire.as_ref().clone(),
+                                            reason: "missing child output mapping".to_owned(),
+                                        }
+                                    })?;
+                                    frames.push(ResolveFrame::Store { slot });
+                                    frames.push(ResolveFrame::Resolve {
+                                        slot: child_slot,
+                                        environment,
                                     });
                                 }
-                                let domain = FamilyDomain::new(0, self.eval_u64(&spec.count)?)?;
-                                let argument = self
-                                    .job
-                                    .expressions_mut()
-                                    .intern_argument(0, ResolvedValueType::Int)?;
-                                let child_occurrence = self.child_occurrence(&wire)?;
-                                frames.push(ResolveFrame::ParallelPrepare {
-                                    state: ParallelState {
-                                        wire,
-                                        spec,
-                                        overrides,
-                                        domain,
-                                        argument,
-                                        parent_args: node.arguments,
-                                        child_inputs: child.inputs().to_vec().into_boxed_slice(),
-                                        child_outputs: child.outputs().to_vec().into_boxed_slice(),
-                                        child_occurrence,
-                                        next_input: 0,
-                                        child_overrides: BTreeMap::new(),
-                                        saved_loop_arguments: self.active_loop_arguments.clone(),
-                                        saved_loop_argument_ranges: self
-                                            .active_loop_argument_ranges
-                                            .clone(),
-                                        saved_parallel_depth: self.active_parallel_depth,
-                                    },
-                                });
-                            }
-                            NodeKind::SequentialLoop(spec) => {
-                                frames.push(ResolveFrame::SequentialPrepare {
-                                    state: SequentialState {
-                                        wire: wire.clone(),
-                                        spec,
-                                        overrides,
-                                        parent_args: node.arguments,
-                                        child_inputs: Box::new([]),
-                                        child_outputs: Box::new([]),
-                                        child_occurrence: self
-                                            .plan
-                                            .child_occurrence(&wire)
-                                            .cloned()
-                                            .ok_or_else(|| ProductionAdapterError::Structural {
-                                                wire: wire.clone(),
-                                                reason: "missing planned child occurrence"
-                                                    .to_owned(),
-                                            })?,
-                                        carried: Vec::new(),
-                                        invariant: Vec::new(),
-                                        next_outputs: Vec::new(),
-                                        iteration_overrides: BTreeMap::new(),
-                                        iteration: 0,
-                                        count: 0,
-                                        saved_loop_indices: self.active_loop_indices.clone(),
-                                        saved_loop_arguments: self.active_loop_arguments.clone(),
-                                        saved_loop_argument_ranges: self
-                                            .active_loop_argument_ranges
-                                            .clone(),
-                                    },
-                                });
-                            }
-                            kind => {
-                                let arguments = node.arguments;
-                                frames.push(ResolveFrame::Lower {
-                                    wire,
-                                    kind,
-                                    output: node.output_type,
-                                    overrides,
-                                    arguments,
-                                    next: 0,
-                                    inputs: Vec::new(),
-                                });
+                                NodeKind::ParallelLoop(spec) => {
+                                    let child = child.ok_or_else(|| {
+                                        ProductionAdapterError::Structural {
+                                            wire: wire.as_ref().clone(),
+                                            reason: "missing compiled child metadata".to_owned(),
+                                        }
+                                    })?;
+                                    if child.inputs.len() != arguments.len() ||
+                                        child.inputs.len() != spec.input_modes.len()
+                                    {
+                                        return Err(ProductionAdapterError::Structural {
+                                            wire: wire.as_ref().clone(),
+                                            reason: format!(
+                                                "parallel input arity mismatch: parent={}, child={}, modes={}",
+                                                arguments.len(),
+                                                child.inputs.len(),
+                                                spec.input_modes.len()
+                                            ),
+                                        });
+                                    }
+                                    let domain = FamilyDomain::new(0, self.eval_u64(&spec.count)?)?;
+                                    let argument =
+                                        self.parallel_formal(&child.occurrence, wire.as_ref())?;
+                                    frames.push(ResolveFrame::ParallelPrepare {
+                                        state: ParallelState {
+                                            wire: wire.as_ref().clone(),
+                                            slot,
+                                            spec: spec.clone(),
+                                            environment,
+                                            domain,
+                                            argument,
+                                            parent_slots: arguments.clone(),
+                                            child_inputs: child.inputs.clone(),
+                                            child_output_slots: child.output_slots.clone(),
+                                            child_occurrence: child.occurrence.clone(),
+                                            next_input: 0,
+                                            child_environment: environment,
+                                            saved_loop_environment: self.loop_environment,
+                                            saved_parallel_depth: self.active_parallel_depth,
+                                            env_checkpoint: self.envs.checkpoint(),
+                                        },
+                                    });
+                                }
+                                NodeKind::SequentialLoop(spec) => {
+                                    let child = child.ok_or_else(|| {
+                                        ProductionAdapterError::Structural {
+                                            wire: wire.as_ref().clone(),
+                                            reason: "missing compiled child metadata".to_owned(),
+                                        }
+                                    })?;
+                                    frames.push(ResolveFrame::SequentialPrepare {
+                                        state: SequentialState {
+                                            wire: wire.as_ref().clone(),
+                                            slot,
+                                            spec: spec.clone(),
+                                            environment,
+                                            parent_slots: arguments.clone(),
+                                            child_inputs: child.inputs.clone(),
+                                            child_outputs: child.outputs.clone(),
+                                            child_output_slots: child.output_slots.clone(),
+                                            carried: Vec::new(),
+                                            invariant: Vec::new(),
+                                            next_outputs: Vec::new(),
+                                            iteration_environment: environment,
+                                            saved_loop_environment: self.loop_environment,
+                                            iteration: 0,
+                                            count: 0,
+                                            saved_invariant_invocation: self
+                                                .active_invariant_invocation,
+                                            invariant_invocation: 0,
+                                            env_checkpoint: self.envs.checkpoint(),
+                                            loop_checkpoint: self.loop_envs.checkpoint(),
+                                        },
+                                    });
+                                }
+                                _ => {
+                                    frames.push(ResolveFrame::Lower {
+                                        slot,
+                                        environment,
+                                        artifact_producer: is_artifact_producer,
+                                        next: 0,
+                                        inputs: Vec::new(),
+                                    });
+                                }
                             }
                         }
                     }
                 }
-                ResolveFrame::Lower { wire, kind, output, overrides, arguments, next, inputs } => {
-                    if next < arguments.len() {
-                        let argument = arguments[next];
+                ResolveFrame::Lower { slot, environment, artifact_producer, next, inputs } => {
+                    let entry = self.lowering_index.entry(slot).ok_or_else(|| {
+                        ProductionAdapterError::Structural {
+                            wire: self.plan.target().residual.clone(),
+                            reason: format!("compiled wire slot {} is out of range", slot.0),
+                        }
+                    })?;
+                    if next < entry.arguments.len() {
+                        let argument = entry.arguments[next];
                         frames.push(ResolveFrame::Lower {
-                            wire: wire.clone(),
-                            kind,
-                            output,
-                            overrides: overrides.clone(),
-                            arguments,
+                            slot,
+                            environment,
+                            artifact_producer,
                             next: next + 1,
                             inputs,
                         });
-                        frames.push(ResolveFrame::Resolve {
-                            wire: PlannedWire {
-                                stage: wire.stage.clone(),
-                                occurrence: wire.occurrence.clone(),
-                                wire: argument,
-                            },
-                            overrides,
-                        });
+                        frames.push(ResolveFrame::Resolve { slot: argument, environment });
                     } else {
-                        let value = self.lower_node(&wire, &kind, &output, &inputs)?;
-                        self.values.insert(wire, value);
+                        let wire = entry.wire.clone();
+                        let output = entry.output_type.clone().ok_or_else(|| {
+                            ProductionAdapterError::MissingWire {
+                                wire: entry.wire.as_ref().clone(),
+                            }
+                        })?;
+                        let kind = entry.kind.clone().ok_or_else(|| {
+                            ProductionAdapterError::MissingWire {
+                                wire: entry.wire.as_ref().clone(),
+                            }
+                        })?;
+                        let value = self.lower_node(
+                            wire.as_ref(),
+                            kind.as_ref(),
+                            output.as_ref(),
+                            artifact_producer,
+                            &inputs,
+                        )?;
+                        self.memo_insert(slot, value);
                         result = Some(value);
                     }
                 }
-                ResolveFrame::Store { wire } => {
+                ResolveFrame::Store { slot } => {
+                    let wire = self
+                        .lowering_index
+                        .entry(slot)
+                        .ok_or_else(|| ProductionAdapterError::Structural {
+                            wire: self.plan.target().residual.clone(),
+                            reason: format!("compiled wire slot {} is out of range", slot.0),
+                        })?
+                        .wire
+                        .clone();
                     let value = result.ok_or_else(|| ProductionAdapterError::Structural {
-                        wire: wire.clone(),
+                        wire: wire.as_ref().clone(),
                         reason: "worklist completed without a child value".to_owned(),
                     })?;
-                    self.record_producer_artifact_if_enabled(&wire, value)?;
-                    self.values.insert(wire, value);
+                    self.record_producer_artifact_if_enabled(slot, value)?;
+                    self.memo_insert(slot, value);
                     result = Some(value);
                 }
                 ResolveFrame::ParallelPrepare { mut state } => {
                     if state.next_input < state.child_inputs.len() {
                         let position = state.next_input;
-                        let parent = *state.parent_args.get(position).ok_or_else(|| {
+                        let parent_slot = *state.parent_slots.get(position).ok_or_else(|| {
                             ProductionAdapterError::Structural {
                                 wire: state.wire.clone(),
                                 reason: "parallel parent input arity mismatch".to_owned(),
                             }
                         })?;
                         state.next_input = position + 1;
-                        let parent_wire = PlannedWire {
-                            stage: state.wire.stage.clone(),
-                            occurrence: state.wire.occurrence.clone(),
-                            wire: parent,
-                        };
-                        let parent_overrides = state.overrides.clone();
+                        let parent_environment = state.environment;
                         frames.push(ResolveFrame::ParallelInput { state, position });
                         frames.push(ResolveFrame::Resolve {
-                            wire: parent_wire,
-                            overrides: parent_overrides,
+                            slot: parent_slot,
+                            environment: parent_environment,
                         });
                     } else {
-                        self.active_loop_arguments = state.saved_loop_arguments.clone();
-                        self.active_loop_arguments.insert(state.spec.index_slot, state.argument);
-                        self.active_loop_argument_ranges = state.saved_loop_argument_ranges.clone();
                         self.active_parallel_depth = state.saved_parallel_depth + 1;
-                        self.active_loop_argument_ranges.insert(
-                            (state.child_occurrence.clone(), state.argument),
+                        self.loop_environment = self.loop_envs.push_parallel(
+                            state.saved_loop_environment,
+                            state.spec.index_slot,
+                            state.argument,
+                            state.child_occurrence.clone(),
                             TrustedIndexRange {
                                 minimum: state.domain.minimum,
                                 maximum_exclusive: state.domain.maximum_exclusive,
                             },
                         );
-                        let output = *state
-                            .child_outputs
+                        let body_slot = *state
+                            .child_output_slots
                             .get(state.wire.wire.port.0 as usize)
                             .ok_or_else(|| ProductionAdapterError::Structural {
                                 wire: state.wire.clone(),
                                 reason: "invalid parallel output".to_owned(),
                             })?;
-                        let body_wire = PlannedWire {
-                            stage: state.wire.stage.clone(),
-                            occurrence: state.child_occurrence.clone(),
-                            wire: output,
-                        };
-                        let body_overrides = state.child_overrides.clone();
+                        let body_environment = state.child_environment;
                         frames.push(ResolveFrame::ParallelBody { state });
                         frames.push(ResolveFrame::Resolve {
-                            wire: body_wire,
-                            overrides: body_overrides,
+                            slot: body_slot,
+                            environment: body_environment,
                         });
                     }
                 }
                 ResolveFrame::ParallelFinish { state, family } => {
-                    let output_type = &self
-                        .plan
-                        .nodes()
-                        .get(&state.wire)
+                    self.envs.truncate(state.env_checkpoint);
+                    let output_type = self
+                        .lowering_index
+                        .entry(state.slot)
                         .ok_or_else(|| ProductionAdapterError::MissingWire {
                             wire: state.wire.clone(),
                         })?
-                        .output_type;
-                    let value = if matches!(output_type, WireType::IndexedFamily { .. }) {
-                        Value::Family(family)
-                    } else {
-                        let domain = self.job.programs().family_domain(family)?;
-                        Value::Expr(self.call_family_in_program_scope(
-                            family,
-                            state.argument,
-                            TrustedIndexRange {
+                        .output_type
+                        .as_ref()
+                        .ok_or_else(|| ProductionAdapterError::MissingWire {
+                            wire: state.wire.clone(),
+                        })?;
+                    let value = match state.spec.output_mode {
+                        mxx_ir_core::node::ParallelOutputMode::Family => {
+                            if !matches!(output_type.as_ref(), WireType::IndexedFamily { .. }) {
+                                return Err(ProductionAdapterError::Structural {
+                                    wire: state.wire.clone(),
+                                    reason: "family parallel output is not an indexed family"
+                                        .to_owned(),
+                                });
+                            }
+                            Value::Family(family)
+                        }
+                        mxx_ir_core::node::ParallelOutputMode::CollectColumns => {
+                            if !matches!(output_type.as_ref(), WireType::Matrix(_)) {
+                                return Err(ProductionAdapterError::Structural {
+                                    wire: state.wire.clone(),
+                                    reason: "column parallel output is not a matrix".to_owned(),
+                                });
+                            }
+                            let domain = self.job.programs().family_domain(family)?;
+                            let range = TrustedIndexRange {
                                 minimum: domain.minimum,
                                 maximum_exclusive: domain.maximum_exclusive,
-                            },
-                        )?)
+                            };
+                            let output_matrix = self.matrix_type(output_type.as_ref())?;
+                            let mut members = Vec::with_capacity(
+                                usize::try_from(domain.maximum_exclusive - domain.minimum)
+                                    .map_err(|_| ProductionAdapterError::Structural {
+                                        wire: state.wire.clone(),
+                                        reason: "parallel column count does not fit usize"
+                                            .to_owned(),
+                                    })?,
+                            );
+                            for index in domain.minimum..domain.maximum_exclusive {
+                                let index = self.job.expressions_mut().intern(
+                                    ValueOperator::Constant(TypedConstant::int(index)),
+                                    Box::new([]),
+                                )?;
+                                members
+                                    .push(self.call_family_in_program_scope(family, index, range)?);
+                            }
+                            let expression = self.job.expressions_mut().intern(
+                                ValueOperator::Matrix(MatrixOperation::Concat {
+                                    axis: 1,
+                                    output: output_matrix.clone(),
+                                    layout: MatrixLayout::row_major(
+                                        output_matrix.rows,
+                                        output_matrix.columns,
+                                    ),
+                                }),
+                                members.into_boxed_slice(),
+                            )?;
+                            Value::Expr(expression)
+                        }
                     };
-                    self.values.insert(state.wire, value);
+                    self.memo_insert(state.slot, value);
                     result = Some(value);
                 }
                 ResolveFrame::ParallelInput { .. } | ResolveFrame::ParallelBody { .. } => {
@@ -2158,6 +3693,20 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     });
                 }
                 ResolveFrame::SequentialPrepare { mut state } => {
+                    #[cfg(test)]
+                    {
+                        self.lowering_diagnostics.invariant_invocations =
+                            self.lowering_diagnostics.invariant_invocations.saturating_add(1);
+                    }
+                    state.invariant_invocation = self.next_invariant_invocation;
+                    self.next_invariant_invocation = self
+                        .next_invariant_invocation
+                        .checked_add(1)
+                        .ok_or_else(|| ProductionAdapterError::Structural {
+                            wire: state.wire.clone(),
+                            reason: "sequential invariant invocation exhausted".to_owned(),
+                        })?;
+                    self.active_invariant_invocation = Some(state.invariant_invocation);
                     let count = self.eval_u64(&state.spec.count)?;
                     state.count = usize::try_from(count).map_err(|_| {
                         ProductionAdapterError::IntegerExpression {
@@ -2165,45 +3714,38 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                             reason: "sequential count does not fit usize".to_owned(),
                         }
                     })?;
-                    if state.parent_args.len() < state.spec.carried_count {
+                    if state.parent_slots.len() < state.spec.carried_count {
                         return Err(ProductionAdapterError::Structural {
                             wire: state.wire,
                             reason: "carried schema exceeds input arity".to_owned(),
                         });
                     }
-                    let child = self.child_scope(&state.wire)?.clone();
-                    if child.outputs().len() != state.spec.carried_count ||
-                        child.inputs().len() != state.parent_args.len()
+                    if state.child_outputs.len() != state.spec.carried_count ||
+                        state.child_inputs.len() != state.parent_slots.len()
                     {
                         return Err(ProductionAdapterError::Structural {
                             wire: state.wire,
                             reason: format!(
                                 "sequential carried schema mismatch: parent={}, child inputs={}, child outputs={}, carried={}",
-                                state.parent_args.len(),
-                                child.inputs().len(),
-                                child.outputs().len(),
+                                state.parent_slots.len(),
+                                state.child_inputs.len(),
+                                state.child_outputs.len(),
                                 state.spec.carried_count
                             ),
                         });
                     }
-                    state.child_inputs = child.inputs().to_vec().into_boxed_slice();
-                    state.child_outputs = child.outputs().to_vec().into_boxed_slice();
                     if state.spec.carried_count == 0 {
                         frames.push(ResolveFrame::SequentialInvariant { state, position: 0 });
                     } else {
-                        let argument = state.parent_args[0];
+                        let argument = state.parent_slots[0];
                         frames.push(ResolveFrame::SequentialInit { state, position: 0 });
                         let state = match frames.last() {
                             Some(ResolveFrame::SequentialInit { state, .. }) => state,
                             _ => unreachable!(),
                         };
                         frames.push(ResolveFrame::Resolve {
-                            wire: PlannedWire {
-                                stage: state.wire.stage.clone(),
-                                occurrence: state.wire.occurrence.clone(),
-                                wire: argument,
-                            },
-                            overrides: state.overrides.clone(),
+                            slot: argument,
+                            environment: state.environment,
                         });
                     }
                 }
@@ -2214,37 +3756,29 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                             reason: "sequential carried initializer is out of range".to_owned(),
                         });
                     }
-                    let argument = state.parent_args[position];
+                    let argument = state.parent_slots[position];
                     frames.push(ResolveFrame::SequentialInit { state, position });
                     let state = match frames.last() {
                         Some(ResolveFrame::SequentialInit { state, .. }) => state,
                         _ => unreachable!(),
                     };
                     frames.push(ResolveFrame::Resolve {
-                        wire: PlannedWire {
-                            stage: state.wire.stage.clone(),
-                            occurrence: state.wire.occurrence.clone(),
-                            wire: argument,
-                        },
-                        overrides: state.overrides.clone(),
+                        slot: argument,
+                        environment: state.environment,
                     });
                 }
                 ResolveFrame::SequentialInvariant { state, position } => {
-                    let invariant_count = state.parent_args.len() - state.spec.carried_count;
+                    let invariant_count = state.parent_slots.len() - state.spec.carried_count;
                     if position < invariant_count {
-                        let argument = state.parent_args[state.spec.carried_count + position];
+                        let argument = state.parent_slots[state.spec.carried_count + position];
                         frames.push(ResolveFrame::SequentialInvariant { state, position });
                         let state = match frames.last() {
                             Some(ResolveFrame::SequentialInvariant { state, .. }) => state,
                             _ => unreachable!(),
                         };
                         frames.push(ResolveFrame::Resolve {
-                            wire: PlannedWire {
-                                stage: state.wire.stage.clone(),
-                                occurrence: state.wire.occurrence.clone(),
-                                wire: argument,
-                            },
-                            overrides: state.overrides.clone(),
+                            slot: argument,
+                            environment: state.environment,
                         });
                     } else if state.count == 0 {
                         frames.push(ResolveFrame::SequentialFinish { state });
@@ -2253,25 +3787,20 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     }
                 }
                 ResolveFrame::SequentialIterationOutput { state, next_output } => {
-                    let output = *state.child_outputs.get(next_output).ok_or_else(|| {
+                    let output = *state.child_output_slots.get(next_output).ok_or_else(|| {
                         ProductionAdapterError::Structural {
                             wire: state.wire.clone(),
                             reason: "sequential output is out of range".to_owned(),
                         }
                     })?;
-                    let overrides = state.iteration_overrides.clone();
                     frames.push(ResolveFrame::SequentialIterationOutput { state, next_output });
                     let state = match frames.last() {
                         Some(ResolveFrame::SequentialIterationOutput { state, .. }) => state,
                         _ => unreachable!(),
                     };
                     frames.push(ResolveFrame::Resolve {
-                        wire: PlannedWire {
-                            stage: state.wire.stage.clone(),
-                            occurrence: state.child_occurrence.clone(),
-                            wire: output,
-                        },
-                        overrides,
+                        slot: output,
+                        environment: state.iteration_environment,
                     });
                 }
                 ResolveFrame::SequentialCommit { mut state, next_state } => {
@@ -2290,9 +3819,10 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     }
                 }
                 ResolveFrame::SequentialFinish { state } => {
-                    self.active_loop_indices = state.saved_loop_indices.clone();
-                    self.active_loop_arguments = state.saved_loop_arguments.clone();
-                    self.active_loop_argument_ranges = state.saved_loop_argument_ranges.clone();
+                    self.loop_envs.truncate(state.loop_checkpoint);
+                    self.envs.truncate(state.env_checkpoint);
+                    self.loop_environment = state.saved_loop_environment;
+                    self.active_invariant_invocation = state.saved_invariant_invocation;
                     let port = state.wire.wire.port.0 as usize;
                     let value = *state.carried.get(port).ok_or_else(|| {
                         ProductionAdapterError::Structural {
@@ -2303,7 +3833,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                             ),
                         }
                     })?;
-                    self.values.insert(state.wire, value);
+                    self.memo_insert(state.slot, value);
                     result = Some(value);
                 }
             }
@@ -2314,28 +3844,24 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                 };
                 match parent {
                     ResolveFrame::Lower {
-                        wire,
-                        kind,
-                        output,
-                        overrides,
-                        arguments,
+                        slot,
+                        environment,
+                        artifact_producer,
                         next,
                         mut inputs,
                     } => {
                         inputs.push(value);
                         frames.push(ResolveFrame::Lower {
-                            wire,
-                            kind,
-                            output,
-                            overrides,
-                            arguments,
+                            slot,
+                            environment,
+                            artifact_producer,
                             next,
                             inputs,
                         });
                     }
-                    ResolveFrame::Store { wire } => {
-                        self.record_producer_artifact_if_enabled(&wire, value)?;
-                        self.values.insert(wire, value);
+                    ResolveFrame::Store { slot } => {
+                        self.record_producer_artifact_if_enabled(slot, value)?;
+                        self.memo_insert(slot, value);
                         result = Some(value);
                     }
                     ResolveFrame::ParallelInput { mut state, position } => {
@@ -2403,32 +3929,30 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                                 });
                             }
                         };
-                        let input = *state.child_inputs.get(position).ok_or_else(|| {
+                        let input = state.child_inputs.get(position).ok_or_else(|| {
                             ProductionAdapterError::Structural {
                                 wire: state.wire.clone(),
                                 reason: "parallel child input is missing".to_owned(),
                             }
                         })?;
-                        state.child_overrides.insert(
-                            PlannedWire {
-                                stage: state.wire.stage.clone(),
-                                occurrence: state.child_occurrence.clone(),
-                                wire: input,
-                            },
-                            mapped,
-                        );
+                        state.child_environment =
+                            self.extend_environment(state.child_environment, input.clone(), mapped);
                         frames.push(ResolveFrame::ParallelPrepare { state });
                     }
                     ResolveFrame::ParallelBody { state } => {
-                        let Value::Expr(body) = value else {
+                        let Value::Expr(mut body) = value else {
                             return Err(ProductionAdapterError::Structural {
                                 wire: state.wire,
                                 reason: "nested family output in generated body".to_owned(),
                             });
                         };
-                        self.active_loop_arguments = state.saved_loop_arguments.clone();
-                        self.active_loop_argument_ranges = state.saved_loop_argument_ranges.clone();
                         self.active_parallel_depth = state.saved_parallel_depth;
+                        self.loop_environment = state.saved_loop_environment;
+                        // Graph construction predates lexical loop IDs and may leave the
+                        // canonical positional `Argument(0)` in a body.  Rebind only that
+                        // legacy placeholder; fresh ancestor binders retain their identities and
+                        // are checked as exact captures by generated_family_with_binding.
+                        body = self.bind_legacy_loop_argument(body, state.argument, &state.wire)?;
                         let (body, lifted_operands) = self.lift_relation_family_operands(
                             &state.child_occurrence,
                             state.domain,
@@ -2436,24 +3960,15 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                             state.argument,
                             &state.wire,
                         )?;
-                        let family =
-                            self.generated_family(&state.child_occurrence, state.domain, body)?;
+                        let family = self.generated_family_with_binding(
+                            &state.child_occurrence,
+                            state.domain,
+                            body,
+                            state.argument,
+                            &self.active_lexical_arguments(),
+                            &state.wire,
+                        )?;
                         for (index, preimage, public, trapdoor, target) in lifted_operands {
-                            if self.diagnostic_budget > 0 {
-                                self.diagnostic_budget -= 1;
-                                info!(
-                                    target: "mxx_correctness::operational_noise",
-                                    "parallel candidate lift occurrence={:?} candidate_index={} output_family={:?} output_program={:?} preimage_family={:?} public_family={:?} trapdoor_family={:?} target_family={:?}",
-                                    state.child_occurrence,
-                                    index,
-                                    family,
-                                    family.program(),
-                                    preimage,
-                                    public,
-                                    trapdoor,
-                                    target,
-                                );
-                            }
                             self.relation_candidates[index].family_operands =
                                 Some((preimage, public, trapdoor, target));
                         }
@@ -2528,43 +4043,12 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         })
     }
 
-    fn child_scope(
-        &self,
-        wire: &PlannedWire,
-    ) -> Result<&mxx_ir_core::graph::GraphScope, ProductionAdapterError> {
-        let graph = self
-            .graphs
-            .get(&wire.stage)
-            .ok_or_else(|| ProductionAdapterError::MissingStage { stage: wire.stage.clone() })?;
-        let definition = graph
-            .child_scope_id(&wire.occurrence.definition, wire.wire.node)
-            .ok_or_else(|| ProductionAdapterError::Structural {
-                wire: wire.clone(),
-                reason: "node has no child scope".to_owned(),
-            })?;
-        graph.scope(&definition).ok_or_else(|| ProductionAdapterError::Structural {
-            wire: wire.clone(),
-            reason: "missing child scope".to_owned(),
-        })
-    }
-
-    fn child_occurrence(
-        &self,
-        wire: &PlannedWire,
-    ) -> Result<super::protocol::ProgramOccurrence, ProductionAdapterError> {
-        self.plan.child_occurrence(wire).cloned().ok_or_else(|| {
-            ProductionAdapterError::Structural {
-                wire: wire.clone(),
-                reason: "missing planned child occurrence".to_owned(),
-            }
-        })
-    }
-
     fn lower_node(
         &mut self,
         wire: &PlannedWire,
         kind: &NodeKind,
         output: &WireType,
+        artifact_producer: bool,
         inputs: &[Value],
     ) -> Result<Value, ProductionAdapterError> {
         let _classification = classify_node_kind(kind);
@@ -2635,14 +4119,25 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                                 )
                             },
                         ),
-                        element_type,
+                        element_type: element_type.clone(),
                         domain: FamilyDomain::new(0, self.eval_u64(count)?)?,
                         artifact: None,
                     };
-                    let family = self.job.with_arena_stores(|expressions, programs, _| {
-                        programs.source_family(expressions, source, explicit_matrix_facts)
-                    })?;
-                    if !(S::ENABLED && self.is_artifact_producer_wire(wire)) {
+                    let family = self
+                        .job
+                        .with_arena_stores(|expressions, programs, _| {
+                            programs.source_family(expressions, source, explicit_matrix_facts)
+                        })
+                        .map_err(|source| {
+                            arena_context(
+                                wire,
+                                "source family construction",
+                                element_type.clone(),
+                                Box::new([]),
+                                source,
+                            )
+                        })?;
+                    if !(S::ENABLED && artifact_producer) {
                         self.record_family_source_if_enabled(family, |adapter| {
                             let body = adapter
                                 .job
@@ -2689,7 +4184,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                         .job
                         .expressions_mut()
                         .intern(ValueOperator::Source(source), Box::new([]))?;
-                    if !(S::ENABLED && self.is_artifact_producer_wire(wire)) {
+                    if !(S::ENABLED && artifact_producer) {
                         self.record_expression_source_if_enabled(expression, |adapter| {
                             let node = adapter
                                 .job
@@ -3107,10 +4602,10 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     let domain = FamilyDomain::new(0, 1)?;
                     let occurrence = &wire.occurrence;
                     Some((
-                        self.opaque_generated_family(occurrence, domain, preimage)?,
-                        self.generated_family(occurrence, domain, public)?,
-                        self.generated_family(occurrence, domain, trapdoor)?,
-                        self.generated_family(occurrence, domain, target)?,
+                        self.opaque_generated_family(occurrence, domain, preimage, wire)?,
+                        self.generated_family(occurrence, domain, public, wire)?,
+                        self.generated_family(occurrence, domain, trapdoor, wire)?,
+                        self.generated_family(occurrence, domain, target, wire)?,
                     ))
                 } else {
                     None
@@ -3371,18 +4866,48 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let count = self.eval_u64(count)?;
-                Value::Family(
-                    self.explicit_family(FamilyDomain::new(0, count)?, values.into_boxed_slice())?,
-                )
+                let captures = self.active_lexical_arguments();
+                let free_arguments = values
+                    .iter()
+                    .map(|value| self.job.expressions().free_argument_ids(*value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let has_open_values = free_arguments.iter().any(|arguments| !arguments.is_empty());
+                if has_open_values {
+                    let active = captures.iter().copied().collect::<BTreeSet<_>>();
+                    let mut used = BTreeSet::new();
+                    for free_arguments in &free_arguments {
+                        if free_arguments.iter().any(|argument| !active.contains(argument)) {
+                            return Err(ProductionAdapterError::Structural {
+                                wire: wire.clone(),
+                                reason: "family pack captures an inactive lexical argument"
+                                    .to_owned(),
+                            });
+                        }
+                        used.extend(free_arguments.iter().copied());
+                    }
+                    let captures = captures
+                        .into_iter()
+                        .filter(|capture| used.contains(capture))
+                        .collect::<Vec<_>>();
+                    Value::Family(self.explicit_family_with_captures(
+                        FamilyDomain::new(0, count)?,
+                        values.into_boxed_slice(),
+                        &captures,
+                        wire,
+                    )?)
+                } else {
+                    Value::Family(self.explicit_family(
+                        FamilyDomain::new(0, count)?,
+                        values.into_boxed_slice(),
+                        wire,
+                    )?)
+                }
             }
-            NodeKind::FamilyGetStatic { index: _ } => {
+            NodeKind::FamilyGetStatic { index } => {
                 let family_id = family(inputs, 0)?;
                 let index = self.static_indices.get(wire).copied().ok_or_else(|| {
                     ProductionAdapterError::IntegerExpression {
-                        expression: match self.plan.nodes().get(wire).map(|node| &node.kind) {
-                            Some(NodeKind::FamilyGetStatic { index }) => index.clone(),
-                            _ => unreachable!("FamilyGetStatic node disappeared from plan"),
-                        },
+                        expression: index.clone(),
                         reason: "static family selector did not close during prepass".to_owned(),
                     }
                 })?;
@@ -3455,7 +4980,7 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
                                 "close closed-family selector",
                             )?),
                         };
-                    let result = self.select_family(selector, &families)?;
+                    let result = self.select_family(selector, &families, wire)?;
                     if S::ENABLED {
                         self.record_family_index_use_if_enabled(
                             IndexUseKind::Select,
@@ -3845,7 +5370,11 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
     }
     fn eval_int(&self, expression: &IntExpr) -> Result<BigInt, ProductionAdapterError> {
         let mut env = self.params.clone();
-        env.loop_indices = self.active_loop_indices.clone();
+        env.loop_indices = self
+            .loop_envs
+            .bindings(self.loop_environment)
+            .filter_map(|frame| frame.index.as_ref().map(|index| (frame.slot, index.clone())))
+            .collect();
         expression.evaluate(&env).map_err(|source| ProductionAdapterError::IntegerExpression {
             expression: expression.clone(),
             reason: source.to_string(),
@@ -4095,8 +5624,8 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         else {
             return Ok(None);
         };
-        let mut ranges = self
-            .active_loop_argument_ranges
+        let active_ranges = self.active_loop_ranges();
+        let mut ranges = active_ranges
             .iter()
             .filter(|((occurrence, _), _)| occurrence == &wire.occurrence)
             .map(|(_, range)| range);
@@ -4126,10 +5655,10 @@ impl<'a, S: FeasibilitySink> ProductionAdapter<'a, S> {
         expression: ExprId,
         wire: &PlannedWire,
     ) -> Result<Option<(Option<ExprId>, BigInt, BigInt)>, ProductionAdapterError> {
-        let candidates = self
-            .active_loop_argument_ranges
-            .keys()
-            .filter(|(occurrence, _)| occurrence == &wire.occurrence)
+        let active_ranges = self.active_loop_ranges();
+        let candidates = active_ranges
+            .iter()
+            .map(|(key, _)| key)
             .map(|(_, argument)| *argument)
             .filter_map(|argument| {
                 affine_form_for_argument(&self.job, expression, argument)
@@ -4487,38 +6016,31 @@ fn expression_has_loop_index(expression: &IntExpr) -> bool {
     }
 }
 
-fn build_occurrence_descendants(
-    plan: &ProtocolPlan,
-) -> BTreeMap<
-    (StageId, super::protocol::ProgramOccurrence),
-    BTreeSet<super::protocol::ProgramOccurrence>,
-> {
-    let mut children = BTreeMap::<
-        (StageId, super::protocol::ProgramOccurrence),
-        BTreeSet<super::protocol::ProgramOccurrence>,
-    >::new();
-    for wire in plan.nodes().keys() {
-        let Some(child) = plan.child_occurrence(wire).cloned() else { continue };
-        children.entry((wire.stage.clone(), wire.occurrence.clone())).or_default().insert(child);
-    }
-    let roots = children.keys().cloned().collect::<Vec<_>>();
-    let mut descendants = BTreeMap::new();
-    for (stage, root) in roots {
-        let key = (stage.clone(), root.clone());
-        let mut found = BTreeSet::from([root]);
-        let mut pending = found.iter().cloned().collect::<Vec<_>>();
-        while let Some(parent) = pending.pop() {
-            if let Some(next) = children.get(&(stage.clone(), parent)) {
-                for child in next {
-                    if found.insert(child.clone()) {
-                        pending.push(child.clone());
-                    }
-                }
+/// Return the exact loop-index slots referenced by an integer descriptor. Slot collection is
+/// deliberately separate from the older boolean helper: lowering must distinguish an expression
+/// whose slots are all concrete sequential binders from one that still captures a parallel
+/// binder, and it must reject a missing slot rather than evaluating it accidentally.
+fn referenced_loop_indices(expression: &IntExpr) -> BTreeSet<u32> {
+    let mut slots = BTreeSet::new();
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        match expression {
+            IntExpr::LoopIndex(slot) => {
+                slots.insert(*slot);
             }
+            IntExpr::Add(left, right) |
+            IntExpr::Sub(left, right) |
+            IntExpr::Mul(left, right) |
+            IntExpr::Div(left, right) |
+            IntExpr::RoundDiv(left, right) => {
+                pending.push(left);
+                pending.push(right);
+            }
+            IntExpr::Log2Ceil(value) => pending.push(value),
+            IntExpr::Const(_) | IntExpr::Var(_) => {}
         }
-        descendants.insert(key, found);
     }
-    descendants
+    slots
 }
 
 fn decomposition_contract(
@@ -4720,6 +6242,22 @@ fn matrix_binary(op: MatrixBinaryOp) -> MatrixOperation {
         MatrixBinaryOp::Multiply => MatrixOperation::Multiply,
     }
 }
+fn arena_context(
+    wire: &PlannedWire,
+    operation: impl Into<String>,
+    expected_output: ResolvedValueType,
+    actual_inputs: Box<[ResolvedValueType]>,
+    source: super::arena::ArenaError,
+) -> ProductionAdapterError {
+    ProductionAdapterError::ArenaContext {
+        wire: wire.clone(),
+        operation: operation.into(),
+        expected_output,
+        actual_inputs,
+        source,
+    }
+}
+
 impl<'a> ProductionAdapter<'a, NoFeasibility> {
     pub(crate) fn new(
         protocol: &'a ProtocolDecl,
@@ -4730,8 +6268,16 @@ impl<'a> ProductionAdapter<'a, NoFeasibility> {
     }
 
     pub(crate) fn lower(self) -> Result<(CheckerJob, ProductionRoots), ProductionAdapterError> {
-        let (job, roots, _) = self.lower_inner()?;
+        let (job, roots, _, _) = self.lower_inner()?;
         Ok((job, roots))
+    }
+
+    #[cfg(test)]
+    fn lower_with_diagnostics(
+        self,
+    ) -> Result<(CheckerJob, ProductionRoots, LoweringDiagnostics), ProductionAdapterError> {
+        let (job, roots, _, diagnostics) = self.lower_inner()?;
+        Ok((job, roots, diagnostics))
     }
 }
 
@@ -4747,7 +6293,8 @@ impl<'a> ProductionAdapter<'a, FeasibilityTrace> {
     pub(crate) fn lower_with_feasibility(
         self,
     ) -> Result<(CheckerJob, ProductionRoots, FeasibilityTrace), ProductionAdapterError> {
-        self.lower_inner()
+        let (job, roots, trace, _) = self.lower_inner()?;
+        Ok((job, roots, trace))
     }
 }
 
@@ -4864,6 +6411,7 @@ pub(crate) mod tests {
     use crate::operational_noise::{
         g0::{BoundAuthority, BoundRule, G0Error, NormalizerEvent},
         program::{ArenaToken, ValueProgramId},
+        protocol::PlannedNode,
     };
 
     fn repeated_named_parallel_artifact_protocol(shared_producer: bool) -> crate::ProtocolDecl {
@@ -5291,12 +6839,23 @@ pub(crate) mod tests {
     }
 
     fn parallel_range_protocol_with_selector_upper(selector_upper: u64) -> crate::ProtocolDecl {
+        parallel_range_protocol_with_selector_upper_and_ring(selector_upper, 1)
+    }
+
+    fn scalar_ring_parallel_range_protocol() -> crate::ProtocolDecl {
+        parallel_range_protocol_with_selector_upper_and_ring(4, 8)
+    }
+
+    fn parallel_range_protocol_with_selector_upper_and_ring(
+        selector_upper: u64,
+        ring_dimension: usize,
+    ) -> crate::ProtocolDecl {
         use crate::{
             InputContractEntry, InputValueContract, ProtocolInputBinding, ProtocolInputDestination,
             ProtocolInputId, StageInputName,
         };
-        use mxx_dsl::{DslContext, Family, Int, Ring};
-        let ring = Ring::new(256, 1);
+        use mxx_dsl::{DslContext, Family, Int, Ring, SemanticAnchor};
+        let ring = Ring::new(256, ring_dimension);
         let left = ring.input_family("left-family", 5, (1, 1));
         let right = ring.input_family("right-family", 7, (1, 1));
         let early = left.get_static(0);
@@ -5304,7 +6863,7 @@ pub(crate) mod tests {
         let zipped = mapped.parallel_zip_offset(right.clone(), 2, |_, first, _| first).unwrap();
         let extracted_selector =
             zipped.clone().get_static(0).extract_coefficient_with_canonical_input_exclusive_upper(
-                0,
+                ring_dimension - 1,
                 Some(BigUint::from(selector_upper)),
             );
         let extracted_selected = left.get(extracted_selector);
@@ -5343,12 +6902,53 @@ pub(crate) mod tests {
                 });
             }
         }
+        if ring_dimension != 1 {
+            // Keep the reference protocol's decrypt-side artifact contract aligned with the
+            // replacement encrypt graph.  This makes the test exercise the adapter rather than
+            // failing at an unrelated cross-stage shape check.
+            use mxx_ir_core::artifact::{ArtifactConfidentiality, ProductionId, SpecHash};
+            let placeholder =
+                ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
+            let ciphertext = ring.artifact_input(
+                placeholder,
+                "ciphertext",
+                (1, 1),
+                ArtifactConfidentiality::Public,
+            );
+            let decoded = ciphertext
+                .threshold_decode_bools(mxx_ir_core::IntExpr::constant(2), 1)
+                .into_iter()
+                .next()
+                .expect("one decoded bit")
+                .semantic_anchor(crate::protocol_example::DECODED_ENDPOINT)
+                .expect("decoded endpoint anchor");
+            let decrypt = DslContext::new("parallel-range-decrypt")
+                .int_parameter("cutoff")
+                .bool_output("decoded", decoded)
+                .expect("decoded output")
+                .build()
+                .expect("decrypt graph");
+            let decrypt_stage = protocol
+                .bundle
+                .workflow
+                .stages
+                .iter_mut()
+                .find(|stage| stage.id == StageId("decrypt".to_owned()))
+                .expect("decrypt stage");
+            decrypt_stage.graph = decrypt.graph.clone();
+            decrypt_stage.semantic_anchors = decrypt.anchors;
+            decrypt_stage.derivation_attachments = decrypt.derivation_attachments;
+            let decoder_node = decrypt.graph.outputs()["decoded"].value.node;
+            for target in &mut protocol.bundle.operational_decoder_targets {
+                target.decoder_node = decoder_node;
+            }
+        }
         let matrix_contract = |count| InputValueContract::Family {
             count: mxx_ir_core::IntExpr::constant(count),
             element: Box::new(InputValueContract::MatrixLarge {
                 matrix_type: mxx_ir_core::types::MatrixType {
                     modulus: mxx_ir_core::IntExpr::constant(256),
-                    ring_dimension: mxx_ir_core::IntExpr::constant(1),
+                    ring_dimension: mxx_ir_core::IntExpr::constant(ring_dimension),
                     rows: mxx_ir_core::IntExpr::constant(1),
                     columns: mxx_ir_core::IntExpr::constant(1),
                 },
@@ -5679,6 +7279,59 @@ pub(crate) mod tests {
         crate::ProtocolDecl::new(protocol).unwrap()
     }
 
+    /// Build a real nested-loop gather whose affine index is `outer * 5 + inner`.
+    ///
+    /// The source family is deliberately supplied as a parameter so the lowering regression can
+    /// distinguish the exact half-open bound `[0, 15)` from the unsound `[0, 14)` declaration.
+    fn nested_affine_gather_protocol(source_count: usize) -> crate::ProtocolDecl {
+        use crate::{ProtocolInputDestination, ProtocolInputId};
+        use mxx_dsl::{DslContext, Family, Int, Parallel, Ring};
+
+        let nested = Parallel::range(3)
+            .try_map_values(|outer| {
+                // Build the source inside the outer body so the inner gather captures a family
+                // from its immediate lexical ancestor, matching the supported DSL capture model.
+                let source = Family::<Int>::pack(
+                    (0..source_count).map(|value| Int::constant(value as i64)).collect(),
+                )?;
+                let indices = Parallel::range(5)
+                    .map_values(|inner| outer.as_int().mul(Int::constant(5)).add(inner.as_int()))?;
+                let gathered = source.clone().parallel_gather(indices)?;
+                Ok::<_, mxx_dsl::DslError>(gathered.get_static(0))
+            })
+            .expect("nested affine gather family");
+        let ring = Ring::new(256, 1);
+        let residual = nested.get_static(0).lift_to_constant_polynomial(ring.matrix_type((1, 1)));
+        let encrypt = DslContext::new("nested-affine-gather-encrypt")
+            .int_parameter("cutoff")
+            .public_output("ciphertext", residual.clone())
+            .unwrap()
+            .private_output("operational-residual", residual)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut protocol = crate::protocol_example::protocol();
+        let encrypt_stage = protocol
+            .bundle
+            .workflow
+            .stages
+            .iter_mut()
+            .find(|stage| stage.id == StageId("encrypt".to_owned()))
+            .unwrap();
+        encrypt_stage.graph = encrypt.graph;
+        encrypt_stage.semantic_anchors = encrypt.anchors;
+        encrypt_stage.derivation_attachments = encrypt.derivation_attachments;
+        for binding in &mut protocol.bundle.input_bindings {
+            if binding.input == ProtocolInputId::from("message") {
+                binding.destinations.retain(|destination| {
+                    matches!(destination, ProtocolInputDestination::Ideal { .. })
+                });
+            }
+        }
+        crate::ProtocolDecl::new(protocol).unwrap_or_else(|error| panic!("{error:?}"))
+    }
+
     fn sequential_scan_protocol(count: usize, nested_parallel: bool) -> crate::ProtocolDecl {
         use crate::{ProtocolInputDestination, ProtocolInputId};
         use mxx_dsl::{DslContext, Ring, Sequential};
@@ -5737,6 +7390,189 @@ pub(crate) mod tests {
             }
         }
         protocol
+    }
+
+    /// Build a nested sequential scan whose inner invariant is the current outer carried value.
+    /// The residual subtracts the exact hand-unrolled recurrence, so normalization proves both
+    /// the carried-state update and the per-invocation invariant recomputation.
+    fn nested_sequential_invariant_protocol() -> crate::ProtocolDecl {
+        use crate::{
+            InputContractEntry, InputValueContract, ProtocolInputBinding, ProtocolInputDestination,
+            ProtocolInputId, StageInputName,
+        };
+        use mxx_dsl::{DslContext, Ring, Sequential};
+        let ring = Ring::new(256, 1);
+        let initial = ring.input("nested-initial", (1, 1));
+        let outer_invariant = ring.input("nested-outer-invariant", (1, 1));
+        let nested = Sequential::range(2)
+            .scan(initial.clone(), outer_invariant.clone(), |_, state, outer_invariant| {
+                let inner = Sequential::range(2)
+                    .scan(ring.zero((1, 1)), state.clone(), |_, inner_state, inner_invariant| {
+                        // This value is invariant within one inner invocation, but it
+                        // must be rebuilt when the outer carried state changes.
+                        Ok(inner_state + inner_invariant)
+                    })
+                    .expect("inner invariant scan");
+                Ok(inner + outer_invariant)
+            })
+            .expect("nested invariant scan");
+
+        let hand_first = ring.zero((1, 1)) + initial.clone() + initial + outer_invariant.clone();
+        let hand_second =
+            ring.zero((1, 1)) + hand_first.clone() + hand_first + outer_invariant.clone();
+        let residual = nested - hand_second;
+        let encrypt = DslContext::new("nested-sequential-invariant")
+            .int_parameter("cutoff")
+            .public_output("ciphertext", residual.clone())
+            .expect("ciphertext output")
+            .private_output("operational-residual", residual)
+            .expect("residual output")
+            .build()
+            .expect("nested invariant graph");
+        let mut protocol = crate::protocol_example::protocol();
+        let encrypt_stage = protocol
+            .bundle
+            .workflow
+            .stages
+            .iter_mut()
+            .find(|stage| stage.id == StageId("encrypt".to_owned()))
+            .expect("encrypt stage");
+        encrypt_stage.graph = encrypt.graph;
+        encrypt_stage.semantic_anchors = encrypt.anchors;
+        encrypt_stage.derivation_attachments = encrypt.derivation_attachments;
+        for binding in &mut protocol.bundle.input_bindings {
+            if binding.input == ProtocolInputId::from("message") {
+                binding.destinations.retain(|destination| {
+                    matches!(destination, ProtocolInputDestination::Ideal { .. })
+                });
+            }
+        }
+        let matrix_contract = InputValueContract::MatrixLarge {
+            matrix_type: MatrixType {
+                modulus: IntExpr::constant(256),
+                ring_dimension: IntExpr::constant(1),
+                rows: IntExpr::constant(1),
+                columns: IntExpr::constant(1),
+            },
+        };
+        for name in ["nested-initial", "nested-outer-invariant"] {
+            let id = ProtocolInputId::from(name);
+            protocol.bundle.input_contract.inputs.push(InputContractEntry {
+                id: id.clone(),
+                name: name.to_owned(),
+                value: matrix_contract.clone(),
+            });
+            protocol.bundle.input_bindings.push(ProtocolInputBinding {
+                input: id,
+                destinations: vec![ProtocolInputDestination::WorkflowStage {
+                    stage: StageId("encrypt".to_owned()),
+                    input: StageInputName(name.to_owned()),
+                }],
+            });
+        }
+        protocol
+    }
+
+    /// Build a real `Parallel -> Sequential -> Parallel` graph and then deserialize an equivalent
+    /// graph whose three structural nodes deliberately share one displayed index slot. This is a
+    /// regression fixture for lexical scope handling; production graph construction normally
+    /// assigns distinct slots by nesting depth.
+    fn same_slot_parallel_sequential_parallel_protocol() -> crate::ProtocolDecl {
+        use crate::{ProtocolInputDestination, ProtocolInputId};
+        use mxx_dsl::{DslContext, Family, Parallel, Ring, Sequential};
+        let ring = Ring::new(256, 1);
+        let outer = Parallel::range(3)
+            .map_values(|outer_index| {
+                let outer_source =
+                    Family::<mxx_dsl::Mat>::pack((0..4).map(|_| ring.zero((1, 1))).collect())
+                        .expect("packed source family");
+                let sequential = Sequential::range(2)
+                    .scan(
+                        ring.zero((1, 1)),
+                        ring.zero((1, 1)),
+                        |sequential_index, state, invariant| {
+                            let source = Family::<mxx_dsl::Mat>::pack(
+                                (0..4).map(|_| ring.zero((1, 1))).collect(),
+                            )
+                            .expect("sequential source family");
+                            let sequential_value = source.get(sequential_index.as_int());
+                            // Evaluate the inner binder explicitly inside the inner parallel body.
+                            // The resulting matrix keeps the test independent of family-capture
+                            // rules while ensuring this body reaches `intern_int_expression`.
+                            let inner = Parallel::range(96)
+                                .map_values(|inner_index| {
+                                    mxx_dsl::Int::evaluate(inner_index.expression())
+                                        .lift_to_constant_polynomial(ring.matrix_type((1, 1)))
+                                })
+                                .expect("inner parallel family");
+                            let inner_value = inner.get_static(0);
+                            Ok(state + invariant + sequential_value + inner_value)
+                        },
+                    )
+                    .expect("sequential scan");
+                // This descriptor is constructed after the sequential scope closes. It must
+                // still refer to the outer parallel binder, not to the final concrete sequential
+                // iteration value that used the same displayed index slot.
+                sequential + outer_source.get(outer_index.as_int())
+            })
+            .expect("outer parallel family");
+        let residual = outer.get_static(0);
+        let encrypt = DslContext::new("same-slot-parallel-sequential-parallel")
+            .int_parameter("cutoff")
+            .public_output("ciphertext", residual.clone())
+            .expect("ciphertext output")
+            .private_output("operational-residual", residual)
+            .expect("residual output")
+            .build()
+            .expect("same-slot graph");
+
+        let mut encoded = serde_json::to_value(&encrypt.graph).expect("serialize graph");
+        fn rewrite_index_slots(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    if fields.contains_key("index_slot") {
+                        fields.insert("index_slot".to_owned(), serde_json::Value::from(0_u32));
+                    }
+                    if fields.get("tag") == Some(&serde_json::Value::from("LoopIndex")) {
+                        fields.insert("value".to_owned(), serde_json::Value::from(0_u32));
+                    }
+                    for child in fields.values_mut() {
+                        rewrite_index_slots(child);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for child in values {
+                        rewrite_index_slots(child);
+                    }
+                }
+                serde_json::Value::Null |
+                serde_json::Value::Bool(_) |
+                serde_json::Value::Number(_) |
+                serde_json::Value::String(_) => {}
+            }
+        }
+        rewrite_index_slots(&mut encoded);
+        let graph = serde_json::from_value(encoded).expect("deserialize same-slot graph");
+
+        let mut protocol = crate::protocol_example::protocol();
+        let encrypt_stage = protocol
+            .bundle
+            .workflow
+            .stages
+            .iter_mut()
+            .find(|stage| stage.id == StageId("encrypt".to_owned()))
+            .expect("encrypt stage");
+        encrypt_stage.graph = graph;
+        encrypt_stage.semantic_anchors = encrypt.anchors;
+        encrypt_stage.derivation_attachments = encrypt.derivation_attachments;
+        for binding in &mut protocol.bundle.input_bindings {
+            if binding.input == ProtocolInputId::from("message") {
+                binding.destinations.retain(|destination| {
+                    matches!(destination, ProtocolInputDestination::Ideal { .. })
+                });
+            }
+        }
+        crate::ProtocolDecl::new(protocol).expect("same-slot protocol")
     }
 
     fn deep_real_graph_protocol() -> crate::ProtocolDecl {
@@ -5864,6 +7700,24 @@ pub(crate) mod tests {
             NodeKindClass::Structural
         );
         let _ = NodeKindClass::TypedUnsupported;
+    }
+
+    #[test]
+    fn dependency_policy_tracks_real_and_type_descriptors() {
+        let dynamic_real = NodeKind::ConstantReal(RealExpr::FromInt(IntExpr::LoopIndex(3)));
+        assert!(node_contains_loop_index(&dynamic_real));
+
+        let dynamic_matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(4),
+            rows: IntExpr::LoopIndex(3),
+            columns: IntExpr::constant(1),
+        };
+        assert!(node_contains_loop_index(&NodeKind::ConstantMatrix {
+            matrix_type: dynamic_matrix.clone(),
+            value: ConstantMatrix::Identity,
+        }));
+        assert!(wire_type_contains_loop_index(&WireType::Matrix(dynamic_matrix)));
     }
 
     #[test]
@@ -6212,6 +8066,7 @@ pub(crate) mod tests {
                 &wire,
                 &NodeKind::LiftIntegerToConstantPolynomial { matrix_type: matrix.clone() },
                 &output,
+                false,
                 &[Value::Expr(exact_input)],
             )
             .expect("exact integer lift");
@@ -6231,6 +8086,7 @@ pub(crate) mod tests {
                 &wire,
                 &NodeKind::LiftIntegerToConstantPolynomial { matrix_type: matrix.clone() },
                 &output,
+                false,
                 &[Value::Expr(dynamic_input)],
             )
             .expect("dynamic integer lift");
@@ -6269,6 +8125,59 @@ pub(crate) mod tests {
             Box::new(IntExpr::LoopIndex(0)),
         )));
         assert!(!contains_loop_index(&IntExpr::constant(1)));
+    }
+
+    #[test]
+    fn integer_descriptors_close_sequential_slots_but_preserve_parallel_slots() {
+        let protocol = parallel_range_protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("parallel plan");
+        let mut adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("parallel adapter");
+        let wire = plan.target().residual.clone();
+        let expression =
+            IntExpr::Add(Box::new(IntExpr::LoopIndex(7)), Box::new(IntExpr::constant(2)));
+
+        adapter.loop_environment =
+            adapter.loop_envs.push_sequential(adapter.loop_environment, 7, BigInt::from(3));
+        let closed = adapter
+            .intern_int_expression(&expression, &wire)
+            .expect("concrete sequential descriptor");
+        assert!(matches!(
+            adapter.job.expressions().node(closed).unwrap().operator,
+            ValueOperator::Constant(TypedConstant {
+                value: ConstantValue::Int(ref value),
+                ..
+            }) if value == &BigInt::from(5)
+        ));
+
+        adapter.loop_environment = LoopEnvId(0);
+        let occurrence = ProgramOccurrence { definition: FrozenGraphScopeId::Root, path: 77 };
+        let formal = adapter.parallel_formal(&occurrence, &wire).expect("parallel formal");
+        adapter.loop_environment = adapter.loop_envs.push_parallel(
+            adapter.loop_environment,
+            7,
+            formal,
+            occurrence,
+            TrustedIndexRange { minimum: 0, maximum_exclusive: 4 },
+        );
+        let open = adapter
+            .intern_int_expression(&expression, &wire)
+            .expect("parallel descriptor remains open");
+        assert!(matches!(
+            adapter.job.expressions().node(open).unwrap().operator,
+            ValueOperator::Scalar(ScalarOperation::Add)
+        ));
+        assert!(adapter.job.expressions().node(open).unwrap().inputs.contains(&formal));
+
+        adapter.loop_environment = LoopEnvId(0);
+        let error = adapter
+            .intern_int_expression(&IntExpr::LoopIndex(7), &wire)
+            .expect_err("inactive loop slots must fail closed");
+        assert!(matches!(error, ProductionAdapterError::IntegerExpression { .. }));
     }
 
     #[test]
@@ -6341,6 +8250,34 @@ pub(crate) mod tests {
             .collect::<BTreeSet<_>>();
         assert!(!five.is_empty() && !seven.is_empty());
         assert!(five.is_disjoint(&seven));
+    }
+
+    #[test]
+    fn parallel_formals_are_stable_per_occurrence() {
+        let protocol = parallel_range_protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("parallel plan");
+        let mut adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("parallel adapter");
+        let first = ProgramOccurrence { definition: FrozenGraphScopeId::Root, path: 11 };
+        let nested = ProgramOccurrence { definition: FrozenGraphScopeId::Root, path: 12 };
+
+        let wire = plan.target().residual.clone();
+        let first_formal = adapter.parallel_formal(&first, &wire).expect("first formal");
+        assert_eq!(
+            Some(first_formal),
+            adapter.parallel_formals.get(&first).copied(),
+            "setup must retain the formal for later output resolution"
+        );
+        assert_eq!(first_formal, adapter.parallel_formal(&first, &wire).expect("cached formal"));
+        assert_ne!(
+            first_formal,
+            adapter.parallel_formal(&nested, &wire).expect("nested formal"),
+            "same displayed index slot in a distinct occurrence needs a distinct binder"
+        );
     }
 
     #[test]
@@ -6438,8 +8375,9 @@ pub(crate) mod tests {
         let body =
             adapter.job.expressions_mut().intern_argument(0, ResolvedValueType::Int).unwrap();
         let occurrence = ProgramOccurrence { definition: FrozenGraphScopeId::Root, path: 0 };
-        let actual = adapter.opaque_generated_family(&occurrence, domain, body).unwrap();
-        let synthetic = adapter.generated_family(&occurrence, domain, body).unwrap();
+        let wire = plan.target().residual.clone();
+        let actual = adapter.opaque_generated_family(&occurrence, domain, body, &wire).unwrap();
+        let synthetic = adapter.generated_family(&occurrence, domain, body, &wire).unwrap();
         assert_ne!(actual, synthetic);
         assert_eq!(adapter.generated_families.get(&(occurrence, body)), Some(&actual));
         let call = adapter
@@ -6540,12 +8478,13 @@ pub(crate) mod tests {
             ValueOperator::Scalar(ScalarOperation::Add)
         ));
 
+        let wire = plan.target().residual.clone();
         let external_public_family =
-            adapter.opaque_generated_family(&occurrence, domain, public).unwrap();
+            adapter.opaque_generated_family(&occurrence, domain, public, &wire).unwrap();
         let external_target_family =
-            adapter.opaque_generated_family(&occurrence, domain, target).unwrap();
+            adapter.opaque_generated_family(&occurrence, domain, target, &wire).unwrap();
         let external_trapdoor_family =
-            adapter.opaque_generated_family(&occurrence, domain, trapdoor).unwrap();
+            adapter.opaque_generated_family(&occurrence, domain, trapdoor, &wire).unwrap();
         let external_public = adapter
             .call_family_in_program_scope(
                 external_public_family,
@@ -6785,6 +8724,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn nested_affine_gather_uses_all_lexical_binder_ranges() {
+        let protocol = nested_affine_gather_protocol(15);
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("affine plan");
+        let adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("exact source extent must be accepted");
+        let (job, _) = adapter.lower().expect("[0, 15) source must accept outer*5+inner");
+        assert!(
+            job.programs()
+                .family_scopes()
+                .into_iter()
+                .any(|(_, domain)| domain == FamilyDomain::new(0, 15).unwrap())
+        );
+
+        let protocol = nested_affine_gather_protocol(14);
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("affine plan");
+        let adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("range validation is deferred to lowering");
+        let error = match adapter.lower() {
+            Ok(_) => panic!("[0, 14) must reject index 14"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("maximum_exclusive: 15"),
+            "rejection must retain the exact maximum 15: {error}"
+        );
+    }
+
+    #[test]
+    fn nested_affine_gather_keeps_unequal_outer_and_inner_shapes() {
+        let protocol = nested_affine_gather_protocol(15);
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("affine plan");
+        let adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("affine plan");
+        let (job, _) = adapter.lower().expect("unequal nested shapes must lower");
+        let domains = job
+            .programs()
+            .family_scopes()
+            .into_iter()
+            .map(|(_, domain)| domain)
+            .collect::<BTreeSet<_>>();
+        assert!(domains.contains(&FamilyDomain::new(0, 3).unwrap()));
+        assert!(domains.contains(&FamilyDomain::new(0, 5).unwrap()));
+    }
+
+    #[test]
     fn sequential_production_frames_handle_zero_one_and_n_simultaneous_updates() {
         for count in [0, 1, 7] {
             let protocol = sequential_scan_protocol(count, false);
@@ -6803,6 +8799,122 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn indexed_memo_reports_generation_invalidation_without_full_scans() {
+        let protocol = sequential_scan_protocol(7, false);
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("sequential plan");
+        let adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("sequential adapter");
+        let (_, _, diagnostics) = adapter.lower_with_diagnostics().expect("sequential lowering");
+        assert!(diagnostics.generation_advances >= 7);
+        assert!(diagnostics.invariant_cache_hits > 0);
+    }
+
+    #[test]
+    fn compiled_plan_reuses_lowering_metadata_for_large_sequential_body() {
+        let count = 128;
+        let protocol = sequential_scan_protocol(count, false);
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("sequential plan");
+        let expected_entries = plan.nodes().len() as u64;
+        let adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("sequential adapter");
+        let (_, _, diagnostics) = adapter.lower_with_diagnostics().expect("sequential lowering");
+        assert_eq!(diagnostics.compiled_plan_builds, 1);
+        assert!(diagnostics.compiled_entries_built >= expected_entries);
+        assert_eq!(diagnostics.sequential_instantiations, count as u64);
+        assert!(diagnostics.compiled_entries_reached > expected_entries);
+    }
+
+    #[test]
+    fn compiled_plan_prevalidates_structural_edges_and_child_scope() {
+        let protocol = repeated_named_parallel_artifact_protocol(false);
+        let plan = ProtocolPlan::build(&protocol, "named-parallel-artifact")
+            .expect("repeated artifact plan");
+        let adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new())
+            .expect("compiled structural plan");
+        assert!(
+            adapter.lowering_index.entries.iter().any(|entry| entry.alias_target.is_some()),
+            "alias targets must be compiled into wire slots"
+        );
+        assert!(
+            adapter.lowering_index.entries.iter().any(|entry| entry.artifact_target.is_some()),
+            "artifact targets must be compiled into wire slots"
+        );
+        assert!(
+            adapter.lowering_index.entries.iter().any(|entry| entry.output_target.is_some()),
+            "child output targets must be compiled into wire slots"
+        );
+        assert!(
+            adapter.lowering_index.entries.iter().any(|entry| {
+                entry.child.as_ref().is_some_and(|child| {
+                    !child.inputs.is_empty() &&
+                        !child.outputs.is_empty() &&
+                        !child.output_slots.is_empty()
+                })
+            }),
+            "child occurrence and scope metadata must be compiled once"
+        );
+    }
+
+    #[test]
+    fn nested_sequential_invariant_recomputes_for_each_outer_invocation() {
+        let protocol = nested_sequential_invariant_protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("nested plan");
+        let adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("nested invariant adapter");
+        let (mut job, roots, diagnostics) =
+            adapter.lower_with_diagnostics().expect("nested invariant lowering");
+        let ProductionRoot::Closed(residual) = roots.residual else {
+            panic!("nested invariant residual must be closed")
+        };
+        let analysis = job.normalize_closed_root(residual).expect("nested invariant evaluation");
+        assert!(
+            analysis.value.exact_nf.as_ref().is_some_and(|normal_form| normal_form.is_zero()),
+            "nested lowering must equal its hand-unrolled recurrence: {analysis:?}"
+        );
+        assert!(
+            diagnostics.invariant_invocations >= 3,
+            "outer invocation and two inner invocations must be distinct: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.invariant_recomputes > 0,
+            "the inner invariant must be recomputed after the outer carried state changes: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn lexical_arena_peaks_do_not_grow_with_sequential_count() {
+        let lower = |count| {
+            let protocol = sequential_scan_protocol(count, false);
+            let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("plan");
+            ProductionAdapter::new(
+                &protocol,
+                &plan,
+                BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+            )
+            .expect("adapter")
+            .lower_with_diagnostics()
+            .expect("lowering")
+            .2
+        };
+        let small = lower(2);
+        let large = lower(128);
+        assert_eq!(small.resolve_env_peak, large.resolve_env_peak);
+        assert_eq!(small.loop_env_peak, large.loop_env_peak);
+    }
+
+    #[test]
     fn sequential_body_can_resume_nested_parallel_without_stack_growth() {
         let protocol = sequential_scan_protocol(4, true);
         let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("nested plan");
@@ -6815,6 +8927,171 @@ pub(crate) mod tests {
         let (job, roots) = adapter.lower().expect("nested sequential lowering");
         assert!(roots.occurrences >= 2);
         assert!(!job.programs().family_scopes().is_empty());
+    }
+
+    #[test]
+    fn same_slot_parallel_sequential_parallel_preserves_lexical_shadowing() {
+        let protocol = same_slot_parallel_sequential_parallel_protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("same-slot plan");
+        let adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("same-slot adapter");
+        let (job, roots) = adapter.lower().expect(
+            "outer parallel, sequential, and inner parallel may share a slot without leaking concrete sequential indices",
+        );
+        assert!(roots.occurrences >= 3, "all three structural occurrences must be lowered");
+        let outer_domain = FamilyDomain::new(0, 3).expect("outer domain");
+        let outer_family = job
+            .programs()
+            .family_scopes()
+            .into_iter()
+            .find(|(_, domain)| *domain == outer_domain)
+            .map(|(program, _)| job.programs().family_for_program(program).expect("outer family"))
+            .expect("outer parallel family must be generated");
+        let outer_program = job.programs().program(outer_family.program()).expect("outer program");
+        let [outer_formal] = outer_program.formal_arguments.as_ref() else {
+            panic!("outer parallel family must retain one fresh formal")
+        };
+        let outer_body = job.programs().family_body(outer_family).expect("outer family body");
+        // The sequential scan has no outer-binder input. Therefore this remaining free argument
+        // can only come from the descriptor constructed after the sequential scope closes.
+        assert_eq!(
+            job.expressions().free_argument_ids(outer_body).expect("outer body free arguments"),
+            BTreeSet::from([*outer_formal]),
+            "post-sequential descriptor must retain the outer parallel formal",
+        );
+
+        let inner_family = job
+            .programs()
+            .family_scopes()
+            .into_iter()
+            .filter(|(_, domain)| *domain == FamilyDomain::new(0, 96).expect("inner domain"))
+            .map(|(program, _)| job.programs().family_for_program(program).expect("inner family"))
+            .find(|family| {
+                let body = job.programs().family_body(*family).expect("inner body");
+                matches!(
+                    job.expressions().node(body).expect("inner body node").operator,
+                    ValueOperator::Matrix(MatrixOperation::LiftConstantPolynomial { .. })
+                )
+            })
+            .expect("inner parallel family must retain its evaluated index body");
+        let inner_program = job.programs().program(inner_family.program()).expect("inner program");
+        let [inner_formal] = inner_program.formal_arguments.as_ref() else {
+            panic!("inner parallel family must retain one fresh formal")
+        };
+        let inner_body = job.programs().family_body(inner_family).expect("inner family body");
+        assert_ne!(
+            *inner_formal, *outer_formal,
+            "nested parallel occurrences need distinct lexical formals even with one slot",
+        );
+        assert_eq!(
+            job.expressions().free_argument_ids(inner_body).expect("inner body free arguments"),
+            BTreeSet::from([*inner_formal]),
+            "inner EvaluateInt must remain open over the inner parallel formal",
+        );
+    }
+
+    fn selector_fixture_plan(kind: NodeKind) -> (crate::ProtocolDecl, ProtocolPlan) {
+        let protocol = crate::protocol_example::protocol();
+        let mut plan = ProtocolPlan::build(&protocol, "example-threshold").expect("base plan");
+        let wire = PlannedWire {
+            stage: StageId("encrypt".to_owned()),
+            occurrence: ProgramOccurrence::root(),
+            wire: WireRef { node: NodeId(0xfeed_0000 + plan.nodes().len() as u64), port: Port(0) },
+        };
+        plan.nodes_mut().insert(
+            wire,
+            PlannedNode { kind, arguments: Box::new([]), output_type: WireType::Int },
+        );
+        (protocol, plan)
+    }
+
+    fn large_open_selector() -> IntExpr {
+        let mut expression = IntExpr::LoopIndex(95);
+        for _ in 0..95 {
+            expression = IntExpr::Add(Box::new(expression), Box::new(IntExpr::constant(1)));
+        }
+        expression
+    }
+
+    #[test]
+    fn selector_prepass_directly_skips_large_open_selectors_and_preserves_sink_identity() {
+        let open = large_open_selector();
+        assert!(expression_has_loop_index(&open));
+        assert_eq!(referenced_loop_indices(&open), BTreeSet::from([95]));
+        let (protocol, plan) = selector_fixture_plan(NodeKind::EvaluateInt(open.clone()));
+        let mut plan = plan;
+        let family_open = PlannedWire {
+            stage: StageId("encrypt".to_owned()),
+            occurrence: ProgramOccurrence::root(),
+            wire: WireRef { node: NodeId(0xfeed_1000), port: Port(0) },
+        };
+        plan.nodes_mut().insert(
+            family_open,
+            PlannedNode {
+                kind: NodeKind::FamilyGetStatic { index: open },
+                arguments: Box::new([]),
+                output_type: WireType::Int,
+            },
+        );
+        let parameters = BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]);
+        let ordinary = ProductionAdapter::new(&protocol, &plan, parameters.clone())
+            .expect("open selectors must be skipped");
+        let traced = ProductionAdapter::<FeasibilityTrace>::new_with_feasibility(
+            &protocol, &plan, parameters,
+        )
+        .expect("traced open selectors must be skipped");
+        assert_eq!(ordinary.selector_prepass_diagnostics.skipped, 2);
+        assert_eq!(ordinary.selector_prepass_diagnostics.eval_errors, 0);
+        assert_eq!(ordinary.selector_prepass_diagnostics, traced.selector_prepass_diagnostics);
+        let (ordinary_job, ordinary_roots) = ordinary.lower().expect("ordinary lowering");
+        let (traced_job, traced_roots, _) =
+            traced.lower_with_feasibility().expect("traced lowering");
+        assert_eq!(ordinary_job.expressions().node_count(), traced_job.expressions().node_count());
+        assert_eq!(ordinary_job.programs().len(), traced_job.programs().len());
+        assert_eq!(ordinary_roots.occurrences, traced_roots.occurrences);
+        assert_eq!(ordinary_roots.samples, traced_roots.samples);
+    }
+
+    #[test]
+    fn selector_prepass_materializes_closed_and_best_effort_selectors_but_rejects_static_errors() {
+        let (protocol, plan) = selector_fixture_plan(NodeKind::FamilyGetStatic { index: 7.into() });
+        let adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("closed static selector");
+        assert_eq!(adapter.selector_prepass_diagnostics.eval_errors, 0);
+        assert!(adapter.static_indices.len() >= 1);
+        assert!(adapter.job.facts().ranges_finalized());
+
+        let (protocol, plan) = selector_fixture_plan(NodeKind::EvaluateInt(IntExpr::Var(
+            "missing-selector".to_owned(),
+        )));
+        let adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("unevaluable EvaluateInt remains best-effort");
+        assert!(adapter.selector_prepass_diagnostics.eval_errors >= 1);
+
+        let (protocol, plan) = selector_fixture_plan(NodeKind::FamilyGetStatic {
+            index: IntExpr::Var("missing-selector".to_owned()),
+        });
+        let error = match ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        ) {
+            Ok(_) => panic!("malformed non-loop FamilyGetStatic must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ProductionAdapterError::IntegerExpression { .. }));
     }
 
     #[test]
@@ -7330,6 +9607,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn production_lowering_accepts_the_last_scalar_ring_coefficient() {
+        let protocol = scalar_ring_parallel_range_protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("parallel plan");
+        let (job, roots, trace) = ProductionAdapter::new_with_feasibility(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("adapter")
+        .lower_with_feasibility()
+        .expect("scalar ring extraction at N-1 must lower");
+        assert!(matches!(roots.residual, ProductionRoot::Closed(_)));
+
+        let extracted = trace
+            .index_use_plans()
+            .find_map(|plan| {
+                plan.frontier
+                    .iter()
+                    .any(|axis| matches!(axis, IndexFrontierAxis::ExtractedCoefficient { .. }))
+                    .then_some(plan.index)
+            })
+            .expect("lowering must retain the extracted coefficient index");
+        let coefficient = job.expressions().node(extracted).expect("coefficient expression");
+        let ValueOperator::ExtractCoefficient { position, .. } = &coefficient.operator else {
+            panic!("expected ValueOperator::ExtractCoefficient, got {:?}", coefficient.operator)
+        };
+        assert_eq!(*position, 7);
+        let [input] = coefficient.inputs.as_ref() else {
+            panic!("coefficient extraction must have one matrix input")
+        };
+        assert_eq!(
+            job.expressions().value_type(*input).expect("coefficient input type"),
+            &ResolvedValueType::Matrix(ResolvedMatrixType::new(256_u16.into(), 8, 1, 1).unwrap())
+        );
+    }
+
+    #[test]
     fn extracted_coefficient_axis_rejects_a_narrower_family_consumer() {
         let protocol = parallel_range_protocol_with_selector_upper(6);
         let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("parallel plan");
@@ -7463,5 +9777,358 @@ pub(crate) mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn collect_columns_protocol_lowers_to_ordered_generic_concat() {
+        use mxx_dsl::{DslContext, Family, Mat, Ring};
+        use mxx_ir_core::expr::IntExpr;
+
+        let mut protocol = crate::protocol_example::protocol();
+        let ring = Ring::new(256, 1);
+        let message = ring.bool_input("message");
+        let selector = message.to_int();
+        let zero = ring.zero((1, 1));
+        let carrier = ring.polynomial([IntExpr::constant(128)]);
+        let ciphertext =
+            selector.select(vec![zero.clone(), carrier.clone()]).expect("ciphertext branches");
+        let family = Family::<Mat>::pack(vec![zero.clone(), carrier, zero]).expect("family");
+        let residual = Family::<Mat>::try_parallel_zip_many_columns(vec![family], |_, values| {
+            values.into_iter().next().ok_or(mxx_dsl::DslError::Schema)
+        })
+        .expect("collect-columns residual");
+        let encrypt = DslContext::new("collect-columns-encrypt")
+            .int_parameter("cutoff")
+            .public_output("ciphertext", ciphertext)
+            .expect("ciphertext output")
+            .private_output("operational-residual", residual)
+            .expect("residual output")
+            .build()
+            .expect("collect-columns graph");
+        let encrypt_stage = protocol
+            .bundle
+            .workflow
+            .stages
+            .iter_mut()
+            .find(|stage| stage.id == StageId("encrypt".to_owned()))
+            .expect("encrypt stage");
+        encrypt_stage.graph = encrypt.graph;
+
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("collect plan");
+        let adapter =
+            ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).expect("collect adapter");
+        let (job, roots) = adapter.lower().expect("collect lowering");
+        let ProductionRoot::Closed(residual) = roots.residual else {
+            panic!("CollectColumns must lower to a closed matrix expression")
+        };
+        let root = job.expressions().node(residual.expression()).expect("concat root");
+        let ValueOperator::Matrix(MatrixOperation::Concat { axis, output, layout }) =
+            &root.operator
+        else {
+            panic!("CollectColumns must use generic matrix concat")
+        };
+        assert_eq!(*axis, 1);
+        assert_eq!(output.columns, 3);
+        assert_eq!(layout, &MatrixLayout::row_major(output.rows, output.columns));
+        assert_eq!(root.inputs.len(), 3);
+
+        let indices = root
+            .inputs
+            .iter()
+            .map(|input| {
+                let node = job.expressions().node(*input).expect("family member");
+                let index = node.inputs.first().copied().expect("family-call index");
+                let index_node = job.expressions().node(index).expect("index constant");
+                let ValueOperator::Constant(TypedConstant {
+                    value: ConstantValue::Int(index), ..
+                }) = &index_node.operator
+                else {
+                    panic!("family member index must be a constant")
+                };
+                index.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec![BigInt::from(0), BigInt::from(1), BigInt::from(2)]);
+    }
+
+    #[test]
+    fn collect_columns_nested_family_pack_closes_outer_binder() {
+        use mxx_dsl::{DslContext, Family, Mat, Ring};
+        use mxx_ir_core::expr::IntExpr;
+
+        let mut protocol = crate::protocol_example::protocol();
+        let ring = Ring::new(256, 1);
+        let message = ring.bool_input("message");
+        let selector = message.to_int();
+        let zero = ring.zero((1, 1));
+        let carrier = ring.polynomial([IntExpr::constant(128)]);
+        let ciphertext = selector.select(vec![zero.clone(), carrier]).expect("ciphertext branches");
+        let seed = Family::<Mat>::pack(vec![zero.clone(), zero.clone()]).expect("outer family");
+        let residual =
+            Family::<Mat>::try_parallel_zip_many_columns(vec![seed], |index, _values| {
+                let varying = index.as_int().lift_to_constant_polynomial(ring.matrix_type((1, 1)));
+                let packed = Family::<Mat>::pack(vec![
+                    varying.clone(),
+                    varying.clone() + zero.clone(),
+                    varying.clone(),
+                    varying,
+                ])?;
+                Ok(packed.get_static(1))
+            })
+            .expect("nested collect-columns residual");
+        let encrypt = DslContext::new("nested-collect-columns-encrypt")
+            .int_parameter("cutoff")
+            .public_output("ciphertext", ciphertext)
+            .expect("ciphertext output")
+            .private_output("operational-residual", residual)
+            .expect("residual output")
+            .build()
+            .expect("nested collect-columns graph");
+        let encrypt_stage = protocol
+            .bundle
+            .workflow
+            .stages
+            .iter_mut()
+            .find(|stage| stage.id == StageId("encrypt".to_owned()))
+            .expect("encrypt stage");
+        encrypt_stage.graph = encrypt.graph;
+
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("nested plan");
+        let parent_loop = plan
+            .nodes()
+            .iter()
+            .find(|(_, node)| {
+                matches!(
+                    node.kind,
+                    NodeKind::ParallelLoop(mxx_ir_core::node::ParallelLoop {
+                        output_mode: mxx_ir_core::node::ParallelOutputMode::CollectColumns,
+                        ..
+                    })
+                )
+            })
+            .map(|(wire, _)| wire.clone())
+            .expect("parent CollectColumns node");
+        let parent_argument = plan.nodes()[&parent_loop].arguments[0];
+        let parent_dependency = PlannedWire {
+            stage: parent_loop.stage.clone(),
+            occurrence: parent_loop.occurrence.clone(),
+            wire: parent_argument,
+        };
+        assert!(plan.nodes().contains_key(&parent_dependency));
+        assert!(plan.aliases().iter().any(|alias| alias.parent == parent_dependency));
+        let adapter =
+            ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).expect("nested adapter");
+        let (job, roots) = adapter.lower().expect("nested lowering");
+        let ProductionRoot::Closed(residual) = roots.residual else {
+            panic!("nested CollectColumns residual must be closed")
+        };
+        assert!(
+            job.expressions()
+                .free_argument_ids(residual.expression())
+                .expect("residual free arguments")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn nested_collect_columns_captures_only_inner_binder() {
+        use mxx_dsl::{DslContext, Family, Mat, Parallel, Ring};
+        use mxx_ir_core::expr::IntExpr;
+
+        let mut protocol = crate::protocol_example::protocol();
+        let ring = Ring::new(256, 1);
+        let message = ring.bool_input("message");
+        let selector = message.to_int();
+        let zero = ring.zero((1, 1));
+        let carrier = ring.polynomial([IntExpr::constant(128)]);
+        let ciphertext = selector.select(vec![zero.clone(), carrier]).expect("ciphertext branches");
+        let outer = Parallel::range(2)
+            .try_map(|_| {
+                let inner = Parallel::range(2).try_map(|index| {
+                    let varying =
+                        index.as_int().lift_to_constant_polynomial(ring.matrix_type((1, 1)));
+                    let packed = Family::<Mat>::pack(vec![varying.clone(), varying])?;
+                    Ok(packed.get_static(1))
+                })?;
+                Ok(inner.get_static(1))
+            })
+            .expect("nested parallel family");
+        let residual = outer.get_static(1);
+        let encrypt = DslContext::new("nested-capture-collect-columns-encrypt")
+            .int_parameter("cutoff")
+            .public_output("ciphertext", ciphertext)
+            .expect("ciphertext output")
+            .private_output("operational-residual", residual)
+            .expect("residual output")
+            .build()
+            .expect("nested capture graph");
+        let encrypt_stage = protocol
+            .bundle
+            .workflow
+            .stages
+            .iter_mut()
+            .find(|stage| stage.id == StageId("encrypt".to_owned()))
+            .expect("encrypt stage");
+        encrypt_stage.graph = encrypt.graph;
+
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("nested plan");
+        let adapter =
+            ProductionAdapter::new(&protocol, &plan, BTreeMap::new()).expect("nested adapter");
+        let (job, roots) = adapter.lower().expect("nested lowering");
+        let ProductionRoot::Closed(residual) = roots.residual else {
+            panic!("nested residual must be closed")
+        };
+        assert!(job.expressions().free_argument_ids(residual.expression()).unwrap().is_empty());
+
+        let explicit_family = job
+            .programs()
+            .family_scopes()
+            .into_iter()
+            .map(|(program, _)| job.programs().family_for_program(program).expect("family"))
+            .find(|family| {
+                let body = job.programs().family_body(*family).expect("family body");
+                matches!(
+                    job.expressions().node(body).expect("family body node").operator,
+                    ValueOperator::ExplicitElement { .. }
+                )
+            })
+            .expect("inner FamilyPack family");
+        let program = job.programs().program(explicit_family.program()).expect("program");
+        let [selector] = program.formal_arguments.as_ref() else {
+            panic!("explicit family has one selector formal")
+        };
+        let body = job.programs().family_body(explicit_family).expect("explicit body");
+        let mut captured = job.expressions().free_argument_ids(body).expect("captures");
+        assert!(captured.remove(selector));
+        assert_eq!(captured.len(), 1, "FamilyPack should record one capture");
+        assert!(
+            job.programs().family_scopes().into_iter().any(|(program, domain)| {
+                domain == FamilyDomain::new(0, 2).unwrap() &&
+                    job.programs()
+                        .program(program)
+                        .map(|program| {
+                            program.formal_arguments.iter().any(|formal| captured.contains(formal))
+                        })
+                        .unwrap_or(false)
+            }),
+            "the sole FamilyPack capture must be the inner loop formal"
+        );
+    }
+
+    #[test]
+    fn arena_context_preserves_normal_operator_owner() {
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
+        let mut adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("example adapter");
+        let wire = plan.target().residual.clone();
+        let output = WireType::Matrix(MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        });
+        let error = adapter
+            .intern_node_operator(
+                &wire,
+                &output,
+                ValueOperator::Constant(TypedConstant::int(1)),
+                Box::new([]),
+                true,
+            )
+            .expect_err("an integer constant cannot satisfy a matrix output");
+        let ProductionAdapterError::ArenaContext { wire: owner, operation, source, .. } = error
+        else {
+            panic!("normal operator errors must retain ArenaContext")
+        };
+        assert_eq!(owner, wire);
+        assert!(operation.contains("Constant"));
+        assert_eq!(source, super::super::arena::ArenaError::ProgramOutputMismatch);
+    }
+
+    #[test]
+    fn arena_context_preserves_rewrite_owner() {
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
+        let mut adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("example adapter");
+        let wire = plan.target().residual.clone();
+        let left = adapter.intern_index_constant(BigInt::from(1_u8)).unwrap();
+        let right = adapter.intern_index_constant(BigInt::from(2_u8)).unwrap();
+        let root = adapter
+            .job
+            .expressions_mut()
+            .intern(ValueOperator::Scalar(ScalarOperation::Add), [left, right].into())
+            .unwrap();
+        let bytes = adapter
+            .job
+            .expressions_mut()
+            .intern(ValueOperator::Constant(TypedConstant::bytes([3_u8; 1])), Box::new([]))
+            .unwrap();
+        let error = adapter
+            .rewrite_expression_exact(&wire, root, &BTreeMap::from([(right, bytes)]))
+            .expect_err("rewriting an integer addition with bytes must fail");
+        let ProductionAdapterError::ArenaContext { wire: owner, operation, source, .. } = error
+        else {
+            panic!("rewrite errors must retain ArenaContext")
+        };
+        assert_eq!(owner, wire);
+        assert!(operation.contains("rewrite"));
+        assert!(matches!(source, super::super::arena::ArenaError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn arena_context_preserves_family_construction_owner() {
+        let protocol = crate::protocol_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "example-threshold").expect("example plan");
+        let mut adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("example adapter");
+        let wire = plan.target().residual.clone();
+        let value = adapter.intern_index_constant(BigInt::from(1_u8)).unwrap();
+        let error = adapter
+            .explicit_family(FamilyDomain::new(0, 2).unwrap(), Box::new([value]), &wire)
+            .expect_err("a family with a missing element must fail");
+        let ProductionAdapterError::ArenaContext { wire: owner, operation, source, .. } = error
+        else {
+            panic!("family construction errors must retain ArenaContext")
+        };
+        assert_eq!(owner, wire);
+        assert_eq!(operation, "explicit family construction");
+        assert!(matches!(source, super::super::arena::ArenaError::InvalidArity { .. }));
+    }
+
+    #[test]
+    fn resolver_progress_reports_only_at_bounded_work_intervals() {
+        let mut progress = ResolveProgress::new();
+        for _ in 0..ResolveProgress::WORK_REPORT_INTERVAL - 1 {
+            assert!(!progress.tick());
+        }
+        assert!(progress.tick());
+        assert_eq!(progress.work_items, ResolveProgress::WORK_REPORT_INTERVAL);
+        assert!(!progress.tick());
+    }
+
+    #[test]
+    fn resolver_progress_reports_the_time_trigger_at_clock_check_boundary() {
+        let mut progress = ResolveProgress::new();
+        progress.last_report = Instant::now() - ResolveProgress::TIME_REPORT_INTERVAL;
+        for _ in 0..ResolveProgress::CLOCK_CHECK_INTERVAL - 1 {
+            assert!(!progress.tick());
+        }
+        assert!(progress.tick());
+        assert_eq!(progress.work_items, ResolveProgress::CLOCK_CHECK_INTERVAL);
+        assert!(!progress.tick());
     }
 }

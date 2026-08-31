@@ -1,8 +1,12 @@
 use super::{
-    Backend, PreimageRequest,
+    Backend, HashSampleRequest, PreimageRequest, UniformSampleRequest,
     poly::{CrtRecomposeMatrix, PolyBackend, PolyBackendError},
 };
+use mxx_ir_core::node::HashVariant;
+use mxx_primitives::sampler::DistType;
+use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
+use rand::Rng;
 use rayon::prelude::*;
 
 impl CrtRecomposeMatrix for GpuDCRTPolyMatrix {
@@ -65,6 +69,88 @@ pub type GpuDcrtBackend = PolyBackend<
     GpuDCRTPolyTrapdoorSampler,
 >;
 
+fn random_gpu_seeds(count: usize) -> Vec<mxx_primitives::poly::dcrt::gpu::GpuRngSeed> {
+    (0..count)
+        .map(|_| {
+            let mut bytes = [0u8; 32];
+            rand::rng().fill(&mut bytes);
+            mxx_primitives::poly::dcrt::gpu::GpuRngSeed::from_bytes(bytes)
+        })
+        .collect()
+}
+
+fn gpu_uniform_batch(
+    backend: &mut GpuDcrtBackend,
+    requests: Vec<UniformSampleRequest>,
+) -> Result<Vec<GpuDCRTPolyMatrix>, PolyBackendError> {
+    let Some(first) = requests.first() else {
+        return Ok(Vec::new());
+    };
+    let parameters = backend.parameters(&first.matrix_type)?;
+    let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+    let expected_range = (BigInt::from(0), modulus - BigInt::from(1));
+    if requests.iter().any(|request| {
+        request.matrix_type != first.matrix_type ||
+            request.range.minimum != expected_range.0 ||
+            request.range.maximum != expected_range.1
+    }) {
+        return Err(PolyBackendError::UnsupportedUniformRange {
+            minimum: first.range.minimum.clone(),
+            maximum: first.range.maximum.clone(),
+        });
+    }
+    let seeds = random_gpu_seeds(requests.len());
+    let outputs = GpuDCRTPolyUniformSampler::new().sample_uniform_batch(
+        parameters,
+        first.matrix_type.rows,
+        first.matrix_type.columns,
+        DistType::FinRingDist,
+        &seeds,
+    );
+    (outputs.len() == requests.len()).then_some(outputs).ok_or(PolyBackendError::InvalidInteger)
+}
+
+fn gpu_hash_batch(
+    backend: &mut GpuDcrtBackend,
+    requests: Vec<HashSampleRequest>,
+) -> Result<Vec<GpuDCRTPolyMatrix>, PolyBackendError> {
+    let Some(first) = requests.first() else {
+        return Ok(Vec::new());
+    };
+    let parameters = backend.parameters(&first.matrix_type)?;
+    if requests.iter().any(|request| {
+        request.matrix_type != first.matrix_type ||
+            request.variant != HashVariant::Plain ||
+            request.gadget_layout.is_some()
+    }) {
+        return Err(PolyBackendError::InvalidInteger);
+    }
+    let keys = requests.iter().map(|request| request.key).collect::<Vec<_>>();
+    let tags = requests.iter().map(|request| request.tag.as_slice()).collect::<Vec<_>>();
+    let outputs = GpuDCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash_batch(
+        parameters,
+        &keys,
+        &tags,
+        first.matrix_type.rows,
+        first.matrix_type.columns,
+        DistType::FinRingDist,
+    );
+    (outputs.len() == requests.len()).then_some(outputs).ok_or(PolyBackendError::InvalidInteger)
+}
+
+impl
+    PolyBackend<
+        GpuDCRTPolyMatrix,
+        GpuDCRTPolyUniformSampler,
+        GpuDCRTPolyHashSampler<keccak_asm::Keccak256>,
+        GpuDCRTPolyTrapdoorSampler,
+    >
+{
+    fn enable_gpu_sampling_batch(&mut self) {
+        self.set_sampling_batch_dispatch(gpu_uniform_batch, gpu_hash_batch);
+    }
+}
+
 pub fn gpu_backend(parameters: impl IntoIterator<Item = GpuDCRTPolyParams>) -> GpuDcrtBackend {
     let parameters = parameters.into_iter().collect::<Vec<_>>();
     let device_ids = detected_gpu_device_ids();
@@ -85,7 +171,9 @@ pub fn gpu_backend_on(
             parameters.iter().map(|parameters| parameters.params_for_device(device_id)).collect()
         })
         .collect();
-    GpuDcrtBackend::new_with_placements(placements)
+    let mut backend = GpuDcrtBackend::new_with_placements(placements);
+    backend.enable_gpu_sampling_batch();
+    backend
 }
 
 pub(super) fn new_for_execution_on<M, U, H, T>(

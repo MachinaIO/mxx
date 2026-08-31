@@ -1,8 +1,8 @@
 use crate::{
     artifact::{ArtifactKey, ArtifactPayload, ArtifactStore},
     backend::{
-        Backend, IndexRange as RuntimeIndexRange, MatrixMulAccumulateRequest, PreimageRequest,
-        RuntimeValue, SampleRange as RuntimeSampleRange,
+        Backend, HashSampleRequest, IndexRange as RuntimeIndexRange, MatrixMulAccumulateRequest,
+        PreimageRequest, RuntimeValue, SampleRange as RuntimeSampleRange, UniformSampleRequest,
     },
     session::{ArtifactHandle, SessionDescriptor, SessionStore},
     transcript::{DrawSite, RecordedValue, SamplingMode, TranscriptError},
@@ -30,7 +30,15 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tracing::info;
+use tracing::{debug, info};
+
+#[cfg(test)]
+use std::cell::RefCell;
+
+#[cfg(test)]
+thread_local! {
+    static EXECUTION_BATCH_WIDTHS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionConfig {
@@ -146,6 +154,84 @@ type TrapdoorParts<B> = (
 
 struct InstanceResult<B: Backend> {
     outputs: Vec<RuntimeValue<B>>,
+}
+
+#[derive(Clone)]
+enum SampleRequest {
+    Uniform(UniformSampleRequest),
+    Hash(HashSampleRequest),
+}
+
+struct PendingSample {
+    instance: usize,
+    path: Vec<InstantiationFrame>,
+    wire: WireRef,
+    matrix_type: ConcreteMatrixType,
+    request: SampleRequest,
+}
+
+fn node_kind_label(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Input { .. } => "input",
+        NodeKind::ConstantInt(_) => "constant_int",
+        NodeKind::EvaluateInt(_) => "evaluate_int",
+        NodeKind::ConstantReal(_) => "constant_real",
+        NodeKind::ConstantBool(_) => "constant_bool",
+        NodeKind::ConstantMatrix { .. } => "constant_matrix",
+        NodeKind::GadgetTrapdoor { .. } => "gadget_trapdoor",
+        NodeKind::TrapdoorPublic => "trapdoor_public",
+        NodeKind::IntBinary(_) => "int_binary",
+        NodeKind::IntCompare(_) => "int_compare",
+        NodeKind::BitExtract { .. } => "bit_extract",
+        NodeKind::IntToReal => "int_to_real",
+        NodeKind::BoolToInt => "bool_to_int",
+        NodeKind::RealBinary(_) => "real_binary",
+        NodeKind::RealSqrt => "real_sqrt",
+        NodeKind::MatrixBinary(_) => "matrix_binary",
+        NodeKind::MatrixMulAccumulate { .. } => "matrix_mul_accumulate",
+        NodeKind::MatrixNegate => "matrix_negate",
+        NodeKind::MatrixScale { .. } => "matrix_scale",
+        NodeKind::RingAutomorphism { .. } => "ring_automorphism",
+        NodeKind::Transpose => "transpose",
+        NodeKind::Slice { .. } => "slice",
+        NodeKind::Tensor => "tensor",
+        NodeKind::Concat { .. } => "concat",
+        NodeKind::UniformResidueSample { .. } => "uniform_residue_sample",
+        NodeKind::UniformIntervalSample { .. } => "uniform_interval_sample",
+        NodeKind::GaussianSample { .. } => "gaussian_sample",
+        NodeKind::HashSample { .. } => "hash_sample",
+        NodeKind::TrapdoorSample { .. } => "trapdoor_sample",
+        NodeKind::PreimageSample { .. } => "preimage_sample",
+        NodeKind::GadgetDecompose { .. } => "gadget_decompose",
+        NodeKind::ExtractCoefficient { .. } => "extract_coefficient",
+        NodeKind::LiftIntegerToConstantPolynomial { .. } => "lift_integer_to_constant_polynomial",
+        NodeKind::ThresholdDecode { .. } => "threshold_decode",
+        NodeKind::CrtRecompose { .. } => "crt_recompose",
+        NodeKind::PackPolynomialCoefficients { .. } => "pack_polynomial_coefficients",
+        NodeKind::SubgraphCall(_) => "subgraph_call",
+        NodeKind::ParallelLoop(_) => "parallel_loop",
+        NodeKind::SequentialLoop(_) => "sequential_loop",
+        NodeKind::FamilyPack { .. } => "family_pack",
+        NodeKind::FamilyGetStatic { .. } => "family_get_static",
+        NodeKind::FamilyGetDynamic => "family_get_dynamic",
+        NodeKind::Select { .. } => "select",
+    }
+}
+
+fn scope_kind_label(scope: &FrozenGraphScopeId) -> &'static str {
+    match scope {
+        FrozenGraphScopeId::Root => "root",
+        FrozenGraphScopeId::Subgraph { .. } => "subgraph",
+        FrozenGraphScopeId::ParallelBody { .. } => "parallel_body",
+        FrozenGraphScopeId::SequentialBody { .. } => "sequential_body",
+    }
+}
+
+fn should_report_loop_progress(completed: usize, total: usize) -> bool {
+    total <= 100 ||
+        completed == 1 ||
+        completed == total ||
+        completed.is_multiple_of(total.div_ceil(100))
 }
 
 struct ExecutableNode<'a> {
@@ -364,6 +450,18 @@ where
     B: Backend,
     S: SessionStore,
 {
+    let execution_started = Instant::now();
+    info!(
+        scope = "root",
+        graph_nodes = validated.source.root_scope().nodes().len(),
+        input_count = inputs.len(),
+        placement_count = backend.placement_count(),
+        max_parallel_instances = config.max_parallel_instances.get(),
+        capture_trace,
+        "execution scope started"
+    );
+    let mut execution_scope =
+        ExecutionScopeProgress { started: execution_started, completed: false };
     let spec_hash = mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
         .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
     let production = session
@@ -443,6 +541,7 @@ where
         artifact_handles,
         staged_family_leases,
     };
+    execution_scope.completed = true;
     Ok((result, executor.trace.take().unwrap_or_default()))
 }
 
@@ -468,6 +567,22 @@ struct PreimageProgress {
     completed: usize,
     last_reported: usize,
     started: Instant,
+}
+
+struct ExecutionScopeProgress {
+    started: Instant,
+    completed: bool,
+}
+
+impl Drop for ExecutionScopeProgress {
+    fn drop(&mut self) {
+        info!(
+            scope = "root",
+            completed = self.completed,
+            elapsed_ms = self.started.elapsed().as_secs_f64() * 1_000.0,
+            "execution scope ended"
+        );
+    }
 }
 
 impl PreimageProgress {
@@ -540,7 +655,7 @@ where
             vec![env.clone()],
             vec![path],
             vec![inputs],
-            vec![placement],
+            &[placement],
         )
         .map(|mut instances| instances.pop().expect("single execution returns one instance"))
     }
@@ -551,7 +666,7 @@ where
         envs: Vec<ParamEnv>,
         paths: Vec<Vec<InstantiationFrame>>,
         inputs: Vec<BTreeMap<String, RuntimeValue<B>>>,
-        placements: Vec<usize>,
+        placements: &[usize],
     ) -> Result<Vec<InstanceResult<B>>, ExecutionError> {
         debug_assert_eq!(envs.len(), paths.len());
         debug_assert_eq!(envs.len(), inputs.len());
@@ -559,6 +674,21 @@ where
         if envs.is_empty() {
             return Ok(Vec::new());
         }
+        let batch_started = Instant::now();
+        let mut node_kind_counts = BTreeMap::<&'static str, usize>::new();
+        let mut placement_counts = BTreeMap::<usize, usize>::new();
+        for placement in placements {
+            *placement_counts.entry(*placement).or_default() += 1;
+        }
+        debug!(
+            scope_kind = scope_kind_label(scope_id),
+            batch_width = envs.len(),
+            placement_count = self.backend.placement_count(),
+            placements = ?placement_counts,
+            "instance batch started"
+        );
+        #[cfg(test)]
+        EXECUTION_BATCH_WIDTHS.with(|widths| widths.borrow_mut().push(envs.len()));
         let scope = self.validated.source.scope(scope_id).ok_or_else(|| {
             ExecutionError::MissingSubgraph { node: NodeId(0), name: format!("{scope_id:?}") }
         })?;
@@ -575,6 +705,7 @@ where
                 kind: handle.kind(),
                 args: scope.arguments(handle).expect("validated node belongs to its scope"),
             };
+            *node_kind_counts.entry(node_kind_label(node.kind)).or_default() += envs.len();
             if matches!(node.kind, NodeKind::PreimageSample { .. }) && envs.len() > 1 {
                 self.execute_preimage_batch(
                     scope_id,
@@ -585,9 +716,41 @@ where
                     &mut values,
                 )?;
             } else if envs.len() > 1 &&
+                self.execute_parallel_sample_node_by_placement(
+                    scope_id,
+                    &envs,
+                    &paths,
+                    &placements,
+                    &node,
+                    &mut values,
+                )?
+            {
+            } else if envs.len() > 1 &&
                 self.execute_parallel_matrix_node_by_placement(
                     &placements,
                     &envs,
+                    &node,
+                    &mut values,
+                )?
+            {
+            } else if envs.len() > 1 &&
+                matches!(node.kind, NodeKind::SequentialLoop(_)) &&
+                self.execute_sequential_loop_batch(
+                    scope_id,
+                    &envs,
+                    &paths,
+                    &placements,
+                    &node,
+                    &mut values,
+                )?
+            {
+            } else if envs.len() > 1 &&
+                matches!(node.kind, NodeKind::ParallelLoop(_)) &&
+                self.execute_parallel_loop_batch(
+                    scope_id,
+                    &envs,
+                    &paths,
+                    &placements,
                     &node,
                     &mut values,
                 )?
@@ -646,7 +809,7 @@ where
             {
                 self.fence_pending_releases()?;
                 info!(
-                    scope = ?scope_id,
+                    scope_kind = scope_kind_label(scope_id),
                     scope_completed_nodes = position + 1,
                     scope_total_nodes = validated_scope.execution_order.len(),
                     total_executed_nodes = self.executed_node_count,
@@ -665,7 +828,547 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
             instances.push(InstanceResult { outputs });
         }
+        debug!(
+            scope_kind = scope_kind_label(scope_id),
+            batch_width = instances.len(),
+            placement_count = self.backend.placement_count(),
+            node_kind_counts = ?node_kind_counts,
+            elapsed_ms = batch_started.elapsed().as_secs_f64() * 1_000.0,
+            "instance batch completed"
+        );
         Ok(instances)
+    }
+
+    /// Executes a sequential loop in lockstep when every parent has the same
+    /// iteration count.  Each iteration is a recursive batch, so nested
+    /// parallel loops can flatten their child jobs across all parents.
+    fn execute_sequential_loop_batch(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        placements: &[usize],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+    ) -> Result<bool, ExecutionError> {
+        let NodeKind::SequentialLoop(loop_node) = node.kind else {
+            unreachable!("sequential loop batch dispatcher only receives sequential loops")
+        };
+        let counts = envs
+            .iter()
+            .map(|env| self.eval_usize(node.id, &loop_node.count, env))
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(&count) = counts.first() else {
+            return Ok(false);
+        };
+        if counts.iter().any(|candidate| *candidate != count) {
+            return Ok(false);
+        }
+        let loop_started = Instant::now();
+        debug!(
+            loop_handle = ?node.id,
+            loop_type = "sequential",
+            count,
+            batch_width = envs.len(),
+            cap = self.config.max_parallel_instances.get(),
+            placement_count = self.backend.placement_count(),
+            "sequential loop started"
+        );
+        let child_id =
+            self.validated.source.child_scope_id(scope_id, node.id).ok_or_else(|| {
+                ExecutionError::MissingSubgraph {
+                    node: node.id,
+                    name: format!("sequential body at {:?}", node.id),
+                }
+            })?;
+        let child = self.validated.source.scope(&child_id).ok_or_else(|| {
+            ExecutionError::MissingSubgraph {
+                node: node.id,
+                name: format!("sequential body at {:?}", node.id),
+            }
+        })?;
+        let input_names = child
+            .inputs()
+            .iter()
+            .map(|wire| {
+                let input = child.node(wire.node).expect("validated sequential input node");
+                let NodeKind::Input { name, .. } = input.kind() else {
+                    unreachable!("validated sequential input must reference an input node")
+                };
+                name.clone()
+            })
+            .collect::<Vec<_>>();
+        let mut carried = values
+            .iter()
+            .map(|parent_values| {
+                node.args[..loop_node.carried_count]
+                    .iter()
+                    .map(|wire| self.value(parent_values, *wire))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let invariants = values
+            .iter()
+            .map(|parent_values| {
+                node.args[loop_node.carried_count..]
+                    .iter()
+                    .map(|wire| self.value(parent_values, *wire))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for index in 0..count {
+            let mut child_envs = Vec::with_capacity(envs.len());
+            let mut child_paths = Vec::with_capacity(envs.len());
+            let mut child_inputs = Vec::with_capacity(envs.len());
+            for parent in 0..envs.len() {
+                child_envs.push(self.child_env(
+                    &envs[parent],
+                    &loop_node.bindings,
+                    Some((loop_node.index_slot, index)),
+                    node.id,
+                )?);
+                let mut child_path = paths[parent].clone();
+                child_path
+                    .push(InstantiationFrame { call: node.id, loop_index: Some(index as u64) });
+                child_paths.push(child_path);
+                child_inputs.push(
+                    input_names
+                        .iter()
+                        .cloned()
+                        .zip(carried[parent].iter().chain(&invariants[parent]).cloned())
+                        .collect::<BTreeMap<_, _>>(),
+                );
+            }
+            let child_results = self.execute_instances_batch(
+                &child_id,
+                child_envs,
+                child_paths,
+                child_inputs,
+                placements,
+            )?;
+            if child_results.len() != carried.len() {
+                return Err(ExecutionError::InvalidBatch(node.id));
+            }
+            carried = child_results.into_iter().map(|instance| instance.outputs).collect();
+            let completed = index + 1;
+            if should_report_loop_progress(completed, count) {
+                debug!(
+                    loop_handle = ?node.id,
+                    loop_type = "sequential",
+                    count,
+                    iteration = index,
+                    completed,
+                    batch_width = envs.len(),
+                    cap = self.config.max_parallel_instances.get(),
+                    placement_count = self.backend.placement_count(),
+                    elapsed_ms = loop_started.elapsed().as_secs_f64() * 1_000.0,
+                    "sequential loop progress"
+                );
+            }
+        }
+        for (parent, parent_values) in values.iter_mut().enumerate() {
+            for (port, value) in carried[parent].drain(..).enumerate() {
+                self.put(parent_values, node.id, port as u32, value);
+            }
+        }
+        debug!(
+            loop_handle = ?node.id,
+            loop_type = "sequential",
+            count,
+            batch_width = envs.len(),
+            cap = self.config.max_parallel_instances.get(),
+            placement_count = self.backend.placement_count(),
+            elapsed_ms = loop_started.elapsed().as_secs_f64() * 1_000.0,
+            "sequential loop completed"
+        );
+        Ok(true)
+    }
+
+    /// Executes equal-count parallel loops from all parents as one deterministic
+    /// parent-major job stream.  Only the current wave's child instances stay
+    /// live; non-staged families are regrouped into their original parent order.
+    fn execute_parallel_loop_batch(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        placements: &[usize],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+    ) -> Result<bool, ExecutionError> {
+        let NodeKind::ParallelLoop(loop_node) = node.kind else {
+            unreachable!("parallel loop batch dispatcher only receives parallel loops")
+        };
+        if matches!(loop_node.output_mode, mxx_ir_core::node::ParallelOutputMode::CollectColumns) {
+            return Ok(false);
+        }
+        let counts = envs
+            .iter()
+            .map(|env| self.eval_usize(node.id, &loop_node.count, env))
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(&count) = counts.first() else {
+            return Ok(false);
+        };
+        if counts.iter().any(|candidate| *candidate != count) {
+            return Ok(false);
+        }
+        let loop_started = Instant::now();
+        debug!(
+            loop_handle = ?node.id,
+            loop_type = "parallel",
+            count,
+            batch_width = envs.len(),
+            cap = self.config.max_parallel_instances.get(),
+            placement_count = self.backend.placement_count(),
+            "parallel loop started"
+        );
+        let child_id =
+            self.validated.source.child_scope_id(scope_id, node.id).ok_or_else(|| {
+                ExecutionError::MissingSubgraph {
+                    node: node.id,
+                    name: format!("parallel body at {:?}", node.id),
+                }
+            })?;
+        let child = self.validated.source.scope(&child_id).ok_or_else(|| {
+            ExecutionError::MissingSubgraph {
+                node: node.id,
+                name: format!("parallel body at {:?}", node.id),
+            }
+        })?;
+        let placement_count = self.backend.placement_count();
+        if placement_count == 0 {
+            return Err(ExecutionError::BackendPlacement { placement: 0, count: 0 });
+        }
+        let mut staged = Vec::with_capacity(envs.len());
+        for path in paths {
+            staged.push(
+                (0..child.outputs().len())
+                    .map(|port| {
+                        self.staged_family_descriptor(scope_id, path, node.id, port as u32, count)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        let mut families =
+            (0..envs.len())
+                .map(|_| {
+                    staged[0]
+                        .iter()
+                        .map(|descriptor| {
+                            if descriptor.is_some() {
+                                Vec::new()
+                            } else {
+                                Vec::with_capacity(count)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+        let parent_placements = placements.to_vec();
+        let mut broadcast_inputs = (0..envs.len())
+            .map(|_| {
+                (0..placement_count)
+                    .map(|_| (0..node.args.len()).map(|_| None).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for parent in 0..envs.len() {
+            for (argument, (_, mode)) in node.args.iter().zip(&loop_node.input_modes).enumerate() {
+                if matches!(mode, LoopInputMode::Broadcast) {
+                    let placed = self
+                        .values_for_placements(self.value(&values[parent], node.args[argument])?)?;
+                    for (placement, value) in placed.into_iter().enumerate() {
+                        broadcast_inputs[parent][placement][argument] = Some(value);
+                    }
+                }
+            }
+        }
+
+        struct Job {
+            parent: usize,
+            index: usize,
+            placement: usize,
+        }
+        let mut next_parent = 0;
+        let mut next_index = 0;
+        let total_jobs = envs.len().saturating_mul(count);
+        let mut completed_jobs: usize = 0;
+        let wave_size = self.config.max_parallel_instances.get();
+        while next_parent < envs.len() {
+            let mut jobs = Vec::with_capacity(wave_size);
+            while jobs.len() < wave_size && next_parent < envs.len() {
+                if next_index == count {
+                    next_parent += 1;
+                    next_index = 0;
+                    continue;
+                }
+                jobs.push(Job {
+                    parent: next_parent,
+                    index: next_index,
+                    placement: next_index % placement_count,
+                });
+                next_index += 1;
+            }
+            if jobs.is_empty() {
+                continue;
+            }
+            let wave_start = completed_jobs;
+            let wave_len = jobs.len();
+            let wave_started = Instant::now();
+            debug!(
+                loop_handle = ?node.id,
+                loop_type = "parallel",
+                count,
+                wave_start,
+                wave_len,
+                cap = wave_size,
+                placement_count,
+                total_jobs,
+                "parallel loop wave started"
+            );
+            let mut child_envs = Vec::with_capacity(jobs.len());
+            let mut child_paths = Vec::with_capacity(jobs.len());
+            let mut child_inputs = Vec::with_capacity(jobs.len());
+            let mut child_placements = Vec::with_capacity(jobs.len());
+            for job in &jobs {
+                child_envs.push(self.child_env(
+                    &envs[job.parent],
+                    &loop_node.bindings,
+                    Some((loop_node.index_slot, job.index)),
+                    node.id,
+                )?);
+                let mut child_path = paths[job.parent].clone();
+                child_path
+                    .push(InstantiationFrame { call: node.id, loop_index: Some(job.index as u64) });
+                child_paths.push(child_path);
+                child_placements.push(job.placement);
+                child_inputs.push(self.loop_child_inputs(
+                    child,
+                    node,
+                    &loop_node.input_modes,
+                    job.index,
+                    job.placement,
+                    &broadcast_inputs[job.parent][job.placement],
+                    &values[job.parent],
+                )?);
+            }
+            let instances = self.execute_instances_batch(
+                &child_id,
+                child_envs,
+                child_paths,
+                child_inputs,
+                &child_placements,
+            )?;
+
+            // Jobs are parent-major, so each parent appears in at most one
+            // contiguous segment of this wave. Store each segment with its
+            // local family index while retaining global wave residency bounds.
+            let mut segment_start = 0;
+            while segment_start < jobs.len() {
+                let parent = jobs[segment_start].parent;
+                let mut segment_end = segment_start + 1;
+                while segment_end < jobs.len() && jobs[segment_end].parent == parent {
+                    segment_end += 1;
+                }
+                self.store_staged_family_wave(
+                    jobs[segment_start].index,
+                    &instances[segment_start..segment_end],
+                    &child_placements[segment_start..segment_end],
+                    &staged[parent],
+                )?;
+                segment_start = segment_end;
+            }
+            for (job, instance) in jobs.into_iter().zip(instances) {
+                for (port, value) in instance.outputs.into_iter().enumerate() {
+                    if staged[job.parent][port].is_none() {
+                        families[job.parent][port].push(value);
+                    }
+                }
+            }
+            completed_jobs = completed_jobs.saturating_add(wave_len);
+            debug!(
+                loop_handle = ?node.id,
+                loop_type = "parallel",
+                count,
+                wave_start,
+                wave_len,
+                completed_jobs,
+                total_jobs,
+                cap = wave_size,
+                placement_count,
+                elapsed_ms = wave_started.elapsed().as_secs_f64() * 1_000.0,
+                "parallel loop wave completed"
+            );
+        }
+        for parent in 0..envs.len() {
+            self.set_placement(parent_placements[parent])?;
+            for (port, descriptor) in staged[parent].iter().enumerate() {
+                let value = match descriptor {
+                    Some((name, descriptor)) => RuntimeValue::StagedArtifactFamily {
+                        production: self.scratch_production.clone(),
+                        name: name.clone(),
+                        descriptor: descriptor.clone(),
+                    },
+                    None => {
+                        RuntimeValue::IndexedFamily(std::mem::take(&mut families[parent][port]))
+                    }
+                };
+                self.put(&mut values[parent], node.id, port as u32, value);
+            }
+        }
+        debug!(
+            loop_handle = ?node.id,
+            loop_type = "parallel",
+            count,
+            batch_width = envs.len(),
+            cap = wave_size,
+            placement_count,
+            total_jobs,
+            elapsed_ms = loop_started.elapsed().as_secs_f64() * 1_000.0,
+            "parallel loop completed"
+        );
+        Ok(true)
+    }
+
+    /// Executes the column-sink form of a parallel loop. Each wave is kept
+    /// live only until its one-column results have been copied into the one
+    /// final destination matrix.
+    fn execute_parallel_collect_columns(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        env: &ParamEnv,
+        path: &[InstantiationFrame],
+        node: &ExecutableNode<'_>,
+        values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
+    ) -> Result<RuntimeValue<B>, ExecutionError> {
+        let NodeKind::ParallelLoop(loop_node) = node.kind else { unreachable!() };
+        let child_id =
+            self.validated.source.child_scope_id(scope_id, node.id).ok_or_else(|| {
+                ExecutionError::MissingSubgraph {
+                    node: node.id,
+                    name: format!("parallel body at {:?}", node.id),
+                }
+            })?;
+        let child = self.validated.source.scope(&child_id).ok_or_else(|| {
+            ExecutionError::MissingSubgraph {
+                node: node.id,
+                name: format!("parallel body at {:?}", node.id),
+            }
+        })?;
+        if child.outputs().len() != 1 {
+            return Err(ExecutionError::InvalidBatch(node.id));
+        }
+        let child_output = child.outputs()[0];
+        let child_output_type = self
+            .validated
+            .scope(&child_id)
+            .and_then(|scope| scope.wire_types.get(&child_output))
+            .ok_or(ExecutionError::ValueKind(child_output))?;
+        let ConcreteWireType::Matrix(child_matrix_type) = child_output_type else {
+            return Err(ExecutionError::ValueKind(child_output));
+        };
+        if child_matrix_type.columns != 1 {
+            return Err(ExecutionError::InvalidBatch(node.id));
+        }
+        let output_wire = WireRef { node: node.id, port: Port(0) };
+        let output_ty = self
+            .validated
+            .scope(scope_id)
+            .and_then(|scope| scope.wire_types.get(&output_wire))
+            .ok_or(ExecutionError::MissingMetadata(WireId {
+                instantiation_path: path.to_vec(),
+                wire: output_wire,
+            }))?;
+        let ConcreteWireType::Matrix(output_ty) = output_ty else {
+            return Err(ExecutionError::ValueKind(output_wire));
+        };
+        let count = self.eval_usize(node.id, &loop_node.count, env)?;
+        if count == 0 {
+            return Err(ExecutionError::InvalidBatch(node.id));
+        }
+        let parent_placement = self.backend.active_placement();
+        let mut target = self
+            .backend
+            .constant_matrix(output_ty, &mxx_ir_core::node::ConstantMatrix::Zero, env)
+            .map_err(Self::backend_error)?;
+        let placement_count = self.backend.placement_count();
+        if placement_count == 0 {
+            return Err(ExecutionError::BackendPlacement { placement: 0, count: 0 });
+        }
+        let mut broadcast_inputs = (0..placement_count)
+            .map(|_| (0..node.args.len()).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        for (argument, (wire, mode)) in node.args.iter().zip(&loop_node.input_modes).enumerate() {
+            if matches!(mode, LoopInputMode::Broadcast) {
+                let placed = self.values_for_placements(self.value(values, *wire)?)?;
+                for (placement, value) in placed.into_iter().enumerate() {
+                    broadcast_inputs[placement][argument] = Some(value);
+                }
+            }
+        }
+        self.set_placement(parent_placement)?;
+        let wave_size = self.config.max_parallel_instances.get();
+        for wave_start in (0..count).step_by(wave_size) {
+            let wave_end = count.min(wave_start.saturating_add(wave_size));
+            let mut child_envs = Vec::with_capacity(wave_end - wave_start);
+            let mut child_paths = Vec::with_capacity(wave_end - wave_start);
+            let mut child_inputs = Vec::with_capacity(wave_end - wave_start);
+            let mut child_placements = Vec::with_capacity(wave_end - wave_start);
+            for index in wave_start..wave_end {
+                let placement = index % placement_count;
+                child_envs.push(self.child_env(
+                    env,
+                    &loop_node.bindings,
+                    Some((loop_node.index_slot, index)),
+                    node.id,
+                )?);
+                let mut child_path = path.to_vec();
+                child_path
+                    .push(InstantiationFrame { call: node.id, loop_index: Some(index as u64) });
+                child_paths.push(child_path);
+                child_placements.push(placement);
+                child_inputs.push(self.loop_child_inputs(
+                    child,
+                    node,
+                    &loop_node.input_modes,
+                    index,
+                    placement,
+                    &broadcast_inputs[placement],
+                    values,
+                )?);
+            }
+            let instances = self.execute_instances_batch(
+                &child_id,
+                child_envs,
+                child_paths,
+                child_inputs,
+                &child_placements,
+            )?;
+            self.set_placement(parent_placement)?;
+            let columns = instances
+                .into_iter()
+                .map(|instance| {
+                    let Some(RuntimeValue::Matrix(matrix)) = instance.outputs.into_iter().next()
+                    else {
+                        return Err(ExecutionError::InvalidBatch(node.id));
+                    };
+                    let matrix = if self.backend.matrix_is_on_active_placement(matrix.as_ref()) {
+                        matrix.as_ref().clone()
+                    } else {
+                        self.backend
+                            .matrix_to_active_placement(matrix.as_ref())
+                            .map_err(Self::backend_error)?
+                    };
+                    Ok(matrix)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.backend
+                .write_columns(&mut target, wave_start, &columns)
+                .map_err(Self::backend_error)?;
+        }
+        self.set_placement(parent_placement)?;
+        Ok(RuntimeValue::Matrix(Arc::new(target)))
     }
 
     fn execute_parallel_matrix_node_by_placement(
@@ -696,6 +1399,318 @@ where
             }
         }
         Ok(true)
+    }
+
+    /// Batch the two sampling nodes whose randomness has a stable, explicit
+    /// request boundary.  Transcript/session hits are materialized first;
+    /// only unresolved draws reach the backend batch hook.
+    fn execute_parallel_sample_node_by_placement(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        placements: &[usize],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+    ) -> Result<bool, ExecutionError> {
+        let supported = matches!(
+            node.kind,
+            NodeKind::UniformResidueSample { .. } |
+                NodeKind::HashSample { variant: HashVariant::Plain, .. }
+        );
+        if !supported {
+            return Ok(false);
+        }
+        let started = Instant::now();
+        for placement in 0..self.backend.placement_count() {
+            let indices = placements
+                .iter()
+                .enumerate()
+                .filter_map(|(index, assigned)| (*assigned == placement).then_some(index))
+                .collect::<Vec<_>>();
+            if !indices.is_empty() {
+                self.execute_sample_batch(
+                    scope_id, envs, paths, node, values, placement, &indices,
+                )?;
+            }
+        }
+        debug!(
+            node_handle = ?node.id,
+            node_kind = node_kind_label(node.kind),
+            batch_width = envs.len(),
+            placement_count = self.backend.placement_count(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "sampling node batch completed"
+        );
+        Ok(true)
+    }
+
+    fn execute_sample_batch(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+        placement: usize,
+        indices: &[usize],
+    ) -> Result<(), ExecutionError> {
+        self.set_placement(placement)?;
+        let mut pending = Vec::with_capacity(indices.len());
+        for &instance in indices {
+            let wire = WireRef { node: node.id, port: Port(0) };
+            let matrix_type = self.matrix_type(scope_id, &paths[instance], wire)?;
+            let request = match node.kind {
+                NodeKind::UniformResidueSample { .. } => {
+                    SampleRequest::Uniform(UniformSampleRequest {
+                        range: RuntimeSampleRange {
+                            minimum: BigInt::from(0),
+                            maximum: &matrix_type.modulus - BigInt::from(1),
+                        },
+                        matrix_type: matrix_type.clone(),
+                    })
+                }
+                NodeKind::HashSample {
+                    tag_prefix,
+                    tag_expressions,
+                    tag_decimal_expressions,
+                    tag_u64_le_expressions,
+                    base,
+                    digit_count,
+                    variant: HashVariant::Plain,
+                    ..
+                } => {
+                    let key = self.bytes(&mut values[instance], node.args[0])?;
+                    let key: [u8; 32] =
+                        key.try_into().map_err(|_| ExecutionError::ValueKind(node.args[0]))?;
+                    let mut tag = tag_prefix.clone();
+                    for expression in tag_expressions {
+                        let value = expression
+                            .evaluate(&envs[instance])
+                            .map_err(|error| self.expression_error(node.id, error))?;
+                        append_tag_integer(&mut tag, &value);
+                    }
+                    for expression in tag_decimal_expressions {
+                        let value = expression
+                            .evaluate(&envs[instance])
+                            .map_err(|error| self.expression_error(node.id, error))?;
+                        tag.extend_from_slice(value.to_string().as_bytes());
+                    }
+                    for expression in tag_u64_le_expressions {
+                        let value = expression
+                            .evaluate(&envs[instance])
+                            .map_err(|error| self.expression_error(node.id, error))?
+                            .to_u64()
+                            .ok_or_else(|| ExecutionError::Expression {
+                                node: node.id,
+                                message: "little-endian hash tag component must fit in u64"
+                                    .to_owned(),
+                            })?;
+                        tag.extend_from_slice(&value.to_le_bytes());
+                    }
+                    for wire in node.args.iter().skip(1) {
+                        append_tag_integer(&mut tag, &self.int(&mut values[instance], *wire)?);
+                    }
+                    if base.is_some() || digit_count.is_some() {
+                        return Err(ExecutionError::Expression {
+                            node: node.id,
+                            message: "plain hash sampling cannot carry a gadget layout".to_owned(),
+                        });
+                    }
+                    SampleRequest::Hash(HashSampleRequest {
+                        matrix_type: matrix_type.clone(),
+                        key,
+                        tag,
+                        variant: HashVariant::Plain,
+                        gadget_layout: None,
+                    })
+                }
+                _ => return Err(ExecutionError::InvalidBatch(node.id)),
+            };
+            pending.push(PendingSample {
+                instance,
+                path: paths[instance].clone(),
+                wire,
+                matrix_type,
+                request,
+            });
+        }
+
+        let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
+        let mut missing = Vec::new();
+        if let Some(production) = self.session.clone() {
+            for (index, request) in pending.iter().enumerate() {
+                let site = DrawSite {
+                    instantiation_path: request.path.clone(),
+                    node: request.wire.node,
+                    port: request.wire.port,
+                };
+                match self
+                    .artifact_store
+                    .transcript_entry(&production, &site)
+                    .map_err(Self::artifact_error)?
+                {
+                    Some(RecordedValue::Matrix { matrix_type, bytes })
+                        if matrix_type == request.matrix_type =>
+                    {
+                        outputs[index] = Some(
+                            self.backend
+                                .matrix_from_bytes(&request.matrix_type, &bytes)
+                                .map_err(Self::backend_error)?,
+                        );
+                    }
+                    Some(RecordedValue::Matrix { .. } | RecordedValue::Trapdoor { .. }) => {
+                        return Err(TranscriptError::KindMismatch(site).into());
+                    }
+                    None => missing.push(index),
+                }
+            }
+            self.sample_missing_batch(&pending, &missing, &mut outputs)?;
+            if !missing.is_empty() {
+                let serialized = self.backend.matrices_to_bytes(
+                    &missing
+                        .iter()
+                        .map(|index| outputs[*index].as_ref().expect("sampled output"))
+                        .collect::<Vec<_>>(),
+                );
+                let entries = missing
+                    .iter()
+                    .zip(serialized)
+                    .map(|(index, bytes)| {
+                        let request = &pending[*index];
+                        (
+                            DrawSite {
+                                instantiation_path: request.path.clone(),
+                                node: request.wire.node,
+                                port: request.wire.port,
+                            },
+                            RecordedValue::Matrix {
+                                matrix_type: request.matrix_type.clone(),
+                                bytes,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                self.artifact_store
+                    .record_transcript_batch(&production, &entries)
+                    .map_err(Self::artifact_error)?;
+            }
+        } else if let SamplingMode::Replay(replayer) = &self.sampling_mode {
+            for (index, request) in pending.iter().enumerate() {
+                let site = DrawSite {
+                    instantiation_path: request.path.clone(),
+                    node: request.wire.node,
+                    port: request.wire.port,
+                };
+                match replayer.get(&site)? {
+                    RecordedValue::Matrix { matrix_type, bytes }
+                        if *matrix_type == request.matrix_type =>
+                    {
+                        outputs[index] = Some(
+                            self.backend
+                                .matrix_from_bytes(&request.matrix_type, bytes)
+                                .map_err(Self::backend_error)?,
+                        );
+                    }
+                    RecordedValue::Matrix { .. } | RecordedValue::Trapdoor { .. } => {
+                        return Err(TranscriptError::KindMismatch(site).into());
+                    }
+                }
+            }
+        } else {
+            missing.extend(0..pending.len());
+            self.sample_missing_batch(&pending, &missing, &mut outputs)?;
+            if let SamplingMode::Record(recorder) = &mut self.sampling_mode {
+                let serialized = self.backend.matrices_to_bytes(
+                    &missing
+                        .iter()
+                        .map(|index| outputs[*index].as_ref().expect("sampled output"))
+                        .collect::<Vec<_>>(),
+                );
+                for (index, bytes) in missing.iter().copied().zip(serialized) {
+                    let request = &pending[index];
+                    recorder.record(
+                        DrawSite {
+                            instantiation_path: request.path.clone(),
+                            node: request.wire.node,
+                            port: request.wire.port,
+                        },
+                        RecordedValue::Matrix { matrix_type: request.matrix_type.clone(), bytes },
+                    )?;
+                }
+            }
+        }
+        for (index, request) in pending.into_iter().enumerate() {
+            self.put(
+                &mut values[request.instance],
+                node.id,
+                0,
+                RuntimeValue::matrix(outputs[index].take().expect("every sample resolved")),
+            );
+        }
+        Ok(())
+    }
+
+    fn sample_missing_batch(
+        &mut self,
+        pending: &[PendingSample],
+        missing: &[usize],
+        outputs: &mut [Option<B::Matrix>],
+    ) -> Result<(), ExecutionError> {
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for &index in missing {
+            let same_group =
+                |group: &[usize]| match (&pending[index].request, &pending[group[0]].request) {
+                    (SampleRequest::Uniform(left), SampleRequest::Uniform(right)) => left == right,
+                    (SampleRequest::Hash(left), SampleRequest::Hash(right)) => {
+                        left.matrix_type == right.matrix_type &&
+                            left.variant == right.variant &&
+                            left.gadget_layout == right.gadget_layout
+                    }
+                    _ => false,
+                };
+            if let Some(group) = groups.iter_mut().find(|group| same_group(group)) {
+                group.push(index);
+            } else {
+                groups.push(vec![index]);
+            }
+        }
+        for group in groups {
+            let first = group[0];
+            let sampled = match &pending[first].request {
+                SampleRequest::Uniform(_) => self
+                    .backend
+                    .sample_uniform_batch(
+                        group
+                            .iter()
+                            .map(|index| match &pending[*index].request {
+                                SampleRequest::Uniform(request) => request.clone(),
+                                SampleRequest::Hash(_) => unreachable!("uniform group kind"),
+                            })
+                            .collect(),
+                    )
+                    .map_err(Self::backend_error)?,
+                SampleRequest::Hash(_) => self
+                    .backend
+                    .sample_hash_batch(
+                        group
+                            .iter()
+                            .map(|index| match &pending[*index].request {
+                                SampleRequest::Hash(request) => request.clone(),
+                                SampleRequest::Uniform(_) => unreachable!("hash group kind"),
+                            })
+                            .collect(),
+                    )
+                    .map_err(Self::backend_error)?,
+            };
+            if sampled.len() != group.len() {
+                return Err(ExecutionError::InvalidBatch(pending[first].wire.node));
+            }
+            for (index, output) in group.into_iter().zip(sampled) {
+                outputs[index] = Some(output);
+            }
+        }
+        Ok(())
     }
 
     fn execute_parallel_matrix_node(
@@ -1067,6 +2082,134 @@ where
         self.staged_families
             .insert((self.scratch_production.clone(), name.clone()), descriptor.clone());
         Ok(Some((name, descriptor)))
+    }
+
+    fn store_staged_family_wave(
+        &mut self,
+        wave_start: usize,
+        instances: &[InstanceResult<B>],
+        placements: &[usize],
+        staged: &[Option<(String, ManifestArtifact)>],
+    ) -> Result<(), ExecutionError> {
+        if instances.len() != placements.len() {
+            return Err(ExecutionError::Backend(
+                "parallel wave instance and placement counts differ".to_owned(),
+            ));
+        }
+        let mut payloads = staged
+            .iter()
+            .map(|descriptor| {
+                descriptor
+                    .as_ref()
+                    .map(|_| (0..instances.len()).map(|_| None).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<Vec<Option<ArtifactPayload>>>>();
+
+        for (port, descriptor) in staged.iter().enumerate() {
+            let Some((_, descriptor)) = descriptor else {
+                continue;
+            };
+            if matches!(descriptor.artifact_type, ArtifactType::Matrix(_)) {
+                continue;
+            }
+            for (offset, instance) in instances.iter().enumerate() {
+                let value = instance.outputs.get(port).ok_or_else(|| {
+                    ExecutionError::Backend(
+                        "parallel wave output count differs from staged descriptors".to_owned(),
+                    )
+                })?;
+                let (payload, _) = self.encode_artifact(value, &descriptor.artifact_type)?;
+                payloads[port][offset] = Some(payload);
+            }
+        }
+
+        let mut matrix_groups: BTreeMap<
+            (ConcreteMatrixType, usize),
+            Vec<(usize, usize, &B::Matrix)>,
+        > = BTreeMap::new();
+        for (port, descriptor) in staged.iter().enumerate() {
+            let Some((_, descriptor)) = descriptor else {
+                continue;
+            };
+            let ArtifactType::Matrix(matrix_type) = &descriptor.artifact_type else {
+                continue;
+            };
+            for (offset, instance) in instances.iter().enumerate() {
+                let value = instance.outputs.get(port).ok_or_else(|| {
+                    ExecutionError::Backend(
+                        "parallel wave output count differs from staged descriptors".to_owned(),
+                    )
+                })?;
+                let RuntimeValue::Matrix(matrix) = value else {
+                    return Err(ExecutionError::Manifest(
+                        "runtime value does not match declared matrix artifact type".to_owned(),
+                    ));
+                };
+                matrix_groups.entry((matrix_type.clone(), placements[offset])).or_default().push((
+                    port,
+                    offset,
+                    matrix.as_ref(),
+                ));
+            }
+        }
+
+        let matrix_group_count = matrix_groups.len();
+        for ((_, placement), group) in matrix_groups {
+            let serialization_started = Instant::now();
+            let group_width = group.len();
+            debug!(
+                group_count = matrix_group_count,
+                width = group_width,
+                placement,
+                "staged artifact matrix serialization started"
+            );
+            self.set_placement(placement)?;
+            let matrix_refs = group.iter().map(|(_, _, matrix)| *matrix).collect::<Vec<_>>();
+            let serialized = self.backend.matrices_to_bytes(&matrix_refs);
+            if serialized.len() != group.len() {
+                return Err(ExecutionError::Backend(
+                    "backend returned an invalid matrix serialization batch length".to_owned(),
+                ));
+            }
+            for ((port, offset, _), bytes) in group.into_iter().zip(serialized) {
+                payloads[port][offset] = Some(ArtifactPayload::Matrix(bytes));
+            }
+            debug!(
+                group_count = matrix_group_count,
+                width = group_width,
+                placement,
+                elapsed_ms = serialization_started.elapsed().as_secs_f64() * 1_000.0,
+                "staged artifact matrix serialization completed"
+            );
+        }
+
+        for (port, descriptor) in staged.iter().enumerate() {
+            let Some((name, descriptor)) = descriptor else {
+                continue;
+            };
+            for offset in 0..instances.len() {
+                let payload = payloads[port][offset].take().ok_or_else(|| {
+                    ExecutionError::Backend(
+                        "parallel wave staged output was not serialized".to_owned(),
+                    )
+                })?;
+                self.artifact_store
+                    .store(
+                        ArtifactKey {
+                            production: self.scratch_production.clone(),
+                            name: name.clone(),
+                            index: Some(wave_start + offset),
+                        },
+                        &descriptor.artifact_type,
+                        descriptor.confidentiality,
+                        descriptor.layout.as_deref(),
+                        payload,
+                    )
+                    .map_err(Self::artifact_error)?;
+            }
+        }
+        Ok(())
     }
 
     fn cleanup_unreturned_staged_families(
@@ -1849,6 +2992,15 @@ where
                 }
             }
             NodeKind::ParallelLoop(loop_node) => {
+                if matches!(
+                    loop_node.output_mode,
+                    mxx_ir_core::node::ParallelOutputMode::CollectColumns
+                ) {
+                    let value =
+                        self.execute_parallel_collect_columns(scope_id, env, path, node, values)?;
+                    self.put(values, node.id, 0, value);
+                    return Ok(());
+                }
                 let child_id =
                     self.validated.source.child_scope_id(scope_id, node.id).ok_or_else(|| {
                         ExecutionError::MissingSubgraph {
@@ -1863,6 +3015,16 @@ where
                     }
                 })?;
                 let count = self.eval_usize(node.id, &loop_node.count, env)?;
+                let loop_started = Instant::now();
+                debug!(
+                    loop_handle = ?node.id,
+                    loop_type = "parallel",
+                    count,
+                    batch_width = 1usize,
+                    cap = self.config.max_parallel_instances.get(),
+                    placement_count = self.backend.placement_count(),
+                    "parallel loop started"
+                );
                 let staged = (0..child.outputs().len())
                     .map(|port| {
                         self.staged_family_descriptor(scope_id, path, node.id, port as u32, count)
@@ -1902,6 +3064,17 @@ where
                 for wave_start in (0..count).step_by(wave_size) {
                     let wave_end = count.min(wave_start.saturating_add(wave_size));
                     let wave_len = wave_end - wave_start;
+                    let wave_started = Instant::now();
+                    debug!(
+                        loop_handle = ?node.id,
+                        loop_type = "parallel",
+                        count,
+                        wave_start,
+                        wave_len,
+                        cap = wave_size,
+                        placement_count,
+                        "parallel loop wave started"
+                    );
                     let mut child_envs = Vec::with_capacity(wave_len);
                     let mut child_paths = Vec::with_capacity(wave_len);
                     let mut child_inputs = Vec::with_capacity(wave_len);
@@ -1936,31 +3109,32 @@ where
                         child_envs,
                         child_paths,
                         child_inputs,
-                        child_placements,
+                        &child_placements,
                     )?;
-                    for (offset, instance) in instances.into_iter().enumerate() {
+                    self.store_staged_family_wave(
+                        wave_start,
+                        &instances,
+                        &child_placements,
+                        &staged,
+                    )?;
+                    for instance in instances {
                         for (port, value) in instance.outputs.into_iter().enumerate() {
-                            if let Some((name, descriptor)) = &staged[port] {
-                                let (payload, _) =
-                                    self.encode_artifact(&value, &descriptor.artifact_type)?;
-                                self.artifact_store
-                                    .store(
-                                        ArtifactKey {
-                                            production: self.scratch_production.clone(),
-                                            name: name.clone(),
-                                            index: Some(wave_start + offset),
-                                        },
-                                        &descriptor.artifact_type,
-                                        descriptor.confidentiality,
-                                        descriptor.layout.as_deref(),
-                                        payload,
-                                    )
-                                    .map_err(Self::artifact_error)?;
-                            } else {
+                            if staged[port].is_none() {
                                 families[port].push(value);
                             }
                         }
                     }
+                    debug!(
+                        loop_handle = ?node.id,
+                        loop_type = "parallel",
+                        count,
+                        wave_start,
+                        wave_len,
+                        cap = wave_size,
+                        placement_count,
+                        elapsed_ms = wave_started.elapsed().as_secs_f64() * 1_000.0,
+                        "parallel loop wave completed"
+                    );
                 }
                 self.set_placement(parent_placement)?;
                 for (port, family) in families.into_iter().enumerate() {
@@ -1974,6 +3148,16 @@ where
                     };
                     self.put(values, node.id, port as u32, value);
                 }
+                debug!(
+                    loop_handle = ?node.id,
+                    loop_type = "parallel",
+                    count,
+                    batch_width = 1usize,
+                    cap = wave_size,
+                    placement_count,
+                    elapsed_ms = loop_started.elapsed().as_secs_f64() * 1_000.0,
+                    "parallel loop completed"
+                );
             }
             NodeKind::SequentialLoop(loop_node) => {
                 let child_id =
@@ -1991,6 +3175,16 @@ where
                 })?;
                 let count = self.eval_usize(node.id, &loop_node.count, env)?;
                 let parent_placement = self.backend.active_placement();
+                let loop_started = Instant::now();
+                debug!(
+                    loop_handle = ?node.id,
+                    loop_type = "sequential",
+                    count,
+                    batch_width = 1usize,
+                    cap = self.config.max_parallel_instances.get(),
+                    placement_count = self.backend.placement_count(),
+                    "sequential loop started"
+                );
                 let mut carried = node.args[..loop_node.carried_count]
                     .iter()
                     .map(|wire| self.value(values, *wire))
@@ -2035,11 +3229,36 @@ where
                             parent_placement,
                         )?
                         .outputs;
+                    let completed = index + 1;
+                    if should_report_loop_progress(completed, count) {
+                        debug!(
+                            loop_handle = ?node.id,
+                            loop_type = "sequential",
+                            count,
+                            iteration = index,
+                            completed,
+                            batch_width = 1usize,
+                            cap = self.config.max_parallel_instances.get(),
+                            placement_count = self.backend.placement_count(),
+                            elapsed_ms = loop_started.elapsed().as_secs_f64() * 1_000.0,
+                            "sequential loop progress"
+                        );
+                    }
                 }
                 self.set_placement(parent_placement)?;
                 for (port, value) in carried.into_iter().enumerate() {
                     self.put(values, node.id, port as u32, value);
                 }
+                debug!(
+                    loop_handle = ?node.id,
+                    loop_type = "sequential",
+                    count,
+                    batch_width = 1usize,
+                    cap = self.config.max_parallel_instances.get(),
+                    placement_count = self.backend.placement_count(),
+                    elapsed_ms = loop_started.elapsed().as_secs_f64() * 1_000.0,
+                    "sequential loop completed"
+                );
             }
             NodeKind::FamilyPack { count } => {
                 let count = self.eval_usize(node.id, count, env)?;
@@ -2169,6 +3388,13 @@ where
         node: &ExecutableNode<'_>,
         values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
     ) -> Result<(), ExecutionError> {
+        let batch_started = Instant::now();
+        debug!(
+            node_handle = ?node.id,
+            batch_width = values.len(),
+            placement_count = self.backend.placement_count(),
+            "preimage sample batch started"
+        );
         struct Pending<M, T> {
             instance: usize,
             placement: usize,
@@ -2221,8 +3447,17 @@ where
             });
         }
         if pending.is_empty() {
+            debug!(
+                node_handle = ?node.id,
+                batch_width = values.len(),
+                pending_width = 0usize,
+                placement_count = self.backend.placement_count(),
+                elapsed_ms = batch_started.elapsed().as_secs_f64() * 1_000.0,
+                "preimage sample batch completed"
+            );
             return Ok(());
         }
+        let pending_width = pending.len();
 
         if let Some(production) = self.session.clone() {
             let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
@@ -2333,6 +3568,14 @@ where
                     RuntimeValue::matrix(output.expect("every session preimage draw is resolved")),
                 );
             }
+            debug!(
+                node_handle = ?node.id,
+                batch_width = values.len(),
+                pending_width,
+                placement_count = self.backend.placement_count(),
+                elapsed_ms = batch_started.elapsed().as_secs_f64() * 1_000.0,
+                "preimage sample batch completed"
+            );
             return Ok(());
         }
 
@@ -2437,6 +3680,14 @@ where
         for (request, output) in pending.into_iter().zip(outputs) {
             self.put(&mut values[request.instance], node.id, 0, RuntimeValue::matrix(output));
         }
+        debug!(
+            node_handle = ?node.id,
+            batch_width = values.len(),
+            pending_width,
+            placement_count = self.backend.placement_count(),
+            elapsed_ms = batch_started.elapsed().as_secs_f64() * 1_000.0,
+            "preimage sample batch completed"
+        );
         Ok(())
     }
 
@@ -3524,6 +4775,18 @@ mod tests {
     use rand::Rng;
 
     #[test]
+    fn progress_labels_redact_node_and_scope_payloads() {
+        let input = NodeKind::Input {
+            name: "secret-schedule-tag".to_owned(),
+            wire_type: WireType::Bool,
+            artifact: None,
+        };
+        assert_eq!(node_kind_label(&input), "input");
+        let scope = FrozenGraphScopeId::Subgraph { canonical_name: "secret-graph-tag".to_owned() };
+        assert_eq!(scope_kind_label(&scope), "subgraph");
+    }
+
+    #[test]
     fn preimage_progress_requires_the_configured_exact_total() {
         let mut progress = PreimageProgress {
             config: PreimageProgressConfig {
@@ -3662,7 +4925,7 @@ mod tests {
             .build()
             .expect("build");
         let validated = built.validate(&ParamEnv::default()).expect("validation");
-        let mut backend = cpu_backend([parameters]);
+        let mut backend = cpu_backend([parameters.clone()]);
         let mut store = MemoryArtifactStore::default();
         let mut result = execute_with_config(
             &validated,
@@ -3688,7 +4951,61 @@ mod tests {
             panic!("materialized range output is not an indexed family");
         };
         assert_eq!(values.len(), 3);
+        let first_bytes = values
+            .iter()
+            .map(|value| {
+                let RuntimeValue::Matrix(matrix) = value else {
+                    panic!("materialized range member is not a matrix")
+                };
+                backend.matrix_to_bytes(matrix)
+            })
+            .collect::<Vec<_>>();
+        let expected_bytes = (0..3)
+            .map(|index| {
+                let mut coefficients =
+                    vec![num_bigint::BigUint::from(0u8); parameters.ring_dimension() as usize];
+                coefficients[0] = num_bigint::BigUint::from(index as u8);
+                let polynomial = DCRTPoly::from_biguints(&parameters, &coefficients);
+                let matrix = DCRTPolyMatrix::from_poly_vec_row(&parameters, vec![polynomial]);
+                backend.matrix_to_bytes(&matrix)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first_bytes, expected_bytes);
+        assert_eq!(backend.matrix_serialization_batch_calls(), 2);
         result.cleanup_staged(&mut store).expect("staged cleanup");
+
+        let mut comparison_backend = cpu_backend([parameters]);
+        let mut comparison_store = MemoryArtifactStore::default();
+        let mut comparison = execute_with_config(
+            &validated,
+            &mut comparison_backend,
+            BTreeMap::new(),
+            &mut comparison_store,
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(3).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("comparison execution");
+        let RuntimeValue::IndexedFamily(values) = comparison
+            .materialize_output("values", &comparison_backend, &mut comparison_store)
+            .expect("materialize comparison output")
+        else {
+            panic!("comparison output is not an indexed family");
+        };
+        let comparison_bytes = values
+            .iter()
+            .map(|value| {
+                let RuntimeValue::Matrix(matrix) = value else {
+                    panic!("comparison member is not a matrix")
+                };
+                comparison_backend.matrix_to_bytes(matrix)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first_bytes, comparison_bytes);
+        assert_eq!(comparison_backend.matrix_serialization_batch_calls(), 1);
+        comparison.cleanup_staged(&mut comparison_store).expect("comparison staged cleanup");
     }
 
     #[test]
@@ -3747,6 +5064,7 @@ mod tests {
         let mut first_backend = cpu_backend([parameters.clone()]);
         let mut first_store = MemoryArtifactStore::default();
         let first = execute_samples(&mut first_backend, &mut first_store);
+        assert_eq!(first_backend.hash_sampling_batch_calls(), 1);
         let mut second_backend = cpu_backend([parameters]);
         let mut second_store = MemoryArtifactStore::default();
         let second = execute_samples(&mut second_backend, &mut second_store);
@@ -3754,6 +5072,115 @@ mod tests {
         assert_ne!(first[0], first[1]);
         assert_ne!(first[0], first[2]);
         assert_ne!(first[1], first[2]);
+    }
+
+    #[test]
+    fn uniform_residue_family_uses_one_batch_and_preserves_member_order() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let family = Parallel::range(3)
+            .map_values(|_| ring.uniform_residue((1, 1)))
+            .expect("uniform family");
+        let validated = DslContext::new("runtime-uniform-batch")
+            .family_output("samples", family)
+            .expect("output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(3).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("execution");
+        assert_eq!(backend.uniform_sampling_batch_calls(), 1);
+        let RuntimeValue::StagedArtifactFamily { .. } = &result.outputs["samples"] else {
+            panic!("uniform family should be staged")
+        };
+        let members = result
+            .materialize_output("samples", &backend, &mut store)
+            .expect("materialize samples");
+        let RuntimeValue::IndexedFamily(members) = members else {
+            panic!("uniform output should be a family")
+        };
+        assert_eq!(members.len(), 3);
+        assert!(members.iter().all(|member| matches!(member, RuntimeValue::Matrix(_))));
+        result.cleanup_staged(&mut store).expect("staged cleanup");
+    }
+
+    #[test]
+    fn uniform_sampling_record_replay_preserves_loop_draw_sites() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let family = Parallel::range(3)
+            .map_values(|_| ring.uniform_residue((1, 1)))
+            .expect("uniform family");
+        let validated = DslContext::new("runtime-uniform-record-replay")
+            .family_output("samples", family)
+            .expect("output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+
+        let mut recorder = crate::transcript::TranscriptRecorder::default();
+        let mut record_backend = cpu_backend([parameters.clone()]);
+        let mut record_store = MemoryArtifactStore::default();
+        let mut recorded = execute_with_config(
+            &validated,
+            &mut record_backend,
+            BTreeMap::new(),
+            &mut record_store,
+            SamplingMode::Record(&mut recorder),
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(3).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("record execution");
+        let sites = recorder.iter().map(|(site, _)| site.clone()).collect::<Vec<_>>();
+        assert_eq!(sites.len(), 3);
+        assert!(sites.iter().all(|site| site.port == Port(0)));
+        assert_eq!(
+            sites
+                .iter()
+                .filter_map(|site| site
+                    .instantiation_path
+                    .first()
+                    .and_then(|frame| frame.loop_index))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        recorded.cleanup_staged(&mut record_store).expect("record staged cleanup");
+
+        let replayer = recorder.into_replayer();
+        let mut replay_backend = cpu_backend([parameters]);
+        let mut replay_store = MemoryArtifactStore::default();
+        let mut replayed = execute_with_config(
+            &validated,
+            &mut replay_backend,
+            BTreeMap::new(),
+            &mut replay_store,
+            SamplingMode::Replay(&replayer),
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(3).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("replay execution");
+        assert_eq!(replay_backend.uniform_sampling_batch_calls(), 0);
+        replayed.cleanup_staged(&mut replay_store).expect("replay staged cleanup");
     }
 
     #[test]
@@ -4113,6 +5540,66 @@ mod tests {
     }
 
     #[test]
+    fn nested_sequential_loop_matches_scalar_parent_execution() {
+        let context = DslContext::new("runtime-nested-sequential-lockstep");
+        let values = Parallel::range(2)
+            .map_values(|outer| {
+                Sequential::range(3)
+                    .scan(outer.as_int(), Int::constant(1), |_, total, increment| {
+                        Ok(total.add(increment))
+                    })
+                    .expect("sequential body")
+            })
+            .expect("parallel body");
+        let validated = context
+            .int_family_output("values", values)
+            .expect("output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+
+        let run = |width| {
+            let mut backend = cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]);
+            let mut store = MemoryArtifactStore::default();
+            let mut result = execute_with_config(
+                &validated,
+                &mut backend,
+                BTreeMap::new(),
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig {
+                    max_parallel_instances: NonZeroUsize::new(width).expect("nonzero"),
+                    ..ExecutionConfig::default()
+                },
+            )
+            .expect("execution");
+            let RuntimeValue::IndexedFamily(values) = result
+                .materialize_output("values", &backend, &mut store)
+                .expect("materialize output")
+            else {
+                panic!("nested loop output must be a family")
+            };
+            values
+                .iter()
+                .map(|value| match value {
+                    RuntimeValue::Int(value) => value.clone(),
+                    _ => panic!("nested loop member must be an integer"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        EXECUTION_BATCH_WIDTHS.with(|widths| widths.borrow_mut().clear());
+        let scalar = run(1);
+        assert_eq!(scalar, vec![BigInt::from(3), BigInt::from(4)]);
+        EXECUTION_BATCH_WIDTHS.with(|widths| widths.borrow_mut().clear());
+        assert_eq!(run(2), scalar, "lockstep width 2 changed output");
+        let widths = EXECUTION_BATCH_WIDTHS.with(|widths| widths.borrow().clone());
+        assert!(widths.iter().any(|width| *width == 2), "recursive batch width was not observed");
+        assert_eq!(run(64), scalar, "lockstep width 64 changed output");
+    }
+
+    #[test]
     fn nested_parallel_segment_pack_executes_little_endian_bits() {
         let context = DslContext::new("runtime-segmented-bit-pack");
         let bits = context.int_family_input("bits", 6);
@@ -4195,6 +5682,58 @@ mod tests {
         };
         assert_eq!(first.as_ref(), &four);
         assert_eq!(second.as_ref(), &DCRTPolyMatrix::zero(&parameters, 1, 1));
+    }
+
+    #[test]
+    fn collect_columns_preserves_order_for_singleton_and_non_power_of_two_counts() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let make = |count| {
+            let family = Parallel::range(count)
+                .map(|index| ring.polynomial([index.expression()]))
+                .expect("source family");
+            Family::try_parallel_zip_many_columns(
+                vec![family],
+                |_, mut inputs| Ok(inputs.remove(0)),
+            )
+            .expect("column collection")
+        };
+        let one = make(1);
+        let three = make(3);
+        let built = DslContext::new("runtime-collect-columns-order")
+            .output("one", one)
+            .expect("singleton output")
+            .output("three", three)
+            .expect("non-power-of-two output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let result = execute(
+            &built,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        let expected_one = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![DCRTPoly::from_usize_to_constant(&parameters, 0)],
+        );
+        let expected_three = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            (0..3).map(|value| DCRTPoly::from_usize_to_constant(&parameters, value)).collect(),
+        );
+        let RuntimeValue::Matrix(one) = &result.outputs["one"] else {
+            panic!("singleton output must be a matrix")
+        };
+        let RuntimeValue::Matrix(three) = &result.outputs["three"] else {
+            panic!("ordered output must be a matrix")
+        };
+        assert_eq!(one.as_ref(), &expected_one);
+        assert_eq!(three.as_ref(), &expected_three);
     }
 
     #[test]

@@ -1,11 +1,14 @@
 //! Declarative BGG+ encoding graph values.
 
 use crate::{BggPublicKeyCompiler, BggPublicKeyType, BggPublicKeyWire};
+use bigdecimal::BigDecimal;
 use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Pending, Ring};
 use mxx_ir_core::{
     IntExpr, RealExpr, ValueHandle, WireType,
     node::{ConcatAxis, IndexRange},
 };
+use num_bigint::ToBigInt;
+use num_traits::{ToPrimitive, Zero};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -202,6 +205,121 @@ pub struct BggSamplerLayout {
     pub gadget_base: IntExpr,
 }
 
+/// Policy for the coefficient cutoff used when sampling a BGG-related
+/// preimage.
+///
+/// `Official` delegates to the authoritative bound calculation in
+/// `mxx-primitives`.  `Explicit` is available for reviewed parameter studies
+/// and test fixtures that intentionally select a different cutoff.  The
+/// policy is resolved by the owning application once all concrete dimensions
+/// are known; it is not an IR node or a runtime sampling mode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreimageCoefficientBound {
+    /// Compute the cutoff from the official preimage sigma formula.
+    Official,
+    /// Use this exact coefficient cutoff instead of the official formula.
+    Explicit(IntExpr),
+}
+
+impl Default for PreimageCoefficientBound {
+    fn default() -> Self {
+        Self::Official
+    }
+}
+
+impl PreimageCoefficientBound {
+    /// Resolves this policy to the concrete integer cutoff used by trapdoor
+    /// preimage rejection.  The official policy is shared by all BGG-based
+    /// applications and delegates its numerical constants to the primitive
+    /// sampler bounds module.  Symbolic or invalid inputs are rejected before
+    /// any graph node is constructed.
+    pub fn resolve(
+        &self,
+        layout: &BggSamplerLayout,
+        trapdoor_rows: usize,
+        sigma: &mxx_ir_core::RealExpr,
+    ) -> Result<IntExpr, BggSampleError> {
+        match self {
+            Self::Explicit(bound) => {
+                let value = bound.evaluate(&mxx_ir_core::ParamEnv::default()).map_err(|_| {
+                    BggSampleError::InvalidPreimageBound("explicit preimage bound must be concrete")
+                })?;
+                if value <= num_bigint::BigInt::zero() {
+                    return Err(BggSampleError::InvalidPreimageBound(
+                        "explicit preimage bound must be positive",
+                    ));
+                }
+                Ok(IntExpr::constant(value))
+            }
+            Self::Official => {
+                let n = layout
+                    .ring_dimension
+                    .evaluate(&mxx_ir_core::ParamEnv::default())
+                    .ok()
+                    .and_then(|value| value.to_u64())
+                    .filter(|value| *value > 0)
+                    .ok_or(BggSampleError::InvalidPreimageBound(
+                        "official preimage bound requires a positive concrete ring dimension",
+                    ))?;
+                let base = layout.gadget_base.evaluate(&mxx_ir_core::ParamEnv::default()).map_err(
+                    |_| {
+                        BggSampleError::InvalidPreimageBound(
+                            "official preimage bound requires a concrete gadget base",
+                        )
+                    },
+                )?;
+                if base < num_bigint::BigInt::from(2) {
+                    return Err(BggSampleError::InvalidPreimageBound(
+                        "official preimage bound requires gadget base >= 2",
+                    ));
+                }
+                let m_g = trapdoor_rows
+                    .checked_mul(layout.digit_count)
+                    .and_then(|value| u64::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or(BggSampleError::InvalidPreimageBound(
+                        "official preimage bound dimensions overflow",
+                    ))?;
+                let sigma =
+                    sigma.evaluate_f64(&mxx_ir_core::ParamEnv::default()).map_err(|_| {
+                        BggSampleError::InvalidPreimageBound(
+                            "official preimage bound requires concrete finite sigma",
+                        )
+                    })?;
+                if !sigma.is_finite() || sigma <= 0.0 {
+                    return Err(BggSampleError::InvalidPreimageBound(
+                        "official preimage bound requires positive finite sigma",
+                    ));
+                }
+                let ring_dim_sqrt =
+                    BigDecimal::from(n).sqrt().ok_or(BggSampleError::InvalidPreimageBound(
+                        "official preimage bound ring dimension sqrt failed",
+                    ))?;
+                let base = BigDecimal::from_bigint(base, 0);
+                let sigma_bound = mxx_primitives::sampler::bounds::compute_preimage_sigma(
+                    &ring_dim_sqrt,
+                    m_g,
+                    &base,
+                    None,
+                    Some(sigma),
+                );
+                let cutoff =
+                    mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(&sigma_bound)
+                        .to_bigint()
+                        .ok_or(BggSampleError::InvalidPreimageBound(
+                            "official preimage bound conversion failed",
+                        ))?;
+                if cutoff <= num_bigint::BigInt::zero() {
+                    return Err(BggSampleError::InvalidPreimageBound(
+                        "official preimage bound resolved to zero",
+                    ));
+                }
+                Ok(IntExpr::constant(cutoff))
+            }
+        }
+    }
+}
+
 impl BggSamplerLayout {
     pub fn ring(&self) -> Ring {
         Ring::new(self.modulus.clone(), self.ring_dimension.clone())
@@ -224,6 +342,8 @@ pub enum BggSampleError {
     SlotCountMismatch,
     #[error("BGG+ Gaussian sampling requires both a sigma and an explicit coefficient cutoff")]
     MissingGaussianBound,
+    #[error("invalid BGG+ preimage coefficient bound: {0}")]
+    InvalidPreimageBound(&'static str),
     #[error(transparent)]
     Dsl(#[from] mxx_dsl::DslError),
 }

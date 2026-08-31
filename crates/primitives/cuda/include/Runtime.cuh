@@ -33,6 +33,17 @@ void gpu_context_destroy(GpuContext *ctx);
 int gpu_context_fence_releases(const GpuContext *ctx);
 int gpu_context_get_N(const GpuContext *ctx, int *out_N);
 
+/// Transfers ownership of pinned host pointers to the context-owned
+/// reclaimer.  The reclaimer records a completion event on `stream`, waits
+/// for that event on its worker thread, and only then calls cudaFreeHost.
+/// A non-zero return means that ownership was retained as a fail-closed leak.
+int gpu_defer_pinned_frees(
+    GpuContext *ctx,
+    int device,
+    cudaStream_t stream,
+    void *const *ptrs,
+    size_t count);
+
 int gpu_event_set_wait(GpuEventSet *events);
 void gpu_event_set_destroy(GpuEventSet *events);
 
@@ -71,6 +82,8 @@ struct GpuNttDeviceConstants
     uint64_t *twiddle_shoup_inverse;
 };
 
+struct PinnedHostReclaimer;
+
 #if defined(__CUDACC__)
 extern __constant__ uint64_t gpu_ntt_const_moduli[GPU_RUNTIME_MAX_LIMBS];
 extern __constant__ uint64_t gpu_ntt_const_n_inv[GPU_RUNTIME_MAX_LIMBS];
@@ -100,6 +113,7 @@ struct GpuContext
     std::vector<std::vector<cudaStream_t>> compute_streams_by_partition;
     std::vector<cudaStream_t> release_streams_by_partition;
     std::vector<cudaEvent_t> release_fence_events_by_partition;
+    PinnedHostReclaimer *pinned_host_reclaimer = nullptr;
     std::atomic<size_t> next_compute_stream{0};
 };
 

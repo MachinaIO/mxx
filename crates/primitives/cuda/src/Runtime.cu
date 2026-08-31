@@ -2,14 +2,199 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
 #include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+struct PinnedHostReclaimer
+{
+    struct Job
+    {
+        int device;
+        cudaEvent_t completion;
+        std::vector<void *> pointers;
+    };
+
+    PinnedHostReclaimer()
+        : worker(&PinnedHostReclaimer::run, this)
+    {
+    }
+
+    ~PinnedHostReclaimer()
+    {
+        shutdown();
+    }
+
+    int enqueue(int device, cudaEvent_t completion, std::vector<void *> &&pointers)
+    {
+        try
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping || joined)
+            {
+                record_failure_locked("pinned-host reclaimer is stopped");
+                return 1;
+            }
+            pending.push_back(Job{device, completion, std::move(pointers)});
+        }
+        catch (const std::exception &error)
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            record_failure_locked(error.what());
+            return 1;
+        }
+        wake.notify_one();
+        return 0;
+    }
+
+    void record_uncertain(const char *message)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        record_failure_locked(message);
+    }
+
+    int wait_idle()
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        idle.wait(lock, [this]() { return pending.empty() && active == 0; });
+        return failed ? 1 : 0;
+    }
+
+    std::string failure_message()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return failure_message_text.empty() ? "pinned-host reclamation failed"
+                                             : failure_message_text;
+    }
+
+    void shutdown()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (joined)
+            {
+                return;
+            }
+            stopping = true;
+        }
+        wake.notify_all();
+        if (worker.joinable())
+        {
+            worker.join();
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        joined = true;
+    }
+
+private:
+    void record_failure_locked(const char *message)
+    {
+        failed = true;
+        if (failure_message_text.empty())
+        {
+            failure_message_text = message ? message : "unknown pinned-host reclamation failure";
+        }
+    }
+
+    void record_failure(const char *message)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        record_failure_locked(message);
+    }
+
+    void process(Job &job)
+    {
+        cudaError_t error = cudaSetDevice(job.device);
+        if (error == cudaSuccess)
+        {
+            error = cudaEventSynchronize(job.completion);
+        }
+        if (error != cudaSuccess)
+        {
+            record_failure(cudaGetErrorString(error));
+            // The event and all pointers are intentionally leaked.  Once
+            // synchronization is uncertain, freeing host memory could race
+            // with an in-flight asynchronous copy.
+            return;
+        }
+
+        error = cudaEventDestroy(job.completion);
+        if (error != cudaSuccess)
+        {
+            record_failure(cudaGetErrorString(error));
+            // Keep the pointers leaked when event destruction is uncertain.
+            return;
+        }
+
+        for (void *pointer : job.pointers)
+        {
+            if (!pointer)
+            {
+                continue;
+            }
+            error = cudaFreeHost(pointer);
+            if (error != cudaSuccess)
+            {
+                // Do not retry an uncertain free.  The failed pointer is
+                // leaked, while independent pointers can still be reclaimed.
+                record_failure(cudaGetErrorString(error));
+            }
+        }
+    }
+
+    void run()
+    {
+        for (;;)
+        {
+            Job job{};
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                wake.wait(lock, [this]() { return stopping || !pending.empty(); });
+                if (pending.empty())
+                {
+                    if (stopping)
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                job = std::move(pending.front());
+                pending.pop_front();
+                ++active;
+            }
+
+            process(job);
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                --active;
+                if (pending.empty() && active == 0)
+                {
+                    idle.notify_all();
+                }
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable idle;
+    std::deque<Job> pending;
+    std::thread worker;
+    size_t active = 0;
+    bool stopping = false;
+    bool joined = false;
+    bool failed = false;
+    std::string failure_message_text;
+};
 
 namespace
 {
@@ -73,13 +258,55 @@ namespace
         return 0;
     }
 
+    int wait_pinned_host_reclaimer(const GpuContext *ctx)
+    {
+        if (!ctx || !ctx->pinned_host_reclaimer)
+        {
+            return 0;
+        }
+        PinnedHostReclaimer *reclaimer = ctx->pinned_host_reclaimer;
+        const int status = reclaimer->wait_idle();
+        if (status != 0)
+        {
+            const std::string message = reclaimer->failure_message();
+            return set_error(message.c_str());
+        }
+        return 0;
+    }
+
+    int shutdown_pinned_host_reclaimer(GpuContext *ctx)
+    {
+        if (!ctx || !ctx->pinned_host_reclaimer)
+        {
+            return 0;
+        }
+        PinnedHostReclaimer *reclaimer = ctx->pinned_host_reclaimer;
+        reclaimer->shutdown();
+        const int status = reclaimer->wait_idle();
+        if (status != 0)
+        {
+            const std::string message = reclaimer->failure_message();
+            delete reclaimer;
+            ctx->pinned_host_reclaimer = nullptr;
+            return set_error(message.c_str());
+        }
+        delete reclaimer;
+        ctx->pinned_host_reclaimer = nullptr;
+        return 0;
+    }
+
     void destroy_context_streams(GpuContext *ctx)
     {
         if (!ctx)
         {
             return;
         }
-        fence_release_streams(ctx);
+        const int stream_status = fence_release_streams(ctx);
+        const int reclaimer_status = shutdown_pinned_host_reclaimer(ctx);
+        if (stream_status != 0 || reclaimer_status != 0)
+        {
+            set_error("GPU context release cleanup failed");
+        }
         for (size_t partition = 0; partition < ctx->gpu_ids.size(); ++partition)
         {
             cudaSetDevice(ctx->gpu_ids[partition]);
@@ -745,6 +972,7 @@ extern "C"
             }
 
             gpu_ctx = new GpuContext();
+            gpu_ctx->pinned_host_reclaimer = new PinnedHostReclaimer();
             gpu_ctx->moduli = std::move(moduli_vec);
             gpu_ctx->ntt_n_inv_by_prime = std::move(n_inv_by_prime);
             gpu_ctx->ntt_root_by_prime = std::move(root_by_prime);
@@ -860,7 +1088,87 @@ extern "C"
         {
             return set_error("invalid gpu_context_fence_releases arguments");
         }
-        return fence_release_streams(ctx);
+        const int stream_status = fence_release_streams(ctx);
+        const int reclaimer_status = wait_pinned_host_reclaimer(ctx);
+        if (stream_status != 0)
+        {
+            return stream_status;
+        }
+        return reclaimer_status;
+    }
+
+    int gpu_defer_pinned_frees(
+        GpuContext *ctx,
+        int device,
+        cudaStream_t stream,
+        void *const *ptrs,
+        size_t count)
+    {
+        if (!ctx || !ctx->pinned_host_reclaimer || device < 0 ||
+            (count != 0 && !ptrs))
+        {
+            return set_error("invalid gpu_defer_pinned_frees arguments");
+        }
+        if (count == 0)
+        {
+            return 0;
+        }
+
+        std::vector<void *> pointers;
+        try
+        {
+            pointers.reserve(count);
+            for (size_t index = 0; index < count; ++index)
+            {
+                if (ptrs[index])
+                {
+                    pointers.push_back(ptrs[index]);
+                }
+            }
+        }
+        catch (const std::exception &error)
+        {
+            ctx->pinned_host_reclaimer->record_uncertain(error.what());
+            return set_error(error);
+        }
+        if (pointers.empty())
+        {
+            return 0;
+        }
+
+        cudaError_t error = cudaSetDevice(device);
+        cudaEvent_t completion = nullptr;
+        if (error == cudaSuccess)
+        {
+            error = cudaEventCreateWithFlags(&completion, cudaEventDisableTiming);
+        }
+        if (error == cudaSuccess)
+        {
+            error = cudaEventRecord(completion, stream);
+        }
+        if (error != cudaSuccess)
+        {
+            if (completion)
+            {
+                // The event may have been recorded before the error was
+                // reported.  Keep it leaked along with the pointers rather
+                // than destroying an event that could still be in flight.
+                completion = nullptr;
+            }
+            ctx->pinned_host_reclaimer->record_uncertain(cudaGetErrorString(error));
+            return set_error(cudaGetErrorString(error));
+        }
+
+        const int enqueue_status =
+            ctx->pinned_host_reclaimer->enqueue(device, completion, std::move(pointers));
+        if (enqueue_status != 0)
+        {
+            // enqueue retains ownership on success.  On failure, the event
+            // and pointers intentionally remain leaked because their last
+            // asynchronous use cannot be proven complete.
+            return set_error("failed to enqueue deferred pinned-host free");
+        }
+        return 0;
     }
 
     int gpu_context_get_N(const GpuContext *ctx, int *out_N)

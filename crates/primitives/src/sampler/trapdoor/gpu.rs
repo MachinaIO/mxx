@@ -336,6 +336,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             request_count = requests.len(),
             "gpu preimage: start multi-target sharded dispatch"
         );
+        let batch_start = Instant::now();
         let common_bound = requests
             .first()
             .map(|request| request.max_coefficient_bound.clone())
@@ -346,7 +347,10 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         );
         let mut pending = requests;
         let mut results = Vec::with_capacity(pending.len());
+        let mut round = 0usize;
         while !pending.is_empty() {
+            let round_start = Instant::now();
+            let pending_before = pending.len();
             let sampled = pending
                 .into_par_iter()
                 .map(|request| {
@@ -375,10 +379,26 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             }
             let (entry_indices, mut matrices): (Vec<_>, Vec<_>) =
                 accepted_candidates.into_iter().unzip();
+            let accepted_count = matrices.len();
+            let pending_after = pending.len();
             GpuDCRTPolyMatrix::ntt_batch_in_place(&mut matrices);
             results.extend(entry_indices.into_iter().zip(matrices));
+            tracing::debug!(
+                round,
+                pending_before,
+                accepted = accepted_count,
+                rejected = pending_after,
+                pending_after,
+                elapsed_ms = round_start.elapsed().as_secs_f64() * 1_000.0,
+                "gpu preimage: rejection round"
+            );
+            round += 1;
         }
-        tracing::debug!("gpu preimage: finished multi-target sharded dispatch");
+        tracing::debug!(
+            rounds = round,
+            elapsed_ms = batch_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: finished multi-target sharded dispatch"
+        );
         results
     }
 

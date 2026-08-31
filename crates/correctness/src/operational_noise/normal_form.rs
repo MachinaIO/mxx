@@ -608,12 +608,20 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         root: ScopedExprId,
         proof: ScopeProof,
     ) -> Result<AnalyzedValue, NormalizeError> {
+        self.normalize_with_existing_scope_proof_and_proof(root, proof).map(|(value, _)| value)
+    }
+
+    fn normalize_with_existing_scope_proof_and_proof(
+        &mut self,
+        root: ScopedExprId,
+        proof: ScopeProof,
+    ) -> Result<(AnalyzedValue, ScopeProof), NormalizeError> {
         self.expressions.validate_scope_proof_for_root(
             &proof,
             root.program(),
             root.expression(),
         )?;
-        self.normalize_with_authority(root, Some(proof))
+        self.normalize_with_authority_and_proof(root, Some(proof))
     }
 
     fn normalize_with_authority(
@@ -621,6 +629,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         root: ScopedExprId,
         scope_proof: Option<ScopeProof>,
     ) -> Result<AnalyzedValue, NormalizeError> {
+        self.normalize_with_authority_and_proof(root, scope_proof).map(|(value, _)| value)
+    }
+
+    fn normalize_with_authority_and_proof(
+        &mut self,
+        root: ScopedExprId,
+        scope_proof: Option<ScopeProof>,
+    ) -> Result<(AnalyzedValue, ScopeProof), NormalizeError> {
         if S::ENABLED {
             self.sink
                 .as_deref_mut()
@@ -632,11 +648,11 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             self.protected_monomial_prefix = self.monomials.len();
         }
         self.normalization_depth = self.normalization_depth.saturating_add(1);
-        let result = self.normalize_inner(root, scope_proof);
+        let result = self.normalize_inner_with_proof(root, scope_proof);
         self.normalization_depth = self.normalization_depth.saturating_sub(1);
         if S::ENABLED {
             match &result {
-                Ok(value) => {
+                Ok((value, _)) => {
                     let counters = self.counters;
                     let end_result = self
                         .sink
@@ -678,6 +694,14 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         root: ScopedExprId,
         scope_proof: Option<ScopeProof>,
     ) -> Result<AnalyzedValue, NormalizeError> {
+        self.normalize_inner_with_proof(root, scope_proof).map(|(value, _)| value)
+    }
+
+    fn normalize_inner_with_proof(
+        &mut self,
+        root: ScopedExprId,
+        scope_proof: Option<ScopeProof>,
+    ) -> Result<(AnalyzedValue, ScopeProof), NormalizeError> {
         if root.program() != self.scope {
             return Err(NormalizeError::InvalidScope {
                 expected: self.scope,
@@ -792,7 +816,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 .exact_nf
                 .as_ref()
                 .map_or(0, |normal_form| normal_form.exact_terms.len() as u64);
-            Ok(value)
+            Ok((value, scope_proof))
         })();
         self.relation_rewriting_enabled = saved_relation_rewriting;
         result
@@ -927,6 +951,13 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         &mut self,
         root: ExprId,
     ) -> Result<AnalyzedValue, NormalizeError> {
+        self.normalize_specialized_root_with_proof(root).map(|(value, _)| value)
+    }
+
+    fn normalize_specialized_root_with_proof(
+        &mut self,
+        root: ExprId,
+    ) -> Result<(AnalyzedValue, ScopeProof), NormalizeError> {
         let proof = self.expressions.scope_proof(self.scope, root)?;
         let scoped = self.expressions.scoped_from_proof(&proof, root)?;
         let saved_cache = std::mem::take(&mut self.cache);
@@ -940,7 +971,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         let saved_fold_final_no_match = self.fold_final_no_match;
         self.fold_final_no_match = false;
 
-        let value = self.normalize_with_existing_scope_proof(scoped, proof);
+        let value = self.normalize_with_existing_scope_proof_and_proof(scoped, proof);
         let nested_expression_bounds = std::mem::take(&mut self.expression_bounds);
         self.cache = saved_cache;
         self.retained_bounded_endpoints = saved_retained_bounded_endpoints;
@@ -1072,18 +1103,6 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                     }
                 }
             }
-            if matches!(
-                node.operator,
-                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose { .. })
-            ) && self.gadget_recompositions.is_some()
-            {
-                if let Some(input) = node.inputs.first() {
-                    // Gadget recomposition consumes the already-normalized input NF after the
-                    // decomposition node has been evaluated. Keep one explicit memo use alive;
-                    // this is a structural hold, not a second semantic occurrence.
-                    *self.remaining_uses.entry(*input).or_default() += 1;
-                }
-            }
         }
         *self.remaining_uses.entry(root).or_default() += 1;
 
@@ -1163,6 +1182,172 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 continue;
             }
             large_product_context.extend(self.expressions.node(expression)?.inputs.iter().copied());
+        }
+
+        // Plan gadget recomposition only from a complete, registry-authorized typed pair.  The
+        // pair may cross scalar-shaped product nodes (which are centralized before the next
+        // matrix product), so flatten only those scalar intermediates.  This planning pass does
+        // not authorize a rewrite; `authorized_gadget_pair_input` is called again at the actual
+        // rewrite boundary.  It installs one durable input hold and retains only prefix product
+        // nodes that would otherwise erase the gadget before the pair is reached.
+        fn flattened_product_factors(
+            expressions: &ExprArena,
+            expression: ExprId,
+            factors: &mut Vec<ExprId>,
+        ) -> Result<(), NormalizeError> {
+            let node = expressions.node(expression)?;
+            if matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Multiply)) &&
+                node.inputs.len() == 2
+            {
+                flattened_product_factors(expressions, node.inputs[0], factors)?;
+                flattened_product_factors(expressions, node.inputs[1], factors)?;
+            } else {
+                factors.push(expression);
+            }
+            Ok(())
+        }
+        let mut planned_gadget_inputs = BTreeSet::new();
+        let mut planned_gadget_pairs = Vec::new();
+        for expression in &reachable {
+            if !matches!(
+                self.expressions.node(*expression)?.operator,
+                ValueOperator::Matrix(MatrixOperation::Multiply)
+            ) {
+                continue;
+            }
+            let mut factors = Vec::new();
+            flattened_product_factors(self.expressions, *expression, &mut factors)?;
+            for left in 0..factors.len().saturating_sub(1) {
+                for right in left + 1..factors.len() {
+                    let scalar_intermediates = factors[left + 1..right].iter().all(|factor| {
+                        matches!(
+                            self.expressions.value_type(*factor),
+                            Ok(ResolvedValueType::Matrix(matrix))
+                                if matrix.rows == 1 && matrix.columns == 1
+                        )
+                    });
+                    if !scalar_intermediates {
+                        continue;
+                    }
+                    let Some(input) = authorized_gadget_pair_input_from(
+                        self.expressions,
+                        self.facts,
+                        self.gadget_recompositions,
+                        self.expressions.scoped_from_proof(scope_proof, factors[left])?,
+                        self.expressions.scoped_from_proof(scope_proof, factors[right])?,
+                    )?
+                    else {
+                        continue;
+                    };
+                    if planned_gadget_inputs.insert(input) {
+                        *self.remaining_uses.entry(input).or_default() += 1;
+                    }
+                    self.retained_large_product_context.insert(input);
+                    planned_gadget_pairs.push((factors[left], factors[right]));
+                }
+            }
+        }
+        // Additive branches can hide one side of the pair from a flat product-factor walk (for
+        // example `(large * G + noise) * D`).  Discover such a candidate only when a complete
+        // typed pair occurs across the two children of an actual product node; the rewrite still
+        // performs the same authorization check at the boundary.
+        fn special_descendants(
+            expressions: &ExprArena,
+            expression: ExprId,
+            gadgets: &mut Vec<ExprId>,
+            decompositions: &mut Vec<ExprId>,
+        ) -> Result<(), NormalizeError> {
+            let node = expressions.node(expression)?;
+            if node
+                .operator
+                .source_matrix_constant()
+                .is_some_and(|kind| matches!(kind, super::arena::MatrixConstantKind::Gadget { .. }))
+            {
+                gadgets.push(expression);
+            }
+            if matches!(
+                node.operator,
+                ValueOperator::Transform(ValueTransformOperation::GadgetDecompose { .. })
+            ) {
+                decompositions.push(expression);
+            }
+            for child in &node.inputs {
+                special_descendants(expressions, *child, gadgets, decompositions)?;
+            }
+            Ok(())
+        }
+        for expression in &reachable {
+            let node = self.expressions.node(*expression)?;
+            if !matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Multiply)) ||
+                node.inputs.len() != 2
+            {
+                continue;
+            }
+            let mut left_gadgets = Vec::new();
+            let mut left_decompositions = Vec::new();
+            let mut right_gadgets = Vec::new();
+            let mut right_decompositions = Vec::new();
+            special_descendants(
+                self.expressions,
+                node.inputs[0],
+                &mut left_gadgets,
+                &mut left_decompositions,
+            )?;
+            special_descendants(
+                self.expressions,
+                node.inputs[1],
+                &mut right_gadgets,
+                &mut right_decompositions,
+            )?;
+            for (gadget, decomposition) in left_gadgets
+                .into_iter()
+                .flat_map(|gadget| {
+                    right_decompositions
+                        .iter()
+                        .copied()
+                        .map(move |decomposition| (gadget, decomposition))
+                })
+                .chain(right_gadgets.into_iter().flat_map(|gadget| {
+                    left_decompositions
+                        .iter()
+                        .copied()
+                        .map(move |decomposition| (gadget, decomposition))
+                }))
+            {
+                let gadget = self.expressions.scoped_from_proof(scope_proof, gadget)?;
+                let decomposition =
+                    self.expressions.scoped_from_proof(scope_proof, decomposition)?;
+                let Some(input) = authorized_gadget_pair_input_from(
+                    self.expressions,
+                    self.facts,
+                    self.gadget_recompositions,
+                    gadget,
+                    decomposition,
+                )?
+                else {
+                    continue;
+                };
+                if planned_gadget_inputs.insert(input) {
+                    *self.remaining_uses.entry(input).or_default() += 1;
+                }
+                self.retained_large_product_context.insert(input);
+                planned_gadget_pairs.push((gadget.expression(), decomposition.expression()));
+            }
+        }
+        for expression in &reachable {
+            if !matches!(
+                self.expressions.node(*expression)?.operator,
+                ValueOperator::Matrix(MatrixOperation::Multiply)
+            ) {
+                continue;
+            }
+            let mut factors = Vec::new();
+            flattened_product_factors(self.expressions, *expression, &mut factors)?;
+            if planned_gadget_pairs.iter().any(|(gadget, decomposition)| {
+                factors.contains(gadget) && !factors.contains(decomposition)
+            }) {
+                self.retained_large_product_context.insert(*expression);
+            }
         }
 
         // A finite endpoint is retained only for one semantic input edge of one direct Multiply.
@@ -1737,6 +1922,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         node: &ExprNode,
         children: &[Arc<AnalyzedValue>],
     ) -> Result<AnalyzedValue, NormalizeError> {
+        if let Some(projected) = self.project_literal_explicit_call(scope_proof, semantic, node)? {
+            return Ok(projected);
+        }
         let bound = self.matrix_bound(semantic, expression, node, children)?;
         if let ValueOperator::Matrix(operation) = &node.operator {
             if let Some(exact_nf) = self.shared_identity_nf(node, operation, children)? {
@@ -1781,6 +1969,114 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             _ => Some(self.atom_nf(scope_proof, semantic)?),
         };
         Ok(AnalyzedValue { semantic, exact_nf: exact.map(Arc::new), coefficient_bound: bound })
+    }
+
+    /// Project a closed literal call into one branch of an explicit family.  This is deliberately
+    /// narrower than beta reduction: only the finalized family body itself may be an
+    /// `ExplicitElement`, the call must carry one direct integer constant in the family's domain,
+    /// and the selected branch must be closed.  In particular, inspecting the family body never
+    /// walks its unselected branches; dynamic, open, and out-of-domain calls remain opaque.
+    fn project_literal_explicit_call(
+        &mut self,
+        scope_proof: &mut ScopeProof,
+        semantic: ScopedExprId,
+        node: &ExprNode,
+    ) -> Result<Option<AnalyzedValue>, NormalizeError> {
+        let Some(branch) = self.literal_explicit_call_branch(node)? else {
+            return Ok(None);
+        };
+        let has_family_summary = self.program_call_matrix_facts(semantic.expression()).is_some();
+        let projected = match self.normalize_specialized_root_with_proof(branch) {
+            Ok((projected, branch_proof)) => {
+                self.expressions.absorb_scope_proof(scope_proof, branch_proof)?;
+                projected
+            }
+            // A family-level summary remains the authority when the selected branch is closed
+            // but its producer-owned bound is not available in this normalizer's fact scope.
+            // This preserves the existing opaque-call transfer rather than turning a valid
+            // summary-backed call into an unsupported branch normalization.
+            Err(NormalizeError::Feasibility(super::g0::G0Error::UnsupportedBoundTransfer)) => {
+                if has_family_summary {
+                    return Ok(None);
+                }
+                return Err(NormalizeError::Feasibility(
+                    super::g0::G0Error::UnsupportedBoundTransfer,
+                ));
+            }
+            Err(error @ NormalizeError::UnsupportedMatrixBound { .. }) => {
+                if has_family_summary {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Some(AnalyzedValue {
+            semantic,
+            exact_nf: projected.exact_nf,
+            coefficient_bound: projected.coefficient_bound,
+        }))
+    }
+
+    /// Return the one branch eligible for literal projection without normalizing it. This
+    /// predicate is also used by the bound-planning prepass so that only an eligible call may
+    /// defer its opaque-family bound until the exact branch is normalized.
+    fn literal_explicit_call_branch(
+        &self,
+        node: &ExprNode,
+    ) -> Result<Option<ExprId>, NormalizeError> {
+        let ValueOperator::ProgramCall { program } = node.operator else {
+            return Ok(None);
+        };
+        let [selector] = node.inputs.as_ref() else {
+            return Ok(None);
+        };
+        let selector_value = {
+            let selector_node = self.expressions.node(*selector)?;
+            let ValueOperator::Constant(TypedConstant {
+                value_type: ResolvedValueType::Int,
+                value: super::arena::ConstantValue::Int(value),
+            }) = &selector_node.operator
+            else {
+                return Ok(None);
+            };
+            value.clone()
+        };
+
+        let projection = self.programs.project_program(program)?;
+        let Some(family) = projection.family else {
+            return Ok(None);
+        };
+        let body = projection.root;
+        if body != family.body {
+            return Ok(None);
+        }
+        let body_node = self.expressions.node(body)?;
+        let ValueOperator::ExplicitElement { domain, element_type } = &body_node.operator else {
+            return Ok(None);
+        };
+        if *domain != family.domain || *element_type != projection.signature.output {
+            return Ok(None);
+        }
+
+        let minimum = BigInt::from(domain.minimum);
+        let maximum_exclusive = BigInt::from(domain.maximum_exclusive);
+        if selector_value < minimum || selector_value >= maximum_exclusive {
+            return Ok(None);
+        }
+        let Some(offset) = (&selector_value - minimum).to_usize() else {
+            return Ok(None);
+        };
+        let Some(branch_position) = 1usize.checked_add(offset) else {
+            return Ok(None);
+        };
+        let Some(branch) = body_node.inputs.get(branch_position).copied() else {
+            return Ok(None);
+        };
+        if !self.expressions.free_argument_ids(branch)?.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(branch))
     }
 
     fn shared_identity_nf(
@@ -4577,6 +4873,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 continue;
             };
             let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
+            // The returned Arc is now owned by this rewrite/splice. Release the temporary map
+            // entry immediately so the structural hold lasts only through this boundary.
+            self.gadget_input_nfs.remove(&input);
             let summary_noise = scale_noise_summary(
                 &input_nf.bounded_summary.coefficient_bound(),
                 coefficient.magnitude(),
@@ -4703,6 +5002,9 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
                 continue;
             };
             let Some(input_nf) = self.gadget_input_nf(input)? else { return Ok(None) };
+            // Let the returned value own the input NF instead of retaining a second durable map
+            // entry after the relation boundary.
+            self.gadget_input_nfs.remove(&input);
             let applied_event = if S::ENABLED {
                 let input_result = self.relation_input_result(input)?;
                 let applied_event = self.observe_applied_relation(super::g0::AppliedRelation {
@@ -5772,35 +6074,42 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
             ValueOperator::DeterministicHash(_) => NumericContract::Known(CoefficientBound::Large),
             ValueOperator::Source(_) | ValueOperator::Sample { .. } => NumericContract::Missing,
             ValueOperator::ProgramCall { program } => {
+                let literal_projection = self.literal_explicit_call_branch(node)?.is_some();
                 if let Some(facts) = self.program_call_matrix_facts(expression) {
                     let bound = facts.coefficient_bound.clone();
-                    if S::ENABLED {
-                        if bound.is_missing() {
+                    if S::ENABLED && self.sink.is_some() {
+                        if bound.is_missing() && !literal_projection {
                             return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
                         }
-                        self.observe_bound_transfer(
-                            owner,
-                            BoundRule::Authority(BoundAuthority::ProgramFamilyFact),
-                        )?;
+                        if !bound.is_missing() {
+                            self.observe_bound_transfer(
+                                owner,
+                                BoundRule::Authority(BoundAuthority::ProgramFamilyFact),
+                            )?;
+                        }
                     }
                     bound
                 } else {
                     let Some((source, bound)) =
                         self.relation_live_preimage(expression, *program)?
                     else {
-                        if S::ENABLED {
+                        if S::ENABLED && self.sink.is_some() && !literal_projection {
                             return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
                         }
                         return Ok(NumericContract::Missing);
                     };
                     if S::ENABLED {
-                        if bound.is_missing() {
+                        if bound.is_missing() && !literal_projection {
                             return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
                         }
-                        self.observe_bound_transfer(
-                            owner,
-                            BoundRule::Authority(BoundAuthority::RelationPreimageSource { source }),
-                        )?;
+                        if !bound.is_missing() {
+                            self.observe_bound_transfer(
+                                owner,
+                                BoundRule::Authority(BoundAuthority::RelationPreimageSource {
+                                    source,
+                                }),
+                            )?;
+                        }
                     }
                     bound
                 }
@@ -6024,7 +6333,7 @@ impl<'a, S: FeasibilitySink> Normalizer<'a, S> {
         bounds: &[NumericContract<CoefficientBound>],
     ) -> Result<NumericContract<CoefficientBound>, NormalizeError> {
         let [left_bound, right_bound] = bounds else {
-            if S::ENABLED {
+            if S::ENABLED && self.sink.is_some() {
                 return Err(super::g0::G0Error::UnsupportedBoundTransfer.into());
             }
             return Ok(NumericContract::Missing);
@@ -7449,6 +7758,480 @@ mod tests {
     }
 
     #[test]
+    fn closed_literal_explicit_family_calls_project_selected_matrix_branch() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let branches = [
+            matrix_source(&mut expressions, "literal-first", matrix.clone(), None),
+            matrix_source(&mut expressions, "literal-middle", matrix.clone(), None),
+            matrix_source(&mut expressions, "literal-last", matrix.clone(), None),
+        ];
+        let mut facts = FactStore::new(&expressions);
+        for (branch, bound) in branches.into_iter().zip([3_u64, 11, 5]) {
+            insert_matrix_bound(&mut facts, &expressions, branch, bound);
+        }
+        let domain = super::super::arena::FamilyDomain::new(10, 13).unwrap();
+        let family =
+            programs.explicit_family(&mut expressions, &facts, domain, Box::new(branches)).unwrap();
+        facts.finalize_ranges();
+
+        for (selector, expected_bound, branch) in
+            [(10_i64, 3_u64, branches[0]), (11, 11, branches[1]), (12, 5, branches[2])]
+        {
+            let selector = expressions
+                .intern(ValueOperator::Constant(TypedConstant::int(selector)), Box::new([]))
+                .unwrap();
+            let selector_value = selector_value(selector, &expressions);
+            let call = programs
+                .call_family_in_range(
+                    &mut expressions,
+                    family,
+                    selector,
+                    TrustedIndexRange::new(selector_value, selector_value + 1).unwrap(),
+                )
+                .unwrap();
+            let caller = programs
+                .opaque_generated_family_from_body(
+                    &mut expressions,
+                    super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                    call,
+                )
+                .unwrap();
+            let semantic = programs.scoped(&expressions, caller.program(), call).unwrap();
+            let mut monomials =
+                MonomialArena::new(&expressions, &programs, caller.program()).unwrap();
+            let value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+                .unwrap()
+                .normalize(semantic)
+                .unwrap();
+            assert_eq!(
+                value.coefficient_bound,
+                NumericContract::Known(CoefficientBound::finite(expected_bound))
+            );
+            let exact = value.exact_nf.expect("selected branch exact normal form");
+            let monomial = *exact.exact_terms.keys().next().expect("selected branch term");
+            let descriptor = monomials.descriptor(monomial).unwrap();
+            assert!(descriptor.central_factors.is_empty());
+            assert_eq!(descriptor.ordered_factors.len(), 1);
+            assert_eq!(descriptor.ordered_factors[0].expression(), branch);
+        }
+    }
+
+    fn selector_value(selector: ExprId, expressions: &ExprArena) -> u64 {
+        let ValueOperator::Constant(TypedConstant {
+            value: super::super::arena::ConstantValue::Int(value),
+            ..
+        }) = &expressions.node(selector).unwrap().operator
+        else {
+            panic!("selector must be an integer literal")
+        };
+        value.to_u64().unwrap()
+    }
+
+    #[test]
+    fn literal_projection_does_not_visit_unselected_or_open_branches() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let selected = matrix_source(&mut expressions, "literal-selected", matrix.clone(), None);
+        let unselected =
+            matrix_source(&mut expressions, "literal-unselected", matrix.clone(), None);
+        let mut facts = FactStore::new(&expressions);
+        insert_matrix_bound(&mut facts, &expressions, selected, 4);
+        let domain = super::super::arena::FamilyDomain::new(0, 2).unwrap();
+        let family = programs
+            .explicit_family(&mut expressions, &facts, domain, Box::new([selected, unselected]))
+            .unwrap();
+        facts.finalize_ranges();
+        let selector = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let call = programs
+            .call_family_in_range(
+                &mut expressions,
+                family,
+                selector,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        let caller = programs
+            .opaque_generated_family_from_body(
+                &mut expressions,
+                super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                call,
+            )
+            .unwrap();
+        let semantic = programs.scoped(&expressions, caller.program(), call).unwrap();
+        let mut monomials = MonomialArena::new(&expressions, &programs, caller.program()).unwrap();
+        let mut trace = FeasibilityTrace::default();
+        let value = Normalizer::new_with_sink(
+            &mut expressions,
+            &programs,
+            &facts,
+            &mut monomials,
+            &mut trace,
+        )
+        .unwrap()
+        .normalize(semantic)
+        .unwrap();
+        assert_eq!(value.coefficient_bound, NumericContract::Known(CoefficientBound::finite(4_u8)));
+        assert!(!trace.normalization_events().iter().any(|event| {
+            matches!(
+                event,
+                NormalizerEvent::Result { owner, .. } if owner.expression() == unselected
+            )
+        }));
+
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let open_call = programs
+            .call_family_in_range(
+                &mut expressions,
+                family,
+                argument,
+                TrustedIndexRange::new(0, 2).unwrap(),
+            )
+            .unwrap();
+        let open_caller = programs
+            .opaque_generated_family_from_body(
+                &mut expressions,
+                super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                open_call,
+            )
+            .unwrap();
+        let open_semantic =
+            programs.scoped(&expressions, open_caller.program(), open_call).unwrap();
+        let mut open_monomials =
+            MonomialArena::new(&expressions, &programs, open_caller.program()).unwrap();
+        let open = Normalizer::new(&mut expressions, &programs, &facts, &mut open_monomials)
+            .unwrap()
+            .normalize(open_semantic)
+            .unwrap();
+        let open_monomial = *open
+            .exact_nf
+            .as_ref()
+            .expect("open call exact atom")
+            .exact_terms
+            .keys()
+            .next()
+            .unwrap();
+        let open_descriptor = open_monomials.descriptor(open_monomial).unwrap();
+        assert_eq!(open_descriptor.ordered_factors.len(), 1);
+        assert_eq!(open_descriptor.ordered_factors[0].expression(), open_call);
+    }
+
+    #[test]
+    fn literal_projection_recurses_through_nested_explicit_calls() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let inner_selected =
+            matrix_source(&mut expressions, "nested-literal-selected", matrix.clone(), None);
+        let inner_unselected =
+            matrix_source(&mut expressions, "nested-literal-unselected", matrix.clone(), None);
+        let mut facts = FactStore::new(&expressions);
+        insert_matrix_bound(&mut facts, &expressions, inner_selected, 6);
+        let inner_domain = super::super::arena::FamilyDomain::new(4, 6).unwrap();
+        let inner = programs
+            .explicit_family(
+                &mut expressions,
+                &facts,
+                inner_domain,
+                Box::new([inner_selected, inner_unselected]),
+            )
+            .unwrap();
+        let inner_selector = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(4)), Box::new([]))
+            .unwrap();
+        let inner_call = programs
+            .call_family_in_range(
+                &mut expressions,
+                inner,
+                inner_selector,
+                TrustedIndexRange::new(4, 5).unwrap(),
+            )
+            .unwrap();
+        let outer_other = matrix_source(&mut expressions, "nested-literal-other", matrix, None);
+        insert_matrix_bound(&mut facts, &expressions, outer_other, 12);
+        let outer_domain = super::super::arena::FamilyDomain::new(0, 2).unwrap();
+        let outer = programs
+            .explicit_family(
+                &mut expressions,
+                &facts,
+                outer_domain,
+                Box::new([inner_call, outer_other]),
+            )
+            .unwrap();
+        facts.finalize_ranges();
+        let outer_selector = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let outer_call = programs
+            .call_family_in_range(
+                &mut expressions,
+                outer,
+                outer_selector,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        let caller = programs
+            .opaque_generated_family_from_body(
+                &mut expressions,
+                super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                outer_call,
+            )
+            .unwrap();
+        let semantic = programs.scoped(&expressions, caller.program(), outer_call).unwrap();
+        let mut monomials = MonomialArena::new(&expressions, &programs, caller.program()).unwrap();
+        let value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        assert_eq!(value.coefficient_bound, NumericContract::Known(CoefficientBound::finite(6_u8)));
+        let monomial = *value.exact_nf.unwrap().exact_terms.keys().next().unwrap();
+        let descriptor = monomials.descriptor(monomial).unwrap();
+        assert_eq!(descriptor.ordered_factors.len(), 1);
+        assert_eq!(descriptor.ordered_factors[0].expression(), inner_selected);
+    }
+
+    #[test]
+    fn literal_projection_absorbs_branch_proof_for_parent_product() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let left = matrix_source(&mut expressions, "proof-left", matrix.clone(), None);
+        let right = matrix_source(&mut expressions, "proof-right", matrix.clone(), None);
+        let public_matrix = matrix_source(&mut expressions, "proof-public", matrix.clone(), None);
+        let branch_sum =
+            expressions.intern_matrix_transform(MatrixOperation::Add, &[left, right]).unwrap();
+        let mut facts = FactStore::new(&expressions);
+        insert_matrix_bound(&mut facts, &expressions, left, 2);
+        insert_matrix_bound(&mut facts, &expressions, right, 3);
+        insert_matrix_bound(&mut facts, &expressions, public_matrix, 5);
+        let domain = super::super::arena::FamilyDomain::new(0, 1).unwrap();
+        let family = programs
+            .explicit_family(&mut expressions, &facts, domain, Box::new([branch_sum]))
+            .unwrap();
+        facts.finalize_ranges();
+        let selector = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let call = programs
+            .call_family_in_range(
+                &mut expressions,
+                family,
+                selector,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        let projected_root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[call, public_matrix])
+            .unwrap();
+        let projected_program = programs
+            .opaque_generated_family_from_body(&mut expressions, domain, projected_root)
+            .unwrap();
+        let projected_semantic =
+            programs.scoped(&expressions, projected_program.program(), projected_root).unwrap();
+        let mut projected_monomials =
+            MonomialArena::new(&expressions, &programs, projected_program.program()).unwrap();
+        let projected =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut projected_monomials)
+                .unwrap()
+                .normalize(projected_semantic)
+                .unwrap();
+
+        let direct_root = expressions
+            .intern_matrix_transform(MatrixOperation::Multiply, &[branch_sum, public_matrix])
+            .unwrap();
+        let direct_program = programs
+            .opaque_generated_family_from_body(&mut expressions, domain, direct_root)
+            .unwrap();
+        let direct_semantic =
+            programs.scoped(&expressions, direct_program.program(), direct_root).unwrap();
+        let mut direct_monomials =
+            MonomialArena::new(&expressions, &programs, direct_program.program()).unwrap();
+        let direct = Normalizer::new(&mut expressions, &programs, &facts, &mut direct_monomials)
+            .unwrap()
+            .normalize(direct_semantic)
+            .unwrap();
+
+        let raw_descriptors = |value: &AnalyzedValue, monomials: &MonomialArena| {
+            value
+                .exact_nf
+                .as_ref()
+                .unwrap()
+                .exact_terms
+                .iter()
+                .map(|(monomial, coefficient)| {
+                    let descriptor = monomials.descriptor(*monomial).unwrap();
+                    (
+                        descriptor
+                            .central_factors
+                            .iter()
+                            .map(|factor| factor.expression())
+                            .collect::<Vec<_>>(),
+                        descriptor
+                            .ordered_factors
+                            .iter()
+                            .map(|factor| factor.expression())
+                            .collect::<Vec<_>>(),
+                        coefficient.clone(),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            raw_descriptors(&projected, &projected_monomials),
+            raw_descriptors(&direct, &direct_monomials)
+        );
+    }
+
+    #[test]
+    fn captured_selected_branch_stays_opaque_and_fail_closed() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let capture = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let source = matrix_source(&mut expressions, "captured-literal", matrix, None);
+        let captured_branch = expressions
+            .intern_matrix_transform(MatrixOperation::Scale, &[source, capture])
+            .unwrap();
+        let closed_branch = matrix_source(&mut expressions, "captured-other", matrix_type(), None);
+        let mut facts = FactStore::new(&expressions);
+        insert_matrix_bound(&mut facts, &expressions, source, 3);
+        insert_matrix_bound(&mut facts, &expressions, closed_branch, 9);
+        let domain = super::super::arena::FamilyDomain::new(0, 2).unwrap();
+        let family = programs
+            .explicit_family_with_captures(
+                &mut expressions,
+                &facts,
+                domain,
+                Box::new([captured_branch, closed_branch]),
+                &[capture],
+                false,
+            )
+            .unwrap();
+        facts.finalize_ranges();
+        let selector = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(0)), Box::new([]))
+            .unwrap();
+        let call = programs
+            .call_family_in_range(
+                &mut expressions,
+                family,
+                selector,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        let caller = programs
+            .generated_family_from_body(
+                &mut expressions,
+                super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                call,
+            )
+            .unwrap();
+        let semantic = programs.scoped(&expressions, caller.program(), call).unwrap();
+        let mut monomials = MonomialArena::new(&expressions, &programs, caller.program()).unwrap();
+        let value = Normalizer::new(&mut expressions, &programs, &facts, &mut monomials)
+            .unwrap()
+            .normalize(semantic)
+            .unwrap();
+        assert_eq!(value.coefficient_bound, NumericContract::Missing);
+        let monomial = *value.exact_nf.unwrap().exact_terms.keys().next().unwrap();
+        let descriptor = monomials.descriptor(monomial).unwrap();
+        assert_eq!(descriptor.ordered_factors.len(), 1);
+        assert_eq!(descriptor.ordered_factors[0].expression(), call);
+    }
+
+    #[test]
+    fn malformed_and_out_of_domain_literal_calls_remain_opaque() {
+        let mut expressions = ExprArena::new();
+        let mut programs = ProgramArena::new();
+        let matrix = matrix_type();
+        let branch = matrix_source(&mut expressions, "opaque-literal-branch", matrix.clone(), None);
+        let mut facts = FactStore::new(&expressions);
+        insert_matrix_bound(&mut facts, &expressions, branch, 8);
+        let domain = super::super::arena::FamilyDomain::new(4, 5).unwrap();
+        let family =
+            programs.explicit_family(&mut expressions, &facts, domain, Box::new([branch])).unwrap();
+        facts.finalize_ranges();
+        let out_of_domain = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(5)), Box::new([]))
+            .unwrap();
+        let out_call = programs.call(&mut expressions, family.program(), &[out_of_domain]).unwrap();
+        let out_caller = programs
+            .opaque_generated_family_from_body(
+                &mut expressions,
+                super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                out_call,
+            )
+            .unwrap();
+        let out_semantic = programs.scoped(&expressions, out_caller.program(), out_call).unwrap();
+        let mut out_monomials =
+            MonomialArena::new(&expressions, &programs, out_caller.program()).unwrap();
+        let out = Normalizer::new(&mut expressions, &programs, &facts, &mut out_monomials)
+            .unwrap()
+            .normalize(out_semantic)
+            .unwrap();
+        let out_monomial = *out.exact_nf.unwrap().exact_terms.keys().next().unwrap();
+        let out_descriptor = out_monomials.descriptor(out_monomial).unwrap();
+        assert_eq!(out_descriptor.ordered_factors.len(), 1);
+        assert_eq!(out_descriptor.ordered_factors[0].expression(), out_call);
+
+        let argument = expressions.intern_argument(0, ResolvedValueType::Int).unwrap();
+        let malformed_other =
+            matrix_source(&mut expressions, "opaque-literal-other", matrix.clone(), None);
+        let malformed_domain = super::super::arena::FamilyDomain::new(4, 6).unwrap();
+        let malformed_root = expressions
+            .intern(
+                ValueOperator::ExplicitElement {
+                    domain: malformed_domain,
+                    element_type: ResolvedValueType::Matrix(matrix.clone()),
+                },
+                Box::new([argument, branch, malformed_other]),
+            )
+            .unwrap();
+        let malformed_program = programs
+            .finalize(
+                &mut expressions,
+                ProgramSignature {
+                    inputs: Box::new([ProgramInput {
+                        value_type: ResolvedValueType::Int,
+                        trusted_index_range: Some(TrustedIndexRange::new(4, 6).unwrap()),
+                    }]),
+                    output: ResolvedValueType::Matrix(matrix),
+                },
+                malformed_root,
+            )
+            .unwrap();
+        let literal = expressions
+            .intern(ValueOperator::Constant(TypedConstant::int(4)), Box::new([]))
+            .unwrap();
+        let malformed_call =
+            programs.call(&mut expressions, malformed_program, &[literal]).unwrap();
+        let malformed_caller = programs
+            .opaque_generated_family_from_body(
+                &mut expressions,
+                super::super::arena::FamilyDomain::new(0, 1).unwrap(),
+                malformed_call,
+            )
+            .unwrap();
+        let malformed_semantic =
+            programs.scoped(&expressions, malformed_caller.program(), malformed_call).unwrap();
+        let mut malformed_monomials =
+            MonomialArena::new(&expressions, &programs, malformed_caller.program()).unwrap();
+        let malformed =
+            Normalizer::new(&mut expressions, &programs, &facts, &mut malformed_monomials)
+                .unwrap()
+                .normalize(malformed_semantic)
+                .unwrap();
+        let malformed_monomial = *malformed.exact_nf.unwrap().exact_terms.keys().next().unwrap();
+        let malformed_descriptor = malformed_monomials.descriptor(malformed_monomial).unwrap();
+        assert_eq!(malformed_descriptor.ordered_factors.len(), 1);
+        assert_eq!(malformed_descriptor.ordered_factors[0].expression(), malformed_call);
+    }
+
+    #[test]
     fn nested_explicit_element_uses_branch_max_and_folds_without_changing_exact_identity() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
@@ -8576,7 +9359,10 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert!(products.iter().any(|(left, right)| {
+        // The product keeps the exact operand identities and does not resurrect a compressed
+        // summary as one side of a new product.  In particular, summary-only evidence must not
+        // replace the retained exact terms merely because the surrounding product is traced.
+        assert!(!products.iter().any(|(left, right)| {
             matches!(left, BoundValueRef::Result { projection: BoundProjection::Summary, .. }) &&
                 matches!(right, BoundValueRef::Transfer(_))
         }));
@@ -8611,7 +9397,7 @@ mod tests {
     }
 
     #[test]
-    fn traced_product_summary_rejects_large_or_missing_before_product_output() {
+    fn traced_product_with_large_operand_retains_exact_identity() {
         for (index, large) in [false, true].into_iter().enumerate() {
             let mut expressions = ExprArena::new();
             let mut programs = ProgramArena::new();
@@ -8636,10 +9422,7 @@ mod tests {
                 facts.insert(&expressions, right, ValueFacts::Matrix(matrix_facts)).unwrap();
             }
             let mut trace = super::super::g0::FeasibilityTrace::default();
-            let before_len = monomials.len();
-            let before_occupied = monomials.occupied_len();
-            let before_events = trace.normalization_events().len();
-            let error = {
+            let result = {
                 let mut normalizer = Normalizer::new_with_sink(
                     &mut expressions,
                     &programs,
@@ -8648,19 +9431,22 @@ mod tests {
                     &mut trace,
                 )
                 .unwrap();
-                normalizer.normalize(semantic).unwrap_err()
+                normalizer.normalize(semantic)
             };
-            assert!(matches!(error, NormalizeError::InvalidExactPlan { .. }));
-            assert_eq!(monomials.len(), before_len + 3);
-            assert_eq!(monomials.occupied_len(), before_occupied + 3);
-            assert!(!trace.normalization_events()[before_events..].iter().any(|event| {
+            let value = result.expect("an uncompressed large operand remains an exact product");
+            assert!(value.exact_nf.as_ref().is_some_and(|nf| !nf.exact_terms.is_empty()));
+            assert!(!trace.normalization_events().iter().any(|event| {
                 matches!(
                     event,
                     super::super::g0::NormalizerEvent::BoundTransfer {
-                        rule: BoundRule::Product { .. } |
-                            BoundRule::MonomialProduct { .. } |
-                            BoundRule::Scale { .. } |
-                            BoundRule::Sum { .. },
+                        rule: BoundRule::Product {
+                            left: BoundValueRef::Result {
+                                projection: BoundProjection::Summary,
+                                ..
+                            },
+                            right: BoundValueRef::Transfer(_),
+                            ..
+                        },
                         ..
                     }
                 )
@@ -9288,7 +10074,7 @@ mod tests {
     }
 
     #[test]
-    fn traced_product_gadget_splice_records_unit_identity_transfer() {
+    fn traced_product_gadget_splice_omits_zero_summary_transfer() {
         let mut expressions = ExprArena::new();
         let mut programs = ProgramArena::new();
         let scalar = ResolvedMatrixType::new(BigUint::from(17_u8), 1, 1, 1).unwrap();
@@ -9371,7 +10157,10 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(identity, 1);
+        // A zero-summary relation is already represented by its AppliedRelation event.  No
+        // identity transfer may reference that event, because the G0 relation validator requires
+        // a nonzero finite source summary for contextual transfer evidence.
+        assert_eq!(identity, 0);
         assert!(!events.iter().any(|event| matches!(
             event,
             super::super::g0::NormalizerEvent::BoundTransfer {

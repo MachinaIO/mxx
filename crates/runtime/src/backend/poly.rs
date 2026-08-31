@@ -1,4 +1,7 @@
-use super::{Backend, IndexRange, MatrixMulAccumulateRequest, PreimageRequest, SampleRange};
+use super::{
+    Backend, HashSampleRequest, IndexRange, MatrixMulAccumulateRequest, PreimageRequest,
+    SampleRange, UniformSampleRequest,
+};
 use mxx_ir_core::{
     ParamEnv,
     node::{ConcatAxis, ConstantMatrix, HashVariant},
@@ -57,6 +60,16 @@ where
     parameters: Vec<BTreeMap<RingKey, <M::P as Poly>::Params>>,
     active_placement: usize,
     preimage_batch_calls: usize,
+    #[cfg(test)]
+    matrix_serialization_batch_calls: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    uniform_sampling_batch_calls: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    hash_sampling_batch_calls: std::sync::atomic::AtomicUsize,
+    uniform_batch_dispatch:
+        Option<fn(&mut Self, Vec<UniformSampleRequest>) -> Result<Vec<M>, PolyBackendError>>,
+    hash_batch_dispatch:
+        Option<fn(&mut Self, Vec<HashSampleRequest>) -> Result<Vec<M>, PolyBackendError>>,
     _marker: PhantomData<(M, U, H, T)>,
 }
 
@@ -154,6 +167,14 @@ where
             parameters: vec![BTreeMap::new()],
             active_placement: 0,
             preimage_batch_calls: 0,
+            #[cfg(test)]
+            matrix_serialization_batch_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            uniform_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            hash_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
+            uniform_batch_dispatch: None,
+            hash_batch_dispatch: None,
             _marker: PhantomData,
         }
     }
@@ -208,6 +229,14 @@ where
             parameters: (0..placements.len()).map(|_| BTreeMap::new()).collect(),
             active_placement: 0,
             preimage_batch_calls: 0,
+            #[cfg(test)]
+            matrix_serialization_batch_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            uniform_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            hash_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
+            uniform_batch_dispatch: None,
+            hash_batch_dispatch: None,
             _marker: PhantomData,
         };
         for (placement, parameters) in placements.into_iter().enumerate() {
@@ -236,6 +265,33 @@ where
     /// bounded-wave batch path from scalar fallback execution.
     pub fn preimage_batch_calls(&self) -> usize {
         self.preimage_batch_calls
+    }
+
+    #[cfg(test)]
+    pub fn matrix_serialization_batch_calls(&self) -> usize {
+        self.matrix_serialization_batch_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn uniform_sampling_batch_calls(&self) -> usize {
+        self.uniform_sampling_batch_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn hash_sampling_batch_calls(&self) -> usize {
+        self.hash_sampling_batch_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Installs backend-specific sampling dispatchers while keeping the
+    /// generic backend's scalar implementation as the safe default.
+    #[cfg(feature = "gpu")]
+    pub(super) fn set_sampling_batch_dispatch(
+        &mut self,
+        uniform: fn(&mut Self, Vec<UniformSampleRequest>) -> Result<Vec<M>, PolyBackendError>,
+        hash: fn(&mut Self, Vec<HashSampleRequest>) -> Result<Vec<M>, PolyBackendError>,
+    ) {
+        self.uniform_batch_dispatch = Some(uniform);
+        self.hash_batch_dispatch = Some(hash);
     }
 
     pub(super) fn parameters(
@@ -668,6 +724,23 @@ where
         })
     }
 
+    fn write_columns(
+        &mut self,
+        target: &mut M,
+        offset: usize,
+        columns: &[M],
+    ) -> Result<(), Self::Error> {
+        let (rows, target_columns) = target.size();
+        if offset.checked_add(columns.len()).is_none_or(|end| end > target_columns) ||
+            columns.iter().any(|column| column.size() != (rows, 1))
+        {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        let sources = columns.iter().collect::<Vec<_>>();
+        target.copy_columns_from(&sources, offset);
+        Ok(())
+    }
+
     fn sample_uniform(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -690,6 +763,21 @@ where
             });
         };
         Ok(U::new().sample_uniform(parameters, ty.rows, ty.columns, distribution))
+    }
+
+    fn sample_uniform_batch(
+        &mut self,
+        requests: Vec<UniformSampleRequest>,
+    ) -> Result<Vec<M>, Self::Error> {
+        #[cfg(test)]
+        self.uniform_sampling_batch_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(dispatch) = self.uniform_batch_dispatch {
+            return dispatch(self, requests);
+        }
+        requests
+            .into_iter()
+            .map(|request| self.sample_uniform(&request.matrix_type, &request.range))
+            .collect()
     }
 
     fn sample_gaussian(
@@ -768,6 +856,31 @@ where
                 )
             }
         })
+    }
+
+    fn sample_hash_batch(
+        &mut self,
+        requests: Vec<HashSampleRequest>,
+    ) -> Result<Vec<M>, Self::Error> {
+        #[cfg(test)]
+        self.hash_sampling_batch_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(dispatch) = self.hash_batch_dispatch {
+            return dispatch(self, requests);
+        }
+        requests
+            .into_iter()
+            .map(|request| {
+                let gadget_layout =
+                    request.gadget_layout.as_ref().map(|(base, digits)| (base, *digits));
+                self.sample_hash(
+                    &request.matrix_type,
+                    request.key,
+                    &request.tag,
+                    request.variant,
+                    gadget_layout,
+                )
+            })
+            .collect()
     }
 
     fn validate_gadget_layout(
@@ -976,6 +1089,13 @@ where
     }
 
     fn matrices_to_bytes(&self, values: &[&M]) -> Vec<Vec<u8>> {
+        #[cfg(test)]
+        {
+            // The counter is test-only instrumentation for verifying executor wave batching.
+            // It does not participate in serialization or production state.
+            self.matrix_serialization_batch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         #[cfg(feature = "gpu")]
         {
             M::compact_bytes_batch(values)

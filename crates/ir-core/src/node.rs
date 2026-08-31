@@ -248,11 +248,18 @@ pub struct SubgraphCall {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ParallelLoop {
     pub count: IntExpr,
-    #[serde(default)]
     pub minimum_count: usize,
     pub index_slot: u32,
     pub bindings: Vec<(String, IntExpr)>,
     pub input_modes: Vec<LoopInputMode>,
+    /// Determines how the body outputs are assembled.
+    pub output_mode: ParallelOutputMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ParallelOutputMode {
+    Family,
+    CollectColumns,
 }
 
 /// A structural loop whose body consumes and returns a carried state.

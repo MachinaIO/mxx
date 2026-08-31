@@ -1323,6 +1323,7 @@ mod tests {
                     index_slot: 0,
                     bindings: Vec::new(),
                     input_modes: vec![crate::node::LoopInputMode::Zip],
+                    output_mode: crate::node::ParallelOutputMode::Family,
                 },
             )
             .output(0)

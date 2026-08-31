@@ -93,6 +93,15 @@ unsafe extern "C" {
         format: c_int,
         out_mat: *mut *mut GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_create_batch(
+        ctx: *mut GpuContextOpaque,
+        level: c_int,
+        rows: usize,
+        cols: usize,
+        format: c_int,
+        output_count: usize,
+        outputs: *mut *mut GpuMatrixOpaque,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_destroy(mat: *mut GpuMatrixOpaque);
     pub(crate) fn gpu_matrix_wait(mat: *const GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_copy(dst: *mut GpuMatrixOpaque, src: *const GpuMatrixOpaque) -> c_int;
@@ -326,6 +335,15 @@ unsafe extern "C" {
         seed: GpuRngSeed,
         full_ncol: usize,
         col_offset: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_sample_distribution_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        output_count: usize,
+        dist_type: c_int,
+        sigma: f64,
+        max_coefficient_bound: u64,
+        coefficient_modulus: u64,
+        seeds: *const GpuRngSeed,
     ) -> c_int;
     pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque) -> c_int;
@@ -803,7 +821,9 @@ impl GpuContext {
         self.raw
     }
 
-    /// Waits only for releases queued on this context's release streams.
+    /// Fences release streams and waits for the context-owned deferred host
+    /// reclamation queue.  This is the explicit synchronization point for
+    /// callers that need all asynchronous resource releases to be complete.
     pub fn fence_released_memory(&self) {
         let status = unsafe { gpu_context_fence_releases(self.raw) };
         check_status(status, "gpu_context_fence_releases");

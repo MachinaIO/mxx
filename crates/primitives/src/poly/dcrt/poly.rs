@@ -118,8 +118,10 @@ impl Poly for DCRTPoly {
 
     #[inline]
     fn coeffs(&self) -> Vec<Self::Elem> {
-        let _native = crate::openfhe_guard::native_guard();
-        let poly_encoding = self.ptr_poly.GetCoefficientsBytes();
+        let poly_encoding = {
+            let _native = crate::openfhe_guard::native_guard();
+            self.ptr_poly.GetCoefficientsBytes()
+        };
         let parsed_values = parse_coefficients_bytes(&poly_encoding);
         let coeffs = parsed_values.coefficients;
         let modulus = parsed_values.modulus;

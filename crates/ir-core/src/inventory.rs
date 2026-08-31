@@ -202,6 +202,7 @@ mod tests {
                 index_slot: 0,
                 bindings: Vec::new(),
                 input_modes: vec![LoopInputMode::Broadcast],
+                output_mode: crate::node::ParallelOutputMode::Family,
             },
         )
         .output(0)

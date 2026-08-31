@@ -1237,16 +1237,49 @@ fn validate_structural_boundaries(
                 let child_type = &child.wire_types[output];
                 let call_type =
                     &validated.wire_types[&WireRef { node: node_id, port: Port(port as u32) }];
-                let expected = if matches!(handle.kind(), NodeKind::ParallelLoop(_)) {
-                    let NodeKind::ParallelLoop(spec) = handle.kind() else { unreachable!() };
-                    ConcreteWireType::IndexedFamily {
-                        element: Box::new(child_type.clone()),
-                        count: nonnegative_usize(
-                            spec.count.evaluate(env)?,
-                            "parallel count",
-                            scope_id,
-                            node_id,
-                        )?,
+                let expected = if let NodeKind::ParallelLoop(spec) = handle.kind() {
+                    let count = nonnegative_usize(
+                        spec.count.evaluate(env)?,
+                        "parallel count",
+                        scope_id,
+                        node_id,
+                    )?;
+                    match spec.output_mode {
+                        crate::node::ParallelOutputMode::Family => {
+                            ConcreteWireType::IndexedFamily {
+                                element: Box::new(child_type.clone()),
+                                count,
+                            }
+                        }
+                        crate::node::ParallelOutputMode::CollectColumns => {
+                            if count == 0 || child_scope.outputs().len() != 1 {
+                                return node_error(
+                                    scope_id,
+                                    node_id,
+                                    "column-collect loop requires a positive count and one body output",
+                                );
+                            }
+                            let ConcreteWireType::Matrix(matrix) = child_type else {
+                                return node_error(
+                                    scope_id,
+                                    node_id,
+                                    "column-collect body must return a matrix",
+                                );
+                            };
+                            if matrix.columns != 1 {
+                                return node_error(
+                                    scope_id,
+                                    node_id,
+                                    "column-collect body must return one column",
+                                );
+                            }
+                            ConcreteWireType::Matrix(ConcreteMatrixType {
+                                modulus: matrix.modulus.clone(),
+                                ring_dimension: matrix.ring_dimension,
+                                rows: matrix.rows,
+                                columns: count,
+                            })
+                        }
                     }
                 } else {
                     child_type.clone()
@@ -1768,6 +1801,76 @@ mod tests {
     }
 
     #[test]
+    fn trapdoor_digit_count_must_be_positive_in_nodes_and_wire_types() {
+        let trapdoor_sample = |digit_count: i64| {
+            let matrix = matrix_type(17, 1, digit_count + 2);
+            let trapdoor = WireType::Trapdoor {
+                matrix: matrix.clone(),
+                sigma: crate::RealExpr::from_integer(1),
+                gadget_base: IntExpr::constant(2),
+                digit_count: IntExpr::constant(digit_count),
+                preimage_max_coefficient_bound: IntExpr::constant(8),
+            };
+            NodeHandle::new(
+                NodeKind::TrapdoorSample {
+                    matrix_type: matrix.clone(),
+                    sigma: crate::RealExpr::from_integer(1),
+                    gadget_base: IntExpr::constant(2),
+                    digit_count: IntExpr::constant(digit_count),
+                    preimage_max_coefficient_bound: IntExpr::constant(8),
+                },
+                Vec::new(),
+                vec![WireType::Matrix(matrix), trapdoor],
+            )
+            .output(0)
+            .expect("trapdoor sample matrix output")
+        };
+
+        assert!(
+            node_message(
+                validate(&graph("zero-trapdoor-digits", trapdoor_sample(0)), &ParamEnv::default())
+                    .unwrap_err()
+            )
+            .contains("digit count")
+        );
+        validate(&graph("positive-trapdoor-digits", trapdoor_sample(1)), &ParamEnv::default())
+            .expect("a trapdoor with one gadget digit is valid");
+
+        let trapdoor_input = |digit_count: i64| {
+            let matrix = matrix_type(17, 1, digit_count + 2);
+            let wire_type = WireType::Trapdoor {
+                matrix,
+                sigma: crate::RealExpr::from_integer(1),
+                gadget_base: IntExpr::constant(2),
+                digit_count: IntExpr::constant(digit_count),
+                preimage_max_coefficient_bound: IntExpr::constant(8),
+            };
+            value(
+                NodeKind::Input {
+                    name: format!("trapdoor-{digit_count}"),
+                    wire_type: wire_type.clone(),
+                    artifact: None,
+                },
+                Vec::new(),
+                vec![wire_type],
+            )
+        };
+
+        assert!(
+            node_message(
+                validate(
+                    &graph("zero-trapdoor-wire-digits", trapdoor_input(0)),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            )
+            .contains("trapdoor digit count")
+        );
+        validate(&graph("positive-trapdoor-wire-digits", trapdoor_input(1)), &ParamEnv::default())
+            .expect("a trapdoor wire with one gadget digit is valid");
+    }
+
+    #[test]
     fn crt_and_decode_validate_all_metadata_against_the_input_type() {
         let level = input("level", matrix_type(257, 1, 2));
         let crt = value(
@@ -1948,6 +2051,7 @@ mod tests {
                         Vec::new()
                     },
                     input_modes: vec![LoopInputMode::Broadcast],
+                    output_mode: crate::node::ParallelOutputMode::Family,
                 },
             )
             .output(0)
@@ -2154,6 +2258,53 @@ mod tests {
                 validate(&graph("invalid-sequential", output), &ParamEnv::default()).unwrap_err()
             ),
             "invalid sequential carried count"
+        );
+    }
+
+    #[test]
+    fn collect_columns_validation_rejects_empty_count_and_multiple_outputs() {
+        let matrix = matrix_type(17, 2, 1);
+        let outer = input("outer", matrix.clone());
+        let make_body = |multiple_outputs| {
+            let (inputs, outputs, scope) = crate::graph::with_new_construction_scope(|scope| {
+                let input = input("body-input", matrix.clone());
+                let outputs =
+                    if multiple_outputs { vec![input.clone(), input] } else { vec![input] };
+                (vec![outputs[0].clone()], outputs, scope)
+            });
+            crate::SubgraphHandle::new("collect-columns-body", scope, inputs, outputs).unwrap()
+        };
+        let collect = |count, body| {
+            NodeHandle::parallel_loop(
+                body,
+                vec![outer.clone()],
+                vec![WireType::Matrix(matrix_type(17, 2, 1))],
+                ParallelLoop {
+                    count: IntExpr::constant(count),
+                    minimum_count: 0,
+                    index_slot: 0,
+                    bindings: Vec::new(),
+                    input_modes: vec![LoopInputMode::Broadcast],
+                    output_mode: crate::node::ParallelOutputMode::CollectColumns,
+                },
+            )
+            .output(0)
+            .unwrap()
+        };
+        let empty_error = node_message(
+            validate(&graph("empty-collect", collect(0, make_body(false))), &ParamEnv::default())
+                .unwrap_err(),
+        );
+        assert!(empty_error.contains("positive count"), "unexpected error: {empty_error}");
+        assert!(
+            node_message(
+                validate(
+                    &graph("multi-collect", collect(2, make_body(true))),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            )
+            .contains("child output count")
         );
     }
 }

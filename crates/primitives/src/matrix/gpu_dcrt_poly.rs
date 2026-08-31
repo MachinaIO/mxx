@@ -13,8 +13,9 @@ use crate::{
                 gpu_event_set_wait, gpu_matrix_add, gpu_matrix_add_block,
                 gpu_matrix_batch_within_coefficient_bound, gpu_matrix_binary_batch,
                 gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_copy_peer, gpu_matrix_create,
-                gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
-                gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
+                gpu_matrix_create_batch, gpu_matrix_create_p1_covariance_cache,
+                gpu_matrix_crt_recompose, gpu_matrix_decompose_base,
+                gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal, gpu_matrix_fill_gadget,
                 gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_small_gadget,
                 gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all, gpu_matrix_intt_batch,
@@ -24,10 +25,11 @@ use crate::{
                 gpu_matrix_mul_vertical_pair, gpu_matrix_negate_batch, gpu_matrix_ntt_all,
                 gpu_matrix_ntt_batch, gpu_matrix_preimage_add_correction,
                 gpu_matrix_preimage_residual, gpu_matrix_ring_automorphism_batch,
-                gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_columns,
-                gpu_matrix_sample_p1_full_cached, gpu_matrix_store_compact_bytes,
-                gpu_matrix_store_compact_bytes_batch, gpu_matrix_store_const_coeff_batch,
-                gpu_matrix_store_rns_batch, gpu_matrix_sub, gpu_matrix_wait,
+                gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_batch,
+                gpu_matrix_sample_distribution_columns, gpu_matrix_sample_p1_full_cached,
+                gpu_matrix_store_compact_bytes, gpu_matrix_store_compact_bytes_batch,
+                gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
+                gpu_matrix_wait,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -819,6 +821,66 @@ impl GpuDCRTPolyMatrix {
         };
         check_status(status, "gpu_matrix_sample_distribution");
         out
+    }
+
+    /// Samples several homogeneous matrices in one CUDA dispatch.  Each output
+    /// has its own seed; the CUDA kernel keeps the scalar stream coordinates
+    /// unchanged, so a batched output is byte-identical to its scalar output.
+    pub(crate) fn sample_distribution_batch(
+        params: &GpuDCRTPolyParams,
+        nrow: usize,
+        ncol: usize,
+        dist: GpuMatrixSampleDist,
+        sigma: f64,
+        max_coefficient_bound: u64,
+        seeds: &[GpuRngSeed],
+    ) -> Vec<Self> {
+        if seeds.is_empty() {
+            return Vec::new();
+        }
+        let max_batch = 65535usize / params.crt_depth().max(1);
+        assert!(
+            seeds.len() <= max_batch,
+            "sampling batch exceeds CUDA grid dimensions: {} > {}",
+            seeds.len(),
+            max_batch
+        );
+        let mut raw_outputs = vec![ptr::null_mut(); seeds.len()];
+        let level = params.crt_depth().saturating_sub(1);
+        let format = GPU_POLY_FORMAT_EVAL;
+        let status = unsafe {
+            gpu_matrix_create_batch(
+                params.ctx_raw(),
+                level as i32,
+                nrow,
+                ncol,
+                format,
+                raw_outputs.len(),
+                raw_outputs.as_mut_ptr(),
+            )
+        };
+        check_status(status, "gpu_matrix_create_batch");
+        let outputs = raw_outputs
+            .into_iter()
+            .map(|raw| Self { params: params.clone(), nrow, ncol, level, is_ntt: true, raw })
+            .collect::<Vec<_>>();
+        if nrow == 0 || ncol == 0 {
+            return outputs;
+        }
+        let output_pointers = outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_sample_distribution_batch(
+                output_pointers.as_ptr(),
+                output_pointers.len(),
+                dist.as_ffi(),
+                sigma,
+                max_coefficient_bound,
+                params.modulus().to_u64().unwrap_or(0),
+                seeds.as_ptr(),
+            )
+        };
+        check_status(status, "gpu_matrix_sample_distribution_batch");
+        outputs
     }
 
     pub(crate) fn sample_distribution_columns(
@@ -3198,6 +3260,55 @@ mod tests {
         let scalar = mixed_contexts.iter().map(PolyMatrix::to_compact_bytes).collect::<Vec<_>>();
         let references = mixed_contexts.iter().collect::<Vec<_>>();
         assert_eq!(GpuDCRTPolyMatrix::compact_bytes_batch_borrowed(&references), scalar);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_sampling_batch_multi_device_matches_scalar_outputs() {
+        gpu_device_sync();
+        let devices = detected_gpu_device_ids();
+        if devices.len() < 2 {
+            return;
+        }
+        // Four CRT limbs over two devices exercise both local limb indices on
+        // each partition; in particular, the second local limb must use its
+        // exact limb offset rather than the partition base.
+        let cpu_params = DCRTPolyParams::new(32, 4, 17, 8);
+        let (moduli, _, _) = cpu_params.to_crt();
+        let gpu_params = GpuDCRTPolyParams::new_with_gpu(
+            cpu_params.ring_dimension(),
+            moduli,
+            cpu_params.base_bits(),
+            devices[..2].to_vec(),
+            Some(2),
+        );
+        let mut random = rand::rng();
+        let seeds =
+            [GpuRngSeed::from_bytes(random.random()), GpuRngSeed::from_bytes(random.random())];
+        let batched = GpuDCRTPolyMatrix::sample_distribution_batch(
+            &gpu_params,
+            1,
+            2,
+            GpuMatrixSampleDist::Uniform,
+            0.0,
+            u64::MAX,
+            &seeds,
+        );
+        assert_eq!(batched.len(), seeds.len());
+        for (actual, seed) in batched.into_iter().zip(seeds) {
+            actual.wait_until_ready();
+            let expected = GpuDCRTPolyMatrix::sample_distribution(
+                &gpu_params,
+                1,
+                2,
+                GpuMatrixSampleDist::Uniform,
+                0.0,
+                u64::MAX,
+                seed,
+            );
+            expected.wait_until_ready();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

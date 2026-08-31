@@ -1,7 +1,7 @@
 //! Abstract numeric states and primitive initial-state constructors.
 
 use crate::{bound, identity::SourceId};
-use mxx_ir_core::types::ConcreteMatrixType;
+use mxx_ir_core::{expr::euclidean_div_rem, types::ConcreteMatrixType};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Signed, Zero};
 use serde::{Deserialize, Serialize};
@@ -207,11 +207,22 @@ impl IntegerState {
         if other.minimum <= BigInt::zero() && other.maximum_inclusive >= BigInt::zero() {
             return Err(StateError::DivisionRangeContainsZero);
         }
+        // Runtime integer division computes floor(n / |d|). On either nonzero
+        // divisor half-line this quotient is monotone between interval
+        // endpoints, so the four endpoint pairs enclose every runtime value.
         let candidates = [
-            &self.minimum / &other.minimum,
-            &self.minimum / &other.maximum_inclusive,
-            &self.maximum_inclusive / &other.minimum,
-            &self.maximum_inclusive / &other.maximum_inclusive,
+            euclidean_div_rem(&self.minimum, &other.minimum)
+                .expect("the divisor interval excludes zero")
+                .0,
+            euclidean_div_rem(&self.minimum, &other.maximum_inclusive)
+                .expect("the divisor interval excludes zero")
+                .0,
+            euclidean_div_rem(&self.maximum_inclusive, &other.minimum)
+                .expect("the divisor interval excludes zero")
+                .0,
+            euclidean_div_rem(&self.maximum_inclusive, &other.maximum_inclusive)
+                .expect("the divisor interval excludes zero")
+                .0,
         ];
         Ok(Self {
             minimum: candidates.iter().min().expect("four quotients").clone(),
@@ -223,17 +234,10 @@ impl IntegerState {
         if other.minimum <= BigInt::zero() && other.maximum_inclusive >= BigInt::zero() {
             return Err(StateError::DivisionRangeContainsZero);
         }
+        // Runtime uses the same positive |d| divisor for remainder, hence
+        // every result lies in [0, |d|-1] even when n or d is negative.
         let maximum_abs = other.minimum.abs().max(other.maximum_inclusive.abs());
-        if self.minimum >= BigInt::zero() && other.minimum > BigInt::zero() {
-            return Ok(Self {
-                minimum: BigInt::zero(),
-                maximum_inclusive: &maximum_abs - BigInt::one(),
-            });
-        }
-        Ok(Self {
-            minimum: -(&maximum_abs - BigInt::one()),
-            maximum_inclusive: &maximum_abs - BigInt::one(),
-        })
+        Ok(Self { minimum: BigInt::zero(), maximum_inclusive: &maximum_abs - BigInt::one() })
     }
 }
 
@@ -509,6 +513,28 @@ mod tests {
         assert_eq!(
             result.right_carrier,
             Some(RightCarrier { source: SourceId(9), left_gain: 0u8.into() })
+        );
+    }
+
+    #[test]
+    fn integer_division_and_remainder_match_runtime_euclidean_semantics() {
+        let numerator = IntegerState::new((-7).into(), 7.into()).unwrap();
+        for (minimum, maximum) in [(2, 4), (-4, -2)] {
+            let denominator = IntegerState::new(minimum.into(), maximum.into()).unwrap();
+            let quotient = numerator.divide(&denominator).unwrap();
+            let remainder = numerator.remainder(&denominator).unwrap();
+            for divisor in minimum..=maximum {
+                for value in -7..=7 {
+                    let (actual_quotient, actual_remainder) =
+                        euclidean_div_rem(&value.into(), &divisor.into()).unwrap();
+                    assert!(quotient.contains(&actual_quotient));
+                    assert!(remainder.contains(&actual_remainder));
+                }
+            }
+        }
+        assert_eq!(
+            IntegerState::singleton(-7).divide(&IntegerState::singleton(3)).unwrap(),
+            IntegerState::singleton(-3)
         );
     }
 }

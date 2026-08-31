@@ -470,6 +470,12 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     has_pending_releases: bool,
 }
 
+struct PreparedPreimage<M, T> {
+    placement: usize,
+    site: DrawSite,
+    request: PreimageRequest<M, T>,
+}
+
 struct PreimageProgress {
     config: PreimageProgressConfig,
     completed: usize,
@@ -2256,7 +2262,14 @@ where
         node: &ExecutableNode<'_>,
         values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
     ) -> Result<(), ExecutionError> {
-        let source_count = self.family_count(values, node.args[0]).unwrap_or(1);
+        // A cardinality-one family is still a family: its sole artifact must
+        // be loaded through family_member rather than treated as a scalar.
+        let source_family_count = self.family_count(values, node.args[0]).ok();
+        let trapdoor_family_count = self.family_count(values, node.args[1]).ok();
+        if source_family_count != trapdoor_family_count {
+            return Err(ExecutionError::ValueKind(node.args[1]));
+        }
+        let source_count = source_family_count.unwrap_or(1);
         let target_count = self.family_count(values, node.args[2])?;
         if source_count == 0 || target_count % source_count != 0 {
             return Err(ExecutionError::ValueKind(node.args[2]));
@@ -2281,28 +2294,22 @@ where
                     wire: output_wire,
                 })
             })?;
-        let mut outputs = Vec::with_capacity(target_count);
+        let placement = self.backend.active_placement();
+        let mut pending = Vec::with_capacity(target_count);
         for lane in 0..target_count {
             let group = lane / branch_count;
-            let public = if source_count == 1 &&
-                !matches!(values.get(&node.args[0]), Some(RuntimeValue::Family(_)))
-            {
-                self.matrix(values, node.args[0])?
-            } else {
+            let public = if source_family_count.is_some() {
                 match self.family_member(values, node.args[0], group, node.id)? {
                     RuntimeValue::Matrix(value) => value,
                     _ => return Err(ExecutionError::ValueKind(node.args[0])),
                 }
-            };
-            let trapdoor = if source_count == 1 &&
-                !matches!(values.get(&node.args[1]), Some(RuntimeValue::Family(_)))
-            {
-                values
-                    .get(&node.args[1])
-                    .cloned()
-                    .ok_or(ExecutionError::MissingWire(node.args[1]))?
             } else {
+                self.matrix(values, node.args[0])?
+            };
+            let trapdoor = if trapdoor_family_count.is_some() {
                 self.family_member(values, node.args[1], group, node.id)?
+            } else {
+                self.materialize(values, node.args[1])?
             };
             let RuntimeValue::Trapdoor {
                 secret: Some(secret),
@@ -2322,21 +2329,35 @@ where
                 RuntimeValue::Matrix(value) => value,
                 _ => return Err(ExecutionError::ValueKind(node.args[2])),
             };
-            let sampled = self
-                .backend
-                .sample_preimage(
-                    &matrix_type,
+            let mut lane_path = path.to_vec();
+            // K[i,j] is one stochastic draw per flattened (i,j) lane. Adding
+            // the lane to the draw path gives record/replay and sessions a
+            // stable, collision-free identity for every sampled preimage.
+            lane_path.push(InstantiationFrame { call: node.id, loop_index: Some(lane as u64) });
+            pending.push(PreparedPreimage {
+                placement,
+                site: DrawSite {
+                    instantiation_path: lane_path,
+                    node: output_wire.node,
+                    port: output_wire.port,
+                },
+                request: PreimageRequest {
+                    matrix_type: matrix_type.clone(),
                     sigma,
-                    &gadget_base,
+                    gadget_base,
                     digit_count,
-                    &max_coefficient_bound,
-                    secret.as_ref(),
-                    &public,
-                    &target,
-                )
-                .map_err(Self::backend_error)?;
-            outputs.push(RuntimeValue::matrix(sampled));
+                    max_coefficient_bound: max_coefficient_bound.clone(),
+                    trapdoor: secret,
+                    public,
+                    target,
+                },
+            });
         }
+        let outputs = self
+            .sample_preimage_requests(&pending)?
+            .into_iter()
+            .map(RuntimeValue::matrix)
+            .collect();
         self.put(values, node.id, 0, RuntimeValue::Family(outputs));
         Ok(())
     }
@@ -2411,14 +2432,7 @@ where
         node: &ExecutableNode<'_>,
         values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
     ) -> Result<(), ExecutionError> {
-        struct Pending<M, T> {
-            instance: usize,
-            placement: usize,
-            wire: WireRef,
-            path: Vec<InstantiationFrame>,
-            request: PreimageRequest<M, T>,
-        }
-
+        let mut destinations = Vec::new();
         let mut pending = Vec::new();
         for instance in 0..values.len() {
             self.set_placement(placements[instance])?;
@@ -2445,11 +2459,14 @@ where
             let max_coefficient_bound = max_coefficient_bound
                 .evaluate(&envs[instance])
                 .map_err(|error| self.expression_error(node.id, error))?;
-            pending.push(Pending {
-                instance,
+            destinations.push(instance);
+            pending.push(PreparedPreimage {
                 placement: placements[instance],
-                wire,
-                path: paths[instance].clone(),
+                site: DrawSite {
+                    instantiation_path: paths[instance].clone(),
+                    node: wire.node,
+                    port: wire.port,
+                },
                 request: PreimageRequest {
                     matrix_type,
                     sigma,
@@ -2465,80 +2482,52 @@ where
         if pending.is_empty() {
             return Ok(());
         }
+        let outputs = self.sample_preimage_requests(&pending)?;
+        for (instance, output) in destinations.into_iter().zip(outputs) {
+            self.put(&mut values[instance], node.id, 0, RuntimeValue::matrix(output));
+        }
+        Ok(())
+    }
 
+    fn sample_preimage_requests(
+        &mut self,
+        pending: &[PreparedPreimage<B::Matrix, B::Trapdoor>],
+    ) -> Result<Vec<B::Matrix>, ExecutionError> {
+        // Both ordinary loop batches and FamilyPreimageSample use this path,
+        // so session recovery, transcript replay, progress accounting, and
+        // backend batching cannot diverge between the two representations.
         if let Some(production) = self.session.clone() {
-            let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
+            let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<_>>();
             let mut missing = Vec::new();
-            for (index, request) in pending.iter().enumerate() {
-                let site = DrawSite {
-                    instantiation_path: request.path.clone(),
-                    node: request.wire.node,
-                    port: request.wire.port,
-                };
+            for (index, prepared) in pending.iter().enumerate() {
                 match self
                     .artifact_store
-                    .transcript_entry(&production, &site)
+                    .transcript_entry(&production, &prepared.site)
                     .map_err(Self::artifact_error)?
                 {
                     Some(RecordedValue::Matrix { matrix_type, bytes })
-                        if matrix_type == request.request.matrix_type =>
+                        if matrix_type == prepared.request.matrix_type =>
                     {
-                        self.set_placement(request.placement)?;
+                        self.set_placement(prepared.placement)?;
                         outputs[index] = Some(
                             self.backend
-                                .matrix_from_bytes(&request.request.matrix_type, &bytes)
+                                .matrix_from_bytes(&prepared.request.matrix_type, &bytes)
                                 .map_err(Self::backend_error)?,
                         );
                     }
                     Some(RecordedValue::Matrix { .. } | RecordedValue::Trapdoor { .. }) => {
-                        return Err(TranscriptError::KindMismatch(site).into());
+                        return Err(TranscriptError::KindMismatch(prepared.site.clone()).into());
                     }
                     None => missing.push(index),
                 }
             }
             if !missing.is_empty() {
-                let mut sampled_by_index =
-                    (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
-                let groups = (0..self.backend.placement_count())
-                    .filter_map(|placement| {
-                        let indices = missing
-                            .iter()
-                            .copied()
-                            .filter(|index| pending[*index].placement == placement)
-                            .collect::<Vec<_>>();
-                        (!indices.is_empty()).then(|| {
-                            let requests: Vec<PreimageRequest<B::Matrix, B::Trapdoor>> = indices
-                                .iter()
-                                .map(|index| pending[*index].request.clone())
-                                .collect();
-                            (placement, indices, requests)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let batches = groups
-                    .iter()
-                    .map(|(placement, _, requests)| (*placement, requests.clone()))
-                    .collect();
-                let sampled_groups = self
-                    .backend
-                    .sample_preimage_batches_by_placement(batches)
-                    .map_err(Self::backend_error)?;
-                for ((expected_placement, indices, _), (placement, sampled)) in
-                    groups.into_iter().zip(sampled_groups)
-                {
-                    debug_assert_eq!(placement, expected_placement);
-                    self.record_preimages(sampled.len());
-                    for (index, output) in indices.into_iter().zip(sampled) {
-                        sampled_by_index[index] = Some(output);
-                    }
-                }
+                let mut sampled = self.sample_preimage_indices(pending, &missing)?;
                 let serialized = self.backend.matrices_to_bytes(
                     &missing
                         .iter()
                         .map(|index| {
-                            sampled_by_index[*index]
-                                .as_ref()
-                                .expect("every missing preimage was sampled")
+                            sampled[*index].as_ref().expect("every missing preimage was sampled")
                         })
                         .collect::<Vec<_>>(),
                 );
@@ -2546,15 +2535,10 @@ where
                     .iter()
                     .zip(serialized)
                     .map(|(index, bytes)| {
-                        let request = &pending[*index];
                         (
-                            DrawSite {
-                                instantiation_path: request.path.clone(),
-                                node: request.wire.node,
-                                port: request.wire.port,
-                            },
+                            pending[*index].site.clone(),
                             RecordedValue::Matrix {
-                                matrix_type: request.request.matrix_type.clone(),
+                                matrix_type: pending[*index].request.matrix_type.clone(),
                                 bytes,
                             },
                         )
@@ -2564,51 +2548,36 @@ where
                     .record_transcript_batch(&production, &entries)
                     .map_err(Self::artifact_error)?;
                 for index in missing {
-                    outputs[index] = sampled_by_index[index].take();
+                    outputs[index] = sampled[index].take();
                 }
             }
-            for (request, output) in pending.into_iter().zip(outputs) {
-                self.put(
-                    &mut values[request.instance],
-                    node.id,
-                    0,
-                    RuntimeValue::matrix(output.expect("every session preimage draw is resolved")),
-                );
-            }
-            return Ok(());
+            return Ok(outputs
+                .into_iter()
+                .map(|output| output.expect("every session preimage draw is resolved"))
+                .collect());
         }
 
         let replayed = match &self.sampling_mode {
             SamplingMode::Replay(replayer) => {
                 let recorded = pending
                     .iter()
-                    .map(|request| {
-                        let site = DrawSite {
-                            instantiation_path: request.path.clone(),
-                            node: request.wire.node,
-                            port: request.wire.port,
-                        };
-                        replayer.get(&site).cloned()
-                    })
+                    .map(|prepared| replayer.get(&prepared.site).cloned())
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut outputs = Vec::with_capacity(pending.len());
-                for (request, recorded) in pending.iter().zip(recorded) {
+                for (prepared, recorded) in pending.iter().zip(recorded) {
                     match recorded {
-                        RecordedValue::Matrix { bytes, .. } => {
-                            self.set_placement(request.placement)?;
+                        RecordedValue::Matrix { matrix_type, bytes }
+                            if matrix_type == prepared.request.matrix_type =>
+                        {
+                            self.set_placement(prepared.placement)?;
                             outputs.push(
                                 self.backend
-                                    .matrix_from_bytes(&request.request.matrix_type, &bytes)
+                                    .matrix_from_bytes(&prepared.request.matrix_type, &bytes)
                                     .map_err(Self::backend_error)?,
                             );
                         }
-                        RecordedValue::Trapdoor { .. } => {
-                            return Err(TranscriptError::KindMismatch(DrawSite {
-                                instantiation_path: request.path.clone(),
-                                node: request.wire.node,
-                                port: request.wire.port,
-                            })
-                            .into());
+                        RecordedValue::Matrix { .. } | RecordedValue::Trapdoor { .. } => {
+                            return Err(TranscriptError::KindMismatch(prepared.site.clone()).into());
                         }
                     }
                 }
@@ -2619,67 +2588,68 @@ where
         let outputs = if let Some(outputs) = replayed {
             outputs
         } else {
-            let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
-            let groups = (0..self.backend.placement_count())
-                .filter_map(|placement| {
-                    let indices = pending
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, request)| {
-                            (request.placement == placement).then_some(index)
-                        })
-                        .collect::<Vec<_>>();
-                    (!indices.is_empty()).then(|| {
-                        let requests: Vec<PreimageRequest<B::Matrix, B::Trapdoor>> =
-                            indices.iter().map(|index| pending[*index].request.clone()).collect();
-                        (placement, indices, requests)
-                    })
-                })
-                .collect::<Vec<_>>();
-            let batches = groups
-                .iter()
-                .map(|(placement, _, requests)| (*placement, requests.clone()))
-                .collect();
-            let sampled_groups = self
-                .backend
-                .sample_preimage_batches_by_placement(batches)
-                .map_err(Self::backend_error)?;
-            for ((expected_placement, indices, _), (placement, sampled)) in
-                groups.into_iter().zip(sampled_groups)
-            {
-                debug_assert_eq!(placement, expected_placement);
-                self.record_preimages(sampled.len());
-                for (index, output) in indices.into_iter().zip(sampled) {
-                    outputs[index] = Some(output);
-                }
-            }
-            outputs
+            let indices = (0..pending.len()).collect::<Vec<_>>();
+            self.sample_preimage_indices(pending, &indices)?
                 .into_iter()
-                .map(|output| output.expect("every preimage request was assigned to a placement"))
+                .map(|output| output.expect("every preimage request was sampled"))
                 .collect()
         };
-        debug_assert_eq!(outputs.len(), pending.len());
-
         if let SamplingMode::Record(recorder) = &mut self.sampling_mode {
             let serialized = self.backend.matrices_to_bytes(&outputs.iter().collect::<Vec<_>>());
-            for ((request, _), bytes) in pending.iter().zip(&outputs).zip(serialized) {
+            for (prepared, bytes) in pending.iter().zip(serialized) {
                 recorder.record(
-                    DrawSite {
-                        instantiation_path: request.path.clone(),
-                        node: request.wire.node,
-                        port: request.wire.port,
-                    },
+                    prepared.site.clone(),
                     RecordedValue::Matrix {
-                        matrix_type: request.request.matrix_type.clone(),
+                        matrix_type: prepared.request.matrix_type.clone(),
                         bytes,
                     },
                 )?;
             }
         }
-        for (request, output) in pending.into_iter().zip(outputs) {
-            self.put(&mut values[request.instance], node.id, 0, RuntimeValue::matrix(output));
+        Ok(outputs)
+    }
+
+    fn sample_preimage_indices(
+        &mut self,
+        pending: &[PreparedPreimage<B::Matrix, B::Trapdoor>],
+        indices: &[usize],
+    ) -> Result<Vec<Option<B::Matrix>>, ExecutionError> {
+        // Requests are grouped once per placement. Each group becomes one
+        // backend batch, keeping all limbs of a matrix on the same device and
+        // avoiding one sampler launch per family lane.
+        let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<_>>();
+        let groups = (0..self.backend.placement_count())
+            .filter_map(|placement| {
+                let group_indices = indices
+                    .iter()
+                    .copied()
+                    .filter(|index| pending[*index].placement == placement)
+                    .collect::<Vec<_>>();
+                (!group_indices.is_empty()).then(|| {
+                    let requests = group_indices
+                        .iter()
+                        .map(|index| pending[*index].request.clone())
+                        .collect::<Vec<_>>();
+                    (placement, group_indices, requests)
+                })
+            })
+            .collect::<Vec<_>>();
+        let batches =
+            groups.iter().map(|(placement, _, requests)| (*placement, requests.clone())).collect();
+        let sampled_groups = self
+            .backend
+            .sample_preimage_batches_by_placement(batches)
+            .map_err(Self::backend_error)?;
+        for ((expected_placement, group_indices, _), (placement, sampled)) in
+            groups.into_iter().zip(sampled_groups)
+        {
+            debug_assert_eq!(placement, expected_placement);
+            self.record_preimages(sampled.len());
+            for (index, output) in group_indices.into_iter().zip(sampled) {
+                outputs[index] = Some(output);
+            }
         }
-        Ok(())
+        Ok(outputs)
     }
 
     fn execute_select(
@@ -3743,6 +3713,7 @@ mod tests {
     use crate::{
         artifact::MemoryArtifactStore,
         backend::poly::{CpuDcrtBackend, cpu_backend},
+        transcript::TranscriptRecorder,
     };
     use mxx_dsl::{
         DslContext, Family, HashTag, Int, MatType, Parallel, Ring, Sequential, Subgraph,
@@ -3977,6 +3948,9 @@ mod tests {
         let public = trapdoors.public_matrices();
         let swapped_public = Family::pack(vec![public.get_static(1), public.get_static(0)])
             .expect("swapped public family");
+        let single_trapdoor = Parallel::range(1)
+            .map_values(|_| ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1_000_000))
+            .expect("single trapdoor family");
         let targets = Parallel::range(2)
             .map(|index| {
                 ring.polynomial([IntExpr::Add(
@@ -4018,6 +3992,10 @@ mod tests {
             .expect("swapped public family output")
             .private_trapdoor_family_output("trapdoors", trapdoors)
             .expect("private trapdoor family output")
+            .public_family_output("public-one", single_trapdoor.public_matrices())
+            .expect("single public family output")
+            .private_trapdoor_family_output("trapdoors-one", single_trapdoor)
+            .expect("single private trapdoor family output")
             .output("product-0", products.get_static(0))
             .expect("first product")
             .output("product-1", products.get_static(1))
@@ -4067,6 +4045,8 @@ mod tests {
         assert_eq!(result.artifact_handles["public"].len(), 2);
         assert_eq!(result.artifact_handles["public-swapped"].len(), 2);
         assert_eq!(result.artifact_handles["trapdoors"].len(), 2);
+        assert_eq!(result.artifact_handles["public-one"].len(), 1);
+        assert_eq!(result.artifact_handles["trapdoors-one"].len(), 1);
         assert_eq!(matrix_output(&result, "product-0"), matrix_output(&result, "target-0"));
         assert_eq!(matrix_output(&result, "product-1"), matrix_output(&result, "target-1"));
         assert_eq!(
@@ -4100,6 +4080,54 @@ mod tests {
             ArtifactConfidentiality::Private
         );
         assert!(manifest.artifacts["trapdoors"].content_hash.is_none());
+        let imported_one = ring.trapdoor_family_artifact_input(
+            production.clone(),
+            "public-one",
+            "trapdoors-one",
+            1,
+            1,
+            5,
+            gadget_base.clone(),
+            digit_count,
+            1_000_000,
+        );
+        let target_one = Parallel::grid(vec![IntExpr::constant(1), IntExpr::constant(1)])
+            .map(|_| ring.polynomial([1.into()]))
+            .expect("single import target");
+        let preimage_one = imported_one
+            .clone()
+            .sample_preimage_branches(target_one.clone(), (digit_count + 2, 1))
+            .expect("single import preimage");
+        let product_one = imported_one.public_matrices().get_static(0).apply_preimage(
+            preimage_one.get_static(vec![IndexExpr::constant(0), IndexExpr::constant(0)]),
+        );
+        let imported_one_graph = DslContext::new("runtime-single-imported-trapdoor-family")
+            .output("product", product_one)
+            .expect("single imported product")
+            .output(
+                "target",
+                target_one.get_static(vec![IndexExpr::constant(0), IndexExpr::constant(0)]),
+            )
+            .expect("single imported target")
+            .build()
+            .expect("single import build")
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest.clone())]),
+            )
+            .expect("single import validation");
+        let imported_one_result = execute(
+            &imported_one_graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+        )
+        .expect("single import execution");
+        assert_eq!(
+            matrix_output(&imported_one_result, "product"),
+            matrix_output(&imported_one_result, "target")
+        );
         let imported = ring.trapdoor_family_artifact_input(
             production.clone(),
             "public",
@@ -4111,10 +4139,10 @@ mod tests {
             digit_count,
             1_000_000,
         );
-        let imported_targets = Parallel::range(2)
-            .map(|index| {
+        let imported_targets = Parallel::grid(vec![IntExpr::constant(2), IntExpr::constant(1)])
+            .map(|indices| {
                 ring.polynomial([IntExpr::Add(
-                    Box::new(index.expression()),
+                    Box::new(indices[0].expression()),
                     Box::new(IntExpr::constant(1)),
                 )
                 .canonicalize()])
@@ -4123,23 +4151,31 @@ mod tests {
         let expected_imported_targets = imported_targets.clone();
         let imported_preimages = imported
             .clone()
-            .parallel_zip_mat_values(imported_targets, |_, trapdoor, target| {
-                trapdoor.sample_preimage(target, (digit_count + 2, 1))
-            })
+            .sample_preimage_branches(imported_targets, (digit_count + 2, 1))
             .expect("imported preimages");
-        let imported_products = parallel_zip(
-            (imported.public_matrices(), imported_preimages),
-            |_, (public, preimage)| public.apply_preimage(preimage),
-        )
-        .expect("imported products");
+        let imported_public = imported.public_matrices();
+        let imported_product_0 = imported_public.get_static(0).apply_preimage(
+            imported_preimages.get_static(vec![IndexExpr::constant(0), IndexExpr::constant(0)]),
+        );
+        let imported_product_1 = imported_public.get_static(1).apply_preimage(
+            imported_preimages.get_static(vec![IndexExpr::constant(1), IndexExpr::constant(0)]),
+        );
         let imported_graph = DslContext::new("runtime-imported-trapdoor-family")
-            .output("product-0", imported_products.get_static(0))
+            .output("product-0", imported_product_0)
             .expect("first imported product")
-            .output("product-1", imported_products.get_static(1))
+            .output("product-1", imported_product_1)
             .expect("second imported product")
-            .output("target-0", expected_imported_targets.get_static(0))
+            .output(
+                "target-0",
+                expected_imported_targets
+                    .get_static(vec![IndexExpr::constant(0), IndexExpr::constant(0)]),
+            )
             .expect("first imported target")
-            .output("target-1", expected_imported_targets.get_static(1))
+            .output(
+                "target-1",
+                expected_imported_targets
+                    .get_static(vec![IndexExpr::constant(1), IndexExpr::constant(0)]),
+            )
             .expect("second imported target")
             .build()
             .expect("import build")
@@ -4148,14 +4184,25 @@ mod tests {
                 &BTreeMap::from([(production.clone(), manifest.clone())]),
             )
             .expect("import validation");
-        let imported_result = execute(
+        let batch_calls_before = backend.preimage_batch_calls();
+        let mut recorder = TranscriptRecorder::default();
+        let imported_result = execute_with_config(
             &imported_graph,
             &mut backend,
             BTreeMap::new(),
             &mut store,
-            SamplingMode::Fresh,
+            SamplingMode::Record(&mut recorder),
+            ExecutionConfig {
+                preimage_progress: Some(PreimageProgressConfig {
+                    total: 2,
+                    report_interval: NonZeroUsize::new(2).expect("nonzero"),
+                }),
+                ..ExecutionConfig::default()
+            },
         )
         .expect("import execution");
+        assert_eq!(backend.preimage_batch_calls(), batch_calls_before + 1);
+        assert_eq!(recorder.iter().count(), 2);
         assert_eq!(
             matrix_output(&imported_result, "product-0"),
             matrix_output(&imported_result, "target-0")
@@ -4163,6 +4210,25 @@ mod tests {
         assert_eq!(
             matrix_output(&imported_result, "product-1"),
             matrix_output(&imported_result, "target-1")
+        );
+        let replayer = recorder.into_replayer();
+        let batch_calls_before_replay = backend.preimage_batch_calls();
+        let replayed_result = execute(
+            &imported_graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Replay(&replayer),
+        )
+        .expect("import replay");
+        assert_eq!(backend.preimage_batch_calls(), batch_calls_before_replay);
+        assert_eq!(
+            matrix_output(&replayed_result, "product-0"),
+            matrix_output(&imported_result, "product-0")
+        );
+        assert_eq!(
+            matrix_output(&replayed_result, "product-1"),
+            matrix_output(&imported_result, "product-1")
         );
 
         let mismatched = ring.trapdoor_family_artifact_input(

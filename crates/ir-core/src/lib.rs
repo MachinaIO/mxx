@@ -16,7 +16,7 @@ pub mod types;
 pub mod validate;
 
 pub use constraints::{ParamConstraint, derive_param_constraints};
-pub use expr::{IntExpr, ParamEnv, Rational, RealExpr};
+pub use expr::{IndexExpr, IndexMap, IntExpr, ParamEnv, Rational, RealExpr};
 pub use graph::{
     CapturePolicy, CapturedValue, CompileParameter, CompileParameterKind, ConstructionScopeId,
     FreezeError, FreezeMap, FreezeResolveError, FrozenGraphScopeId, Graph, GraphOutput, GraphScope,

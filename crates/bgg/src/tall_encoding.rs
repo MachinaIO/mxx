@@ -116,6 +116,8 @@ impl BggTallEncodingCompiler {
         lhs: &BggTallEncodingWire,
         rhs: &BggTallEncodingWire,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
+        // Row-wise addition preserves C_i = s_i A - x_i s_i G + e_i:
+        // carriers and diagonal messages are combined at the same slot.
         let mut output = self.binary(
             lhs,
             rhs,
@@ -136,6 +138,8 @@ impl BggTallEncodingCompiler {
         lhs: &BggTallEncodingWire,
         rhs: &BggTallEncodingWire,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
+        // Row-wise subtraction keeps the slot alignment and computes both
+        // C_i^L - C_i^R and x_i^L - x_i^R component by component.
         self.binary(
             lhs,
             rhs,
@@ -158,12 +162,16 @@ impl BggTallEncodingCompiler {
             .pubkey
             .matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
+        // With G K_R = A_R, each slot computes C_i^L K_R + x_i^L C_i^R.
+        // The decomposition is consumed on the right, and the correction term
+        // cancels the cross term so the result carries x_i^L x_i^R.
         let rows = lhs.rows.clone().parallel_zip3(
             rhs.rows.clone(),
             lhs_plaintexts.clone(),
-            move |_, left, right, plaintext| left * decomposed_rhs.clone() + right * plaintext,
+            move |_, left, right, plaintext| {
+                left.mul_decomposed(decomposed_rhs.clone()) + plaintext * right
+            },
         )?;
         let plaintext = match &rhs.plaintext {
             BggTallPlaintext::Diagonal(rhs_plaintexts) => BggTallPlaintext::Diagonal(
@@ -187,7 +195,7 @@ impl BggTallEncodingCompiler {
         input: &BggTallEncodingWire,
         scalar: &Mat,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
-        self.scalar_mul(input, scalar, scalar.clone(), false)
+        self.scalar_mul(input, scalar, None, false)
     }
 
     /// Multiplies every row by the gadget decomposition of a large scalar.
@@ -197,7 +205,7 @@ impl BggTallEncodingCompiler {
         scalar: &Mat,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
         let decomposed = self.public_key.large_scalar_decomposition(&input.pubkey, scalar);
-        self.scalar_mul(input, scalar, decomposed, true)
+        self.scalar_mul(input, scalar, Some(decomposed), true)
     }
 
     /// Applies one provisioned cyclic rotation pair.
@@ -228,22 +236,24 @@ impl BggTallEncodingCompiler {
             .pubkey
             .matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
+        // The first rotation step is L C_{i+offset} G^-1(A); the rotated
+        // source row remains an explicit additive carrier contribution.
         let step1 =
             transform.left_rows.clone().parallel_zip(rotated_rows, move |_, left, input| {
-                left * decomposed_input.clone() + input
+                left.mul_decomposed(decomposed_input.clone()) + input
             })?;
         let decomposed_right = transform
             .right_matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
+        // The second step applies G^-1(R) and adds the rotated plaintext times
+        // the right helper row, completing the two-sided transform.
         let rows = step1.parallel_zip3(
             rotated_plaintexts.clone(),
             rotated_right_rows,
             move |_, intermediate, plaintext, right| {
-                intermediate * decomposed_right.clone() + right * plaintext
+                intermediate.mul_decomposed(decomposed_right.clone()) + plaintext * right
             },
         )?;
         Ok(BggTallEncodingWire {
@@ -309,11 +319,14 @@ impl BggTallEncodingCompiler {
                 &scalar,
             );
         }
+        // The helper row is the sum of all non-anchor source lanes; the anchor
+        // lane is handled separately as scalar_0 * C_0 below.
         let mut left_times_input_rows = input_lanes[1].clone();
         for lane_rows in input_lanes.iter().skip(2) {
             left_times_input_rows = left_times_input_rows
                 .parallel_zip(lane_rows.clone(), |_, left, right| left + right)?;
         }
+        // Each lane contributes x_a tensor R_a to the message-weighted helper.
         let mut left_message_times_right_rows = right_helper_lanes[1]
             .clone()
             .parallel_zip(plaintext_lanes[1].clone(), |_, row, plaintext| plaintext.tensor(row))?;
@@ -355,6 +368,8 @@ impl BggTallEncodingCompiler {
         };
         let anchor_scalar =
             ring.polynomial([IntExpr::constant(num_bigint::BigInt::from(lane_scalars[0].clone()))]);
+        // The anchor contribution uses the large-scalar target scalar_0 * G,
+        // preserving the gadget carrier during decomposition.
         let anchor_term = self.large_scalar_mul(&anchor_input, &anchor_scalar)?;
         self.add(&anchor_term, &helper_output)
     }
@@ -372,27 +387,23 @@ impl BggTallEncodingCompiler {
             .pubkey
             .matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
-        let intermediate =
-            left_rows.parallel_zip(left_times_input_rows, move |_, left, input| {
-                Mat::multi_row_gemm_accumulate(
-                    vec![(1, left, decomposed_input.clone())],
-                    Some(input),
-                )
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
+        // This computes L C G^-1(A) + M: the public relation is consumed on
+        // the right while the supplied row term M remains in the output.
+        let intermediate = left_rows
+            .parallel_zip(left_times_input_rows, move |_, left, input| {
+                left.mul_decomposed(decomposed_input.clone()) + input
             })?;
         let decomposed_right = transform
             .right_matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
+        // Apply the right decomposition and add the precomputed plaintext
+        // tensor/right-row term to finish the linear transform.
         let rows = intermediate.parallel_zip(
             left_message_times_right_rows,
             move |_, intermediate, right| {
-                Mat::multi_row_gemm_accumulate(
-                    vec![(1, intermediate, decomposed_right.clone())],
-                    Some(right),
-                )
+                intermediate.mul_decomposed(decomposed_right.clone()) + right
             },
         )?;
         Ok(BggTallEncodingWire {
@@ -419,13 +430,15 @@ impl BggTallEncodingCompiler {
                 .matrix
                 .clone()
                 .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                .as_mat();
+                .into_preimage_relation()
+                .materialize_exact();
         BggPublicKeyWire {
             matrix: first *
                 right_matrix
                     .clone()
                     .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                    .as_mat(),
+                    .into_preimage_relation()
+                    .materialize_exact(),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -468,10 +481,22 @@ impl BggTallEncodingCompiler {
         &self,
         input: &BggTallEncodingWire,
         scalar: &Mat,
-        row_factor: Mat,
+        row_factor: Option<mxx_dsl::Decomposition>,
         large: bool,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
-        let rows = input.rows.clone().parallel_map(move |_, row| row * row_factor.clone())?;
+        // Small scalars use direct t C_i.  Large scalars use K_t satisfying
+        // G K_t = tG; revealed diagonal metadata is updated as t x_i in both
+        // cases.
+        let rows = match row_factor {
+            Some(row_factor) => input
+                .rows
+                .clone()
+                .parallel_map(move |_, row| row.mul_decomposed(row_factor.clone()))?,
+            None => {
+                let scalar = scalar.clone();
+                input.rows.clone().parallel_map(move |_, row| scalar.clone() * row)?
+            }
+        };
         let plaintext = match &input.plaintext {
             BggTallPlaintext::Hidden => BggTallPlaintext::Hidden,
             BggTallPlaintext::Diagonal(values) => {
@@ -544,6 +569,8 @@ impl BggTallEncodingSampler {
         let public_matrix = public_key.matrix.clone();
         let rows =
             secret_rows.clone().parallel_zip(plaintexts.clone(), move |_, secret, plaintext| {
+                // Each row is C_x = sA - (x tensor s)G + e.  G remains the
+                // rightmost carrier factor, including the known-zero case 0*G.
                 secret.clone() * public_matrix.clone() - plaintext * (secret * gadget.clone()) +
                     match (&sigma, &bound) {
                         (Some(sigma), Some(bound)) => {
@@ -615,7 +642,6 @@ impl BggTallEncodingSampler {
         let row_families =
             Family::<Mat>::parallel_zip_many_values(input_families, move |_, values| {
                 let secret_row = &values[0];
-                let secret_gadget = secret_row.clone() * gadget.clone();
                 let packed_error = match (&sigma, &bound) {
                     (Some(sigma), Some(bound)) => {
                         ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
@@ -633,8 +659,10 @@ impl BggTallEncodingSampler {
                                 end: (columns * (index + 1)).into(),
                             }),
                         );
+                        // The packed sampler slices only independent error
+                        // columns; the signal keeps its complete gadget term.
                         secret_row.clone() * public_matrices[index].clone() -
-                            plaintext.clone().tensor(secret_gadget.clone()) +
+                            plaintext.clone().tensor(secret_row.clone()) * gadget.clone() +
                             error
                     })
                     .collect::<Vec<_>>()
@@ -1317,6 +1345,25 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(error_slices.len(), public_keys.len(), "each block slices the shared error");
+        assert!(nodes.iter().any(|node| matches!(
+            node.kind(),
+            NodeKind::ConstantMatrix {
+                value: mxx_ir_core::node::ConstantMatrix::Gadget { .. },
+                ..
+            }
+        )));
+        assert!(
+            !nodes.iter().any(|node| {
+                matches!(node.kind(), NodeKind::Tensor) &&
+                    node.arguments().get(1).is_some_and(|right| {
+                        matches!(
+                            right.node().kind(),
+                            NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply)
+                        )
+                    })
+            }),
+            "the Tall tensor must receive the carrierless secret, before the real final gadget factor"
+        );
     }
 
     #[test]
@@ -1822,8 +1869,8 @@ mod tests {
 
         let nodes =
             built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
-        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))));
-        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic)));
+        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::ParallelGrid(_))));
+        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic { .. })));
         assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyPack { .. })));
     }
 
@@ -2032,10 +2079,10 @@ mod tests {
             assert_eq!(
                 nodes
                     .iter()
-                    .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+                    .filter(|node| matches!(node.kind(), NodeKind::ParallelGrid(_)))
                     .count(),
                 3,
-                "mask generation, Tall sampling, and SIMD multiplication each retain one loop"
+                "mask generation, Tall sampling, and SIMD multiplication each retain one grid"
             );
         }
         let graph_size = |graph: &BuiltGraph| {

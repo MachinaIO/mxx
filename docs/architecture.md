@@ -7,12 +7,13 @@ on the crate that owns an abstraction.
 
 ```text
 mxx-runtime              -> mxx-ir-core, mxx-primitives
-mxx-bench-estimator      -> mxx-ir-core, mxx-runtime
+mxx-bench-estimator      -> mxx-ir-core, mxx-runtime; optional mxx-primitives
 mxx-dsl                  -> mxx-ir-core
-mxx-correctness          -> mxx-ir-core, mxx-dsl
-mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
-mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core
-mxx-we                   -> mxx-bgg, mxx-correctness, mxx-gadgets, mxx-runtime
+mxx-noise-simulator      -> mxx-ir-core
+mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives; optional mxx-runtime
+mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core, mxx-primitives
+mxx-we                   -> mxx-bench-estimator, mxx-bgg, mxx-dsl, mxx-gadgets,
+                            mxx-ir-core, mxx-noise-simulator, mxx-primitives, mxx-runtime
 mxx-func-enc/io          -> lower layers when their application modules are enabled
 ```
 
@@ -34,26 +35,29 @@ preserving both the preimage equation and the authoritative cutoff.
 
 Owns the canonical executable graph, compile expressions, artifact metadata, parameter/type/shape
 validation, execution ordering, and liveness. `derive_param_constraints` is the shared source of
-decidable compile-parameter conditions consumed by concrete validation and operational checking. Sampler
-nodes serialize required integer coefficient cutoffs. Subgraph and parallel-loop bodies are
-structural and stored once.
+decidable compile-parameter conditions consumed by concrete validation and noise simulation.
+Sampler nodes serialize required integer coefficient cutoffs. Subgraph, `ParallelGrid`, and
+`SequentialLoop` bodies are structural and stored once. Rank-N `Family` values retain logical axes
+while runtime storage remains flat and row-major. `Preimage` is a distinct wire type consumed by
+`ApplyPreimage`; ordinary matrix multiplication does not consume relations.
 
 ### `mxx-dsl`
 
-Creates immutable core nodes immediately. It has no symbolic reinterpretation layer.
-`IdealSpec` and `PurePredicateSpec` accept only sampler-free graphs for correctness declarations.
-Indexed `Family` operations create structural parallel loops.
+Creates immutable core nodes immediately. It has no symbolic reinterpretation layer. Typed
+`Preimage` and `Decomposition` wrappers retain relation identity, and rank-N `Family` operations
+create structural `ParallelGrid` nodes.
 
 ### `mxx-runtime`
 
 Executes validated schedules on CPU or GPU primitive backends and owns runtime values, sampling
 transcripts, sessions, artifacts, and bounded parallel waves.
 
-### `mxx-correctness`
+### `mxx-noise-simulator`
 
-The library validates linked workflow declarations and evaluates their operational noise bounds
-with the Rust checker. Protocol declarations remain crate-owned; there is no central protocol
-registry or parameter-check executable.
+Interprets frozen `mxx-ir-core` graphs under one concrete parameter environment and returns maximum
+absolute coefficient-error bounds for requested matrix roots. It has no dependency on the DSL,
+runtime, gadgets, BGG+, or applications. Decoder policy and functional correctness remain
+application responsibilities.
 
 ### `mxx-gadgets` and `mxx-bgg`
 
@@ -66,9 +70,8 @@ slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
 `mxx-we` owns the implementation-independent witness-encryption declaration/runtime traits and the
 Diamond protocol. A Diamond protocol fixes a layered Boolean shape but accepts gate opcodes and
 previous-layer indices as public runtime families. Encryption and decryption consume the same
-circuit assignment; witness bits are decryption-only inputs. Parameter search uses deterministic
-worst-case bounds and accepts a candidate only after the generic Rust operational checker accepts
-the frozen workflow and concrete parameter environment.
+circuit assignment; witness bits are decryption-only inputs. Parameter search simulates the frozen
+encryption/decryption stages and applies the Boolean decoder interval outside the simulator.
 
 `mxx-func-enc` and `mxx-io` currently expose compiling interface shells. Their protocol modules
-remain disabled. Diamond iO must migrate to the Rust operational checker before it is enabled.
+remain disabled.

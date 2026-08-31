@@ -1,10 +1,7 @@
 //! Standalone WEE25 commitment trees expressed with the declarative DSL.
 
 use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Ring};
-use mxx_ir_core::{
-    IntExpr,
-    node::{ConcatAxis, IndexRange},
-};
+use mxx_ir_core::{IntExpr, node::ConcatAxis};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -153,7 +150,7 @@ impl Wee25CommitmentCompiler {
         }
         let columns = self.tree_base * self.public_columns();
         let message = Mat::concat(ConcatAxis::Columns, blocks.to_vec());
-        let decomposition = message.decompose(self.gadget_base.clone(), self.digit_count).as_mat();
+        let decomposition = message.decompose(self.gadget_base.clone(), self.digit_count);
         let terms = (0..columns * self.gadget_rows())
             .map(|index| {
                 let column = index / self.gadget_rows();
@@ -165,10 +162,7 @@ impl Wee25CommitmentCompiler {
                     tag,
                     (self.secret_size, self.public_columns()),
                 );
-                let digit = decomposition.clone().slice(
-                    Some(IndexRange { start: digit_row.into(), end: (digit_row + 1).into() }),
-                    Some(IndexRange { start: column.into(), end: (column + 1).into() }),
-                );
+                let digit = decomposition.entry(digit_row, column);
                 w * digit
             })
             .collect::<Vec<_>>();

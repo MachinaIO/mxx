@@ -82,7 +82,7 @@ impl ArtifactType {
             ConcreteWireType::Int |
             ConcreteWireType::Real |
             ConcreteWireType::Bool |
-            ConcreteWireType::IndexedFamily { .. } => None,
+            ConcreteWireType::Family { .. } => None,
         }
     }
 }
@@ -90,7 +90,7 @@ impl ArtifactType {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManifestArtifact {
     pub artifact_type: ArtifactType,
-    pub family_count: Option<usize>,
+    pub family_shape: Option<Vec<usize>>,
     pub confidentiality: ArtifactConfidentiality,
     pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
@@ -100,10 +100,25 @@ pub struct ManifestArtifact {
 pub enum ManifestValidationError {
     #[error("private artifact {name} must not expose a content hash")]
     PrivateContentHash { name: String },
+    #[error("artifact {name} has an empty family shape")]
+    EmptyFamilyShape { name: String },
+    #[error("artifact {name} family shape product overflows usize")]
+    FamilyShapeOverflow { name: String },
 }
 
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestValidationError> {
     for (name, artifact) in &manifest.artifacts {
+        if let Some(shape) = &artifact.family_shape {
+            if shape.is_empty() {
+                return Err(ManifestValidationError::EmptyFamilyShape { name: name.clone() });
+            }
+            shape
+                .iter()
+                .try_fold(1usize, |product, extent| product.checked_mul(*extent))
+                .ok_or_else(|| ManifestValidationError::FamilyShapeOverflow {
+                    name: name.clone(),
+                })?;
+        }
         if artifact.confidentiality == ArtifactConfidentiality::Private &&
             artifact.content_hash.is_some()
         {
@@ -117,7 +132,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestValidationEr
 pub struct ExportArtifact {
     pub wire: WireId,
     pub artifact_type: ArtifactType,
-    pub family_count: Option<usize>,
+    pub family_shape: Option<Vec<usize>>,
     pub confidentiality: ArtifactConfidentiality,
     pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
@@ -146,7 +161,7 @@ pub fn export_manifest(
                 name.clone(),
                 ManifestArtifact {
                     artifact_type: artifact.artifact_type.clone(),
-                    family_count: artifact.family_count,
+                    family_shape: artifact.family_shape.clone(),
                     confidentiality: artifact.confidentiality,
                     content_hash: match artifact.confidentiality {
                         ArtifactConfidentiality::Public => artifact.content_hash,
@@ -182,9 +197,9 @@ pub fn export_validated_manifest(
                     .wire_types
                     .get(&output.value)
                     .ok_or_else(|| ManifestExportError::MissingOutput { name: name.clone() })?;
-                let (element_type, first_class_family_count) = match wire_type {
-                    ConcreteWireType::IndexedFamily { element, count } => {
-                        (element.as_ref(), Some(*count))
+                let (element_type, first_class_family_shape) = match wire_type {
+                    ConcreteWireType::Family { element, shape } => {
+                        (element.as_ref(), Some(shape.clone()))
                     }
                     scalar => (scalar, None),
                 };
@@ -195,7 +210,7 @@ pub fn export_validated_manifest(
                     ExportArtifact {
                         wire: id,
                         artifact_type,
-                        family_count: first_class_family_count,
+                        family_shape: first_class_family_shape,
                         confidentiality,
                         content_hash: None,
                         layout: None,
@@ -220,7 +235,7 @@ mod tests {
                 "private".to_owned(),
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 1 },
-                    family_count: None,
+                    family_shape: None,
                     confidentiality: ArtifactConfidentiality::Private,
                     content_hash: Some([3; 32]),
                     layout: None,

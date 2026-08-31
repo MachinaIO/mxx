@@ -1,33 +1,22 @@
 use super::{DiamondArtifactNames, DiamondConfigError, DiamondWeConfig};
-use crate::{WitnessEncryptionInterface, WitnessEncryptionProtocolDecl};
 use mxx_bgg::{
     BggEncodingCompiler, BggEncodingFamily, BggEncodingWire, BggPublicKeyCompiler,
     BggPublicKeyFamily, BggPublicKeySampler, BggPublicKeyWire, BggSamplerLayout,
     DynamicBooleanBggError, evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
 };
-use mxx_correctness::{
-    ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec,
-    EndpointAnchor, EndpointAnchors, EndpointSemanticBinding, EndpointSpecId, InputContract,
-    InputContractEntry, InputValueContract, OperationalDecoderKind, OperationalDecoderTarget,
-    OutputRef, ParameterDecl, ParameterKind, ProtocolDecl, ProtocolInputBinding,
-    ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage, StageId,
-    StageInputName, Workflow,
-};
 use mxx_dsl::{
-    Bool, BuiltGraph, DslContext, DslError, Int, Mat, Parallel, PurePredicateSpec, SemanticAnchor,
-    Sequential, parallel_zip_bundle_result,
+    Bool, BuiltGraph, DslContext, DslError, Int, Mat, Parallel, parallel_zip_bundle_result,
 };
 use mxx_gadgets::{
     circuit::{
         BOOLEAN_INSTANCE_INPUT, BOOLEAN_WITNESS_INPUT, BooleanCircuitError,
         BooleanCircuitFamilyInputs, BooleanCircuitFamilyParams, BooleanCircuitShape,
-        boolean_circuit_satisfaction_predicate, boolean_circuit_validity_predicate,
     },
     input_injector::{DiamondInputInjector, DiamondInputParams, DiamondInputPreprocessError},
 };
 use mxx_ir_core::{
     IntExpr, ParamEnv,
-    artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
+    artifact::{ArtifactConfidentiality, ProductionId},
     node::{ConcatAxis, IndexRange},
 };
 use thiserror::Error;
@@ -36,7 +25,6 @@ pub const HASH_KEY_INPUT: &str = "diamond-hash-key";
 pub const MESSAGE_INPUT: &str = "diamond-message";
 pub const DECODED_OUTPUT: &str = "diamond-decoded";
 pub const NOISY_PLAINTEXT_OUTPUT: &str = "diamond-noisy-plaintext";
-const IDEAL_MESSAGE_OUTPUT: &str = "message";
 
 #[derive(Clone)]
 struct DiamondGraphParams {
@@ -92,47 +80,6 @@ impl DiamondGraphParams {
             },
         )
     }
-}
-
-fn diamond_parameter_validity_predicate(
-    context: DslContext,
-    circuit: &BooleanCircuitFamilyParams,
-    params: &DiamondGraphParams,
-) -> Result<PurePredicateSpec, DslError> {
-    let evaluate = |expression| context.evaluate_int(expression);
-    let modulus = evaluate(params.input.modulus.clone());
-    let ring_dimension = evaluate(params.input.ring_dimension.clone());
-    let input_count = evaluate(params.input.input_count.clone());
-    let digit_base = evaluate(params.input.digit_base.clone());
-    let batch_bits = evaluate(params.input.batch_bits.clone());
-    let gadget_base = evaluate(params.input.gadget_base.clone());
-    let digit_count = evaluate(params.input.digit_count.clone());
-    let error_bound = evaluate(params.input.error_max_coefficient_bound.clone());
-    let preimage_bound = evaluate(params.input.preimage_max_coefficient_bound.clone());
-    let witness_width = evaluate(circuit.witness_width.clone());
-    let two_to_batch_bits = Sequential::range(params.input.batch_bits.clone()).scan(
-        Int::constant(1),
-        Int::constant(0),
-        |_, power, _| Ok(power.mul(Int::constant(2))),
-    )?;
-    let conditions = [
-        Int::constant(1).less_equal(modulus),
-        Int::constant(1).less_equal(ring_dimension),
-        Int::constant(1).less_equal(input_count.clone()),
-        Int::constant(1).less_equal(batch_bits.clone()),
-        Int::constant(1).less_equal(digit_count),
-        Int::constant(2).less_equal(gadget_base),
-        Int::constant(0).less_equal(error_bound),
-        Int::constant(0).less_equal(preimage_bound),
-        two_to_batch_bits.less_equal(digit_base),
-        witness_width.equal(input_count.mul(batch_bits)),
-    ];
-    let valid = conditions
-        .into_iter()
-        .map(Bool::to_int)
-        .fold(Int::constant(1), Int::mul)
-        .equal(Int::constant(1));
-    PurePredicateSpec::new(context.bool_output("valid-parameters", valid)?.build()?)
 }
 
 fn padded_witness_public_key_indices(
@@ -208,8 +155,8 @@ pub enum DiamondCompileError {
     WitnessWidth,
     #[error("the Boolean circuit maximum layer width is smaller than its input width")]
     FamilyWidth,
-    #[error("Diamond protocol declaration failed: {0}")]
-    Protocol(String),
+    #[error("Diamond parameter expression evaluation failed: {0}")]
+    ParameterExpression(String),
 }
 
 impl DiamondWeCompiler {
@@ -266,17 +213,15 @@ impl DiamondWeCompiler {
             reals: [
                 (
                     DiamondGraphParams::TRAPDOOR_SIGMA.to_owned(),
-                    self.config
-                        .trapdoor_sigma
-                        .evaluate_rational(&ParamEnv::default())
-                        .map_err(|error| DiamondCompileError::Protocol(error.to_string()))?,
+                    self.config.trapdoor_sigma.evaluate_rational(&ParamEnv::default()).map_err(
+                        |error| DiamondCompileError::ParameterExpression(error.to_string()),
+                    )?,
                 ),
                 (
                     DiamondGraphParams::ERROR_SIGMA.to_owned(),
-                    self.config
-                        .error_sigma
-                        .evaluate_rational(&ParamEnv::default())
-                        .map_err(|error| DiamondCompileError::Protocol(error.to_string()))?,
+                    self.config.error_sigma.evaluate_rational(&ParamEnv::default()).map_err(
+                        |error| DiamondCompileError::ParameterExpression(error.to_string()),
+                    )?,
                 ),
             ]
             .into_iter()
@@ -300,10 +245,6 @@ impl DiamondWeCompiler {
         Ok(DiamondWeProtocolFamily::new(self.config.bgg_tag.clone())
             .build_decryption(encryption)?
             .graph)
-    }
-
-    pub fn protocol_decl(&self) -> Result<WitnessEncryptionProtocolDecl, DiamondCompileError> {
-        DiamondWeProtocolFamily::new(self.config.bgg_tag.clone()).protocol_decl()
     }
 }
 
@@ -385,10 +326,8 @@ impl DiamondWeProtocolFamily {
             public_key_compiler.clone(),
         )?;
         let circuit_output_index = circuit_data.output_source();
-        let circuit_output_matrix = circuit_output_family
-            .matrices
-            .get(circuit_output_index.clone())
-            .semantic_anchor("diamond.encrypt.selected-circuit-public-key")?;
+        let circuit_output_matrix =
+            circuit_output_family.matrices.get(circuit_output_index.clone());
         let circuit_output =
             BggPublicKeyWire { matrix: circuit_output_matrix, reveal_plaintext: true };
 
@@ -399,31 +338,40 @@ impl DiamondWeProtocolFamily {
         );
         let public_columns = graph_params.input.digit_count.clone();
         let state_columns = graph_params.input.state_columns();
-        let zero_row = ring.zero((1, public_columns.clone()));
-        let one_difference = one_public_key.matrix.clone() - gadget.clone();
-        let one_target = Mat::concat(ConcatAxis::Rows, vec![one_difference, zero_row]);
+        let scalar_zero = ring.zero((1, 1));
+        let scalar_one = ring.identity(1);
+        let top_row = Mat::concat(ConcatAxis::Rows, vec![scalar_one.clone(), scalar_zero.clone()]);
+        let bottom_row = Mat::concat(ConcatAxis::Rows, vec![scalar_zero, scalar_one]);
+        // These two rows retain the full two-coordinate source basis.  A
+        // projection target must therefore keep both source matrices visible:
+        // the top coordinate carries the public key and the bottom coordinate
+        // carries the gadget correction.
+        let one_target =
+            top_row.clone() * one_public_key.matrix.clone() - top_row.clone() * gadget.clone();
+        // The one preimage is sampled for T_one = top*(A_one - G), so applying
+        // it later to the initial state consumes exactly this target relation.
         let projection_trapdoor = input_preprocessing.final_trapdoors.get_static(0);
         let one_trapdoor = projection_trapdoor.clone();
         let one_sample = one_trapdoor
             .sample_preimage(one_target, (state_columns.clone(), public_columns.clone()));
-        let one_preimage = one_sample.as_mat();
+        let one_preimage = one_sample;
         let witness_indices =
             Parallel::range(witness_size).map_values(|bit| bit.as_int().add(Int::constant(1)))?;
         let witness_trapdoors =
             input_preprocessing.final_trapdoors.clone().parallel_gather(witness_indices.clone())?;
         let witness_public_keys = public_keys.matrices.clone().parallel_gather(witness_indices)?;
         let witness_targets = witness_public_keys.parallel_map_values({
+            let top_row = top_row.clone();
+            let bottom_row = bottom_row.clone();
             let gadget = gadget.clone();
-            move |_, public_key| {
-                let negated_gadget = -gadget.clone();
-                Mat::concat(ConcatAxis::Rows, vec![public_key, negated_gadget])
-            }
+            // Each witness target is T_w = top*A_w - bottom*G.  Both source
+            // rows remain in the target because the final injector state has
+            // two coordinates, even though only one public column is selected.
+            move |_, public_key| top_row.clone() * public_key - bottom_row.clone() * gadget.clone()
         })?;
         let witness_preimages =
             witness_trapdoors.parallel_zip_mat_values(witness_targets, |_, trapdoor, target| {
-                let sample = trapdoor
-                    .sample_preimage(target, (state_columns.clone(), public_columns.clone()));
-                sample.as_mat()
+                trapdoor.sample_preimage(target, (state_columns.clone(), public_columns.clone()))
             })?;
 
         let k_public_key_matrix = ring.hash_matrix(
@@ -441,45 +389,51 @@ impl DiamondWeProtocolFamily {
             Box::new(graph_params.input.modulus.clone()),
             Box::new(mxx_ir_core::IntExpr::constant(2)),
         );
-        let half_modulus_polynomial = ring
-            .polynomial([half_modulus.into()])
-            .semantic_anchor("diamond.encrypt.message-carrier")?;
-        let k_target = Mat::concat(
-            ConcatAxis::Rows,
-            vec![k_public_key_first.clone(), half_modulus_polynomial],
-        );
+        let half_modulus_polynomial = ring.polynomial([half_modulus.into()]);
+        // K is centered at ceil(q/2) in the bottom source coordinate:
+        // T_K = top*K_first + bottom*floor(q/2).  The large scalar is thus a
+        // scalar times the gadget-shaped coordinate, not an arbitrary target.
+        let k_target = top_row.clone() * k_public_key_first.clone() +
+            bottom_row.clone() * half_modulus_polynomial;
         let k_trapdoor = projection_trapdoor.clone();
         let k_sample = k_trapdoor.sample_preimage(k_target, (state_columns.clone(), 1));
-        let k_preimage = k_sample.as_mat();
+        let k_preimage = k_sample;
         let r = ring.hash_matrix(hash_key, self.tag(b":r"), (1, public_columns.clone()));
         let r_column = r.slice(None, first_column);
         let r_decomposition = r_column.decompose(
             graph_params.input.gadget_base.clone(),
             graph_params.input.digit_count.clone(),
         );
-        let r_materialized = r_decomposition.as_mat();
-        let r_decomposed = r_materialized;
         let difference = public_key_compiler.sub(&one_public_key, &circuit_output);
-        let projected_difference = difference.matrix * r_decomposed.clone();
+        // R is consumed through its explicit decomposition.  The residual
+        // public target is T_dec = K_first + (A_one-A_circuit)R, retaining the
+        // source matrix product before the decoder preimage is sampled.
+        let projected_difference = difference.matrix *
+            r_decomposition.clone().into_preimage_relation().materialize_exact();
         let decoder_public_key = k_public_key_first + projected_difference;
-        let decoder_zero = ring.zero((1, 1));
-        let decoder_target = Mat::concat(ConcatAxis::Rows, vec![decoder_public_key, decoder_zero]);
+        let decoder_target = top_row * decoder_public_key;
         let decoder_trapdoor = projection_trapdoor;
         let decoder_sample = decoder_trapdoor.sample_preimage(decoder_target, (state_columns, 1));
-        let decoder_preimage = decoder_sample.as_mat();
+        let decoder_preimage = decoder_sample;
 
         let graph = context
-            .public_output(DiamondArtifactNames::INITIAL_STATE, input_preprocessing.p)?
-            .public_output(DiamondArtifactNames::ONE_PREIMAGE, one_preimage)?
-            .public_output(DiamondArtifactNames::K_PREIMAGE, k_preimage)?
-            .public_output(DiamondArtifactNames::DECODER_PREIMAGE, decoder_preimage)?
-            .public_output(DiamondArtifactNames::R_DECOMPOSED, r_decomposed)?
+            .public_family_output(DiamondArtifactNames::INITIAL_STATE, input_preprocessing.initial)?
+            .public_preimage_output(DiamondArtifactNames::ONE_PREIMAGE, one_preimage)?
+            .public_preimage_output(DiamondArtifactNames::K_PREIMAGE, k_preimage)?
+            .public_preimage_output(DiamondArtifactNames::DECODER_PREIMAGE, decoder_preimage)?
+            .public_preimage_output(
+                DiamondArtifactNames::R_DECOMPOSED,
+                r_decomposition.into_preimage_relation(),
+            )?
             .public_family_output(DiamondArtifactNames::PUBLIC_KEYS, public_keys.matrices)?
-            .public_family_output(
+            .public_preimage_family_output(
                 DiamondArtifactNames::TRANSITIONS,
                 input_preprocessing.transitions,
             )?
-            .public_family_output(DiamondArtifactNames::WITNESS_PREIMAGES, witness_preimages)?
+            .public_preimage_family_output(
+                DiamondArtifactNames::WITNESS_PREIMAGES,
+                witness_preimages,
+            )?
             .build()?;
         Ok(DiamondEncryptionBuild { graph: DiamondEncryptionGraph { graph } })
     }
@@ -492,14 +446,16 @@ impl DiamondWeProtocolFamily {
             BooleanCircuitFamilyParams::declare(DslContext::new("diamond-we-decryption"));
         let (context, graph_params) = DiamondGraphParams::declare(context);
         let ring = graph_params.input.ring();
+        let max_state_count = graph_params.input.max_state_count();
         let circuit_data = BooleanCircuitFamilyInputs::protocol_inputs(&context, &circuit_params);
         let instance = context
             .int_family_input(BOOLEAN_INSTANCE_INPUT, circuit_params.max_layer_width.clone());
         let state_columns = graph_params.input.state_columns();
         let public_columns = graph_params.input.digit_count.clone();
-        let initial_state = ring.artifact_input(
+        let initial_state = ring.family_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::INITIAL_STATE,
+            max_state_count.clone(),
             (1, state_columns.clone()),
             ArtifactConfidentiality::Public,
         );
@@ -514,25 +470,20 @@ impl DiamondWeProtocolFamily {
             graph_params.input.batch_bits.clone(),
         )?;
         let max_state_count = graph_params.input.max_state_count();
-        let transition_count = IntExpr::Mul(
-            Box::new(graph_params.input.input_count.clone()),
-            Box::new(IntExpr::Mul(
-                Box::new(graph_params.input.digit_base.clone()),
-                Box::new(max_state_count.clone()),
-            )),
-        )
-        .canonicalize();
-        let transitions = ring.family_artifact_input(
+        let transitions = ring.preimage_family_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::TRANSITIONS,
-            transition_count,
+            vec![
+                graph_params.input.input_count.clone(),
+                max_state_count.clone(),
+                graph_params.input.digit_base.clone(),
+            ],
             (state_columns.clone(), state_columns.clone()),
             ArtifactConfidentiality::Public,
         );
         let input_evaluation = DiamondInputInjector::parameterized(graph_params.input.clone())
             .evaluate(initial_state, witness_digits, transitions)?;
-        let states =
-            input_evaluation.states.semantic_anchor("diamond.decrypt.input-injector-states")?;
+        let states = input_evaluation.states;
         let public_key_compiler = Self::public_key_compiler(&graph_params);
         let encoding_compiler = BggEncodingCompiler { public_key: public_key_compiler.clone() };
         let public_key_matrices = ring.family_artifact_input(
@@ -544,28 +495,30 @@ impl DiamondWeProtocolFamily {
         );
         let public_keys =
             BggPublicKeyFamily { matrices: public_key_matrices, reveal_plaintext: true };
-        let one_preimage = ring.artifact_input(
+        let one_preimage = ring.preimage_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::ONE_PREIMAGE,
             (state_columns.clone(), public_columns.clone()),
             ArtifactConfidentiality::Public,
         );
-        let k_preimage = ring.artifact_input(
+        let k_preimage = ring.preimage_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::K_PREIMAGE,
             (state_columns.clone(), 1),
             ArtifactConfidentiality::Public,
         );
-        let decoder_preimage = ring.artifact_input(
+        let decoder_preimage = ring.preimage_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::DECODER_PREIMAGE,
             (state_columns.clone(), 1),
             ArtifactConfidentiality::Public,
         );
+        // Applying each preimage is the online projection step: state * K
+        // consumes the corresponding encryption-time target relation.
         let initial_projection_state = states.get_static(0);
-        let one_vector = initial_projection_state.clone() * one_preimage;
-        let k_vector = initial_projection_state.clone() * k_preimage;
-        let decoder = initial_projection_state * decoder_preimage;
+        let one_vector = initial_projection_state.clone().apply_preimage(one_preimage);
+        let k_vector = initial_projection_state.clone().apply_preimage(k_preimage);
+        let decoder = initial_projection_state.apply_preimage(decoder_preimage);
         let one_public_key_matrix = public_keys.matrices.get_static(0);
         let one_plaintext_matrix = ring.identity(1);
         let one_encoding = BggEncodingWire {
@@ -574,19 +527,21 @@ impl DiamondWeProtocolFamily {
             plaintext: Some(one_plaintext_matrix),
         };
         let zero_encoding = encoding_compiler.sub(&one_encoding, &one_encoding).expect("revealed");
-        let witness_preimages = ring.family_artifact_input(
+        let witness_preimages = ring.preimage_family_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::WITNESS_PREIMAGES,
-            witness_size.clone(),
+            vec![witness_size.clone()],
             (state_columns.clone(), public_columns.clone()),
             ArtifactConfidentiality::Public,
         );
         let witness_state_indices = Parallel::range(witness_size.clone())
             .map_values(|bit| bit.as_int().add(Int::constant(1)))?;
         let witness_states = states.parallel_gather(witness_state_indices)?;
+        // Witness states are projected by explicit ApplyPreimage operations;
+        // the preimage artifact is consumed on the right of each state row.
         let witness_vectors = parallel_zip_bundle_result(
             (witness_states, witness_preimages),
-            |_, (state, preimage)| Ok::<_, DslError>(state * preimage),
+            |_, (state, preimage)| Ok::<_, DslError>(state.apply_preimage(preimage)),
         )?;
         let witness_public_indices = Parallel::range(witness_size.clone())
             .map_values(|bit| bit.as_int().add(Int::constant(1)))?;
@@ -609,10 +564,15 @@ impl DiamondWeProtocolFamily {
                     let slot = slot.as_int();
                     let after_instance = instance_width.clone().less_equal(slot.clone()).to_int();
                     let before_end = slot.clone().less_equal(witness_end.clone()).to_int();
+                    // Select the nonnegative base before subtracting it.  This is
+                    // equivalent to selecting `0` versus `slot - instance_width`,
+                    // but keeps the abstract selector family in
+                    // `[0, witness_size)` without requiring Boolean correlation.
                     let output = after_instance
                         .mul(before_end)
-                        .select_int(vec![Int::constant(0), slot.sub(instance_width.clone())])
-                        .expect("two witness indices");
+                        .select_int(vec![instance_width.clone(), slot])
+                        .expect("two witness indices")
+                        .sub(instance_width.clone());
                     output
                 }
             })?;
@@ -698,23 +658,21 @@ impl DiamondWeProtocolFamily {
             encoding_compiler,
         )?;
         let circuit_output_index = circuit_data.output_source();
-        let circuit_vector = circuit_output_family
-            .vectors
-            .get(circuit_output_index.clone())
-            .semantic_anchor("diamond.decrypt.selected-circuit-vector")?;
-        let r_decomposed = ring.artifact_input(
+        let circuit_vector = circuit_output_family.vectors.get(circuit_output_index.clone());
+        let r_decomposed = ring.preimage_artifact_input(
             encryption,
             DiamondArtifactNames::R_DECOMPOSED,
             (public_columns, 1),
             ArtifactConfidentiality::Public,
         );
+        // The residual decoder target is R_dec = (C_one-C_out) * R.  Apply the
+        // stored decomposition to consume R_dec, then subtract the K and
+        // residual projections from the decoder state.
         let one_minus_circuit = one_encoding.vector - circuit_vector;
-        let projected_difference = one_minus_circuit * r_decomposed;
+        let projected_difference = one_minus_circuit.apply_preimage(r_decomposed);
         let k_plus_projection = k_vector + projected_difference;
-        let noisy_plaintext =
-            (decoder - k_plus_projection).semantic_anchor("diamond.decoder.residual")?;
+        let noisy_plaintext = decoder - k_plus_projection;
         let decoded = decode_boolean_interval(noisy_plaintext.clone(), graph_params.input.modulus);
-        let decoded = decoded.semantic_anchor("diamond.decoder.result")?;
         let graph = context
             .output(NOISY_PLAINTEXT_OUTPUT, noisy_plaintext)?
             .bool_output(DECODED_OUTPUT, decoded)?
@@ -745,333 +703,6 @@ impl DiamondWeProtocolFamily {
         tag.extend_from_slice(suffix);
         tag
     }
-
-    pub fn protocol_decl(&self) -> Result<WitnessEncryptionProtocolDecl, DiamondCompileError> {
-        const ENCRYPT: &str = "encrypt";
-        const DECRYPT: &str = "decrypt";
-        let encrypt_id = StageId(ENCRYPT.to_owned());
-        let decrypt_id = StageId(DECRYPT.to_owned());
-        let encryption_build = self.build_encryption()?;
-        // Runtime production identity is deliberately absent from protocol identity. Stage-relative
-        // artifact bindings below carry the semantic producer relation; a concrete compiler
-        // replaces this placeholder with the actual parameter-bound production id before
-        // execution.
-        let encryption_production =
-            ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
-        let decryption_build = self.build_decryption(encryption_production)?;
-        let bindings = [
-            (DiamondArtifactNames::INITIAL_STATE, false),
-            (DiamondArtifactNames::ONE_PREIMAGE, false),
-            (DiamondArtifactNames::K_PREIMAGE, false),
-            (DiamondArtifactNames::DECODER_PREIMAGE, false),
-            (DiamondArtifactNames::R_DECOMPOSED, false),
-            (DiamondArtifactNames::TRANSITIONS, true),
-            (DiamondArtifactNames::WITNESS_PREIMAGES, true),
-            (DiamondArtifactNames::PUBLIC_KEYS, true),
-        ]
-        .into_iter()
-        .map(|(artifact, family)| ArtifactBinding {
-            consumer_input: StageInputName(if family {
-                format!("artifact:{artifact}")
-            } else {
-                artifact.to_owned()
-            }),
-            producer_stage: encrypt_id.clone(),
-            producer_output: ArtifactName(artifact.to_owned()),
-        })
-        .collect::<Vec<_>>();
-        let encryption = encryption_build.graph.graph;
-        let decryption = decryption_build.graph.graph;
-
-        let (valid_context, _) =
-            DiamondGraphParams::declare(DslContext::new("diamond-we-valid-circuit-data"));
-        let valid = boolean_circuit_validity_predicate(valid_context)?;
-        let (satisfied_context, _) =
-            DiamondGraphParams::declare(DslContext::new("diamond-we-satisfied-circuit"));
-        let satisfied = boolean_circuit_satisfaction_predicate(satisfied_context)?;
-        let (parameter_context, parameter_circuit) =
-            BooleanCircuitFamilyParams::declare(DslContext::new("diamond-we-valid-parameters"));
-        let (parameter_context, parameter_values) = DiamondGraphParams::declare(parameter_context);
-        let valid_parameters = diamond_parameter_validity_predicate(
-            parameter_context,
-            &parameter_circuit,
-            &parameter_values,
-        )?;
-        let (ideal_context, ideal_params) =
-            DiamondGraphParams::declare(DslContext::new("diamond-we-ideal"));
-        let ideal_ring = ideal_params.input.ring();
-        let (ideal_context, _) = BooleanCircuitFamilyParams::declare(ideal_context);
-        let ideal = mxx_dsl::IdealSpec::new(
-            ideal_context
-                .bool_output(IDEAL_MESSAGE_OUTPUT, ideal_ring.bool_input(MESSAGE_INPUT))?
-                .build()?,
-        )?;
-        let circuit_names = [
-            "circuit-active-gate-count",
-            "circuit-gate-kind",
-            "circuit-left-source",
-            "circuit-right-source",
-            "circuit-output-source",
-        ];
-        let parameter = |name: &str| IntExpr::Var(name.to_owned());
-        let max_layer_width = parameter(BooleanCircuitFamilyParams::MAX_LAYER_WIDTH_PARAMETER);
-        let flattened_gate_count = IntExpr::Mul(
-            Box::new(parameter(BooleanCircuitFamilyParams::DEPTH_PARAMETER)),
-            Box::new(max_layer_width.clone()),
-        );
-        let max_source =
-            IntExpr::Sub(Box::new(max_layer_width.clone()), Box::new(IntExpr::constant(1)));
-        let integer_family =
-            |count: IntExpr, lower: IntExpr, upper: IntExpr| InputValueContract::Family {
-                count,
-                element: Box::new(InputValueContract::IntegerRange { lower, upper }),
-            };
-        let circuit_contracts = [
-            (
-                circuit_names[0],
-                integer_family(
-                    parameter(BooleanCircuitFamilyParams::DEPTH_PARAMETER),
-                    IntExpr::constant(0),
-                    max_layer_width.clone(),
-                ),
-            ),
-            (
-                circuit_names[1],
-                integer_family(
-                    flattened_gate_count.clone(),
-                    IntExpr::constant(0),
-                    IntExpr::constant(5),
-                ),
-            ),
-            (
-                circuit_names[2],
-                integer_family(
-                    flattened_gate_count.clone(),
-                    IntExpr::constant(0),
-                    max_source.clone(),
-                ),
-            ),
-            (
-                circuit_names[3],
-                integer_family(flattened_gate_count, IntExpr::constant(0), max_source.clone()),
-            ),
-            (
-                circuit_names[4],
-                integer_family(IntExpr::constant(1), IntExpr::constant(0), max_source),
-            ),
-        ];
-        let boolean_family =
-            || integer_family(max_layer_width.clone(), IntExpr::constant(0), IntExpr::constant(1));
-        let mut input_contracts = circuit_contracts
-            .iter()
-            .map(|(name, value)| InputContractEntry {
-                id: ProtocolInputId::from(*name),
-                name: (*name).to_owned(),
-                value: value.clone(),
-            })
-            .collect::<Vec<_>>();
-        input_contracts.extend([
-            InputContractEntry {
-                id: ProtocolInputId::from(BOOLEAN_INSTANCE_INPUT),
-                name: BOOLEAN_INSTANCE_INPUT.to_owned(),
-                value: boolean_family(),
-            },
-            InputContractEntry {
-                id: ProtocolInputId::from(BOOLEAN_WITNESS_INPUT),
-                name: BOOLEAN_WITNESS_INPUT.to_owned(),
-                value: boolean_family(),
-            },
-            InputContractEntry {
-                id: ProtocolInputId::from(MESSAGE_INPUT),
-                name: MESSAGE_INPUT.to_owned(),
-                value: InputValueContract::Boolean,
-            },
-            InputContractEntry {
-                id: ProtocolInputId::from(HASH_KEY_INPUT),
-                name: HASH_KEY_INPUT.to_owned(),
-                value: InputValueContract::Bytes { length: IntExpr::constant(32) },
-            },
-        ]);
-        let workflow_destination =
-            |stage: &StageId, name: &str| ProtocolInputDestination::WorkflowStage {
-                stage: stage.clone(),
-                input: StageInputName(name.to_owned()),
-            };
-        let mut input_bindings = circuit_names
-            .iter()
-            .map(|name| ProtocolInputBinding {
-                input: ProtocolInputId::from(*name),
-                destinations: vec![
-                    workflow_destination(&encrypt_id, name),
-                    workflow_destination(&decrypt_id, name),
-                    ProtocolInputDestination::Requirement {
-                        requirement: 1,
-                        input: (*name).to_owned(),
-                    },
-                    ProtocolInputDestination::Requirement {
-                        requirement: 2,
-                        input: (*name).to_owned(),
-                    },
-                ],
-            })
-            .collect::<Vec<_>>();
-        input_bindings.extend([
-            ProtocolInputBinding {
-                input: ProtocolInputId::from(BOOLEAN_INSTANCE_INPUT),
-                destinations: vec![
-                    workflow_destination(&encrypt_id, BOOLEAN_INSTANCE_INPUT),
-                    workflow_destination(&decrypt_id, BOOLEAN_INSTANCE_INPUT),
-                    ProtocolInputDestination::Requirement {
-                        requirement: 2,
-                        input: BOOLEAN_INSTANCE_INPUT.to_owned(),
-                    },
-                ],
-            },
-            ProtocolInputBinding {
-                input: ProtocolInputId::from(BOOLEAN_WITNESS_INPUT),
-                destinations: vec![
-                    workflow_destination(&decrypt_id, BOOLEAN_WITNESS_INPUT),
-                    ProtocolInputDestination::Requirement {
-                        requirement: 2,
-                        input: BOOLEAN_WITNESS_INPUT.to_owned(),
-                    },
-                ],
-            },
-            ProtocolInputBinding {
-                input: ProtocolInputId::from(MESSAGE_INPUT),
-                destinations: vec![
-                    workflow_destination(&encrypt_id, MESSAGE_INPUT),
-                    ProtocolInputDestination::Ideal { input: MESSAGE_INPUT.to_owned() },
-                ],
-            },
-            ProtocolInputBinding {
-                input: ProtocolInputId::from(HASH_KEY_INPUT),
-                destinations: vec![workflow_destination(&encrypt_id, HASH_KEY_INPUT)],
-            },
-        ]);
-        let endpoint = EndpointSpecId::DiamondBooleanInterval;
-        let decoder_node = decryption.graph.outputs()[DECODED_OUTPUT].value.node;
-        let declaration = ProtocolDecl {
-            params: [
-                (
-                    ParameterKind::Dimension,
-                    &[
-                        BooleanCircuitFamilyParams::INSTANCE_WIDTH_PARAMETER,
-                        BooleanCircuitFamilyParams::WITNESS_WIDTH_PARAMETER,
-                        BooleanCircuitFamilyParams::DEPTH_PARAMETER,
-                        BooleanCircuitFamilyParams::MAX_LAYER_WIDTH_PARAMETER,
-                        DiamondGraphParams::RING_DIMENSION,
-                        DiamondGraphParams::INPUT_COUNT,
-                        DiamondGraphParams::DIGIT_BASE,
-                        DiamondGraphParams::BATCH_BITS,
-                        DiamondGraphParams::DIGIT_COUNT,
-                    ][..],
-                ),
-                (
-                    ParameterKind::Integer,
-                    &[
-                        DiamondGraphParams::MODULUS,
-                        DiamondGraphParams::GADGET_BASE,
-                        DiamondGraphParams::ERROR_BOUND,
-                        DiamondGraphParams::PREIMAGE_BOUND,
-                    ][..],
-                ),
-                (
-                    ParameterKind::Rational,
-                    &[DiamondGraphParams::TRAPDOOR_SIGMA, DiamondGraphParams::ERROR_SIGMA][..],
-                ),
-            ]
-            .into_iter()
-            .flat_map(|(kind, names)| {
-                names
-                    .iter()
-                    .map(move |name| ParameterDecl { name: (*name).to_owned(), kind: kind.clone() })
-            })
-            .collect(),
-            bundle: ClosedProtocolBundle {
-                workflow: Workflow {
-                    stages: vec![
-                        ProtocolStage {
-                            id: encrypt_id.clone(),
-                            graph: encryption.graph,
-                            semantic_anchors: encryption.anchors,
-                            derivation_attachments: encryption.derivation_attachments,
-                            bindings: Vec::new(),
-                        },
-                        ProtocolStage {
-                            id: decrypt_id.clone(),
-                            graph: decryption.graph,
-                            semantic_anchors: decryption.anchors,
-                            derivation_attachments: decryption.derivation_attachments,
-                            bindings,
-                        },
-                    ],
-                    entrypoint: decrypt_id.clone(),
-                },
-                ideal,
-                requirements: vec![valid_parameters, valid, satisfied],
-                comparator: ComparatorSpec::Equality {
-                    endpoints: vec![ComparatorEndpointBinding {
-                        endpoint,
-                        actual_input: DECODED_OUTPUT.to_owned(),
-                        ideal_input: IDEAL_MESSAGE_OUTPUT.to_owned(),
-                        result_output: "failure".to_owned(),
-                        failure_value: true,
-                    }],
-                },
-                endpoints: EndpointAnchors {
-                    entries: vec![EndpointAnchor {
-                        spec: endpoint,
-                        stage: decrypt_id.clone(),
-                        semantic_anchor: "diamond.decoder.result".to_owned(),
-                        semantics: EndpointSemanticBinding::DiamondBoolean {
-                            residual_stage: decrypt_id.clone(),
-                            residual_anchor: "diamond.decoder.residual".to_owned(),
-                            carrier_stage: encrypt_id.clone(),
-                            carrier_anchor: "diamond.encrypt.message-carrier".to_owned(),
-                            message: ProtocolInputId::from(MESSAGE_INPUT),
-                        },
-                        workflow_output: OutputRef {
-                            stage: decrypt_id.clone(),
-                            output: DECODED_OUTPUT.to_owned(),
-                        },
-                        ideal_output: IDEAL_MESSAGE_OUTPUT.to_owned(),
-                    }],
-                },
-                operational_decoder_targets: vec![OperationalDecoderTarget {
-                    target_id: "diamond-boolean-interval".to_owned(),
-                    residual_stage: decrypt_id.clone(),
-                    residual_output: NOISY_PLAINTEXT_OUTPUT.to_owned(),
-                    decoder_stage: decrypt_id.clone(),
-                    decoder_node,
-                    kind: OperationalDecoderKind::BooleanInterval,
-                }],
-                endpoint_specs: vec![endpoint],
-                input_contract: InputContract { inputs: input_contracts },
-                input_bindings,
-                precondition_spec: ProtocolPreconditionSpec {
-                    requirement_outputs: vec![
-                        "valid-parameters".to_owned(),
-                        "valid".to_owned(),
-                        "satisfied".to_owned(),
-                    ],
-                },
-            },
-        };
-        let declaration = ProtocolDecl::new(declaration)
-            .map_err(|error| DiamondCompileError::Protocol(error.to_string()))?;
-        WitnessEncryptionProtocolDecl::new(
-            declaration,
-            WitnessEncryptionInterface {
-                encryption_stage: encrypt_id,
-                decryption_stage: decrypt_id,
-                message: ProtocolInputId::from(MESSAGE_INPUT),
-                instance: ProtocolInputId::from(BOOLEAN_INSTANCE_INPUT),
-                witness: ProtocolInputId::from(BOOLEAN_WITNESS_INPUT),
-            },
-        )
-        .map_err(|error| DiamondCompileError::Protocol(error.to_string()))
-    }
 }
 
 fn decode_boolean_interval(noisy_plaintext: Mat, modulus: IntExpr) -> Bool {
@@ -1093,8 +724,9 @@ mod tests {
         RealExpr,
         artifact::{ProductionId, SpecHash, export_validated_manifest},
         node::NodeKind,
+        types::WireType,
     };
-    use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
+    use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
     use mxx_runtime::{
         RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
         transcript::SamplingMode,
@@ -1148,11 +780,6 @@ mod tests {
         let production = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [9; 32] };
         let manifest = export_validated_manifest(production.clone(), &validated).unwrap();
         let decryption = compiler.build_decryption(production.clone()).unwrap().graph;
-        let decoded_output = decryption.graph.outputs()[DECODED_OUTPUT].value;
-        let decoded_anchor =
-            decryption.anchors.get("diamond.decoder.result").expect("decoded endpoint anchor");
-        assert_eq!(decoded_anchor.len(), 1);
-        assert_eq!(decoded_anchor[0].wire, decoded_output);
         decryption
             .validate_with_manifests(&bindings, &BTreeMap::from([(production, manifest)]))
             .unwrap();
@@ -1201,6 +828,143 @@ mod tests {
     }
 
     #[test]
+    fn diamond_projection_artifacts_retain_preimage_types_and_use_strict_consumers() {
+        let compiler = compiler();
+        let encryption = compiler.build_encryption().unwrap().graph;
+        let bindings = compiler.circuit_bindings().unwrap();
+        let validated = encryption.validate(&bindings).unwrap();
+
+        for name in [
+            DiamondArtifactNames::ONE_PREIMAGE,
+            DiamondArtifactNames::K_PREIMAGE,
+            DiamondArtifactNames::DECODER_PREIMAGE,
+            DiamondArtifactNames::R_DECOMPOSED,
+        ] {
+            let output = encryption.graph.outputs()[name].value;
+            let output_type = &encryption
+                .graph
+                .root_scope()
+                .node(output.node)
+                .expect("projection artifact output node")
+                .output_types()[output.port.0 as usize];
+            assert!(matches!(output_type, WireType::Preimage(_)), "{name} lost its relation");
+        }
+
+        let witness_output =
+            encryption.graph.outputs()[DiamondArtifactNames::WITNESS_PREIMAGES].value;
+        let witness_type = &encryption
+            .graph
+            .root_scope()
+            .node(witness_output.node)
+            .expect("witness preimage family output node")
+            .output_types()[witness_output.port.0 as usize];
+        assert!(matches!(
+            witness_type,
+            WireType::Family { element, .. }
+                if matches!(element.as_ref(), WireType::Preimage(_))
+        ));
+        assert!(
+            encryption
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .any(|node| matches!(node.kind(), NodeKind::MaterializePreimageExact)),
+            "the exact public-key projection must use the guarded materialization path"
+        );
+
+        let production = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [9; 32] };
+        let manifest = export_validated_manifest(production.clone(), &validated).unwrap();
+        let decryption = compiler.build_decryption(production.clone()).unwrap().graph;
+        decryption
+            .validate_with_manifests(&bindings, &BTreeMap::from([(production, manifest)]))
+            .unwrap();
+        assert!(
+            decryption
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node.kind(), NodeKind::ApplyPreimage))
+                .count() >=
+                4
+        );
+    }
+
+    #[test]
+    fn projection_target_layout_rewrite_matches_direct_row_concatenation() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let ring = mxx_dsl::Ring::new(
+            num_bigint::BigInt::from(parameters.modulus().as_ref().clone()),
+            parameters.ring_dimension() as usize,
+        );
+        let gadget = ring.gadget(1, 16, 5);
+        let public = gadget.clone() + ring.identity(1).tensor(gadget.clone());
+        let scalar = ring.polynomial([7.into()]);
+        let zero_row = ring.zero((1, 5));
+        let zero_scalar = ring.zero((1, 1));
+        let one_scalar = ring.identity(1);
+        let top = Mat::concat(ConcatAxis::Rows, vec![one_scalar.clone(), zero_scalar.clone()]);
+        let bottom = Mat::concat(ConcatAxis::Rows, vec![zero_scalar.clone(), one_scalar]);
+
+        let one_direct =
+            Mat::concat(ConcatAxis::Rows, vec![public.clone() - gadget.clone(), zero_row.clone()]);
+        let one_rewritten = top.clone() * public.clone() - top.clone() * gadget.clone();
+        let witness_direct = Mat::concat(ConcatAxis::Rows, vec![public.clone(), -gadget.clone()]);
+        let witness_rewritten = top.clone() * public.clone() - bottom.clone() * gadget.clone();
+        let scalar_direct =
+            Mat::concat(ConcatAxis::Rows, vec![ring.polynomial([5.into()]), scalar.clone()]);
+        let scalar_rewritten = top.clone() * ring.polynomial([5.into()]) + bottom.clone() * scalar;
+        let decoder_direct =
+            Mat::concat(ConcatAxis::Rows, vec![ring.polynomial([9.into()]), zero_scalar]);
+        let decoder_rewritten = top * ring.polynomial([9.into()]);
+
+        let graph = DslContext::new("diamond-projection-target-layout")
+            .output("one-direct", one_direct)
+            .unwrap()
+            .output("one-rewritten", one_rewritten)
+            .unwrap()
+            .output("witness-direct", witness_direct)
+            .unwrap()
+            .output("witness-rewritten", witness_rewritten)
+            .unwrap()
+            .output("scalar-direct", scalar_direct)
+            .unwrap()
+            .output("scalar-rewritten", scalar_rewritten)
+            .unwrap()
+            .output("decoder-direct", decoder_direct)
+            .unwrap()
+            .output("decoder-rewritten", decoder_rewritten)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let result = execute(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        for (direct, rewritten) in [
+            ("one-direct", "one-rewritten"),
+            ("witness-direct", "witness-rewritten"),
+            ("scalar-direct", "scalar-rewritten"),
+            ("decoder-direct", "decoder-rewritten"),
+        ] {
+            let RuntimeValue::Matrix(direct) = &result.outputs[direct] else {
+                panic!("direct target must be a matrix")
+            };
+            let RuntimeValue::Matrix(rewritten) = &result.outputs[rewritten] else {
+                panic!("rewritten target must be a matrix")
+            };
+            assert_eq!(direct.as_ref(), rewritten.as_ref());
+        }
+    }
+
+    #[test]
     fn padded_witness_public_key_indices_never_leave_the_exported_family() {
         let indices = padded_witness_public_key_indices(
             Int::constant(1),
@@ -1223,7 +987,7 @@ mod tests {
             SamplingMode::Fresh,
         )
         .unwrap();
-        let RuntimeValue::IndexedFamily(indices) = &result.outputs["indices"] else {
+        let RuntimeValue::Family(indices) = &result.outputs["indices"] else {
             panic!("indices output must be an integer family")
         };
         let actual = indices
@@ -1234,104 +998,5 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, vec![0.into(), 1.into(), 0.into(), 0.into()]);
-    }
-
-    #[test]
-    fn parameter_predicate_enforces_dynamic_layout_invariants() {
-        let (context, circuit) =
-            BooleanCircuitFamilyParams::declare(DslContext::new("diamond-parameter-validity"));
-        let (context, params) = DiamondGraphParams::declare(context);
-        let predicate = diamond_parameter_validity_predicate(context, &circuit, &params).unwrap();
-        let execute_with = |bindings: &ParamEnv| {
-            let validated = mxx_ir_core::validate(&predicate.graph, bindings).unwrap();
-            let result = execute(
-                &validated,
-                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
-                BTreeMap::new(),
-                &mut MemoryArtifactStore::default(),
-                SamplingMode::Fresh,
-            )
-            .unwrap();
-            matches!(result.outputs.get("valid-parameters"), Some(RuntimeValue::Bool(true)))
-        };
-        let valid = compiler().circuit_bindings().unwrap();
-        assert!(execute_with(&valid));
-
-        let mut wrong_witness_width = valid.clone();
-        wrong_witness_width
-            .integers
-            .insert(BooleanCircuitFamilyParams::WITNESS_WIDTH_PARAMETER.to_owned(), 2.into());
-        assert!(!execute_with(&wrong_witness_width));
-
-        let mut undersized_digit_base = valid;
-        undersized_digit_base.integers.insert(DiamondGraphParams::BATCH_BITS.to_owned(), 2.into());
-        assert!(!execute_with(&undersized_digit_base));
-    }
-
-    #[test]
-    fn protocol_declaration_covers_dynamic_circuit_and_witness_inputs() {
-        let compiler = compiler();
-        let declaration = compiler.protocol_decl().unwrap();
-        assert_eq!(declaration.protocol().bundle.requirements.len(), 3);
-        assert_eq!(declaration.protocol().params.len(), 15);
-        assert_eq!(
-            declaration
-                .protocol()
-                .bundle
-                .input_contract
-                .inputs
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<std::collections::BTreeSet<_>>(),
-            [
-                "circuit-active-gate-count",
-                "circuit-gate-kind",
-                "circuit-left-source",
-                "circuit-right-source",
-                "circuit-output-source",
-                BOOLEAN_INSTANCE_INPUT,
-                BOOLEAN_WITNESS_INPUT,
-                MESSAGE_INPUT,
-                HASH_KEY_INPUT,
-            ]
-            .into_iter()
-            .collect()
-        );
-        let witness = declaration
-            .protocol()
-            .bundle
-            .input_bindings
-            .iter()
-            .find(|binding| binding.input.0 == BOOLEAN_WITNESS_INPUT)
-            .unwrap();
-        assert_eq!(
-            witness.destinations,
-            vec![
-                ProtocolInputDestination::WorkflowStage {
-                    stage: StageId("decrypt".to_owned()),
-                    input: StageInputName(BOOLEAN_WITNESS_INPUT.to_owned()),
-                },
-                ProtocolInputDestination::Requirement {
-                    requirement: 2,
-                    input: BOOLEAN_WITNESS_INPUT.to_owned(),
-                },
-            ]
-        );
-        assert!(declaration.protocol().bundle.input_bindings.iter().any(
-            |binding| binding.input.0 == "circuit-gate-kind" && binding.destinations.len() == 4
-        ));
-        assert_eq!(
-            declaration.protocol().bundle.precondition_spec.requirement_outputs,
-            ["valid-parameters", "valid", "satisfied"]
-        );
-        assert_eq!(
-            declaration.protocol().bundle.endpoints.entries[0].semantic_anchor,
-            "diamond.decoder.result"
-        );
-        assert!(matches!(
-            &declaration.protocol().bundle.comparator,
-            ComparatorSpec::Equality { endpoints }
-                if endpoints.len() == 1 && endpoints[0].failure_value
-        ));
     }
 }

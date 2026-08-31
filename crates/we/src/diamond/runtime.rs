@@ -289,7 +289,7 @@ fn circuit_inputs<B: Backend>(
 ) -> BTreeMap<String, RuntimeValue<B>> {
     let maximum_width = shape.analyze().expect("validated Boolean shape").maximum_layer_width;
     let family = |values: Vec<num_bigint::BigInt>| {
-        RuntimeValue::IndexedFamily(values.into_iter().map(RuntimeValue::Int).collect())
+        RuntimeValue::Family(values.into_iter().map(RuntimeValue::Int).collect())
     };
     let mut active_gate_counts = Vec::with_capacity(circuit.layers.len());
     let mut kinds = Vec::with_capacity(circuit.layers.len() * maximum_width);
@@ -324,7 +324,7 @@ fn insert_boolean_family_input<B: Backend>(
     padded.resize(maximum_width, 0.into());
     inputs.insert(
         name.to_owned(),
-        RuntimeValue::IndexedFamily(padded.into_iter().map(RuntimeValue::Int).collect()),
+        RuntimeValue::Family(padded.into_iter().map(RuntimeValue::Int).collect()),
     );
 }
 

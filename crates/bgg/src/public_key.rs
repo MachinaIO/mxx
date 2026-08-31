@@ -2,7 +2,8 @@
 
 use crate::{boolean::BggPublicKeyFamily, encoding::BggSamplerLayout};
 use mxx_dsl::{
-    Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel, Pending, Ring,
+    Bytes, Decomposition, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel,
+    Pending, Ring,
 };
 use mxx_ir_core::{IntExpr, ValueHandle, node::IndexRange};
 
@@ -69,6 +70,9 @@ pub struct BggPublicKeyCompiler {
 
 impl BggPublicKeyCompiler {
     pub fn add(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
+        // Public matrices add in the same coordinates as their encodings:
+        // A_out = A_L + A_R, with the reveal bit retained only when both
+        // plaintext relations are known.
         BggPublicKeyWire {
             matrix: lhs.matrix.clone() + rhs.matrix.clone(),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
@@ -76,6 +80,8 @@ impl BggPublicKeyCompiler {
     }
 
     pub fn sub(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
+        // Subtraction forms A_out = A_L - A_R component by component; no
+        // decomposition is needed because the gadget-column layout is fixed.
         BggPublicKeyWire {
             matrix: lhs.matrix.clone() - rhs.matrix.clone(),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
@@ -84,8 +90,7 @@ impl BggPublicKeyCompiler {
 
     /// Builds `lhs * G^-1(rhs)` directly in the executable core DAG.
     pub fn mul(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
-        let decomposed =
-            rhs.matrix.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat();
+        let decomposed = rhs.matrix.clone().decompose(self.base.clone(), self.digit_count.clone());
         self.mul_with_decomposition(lhs, rhs, decomposed)
     }
 
@@ -93,15 +98,20 @@ impl BggPublicKeyCompiler {
         &self,
         lhs: &BggPublicKeyWire,
         rhs: &BggPublicKeyWire,
-        decomposed_rhs: Mat,
+        decomposed_rhs: Decomposition,
     ) -> BggPublicKeyWire {
+        // If G K_R = A_R, then A_L K_R is the public-key product A_L G^-1(A_R).
+        // Materializing the exact relation makes the rightmost K_R explicit.
         BggPublicKeyWire {
-            matrix: lhs.matrix.clone() * decomposed_rhs,
+            matrix: lhs.matrix.clone() *
+                decomposed_rhs.into_preimage_relation().materialize_exact(),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
         }
     }
 
     pub fn small_scalar_mul(&self, input: &BggPublicKeyWire, scalar: &Mat) -> BggPublicKeyWire {
+        // Small-scalar multiplication is the direct relation A_out = A * t;
+        // the scalar does not require gadget decomposition.
         BggPublicKeyWire {
             matrix: input.matrix.clone() * scalar.clone(),
             reveal_plaintext: input.reveal_plaintext,
@@ -114,10 +124,12 @@ impl BggPublicKeyCompiler {
     }
 
     pub fn matrix_mul(&self, input: &BggPublicKeyWire, target: &Mat) -> BggPublicKeyWire {
-        let decomposed =
-            target.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat();
+        let decomposed = target.clone().decompose(self.base.clone(), self.digit_count.clone());
+        // For an arbitrary target T, this computes A G^-1(T) by the relation
+        // G K_T = T.  T is only a consumed matrix target, not a claim that it
+        // is itself a canonical gadget encoding.
         BggPublicKeyWire {
-            matrix: input.matrix.clone() * decomposed,
+            matrix: input.matrix.clone() * decomposed.into_preimage_relation().materialize_exact(),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -125,18 +137,25 @@ impl BggPublicKeyCompiler {
     pub(crate) fn large_scalar_mul_with_decomposition(
         &self,
         input: &BggPublicKeyWire,
-        decomposed: Mat,
+        decomposed: Decomposition,
     ) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: input.matrix.clone() * decomposed,
+            matrix: input.matrix.clone() * decomposed.into_preimage_relation().materialize_exact(),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
 
-    pub(crate) fn large_scalar_decomposition(&self, input: &BggPublicKeyWire, scalar: &Mat) -> Mat {
+    pub(crate) fn large_scalar_decomposition(
+        &self,
+        input: &BggPublicKeyWire,
+        scalar: &Mat,
+    ) -> Decomposition {
         let rows = input.matrix.matrix_type().rows.clone();
         let gadget = self.ring.gadget(rows, self.base.clone(), self.digit_count.clone());
-        (gadget * scalar.clone()).decompose(self.base.clone(), self.digit_count.clone()).as_mat()
+        // A large scalar t must be converted into a gadget-carried target tG.
+        // Decomposing `t * G` therefore yields K_t with G K_t = tG, so applying
+        // K_t has exactly the intended scalar action on the public matrix.
+        (scalar.clone() * gadget).decompose(self.base.clone(), self.digit_count.clone())
     }
 }
 
@@ -214,7 +233,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output, row};
     use mxx_dsl::DslContext;
-    use mxx_ir_core::ParamEnv;
+    use mxx_ir_core::{ParamEnv, node::NodeKind};
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
@@ -236,6 +255,19 @@ mod tests {
             .build()
             .expect("build");
         mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid graph");
+        let kinds = built
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .map(|node| node.kind())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds.iter().filter(|kind| matches!(kind, NodeKind::MaterializePreimageExact)).count(),
+            1,
+            "public-key multiplication must explicitly materialize only an exact target",
+        );
+        assert!(!kinds.iter().any(|kind| matches!(kind, NodeKind::ApplyPreimage)));
     }
 
     #[test]

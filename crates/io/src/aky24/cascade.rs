@@ -9,7 +9,7 @@ use super::{
         PrivatePrfeLayerWires,
     },
 };
-use mxx_dsl::{BuiltGraph, DslContext, Family, Mat, Ring};
+use mxx_dsl::{BuiltGraph, DslContext, Family, Mat, Preimage, Ring};
 use mxx_gadgets::{
     circuit::PolyCircuit,
     circuit_gadgets::fhe_prg::goldreich::{
@@ -158,7 +158,7 @@ impl Aky24CascadeCompiler {
         let universal_key = self.layers[0].keygen(&universal_high, &universal_low, &[])?;
 
         struct BranchFamilies {
-            preimages: Family<Mat>,
+            preimages: Family<Preimage>,
             nonces: Vec<Family<Mat>>,
             masked_payloads: Family<Mat>,
             randomness: Vec<Family<Mat>>,
@@ -231,7 +231,7 @@ impl Aky24CascadeCompiler {
                 )?;
         }
         context = context
-            .public_output(Aky24ArtifactNames::FINAL_KEY_PREIMAGE, universal_key.preimage)?
+            .public_preimage_output(Aky24ArtifactNames::FINAL_KEY_PREIMAGE, universal_key.preimage)?
             .public_output(Aky24ArtifactNames::FUNCTION_CIPHERTEXT_C_B, final_ciphertext.c_b)?
             .public_output(Aky24ArtifactNames::FUNCTION_CIPHERTEXT_X, final_ciphertext.x)?
             .public_family_output(
@@ -243,7 +243,7 @@ impl Aky24CascadeCompiler {
         for (input, branch) in branches.iter().enumerate() {
             for (choice, bit) in [false, true].into_iter().enumerate() {
                 context = context
-                    .public_output(
+                    .public_preimage_output(
                         Aky24ArtifactNames::input_ciphertext_preimage(input, bit),
                         branch.preimages.get_static(choice),
                     )?
@@ -381,7 +381,7 @@ impl Aky24CascadeCompiler {
                 function.num_output(),
             );
             let key = PrivatePrfeFunctionKeyWire {
-                preimage: ring.artifact_input(
+                preimage: ring.preimage_artifact_input(
                     production.clone(),
                     Aky24ArtifactNames::input_ciphertext_preimage(input_index, selected),
                     (
@@ -405,7 +405,7 @@ impl Aky24CascadeCompiler {
         let high = public_layers[0].arithmetic_veval(&universal, 0, q_half)?;
         let low = zero_veval(public_layers[0].attribute_public.len() - 1, universal.num_output());
         let key = PrivatePrfeFunctionKeyWire {
-            preimage: ring.artifact_input(
+            preimage: ring.preimage_artifact_input(
                 production,
                 Aky24ArtifactNames::FINAL_KEY_PREIMAGE,
                 (2 * (self.config.digit_count + 2), self.config.function.output_bits),

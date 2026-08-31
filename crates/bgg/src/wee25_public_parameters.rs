@@ -4,7 +4,7 @@ use crate::{
     WEE25_PUBLIC_B, WEE25_T_BOTTOM, Wee25CommitmentCompiler, Wee25CommitmentError,
     Wee25PublicParameterWires,
 };
-use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Trapdoor};
+use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Preimage, Trapdoor};
 use mxx_ir_core::{
     IntExpr, RealExpr,
     node::{ConcatAxis, ConstantMatrix, IndexRange},
@@ -94,7 +94,7 @@ impl Wee25PublicParameterCompiler {
         context = context.public_family_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
         for (index, family) in wires.public_parameters.t_top.into_iter().enumerate() {
             let part_count = self.layout.public_parameter_part_count();
-            context = context.public_family_output(
+            context = context.public_preimage_family_output(
                 self.layout.public_parameter_top_name(index / part_count, index % part_count),
                 family,
             )?;
@@ -109,7 +109,7 @@ impl Wee25PublicParameterCompiler {
         t_bottom: &Mat,
         digit_row: usize,
         part: usize,
-    ) -> Result<Family<Mat>, Wee25CommitmentError> {
+    ) -> Result<Family<Preimage>, Wee25CommitmentError> {
         let matrices = (0..self.layout.public_parameter_block_count())
             .map(|block| {
                 let block_index = block * self.layout.gadget_rows() + digit_row;
@@ -131,7 +131,6 @@ impl Wee25PublicParameterCompiler {
                     target,
                     (self.layout.public_columns(), self.layout.public_columns()),
                 )
-                .as_mat()
             })
             .collect::<Vec<_>>();
         Ok(Family::pack(matrices)?)
@@ -177,7 +176,16 @@ impl Wee25PublicParameterCompiler {
                     .into_iter()
                     .reduce(|sum, term| sum + term)
                     .unwrap_or_else(|| ring.zero((1, m_b)));
-                row.decompose(self.layout.gadget_base.clone(), k).as_mat()
+                let decomposition = row.decompose(self.layout.gadget_base.clone(), k);
+                let digit_rows = (0..k)
+                    .map(|digit_row| {
+                        Mat::concat(
+                            ConcatAxis::Columns,
+                            (0..m_b).map(|column| decomposition.entry(digit_row, column)).collect(),
+                        )
+                    })
+                    .collect();
+                Mat::concat(ConcatAxis::Rows, digit_rows)
             })
             .collect::<Vec<_>>();
         if rows.len() == 1 { rows[0].clone() } else { Mat::concat(ConcatAxis::Rows, rows) }
@@ -279,7 +287,7 @@ mod tests {
                 let family = digit_row * layout.public_parameter_part_count() + part;
                 for block in 0..layout.public_parameter_block_count() {
                     context = context
-                        .output(
+                        .preimage_output(
                             format!("top-{digit_row}-{part}-{block}"),
                             wires.public_parameters.t_top[family].get_static(block),
                         )

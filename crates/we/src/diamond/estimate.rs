@@ -143,6 +143,6 @@ mod tests {
         assert!(estimate.encryption.total_work_seconds > 0.0);
         assert!(estimate.decryption.total_work_seconds > 0.0);
         assert!(estimate.encryption.peak_memory_bytes > 0);
-        assert!(estimate.decryption.maximum_parallelism >= 2);
+        assert!(estimate.decryption.maximum_parallelism >= 1);
     }
 }

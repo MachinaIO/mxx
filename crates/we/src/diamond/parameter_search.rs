@@ -1,13 +1,14 @@
 use super::{
     DiamondWeCompiler, DiamondWeConfig, default_error_max_coefficient_bound,
     default_preimage_max_coefficient_bound,
-};
-use mxx_correctness::operational_noise::{
-    OperationalCheckRequest, OperationalGadgetLayout, OperationalParameterValue,
-    OperationalSimulationReport, check_operational_noise_candidate,
+    graph::{HASH_KEY_INPUT, MESSAGE_INPUT, NOISY_PLAINTEXT_OUTPUT},
 };
 use mxx_gadgets::circuit::{BooleanCircuitError, BooleanCircuitShape};
 use mxx_ir_core::RealExpr;
+use mxx_noise_simulator::{
+    ExternalInputFact, ExternalInputValue, SimulationLimits, SimulationProgram, SimulationRequest,
+    SimulationRoot, SimulationStage, StageId, simulate,
+};
 use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
 use std::{collections::BTreeMap, process::Command, sync::Arc, time::Instant};
@@ -53,11 +54,11 @@ pub enum DiamondParameterSearchError {
     Shape(#[from] BooleanCircuitError),
     #[error("Diamond CRT-depth growth overflowed")]
     DepthOverflow,
-    #[error("no correctness-valid Diamond parameters were found up to CRT depth {max_crt_depth}")]
+    #[error("no noise-safe Diamond parameters were found up to CRT depth {max_crt_depth}")]
     SearchExhausted { max_crt_depth: usize },
     #[error("no ring dimension in the configured range meets the security target")]
     NoSecureRingDimension,
-    #[error("no correctness-valid Diamond parameters were found")]
+    #[error("no noise-safe Diamond parameters were found")]
     NoCorrectParameters,
     #[error("lattice-estimator-cli could not be started: {0}")]
     EstimatorIo(#[from] std::io::Error),
@@ -69,8 +70,8 @@ pub enum DiamondParameterSearchError {
     Expression,
     #[error("the selected Diamond compiler configuration is invalid: {0}")]
     Config(String),
-    #[error("the Rust operational checker could not evaluate the Diamond candidate: {0}")]
-    CheckerInfrastructure(String),
+    #[error("the Diamond noise simulator could not evaluate the candidate: {0}")]
+    SimulatorInfrastructure(String),
 }
 
 struct Candidate {
@@ -274,33 +275,37 @@ impl DiamondParameterSearch {
             error_max_coefficient_bound = %compiler.config.error_max_coefficient_bound,
             preimage_max_coefficient_bound = %compiler.config.preimage_max_coefficient_bound,
             setup_elapsed_seconds = started.elapsed().as_secs_f64(),
-            "constructed Diamond WE checker candidate"
+            "constructed Diamond WE simulator candidate"
         );
-        let declaration = compiler
-            .protocol_decl()
-            .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?;
-        let request = operational_request(&parameters, &compiler)?;
-        let checker_started = Instant::now();
-        let report = check_operational_noise_candidate(declaration.protocol(), &request).map_err(
-            |error| DiamondParameterSearchError::CheckerInfrastructure(error.to_string()),
-        )?;
-        let correct = operational_decision(&report);
+        let request = simulation_request(&compiler)?;
+        let simulator_started = Instant::now();
+        let report = simulate(&request).map_err(|error| {
+            DiamondParameterSearchError::SimulatorInfrastructure(error.to_string())
+        })?;
+        let noise_bound = report
+            .roots
+            .iter()
+            .find(|root| {
+                root.root.stage == StageId("decrypt".to_owned()) &&
+                    root.root.output == NOISY_PLAINTEXT_OUTPUT
+            })
+            .map(|root| &root.maximum_absolute_coefficient_error)
+            .ok_or_else(|| {
+                DiamondParameterSearchError::SimulatorInfrastructure(
+                    "simulator report omitted the Diamond residual root".to_owned(),
+                )
+            })?;
+        let correct = boolean_interval_accepts(&compiler.config.modulus, noise_bound);
         info!(
             crt_depth,
             ring_dimension,
             accepted = correct,
-            noise_bound = %report.noise_bound,
-            ciphertext_modulus = %report.ciphertext_modulus,
-            lowered_term_count = report.diagnostics.lowered_term_count,
-            normalization_node_count = report.diagnostics.normalization_node_count,
-            normalization_node_total = report.diagnostics.normalization_node_total,
-            normalization_exact_term_count = report.diagnostics.normalization_exact_term_count,
-            normalization_relation_count = report.diagnostics.normalization_relation_count,
-            normalization_relation_applied = report.diagnostics.normalization_relation_applied,
-            normalization_relation_remaining = report.diagnostics.normalization_relation_remaining,
-            normalization_bounded_fold_count = report.diagnostics.normalization_bounded_fold_count,
-            elapsed_seconds = checker_started.elapsed().as_secs_f64(),
-            "finished Diamond WE Rust operational-noise check"
+            noise_bound = %noise_bound,
+            planned_wires = report.diagnostics.planned_wires,
+            transfer_steps = report.diagnostics.transfer_steps,
+            dropped_carriers = report.diagnostics.dropped_carriers.len(),
+            elapsed_seconds = simulator_started.elapsed().as_secs_f64(),
+            "finished Diamond WE noise simulation"
         );
         Ok(Candidate {
             selected: DiamondSelectedParameters {
@@ -343,54 +348,174 @@ impl DiamondParameterSearch {
     }
 }
 
-/// A successfully evaluated report is a candidate decision; only checker errors are search
-/// infrastructure failures.  Keeping this boundary explicit prevents ordinary rejected bounds
-/// from aborting CRT-depth search.
-fn operational_decision(report: &OperationalSimulationReport) -> bool {
-    report.accepted
-}
-
-fn operational_request(
-    parameters: &DCRTPolyParams,
+fn simulation_request(
     compiler: &DiamondWeCompiler,
-) -> Result<OperationalCheckRequest, DiamondParameterSearchError> {
-    let config = &compiler.config;
-    let (crt_moduli, crt_bits, _) = parameters.to_crt();
-    let base_bits = parameters.base_bits();
-    let small_digit_count = crt_bits.div_ceil(base_bits as usize);
-    let smallest_crt_modulus =
-        crt_moduli.iter().copied().min().ok_or(DiamondParameterSearchError::InvalidRange)?;
-    let bindings = compiler
+) -> Result<SimulationRequest, DiamondParameterSearchError> {
+    let environment = compiler
         .circuit_bindings()
         .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?;
-    let binding_count = bindings.integers.len() + bindings.reals.len();
-    let mut environment = bindings
-        .integers
-        .into_iter()
-        .map(|(name, value)| (name, OperationalParameterValue::Integer(value)))
-        .collect::<Vec<_>>();
-    for (name, value) in bindings.reals {
-        if value.denominator() != &BigInt::from(1) {
-            return Err(DiamondParameterSearchError::Expression);
-        }
-        environment.push((name, OperationalParameterValue::Integer(value.numerator().clone())));
-    }
-    debug_assert_eq!(environment.len(), binding_count);
-    Ok(OperationalCheckRequest {
+    let encryption = compiler
+        .build_encryption()
+        .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?
+        .graph;
+    let encryption_production = mxx_ir_core::artifact::ProductionId {
+        spec_hash: mxx_ir_core::encoding::spec_hash(&encryption.graph, &environment)
+            .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?,
+        execution_nonce: [0; 32],
+    };
+    let decryption = compiler
+        .build_decryption(encryption_production.clone())
+        .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?
+        .graph;
+    let decryption_production = mxx_ir_core::artifact::ProductionId {
+        spec_hash: mxx_ir_core::encoding::spec_hash(&decryption.graph, &environment)
+            .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?,
+        execution_nonce: [0; 32],
+    };
+    let encrypt = StageId("encrypt".to_owned());
+    let decrypt = StageId("decrypt".to_owned());
+    let mut external_inputs = Vec::new();
+    add_circuit_facts(
+        &mut external_inputs,
+        &encrypt,
+        compiler.shape.depth,
+        compiler.shape.max_layer_width,
+    );
+    add_circuit_facts(
+        &mut external_inputs,
+        &decrypt,
+        compiler.shape.depth,
+        compiler.shape.max_layer_width,
+    );
+    external_inputs.extend([
+        ExternalInputFact {
+            stage: encrypt.clone(),
+            input: HASH_KEY_INPUT.to_owned(),
+            value: ExternalInputValue::Bytes,
+        },
+        ExternalInputFact {
+            stage: encrypt.clone(),
+            input: MESSAGE_INPUT.to_owned(),
+            value: ExternalInputValue::Boolean,
+        },
+        integer_family_fact(
+            &encrypt,
+            mxx_gadgets::circuit::BOOLEAN_INSTANCE_INPUT,
+            vec![compiler.shape.max_layer_width],
+            0,
+            1,
+        ),
+        integer_family_fact(
+            &decrypt,
+            mxx_gadgets::circuit::BOOLEAN_INSTANCE_INPUT,
+            vec![compiler.shape.max_layer_width],
+            0,
+            1,
+        ),
+        integer_family_fact(
+            &decrypt,
+            mxx_gadgets::circuit::BOOLEAN_WITNESS_INPUT,
+            vec![compiler.shape.max_layer_width],
+            0,
+            1,
+        ),
+    ]);
+    Ok(SimulationRequest {
+        program: SimulationProgram {
+            stages: vec![
+                SimulationStage {
+                    id: encrypt,
+                    production_id: encryption_production,
+                    graph: encryption.graph,
+                },
+                SimulationStage {
+                    id: decrypt.clone(),
+                    production_id: decryption_production,
+                    graph: decryption.graph,
+                },
+            ],
+        },
         environment,
-        layouts: vec![OperationalGadgetLayout {
-            params_id: "diamond-dcrt".to_owned(),
-            ring_dimension: parameters.ring_dimension() as usize,
-            crt_moduli,
-            crt_bits,
-            base_bits: base_bits as usize,
-            base: config.gadget_base.clone(),
-            regular_digit_count: config.digit_count,
-            small_digit_count,
-            smallest_crt_modulus,
-        }],
-        target_id: "diamond-boolean-interval".to_owned(),
+        roots: vec![SimulationRoot { stage: decrypt, output: NOISY_PLAINTEXT_OUTPUT.to_owned() }],
+        external_inputs,
+        limits: SimulationLimits::default(),
     })
+}
+
+fn add_circuit_facts(
+    facts: &mut Vec<ExternalInputFact>,
+    stage: &StageId,
+    depth: usize,
+    max_layer_width: usize,
+) {
+    let flattened = depth.saturating_mul(max_layer_width);
+    facts.extend([
+        integer_family_fact(stage, "circuit-active-gate-count", vec![depth], 0, max_layer_width),
+        integer_family_fact(stage, "circuit-gate-kind", vec![flattened], 0, 5),
+        integer_family_fact(
+            stage,
+            "circuit-left-source",
+            vec![flattened],
+            0,
+            max_layer_width.saturating_sub(1),
+        ),
+        integer_family_fact(
+            stage,
+            "circuit-right-source",
+            vec![flattened],
+            0,
+            max_layer_width.saturating_sub(1),
+        ),
+        integer_family_fact(
+            stage,
+            "circuit-output-source",
+            vec![1],
+            0,
+            max_layer_width.saturating_sub(1),
+        ),
+    ]);
+}
+
+fn integer_family_fact(
+    stage: &StageId,
+    input: &str,
+    shape: Vec<usize>,
+    minimum: i64,
+    maximum_inclusive: usize,
+) -> ExternalInputFact {
+    ExternalInputFact {
+        stage: stage.clone(),
+        input: input.to_owned(),
+        value: ExternalInputValue::Family {
+            shape,
+            element: Box::new(ExternalInputValue::IntegerRange {
+                minimum: minimum.into(),
+                maximum_inclusive: (maximum_inclusive as i64).into(),
+            }),
+        },
+    }
+}
+
+fn boolean_interval_accepts(modulus: &BigInt, noise: &BigUint) -> bool {
+    if modulus < &BigInt::from(4_u8) {
+        return false;
+    }
+    let quarter = mxx_ir_core::IntExpr::RoundDiv(
+        Box::new(mxx_ir_core::IntExpr::constant(modulus.clone() - BigInt::from(2_u8))),
+        Box::new(mxx_ir_core::IntExpr::constant(4_u8)),
+    )
+    .evaluate(&mxx_ir_core::ParamEnv::default())
+    .expect("constant positive RoundDiv denominator");
+    let half = modulus / BigInt::from(2_u8);
+    let noise = BigInt::from(noise.clone());
+    // The decoder's true interval is inclusive.  A zero plaintext with an
+    // error of exactly `quarter` therefore crosses its lower boundary, so
+    // the false-message condition is strict even though the true-message
+    // boundaries below are inclusive.
+    quarter > noise.clone() &&
+        modulus - (BigInt::from(3_u8) * &quarter + &noise) > BigInt::ZERO &&
+        half >= quarter.clone() + &noise &&
+        BigInt::from(3_u8) * quarter >= half + noise
 }
 
 fn lattice_security_bits(
@@ -431,10 +556,10 @@ mod tests {
     fn small_search() -> DiamondParameterSearch {
         DiamondParameterSearch {
             shape: BooleanCircuitShape {
-                instance_width: 0,
+                instance_width: 1,
                 witness_width: 1,
                 depth: 1,
-                max_layer_width: 1,
+                max_layer_width: 2,
             },
             min_crt_depth: 1,
             initial_max_crt_depth: 2,
@@ -453,64 +578,26 @@ mod tests {
         }
     }
 
-    fn smallest_checker_candidate() -> (DCRTPolyParams, DiamondWeCompiler) {
-        let search = small_search();
-        let parameters = DCRTPolyParams::new(32, 2, 60, 2);
-        let error_sigma = RealExpr::from_f64_exact(search.error_sigma).unwrap();
-        let trapdoor_sigma = RealExpr::from_f64_exact(search.trapdoor_sigma).unwrap();
-        let compiler = DiamondWeCompiler::new(
-            DiamondWeConfig {
-                modulus: BigInt::from(parameters.modulus().as_ref().clone()),
-                ring_dimension: parameters.ring_dimension() as usize,
-                input_count: search.input_count,
-                digit_base: search.digit_base,
-                batch_bits: search.batch_bits,
-                gadget_base: BigInt::from(1_u8) << search.gadget_base_bits,
-                digit_count: parameters.modulus_digits(),
-                trapdoor_sigma,
-                error_sigma,
-                error_max_coefficient_bound: BigInt::from(26),
-                preimage_max_coefficient_bound: BigInt::from(26),
-                bgg_tag: search.bgg_tag,
-            },
-            search.shape,
-        )
-        .unwrap();
-        (parameters, compiler)
+    #[test]
+    fn boolean_interval_acceptance_is_owned_by_parameter_search() {
+        assert!(boolean_interval_accepts(&BigInt::from(257_u16), &BigUint::from(1_u8)));
+        assert!(!boolean_interval_accepts(&BigInt::from(257_u16), &BigUint::from(100_u8)));
+        assert!(!boolean_interval_accepts(&BigInt::from(3_u8), &BigUint::ZERO));
     }
 
     #[test]
-    fn operational_request_uses_the_concrete_dcrt_layout_and_all_graph_parameters() {
-        assert_eq!(
-            default_error_max_coefficient_bound(&RealExpr::from_integer(4)).unwrap(),
-            BigInt::from(26)
-        );
-        let (parameters, compiler) = smallest_checker_candidate();
-        let request = operational_request(&parameters, &compiler).unwrap();
-        let bindings = compiler.circuit_bindings().unwrap();
-        assert_eq!(request.environment.len(), bindings.integers.len() + bindings.reals.len());
-        assert_eq!(request.target_id, "diamond-boolean-interval");
-        assert_eq!(request.layouts.len(), 1);
-        let layout = &request.layouts[0];
-        let (crt_moduli, crt_bits, _) = parameters.to_crt();
-        assert_eq!(layout.ring_dimension, parameters.ring_dimension() as usize);
-        assert_eq!(layout.crt_moduli, crt_moduli);
-        assert_eq!(layout.crt_bits, crt_bits);
-        assert_eq!(layout.base_bits, parameters.base_bits() as usize);
-        assert_eq!(layout.base, compiler.config.gadget_base);
-    }
-
-    #[test]
-    fn smallest_diamond_candidate_reaches_typed_checker_rejection() {
-        let (parameters, compiler) = smallest_checker_candidate();
-        let declaration = compiler.protocol_decl().unwrap();
-        let request = operational_request(&parameters, &compiler).unwrap();
-        let error = check_operational_noise_candidate(declaration.protocol(), &request)
-            .expect_err("the current Diamond residual is rejected during typed lowering");
-        assert!(matches!(
-            error,
-            mxx_correctness::operational_noise::OperationalSimulationError::Production(_)
-        ));
+    fn boolean_interval_uses_decoder_round_division_at_modulus_boundaries() {
+        for modulus in [4_u8, 5, 6, 7] {
+            assert!(
+                boolean_interval_accepts(&BigInt::from(modulus), &BigUint::ZERO),
+                "q={modulus} should accept zero noise"
+            );
+        }
+        assert!(boolean_interval_accepts(&BigInt::from(257_u16), &BigUint::from(63_u8)));
+        // q=257 has Q=RoundDiv(255,4)=64.  Although 128 +/- 64 is still
+        // inside the inclusive true interval [64,192], 0 + 64 is decoded as
+        // true, so uniform correctness requires rejecting this boundary.
+        assert!(!boolean_interval_accepts(&BigInt::from(257_u16), &BigUint::from(64_u8)));
     }
 
     #[test]

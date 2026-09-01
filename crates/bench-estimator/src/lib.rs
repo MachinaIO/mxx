@@ -5,13 +5,13 @@ pub mod gpu;
 pub mod harness;
 
 use mxx_ir_core::{
-    FrozenGraphScopeId, ParamEnv, ValidatedGraph, encoding,
+    FrozenGraphScopeId, IntExpr, ParamEnv, RealExpr, ValidatedGraph, encoding,
     node::NodeKind,
     types::{ConcreteWireType, NodeId, WireRef, WireType},
 };
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -320,12 +320,6 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 self.cached_child(child, child_bindings)
             }
             NodeKind::ParallelGrid(grid) => {
-                if !self.backend.loop_index_invariant(self.validated.source.name(), node) {
-                    return Err(EstimateError::LoopIndexDependentCost {
-                        scope: node.scope.clone(),
-                        node: node.id,
-                    });
-                }
                 let count = grid_size(bindings, &grid.shape)?;
                 if count == 0 {
                     return Ok((NodeMeasurement::default(), 0.0, 0, 1));
@@ -335,6 +329,22 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .source
                     .child_scope_id(node.scope, node.id)
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
+                // A grid may extrapolate only work which is invariant under
+                // its own coordinates. Ambient loop slots belong to their
+                // owning extrapolation boundary and are checked there.
+                if measured_cost_depends_on_loop_slots(
+                    &self.validated.source,
+                    node,
+                    &child,
+                    &grid.index_slots,
+                    bindings,
+                )? || !self.backend.loop_index_invariant(self.validated.source.name(), node)
+                {
+                    return Err(EstimateError::LoopIndexDependentCost {
+                        scope: node.scope.clone(),
+                        node: node.id,
+                    });
+                }
                 let child_bindings = grid_child_bindings(bindings, grid)?;
                 let (one, preimage_work, peak, parallelism) =
                     self.cached_child(child, child_bindings)?;
@@ -355,12 +365,6 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 ))
             }
             NodeKind::SequentialLoop(loop_node) => {
-                if !self.backend.loop_index_invariant(self.validated.source.name(), node) {
-                    return Err(EstimateError::LoopIndexDependentCost {
-                        scope: node.scope.clone(),
-                        node: node.id,
-                    });
-                }
                 let count = loop_node
                     .count
                     .evaluate(bindings)
@@ -377,6 +381,20 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .source
                     .child_scope_id(node.scope, node.id)
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
+                let owner_slot = [loop_node.index_slot];
+                if measured_cost_depends_on_loop_slots(
+                    &self.validated.source,
+                    node,
+                    &child,
+                    &owner_slot,
+                    bindings,
+                )? || !self.backend.loop_index_invariant(self.validated.source.name(), node)
+                {
+                    return Err(EstimateError::LoopIndexDependentCost {
+                        scope: node.scope.clone(),
+                        node: node.id,
+                    });
+                }
                 let child_bindings =
                     child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
                 let (one, preimage_work, peak, parallelism) =
@@ -554,13 +572,290 @@ fn grid_child_bindings(
     Ok(child)
 }
 
+fn measured_cost_depends_on_loop_slots(
+    graph: &mxx_ir_core::Graph,
+    owner: &MeasurementNode<'_>,
+    child_scope: &FrozenGraphScopeId,
+    slots: &[u32],
+    bindings: &ParamEnv,
+) -> Result<bool, EstimateError> {
+    if node_cost_inputs_depend_on(owner.kind, owner.output_types, slots, &BTreeSet::new()) {
+        return Ok(true);
+    }
+    let (child_binding_expressions, child_env) = match owner.kind {
+        NodeKind::ParallelGrid(grid) => (&grid.bindings, grid_child_bindings(bindings, grid)?),
+        NodeKind::SequentialLoop(loop_node) => (
+            &loop_node.bindings,
+            child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?,
+        ),
+        _ => return Ok(false),
+    };
+    let dependent_variables =
+        child_dependent_variables(&BTreeSet::new(), child_binding_expressions, slots);
+    scope_tree_cost_depends_on(graph, child_scope, slots, &dependent_variables, &child_env)
+}
+
+fn scope_tree_cost_depends_on(
+    graph: &mxx_ir_core::Graph,
+    scope_id: &FrozenGraphScopeId,
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+    bindings: &ParamEnv,
+) -> Result<bool, EstimateError> {
+    let scope =
+        graph.scope(scope_id).ok_or_else(|| EstimateError::MissingScope(scope_id.clone()))?;
+    for (position, node) in scope.nodes().iter().enumerate() {
+        // A zero-cardinality lexical owner executes no body nodes. Check the
+        // cardinality expression itself for owner dependence, then mirror
+        // node_cost's early zero return before inspecting any body-derived
+        // output type or parameter.
+        match node.kind() {
+            NodeKind::ParallelGrid(grid) => {
+                if grid
+                    .shape
+                    .iter()
+                    .any(|extent| int_expr_depends_on(extent, slots, dependent_variables))
+                {
+                    return Ok(true);
+                }
+                if grid_size(bindings, &grid.shape)? == 0 {
+                    continue;
+                }
+            }
+            NodeKind::SequentialLoop(loop_node) => {
+                if int_expr_depends_on(&loop_node.count, slots, dependent_variables) {
+                    return Ok(true);
+                }
+                let count = loop_node
+                    .count
+                    .evaluate(bindings)
+                    .map_err(|error| EstimateError::Expression(error.to_string()))?
+                    .to_usize()
+                    .ok_or_else(|| {
+                        EstimateError::Expression("sequential loop count is not usize".to_owned())
+                    })?;
+                if count == 0 {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        if node_cost_inputs_depend_on(node.kind(), node.output_types(), slots, dependent_variables)
+        {
+            return Ok(true);
+        }
+        let Some(child) = graph.child_scope_id(scope_id, NodeId(position as u64)) else {
+            continue;
+        };
+        let (child_binding_expressions, child_env, child_slots) = match node.kind() {
+            NodeKind::SubgraphCall(call) => {
+                (&call.bindings, child_bindings(bindings, &call.bindings, None)?, &[][..])
+            }
+            NodeKind::ParallelGrid(grid) => {
+                (&grid.bindings, grid_child_bindings(bindings, grid)?, slots)
+            }
+            NodeKind::SequentialLoop(loop_node) => (
+                &loop_node.bindings,
+                child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?,
+                slots,
+            ),
+            _ => continue,
+        };
+        let child_variables =
+            child_dependent_variables(dependent_variables, child_binding_expressions, slots);
+        if scope_tree_cost_depends_on(graph, &child, child_slots, &child_variables, &child_env)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn node_cost_inputs_depend_on(
+    kind: &NodeKind,
+    output_types: &[WireType],
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+) -> bool {
+    // Every argument type is the output type of either a producer in this
+    // scope or a formal Input node, both of which are visited by the scope
+    // walk. This therefore covers geometry/type changes on both sides of a
+    // measured operation without treating value-only selectors as cost.
+    if output_types
+        .iter()
+        .any(|wire_type| wire_type_depends_on(wire_type, slots, dependent_variables))
+    {
+        return true;
+    }
+    match kind {
+        NodeKind::GadgetTrapdoor { base, .. } => {
+            int_expr_depends_on(base, slots, dependent_variables)
+        }
+        NodeKind::UniformIntervalSample { range, .. } => [&range.minimum, &range.maximum]
+            .into_iter()
+            .any(|expression| int_expr_depends_on(expression, slots, dependent_variables)),
+        NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
+            real_expr_depends_on(sigma, slots, dependent_variables) ||
+                int_expr_depends_on(max_coefficient_bound, slots, dependent_variables)
+        }
+        NodeKind::TrapdoorSample {
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+            ..
+        } => {
+            real_expr_depends_on(sigma, slots, dependent_variables) ||
+                [gadget_base, digit_count, preimage_max_coefficient_bound].into_iter().any(
+                    |expression| int_expr_depends_on(expression, slots, dependent_variables),
+                )
+        }
+        NodeKind::PreimageSample { max_coefficient_bound, .. } |
+        NodeKind::FamilyPreimageSample { max_coefficient_bound, .. } => {
+            int_expr_depends_on(max_coefficient_bound, slots, dependent_variables)
+        }
+        NodeKind::GadgetDecompose { base, digit_count, .. } => [base, digit_count]
+            .into_iter()
+            .any(|expression| int_expr_depends_on(expression, slots, dependent_variables)),
+        NodeKind::ThresholdDecode { plaintext_modulus, length, .. } => [plaintext_modulus, length]
+            .into_iter()
+            .any(|expression| int_expr_depends_on(expression, slots, dependent_variables)),
+        NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => {
+            plaintext_moduli
+                .iter()
+                .chain(reconstruction_coefficients)
+                .any(|expression| int_expr_depends_on(expression, slots, dependent_variables))
+        }
+        NodeKind::PackPolynomialCoefficients { coefficient_bits, .. } => {
+            int_expr_depends_on(coefficient_bits, slots, dependent_variables)
+        }
+        NodeKind::ParallelGrid(grid) => {
+            grid.shape.iter().any(|extent| int_expr_depends_on(extent, slots, dependent_variables))
+        }
+        NodeKind::SequentialLoop(loop_node) => {
+            int_expr_depends_on(&loop_node.count, slots, dependent_variables)
+        }
+        _ => false,
+    }
+}
+
+fn child_dependent_variables(
+    parent: &BTreeSet<String>,
+    bindings: &[(String, mxx_ir_core::IntExpr)],
+    slots: &[u32],
+) -> BTreeSet<String> {
+    let rebound = bindings.iter().map(|(name, _)| name).collect::<BTreeSet<_>>();
+    let mut child =
+        parent.iter().filter(|name| !rebound.contains(name)).cloned().collect::<BTreeSet<_>>();
+    for (name, expression) in bindings {
+        if int_expr_depends_on(expression, slots, parent) {
+            child.insert(name.clone());
+        }
+    }
+    child
+}
+
+fn int_expr_depends_on(
+    expression: &IntExpr,
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+) -> bool {
+    match expression {
+        IntExpr::Const(_) => false,
+        IntExpr::Var(name) => dependent_variables.contains(name),
+        IntExpr::LoopIndex(slot) => slots.contains(slot),
+        IntExpr::Add(left, right) |
+        IntExpr::Sub(left, right) |
+        IntExpr::Mul(left, right) |
+        IntExpr::Div(left, right) |
+        IntExpr::RoundDiv(left, right) => {
+            int_expr_depends_on(left, slots, dependent_variables) ||
+                int_expr_depends_on(right, slots, dependent_variables)
+        }
+        IntExpr::Log2Ceil(value) => int_expr_depends_on(value, slots, dependent_variables),
+    }
+}
+
+fn real_expr_depends_on(
+    expression: &RealExpr,
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+) -> bool {
+    match expression {
+        RealExpr::Rational(_) | RealExpr::Var(_) => false,
+        RealExpr::FromInt(value) => int_expr_depends_on(value, slots, dependent_variables),
+        RealExpr::Add(left, right) |
+        RealExpr::Sub(left, right) |
+        RealExpr::Mul(left, right) |
+        RealExpr::Div(left, right) => {
+            real_expr_depends_on(left, slots, dependent_variables) ||
+                real_expr_depends_on(right, slots, dependent_variables)
+        }
+        RealExpr::Sqrt(value) => real_expr_depends_on(value, slots, dependent_variables),
+    }
+}
+
+fn matrix_type_depends_on(
+    matrix: &mxx_ir_core::types::MatrixType,
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+) -> bool {
+    [&matrix.modulus, &matrix.ring_dimension, &matrix.rows, &matrix.columns]
+        .into_iter()
+        .any(|expression| int_expr_depends_on(expression, slots, dependent_variables))
+}
+
+fn wire_type_depends_on(
+    wire_type: &WireType,
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+) -> bool {
+    match wire_type {
+        WireType::Bytes { length } => int_expr_depends_on(length, slots, dependent_variables),
+        WireType::Matrix(matrix) | WireType::Preimage(matrix) => {
+            matrix_type_depends_on(matrix, slots, dependent_variables)
+        }
+        WireType::Trapdoor {
+            matrix,
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+        } => {
+            matrix_type_depends_on(matrix, slots, dependent_variables) ||
+                real_expr_depends_on(sigma, slots, dependent_variables) ||
+                [gadget_base, digit_count, preimage_max_coefficient_bound].into_iter().any(
+                    |expression| int_expr_depends_on(expression, slots, dependent_variables),
+                )
+        }
+        WireType::Family { element, shape } => {
+            wire_type_depends_on(element, slots, dependent_variables) ||
+                shape
+                    .iter()
+                    .any(|extent| int_expr_depends_on(extent, slots, dependent_variables))
+        }
+        WireType::ConstantInt |
+        WireType::ConstantReal |
+        WireType::ConstantBool |
+        WireType::Int |
+        WireType::Real |
+        WireType::Bool |
+        WireType::TypedBlob { .. } => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mxx_dsl::{
-        DslContext, Family, Int, IntType, Mat, MatType, Parallel, Ring, Sequential, Subgraph,
+        DslContext, Family, GraphValue, Int, IntType, Mat, MatFamilyType, MatType, Parallel,
+        Pending, Ring, Sequential, Subgraph,
     };
-    use std::convert::Infallible;
+    use mxx_ir_core::{
+        Graph, GraphOutput, IntExpr, NodeHandle, SubgraphHandle, WireType,
+        graph::with_new_construction_scope,
+        node::{IndexRange, ParallelGrid, SequentialLoop},
+    };
+    use std::{cell::Cell, convert::Infallible};
 
     struct UnitBackend;
 
@@ -760,5 +1055,460 @@ mod tests {
             .find_map(|(scope, cost)| scope.contains("grid-identity").then_some(cost.invocations))
             .expect("grid subgraph cost");
         assert_eq!(invocations, 6);
+    }
+
+    #[test]
+    fn parallel_grid_rejects_index_dependent_cost_bindings_and_multiplies_invariant_cost() {
+        fn gaussian_grid(shape: usize, binding: IntExpr) -> ValidatedGraph {
+            let ring = Ring::new(257, 8);
+            let matrix_type = ring.matrix_type((1, 1));
+            let body = with_new_construction_scope(|scope| {
+                let sample = ring.gaussian((1, 1), 5, IntExpr::Var("sampler_bound".to_owned()));
+                SubgraphHandle::new(
+                    "measured-grid-body",
+                    scope,
+                    Vec::new(),
+                    vec![sample.value_handle().clone()],
+                )
+                .expect("grid body")
+            });
+            let grid = NodeHandle::parallel_grid(
+                body,
+                Vec::new(),
+                vec![WireType::Family {
+                    element: Box::new(WireType::Matrix(matrix_type)),
+                    shape: vec![IntExpr::constant(shape)],
+                }],
+                ParallelGrid {
+                    shape: vec![IntExpr::constant(shape)],
+                    index_slots: vec![7],
+                    bindings: vec![("sampler_bound".to_owned(), binding)],
+                    input_modes: Vec::new(),
+                },
+            )
+            .output(0)
+            .expect("grid output");
+            let (graph, _) = Graph::freeze(
+                "estimate-grid-binding-invariance",
+                Vec::new(),
+                BTreeMap::from([(
+                    "samples".to_owned(),
+                    GraphOutput { value: grid, confidentiality: None },
+                )]),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .expect("graph");
+            let bindings = ParamEnv {
+                integers: BTreeMap::from([("sampler_bound".to_owned(), 19.into())]),
+                ..ParamEnv::default()
+            };
+            mxx_ir_core::validate(&graph, &bindings).expect("valid grid")
+        }
+
+        struct CountingBackend {
+            measurements: usize,
+        }
+
+        impl MeasurementBackend for CountingBackend {
+            type Error = Infallible;
+
+            fn measure(
+                &mut self,
+                _graph: &str,
+                _node: &MeasurementNode<'_>,
+                _bindings: &ParamEnv,
+            ) -> Result<NodeMeasurement, Self::Error> {
+                self.measurements += 1;
+                Ok(NodeMeasurement { work_seconds: 2.0, latency_seconds: 2.0, workspace_bytes: 4 })
+            }
+
+            fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
+                8
+            }
+        }
+
+        let dependent = gaussian_grid(3, IntExpr::LoopIndex(7));
+        let mut dependent_backend = CountingBackend { measurements: 0 };
+        assert!(matches!(
+            estimate(&dependent, &mut dependent_backend, &EstimateConfig::default()),
+            Err(EstimateError::LoopIndexDependentCost { .. })
+        ));
+        assert_eq!(dependent_backend.measurements, 0);
+
+        let empty_dependent = gaussian_grid(0, IntExpr::LoopIndex(7));
+        let mut empty_backend = CountingBackend { measurements: 0 };
+        let empty_report =
+            estimate(&empty_dependent, &mut empty_backend, &EstimateConfig::default())
+                .expect("empty grid has no work to extrapolate");
+        assert_eq!(empty_backend.measurements, 0);
+        assert_eq!(empty_report.total_work_seconds, 0.0);
+
+        let invariant = gaussian_grid(3, IntExpr::constant(19));
+        let mut invariant_backend = CountingBackend { measurements: 0 };
+        let report = estimate(&invariant, &mut invariant_backend, &EstimateConfig::default())
+            .expect("invariant estimate");
+        assert_eq!(invariant_backend.measurements, 1);
+        assert_eq!(report.total_work_seconds, 6.0);
+    }
+
+    #[test]
+    fn sequential_owner_rejects_an_ambient_slot_used_by_a_nested_grid_binding() {
+        let ring = Ring::new(257, 8);
+        let matrix_type = ring.matrix_type((1, 1));
+        let initial = Parallel::range(1).map_values(|_| ring.zero((1, 1))).expect("initial family");
+        let output = Sequential::range(3)
+            .scan(initial, Int::constant(0), |layer, _state, _| {
+                let body = with_new_construction_scope(|scope| {
+                    let sample = ring.gaussian((1, 1), 5, IntExpr::Var("ambient_bound".to_owned()));
+                    SubgraphHandle::new(
+                        "nested-grid-body",
+                        scope,
+                        Vec::new(),
+                        vec![sample.value_handle().clone()],
+                    )
+                    .expect("nested grid body")
+                });
+                let family_type = MatFamilyType {
+                    element: matrix_type.clone(),
+                    shape: vec![IntExpr::constant(1)],
+                };
+                let nested_grid = NodeHandle::parallel_grid(
+                    body,
+                    Vec::new(),
+                    vec![WireType::Family {
+                        element: Box::new(WireType::Matrix(matrix_type.clone())),
+                        shape: vec![IntExpr::constant(1)],
+                    }],
+                    ParallelGrid {
+                        shape: vec![IntExpr::constant(1)],
+                        index_slots: vec![10_000],
+                        bindings: vec![("ambient_bound".to_owned(), layer.expression())],
+                        input_modes: Vec::new(),
+                    },
+                )
+                .output(0)
+                .expect("nested grid output");
+                Family::<Mat>::from_values(&family_type, &[nested_grid], Pending::default())
+            })
+            .expect("sequential scan");
+        let built = DslContext::new("estimate-sequential-ambient-grid-binding")
+            .family_output("output", output)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validation_bindings = ParamEnv {
+            integers: BTreeMap::from([("ambient_bound".to_owned(), 19.into())]),
+            ..ParamEnv::default()
+        };
+        let validated =
+            mxx_ir_core::validate(&built.graph, &validation_bindings).expect("valid graph");
+
+        struct RejectMeasurementBackend {
+            gaussian_measurements: usize,
+        }
+
+        impl MeasurementBackend for RejectMeasurementBackend {
+            type Error = Infallible;
+
+            fn measure(
+                &mut self,
+                _graph: &str,
+                node: &MeasurementNode<'_>,
+                _bindings: &ParamEnv,
+            ) -> Result<NodeMeasurement, Self::Error> {
+                if matches!(node.kind, NodeKind::GaussianSample { .. }) {
+                    self.gaussian_measurements += 1;
+                }
+                Ok(NodeMeasurement::default())
+            }
+
+            fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
+                0
+            }
+        }
+
+        let mut backend = RejectMeasurementBackend { gaussian_measurements: 0 };
+        assert!(matches!(
+            estimate(&validated, &mut backend, &EstimateConfig::default()),
+            Err(EstimateError::LoopIndexDependentCost { .. })
+        ));
+        assert_eq!(backend.gaussian_measurements, 0);
+    }
+
+    #[test]
+    fn grid_ignores_a_colliding_slot_in_an_independent_subgraph_namespace() {
+        let ring = Ring::new(257, 8);
+        let matrix_type = ring.matrix_type((1, 1));
+        let local_slot = Cell::new(None);
+        let independent = Subgraph::<Mat, Mat>::try_define(
+            "independent-empty-loop",
+            MatType(matrix_type.clone()),
+            |value| {
+                Sequential::range(0).scan(value, Int::constant(0), |layer, _state, _invariant| {
+                    let IntExpr::LoopIndex(slot) = layer.expression() else {
+                        panic!("sequential layer must be a loop index")
+                    };
+                    local_slot.set(Some(slot));
+                    Ok(ring.gaussian((1, 1), 5, IntExpr::LoopIndex(slot)))
+                })
+            },
+        )
+        .expect("independent subgraph");
+        let colliding_slot = local_slot.get().expect("local sequential slot");
+
+        let outer_body = with_new_construction_scope(|scope| {
+            let output = independent.call(ring.zero((1, 1))).expect("subgraph call");
+            SubgraphHandle::new(
+                "outer-grid-body",
+                scope,
+                Vec::new(),
+                vec![output.value_handle().clone()],
+            )
+            .expect("outer grid body")
+        });
+        let output = NodeHandle::parallel_grid(
+            outer_body,
+            Vec::new(),
+            vec![WireType::Family {
+                element: Box::new(WireType::Matrix(matrix_type)),
+                shape: vec![IntExpr::constant(2)],
+            }],
+            ParallelGrid {
+                shape: vec![IntExpr::constant(2)],
+                index_slots: vec![colliding_slot],
+                bindings: Vec::new(),
+                input_modes: Vec::new(),
+            },
+        )
+        .output(0)
+        .expect("outer grid output");
+        let (graph, _) = Graph::freeze(
+            "estimate-independent-slot-namespaces",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("graph");
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("valid graph");
+
+        let report =
+            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+        assert!(report.total_work_seconds > 0.0);
+    }
+
+    #[test]
+    fn grid_allows_loop_dependent_slice_offsets_with_invariant_geometry() {
+        let ring = Ring::new(257, 8);
+        let source = ring.zero((1, 6));
+        let slices = Parallel::range(3)
+            .map(|lane| {
+                let start =
+                    IntExpr::Mul(Box::new(IntExpr::constant(2)), Box::new(lane.expression()));
+                let end = IntExpr::Add(Box::new(start.clone()), Box::new(IntExpr::constant(2)));
+                source.clone().slice(None, Some(IndexRange { start, end }))
+            })
+            .expect("parallel slices");
+        let built = DslContext::new("estimate-loop-dependent-slice-offset")
+            .family_output("slices", slices)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+
+        let report = estimate(
+            &validated,
+            &mut UnitBackend,
+            &EstimateConfig { device_pool_size: 3, per_instance_occupancy: 1 },
+        )
+        .expect("slice offsets do not change measured geometry");
+        assert!(report.total_work_seconds > 0.0);
+        assert_eq!(report.maximum_parallelism, 3);
+    }
+
+    #[test]
+    fn sequential_walk_skips_an_empty_nested_grid_with_tainted_sampler_binding() {
+        let ring = Ring::new(257, 8);
+        let matrix_type = ring.matrix_type((1, 1));
+        let initial = Parallel::range(0).map_values(|_| ring.zero((1, 1))).expect("empty initial");
+        let output = Sequential::range(3)
+            .scan(initial, Int::constant(0), |layer, _state, _| {
+                let body = with_new_construction_scope(|scope| {
+                    let sample = ring.gaussian((1, 1), 5, IntExpr::Var("unused_bound".to_owned()));
+                    SubgraphHandle::new(
+                        "empty-nested-grid-body",
+                        scope,
+                        Vec::new(),
+                        vec![sample.value_handle().clone()],
+                    )
+                    .expect("nested body")
+                });
+                let nested = NodeHandle::parallel_grid(
+                    body,
+                    Vec::new(),
+                    vec![WireType::Family {
+                        element: Box::new(WireType::Matrix(matrix_type.clone())),
+                        shape: vec![IntExpr::constant(0)],
+                    }],
+                    ParallelGrid {
+                        shape: vec![IntExpr::constant(0)],
+                        index_slots: vec![20_000],
+                        bindings: vec![("unused_bound".to_owned(), layer.expression())],
+                        input_modes: Vec::new(),
+                    },
+                )
+                .output(0)
+                .expect("empty nested grid");
+                Family::<Mat>::from_values(
+                    &MatFamilyType {
+                        element: matrix_type.clone(),
+                        shape: vec![IntExpr::constant(0)],
+                    },
+                    &[nested],
+                    Pending::default(),
+                )
+            })
+            .expect("sequential scan");
+        let built = DslContext::new("estimate-empty-nested-grid")
+            .family_output("output", output)
+            .expect("output")
+            .build()
+            .expect("build");
+        let bindings = ParamEnv {
+            integers: BTreeMap::from([("unused_bound".to_owned(), 19.into())]),
+            ..ParamEnv::default()
+        };
+        let validated = mxx_ir_core::validate(&built.graph, &bindings).expect("valid graph");
+
+        struct GaussianCountingBackend(usize);
+
+        impl MeasurementBackend for GaussianCountingBackend {
+            type Error = Infallible;
+
+            fn measure(
+                &mut self,
+                _graph: &str,
+                node: &MeasurementNode<'_>,
+                _bindings: &ParamEnv,
+            ) -> Result<NodeMeasurement, Self::Error> {
+                if matches!(node.kind, NodeKind::GaussianSample { .. }) {
+                    self.0 += 1;
+                }
+                Ok(NodeMeasurement::default())
+            }
+
+            fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
+                0
+            }
+        }
+
+        let mut backend = GaussianCountingBackend(0);
+        estimate(&validated, &mut backend, &EstimateConfig::default()).expect("estimate");
+        assert_eq!(backend.0, 0);
+    }
+
+    #[test]
+    fn integer_binding_does_not_taint_same_named_real_sampler_parameter() {
+        let tainted = child_dependent_variables(
+            &BTreeSet::new(),
+            &[("shared_name".to_owned(), IntExpr::LoopIndex(30_000))],
+            &[30_000],
+        );
+        assert!(!real_expr_depends_on(&RealExpr::Var("shared_name".to_owned()), &[], &tainted,));
+        assert!(real_expr_depends_on(
+            &RealExpr::FromInt(IntExpr::Var("shared_name".to_owned())),
+            &[],
+            &tainted,
+        ));
+    }
+
+    #[test]
+    fn tainted_call_binding_does_not_enter_a_canonical_empty_loop_body() {
+        let ring = Ring::new(257, 8);
+        let matrix_type = ring.matrix_type((1, 1));
+        let canonical = with_new_construction_scope(|canonical_scope| {
+            let initial = ring.zero((1, 1));
+            let loop_body = with_new_construction_scope(|body_scope| {
+                let state = ring.input("__canonical_empty_state", (1, 1));
+                let sample = ring.gaussian((1, 1), 5, IntExpr::Var("unused_call_bound".to_owned()));
+                SubgraphHandle::new(
+                    "canonical-empty-body",
+                    body_scope,
+                    vec![state.value_handle().clone()],
+                    vec![sample.value_handle().clone()],
+                )
+                .expect("empty body")
+            });
+            let empty = NodeHandle::sequential_loop(
+                loop_body,
+                vec![initial.value_handle().clone()],
+                vec![WireType::Matrix(matrix_type.clone())],
+                SequentialLoop {
+                    count: IntExpr::constant(0),
+                    index_slot: 40_001,
+                    bindings: Vec::new(),
+                    carried_count: 1,
+                },
+            )
+            .output(0)
+            .expect("empty loop output");
+            SubgraphHandle::new("canonical-empty-loop", canonical_scope, Vec::new(), vec![empty])
+                .expect("canonical subgraph")
+        });
+        let outer_body = with_new_construction_scope(|scope| {
+            let call = NodeHandle::subgraph_call(
+                canonical,
+                Vec::new(),
+                vec![("unused_call_bound".to_owned(), IntExpr::LoopIndex(40_000))],
+                Vec::new(),
+            )
+            .output(0)
+            .expect("call output");
+            SubgraphHandle::new("outer-caller-body", scope, Vec::new(), vec![call])
+                .expect("outer body")
+        });
+        let output = NodeHandle::parallel_grid(
+            outer_body,
+            Vec::new(),
+            vec![WireType::Family {
+                element: Box::new(WireType::Matrix(matrix_type)),
+                shape: vec![IntExpr::constant(2)],
+            }],
+            ParallelGrid {
+                shape: vec![IntExpr::constant(2)],
+                index_slots: vec![40_000],
+                bindings: Vec::new(),
+                input_modes: Vec::new(),
+            },
+        )
+        .output(0)
+        .expect("outer output");
+        let (graph, _) = Graph::freeze(
+            "estimate-canonical-empty-loop",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("graph");
+        let bindings = ParamEnv {
+            integers: BTreeMap::from([("unused_call_bound".to_owned(), 19.into())]),
+            loop_indices: BTreeMap::from([(40_000, 0.into())]),
+            ..ParamEnv::default()
+        };
+        let validated = mxx_ir_core::validate(&graph, &bindings).expect("valid graph");
+
+        estimate(&validated, &mut UnitBackend, &EstimateConfig::default())
+            .expect("empty canonical loop body is unreachable");
     }
 }

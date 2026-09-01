@@ -9,7 +9,7 @@ use crate::{
 };
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
-    artifact::{ArtifactType, ManifestArtifact, ProductionId},
+    artifact::{ArtifactConfidentiality, ArtifactType, ManifestArtifact, ProductionId},
     expr::{IndexExpr, euclidean_div_rem},
     graph::{FrozenGraphScopeId, GraphScope},
     node::{
@@ -379,6 +379,7 @@ where
     let production = session
         .clone()
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
+    let scratch_production = scratch_production_id(&production, rand::random());
     let mut executor = Executor {
         validated,
         backend,
@@ -388,6 +389,7 @@ where
         session,
         config,
         production,
+        scratch_production,
         staged_families: BTreeMap::new(),
         preimage_progress: config.preimage_progress.map(PreimageProgress::new),
         executed_node_count: 0,
@@ -444,7 +446,12 @@ where
             });
         }
     }
-    executor.fence_pending_releases()?;
+    if let Err(error) = executor.fence_pending_releases() {
+        return Err(ExecutionError::StagedCleanup {
+            message: format!("final release fence failed: {error}"),
+            leases: staged_family_leases,
+        });
+    }
     let result = ExecutionResult {
         outputs: named_outputs,
         production_id,
@@ -463,6 +470,7 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     session: Option<ProductionId>,
     config: ExecutionConfig,
     production: ProductionId,
+    scratch_production: ProductionId,
     staged_families: BTreeMap<(ProductionId, String), ManifestArtifact>,
     preimage_progress: Option<PreimageProgress>,
     executed_node_count: usize,
@@ -1040,6 +1048,43 @@ where
             );
         }
         Ok((Some(production), handles))
+    }
+
+    fn staged_family_descriptor(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        path: &[InstantiationFrame],
+        node: NodeId,
+        port: u32,
+        shape: &[usize],
+    ) -> Result<Option<(String, ManifestArtifact)>, ExecutionError> {
+        let wire_id =
+            WireId { instantiation_path: path.to_vec(), wire: WireRef { node, port: Port(port) } };
+        let Some(ConcreteWireType::Family { element, shape: validated_shape }) =
+            self.validated_wire_type(scope_id, wire_id.wire)
+        else {
+            return Ok(None);
+        };
+        if validated_shape != shape {
+            return Err(ExecutionError::MissingMetadata(wire_id));
+        }
+        let Some(artifact_type) = ArtifactType::from_wire_type(element) else {
+            return Ok(None);
+        };
+        let encoded = mxx_ir_core::encoding::canonical_json(&wire_id)
+            .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
+        let digest = Sha256::digest(encoded);
+        let name = format!("runtime-staged-{}", hex_bytes(&digest));
+        let descriptor = ManifestArtifact {
+            artifact_type,
+            family_shape: Some(shape.to_vec()),
+            confidentiality: ArtifactConfidentiality::Private,
+            content_hash: None,
+            layout: Some("runtime/staged-family-v1".to_owned()),
+        };
+        self.staged_families
+            .insert((self.scratch_production.clone(), name.clone()), descriptor.clone());
+        Ok(Some((name, descriptor)))
     }
 
     fn cleanup_unreturned_staged_families(
@@ -2169,9 +2214,22 @@ where
                 {
                     return Err(ExecutionError::ValueKind(WireRef { node: node.id, port: Port(0) }));
                 }
-                let mut outputs = (0..child.outputs().len())
-                    .map(|_| Vec::with_capacity(count))
-                    .collect::<Vec<_>>();
+                let staged = (0..child.outputs().len())
+                    .map(|port| {
+                        self.staged_family_descriptor(scope_id, path, node.id, port as u32, &shape)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut outputs =
+                    staged
+                        .iter()
+                        .map(|descriptor| {
+                            if descriptor.is_some() {
+                                Vec::new()
+                            } else {
+                                Vec::with_capacity(count)
+                            }
+                        })
+                        .collect::<Vec<_>>();
                 let parent_placement = self.backend.active_placement();
                 let placement_count = self.backend.placement_count();
                 if placement_count == 0 {
@@ -2232,15 +2290,43 @@ where
                         child_inputs,
                         placements,
                     )?;
-                    for instance in instances {
+                    for (offset, instance) in instances.into_iter().enumerate() {
                         for (port, value) in instance.outputs.into_iter().enumerate() {
-                            outputs[port].push(value);
+                            if let Some((name, descriptor)) = &staged[port] {
+                                let (payload, _) =
+                                    self.encode_artifact(&value, &descriptor.artifact_type)?;
+                                self.artifact_store
+                                    .store(
+                                        ArtifactKey {
+                                            production: self.scratch_production.clone(),
+                                            name: name.clone(),
+                                            index: Some(wave_start + offset),
+                                        },
+                                        &descriptor.artifact_type,
+                                        descriptor.confidentiality,
+                                        descriptor.layout.as_deref(),
+                                        payload,
+                                    )
+                                    .map_err(Self::artifact_error)?;
+                                self.has_pending_releases |=
+                                    value.releases_backend_resources_on_drop();
+                            } else {
+                                outputs[port].push(value);
+                            }
                         }
                     }
                 }
                 self.set_placement(parent_placement)?;
                 for (port, output) in outputs.into_iter().enumerate() {
-                    self.put(values, node.id, port as u32, RuntimeValue::Family(output));
+                    let value = match &staged[port] {
+                        Some((name, descriptor)) => RuntimeValue::StagedArtifactFamily {
+                            production: self.scratch_production.clone(),
+                            name: name.clone(),
+                            descriptor: descriptor.clone(),
+                        },
+                        None => RuntimeValue::Family(output),
+                    };
+                    self.put(values, node.id, port as u32, value);
                 }
             }
             NodeKind::Select { count } => {
@@ -3527,6 +3613,30 @@ fn hash_sized(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+fn scratch_production_id(
+    production: &ProductionId,
+    scratch_execution_nonce: [u8; 32],
+) -> ProductionId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mxx-runtime/staged-family/v1");
+    hasher.update(production.spec_hash.0);
+    hasher.update(production.execution_nonce);
+    ProductionId {
+        spec_hash: mxx_ir_core::artifact::SpecHash(hasher.finalize().into()),
+        execution_nonce: scratch_execution_nonce,
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 fn collect_staged_families<B: Backend>(
     value: &RuntimeValue<B>,
     families: &mut BTreeMap<(ProductionId, String), usize>,
@@ -3890,7 +4000,7 @@ mod tests {
             .map(|index| ring.polynomial([index.expression()]))
             .expect("range loop");
         let built = DslContext::new("runtime-range")
-            .family_output("values", family)
+            .public_family_output("values", family)
             .expect("output")
             .build()
             .expect("build");
@@ -3909,9 +4019,18 @@ mod tests {
             },
         )
         .expect("execution");
-        if let RuntimeValue::StagedArtifactFamily { descriptor, .. } = &result.outputs["values"] {
-            assert_eq!(descriptor.family_shape, Some(vec![3]));
-        }
+        let RuntimeValue::LazyArtifactFamily { descriptor, .. } = &result.outputs["values"] else {
+            panic!("persisted matrix grid output is not a lazy artifact family")
+        };
+        assert_eq!(descriptor.family_shape, Some(vec![3]));
+        assert_eq!(result.artifact_handles["values"].len(), 3);
+        assert!(result.staged_family_leases.is_empty());
+        let production = result.production_id.clone().expect("artifact production");
+        assert_eq!(
+            store.manifest(&production).expect("artifact manifest").artifacts["values"]
+                .family_shape,
+            Some(vec![3])
+        );
         let RuntimeValue::Family(values) = result
             .materialize_output("values", &backend, &mut store)
             .expect("materialize range output")
@@ -3920,6 +4039,71 @@ mod tests {
         };
         assert_eq!(values.len(), 3);
         result.cleanup_staged(&mut store).expect("staged cleanup");
+    }
+
+    #[test]
+    fn final_fence_failure_returns_cleanup_ownership_for_staged_grid_outputs() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let family = Parallel::range(3)
+            .map(|index| ring.polynomial([index.expression()]))
+            .expect("range loop");
+        let validated = DslContext::new("runtime-staged-final-fence-failure")
+            .family_output("values", family)
+            .expect("unexported output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut backend = cpu_backend([parameters]);
+        backend.fail_next_release_fence();
+        let mut store = MemoryArtifactStore::default();
+        let mut error = match execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(2).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        ) {
+            Ok(_) => panic!("injected final release fence unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let (production, name, descriptor) = match &error {
+            ExecutionError::StagedCleanup { message, leases } => {
+                assert!(message.contains("final release fence failed"));
+                assert_eq!(leases.len(), 1);
+                assert_eq!(leases[0].descriptor.family_shape, Some(vec![3]));
+                (leases[0].production.clone(), leases[0].name.clone(), leases[0].descriptor.clone())
+            }
+            other => panic!("final fence failure lost staged cleanup ownership: {other}"),
+        };
+        for index in 0..3 {
+            let key = ArtifactKey {
+                production: production.clone(),
+                name: name.clone(),
+                index: Some(index),
+            };
+            assert!(store.load_staged(&key, &descriptor).is_ok());
+        }
+
+        error.cleanup_staged(&mut store).expect("retry staged cleanup");
+        for index in 0..3 {
+            let key = ArtifactKey {
+                production: production.clone(),
+                name: name.clone(),
+                index: Some(index),
+            };
+            assert!(store.load_staged(&key, &descriptor).is_err());
+        }
+        assert!(matches!(
+            error,
+            ExecutionError::StagedCleanup { ref leases, .. } if leases.is_empty()
+        ));
     }
 
     #[test]
@@ -4685,7 +4869,8 @@ mod tests {
 
         assert!(matches!(
             &result.outputs["products"],
-            RuntimeValue::Family(values) if values.len() == 3
+            RuntimeValue::StagedArtifactFamily { descriptor, .. }
+                if descriptor.family_shape == Some(vec![3])
         ));
         assert_eq!(backend.multiply_calls(), 0);
         assert_eq!(backend.multiply_batch_sizes(), &[3]);

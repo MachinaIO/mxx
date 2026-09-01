@@ -48,6 +48,9 @@ pub enum PolyBackendError {
         backend_base: BigInt,
         backend_digits: usize,
     },
+    #[cfg(test)]
+    #[error("injected release-fence failure")]
+    InjectedReleaseFenceFailure,
 }
 
 pub struct PolyBackend<M, U, H, T>
@@ -61,6 +64,8 @@ where
     multiply_calls: usize,
     #[cfg(test)]
     multiply_batch_sizes: Vec<usize>,
+    #[cfg(test)]
+    fail_next_release_fence: bool,
     _marker: PhantomData<(M, U, H, T)>,
 }
 
@@ -162,6 +167,8 @@ where
             multiply_calls: 0,
             #[cfg(test)]
             multiply_batch_sizes: Vec::new(),
+            #[cfg(test)]
+            fail_next_release_fence: false,
             _marker: PhantomData,
         }
     }
@@ -237,6 +244,11 @@ where
     #[cfg(test)]
     pub(crate) fn multiply_batch_sizes(&self) -> &[usize] {
         &self.multiply_batch_sizes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_release_fence(&mut self) {
+        self.fail_next_release_fence = true;
     }
 
     pub(super) fn parameters(
@@ -353,6 +365,10 @@ where
     }
 
     fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_release_fence) {
+            return Err(PolyBackendError::InjectedReleaseFenceFailure);
+        }
         for placement in &self.parameters {
             for parameters in placement.values() {
                 parameters.fence_released_memory();

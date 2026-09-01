@@ -691,6 +691,7 @@ where
         if !matches!(
             node.kind,
             NodeKind::MatrixBinary(_) |
+                NodeKind::ApplyPreimage |
                 NodeKind::MatrixMulAccumulate { .. } |
                 NodeKind::MatrixNegate |
                 NodeKind::MatrixScale { .. }
@@ -720,7 +721,7 @@ where
     ) -> Result<(), ExecutionError> {
         self.set_placement(placement)?;
         let outputs = match node.kind {
-            NodeKind::MatrixBinary(operation) => {
+            NodeKind::MatrixBinary(_) | NodeKind::ApplyPreimage => {
                 let mut inputs = Vec::with_capacity(indices.len());
                 for index in indices {
                     let instance = &mut values[*index];
@@ -728,10 +729,15 @@ where
                     let right = self.matrix(instance, node.args[1])?;
                     inputs.push((left, right));
                 }
-                match operation {
-                    MatrixBinaryOp::Add => self.backend.add_batch(inputs),
-                    MatrixBinaryOp::Subtract => self.backend.sub_batch(inputs),
-                    MatrixBinaryOp::Multiply => self.backend.multiply_batch(inputs),
+                match node.kind {
+                    NodeKind::MatrixBinary(MatrixBinaryOp::Add) => self.backend.add_batch(inputs),
+                    NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) => {
+                        self.backend.sub_batch(inputs)
+                    }
+                    NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) | NodeKind::ApplyPreimage => {
+                        self.backend.multiply_batch(inputs)
+                    }
+                    _ => unreachable!("matrix batch kind checked by caller"),
                 }
                 .map_err(Self::backend_error)?
             }
@@ -4627,6 +4633,62 @@ mod tests {
         };
         assert_eq!(first.as_ref(), &four);
         assert_eq!(second.as_ref(), &DCRTPolyMatrix::zero(&parameters, 1, 1));
+    }
+
+    #[test]
+    fn parallel_apply_preimage_uses_one_relation_aware_multiply_batch() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let digit_count = parameters.modulus_digits();
+        let gadget_base = BigInt::from(1u64 << parameters.base_bits());
+        let trapdoor = ring.sample_trapdoor(1, 5, gadget_base, digit_count, 1_000_000);
+        let preimages = Parallel::range(3)
+            .map_values({
+                let trapdoor = trapdoor.clone();
+                let ring = ring.clone();
+                move |index| {
+                    trapdoor.sample_preimage(
+                        ring.polynomial([index.expression()]),
+                        (digit_count + 2, 1),
+                    )
+                }
+            })
+            .expect("preimage family");
+        let left = ring.input("left", (1, digit_count + 2));
+        let products = preimages
+            .parallel_map_values(move |_, preimage| left.clone().apply_preimage(preimage))
+            .expect("applied preimage family");
+        let validated = DslContext::new("runtime-parallel-apply-preimage-batch")
+            .family_output("products", products)
+            .expect("products output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut backend = cpu_backend([parameters.clone()]);
+        let result = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::from([(
+                "left".to_owned(),
+                RuntimeValue::matrix(DCRTPolyMatrix::zero(&parameters, 1, digit_count + 2)),
+            )]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(3).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("execution");
+
+        assert!(matches!(
+            &result.outputs["products"],
+            RuntimeValue::Family(values) if values.len() == 3
+        ));
+        assert_eq!(backend.multiply_calls(), 0);
+        assert_eq!(backend.multiply_batch_sizes(), &[3]);
     }
 
     #[test]

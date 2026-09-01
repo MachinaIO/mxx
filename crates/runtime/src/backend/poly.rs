@@ -57,6 +57,10 @@ where
     pub(super) parameters: Vec<BTreeMap<RingKey, <M::P as Poly>::Params>>,
     active_placement: usize,
     preimage_batch_calls: usize,
+    #[cfg(test)]
+    multiply_calls: usize,
+    #[cfg(test)]
+    multiply_batch_sizes: Vec<usize>,
     _marker: PhantomData<(M, U, H, T)>,
 }
 
@@ -154,6 +158,10 @@ where
             parameters: vec![BTreeMap::new()],
             active_placement: 0,
             preimage_batch_calls: 0,
+            #[cfg(test)]
+            multiply_calls: 0,
+            #[cfg(test)]
+            multiply_batch_sizes: Vec::new(),
             _marker: PhantomData,
         }
     }
@@ -219,6 +227,16 @@ where
     /// bounded-wave batch path from scalar fallback execution.
     pub fn preimage_batch_calls(&self) -> usize {
         self.preimage_batch_calls
+    }
+
+    #[cfg(test)]
+    pub(crate) fn multiply_calls(&self) -> usize {
+        self.multiply_calls
+    }
+
+    #[cfg(test)]
+    pub(crate) fn multiply_batch_sizes(&self) -> &[usize] {
+        &self.multiply_batch_sizes
     }
 
     pub(super) fn parameters(
@@ -521,6 +539,10 @@ where
     }
 
     fn multiply(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
+        #[cfg(test)]
+        {
+            self.multiply_calls += 1;
+        }
         let left_size = left.size();
         let right_size = right.size();
         Ok(if left_size == (1, 1) {
@@ -533,6 +555,8 @@ where
     }
 
     fn multiply_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
+        #[cfg(test)]
+        self.multiply_batch_sizes.push(inputs.len());
         Ok(M::multiply_batch_out_of_place(inputs))
     }
 

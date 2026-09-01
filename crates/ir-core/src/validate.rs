@@ -1836,8 +1836,17 @@ fn validate_index_expr(
                     validate_index_expr(branch, output_rank, env, scope, node, sequential_slots)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            match selector.and_then(|value| value.to_usize()) {
-                Some(index) => branches.get(index).cloned().flatten(),
+            match selector {
+                Some(value) => {
+                    let Some(index) = value.to_usize() else {
+                        return node_error(scope, node, "index map select selector is out of range");
+                    };
+                    branches.get(index).cloned().ok_or_else(|| ValidationError::Node {
+                        scope: scope.clone(),
+                        node,
+                        message: "index map select selector is out of range".to_owned(),
+                    })?
+                }
                 None => None,
             }
         }
@@ -2424,6 +2433,32 @@ mod tests {
             ),
             "preimage public matrix does not match its trapdoor type"
         );
+    }
+
+    #[test]
+    fn index_select_rejects_invalid_constants_and_preserves_dynamic_axes() {
+        let evaluate = |selector| {
+            validate_index_expr(
+                &IndexExpr::Select {
+                    selector: Box::new(selector),
+                    branches: vec![IndexExpr::constant(3), IndexExpr::constant(7)],
+                },
+                1,
+                &ParamEnv::default(),
+                &FrozenGraphScopeId::Root,
+                NodeId(0),
+                &BTreeSet::new(),
+            )
+        };
+
+        assert_eq!(evaluate(IndexExpr::constant(1)).unwrap(), Some(BigInt::from(7)));
+        for selector in [-1, 2] {
+            assert_eq!(
+                node_message(evaluate(IndexExpr::constant(selector)).unwrap_err()),
+                "index map select selector is out of range"
+            );
+        }
+        assert_eq!(evaluate(IndexExpr::Axis(0)).unwrap(), None);
     }
 
     #[test]

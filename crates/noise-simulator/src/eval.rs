@@ -154,35 +154,43 @@ fn artifact_validation_order(
 
 pub(crate) fn run(request: &SimulationRequest) -> Result<crate::SimulationReport, SimulationError> {
     request.validate()?;
-    let plan = crate::plan::Plan::build(request)?;
     // Validate stages in program order while accumulating the exact manifests
     // exported by their producers.  Cross-stage artifact inputs cannot be
     // validated in isolation: the consumer must see the producer's concrete
     // output type, family shape, and confidentiality.
     // Validation elaborates every stage's complete graph, including dead
     // artifact inputs, so close the manifest dependency graph over all stages.
-    let needed =
-        request.program.stages.iter().map(|stage| stage.id.clone()).collect::<HashSet<_>>();
-    let validation_order = artifact_validation_order(request, &needed)?;
-    let mut manifests = BTreeMap::new();
-    for index in validation_order {
-        let stage = &request.program.stages[index];
-        let validated =
-            mxx_ir_core::validate_with_manifests(&stage.graph, &request.environment, &manifests)
-                .map_err(|error| SimulationError::InvalidGraph {
-                    message: format!("stage {:?}: {error}", stage.id),
-                    site: None,
-                })?;
-        let manifest = mxx_ir_core::artifact::export_validated_manifest(
-            stage.production_id.clone(),
-            &validated,
-        )
-        .map_err(|error| SimulationError::InvalidGraph {
-            message: error.to_string(),
-            site: None,
-        })?;
-        manifests.insert(stage.production_id.clone(), manifest);
+    {
+        let needed =
+            request.program.stages.iter().map(|stage| stage.id.clone()).collect::<HashSet<_>>();
+        let validation_order = artifact_validation_order(request, &needed)?;
+        let mut manifests = BTreeMap::new();
+        for index in validation_order {
+            let stage = &request.program.stages[index];
+            let validated = mxx_ir_core::validate_with_manifests(
+                &stage.graph,
+                &request.environment,
+                &manifests,
+            )
+            .map_err(|error| SimulationError::InvalidGraph {
+                message: format!("stage {:?}: {error}", stage.id),
+                site: None,
+            })?;
+            let manifest = mxx_ir_core::artifact::export_validated_manifest(
+                stage.production_id.clone(),
+                &validated,
+            )
+            .map_err(|error| SimulationError::InvalidGraph {
+                message: error.to_string(),
+                site: None,
+            })?;
+            manifests.insert(stage.production_id.clone(), manifest);
+        }
     }
+    // The occurrence-aware plan is built only after every requested graph and
+    // its artifact manifest have passed deep validation.  Keep the temporary
+    // validation graph and manifest data out of the peak evaluation lifetime.
+    let plan = crate::plan::Plan::build(request)?;
     if request.limits.maximum_planned_wires.is_some_and(|limit| plan.wires.len() > limit) {
         return Err(SimulationError::ResourceLimitExceeded {
             message: "maximum planned wires exceeded".into(),
@@ -9182,6 +9190,106 @@ mod tests {
             limits: crate::SimulationLimits::default(),
         };
         assert!(run(&request).is_ok());
+    }
+
+    #[test]
+    fn invalid_cross_stage_artifact_is_rejected_before_planning() {
+        let producer_matrix = MatrixType {
+            modulus: mxx_ir_core::IntExpr::constant(17),
+            ring_dimension: mxx_ir_core::IntExpr::constant(4),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
+        };
+        let consumer_matrix =
+            MatrixType { modulus: mxx_ir_core::IntExpr::constant(19), ..producer_matrix.clone() };
+        let produced = NodeHandle::new(
+            NodeKind::ConstantMatrix {
+                matrix_type: producer_matrix.clone(),
+                value: ConstantMatrix::Zero,
+            },
+            vec![],
+            vec![WireType::Matrix(producer_matrix)],
+        )
+        .output(0)
+        .unwrap();
+        let (producer_graph, _) = Graph::freeze(
+            "invalid-artifact-producer",
+            vec![],
+            BTreeMap::from([(
+                "artifact".into(),
+                GraphOutput {
+                    value: produced,
+                    confidentiality: Some(ArtifactConfidentiality::Public),
+                },
+            )]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let environment = ParamEnv::default();
+        let producer_id = ProductionId {
+            spec_hash: spec_hash(&producer_graph, &environment).unwrap(),
+            execution_nonce: [5; 32],
+        };
+        let consumed = NodeHandle::new(
+            NodeKind::Input {
+                name: "consumed".into(),
+                wire_type: WireType::Matrix(consumer_matrix.clone()),
+                artifact: Some(ArtifactInput {
+                    production_id: producer_id.clone(),
+                    artifact_name: "artifact".into(),
+                    confidentiality: ArtifactConfidentiality::Public,
+                }),
+            },
+            vec![],
+            vec![WireType::Matrix(consumer_matrix)],
+        )
+        .output(0)
+        .unwrap();
+        let (consumer_graph, _) = Graph::freeze(
+            "invalid-artifact-consumer",
+            vec![],
+            BTreeMap::from([(
+                "out".into(),
+                GraphOutput { value: consumed, confidentiality: None },
+            )]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let consumer = crate::StageId("invalid-consumer".into());
+        let request = SimulationRequest {
+            program: crate::SimulationProgram {
+                stages: vec![
+                    crate::SimulationStage {
+                        id: consumer.clone(),
+                        production_id: ProductionId {
+                            spec_hash: spec_hash(&consumer_graph, &environment).unwrap(),
+                            execution_nonce: [6; 32],
+                        },
+                        graph: consumer_graph,
+                    },
+                    crate::SimulationStage {
+                        id: crate::StageId("invalid-producer".into()),
+                        production_id: producer_id,
+                        graph: producer_graph,
+                    },
+                ],
+            },
+            environment,
+            roots: vec![crate::SimulationRoot { stage: consumer, output: "out".into() }],
+            external_inputs: vec![],
+            limits: crate::SimulationLimits::default(),
+        };
+
+        let result = run(&request);
+        assert!(matches!(
+            result,
+            Err(SimulationError::InvalidGraph { message, .. })
+                if message.contains("artifact type does not match manifest")
+        ));
     }
 
     #[test]

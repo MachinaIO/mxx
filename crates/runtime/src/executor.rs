@@ -484,6 +484,14 @@ struct PreparedPreimage<M, T> {
     request: PreimageRequest<M, T>,
 }
 
+struct PreparedPreimageGroup<M, T> {
+    public: Arc<M>,
+    trapdoor: Arc<T>,
+    sigma: f64,
+    gadget_base: BigInt,
+    digit_count: usize,
+}
+
 struct PreimageProgress {
     config: PreimageProgressConfig,
     completed: usize,
@@ -2479,6 +2487,9 @@ where
         if target_count % source_count != 0 {
             return Err(ExecutionError::ValueKind(node.args[2]));
         }
+        if target_count == 0 {
+            return Ok(Vec::new());
+        }
         let branch_count = target_count / source_count;
         let max_coefficient_bound = match node.kind {
             NodeKind::FamilyPreimageSample { max_coefficient_bound, .. } => max_coefficient_bound
@@ -2499,9 +2510,12 @@ where
                     wire: output_wire,
                 })
             })?;
-        let mut pending = Vec::with_capacity(target_count);
-        for lane in 0..target_count {
-            let group = lane / branch_count;
+        // B_i and its trapdoor are shared by every branch j in
+        // B_i * K_i,j = T_i,j. Materialize each source group once so an
+        // artifact-backed family performs one decode/transfer per i, then
+        // clone the resulting Arcs into all branch requests.
+        let mut groups = Vec::with_capacity(source_count);
+        for group in 0..source_count {
             let public = if source_family_count.is_some() {
                 match self.family_member(values, node.args[0], group, node.id)? {
                     RuntimeValue::Matrix(value) => value,
@@ -2529,6 +2543,18 @@ where
             if public.as_ref() != trapdoor_public.as_ref() {
                 return Err(ExecutionError::PreimagePublicMismatch(node.id));
             }
+            groups.push(PreparedPreimageGroup {
+                public,
+                trapdoor: secret,
+                sigma,
+                gadget_base,
+                digit_count,
+            });
+        }
+
+        let mut pending = Vec::with_capacity(target_count);
+        for lane in 0..target_count {
+            let group = &groups[lane / branch_count];
             let target = match self.family_member(values, node.args[2], lane, node.id)? {
                 RuntimeValue::Matrix(value) => value,
                 _ => return Err(ExecutionError::ValueKind(node.args[2])),
@@ -2547,12 +2573,12 @@ where
                 },
                 request: PreimageRequest {
                     matrix_type: matrix_type.clone(),
-                    sigma,
-                    gadget_base,
-                    digit_count,
+                    sigma: group.sigma,
+                    gadget_base: group.gadget_base.clone(),
+                    digit_count: group.digit_count,
                     max_coefficient_bound: max_coefficient_bound.clone(),
-                    trapdoor: secret,
-                    public,
+                    trapdoor: group.trapdoor.clone(),
+                    public: group.public.clone(),
                     target,
                 },
             });
@@ -4377,6 +4403,80 @@ mod tests {
         };
         assert_eq!(replayed_bytes, first_bytes);
         replayed.cleanup_staged(&mut replay_store).expect("replayed staged cleanup");
+    }
+
+    #[test]
+    fn artifact_family_preimage_materializes_shared_source_group_once() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let digit_count = parameters.modulus_digits();
+        let gadget_base = BigInt::from(1u64 << parameters.base_bits());
+        let trapdoors = Parallel::range(1)
+            .map_values(|_| ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1_000_000))
+            .expect("source trapdoor family");
+        let producer = DslContext::new("runtime-artifact-preimage-source-producer")
+            .public_family_output("public", trapdoors.public_matrices())
+            .expect("public family output")
+            .private_trapdoor_family_output("trapdoors", trapdoors)
+            .expect("trapdoor family output")
+            .build()
+            .expect("producer build")
+            .validate(&ParamEnv::default())
+            .expect("producer validation");
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let produced =
+            execute(&producer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .expect("producer execution");
+        let production = produced.production_id.expect("producer artifact production");
+        let manifest = store.manifest(&production).expect("producer manifest").clone();
+
+        let imported = ring.trapdoor_family_artifact_input(
+            production.clone(),
+            "public",
+            "trapdoors",
+            1,
+            1,
+            5,
+            gadget_base,
+            digit_count,
+            1_000_000,
+        );
+        let targets = Parallel::grid(vec![IntExpr::constant(1), IntExpr::constant(3)])
+            .map(|indices| ring.polynomial([indices[1].expression()]))
+            .expect("branch target family");
+        let preimages = imported
+            .sample_preimage_branches(targets, (digit_count + 2, 1))
+            .expect("artifact-backed family preimages");
+        let consumer = DslContext::new("runtime-artifact-preimage-source-consumer")
+            .preimage_family_output("preimages", preimages)
+            .expect("preimage family output")
+            .build()
+            .expect("consumer build")
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .expect("consumer validation");
+        let public_key = ArtifactKey {
+            production: production.clone(),
+            name: "public".to_owned(),
+            index: Some(0),
+        };
+        let trapdoor_key = ArtifactKey { production, name: "trapdoors".to_owned(), index: Some(0) };
+        let public_loads_before = store.load_count(&public_key);
+        let trapdoor_loads_before = store.load_count(&trapdoor_key);
+        let batch_sizes_before = backend.preimage_batch_sizes().len();
+
+        let mut consumed =
+            execute(&consumer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .expect("consumer execution");
+
+        assert_eq!(store.load_count(&public_key), public_loads_before + 1);
+        assert_eq!(store.load_count(&trapdoor_key), trapdoor_loads_before + 1);
+        assert_eq!(&backend.preimage_batch_sizes()[batch_sizes_before..], &[3]);
+        consumed.cleanup_staged(&mut store).expect("preimage staged cleanup");
     }
 
     #[test]
